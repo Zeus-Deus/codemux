@@ -359,7 +359,7 @@ function viewState(view: SubagentView): { phase: DelegationPhase; line: string }
         : /^paused\b/i.test(activity ?? "")
           ? "paused"
           : "working";
-      return { phase, line: activity ?? "Working in its tab" };
+      return { phase, line: activity ?? "Working in its workspace" };
     }
     case "completed":
       return { phase: "done", line: result ?? "Done" };

@@ -177,6 +177,12 @@ impl Harness {
     }
 
     async fn with_install_check(is_installed: fn(ProviderKind) -> bool) -> Self {
+        // Every test here emits app state, which persists the layout: keep
+        // that in Cargo's scratch directory, never the user's config.
+        codemux_lib::state::redirect_layout_persistence(
+            std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("agent-delegation-layout-{}.json", std::process::id())),
+        );
         let app = tauri::test::mock_app();
         // The delegation setting is left unset: the feature is on by default.
         let db = DatabaseStore::new_in_memory();
@@ -449,7 +455,7 @@ mod delegation {
     // ── Delegating ──
 
     #[tokio::test]
-    async fn delegating_opens_a_background_tab_beside_the_parent_and_sends_the_exact_task() {
+    async fn delegating_opens_a_background_child_workspace_and_sends_the_exact_task() {
         let h = Harness::new().await;
         let state = h.app_state();
         let before = state.find_workspace(&h.workspace).unwrap();
@@ -482,16 +488,29 @@ mod delegation {
         );
         assert!(started["note"].as_str().unwrap().contains("durable"));
 
-        // Its own tab, right after the parent's, titled; focus stays put.
+        // Its own workspace nested under the parent's, in the same folder,
+        // titled; the parent's workspace and focus stay put.
         let after = state.find_workspace(&h.workspace).unwrap();
         assert_eq!(state.snapshot().active_workspace_id, active_workspace);
         assert_eq!(after.active_tab_id, before.active_tab_id);
         assert_eq!(after.active_surface_id, before.active_surface_id);
-        assert_eq!(after.tabs.len(), before.tabs.len() + 1);
-        let child_tab = tab_index(&state, &after, &child);
-        assert_eq!(child_tab, tab_index(&state, &after, &h.parent) + 1);
-        assert_eq!(after.tabs[child_tab].title, "Codex · Add slugify helper");
+        assert_eq!(after.tabs.len(), before.tabs.len());
         let child_pane = state.agent_chat_pane_id_for_thread(&child).unwrap();
+        let child_workspace = state.workspace_id_for_pane(&child_pane).unwrap();
+        let ws = state.find_workspace(&child_workspace).unwrap();
+        assert_ne!(child_workspace, h.workspace);
+        assert_eq!(ws.parent_workspace_id.as_deref(), Some(h.workspace.as_str()));
+        assert_eq!(ws.title, "Add slugify helper");
+        assert_eq!(ws.cwd, h.cwd);
+        assert_eq!(ws.worktree_path, None);
+        assert_eq!(ws.project_root, after.project_root);
+        assert_eq!(ws.tabs.len(), 1);
+        assert_eq!(ws.tabs[tab_index(&state, &ws, &child)].title, "Codex · Add slugify helper");
+        // Its first chat is selected inside it, so opening it shows the chat.
+        let child_surface = ws.surfaces.iter().find(|s| s.active_pane_id.0 == child_pane).unwrap();
+        assert_eq!(ws.active_surface_id, child_surface.surface_id);
+        assert_eq!(ws.active_tab_id, ws.tabs[0].tab_id);
+        assert_eq!(ws.tabs[0].surface_id.as_ref(), Some(&ws.active_surface_id));
         assert_eq!(
             state.agent_chat_pane_thread(&child_pane),
             Some((ProviderKind::Codex, child.clone()))
@@ -519,13 +538,13 @@ mod delegation {
         assert!(input.fresh_session);
         assert!(input.resume_cursor.is_none());
         assert_eq!(input.cwd.to_string_lossy(), h.cwd);
-        assert_eq!(input.workspace_id.as_deref(), Some(h.workspace.as_str()));
+        assert_eq!(input.workspace_id.as_deref(), Some(child_workspace.as_str()));
 
         // An ordinary chat row: its title, full mode and the exact task text.
         let db = h.db();
         let record = db.get_agent_chat_session(&child).unwrap();
         assert_eq!(record.provider, "codex");
-        assert_eq!(record.workspace_id, h.workspace);
+        assert_eq!(record.workspace_id, child_workspace);
         assert_eq!(record.cwd.as_deref(), Some(h.cwd.as_str()));
         assert_eq!(record.title.as_deref(), Some("Add slugify helper"));
         assert_eq!(
@@ -559,7 +578,7 @@ mod delegation {
             assert!(card.parent_item_id.is_none());
         }
         let running = cards.last().unwrap();
-        assert_eq!(running.activity.as_deref(), Some("Working in its tab"));
+        assert_eq!(running.activity.as_deref(), Some("Working in its workspace"));
         assert!(running.result_text.is_none());
         assert!(running.duration_ms.is_none());
 
@@ -826,7 +845,7 @@ mod delegation {
         }).await;
         h.deliver().await;
         let record = h.db().delegation_task_for_child(&child).unwrap().unwrap();
-        assert_eq!(record.result.as_ref().unwrap().text, "The user closed its tab. Partial changes may be in the working tree.");
+        assert_eq!(record.result.as_ref().unwrap().text, "The user closed its chat. Partial changes may be in the working tree.");
         assert_ne!(record.completion_delivery, "disposed_by_stop");
         assert!(h
             .db()
@@ -878,6 +897,11 @@ mod delegation {
         let card = h.card(&child);
         assert_eq!(card.status, SubagentStatus::Stopped);
         assert_eq!(card.result_text.as_deref(), Some(STOPPED_WITH_PARENT));
+        // Its own workspace closed with it.
+        let child_workspace = h.db().delegation_task_for_child(&child).unwrap().unwrap().workspace_id;
+        assert_ne!(child_workspace, h.workspace);
+        assert!(h.app_state().find_workspace(&child_workspace).is_none());
+        assert!(h.app_state().find_workspace(&h.workspace).is_some());
         wait_for("the orphaned child to be interrupted", || {
             h.interrupted(ProviderKind::Codex, &child)
         })
@@ -981,7 +1005,7 @@ mod delegation {
         request("req-1");
         assert_eq!(
             h.card(&child).activity.as_deref(),
-            Some("Waiting for your answer in its tab")
+            Some("Waiting for your answer in its workspace")
         );
         agent_chat_respond_to_request(
             h.handle.clone(),
@@ -1005,7 +1029,7 @@ mod delegation {
             )));
         assert_eq!(
             h.card(&child).activity.as_deref(),
-            Some("Working in its tab")
+            Some("Working in its workspace")
         );
 
         // Only an explicit answer resolves an approval.
@@ -1058,7 +1082,7 @@ mod delegation {
         ask(&failed);
         assert_eq!(
             h.card(&failed).activity.as_deref(),
-            Some("Waiting for your answer in its tab")
+            Some("Waiting for your answer in its workspace")
         );
         h.turn_ends(
             &failed,
@@ -1110,7 +1134,7 @@ mod delegation {
         assert_eq!(h.card(&waiting).status, SubagentStatus::Running);
         assert_eq!(
             h.card(&waiting).activity.as_deref(),
-            Some("Waiting for your answer in its tab")
+            Some("Waiting for your answer in its workspace")
         );
         forward_event(
             &h.handle,
@@ -1174,7 +1198,7 @@ mod delegation {
         );
         assert_eq!(
             h.card(&child).activity.as_deref(),
-            Some("Waiting for your answer in its tab")
+            Some("Waiting for your answer in its workspace")
         );
         for _ in 0..3 {
             sweep_pass(&h.handle).await;
@@ -1193,7 +1217,7 @@ mod delegation {
         );
         assert_eq!(
             h.card(&child).activity.as_deref(),
-            Some("Working in its tab")
+            Some("Working in its workspace")
         );
 
         // A native async question, answered (here: dismissed) in its tab.
@@ -1217,7 +1241,7 @@ mod delegation {
         );
         assert_eq!(
             h.card(&child).activity.as_deref(),
-            Some("Waiting for your answer in its tab")
+            Some("Waiting for your answer in its workspace")
         );
         for _ in 0..3 {
             sweep_pass(&h.handle).await;
@@ -1233,7 +1257,7 @@ mod delegation {
         .unwrap();
         assert_eq!(
             h.card(&child).activity.as_deref(),
-            Some("Working in its tab")
+            Some("Working in its workspace")
         );
 
         // One idle pass is not enough; the second finalizes, failing closed.
@@ -1346,7 +1370,7 @@ mod delegation {
         );
         assert_eq!(
             h.card(&child).activity.as_deref(),
-            Some("Working in its tab")
+            Some("Working in its workspace")
         );
         h.child_reports(&child, "Finished after the reset.");
         h.settle(&child).await;
@@ -1590,6 +1614,7 @@ mod delegation {
             .unwrap()
             .tabs
             .len();
+        let workspaces_before = h.app_state().snapshot().workspaces.len();
 
         // Explicit escalation is rejected even though tools are visible in Plan.
         let mut escalation=args("codex", "Add slugify helper");escalation["permission_mode"]=json!("danger-full-access");
@@ -1623,7 +1648,9 @@ mod delegation {
             "This chat has no open workspace."
         );
 
-        // None of them created a tab, a card, a session or a journal row.
+        // None of them created a workspace, a tab, a card, a session or a
+        // journal row.
+        assert_eq!(h.app_state().snapshot().workspaces.len(), workspaces_before);
         assert_eq!(
             h.app_state()
                 .find_workspace(&h.workspace)

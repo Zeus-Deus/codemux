@@ -294,7 +294,7 @@ export function useDelegationOccupant({
       ? "reports post here"
       : blocked
         ? delegationPhaseSummary(rows)
-        : "working in their tabs",
+        : "working in their workspaces",
     elapsed: (now) => delegationElapsedLabel(running, now),
     secondaryAction: {
       label: allStopping ? "Stopping…" : "Stop all",

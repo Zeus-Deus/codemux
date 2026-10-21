@@ -62,7 +62,7 @@ function view(overrides: Partial<SubagentView> = {}): SubagentView {
     model: "gpt-6.1-codex",
     effort: "high",
     status: "running",
-    activity: "Working in its tab",
+    activity: "Working in its workspace",
     items: [],
     toneIndex: 0,
     ...overrides,
@@ -249,7 +249,7 @@ describe("delegationRow", () => {
     );
     expect(delegationRow(null, view()).phase).toBe("working");
     expect(
-      delegationRow(null, view({ activity: "Waiting for your answer in its tab" })).phase,
+      delegationRow(null, view({ activity: "Waiting for your answer in its workspace" })).phase,
     ).toBe("waiting");
     expect(
       delegationRow(null, view({ activity: "Paused: Codex usage limit · resumes 3:40 PM" }))
@@ -307,7 +307,7 @@ describe("delegationRow", () => {
     const rows = [
       delegationRow(null, view({ id: "delegate:c3", status: "completed" })),
       delegationRow(null, view()),
-      delegationRow(null, view({ id: "delegate:c2", activity: "Waiting for your answer in its tab" })),
+      delegationRow(null, view({ id: "delegate:c2", activity: "Waiting for your answer in its workspace" })),
       delegationRow(null, view({ id: "delegate:c4", status: "pending" })),
     ];
     expect(delegationPhaseSummary(rows)).toBe("2 working · 1 waiting · 1 done");

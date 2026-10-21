@@ -151,6 +151,16 @@ pub fn paths_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Whether `path` is `root` or inside it, by the same identity rules as
+/// [`paths_equal`].
+pub fn path_within(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+        || match (path.canonicalize(), root.canonicalize()) {
+            (Ok(path), Ok(root)) => path.starts_with(root),
+            _ => false,
+        }
+}
+
 /// Expand a `~/` prefix using the OS-detected home dir. Returns the
 /// input unchanged when no `~/` prefix is present. Falls back to
 /// the raw path when home_dir is unavailable.

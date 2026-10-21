@@ -159,7 +159,7 @@ function plans(runId: number, opts: DelegatedTaskOptions): ChildPlan[] {
     effort: "high",
     toolUseId: `toolu_delegate_codex_${runId}`,
     outcome: opts.hold ? "hold" : opts.fail && !opts.parallel ? "failed" : "completed",
-    heldActivity: opts.needsInput ? "Waiting for your answer in its tab" : undefined,
+    heldActivity: opts.needsInput ? "Waiting for your answer in its workspace" : undefined,
     finishAt: opts.fail && !opts.parallel ? 2_700 : opts.parallel ? 3_300 : 3_500,
     report:
       opts.fail && !opts.parallel
@@ -190,7 +190,7 @@ function plans(runId: number, opts: DelegatedTaskOptions): ChildPlan[] {
           "- Result rows use persisted notification metadata and retain the child link.",
           "Checked the task records and transcript projections; no files changed.",
         ].join("\n"),
-    heldActivity: "Waiting for your answer in its tab",
+    heldActivity: "Waiting for your answer in its workspace",
   };
   return [codex, claude];
 }
@@ -534,7 +534,7 @@ export function streamDelegatedTask(
       base + 650,
       () => {
         child.status = "running";
-        child.activity = "Working in its tab";
+        child.activity = "Working in its workspace";
         emit(snapshot(child));
       },
       plan.threadId,
@@ -545,7 +545,7 @@ export function streamDelegatedTask(
         schedule(
           base + 1_900,
           () => {
-            child.activity = opts.needsInput ? "Waiting for your answer in its tab" : activity;
+            child.activity = opts.needsInput ? "Waiting for your answer in its workspace" : activity;
             emit(snapshot(child));
           },
           plan.threadId,

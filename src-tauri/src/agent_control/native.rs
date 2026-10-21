@@ -61,7 +61,7 @@ impl<R: Runtime> HostTools for OrchestrationHost<R> {
         let mut result: Vec<_> = tools.into_iter().map(|mut tool| {
             if let Some(required) = tool.input_schema["required"].as_array_mut() { required.retain(|v| v != "workspace_id" && !(tool.name == "thread_launch" && (v == "permission_mode" || v == "provider" || v == "client_request_id"))); }
             if tool.name == "thread_launch" {
-                tool.description = "Start a top-level chat only when the user requests a separate conversation. Defaults to the caller's existing project-root checkout. Omitted or null permission_mode inherits the caller's effective ceiling; explicit modes cannot exceed it. Worktree strategies are unsupported. Returns an operation receipt; use operation_status. Use delegate_task for owned child work.";
+                tool.description = "If the user asks to delegate work or wants results back, use delegate_task instead. Start an independent chat only when the user requests a separate conversation. Without workspace_id the chat gets its own workspace, nested under yours in the same folder and titled with title; with workspace_id it opens as a tab in that workspace. Omitted or null permission_mode inherits the caller's effective ceiling; explicit modes cannot exceed it. Worktree strategies are unsupported. Returns an operation receipt; use operation_status.";
                 tool.input_schema["properties"]["provider_instance_id"] = json!({"type":"string"});
                 tool.input_schema["properties"]["worktree"] = json!({"description":"Unsupported in this version"});
             }
@@ -77,7 +77,7 @@ impl<R: Runtime> HostTools for OrchestrationHost<R> {
             McpTool { name: tool.name.into(), prefixed_name: prefix_tool_name("codemux", tool.name), description: Some(description), input_schema: tool.input_schema, server_id: "codemux".into() }
         }).collect();
         for (name, description, schema) in [
-            ("create_threads", "Start independent top-level chats ONLY when the user requests separate conversations. All entries share the selected existing checkout. Results do not automatically return; use delegate_task for owned work.", json!({"type":"object","properties":{"workspace_id":{"type":"string"},"client_request_id":{"type":"string"},"threads":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object"}}},"required":["threads"],"additionalProperties":false})),
+            ("create_threads", "If the user asks to delegate work or wants results back, use delegate_task instead. Start independent chats ONLY when the user requests separate conversations. Without workspace_id each chat gets its own workspace, nested under yours in the same folder; with workspace_id they open as tabs in that workspace. Results do not automatically return.", json!({"type":"object","properties":{"workspace_id":{"type":"string"},"client_request_id":{"type":"string"},"threads":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object"}}},"required":["threads"],"additionalProperties":false})),
             ("thread_search", "Search bounded safe-visible chat titles and prose. Defaults to the caller's project. Explicit workspace selects that project. Chat links use codemux-chat://v1/<thread_id>.", json!({"type":"object","properties":{"workspace_id":{"type":"string"},"query":{"type":"string","minLength":1,"maxLength":1000},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["query"],"additionalProperties":false})),
         ] { result.push(McpTool { name:name.into(),prefixed_name:prefix_tool_name("codemux",name),description:Some(description.into()),input_schema:schema,server_id:"codemux".into() }); }
         result
@@ -259,6 +259,7 @@ pub(crate) async fn call_with_id<R: Runtime>(
     if !args.is_object() {
         return Err("invalid_arguments: pass an object".into());
     }
+    let mut child_workspace = false;
     if matches!(
         name.as_str(),
         "thread_send" | "thread_read" | "thread_wait" | "thread_interrupt"
@@ -276,18 +277,10 @@ pub(crate) async fn call_with_id<R: Runtime>(
             .state::<DatabaseStore>()
             .get_agent_chat_session(&actor.thread_id)
             .ok_or("Calling chat missing")?;
-        let workspace =
-            service::workspace(&app, &record.workspace_id, false).map_err(|e| e.to_string())?;
-        let default = if name == "thread_launch" {
-            let root =
-                std::path::Path::new(workspace.project_root.as_deref().unwrap_or(&workspace.cwd))
-                    .canonicalize()
-                    .map_err(|e| e.to_string())?;
-            app.state::<AppStateStore>().snapshot().workspaces.into_iter().find(|w|std::path::Path::new(&w.cwd).canonicalize().is_ok_and(|cwd|cwd==root)).map(|w|w.workspace_id.0).ok_or("workspace_not_found: open the caller's project-root checkout, or select an existing workspace explicitly")?
-        } else {
-            record.workspace_id
-        };
-        args["workspace_id"] = json!(default);
+        // A launch without a workspace places each chat in its own child
+        // workspace of the caller's; it never picks another existing one.
+        child_workspace = matches!(name.as_str(), "thread_launch" | "create_threads");
+        args["workspace_id"] = json!(record.workspace_id);
     }
     let result = match name.as_str() {
         "orchestrator_capabilities" => {
@@ -342,7 +335,7 @@ pub(crate) async fn call_with_id<R: Runtime>(
             use sha2::{Digest, Sha256};
             // A retry without an explicit key must recover the same per-entry
             // receipts, including after a partially successful batch.
-            let implicit_key = format!("batch:{:x}", Sha256::digest(serde_json::to_vec(&json!({"session":actor.session_id,"run":actor.permit.identity()?.run_id,"args":args})).map_err(|e|e.to_string())?));
+            let implicit_key = format!("batch:{:x}", Sha256::digest(serde_json::to_vec(&json!({"session":actor.session_id,"run":actor.permit.identity()?.run_id,"args":args,"child_workspace":child_workspace})).map_err(|e|e.to_string())?));
             let input: Batch = service::parse(args).map_err(|e| e.to_string())?;
             if input.threads.is_empty() || input.threads.len() > 20 {
                 return Err("invalid_arguments: batch size must be 1–20".into());
@@ -363,7 +356,7 @@ pub(crate) async fn call_with_id<R: Runtime>(
                         entry_key
                     } else { format!("batch:{:x}:{index}", Sha256::digest(key.as_bytes())) });
                     prepare_launch(&caller, &actor, &mut entry)?;
-                    service::launch(&app, &caller, entry).await.map_err(|e| e.to_string())
+                    service::launch_placed(&app, &caller, entry, child_workspace).await.map_err(|e| e.to_string())
                 }.await;
                 match result {
                     Ok(receipt) => receipts.push(receipt),
@@ -374,7 +367,7 @@ pub(crate) async fn call_with_id<R: Runtime>(
         }
         "thread_launch" => {
             prepare_launch(&caller, &actor, &mut args)?;
-            service::launch(&app, &caller, args)
+            service::launch_placed(&app, &caller, args, child_workspace)
                 .await
                 .map_err(|e| e.to_string())?
         }

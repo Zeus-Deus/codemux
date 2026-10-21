@@ -2503,3 +2503,163 @@ async fn native_callers_round2_dispatch_stop_fence_survives_late_callback_captur
     let receipt = native::call(app.handle().clone(),actor,"thread_launch".into(),json!({"client_request_id":"fresh-launch"})).await.unwrap();
     assert_eq!(receipt["state"],"accepted");
 }
+
+async fn settle_native(app: &tauri::App<tauri::test::MockRuntime>, actor: &crate::delegation::app::NativeActor, receipt: &serde_json::Value) -> serde_json::Value {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let status = super::native::call(app.handle().clone(), actor.clone(), "operation_status".into(), json!({"operation_id":receipt["operation_id"]})).await.unwrap();
+            if !matches!(status["state"].as_str(), Some("accepted" | "running")) { break status; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_launch_without_workspace_gets_its_own_titled_child_workspace() {
+    if crate::state::run_with_isolated_layout("agent_control::tests::native_launch_without_workspace_gets_its_own_titled_child_workspace") { return; }
+    use crate::agent_provider::ProviderKind;
+    let (app, _, root, workspace, _thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
+    let state = app.state::<crate::state::AppStateStore>();
+    // The caller sits in a linked worktree; the project's protected main
+    // checkout is open and already holds an unrelated chat.
+    let main_dir = tempfile::tempdir().unwrap();
+    let main_root = main_dir.path().display().to_string();
+    let main = state.create_empty_workspace_at_path(main_dir.path().to_path_buf()).0;
+    state.set_workspace_protected(&main, true);
+    state.set_workspace_project_root(&main, main_root.clone());
+    state.create_agent_chat_pane(&main, Some(ProviderKind::Claude), None, Some(crate::presets::LaunchMode::NewTab), Some("old-root-chat".into())).unwrap();
+    state.set_workspace_project_root(&workspace, main_root.clone());
+    state.set_workspace_project_identity(&workspace, Some("project-uid".into()), Some("worktree".into()));
+    state.set_workspace_worktree(&workspace, root.path().display().to_string(), "Coordinator".into());
+    assert!(state.activate_workspace(&workspace));
+    let root_before = serde_json::to_value(state.find_workspace(&main).unwrap()).unwrap();
+    let count_before = state.snapshot().workspaces.len();
+
+    let mut children = vec![];
+    for (key, title) in [("ci-review-a", "CI speed review — A"), ("ci-review-b", "CI speed review — B")] {
+        let args = json!({"client_request_id":key,"provider":"claude","title":title});
+        let receipt = super::native::call(app.handle().clone(), actor.clone(), "thread_launch".into(), args.clone()).await.unwrap();
+        let outcome = settle_native(&app, &actor, &receipt).await;
+        assert_eq!(outcome["state"], "succeeded", "{outcome}");
+        let child = receipt["workspace_id"].as_str().unwrap().to_string();
+        assert_eq!(outcome["workspace_id"], child);
+        assert_ne!(child, workspace);
+        assert_ne!(child, main);
+        // A retry reuses the receipt and creates nothing new.
+        let retry = super::native::call(app.handle().clone(), actor.clone(), "thread_launch".into(), args).await.unwrap();
+        assert_eq!(retry["operation_id"], receipt["operation_id"]);
+        assert_eq!(retry["workspace_id"], child);
+
+        let ws = state.find_workspace(&child).unwrap();
+        assert_eq!(ws.parent_workspace_id.as_deref(), Some(workspace.as_str()));
+        assert_eq!(ws.cwd, root.path().display().to_string());
+        assert_eq!(ws.worktree_path, None);
+        assert_eq!(ws.project_root.as_deref(), Some(main_root.as_str()));
+        assert_eq!(ws.project_uid.as_deref(), Some("project-uid"));
+        assert!(!ws.protected);
+        assert_eq!(ws.title, title);
+        assert_eq!(ws.tabs.len(), 1);
+        assert_eq!(ws.tabs[0].title, title);
+        assert_eq!(ws.surfaces[0].title, title);
+        // Its chat is selected inside it, so opening it shows the chat.
+        assert_eq!(ws.active_tab_id, ws.tabs[0].tab_id);
+        assert_eq!(ws.active_surface_id, ws.surfaces[0].surface_id);
+        assert_eq!(ws.tabs[0].surface_id.as_ref(), Some(&ws.active_surface_id));
+        let thread = outcome["thread_id"].as_str().unwrap();
+        let record = app.state::<crate::database::DatabaseStore>().get_agent_chat_session(thread).unwrap();
+        assert_eq!(record.workspace_id, child);
+        assert_eq!(record.title.as_deref(), Some(title));
+        children.push(child);
+    }
+    assert_eq!(state.snapshot().workspaces.len(), count_before + 2);
+    assert_eq!(state.snapshot().active_workspace_id.0, workspace, "launches never take focus");
+    assert_eq!(serde_json::to_value(state.find_workspace(&main).unwrap()).unwrap(), root_before, "the main checkout is untouched");
+
+    // A batch without a workspace gets one child workspace per chat.
+    let batch = super::native::call(app.handle().clone(), actor.clone(), "create_threads".into(), json!({"client_request_id":"batch-1","threads":[{"provider":"claude","title":"Batch one"},{"provider":"claude","message":"Look at the parser\nand more"}]})).await.unwrap();
+    let receipts = batch["threads"].as_array().unwrap();
+    assert_eq!(receipts.len(), 2, "{batch}");
+    for (receipt, title) in receipts.iter().zip(["Batch one", "Look at the parser"]) {
+        assert_eq!(settle_native(&app, &actor, receipt).await["state"], "succeeded");
+        let ws = state.find_workspace(receipt["workspace_id"].as_str().unwrap()).unwrap();
+        assert_eq!(ws.parent_workspace_id.as_deref(), Some(workspace.as_str()));
+        assert_eq!(ws.title, title);
+    }
+    assert_eq!(state.snapshot().workspaces.len(), count_before + 4);
+
+    // An explicit workspace keeps the tab placement, titled as requested.
+    let tabs_before = state.find_workspace(&workspace).unwrap().tabs.len();
+    let receipt = super::native::call(app.handle().clone(), actor.clone(), "thread_launch".into(), json!({"workspace_id":workspace,"provider":"claude","title":"Explicit tab"})).await.unwrap();
+    assert_eq!(settle_native(&app, &actor, &receipt).await["state"], "succeeded");
+    assert_eq!(receipt["workspace_id"], workspace);
+    let ws = state.find_workspace(&workspace).unwrap();
+    assert_eq!(ws.tabs.len(), tabs_before + 1);
+    assert_eq!(ws.tabs.last().unwrap().title, "Explicit tab");
+    assert_eq!(state.snapshot().workspaces.len(), count_before + 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delegated_children_get_child_workspaces_that_close_with_the_parent() {
+    if crate::state::run_with_isolated_layout("agent_control::tests::delegated_children_get_child_workspaces_that_close_with_the_parent") { return; }
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, _, root, workspace, thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
+    app.manage(crate::terminal::PtyState::default());
+    let state = app.state::<crate::state::AppStateStore>();
+    let db = app.state::<crate::database::DatabaseStore>();
+    let parent_tabs = state.find_workspace(&workspace).unwrap().tabs.len();
+    let control = super::native::qualify(app.handle(), &actor).await.unwrap();
+    let host = crate::commands::delegation::DelegationHost::with_install_check(app.handle().clone(), |_| true);
+    let caller = HostCaller { control: Some(control), thread_id: thread.clone(), provider: crate::agent_provider::ProviderKind::Claude, workspace_id: Some(workspace.clone()), permission_mode: Some("bypassPermissions".into()) };
+    let args = json!({"provider":"claude","title":"Review the parser","task":"Review the parser module and report any defects you find.","client_request_id":"delegate-child-1"});
+    let receipt = host.call_async(&caller, "mcp__codemux__delegate_task", &args, None, None).await.unwrap();
+    let retry = host.call_async(&caller, "mcp__codemux__delegate_task", &args, None, None).await.unwrap();
+    assert_eq!(retry["task_id"], receipt["task_id"], "{retry}");
+    let task = db.delegation_tasks(Some(&thread)).unwrap().pop().unwrap();
+    let child_thread = task.child_thread_id.clone().unwrap();
+    let child = task.workspace_id.clone();
+    assert_eq!(db.delegation_tasks(Some(&thread)).unwrap().len(), 1);
+
+    // Its own workspace, nested under the parent's, in the same folder.
+    let ws = state.find_workspace(&child).unwrap();
+    assert_ne!(child, workspace);
+    assert_eq!(ws.parent_workspace_id.as_deref(), Some(workspace.as_str()));
+    assert_eq!(ws.title, "Review the parser");
+    assert_eq!(ws.cwd, root.path().display().to_string());
+    assert_eq!(ws.worktree_path, None);
+    assert_eq!(ws.tabs.len(), 1);
+    assert_eq!(ws.tabs[0].title, "Claude · Review the parser");
+    let pane = state.agent_chat_pane_id_for_thread(&child_thread).unwrap();
+    assert_eq!(state.workspace_id_for_pane(&pane).as_deref(), Some(child.as_str()));
+    assert_eq!(state.find_workspace(&workspace).unwrap().tabs.len(), parent_tabs, "no tab in the parent's workspace");
+
+    // An independent launch is not owned and survives the parent's close.
+    let launch = super::native::call(app.handle().clone(), actor.clone(), "thread_launch".into(), json!({"provider":"claude","title":"Independent"})).await.unwrap();
+    assert_eq!(settle_native(&app, &actor, &launch).await["state"], "succeeded");
+    let independent = launch["workspace_id"].as_str().unwrap().to_string();
+
+    crate::commands::workspace::close_workspace_with_worktree_impl(
+        app.handle().clone(), &state, &db, workspace.clone(), false, None, None,
+    ).await.unwrap();
+    assert!(state.find_workspace(&child).is_none(), "the delegated child closes with its parent's workspace");
+    assert!(state.find_workspace(&independent).is_some(), "an independent launch stays");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !db.delegation_task_for_child(&child_thread).unwrap().unwrap().status.terminal() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn native_launch_catalog_steers_delegation_to_delegate_task() {
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, _, _root, workspace, thread, _authority, _actor) = native_caller_fixture("bypassPermissions").await;
+    let host = super::native::OrchestrationHost(app.handle().clone());
+    let caller = HostCaller { control: None, thread_id: thread, provider: crate::agent_provider::ProviderKind::Claude, workspace_id: Some(workspace), permission_mode: Some("bypassPermissions".into()) };
+    let tools = host.tools_for(&caller);
+    for name in ["thread_launch", "create_threads"] {
+        let description = tools.iter().find(|t| t.name == name).unwrap().description.clone().unwrap();
+        assert!(description.starts_with("If the user asks to delegate work or wants results back, use delegate_task instead."), "{description}");
+        assert!(description.contains("nested under yours"), "{description}");
+        assert!(!description.contains("project-root"), "{description}");
+    }
+}

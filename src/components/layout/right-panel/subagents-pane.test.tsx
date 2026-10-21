@@ -514,7 +514,7 @@ describe("SubagentsPane — delegated tasks", () => {
     description: "Add slugify helper",
     model: "gpt-6.1-codex",
     effort: "high",
-    activity: "Working in its tab",
+    activity: "Working in its workspace",
   });
 
   it("marks a delegated row with its provider and model · effort", () => {

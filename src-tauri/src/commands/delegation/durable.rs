@@ -389,7 +389,7 @@ fn event_child_run(event: &ProviderRuntimeEvent) -> Option<&str> {
 pub(super) fn placement_for_child(db: &DatabaseStore, child: &str) -> Placement {
     db.get_follow_up_task(child)
         .map(|row| Placement::Worktree(super::super::follow_ups::placement_of(&row)))
-        .unwrap_or(Placement::Tab)
+        .unwrap_or(Placement::Shared)
 }
 
 pub(super) fn recover_tasks<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
@@ -554,7 +554,7 @@ pub(super) fn recover_tasks<R: Runtime>(app: &AppHandle<R>) -> Result<(), String
             publish_finished(app, child)?;
             // Publication and follow-up state live in separate stores. Repair
             // either crash window, including an already committed result.
-            if !task.placement.is_tab() {
+            if !task.placement.is_shared() {
                 super::super::follow_ups::on_task_finished(app, child, outcome_id(&task.phase));
             }
         }

@@ -52,7 +52,7 @@ const delegated = (status: SubagentSnapshot["status"]) =>
     task_kind: "agent",
     provider_ref: "child-1",
     status,
-    activity: status === "running" ? "Working in its tab" : null,
+    activity: status === "running" ? "Working in its workspace" : null,
   });
 
 const running: ProviderRuntimeEvent = {

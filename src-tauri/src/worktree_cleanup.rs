@@ -137,17 +137,18 @@ static KICK: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::
 /// from its final check through the delete, so a workspace can't adopt a
 /// checkout that is being deleted (see [`opening_guard`]).
 static OPENING: LazyLock<tokio::sync::RwLock<()>> = LazyLock::new(|| tokio::sync::RwLock::new(()));
-/// Checkouts whose workspace's chats haven't confirmed they stopped, with a
-/// count per close (see [`RetireHold`]). A failed stop is never released
-/// (until restart, which ends every session Codemux started).
-static STOPPING: LazyLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
-    LazyLock::new(Default::default);
 
 /// Held by every path that opens a workspace on an existing checkout, from
 /// before it looks at the directory until the workspace is in app state.
 /// Never acquire it twice in one task: a queued removal would deadlock.
 pub(crate) async fn opening_guard() -> tokio::sync::RwLockReadGuard<'static, ()> {
     OPENING.read().await
+}
+
+/// Held by every deletion of a checkout's files from its final check
+/// through the delete, so no workspace opens one meanwhile.
+pub(crate) async fn removal_guard() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    OPENING.write().await
 }
 
 fn now_secs() -> u64 {
@@ -193,93 +194,39 @@ fn is_disposable(ws: &WorkspaceSnapshot) -> bool {
         && crate::commands::workspace::archive_refusal_reason(ws).is_none()
 }
 
-/// Workspaces with a chat stop that failed: their checkouts stay out of
-/// cleanup until restart.
-static FAILED_STOPS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
-
-/// Called when stopping chats of `workspace_ids` failed.
-pub(crate) fn note_failed_stop(workspace_ids: &[String]) {
-    FAILED_STOPS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .extend(workspace_ids.iter().cloned());
-}
-
-/// Keeps one checkout out of cleanup while its workspace's sessions stop.
-/// Dropping it releases the hold; [`RetireHold::keep`] makes it permanent.
-pub(crate) struct RetireHold(Option<PathBuf>);
-
-impl RetireHold {
-    pub(crate) fn keep(mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for RetireHold {
-    fn drop(&mut self) {
-        let Some(key) = self.0.take() else { return };
-        let mut stopping = STOPPING.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = stopping.get_mut(&key) {
-            *count -= 1;
-            if *count == 0 {
-                stopping.remove(&key);
-            }
-        }
-    }
-}
-
-/// Take before a workspace leaves app state: from then on nothing else
-/// marks its checkout as in use. Covers a worktree workspace and a plain
-/// one opened inside Codemux's worktree directory. Synchronous.
-pub(crate) fn hold_checkout(ws: &WorkspaceSnapshot) -> RetireHold {
-    let path = ws.worktree_path.as_deref().unwrap_or(&ws.cwd);
-    let key = path_key(Path::new(path));
-    if !managed_root().is_some_and(|root| key.starts_with(root)) {
-        return RetireHold(None);
-    }
-    *STOPPING.lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default() += 1;
-    RetireHold(Some(key))
-}
-
 /// The workspace left app state with its checkout on disk and its chats
 /// told to stop (`issued`, plus `earlier` stops of chats closed before).
 /// Once every stop is acknowledged, a plain close is recorded so a later
-/// sweep can offer the worktree when stale, and then the hold is released.
-/// Any failed stop, now or earlier in the workspace, keeps the hold.
+/// sweep can offer the worktree when stale, and then the claim is released.
+/// Any failed stop, now or earlier in the workspace, keeps the claim.
 pub(crate) fn retire_workspace<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    hold: RetireHold,
+    claim: crate::checkout_claims::CloseClaim,
     ws: &WorkspaceSnapshot,
-    earlier: crate::commands::agent_chat::EarlierStops,
-    issued: crate::commands::agent_chat::EarlierStops,
+    mut earlier: crate::checkout_claims::Stops,
+    issued: crate::checkout_claims::Stops,
     record_close: bool,
 ) {
-    let pending = crate::commands::agent_chat::snapshot_pending_stops(&ws.workspace_id.0);
+    earlier.extend(issued);
+    earlier.extend(crate::checkout_claims::stops_of_workspace(&ws.workspace_id.0));
     let app = app.clone();
     let ws = ws.clone();
     tauri::async_runtime::spawn(async move {
-        let mut stopped = Ok(());
-        for stops in [earlier, issued, pending] {
-            stopped = stopped.and(crate::commands::agent_chat::wait_for_stops(stops).await);
-        }
-        let failed_before = FAILED_STOPS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&ws.workspace_id.0);
-        if stopped.is_err() || failed_before {
+        if let Err(error) = crate::checkout_claims::wait_for(earlier).await {
             eprintln!(
                 "[worktree-cleanup] keeping {} out of cleanup: a chat did not stop",
                 ws.worktree_path.as_deref().unwrap_or(&ws.cwd),
             );
-            hold.keep();
+            claim.failed(error);
             return;
         }
+        claim.stopped();
         if record_close && is_disposable(&ws) {
             remember_closed(&app.state::<crate::database::DatabaseStore>(), &ws);
         }
         // Released only after the close is recorded, so a sweep never sees
-        // the checkout without either the hold or its fresh close time.
-        drop(hold);
+        // the checkout without either the claim or its fresh close time.
+        drop(claim);
     });
 }
 
@@ -304,8 +251,9 @@ fn live_paths(snapshot: &AppStateSnapshot) -> HashSet<PathBuf> {
     open_paths(snapshot, true)
 }
 
-/// The checkouts live workspaces own. A chat pane only borrows a folder,
-/// so it doesn't retire that folder's closed record.
+/// The checkouts live workspaces own. A chat pane or a chat child
+/// workspace only borrows a folder, so it doesn't retire that folder's
+/// closed record: the owner's record is the only one there is.
 fn workspace_paths(snapshot: &AppStateSnapshot) -> HashSet<PathBuf> {
     open_paths(snapshot, false)
 }
@@ -321,8 +269,11 @@ fn open_paths(snapshot: &AppStateSnapshot, with_chats: bool) -> HashSet<PathBuf>
         }
     }
     let mut paths = Vec::new();
-    for ws in &snapshot.workspaces {
-        paths.push(ws.cwd.as_str());
+    // A remote-only workspace's folders are on its host, not here.
+    for ws in snapshot.workspaces.iter().filter(|ws| !ws.is_remote_only()) {
+        if with_chats || !ws.is_chat_child() {
+            paths.push(ws.cwd.as_str());
+        }
         paths.extend(ws.worktree_path.as_deref());
         if with_chats {
             for surface in &ws.surfaces {
@@ -727,15 +678,9 @@ fn is_busy(path: &Path, cwds: &[PathBuf]) -> bool {
 
 /// What still runs in `path`, if anything Codemux can see.
 fn activity(path: &Path, cwds: &[PathBuf]) -> Option<&'static str> {
-    // A plain workspace may run from a folder inside the worktree, so a
-    // hold anywhere under it counts.
-    let key = path_key(path);
-    let stopping = STOPPING
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .keys()
-        .any(|held| held.starts_with(&key));
-    if stopping {
+    // A workspace or chat may have run from a folder inside the worktree,
+    // so a claim anywhere under it counts.
+    if crate::checkout_claims::held_in(path) {
         Some("A chat that ran in it hasn't confirmed it stopped")
     } else if is_busy(path, cwds) {
         Some("A process is running inside it")
@@ -822,6 +767,28 @@ fn remove_worktree(path: &Path) -> Result<(), String> {
     .map(drop)
 }
 
+/// Delete `path` with `remove` unless a live workspace has it open or a
+/// chat that ran in it hasn't confirmed it stopped; errs with the reason it
+/// was kept. Checked under the state lock and fenced through the delete,
+/// like every other deletion: chat workspaces are created and restored
+/// without the opening guard, so the fence is what keeps them out.
+fn remove_unless_in_use(
+    state: &AppStateStore,
+    path: &Path,
+    remove: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let _fence = state.fence_checkout_removal(path, |snapshot| {
+        if is_open(&live_paths(snapshot), &path_key(path)) {
+            return Err("A workspace opened it again".to_string());
+        }
+        match activity(path, &[]) {
+            Some(reason) => Err(reason.to_string()),
+            None => Ok(()),
+        }
+    })?;
+    remove(path).map_err(|error| format!("git refused to remove it: {error}"))
+}
+
 /// Remove the requested worktrees that are still stale and safe. Each one
 /// is evaluated from fresh state, then checked again (git state, live
 /// workspaces, processes, holds) with workspace opening blocked from that
@@ -865,7 +832,7 @@ async fn remove_locked<R: tauri::Runtime>(
         // Final check and delete: no workspace may open a checkout from
         // here on, and the close path's Hermes lock keeps a Hermes start
         // from claiming the directory.
-        let _opening = OPENING.write().await;
+        let _opening = removal_guard().await;
         let _hermes = crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await;
         // Gathered again: a reopen and close since the first pass leaves a
         // newer retirement time that must restart the settle period.
@@ -880,22 +847,13 @@ async fn remove_locked<R: tauri::Runtime>(
             let db = app_for_task.state::<crate::database::DatabaseStore>();
             let mut pr = pr;
             let verdict = evaluate_one(&db, &candidate, &process_cwds(), &mut pr)?;
-            let snapshot = app_for_task.state::<AppStateStore>().snapshot();
             if verdict.kept_because.is_some() {
                 return Some(verdict);
             }
-            if is_open(&live_paths(&snapshot), &path_key(&candidate.path)) {
-                return Some(StaleWorktree {
-                    kept_because: Some("A workspace opened it again".to_string()),
-                    ..verdict
-                });
-            }
-            Some(match remove_worktree(&candidate.path) {
+            let state = app_for_task.state::<AppStateStore>();
+            Some(match remove_unless_in_use(&state, &candidate.path, remove_worktree) {
                 Ok(()) => verdict,
-                Err(error) => StaleWorktree {
-                    kept_because: Some(format!("git refused to remove it: {error}")),
-                    ..verdict
-                },
+                Err(reason) => StaleWorktree { kept_because: Some(reason), ..verdict },
             })
         })
         .await;
@@ -1322,6 +1280,108 @@ mod tests {
         assert_eq!(prune_closed(&snapshot, std::slice::from_ref(&record)), vec![record]);
     }
 
+    /// The owner closed while a chat it launched kept working in its
+    /// worktree: the chat's workspace must not retire the owner's record,
+    /// or the worktree could never be found once that chat closes too.
+    #[test]
+    fn a_chat_workspace_left_open_keeps_its_owners_closed_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = path_key(dir.path());
+        let worktree = root.join("feature");
+        std::fs::create_dir(&worktree).unwrap();
+        let store = AppStateStore::default();
+        let owner = store.create_empty_workspace_at_path(worktree.clone()).0;
+        let child = AppStateStore::reserve_workspace_id();
+        store
+            .create_chat_child_workspace(&child, &owner, &worktree.display().to_string(), "Review")
+            .unwrap();
+        store.close_workspace(&owner).unwrap();
+        let closed = vec![ClosedWorktree {
+            path: worktree.to_string_lossy().into_owned(),
+            title: "Feature".into(),
+            branch: None,
+            closed_at: 0,
+        }];
+
+        // Scan while the chat's workspace is open: kept, but not offered.
+        let snapshot = store.snapshot();
+        let kept = prune_closed(&snapshot, &closed);
+        assert_eq!(kept, closed, "the owner's record survives");
+        assert!(gather_candidates(&snapshot, &kept, &root).is_empty(), "the chat still works there");
+
+        // Scan after it closed: offered from the owner's record.
+        store.close_workspace(&child.0).unwrap();
+        let snapshot = store.snapshot();
+        let kept = prune_closed(&snapshot, &kept);
+        assert_eq!(kept, closed);
+        let offered: Vec<_> = gather_candidates(&snapshot, &kept, &root).into_iter().map(|c| c.path).collect();
+        assert_eq!(offered, vec![worktree]);
+    }
+
+    /// A workspace attached in place on a remote host names the host's
+    /// folders: a local worktree spelled the same is neither open nor owned.
+    #[test]
+    fn a_remote_only_workspace_does_not_hold_a_local_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = path_key(dir.path());
+        let worktree = root.join("feature");
+        std::fs::create_dir(&worktree).unwrap();
+        let store = AppStateStore::default();
+        store.create_remote_attach_workspace(
+            "On host".into(), 7, worktree.display().to_string(), None, None, None, None,
+        );
+        let closed = vec![ClosedWorktree {
+            path: worktree.to_string_lossy().into_owned(),
+            title: "Feature".into(),
+            branch: None,
+            closed_at: 0,
+        }];
+        let snapshot = store.snapshot();
+        assert!(!is_open(&live_paths(&snapshot), &worktree));
+        assert_eq!(prune_closed(&snapshot, &closed), closed);
+        assert_eq!(gather_candidates(&snapshot, &closed, &root).len(), 1);
+    }
+
+    /// Cleanup's delete runs under the removal fence: a chat workspace
+    /// restored into the checkout meanwhile is refused, and one restored
+    /// before cleanup's final check keeps the files.
+    #[test]
+    fn cleanup_fences_its_delete_against_restoring_a_chat_workspace() {
+        let checkout = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let store = AppStateStore::default();
+        let parent = store.create_empty_workspace_at_path(elsewhere.path().to_path_buf()).0;
+        let child = AppStateStore::reserve_workspace_id();
+        store
+            .create_chat_child_workspace(&child, &parent, &checkout.path().display().to_string(), "Review")
+            .unwrap();
+        let entry = crate::state::build_archive_entry(&store.find_workspace(&child.0).unwrap());
+        store.close_workspace(&child.0).unwrap();
+
+        let (entered, inside) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let go = go;
+            let (store, path) = (&store, checkout.path());
+            let removal = scope.spawn(move || {
+                remove_unless_in_use(store, path, move |_| {
+                    entered.send(()).unwrap();
+                    wait.recv().unwrap();
+                    Ok(())
+                })
+            });
+            inside.recv().unwrap();
+            let error = store.restore_chat_child_workspace(&entry, false).unwrap_err();
+            assert!(error.contains("is being deleted"), "{error}");
+            go.send(()).unwrap();
+            assert_eq!(removal.join().unwrap(), Ok(()));
+        });
+
+        store.restore_chat_child_workspace(&entry, false).unwrap();
+        let kept = remove_unless_in_use(&store, checkout.path(), |_| panic!("deleted a checkout in use"));
+        assert_eq!(kept.unwrap_err(), "A workspace opened it again");
+    }
+
     #[test]
     fn the_latest_retirement_wins_for_one_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -1377,35 +1437,13 @@ mod tests {
     #[test]
     fn an_unconfirmed_chat_stop_holds_the_worktree() {
         let dir = tempfile::tempdir().unwrap();
-        let key = path_key(dir.path());
-        let nested = key.join("src");
-        STOPPING.lock().unwrap().insert(key.clone(), 1);
+        let cwd = Some(dir.path().join("src").display().to_string());
+        // A chat that ran from a folder inside the worktree, still stopping.
+        let (mut batch, _) = crate::checkout_claims::begin_stops(vec![("cleanup-held".into(), None, cwd)]);
         let held = activity(dir.path(), &[]);
-        STOPPING.lock().unwrap().remove(&key);
         assert!(held.is_some_and(|reason| reason.contains("chat")));
+        batch.settle("cleanup-held", Ok(()));
         assert_eq!(activity(dir.path(), &[]), None);
-
-        // A workspace that ran from a folder inside the worktree.
-        STOPPING.lock().unwrap().insert(nested.clone(), 1);
-        let held = activity(dir.path(), &[]);
-        STOPPING.lock().unwrap().remove(&nested);
-        assert!(held.is_some());
-    }
-
-    #[test]
-    fn a_retire_hold_releases_on_drop_unless_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let (released, kept) = (path_key(dir.path()).join("a"), path_key(dir.path()).join("b"));
-        for key in [&released, &kept] {
-            *STOPPING.lock().unwrap().entry(key.clone()).or_default() += 1;
-        }
-        drop(RetireHold(Some(released.clone())));
-        RetireHold(Some(kept.clone())).keep();
-        let stopping = STOPPING.lock().unwrap();
-        assert!(!stopping.contains_key(&released));
-        assert!(stopping.contains_key(&kept));
-        drop(stopping);
-        STOPPING.lock().unwrap().remove(&kept);
     }
 
     #[test]

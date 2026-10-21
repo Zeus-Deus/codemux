@@ -971,6 +971,79 @@ const wsFollowUpFolds = followUpChild({
   lastActiveAgoMs: 25 * 60_000,
 });
 
+// Agent-started chats: a coordinator chat launched or delegated these. Each
+// is its own workspace in the coordinator's folder (no worktree of its own),
+// titled with the task, and nested under the coordinator.
+
+const optimizeCiCwd = `${HOME}/.codemux/worktrees/codemux/optimize-ci-threads`;
+
+const wsOptimizeCi = (() => {
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-optimize-ci",
+    title: "Optimize CI performance",
+    cwd: optimizeCiCwd,
+    worktree_path: optimizeCiCwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: "optimize-ci-threads",
+  });
+  const { pane, surface, tab } = chatSurface("Agent Chat", optimizeCiCwd, null);
+  paneStatuses[pane.pane_id] = "working";
+  return {
+    ...ws,
+    last_active_at: Date.now() - 2 * 60_000,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
+
+function agentStartedChild(seed: {
+  workspace_id: string;
+  title: string;
+  status: PaneStatus;
+  provider: AgentChatProviderKind;
+  lastActiveAgoMs: number;
+}): WorkspaceSnapshot {
+  const ws = makeWorkspace({
+    workspace_id: seed.workspace_id,
+    title: seed.title,
+    cwd: optimizeCiCwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    git_branch: "optimize-ci-threads",
+  });
+  const { pane, surface, tab } = chatSurface(seed.title, optimizeCiCwd, null, seed.provider);
+  if (seed.status !== "idle") paneStatuses[pane.pane_id] = seed.status;
+  return {
+    ...ws,
+    parent_workspace_id: wsOptimizeCi.workspace_id,
+    last_active_at: Date.now() - seed.lastActiveAgoMs,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+}
+
+const wsCiReviewSol = agentStartedChild({
+  workspace_id: "ws-ci-review-sol",
+  title: "CI speed review — GPT-6.1-Sol",
+  status: "working",
+  provider: "codex",
+  lastActiveAgoMs: 30_000,
+});
+
+const wsCiReviewOpus = agentStartedChild({
+  workspace_id: "ws-ci-review-opus",
+  title: "CI speed review — Opus 5.5",
+  status: "review",
+  provider: "claude",
+  lastActiveAgoMs: 90_000,
+});
+
 // No-project chats: conversations started from the header's New agent
 // button, rooted at the home directory rather than a repository. The
 // Projects view lists them under "Chats".
@@ -1214,6 +1287,9 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsFollowUpFolds,
   wsFollowUpShortcut,
   wsFollowUpNest,
+  wsOptimizeCi,
+  wsCiReviewOpus,
+  wsCiReviewSol,
 ];
 
 // ── Archived workspaces ─────────────────────────────────────────────

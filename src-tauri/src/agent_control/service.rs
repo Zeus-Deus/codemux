@@ -145,12 +145,24 @@ struct Launch {
 }
 
 pub(crate) async fn launch<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    launch_placed(app, caller, args, false).await
+}
+
+/// With `child_workspace`, `workspace_id` names the caller's workspace and
+/// the chat gets its own background workspace nested under it, in the same
+/// folder, titled after the chat.
+pub(crate) async fn launch_placed<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value, child_workspace: bool) -> Result<Value, ControlError> {
     if !args.as_object().is_some_and(|args| args.contains_key("permission_mode")) {
         return Err(ControlError::new("permission_mode_required", "Select an advertised worker permission mode explicitly; null is allowed only when the provider has no modes"));
     }
-    let input: Launch = parse(args.clone())?;
+    let mut input: Launch = parse(args.clone())?;
     identifier(&input.client_request_id, "client_request_id", 128)?;
     identifier(&input.workspace_id, "workspace_id", 256)?;
+    // The placement is part of the request: a retry must not turn a tab
+    // launch into a child workspace or back.
+    let mut keyed = args;
+    if child_workspace { keyed["placement"] = json!("child_workspace"); }
+    let args = keyed;
     if let Some(receipt) = retry_receipt(app, caller, "thread_launch", &args)? { return Ok(receipt); }
     let workspace = workspace(app, &input.workspace_id, true)?;
     permission_ceiling(caller, input.provider, input.permission_mode.as_deref())?;
@@ -164,12 +176,30 @@ pub(crate) async fn launch<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
     let epoch = app.state::<NativeControlState>().epoch.clone();
     let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&args).map_err(|e|ControlError::new("invalid_arguments",e.to_string()))?));
     let thread = uuid::Uuid::new_v4().to_string();
+    // Named before admission so the receipt and any retry point at it.
+    let target = if child_workspace { AppStateStore::reserve_workspace_id().0 } else { workspace.workspace_id.0.clone() };
     let admitted = caller.admit(||app.state::<DatabaseStore>().admit_control_operation_for_thread(
         &caller.principal, &input.client_request_id, "thread_launch", &fingerprint, &epoch,
-        Some(&workspace.workspace_id.0), Some(&thread), caller.thread_id().zip(caller.admission_generation()),
+        Some(&target), Some(&thread), caller.thread_id().zip(caller.admission_generation()),
     )).map_err(|e| ControlError::new(if e.starts_with("request_key_conflict") { "request_key_conflict" } else if e.starts_with("resource_limit") { "resource_limit" } else { "operation_admission_failed" }, e))?;
     let receipt = serde_json::to_value(&admitted.receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
     if !admitted.newly_admitted { return Ok(receipt); }
+    if child_workspace {
+        let title = input.title.clone().unwrap_or_else(|| chat_title(input.provider, input.message.as_deref()));
+        let created = app.state::<AppStateStore>().create_chat_child_workspace(
+            &crate::state::WorkspaceId(target.clone()), &workspace.workspace_id.0, &workspace.cwd, &title,
+        );
+        if let Err(error) = created {
+            let error = ControlError::new("workspace_not_found", error);
+            let db = app.state::<DatabaseStore>();
+            let _ = db.orchestration_launch_finished(&thread);
+            let _ = db.update_control_operation(&caller.principal, &admitted.receipt.operation_id, &epoch, "failed", None, None, None, serde_json::to_value(&error).ok().as_ref());
+            return Err(error);
+        }
+        input.title = Some(title);
+        input.workspace_id = target;
+        crate::state::emit_app_state(app);
+    }
     let app = app.clone();
     let mut caller = caller.clone();
     let operation = admitted.receipt.operation_id;
@@ -178,8 +208,10 @@ pub(crate) async fn launch<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
         let db = app.state::<DatabaseStore>();
         if db.update_control_operation(&caller.principal, &operation, &epoch, "running", None, None, None, None).is_err() { return; }
         let idle_launch = input.message.is_none();
+        let workspace_id = input.workspace_id.clone();
         let outcome = materialize(&app, &caller, input, &thread).await;
         if idle_launch || outcome.is_err() { let _ = db.orchestration_launch_finished(&thread); }
+        if child_workspace && outcome.is_err() { close_empty_child_workspace(&app, &workspace_id); }
         let (state, result, error) = match outcome {
             Ok(result) => ("succeeded", Some(result), None),
             Err(error) => ("failed", None, serde_json::to_value(error).ok()),
@@ -189,6 +221,24 @@ pub(crate) async fn launch<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
         }
     });
     Ok(receipt)
+}
+
+/// A title for a launched chat that named none: its message's first line.
+fn chat_title(provider: ProviderKind, message: Option<&str>) -> String {
+    let line = message.and_then(|m| m.lines().map(str::trim).find(|l| !l.is_empty()));
+    match line {
+        Some(line) if line.chars().count() > 60 => format!("{}…", line.chars().take(59).collect::<String>().trim_end()),
+        Some(line) => line.to_string(),
+        None => format!("{} chat", crate::commands::delegation::provider_label(provider)),
+    }
+}
+
+/// A failed launch leaves no empty row behind in the sidebar.
+fn close_empty_child_workspace<R: Runtime>(app: &AppHandle<R>, workspace_id: &str) {
+    let state = app.state::<AppStateStore>();
+    if state.find_workspace(workspace_id).is_some_and(|w| w.surfaces.is_empty()) && state.close_workspace(workspace_id).is_ok() {
+        crate::state::emit_app_state(app);
+    }
 }
 
 pub(crate) fn validate_permission_mode(provider: ProviderKind, mode: Option<&str>, caps: &ProviderChatCapabilities) -> Result<(), ControlError> {
@@ -273,10 +323,15 @@ async fn materialize<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, inp
         fast_mode: Some(input.fast_mode), service_tier: None,
     })?;
     if let Some(title) = &input.title { db.set_agent_chat_title(thread, title)?; }
-    let pane = agent_chat::agent_chat_create_pane(
-        app.clone(), app.state(), app.state(), input.workspace_id.clone(), Some(input.provider),
-        Some(workspace.cwd.clone()), Some(crate::presets::LaunchMode::NewTab), Some(thread.into()), Some(input.select && caller.thread_id().is_none()),
+    agent_chat::feature_flag_on(&app.state::<crate::observability::ObservabilityStore>())?;
+    let state = app.state::<AppStateStore>();
+    let (pane, created) = state.create_or_reuse_agent_chat_pane_with_selection(
+        &input.workspace_id, Some(input.provider), Some(workspace.cwd.clone()),
+        Some(crate::presets::LaunchMode::NewTab), Some(thread.into()), input.select && caller.thread_id().is_none(),
     )?;
+    if let Some(title) = input.title.as_deref().filter(|_| created) { state.title_chat_tab(&input.workspace_id, &pane, title); }
+    crate::state::emit_app_state(app);
+    let pane = pane.0;
     let plan_mode = input.provider == ProviderKind::Codex && (input.permission_mode.as_deref() == Some("plan") || (input.permission_mode.as_deref() == Some("read-only") && caller.ceiling().is_some_and(|c| c.plan)));
     let start = StartSessionInput {
         thread_id: ThreadId(thread.into()), cwd: workspace.cwd.into(), model: input.model,
