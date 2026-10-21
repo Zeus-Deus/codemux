@@ -20,6 +20,7 @@ import {
 } from "@/stores/app-store";
 import { useHosts } from "@/stores/hosts-store";
 import { useUIStore } from "@/stores/ui-store";
+import { useQuestionAttention } from "@/stores/async-question-attention-store";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { toast } from "@/lib/toast";
 import {
@@ -842,6 +843,9 @@ export function SidebarInbox() {
   // delta path, these three keep their identity unless their own domain moved.
   const workspaces = useAppStore((s) => s.appState?.workspaces);
   const paneStatuses = useAppStore((s) => s.appState?.pane_statuses);
+  // Unanswered agent questions per workspace. Independent of pane status: an
+  // agent can be working, done or idle while a question waits for the user.
+  const questionCounts = useQuestionAttention((s) => s.workspaces);
   // Only "has the first snapshot landed" — a boolean, so the guards below stop
   // dragging the whole snapshot into their dependency arrays.
   const appStateLoaded = useAppStore((s) => s.appState !== null);
@@ -1221,7 +1225,10 @@ export function SidebarInbox() {
   // work that is actually waiting on the user. A child stands alone again
   // while it needs the user, while it is the open workspace (the "you are
   // here" rule the shelves follow), when it is pinned, or when its parent is
-  // not an active card to fold into.
+  // not an active card to fold into. A child waiting on the user means a
+  // permission request or an unanswered question.
+  const childNeedsUser = (ws: WorkspaceSnapshot) =>
+    statusOf(ws) === "permission" || (questionCounts[ws.workspace_id] ?? 0) > 0;
   const hostIds = new Set(
     [...pinnedCards, ...unfoldedActiveCards].map((ws) => ws.workspace_id),
   );
@@ -1232,7 +1239,7 @@ export function SidebarInbox() {
       parentId &&
       hostIds.has(parentId) &&
       ws.workspace_id !== activeWorkspaceId &&
-      statusOf(ws) !== "permission"
+      !childNeedsUser(ws)
     ) {
       foldedIds.add(ws.workspace_id);
     }
@@ -1271,8 +1278,11 @@ export function SidebarInbox() {
       id: ws.workspace_id,
       title: ws.title,
       status: statusOf(ws),
+      needsUser: childNeedsUser(ws),
     }));
-    const sig = list.map((c) => `${c.id}\u0000${c.title}\u0000${c.status}`).join("\u0001");
+    const sig = list
+      .map((c) => `${c.id}\u0000${c.title}\u0000${c.status}\u0000${c.needsUser}`)
+      .join("\u0001");
     const cached = delegatedIntern.current.get(hostId);
     if (cached?.sig === sig) return cached.list;
     delegatedIntern.current.set(hostId, { sig, list });
@@ -1652,6 +1662,8 @@ export function SidebarInbox() {
   const handleListContextMenuCapture = (e: React.MouseEvent) => {
     if (selection.length < 2) return;
     const target = e.target as HTMLElement | null;
+    // A delegated row names a child, not the card that encloses it.
+    if (target?.closest?.("[data-delegated-row]")) return;
     const row = target?.closest?.(
       "[data-inbox-card],[data-snoozed-row],[data-settled-row]",
     );

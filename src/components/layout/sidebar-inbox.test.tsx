@@ -181,6 +181,7 @@ import {
 import { getJumpTarget } from "./sidebar-inbox-jump";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
+import { useQuestionAttention } from "@/stores/async-question-attention-store";
 
 let wsCounter = 0;
 import type { WorkspacePrRef } from "@/lib/workspace-prs";
@@ -324,6 +325,7 @@ beforeEach(() => {
   detectedPorts = [];
   wsCounter = 0;
   hoverCardStatus = {};
+  useQuestionAttention.setState({ revision: -1, workspaces: {} });
 });
 
 afterEach(async () => {
@@ -3703,6 +3705,100 @@ describe("SidebarInbox — follow-up children", () => {
     within(parentCard).getByRole("button", {
       name: /1 delegated · 1 needs you/,
     });
+  });
+
+  it("brings a child with an unanswered question out without a status change", async () => {
+    const parent = makeWorkspace({ title: "Optimize CI" });
+    const child = makeWorkspace({
+      title: "Add CI path filters",
+      parent_workspace_id: parent.workspace_id,
+      surfaces: surfaceWithPane("p-child"),
+    });
+    workspaces = [parent, child];
+    paneStatuses = { "p-child": "working" };
+    const { container, rerender } = await flushRender();
+    expect(
+      container.querySelector(`[data-inbox-card="${child.workspace_id}"]`),
+    ).toBeNull();
+
+    act(() => {
+      useQuestionAttention.setState({
+        revision: 1,
+        workspaces: { [child.workspace_id]: 1 },
+      });
+    });
+    await rerenderInbox(rerender);
+    const childCard = container.querySelector(
+      `[data-inbox-card="${child.workspace_id}"]`,
+    ) as HTMLElement;
+    expect(childCard).not.toBeNull();
+    within(childCard).getByLabelText("1 unanswered agent question");
+    const parentCard = container.querySelector(
+      `[data-inbox-card="${parent.workspace_id}"]`,
+    ) as HTMLElement;
+    within(parentCard).getByRole("button", {
+      name: /1 delegated · 1 needs you/,
+    });
+  });
+
+  it("offers no parent actions from a child's row", async () => {
+    const parent = makeWorkspace({ title: "Optimize CI" });
+    const other = makeWorkspace({ title: "Other work" });
+    const child = makeWorkspace({
+      title: "Add CI path filters",
+      parent_workspace_id: parent.workspace_id,
+    });
+    workspaces = [parent, other, child];
+    const { container } = await flushRender();
+    const parentCard = container.querySelector(
+      `[data-inbox-card="${parent.workspace_id}"]`,
+    ) as HTMLElement;
+    const otherCard = container.querySelector(
+      `[data-inbox-card="${other.workspace_id}"]`,
+    ) as HTMLElement;
+    // A bulk selection that includes the parent.
+    fireEvent.click(parentCard, { ctrlKey: true });
+    fireEvent.click(otherCard, { ctrlKey: true });
+    fireEvent.click(
+      within(parentCard).getByRole("button", { name: /1 delegated/ }),
+    );
+    const row = screen.getByRole("button", { name: /Add CI path filters/ });
+    fireEvent.contextMenu(row);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("Pin workspace")).toBeNull();
+    expect(screen.queryByText(/^Settle \(/)).toBeNull();
+  });
+
+  it("clears a multi-selection when a child's row opens it", async () => {
+    const parent = makeWorkspace({ title: "Optimize CI" });
+    const other = makeWorkspace({ title: "Other work" });
+    const child = makeWorkspace({
+      title: "Add CI path filters",
+      parent_workspace_id: parent.workspace_id,
+    });
+    workspaces = [parent, other, child];
+    const { container } = await flushRender();
+    const parentCard = container.querySelector(
+      `[data-inbox-card="${parent.workspace_id}"]`,
+    ) as HTMLElement;
+    const otherCard = container.querySelector(
+      `[data-inbox-card="${other.workspace_id}"]`,
+    ) as HTMLElement;
+    fireEvent.click(parentCard, { ctrlKey: true });
+    fireEvent.click(otherCard, { ctrlKey: true });
+    expect(container.querySelectorAll("[data-selected]")).toHaveLength(2);
+
+    fireEvent.click(
+      within(parentCard).getByRole("button", { name: /1 delegated/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Add CI path filters/ }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(container.querySelectorAll("[data-selected]")).toHaveLength(0);
+    expect(activateWorkspace).toHaveBeenCalledWith(child.workspace_id);
   });
 
   it("shows the open child as its own card", async () => {

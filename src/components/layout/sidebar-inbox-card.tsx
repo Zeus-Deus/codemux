@@ -59,6 +59,9 @@ export interface DelegatedChild {
   id: string;
   title: string;
   status: ActivePaneStatus | null;
+  /** Waiting on the user: a permission request or an unanswered question.
+   *  Such a child also renders as its own card. */
+  needsUser: boolean;
 }
 
 export interface InboxRepo {
@@ -238,6 +241,11 @@ const DELEGATED_STATUS: Record<ActivePaneStatus, { label: string; className: str
   review: { label: "Done", className: "text-status-open" },
 };
 
+function delegatedDotClass(c: DelegatedChild): string {
+  if (c.needsUser) return DELEGATED_DOT_CLASS.permission;
+  return c.status ? DELEGATED_DOT_CLASS[c.status] : "bg-muted-foreground/40";
+}
+
 /** Most status dots the chip draws before the count has to speak alone. */
 const DELEGATED_MAX_DOTS = 5;
 
@@ -254,7 +262,7 @@ function DelegatedChip({
   listId: string;
   onToggle: () => void;
 }) {
-  const needs = items.filter((c) => c.status === "permission").length;
+  const needs = items.filter((c) => c.needsUser).length;
   const done = items.filter((c) => c.status === "review").length;
   const detail = needs > 0 ? `${needs} needs you` : done > 0 ? `${done} done` : null;
   return (
@@ -286,7 +294,7 @@ function DelegatedChip({
             key={c.id}
             className={cn(
               "size-1.5 rounded-full",
-              c.status ? DELEGATED_DOT_CLASS[c.status] : "bg-muted-foreground/40",
+              delegatedDotClass(c),
             )}
           />
         ))}
@@ -311,9 +319,11 @@ function DelegatedChip({
 function DelegatedList({
   id,
   items,
+  onOpen,
 }: {
   id: string;
   items: readonly DelegatedChild[];
+  onOpen: (workspaceId: string) => void;
 }) {
   return (
     <ul
@@ -323,7 +333,11 @@ function DelegatedList({
       className="mt-1 flex flex-col"
     >
       {items.map((c) => {
-        const status = c.status ? DELEGATED_STATUS[c.status] : null;
+        const status = c.needsUser
+          ? DELEGATED_STATUS.permission
+          : c.status
+            ? DELEGATED_STATUS[c.status]
+            : null;
         return (
           <li key={c.id}>
             <button
@@ -332,7 +346,13 @@ function DelegatedList({
               onClick={(e) => {
                 // The card root would otherwise activate the parent too.
                 e.stopPropagation();
-                activateWorkspaceInteraction(c.id).catch(console.error);
+                onOpen(c.id);
+              }}
+              onContextMenu={(e) => {
+                // The enclosing menu acts on the parent; none of its actions
+                // may be offered from a child's row.
+                e.preventDefault();
+                e.stopPropagation();
               }}
               className="flex w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-left text-label text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground"
             >
@@ -340,7 +360,7 @@ function DelegatedList({
                 aria-hidden
                 className={cn(
                   "size-1.5 shrink-0 rounded-full",
-                  c.status ? DELEGATED_DOT_CLASS[c.status] : "bg-muted-foreground/40",
+                  delegatedDotClass(c),
                 )}
               />
               <span className="min-w-0 flex-1 truncate">{c.title}</span>
@@ -1090,7 +1110,15 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 />
               )}
               {showDelegatedList && (
-                <DelegatedList id={delegatedListId} items={delegated} />
+                <DelegatedList
+                  id={delegatedListId}
+                  items={delegated}
+                  onOpen={(childId) => {
+                    // Same as opening any card: navigation ends a multi-select.
+                    onSelect(childId, "single");
+                    activateWorkspaceInteraction(childId).catch(console.error);
+                  }}
+                />
               )}
 
               {/* Mono meta line, two columns: the git-local facts (branch ·
