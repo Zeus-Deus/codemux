@@ -123,6 +123,7 @@ pub struct AcpSpawnConfig {
 
 /// The `mcpServers` for a Cursor or Grok session. A session on a device gets
 /// none of this computer's tools.
+#[cfg(test)]
 async fn acp_mcp_servers(
     dialect: AcpDialect,
     registry: Option<&crate::mcp::registry::McpRegistry>,
@@ -138,6 +139,7 @@ async fn acp_mcp_servers(
             workspace_id,
             native_sources: dialect.native_mcp_sources().to_vec(),
             flat_tool_names: dialect.is_grok(),
+            native: None,
         },
         super::mcp::SERVER_NAME,
         super::mcp::Transport::negotiated(initialized),
@@ -394,6 +396,8 @@ pub(crate) struct AcpSession {
     pub thread_id: ThreadId,
     pub provider_session_id: ProviderSessionId,
     pub state: Mutex<AcpSessionState>,
+    mcp: Option<super::mcp::ChatMcp>,
+    metadata_replay: AtomicBool,
     cwd: PathBuf,
     /// Runs on a device over SSH; `cwd` is a path there, not on this computer.
     on_device: bool,
@@ -613,15 +617,14 @@ impl AcpSession {
                 });
             }
 
-            let mcp_servers = acp_mcp_servers(
-                dialect,
-                spawn.mcp_registry.as_ref(),
-                remote.as_ref(),
-                &thread_id.0,
+            let mcp = crate::agent_provider::local_tool_registry(spawn.mcp_registry.as_ref(),
+                remote.as_ref()).map(|registry|
+                super::mcp::ChatMcp::new(registry,
+                &thread_id.0, dialect.provider(),
                 spawn.workspace_id.clone(),
-                &initialized,
-            )
-            .await;
+                    Some(permission_mode.clone().unwrap_or_else(|| dialect.default_permission_mode().into())),
+                    super::mcp::SERVER_NAME.into(), super::mcp::Transport::negotiated(&initialized), dialect.native_mcp_sources().to_vec(), dialect.is_grok()));
+            let mcp_servers = match &mcp { Some(mcp) => mcp.servers().await, None => json!([]) };
             let new_session_params = || {
                 let mut params = json!({ "cwd": cwd.clone(), "mcpServers": mcp_servers.clone() });
                 if dialect.is_grok() {
@@ -680,21 +683,27 @@ impl AcpSession {
                 provider_session_id,
                 initialized,
                 startup_grok_model,
+                mcp,
             ))
         }
         .await;
 
-        let (setup, provider_session_id, initialized, startup_grok_model) = match setup {
+        let (setup, provider_session_id, initialized, startup_grok_model, mcp) = match setup {
             Ok(value) => value,
             Err(error) => {
                 let _ = child.shutdown().await;
                 return Err(error);
             }
         };
+        if let Some(mcp) = &mcp {
+            mcp.session.bind_session(&provider_session_id);
+        }
         let (notification_barrier_tx, notification_barrier_rx) = mpsc::unbounded_channel();
         let (request_barrier_tx, request_barrier_rx) = mpsc::unbounded_channel();
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
+            mcp,
+            metadata_replay: AtomicBool::new(false),
             provider_session_id: ProviderSessionId(provider_session_id),
             state: Mutex::new(AcpSessionState {
                 status: SessionStatus::Ready,
@@ -1117,6 +1126,46 @@ impl AcpSession {
         if let Some(checkpoint) = &input.turn_checkpoint {
             if let Err(error) = checkpoint.verify_dispatch() { Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await; return Err(PrepareTurnError::Rejected(error)); }
         }
+        if let Some(mcp) = &self.mcp {
+            if mcp.needs_refresh() {
+                let servers = mcp.servers().await;
+                self.metadata_replay.store(true, Ordering::SeqCst);
+                let loaded=self.child.request("session/load", json!({"sessionId":self.provider_session_id.0,"cwd":self.cwd,"mcpServers":servers})).await;
+                self.await_child_messages_drained().await;
+                self.metadata_replay.store(false, Ordering::SeqCst);
+                let loaded =
+                    loaded.map_err(|e| PrepareTurnError::Failed(map_rpc_error(e, self.dialect)))?;
+                if loaded
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id != self.provider_session_id.0)
+                {
+                    return Err(PrepareTurnError::Failed(ProviderError::ValidationError {
+                        message: "Native session identity changed during MCP refresh".into(),
+                    }));
+                }
+                let mode = loaded
+                    .pointer("/modes/currentModeId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        config_options(&loaded)
+                            .iter()
+                            .find(|option| {
+                                option.get("id").and_then(Value::as_str) == Some("mode")
+                                    || option.get("category").and_then(Value::as_str)
+                                        == Some("mode")
+                            })
+                            .and_then(|option| option.get("currentValue"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+                if let Some(mode) = mode {
+                    mcp.session.set_mode(Some(mode.clone()));
+                    self.state.lock().await.permission_mode = mode;
+                }
+            }
+        }
         let turn_id = TurnId(self.opaque_id("turn"));
         {
             let mut state = self.state.lock().await;
@@ -1160,7 +1209,11 @@ impl AcpSession {
             }
         }
 
-        Ok((turn_id, build_prompt(&input)))
+        let mut prompt = build_prompt(&input);
+        if let Some(mcp) = &self.mcp {
+            prompt[0]["text"] = json!(mcp.prompt(&input.text));
+        }
+        Ok((turn_id, prompt))
     }
 
     async fn run_prompt_worker(
@@ -1182,6 +1235,9 @@ impl AcpSession {
             } else {
                 self.send_prompt(&turn_id, &prompt, generation, checkpoint.as_ref()).await
             };
+            if let Some(mcp) = &self.mcp {
+                mcp.session.authority.finish(&turn_id.0);
+            }
             let mut next = self.finish_turn(turn_id, response, generation).await;
             loop {
                 let Some((queued, next_generation)) = next else {
@@ -1340,6 +1396,15 @@ impl AcpSession {
                 checkpoint.abort().await;
                 return Err(RpcChildError::RpcError(RpcError {code:-32001,message:error.to_string(),data:None}));
             }
+        }
+        if let Some(mcp) = &self.mcp {
+            mcp.session.begin(&turn.0, checkpoint).map_err(|error| {
+                RpcChildError::RpcError(RpcError {
+                    code: -32001,
+                    message: error.to_string(),
+                    data: None,
+                })
+            })?;
         }
         let mut cancellation_expired = false;
         let response = {
@@ -1880,6 +1945,9 @@ impl AcpSession {
         // Agent/Ask; resolve through the advertised options when available.
         self.set_semantic_config(ConfigKind::Mode, &mode, true)
             .await?;
+        if let Some(mcp) = &self.mcp {
+            mcp.session.set_mode(Some(mode.clone()));
+        }
         self.state.lock().await.permission_mode = mode;
         Ok(())
     }
@@ -2412,6 +2480,38 @@ impl AcpSession {
                 .await;
             return;
         }
+        if kind == "current_mode_update" {
+            let mode = update
+                .get("currentModeId")
+                .or_else(|| update.get("modeId"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(mcp) = &self.mcp {
+                mcp.session.set_mode(mode.clone());
+            }
+            if let Some(mode) = mode {
+                self.state.lock().await.permission_mode = mode;
+            }
+            return;
+        }
+        if kind == "config_option_update" {
+            for option in config_options(update) {
+                if option.get("id").and_then(Value::as_str) == Some("mode")
+                    || option.get("category").and_then(Value::as_str) == Some("mode")
+                {
+                    let mode = option
+                        .get("currentValue")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if let Some(mcp) = &self.mcp {
+                        mcp.session.set_mode(mode);
+                    }
+                }
+            }
+        }
+        if self.metadata_replay.load(Ordering::SeqCst) {
+            return;
+        }
         let Some(turn_id) = self.state.lock().await.active_turn.clone() else {
             // Session-load replay is already persisted in Codemux. Avoid
             // duplicating it, but don't call a valid replay frame unknown.
@@ -2645,6 +2745,9 @@ impl AcpSession {
     }
 
     pub async fn shutdown(&self) {
+        if let Some(mcp) = &self.mcp {
+            mcp.session.authority.revoke();
+        }
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }

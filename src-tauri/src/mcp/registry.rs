@@ -101,7 +101,7 @@ pub struct McpRegistry {
     gateway: Arc<OnceCell<Arc<super::gateway::McpGatewayRuntime>>>,
     native_delegation: Arc<std::sync::Mutex<Option<NativeDelegationHandler>>>,
     /// Tools Codemux serves itself, in-process, to its own Claude and Codex
-    /// chats (see [`HostTools`]). Set once at startup.
+    /// chats and authenticated gateway sessions (see [`HostTools`]). Set once at startup.
     host: Arc<std::sync::OnceLock<Arc<dyn HostTools>>>,
     plugin_epoch: Arc<std::sync::atomic::AtomicU64>,
     activity: Arc<std::sync::OnceLock<Arc<dyn Fn(PluginMcpActivity) + Send + Sync>>>,
@@ -125,9 +125,9 @@ pub struct HostCaller {
 /// Tools Codemux answers itself instead of forwarding to an MCP child.
 ///
 /// Deliberately invisible to [`McpRegistry::list_all_tools`] and
-/// [`McpRegistry::dispatch_tool_call`]: those also back the OpenCode
-/// gateway and `codemux mcp`, which cannot identify the calling chat. Only
-/// adapters that know their session (Claude, Codex) list and call these.
+/// [`McpRegistry::dispatch_tool_call`]: unbound MCP clients cannot identify
+/// the calling chat. Session adapters and authenticated per-chat gateway
+/// credentials list and call these through the native route.
 pub trait HostTools: Send + Sync {
     /// Tools to offer `caller`, already prefixed like registry tools.
     fn tools_for(&self, caller: &HostCaller) -> Vec<McpTool>;
@@ -252,6 +252,15 @@ pub(crate) fn native_relay_allowed(raw:&str, full_access:bool)->bool {
         "issue_list" | "issue_get" | "preset_list" | "delegation_targets" | "delegate_remote_task")
 }
 pub(crate) fn native_tool_visible(tool:&McpTool, caller:&HostCaller)->bool {
+    if matches!(
+        tool.name.as_str(),
+        "delegation_targets" | "delegate_remote_task"
+    ) && !matches!(
+        caller.provider,
+        crate::agent_provider::ProviderKind::Claude | crate::agent_provider::ProviderKind::Codex
+    ) {
+        return false;
+    }
     let full = crate::agent_control::permissions::Ceiling::for_mode(caller.provider, caller.permission_mode.as_deref()).is_some_and(|c| c.full_access());
     !tool.prefixed_name.starts_with("mcp__codemux__") || native_relay_allowed(&tool.name, full)
 }
@@ -279,7 +288,7 @@ impl McpRegistry {
     ) -> Result<serde_json::Value, String> {
         self.dispatch_native_tool_call_with_id(name, arguments, actor, None).await
     }
-    async fn dispatch_native_tool_call_with_id(
+    pub(crate) async fn dispatch_native_tool_call_with_id(
         &self, name: &str, arguments: serde_json::Value,
         actor: crate::delegation::app::NativeActor, call_id: Option<String>,
     ) -> Result<serde_json::Value, String> {

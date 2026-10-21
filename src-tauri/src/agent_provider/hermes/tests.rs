@@ -10,8 +10,8 @@ impl BindingStore for crate::database::DatabaseStore {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_l3_native_stop_wakes_cold_hermes_profile_operation_wait() {
-    use tauri::Manager;
     use crate::commands::agent_chat::{self, ProviderRegistry};
+    use tauri::Manager;
     let binary = std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
     assert!(binary.is_file(), "synthetic ACP fixture required, never a real Hermes CLI");
@@ -108,7 +108,9 @@ async fn review_pump_fixture_with_binary(binary: Option<std::path::PathBuf>) -> 
         routes:Mutex::new(HashMap::new()), commands:Mutex::new(HashMap::new()), queue:Mutex::new(Queue::default()), barrier});
     let mut binding = test_binding(root.path()); binding.profile=profile; binding.acp_session_id=Some("review-session".into());
     binding.current_native_id=Some("existing-native".into());
-    let chat = Arc::new(Chat {binding:Mutex::new(binding), runtime:runtime.clone(), mcp_servers:json!([]), state:Mutex::new(ChatState::default()), finished:Notify::new()});
+    let chat = Arc::new(Chat {binding:Mutex::new(binding), runtime:runtime.clone(), mcp_servers:json!([]),
+        mcp: None,
+        state:Mutex::new(ChatState::default()), finished:Notify::new()});
     provider.inner.chats.lock().await.insert(ThreadId("thread".into()), chat.clone());
     runtime.routes.lock().await.insert("review-session".into(), Arc::downgrade(&chat));
     let inner = provider.inner.clone(); let r = runtime.clone();
@@ -1139,8 +1141,8 @@ fn hermes_offline_free_model_change_fails_without_mutating_binding() {
 #[cfg(unix)]
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn review_r2_hermes_child_exit_settles_delivery_attention() {
-    use tauri::Manager;
     use std::os::unix::fs::PermissionsExt;
+    use tauri::Manager;
     let peer=tempfile::tempdir().unwrap();
     let binary=peer.path().join("exit-peer.py");
     std::fs::write(&binary,"#!/usr/bin/env python3\nimport sys\nsys.stdin.readline()\nsys.exit(7)\n").unwrap();
@@ -1170,8 +1172,8 @@ async fn review_r2_hermes_child_exit_settles_delivery_attention() {
 #[cfg(unix)]
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn review_r2_hermes_cancellation_timeout_settles_delivery_attention() {
-    use tauri::Manager;
     use std::os::unix::fs::PermissionsExt;
+    use tauri::Manager;
     let peer=tempfile::tempdir().unwrap();
     let binary=peer.path().join("unanswered-peer.py");
     std::fs::write(&binary,"#!/usr/bin/env python3\nimport sys,pathlib\nsys.stdin.readline()\npathlib.Path(__file__).with_suffix('.ready').write_text('ready')\nfor line in sys.stdin: pass\n").unwrap();
@@ -1264,4 +1266,39 @@ async fn orchestration_message_hermes_failed_release_reholds_durable_rows_before
     assert!(runtime.queue.lock().await.jobs.iter().any(|job|job.id==b));
     assert!(!db.message_delivery("B").unwrap().unwrap().attempted);
     runtime.child.shutdown().await.unwrap();task.abort();let _=task.await;
+}
+
+#[tokio::test]
+async fn all_provider_hermes_capabilities_do_not_reacquire_the_active_profile_operation() {
+    let (_root, provider, runtime, _chat, task) = review_pump_fixture().await;
+    let key = runtime_key(&runtime.profile);
+    provider
+        .inner
+        .runtimes
+        .lock()
+        .await
+        .insert(key.clone(), runtime.clone());
+    let acknowledged = json!({"models":{"currentModelId":"openai:fixture-model","availableModels":[{"modelId":"openai:fixture-model","name":"Fixture"}]}});
+    provider
+        .inner
+        .catalogs
+        .lock()
+        .await
+        .insert(key, acknowledged.clone());
+    let held = runtime.operation.lock().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        provider.orchestration_catalog(runtime.profile.clone()),
+    )
+    .await;
+    drop(held);
+    runtime.child.shutdown().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    assert_eq!(
+        result
+            .expect("native discovery must not wait on its own profile operation")
+            .unwrap(),
+        acknowledged
+    );
 }

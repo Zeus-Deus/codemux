@@ -43,9 +43,8 @@ pub(crate) fn tool_name(name: &str) -> Option<&str> {
     })
 }
 impl<R: Runtime> HostTools for OrchestrationHost<R> {
-    fn tools_for(&self, caller: &HostCaller) -> Vec<McpTool> {
-        if !matches!(caller.provider, ProviderKind::Claude | ProviderKind::Codex)
-            || !self
+    fn tools_for(&self, _caller: &HostCaller) -> Vec<McpTool> {
+        if !self
                 .0
                 .try_state::<DatabaseStore>()
                 .is_some_and(|db| crate::commands::delegation::setting_on(&db))
@@ -63,6 +62,7 @@ impl<R: Runtime> HostTools for OrchestrationHost<R> {
             if tool.name == "thread_launch" {
                 tool.description = "If the user asks to delegate work or wants results back, use delegate_task instead. Start an independent chat only when the user requests a separate conversation. Without workspace_id the chat gets its own workspace, nested under yours in the same folder and titled with title; with workspace_id it opens as a tab in that workspace. Omitted or null permission_mode inherits the caller's effective ceiling; explicit modes cannot exceed it. Worktree strategies are unsupported. Returns an operation receipt; use operation_status.";
                 tool.input_schema["properties"]["provider_instance_id"] = json!({"type":"string"});
+                tool.input_schema["properties"]["target"] = super::selection::schema();
                 tool.input_schema["properties"]["worktree"] = json!({"description":"Unsupported in this version"});
             }
             if tool.name == "thread_read" {
@@ -125,14 +125,19 @@ async fn qualify_for<R: Runtime>(app: &AppHandle<R>, actor: &crate::delegation::
         .state::<DatabaseStore>()
         .get_agent_chat_session(&actor.thread_id)
         .ok_or_else(|| ControlError::new("stale_caller", "Calling chat no longer exists"))?;
-    let native =
-        Ceiling::for_mode(actor.provider, actor.permission_mode.as_deref()).ok_or_else(|| {
+    let native = if actor.provider == ProviderKind::Acp {
+        crate::delegation::authority::NativeAuthority::effective_ceiling(&actor.thread_id)
+            .map_err(ControlError::from)?
+    } else {
+        Ceiling::for_mode(actor.provider, actor.permission_mode.as_deref())
+    }
+    .ok_or_else(|| {
             ControlError::new(
                 "unsupported_permission_ceiling",
                 "Effective native mode is unknown",
             )
         })?;
-    let canonical = Ceiling::for_mode(actor.provider, record.permission_mode.as_deref())
+    let canonical = Ceiling::for_record(&app.state::<DatabaseStore>(), &record, actor.provider)
         .ok_or_else(|| {
             ControlError::new("unsupported_permission_ceiling", "Stored mode is unknown")
         })?;
@@ -140,7 +145,10 @@ async fn qualify_for<R: Runtime>(app: &AppHandle<R>, actor: &crate::delegation::
         admitted: None,
         identity: CallerPrincipal::Thread {
             thread_id: actor.thread_id.clone(),
-            provider_instance_id: crate::commands::delegation::provider_id(actor.provider).into(),
+            provider_instance_id: super::selection::current_instance(
+                &app.state::<DatabaseStore>(),
+                &actor.thread_id,
+                actor.provider)?,
             provider: actor.provider,
             session_id: actor.session_id.clone(),
             authority,
@@ -225,6 +233,29 @@ pub(crate) async fn call_with_id<R: Runtime>(
             .state::<DatabaseStore>()
             .get_agent_chat_session(&actor.thread_id)
             .ok_or("Calling chat missing")?;
+        if name == "delegate_task"
+            && args.get("target").is_none_or(Value::is_null)
+            && args.get("provider").is_none_or(Value::is_null)
+        {
+            let instance = super::selection::current_instance(
+                &app.state::<DatabaseStore>(),
+                &actor.thread_id,
+                actor.provider,
+            )?;
+            let model = args
+                .get("model")
+                .filter(|m| !m.is_null())
+                .cloned()
+                .unwrap_or_else(|| json!(record.model));
+            let mut options = json!({});
+            if let Some(effort) = args.get("effort").filter(|e| !e.is_null()) {
+                options["effort"] = effort.clone();
+            }
+            args["target"] = json!({"instance_id":instance,"model":model,"options":options});
+            if args.get("provider").is_some_and(Value::is_null) {
+                args.as_object_mut().unwrap().remove("provider");
+            }
+        }
         let host_caller = HostCaller {
             control: Some(caller),
             thread_id: actor.thread_id.clone(),
@@ -289,7 +320,9 @@ pub(crate) async fn call_with_id<R: Runtime>(
                 .map_err(|e| e.to_string())?;
             if let Some(providers) = result["providers"].as_array_mut() {
                 for provider in providers {
-                    provider["provider_instance_id"] = provider["provider"].clone();
+                    if provider.get("provider_instance_id").is_none() {
+                        provider["provider_instance_id"] = provider["provider"].clone();
+                    }
                     provider["models"] = provider["capabilities"]["models"].clone();
                     if matches!(provider["provider"].as_str(), Some("claude" | "codex")) {
                         if let Some(modes) = provider["allowed_permission_modes"].as_array_mut() {
@@ -311,10 +344,7 @@ pub(crate) async fn call_with_id<R: Runtime>(
                                     .and_then(|ceiling| ceiling.inherited(kind).ok())
                             })
                             .map_or(Value::Null, Value::String);
-                    provider["native_orchestration"] = json!(matches!(
-                        provider["provider"].as_str(),
-                        Some("claude" | "codex")
-                    ));
+                    provider["native_orchestration"] = json!(true);
                 }
             }
             result["limits"] =
@@ -355,6 +385,7 @@ pub(crate) async fn call_with_id<R: Runtime>(
                     entry["client_request_id"] = json!(if entry_key.len() <= 128 {
                         entry_key
                     } else { format!("batch:{:x}:{index}", Sha256::digest(key.as_bytes())) });
+                    inherit_selection(&app, &actor, &mut entry)?;
                     prepare_launch(&caller, &actor, &mut entry)?;
                     service::launch_placed(&app, &caller, entry, child_workspace).await.map_err(|e| e.to_string())
                 }.await;
@@ -366,6 +397,7 @@ pub(crate) async fn call_with_id<R: Runtime>(
             json!({"threads":receipts,"client_request_id":key})
         }
         "thread_launch" => {
+            inherit_selection(&app, &actor, &mut args)?;
             prepare_launch(&caller, &actor, &mut args)?;
             service::launch_placed(&app, &caller, args, child_workspace)
                 .await
@@ -383,36 +415,89 @@ pub(crate) async fn call_with_id<R: Runtime>(
     };
     Ok(with_chat_links(result))
 }
+fn inherit_selection<R: Runtime>(
+    app: &AppHandle<R>,
+    actor: &crate::delegation::app::NativeActor,
+    args: &mut Value,
+) -> Result<(), String> {
+    if args.get("target").is_none_or(Value::is_null)
+        && args.get("provider_instance_id").is_none_or(Value::is_null)
+        && args.get("provider").is_none_or(Value::is_null)
+    {
+        let db = app.state::<DatabaseStore>();
+        let instance = super::selection::current_instance(&db, &actor.thread_id, actor.provider)?;
+        // Instance identity is inherited, model/options are inherited only
+        // when the caller has not requested a different model.
+        let record = db
+            .get_agent_chat_session(&actor.thread_id)
+            .ok_or("Calling chat missing")?;
+        let model = args
+            .get("model")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .unwrap_or_else(|| json!(record.model));
+        let mut options = json!({});
+        if model == json!(record.model) {
+            if let Some(effort) = record.effort {
+                options["effort"] = json!(effort);
+            }
+            if let Some(window) = record.context_window {
+                options["context_window"] = json!(window);
+            }
+            if !record.service_tier.is_empty() && record.service_tier != "default" {
+                options["service_tier"] = json!(record.service_tier);
+            }
+            if record.fast_mode {
+                options["fast_mode"] = json!(true);
+            }
+        }
+        args["target"] = json!({"instance_id":instance,"model":model,"options":options});
+    }
+    Ok(())
+}
 fn prepare_launch(
     caller: &ControlCaller,
     actor: &crate::delegation::app::NativeActor,
     args: &mut Value,
 ) -> Result<(), String> {
-    if let Some(instance) = args
+    let instance = args
         .as_object_mut()
         .and_then(|o| o.remove("provider_instance_id"))
-        .filter(|instance| !instance.is_null())
+        .filter(|v| !v.is_null());
+    if let Some(instance) = instance {
+        if args.get("target").is_some_and(|v| !v.is_null())
     {
-        if args.get("provider").is_some_and(|p| !p.is_null() && p != &instance) {
-            return Err("invalid_arguments: conflicting provider selection".into());
+            return Err("invalid_arguments: select target or provider_instance_id".into());
         }
-        args["provider"] = instance;
+        args["target"] = json!({"instance_id":instance,"model":args["model"],"options":{}});
     }
     args["select"] = json!(false);
+    if let Some(instance) = args["target"]["instance_id"]
+        .as_str()
+        .or_else(|| args["target"]["provider_instance_id"].as_str())
+    {
+        let slug = instance.split(':').next().unwrap_or_default();
+        let provider =
+            crate::commands::delegation::parse_provider(slug).ok_or("unsupported_provider")?;
+        if args.get("provider").is_some_and(|p| !p.is_null() && p != &json!(provider)) {
+            return Err("invalid_arguments: conflicting provider selection".into());
+        }
+        args["provider"] = json!(provider);
+    }
     if args.get("provider").is_none_or(Value::is_null) {
         args["provider"] = json!(actor.provider);
     }
     let provider: ProviderKind =
         serde_json::from_value(args["provider"].clone()).map_err(|_| "unsupported_provider")?;
-    if !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
-        return Err("unsupported_provider: native launch injection is currently available for Claude and Codex".into());
-    }
     if args.get("permission_mode").is_none_or(Value::is_null) {
         args["permission_mode"] = json!(caller
             .ceiling()
             .ok_or("Missing caller ceiling")?
             .inherited(provider)
             .map_err(|e| e.to_string())?);
+    }
+    if provider == ProviderKind::OpenCode && args["permission_mode"] == "default" {
+        args["permission_mode"] = Value::Null;
     }
     if args.get("client_request_id").is_none_or(Value::is_null) {
         args["client_request_id"] = json!(uuid::Uuid::new_v4().to_string());

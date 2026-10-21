@@ -28,6 +28,7 @@ struct Upstream {
     authorization: HeaderValue,
     /// `Mcp-Session-Id` the server assigned at `initialize`, if any.
     session: Arc<Mutex<Option<HeaderValue>>>,
+    protocol: Arc<Mutex<Option<HeaderValue>>>,
     out: mpsc::UnboundedSender<String>,
     /// In-flight requests and the event-stream listener. Each holds a sender
     /// to stdout, so they are cancelled when the agent hangs up; otherwise the
@@ -79,6 +80,7 @@ pub async fn run() -> Result<(), String> {
         url,
         authorization,
         session: Arc::default(),
+        protocol: Arc::default(),
         out,
         tasks: Arc::default(),
         #[cfg(test)]
@@ -126,6 +128,13 @@ impl Upstream {
     }
 
     fn send(&self, message: &Value) {
+        if let Some(version) = message
+            .pointer("/result/protocolVersion")
+            .and_then(Value::as_str)
+            .and_then(|v| HeaderValue::from_str(v).ok())
+        {
+            *self.protocol.lock().unwrap() = Some(version);
+        }
         let _ = self.out.send(message.to_string());
     }
 
@@ -134,6 +143,9 @@ impl Upstream {
         headers.insert(AUTHORIZATION, self.authorization.clone());
         if let Some(session) = self.session.lock().unwrap_or_else(|p| p.into_inner()).clone() {
             headers.insert(SESSION_HEADER, session);
+        }
+        if let Some(protocol) = self.protocol.lock().unwrap().clone() {
+            headers.insert("mcp-protocol-version", protocol);
         }
         headers
     }
@@ -292,6 +304,7 @@ mod tests {
             url: connection.url.clone(),
             authorization: HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
             session: Arc::default(),
+            protocol: Arc::default(),
             out: out.clone(),
             tasks: Arc::default(),
             before_listen: Arc::default(),
@@ -335,6 +348,7 @@ mod tests {
             url: connection.url.clone(),
             authorization: HeaderValue::from_str(&format!("Bearer {}", connection.bearer_token)).unwrap(),
             session: Arc::default(),
+            protocol: Arc::default(),
             out,
             tasks: Arc::default(),
             before_listen: Arc::default(),
@@ -378,4 +392,84 @@ mod tests {
         assert_eq!(parser.push(b"\n"), Vec::<String>::new());
         assert_eq!(parser.finish().as_deref(), Some("tail"));
     }
+}
+
+/// One-shot fallback for agents that accept MCP injection but hide its tools.
+/// This is an ordinary authenticated gateway client, never a control-socket client.
+pub async fn call(
+    tool: Option<String>,
+    arguments: Option<String>,
+    connection_file: Option<std::path::PathBuf>,
+    list: bool,
+) -> Result<(), String> {
+    let connection: super::gateway::McpGatewayConnection = match connection_file {
+        Some(path) => {
+            let file = std::fs::File::open(path)
+                .map_err(|e| format!("Chat MCP connection is unavailable: {e}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if file
+                    .metadata()
+                    .map_err(|e| e.to_string())?
+                    .permissions()
+                    .mode()
+                    & 0o077
+                    != 0
+                {
+                    return Err("Chat MCP connection must be private to its owner".into());
+                }
+            }
+            serde_json::from_reader(file).map_err(|_| "Invalid chat MCP connection".to_string())?
+        }
+        None => super::gateway::McpGatewayConnection {
+            url: std::env::var(BRIDGE_URL_ENV)
+                .map_err(|_| "No authenticated chat MCP connection".to_string())?,
+            bearer_token: std::env::var(BRIDGE_TOKEN_ENV)
+                .map_err(|_| "No authenticated chat MCP connection".to_string())?,
+        },
+    };
+    let url = reqwest::Url::parse(&connection.url).map_err(|_| "Invalid chat MCP endpoint")?;
+    if url.scheme() != "http"
+        || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+        || url.path() != "/mcp"
+    {
+        return Err("Chat MCP endpoint must be the local gateway".into());
+    }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let message = if list {
+        json!({"jsonrpc":"2.0","id":request_id,"method":"tools/list","params":{}})
+    } else {
+        let name = tool.ok_or("Pass a tool name, or --list")?;
+        let name = name.strip_prefix("mcp__codemux__").unwrap_or(&name);
+        let args: Value = serde_json::from_str(arguments.as_deref().unwrap_or("{}"))
+            .map_err(|e| format!("Invalid arguments JSON: {e}"))?;
+        json!({"jsonrpc":"2.0","id":request_id,"method":"tools/call","params":{"name":name,"arguments":args}})
+    };
+    let reply = client
+        .post(url)
+        .bearer_auth(connection.bearer_token)
+        .json(&message)
+        .send()
+        .await
+        .map_err(|_| "Chat MCP gateway is unavailable")?;
+    if !reply.status().is_success() {
+        return Err(format!("Chat MCP gateway returned HTTP {}", reply.status()));
+    }
+    let reply: Value = reply
+        .json()
+        .await
+        .map_err(|_| "Invalid chat MCP gateway reply")?;
+    println!(
+        "{}",
+        serde_json::to_string(&reply).map_err(|e| e.to_string())?
+    );
+    if reply.get("error").is_some() || reply["result"]["isError"] == true {
+        return Err("Chat MCP call was refused; inspect the JSON result".into());
+    }
+    Ok(())
 }

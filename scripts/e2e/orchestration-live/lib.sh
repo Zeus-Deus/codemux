@@ -83,6 +83,54 @@ claude_auth_entry() {
   return 1
 }
 
+# Additional providers are opt-in, so ordinary Claude/Codex runs do not gain
+# access to unrelated credentials. Atomic auth writers need directory mounts.
+provider_enabled() { case ",${ORCH_LIVE_PROVIDERS:-claude,codex}," in *",$1,"*) return 0;; *) return 1;; esac; }
+auth_entry() { case "$1" in auth.json|auth.json.tmp*|.auth.json*|auth.lock|.auth.lock*|auth.json.lock*) return 0;; *) return 1;; esac; }
+auth_mount_args() { # real directory, sandbox destination, private overlay
+  local source="$1" target="$2" overlay="$3" entry name
+  [ -d "$source" ] || return 0
+  mkdir -p "$overlay"
+  printf '%s\n' --bind "$source" "$target"
+  for entry in "$source"/* "$source"/.[!.]* "$source"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    name="${entry##*/}"; auth_entry "$name" && continue
+    if [ -d "$entry" ] && [ ! -L "$entry" ]; then
+      mkdir -p "$overlay/$name"
+      printf '%s\n' --bind "$overlay/$name" "$target/$name"
+    elif [ ! -L "$entry" ]; then
+      [ -f "$overlay/$name" ] || : >"$overlay/$name"
+      printf '%s\n' --bind "$overlay/$name" "$target/$name"
+    else
+      # A link can escape an overlay. Reject instead of following or exposing it.
+      printf '%s\n' --ro-bind "$ROOT/empty/file" "$target/$name"
+    fi
+  done
+}
+
+# Hermes separates its source tree from committed dependency generations.
+# Reuse code read-only, but keep installation metadata/locks/leases private.
+hermes_runtime_mount_args() {
+  local real_home="$1" source key state overlay generation relative
+  source="$real_home/.hermes/hermes-agent"
+  [ -d "$source" ] || return 0
+  key="$(python3 -c 'import hashlib,os,sys;print(hashlib.sha256(os.path.realpath(sys.argv[1]).encode()).hexdigest()[:16])' "$source")"
+  state="$real_home/.hermes/installs/$key"
+  overlay="$ROOT/private/hermes/installs/$key"
+  [ -f "$state/facts.json" ] || return 0
+  mkdir -p "$overlay"
+  cp -p "$state/facts.json" "$overlay/facts.json"
+  [ ! -d "$state/inputs" ] || cp -a "$state/inputs" "$overlay/"
+  : >"$overlay/.install.lock"
+  generation="$(python3 -c 'import json,sys;v=json.load(open(sys.argv[1])).get("packages",{}).get("venv",{}).get("environment");print(v or "")' "$state/facts.json")"
+  case "$generation" in "$state/environments/"*/venv) ;; *) return 0;; esac
+  generation="${generation%/venv}"
+  relative="${generation#"$state/"}"
+  mkdir -p "$overlay/$relative" "$ROOT/private/hermes-leases"
+  printf '%s\n' --ro-bind "$generation" "$real_home/.hermes/installs/$key/$relative"
+  printf '%s\n' --bind "$ROOT/private/hermes-leases" "$real_home/.hermes/installs/$key/$relative/.leases"
+}
+
 # bwrap arguments for the sandbox the serve process (and every provider CLI it
 # spawns) runs in. Allow-list: the host is read-only, /dev, /proc, /tmp,
 # /var/tmp and /run are private, HOME is private, and the only writable host
@@ -137,6 +185,18 @@ sandbox_args() {
   # file bind-mount supports.
   [ -f "$real_home/.codex/auth.json" ] && \
     printf '%s\n' --bind "$real_home/.codex/auth.json" "$real_home/.codex/auth.json"
+  if provider_enabled opencode; then auth_mount_args "$real_home/.local/share/opencode" "$ROOT/data/opencode" "$ROOT/private/opencode"; fi
+  if provider_enabled cursor; then auth_mount_args "$real_home/.config/cursor" "$ROOT/config/cursor" "$ROOT/private/cursor"; fi
+  if provider_enabled grok && [ -f "$real_home/.grok/auth.json" ]; then auth_mount_args "$real_home/.grok" "$real_home/.grok" "$ROOT/private/grok"; fi
+  if provider_enabled hermes; then
+    auth_mount_args "$real_home/.hermes" "$real_home/.hermes" "$ROOT/private/hermes"
+    # Runtime code and its interpreter are read-only; history/config are private.
+    for entry in hermes-agent tools; do
+      [ ! -d "$real_home/.hermes/$entry" ] || printf '%s\n' --ro-bind "$real_home/.hermes/$entry" "$real_home/.hermes/$entry"
+    done
+    hermes_runtime_mount_args "$real_home"
+    [ ! -f "$real_home/.local/bin/hermes" ] || printf '%s\n' --ro-bind "$real_home/.local/bin/hermes" "$real_home/.local/bin/hermes"
+  fi
   return 0
 }
 
@@ -159,7 +219,9 @@ sandbox_env() {
     "CODEMUX_E2E_LOCAL_REMOTE=1" \
     "CODEMUX_DISABLE_PTY_DAEMON=1" \
     "DISABLE_AUTOUPDATER=1" \
-    "ORCH_LIVE_RUN_ID=${RUN_ID:-}"
+    "ORCH_LIVE_RUN_ID=${RUN_ID:-}" \
+    "HERMES_HOME=$HOME/.hermes" \
+    "HERMES_DISABLE_LAZY_INSTALLS=1"
 }
 
 # Run a command inside the sandbox (foreground).
@@ -330,9 +392,34 @@ claude_real_snapshot() {
   done | LC_ALL=C sort
 }
 
+extra_auth_directories() {
+  provider_enabled opencode && printf '%s\n' "$HOME/.local/share/opencode"
+  provider_enabled cursor && printf '%s\n' "$HOME/.config/cursor"
+  provider_enabled grok && [ -f "$HOME/.grok/auth.json" ] && printf '%s\n' "$HOME/.grok"
+  provider_enabled hermes && printf '%s\n' "$HOME/.hermes"
+  return 0
+}
+extra_auth_snapshot() {
+  local directory entry name
+  while IFS= read -r directory; do
+    [ -d "$directory" ] || continue
+    for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      name="${entry##*/}"; auth_entry "$name" && continue
+      if [ -L "$entry" ]; then printf '%s\tL\t%s\t%s\n' "$directory" "$name" "$(readlink "$entry")";
+      else printf '%s\tE\t%s\n' "$directory" "$name"; fi
+    done
+  done < <(extra_auth_directories) | LC_ALL=C sort
+}
+
 # The user's real provider credential files down.sh checks.
 real_credential_files() {
   printf '%s\n' "$HOME/.codex/auth.json" "$HOME/.claude/.credentials.json"
+  provider_enabled opencode && printf '%s\n' "$HOME/.local/share/opencode/auth.json"
+  provider_enabled cursor && printf '%s\n' "$HOME/.config/cursor/auth.json"
+  provider_enabled grok && printf '%s\n' "$HOME/.grok/auth.json"
+  provider_enabled hermes && printf '%s\n' "$HOME/.hermes/auth.json"
+  return 0
 }
 
 # up.sh records which of them exist, so down.sh can tell a file that was
@@ -382,6 +469,13 @@ check_real_credentials() {
       snap_rc=1
     done < <(LC_ALL=C comm -23 "$before" <(printf '%s\n' "$after"))
     [ "$snap_rc" = 0 ] && pass "real ~/.claude has no new or changed top-level entries besides Claude's credential entries"
+  fi
+  if [ -f "$ROOT/extra-auth.snapshot" ]; then
+    after="$(extra_auth_snapshot)"
+    if ! diff -u "$ROOT/extra-auth.snapshot" <(printf '%s\n' "$after" | sed '/^$/d') >"$ROOT/logs/extra-auth-changes.log"; then
+      echo "FAIL: an additional provider's real auth directory gained or lost non-auth entries; inspect $ROOT/logs/extra-auth-changes.log" >&2
+      snap_rc=1
+    else pass "additional provider auth directories retained all non-auth entries"; fi
   fi
   [ "$rc" = 0 ] && [ "$snap_rc" = 0 ]
 }

@@ -68,8 +68,7 @@ fn caller_ceiling(caller: &HostCaller) -> Option<crate::agent_control::permissio
 }
 
 fn eligible(caller: &HostCaller, is_child: bool, workspace: &WorkspaceSnapshot) -> bool {
-    matches!(caller.provider, ProviderKind::Claude | ProviderKind::Codex)
-        && caller_ceiling(caller).is_some_and(|ceiling| !ceiling.plan)
+    caller_ceiling(caller).is_some_and(|ceiling| !ceiling.plan)
         && !is_child
         && workspace.host_id.is_none()
         && workspace.remote_cwd.is_none()

@@ -358,7 +358,8 @@ async fn mario_r7_true_errors_and_limits_remain_distinct_across_native_history()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mario_r4_child_unknown_and_empty_approvals_keep_selected_parent_wait_busy() {
-    use crate::agent_provider::{ProviderRuntimeEvent, RequestId, ThreadId, TurnId, TurnStatus, SessionStatus, SubagentSnapshot, SubagentStatus};
+    use crate::agent_provider::{ProviderRuntimeEvent, RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, ThreadId, TurnId, TurnStatus,
+    };
     use crate::commands::agent_chat::{forward_event, SubagentTracker};
     for callback_turn in ["child-b", "", "unknown-turn"] {
         let (app, provider, _root, workspace) = fixture().await;
@@ -968,7 +969,8 @@ async fn review_l5_identical_retry_recovers_receipt_after_pane_close() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_l6_selected_parent_wait_remains_busy_until_delegate_settles() {
-    use crate::agent_provider::{ProviderRuntimeEvent, ThreadId, TurnId, TurnStatus, SubagentSnapshot, SubagentStatus};
+    use crate::agent_provider::{ProviderRuntimeEvent, SubagentSnapshot, SubagentStatus, ThreadId, TurnId, TurnStatus,
+    };
     let (app, _, _root, workspace) = fixture().await;
     let receipt = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
         "workspace_id":workspace,"client_request_id":"review-l6-launch","provider":"claude","permission_mode":"default",
@@ -1004,7 +1006,7 @@ async fn review_l6_selected_parent_wait_remains_busy_until_delegate_settles() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_l2_receipt_admitted_send_cannot_restart_after_completed_native_stop() {
-    use crate::agent_provider::{ThreadId, ProviderKind, AgentProvider};
+    use crate::agent_provider::{AgentProvider, ProviderKind, ThreadId};
     let (app, provider, _root, workspace) = fixture().await;
     let launch = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
         "workspace_id":workspace,"client_request_id":"review-l2-launch","provider":"claude","permission_mode":"default",
@@ -1033,7 +1035,7 @@ async fn review_l2_receipt_admitted_send_cannot_restart_after_completed_native_s
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_s4_outside_approval_handle_survives_no_provider_id_recycling() {
-    use crate::agent_provider::{ProviderRuntimeEvent, ThreadId, TurnId, RequestId};
+    use crate::agent_provider::{ProviderRuntimeEvent, RequestId, ThreadId, TurnId};
     let (app, provider, _root, workspace) = fixture().await;
     let launch = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
         "workspace_id":workspace,"client_request_id":"review-s4-launch","provider":"claude","permission_mode":"default",
@@ -1527,7 +1529,7 @@ async fn orchestration_message_definite_error_survives_attention_and_cold_status
 
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn orchestration_message_controller_interrupt_selects_current_run_without_stop_fence() {
-    use crate::agent_provider::{ProviderRuntimeEvent,ThreadId,TurnId,SessionStatus};
+    use crate::agent_provider::{ProviderRuntimeEvent, SessionStatus, ThreadId, TurnId};
     let (app,provider,_root,workspace)=fixture().await;
     let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"interrupt-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
     let launched=settle_operation(&app,&receipt).await; let thread=launched["thread_id"].as_str().unwrap();
@@ -2078,8 +2080,8 @@ async fn native_callers_toggle_is_enforced_at_dispatch_but_suggestions_still_wor
 
 #[tokio::test]
 async fn native_callers_validate_every_explicit_delegate_mode_against_catalog() {
-    use crate::mcp::registry::{HostCaller,HostTools};
     use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller,HostTools};
     for (parent_mode,child_mode,expected_plan) in [("plan","plan",true),("bypassPermissions","read-only",false),("bypassPermissions","invented",false),("bypassPermissions","workspace-write",false)] {
         let (app,_,_root,workspace,thread,_authority,actor)=native_caller_fixture(parent_mode).await;
         let mut caps=crate::agent_provider::codex::capabilities::build_capabilities(vec![]);
@@ -2662,4 +2664,176 @@ async fn native_launch_catalog_steers_delegation_to_delegate_task() {
         assert!(description.contains("nested under yours"), "{description}");
         assert!(!description.contains("project-root"), "{description}");
     }
+}
+
+#[tokio::test]
+async fn all_provider_target_validation_precedes_admission_and_preserves_instance_catalog() {
+    let (app, _, _root, workspace, _thread, _authority, actor) =
+        native_caller_fixture("bypassPermissions").await;
+    let db = app.state::<crate::database::DatabaseStore>();
+    db.set_setting(
+        "hermes.installation",
+        "/missing/orchestration-fixture-hermes",
+    )
+    .unwrap();
+    let before = db.control_thread_ids(&workspace, None, 100).unwrap();
+    for target in [
+        json!({"instance_id":"acp:missing"}),
+        json!({"instance_id":"hermes:missing"}),
+        json!({"instance_id":"claude:missing"}),
+        json!({"instance_id":"claude","model":"unadvertised-model"}),
+        json!({"instance_id":"claude","options":{"executable":"/bin/sh"}}),
+    ] {
+        let result = super::native::call(
+            app.handle().clone(),
+            actor.clone(),
+            "thread_launch".into(),
+            json!({"target":target,"title":"Unavailable selection"}),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(
+            db.control_thread_ids(&workspace, None, 100).unwrap(),
+            before,
+            "a readiness rejection must not publish a child pane/session"
+        );
+    }
+}
+
+#[tokio::test]
+async fn all_provider_host_catalog_uses_the_same_tools_in_every_mode() {
+    use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, _, _root, workspace, thread, _authority, _actor) =
+        native_caller_fixture("default").await;
+    let host = super::native::OrchestrationHost(app.handle().clone());
+    for provider in [
+        ProviderKind::OpenCode,
+        ProviderKind::Cursor,
+        ProviderKind::Grok,
+        ProviderKind::Hermes,
+        ProviderKind::Acp,
+    ] {
+        for mode in [
+            None,
+            Some("plan"),
+            Some("default"),
+            Some("agent"),
+            Some("supervised"),
+        ] {
+            let caller = HostCaller {
+                control: None,
+                thread_id: thread.clone(),
+                provider,
+                workspace_id: Some(workspace.clone()),
+                permission_mode: mode.map(str::to_string),
+            };
+            let names: Vec<_> = host
+                .tools_for(&caller)
+                .into_iter()
+                .map(|t| t.name)
+                .collect();
+            for name in [
+                "orchestrator_capabilities",
+                "thread_send",
+                "thread_launch",
+                "thread_wait",
+                "thread_interrupt",
+                "create_threads",
+            ] {
+                assert!(
+                    names.iter().any(|n| n == name),
+                    "{provider:?} {mode:?}: {names:?}"
+                );
+            }
+            assert!(!names.iter().any(|n| n == "thread_respond"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn all_provider_task_retry_keeps_the_admitted_selection_when_target_is_unavailable() {
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, _, _root, workspace, thread, _authority, actor) =
+        native_caller_fixture("bypassPermissions").await;
+    let caller = super::native::qualify(app.handle(), &actor).await.unwrap();
+    let db = app.state::<crate::database::DatabaseStore>();
+    let args = json!({"target":{"instance_id":"acp:removed-instance","model":null,"options":{}},"title":"Already admitted worker","task":"Review this previously admitted task without launching another worker","client_request_id":"admitted-selection","permission_mode":"supervised"});
+    let mut record = crate::database::delegation_tasks::TaskRecord::new(
+        "existing-selection-task".into(),
+        thread.clone(),
+        Some("existing-selection-child".into()),
+        "acp".into(),
+        args["title"].as_str().unwrap().into(),
+        args["task"].as_str().unwrap().into(),
+        1,
+    );
+    record.workspace_id = workspace.clone();
+    record.permission_mode = Some("supervised".into());
+    let payload = json!({"provider":"acp","title":args["title"],"task":args["task"],"model":null,"effort":null,"role":null,"mode":"async","wait_ms":20000,"permission_mode":"supervised","target":args["target"]});
+    db.admit_delegation_task(&record, Some("admitted-selection"), &payload)
+        .unwrap();
+    let host = crate::commands::delegation::DelegationHost::with_install_check(
+        app.handle().clone(),
+        |_| false,
+    );
+    let host_caller = HostCaller {
+        control: Some(caller),
+        thread_id: thread,
+        provider: crate::agent_provider::ProviderKind::Claude,
+        workspace_id: Some(workspace),
+        permission_mode: Some("bypassPermissions".into()),
+    };
+    let response = host
+        .call_async(
+            &host_caller,
+            "mcp__codemux__delegate_task",
+            &args,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(response["isError"], true, "{response}");
+    assert!(response.to_string().contains("existing-selection-task"));
+    let mut conflict = args;
+    conflict["task"] = json!("This is a different task with the same retry key");
+    let response = host
+        .call_async(
+            &host_caller,
+            "mcp__codemux__delegate_task",
+            &conflict,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response["isError"], true);
+    assert!(response.to_string().contains("client_request_id_conflict"));
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn all_provider_queued_launch_keeps_delivery_authority_after_receipt_success() {
+    let (app,provider,_root,_workspace,_thread,_authority,actor)=native_caller_fixture("default").await;
+    provider.queue_next_send();
+    let caller=native::qualify(app.handle(),&actor).await.unwrap();
+    let receipt=native::call(app.handle().clone(),actor,"thread_launch".into(),json!({"client_request_id":"deferred-launch","title":"Queued worker","message":"Run after the launch receipt succeeds"})).await.unwrap();
+    let launched=tokio::time::timeout(std::time::Duration::from_secs(15),async {
+        loop {
+            let status=service::operation_status(app.handle(),&caller,json!({"operation_id":receipt["operation_id"]})).unwrap();
+            if !matches!(status["state"].as_str(),Some("accepted"|"running")){break status;}
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(launched["state"],"succeeded");
+    let thread=launched["thread_id"].as_str().unwrap();
+    let input=provider.take_queued_input();
+    let checkpoint=input.turn_checkpoint.unwrap();
+    checkpoint.prepare().await;
+    checkpoint.verify_dispatch().expect("a succeeded launch does not revoke its queued first message");
+    app.state::<NativeControlState>().thread_gate(thread).cancel();
+    app.state::<crate::database::DatabaseStore>().stop_message_deliveries(thread).unwrap();
+    assert!(checkpoint.verify_dispatch().is_err(),"Stop still revokes the queued first message");
+    checkpoint.abort().await;
+    assert!(provider.calls.snapshot().iter().all(|c|!matches!(c,mock_agent_provider::MockCall::SendTurn(..))));
 }

@@ -14,6 +14,7 @@ pub mod parser;
 pub mod paths;
 pub mod registry;
 pub mod runtime;
+pub(crate) mod thread_gateway;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

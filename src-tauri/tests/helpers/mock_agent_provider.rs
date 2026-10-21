@@ -85,6 +85,8 @@ pub struct MockAgentProvider {
     /// on what the command layer actually handed the provider (workspace
     /// id, env overlay, resume cursor) rather than only that it was called.
     start_inputs: Arc<Mutex<Vec<StartSessionInput>>>,
+    queue_next_send: std::sync::atomic::AtomicBool,
+    queued_input: Mutex<Option<SendTurnInput>>,
 }
 
 impl MockAgentProvider {
@@ -108,7 +110,19 @@ impl MockAgentProvider {
             send_error: Mutex::new(None),
             send_error_after_accept: Mutex::new(None),
             start_inputs: Arc::new(Mutex::new(Vec::new())),
+            queue_next_send: std::sync::atomic::AtomicBool::new(false),
+            queued_input: Mutex::new(None),
         }
+    }
+
+    /// Queue without dispatching, as profile-serialized adapters do.
+    #[allow(dead_code)]
+    pub fn queue_next_send(&self) {
+        self.queue_next_send.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[allow(dead_code)]
+    pub fn take_queued_input(&self) -> SendTurnInput {
+        self.queued_input.lock().unwrap().take().expect("queued send")
     }
 
     /// Snapshot of every `start_session` input received so far.
@@ -254,6 +268,10 @@ impl AgentProvider for MockAgentProvider {
     }
 
     async fn send_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
+        if self.queue_next_send.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            *self.queued_input.lock().unwrap() = Some(input);
+            return Ok(TurnStartResult { steered: false, turn_id: TurnId(String::new()), queued_id: Some("deferred-native-queue".into()) });
+        }
         let gate = self.send_gate.lock().unwrap().take();
         if let Some((entered, release)) = gate {
             entered.notify_one();

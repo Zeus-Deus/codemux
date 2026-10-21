@@ -1710,13 +1710,13 @@ mod delegation {
         };
         assert_eq!(listed(&codex("danger-full-access")).len(), 1);
         assert_eq!(listed(&codex("workspace-write")).len(),1);
-        // Other providers never orchestrate.
+        // Every provider receives the same authenticated orchestration facade.
         let cursor = HostCaller {
             control: None,
             provider: ProviderKind::Cursor,
             ..h.caller(None)
         };
-        assert!(listed(&cursor).is_empty());
+        assert_eq!(listed(&cursor).len(), 1);
 
         // A running child neither sees the tool nor may call it.
         let child = h

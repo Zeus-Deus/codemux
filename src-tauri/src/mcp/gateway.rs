@@ -39,9 +39,9 @@ pub const OPENCODE_NATIVE_SOURCES: [McpConfigSource; 2] = [
     McpConfigSource::OpenCodeProject,
 ];
 
-/// Connection details handed to a provider adapter. Tokens are generated in
-/// this process and never written to disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Connection details handed to a provider adapter. The optional CLI fallback
+/// keeps them in a session-owned, owner-only temporary file.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct McpGatewayConnection {
     pub url: String,
     pub bearer_token: String,
@@ -61,6 +61,7 @@ pub struct GatewayCaller {
     /// `<server>__<tool>` has exactly one `__` (`grok mcp doctor`), and
     /// registry names such as `mcp__docs__search` already contain it.
     pub flat_tool_names: bool,
+    pub(crate) native: Option<super::thread_gateway::GatewayBinding>,
 }
 
 /// `name` with every run of characters outside `[A-Za-z0-9-]` folded to one
@@ -103,10 +104,20 @@ fn presented_names(tools: &[McpTool], flat: bool) -> Vec<String> {
         .collect()
 }
 
-/// Per-chat tokens. A chat keeps its token for the life of this process:
-/// Hermes serves many chats from one process and keys ACP MCP servers by
-/// name, so a chat that reopens on the same process reuses the connection it
-/// registered first, token included.
+fn caller_names(tools: &[McpTool], caller: &GatewayCaller) -> Vec<String> {
+    let mut presented = tools.to_vec();
+    if caller.native.is_some() {
+        for tool in &mut presented {
+            if tool.prefixed_name.starts_with("mcp__codemux__") {
+                tool.prefixed_name = tool.name.clone();
+            }
+        }
+    }
+    presented_names(&presented, caller.flat_tool_names)
+}
+
+/// A native chat credential belongs to one session and Stop epoch. Session
+/// replacement and Stop revoke the old credential before a new one is issued.
 #[derive(Default)]
 struct Grants {
     tokens: HashMap<String, String>,
@@ -123,6 +134,14 @@ pub struct McpGatewayRuntime {
 /// Environment the `codemux mcp-bridge` stdio proxy reads its target from.
 pub const BRIDGE_URL_ENV: &str = "CODEMUX_MCP_GATEWAY_URL";
 pub const BRIDGE_TOKEN_ENV: &str = "CODEMUX_MCP_GATEWAY_TOKEN";
+
+impl std::fmt::Debug for McpGatewayConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpGatewayConnection")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
 
 impl McpGatewayConnection {
     /// ACP `McpServerHttp` entry for this connection.
@@ -167,7 +186,35 @@ impl McpGatewayRuntime {
     /// Refreshes the caller each time so a reopened chat picks up its
     /// current workspace.
     pub fn chat_connection(&self, key: &str, caller: GatewayCaller) -> McpGatewayConnection {
+        if caller
+            .native
+            .as_ref()
+            .is_some_and(|binding| !binding.current())
+        {
+            return McpGatewayConnection {
+                url: self.connection.url.clone(),
+                bearer_token: new_token(),
+            };
+        }
         let mut grants = self.grants.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        grants.callers.retain(|_, caller| {
+            caller
+                .native
+                .as_ref()
+                .is_none_or(|binding| binding.current())
+        });
+        let active: std::collections::HashSet<_> = grants.callers.keys().cloned().collect();
+        grants.tokens.retain(|_, token| active.contains(token));
+        if grants
+            .tokens
+            .get(key)
+            .and_then(|token| grants.callers.get(token))
+            .is_some_and(|old| old.native != caller.native)
+        {
+            if let Some(old) = grants.tokens.remove(key) {
+                grants.callers.remove(&old);
+            }
+        }
         let token = grants
             .tokens
             .entry(key.to_string())
@@ -189,10 +236,21 @@ impl Drop for McpGatewayRuntime {
 
 #[derive(Clone)]
 struct GatewayState {
+    calls: Arc<Mutex<HashMap<(String, String), tokio::sync::watch::Sender<bool>>>>,
     registry: McpRegistry,
     /// The shared token OpenCode's instance-global registration uses.
     bearer_token: Arc<str>,
     grants: Arc<Mutex<Grants>>,
+}
+
+struct CallLease {
+    calls: Arc<Mutex<HashMap<(String, String), tokio::sync::watch::Sender<bool>>>>,
+    key: (String, String),
+}
+impl Drop for CallLease {
+    fn drop(&mut self) {
+        self.calls.lock().unwrap().remove(&self.key);
+    }
 }
 
 fn new_token() -> String {
@@ -213,6 +271,7 @@ pub async fn start_gateway(registry: McpRegistry) -> Result<McpGatewayRuntime, S
         registry,
         bearer_token: Arc::from(bearer_token.as_str()),
         grants: grants.clone(),
+        calls: Default::default(),
     };
     let app = router(state);
     let task = tokio::spawn(async move {
@@ -303,6 +362,23 @@ async fn handle_post(
 
     // MCP notifications have no id and are acknowledged at the HTTP layer.
     if id.is_none() {
+        if method == "notifications/cancelled" {
+            if let (Some(token), Some(request)) = (
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|h| h.to_str().ok()),
+                params.get("requestId"),
+            ) {
+                if let Some(cancel) = state
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .get(&(token.into(), request.to_string()))
+                {
+                    let _ = cancel.send(true);
+                }
+            }
+        }
         return StatusCode::ACCEPTED.into_response();
     }
     let id = id.unwrap_or(Value::Null);
@@ -332,7 +408,7 @@ async fn handle_post(
         "ping" => rpc_result(id, json!({})).into_response(),
         "tools/list" => {
             let tools = caller_tools(&state, &caller).await;
-            let names = presented_names(&tools, caller.flat_tool_names);
+            let names = caller_names(&tools, &caller);
             let data: Vec<Value> = tools
                 .into_iter()
                 .zip(names)
@@ -350,35 +426,92 @@ async fn handle_post(
             let Some(requested) = params.get("name").and_then(Value::as_str) else {
                 return rpc_error(id, -32602, "tools/call requires params.name").into_response();
             };
-            // Map a presented name back to the registry's.
-            let resolved = if caller.flat_tool_names {
-                let tools = caller_tools(&state, &caller).await;
-                presented_names(&tools, true)
+            // Listing and dispatch share source exclusions and native policy.
+            let tools = caller_tools(&state, &caller).await;
+            let resolved = caller_names(&tools, &caller)
                     .into_iter()
                     .zip(tools)
                     .find(|(name, _)| name == requested)
-                    .map(|(_, tool)| tool.prefixed_name)
-            } else {
-                None
-            };
-            let name = resolved.as_deref().unwrap_or(requested);
+                    .map(|(_, tool)| tool.prefixed_name);
             let arguments = params
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let bridge = state
+            let key = (
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
+                id.to_string(),
+            );
+            let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+            {
+                let mut calls = state.calls.lock().unwrap();
+                if calls.contains_key(&key) {
+                    return rpc_error(id, -32600, "request ID is already in flight")
+                        .into_response();
+                }
+                calls.insert(key.clone(), cancel);
+            }
+            let _lease = CallLease {
+                calls: state.calls.clone(),
+                key: key.clone(),
+            };
+            let invocation = async {
+                let result = if let Some(name) = resolved {
+                    if let Some(binding) = &caller.native {
+                        let actor = binding.session.actor();
+                        match actor.permit.wait_ready().await {
+                            Err(error) => Err(error),
+                            Ok(()) if !binding.current() => {
+                                Err("stale_caller: gateway credential was revoked".into())
+                            }
+                            Ok(()) => match state
                 .registry
-                .call_plugin_bridge(name, arguments.clone(), workspace_id, &[])
-                .await;
-            let result = match bridge {
+                .call_plugin_bridge(&name, arguments.clone(), workspace_id, &[])
+                .await
+                            {
+                                Some(result) => result,
+                                None => {
+                                    state
+                                        .registry
+                                        .dispatch_native_tool_call_with_id(
+                                            &name,
+                                            arguments,
+                                            actor,
+                                            Some(id.to_string()),
+                                        )
+                                        .await
+                                }
+                            },
+                        }
+                    } else {
+                        match state
+                            .registry
+                            .call_plugin_bridge(&name, arguments.clone(), workspace_id, &[])
+                            .await
+                        {
                 Some(result) => result,
                 None => {
                     state
                         .registry
-                        .dispatch_tool_call(name, arguments, workspace_id)
+                        .dispatch_tool_call(&name, arguments, workspace_id)
                         .await
                 }
+            }
+                    }
+                } else {
+                    Err("provider_control_denied: tool is unavailable to this chat".into())
+                };
+                result
             };
+            let result = tokio::select! {
+                biased;
+                _=cancelled.changed()=>Err("request_cancelled: tool invocation ended; accepted work remains readable".into()),
+                result=invocation=>result,
+            };
+            state.calls.lock().unwrap().remove(&key);
             match result {
                 Ok(result) => rpc_result(id, result).into_response(),
                 Err(message) => rpc_result(
@@ -402,7 +535,14 @@ async fn caller_tools(state: &GatewayState, caller: &GatewayCaller) -> Vec<McpTo
         .registry
         .list_tools_for_workspace(&caller.native_sources, caller.workspace_id.as_deref())
         .await;
+    if let Some(binding) = &caller.native {
+        let host = binding.session.caller();
+        tools.retain(|tool| super::registry::native_tool_visible(tool, &host));
+        tools.extend(state.registry.host_tools(&host));
+    }
     tools.extend(super::registry::plugin_bridge_tools());
+    let mut seen = std::collections::HashSet::new();
+    tools.retain(|tool| seen.insert(tool.prefixed_name.clone()));
     tools
 }
 
@@ -425,10 +565,17 @@ fn authenticate(headers: &HeaderMap, state: &GatewayState) -> Option<GatewayCall
             workspace_id: None,
             native_sources: OPENCODE_NATIVE_SOURCES.to_vec(),
             flat_tool_names: false,
+            native: None,
         });
     }
     let grants = state.grants.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    grants.callers.get(token).cloned()
+    grants.callers.get(token)
+        .filter(|caller| {
+            caller
+                .native
+                .as_ref()
+                .is_none_or(|binding| binding.current())
+        }).cloned()
 }
 
 /// MCP's HTTP transport requires Origin validation to prevent DNS rebinding.
@@ -471,6 +618,7 @@ mod tests {
             registry: McpRegistry::new(),
             bearer_token: Arc::from("test-token"),
             grants: Arc::default(),
+            calls: Default::default(),
         }
     }
 
@@ -525,6 +673,7 @@ mod tests {
             registry,
             bearer_token: Arc::from("test-token"),
             grants: Arc::default(),
+            calls: Default::default(),
         };
 
         let response = router(state)
@@ -601,6 +750,7 @@ mod tests {
             registry,
             bearer_token: Arc::from(runtime.connection().bearer_token.as_str()),
             grants: runtime.grants.clone(),
+            calls: Default::default(),
         };
         let cursor = runtime.chat_connection(
             "thread-cursor",
@@ -608,6 +758,7 @@ mod tests {
                 workspace_id: Some("ws-1".into()),
                 native_sources: vec![McpConfigSource::CursorUser],
                 flat_tool_names: false,
+                native: None,
             },
         );
         let hermes = runtime.chat_connection("thread-hermes", GatewayCaller::default());
@@ -636,6 +787,7 @@ mod tests {
             workspace_id: Some("ws-2".into()),
             native_sources: vec![McpConfigSource::ClaudeUser],
             flat_tool_names: false,
+            native: None,
         };
         let second = runtime.chat_connection("thread", caller.clone());
         assert_eq!(first, second);
@@ -697,12 +849,15 @@ mod tests {
             registry,
             bearer_token: Arc::from(runtime.connection().bearer_token.as_str()),
             grants: runtime.grants.clone(),
+            calls: Default::default(),
         };
         let chat = |key: &str, workspace: &str| {
             runtime
                 .chat_connection(
                     key,
-                    GatewayCaller { workspace_id: Some(workspace.into()), native_sources: vec![], flat_tool_names: false },
+                    GatewayCaller { workspace_id: Some(workspace.into()), native_sources: vec![], flat_tool_names: false,
+                        native: None,
+                    },
                 )
                 .bearer_token
         };
@@ -774,6 +929,7 @@ mod tests {
             registry,
             bearer_token: Arc::from(runtime.connection().bearer_token.as_str()),
             grants: runtime.grants.clone(),
+            calls: Default::default(),
         };
         let token = runtime
             .chat_connection(
@@ -834,6 +990,7 @@ mod tests {
             registry: registry.clone(),
             bearer_token: Arc::from("test-token"),
             grants: Arc::default(),
+            calls: Default::default(),
         });
         let response = app
             .clone()
@@ -882,6 +1039,7 @@ mod tests {
             registry: registry.clone(),
             bearer_token: Arc::from("test-token"),
             grants: Arc::default(),
+            calls: Default::default(),
         });
         for params in [
             json!({"name":"fixture__image","arguments":{}}),
@@ -915,6 +1073,7 @@ mod tests {
             registry: registry.clone(),
             bearer_token: Arc::from("test-token"),
             grants: Arc::default(),
+            calls: Default::default(),
         });
         for method in ["tools/list", "tools/call"] {
             let mut req = request(
@@ -972,5 +1131,266 @@ mod tests {
         assert!(std::str::from_utf8(&frame)
             .unwrap()
             .contains("notifications/tools/list_changed"));
+    }
+}
+
+#[cfg(test)]
+mod all_provider_tests {
+    use super::*;
+    use crate::{
+        agent_provider::ProviderKind,
+        mcp::{
+            registry::{HostCaller, HostTools},
+            runtime::prefix_tool_name,
+            thread_gateway::{GatewayBinding, GatewaySession},
+        },
+    };
+    struct Host;
+    impl HostTools for Host {
+        fn tools_for(&self, _: &HostCaller) -> Vec<McpTool> {
+            vec![McpTool {
+                name: "orchestrator_capabilities".into(),
+                prefixed_name: prefix_tool_name("codemux", "orchestrator_capabilities"),
+                description: None,
+                input_schema: json!({"type":"object"}),
+                server_id: "codemux".into(),
+            }]
+        }
+        fn call(&self, _: &HostCaller, _: &str, _: &Value) -> Option<Value> {
+            None
+        }
+    }
+    #[tokio::test]
+    async fn all_provider_gateway_identity_is_session_bound_rotates_and_rejects_hidden_tools() {
+        let registry = McpRegistry::new();
+        registry.set_host_tools(Arc::new(Host));
+        registry.set_native_delegation_handler(Arc::new(|actor,_,args,_|Box::pin(async move {
+            actor.permit.identity()?.verify(&actor.thread_id)?;
+            Ok(json!({"thread":actor.thread_id,"session":actor.session_id,"untrusted":args["thread_id"]}))
+        })));
+        let gateway = start_gateway(registry).await.unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (index, kind) in [
+            ProviderKind::OpenCode,
+            ProviderKind::Cursor,
+            ProviderKind::Grok,
+            ProviderKind::Hermes,
+            ProviderKind::Acp,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let first = GatewaySession::new(
+                &format!("all-provider-{index}-a"),
+                kind,
+                Some("same-workspace".into()),
+                Some("default".into()),
+            );
+            first.bind_session("session-a");
+            first.begin("turn-a", None).unwrap();
+            let second = GatewaySession::new(
+                &format!("all-provider-{index}-b"),
+                kind,
+                Some("same-workspace".into()),
+                Some("default".into()),
+            );
+            second.bind_session("session-b");
+            second.begin("turn-b", None).unwrap();
+            let connection = |session: &Arc<GatewaySession>| {
+                gateway.chat_connection(
+                    &session.caller().thread_id,
+                    GatewayCaller {
+                        native: Some(GatewayBinding::new(session.clone())),
+                        ..Default::default()
+                    },
+                )
+            };
+            let a = connection(&first);
+            let b = connection(&second);
+            assert_ne!(a.bearer_token, b.bearer_token);
+            let listed: Value = client
+                .post(&a.url)
+                .bearer_auth(&a.bearer_token)
+                .json(&json!({"id":1,"method":"tools/list"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(
+                listed["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["name"] == "orchestrator_capabilities"),
+                "{listed}"
+            );
+            let invoke = |connection: McpGatewayConnection, name: &'static str, args: Value| {
+                let client = client.clone();
+                async move {
+                    client.post(connection.url).bearer_auth(connection.bearer_token).json(&json!({"id":2,"method":"tools/call","params":{"name":name,"arguments":args}})).send().await.unwrap()
+                }
+            };
+            let reply: Value = invoke(
+                a.clone(),
+                "orchestrator_capabilities",
+                json!({"thread_id":second.caller().thread_id}),
+            )
+            .await
+            .json()
+            .await
+            .unwrap();
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            let body: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["thread"], first.caller().thread_id);
+            assert_eq!(body["session"], "session-a");
+            let hidden: Value = invoke(a.clone(), "thread_respond", json!({}))
+                .await
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(hidden["result"]["isError"], true);
+            first.authority.invalidate();
+            assert_eq!(
+                invoke(a.clone(), "orchestrator_capabilities", json!({}))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let rotated = connection(&first);
+            assert_ne!(a.bearer_token, rotated.bearer_token);
+            first.begin("after-stop", None).unwrap();
+            assert_eq!(
+                invoke(a, "orchestrator_capabilities", json!({}))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                invoke(rotated, "orchestrator_capabilities", json!({}))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                invoke(b, "orchestrator_capabilities", json!({}))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            let replacement = GatewaySession::new(
+                &first.caller().thread_id,
+                kind,
+                Some("same-workspace".into()),
+                Some("default".into()),
+            );
+            replacement.bind_session("replacement");
+            replacement.begin("new-run", None).unwrap();
+            assert!(
+                !GatewayBinding::new(first.clone())
+                    .session
+                    .actor()
+                    .permit
+                    .identity()
+                    .is_ok(),
+                "replaced session must be revoked"
+            );
+            let new = connection(&replacement);
+            assert_ne!(new.bearer_token, connection(&first).bearer_token);
+        }
+    }
+}
+
+#[cfg(test)]
+mod all_provider_cancel_tests {
+    use super::*;
+    use crate::{
+        agent_provider::ProviderKind,
+        mcp::{
+            registry::{HostCaller, HostTools},
+            runtime::prefix_tool_name,
+            thread_gateway::{GatewayBinding, GatewaySession},
+        },
+    };
+    struct Host;
+    impl HostTools for Host {
+        fn tools_for(&self, _: &HostCaller) -> Vec<McpTool> {
+            vec![McpTool {
+                name: "thread_wait".into(),
+                prefixed_name: prefix_tool_name("codemux", "thread_wait"),
+                description: None,
+                input_schema: json!({}),
+                server_id: "codemux".into(),
+            }]
+        }
+        fn call(&self, _: &HostCaller, _: &str, _: &Value) -> Option<Value> {
+            None
+        }
+    }
+    #[tokio::test]
+    async fn all_provider_cancellation_is_bound_to_the_calling_credential() {
+        let registry = McpRegistry::new();
+        registry.set_host_tools(Arc::new(Host));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        registry.set_native_delegation_handler(Arc::new(move |_, _, _, _| {
+            let signal = signal.clone();
+            Box::pin(async move {
+                signal.notify_one();
+                std::future::pending().await
+            })
+        }));
+        let gateway = start_gateway(registry).await.unwrap();
+        let session = GatewaySession::new(
+            "cancel-native",
+            ProviderKind::Cursor,
+            None,
+            Some("agent".into()),
+        );
+        session.bind_session("s");
+        session.begin("turn", None).unwrap();
+        let connection = gateway.chat_connection(
+            "cancel-native",
+            GatewayCaller {
+                native: Some(GatewayBinding::new(session)),
+                ..Default::default()
+            },
+        );
+        let other = gateway.chat_connection("other", Default::default());
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let call = {
+            let client = client.clone();
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                client.post(connection.url).bearer_auth(connection.bearer_token).json(&json!({"id":19,"method":"tools/call","params":{"name":"thread_wait","arguments":{}}})).send().await.unwrap().json::<Value>().await.unwrap()
+            })
+        };
+        entered.notified().await;
+        let cancel = json!({"method":"notifications/cancelled","params":{"requestId":19}});
+        client
+            .post(&other.url)
+            .bearer_auth(other.bearer_token)
+            .json(&cancel)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            !call.is_finished(),
+            "another credential cannot cancel this call"
+        );
+        client
+            .post(&connection.url)
+            .bearer_auth(connection.bearer_token)
+            .json(&cancel)
+            .send()
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), call)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], true);
+        assert!(reply.to_string().contains("request_cancelled"));
     }
 }

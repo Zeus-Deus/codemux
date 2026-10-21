@@ -3617,7 +3617,17 @@ async fn send_turn_context_reporting<R: Runtime>(
     }
     let machine = !context.is_human();
     let mut resumed_ids = Vec::new();
-    let result = send_turn_internal(app.clone(), provider, input.clone(), context, reached, &mut resumed_ids).await;
+    let result = async {
+        // A queued adapter may dispatch after the launch receipt succeeds.
+        // Once admitted, the durable message owns this dispatch authority.
+        if let Some(control) = context.control.as_mut() {
+            if matches!(control.caller.admitted, Some(crate::agent_control::AdmittedAuthority::Operation { .. })) {
+                control.verify(&app)?;
+                control.caller.admitted = Some(crate::agent_control::AdmittedAuthority::Delivery { delivery_id: id.clone() });
+            }
+        }
+        send_turn_internal(app.clone(), provider, input.clone(), context, reached, &mut resumed_ids).await
+    }.await;
     if result.is_err() { db.rehold_message_deliveries(&resumed_ids)?; }
     match &result {
         Ok(result) => {
@@ -8203,6 +8213,11 @@ fn delivery_transition(event: &ProviderRuntimeEvent) -> bool {
 /// UUID carried by `ResumeCursorUpdated` so the history dropdown can
 /// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeEvent) {
+    if let ProviderRuntimeEvent::TurnCompleted { thread_id, turn_id, ..
+    } = &event
+    {
+        crate::delegation::authority::NativeAuthority::finish_thread(&thread_id.0, &turn_id.0);
+    }
     if let ProviderRuntimeEvent::TurnCompleted { thread_id, .. } = &event {
         if let Some(db) = app.try_state::<DatabaseStore>() { let _ = db.orchestration_launch_finished(&thread_id.0); }
     }

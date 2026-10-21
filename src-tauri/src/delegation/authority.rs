@@ -50,6 +50,7 @@ pub(crate) struct State {
     tools_live: bool,
     policy_epoch: u64,
     policy_changes: u32,
+    token_epoch: u64,
     generation: u64,
     turn: Option<String>,
     stop_generation: u64,
@@ -157,6 +158,10 @@ impl NativeAuthority {
         self.changed.notify_waiters();
         PolicyTransition { owner: self }
     }
+    pub(crate) fn set_ceiling(&self, ceiling: crate::agent_control::permissions::Ceiling) {
+        self.state.lock().unwrap().policy = Some(ceiling);
+        self.changed.notify_waiters();
+    }
     pub fn effective_ceiling(
         thread: &str,
     ) -> Result<Option<crate::agent_control::permissions::Ceiling>, String> {
@@ -180,6 +185,7 @@ impl NativeAuthority {
                 tools_live: false,
                 policy_epoch: 0,
                 policy_changes: 0,
+                token_epoch: 0,
                 generation: 0,
                 turn: None,
                 stop_generation: 0,
@@ -259,6 +265,12 @@ impl NativeAuthority {
             self.changed.notify_waiters();
         }
     }
+    pub(crate) fn finish_thread(thread: &str, turn: &str) {
+        let owner = RUNTIMES.lock().unwrap().get(thread).and_then(Weak::upgrade);
+        if let Some(owner) = owner {
+            owner.finish(turn);
+        }
+    }
     pub fn finish(&self, turn: &str) {
         let mut state = self.state.lock().unwrap();
         if state.turn.as_deref() == Some(turn) {
@@ -268,10 +280,17 @@ impl NativeAuthority {
             self.changed.notify_waiters();
         }
     }
+    pub(crate) fn session_live(&self) -> bool {
+        self.state.lock().unwrap().live
+    }
+    pub(crate) fn token_epoch(&self) -> u64 {
+        self.state.lock().unwrap().token_epoch
+    }
     pub fn invalidate(&self) {
         let mut state = self.state.lock().unwrap();
         state.activity += 1;
         state.tools_live = false;
+        state.token_epoch += 1;
         for job in state.callbacks.drain(..) { job.abort(); }
         state.dispatch_wakers.retain(|w| w.strong_count() > 0);
         for waker in state.dispatch_wakers.iter().filter_map(Weak::upgrade) {
@@ -300,6 +319,7 @@ impl NativeAuthority {
         let mut state = self.state.lock().unwrap();
         state.activity += 1;
         state.tools_live = false;
+        state.token_epoch += 1;
         state.dispatch_wakers.retain(|w| w.strong_count() > 0);
         for waker in state.dispatch_wakers.iter().filter_map(Weak::upgrade) {
             waker.wake();

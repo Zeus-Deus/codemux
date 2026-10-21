@@ -188,6 +188,9 @@ pub struct OpenCodeSession {
     /// next prompt should be batched with.
     reminder_pending: AtomicBool,
     server_handle: OpenCodeServerHandle,
+    owned_manager: Option<Arc<OpenCodeServerManager>>,
+    mcp: Option<crate::agent_provider::acp::mcp::ChatMcp>,
+    directory: Option<std::path::PathBuf>,
     http: reqwest::Client,
     /// Routing context shared with the SSE listener — the listener
     /// reads it on each event so updates land before the next
@@ -245,6 +248,12 @@ impl OpenCodeSession {
         directory: Option<std::path::PathBuf>,
         workspace_id: Option<String>,
     ) -> Result<Arc<Self>, ProviderError> {
+        // Runtime MCP registration is directory-scoped. Each app chat owns
+        // a server so another chat in the same checkout cannot replace it.
+        let owned_manager = mcp_registry
+            .as_ref()
+            .map(|_| Arc::new(OpenCodeServerManager::new()));
+        let manager = owned_manager.as_ref().unwrap_or(&manager);
         let server_handle = manager.ensure_running().await.map_err(|err| {
             if err == "opencode_not_installed" {
                 ProviderError::NotInstalled {
@@ -285,11 +294,29 @@ impl OpenCodeSession {
         // `POST /mcp` endpoint in 1.18.18, and older binaries must still be
         // able to start a session — just without Codemux-configured servers.
         // Failures surface as a RuntimeWarning instead of killing the session.
-        if let Some(registry) = mcp_registry.as_ref() {
-            if let Err(error) =
-                attach_mcp_gateway_scoped(&http, &server_handle, registry, directory.as_deref(), workspace_id.as_deref())
+        let mcp = mcp_registry.map(|registry| {
+            crate::agent_provider::acp::mcp::ChatMcp::new(
+                registry,
+                &thread_id.0,
+                ProviderKind::OpenCode,
+                workspace_id,
+                Some("default".into()),
+                "codemux".into(),
+                crate::agent_provider::acp::mcp::Transport::Http,
+                crate::mcp::gateway::OPENCODE_NATIVE_SOURCES.to_vec(),
+                false,
+            )
+        });
+        if let Some(mcp) = &mcp {
+            let attached = async {
+                let connection = mcp
+                    .connection()
                     .await
-            {
+                    .map_err(|message| ProviderError::RpcError { message })?;
+                attach_mcp_connection(&http, &server_handle, directory.as_deref(), connection).await
+            }
+            .await;
+            if let Err(error) = attached {
                 eprintln!("[codemux::opencode] shared MCP gateway attach failed: {error}");
                 let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                     thread_id: Some(thread_id.clone()),
@@ -433,6 +460,9 @@ impl OpenCodeSession {
         };
         let provider_session_id = ProviderSessionId(session_id.clone());
 
+        if let Some(mcp) = &mcp {
+            mcp.session.bind_session(&provider_session_id.0);
+        }
         let initial_turn = TurnId(format!("turn_{}", Uuid::new_v4()));
         let event_ctx = Arc::new(Mutex::new(EventContext {
             thread_id: thread_id.clone(),
@@ -517,6 +547,9 @@ impl OpenCodeSession {
             applied_agent: Mutex::new(None),
             reminder_pending: AtomicBool::new(false),
             server_handle,
+            owned_manager,
+            mcp,
+            directory,
             http,
             event_ctx,
             router,
@@ -600,6 +633,13 @@ impl OpenCodeSession {
                 };
                 let Some(session) = weak.upgrade() else { break };
                 match event {
+                    ProviderRuntimeEvent::TurnCompleted {
+                        thread_id, turn_id, ..
+                    } if thread_id == session.thread_id => {
+                        if let Some(mcp) = &session.mcp {
+                            mcp.session.authority.finish(&turn_id.0);
+                        }
+                    }
                     ProviderRuntimeEvent::SessionStateChanged {
                         thread_id,
                         status: SessionStatus::Ready,
@@ -908,11 +948,15 @@ impl OpenCodeSession {
             let hold = self.queue_hold();
             crate::agent_provider::queue_edit::move_before(&mut queue, &self.thread_id, id, before, hold.pinned())?
         };
-        let Some(queued_ids) = moved else { return Ok(false) };
-        let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnsReordered {
-            thread_id: self.thread_id.clone(),
-            queued_ids,
-        });
+        let Some(queued_ids) = moved else {
+            return Ok(false);
+        };
+        let _ = self
+            .event_tx
+            .send(ProviderRuntimeEvent::QueuedTurnsReordered {
+                thread_id: self.thread_id.clone(),
+                queued_ids,
+            });
         Ok(true)
     }
 
@@ -1317,8 +1361,12 @@ impl OpenCodeSession {
                 message: "OpenCode /compact accepts no arguments or images.".into(),
             });
         }
+        let agent_text = match &self.mcp {
+            Some(mcp) => mcp.prompt(&text),
+            None => text.clone(),
+        };
         let mut prompt =
-            build_prompt_async_request(text.clone(), model.as_deref(), variant.as_deref(), &images)
+            build_prompt_async_request(agent_text, model.as_deref(), variant.as_deref(), &images)
                 .map_err(|err| ProviderError::ValidationError { message: err })?;
         let agent = *self.agent.lock().await;
         prompt.agent = agent.map(str::to_string);
@@ -1496,6 +1544,21 @@ impl OpenCodeSession {
                 .native
                 .clear_deferred_execution(&self.provider_session_id.0);
         }
+        if let Some(mcp) = &self.mcp {
+            if mcp.needs_refresh() {
+                let connection = mcp
+                    .connection()
+                    .await
+                    .map_err(|message| ProviderError::RpcError { message })?;
+                attach_mcp_connection(
+                    &self.http,
+                    &self.server_handle,
+                    self.directory.as_deref(),
+                    connection,
+                )
+                .await?;
+            }
+        }
         let turn_id = loop {
             // Model preparation can outlive the reconciled event stream.
             // Wait outside its locks, then fence the reservation commit too.
@@ -1506,9 +1569,9 @@ impl OpenCodeSession {
             } else {
                 None
             };
-            let ready = self.ready.borrow();
+            let ready = *self.ready.borrow();
             self.ensure_open()?;
-            if native_v2 && !*ready {
+            if native_v2 && !ready {
                 continue;
             }
             if native_v2
@@ -1541,6 +1604,19 @@ impl OpenCodeSession {
                         id,
                         &ctx.turn_id.0,
                     );
+                }
+            }
+            if !steer {
+                if let Some(mcp) = &self.mcp {
+                    mcp.session.set_mode(Some(
+                        if *self.agent.lock().await == Some("plan") {
+                            "plan"
+                        } else {
+                            "default"
+                        }
+                        .into(),
+                    ));
+                    mcp.session.begin(&ctx.turn_id.0, checkpoint.as_ref())?;
                 }
             }
             break ctx.turn_id.clone();
@@ -2177,6 +2253,9 @@ impl OpenCodeSession {
     /// Close this attachment only after all native admission/wake requests
     /// are acknowledged, its pending input is cancelled and execution is idle.
     pub async fn shutdown(&self) -> Result<(), ProviderError> {
+        if let Some(mcp) = &self.mcp {
+            mcp.session.authority.revoke();
+        }
         self.teardown_requested.store(true, Ordering::Relaxed);
         self.dead.store(true, Ordering::Relaxed);
         self.closing.send_replace(true);
@@ -2283,6 +2362,12 @@ impl OpenCodeSession {
                 });
             }
         }
+        if let Some(manager) = &self.owned_manager {
+            manager
+                .shutdown()
+                .await
+                .map_err(|message| ProviderError::RpcError { message })?;
+        }
         self.teardown_complete.store(true, Ordering::Relaxed);
         let _ = self
             .event_tx
@@ -2368,6 +2453,7 @@ async fn attach_mcp_gateway(
     attach_mcp_gateway_scoped(http, server, registry, None, None).await
 }
 
+#[cfg(test)]
 async fn attach_mcp_gateway_scoped(
     http: &reqwest::Client,
     server: &OpenCodeServerHandle,
@@ -2387,16 +2473,20 @@ async fn attach_mcp_gateway_scoped(
             let key = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
             let token_key = format!("opencode-directory:{}", key.display());
             registry.gateway_runtime().await.map(|gateway| {
-                server.gateway_workspaces.record_and_publish(&key, workspace_id, |authority| {
-                    gateway.chat_connection(
-                        &token_key,
-                        crate::mcp::gateway::GatewayCaller {
-                            workspace_id: authority,
-                            native_sources: crate::mcp::gateway::OPENCODE_NATIVE_SOURCES.to_vec(),
-                            flat_tool_names: false,
-                        },
-                    )
-                })
+                server
+                    .gateway_workspaces
+                    .record_and_publish(&key, workspace_id, |authority| {
+                        gateway.chat_connection(
+                            &token_key,
+                            crate::mcp::gateway::GatewayCaller {
+                                workspace_id: authority,
+                                native_sources: crate::mcp::gateway::OPENCODE_NATIVE_SOURCES
+                                    .to_vec(),
+                                flat_tool_names: false,
+                                native: None,
+                            },
+                        )
+                    })
             })
         }
         None => registry.gateway_connection().await,
@@ -2405,6 +2495,15 @@ async fn attach_mcp_gateway_scoped(
         message: "failed to start Codemux MCP gateway".into(),
         source: Some(message),
     })?;
+    attach_mcp_connection(http, server, directory, connection).await
+}
+
+async fn attach_mcp_connection(
+    http: &reqwest::Client,
+    server: &OpenCodeServerHandle,
+    directory: Option<&std::path::Path>,
+    connection: crate::mcp::gateway::McpGatewayConnection,
+) -> Result<(), ProviderError> {
     if server.api == super::api::OpenCodeApi::V2 {
         let mut request = http.put(format!(
             "{}/api/experimental/mcp/codemux",
@@ -2422,36 +2521,44 @@ async fn attach_mcp_gateway_scoped(
                 ),
             });
         }
-        let mut request = http.get(format!("{}/api/mcp", server.base_url.trim_end_matches('/')));
-        if let Some(directory) = directory {
-            request = request.query(&[("location[directory]", directory.to_string_lossy())]);
+        // The runtime publishes a pending registration before its MCP
+        // initialize/list handshake completes. Do not start a tool-less turn.
+        for attempt in 0..40 {
+            let mut request =
+                http.get(format!("{}/api/mcp", server.base_url.trim_end_matches('/')));
+            if let Some(directory) = directory {
+                request = request.query(&[("location[directory]", directory.to_string_lossy())]);
+            }
+            let status: serde_json::Value = request
+                .basic_auth("opencode", Some(&server.server_password))
+                .send()
+                .await
+                .map_err(|e| ProviderError::RpcError {
+                    message: e.to_string(),
+                })?
+                .error_for_status()
+                .map_err(|e| ProviderError::RpcError {
+                    message: e.to_string(),
+                })?
+                .json()
+                .await
+                .map_err(|e| ProviderError::RpcError {
+                    message: e.to_string(),
+                })?;
+            if status["data"].as_array().is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|e| e["name"] == "codemux" && e["status"]["status"] == "connected")
+            }) {
+                return Ok(());
+            }
+            if attempt < 39 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
-        let status: serde_json::Value = request
-            .basic_auth("opencode", Some(&server.server_password))
-            .send()
-            .await
-            .map_err(|e| ProviderError::RpcError {
-                message: e.to_string(),
-            })?
-            .error_for_status()
-            .map_err(|e| ProviderError::RpcError {
-                message: e.to_string(),
-            })?
-            .json()
-            .await
-            .map_err(|e| ProviderError::RpcError {
-                message: e.to_string(),
-            })?;
-        if !status["data"].as_array().is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|e| e["name"] == "codemux" && e["status"]["status"] == "connected")
-        }) {
-            return Err(ProviderError::RpcError {
-                message: "Codemux MCP gateway was registered but is not connected".into(),
-            });
-        }
-        return Ok(());
+        return Err(ProviderError::RpcError {
+            message: "Codemux MCP gateway was registered but is not connected".into(),
+        });
     }
     let url = format!("{}/mcp", server.base_url.trim_end_matches('/'));
     let response = http
@@ -2993,7 +3100,6 @@ pub(crate) mod tests {
         queued_post.assert_async().await;
     }
 
-
     #[tokio::test]
     async fn orchestration_message_opencode_machine_send_retains_hold_and_held_drain() {
         let mut server=Server::new_async().await;
@@ -3389,6 +3495,9 @@ pub(crate) mod tests {
             applied_agent: Mutex::new(None),
             reminder_pending: AtomicBool::new(false),
             server_handle: handle,
+            owned_manager: None,
+            mcp: None,
+            directory: None,
             http,
             event_ctx,
             router: Arc::new(Mutex::new(SseRouter::new(provider_session_id.0.clone()))),
@@ -6467,5 +6576,58 @@ pub(crate) mod tests {
             .unwrap();
         await_native_http(&session).await;
         command.assert_async().await;
+    }
+}
+
+#[cfg(test)]
+mod all_provider_gateway_readiness_tests {
+    use super::*;
+    #[tokio::test]
+    async fn all_provider_opencode_waits_for_pending_mcp_registration_before_starting_a_turn() {
+        let mut server = mockito::Server::new_async().await;
+        let put = server
+            .mock("PUT", "/api/experimental/mcp/codemux")
+            .with_status(204)
+            .expect(1)
+            .create_async()
+            .await;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let get = server
+            .mock("GET", "/api/mcp")
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let state = if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    "pending"
+                } else {
+                    "connected"
+                };
+                serde_json::json!({"data":[{"name":"codemux","status":{"status":state}}]})
+                    .to_string()
+                    .into_bytes()
+            })
+            .expect(2)
+            .create_async()
+            .await;
+        let handle = OpenCodeServerHandle {
+            base_url: server.url(),
+            server_password: "test-password".into(),
+            api: super::super::api::OpenCodeApi::V2,
+            gateway_workspaces: Default::default(),
+        };
+        attach_mcp_connection(
+            &reqwest::Client::new(),
+            &handle,
+            None,
+            crate::mcp::gateway::McpGatewayConnection {
+                url: "http://127.0.0.1:1/mcp".into(),
+                bearer_token: "test-token".into(),
+            },
+        )
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        put.assert_async().await;
+        get.assert_async().await;
     }
 }

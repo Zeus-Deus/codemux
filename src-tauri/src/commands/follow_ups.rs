@@ -1683,7 +1683,7 @@ pub(crate) mod tests {
             names(&caller(ProviderKind::Claude, Some("plan"))),
             vec!["delegate_task", "task_status", "task_cancel", "suggest_tasks"]
         );
-        assert!(names(&caller(ProviderKind::Cursor, None)).is_empty());
+        assert_eq!(names(&caller(ProviderKind::Cursor, None)), vec!["delegate_task", "task_status", "task_cancel"]);
 
         let claude = caller(ProviderKind::Claude, Some("default"));
         let answer = host

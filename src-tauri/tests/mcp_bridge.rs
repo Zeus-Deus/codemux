@@ -148,3 +148,56 @@ async fn bridge_exits_when_the_agent_closes_stdin() {
         .unwrap();
     assert_eq!(health.status(), 200, "gateway stays healthy");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_provider_one_shot_cli_uses_gateway_auth_and_never_the_control_socket() {
+    let registry = McpRegistry::new();
+    let connection = registry
+        .gateway_chat_connection("one-shot", GatewayCaller::default())
+        .await
+        .unwrap();
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&mut file, &connection).unwrap();
+    file.flush().unwrap();
+    let path = file.path().to_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_codemux"))
+            .args(["mcp-call", "--connection-file"])
+            .arg(path)
+            .arg("--list")
+            .env("CODEMUX_SOCKET", "/missing/control-socket")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(reply["result"]["tools"].is_array());
+    let path = file.path().to_owned();
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&McpGatewayConnection {
+            url: connection.url,
+            bearer_token: "wrong-token".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_codemux"))
+            .args(["mcp-call", "--connection-file"])
+            .arg(path)
+            .arg("--list")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("401"));
+}

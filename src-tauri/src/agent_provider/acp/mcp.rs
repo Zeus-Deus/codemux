@@ -152,6 +152,7 @@ mod tests {
             workspace_id: Some("ws".into()),
             native_sources: CURSOR_NATIVE_SOURCES.to_vec(),
             flat_tool_names: false,
+            native: None,
         };
         let http =
             session_mcp_servers(Some(&registry), "t1", caller.clone(), SERVER_NAME, Transport::Http)
@@ -179,5 +180,119 @@ mod tests {
                 .unwrap()
                 .trim_start_matches("Bearer ")
         );
+    }
+}
+
+/// One injected server bound to one app session, including shared-profile runtimes.
+#[derive(Debug)]
+pub(crate) struct ChatMcp {
+    registry: McpRegistry,
+    pub(crate) session: std::sync::Arc<crate::mcp::thread_gateway::GatewaySession>,
+    name: String,
+    transport: Transport,
+    sources: Vec<McpConfigSource>,
+    flat: bool,
+    published_epoch: std::sync::atomic::AtomicU64,
+    fallback: std::sync::Mutex<Option<tempfile::NamedTempFile>>,
+}
+impl ChatMcp {
+    pub(crate) fn new(
+        registry: McpRegistry,
+        thread: &str,
+        provider: crate::agent_provider::ProviderKind,
+        workspace: Option<String>,
+        mode: Option<String>,
+        name: String,
+        transport: Transport,
+        sources: Vec<McpConfigSource>,
+        flat: bool,
+    ) -> Self {
+        Self {
+            registry,
+            session: crate::mcp::thread_gateway::GatewaySession::new(
+                thread, provider, workspace, mode,
+            ),
+            name: format!("{name}_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+            transport,
+            sources,
+            flat,
+            fallback: Default::default(),
+            published_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
+    pub(crate) fn needs_refresh(&self) -> bool {
+        self.published_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != self.session.authority.token_epoch()
+    }
+    pub(crate) fn prompt(&self, text: &str) -> String {
+        let file = self.fallback.lock().unwrap();
+        let Some(file) = file.as_ref() else {
+            return text.into();
+        };
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\"'\"'"));
+        format!("{text}\n\n[Codemux host guidance: use the injected Codemux MCP tools for orchestration. If your harness does not expose them, run {} mcp-call --connection-file {} --list to discover the same tools, then mcp-call --connection-file {} <tool> '<JSON arguments>'. This connection belongs only to this chat. Do not poll after async delegation; end the turn and wait for its result. When asked to report to a coordinator, use thread_send.]",quote(&crate::mcp_server::codemux_mcp_command()),quote(&file.path().to_string_lossy()),quote(&file.path().to_string_lossy()))
+    }
+    pub(crate) async fn connection(
+        &self,
+    ) -> Result<crate::mcp::gateway::McpGatewayConnection, String> {
+        use std::io::{Seek, Write};
+        let binding = crate::mcp::thread_gateway::GatewayBinding::new(self.session.clone());
+        let epoch = binding.epoch;
+        let connection = self
+            .registry
+            .gateway_chat_connection(
+                &self.session.caller().thread_id,
+                GatewayCaller {
+                    workspace_id: self.session.caller().workspace_id,
+                    native_sources: self.sources.clone(),
+                    flat_tool_names: self.flat,
+                    native: Some(binding),
+                },
+            )
+            .await?;
+        let mut file = self.fallback.lock().unwrap();
+        if file.is_none() {
+            let dir = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir);
+            *file = Some(
+                tempfile::Builder::new()
+                    .prefix("codemux-mcp-")
+                    .tempfile_in(dir)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        let file = file.as_mut().unwrap();
+        file.as_file_mut().set_len(0).map_err(|e| e.to_string())?;
+        file.as_file_mut().rewind().map_err(|e| e.to_string())?;
+        serde_json::to_writer(file.as_file_mut(), &connection).map_err(|e| e.to_string())?;
+        file.flush().map_err(|e| e.to_string())?;
+        self.published_epoch
+            .store(epoch, std::sync::atomic::Ordering::SeqCst);
+        Ok(connection)
+    }
+    pub(crate) async fn servers(&self) -> Value {
+        match self.connection().await {
+            Ok(connection) => {
+                let epoch = self
+                    .published_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                let name = format!("{}_{epoch}", self.name);
+                json!([match self.transport {
+                    Transport::Http => connection.acp_http_server(&name),
+                    Transport::StdioBridge => connection
+                        .acp_stdio_bridge(&name, &crate::mcp_server::codemux_mcp_command()),
+                }])
+            }
+            Err(error) => {
+                eprintln!("[codemux::acp] chat MCP unavailable: {error}");
+                json!([])
+            }
+        }
+    }
+}
+
+impl Drop for ChatMcp {
+    fn drop(&mut self) {
+        self.session.authority.revoke();
     }
 }

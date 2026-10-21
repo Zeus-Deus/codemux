@@ -141,6 +141,7 @@ struct Chat {
     runtime: Arc<Runtime>,
     /// ACP `mcpServers` sent on every `session/new` and `session/load`.
     mcp_servers: Value,
+    mcp: Option<crate::agent_provider::acp::mcp::ChatMcp>,
     state: Mutex<ChatState>,
     finished: Notify,
 }
@@ -206,6 +207,7 @@ struct Inner {
     store: Arc<dyn BindingStore>,
     events: broadcast::Sender<ProviderRuntimeEvent>,
     mcp_registry: Option<crate::mcp::registry::McpRegistry>,
+    catalogs: Mutex<HashMap<String, Value>>,
 }
 /// Gateway server name for one chat. A Hermes process serves every chat on
 /// its profile and keeps ACP MCP servers by name, reusing a connected one, so a
@@ -238,6 +240,7 @@ impl HermesProvider {
                 store,
                 events,
                 mcp_registry,
+                catalogs: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -290,14 +293,41 @@ impl HermesProvider {
         durable_profile(&profile)?;
         let runtime = self.inner.runtime(profile).await?;
         let _guard = runtime.operation.lock().await;
-        runtime
+        let catalog = runtime
             .child
             .request(
                 "session/new",
                 json!({"cwd":runtime.profile.home,"mcpServers":[]}),
             )
             .await
-            .map_err(rpc)
+            .map_err(rpc)?;
+        self.inner
+            .catalogs
+            .lock()
+            .await
+            .insert(runtime_key(&runtime.profile), catalog.clone());
+        Ok(catalog)
+    }
+    /// A native tool runs while its chat owns runtime.operation. Reuse the
+    /// acknowledged composer catalog instead of probing under that same lock.
+    pub(crate) async fn orchestration_catalog(
+        &self,
+        profile: Profile,
+    ) -> Result<Value, ProviderError> {
+        profile.validate().map_err(invalid)?;
+        durable_profile(&profile)?;
+        let runtime = self.inner.runtime(profile.clone()).await?;
+        if let Some(catalog) = self
+            .inner
+            .catalogs
+            .lock()
+            .await
+            .get(&runtime_key(&runtime.profile))
+            .cloned()
+        {
+            return Ok(catalog);
+        }
+        self.catalog(profile).await
     }
     pub async fn disconnect(&self, profile: Profile) -> Result<(), ProviderError> {
         let key = runtime_key(&profile);
@@ -322,6 +352,7 @@ impl HermesProvider {
             runtime.child.shutdown().await.map_err(rpc)?;
             runtime.ownership.lock().unwrap().take();
             self.inner.runtimes.lock().await.remove(&key);
+            self.inner.catalogs.lock().await.remove(&key);
         }
         Ok(())
     }
@@ -434,6 +465,10 @@ impl Inner {
         Ok(runtime)
     }
     async fn fail_runtime(&self, runtime: &Runtime, message: &str) {
+        self.catalogs
+            .lock()
+            .await
+            .remove(&runtime_key(&runtime.profile));
         if !runtime.child.is_alive() {
             runtime.ownership.lock().unwrap().take();
         }
@@ -507,6 +542,13 @@ impl Inner {
             }
             ThreadId(binding.thread_id.clone())
         };
+        if text(update, "sessionUpdate") == Some("current_mode_update") {
+            if let Some(mcp) = &chat.mcp {
+                mcp.session
+                    .set_mode(text(update, "currentModeId").map(str::to_string));
+            }
+            return;
+        }
         let mut s = chat.state.lock().await;
         if s.replaying {
             return;
@@ -756,11 +798,21 @@ impl Inner {
                         return Err(error);
                     }
                 }
+                if let Some(mcp) = &chat.mcp {
+                    if mcp.needs_refresh() {
+                        chat.state.lock().await.replaying = true;
+                        let refreshed = runtime.child.request("session/load", json!({"sessionId":binding.acp_session_id,"cwd":binding.cwd,"mcpServers":mcp.servers().await})).await;
+                        let (tx,rx)=oneshot::channel(); let _=runtime.barrier.send(tx); let _=rx.await;
+                        chat.state.lock().await.replaying = false;
+                        refreshed.map_err(rpc)?;
+                    }
+                    mcp.session.begin(&turn.0, job.input.turn_checkpoint.as_ref())?;
+                }
                 dispatched = true;
                 runtime.queue.lock().await.holds.entry(thread.clone()).or_default().settle(&job.id,true);
                 self.emit(ProviderRuntimeEvent::QueuedTurnDispatched {thread_id:thread.clone(),queued_id:job.id.clone(),turn_id:turn.clone(),text:job.input.display_text.clone().unwrap_or_else(||job.input.text.clone()),steered:false});
                 self.emit(ProviderRuntimeEvent::SessionStateChanged {thread_id:thread.clone(),status:SessionStatus::Running {active_turn:turn.clone()}});
-                let response = runtime.child.request_with_timeout("session/prompt",json!({"sessionId":binding.acp_session_id,"prompt":[{"type":"text","text":job.input.text}]}),Duration::from_secs(24*60*60)).await;
+                let response = runtime.child.request_with_timeout("session/prompt",json!({"sessionId":binding.acp_session_id,"prompt":[{"type":"text","text":match &chat.mcp {Some(mcp)=>mcp.prompt(&job.input.text),None=>job.input.text.clone()}}]}),Duration::from_secs(24*60*60)).await;
                 prompt_responded = matches!(&response, Ok(_) | Err(crate::json_rpc_child::RpcChildError::RpcError(_)));
                 if prompt_responded {
                     if let Some(checkpoint) = &job.input.turn_checkpoint { checkpoint.accepted(&turn).await; }
@@ -772,7 +824,7 @@ impl Inner {
                 // for provenance once history exists, suppressing its native replay.
                 if chat.binding.lock().await.current_native_id.is_none() && text(&response,"stopReason") != Some("cancelled") {
                     chat.state.lock().await.replaying=true;
-                    let metadata=runtime.child.request("session/load",json!({"sessionId":binding.acp_session_id,"cwd":binding.cwd,"mcpServers":chat.mcp_servers})).await.map_err(rpc)?;
+                    let metadata=runtime.child.request("session/load",json!({"sessionId":binding.acp_session_id,"cwd":binding.cwd,"mcpServers":match &chat.mcp {Some(mcp)=>mcp.servers().await,None=>chat.mcp_servers.clone()}})).await.map_err(rpc)?;
                     let (tx,rx)=oneshot::channel();let _=runtime.barrier.send(tx);let _=rx.await;
                     chat.state.lock().await.replaying=false;
                     let mut b=chat.binding.lock().await;
@@ -788,6 +840,9 @@ impl Inner {
             }
             if !dispatched {
                 runtime.queue.lock().await.holds.entry(thread.clone()).or_default().settle(&job.id,false);
+            }
+            if let Some(mcp) = &chat.mcp {
+                mcp.session.authority.finish(&turn.0);
             }
             let mut state = chat.state.lock().await;
             state.active_checkpoint = None;
@@ -1089,18 +1144,28 @@ impl AgentProvider for HermesProvider {
                 None
             };
         // Hermes 0.21.5 advertises no `mcpCapabilities` but takes HTTP servers.
-        let mcp_servers = crate::agent_provider::acp::mcp::session_mcp_servers(
-            self.inner.mcp_registry.as_ref(),
+        let mcp = self.inner.mcp_registry.clone().map(|registry| {
+            crate::agent_provider::acp::mcp::ChatMcp::new(
+                registry,
             &input.thread_id.0,
-            crate::mcp::gateway::GatewayCaller {
-                workspace_id: input.workspace_id.clone().or_else(|| binding.workspace_id.clone()),
-                native_sources: Vec::new(),
-                flat_tool_names: false,
-            },
-            &mcp_server_name(&input.thread_id.0),
+                ProviderKind::Hermes,
+                input.workspace_id.clone().or_else(|| binding.workspace_id.clone()),
+                Some(
+                    binding
+                        .permission_mode
+                        .clone()
+                        .unwrap_or_else(|| "default".into()),
+                ),
+                mcp_server_name(&input.thread_id.0),
             crate::agent_provider::acp::mcp::Transport::Http,
-        )
-        .await;
+                vec![],
+                false,
+            )
+        });
+        let mcp_servers = match &mcp {
+            Some(mcp) => mcp.servers().await,
+            None => json!([]),
+        };
         // Initialization has no worktree access. Commit the hold only immediately
         // before new/load can access it. Recheck after waiting on the profile gate:
         // deletion may have completed while initialization/another chat was busy.
@@ -1225,6 +1290,19 @@ impl AgentProvider for HermesProvider {
                 ));
             }
         }
+        if let Some(mcp) = &mcp {
+            mcp.session
+                .set_mode(binding.permission_mode.clone().or_else(|| {
+                    res.pointer("/modes/currentModeId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }));
+        }
+        self.inner
+            .catalogs
+            .lock()
+            .await
+            .insert(runtime_key(&binding.profile), res.clone());
         let models: HashSet<String> = res
             .pointer("/models/availableModels")
             .and_then(Value::as_array)
@@ -1242,10 +1320,15 @@ impl AgentProvider for HermesProvider {
             status: SessionStatus::Ready,
             resume_cursor: Some(json!({"sessionId":sid,"binding":binding})),
         };
+        if let Some(mcp) = &mcp {
+            mcp.session
+                .bind_session(binding.acp_session_id.as_deref().unwrap_or_default());
+        }
         let chat = Arc::new(Chat {
             binding: Mutex::new(binding),
             runtime: runtime.clone(),
             mcp_servers,
+            mcp,
             state: Mutex::new(ChatState {
                 models,
                 modes,
@@ -1385,7 +1468,8 @@ impl AgentProvider for HermesProvider {
         let active = chat.state.lock().await.active.clone();
         {
             let mut queue = runtime.queue.lock().await;
-            let Some(index) = queue.jobs.iter().position(|job|job.id == queued_id && job.input.thread_id == thread_id) else { return Ok(()) };
+            let Some(index) = queue.jobs.iter().position(|job|job.id == queued_id && job.input.thread_id == thread_id) else { return Ok(());
+            };
             queue.jobs[index].input.authorize_queue_promotion()?;
             let job = queue.jobs.remove(index).unwrap();
             queue.jobs.push_front(job);
@@ -1422,7 +1506,8 @@ impl AgentProvider for HermesProvider {
         let chat = self.chat(&thread_id).await?;
         let mut q = chat.runtime.queue.lock().await;
         let moved = crate::agent_provider::queue_edit::move_before(&mut q.jobs, &thread_id, &queued_id, before.as_deref(), None)?;
-        let Some(queued_ids) = moved else { return Ok(false) };
+        let Some(queued_ids) = moved else { return Ok(false);
+        };
         self.inner.emit(ProviderRuntimeEvent::QueuedTurnsReordered { thread_id, queued_ids });
         Ok(true)
     }
@@ -1598,7 +1683,7 @@ impl AgentProvider for HermesProvider {
             .child
             .request(
                 "session/load",
-                json!({"sessionId":b.acp_session_id,"cwd":b.cwd,"mcpServers":chat.mcp_servers}),
+                json!({"sessionId":b.acp_session_id,"cwd":b.cwd,"mcpServers":match &chat.mcp {Some(mcp)=>mcp.servers().await,None=>chat.mcp_servers.clone()}}),
             )
             .await;
         // Release binding before the router barrier (provenance updates take that lock).
@@ -1618,6 +1703,11 @@ impl AgentProvider for HermesProvider {
                 "repair_required: Hermes model selection was not confirmed",
             ));
         }
+        self.inner
+            .catalogs
+            .lock()
+            .await
+            .insert(runtime_key(&chat.runtime.profile), response.clone());
         let mut b = chat.binding.lock().await;
         b.model_override = Some(model.clone());
         b.resolved_model = Some(model);
@@ -1655,7 +1745,7 @@ impl AgentProvider for HermesProvider {
             .child
             .request(
                 "session/load",
-                json!({"sessionId":b.acp_session_id,"cwd":b.cwd,"mcpServers":chat.mcp_servers}),
+                json!({"sessionId":b.acp_session_id,"cwd":b.cwd,"mcpServers":match &chat.mcp {Some(mcp)=>mcp.servers().await,None=>chat.mcp_servers.clone()}}),
             )
             .await;
         let (tx, rx) = oneshot::channel();
@@ -1673,6 +1763,16 @@ impl AgentProvider for HermesProvider {
             return Err(invalid(
                 "repair_required: Hermes did not confirm the selected edit policy",
             ));
+        }
+        if let Some(mcp) = &chat.mcp {
+            mcp.session.set_mode(Some(mode.clone()));
+        }
+        if let Ok(catalog) = &checked {
+            self.inner
+                .catalogs
+                .lock()
+                .await
+                .insert(runtime_key(&b.profile), catalog.clone());
         }
         b.permission_mode = Some(mode);
         *chat.binding.lock().await = b.clone();

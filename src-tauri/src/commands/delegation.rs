@@ -575,10 +575,10 @@ pub(crate) fn provider_label(provider: ProviderKind) -> &'static str {
     }
 }
 
-pub(super) fn parse_provider(id: &str) -> Option<ProviderKind> {
+pub(crate) fn parse_provider(id: &str) -> Option<ProviderKind> {
     CANDIDATES
         .into_iter()
-        .chain([ProviderKind::Hermes])
+        .chain([ProviderKind::Hermes, ProviderKind::Acp])
         .find(|kind| provider_id(*kind) == id.trim().to_ascii_lowercase())
 }
 
@@ -605,16 +605,12 @@ fn mode_label(mode: Option<&str>) -> String {
     }
 }
 
-/// Agents to offer `caller` (with the setting on), or none when the tool
-/// must not be listed. Codex decides once at session start, from the mode
-/// it started in.
+/// Installed provider families; native policy checks qualify each invocation.
 pub(crate) fn offered_agents(
-    caller: &HostCaller,
-    caller_is_child: bool,
+    _caller: &HostCaller,
+    _caller_is_child: bool,
     is_installed: impl Fn(ProviderKind) -> bool,
 ) -> Vec<ProviderKind> {
-    let _ = caller_is_child;
-    if !matches!(caller.provider, ProviderKind::Claude | ProviderKind::Codex) { return Vec::new(); }
     CANDIDATES
         .into_iter()
         .filter(|kind| is_installed(*kind))
@@ -786,6 +782,7 @@ fn delegate_tool(agents: &[ProviderKind]) -> McpTool {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "target": crate::agent_control::selection::schema(),
                 "provider": {
                     "type": "string",
                     "enum": agents.iter().map(|kind| provider_id(*kind)).collect::<Vec<_>>(),
@@ -813,7 +810,7 @@ fn delegate_tool(agents: &[ProviderKind]) -> McpTool {
                     "description": "Effort/reasoning level, only if the user named one. Omit for that agent's default."
                 }
             },
-            "required": ["provider", "title", "task"]
+            "required": ["title", "task"]
         }),
         server_id: "codemux-host".to_string(),
     }
@@ -892,16 +889,100 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                 return self.call(caller, name, args);
             }
             let requested_deadline = now_ms() + args["wait_ms"].as_u64().unwrap_or(20_000).min(20_000) as i64;
+            let mut arguments = args.clone();
             let validation = async {
                 let input: DelegateArgs = serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
-                let provider = parse_provider(&input.provider).ok_or("unsupported_provider")?;
+                if input
+                    .mode
+                    .as_deref()
+                    .is_some_and(|m| !matches!(m, "async" | "wait"))
+                    || input.wait_ms.is_some_and(|ms| ms > 20_000)
+                {
+                    return Err("Use mode async|wait with wait_ms <= 20000".into());
+                }
+                if let Some(key) = &input.client_request_id {
+                    if key.trim().is_empty() || key.len() > 256 {
+                        return Err("client_request_id must contain 1-256 bytes".into());
+                    }
+                    let mut retry = args.clone();
+                    if let Some(target) = &input.target {
+                        let provider = parse_provider(
+                            target.instance_id.split(':').next().unwrap_or_default(),
+                        )
+                        .ok_or("unsupported_provider")?;
+                        retry["provider"] = json!(provider);
+                        retry["model"] = json!(target.model);
+                        if let Some(effort) = target.options.get("effort") {
+                            retry["effort"] = effort.clone();
+                        }
+                    }
+                    let retry_args: DelegateArgs =
+                        serde_json::from_value(retry.clone()).map_err(|e| e.to_string())?;
+                    let requested = requested_task(&caller.thread_id, &retry, |_| true)?;
+                    if let Some(prior) = self.app.state::<DatabaseStore>().delegation_retry(
+                        &caller.thread_id,
+                        key,
+                        &admission_payload(&requested, &retry_args),
+                    )? {
+                        return Ok((None, Some(task_receipt(&prior))));
+                    }
+                }
+                if let Some(target) = input.target {
+                    let cwd = self
+                        .app
+                        .state::<DatabaseStore>()
+                        .get_agent_chat_session(&caller.thread_id)
+                        .and_then(|r| r.cwd)
+                        .ok_or("Calling cwd missing")?;
+                    let (resolved, caps, _) =
+                        crate::agent_control::selection::resolve(&self.app, target, &cwd)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    if !input.provider.is_empty()
+                        && parse_provider(&input.provider) != Some(resolved.provider)
+                    {
+                        return Err("invalid_arguments: provider and target disagree".into());
+                    }
+                    arguments["provider"] = json!(resolved.provider);
+                    arguments["model"] = json!(resolved.model);
+                    if let Some(effort) = resolved.options.get("effort") {
+                        arguments["effort"] = effort.clone();
+                    }
+                    let mode = input.permission_mode.clone().map(Ok).unwrap_or_else(|| {
+                        caller
+                            .control
+                            .as_ref()
+                            .and_then(|c| c.ceiling())
+                            .ok_or("Missing caller ceiling".into())
+                            .and_then(|c| c.inherited(resolved.provider).map_err(|e| e.to_string()))
+                    })?;
+                    crate::agent_control::service::validate_permission_mode(
+                        resolved.provider,
+                        if resolved.provider == ProviderKind::OpenCode {
+                            None
+                        } else {
+                            Some(&mode)
+                        },
+                        &caps,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok((Some(resolved), None))
+                } else {
+                    let provider = parse_provider(&input.provider).ok_or("unsupported_provider")?;
                 if let Some(mode) = input.permission_mode.as_deref() {
                     let caps = crate::agent_control::service::capabilities(&self.app, provider).await.map_err(|e| e.to_string())?;
                     crate::agent_control::service::validate_permission_mode(provider, Some(mode), &caps).map_err(|e| e.to_string())?;
                 }
-                Ok(())
+                Ok((None, None))
+                }
             }.await;
-            let result = validation.and_then(|()| delegate_with_call(&self.app, caller, args, self.is_installed, call_id, run_id, true));
+            let result = validation.and_then(|(resolved, retry)| match retry {
+                Some(receipt) => Ok(receipt),
+                None => delegate_with_call(&self.app, caller,
+                    &arguments, self.is_installed, call_id, run_id, true,
+                    resolved,
+                ),
+            });
             let result = match result {
                 Ok(mut receipt) => {
                     if args["mode"] == "wait" {
@@ -997,7 +1078,9 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DelegateArgs {
+    #[serde(default)]
     provider: String,
+    target: Option<crate::agent_control::selection::ProviderSelection>,
     #[serde(default)]
     title: String,
     task: String,
@@ -1008,6 +1091,10 @@ struct DelegateArgs {
     wait_ms: Option<u64>,
     role: Option<String>,
     permission_mode: Option<String>,
+}
+
+fn admission_payload(task: &Task, args: &DelegateArgs) -> Value {
+    json!({"provider":provider_id(task.provider),"title":task.title,"task":task.brief,"model":task.model,"effort":task.effort,"role":task.role,"mode":args.mode.as_deref().unwrap_or("async"),"wait_ms":args.wait_ms.unwrap_or(20000),"permission_mode":args.permission_mode,"target":args.target})
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -1025,7 +1112,7 @@ fn requested_task(
     let args: DelegateArgs = serde_json::from_value(arguments.clone())
         .map_err(|_| "Pass provider, title and task as strings.".to_string())?;
     let provider = parse_provider(&args.provider)
-        .filter(|kind| CANDIDATES.contains(kind))
+        .filter(|kind| CANDIDATES.contains(kind) || args.target.is_some())
         .ok_or_else(|| {
             format!(
                 "Unknown agent \"{}\"; use one of: {}.",
@@ -1050,8 +1137,16 @@ fn requested_task(
     };
     let title = excerpt(title.trim(), MAX_TITLE_CHARS, "");
     let mut task = Task::new(parent, provider, &title, brief, now_ms());
-    task.model = non_empty(args.model);
-    task.effort = non_empty(args.effort);
+    task.model = if args.target.is_some() {
+        args.model
+    } else {
+        non_empty(args.model)
+    };
+    task.effort = if args.target.is_some() {
+        args.effort
+    } else {
+        non_empty(args.effort)
+    };
     task.role = non_empty(args.role);
     Ok(task)
 }
@@ -1065,7 +1160,9 @@ fn delegate<R: Runtime>(
     arguments: &Value,
     is_installed: fn(ProviderKind) -> bool,
 ) -> Result<Value, String> {
-    delegate_with_call(app, caller, arguments, is_installed, None, None, false)
+    delegate_with_call(app, caller, arguments, is_installed, None, None, false,
+        None,
+    )
 }
 fn delegate_with_call<R: Runtime>(
     app: &AppHandle<R>,
@@ -1075,6 +1172,7 @@ fn delegate_with_call<R: Runtime>(
     tool_call_id: Option<&str>,
     run_id: Option<&str>,
     validated_mode: bool,
+    resolved: Option<crate::agent_control::selection::ResolvedSelection>,
 ) -> Result<Value, String> {
     let unavailable = || "Delegation is unavailable in this Codemux build.".to_string();
     let db = app.try_state::<DatabaseStore>().ok_or_else(unavailable)?;
@@ -1113,15 +1211,15 @@ fn delegate_with_call<R: Runtime>(
     }
     let mut task = requested_task(parent, arguments, |_| true)?;
     task.tool_call_id = tool_call_id.map(str::to_string);
-    let payload = json!({"provider":provider_id(task.provider),"title":task.title,"task":task.brief,"model":task.model,"effort":task.effort,"role":task.role,"mode":args.mode.as_deref().unwrap_or("async"),"wait_ms":args.wait_ms.unwrap_or(20000),"permission_mode":args.permission_mode});
+    let payload = admission_payload(&task, &args);
     if let Some(key) = &args.client_request_id {
         if let Some(prior) = db.delegation_retry(parent, key, &payload)? {
             return Ok(task_receipt(&prior));
         }
     }
     let provider = task.provider;
-    if caller.control.is_some() && !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {return Err("unsupported_provider: native child injection for this provider comes in a later layer".into());}
-    if !is_installed(provider) {
+    if !is_installed(provider)
+        && !(resolved.is_some() && matches!(provider, ProviderKind::Acp | ProviderKind::Hermes)) {
         return Err(format!(
             "{} is not installed on this machine.",
             provider_label(provider)
@@ -1155,6 +1253,7 @@ fn delegate_with_call<R: Runtime>(
         let mut record = record_of(&child, &task);
         record.workspace_id = child_workspace.0.clone();
         record.cwd = cwd.clone();
+        record.selection = resolved;
         record.parent_run_id = run_id.map(str::to_string).or_else(|| {
             app.try_state::<crate::agent_control::NativeControlState>()
                 .and_then(|state| state.thread_runtime(parent))
@@ -1174,7 +1273,11 @@ fn delegate_with_call<R: Runtime>(
             return Err("unsupported_permission_mode: explicit delegate modes require async catalog validation".into());
         }
         record.plan_mode = provider == ProviderKind::Codex && (mode == "plan" || (args.permission_mode.is_none() && ceiling.plan));
-        record.permission_mode = Some(if provider == ProviderKind::Codex && mode == "plan" { "read-only".into() } else { mode });
+        record.permission_mode = if provider == ProviderKind::OpenCode && mode == "default" {
+            None
+        } else {
+            Some(if provider == ProviderKind::Codex && mode == "plan" { "read-only".into() } else { mode })
+        };
         record.caller = caller.control.clone().map(|mut caller|{caller.admitted=Some(crate::agent_control::AdmittedAuthority::Task {task_id:record.task_id.clone()});caller});
         record.admission_generation = Some(admission_generation);
         record.wait_until = wait_until;
@@ -1304,8 +1407,38 @@ pub(crate) async fn run_starter<R: Runtime>(
     }
     let provider = task.provider;
     let record = match app.state::<DatabaseStore>().delegation_task_for_child(&child) { Ok(Some(record)) => record, _ => return };
-    let input = child_input(&child, cwd, provider, task.model, task.effort, record.permission_mode.clone());
-    let control = record.caller.clone().map(|caller| crate::agent_control::NativeControlGuard { caller, workspace_id:record.workspace_id.clone(),thread_id:child.clone(),provider,admission:None }.retain_admission(&app));
+    let mut input = child_input(&child, cwd, provider, task.model, task.effort, record.permission_mode.clone());
+    if let Some(selection) = &record.selection {
+        if let Err(error) = crate::agent_control::selection::verify(&app, selection) {
+            state.finish(&app, &child, Phase::Failed(error.to_string()));
+            return;
+        }
+        if let Err(error) =
+            crate::agent_control::selection::bind_new_thread(&app, selection, &child)
+        {
+            state.finish(&app, &child, Phase::Failed(error.to_string()));
+            return;
+        }
+        input.extra = selection.extra.clone();
+        input.context_window = selection
+            .options
+            .get("context_window")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        input.service_tier = selection
+            .options
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        input.fast_mode = selection
+            .options
+            .get("fast_mode")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    }
+    let control = record.caller.clone().map(|caller| {
+        crate::agent_control::NativeControlGuard { caller, workspace_id:record.workspace_id.clone(),thread_id:child.clone(),provider,admission:None }.retain_admission(&app)
+    });
     let start = super::agent_chat::agent_chat_start_session_guarded(app.clone(), pane_id, provider, input, None, control.clone());
     let failure = match tokio::time::timeout(START_TIMEOUT, start).await {
         Ok(Ok(_)) if !state.is_starting(&child) => return,
@@ -2052,7 +2185,7 @@ mod tests {
         let codex_ask = caller(ProviderKind::Codex, Some("workspace-write"));
         assert_eq!(offered_agents(&codex_ask, false, installed).len(),2);
         let cursor = caller(ProviderKind::Cursor, Some("agent"));
-        assert!(offered_agents(&cursor, false, installed).is_empty());
+        assert_eq!(offered_agents(&cursor, false, installed).len(), 2);
     }
 
     #[test]
@@ -2212,4 +2345,15 @@ mod tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod all_provider_opaque_selector_tests {
+    use super::*;
+    #[test]
+    fn all_provider_typed_model_and_effort_values_are_not_trimmed() {
+        let task=requested_task("parent",&json!({"provider":"acp","target":{"instance_id":"acp:fixture","model":" model with spaces ","options":{"effort":" exact effort "}},"title":"Opaque selector","task":"Review the exact configured provider selector values","model":" model with spaces ","effort":" exact effort "}),|_|true).unwrap();
+        assert_eq!(task.model.as_deref(), Some(" model with spaces "));
+        assert_eq!(task.effort.as_deref(), Some(" exact effort "));
+    }
 }

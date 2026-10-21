@@ -169,6 +169,15 @@ pub enum CommandSet {
     /// starts this for agents that only take stdio MCP servers.
     #[command(hide = true)]
     McpBridge,
+    /// Call an injected chat MCP tool with the chat's own authority.
+    McpCall {
+        tool: Option<String>,
+        arguments: Option<String>,
+        #[arg(long)]
+        connection_file: Option<std::path::PathBuf>,
+        #[arg(long)]
+        list: bool,
+    },
     /// Run as the persistent PTY daemon (internal subcommand spawned by the
     /// Tauri app; long-lived process that owns agent PTYs so they survive
     /// the app being closed).
@@ -1022,6 +1031,15 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
             crate::mcp::bridge::run().await?;
             Ok(true)
         }
+        Some(CommandSet::McpCall {
+            tool,
+            arguments,
+            connection_file,
+            list,
+        }) => {
+            crate::mcp::bridge::call(tool, arguments, connection_file, list).await?;
+            Ok(true)
+        }
         Some(CommandSet::PtyDaemon { socket }) => {
             // The daemon's `run` only returns on a fatal listener error;
             // it never returns Ok. Translate into a CLI error string so the
@@ -1511,4 +1529,3 @@ mod tests {
         print_enable_result(&data);
     }
 }
-

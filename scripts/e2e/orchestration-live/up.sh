@@ -71,6 +71,7 @@ REPO_DIR='$REPO_DIR'
 BIN='$BIN'
 SIDECAR='$SIDECAR'
 RUN_ID='$RUN_ID'
+ORCH_LIVE_PROVIDERS='${ORCH_LIVE_PROVIDERS:-claude,codex}'
 SERVE_PID='$SERVE_PID'
 SERVE_START='$SERVE_START'
 INIT_PID='$INIT_PID'
@@ -105,7 +106,7 @@ mkdir -p "$ROOT/config/codemux-dev/chatgpt"
   || echo '{"local_workbench":true}' >"$ROOT/config/codemux-dev/chatgpt/state.json"
 
 # CLI symlinks (see resolve_cli).
-for cli in claude codex node npm npx; do
+for cli in claude codex node npm npx opencode cursor-agent grok hermes; do
   target="$(resolve_cli "$cli" || true)"
   if [ -n "$target" ]; then ln -sfn "$target" "$ROOT/bin/$cli"; else note "$cli not found; skipped"; fi
 done
@@ -130,6 +131,16 @@ mkdir -p "$ROOT/home/.codex" "$ROOT/home/.claude"
 # so the CLI doesn't go looking for the user's backups.
 [ -f "$ROOT/home/.claude.json" ] || echo '{"hasCompletedOnboarding":true}' >"$ROOT/home/.claude.json"
 
+# Private destinations for opt-in auth stores. No OAuth file is copied.
+mkdir -p "$ROOT/data/opencode" "$ROOT/config/cursor" "$ROOT/home/.grok" "$ROOT/home/.hermes" "$ROOT/private/"{opencode,cursor,grok,hermes}
+if provider_enabled hermes; then
+  cat >"$ROOT/private/hermes/config.yaml" <<'HERMES_CONFIG'
+model:
+  provider: openai-codex
+  default: gpt-6-luna
+HERMES_CONFIG
+fi
+
 # Seed repo: one commit, used as the workspace every scenario starts in.
 if [ ! -d "$ROOT/repo/.git" ]; then
   git -C "$ROOT/repo" init -q -b main
@@ -143,6 +154,7 @@ fi
 # down.sh compares the real ~/.claude, and which credential files exist,
 # against these.
 claude_real_snapshot >"$ROOT/claude-real.snapshot"
+extra_auth_snapshot >"$ROOT/extra-auth.snapshot"
 record_real_credentials
 
 # ── Pre-flight ───────────────────────────────────────────────────────────
@@ -156,7 +168,9 @@ gitdir="$(git -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2
 ro_paths=(/ /usr /etc "$REPO_DIR")
 [ -n "$gitdir" ] && ro_paths+=("$gitdir")
 [ -n "$gitdir" ] && [ "$(readlink -f "$gitdir")" != "$gitdir" ] && ro_paths+=("$(readlink -f "$gitdir")")
-writable="$ROOT:$HOME:$HOME/.codex/auth.json:$CLAUDE_AUTH_MOUNT:/tmp:/var/tmp:/run:/dev/:/proc/"
+writable="$ROOT:$ROOT/:$HOME:$HOME/.codex/auth.json:$CLAUDE_AUTH_MOUNT:/tmp:/var/tmp:/run:/dev/:/proc/"
+provider_enabled hermes && writable="$writable:$HOME/.hermes:$HOME/.hermes/"
+provider_enabled grok && writable="$writable:$HOME/.grok:$HOME/.grok/"
 iso_out="$(in_sandbox env ORCH_LIVE_WRITABLE="$writable" \
   bash "$HARNESS_DIR/isolation-check.sh" "$(id -u)" "$probe" "$CLAUDE_AUTH_MOUNT" "${ro_paths[@]}" 2>&1)" \
   && iso_rc=0 || iso_rc=$?
@@ -199,6 +213,25 @@ if [ "$CLAUDE_CREDS" = 1 ]; then
   rm -f "$HOME/.claude/$rprobe"
   pass "a temp-file + rename in the Claude storage dir reaches the host (token refresh path)"
 fi
+for provider in opencode cursor grok hermes; do
+  provider_enabled "$provider" || continue
+  case "$provider" in
+    opencode) source="$HOME/.local/share/opencode/auth.json"; target="$ROOT/data/opencode/auth.json";;
+    cursor) source="$HOME/.config/cursor/auth.json"; target="$ROOT/config/cursor/auth.json";;
+    grok) source="$HOME/.grok/auth.json"; target="$HOME/.grok/auth.json";;
+    hermes) source="$HOME/.hermes/auth.json"; target="$HOME/.hermes/auth.json";;
+  esac
+  if [ -f "$source" ]; then
+    same_file "$source" "$target"
+    rprobe=".orch-live-rename-probe-$RUN_ID"
+    in_sandbox sh -c 'echo probe >"$1/$2.tmp" && mv "$1/$2.tmp" "$1/$2" && rm "$1/$2"' _ "${target%/*}" "$rprobe" \
+      2>>"$preflight_log" || fail "$provider atomic credential-write preflight failed"
+    [ ! -e "${source%/*}/$rprobe" ] || fail "$provider rename probe cleanup failed"
+    pass "$provider auth directory supports atomic refresh writes"
+  else
+    note "$provider: no auth.json; record live authentication as an unverified gap"
+  fi
+done
 if [ "${ORCH_LIVE_SKIP_CLI_PREFLIGHT:-0}" != 1 ] && [ "$REUSE" = 0 ]; then
   if [ "$CLAUDE_CREDS" = 1 ] && [ -e "$ROOT/bin/claude" ]; then
     out="$(in_sandbox timeout 120 sh -c 'cd "$1" && exec claude -p "Reply with exactly: PREFLIGHT_OK" --model claude-haiku-4-5' _ "$ROOT/repo" \
