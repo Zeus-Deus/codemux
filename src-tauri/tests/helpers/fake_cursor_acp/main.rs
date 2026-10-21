@@ -7,6 +7,9 @@
 //! Methods understood:
 //!   - `initialize` → advertises HTTP MCP servers, like cursor-agent
 //!     2026.10.14. `authenticate` → empty result.
+//!   - Capability discovery rejects `authenticate` (it would start browser
+//!     login in the real CLI) and serves `cursor/list_available_models` from
+//!     startup credentials. A copy named `signed-out` reports auth required.
 //!   - `session/new`  → `{sessionId, configOptions}`, followed by the
 //!     `available_commands_update` the real CLI pushes once a session
 //!     exists. Entries carry only a name and description — this path has
@@ -139,6 +142,11 @@ fn main() {
     // `session/cancel` arrives.
     let mut held_prompt: Option<Value> = None;
     let mut mcp_servers = Value::Null;
+    let mut capability_harvest = false;
+    let signed_out = std::env::current_exe()
+        .expect("fixture executable")
+        .file_stem()
+        .is_some_and(|name| name == "signed-out");
 
     loop {
         line.clear();
@@ -169,12 +177,33 @@ fn main() {
         }
         match method {
             "initialize" => {
+                capability_harvest = params["clientInfo"]["name"] == "codemux-capability-harvest";
                 if let Some(id) = id {
                     write_line(&json!({
                         "jsonrpc": "2.0",
                         "id": id,
                         "result": {"agentCapabilities": {"mcpCapabilities": {"http": true, "sse": true}}}
                     }));
+                }
+            }
+            "authenticate" if capability_harvest => {
+                if let Some(id) = id {
+                    write_line(&json!({"jsonrpc": "2.0", "id": id, "error": {
+                        "code": -32602, "message": "Capability discovery must not initiate browser login"
+                    }}));
+                }
+            }
+            "cursor/list_available_models" => {
+                if let Some(id) = id {
+                    if signed_out {
+                        write_line(&json!({"jsonrpc": "2.0", "id": id, "error": {
+                            "code": -32000, "message": "Authentication required. Run cursor-agent login first."
+                        }}));
+                    } else {
+                        write_line(&json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "models": [{"value": "fake-model", "name": "Fake Model"}]
+                        }}));
+                    }
                 }
             }
             "authenticate" | "session/load" => {

@@ -120,10 +120,9 @@ pub async fn harvest_cursor_capabilities(
             )
             .await
             .map_err(map_rpc_error)?;
-        child
-            .request("authenticate", json!({ "methodId": "cursor_login" }))
-            .await
-            .map_err(map_auth_error)?;
+        // Cursor loads existing credentials during ACP startup. Its
+        // `cursor_login` method can open a browser when signed out, so passive
+        // discovery must let the model request report auth required instead.
         let raw = child
             .request("cursor/list_available_models", json!({}))
             .await
@@ -153,19 +152,6 @@ fn map_spawn_error(err: RpcChildError, binary_path: &Path) -> HarvestError {
         other => HarvestError::HarvestFailed {
             message: format!("Could not start Cursor ACP: {other}"),
         },
-    }
-}
-
-fn map_auth_error(err: RpcChildError) -> HarvestError {
-    let message = err.to_string();
-    if looks_unauthenticated(&message) {
-        HarvestError::NotAuthenticated {
-            hint: "Run `cursor-agent login` and try again.".into(),
-        }
-    } else {
-        HarvestError::HarvestFailed {
-            message: format!("Cursor authentication probe failed: {message}"),
-        }
     }
 }
 
