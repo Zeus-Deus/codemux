@@ -1,13 +1,21 @@
 // Child workspaces: a coordinator chat in a linked worktree starts two chats
 // with thread_launch (no workspace) and delegates one task. Each child must
 // become its own workspace, nested under the coordinator, in its folder and
-// titled with the task, while the populated main checkout stays as it was.
+// titled with the task, while the populated, protected main checkout stays
+// as it was. Then the coordinator's checkout cannot be deleted while the
+// launched chats use it, and closing the coordinator closes the delegated
+// chat's workspace but not the launched ones.
+//
+// Run it on a restarted root (up.sh, down.sh, up.sh <root>): the seeded
+// checkout is stamped protected by the boot-time backfill.
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 
 export const name = "child-workspaces";
 export const description =
   "A worktree coordinator calls thread_launch twice without a workspace and delegate_task once; " +
-  "assert three titled child workspaces nested under it and an unchanged main checkout.";
+  "assert three titled child workspaces nested under it and an unchanged protected main checkout; " +
+  "deleting the coordinator's checkout refuses, and closing it closes only the delegated child.";
 
 const CLAUDE_MODEL = process.env.ORCH_LIVE_CLAUDE_MODEL ?? "claude-haiku-4-5";
 const CODEX_MODEL = process.env.ORCH_LIVE_CODEX_MODEL ?? "gpt-6-luna";
@@ -60,6 +68,7 @@ export async function run(ctx) {
   ctx.check("coordinator is a linked worktree workspace", !!coordinator?.worktree_path, coordinator && { cwd: coordinator.cwd, worktree_path: coordinator.worktree_path });
   const root = (await workspaces(ctx)).find((w) => w.workspace_id === rootId);
   ctx.observe("main checkout", { id: rootId, cwd: root.cwd, protected: root.protected, tabs: root.tabs.length });
+  ctx.check("main checkout is protected", root.protected === true, { protected: root.protected });
   ctx.observe("coordinator workspace", { id: coordinatorId, cwd: coordinator.cwd });
   const rootBefore = layoutOf(root);
   const countBefore = (await workspaces(ctx)).length;
@@ -111,4 +120,37 @@ export async function run(ctx) {
   await ctx.shot("child-workspaces-projects");
   await ctx.driver.clickSelector('[aria-label="Activity view"]').catch(() => {});
   await ctx.shot("child-workspaces-inbox");
+
+  // The launched chats still work in the coordinator's checkout: deleting
+  // its files refuses and changes nothing. Through the control socket (the
+  // MCP workspace_close path): the web remote never deletes files.
+  const family = async () => (await workspaces(ctx))
+    .filter((w) => w.workspace_id === coordinatorId || w.parent_workspace_id === coordinatorId).length;
+  const deleteError = await ctx.codemux("close_workspace", {
+    workspace_id: coordinatorId, delete_worktree: true, force_delete: true,
+  }).then(() => null, (error) => error.message);
+  ctx.observe("refused delete", deleteError);
+  ctx.check("deleting the coordinator's checkout refuses while launched chats use it",
+    /2 workspaces still use this checkout/.test(deleteError ?? ""), deleteError);
+  ctx.check("the refused delete closed nothing", (await family()) === 4);
+  // The sandbox's HOME is <root>/home on this side.
+  const onHost = coordinator.worktree_path.replace(process.env.HOME, `${ctx.env.ROOT}/home`);
+  ctx.check("the coordinator's files stay", existsSync(onHost), onHost);
+
+  // Closing the coordinator closes the chat it delegated, as its tab used
+  // to close with it; chats it launched are independent and stay.
+  const delegatedId = children.find((w) => w.title === TITLES.delegated).workspace_id;
+  await ctx.driver.invoke("close_workspace", { workspaceId: coordinatorId, forceDelete: false });
+  const remaining = await ctx.waitFor(async () => {
+    const all = await workspaces(ctx);
+    return all.some((w) => w.workspace_id === coordinatorId || w.workspace_id === delegatedId) ? null : all;
+  }, { timeout: 60_000, interval: 1_000, label: "coordinator and delegated child to close" });
+  ctx.check("the coordinator and its delegated chat's workspace closed", true);
+  ctx.check("the launched chats' workspaces stay",
+    launched.every((w) => remaining.some((r) => r.workspace_id === w.workspace_id)),
+    remaining.map((w) => w.title));
+  ctx.check("main checkout layout still unchanged",
+    layoutOf(remaining.find((w) => w.workspace_id === rootId)) === rootBefore);
+  await ctx.driver.clickSelector('[aria-label="Projects view"]').catch(() => {});
+  await ctx.shot("child-workspaces-after-parent-close");
 }
