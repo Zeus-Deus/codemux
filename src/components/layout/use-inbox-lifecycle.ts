@@ -40,7 +40,7 @@ function wake(
  *  mounted, so when these effects belonged to the Activity view a user who
  *  stayed in Projects silently missed every transition — a settled workspace
  *  that started working was never resurfaced, and once it finished it went
- *  straight back under "Show N settled" with nothing able to recover it.
+ *  straight back onto the Settled shelf with nothing able to recover it.
  *  Mount this exactly once, somewhere that is always rendered
  *  (`SidebarWorkspaceList` does it via `<InboxLifecycle />`). Views that want
  *  to animate a transition listen through `subscribeInboxLifecycle`. */

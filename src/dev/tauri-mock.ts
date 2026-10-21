@@ -197,6 +197,45 @@ const codexCliSignedOutFixture = new URLSearchParams(window.location.search).get
 if (sessionImportFixture) {
   appState = { ...appState, workspaces: [], active_workspace_id: "", archived_workspaces: [], pane_statuses: {} };
 }
+// `?fixture=many-projects`: a long history of projects whose work is all
+// settled — one touched yesterday, the rest weeks ago — for the Projects
+// view's "N more projects" footer and Settled shelf.
+const MANY_PROJECTS_SETTLED: { id: string; at: number }[] = [];
+if (new URLSearchParams(window.location.search).get("fixture") === "many-projects") {
+  const template = appState.workspaces[0];
+  const day = 86_400_000;
+  const old = [
+    "website", "parser", "field-notes", "api-gateway", "dotfiles", "ml-sandbox",
+    "invoice-tool", "game-jam", "blog", "infra", "design-system", "cli-utils",
+  ].map((name, i) => ({ name, ago: (12 + i * 3) * day, count: 1 + (i % 3) }));
+  const projects = [{ name: "docs-site", ago: day, count: 2 }, ...old];
+  const extra: WorkspaceSnapshot[] = [];
+  for (const { name, ago, count } of projects) {
+    const root = `${MOCK_HOME_DIR}/projects/${name}`;
+    for (let i = 0; i < count; i += 1) {
+      const id = `ws-history-${name}-${i}`;
+      const at = Date.now() - ago - i * 3_600_000;
+      extra.push({
+        ...template,
+        workspace_id: id,
+        title: `${name} task ${i + 1}`,
+        cwd: root,
+        project_root: root,
+        worktree_path: null,
+        parent_workspace_id: null,
+        pinned_at: null,
+        tabs: [],
+        surfaces: [],
+        active_tab_id: "",
+        active_surface_id: "",
+        last_active_at: at,
+        last_visited_at: at,
+      });
+      MANY_PROJECTS_SETTLED.push({ id, at });
+    }
+  }
+  appState = { ...appState, workspaces: [...extra, ...appState.workspaces] };
+}
 const MOCK_RECENT_PROJECTS = [
   { path: `${MOCK_HOME_DIR}/code/parser`, name: "parser", last_opened_at: "2026-10-05T09:12:00Z" },
   { path: `${MOCK_HOME_DIR}/code/field-notes`, name: "field-notes", last_opened_at: "2026-10-03T16:40:00Z" },
@@ -4875,6 +4914,7 @@ const handlers: Record<string, Handler> = {
             { id: "ws-codemux-auth", at: 1_756_200_000_000 },
             { id: "ws-codemux-sidebar", at: 1_756_100_000_000 },
             { id: "ws-vexis-bench", at: 1_756_000_000_000 },
+            ...MANY_PROJECTS_SETTLED,
           ],
           snoozed: [],
           keepActive: [],
