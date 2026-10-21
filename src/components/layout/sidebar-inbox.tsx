@@ -38,6 +38,7 @@ import { useProjectAppearance } from "./use-project-appearance";
 import {
   SidebarInboxCard,
   metaClusterWidth,
+  type DelegatedChild,
   type InboxRepo,
 } from "./sidebar-inbox-card";
 import { SidebarNeedsYouStrip } from "./sidebar-needs-you-strip";
@@ -1162,6 +1163,10 @@ export function SidebarInbox() {
     return map;
   }, [projectGroups]);
 
+  const delegatedIntern = useRef(
+    new Map<string, { sig: string; list: readonly DelegatedChild[] }>(),
+  );
+
   const settledIds = useMemo(
     () => new Set(settled.map((e) => e.id)),
     [settled],
@@ -1209,7 +1214,73 @@ export function SidebarInbox() {
         !settledIds.has(ws.workspace_id) &&
         !snoozedIds.has(ws.workspace_id),
     );
-  const activeCards = allActiveCards.filter(matchesFilter);
+  const unfoldedActiveCards = allActiveCards.filter(matchesFilter);
+
+  // Delegated follow-ups fold into their parent's card. Their parent agent
+  // watches them and reads their results, so a full card each would bury the
+  // work that is actually waiting on the user. A child stands alone again
+  // while it needs the user, while it is the open workspace (the "you are
+  // here" rule the shelves follow), when it is pinned, or when its parent is
+  // not an active card to fold into.
+  const hostIds = new Set(
+    [...pinnedCards, ...unfoldedActiveCards].map((ws) => ws.workspace_id),
+  );
+  const foldedIds = new Set<string>();
+  for (const ws of unfoldedActiveCards) {
+    const parentId = ws.parent_workspace_id;
+    if (
+      parentId &&
+      hostIds.has(parentId) &&
+      ws.workspace_id !== activeWorkspaceId &&
+      statusOf(ws) !== "permission"
+    ) {
+      foldedIds.add(ws.workspace_id);
+    }
+  }
+  /** Nearest ancestor that renders as its own card, so a follow-up of a
+   *  folded follow-up lists under the card the user can actually see. */
+  const foldHostOf = (ws: WorkspaceSnapshot): string | null => {
+    let id = ws.parent_workspace_id ?? null;
+    const seen = new Set<string>();
+    while (id && foldedIds.has(id) && !seen.has(id)) {
+      seen.add(id);
+      id = workspaceById.get(id)?.parent_workspace_id ?? null;
+    }
+    return id && hostIds.has(id) && !foldedIds.has(id) ? id : null;
+  };
+  // Escalated children stay in their parent's list too, so the chip's count
+  // never changes just because one of them asked for something.
+  const delegatedByHost = new Map<string, WorkspaceSnapshot[]>();
+  for (const ws of unfoldedActiveCards) {
+    if (!ws.parent_workspace_id || !hostIds.has(ws.parent_workspace_id)) continue;
+    const host = foldHostOf(ws);
+    if (!host) continue;
+    const list = delegatedByHost.get(host);
+    if (list) list.push(ws);
+    else delegatedByHost.set(host, [ws]);
+  }
+  /** Interned per host so an unchanged list keeps its identity across ticks
+   *  and the parent card's memo boundary holds. */
+  const delegatedOf = (hostId: string): readonly DelegatedChild[] | undefined => {
+    const children = delegatedByHost.get(hostId);
+    if (!children) {
+      delegatedIntern.current.delete(hostId);
+      return undefined;
+    }
+    const list = children.map((ws) => ({
+      id: ws.workspace_id,
+      title: ws.title,
+      status: statusOf(ws),
+    }));
+    const sig = list.map((c) => `${c.id}\u0000${c.title}\u0000${c.status}`).join("\u0001");
+    const cached = delegatedIntern.current.get(hostId);
+    if (cached?.sig === sig) return cached.list;
+    delegatedIntern.current.set(hostId, { sig, list });
+    return list;
+  };
+  const activeCards = unfoldedActiveCards.filter(
+    (ws) => !foldedIds.has(ws.workspace_id),
+  );
 
   /** The workspace you are looking at is never unread, whatever the backend
    *  stamps say — the visit is happening right now. Shared by the card and by
@@ -1689,6 +1760,7 @@ export function SidebarInbox() {
         selected={selectedIds.has(id)}
         onSelect={handleSelect}
         onMarkUnread={handleMarkUnread}
+        delegated={delegatedOf(id)}
         parentTitle={
           ws.parent_workspace_id
             ? workspaceById.get(ws.parent_workspace_id)?.title ?? null
