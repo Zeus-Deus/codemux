@@ -13,8 +13,9 @@ import type {
  * checkpoint event, and keep the mount-time list fetch pending so its
  * resolution can be ordered AFTER that event.
  */
-const { agentChatListTurnCheckpoints, handlers } = vi.hoisted(() => ({
+const { agentChatListTurnCheckpoints, handlers, unlisten } = vi.hoisted(() => ({
   agentChatListTurnCheckpoints: vi.fn(),
+  unlisten: vi.fn(),
   handlers: {} as {
     checkpoint?: (payload: AgentChatTurnCheckpointPayload) => void;
     reverted?: (payload: AgentChatTurnCheckpointRevertedPayload) => void;
@@ -28,17 +29,17 @@ vi.mock("@/tauri/events", () => ({
     cb: (payload: AgentChatTurnCheckpointPayload) => void,
   ) => {
     handlers.checkpoint = cb;
-    return Promise.resolve(() => {});
+    return Promise.resolve(unlisten);
   },
   onAgentChatTurnCheckpointReverted: (
     cb: (payload: AgentChatTurnCheckpointRevertedPayload) => void,
   ) => {
     handlers.reverted = cb;
-    return Promise.resolve(() => {});
+    return Promise.resolve(unlisten);
   },
   onAgentChatTurnCheckpointsInvalidated: (cb: (threadId: string) => void) => {
     handlers.invalidated = cb;
-    return Promise.resolve(() => {});
+    return Promise.resolve(unlisten);
   },
 }));
 
@@ -76,6 +77,7 @@ describe("useAgentChatTurnCheckpoints", () => {
     delete handlers.reverted;
     delete handlers.invalidated;
     agentChatListTurnCheckpoints.mockReset();
+    unlisten.mockReset();
   });
   afterEach(() => {
     cleanup();
@@ -268,6 +270,37 @@ describe("useAgentChatTurnCheckpoints", () => {
     expect(agentChatListTurnCheckpoints).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["revert", "invalidation"] as const)(
+    "ignores another thread's %s without suppressing hydration",
+    async (replacement) => {
+      const pending = deferredRecords();
+      agentChatListTurnCheckpoints.mockReturnValue(pending.promise);
+      const { result } = renderHook(() => useAgentChatTurnCheckpoints("t1"));
+      act(() => {
+        handlers.checkpoint?.({
+          thread_id: "t1",
+          checkpoint: record(3),
+          oldest_turn_index: 1,
+        });
+        if (replacement === "revert") {
+          handlers.reverted?.({
+            thread_id: "t2",
+            turn_index: 1,
+            transcript_cutoff_id: 1,
+            remaining_checkpoints: [record(1, "t2")],
+          });
+        } else {
+          handlers.invalidated?.("t2");
+        }
+      });
+      expect(result.current).toEqual([record(3)]);
+      await act(async () => {
+        pending.resolve([record(1), record(2)]);
+      });
+      expect(result.current).toEqual([record(1), record(2), record(3)]);
+    },
+  );
+
   it.each(["resolve", "reject"] as const)(
     "ignores a cancelled Strict Mode fetch that %ss without clearing the active buffer",
     async (settlement) => {
@@ -301,41 +334,23 @@ describe("useAgentChatTurnCheckpoints", () => {
   );
 
   it.each(["resolve", "reject"] as const)(
-    "ignores stale fetches and event handlers after unmount when the fetch %ss",
+    "unsubscribes listeners and ignores a late fetch that %ss after unmount",
     async (settlement) => {
       const pending = deferredRecords();
       agentChatListTurnCheckpoints.mockReturnValue(pending.promise);
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-      const { result, unmount } = renderHook(() =>
+      const { unmount } = renderHook(() =>
         useAgentChatTurnCheckpoints("t1"),
       );
-      const oldHandlers = { ...handlers };
-      act(() => {
-        handlers.checkpoint?.({
-          thread_id: "t1",
-          checkpoint: record(3),
-          oldest_turn_index: 1,
-        });
-      });
-      const beforeUnmount = result.current;
+      // Let asynchronous listener registration finish before cleanup.
+      await act(async () => {});
+      expect(unlisten).not.toHaveBeenCalled();
       unmount();
+      expect(unlisten).toHaveBeenCalledTimes(3);
       await act(async () => {
-        oldHandlers.checkpoint?.({
-          thread_id: "t1",
-          checkpoint: record(4),
-          oldest_turn_index: 1,
-        });
-        oldHandlers.reverted?.({
-          thread_id: "t1",
-          turn_index: 2,
-          transcript_cutoff_id: 2,
-          remaining_checkpoints: [record(1)],
-        });
-        oldHandlers.invalidated?.("t1");
         if (settlement === "resolve") pending.resolve([record(1), record(2)]);
         else pending.reject(new Error("unmounted request"));
       });
-      expect(result.current).toBe(beforeUnmount);
       expect(warn).not.toHaveBeenCalled();
     },
   );
