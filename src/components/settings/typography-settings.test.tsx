@@ -60,7 +60,7 @@ describe("TypographySettings", () => {
     expect(screen.getByText("Developer font")).toBeInTheDocument();
     expect(screen.getByText("Conversation · 14px")).toBeInTheDocument();
     expect(screen.getByText("Code · terminal")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Font family: DM Sans" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Font family: Inter" })).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Font family: JetBrains Mono" }),
     ).toBeInTheDocument();

@@ -2,7 +2,10 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/jetbrains-mono";
-@import "@fontsource-variable/dm-sans";
+/* Inter's optical-size build: small UI text gets the text cut and page
+ * titles the tighter display cut, chosen by the browser from the size. */
+@import "@fontsource-variable/inter/opsz.css";
+@import "@fontsource-variable/inter/opsz-italic.css";
 @import "@xterm/xterm/css/xterm.css";
 
 /* Streamdown (streaming markdown renderer used by the agent-chat
@@ -35,7 +38,7 @@
 }
 
 @theme inline {
-    /* Headings use the UI sans (DM Sans), NOT mono — per the design
+    /* Headings use the UI sans (Inter), NOT mono — per the design
      * system, mono is reserved for code-like metadata only. */
     --font-heading: var(--font-interface);
     --font-sans: var(--font-interface);
@@ -135,7 +138,7 @@
     /* Keep the runtime choices one level below Tailwind's theme names.
      * `@theme inline` then compiles font-sans/font-mono utilities against
      * these live tokens instead of baking the bundled families into CSS. */
-    --font-interface: 'DM Sans Variable', 'DM Sans', ui-sans-serif, system-ui, sans-serif;
+    --font-interface: 'Inter Variable', 'Inter', ui-sans-serif, system-ui, sans-serif;
     --font-code: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     --font-conversation: var(--font-interface);
     --font-terminal: var(--font-code);

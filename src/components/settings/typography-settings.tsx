@@ -201,7 +201,7 @@ export function TypographySettings() {
               title="Interface & conversation"
               description="One typeface across the app; conversation text follows two pixels smaller for a calmer reading rhythm."
               family={typography.interfacePreference}
-              defaultFamily="DM Sans"
+              defaultFamily="Inter"
               defaultStack={DEFAULT_INTERFACE_FONT_STACK}
               size={typography.interfaceSize}
               sizeLabel="Interface font size"
@@ -247,7 +247,7 @@ export function TypographySettings() {
             <TypographySurfaceCard
               {...SURFACE_COPY.interface}
               family={typography.interfacePreference}
-              defaultFamily="DM Sans"
+              defaultFamily="Inter"
               defaultStack={DEFAULT_INTERFACE_FONT_STACK}
               size={typography.interfaceSize}
               sizeLabel="Interface font size"
