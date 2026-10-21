@@ -386,7 +386,7 @@ function ShelfHeader({
         {label}
       </Eyebrow>
       {showCount && (
-        <span className="font-mono text-caption tabular-nums text-muted-foreground/70">
+        <span className="text-label tabular-nums text-muted-foreground/70">
           ({count})
         </span>
       )}
@@ -656,7 +656,7 @@ const SettledRow = memo(function SettledRow({
         className="relative h-5 overflow-hidden whitespace-nowrap"
       >
         {time && (
-          <span className="absolute inset-y-0 right-0 flex items-center font-mono text-label tabular-nums text-muted-foreground/70 group-hover/settled:hidden group-focus-within/settled:hidden">
+          <span className="absolute inset-y-0 right-0 flex items-center text-label tabular-nums text-muted-foreground/70 group-hover/settled:hidden group-focus-within/settled:hidden">
             {time}
           </span>
         )}
@@ -795,13 +795,13 @@ const SnoozeRow = memo(function SnoozeRow({
         <span className="min-w-0 flex-1 truncate text-label font-medium text-muted-foreground">
           {workspace.title}
         </span>
-        {/* Same face as a settled row's age (`font-mono tabular-nums`): the two
-            shelves sit directly on top of each other, and a proportional "3h"
-            beside a mono one is exactly the kind of half-match the eye reads as
-            a mistake. */}
+        {/* Same face as a settled row's age (sans `tabular-nums`): the two
+            shelves sit directly on top of each other, and a "3h" set
+            differently from its neighbour is exactly the kind of half-match
+            the eye reads as a mistake. */}
         <span
           aria-label={`Wakes in ${timeUntil}`}
-          className="shrink-0 font-mono text-label tabular-nums text-muted-foreground/70 group-hover/snoozed:hidden group-focus-within/snoozed:hidden"
+          className="shrink-0 text-label tabular-nums text-muted-foreground/70 group-hover/snoozed:hidden group-focus-within/snoozed:hidden"
         >
           {timeUntil}
         </span>
@@ -1982,7 +1982,7 @@ export function SidebarInbox() {
                         onClick={() =>
                           setSettledVisibleCount((c) => c + SETTLED_PAGE_COUNT)
                         }
-                        className="flex h-7 w-full items-center justify-center rounded-lg font-mono text-label text-muted-foreground/70 transition-colors duration-150 hover:text-foreground"
+                        className="flex h-7 w-full items-center justify-center rounded-lg text-label text-muted-foreground/70 transition-colors duration-150 hover:text-foreground"
                       >
                         {`Show ${next} more (${settledHidden} hidden)`}
                       </button>
@@ -2047,7 +2047,7 @@ export function SidebarInbox() {
                       className="gap-4 text-label"
                     >
                       <span className="flex-1">{preset.label}</span>
-                      <span className="shrink-0 font-mono text-caption tabular-nums text-muted-foreground">
+                      <span className="shrink-0 text-label tabular-nums text-muted-foreground">
                         {preset.whenLabel}
                       </span>
                     </DropdownMenuItem>

@@ -393,7 +393,7 @@ function WorkspaceMenuHeader({
           {workspace.title}
         </span>
         {project && (
-          <span className="truncate font-mono text-caption text-muted-foreground/70">
+          <span className="truncate text-label text-muted-foreground/70">
             {project.name}
           </span>
         )}
@@ -462,7 +462,7 @@ function MoveToDeviceSubmenu({
               <Server />
               <span className="flex min-w-0 flex-1 flex-col">
                 <span className="truncate">{host.name}</span>
-                <span className="truncate font-mono text-caption text-muted-foreground/70">
+                <span className={cn("truncate text-caption text-muted-foreground/70", !host.dirty && "font-mono")}>
                   {host.dirty ? "not synced yet" : host.ssh_target}
                 </span>
               </span>
@@ -1446,7 +1446,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                             type="button"
                             onClick={(e) => e.stopPropagation()}
                             aria-label={`${shippedCount} shipped`}
-                            className="flex items-center gap-1 font-mono text-label leading-none tabular-nums text-muted-foreground select-none transition-transform duration-150 group-hover/row:-translate-x-8"
+                            className="flex items-center gap-1 text-label leading-none tabular-nums text-muted-foreground select-none transition-transform duration-150 group-hover/row:-translate-x-8"
                           >
                             <span className="text-status-open">✓</span>
                             {shippedCount} shipped

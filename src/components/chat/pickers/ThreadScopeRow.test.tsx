@@ -433,7 +433,7 @@ describe("ThreadScopeRow", () => {
       });
     });
 
-    it("shows a WORKTREE badge on branches that have a worktree on this device", async () => {
+    it("shows a Worktree badge on branches that have a worktree on this device", async () => {
       currentWorkspaces = [
         makeWs({
           workspace_id: "ws-foo-main",
@@ -446,7 +446,7 @@ describe("ThreadScopeRow", () => {
       renderRow();
       await user.click(screen.getByText("main"));
       await waitFor(() => {
-        expect(screen.getByText("WORKTREE")).toBeInTheDocument();
+        expect(screen.getByText("Worktree")).toBeInTheDocument();
       });
     });
   });

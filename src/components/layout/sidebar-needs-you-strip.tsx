@@ -215,11 +215,11 @@ export function SidebarNeedsYouStrip({
       role="region"
       aria-label="Workspaces needing you"
     >
-      {/* Header line: small red dot + mono uppercase label with a count. */}
+      {/* Header line: small red dot + a sentence-case label with a count. */}
       <div className="flex items-center gap-1.5 px-1 pb-1">
         <span className="size-1.5 rounded-full bg-status-attention shrink-0" />
-        <span className="font-mono text-caption font-semibold tracking-[0.14em] text-status-attention">
-          NEEDS YOU · {entries.length}
+        <span className="text-label font-medium tabular-nums text-status-attention">
+          Needs you · {entries.length}
         </span>
       </div>
 
@@ -249,7 +249,7 @@ export function SidebarNeedsYouStrip({
                 <span className="min-w-0 flex-1 truncate text-body-sm text-foreground">
                   {workspace.title}
                 </span>
-                <span className="ml-auto flex items-center gap-1 shrink-0 font-mono text-caption text-muted-foreground tabular-nums">
+                <span className="ml-auto flex items-center gap-1 shrink-0 text-label text-muted-foreground tabular-nums">
                   {age}
                   <ArrowDown className="size-3" aria-hidden />
                 </span>
@@ -259,7 +259,7 @@ export function SidebarNeedsYouStrip({
         {/* Never let the cap hide work silently — say how many blocked
             workspaces are only reachable by scrolling. */}
         {entries.length > MAX_VISIBLE_ENTRIES && (
-          <span className="px-1 pt-1 font-mono text-caption text-muted-foreground">
+          <span className="px-1 pt-1 text-label text-muted-foreground">
             +{entries.length - MAX_VISIBLE_ENTRIES} more below
           </span>
         )}

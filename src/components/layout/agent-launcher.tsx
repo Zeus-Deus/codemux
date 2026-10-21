@@ -168,9 +168,6 @@ const NOT_INSTALLED = "not installed";
 const LAUNCHER_ITEM_CLASS =
   "h-[30px] rounded-md px-2 py-0 text-body";
 
-const LAUNCHER_GROUP_CLASS =
-  "**:[[cmdk-group-heading]]:font-mono **:[[cmdk-group-heading]]:text-caption **:[[cmdk-group-heading]]:font-semibold **:[[cmdk-group-heading]]:tracking-[0.09em] **:[[cmdk-group-heading]]:uppercase";
-
 function LauncherDestination({
   presetId,
   children,
@@ -426,7 +423,7 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
           >
             <CommandEmpty>No matches.</CommandEmpty>
             {mobile && (
-              <CommandGroup heading="Agent" className={LAUNCHER_GROUP_CLASS}>
+              <CommandGroup heading="Agent">
                 <CommandItem value="new chat" onSelect={launchChat} showCheckmark={false} className={LAUNCHER_ITEM_CLASS}>
                   <Plus className="size-4" />
                   <span className="flex-1">New chat</span>
@@ -434,7 +431,7 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
               </CommandGroup>
             )}
             {!mobile && chatPresets.length > 0 && (
-              <CommandGroup heading="GUI" className={LAUNCHER_GROUP_CLASS}>
+              <CommandGroup heading="GUI">
                 {chatPresets.map((preset) => (
                   <CommandItem
                     key={preset.id}
@@ -458,7 +455,6 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
             {!mobile && cliPresets.length > 0 && (
               <CommandGroup
                 heading="CLI agents"
-                className={LAUNCHER_GROUP_CLASS}
               >
                 {cliPresets.map((preset) => {
                   const ready = isPresetInstalled(installed, preset.id);
@@ -485,7 +481,7 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
                 })}
               </CommandGroup>
             )}
-            <CommandGroup heading="Panes" className={LAUNCHER_GROUP_CLASS}>
+            <CommandGroup heading="Panes">
               <CommandItem
                 value="pane terminal"
                 onSelect={createTerminal}
@@ -619,7 +615,7 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
           >
             <CommandEmpty>No matches.</CommandEmpty>
             {chatPresets.length > 0 && (
-              <CommandGroup heading="GUI" className={LAUNCHER_GROUP_CLASS}>
+              <CommandGroup heading="GUI">
                 {chatPresets.map((preset) => (
                   <CommandItem
                     key={preset.id}
@@ -641,7 +637,6 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
             {cliPresets.length > 0 && (
               <CommandGroup
                 heading="CLI agents"
-                className={LAUNCHER_GROUP_CLASS}
               >
                 {cliPresets.map((preset) => {
                   const ready = isPresetInstalled(installed, preset.id);

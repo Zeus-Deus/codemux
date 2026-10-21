@@ -66,9 +66,9 @@ export function SidebarLiveSection({ entries, activeWorkspaceId }: Props) {
     >
       <div className="flex items-center gap-1.5 px-2 pb-1 pt-1">
         <Eyebrow tone="accent">
-          LIVE
+          Live
         </Eyebrow>
-        <span className="font-mono text-caption font-semibold tracking-[0.14em] text-muted-foreground">
+        <span className="text-label font-medium tabular-nums text-muted-foreground">
           · {entries.length}
         </span>
       </div>

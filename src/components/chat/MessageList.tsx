@@ -1800,7 +1800,7 @@ function AutoResumedTurnDivider({ text, label }: { text: string; label: string }
         className="group flex w-full items-center gap-3 rounded-sm text-muted-foreground/70 outline-none transition-colors duration-150 hover:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
       >
         <span className="h-px flex-1 bg-border/60" />
-        <span className="inline-flex items-center gap-1.5 font-mono text-label font-medium tracking-wide">
+        <span className="inline-flex items-center gap-1.5 text-label font-medium">
           <RotateCw className="size-3 shrink-0" aria-hidden />
           {label}
           <ChevronDown
@@ -1829,7 +1829,7 @@ function SessionStartMarker({ startedAt }: { startedAt?: number }) {
   return (
     <Marker
       variant="separator"
-      className="font-mono text-label font-medium tracking-wide text-muted-foreground/70 before:bg-border/60 after:bg-border/60"
+      className="text-label font-medium text-muted-foreground/70 before:bg-border/60 after:bg-border/60"
     >
       <MarkerContent>{formatSessionStart(startedAt)}</MarkerContent>
     </Marker>

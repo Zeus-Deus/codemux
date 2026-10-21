@@ -134,7 +134,7 @@ export function MergeSheet({
           <label className="flex flex-col gap-1.5">
             <span
               className={cn(
-                "font-mono font-semibold uppercase tracking-eyebrow text-muted-foreground",
+                "font-medium text-muted-foreground",
                 tzEyebrow,
               )}
             >
@@ -154,7 +154,7 @@ export function MergeSheet({
           <label className="flex flex-col gap-1.5">
             <span
               className={cn(
-                "font-mono font-semibold uppercase tracking-eyebrow text-muted-foreground",
+                "font-medium text-muted-foreground",
                 tzEyebrow,
               )}
             >

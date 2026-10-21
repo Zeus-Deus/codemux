@@ -145,7 +145,8 @@ describe("RenameWorkspaceDialog", () => {
     const input = screen.getByRole("textbox", { name: "Workspace name" });
     expect(input).toHaveValue("add-gpt5-benchmark-runs");
     expect(input).toHaveFocus();
-    expect(screen.getByText("world-bench · master")).toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toHaveAccessibleDescription("world-bench · master");
+    expect(screen.getByText("master")).toHaveClass("font-mono");
     expect(screen.getByText(`23/${WORKSPACE_NAME_MAX_LENGTH}`)).toBeInTheDocument();
   });
 

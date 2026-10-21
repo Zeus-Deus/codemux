@@ -1,6 +1,6 @@
 import { normalizeFontFamily, quoteFontFamily } from "./typography";
 
-const BUNDLED_FONTS = ["DM Sans Variable", "JetBrains Mono Variable"] as const;
+const BUNDLED_FONTS = ["Inter Variable", "JetBrains Mono Variable"] as const;
 
 // A fallback catalog for WebKitGTK / WKWebView, where Local Font Access is
 // unavailable. Metric probing filters this to faces that really render on the

@@ -201,7 +201,7 @@ export function TypographySettings() {
               title="Interface & conversation"
               description="One typeface across the app; conversation text follows two pixels smaller for a calmer reading rhythm."
               family={typography.interfacePreference}
-              defaultFamily="DM Sans"
+              defaultFamily="Inter"
               defaultStack={DEFAULT_INTERFACE_FONT_STACK}
               size={typography.interfaceSize}
               sizeLabel="Interface font size"
@@ -247,7 +247,7 @@ export function TypographySettings() {
             <TypographySurfaceCard
               {...SURFACE_COPY.interface}
               family={typography.interfacePreference}
-              defaultFamily="DM Sans"
+              defaultFamily="Inter"
               defaultStack={DEFAULT_INTERFACE_FONT_STACK}
               size={typography.interfaceSize}
               sizeLabel="Interface font size"
@@ -369,7 +369,7 @@ function TypographySurfaceCard({
             <div className="flex flex-wrap items-center gap-2">
               <p className="text-body font-semibold text-foreground">{title}</p>
               {linkedLabel ? (
-                <span className="rounded-full border border-hairline bg-surface-1 px-2 py-0.5 font-mono text-micro text-muted-foreground/75">
+                <span className="rounded-full border border-hairline bg-surface-1 px-2 py-0.5 text-caption text-muted-foreground/75">
                   {linkedLabel}
                 </span>
               ) : null}

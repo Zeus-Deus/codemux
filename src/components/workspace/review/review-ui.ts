@@ -21,7 +21,7 @@
  * for code, the line-height it can't be read without) lives here.
  */
 
-/** Uppercase eyebrows and mono micro-labels. The floor — nothing below. */
+/** Section labels and micro-labels. The floor — nothing below. */
 export const tzEyebrow = "text-label";
 /** Meta, captions, hints — the quiet line under a title. */
 export const tzMeta = "text-body-sm";

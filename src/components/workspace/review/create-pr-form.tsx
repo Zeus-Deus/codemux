@@ -109,7 +109,7 @@ async function loadRepoTemplate(
 }
 
 const LABEL =
-  `font-mono ${tzEyebrow} font-semibold uppercase tracking-eyebrow text-muted-foreground`;
+  `${tzEyebrow} font-medium text-muted-foreground`;
 
 const FIELD =
   `w-full rounded-md border-0 bg-muted/60 px-2.5 py-2 ${tzRowTitle} text-foreground ` +

@@ -460,10 +460,10 @@ function BranchControl({
                       </span>
                       {hasWorktree && (
                         <Eyebrow className="shrink-0 rounded-sm bg-status-working/15 px-1.5 py-0.5 text-status-working">
-                          WORKTREE
+                          Worktree
                         </Eyebrow>
                       )}
-                      <span className="shrink-0 font-mono text-label text-muted-foreground/70">
+                      <span className="shrink-0 text-label tabular-nums text-muted-foreground/70">
                         {formatRelativeTime(branch.last_commit_unix)}
                       </span>
                     </CommandItem>

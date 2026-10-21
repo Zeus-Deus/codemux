@@ -126,9 +126,14 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
   const isDirty = status.kind === "ready";
   const projectPath = workspace.project_root ?? workspace.cwd;
   const projectName = basename(projectPath) || projectPath;
-  const contextLabel = workspace.git_branch
-    ? `${projectName} · ${workspace.git_branch}`
-    : projectName;
+  // Only the branch is code-like; the project name is a label.
+  const contextLabel = workspace.git_branch ? (
+    <>
+      {projectName} · <span className="font-mono">{workspace.git_branch}</span>
+    </>
+  ) : (
+    projectName
+  );
 
   const rejectInvalid = () => {
     setTouched(true);
@@ -198,7 +203,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
         <div className="flex items-center gap-2.5 border-b border-border/70 py-[13px] pr-3.5 pl-4">
           <span
             aria-hidden
-            className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-ember/20 font-mono text-label font-medium text-accent-ember"
+            className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-ember/20 text-label font-semibold text-accent-ember"
           >
             W
           </span>
@@ -207,7 +212,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
               Rename workspace
             </DialogTitle>
             <DialogDescription
-              className="truncate font-mono text-caption leading-tight text-muted-foreground/70"
+              className="truncate text-label leading-tight text-muted-foreground/70"
             >
               {contextLabel}
             </DialogDescription>
@@ -268,7 +273,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
               )}
               <span
                 className={cn(
-                  "shrink-0 font-mono text-caption tabular-nums",
+                  "shrink-0 text-label tabular-nums",
                   trimmedName.length > WORKSPACE_NAME_MAX_LENGTH
                     ? "text-status-attention"
                     : "text-muted-foreground/55",
@@ -280,7 +285,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
             <p
               id="rename-workspace-hint"
               className={cn(
-                "min-h-[15px] font-mono text-caption leading-[15px] text-pretty",
+                "min-h-[15px] text-label leading-[15px] text-pretty",
                 showError
                   ? "text-status-attention"
                   : status.kind === "ready"
@@ -293,7 +298,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
           </div>
 
           <div className="flex items-center gap-2 border-t border-hairline-strong bg-surface-1 px-3 py-[11px]">
-            <span className="flex min-w-0 flex-1 items-center gap-1.5 font-mono text-caption text-muted-foreground/55">
+            <span className="flex min-w-0 flex-1 items-center gap-1.5 text-label text-muted-foreground/55">
               <Kbd>esc</Kbd>
               <span>cancel</span>
             </span>

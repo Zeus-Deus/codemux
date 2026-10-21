@@ -768,7 +768,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
           {workingTime && (
             <span
               aria-hidden="true"
-              className="font-mono font-medium tabular-nums"
+              className="font-medium tabular-nums"
             >
               {workingTime}
             </span>
@@ -1032,7 +1032,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                           {/* The relative label says how far, never when.
                               "Next week" without this is a deferral the user
                               has to guess the length of. */}
-                          <span className="shrink-0 font-mono text-caption tabular-nums text-muted-foreground">
+                          <span className="shrink-0 text-label tabular-nums text-muted-foreground">
                             {preset.whenLabel}
                           </span>
                         </DropdownMenuItem>

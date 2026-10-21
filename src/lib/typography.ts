@@ -26,7 +26,7 @@ export const TYPOGRAPHY_RANGES = {
 } as const;
 
 export const DEFAULT_INTERFACE_FONT_STACK =
-  "'DM Sans Variable', 'DM Sans', ui-sans-serif, system-ui, sans-serif";
+  "'Inter Variable', 'Inter', ui-sans-serif, system-ui, sans-serif";
 export const DEFAULT_CODE_FONT_STACK =
   "'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 
