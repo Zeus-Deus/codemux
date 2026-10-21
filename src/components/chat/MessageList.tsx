@@ -2252,6 +2252,7 @@ function TurnFoldRow({
   label,
   expanded,
   failedCount,
+  hiddenCount,
   changes,
   liveSince,
   workspaceId,
@@ -2264,6 +2265,7 @@ function TurnFoldRow({
   label: string;
   expanded: boolean;
   failedCount: number;
+  hiddenCount: number;
   changes?: TurnChangeSummary;
   liveSince?: number | null;
   workspaceId?: string | null;
@@ -2271,11 +2273,22 @@ function TurnFoldRow({
   onShowTurnDiff?: (turnId: string, trigger: HTMLElement) => void;
   onToggleTurnFold: (turnId: string, pinnedBy: readonly string[]) => void;
 }) {
-  if (liveSince !== undefined) {
-    // The running turn's header: the thread's one clock. Nothing is folded
-    // yet, so it is plain text in the fold's place rather than a toggle.
+  const changesChip = changes ? (
+    <TurnChangesChip
+      changes={changes}
+      workspaceId={workspaceId}
+      cwd={cwd}
+      onShowDiff={
+        onShowTurnDiff ? (trigger) => onShowTurnDiff(turnId, trigger) : undefined
+      }
+    />
+  ) : null;
+  if (liveSince !== undefined || hiddenCount === 0) {
+    // Nothing to fold: the running turn's ticking header (the thread's one
+    // clock), or a settled turn whose answer is all it has. Plain text in
+    // the fold's place rather than a toggle.
     return (
-      <div className="flex items-center gap-3 border-b border-border/60 pb-2 pt-1">
+      <div className="flex items-center justify-between gap-3 border-b border-border/60 pb-2 pt-1">
         <span className="flex items-center gap-1 px-1 text-body tabular-nums text-muted-foreground">
           {liveSince == null ? (
             label
@@ -2285,6 +2298,7 @@ function TurnFoldRow({
             />
           )}
         </span>
+        {changesChip}
       </div>
     );
   }
@@ -2305,16 +2319,7 @@ function TurnFoldRow({
         ) : null}
         <Icon className="size-3.5" aria-hidden />
       </button>
-      {changes ? (
-        <TurnChangesChip
-          changes={changes}
-          workspaceId={workspaceId}
-          cwd={cwd}
-          onShowDiff={
-            onShowTurnDiff ? (trigger) => onShowTurnDiff(turnId, trigger) : undefined
-          }
-        />
-      ) : null}
+      {changesChip}
     </div>
   );
 }
@@ -2417,6 +2422,7 @@ function SlotRow({
           label={slot.body.label}
           expanded={slot.body.expanded}
           failedCount={slot.body.failedCount}
+          hiddenCount={slot.body.hiddenCount}
           changes={slot.body.changes}
           liveSince={slot.body.liveSince}
           workspaceId={workspaceId}

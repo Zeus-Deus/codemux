@@ -731,6 +731,39 @@ describe("buildTranscriptSlots — live turn header", () => {
     }
   });
 
+  it("keeps a plain duration row in place for a text-only answer", () => {
+    const live = buildTranscriptSlots(
+      [userMsg(0, "hi", 1_000), { ...assistantMsg(1, "hello"), streaming: true } as ChatViewItem],
+      true,
+    );
+    const settled = buildTranscriptSlots(
+      [userMsg(0, "hi", 1_000), assistantMsg(1, "hello"), turnEnd(2, 4_000)],
+      false,
+    );
+    expect(live.map((slot) => slot.body.kind)).toEqual(["item", "turn_fold", "item"]);
+    expect(settled.map((slot) => slot.body.kind)).toEqual(["item", "turn_fold", "item"]);
+    expect(settled[1].body).toMatchObject({ label: "Worked for 3s", hiddenCount: 0 });
+  });
+
+  it("keeps the header under the prompt when a visible card precedes the work", () => {
+    const delegate = tool(1, {
+      tool_name: "mcp__codemux__delegate_task",
+      input: { provider: "codex", title: "Task", task: "A complete, self-contained brief." },
+      result_content: [{ type: "text", text: JSON.stringify({ started: { provider: "codex", thread: "c1" } }) }],
+    });
+    const work = [tool(2), tool(3)];
+    const live = buildTranscriptSlots([userMsg(0, "go", 1_000), delegate, ...work], true);
+    const settled = buildTranscriptSlots(
+      [userMsg(0, "go", 1_000), delegate, ...work, assistantMsg(4, "done"), turnEnd(5, 9_000)],
+      false,
+    );
+    expect(live[1].body.kind).toBe("turn_fold");
+    expect(settled[1].body).toMatchObject({ kind: "turn_fold", label: "Worked for 8s" });
+    // The delegation card stays visible below the header.
+    expect(settled[2].body.kind).toBe("delegation");
+    expect(settled[1].body.kind === "turn_fold" && settled[1].body.hiddenCount).toBeGreaterThan(0);
+  });
+
   it("shows no live header while nothing streams", () => {
     const slots = buildTranscriptSlots([userMsg(0, "fix it", 1_000), tool(1)], false);
     expect(slots.some((slot) => slot.body.kind === "turn_fold")).toBe(false);

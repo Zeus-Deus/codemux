@@ -51,6 +51,8 @@ export interface TurnFoldBody {
    *  logs while the turn ran (see `buildTranscriptSlots`). Collapsing the
    *  fold has to release every one of them. */
   pinnedBy: readonly string[];
+  /** 0 when the turn has nothing to fold (a plain answer): the row is then
+   *  just its duration, not a toggle. */
   hiddenCount: number;
   failedCount: number;
   /** Files the turn's edit calls wrote; absent when it wrote none. */
@@ -444,16 +446,14 @@ function buildPresentationEntries(
     };
     const changes = summarizeTurnChanges(segment.items);
     if (changes) body.changes = changes;
-    let foldInserted = false;
 
     for (const item of segment.items) {
       if (item.kind === "turn_ended" && silentTurnEnd(item)) continue;
-      if (hiddenIds.has(item.id) && !foldInserted) {
-        entries.push({ kind: "turn_fold", body });
-        foldInserted = true;
-      }
       if (hiddenIds.has(item.id) && !expanded) continue;
       entries.push({ kind: "item", item, revealed: hiddenIds.has(item.id) });
+      // The fold sits right under the prompt, where the live header stood,
+      // even when nothing precedes the answer and there is nothing to fold.
+      if (item === segment.user) entries.push({ kind: "turn_fold", body });
     }
   }
 
