@@ -1673,9 +1673,7 @@ fn close_tasks<R: Runtime>(app: &AppHandle<R>, thread: &str) {
         .filter(|(_, task)| task.parent == thread && task.placement.is_tab())
         .map(|(child, task)| (child.clone(), task.clone())).collect();
     for (child, task) in children {
-        if let Err(error) = crate::delegation::app::user_activity(app, &child, true) {
-            log::warn!("Could not revoke closed child authority: {error}");
-        }
+        crate::delegation::authority::NativeAuthority::user_activity_thread(&child, true);
         super::agent_chat::native_thread_gate(app, &child).cancel();
         if let Some(db) = app.try_state::<DatabaseStore>() {
             let _ = db.dispose_delegation_task_for_close(thread, &task.task_id);
