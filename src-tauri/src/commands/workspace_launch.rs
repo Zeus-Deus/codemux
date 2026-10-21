@@ -61,9 +61,15 @@ impl LaunchArgs {
     }
 }
 
+fn caller_ceiling(caller: &HostCaller) -> Option<crate::agent_control::permissions::Ceiling> {
+    caller.control.as_ref().and_then(|control| control.ceiling()).or_else(|| {
+        crate::agent_control::permissions::Ceiling::for_mode(caller.provider, caller.permission_mode.as_deref())
+    })
+}
+
 fn eligible(caller: &HostCaller, is_child: bool, workspace: &WorkspaceSnapshot) -> bool {
     matches!(caller.provider, ProviderKind::Claude | ProviderKind::Codex)
-        && crate::agent_control::permissions::Ceiling::for_mode(caller.provider, caller.permission_mode.as_deref()).is_some_and(|ceiling| !ceiling.plan)
+        && caller_ceiling(caller).is_some_and(|ceiling| !ceiling.plan)
         && !is_child
         && workspace.host_id.is_none()
         && workspace.remote_cwd.is_none()
@@ -218,23 +224,35 @@ pub struct WorkspaceLaunchHost<R: Runtime> {
 
 impl<R: Runtime> WorkspaceLaunchHost<R> {
     pub fn new(app: AppHandle<R>) -> Self {
+        // Registration and native per-call hosts share checkout reservations.
+        // manage keeps the existing value if another host initialized it first.
+        app.manage(Arc::new(LaunchState::default()));
+        let state = app.state::<Arc<LaunchState>>().inner().clone();
         Self {
             app,
-            state: Arc::default(),
+            state,
             is_installed: |kind| which::which(super::provider_updates::binary_name(kind)).is_ok(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_install_check(app: AppHandle<R>, is_installed: fn(ProviderKind) -> bool) -> Self {
-        Self { app, state: Arc::default(), is_installed }
+        Self { is_installed, ..Self::new(app) }
+    }
+
+    fn offered_providers(&self, caller: &HostCaller) -> Vec<ProviderKind> {
+        offered_agents(caller, false, self.is_installed).into_iter().filter(|provider| {
+            caller_ceiling(caller).is_some_and(|ceiling| ceiling.inherited_workspace(*provider).is_ok())
+        }).collect()
     }
 
     fn launch(&self, caller: &HostCaller, arguments: &Value) -> Result<Value, String> {
         let input = LaunchArgs::parse(arguments)?;
         let (workspace, repo) = caller_workspace(&self.app, caller)?;
         let provider = input.provider.unwrap_or(caller.provider);
-        if !offered_agents(caller, false, self.is_installed).contains(&provider) {
+        caller_ceiling(caller).ok_or("unsupported_permission_ceiling: This chat's workspace permission policy is unknown")?
+            .inherited_workspace(provider).map_err(|error| error.to_string())?;
+        if !self.offered_providers(caller).contains(&provider) {
             return Err("Choose an installed provider offered by workspace_launch.".into());
         }
         if let Some(branch) = &input.branch {
@@ -268,13 +286,17 @@ impl<R: Runtime> WorkspaceLaunchHost<R> {
         let control = caller.control.as_mut().ok_or("stale_caller: workspace launch requires authenticated chat authority")?;
         service::authorize_native(&app, control, false).map_err(|e|e.to_string())?;
         let epoch = app.state::<crate::agent_control::NativeControlState>().epoch.clone();
+        let thread = uuid::Uuid::new_v4().to_string();
         let admission = control.admit(|| app.state::<crate::database::DatabaseStore>().admit_control_operation_for_thread(
-            &control.principal, &uuid::Uuid::new_v4().to_string(), "workspace_launch", &arguments.to_string(), &epoch, Some(&workspace.workspace_id.0), None, control.thread_id().zip(control.admission_generation()),
+            &control.principal, &uuid::Uuid::new_v4().to_string(), "workspace_launch", &arguments.to_string(), &epoch, Some(&workspace.workspace_id.0), Some(&thread), control.thread_id().zip(control.admission_generation()),
         ))?;
         let operation = admission.receipt.operation_id;
         if control.thread_id().is_some() {control.admitted=Some(crate::agent_control::AdmittedAuthority::Operation {operation_id:operation.clone()});}
         tauri::async_runtime::spawn(async move {
-            let outcome = start(&app, &caller, input, provider, repo, branch, base).await;
+            let outcome = start(&app, &caller, input, provider, repo, branch, base, &thread).await;
+            if outcome.is_err() {
+                let _ = app.state::<crate::database::DatabaseStore>().orchestration_launch_finished(&thread);
+            }
             let (status,error) = match &outcome { Ok(()) => ("succeeded",None), Err(error) => ("failed",Some(json!({"message":error}))) };
             let _ = app.state::<crate::database::DatabaseStore>().update_control_operation(&caller.control.as_ref().unwrap().principal,&operation,&epoch,status,None,None,None,error.as_ref());
             if let Err(error) = outcome {
@@ -304,6 +326,7 @@ async fn start<R: Runtime>(
     repo: PathBuf,
     branch: String,
     base: String,
+    thread: &str,
 ) -> Result<(), String> {
     let title = input.title.clone();
     let outcome: Result<(), String> = async {
@@ -354,7 +377,7 @@ async fn start<R: Runtime>(
         // Keep a failed launch's checkout for inspection: setup scripts may
         // already have written files, so automatic deletion is not safe.
         prepared
-            .materialize(app, &control, created.workspace_id.clone())
+            .materialize(app, &control, created.workspace_id.clone(), thread)
             .await
             .map_err(|error| format!("{error}. The created workspace was kept for inspection."))?;
         Ok(())
@@ -368,7 +391,7 @@ impl<R: Runtime> HostTools for WorkspaceLaunchHost<R> {
         if caller_workspace(&self.app, caller).is_err() {
             return vec![];
         }
-        let agents = offered_agents(caller, false, self.is_installed);
+        let agents = self.offered_providers(caller);
         if agents.is_empty() {
             return vec![];
         }
@@ -489,6 +512,30 @@ mod tests {
             let caller = HostCaller {control:None,thread_id:"parent".into(),provider,workspace_id:Some(id.0.clone()),permission_mode:Some(mode.into())};
             assert!(eligible(&caller, false, &workspace), "{provider:?} {mode}");
         }
+    }
+
+    #[test]
+    fn workspace_launch_hosts_share_concurrent_reservations_and_cap() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let registered = WorkspaceLaunchHost::new(handle.clone());
+        // Native dispatch constructs a host for each call. Keep reservations
+        // in flight to isolate the checkout cap from the root execution budget.
+        let reserve = || {
+            let host = WorkspaceLaunchHost::new(handle.clone());
+            host.state.reserve("parent", Path::new("/repo"), &args(), || Ok(HashSet::new())).unwrap()
+        };
+        let mut slots = std::thread::scope(|scope| {
+            let first = scope.spawn(&reserve);
+            let second = scope.spawn(&reserve);
+            vec![first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_ne!(slots[0].key.1, slots[1].key.1);
+        for _ in 2..6 { slots.push(reserve()); }
+        let error = registered.state.reserve("parent", Path::new("/repo"), &args(), || Ok(HashSet::new())).err().unwrap();
+        assert!(error.contains("6 workspace launches in flight"), "{error}");
+        slots.pop();
+        assert!(registered.state.reserve("parent", Path::new("/repo"), &args(), || Ok(HashSet::new())).is_ok());
     }
 
     #[test]

@@ -241,7 +241,7 @@ impl PreparedWorkspaceChat {
     ) -> Result<Self, ControlError> {
         let input = Launch {
             workspace_id: String::new(), client_request_id: uuid::Uuid::new_v4().to_string(),
-            provider, permission_mode: if let Some(ceiling)=caller.ceiling() {Some(ceiling.inherited(provider)?)} else if caller.access==ControlAccess::FullAccess {crate::commands::agent_chat::fallback_permission_mode(provider).map(str::to_string)} else {return Err(ControlError::new("unsupported_permission_ceiling","Explicit reviewed worker policy required"));},
+            provider, permission_mode: if let Some(ceiling)=caller.ceiling() {ceiling.inherited_workspace(provider)?} else if caller.access==ControlAccess::FullAccess {crate::commands::agent_chat::fallback_permission_mode(provider).map(str::to_string)} else {return Err(ControlError::new("unsupported_permission_ceiling","Explicit reviewed worker policy required"));},
             title: Some(title), message: Some(message), model, effort,
             context_window: None, fast_mode: false, select: false, worktree: None,
         };
@@ -251,10 +251,10 @@ impl PreparedWorkspaceChat {
     }
 
     pub(crate) async fn materialize<R: Runtime>(
-        mut self, app: &AppHandle<R>, caller: &ControlCaller, workspace_id: String,
+        mut self, app: &AppHandle<R>, caller: &ControlCaller, workspace_id: String, thread: &str,
     ) -> Result<Value, ControlError> {
         self.0.workspace_id = workspace_id;
-        materialize(app, caller, self.0, &uuid::Uuid::new_v4().to_string()).await
+        materialize(app, caller, self.0, thread).await
     }
 }
 

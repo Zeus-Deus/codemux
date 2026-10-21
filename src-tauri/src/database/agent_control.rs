@@ -285,7 +285,7 @@ impl DatabaseStore {
         }
         let id = uuid::Uuid::new_v4().to_string();
         if let Some((sender, generation)) = sender {
-            if let Some(target) = thread_id.filter(|_| tool == "thread_launch") {
+            if let Some(target) = thread_id.filter(|_| matches!(tool, "thread_launch" | "workspace_launch")) {
                 super::delegation_tasks::admit_launch(&tx, sender, target, &id, generation)?;
             } else {
                 super::delegation_tasks::verify_admission_generation(&tx, sender, generation)?;

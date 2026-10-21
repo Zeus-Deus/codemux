@@ -1229,6 +1229,28 @@ mod tests {
 #[cfg(test)]
 mod native_budget_tests {
     use super::*;
+    #[test]
+    fn native_workspace_launch_inherits_root_depth_and_shared_admissions() {
+        let db = DatabaseStore::new_in_memory();
+        db.orchestration_human_root("A").unwrap();
+        let root = db.orchestration_context("A").unwrap().root_id;
+        db.admit_control_operation_for_thread("thread:A", "B", "thread_launch", "B", "epoch", Some("workspace"), Some("B"), Some(("A", 0))).unwrap();
+        db.admit_control_operation_for_thread("thread:B", "C", "workspace_launch", "C", "epoch", Some("workspace"), Some("C"), Some(("B", 0))).unwrap();
+        let context = db.orchestration_context("C").unwrap();
+        assert_eq!(context.root_id, root);
+        assert_eq!(context.depth, 2);
+        db.orchestration_launch_finished("B").unwrap();
+        db.orchestration_launch_finished("C").unwrap();
+        for i in 2..6 {
+            let child = format!("child-{i}");
+            db.admit_control_operation_for_thread("thread:C", &child, "workspace_launch", &child, "epoch", Some("workspace"), Some(&child), Some(("C", 0))).unwrap();
+            db.orchestration_launch_finished(&child).unwrap();
+        }
+        let error = db.admit_control_operation_for_thread("thread:C", "seventh", "workspace_launch", "seventh", "epoch", Some("workspace"), Some("seventh"), Some(("C", 0))).err().unwrap();
+        assert!(error.contains("6 new-work admissions"), "{error}");
+        assert!(db.control_operation_by_key("thread:C", "seventh", "workspace_launch", "seventh", "epoch").unwrap().is_none());
+    }
+
     fn record(
         db: &DatabaseStore,
         parent: &str,

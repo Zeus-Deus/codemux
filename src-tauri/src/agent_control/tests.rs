@@ -1286,7 +1286,7 @@ async fn workspace_chat_launch_shares_native_start_without_selecting_workspace()
     let prepared = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
         crate::agent_provider::ProviderKind::Claude, "Fix sidebar tests".into(), "Self-contained fixture brief".into(), None, None,
     ).await.unwrap();
-    let launched = prepared.materialize(app.handle(), &caller, target.0.clone()).await.unwrap();
+    let launched = prepared.materialize(app.handle(), &caller, target.0.clone(), "prepared-workspace-child").await.unwrap();
     let thread = launched["thread_id"].as_str().unwrap();
     assert_eq!(app.state::<crate::state::AppStateStore>().snapshot().active_workspace_id.0, parent);
     let record = app.state::<crate::database::DatabaseStore>().get_agent_chat_session(thread).unwrap();
@@ -2213,7 +2213,7 @@ async fn native_callers_workspace_launch_routes_and_keeps_admitted_thread_author
     app.state::<crate::state::AppStateStore>().close_pane(&pane).unwrap();
     let child_workspace=app.state::<crate::state::AppStateStore>().create_empty_workspace_at_path(root.path().into());
     let prepared=service::PreparedWorkspaceChat::prepare(app.handle(),&caller,crate::agent_provider::ProviderKind::Claude,"Independent workspace".into(),"Work independently on this fixture".into(),None,None).await.unwrap();
-    let launched=prepared.materialize(app.handle(),&caller,child_workspace.0).await.unwrap();
+    let launched=prepared.materialize(app.handle(),&caller,child_workspace.0,"independent-child").await.unwrap();
     let child=launched["thread_id"].as_str().unwrap();
     assert!(provider.calls.snapshot().iter().any(|c|matches!(c,mock_agent_provider::MockCall::SendTurn(t,_) if t.0==child)));
 }
@@ -2412,9 +2412,61 @@ async fn native_callers_round2_workspace_launch_inherits_lower_modes_and_keeps_p
         assert!(caller.control.as_ref().unwrap().ceiling().unwrap().permits(launched_ceiling));
         assert_eq!(input.permission_mode.as_deref(),Some(mode));
         assert_eq!(app.state::<crate::database::DatabaseStore>().get_agent_chat_session(&child).unwrap().permission_mode,input.permission_mode);
+        let db = app.state::<crate::database::DatabaseStore>();
+        let parent_context = db.orchestration_context(&thread).unwrap();
+        let child_context = db.orchestration_context(&child).unwrap();
+        assert_eq!(child_context.root_id, parent_context.root_id);
+        assert_eq!(child_context.depth, parent_context.depth + 1);
+        for i in 1..6 {
+            let target = format!("other-launch-{i}");
+            db.admit_control_operation_for_thread(&caller.control.as_ref().unwrap().principal, &target, "thread_launch", &target, &app.state::<NativeControlState>().epoch, Some(caller.workspace_id.as_deref().unwrap()), Some(&target), Some((&thread, 0))).unwrap();
+            db.orchestration_launch_finished(&target).unwrap();
+        }
+        let refused = host.call(&caller, "mcp__codemux__workspace_launch", &json!({"title":"Over budget", "message":"This must fail before starting"})).unwrap();
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert!(refused.to_string().contains("6 new-work admissions"), "{refused}");
         // Only this test's checkout is removed; its repository is a TempDir.
         git(&["worktree","remove","--force",input.cwd.to_str().unwrap()]);
         std::fs::remove_dir(input.cwd.parent().unwrap()).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn native_callers_round3_workspace_provider_listing_matches_ceiling_dispatch() {
+    use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller, HostTools};
+    for mode in ["default", "acceptEdits", "bypassPermissions"] {
+        let (app, _, root, workspace, thread, _authority, actor) = native_caller_fixture(mode).await;
+        for args in [vec!["init", "-b", "main"], vec!["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base"]] {
+            assert!(std::process::Command::new("git").current_dir(root.path()).args(args).output().unwrap().status.success());
+        }
+        let mut control = native::qualify(app.handle(), &actor).await.unwrap();
+        // Discovery must use the qualified ceiling, even if the callback's
+        // cached mode is broader than the effective turn policy.
+        let caller = HostCaller {control:Some(control.clone()), thread_id:thread, provider:ProviderKind::Claude, workspace_id:Some(workspace), permission_mode:Some("bypassPermissions".into())};
+        let host = crate::commands::workspace_launch::WorkspaceLaunchHost::with_install_check(app.handle().clone(), |_|true);
+        let tools = host.tools_for(&caller);
+        let offered = tools[0].input_schema["properties"]["provider"]["enum"].as_array().unwrap();
+        assert_eq!(offered.contains(&json!("opencode")), mode == "bypassPermissions");
+        assert!(offered.contains(&json!("cursor")) && offered.contains(&json!("grok")));
+        if mode != "bypassPermissions" {
+            let denied = host.call(&caller, "mcp__codemux__workspace_launch", &json!({"title":"Denied provider", "message":"A complete brief", "provider":"opencode"})).unwrap();
+            assert_eq!(denied["isError"], true, "{denied}");
+            assert!(denied.to_string().contains("permission"), "{denied}");
+        } else {
+            let opencode = Arc::new(mock_agent_provider::MockAgentProvider::new(ProviderKind::OpenCode));
+            app.state::<crate::commands::agent_chat::ProviderRegistry>().set_opencode(opencode.clone()).await;
+            app.state::<NativeControlState>().fixture_capabilities.lock().unwrap().insert(ProviderKind::OpenCode, crate::agent_provider::opencode::capabilities::opencode_stage1_placeholder());
+            // Exercise actual preparation and startup, not just the enum.
+            let admitted = app.state::<crate::database::DatabaseStore>().admit_control_operation(&control.principal, "opencode-workspace", "workspace_launch", "payload", &app.state::<NativeControlState>().epoch, None, Some("opencode-child")).unwrap();
+            control.admitted = Some(AdmittedAuthority::Operation {operation_id:admitted.receipt.operation_id});
+            let prepared = service::PreparedWorkspaceChat::prepare(app.handle(), &control, ProviderKind::OpenCode, "OpenCode workspace".into(), "A complete OpenCode brief".into(), None, None).await.unwrap();
+            let launched = prepared.materialize(app.handle(), &control, caller.workspace_id.clone().unwrap(), "opencode-child").await.unwrap();
+            let child = launched["thread_id"].as_str().unwrap();
+            let start = opencode.start_inputs().into_iter().find(|input| input.thread_id.0 == child).unwrap();
+            assert_eq!(start.permission_mode, None);
+            assert!(opencode.calls.snapshot().iter().any(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(t,_) if t.0==child)));
+        }
     }
 }
 
