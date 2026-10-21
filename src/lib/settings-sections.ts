@@ -161,12 +161,14 @@ export function buildSettingsPages(agentChatEnabled: boolean): SettingsPage[] {
       id: "extensions",
       label: "Extensions",
       icon: Blocks,
-      description: "Skills, MCP servers and plugins that add to what agents and Codemux can do.",
+      description: "Plugins, MCP servers and skills that add to what agents and Codemux can do.",
+      // Skills goes last: it is the one list that grows with every
+      // provider installed, and would otherwise push the rest down.
       sections: [
-        ...chatOnly([{ id: "skills", label: "Skills", icon: BookOpen }]),
+        { id: "plugins", label: "Plugins", icon: Blocks },
         // Inbound administration stays available in the CLI interface too.
         { id: "mcp", label: "MCP Servers", icon: Plug },
-        { id: "plugins", label: "Plugins", icon: Blocks },
+        ...chatOnly([{ id: "skills", label: "Skills", icon: BookOpen }]),
       ],
     },
     {

@@ -1,9 +1,10 @@
-// Group + sort skills for the Settings → Skills section. Backend
-// already returns skills in a stable order (provider → scope → name);
-// the Settings UI re-buckets them into human-readable headings the
-// user sees in the sidebar nav, with one bucket per provider/scope
-// combination plus a single "Plugin" bucket that collapses Claude's
-// marketplace + external_plugins skills regardless of plugin slug.
+// Shape skills for the Settings → Skills list. The backend returns one
+// entry per place a skill was found, and the same SKILL.md is commonly
+// reachable from several providers (`~/.claude/skills`, `~/.agents/skills`
+// and `~/.codemux/skills` are often symlinks to one source, or identical
+// copies). Settings shows one row per skill name, tagged with every
+// source that has it, and only splits a row into versions when the
+// content actually differs.
 
 import type { Skill, SkillProvider, SkillScope } from "@/tauri/commands";
 
@@ -14,66 +15,91 @@ const PROVIDER_LABEL: Record<SkillProvider, string> = {
   codemux: "Codemux",
 };
 
-/**
- * Display heading for a skill's group in the Settings UI. Plugin-scope
- * skills collapse into a single "Plugin" group regardless of provider
- * (in practice all plugins are Claude today; the schema permits
- * provider variance and we keep it future-proof by hiding it here).
- */
-export function groupHeadingFor(skill: Skill): string {
+const SCOPE_LABEL: Partial<Record<SkillScope, string>> = {
+  project: "Project",
+  managed: "Managed",
+  admin: "Admin",
+  system: "System",
+};
+
+/** Short tag naming where one copy of a skill comes from. User-wide and
+ *  provider-configured skills are the common case and show the provider
+ *  alone; plugin skills collapse into "Plugin" whatever their provider. */
+export function skillSourceLabel(skill: Skill): string {
   if (skill.scope === "plugin") return "Plugin";
-  return `${capitalizeScope(skill.scope)} · ${PROVIDER_LABEL[skill.provider]}`;
+  const scope = SCOPE_LABEL[skill.scope];
+  const provider = PROVIDER_LABEL[skill.provider];
+  return scope ? `${provider} · ${scope}` : provider;
 }
 
-function capitalizeScope(scope: SkillScope): string {
-  if (scope === "user") return "User";
-  if (scope === "project") return "Project";
-  if (scope === "plugin") return "Plugin";
-  return scope.charAt(0).toUpperCase() + scope.slice(1);
+/** Unique source tags across `skills`, in input order. */
+export function skillSourceLabels(skills: Skill[]): string[] {
+  return [...new Set(skills.map(skillSourceLabel))];
+}
+
+/** Copies of one skill whose content is identical. */
+export interface SkillVersion {
+  /** Every place this content was found; never empty. The first copy is
+   *  the one Settings opens. */
+  copies: Skill[];
+}
+
+export interface SkillEntry {
+  name: string;
+  /** One element unless same-named skills differ in content. */
+  versions: SkillVersion[];
+}
+
+function hasContent(skill: Skill): boolean {
+  return skill.readable !== false && skill.body.trim() !== "";
+}
+
+/** True when two same-named skills are one definition: the same file, or
+ *  readable copies with identical frontmatter and body. Unreadable
+ *  catalog entries only match by path, since their content is unknown. */
+function sameDefinition(a: Skill, b: Skill): boolean {
+  if (a.filePath !== "" && a.filePath === b.filePath) return true;
+  return (
+    hasContent(a) &&
+    hasContent(b) &&
+    a.body === b.body &&
+    a.description === b.description &&
+    JSON.stringify(a.rawFrontmatter) === JSON.stringify(b.rawFrontmatter)
+  );
 }
 
 /**
- * Stable ordering for groups. Anything not in the list (future
- * provider scopes) sinks to the end alphabetically.
+ * Collapse skills into one entry per name, sorted case-insensitively.
+ * Copies of the same definition share a version; a copy reached twice
+ * through the same provider and scope (e.g. two symlinked roots of one
+ * provider) is kept once.
  */
-export const GROUP_ORDER: ReadonlyArray<string> = [
-  "User · Claude",
-  "User · Codex",
-  "User · OpenCode",
-  "User · Codemux",
-  "Project · Claude",
-  "Project · Codex",
-  "Project · OpenCode",
-  "Project · Codemux",
-  "Plugin",
-];
-
-export interface SkillGroup {
-  heading: string;
-  skills: Skill[];
-}
-
-/**
- * Find skills that share a name across different scopes/providers.
- * Returns a Map keyed by name → skills (always ≥2 entries per key).
- * Skills with unique names are excluded entirely.
- *
- * Used by the Settings UI to surface naming clashes at the top of
- * the page so users can disambiguate explicitly. The slash popup
- * itself disambiguates inline via the description suffix (`provider
- * · scope`) and never silently picks one over the other.
- */
-export function detectConflicts(skills: Skill[]): Map<string, Skill[]> {
-  const byName = new Map<string, Skill[]>();
+export function groupSkillsForSettings(skills: Skill[]): SkillEntry[] {
+  const byName = new Map<string, SkillVersion[]>();
   for (const skill of skills) {
-    const list = byName.get(skill.name);
-    if (list) list.push(skill);
-    else byName.set(skill.name, [skill]);
+    let versions = byName.get(skill.name);
+    if (!versions) {
+      versions = [];
+      byName.set(skill.name, versions);
+    }
+    const version = versions.find((candidate) =>
+      candidate.copies.some((copy) => sameDefinition(copy, skill)),
+    );
+    if (!version) {
+      versions.push({ copies: [skill] });
+      continue;
+    }
+    const duplicate = version.copies.some(
+      (copy) =>
+        copy.id === skill.id &&
+        copy.provider === skill.provider &&
+        copy.scope === skill.scope,
+    );
+    if (!duplicate) version.copies.push(skill);
   }
-  for (const name of [...byName.keys()]) {
-    if ((byName.get(name) ?? []).length <= 1) byName.delete(name);
-  }
-  return byName;
+  return [...byName.entries()]
+    .map(([name, versions]) => ({ name, versions }))
+    .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
 }
 
 /**
@@ -103,9 +129,8 @@ export function detectConflicts(skills: Skill[]): Map<string, Skill[]> {
  * prevent. Real duplicates come from one source reached through
  * several roots, so their names match exactly anyway.
  *
- * This is deliberately NOT applied to the Settings list: seeing every
- * install location is the point there, and `detectConflicts` above
- * surfaces exactly these clashes so they stay discoverable.
+ * Settings uses `groupSkillsForSettings` instead, which keeps every
+ * install location visible and separates copies whose content differs.
  */
 export function dedupeSkillsByName(skills: Skill[]): Skill[] {
   const seen = new Set<string>();
@@ -114,50 +139,6 @@ export function dedupeSkillsByName(skills: Skill[]): Skill[] {
     if (seen.has(skill.name)) continue;
     seen.add(skill.name);
     out.push(skill);
-  }
-  return out;
-}
-
-/**
- * Bucket skills by their group heading, returning groups in
- * `GROUP_ORDER`. Within each group skills are sorted alphabetically
- * by name (case-insensitive). Empty groups are dropped.
- */
-export function groupSkillsByScope(skills: Skill[]): SkillGroup[] {
-  const buckets = new Map<string, Skill[]>();
-  for (const skill of skills) {
-    const heading = groupHeadingFor(skill);
-    const list = buckets.get(heading);
-    if (list) list.push(skill);
-    else buckets.set(heading, [skill]);
-  }
-
-  const out: SkillGroup[] = [];
-  // First pass: emit groups in `GROUP_ORDER` if present.
-  for (const heading of GROUP_ORDER) {
-    const skillsForHeading = buckets.get(heading);
-    if (skillsForHeading && skillsForHeading.length > 0) {
-      out.push({
-        heading,
-        skills: [...skillsForHeading].sort((a, b) =>
-          a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
-        ),
-      });
-      buckets.delete(heading);
-    }
-  }
-  // Second pass: any unknown headings (future schema) sink to the end
-  // sorted alphabetically by heading so users see a stable list.
-  const remaining = [...buckets.entries()].sort(([a], [b]) =>
-    a.localeCompare(b),
-  );
-  for (const [heading, skillsForHeading] of remaining) {
-    out.push({
-      heading,
-      skills: [...skillsForHeading].sort((a, b) =>
-        a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
-      ),
-    });
   }
   return out;
 }

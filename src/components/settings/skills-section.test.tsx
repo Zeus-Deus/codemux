@@ -85,6 +85,7 @@ function resetSkillsStore() {
     error: null,
     loadedAt: 0,
     includePlugins: true,
+    disabledIds: [],
   });
 }
 
@@ -157,27 +158,55 @@ describe("SkillsSection", () => {
     });
   });
 
-  it("renders skills grouped by scope · provider", async () => {
+  it("renders one row per skill, tagged with every source", async () => {
     listSkillsMock.mockResolvedValue([
-      makeSkill({ id: "u-c", name: "user-claude", provider: "claude", scope: "user" }),
-      makeSkill({ id: "u-x", name: "user-codex", provider: "codex", scope: "user" }),
+      makeSkill({ id: "shared", name: "shared", provider: "claude" }),
+      makeSkill({ id: "shared", name: "shared", provider: "codex" }),
       makeSkill({
         id: "p",
         name: "plugin-skill",
         provider: "claude",
         scope: "plugin",
         pluginSlug: "demo",
+        filePath: "/plugins/demo/SKILL.md",
       }),
     ]);
     render(<SkillsSection projectRoot={null} />);
     await waitFor(() => {
-      expect(screen.getByText("User · Claude")).toBeInTheDocument();
+      expect(screen.getByText("shared")).toBeInTheDocument();
     });
-    expect(screen.getByText("User · Codex")).toBeInTheDocument();
-    expect(screen.getByText("Plugin")).toBeInTheDocument();
-    expect(screen.getByText("user-claude")).toBeInTheDocument();
-    expect(screen.getByText("user-codex")).toBeInTheDocument();
-    expect(screen.getByText("plugin-skill")).toBeInTheDocument();
+    expect(screen.getAllByText("shared")).toHaveLength(1);
+    const sharedRow = screen.getByTestId("skill-row-shared");
+    expect(sharedRow).toHaveTextContent("Claude");
+    expect(sharedRow).toHaveTextContent("Codex");
+    expect(screen.getByTestId("skill-row-p")).toHaveTextContent("Plugin");
+    expect(
+      screen.queryByTestId("skills-differing-note"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("filters rows by text and by source", async () => {
+    listSkillsMock.mockResolvedValue([
+      makeSkill({ id: "a", name: "alpha", provider: "claude", filePath: "/a" }),
+      makeSkill({ id: "b", name: "beta", provider: "codex", filePath: "/b" }),
+    ]);
+    render(<SkillsSection projectRoot={null} />);
+    await waitFor(() => {
+      expect(screen.getByText("alpha")).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText("Filter skills"), {
+      target: { value: "bet" },
+    });
+    expect(screen.queryByText("alpha")).not.toBeInTheDocument();
+    expect(screen.getByText("beta")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Filter skills"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("radio", { name: "Claude" }));
+    expect(screen.getByText("alpha")).toBeInTheDocument();
+    expect(screen.queryByText("beta")).not.toBeInTheDocument();
   });
 
   it("Refresh button forces a re-fetch even when within TTL", async () => {
@@ -309,46 +338,67 @@ describe("SkillsSection", () => {
     });
   });
 
-  it("renders a 'Naming conflicts' section at the top when same-name skills exist", async () => {
+  it("flags same-named skills whose content differs and lists their versions", async () => {
     listSkillsMock.mockResolvedValue([
       makeSkill({
-        id: "u-release",
+        id: "fresh",
         name: "release",
         provider: "claude",
-        scope: "user",
-        description: "User-wide release",
+        filePath: "/fleet/release/SKILL.md",
+        body: "New steps.",
       }),
       makeSkill({
-        id: "p-release",
+        id: "fresh",
         name: "release",
-        provider: "claude",
-        scope: "project",
-        description: "Project release",
+        provider: "codex",
+        filePath: "/fleet/release/SKILL.md",
+        body: "New steps.",
       }),
-      makeSkill({ id: "alone", name: "lonely", provider: "claude", scope: "user" }),
+      makeSkill({
+        id: "stale",
+        name: "release",
+        provider: "codemux",
+        filePath: "/codemux/release/SKILL.md",
+        body: "Old steps.",
+      }),
     ]);
 
     render(<SkillsSection projectRoot={null} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("skills-conflicts")).toBeInTheDocument();
+      expect(screen.getByTestId("skills-differing-note")).toHaveTextContent(
+        "1 skill has different versions",
+      );
     });
-    const conflictGroup = screen.getByTestId("conflict-group-release");
-    expect(conflictGroup).toHaveTextContent("release");
-    expect(conflictGroup).toHaveTextContent("User · Claude");
-    expect(conflictGroup).toHaveTextContent("Project · Claude");
+    expect(screen.getAllByText("release")).toHaveLength(1);
+    const toggle = screen.getByRole("button", { name: /2 versions/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
 
-    // The unique-named skill stays in its normal scope group, not in
-    // the conflict block.
-    expect(
-      screen.queryByTestId("conflict-group-lonely"),
-    ).not.toBeInTheDocument();
-    expect(screen.getByText("lonely")).toBeInTheDocument();
+    fireEvent.click(toggle);
+    const versions = screen.getByTestId("skill-versions-release");
+    expect(versions).toHaveTextContent("/claude:user:release");
+    expect(versions).toHaveTextContent("/codemux:user:release");
+    expect(versions).toHaveTextContent("/codemux/release/SKILL.md");
+
+    // Each version keeps its own switch.
+    fireEvent.click(
+      screen.getByRole("switch", {
+        name: "Remove /codemux:user:release from Codemux",
+      }),
+    );
+    expect(useSkillsStore.getState().disabledIds).toEqual(["stale"]);
   });
 
-  it("toggling a per-row switch flips disabled state in the store", async () => {
+  it("a row's switch disables every copy of the skill together", async () => {
     listSkillsMock.mockResolvedValue([
-      makeSkill({ id: "demo", name: "demo-skill" }),
+      makeSkill({ id: "demo", name: "demo-skill", body: "Same." }),
+      makeSkill({
+        id: "demo-copy",
+        name: "demo-skill",
+        provider: "codemux",
+        filePath: "/codemux/demo/SKILL.md",
+        body: "Same.",
+      }),
     ]);
     render(<SkillsSection projectRoot={null} />);
     await waitFor(() => {
@@ -359,23 +409,14 @@ describe("SkillsSection", () => {
     fireEvent.click(screen.getByTestId("skill-row-switch-demo"));
 
     await waitFor(() => {
-      expect(useSkillsStore.getState().disabledIds).toEqual(["demo"]);
+      expect(useSkillsStore.getState().disabledIds).toEqual([
+        "demo",
+        "demo-copy",
+      ]);
     });
     // Row stays rendered, just visually disabled.
     expect(screen.getByText("demo-skill")).toBeInTheDocument();
     expect(screen.getByTestId("skill-row-disabled-badge")).toBeInTheDocument();
-  });
-
-  it("does NOT render the conflicts section when every name is unique", async () => {
-    listSkillsMock.mockResolvedValue([
-      makeSkill({ id: "a", name: "alpha", provider: "claude", scope: "user" }),
-      makeSkill({ id: "b", name: "beta", provider: "codex", scope: "user" }),
-    ]);
-    render(<SkillsSection projectRoot={null} />);
-    await waitFor(() => {
-      expect(screen.getByText("alpha")).toBeInTheDocument();
-    });
-    expect(screen.queryByTestId("skills-conflicts")).not.toBeInTheDocument();
   });
 
   it("starts the file watcher on mount", async () => {

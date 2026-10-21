@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+
 import { BookOpen, ExternalLink, Eye, Link2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -20,8 +22,14 @@ interface Props {
   enabled: boolean;
   /** Toggle the enabled / disabled state. */
   onToggleEnabled: () => void;
-  onView: () => void;
-  onOpenFile: () => void;
+  /** Omitted when the row stands for several differing versions; each
+   *  version then carries its own View / Open actions. */
+  onView?: () => void;
+  onOpenFile?: () => void;
+  /** Where this skill was found, e.g. ["Claude", "Codex"]. */
+  sources?: string[];
+  /** Extra control shown before the switch (the versions toggle). */
+  trailing?: ReactNode;
 }
 
 /**
@@ -37,6 +45,8 @@ export function SkillRow({
   onToggleEnabled,
   onView,
   onOpenFile,
+  sources = [],
+  trailing,
 }: Props) {
   const status = skill.validationError
     ? `Invalid: ${skill.validationError}`
@@ -123,7 +133,10 @@ export function SkillRow({
           {status || "Unavailable"}
         </p>
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex shrink-0 items-center gap-2">
+        {sources.length > 0 && (
+          <SourceTags sources={sources} />
+        )}
         <div
           className={cn(
             "flex items-center gap-1",
@@ -131,7 +144,7 @@ export function SkillRow({
             "group-hover:opacity-100 focus-within:opacity-100 pointer-coarse:opacity-100",
           )}
         >
-          {skill.readable !== false && (
+          {skill.readable !== false && onView && (
             <Button
               variant="ghost"
               size="sm"
@@ -141,7 +154,7 @@ export function SkillRow({
               View
             </Button>
           )}
-          {skill.readable !== false && Boolean(skill.skillDir) && (
+          {skill.readable !== false && Boolean(skill.skillDir) && onOpenFile && (
             <Button
               variant="ghost"
               size="sm"
@@ -152,6 +165,7 @@ export function SkillRow({
             </Button>
           )}
         </div>
+        {trailing}
         {/* Switch sits outside the hover-reveal cluster — always
             visible so users know per-row enable/disable exists at
             a glance. Stops propagation so accidental clicks on the
@@ -171,5 +185,21 @@ export function SkillRow({
         />
       </div>
     </div>
+  );
+}
+
+/** Small outlined tags naming each source of a skill. */
+export function SourceTags({ sources }: { sources: string[] }) {
+  return (
+    <span className="flex items-center gap-1" data-testid="skill-source-tags">
+      {sources.map((source) => (
+        <span
+          key={source}
+          className="rounded-sm border border-border/60 px-1.5 py-px text-caption text-muted-foreground"
+        >
+          {source}
+        </span>
+      ))}
+    </span>
   );
 }

@@ -50,9 +50,10 @@ interface SkillsState {
 
   loadSkills: (projectRoot: string | null, force?: boolean) => Promise<void>;
   setIncludePlugins: (value: boolean) => void;
-  /** Toggle a skill's disabled state. Idempotent — calling on an
-   *  already-disabled id with the opposite value flips it back. */
-  toggleSkillDisabled: (id: string) => void;
+  /** Disable or re-enable a set of preference ids together. Settings
+   *  shows one row for every copy of a skill, so its switch moves all of
+   *  them at once. */
+  setSkillsDisabled: (ids: string[], disabled: boolean) => void;
   /** Drop the cache without re-fetching. Next `loadSkills` call refetches. */
   invalidate: () => void;
 }
@@ -246,13 +247,13 @@ export const useSkillsStore = create<SkillsState>()(
         }));
       },
 
-      toggleSkillDisabled: (id) => {
-        const current = get().disabledIds;
-        const isDisabled = current.includes(id);
-        const next = isDisabled
-          ? current.filter((x) => x !== id)
-          : [...current, id].sort();
-        set({ disabledIds: next });
+      setSkillsDisabled: (ids, disabled) => {
+        const next = new Set(get().disabledIds);
+        for (const id of ids) {
+          if (disabled) next.add(id);
+          else next.delete(id);
+        }
+        set({ disabledIds: [...next].sort() });
       },
 
       invalidate: () => {

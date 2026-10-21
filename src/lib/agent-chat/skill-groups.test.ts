@@ -3,11 +3,10 @@ import { describe, expect, it } from "vitest";
 import type { Skill, SkillProvider, SkillScope } from "@/tauri/commands";
 
 import {
-  GROUP_ORDER,
   dedupeSkillsByName,
-  detectConflicts,
-  groupHeadingFor,
-  groupSkillsByScope,
+  groupSkillsForSettings,
+  skillSourceLabel,
+  skillSourceLabels,
 } from "./skill-groups";
 
 function makeSkill(
@@ -34,117 +33,118 @@ function makeSkill(
   };
 }
 
-describe("groupHeadingFor", () => {
-  it("emits 'Scope · Provider' for non-plugin skills", () => {
-    expect(groupHeadingFor(makeSkill("a", "claude", "user"))).toBe(
-      "User · Claude",
-    );
-    expect(groupHeadingFor(makeSkill("a", "codex", "user"))).toBe(
-      "User · Codex",
-    );
-    expect(groupHeadingFor(makeSkill("a", "claude", "project"))).toBe(
-      "Project · Claude",
-    );
-    expect(groupHeadingFor(makeSkill("a", "codemux", "user"))).toBe(
-      "User · Codemux",
-    );
-    expect(groupHeadingFor(makeSkill("a", "opencode", "project"))).toBe(
-      "Project · OpenCode",
+/** A copy of `name` stored at its own path with the given content. */
+function copyAt(
+  name: string,
+  provider: SkillProvider,
+  path: string,
+  body: string,
+  scope: SkillScope = "user",
+): Skill {
+  return {
+    ...makeSkill(name, provider, scope),
+    id: `id-${path}`,
+    filePath: `${path}/SKILL.md`,
+    skillDir: path,
+    body,
+  };
+}
+
+describe("skillSourceLabel", () => {
+  it("names the provider alone for user-wide and configured skills", () => {
+    expect(skillSourceLabel(makeSkill("a", "claude", "user"))).toBe("Claude");
+    expect(skillSourceLabel(makeSkill("a", "opencode", "configured"))).toBe(
+      "OpenCode",
     );
   });
 
-  it("collapses every plugin scope into a single 'Plugin' bucket", () => {
+  it("adds narrower scopes and collapses plugins", () => {
+    expect(skillSourceLabel(makeSkill("a", "codex", "project"))).toBe(
+      "Codex · Project",
+    );
     expect(
-      groupHeadingFor(makeSkill("a", "claude", "plugin", "frontend-design")),
+      skillSourceLabel(makeSkill("a", "claude", "plugin", "frontend-design")),
     ).toBe("Plugin");
+  });
+
+  it("lists each source once, in input order", () => {
+    expect(
+      skillSourceLabels([
+        makeSkill("a", "codex", "user"),
+        makeSkill("b", "claude", "user"),
+        makeSkill("c", "codex", "user"),
+      ]),
+    ).toEqual(["Codex", "Claude"]);
   });
 });
 
-describe("groupSkillsByScope", () => {
-  it("returns groups in GROUP_ORDER, dropping empty buckets", () => {
-    const groups = groupSkillsByScope([
-      makeSkill("plugin-skill", "claude", "plugin", "frontend-design"),
-      makeSkill("user-codex", "codex", "user"),
-      makeSkill("user-claude", "claude", "user"),
+describe("groupSkillsForSettings", () => {
+  it("merges one file reached from several providers into one version", () => {
+    // makeSkill gives same-named skills the same canonical path, the
+    // shape a symlinked source produces.
+    const entries = groupSkillsForSettings([
+      makeSkill("omarchy", "claude", "user"),
+      makeSkill("omarchy", "codex", "user"),
+      makeSkill("omarchy", "codemux", "user"),
     ]);
-    expect(groups.map((g) => g.heading)).toEqual([
-      "User · Claude",
-      "User · Codex",
-      "Plugin",
+    expect(entries).toHaveLength(1);
+    expect(entries[0].versions).toHaveLength(1);
+    expect(entries[0].versions[0].copies.map((s) => s.provider)).toEqual([
+      "claude",
+      "codex",
+      "codemux",
     ]);
   });
 
-  it("sorts skills within a group alphabetically (case-insensitive)", () => {
-    const groups = groupSkillsByScope([
+  it("merges separate copies whose content is identical", () => {
+    const entries = groupSkillsForSettings([
+      copyAt("file-pr", "claude", "/fleet/file-pr", "Same body."),
+      copyAt("file-pr", "codemux", "/codemux/file-pr", "Same body."),
+    ]);
+    expect(entries[0].versions).toHaveLength(1);
+    expect(entries[0].versions[0].copies).toHaveLength(2);
+  });
+
+  it("splits copies whose content differs into versions", () => {
+    const entries = groupSkillsForSettings([
+      copyAt("omarchy", "claude", "/system/omarchy", "New body."),
+      copyAt("omarchy", "codex", "/system/omarchy", "New body."),
+      copyAt("omarchy", "codemux", "/codemux/omarchy", "Old body."),
+    ]);
+    expect(entries[0].versions.map((v) => v.copies.length)).toEqual([2, 1]);
+    expect(entries[0].versions[1].copies[0].provider).toBe("codemux");
+  });
+
+  it("never merges unreadable copies by their empty content", () => {
+    const entries = groupSkillsForSettings([
+      { ...copyAt("hidden", "codex", "/a/hidden", ""), readable: false },
+      { ...copyAt("hidden", "codex", "/b/hidden", ""), readable: false },
+    ]);
+    expect(entries[0].versions).toHaveLength(2);
+  });
+
+  it("keeps a file reached twice through the same provider once", () => {
+    const entries = groupSkillsForSettings([
+      makeSkill("diagnose-crash", "codex", "user"),
+      makeSkill("diagnose-crash", "codex", "user"),
+      makeSkill("diagnose-crash", "claude", "user"),
+    ]);
+    expect(
+      entries[0].versions[0].copies.map((s) => s.provider),
+    ).toEqual(["codex", "claude"]);
+  });
+
+  it("sorts entries by name, case-insensitively", () => {
+    const entries = groupSkillsForSettings([
       makeSkill("Zeta", "claude", "user"),
-      makeSkill("alpha", "claude", "user"),
-      makeSkill("beta", "claude", "user"),
+      makeSkill("alpha", "codex", "user"),
+      makeSkill("beta", "claude", "plugin", "p"),
     ]);
-    expect(groups[0].skills.map((s) => s.name)).toEqual([
-      "alpha",
-      "beta",
-      "Zeta",
-    ]);
+    expect(entries.map((e) => e.name)).toEqual(["alpha", "beta", "Zeta"]);
   });
 
   it("returns an empty array when no skills are passed", () => {
-    expect(groupSkillsByScope([])).toEqual([]);
-  });
-
-  it("emits all 9 known groups in the locked order when skills span them", () => {
-    const skills: Skill[] = [
-      makeSkill("a", "claude", "user"),
-      makeSkill("b", "codex", "user"),
-      makeSkill("c", "opencode", "user"),
-      makeSkill("d", "codemux", "user"),
-      makeSkill("e", "claude", "project"),
-      makeSkill("f", "codex", "project"),
-      makeSkill("g", "opencode", "project"),
-      makeSkill("h", "codemux", "project"),
-      makeSkill("i", "claude", "plugin", "p"),
-    ];
-    const groups = groupSkillsByScope(skills);
-    expect(groups.map((g) => g.heading)).toEqual([...GROUP_ORDER]);
-  });
-
-  it("detectConflicts returns nothing when every name is unique", () => {
-    const conflicts = detectConflicts([
-      makeSkill("alpha", "claude", "user"),
-      makeSkill("beta", "claude", "user"),
-      makeSkill("gamma", "codex", "user"),
-    ]);
-    expect(conflicts.size).toBe(0);
-  });
-
-  it("detectConflicts surfaces same-name skills across scopes", () => {
-    const userRelease = makeSkill("release", "claude", "user");
-    const projectRelease = makeSkill("release", "claude", "project");
-    const conflicts = detectConflicts([
-      userRelease,
-      projectRelease,
-      makeSkill("other", "claude", "user"),
-    ]);
-    expect(conflicts.size).toBe(1);
-    expect(conflicts.get("release")).toHaveLength(2);
-  });
-
-  it("detectConflicts surfaces same-name skills across providers", () => {
-    const conflicts = detectConflicts([
-      makeSkill("foo", "claude", "user"),
-      makeSkill("foo", "codex", "user"),
-    ]);
-    expect(conflicts.size).toBe(1);
-    expect(conflicts.get("foo")?.map((s) => s.provider).sort()).toEqual([
-      "claude",
-      "codex",
-    ]);
-  });
-
-  it("detectConflicts ignores skills that have only one entry per name", () => {
-    const conflicts = detectConflicts([
-      makeSkill("solo", "claude", "user"),
-    ]);
-    expect(conflicts.size).toBe(0);
+    expect(groupSkillsForSettings([])).toEqual([]);
   });
 
   it("dedupeSkillsByName keeps the first copy of a name, dropping the rest", () => {
@@ -189,28 +189,14 @@ describe("groupSkillsByScope", () => {
     expect(input).toHaveLength(2);
   });
 
-  it("detectConflicts still reports duplicates that the popup collapses", () => {
-    // Settings must keep showing every install location even though
-    // the composer only ever offers one — the two behaviours are
-    // intentionally different views of the same data.
+  it("Settings keeps every install location that the popup collapses", () => {
+    // The composer only ever offers one copy; Settings still shows
+    // where each copy lives.
     const skills = [
       makeSkill("omarchy", "claude", "user"),
       makeSkill("omarchy", "codex", "user"),
     ];
     expect(dedupeSkillsByName(skills)).toHaveLength(1);
-    expect(detectConflicts(skills).get("omarchy")).toHaveLength(2);
-  });
-
-  it("produces independent arrays per group (mutating one doesn't bleed)", () => {
-    const groups = groupSkillsByScope([
-      makeSkill("a", "claude", "user"),
-      makeSkill("b", "claude", "user"),
-    ]);
-    groups[0].skills.pop();
-    const groupsAgain = groupSkillsByScope([
-      makeSkill("a", "claude", "user"),
-      makeSkill("b", "claude", "user"),
-    ]);
-    expect(groupsAgain[0].skills).toHaveLength(2);
+    expect(groupSkillsForSettings(skills)[0].versions[0].copies).toHaveLength(2);
   });
 });
