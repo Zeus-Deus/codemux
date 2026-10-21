@@ -13,6 +13,20 @@ import {
   type AgentChatTurnCheckpointRevertedPayload,
 } from "@/tauri/events";
 
+function applyCheckpoint(
+  current: AgentChatTurnCheckpointRecord[],
+  payload: AgentChatTurnCheckpointPayload,
+): AgentChatTurnCheckpointRecord[] {
+  const withoutSame = current.filter(
+    (record) =>
+      record.turn_index >= payload.oldest_turn_index &&
+      record.turn_index !== payload.checkpoint.turn_index,
+  );
+  return [...withoutSame, payload.checkpoint].sort(
+    (a, b) => a.turn_index - b.turn_index,
+  );
+}
+
 /** Live, committed per-turn checkpoint timeline for one chat. */
 export function useAgentChatTurnCheckpoints(
   threadId: string | null,
@@ -20,25 +34,17 @@ export function useAgentChatTurnCheckpoints(
   const [checkpoints, setCheckpoints] = useState<
     AgentChatTurnCheckpointRecord[]
   >([]);
-  /** A live event landed for this thread, so the in-flight mount fetch —
-   * taken before it — is stale and must not overwrite the newer state. */
-  const sawLiveUpdate = useRef(false);
+  // Additions are incremental: replay them over the fetched history. A
+  // revert or invalidation replaces the entire timeline, so null disables
+  // hydration after either event (and once the fetch has settled).
+  const pendingAdditions = useRef<AgentChatTurnCheckpointPayload[] | null>(null);
 
   useTauriEvent<AgentChatTurnCheckpointPayload>(
     onAgentChatTurnCheckpoint,
     (payload) => {
       if (payload.thread_id !== threadId) return;
-      sawLiveUpdate.current = true;
-      setCheckpoints((current) => {
-        const withoutSame = current.filter(
-          (record) =>
-            record.turn_index >= payload.oldest_turn_index &&
-            record.turn_index !== payload.checkpoint.turn_index,
-        );
-        return [...withoutSame, payload.checkpoint].sort(
-          (a, b) => a.turn_index - b.turn_index,
-        );
-      });
+      pendingAdditions.current?.push(payload);
+      setCheckpoints((current) => applyCheckpoint(current, payload));
     },
     [threadId],
   );
@@ -47,7 +53,7 @@ export function useAgentChatTurnCheckpoints(
     onAgentChatTurnCheckpointReverted,
     (payload) => {
       if (payload.thread_id !== threadId) return;
-      sawLiveUpdate.current = true;
+      pendingAdditions.current = null;
       setCheckpoints(payload.remaining_checkpoints);
     },
     [threadId],
@@ -57,7 +63,7 @@ export function useAgentChatTurnCheckpoints(
     onAgentChatTurnCheckpointsInvalidated,
     (invalidatedThreadId) => {
       if (invalidatedThreadId !== threadId) return;
-      sawLiveUpdate.current = true;
+      pendingAdditions.current = null;
       setCheckpoints([]);
     },
     [threadId],
@@ -70,20 +76,27 @@ export function useAgentChatTurnCheckpoints(
     // one-shot render-time signals the pane consumes in its own mount effects
     // (e.g. the promoted-draft composer focus handoff).
     setCheckpoints((current) => (current.length === 0 ? current : []));
-    sawLiveUpdate.current = false;
+    pendingAdditions.current = null;
     if (threadId == null) return;
+    pendingAdditions.current = [];
     let cancelled = false;
     void agentChatListTurnCheckpoints(threadId)
       .then((records) => {
-        // A checkpoint/revert/invalidation event that arrived while this
-        // request was in flight already holds the newer timeline.
-        if (!cancelled && !sawLiveUpdate.current) setCheckpoints(records);
+        if (cancelled) return;
+        const additions = pendingAdditions.current;
+        pendingAdditions.current = null;
+        if (additions !== null) {
+          setCheckpoints(additions.reduce(applyCheckpoint, records));
+        }
       })
       .catch((error) => {
+        if (cancelled) return;
+        pendingAdditions.current = null;
         console.warn("[agent-chat] turn checkpoint fetch failed:", error);
       });
     return () => {
       cancelled = true;
+      pendingAdditions.current = null;
     };
   }, [threadId]);
 
