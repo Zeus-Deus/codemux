@@ -1289,7 +1289,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
               isWorking && "border-border/60 bg-muted/30",
               isPermission && "border-status-attention/25 bg-status-attention/5",
               reviewExpanded && "border-status-open/20 bg-status-open/5",
-              isActive && "bg-muted",
+              isActive && "bg-sidebar-accent",
             )}
           >
             {/* Icon column — size-5 to subordinate to project avatar.

@@ -695,8 +695,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 // sole owner of the card's opacity — the leaving collapse and
                 // the rise-in keyframe — with nothing here to fight it.
                 "transition-[color,background-color,border-color] duration-150",
+                // The open workspace takes the theme's sidebar highlight, so a
+                // tinted palette tints it and a neutral one stays neutral.
                 isActive
-                  ? "border-border bg-surface-3"
+                  ? "border-transparent bg-sidebar-accent"
                   // No red border for a needs-you card: the status dot, the
                   // red "Needs you" readout and the red blocker line already
                   // say it three times, and a fourth signal wrapped around the
@@ -705,8 +707,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 // Multi-select layers a ring over whatever the card already
                 // is, so "checked for a bulk action" never has to compete with
                 // "this is the workspace you're looking at" for the same
-                // pixels. Ember is the one accent reserved for selection; the
-                // resting/active treatments stay pure lightness.
+                // pixels. Ember is the one accent reserved for selection.
                 selected &&
                   "border-transparent bg-accent-ember/[0.08] ring-1 ring-accent-ember/55",
               )}
