@@ -52,5 +52,24 @@ expect 'toolchain file' "$all" rust-toolchain.toml
 expect 'ci workflow' "$all" .github/workflows/ci.yml
 expect 'docs plus frontend' "$web" README.md src/App.tsx
 
+# A frontend file Rust references must trigger Rust even after the PR deletes
+# or renames it away, when it no longer exists in the checkout. Run the
+# classifier in a scratch repo so the referenced file is genuinely absent.
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+mkdir -p "$scratch/scripts" "$scratch/src-tauri/src" "$scratch/src-tauri/tests" "$scratch/src/lib"
+cp "$SCRIPT_DIR/ci-changes.sh" "$scratch/scripts/"
+printf 'const S: &str = include_str!("../../src/lib/gone.js");\n' > "$scratch/src-tauri/src/lib.rs"
+touch "$scratch/src-tauri/build.rs" "$scratch/src/lib/renamed.js"
+actual=$(printf '%s\n' src/lib/gone.js src/lib/renamed.js | bash "$scratch/scripts/ci-changes.sh" | tr '\n' ' ')
+if [ "$actual" = "$desktop " ]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: deleted Rust frontend input"
+  echo "  expected: $desktop"
+  echo "  actual:   $actual"
+fi
+
 echo "ci-changes: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

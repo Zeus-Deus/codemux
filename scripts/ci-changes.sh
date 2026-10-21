@@ -19,9 +19,12 @@ cd "$(dirname "$0")/.."
 # chat workflow script, shared JSON fixtures, ...). Derived from the references
 # in src-tauri so a new cross-language input keeps triggering Rust without
 # anyone updating this script. Over-matching only runs Rust more often.
+# Paths are kept even when missing: deleting or renaming away a referenced
+# file is exactly the change Rust must compile against. `*.rs` matches are the
+# crate's own `../src/` module paths, not frontend files.
 rust_frontend_inputs=()
 while IFS= read -r path; do
-  if [ -e "$path" ]; then rust_frontend_inputs+=("$path"); fi
+  if [[ $path != *.rs ]]; then rust_frontend_inputs+=("$path"); fi
 done < <(
   grep -rhoE '(\.\./)+src/[A-Za-z0-9_./@-]*[A-Za-z0-9_@-]' src-tauri/src src-tauri/tests src-tauri/build.rs |
     sed -E 's#^(\.\./)+##' | sort -u
