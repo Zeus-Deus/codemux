@@ -762,6 +762,26 @@ pub struct ArchivedWorkspaceSnapshot {
     pub archived_at: u64,
 }
 
+/// Fields of a workspace created for an agent-started chat.
+struct ChatChildWorkspace {
+    parent_workspace_id: Option<String>,
+    title: String,
+    cwd: String,
+    project_root: Option<String>,
+    project_uid: Option<String>,
+    is_git: bool,
+    git_branch: Option<String>,
+    host_id: Option<i64>,
+    remote_cwd: Option<String>,
+    remote_root: Option<String>,
+}
+
+/// An archive entry for a chat child workspace: no worktree of its own, and
+/// a parent. Several can share one folder, so the folder is not its identity.
+pub fn is_chat_child_entry(entry: &ArchivedWorkspaceSnapshot) -> bool {
+    entry.worktree_path.is_none() && entry.parent_workspace_id.is_some()
+}
+
 /// Copy the archive-relevant fields out of a live workspace. Pure —
 /// callers decide when to add the result to state (specifically AFTER
 /// the close path succeeded, so a failed teardown never leaves a
@@ -1885,26 +1905,49 @@ impl AppStateStore {
             Some(thread.into()),
         )?;
         if created {
-            let w = snapshot
-                .workspaces
-                .iter_mut()
-                .find(|w| w.workspace_id.0 == workspace)
-                .unwrap();
-            if let Some(surface) = w.surfaces.iter_mut().find(|s| s.active_pane_id == pane) {
-                surface.title = title.into();
-                if let PaneNodeSnapshot::AgentChat { title: t, .. } = &mut surface.root {
-                    *t = title.into();
-                }
-                if let Some(tab) = w
-                    .tabs
-                    .iter_mut()
-                    .find(|t| t.surface_id.as_ref() == Some(&surface.surface_id))
-                {
-                    tab.title = title.into();
-                }
-            }
+            Self::title_chat_tab_locked(snapshot, workspace, &pane, title);
         }
         Ok(())
+    }
+
+    /// Title the tab whose surface is exactly the chat pane `pane`: the
+    /// pane, its surface and its tab. A chat split into another tab's
+    /// surface keeps that tab's title.
+    fn title_chat_tab_locked(
+        snapshot: &mut AppStateSnapshot,
+        workspace_id: &str,
+        pane: &PaneId,
+        title: &str,
+    ) {
+        let Some(w) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        else {
+            return;
+        };
+        let Some(surface) = w.surfaces.iter_mut().find(|s| {
+            matches!(&s.root, PaneNodeSnapshot::AgentChat { pane_id, .. } if pane_id == pane)
+        }) else {
+            return;
+        };
+        surface.title = title.into();
+        if let PaneNodeSnapshot::AgentChat { title: t, .. } = &mut surface.root {
+            *t = title.into();
+        }
+        if let Some(tab) = w
+            .tabs
+            .iter_mut()
+            .find(|t| t.surface_id.as_ref() == Some(&surface.surface_id))
+        {
+            tab.title = title.into();
+        }
+    }
+
+    /// [`Self::title_chat_tab_locked`] for callers outside the lock.
+    pub fn title_chat_tab(&self, workspace_id: &str, pane: &PaneId, title: &str) {
+        let mut snapshot = self.inner.lock().unwrap();
+        Self::title_chat_tab_locked(&mut snapshot, workspace_id, pane, title);
     }
     pub fn create_workspace(&self) -> WorkspaceId {
         self.create_workspace_at_path(current_project_root())
@@ -1956,6 +1999,109 @@ impl AppStateStore {
         Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
             Self::create_empty_workspace_at_path_locked(snapshot, cwd_path)
         })
+    }
+
+    /// A fresh id for a workspace that is created later, so an admission
+    /// record can name the workspace before it exists.
+    pub fn reserve_workspace_id() -> WorkspaceId {
+        WorkspaceId(next_id("workspace"))
+    }
+
+    /// Create the background workspace for a chat an agent started.
+    ///
+    /// It shares the parent's folder: no worktree, terminals or setup
+    /// scripts, and closing it never touches files. Project and host fields
+    /// come from the parent so the row nests under it. Idempotent on `id`,
+    /// and never changes the active workspace.
+    pub fn create_chat_child_workspace(
+        &self,
+        id: &WorkspaceId,
+        parent_workspace_id: &str,
+        cwd: &str,
+        title: &str,
+    ) -> Result<WorkspaceId, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        if snapshot.workspaces.iter().any(|w| &w.workspace_id == id) {
+            return Ok(id.clone());
+        }
+        let parent = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == parent_workspace_id)
+            .cloned()
+            .ok_or_else(|| format!("No workspace found for {parent_workspace_id}"))?;
+        Self::with_workspace_selection(&mut snapshot, false, |snapshot| {
+            Self::insert_chat_child_workspace_locked(
+                snapshot,
+                id.clone(),
+                ChatChildWorkspace {
+                    parent_workspace_id: Some(parent.workspace_id.0.clone()),
+                    title: title.to_string(),
+                    cwd: cwd.to_string(),
+                    project_root: parent.project_root.clone(),
+                    project_uid: parent.project_uid.clone(),
+                    is_git: parent.is_git,
+                    git_branch: parent.git_branch.clone(),
+                    host_id: parent.host_id,
+                    remote_cwd: parent.remote_cwd.clone(),
+                    remote_root: parent.remote_root.clone(),
+                },
+            );
+        });
+        Ok(id.clone())
+    }
+
+    /// Restore an archived chat child workspace with its title, project
+    /// fields and parent link. Like creation, it carries no worktree.
+    pub fn restore_chat_child_workspace(
+        &self,
+        entry: &ArchivedWorkspaceSnapshot,
+        select: bool,
+    ) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        let id = Self::reserve_workspace_id();
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            Self::insert_chat_child_workspace_locked(
+                snapshot,
+                id.clone(),
+                ChatChildWorkspace {
+                    parent_workspace_id: entry.parent_workspace_id.clone(),
+                    title: entry.title.clone(),
+                    cwd: entry.cwd.clone(),
+                    project_root: entry.project_root.clone(),
+                    project_uid: entry.project_uid.clone(),
+                    is_git: entry.is_git,
+                    git_branch: entry.git_branch.clone(),
+                    host_id: None,
+                    remote_cwd: None,
+                    remote_root: None,
+                },
+            );
+        });
+        id
+    }
+
+    fn insert_chat_child_workspace_locked(
+        snapshot: &mut AppStateSnapshot,
+        id: WorkspaceId,
+        child: ChatChildWorkspace,
+    ) {
+        Self::create_empty_workspace_at_path_locked(snapshot, PathBuf::from(&child.cwd));
+        let workspace = snapshot
+            .workspaces
+            .last_mut()
+            .expect("workspace was just inserted");
+        workspace.workspace_id = id.clone();
+        workspace.title = child.title;
+        workspace.parent_workspace_id = child.parent_workspace_id;
+        workspace.project_root = child.project_root;
+        workspace.project_uid = child.project_uid;
+        workspace.is_git = child.is_git;
+        workspace.git_branch = child.git_branch;
+        workspace.host_id = child.host_id;
+        workspace.remote_cwd = child.remote_cwd;
+        workspace.remote_root = child.remote_root;
+        snapshot.active_workspace_id = id;
     }
 
     /// Body of [`Self::create_empty_workspace_at_path`], factored out so
@@ -4209,16 +4355,22 @@ impl AppStateStore {
     }
 
     /// Add an archive entry, first evicting any stale entry for the same
-    /// on-disk location (same `(cwd, worktree_path)` pair). Dedupe keyed
+    /// on-disk location (same `(cwd, worktree_path)` pair; chat child
+    /// entries are exempt, see [`is_chat_child_entry`]). Dedupe keyed
     /// on location rather than workspace id because re-archiving the
     /// same folder produces a NEW workspace id each cycle — without the
     /// location key the list would grow one ghost entry per
     /// archive/restore round-trip.
     pub fn add_archived_workspace(&self, entry: ArchivedWorkspaceSnapshot) {
         let mut snapshot = self.inner.lock().unwrap();
-        snapshot
-            .archived_workspaces
-            .retain(|e| !(e.cwd == entry.cwd && e.worktree_path == entry.worktree_path));
+        // Chat child workspaces share their parent's folder, so neither
+        // they nor a folder entry may evict each other by location.
+        if !is_chat_child_entry(&entry) {
+            snapshot.archived_workspaces.retain(|e| {
+                is_chat_child_entry(e)
+                    || !(e.cwd == entry.cwd && e.worktree_path == entry.worktree_path)
+            });
+        }
         snapshot.archived_workspaces.push(entry);
     }
 

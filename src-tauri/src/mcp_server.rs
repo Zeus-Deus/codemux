@@ -114,8 +114,8 @@ pub(crate) fn remote_delegation_tools_for_test() -> Vec<crate::mcp::runtime::Mcp
 
 fn register_tools() -> Vec<McpTool> {
     let mut tools = vec![
-        McpTool {name:"delegation_targets",description:"List user-authorized host/existing-checkout/provider/mode targets for this native parent. Grants are immutable to agents. Available only in an actual Codex/Claude adapter; generic MCP metadata is not authority.",input_schema:json!({"type":"object","properties":{},"additionalProperties":false})},
-        McpTool {name:REMOTE_DELEGATE_TOOL,description:"Delegate a SELF-CONTAINED coding task to an explicitly authorized remote checkout. Supply only the needed goal/context, never credentials or full conversation history. Returns a durable task receipt promptly; the backend follows asynchronously and delivers its specific final result when this parent is idle. Continue local work or end the turn; do not busy-poll. Exact client_request_id retries dedupe; changed reuse is rejected. Only receiver-native Codex/Claude execution is currently supported.",input_schema:json!({"type":"object","properties":{"target_id":{"type":"string"},"prompt":{"type":"string","maxLength":32000},"title":{"type":"string"},"model":{"type":["string","null"]},"effort":{"type":["string","null"]},"client_request_id":{"type":"string","description":"Stable per-parent request identity. Reuse only for the identical task request."}},"required":["target_id","prompt","client_request_id"],"additionalProperties":false})},
+        McpTool {name:"delegation_targets",description:"List SSH remote hosts the user granted for delegate_remote_task (host/existing-checkout/provider/mode targets). For remote delegation only: an empty list says nothing about local delegation. To delegate to local child chats, use delegate_task. Grants are immutable to agents. Available only in an actual Codex/Claude adapter; generic MCP metadata is not authority.",input_schema:json!({"type":"object","properties":{},"additionalProperties":false})},
+        McpTool {name:REMOTE_DELEGATE_TOOL,description:"Delegate a SELF-CONTAINED coding task to a user-granted SSH remote host checkout from delegation_targets. Remote hosts only; use delegate_task for local child chats. Supply only the needed goal/context, never credentials or full conversation history. Returns a durable task receipt promptly; the backend follows asynchronously and delivers its specific final result when this parent is idle. Continue local work or end the turn; do not busy-poll. Exact client_request_id retries dedupe; changed reuse is rejected. Only receiver-native Codex/Claude execution is currently supported.",input_schema:json!({"type":"object","properties":{"target_id":{"type":"string"},"prompt":{"type":"string","maxLength":32000},"title":{"type":"string"},"model":{"type":["string","null"]},"effort":{"type":["string","null"]},"client_request_id":{"type":"string","description":"Stable per-parent request identity. Reuse only for the identical task request."}},"required":["target_id","prompt","client_request_id"],"additionalProperties":false})},
         McpTool {name:"task_status",description:"Read this native parent's cached remote task and actual native events after an optional cursor. No launch and no remote busy-poll: the coordinator follows in the background. Use on demand, not in a tight waiting loop.",input_schema:json!({"type":"object","properties":{"task_id":{"type":"string"},"cursor":{"type":"integer","minimum":0}},"required":["task_id"],"additionalProperties":false})},
         McpTool {name:"task_cancel",description:"Persist a stop request for this native parent's remote task. Offline stop remains unconfirmed until the receiver acknowledges cancellation. Suppresses result wakes. Cannot authorize targets or cancel another parent's task.",input_schema:json!({"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false})},
         // -- Browser tools --
@@ -3458,6 +3458,12 @@ mod tests {
                 tools.iter().any(|tool| tool.name == name),
                 "Missing native delegation tool: {name}"
             );
+        }
+        // An empty grant list must not read as "local delegation is off".
+        for name in ["delegation_targets", REMOTE_DELEGATE_TOOL] {
+            let description = tools.iter().find(|tool| tool.name == name).unwrap().description;
+            assert!(description.contains("SSH remote host"), "{description}");
+            assert!(description.contains("use delegate_task"), "{description}");
         }
     }
 }

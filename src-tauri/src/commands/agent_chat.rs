@@ -6323,7 +6323,14 @@ fn pending_stops() -> &'static Mutex<HashMap<String, PendingStop>> {
 }
 
 /// Stops in flight for a workspace's chats, taken by [`snapshot_pending_stops`].
+#[derive(Clone, Default)]
 pub struct EarlierStops(Vec<tokio::sync::watch::Receiver<Option<Result<(), String>>>>);
+
+impl EarlierStops {
+    pub(crate) fn extend(&mut self, other: EarlierStops) {
+        self.0.extend(other.0);
+    }
+}
 
 /// In-flight stops of sessions in `workspace_id`, or whose workspace is
 /// unknown. Take this synchronously as soon as the workspace is closed: a
@@ -13061,6 +13068,64 @@ mod tests {
         assert!(waited, "workspace deletion completed before its agent stopped");
         assert!(retained_while_stopping, "worktree must exist while the agent is stopping");
         assert!(!worktree.exists(), "worktree should be removed after shutdown");
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_closes_child_workspaces_and_waits_for_their_agents() {
+        if worktree_close_fixture_child("worktree_deletion_closes_child_workspaces_and_waits_for_their_agents") {
+            return;
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(PlacementProvider {
+            stop_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let (_repo, app, workspace, worktree) = worktree_close_app("close-parent", provider.clone()).await;
+        let handle = app.handle().clone();
+        // An agent-started chat runs in a child workspace in the same checkout.
+        let child_thread = "close-child";
+        let child = {
+            let state = handle.state::<AppStateStore>();
+            let child = AppStateStore::reserve_workspace_id();
+            let cwd = worktree.display().to_string();
+            state.create_chat_child_workspace(&child, &workspace, &cwd, "Child review").unwrap();
+            state.create_agent_chat_pane(&child.0, Some(ProviderKind::Codex), None, None, Some(child_thread.into())).unwrap();
+            handle.state::<DatabaseStore>().upsert_agent_chat_session(child_thread, &child.0, Some(&cwd), "codex").unwrap();
+            provider.live.lock().unwrap().insert(child_thread.to_string());
+            child.0
+        };
+        let mut close = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                super::super::workspace::close_workspace_with_worktree_impl(
+                    handle.clone(), &handle.state::<AppStateStore>(), &handle.state::<DatabaseStore>(),
+                    workspace, true, Some(false), Some(true),
+                ).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), provider.stop_started.notified()).await.unwrap();
+        let waited = tokio::time::timeout(Duration::from_millis(100), &mut close).await.is_err();
+        assert!(waited, "workspace deletion completed before its agents stopped");
+        assert!(worktree.exists(), "worktree must exist while agents are stopping");
+        assert!(
+            handle.state::<AppStateStore>().find_workspace(&child).is_none(),
+            "the child workspace closes with the checkout it runs in"
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                release.notify_waiters();
+                if let Ok(result) = tokio::time::timeout(Duration::from_millis(10), &mut close).await {
+                    break result;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        result.unwrap().unwrap();
+        let stopped = provider.stopped.lock().unwrap().clone();
+        assert!(stopped.contains(&"close-parent".to_string()), "{stopped:?}");
+        assert!(stopped.contains(&child_thread.to_string()), "{stopped:?}");
+        assert!(!worktree.exists(), "worktree should be removed after every agent stopped");
     }
 
     #[tokio::test]

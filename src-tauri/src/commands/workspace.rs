@@ -1220,6 +1220,78 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
     delete_branch: Option<bool>,
     force_delete: Option<bool>,
 ) -> Result<(), String> {
+    close_workspace_tracked(app, state, db, workspace_id, remove_worktree, delete_branch, force_delete)
+        .await
+        .map(drop)
+}
+
+/// Workspaces that close together with `closing`:
+/// - its delegated chat children, which used to be tabs of `closing` and
+///   closed with it;
+/// - when `deleting` names its checkout, every other workspace inside it,
+///   so no agent keeps running in files about to be removed.
+fn dependent_workspaces(
+    snapshot: &crate::state::AppStateSnapshot,
+    db: &crate::database::DatabaseStore,
+    closing: &str,
+    deleting: Option<&str>,
+) -> Vec<String> {
+    let inside = |path: &str, root: &Path| {
+        Path::new(path).starts_with(root)
+            || Path::new(path)
+                .canonicalize()
+                .ok()
+                .zip(root.canonicalize().ok())
+                .is_some_and(|(path, root)| path.starts_with(root))
+    };
+    snapshot
+        .workspaces
+        .iter()
+        .filter(|w| w.workspace_id.0 != closing)
+        .filter(|w| {
+            let delegated = w.parent_workspace_id.as_deref() == Some(closing)
+                && w.worktree_path.is_none()
+                && crate::state::collect_agent_chat_threads(&w.surfaces)
+                    .iter()
+                    .any(|(_, thread)| db.delegation_task_for_child(thread).ok().flatten().is_some());
+            let in_checkout = deleting.is_some_and(|root| {
+                let root = Path::new(root);
+                inside(&w.cwd, root) || w.worktree_path.as_deref().is_some_and(|p| inside(p, root))
+            });
+            delegated || in_checkout
+        })
+        .map(|w| w.workspace_id.0.clone())
+        .collect()
+}
+
+/// Close a dependent workspace (see [`dependent_workspaces`]) without
+/// touching files. Boxed: the close recurses through it.
+fn close_dependent_workspace<'a, R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &'a AppStateStore,
+    db: &'a crate::database::DatabaseStore,
+    workspace_id: String,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<crate::commands::agent_chat::EarlierStops, String>>
+            + Send
+            + 'a,
+    >,
+> {
+    Box::pin(close_workspace_tracked(app, state, db, workspace_id, false, None, Some(true)))
+}
+
+/// The close itself. Resolves with the chat stops still in flight, so a
+/// caller deleting the files those chats ran in can wait for them.
+async fn close_workspace_tracked<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    workspace_id: String,
+    remove_worktree: bool,
+    delete_branch: Option<bool>,
+    force_delete: Option<bool>,
+) -> Result<crate::commands::agent_chat::EarlierStops, String> {
     // Fast refusal while the workspace is still intact. Not under the
     // Hermes lifecycle lock: teardown must not serialize every close, so
     // the hold is re-checked under the lock right before the delete.
@@ -1325,6 +1397,12 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         }
     }
 
+    let dependents = dependent_workspaces(
+        &state.snapshot(),
+        db,
+        &workspace_id,
+        worktree_path.as_deref().filter(|_| remove_worktree),
+    );
     let closing = state.find_workspace(&workspace_id);
     // Before the workspace leaves state, so cleanup never sees its checkout
     // unclaimed while sessions still run in it.
@@ -1421,6 +1499,29 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
     }
 
     let deleting_files = remove_worktree && worktree_path.is_some();
+    let mut earlier_stops = earlier_stops;
+    let mut threads = close_result.removed_agent_chat_threads;
+    if !dependents.is_empty() {
+        // This workspace's chats stop first, so delegated children see
+        // their parent close, as when they were its tabs.
+        earlier_stops.extend(crate::commands::agent_chat::shutdown_agent_chat_threads(
+            &app,
+            std::mem::take(&mut threads),
+        ));
+        for dependent in dependents {
+            match close_dependent_workspace(app.clone(), state, db, dependent.clone()).await {
+                Ok(stops) => earlier_stops.extend(stops),
+                Err(error) if deleting_files => {
+                    if let Some(hold) = cleanup_hold.take() {
+                        hold.keep();
+                    }
+                    return Err(format!("Could not close workspace {dependent} inside this worktree ({error}); worktree files retained."));
+                }
+                Err(error) => log::warn!("Could not close child workspace {dependent}: {error}"),
+            }
+        }
+    }
+    let mut in_flight = crate::commands::agent_chat::EarlierStops::default();
     if deleting_files {
         // Agents run inside the worktree; deleting it while one is still
         // stopping would pull files out from under a live process. A stop
@@ -1429,7 +1530,7 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
             &app,
             &workspace_id,
             earlier_stops,
-            close_result.removed_agent_chat_threads,
+            threads,
         )
         .await
         .map_err(|error| {
@@ -1440,10 +1541,9 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
             format!("Agent session did not stop ({error}); worktree files retained.")
         })?;
     } else {
-        let issued = crate::commands::agent_chat::shutdown_agent_chat_threads(
-            &app,
-            close_result.removed_agent_chat_threads,
-        );
+        let issued = crate::commands::agent_chat::shutdown_agent_chat_threads(&app, threads);
+        in_flight.extend(earlier_stops.clone());
+        in_flight.extend(issued.clone());
         // Files stay on disk: cleanup may offer them once these stops are
         // acknowledged (and the worktree goes stale).
         if let (Some(ws), Some(hold)) = (closing.as_ref(), cleanup_hold.take()) {
@@ -1505,7 +1605,7 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
     }
 
     crate::state::emit_app_state(&app);
-    Ok(())
+    Ok(in_flight)
 }
 
 /// The ONE root-protection predicate shared by every file-deletion
@@ -1531,19 +1631,26 @@ fn is_undeletable_root(
 pub(crate) fn refuse_worktree_removal(
     ws: &crate::state::WorkspaceSnapshot,
 ) -> Option<String> {
-    if is_undeletable_root(
+    if !is_undeletable_root(
         ws.protected,
         ws.workspace_kind.as_deref(),
         ws.worktree_path.as_deref(),
     ) {
-        Some(
-            "This workspace is the project's root checkout and cannot be deleted. \
-             Archive or close it instead."
-                .to_string(),
-        )
-    } else {
-        None
+        return None;
     }
+    // A chat child workspace shares its parent's folder; it owns no files.
+    if ws.parent_workspace_id.is_some() && ws.worktree_path.is_none() && !ws.protected {
+        return Some(
+            "This workspace shares its folder with the workspace it was started from and \
+             has no files of its own to delete. Archive or close it instead."
+                .to_string(),
+        );
+    }
+    Some(
+        "This workspace is the project's root checkout and cannot be deleted. \
+         Archive or close it instead."
+            .to_string(),
+    )
 }
 
 /// Same decision for an ARCHIVED entry: `Some(reason)` when the entry's
@@ -1754,16 +1861,23 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
     // same cwd. A bare cwd match must not count for worktree entries:
     // a live worktree workspace can share the root's cwd, and matching
     // it would silently "restore" the wrong workspace.
+    // Chat child workspaces share a folder with their parent and siblings,
+    // so the folder never identifies one: only its own id does.
+    let chat_child = crate::state::is_chat_child_entry(&entry);
     let existing = {
         let snapshot = state.snapshot();
         snapshot
             .workspaces
             .iter()
             .find(|w| {
-                if entry.worktree_path.is_some() {
+                if chat_child {
+                    w.workspace_id.0 == entry.workspace_id
+                } else if entry.worktree_path.is_some() {
                     w.worktree_path == entry.worktree_path
                 } else {
-                    w.cwd == entry.cwd && w.worktree_path.is_none()
+                    w.cwd == entry.cwd
+                        && w.worktree_path.is_none()
+                        && w.parent_workspace_id.is_none()
                 }
             })
             .map(|w| w.workspace_id.0.clone())
@@ -1784,7 +1898,15 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
         return Ok(existing_id);
     }
 
-    let restored_id = if let Some(ref wt_path) = entry.worktree_path {
+    let restored_id = if chat_child {
+        if !Path::new(&entry.cwd).exists() {
+            return Err(format!(
+                "Nothing left to restore: {} no longer exists on disk.",
+                entry.cwd
+            ));
+        }
+        state.restore_chat_child_workspace(&entry, select).0
+    } else if let Some(ref wt_path) = entry.worktree_path {
         // Per-branch worktree entry: restore through the SAME creation
         // path the branch-picker fork flow uses.
         // `git_create_worktree`'s reuse-on-disk behavior hands back the
@@ -4180,6 +4302,76 @@ mod archive_guard_tests {
             archive_refusal_reason(&ws).is_none(),
             "an ordinary local workspace must be archivable"
         );
+    }
+
+    #[test]
+    fn chat_child_delete_refusal_does_not_call_it_the_root_checkout() {
+        let mut ws = sample_workspace();
+        ws.worktree_path = None;
+        ws.protected = false;
+        ws.workspace_kind = None;
+        ws.parent_workspace_id = Some("workspace-parent".into());
+        let reason = refuse_worktree_removal(&ws).expect("a chat child owns no files");
+        assert!(!reason.contains("root checkout"), "{reason}");
+        assert!(reason.contains("Archive or close it instead"), "{reason}");
+    }
+
+    /// Archive entries normally dedupe by folder, and restore reuses a live
+    /// workspace at the same folder. Chat child workspaces share their
+    /// parent's folder, so each must archive and restore as itself.
+    #[tokio::test]
+    async fn chat_children_sharing_a_folder_archive_and_restore_independently() {
+        use tauri::Manager;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().display().to_string();
+        let store = AppStateStore::default();
+        let parent = store.create_empty_workspace_at_path(dir.path().to_path_buf()).0;
+        let mut children = vec![];
+        for title in ["Child A", "Child B"] {
+            let id = AppStateStore::reserve_workspace_id();
+            store.create_chat_child_workspace(&id, &parent, &cwd, title).unwrap();
+            children.push(id.0);
+        }
+        let app = tauri::test::mock_app();
+        app.manage(store);
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(crate::terminal::PtyState::default());
+        let presets = crate::presets::PresetStoreState::new(&app.state::<crate::database::DatabaseStore>());
+        let state = app.state::<AppStateStore>();
+        let db = app.state::<crate::database::DatabaseStore>();
+        let pty = app.state::<crate::terminal::PtyState>();
+
+        let mut archives = vec![];
+        for child in &children {
+            archives.push(archive_workspace_impl(app.handle().clone(), &state, &db, child.clone()).await.unwrap());
+        }
+        // A folder entry for the same path does not evict them either.
+        let mut folder = build_archive_entry(&state.find_workspace(&parent).unwrap());
+        folder.workspace_id = "workspace-gone".into();
+        state.add_archived_workspace(folder);
+        assert_eq!(state.archived_workspaces_list().len(), 3);
+
+        // The parent is live at the same folder; neither restore reuses it
+        // or each other.
+        let mut restored = vec![];
+        for (archive, title) in archives.into_iter().zip(["Child A", "Child B"]) {
+            let id = unarchive_workspace_impl_with_selection(
+                app.handle().clone(), &state, &db, &pty, &presets, archive, false,
+            )
+            .await
+            .unwrap();
+            let ws = state.find_workspace(&id).unwrap();
+            assert_ne!(id, parent);
+            assert_eq!(ws.title, title);
+            assert_eq!(ws.parent_workspace_id.as_deref(), Some(parent.as_str()));
+            assert_eq!(ws.worktree_path, None);
+            assert_eq!(ws.cwd, cwd);
+            assert!(ws.tabs.is_empty(), "restore starts no terminal");
+            restored.push(id);
+        }
+        assert_ne!(restored[0], restored[1]);
+        assert_eq!(state.archived_workspaces_list().len(), 1, "only the folder entry is left");
+        assert_eq!(state.snapshot().active_workspace_id.0, parent);
     }
 }
 

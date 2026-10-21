@@ -64,7 +64,7 @@ const CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: another coding agent handed y
 /// The footer for a started suggested task, which runs on its own branch.
 pub(crate) const WORKTREE_CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: the user started this task from another chat's suggestions; that chat will read your final message. You are in your own git worktree on a new branch made from that chat's latest commit (its uncommitted edits are not here). Work independently. Ask a question if truly blocked; it reaches the coordinator. Otherwise choose a safe option and explain it. When done, COMMIT all of your work on this branch (do not push, do not switch branches) so it can be merged back; leave nothing uncommitted. End with a short report: what you changed (files), the commit(s), how you checked it, and anything left undone.";
 
-const TOOL_DESCRIPTION: &str = "Delegate a self-contained task to another installed coding agent in a background chat. The child sees only the brief. Results arrive independently through durable automatic delivery. Use client_request_id for retries: the same key and unchanged task arguments return the same task and child; async/wait controls may change on a retry. mode defaults to async; wait waits at most 20 seconds without cancelling on timeout. Use task_status/task_cancel with task_id; child_thread_id is a different identity. Read a complete terminal result with task_status to acknowledge its automatic delivery. Chat links use codemux-chat://v1/<threadId>. For another independent review round, delegate again with a fresh key and complete brief. End your turn after async delegation; do not poll. If the brief asks you to report to a coordinator, use thread_send to that chat.";
+const TOOL_DESCRIPTION: &str = "Delegate a self-contained task to another installed coding agent in a background chat on this device. Each child gets its own workspace, nested under yours in the same folder. The child sees only the brief. Results arrive independently through durable automatic delivery. Use client_request_id for retries: the same key and unchanged task arguments return the same task and child; async/wait controls may change on a retry. mode defaults to async; wait waits at most 20 seconds without cancelling on timeout. Use task_status/task_cancel with task_id; child_thread_id is a different identity. Read a complete terminal result with task_status to acknowledge its automatic delivery. Chat links use codemux-chat://v1/<threadId>. For another independent review round, delegate again with a fresh key and complete brief. End your turn after async delegation; do not poll. If the brief asks you to report to a coordinator, use thread_send to that chat.";
 
 mod durable;
 #[cfg(test)]
@@ -112,13 +112,13 @@ impl StopReason {
             Self::User => "The user stopped this task. Partial changes may be in the working tree.",
             Self::AgentCancellation => "The parent agent cancelled this task. Partial changes may be in the working tree.",
             Self::TabClosed => {
-                "The user closed its tab. Partial changes may be in the working tree."
+                "The user closed its chat. Partial changes may be in the working tree."
             }
             Self::WorkspaceClosed => {
                 "The user closed its chat or workspace. Its branch keeps whatever it committed."
             }
             Self::Restarted => {
-                "Its chat was restarted or replaced in its tab before it finished; partial work is in the tab."
+                "Its chat was restarted or replaced before it finished; partial work is in its workspace."
             }
             Self::Parent => "Stopped together with this chat.",
             Self::AppClosed => "Codemux closed before this task finished.",
@@ -146,10 +146,10 @@ impl Phase {
 /// Where a task's child chat runs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum Placement {
-    /// `delegate_task`: a background tab of the parent's workspace, in the
-    /// same folder.
+    /// `delegate_task`: its own background workspace nested under the
+    /// parent's, in the same folder. It closes with the parent's workspace.
     #[default]
-    Tab,
+    Shared,
     /// A suggested task the user started: its own workspace on its own git
     /// worktree branch.
     Worktree(WorktreePlacement),
@@ -164,16 +164,13 @@ pub(crate) struct WorktreePlacement {
 }
 
 impl Placement {
-    fn is_tab(&self) -> bool {
-        matches!(self, Self::Tab)
+    fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared)
     }
 
     /// Where the user goes to watch the child, for activity lines.
     fn place(&self) -> &'static str {
-        match self {
-            Self::Tab => "its tab",
-            Self::Worktree(_) => "its workspace",
-        }
+        "its workspace"
     }
 }
 
@@ -244,7 +241,7 @@ impl Task {
             usage_reset_ms: None,
             idle_passes: 0,
             activity: String::new(),
-            placement: Placement::Tab,
+            placement: Placement::Shared,
         }
     }
 
@@ -501,7 +498,7 @@ impl DelegationState {
             task.phase = phase;
             task.finished_at_ms = Some(now_ms());
             task.refresh_activity();
-            let worktree_outcome = (!task.placement.is_tab()).then(|| outcome_id(&task.phase));
+            let worktree_outcome = (!task.placement.is_shared()).then(|| outcome_id(&task.phase));
             (task.parent.clone(), worktree_outcome)
         };
         if let Err(error) = publish_finished(app, child) {
@@ -565,7 +562,7 @@ pub(crate) fn provider_id(provider: ProviderKind) -> &'static str {
     }
 }
 
-pub(super) fn provider_label(provider: ProviderKind) -> &'static str {
+pub(crate) fn provider_label(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Claude => "Claude",
         ProviderKind::Codex => "Codex",
@@ -760,7 +757,7 @@ fn snapshot(child_thread_id: &str, task: &Task) -> SubagentSnapshot {
         task_id: Some(task.task_id.clone()),
         subagent_id: format!("{DELEGATED_ROW_PREFIX}{child_thread_id}"),
         parent_item_id: match &task.placement {
-            Placement::Tab => task.tool_call_id.clone(),
+            Placement::Shared => task.tool_call_id.clone(),
             Placement::Worktree(worktree) => Some(worktree.suggestion.clone()),
         },
         name: Some(provider_label(task.provider).to_string()),
@@ -1130,7 +1127,8 @@ fn delegate_with_call<R: Runtime>(
         ));
     }
 
-    // The child joins the workspace the parent's pane is in right now.
+    // The child gets its own workspace, nested under the one the parent's
+    // pane is in right now, in the parent's folder.
     let workspace = app_state
         .agent_chat_pane_id_for_thread(parent)
         .and_then(|pane| app_state.workspace_id_for_pane(&pane))
@@ -1144,6 +1142,8 @@ fn delegate_with_call<R: Runtime>(
         .unwrap_or_else(|| workspace.cwd.clone());
 
     let child = uuid::Uuid::new_v4().to_string();
+    // Named before admission so the durable record points at it.
+    let child_workspace = AppStateStore::reserve_workspace_id();
     // Serialize capacity reservation and durable admission for concurrent calls.
     let (record, siblings) = state.admit(caller.control.as_ref(), |inner| {
         if let Some(key) = &args.client_request_id {
@@ -1152,7 +1152,7 @@ fn delegate_with_call<R: Runtime>(
             }
         }
         let mut record = record_of(&child, &task);
-        record.workspace_id = workspace_id.clone();
+        record.workspace_id = child_workspace.0.clone();
         record.cwd = cwd.clone();
         record.parent_run_id = run_id.map(str::to_string).or_else(|| {
             app.try_state::<crate::agent_control::NativeControlState>()
@@ -1190,24 +1190,32 @@ fn delegate_with_call<R: Runtime>(
         inner.tasks.insert(child.clone(), task.clone());
         Ok((record, Some(siblings)))
     })?;
-    let Some(siblings) = siblings else { return Ok(task_receipt(&record)); };
+    if siblings.is_none() { return Ok(task_receipt(&record)); }
     let tab_title = format!("{} · {}", provider_label(provider), task.title);
-    let pane = app_state.create_background_chat_tab(
-        &workspace_id,
-        provider,
-        Some(cwd.clone()),
-        &child,
-        parent,
-        &siblings,
-        &tab_title,
-    );
+    let pane = app_state
+        .create_chat_child_workspace(&child_workspace, &workspace_id, &cwd, &task.title)
+        .and_then(|_| {
+            app_state.create_background_chat_tab(
+                &child_workspace.0,
+                provider,
+                Some(cwd.clone()),
+                &child,
+                parent,
+                &[],
+                &tab_title,
+            )
+        });
     let pane_id = match pane {
         Ok(pane) => pane.0,
         Err(error) => {
+            if app_state.find_workspace(&child_workspace.0).is_some_and(|w| w.surfaces.is_empty()) {
+                let _ = app_state.close_workspace(&child_workspace.0);
+                crate::state::emit_app_state(app);
+            }
             state.finish(
                 app,
                 &child,
-                Phase::Failed(format!("Could not open task tab: {error}")),
+                Phase::Failed(format!("Could not open task workspace: {error}")),
             );
             return Ok(task_receipt(
                 &db.delegation_task(&record.task_id)?
@@ -1301,7 +1309,7 @@ pub(crate) async fn run_starter<R: Runtime>(
     let failure = match tokio::time::timeout(START_TIMEOUT, start).await {
         Ok(Ok(_)) if !state.is_starting(&child) => return,
         Ok(Ok(_)) => {
-            let footer = if task.placement.is_tab() {
+            let footer = if task.placement.is_shared() {
                 CHILD_FOOTER
             } else {
                 WORKTREE_CHILD_FOOTER
@@ -1675,14 +1683,14 @@ fn close_tasks<R: Runtime>(app: &AppHandle<R>, thread: &str) {
         log::warn!("Could not cancel closed chat's SSH tasks: {error}");
     }
     let Some(state) = app.try_state::<DelegationState>() else { return; };
-    let reason = if state.task_matches(thread, |task| !task.placement.is_tab()) {
+    let reason = if state.task_matches(thread, |task| !task.placement.is_shared()) {
         StopReason::WorkspaceClosed
     } else { StopReason::TabClosed };
     if let Some(parent) = state.finish(app, thread, Phase::Stopped(reason)) {
         spawn_deliver(app, &parent, Duration::ZERO);
     }
     let children: Vec<_> = state.lock().tasks.iter()
-        .filter(|(_, task)| task.parent == thread && task.placement.is_tab())
+        .filter(|(_, task)| task.parent == thread && task.placement.is_shared())
         .map(|(child, task)| (child.clone(), task.clone())).collect();
     for (child, task) in children {
         crate::delegation::authority::NativeAuthority::user_activity_thread(&child, true);
@@ -2131,12 +2139,12 @@ mod tests {
         waiting.open_requests.insert("req".into());
         assert_eq!(
             snapshot("c", &waiting).activity.as_deref(),
-            Some("Waiting for your answer in its tab")
+            Some("Waiting for your answer in its workspace")
         );
         waiting.open_requests.clear();
         assert_eq!(
             snapshot("c", &waiting).activity.as_deref(),
-            Some("Working in its tab")
+            Some("Working in its workspace")
         );
         waiting.paused_until = Some(1_800_000_000_000);
         assert!(snapshot("c", &waiting)
@@ -2151,7 +2159,7 @@ mod tests {
         assert_eq!(done.duration_ms, Some(372_000));
         assert!(done
             .result_text
-            .is_some_and(|text| text.ends_with("… Full report in its tab")));
+            .is_some_and(|text| text.ends_with("… Full report in its workspace")));
         let stopped = snapshot("c", &task(0, Phase::Stopped(StopReason::AppClosed)));
         assert_eq!(stopped.status, SubagentStatus::Stopped);
         assert_eq!(
