@@ -3128,3 +3128,29 @@ async fn all_provider_hermes_only_machine_still_offers_delegation() {
     let delegate = host.tools_for(&caller).into_iter().find(|t| t.name == "delegate_task").unwrap();
     assert!(delegate.input_schema["properties"]["provider"].get("enum").is_none(), "no empty provider enum");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_provider_premium_codex_tiers_start_delegated_children() {
+    use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, provider, _root, workspace, thread, _authority, actor) =
+        native_caller_provider_fixture(ProviderKind::Codex, "danger-full-access").await;
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap()
+        .insert(ProviderKind::Codex, premium_codex_capabilities());
+    let caller = HostCaller { control: Some(native::qualify(app.handle(), &actor).await.unwrap()), thread_id: thread.clone(), provider: ProviderKind::Codex, workspace_id: Some(workspace), permission_mode: Some("danger-full-access".into()) };
+    let host = crate::commands::delegation::DelegationHost::with_install_check(app.handle().clone(), |_| true);
+    for tier in ["priority", "ultrafast"] {
+        let result = host.call_async(&caller, "mcp__codemux__delegate_task", &json!({"target":{"instance_id":"codex","model":"premium-model","options":{"service_tier":tier}},"title":format!("{tier} child"),"task":"Compute 17 plus 18 without using any tools."}), None, None).await.unwrap();
+        assert_ne!(result["isError"], true, "{tier}: {result}");
+        let task_id = serde_json::from_str::<serde_json::Value>(result["content"][0]["text"].as_str().unwrap()).unwrap()["task_id"].as_str().unwrap().to_string();
+        let child = app.state::<crate::database::DatabaseStore>().delegation_task(&task_id).unwrap().unwrap().child_thread_id.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if provider.start_inputs().iter().any(|input| input.thread_id.0 == child && input.service_tier.as_deref() == Some(tier)) { break; }
+                let task = app.state::<crate::database::DatabaseStore>().delegation_task(&task_id).unwrap().unwrap();
+                assert!(!task.status.terminal(), "{tier} child ended before starting: {task:?}");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap_or_else(|_| panic!("the {tier} child started"));
+    }
+}

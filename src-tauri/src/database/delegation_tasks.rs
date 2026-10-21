@@ -651,10 +651,13 @@ impl DatabaseStore {
                     .and_then(|options| options.get("fast_mode"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                // Stored as a session-config write would: the tier, else the
+                // legacy flag, and the flag always derived from the tier.
                 let tier = options
                     .and_then(|options| options.get("service_tier"))
                     .and_then(Value::as_str)
-                    .unwrap_or("default");
+                    .unwrap_or(if fast { "fast" } else { "default" });
+                let fast = crate::database::legacy_fast_mode(tier);
                 tx.execute("INSERT INTO agent_chat_sessions (thread_id,workspace_id,cwd,provider,title,model,effort,permission_mode,context_window,fast_mode,service_tier) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(thread_id) DO NOTHING",params![child,task.workspace_id,task.cwd,task.provider,task.title,task.model,task.effort,task.permission_mode,context,fast,tier]).map_err(|e|e.to_string())?;
             }
         }

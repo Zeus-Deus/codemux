@@ -1146,13 +1146,32 @@ impl OpenCodeSession {
             let _outbound = self.outbound.lock().await;
             // A rejected switch must leave the previous selection in force.
             if self.server_handle.api == super::api::OpenCodeApi::V2 {
-                self.switch_native_agent(agent).await?;
                 // A running turn continues in the new agent, so its Codemux
-                // calls take the new policy now: calls admitted under the old
-                // one end. OpenCode 1 chats carry no Codemux tools.
-                if let Some(mcp) = &self.mcp {
-                    mcp.session.set_mode(Some(Self::gateway_mode(agent).into()));
+                // calls take the new policy: calls admitted under the old one
+                // end, and none is admitted while the switch is in flight.
+                // OpenCode 1 chats carry no Codemux tools.
+                let mode = Self::gateway_mode(agent);
+                let _transition = self
+                    .mcp
+                    .as_ref()
+                    .filter(|mcp| mcp.session.caller().permission_mode.as_deref() != Some(mode))
+                    .map(|mcp| mcp.session.authority.policy_transition());
+                let switched = self.switch_native_agent(agent).await;
+                // A refused switch keeps the old policy. One whose answer was
+                // lost may still have landed, so a switch to Plan fails
+                // closed, and the next prompt re-reads the server's agent
+                // before applying its own.
+                let ambiguous = matches!(&switched, Err(ProviderError::RpcError { message })
+                    if message.starts_with("agent_send_failed"));
+                if ambiguous {
+                    *self.applied_agent.lock().await = None;
                 }
+                if let Some(mcp) = &self.mcp {
+                    if switched.is_ok() || (ambiguous && mode == "plan") {
+                        mcp.session.set_mode(Some(mode.into()));
+                    }
+                }
+                switched?;
             }
             *self.agent.lock().await = Some(agent);
             Ok(())
@@ -4061,6 +4080,77 @@ pub(crate) mod tests {
         assert!(session.select_agent("build").await.is_err());
         refused.assert_async().await;
         assert_eq!(gateway.caller().permission_mode.as_deref(), Some("plan"));
+    }
+
+    /// No Codemux call is admitted while a live switch is in flight, and the
+    /// calls admitted before it end as it starts.
+    #[tokio::test]
+    async fn a_live_agent_switch_fences_codemux_calls_while_in_flight() {
+        let mut server = Server::new_async().await;
+        let _agents = server
+            .mock("GET", "/api/agent")
+            .with_status(200)
+            .with_body(r#"{"data":[]}"#)
+            .create_async()
+            .await;
+        let (arrived, arrival) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new((arrived, released));
+        let _switch = server
+            .mock("POST", "/api/session/s/agent")
+            .with_status(204)
+            .with_body_from_request(move |_| {
+                let gate = gate.lock().unwrap();
+                gate.0.send(()).unwrap();
+                gate.1.recv().unwrap();
+                Vec::new()
+            })
+            .create_async()
+            .await;
+        let thread = "opencode-in-flight-agent-switch";
+        let mcp = crate::agent_provider::acp::mcp::ChatMcp::new(
+            McpRegistry::default(),
+            thread,
+            ProviderKind::OpenCode,
+            None,
+            Some("default".into()),
+            "codemux_fence".into(),
+            None,
+            vec![],
+            false,
+        );
+        let gateway = mcp.session.clone();
+        let (session, _, _, _) = mock_session_with_mcp(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+            thread,
+            Some(mcp),
+        )
+        .await;
+        gateway.begin("turn-build", None).unwrap();
+        let permit = gateway.authority.capture();
+        let call = tokio::spawn(std::future::pending::<()>());
+        gateway.authority.track(&permit, call.abort_handle());
+        let switching = {
+            let session = session.clone();
+            tokio::spawn(async move { session.select_agent("plan").await })
+        };
+        tokio::task::spawn_blocking(move || {
+            arrival.recv_timeout(std::time::Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .expect("the switch reached the server");
+        // Mid-switch: the Build call has ended and no new call is admitted.
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), call).await;
+        assert!(ended.expect("the Build call kept running").unwrap_err().is_cancelled());
+        assert!(gateway.authority.capture().wait_ready().await.is_err());
+        release.send(()).unwrap();
+        switching.await.unwrap().unwrap();
+        assert_eq!(gateway.caller().permission_mode.as_deref(), Some("plan"));
+        gateway.authority.capture().wait_ready().await.unwrap();
     }
 
     #[tokio::test]

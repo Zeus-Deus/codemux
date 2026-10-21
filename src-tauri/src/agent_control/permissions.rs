@@ -131,7 +131,15 @@ impl Ceiling {
             Codex if self.filesystem == 2 && self.approvals == 2 => "danger-full-access",
             Codex if self.filesystem >= 1 && self.approvals >= 1 => "workspace-write",
             Codex => "read-only",
-            Cursor | Grok if self.plan => "plan",
+            Cursor if self.plan => "plan",
+            // Grok offers only Ask and Agent, neither of which keeps a Plan
+            // chat's intent; its start would turn `plan` into Ask.
+            Grok if self.plan => {
+                return Err(ControlError::new(
+                    "unsupported_permission_ceiling",
+                    "Grok has no planning mode within this chat's Plan policy",
+                ))
+            }
             Cursor | Grok if self.filesystem == 2 && self.approvals == 2 => "agent",
             Cursor | Grok => "ask",
             Hermes if self.full_access() => "dont_ask",
@@ -317,5 +325,15 @@ mod provider_reach_tests {
         assert!(plan.inherited(Hermes).is_err(), "Hermes has no plan mode");
         assert!(!plan.permits(mode(OpenCode, "default")));
         assert!(!mode(Claude, "plan").permits(plan));
+    }
+
+    #[test]
+    fn plan_callers_get_no_grok_child_since_grok_cannot_plan() {
+        for (provider, parent) in [(Claude, "plan"), (Codex, "plan"), (Cursor, "plan"), (OpenCode, "plan")] {
+            let plan = mode(provider, parent);
+            assert!(plan.inherited(Grok).is_err(), "{provider:?} {parent}");
+            assert!(plan.inherited_workspace(Grok).is_err(), "{provider:?} {parent}");
+            assert_eq!(plan.inherited(Cursor).unwrap(), "plan");
+        }
     }
 }
