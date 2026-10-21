@@ -1800,6 +1800,12 @@ impl AgentProvider for HermesProvider {
                 "unsupported: edit policy is not advertised by Hermes",
             ));
         }
+        // Callbacks never span the provider RPC; a failed change keeps the
+        // old policy for later calls.
+        let _transition = chat
+            .mcp
+            .as_ref()
+            .map(|mcp| mcp.session.authority.policy_transition());
         let mut b = chat.binding.lock().await.clone();
         chat.runtime
             .child

@@ -151,9 +151,9 @@ impl Ceiling {
     pub fn inherited_workspace(self, provider: ProviderKind) -> Result<Option<String>, ControlError> {
         use ProviderKind::*;
         let mode = match provider {
-            Claude | Codex => Some(self.inherited(provider)?),
-            Cursor | Grok => Some(if self.full_access() { "agent" } else { "ask" }.into()),
-            OpenCode if self.full_access() => None,
+            Claude | Codex | Cursor | Grok | Hermes => Some(self.inherited(provider)?),
+            // OpenCode has no chat permission picker; its default is unset.
+            OpenCode => Some(self.inherited(provider)?).filter(|mode| mode != "default"),
             _ => return Err(ControlError::new("unsupported_permission_ceiling", "This provider has no workspace permission mapping within this chat's effective policy")),
         };
         if !Self::for_mode(provider, mode.as_deref()).is_some_and(|target| self.permits(target)) {
@@ -181,7 +181,7 @@ mod tests {
             }
             assert_eq!(ceiling.inherited_workspace(OpenCode).is_ok(), ceiling.full_access());
             if ceiling.full_access() { assert_eq!(ceiling.inherited_workspace(OpenCode).unwrap(), None); }
-            assert!(ceiling.inherited_workspace(Hermes).is_err());
+            assert_eq!(ceiling.inherited_workspace(Hermes).ok().flatten().as_deref(), ceiling.full_access().then_some("dont_ask"));
         }
     }
 }

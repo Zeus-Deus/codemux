@@ -14,9 +14,11 @@ fn same_admission_payload(saved: &str, requested: &Value) -> bool {
         if let Some(object) = value.as_object_mut() {
             object.remove("mode");
             object.remove("wait_ms");
-            // Older admissions omitted this optional field entirely.
-            if object.get("permission_mode").is_some_and(Value::is_null) {
-                object.remove("permission_mode");
+            // Older admissions omitted these optional fields entirely.
+            for key in ["permission_mode", "target"] {
+                if object.get(key).is_some_and(Value::is_null) {
+                    object.remove(key);
+                }
             }
         }
     }
@@ -924,6 +926,20 @@ mod tests {
             retry["permission_mode"] = serde_json::json!(mode);
             assert!(db.delegation_retry("parent", "upgrade-key", &retry).unwrap_err().contains("client_request_id_conflict"));
         }
+    }
+
+    #[test]
+    fn legacy_admission_without_a_target_retries_as_the_same_task() {
+        let db = DatabaseStore::new_in_memory();
+        let task = TaskRecord::new("legacy-target".into(), "parent".into(), Some("child".into()), "codex".into(), "Review".into(), "Review the saved task".into(), 1);
+        // Payload shape saved before typed provider targets existed.
+        let old = serde_json::json!({"provider":"codex","title":"Review","task":"Review the saved task","model":null,"effort":null,"role":null,"mode":"async","wait_ms":20000,"permission_mode":null});
+        db.admit_delegation_task(&task, Some("target-key"), &old).unwrap();
+        let mut retry = old.clone();
+        retry["target"] = Value::Null;
+        assert_eq!(db.delegation_retry("parent", "target-key", &retry).unwrap().unwrap().task_id, task.task_id);
+        retry["target"] = serde_json::json!({"instance_id":"codex:account-b","model":null,"options":{}});
+        assert!(db.delegation_retry("parent", "target-key", &retry).unwrap_err().contains("client_request_id_conflict"));
     }
 
     #[test]

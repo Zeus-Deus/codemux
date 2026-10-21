@@ -55,7 +55,11 @@ impl GatewaySession {
     pub(crate) fn contacted(&self) -> bool {
         self.contacted.load(std::sync::atomic::Ordering::Relaxed)
     }
+    /// A changed mode is a policy transition: callbacks admitted under the
+    /// old reach end, later ones run under the new one. Stop is separate.
     pub(crate) fn set_mode(&self, mode: Option<String>) {
+        let changed = *self.mode.lock().unwrap() != mode;
+        let _transition = changed.then(|| self.authority.policy_transition());
         self.authority.set_policy(self.provider, mode.as_deref());
         *self.mode.lock().unwrap() = mode;
     }
@@ -110,5 +114,33 @@ impl GatewayBinding {
     }
     pub(crate) fn current(&self) -> bool {
         self.session.authority.session_live()
+    }
+}
+
+#[cfg(test)]
+mod policy_transition_tests {
+    use super::*;
+    use crate::agent_control::permissions::Ceiling;
+
+    #[tokio::test]
+    async fn a_mode_change_ends_callbacks_admitted_under_the_old_policy() {
+        let thread = "gateway-mode-transition";
+        let session = GatewaySession::new(thread, ProviderKind::Cursor, None, Some("agent".into()));
+        session.begin("turn", None).unwrap();
+        let old = session.authority.capture();
+        let job = tokio::spawn(std::future::pending::<()>());
+        session.authority.track(&old, job.abort_handle());
+        // A replayed notification of the current mode changes nothing.
+        session.set_mode(Some("agent".into()));
+        old.wait_ready().await.unwrap();
+        session.set_mode(Some("ask".into()));
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), job).await;
+        assert!(ended.expect("old callback kept running").unwrap_err().is_cancelled());
+        assert!(old.wait_ready().await.is_err());
+        session.authority.capture().wait_ready().await.unwrap();
+        assert_eq!(
+            NativeAuthority::effective_ceiling(thread).unwrap(),
+            Ceiling::for_mode(ProviderKind::Cursor, Some("ask"))
+        );
     }
 }

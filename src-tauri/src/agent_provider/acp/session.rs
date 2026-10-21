@@ -1904,6 +1904,12 @@ impl AcpSession {
                     .into(),
             });
         }
+        // Callbacks never span the provider RPC; a failed change keeps the
+        // old policy for later calls.
+        let _transition = self
+            .mcp
+            .as_ref()
+            .map(|mcp| mcp.session.authority.policy_transition());
         // `mode` is a stable ACP config option. Cursor's current values are
         // Agent/Ask; resolve through the advertised options when available.
         self.set_semantic_config(ConfigKind::Mode, &mode, true)

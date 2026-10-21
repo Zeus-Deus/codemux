@@ -203,7 +203,10 @@ impl McpGatewayRuntime {
             .entry(key.to_string())
             .or_insert_with(new_token)
             .clone();
-        grants.callers.insert(token.clone(), caller);
+        let replaced = grants.callers.insert(token.clone(), caller);
+        // A replaced session revokes its authority on drop; not under the map.
+        drop(grants);
+        drop(replaced);
         McpGatewayConnection {
             url: self.connection.url.clone(),
             bearer_token: token,
@@ -214,13 +217,17 @@ impl McpGatewayRuntime {
     pub fn revoke(&self, prefix: &str) {
         let mut grants = self.grants.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let Grants { tokens, callers } = &mut *grants;
+        let mut revoked = Vec::new();
         tokens.retain(|key, token| {
             let keep = !key.starts_with(prefix);
             if !keep {
-                callers.remove(token);
+                revoked.extend(callers.remove(token));
             }
             keep
         });
+        // Revoked sessions end their authority on drop; not under the map.
+        drop(grants);
+        drop(revoked);
     }
 }
 
@@ -613,14 +620,19 @@ fn authenticate(headers: &HeaderMap, state: &GatewayState) -> Option<GatewayCall
             native: None,
         });
     }
-    let grants = state.grants.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    grants.callers.get(token)
-        .filter(|caller| {
-            caller
-                .native
-                .as_ref()
-                .is_none_or(|binding| binding.current())
-        }).cloned()
+    // Release the grant map before asking the session's authority.
+    let caller = state
+        .grants
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .callers
+        .get(token)
+        .cloned()?;
+    caller
+        .native
+        .as_ref()
+        .is_none_or(|binding| binding.current())
+        .then_some(caller)
 }
 
 /// MCP's HTTP transport requires Origin validation to prevent DNS rebinding.

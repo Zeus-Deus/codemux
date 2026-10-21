@@ -958,7 +958,17 @@ impl Session {
     }
     async fn set_config(&self, id: &str, value: Value) -> Result<AcpCatalog, ProviderError> {
         let _control = self.control.lock().await;
-        self.set_config_locked(id, value, None).await
+        // Any option may change the agent's reach, so the change is a policy
+        // transition and the ceiling follows the catalog the agent reports.
+        let Some(mcp) = &self.mcp else {
+            return self.set_config_locked(id, value, None).await;
+        };
+        let _transition = mcp.session.authority.policy_transition();
+        let result = self.set_config_locked(id, value, None).await;
+        let policy =
+            crate::agent_control::permissions::Ceiling::opaque_policy(&*self.binding.lock().await);
+        mcp.session.authority.set_ceiling(policy);
+        result
     }
     // Caller owns control; internal turn overrides must not re-enter the gate.
     async fn set_config_locked(&self, id: &str, value: Value, turn: Option<&TurnId>) -> Result<AcpCatalog, ProviderError> {
