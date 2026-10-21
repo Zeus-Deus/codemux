@@ -2516,6 +2516,7 @@ async fn settle_native(app: &tauri::App<tauri::test::MockRuntime>, actor: &crate
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_launch_without_workspace_gets_its_own_titled_child_workspace() {
+    if crate::state::run_with_isolated_layout("agent_control::tests::native_launch_without_workspace_gets_its_own_titled_child_workspace") { return; }
     use crate::agent_provider::ProviderKind;
     let (app, _, root, workspace, _thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
     let state = app.state::<crate::state::AppStateStore>();
@@ -2595,6 +2596,7 @@ async fn native_launch_without_workspace_gets_its_own_titled_child_workspace() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delegated_children_get_child_workspaces_that_close_with_the_parent() {
+    if crate::state::run_with_isolated_layout("agent_control::tests::delegated_children_get_child_workspaces_that_close_with_the_parent") { return; }
     use crate::mcp::registry::{HostCaller, HostTools};
     let (app, _, root, workspace, thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
     app.manage(crate::terminal::PtyState::default());

@@ -886,6 +886,11 @@ mod delegation {
         let card = h.card(&child);
         assert_eq!(card.status, SubagentStatus::Stopped);
         assert_eq!(card.result_text.as_deref(), Some(STOPPED_WITH_PARENT));
+        // Its own workspace closed with it.
+        let child_workspace = h.db().delegation_task_for_child(&child).unwrap().unwrap().workspace_id;
+        assert_ne!(child_workspace, h.workspace);
+        assert!(h.app_state().find_workspace(&child_workspace).is_none());
+        assert!(h.app_state().find_workspace(&h.workspace).is_some());
         wait_for("the orphaned child to be interrupted", || {
             h.interrupted(ProviderKind::Codex, &child)
         })

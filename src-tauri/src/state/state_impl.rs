@@ -701,6 +701,12 @@ pub struct WorkspaceSnapshot {
 }
 
 impl WorkspaceSnapshot {
+    /// A workspace started for an agent's chat: it borrows the folder of
+    /// the workspace it came from and owns no files.
+    pub fn is_chat_child(&self) -> bool {
+        self.parent_workspace_id.is_some() && self.worktree_path.is_none()
+    }
+
     /// Legacy import shells were the only attach-only workspaces without a
     /// host id or remote cwd. Remote attach-in-place shells retain remote_cwd
     /// even on host reassignment. New layouts use explicit provenance so host
@@ -774,6 +780,31 @@ struct ChatChildWorkspace {
     host_id: Option<i64>,
     remote_cwd: Option<String>,
     remote_root: Option<String>,
+    attach_only: bool,
+    imported_snapshot_only: Option<bool>,
+}
+
+/// Checkouts whose files are being removed, one entry per fence.
+static REMOVING_CHECKOUTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn checkout_being_removed(path: &Path) -> bool {
+    REMOVING_CHECKOUTS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|root| crate::workspace_paths::path_within(path, root))
+}
+
+/// See [`AppStateStore::fence_checkout_removal`].
+pub struct CheckoutRemovalFence(PathBuf);
+
+impl Drop for CheckoutRemovalFence {
+    fn drop(&mut self) {
+        let mut removing = REMOVING_CHECKOUTS.lock().unwrap();
+        if let Some(index) = removing.iter().position(|root| root == &self.0) {
+            removing.remove(index);
+        }
+    }
 }
 
 /// An archive entry for a chat child workspace: no worktree of its own, and
@@ -2024,6 +2055,9 @@ impl AppStateStore {
         if snapshot.workspaces.iter().any(|w| &w.workspace_id == id) {
             return Ok(id.clone());
         }
+        if checkout_being_removed(Path::new(cwd)) {
+            return Err(format!("{cwd} is being deleted"));
+        }
         let parent = snapshot
             .workspaces
             .iter()
@@ -2045,10 +2079,27 @@ impl AppStateStore {
                     host_id: parent.host_id,
                     remote_cwd: parent.remote_cwd.clone(),
                     remote_root: parent.remote_root.clone(),
+                    attach_only: parent.attach_only,
+                    imported_snapshot_only: parent.imported_snapshot_only,
                 },
             );
         });
         Ok(id.clone())
+    }
+
+    /// Run `check` on the current state and, when it passes, fence `root`
+    /// until the returned guard drops: no chat child workspace can be
+    /// created inside it meanwhile. Both happen under the state lock, so
+    /// none appears between the check and the fence.
+    pub fn fence_checkout_removal(
+        &self,
+        root: &Path,
+        check: impl FnOnce(&AppStateSnapshot) -> Result<(), String>,
+    ) -> Result<CheckoutRemovalFence, String> {
+        let snapshot = self.inner.lock().unwrap();
+        check(&snapshot)?;
+        REMOVING_CHECKOUTS.lock().unwrap().push(root.to_path_buf());
+        Ok(CheckoutRemovalFence(root.to_path_buf()))
     }
 
     /// Restore an archived chat child workspace with its title, project
@@ -2072,9 +2123,13 @@ impl AppStateStore {
                     project_uid: entry.project_uid.clone(),
                     is_git: entry.is_git,
                     git_branch: entry.git_branch.clone(),
+                    // Archiving refuses host-bound and attach-only
+                    // workspaces, so an entry never carries either.
                     host_id: None,
                     remote_cwd: None,
                     remote_root: None,
+                    attach_only: false,
+                    imported_snapshot_only: None,
                 },
             );
         });
@@ -2101,6 +2156,8 @@ impl AppStateStore {
         workspace.host_id = child.host_id;
         workspace.remote_cwd = child.remote_cwd;
         workspace.remote_root = child.remote_root;
+        workspace.attach_only = child.attach_only;
+        workspace.imported_snapshot_only = child.imported_snapshot_only;
         snapshot.active_workspace_id = id;
     }
 
@@ -7148,6 +7205,31 @@ fn normalize_sizes(mut sizes: Vec<f32>) -> Vec<f32> {
     }
 
     sizes.into_iter().map(|size| size / total).collect()
+}
+
+/// Re-run the test at `path` (e.g. `commands::workspace::tests::name`) in a
+/// child process whose layout persistence goes to a temporary file. Returns
+/// true in the parent, which should return at once; false in the child,
+/// which runs the body. Any test that emits app state needs this: an emit
+/// persists the layout, by default to the user's own file.
+#[cfg(test)]
+pub(crate) fn run_with_isolated_layout(path: &str) -> bool {
+    if std::env::var_os("CODEMUX_TEST_LAYOUT_PATH").is_some() {
+        return false;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", path, "--nocapture"])
+        .env("CODEMUX_TEST_LAYOUT_PATH", root.path().join("layout.json"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "isolated test {path}: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    true
 }
 
 fn persisted_layout_path() -> Option<PathBuf> {
