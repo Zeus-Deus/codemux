@@ -485,6 +485,13 @@ impl Session {
     }
     async fn publish_catalog(&self) -> Result<(), ProviderError> {
         let binding = self.binding.lock().await;
+        // Every accepted catalog mutation, solicited or not, keeps the
+        // gateway's ceiling on the fingerprint orchestration validates.
+        if let Some(mcp) = &self.mcp {
+            mcp.session.authority.transition_ceiling(
+                crate::agent_control::permissions::Ceiling::opaque_policy(&binding),
+            );
+        }
         if self.durable.load(Ordering::SeqCst) {
             self.store
                 .update_binding(&binding)

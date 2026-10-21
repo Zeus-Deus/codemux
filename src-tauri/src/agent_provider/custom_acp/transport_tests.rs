@@ -193,3 +193,54 @@ async fn all_provider_custom_acp_new_load_resume_inject_and_discovery_stays_unpr
         }
     }
 }
+
+/// An unsolicited mid-turn catalog notification changes the opaque policy
+/// fingerprint. The gateway ceiling must follow it, or orchestration calls
+/// fail validation until the next turn.
+#[tokio::test]
+async fn all_provider_custom_acp_unsolicited_catalog_update_refreshes_gateway_policy() {
+    use crate::agent_control::permissions::Ceiling;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::default());
+    *store.launch.lock().unwrap() = Some(AcpLaunchConfig {
+        agent: super::super::AcpAgent {
+            id: "notified".into(), name: "Notified fixture".into(), executable: super::super::test_python::executable(),
+            args: vec!["-I".into(),format!("{}/tests/helpers/fake_custom_acp.py",env!("CARGO_MANIFEST_DIR"))],
+            environment: Default::default(), enabled: true, auth_method: None, revision: "notified-revision".into(),
+        },
+        environment: HashMap::from([
+            ("FAKE_ACP_MODE".into(),"notify-catalog-hold".into()),
+            ("FAKE_ACP_LOG".into(),dir.path().join("wire.jsonl").to_string_lossy().into_owned()),
+            ("HOME".into(),dir.path().to_string_lossy().into_owned()),
+            ("TMPDIR".into(),dir.path().to_string_lossy().into_owned()),
+        ]),
+    });
+    let provider = GenericAcpProvider::new_with_mcp_registry(store, Some(crate::mcp::registry::McpRegistry::new()));
+    let thread = ThreadId("notified-policy".into());
+    provider.start_session(serde_json::from_value(json!({"thread_id":thread.0,"cwd":dir.path(),"additional_directories":[],"extra":{"acp_agent_id":"notified"}})).unwrap()).await.unwrap();
+    let session = provider.session(&thread).await.unwrap();
+    let authority = session.mcp.as_ref().expect("chat MCP").session.authority.clone();
+    let before = Ceiling::opaque_policy(&*session.binding.lock().await);
+    assert_eq!(crate::delegation::authority::NativeAuthority::effective_ceiling(&thread.0).unwrap(), Some(before));
+    provider.send_turn(serde_json::from_value(json!({"thread_id":thread.0,"text":"held"})).unwrap()).await.unwrap();
+    // The fixture flips a boolean option mid-turn, unprompted, and holds the turn.
+    let canonical = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let binding = session.binding.lock().await.clone();
+            if binding.catalog.config_options.iter().any(|o| o.id == "boolean selector" && o.current_value == json!(true)) {
+                break Ceiling::opaque_policy(&binding);
+            }
+            drop(binding);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("the notification was applied");
+    assert_ne!(canonical, before, "the notification changes the policy fingerprint");
+    let effective = crate::delegation::authority::NativeAuthority::effective_ceiling(&thread.0).unwrap().unwrap();
+    assert_eq!(effective, canonical, "the gateway ceiling kept the old fingerprint");
+    // The checks orchestration runs: admission takes effective ∩ canonical,
+    // validation requires the canonical record to permit it.
+    assert!(canonical.permits(effective.intersection(canonical)));
+    // Callbacks captured now run under the refreshed policy.
+    tokio::time::timeout(Duration::from_secs(2), authority.capture().wait_ready()).await.unwrap().unwrap();
+    let _ = provider.stop_session(thread).await;
+}

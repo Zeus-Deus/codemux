@@ -161,6 +161,15 @@ impl NativeAuthority {
         self.state.lock().unwrap().policy = Some(ceiling);
         self.changed.notify_waiters();
     }
+    /// A provider-reported policy change (including unsolicited notifications)
+    /// is a policy transition; an unchanged ceiling leaves callbacks running.
+    pub(crate) fn transition_ceiling(&self, ceiling: crate::agent_control::permissions::Ceiling) {
+        if self.state.lock().unwrap().policy == Some(ceiling) {
+            return;
+        }
+        let _transition = self.policy_transition();
+        self.set_ceiling(ceiling);
+    }
     pub fn effective_ceiling(
         thread: &str,
     ) -> Result<Option<crate::agent_control::permissions::Ceiling>, String> {
