@@ -47,7 +47,7 @@ import {
 import { _resetEditorDiscoveryForTests } from "@/stores/editor-discovery-store";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "@/lib/toast";
-import { useSkillsStore } from "@/stores/skills-store";
+import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
 import {
   DEFAULT_SETTINGS,
   useSyncedSettingsStore,
@@ -387,6 +387,46 @@ describe("SkillsSection", () => {
       }),
     );
     expect(useSkillsStore.getState().disabledIds).toEqual(["stale"]);
+
+    // The fresh version is still offered, so the row still reads as on.
+    expect(screen.getByTestId("skill-row-switch-fresh")).toBeChecked();
+    expect(
+      screen.queryByTestId("skill-row-disabled-badge"),
+    ).not.toBeInTheDocument();
+    expect(
+      selectActiveSkills(useSkillsStore.getState()).map((s) => s.id),
+    ).toEqual(["fresh", "fresh"]);
+
+    // Switching the row off then disables every version.
+    fireEvent.click(screen.getByTestId("skill-row-switch-fresh"));
+    expect(useSkillsStore.getState().disabledIds).toEqual(["fresh", "stale"]);
+    expect(screen.getByTestId("skill-row-disabled-badge")).toBeInTheDocument();
+  });
+
+  it("falls back to All when the selected source leaves the inventory", async () => {
+    const claude = makeSkill({ id: "c", name: "claude-skill", filePath: "/c" });
+    const plugin = makeSkill({
+      id: "p",
+      name: "plugin-skill",
+      scope: "plugin",
+      pluginSlug: "demo",
+      filePath: "/p",
+    });
+    listSkillsMock.mockResolvedValue([claude, plugin]);
+    render(<SkillsSection projectRoot={null} />);
+    await waitFor(() => {
+      expect(screen.getByText("plugin-skill")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("radio", { name: "Plugin" }));
+    expect(screen.queryByText("claude-skill")).not.toBeInTheDocument();
+
+    // Excluding plugin skills reloads an inventory without that source.
+    listSkillsMock.mockResolvedValue([claude]);
+    fireEvent.click(screen.getByTestId("include-plugins-switch"));
+    await waitFor(() => {
+      expect(screen.getByText("claude-skill")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("skills-no-matches")).not.toBeInTheDocument();
   });
 
   it("a row's switch disables every copy of the skill together", async () => {

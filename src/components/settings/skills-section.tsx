@@ -115,9 +115,12 @@ export function SkillsSection({ projectRoot }: Props) {
   const differing = entries.filter((entry) => entry.versions.length > 1).length;
   const [query, setQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState("all");
+  // A reload can drop the selected source (e.g. plugin skills turned off);
+  // fall back to All rather than hiding every row behind a hidden control.
+  const activeSource = sources.includes(sourceFilter) ? sourceFilter : "all";
   const shownEntries = useMemo(
-    () => filterEntries(entries, query, sourceFilter),
-    [entries, query, sourceFilter],
+    () => filterEntries(entries, query, activeSource),
+    [entries, query, activeSource],
   );
 
   const [pendingView, setPendingView] = useState<Skill | null>(null);
@@ -299,7 +302,7 @@ export function SkillsSection({ projectRoot }: Props) {
                 size="sm"
                 variant="outline"
                 spacing={0}
-                value={sourceFilter}
+                value={activeSource}
                 onValueChange={(next) => setSourceFilter(next || "all")}
                 aria-label="Show skills from"
               >
@@ -366,6 +369,13 @@ function filterEntries(
   });
 }
 
+/** True while any of `ids` is still enabled. The composer offers a name
+ *  as long as one copy of it is enabled, so a row only reads as off once
+ *  every copy is; switching it off then disables them all. */
+function anyEnabled(ids: string[], disabledIds: string[]): boolean {
+  return ids.some((id) => !disabledIds.includes(id));
+}
+
 /** Preference ids that the row's switch controls. Invalid skills can't be
  *  enabled, so they're left out. */
 function preferenceIds(copies: Skill[]): string[] {
@@ -397,7 +407,7 @@ function SkillEntryRow({
   const copies = entry.versions.flatMap((version) => version.copies);
   const primary = copies[0];
   const ids = preferenceIds(copies);
-  const enabled = ids.every((id) => !disabledIds.includes(id));
+  const enabled = anyEnabled(ids, disabledIds);
   const multiple = entry.versions.length > 1;
   const versionsId = `skill-versions-${primary.id}`;
 
@@ -472,7 +482,7 @@ function SkillVersionRow({
 }) {
   const skill = copies[0];
   const ids = preferenceIds(copies);
-  const enabled = ids.every((id) => !disabledIds.includes(id));
+  const enabled = anyEnabled(ids, disabledIds);
   const canToggle = ids.length > 0;
   return (
     <div className="group flex items-center gap-3 py-1.5 pr-3">
