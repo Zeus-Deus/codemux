@@ -9,6 +9,9 @@ use std::sync::Arc;
 
 use codemux_lib::agent_provider::acp::session::AcpDialect;
 use codemux_lib::agent_provider::acp::slash_commands::AcpSlashCommandCache;
+use codemux_lib::agent_provider::cursor::capabilities::{
+    harvest_cursor_capabilities, HarvestError,
+};
 use codemux_lib::agent_provider::cursor::{CursorAgentProvider, CursorProviderConfig};
 use codemux_lib::agent_provider::{
     AgentProvider, ApprovalDecision, CompletedItem, ProviderError, ProviderRuntimeEvent, RequestId,
@@ -16,6 +19,33 @@ use codemux_lib::agent_provider::{
 };
 use futures_util::StreamExt;
 use tokio::time::{timeout, Duration};
+
+#[tokio::test]
+async fn cursor_discovery_uses_existing_credentials_without_requesting_login() {
+    let capabilities =
+        harvest_cursor_capabilities(std::path::Path::new(env!("CARGO_BIN_EXE_fake_cursor_acp")))
+            .await
+            .expect("discovery must read models without requesting interactive authentication");
+
+    assert_eq!(capabilities.models.len(), 1);
+    assert_eq!(capabilities.models[0].id, "fake-model");
+}
+
+#[tokio::test]
+async fn cursor_discovery_reports_signed_out_without_requesting_login() {
+    let fixture_dir = tempfile::tempdir().expect("fixture directory");
+    let binary = fixture_dir
+        .path()
+        .join(format!("signed-out{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(env!("CARGO_BIN_EXE_fake_cursor_acp"), &binary).expect("copy signed-out fixture");
+
+    let error = harvest_cursor_capabilities(&binary)
+        .await
+        .expect_err("signed-out discovery must fail without requesting interactive authentication");
+
+    assert!(matches!(error, HarvestError::NotAuthenticated { hint }
+        if hint.contains("cursor-agent login")));
+}
 
 fn start_input(
     thread_id: &str,
