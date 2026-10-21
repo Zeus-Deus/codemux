@@ -244,9 +244,11 @@ export function ComposerCommandMenu({
                               <span
                                 className={cn(
                                   "min-w-0 flex-1 truncate text-label text-muted-foreground/70",
-                                  // The highlighted row shows its whole
-                                  // description instead of an ellipsis.
-                                  "group-data-[selected=true]/row:whitespace-normal",
+                                  // Highlighting only recolours: a row that
+                                  // grew to show its whole description
+                                  // would shove every row below it as the
+                                  // pointer passes. The title tooltip has
+                                  // the full text.
                                   "group-data-[selected=true]/row:text-muted-foreground",
                                 )}
                               >

@@ -271,7 +271,7 @@ describe("Composer + button + attach popup (Step 8 Stage 3)", () => {
     // missing attribute or "false" both mean "enabled".
     const attr = row.getAttribute("data-disabled");
     expect(attr === null || attr === "false").toBe(true);
-    expect(getByText("Split a task across agents working in parallel")).toBeInTheDocument();
+    expect(getByText("Run a task on parallel agents")).toBeInTheDocument();
   });
 
   it("picking /workflow from the + popup inserts the literal /workflow token", () => {

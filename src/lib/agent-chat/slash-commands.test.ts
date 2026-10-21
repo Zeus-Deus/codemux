@@ -454,7 +454,7 @@ describe("buildWorkflowCommand", () => {
     expect(item.command).toBe("/workflow");
     expect(item.disabled).toBe(false);
     expect(item.description).toBe(
-      "Split a task across agents working in parallel",
+      "Run a task on parallel agents",
     );
   });
 
