@@ -75,9 +75,10 @@ export async function run(ctx) {
       continue;
     }
     for(const role of ['coordinator','worker']) {
-      // OpenCode and Hermes run an unrestricted shell in every mode, so only
-      // a full-access coordinator may launch them.
-      try {await report(ctx,role==='coordinator'?config:{...CLAUDE,permissionMode:['opencode','hermes'].includes(provider)||config.permissionMode==='agent'?'bypassPermissions':'default'},role==='worker'?config:{...CLAUDE,mode:config.permissionMode==='agent'||config.permissionMode==='dont_ask'?'bypassPermissions':'default'});matrix.push({provider,role,status:'pass'});}
+      // OpenCode and Hermes run an unrestricted shell in every mode: only a
+      // full-access coordinator may launch them, and only a full-access
+      // worker may report back to them.
+      try {await report(ctx,role==='coordinator'?config:{...CLAUDE,permissionMode:['opencode','hermes'].includes(provider)||config.permissionMode==='agent'?'bypassPermissions':'default'},role==='worker'?config:{...CLAUDE,mode:['opencode','hermes'].includes(provider)||config.permissionMode==='agent'?'bypassPermissions':'default'});matrix.push({provider,role,status:'pass'});}
       catch(error){matrix.push({provider,role,status:'fail',reason:String(error)});ctx.observe(`failure ${provider} ${role}`,String(error));await ctx.shot(`pr4-${provider}-${role}-failure`).catch(()=>{});}
     }
   }

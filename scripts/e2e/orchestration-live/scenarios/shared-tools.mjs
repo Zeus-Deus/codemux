@@ -67,20 +67,24 @@ async function settled(ctx, threadId, label) {
   }, { timeout: 240_000, interval: 1000, label });
 }
 
-/** Content of the first assistant message matching `re`, or null. */
+/** The first assistant text matching `re`, or null. Read from the store so
+ *  chats in any workspace work. */
 async function replyMatching(ctx, threadId, re) {
-  const page = await ctx.assert.conversation(threadId, 200).catch(() => null);
-  const messages = (page?.data ?? page)?.messages ?? [];
-  return messages.find((m) => m.role === 'assistant' && re.test(m.content ?? ''))?.content ?? null;
+  const rows = await ctx.assert.sql(`SELECT json_extract(payload,'$.item.text') AS text FROM agent_chat_messages WHERE thread_id=${q(threadId)} AND json_extract(payload,'$.type')='item_completed' AND json_extract(payload,'$.item.kind')='assistant_text' ORDER BY id`);
+  return rows.map((row) => row.text ?? '').find((text) => re.test(text)) ?? null;
 }
 
-async function received(ctx, receiver, marker) {
-  const rows = await ctx.assert.sql(`SELECT sender_thread_id,created_by,json_extract(payload,'$.text') AS text FROM agent_chat_messages WHERE thread_id=${q(receiver)} AND json_extract(payload,'$.type')='user_message'`);
-  return rows.find((row) => row.created_by === 'agent' && row.text?.includes(marker));
+/** The delivery `sender` made to `receiver`. Its principal is the gateway
+ *  credential's chat, recorded at admission, so a busy receiver that only
+ *  queues the message still proves who sent it. */
+async function delivered(ctx, receiver, sender) {
+  const rows = await ctx.assert.sql(`SELECT id,state,principal FROM agent_message_deliveries WHERE thread_id=${q(receiver)} AND principal=${q(`thread:${sender}`)}`);
+  return rows[0];
 }
 
 export async function run(ctx) {
-  const providers = (ctx.env.ORCH_LIVE_PROVIDERS ?? '').split(',');
+  // ORCH_LIVE_SHARED_TOOLS=opencode|hermes runs one half.
+  const providers = (process.env.ORCH_LIVE_SHARED_TOOLS ?? ctx.env.ORCH_LIVE_PROVIDERS ?? '').split(',');
   const measures = {};
 
   if (providers.includes('opencode')) {
@@ -101,8 +105,8 @@ export async function run(ctx) {
       await send(ctx, 'opencode', chat.threadId, `Call the injected Codemux thread_send tool once with thread_id ${JSON.stringify(receiver.threadId)}, client_request_id "id-${tags[i]}", delivery "queue", message "FROM-${tags[i]}". Then reply SENT. Do not call any other tool.`);
     }
     for (const [i, chat] of same.slice(0, 2).entries()) {
-      const row = await ctx.waitFor(() => received(ctx, receiver.threadId, `FROM-${tags[i]}`), { timeout: 240_000, interval: 1000, label: `identity proof ${i}` });
-      ctx.check(`shared-server chat ${i} sends as itself`, row.sender_thread_id === chat.threadId, { row, chat: chat.threadId });
+      const row = await ctx.waitFor(() => delivered(ctx, receiver.threadId, chat.threadId), { timeout: 240_000, interval: 1000, label: `identity proof ${i}` });
+      ctx.check(`shared-server chat ${i} sends as itself`, !!row, { row, chat: chat.threadId });
     }
 
     const others = [];
@@ -139,6 +143,19 @@ export async function run(ctx) {
     const modelReply = await ctx.waitFor(() => replyMatching(ctx, hermes.threadId, /Current model:|Model switched|Error/), { timeout: 60_000, interval: 500, label: '/model answered' });
     ctx.check('/model reaches Hermes with no appended argument', modelReply.startsWith('Current model:'), modelReply);
 
+    // Hermes defers MCP tools behind tool_search; /tools reports how many.
+    // A second Codemux toolset would raise the count.
+    const toolCount = async (seen) => {
+      await send(ctx, 'hermes', hermes.threadId, '/tools');
+      const listing = await ctx.waitFor(async () => {
+        const rows = await ctx.assert.sql(`SELECT json_extract(payload,'$.item.text') AS text FROM agent_chat_messages WHERE thread_id=${q(hermes.threadId)} AND json_extract(payload,'$.item.kind')='assistant_text' ORDER BY id`);
+        const listings = rows.map((r) => r.text ?? '').filter((t) => t.startsWith('Available tools'));
+        return listings.length > seen ? listings.at(-1) : null;
+      }, { timeout: 60_000, interval: 500, label: '/tools answered' });
+      return { listed: Number(/Available tools \((\d+)\)/.exec(listing)?.[1]), deferred: Number(/Search (\d+) additional tools/.exec(listing)?.[1]) };
+    };
+    const beforeStop = await toolCount(0);
+
     // Stop a running turn twice through the Stop command.
     await send(ctx, 'hermes', hermes.threadId, "Run this exact shell command and wait for it: python3 -c 'import time; time.sleep(120)'. Then reply DONE.");
     await ctx.waitFor(async () => {
@@ -154,16 +171,15 @@ export async function run(ctx) {
     }
     await settled(ctx, hermes.threadId, 'Hermes stopped');
 
-    await send(ctx, 'hermes', hermes.threadId, '/tools');
-    const listing = await ctx.waitFor(() => replyMatching(ctx, hermes.threadId, /Available tools/), { timeout: 60_000, interval: 500, label: '/tools answered' });
-    const tools = listing.split('\n').filter((line) => /thread_send:/.test(line));
-    ctx.check('one Codemux toolset after two Stops', tools.length === 1, tools);
+    const afterStop = await toolCount(1);
+    ctx.check('one Codemux toolset after two Stops', afterStop.deferred === beforeStop.deferred && afterStop.listed === beforeStop.listed && afterStop.deferred > 0, { beforeStop, afterStop });
+    const tools = { beforeStop, afterStop };
 
     const tag = randomUUID().slice(0, 8);
     const receiver = await startIn(ctx, ctx.env.WORKSPACE_ID, ctx.env.REPO, { provider: 'hermes', model, permissionMode: 'dont_ask', extra: { hermes_profile: profile } });
     await send(ctx, 'hermes', hermes.threadId, `Call the injected Codemux thread_send tool once with thread_id ${JSON.stringify(receiver.threadId)}, client_request_id "stop-${tag}", delivery "queue", message "AFTER-STOP-${tag}". Then reply SENT.`);
-    const row = await ctx.waitFor(() => received(ctx, receiver.threadId, `AFTER-STOP-${tag}`), { timeout: 240_000, interval: 1000, label: 'Hermes tool call after Stop' });
-    ctx.check('Hermes tool call after Stop acts as the chat', row.sender_thread_id === hermes.threadId, row);
+    const row = await ctx.waitFor(() => delivered(ctx, receiver.threadId, hermes.threadId), { timeout: 240_000, interval: 1000, label: 'Hermes tool call after Stop' });
+    ctx.check('Hermes tool call after Stop acts as the chat', !!row, row);
     ctx.observe('hermes', { chat: hermes.threadId, receiver: receiver.threadId, tools, modelReply });
     await ctx.openTab(await ctx.tabOf(hermes.paneId));
     await ctx.shot('pr4fix-hermes-after-stop');

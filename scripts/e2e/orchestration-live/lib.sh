@@ -366,7 +366,10 @@ stop_sandbox() {
     fi
   fi
   if wait_sandbox_gone "$grace"; then return 0; fi
-  note "sandbox still running $grace s after serve stopped; SIGTERM to its remaining processes"
+  note "sandbox still running $grace s after serve stopped; SIGTERM to its remaining processes:"
+  for child in $(descendants "$pid"); do
+    note "  $child $(tr '\0' ' ' <"/proc/$child/cmdline" 2>/dev/null | cut -c1-160)"
+  done
   for child in $(descendants "$pid" | tac); do
     kill -TERM "$child" 2>/dev/null || true
   done
