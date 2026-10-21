@@ -177,6 +177,12 @@ impl Harness {
     }
 
     async fn with_install_check(is_installed: fn(ProviderKind) -> bool) -> Self {
+        // Every test here emits app state, which persists the layout: keep
+        // that in Cargo's scratch directory, never the user's config.
+        codemux_lib::state::redirect_layout_persistence(
+            std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("agent-delegation-layout-{}.json", std::process::id())),
+        );
         let app = tauri::test::mock_app();
         // The delegation setting is left unset: the feature is on by default.
         let db = DatabaseStore::new_in_memory();

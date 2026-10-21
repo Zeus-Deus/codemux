@@ -7250,7 +7250,22 @@ pub(crate) fn run_with_isolated_layout(path: &str) -> bool {
     true
 }
 
+/// See [`redirect_layout_persistence`].
+static LAYOUT_PATH_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// For integration tests, which build this library without `cfg(test)`:
+/// every layout read and write in this process goes to `path` instead of
+/// the user's own file. Call before any app state is emitted; the first
+/// call wins. No environment change, so parallel tests stay sound.
+#[doc(hidden)]
+pub fn redirect_layout_persistence(path: PathBuf) {
+    let _ = LAYOUT_PATH_OVERRIDE.set(path);
+}
+
 fn persisted_layout_path() -> Option<PathBuf> {
+    if let Some(path) = LAYOUT_PATH_OVERRIDE.get() {
+        return Some(path.clone());
+    }
     // Windows config_dir uses a Known Folder API, not APPDATA overrides.
     // Subprocess-only fixtures must never fall back to the user's layout.
     #[cfg(test)]
