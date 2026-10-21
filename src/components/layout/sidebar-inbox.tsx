@@ -1910,8 +1910,11 @@ export function SidebarInbox() {
                   marker="data-wrapping-up-divider"
                 />
                 <PresenceList animate={rowMotion}>
+                  {/* The drop preview shares the dropped card's key, so the
+                      drop swaps the row's contents in place instead of
+                      collapsing the preview and regrowing the card. */}
                   {(previewWrappingUp ?? visibleWrappingUp).map((ws, index) => ws.workspace_id === wrappingPreviewId
-                    ? <div key="wrapping-drop-preview" data-inbox-wrapping-preview className="mb-1.5 flex min-h-[88px] items-center justify-center rounded-lg border border-dashed border-foreground/25 text-label text-muted-foreground">Unpin into Wrapping up</div>
+                    ? <PresenceRow key={ws.workspace_id}><div data-inbox-wrapping-preview className="mb-1.5 flex min-h-[88px] items-center justify-center rounded-lg border border-dashed border-foreground/25 text-label text-muted-foreground">Unpin into Wrapping up</div></PresenceRow>
                     : <PresenceRow key={ws.workspace_id}>{renderCard(ws, pinnedCards.length + topTier.length + index)}</PresenceRow>)}
                 </PresenceList>
               </>

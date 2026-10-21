@@ -74,10 +74,17 @@ export function Collapse({
   const moving = phase === "opening" || phase === "closing";
   useEffect(() => {
     if (!moving) return;
-    // Nothing to wait for when the transition is switched off (reduced
-    // motion, or no stylesheet at all): settle now rather than on a timer.
+    // Nothing to wait for when the transition is switched off: settle now
+    // rather than on a timer. Reduced motion either drops the property
+    // (`motion-reduce:transition-none`) or clamps every duration to 0.01ms
+    // (the global rule), so anything under 1ms counts as off.
     const element = ref.current;
-    if (element && !(parseFloat(getComputedStyle(element).transitionDuration) > 0)) {
+    const style = element ? getComputedStyle(element) : null;
+    if (
+      style &&
+      (style.transitionProperty === "none" ||
+        !(parseFloat(style.transitionDuration) >= 0.001))
+    ) {
       settleRef.current();
       return;
     }
