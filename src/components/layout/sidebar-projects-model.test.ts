@@ -3,7 +3,9 @@ import type { WorkspaceSnapshot } from "@/tauri/types";
 import type { ProjectGroup } from "@/stores/app-store";
 import {
   buildProjectsModel,
+  groupShelf,
   isChatWorkspace,
+  RECENT_PROJECT_MS,
   nestRows,
   visibleLiveIds,
 } from "./sidebar-projects-model";
@@ -11,6 +13,7 @@ import {
 const HOME = "/home/u";
 const APP = "/home/u/projects/app";
 const LIB = "/home/u/projects/lib";
+const NOW = 10 * RECENT_PROJECT_MS;
 
 function ws(
   id: string,
@@ -55,7 +58,14 @@ function group(path: string, workspaces: WorkspaceSnapshot[]): ProjectGroup {
 
 function build(
   all: WorkspaceSnapshot[],
-  opts: { parked?: string[]; liveOverride?: string[]; filter?: string | null } = {},
+  opts: {
+    parked?: string[];
+    liveOverride?: string[];
+    filter?: string | null;
+    parkedAt?: Record<string, number>;
+    active?: string;
+    forcePaths?: string[];
+  } = {},
 ) {
   const byPath = new Map<string, WorkspaceSnapshot[]>();
   for (const w of all) {
@@ -69,6 +79,10 @@ function build(
     parkedIds: new Set(opts.parked ?? []),
     liveOverride: new Set(opts.liveOverride ?? []),
     filter: opts.filter ?? null,
+    parkedAt: new Map(Object.entries(opts.parkedAt ?? {})),
+    activeWorkspaceId: opts.active,
+    forcePaths: new Set(opts.forcePaths ?? []),
+    now: NOW,
   });
 }
 
@@ -192,6 +206,94 @@ describe("buildProjectsModel", () => {
       { filter: LIB },
     );
     expect(model.projects.map((p) => p.name)).toEqual(["lib"]);
+  });
+});
+
+describe("quiet projects and the settled shelf", () => {
+  const lib = (id: string, o: Partial<WorkspaceSnapshot> = {}) =>
+    ws(id, { cwd: LIB, project_root: LIB, ...o });
+  const names = (sections: { name: string }[]) => sections.map((s) => s.name);
+
+  it("moves a project with nothing live and no recent activity to quietProjects", () => {
+    const model = build(
+      [ws("live"), lib("old", { last_active_at: NOW - RECENT_PROJECT_MS - 1 })],
+      { parked: ["old"] },
+    );
+    expect(names(model.projects)).toEqual(["app"]);
+    expect(names(model.quietProjects)).toEqual(["lib"]);
+  });
+
+  it("keeps a parked-only project visible while its activity or visit is recent", () => {
+    const recentWork = build([lib("a", { last_active_at: NOW - 1000 })], {
+      parked: ["a"],
+    });
+    expect(names(recentWork.projects)).toEqual(["lib"]);
+    expect(recentWork.projects[0].lastActiveAt).toBe(NOW - 1000);
+    const recentVisit = build(
+      [lib("a", { last_active_at: 1, last_visited_at: NOW - 1000 })],
+      { parked: ["a"] },
+    );
+    expect(names(recentVisit.projects)).toEqual(["lib"]);
+  });
+
+  it("keeps a quiet project visible for the open workspace, a pending create, or the filter", () => {
+    const all = [lib("a")];
+    expect(names(build(all, { parked: ["a"] }).projects)).toEqual([]);
+    expect(names(build(all, { parked: ["a"], active: "a" }).projects)).toEqual(["lib"]);
+    expect(names(build(all, { parked: ["a"], forcePaths: [LIB] }).projects)).toEqual(["lib"]);
+    expect(names(build(all, { parked: ["a"], filter: LIB }).projects)).toEqual(["lib"]);
+  });
+
+  it("hides Chats when no chat is live, unless the open workspace is one", () => {
+    const chat = ws("chat", { cwd: HOME, project_root: HOME, is_git: false });
+    expect(build([chat], { parked: ["chat"] }).chats).toBeNull();
+    expect(build([chat], { parked: ["chat"], active: "chat" }).chats).not.toBeNull();
+  });
+
+  it("lists every parked workspace in the shelf, most recently parked first", () => {
+    const model = build(
+      [
+        ws("live"),
+        ws("app-old"),
+        lib("lib-new"),
+        ws("chat", { cwd: HOME, project_root: HOME, is_git: false }),
+      ],
+      {
+        parked: ["app-old", "lib-new", "chat"],
+        parkedAt: { "app-old": 1, "lib-new": 3, chat: 2 },
+      },
+    );
+    expect(model.shelf.map((e) => e.workspace.workspace_id)).toEqual([
+      "lib-new",
+      "chat",
+      "app-old",
+    ]);
+    expect(model.shelf[1].sectionName).toBe("Chats");
+  });
+});
+
+describe("groupShelf", () => {
+  const entry = (id: string, path: string) => ({
+    workspace: ws(id),
+    sectionName: path.split("/").pop()!,
+    sectionPath: path,
+  });
+  const shelf = [entry("a1", APP), entry("l1", LIB), entry("a2", APP), entry("l2", LIB)];
+
+  it("groups the first entries under their section in recency order", () => {
+    const groups = groupShelf(shelf, 3);
+    expect(groups.map((g) => [g.name, g.workspaces.map((w) => w.workspace_id)])).toEqual([
+      ["app", ["a1", "a2"]],
+      ["lib", ["l1"]],
+    ]);
+  });
+
+  it("pulls the open workspace in from past the limit", () => {
+    const groups = groupShelf(shelf, 1, "l2");
+    expect(groups.map((g) => g.workspaces.map((w) => w.workspace_id))).toEqual([
+      ["a1"],
+      ["l2"],
+    ]);
   });
 });
 

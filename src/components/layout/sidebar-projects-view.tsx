@@ -74,6 +74,7 @@ import type { InboxRepo } from "./sidebar-inbox-card";
 import { useSidebarViewStore } from "./sidebar-view-store";
 import {
   buildProjectsModel,
+  groupShelf,
   visibleLiveIds,
   type ProjectsRow,
   type ProjectsSection,
@@ -174,7 +175,8 @@ interface ProjectRowProps {
   /** Right-side text when no live status speaks: relative time since work,
    *  or time until a snooze wakes. */
   meta: string | null;
-  /** Parked rows (settled / snoozed) under "Show N settled". */
+  /** Parked rows (settled / snoozed), shown in the shelf or under a project
+   *  with nothing live. */
   parked: "settled" | "snoozed" | null;
 }
 
@@ -321,10 +323,52 @@ function GroupAvatar({ name, path }: { name: string; path: string }) {
   );
 }
 
-function parkedLabel(settled: number, snoozed: number): string {
-  if (snoozed === 0) return `${settled} settled`;
-  if (settled === 0) return `${snoozed} snoozed`;
-  return `${settled + snoozed} settled or snoozed`;
+function shelfLabel(settled: number, snoozed: number): string {
+  if (snoozed === 0) return "Settled";
+  if (settled === 0) return "Snoozed";
+  return "Settled & snoozed";
+}
+
+/** Settled-shelf paging: recent history first, the deep tail on request. */
+const SHELF_INITIAL_COUNT = 10;
+const SHELF_PAGE_COUNT = 25;
+
+/** A footer disclosure ("N more projects", the Settled shelf). */
+function FooterToggle({
+  open,
+  label,
+  count,
+  onToggle,
+  ...data
+}: {
+  open: boolean;
+  label: string;
+  count?: number;
+  onToggle: () => void;
+} & Record<`data-${string}`, string>) {
+  return (
+    <button
+      type="button"
+      aria-expanded={open}
+      onClick={onToggle}
+      {...data}
+      className="flex h-8 w-full min-w-0 items-center gap-2 rounded-lg pl-1.5 pr-1 text-left text-body font-medium text-muted-foreground outline-none transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:bg-surface-2"
+    >
+      <ChevronRight
+        aria-hidden
+        className={cn(
+          "size-3.5 shrink-0 text-muted-foreground/70 transition-transform duration-150",
+          open && "rotate-90",
+        )}
+      />
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      {count !== undefined && (
+        <span className="min-w-6 px-1 text-center text-label tabular-nums text-muted-foreground/70">
+          {count}
+        </span>
+      )}
+    </button>
+  );
 }
 
 export function SidebarProjectsView() {
@@ -376,6 +420,16 @@ export function SidebarProjectsView() {
     () => new Set([...settledIds, ...snoozedIds]),
     [settledIds, snoozedIds],
   );
+  const parkedAt = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const e of settled) map.set(e.id, resolveSettledTimestamp(e));
+    for (const e of snoozed) map.set(e.id, e.at);
+    return map;
+  }, [settled, snoozed]);
+  const pendingPaths = useMemo(
+    () => new Set(pendingWorkspaces.map((pw) => pw.projectPath)),
+    [pendingWorkspaces],
+  );
 
   const statusById = useMemo(() => {
     const map = new Map<string, ActivePaneStatus | null>();
@@ -417,8 +471,23 @@ export function SidebarProjectsView() {
         parkedIds,
         liveOverride,
         filter,
+        parkedAt,
+        activeWorkspaceId,
+        forcePaths: pendingPaths,
+        now,
       }),
-    [projectGroups, homeDir, storedIndex, parkedIds, liveOverride, filter],
+    [
+      projectGroups,
+      homeDir,
+      storedIndex,
+      parkedIds,
+      liveOverride,
+      filter,
+      parkedAt,
+      activeWorkspaceId,
+      pendingPaths,
+      now,
+    ],
   );
 
   // Interned `{name, path}` per project so memoized rows keep a stable `repo`.
@@ -470,17 +539,21 @@ export function SidebarProjectsView() {
   }, [jumpKey]);
   useEffect(() => () => setJumpTargets([]), []);
 
-  // "Show N settled" disclosure, per project. Session-only, like the inbox's
-  // Settled shelf, which also starts closed.
-  const [openParked, setOpenParked] = useState<ReadonlySet<string>>(new Set());
-  const toggleParked = useCallback((path: string) => {
-    setOpenParked((prev) => {
+  // A project with nothing live opens onto its parked rows. That fold is
+  // session-only and starts closed, unlike the persisted fold of live groups.
+  const [openQuiet, setOpenQuiet] = useState<ReadonlySet<string>>(new Set());
+  const setQuietOpen = useCallback((path: string, folded: boolean) => {
+    setOpenQuiet((prev) => {
       const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
+      if (folded) next.delete(path);
       else next.add(path);
       return next;
     });
   }, []);
+  // The footer disclosures, also session-only and closed on launch.
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [shelfOpen, setShelfOpen] = useState(false);
+  const [shelfLimit, setShelfLimit] = useState(SHELF_INITIAL_COUNT);
 
   const statusOf = (id: string) => statusById.get(id) ?? null;
   const unreadOf = (ws: WorkspaceSnapshot) =>
@@ -525,57 +598,37 @@ export function SidebarProjectsView() {
       );
     });
 
-  const renderParked = (section: ProjectsSection) => {
-    if (section.parked.length === 0) return null;
-    const open = openParked.has(section.path);
-    // The open workspace never hides behind a closed toggle.
-    const visible = open
-      ? section.parked
-      : section.parked.filter((ws) => ws.workspace_id === activeWorkspaceId);
-    const settledCount = section.parked.filter((ws) =>
-      settledIds.has(ws.workspace_id),
-    ).length;
-    const snoozedCount = section.parked.length - settledCount;
+  const renderParkedRow = (ws: WorkspaceSnapshot) => {
+    const repo = repoByWorkspace.get(ws.workspace_id);
+    if (!repo) return null;
+    const snoozeEntry = snoozedById.get(ws.workspace_id);
+    const settledEntry = settledById.get(ws.workspace_id);
+    const meta = snoozeEntry
+      ? formatTimeUntil(snoozeEntry.until - now)
+      : settledEntry
+        ? formatElapsed(now - resolveSettledTimestamp(settledEntry))
+        : null;
     return (
-      <>
-        {visible.map((ws) => {
-          const repo = repoByWorkspace.get(ws.workspace_id);
-          if (!repo) return null;
-          const snoozeEntry = snoozedById.get(ws.workspace_id);
-          const settledEntry = settledById.get(ws.workspace_id);
-          const meta = snoozeEntry
-            ? formatTimeUntil(snoozeEntry.until - now)
-            : settledEntry
-              ? formatElapsed(now - resolveSettledTimestamp(settledEntry))
-              : null;
-          return (
-            <SidebarMenuItem key={ws.workspace_id}>
-              <ProjectRow
-                workspace={ws}
-                repo={repo}
-                status={statusOf(ws.workspace_id)}
-                isActive={ws.workspace_id === activeWorkspaceId}
-                unread={unreadOf(ws)}
-                meta={meta}
-                parked={snoozeEntry ? "snoozed" : "settled"}
-              />
-            </SidebarMenuItem>
-          );
-        })}
-        <SidebarMenuItem>
-          <button
-            type="button"
-            data-parked-toggle={section.path}
-            aria-expanded={open}
-            onClick={() => toggleParked(section.path)}
-            className="flex h-7 w-full items-center rounded-lg pl-[30px] text-left text-label text-muted-foreground/80 transition-colors duration-150 hover:text-foreground"
-          >
-            {open ? "Hide" : "Show"} {parkedLabel(settledCount, snoozedCount)}
-          </button>
-        </SidebarMenuItem>
-      </>
+      <SidebarMenuItem key={ws.workspace_id}>
+        <ProjectRow
+          workspace={ws}
+          repo={repo}
+          status={statusOf(ws.workspace_id)}
+          isActive={ws.workspace_id === activeWorkspaceId}
+          unread={unreadOf(ws)}
+          meta={meta}
+          parked={snoozeEntry ? "snoozed" : "settled"}
+        />
+      </SidebarMenuItem>
     );
   };
+
+  /** Parked rows a section lists inline: all of them when it has nothing
+   *  live and is open, otherwise only the open workspace, which never hides. */
+  const inlineParked = (section: ProjectsSection, open: boolean) =>
+    section.rows.length === 0 && open
+      ? section.parked
+      : section.parked.filter((ws) => ws.workspace_id === activeWorkspaceId);
 
   const pendingByProject = useMemo(() => {
     const map = new Map<string, typeof pendingWorkspaces>();
@@ -593,7 +646,57 @@ export function SidebarProjectsView() {
   const isEmpty =
     model.chats === null &&
     model.projects.length === 0 &&
+    model.quietProjects.length === 0 &&
+    model.shelf.length === 0 &&
     pendingWorkspaces.length === 0;
+
+  const renderProject = (project: ProjectsSection) => {
+    const quiet = project.rows.length === 0;
+    const open = quiet ? openQuiet.has(project.path) : folded[project.path] !== true;
+    // A create in flight (or its failed row) is live work: it shows even
+    // while a quiet project's history is closed.
+    const pending =
+      open || quiet ? (pendingByProject.get(project.path) ?? []) : [];
+    const parked = inlineParked(project, open);
+    return (
+      <SidebarMenuItem key={project.path} data-project-group={project.path}>
+        <ProjectGroupHeader
+          name={project.name}
+          path={project.path}
+          count={project.liveCount}
+          meta={
+            quiet && project.lastActiveAt !== null
+              ? formatElapsed(now - project.lastActiveAt)
+              : null
+          }
+          folded={!open}
+          needsYou={!open && hasNeedsYou(project.rows)}
+          onToggle={quiet ? setQuietOpen : setFolded}
+        />
+        {(open || parked.length > 0 || pending.length > 0) && (
+          <SidebarMenu className="pb-1">
+            {open && renderRows(project.rows)}
+            {pending.map((pw) => (
+              <SidebarMenuItem key={pw.id}>
+                <PendingWorkspaceRow pending={pw} className="gap-2 px-2 py-2" />
+              </SidebarMenuItem>
+            ))}
+            {parked.map(renderParkedRow)}
+          </SidebarMenu>
+        )}
+      </SidebarMenuItem>
+    );
+  };
+
+  const shelfSettledCount = model.shelf.filter((e) =>
+    settledIds.has(e.workspace.workspace_id),
+  ).length;
+  const shelfGroups = shelfOpen
+    ? groupShelf(model.shelf, shelfLimit, activeWorkspaceId)
+    : [];
+  const shelfHidden =
+    model.shelf.length -
+    shelfGroups.reduce((n, g) => n + g.workspaces.length, 0);
 
   return (
     <div className="flex flex-1 flex-col" data-sidebar-projects-view>
@@ -634,7 +737,7 @@ export function SidebarProjectsView() {
             <ChatsHeader />
             <SidebarMenu>
               {renderRows(model.chats.rows)}
-              {renderParked(model.chats)}
+              {inlineParked(model.chats, false).map(renderParkedRow)}
             </SidebarMenu>
           </SidebarGroup>
         )}
@@ -644,42 +747,66 @@ export function SidebarProjectsView() {
             <SidebarGroupLabel className="h-7 pt-1">
               <Eyebrow>Projects</Eyebrow>
             </SidebarGroupLabel>
-            <SidebarMenu>
-              {model.projects.map((project) => {
-                const isFolded = folded[project.path] === true;
-                const pending = pendingByProject.get(project.path) ?? [];
-                return (
-                  <SidebarMenuItem
-                    key={project.path}
-                    data-project-group={project.path}
-                  >
-                    <ProjectGroupHeader
-                      name={project.name}
-                      path={project.path}
-                      count={project.liveCount}
-                      folded={isFolded}
-                      needsYou={isFolded && hasNeedsYou(project.rows)}
-                      onToggle={setFolded}
-                    />
-                    {!isFolded && (
-                      <SidebarMenu className="pb-1">
-                        {renderRows(project.rows)}
-                        {pending.map((pw) => (
-                          <SidebarMenuItem key={pw.id}>
-                            <PendingWorkspaceRow
-                              pending={pw}
-                              className="gap-2 px-2 py-2"
-                            />
-                          </SidebarMenuItem>
-                        ))}
-                        {renderParked(project)}
-                      </SidebarMenu>
-                    )}
-                  </SidebarMenuItem>
-                );
-              })}
-            </SidebarMenu>
+            <SidebarMenu>{model.projects.map(renderProject)}</SidebarMenu>
           </SidebarGroup>
+        )}
+
+        {(model.quietProjects.length > 0 || model.shelf.length > 0) && (
+          <div className="mt-2 flex flex-col gap-1 border-t border-border/70 pt-2">
+            {model.quietProjects.length > 0 && (
+              <SidebarGroup
+                role="region"
+                aria-label="More projects"
+                className="p-0"
+              >
+                <FooterToggle
+                  open={moreOpen}
+                  label={`${model.quietProjects.length} more ${
+                    model.quietProjects.length === 1 ? "project" : "projects"
+                  }`}
+                  onToggle={() => setMoreOpen((v) => !v)}
+                  data-more-projects-toggle=""
+                />
+                {moreOpen && (
+                  <SidebarMenu>{model.quietProjects.map(renderProject)}</SidebarMenu>
+                )}
+              </SidebarGroup>
+            )}
+            {model.shelf.length > 0 && (
+              <SidebarGroup role="region" aria-label="Settled" className="p-0">
+                <FooterToggle
+                  open={shelfOpen}
+                  label={shelfLabel(
+                    shelfSettledCount,
+                    model.shelf.length - shelfSettledCount,
+                  )}
+                  count={model.shelf.length}
+                  onToggle={() => {
+                    setShelfOpen((v) => !v);
+                    setShelfLimit(SHELF_INITIAL_COUNT);
+                  }}
+                  data-settled-shelf-toggle=""
+                />
+                {shelfGroups.map((g) => (
+                  <div key={g.path} data-shelf-group={g.path}>
+                    <div className="truncate pb-0.5 pl-[30px] pr-2 pt-1.5 text-label font-semibold text-muted-foreground/80">
+                      {g.name}
+                    </div>
+                    <SidebarMenu>{g.workspaces.map(renderParkedRow)}</SidebarMenu>
+                  </div>
+                ))}
+                {shelfOpen && shelfHidden > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setShelfLimit((n) => n + SHELF_PAGE_COUNT)}
+                    className="flex h-7 w-full items-center rounded-lg pl-[30px] text-left text-label text-muted-foreground/80 transition-colors duration-150 hover:text-foreground"
+                  >
+                    Show {Math.min(shelfHidden, SHELF_PAGE_COUNT)} more
+                  </button>
+                )}
+              </SidebarGroup>
+            )}
+          </div>
         )}
       </div>
     </div>
@@ -720,6 +847,7 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
   name,
   path,
   count,
+  meta,
   folded,
   needsYou,
   onToggle,
@@ -727,6 +855,9 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
   name: string;
   path: string;
   count: number;
+  /** Shown in place of a zero count: time since the project's last
+   *  activity. */
+  meta: string | null;
   folded: boolean;
   /** Folded and hiding a workspace that is waiting on the user. */
   needsYou: boolean;
@@ -739,7 +870,7 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
       <button
         type="button"
         aria-expanded={!folded}
-        aria-label={`${name} (${count})`}
+        aria-label={count > 0 ? `${name} (${count})` : name}
         data-project-header={path}
         onClick={() => onToggle(path, !folded)}
         className="col-start-1 row-start-1 flex h-full min-w-0 items-center gap-2 rounded-lg pl-1.5 text-left outline-none focus-visible:bg-surface-2"
@@ -769,9 +900,12 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
       {/* The count and create action share a cell, outside the fold toggle. */}
       <span
         aria-hidden
-        className="pointer-events-none col-start-2 row-start-1 min-w-6 px-1 text-center text-label tabular-nums text-muted-foreground/70 transition-opacity duration-150 motion-reduce:transition-none group-hover/proj:opacity-0 group-focus-within/proj:opacity-0 pointer-coarse:opacity-0"
+        className={cn(
+          "pointer-events-none col-start-2 row-start-1 min-w-6 px-1 text-center text-label tabular-nums text-muted-foreground/70 transition-opacity duration-150 motion-reduce:transition-none group-hover/proj:opacity-0 group-focus-within/proj:opacity-0 pointer-coarse:opacity-0",
+          count === 0 && "font-mono",
+        )}
       >
-        {count}
+        {count > 0 ? count : meta}
       </span>
       <Tooltip>
         <TooltipTrigger asChild>

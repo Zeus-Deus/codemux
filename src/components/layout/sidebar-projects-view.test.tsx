@@ -129,6 +129,7 @@ import {
 } from "./sidebar-view-store";
 import { activateWorkspace, dbSetUiState } from "@/tauri/commands";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { getJumpTarget } from "./sidebar-inbox-jump";
 
@@ -322,11 +323,11 @@ describe("SidebarProjectsView", () => {
     ).toBeNull();
   });
 
-  it("folds settled workspaces into a per-project Show N settled toggle", async () => {
+  it("collects settled workspaces into one Settled shelf grouped by project", async () => {
     workspaces = [
       makeWorkspace({ title: "live" }),
       makeWorkspace({ title: "parked one" }),
-      makeWorkspace({ title: "parked two" }),
+      makeWorkspace({ title: "parked two", cwd: LIB, project_root: LIB }),
     ];
     persistedSettled = JSON.stringify({
       settled: [
@@ -337,16 +338,104 @@ describe("SidebarProjectsView", () => {
       keepActive: [],
       activity: {},
     });
-    await renderView();
+    const { container } = await renderView();
     expect(screen.queryByText("parked one")).toBeNull();
-    const toggle = screen.getByRole("button", { name: "Show 2 settled" });
+    expect(screen.queryByRole("button", { name: /Show \d+ settled/ })).toBeNull();
+    const toggle = screen.getByRole("button", { name: "Settled 2" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const groups = [...container.querySelectorAll("[data-shelf-group]")].map((el) =>
+      el.getAttribute("data-shelf-group"),
+    );
+    // Most recently settled first: lib's workspace was settled last.
+    expect(groups).toEqual([LIB, APP]);
     expect(screen.getByText("parked one")).toBeInTheDocument();
     expect(screen.getByText("parked two")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Hide 2 settled" })).toHaveAttribute(
-      "aria-expanded",
-      "true",
-    );
+  });
+
+  it("folds projects with nothing live into N more projects, opening onto their history", async () => {
+    workspaces = [
+      makeWorkspace({ title: "live" }),
+      makeWorkspace({ title: "old lib work", cwd: LIB, project_root: LIB }),
+    ];
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-2", at: 1 }],
+      snoozed: [],
+      keepActive: [],
+      activity: {},
+    });
+    const { container } = await renderView();
+    const headers = () =>
+      [...container.querySelectorAll("[data-project-header]")].map((el) =>
+        el.getAttribute("data-project-header"),
+      );
+    expect(headers()).toEqual([APP]);
+    fireEvent.click(screen.getByRole("button", { name: "1 more project" }));
+    expect(headers()).toEqual([APP, LIB]);
+    const lib = screen.getByRole("button", { name: "lib" });
+    expect(lib).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("old lib work")).toBeNull();
+    fireEvent.click(lib);
+    expect(lib).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("old lib work")).toBeInTheDocument();
+    // A session-only fold: nothing persisted for a project with no live rows.
+    expect(useSidebarViewStore.getState().folded).toEqual({});
+  });
+
+  it("shows a pending and then failed create in a settled-only project without opening its history", async () => {
+    workspaces = [makeWorkspace({ title: "old lib work", cwd: LIB, project_root: LIB })];
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-1", at: 1 }],
+      snoozed: [],
+      keepActive: [],
+      activity: {},
+    });
+    useUIStore.setState({
+      pendingWorkspaces: [
+        { id: "pw-1", name: "new-branch", projectPath: LIB, status: "creating" },
+      ],
+    });
+    try {
+      const { container, rerender } = await renderView();
+      const group = container.querySelector(`[data-project-group="${LIB}"]`) as HTMLElement;
+      expect(group).not.toBeNull();
+      expect(within(group).getByRole("button", { name: "lib" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      expect(within(group).getByText("new-branch")).toBeInTheDocument();
+      expect(within(group).queryByText("old lib work")).toBeNull();
+
+      act(() => {
+        useUIStore.getState().failPendingWorkspace("pw-1", "branch already exists");
+      });
+      rerender(
+        <TooltipProvider>
+          <SidebarProjectsView />
+        </TooltipProvider>,
+      );
+      expect(within(group).getByText("branch already exists")).toBeInTheDocument();
+    } finally {
+      useUIStore.setState({ pendingWorkspaces: [] });
+    }
+  });
+
+  it("keeps a recently active project with nothing live, showing its age instead of 0", async () => {
+    const recent = Date.now() - 2 * 60 * 60 * 1000;
+    workspaces = [
+      makeWorkspace({ title: "done lib", cwd: LIB, project_root: LIB, last_active_at: recent }),
+    ];
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-1", at: 1 }],
+      snoozed: [],
+      keepActive: [],
+      activity: {},
+    });
+    const { container } = await renderView();
+    const header = screen.getByRole("button", { name: "lib" });
+    expect(header.closest("[data-project-group]")).toHaveTextContent("2h");
+    expect(container.querySelector("[data-more-projects-toggle]")).toBeNull();
   });
 
   it("activates a workspace when its row is clicked", async () => {
@@ -413,7 +502,7 @@ describe("SidebarProjectsView", () => {
       useSidebarInboxStore.getState().settle("ws-1");
     });
     expect(screen.queryByText("row")).toBeNull();
-    expect(screen.getByRole("button", { name: "Show 1 settled" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Settled 1" })).toBeInTheDocument();
   });
 });
 
@@ -470,7 +559,7 @@ describe("SidebarProjectsView — inbox lifecycle while Projects is shown", () =
     });
     const { container, rerender } = await renderSidebar();
     expect(container.querySelector("[data-inbox-card]")).toBeNull();
-    expect(screen.getByRole("button", { name: "Show 1 settled" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Settled 1" })).toBeInTheDocument();
 
     paneStatuses = { p1: "working" };
     await rerenderSidebar(rerender);
@@ -483,7 +572,7 @@ describe("SidebarProjectsView — inbox lifecycle while Projects is shown", () =
     await rerenderSidebar(rerender);
     expect(useSidebarInboxStore.getState().settled).toEqual([]);
     expect(container.querySelector('[data-projects-row="ws-1"]')).not.toBeNull();
-    expect(screen.queryByRole("button", { name: /settled$/ })).toBeNull();
+    expect(container.querySelector("[data-settled-shelf-toggle]")).toBeNull();
   });
 
   it("wakes a snoozed workspace whose agent raises a hand, and keeps it awake after", async () => {

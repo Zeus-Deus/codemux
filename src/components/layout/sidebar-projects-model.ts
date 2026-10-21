@@ -13,19 +13,39 @@ export interface ProjectsSection {
   path: string;
   /** Live rows, top level in newest-first order, children nested. */
   rows: ProjectsRow[];
-  /** Settled or snoozed workspaces, folded behind "Show N settled". Flat:
-   *  a parked child has no live parent row to hang from. */
+  /** Settled or snoozed workspaces, newest first. Flat: a parked child has
+   *  no live parent row to hang from. Listed in the shelf, and under the
+   *  header of a project with nothing live. */
   parked: WorkspaceSnapshot[];
   /** Live workspaces in this section, children included — the header count. */
   liveCount: number;
+  /** Newest agent activity or visit across the section's workspaces (ms
+   *  epoch), or null when none is known. */
+  lastActiveAt: number | null;
+}
+
+/** One parked workspace in the sidebar-wide Settled shelf. */
+export interface ShelfEntry {
+  workspace: WorkspaceSnapshot;
+  sectionName: string;
+  sectionPath: string;
 }
 
 export interface ProjectsModel {
-  /** Workspaces that belong to no git project: home-directory chats and
-   *  folders that were never a project. Null when there are none. */
+  /** Live home-directory chats and folders that were never a project. Null
+   *  when nothing there is live; parked chats live in the shelf. */
   chats: ProjectsSection | null;
+  /** Projects with live work, recent activity, or the open workspace. */
   projects: ProjectsSection[];
+  /** Everything else, folded behind "N more projects". */
+  quietProjects: ProjectsSection[];
+  /** Every parked workspace, most recently parked first. */
+  shelf: ShelfEntry[];
 }
+
+/** How long a project with nothing live stays in the main list after its
+ *  last activity, so settling the last chat doesn't make it vanish at once. */
+export const RECENT_PROJECT_MS = 3 * 24 * 60 * 60 * 1000;
 
 /** Whether a workspace is a plain chat rather than work inside a project.
  *
@@ -109,7 +129,11 @@ function countRows(rows: readonly ProjectsRow[]): number {
  *  creation order, never status, so rows hold still while agents run.
  *  `parkedIds` are settled/snoozed workspaces; `liveOverride` lets a parked
  *  workspace whose agent is working or blocked stay visible (the same safety
- *  net the inbox applies), without writing to the lifecycle store. */
+ *  net the inbox applies), without writing to the lifecycle store.
+ *
+ *  A project stays in the main list while it has live work, holds the open
+ *  workspace, or saw activity within `RECENT_PROJECT_MS`; the rest go to
+ *  `quietProjects`. A filtered view always shows its one project. */
 export function buildProjectsModel(input: {
   projectGroups: readonly ProjectGroup[];
   homeDir: string | null;
@@ -118,9 +142,19 @@ export function buildProjectsModel(input: {
   liveOverride?: ReadonlySet<string>;
   /** Inbox project filter (a project path), or null for all projects. */
   filter: string | null;
+  /** When each parked workspace was parked (ms epoch) — the shelf order. */
+  parkedAt?: ReadonlyMap<string, number>;
+  /** The open workspace: its section always stays in the main list. */
+  activeWorkspaceId?: string;
+  /** Project paths that must stay in the main list (a workspace is being
+   *  created there). */
+  forcePaths?: ReadonlySet<string>;
+  now: number;
 }): ProjectsModel {
-  const { projectGroups, homeDir, storedIndex, parkedIds, filter } = input;
+  const { projectGroups, homeDir, storedIndex, parkedIds, filter, now } = input;
   const liveOverride = input.liveOverride ?? new Set<string>();
+  const parkedAt = input.parkedAt ?? new Map<string, number>();
+  const forcePaths = input.forcePaths ?? new Set<string>();
   const newestFirst = (a: WorkspaceSnapshot, b: WorkspaceSnapshot) =>
     (storedIndex.get(b.workspace_id) ?? 0) -
     (storedIndex.get(a.workspace_id) ?? 0);
@@ -141,11 +175,31 @@ export function buildProjectsModel(input: {
       (isParked(ws) ? parked : live).push(ws);
     }
     const rows = nestRows(live);
-    return { name, path, rows, parked, liveCount: countRows(rows) };
+    let lastActiveAt: number | null = null;
+    for (const ws of workspaces) {
+      for (const at of [ws.last_active_at, ws.last_visited_at]) {
+        if (at != null && (lastActiveAt === null || at > lastActiveAt)) {
+          lastActiveAt = at;
+        }
+      }
+    }
+    return { name, path, rows, parked, liveCount: countRows(rows), lastActiveAt };
+  };
+
+  const holdsActive = (s: ProjectsSection) =>
+    input.activeWorkspaceId !== undefined &&
+    s.parked.some((ws) => ws.workspace_id === input.activeWorkspaceId);
+
+  const shelf: ShelfEntry[] = [];
+  const shelve = (s: ProjectsSection) => {
+    for (const ws of s.parked) {
+      shelf.push({ workspace: ws, sectionName: s.name, sectionPath: s.path });
+    }
   };
 
   const chatWorkspaces: WorkspaceSnapshot[] = [];
   const projects: ProjectsSection[] = [];
+  const quietProjects: ProjectsSection[] = [];
   for (const group of projectGroups) {
     if (filter !== null && group.projectPath !== filter) continue;
     const own: WorkspaceSnapshot[] = [];
@@ -153,18 +207,61 @@ export function buildProjectsModel(input: {
       if (isChatWorkspace(ws, homeDir)) chatWorkspaces.push(ws);
       else own.push(ws);
     }
-    if (own.length > 0) {
-      projects.push(section(group.projectName, group.projectPath, own));
-    }
+    if (own.length === 0) continue;
+    const s = section(group.projectName, group.projectPath, own);
+    shelve(s);
+    const shown =
+      filter !== null ||
+      s.rows.length > 0 ||
+      holdsActive(s) ||
+      forcePaths.has(s.path) ||
+      (s.lastActiveAt !== null && now - s.lastActiveAt < RECENT_PROJECT_MS);
+    (shown ? projects : quietProjects).push(s);
   }
 
-  return {
-    chats:
-      chatWorkspaces.length > 0
-        ? section("Chats", homeDir ?? "", chatWorkspaces)
-        : null,
-    projects,
-  };
+  let chats: ProjectsSection | null = null;
+  if (chatWorkspaces.length > 0) {
+    const s = section("Chats", homeDir ?? "", chatWorkspaces);
+    shelve(s);
+    if (s.rows.length > 0 || holdsActive(s)) chats = s;
+  }
+
+  // Stable sort: equal timestamps keep section order.
+  shelf.sort(
+    (a, b) =>
+      (parkedAt.get(b.workspace.workspace_id) ?? 0) -
+      (parkedAt.get(a.workspace.workspace_id) ?? 0),
+  );
+
+  return { chats, projects, quietProjects, shelf };
+}
+
+/** The shelf's first `limit` entries grouped under their section, sections in
+ *  order of their most recent entry. `keepId` (the open workspace) is pulled
+ *  in from past the limit so it never hides behind "Show more". */
+export function groupShelf(
+  shelf: readonly ShelfEntry[],
+  limit: number,
+  keepId?: string,
+): { name: string; path: string; workspaces: WorkspaceSnapshot[] }[] {
+  const visible = shelf.slice(0, limit);
+  const kept = shelf
+    .slice(limit)
+    .find((e) => e.workspace.workspace_id === keepId);
+  if (kept) visible.push(kept);
+  const groups = new Map<
+    string,
+    { name: string; path: string; workspaces: WorkspaceSnapshot[] }
+  >();
+  for (const e of visible) {
+    let g = groups.get(e.sectionPath);
+    if (!g) {
+      g = { name: e.sectionName, path: e.sectionPath, workspaces: [] };
+      groups.set(e.sectionPath, g);
+    }
+    g.workspaces.push(e.workspace);
+  }
+  return [...groups.values()];
 }
 
 /** Live row ids in visual order, honouring folded groups — the Alt+1..9
