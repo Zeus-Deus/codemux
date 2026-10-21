@@ -19,7 +19,7 @@ const TOOL_NAME: &str = "workspace_launch";
 const MAX_IN_FLIGHT: usize = 6;
 const TOOL_DESCRIPTION: &str = "Start a NEW top-level workspace with its own git worktree, branch and agent chat. Use ONLY when the user asks for separate/new workspaces, threads, or parallel independent work they will follow in the sidebar. Its results do NOT come back to this chat; use delegate_task when you need results back. Call workspace_launch once per workspace; several calls in one turn are fine. The caller stays in this chat.
 
-The new agent sees ONLY `message`. Write a self-contained brief: goal, relevant files, constraints, how to verify, and whether to open a PR. Omit provider to use your own provider. Pass model and effort only when the user asked for them; otherwise omit for that provider's defaults. The new chat inherits this chat's permission ceiling.
+The new agent sees ONLY `message`. Write a self-contained brief: goal, relevant files, constraints, how to verify, and whether to open a PR. Omit provider to use your own provider (a Hermes chat keeps its own profile). To pick a configured instance such as a Hermes profile, pass target.instance_id from orchestrator_capabilities instead of provider. Pass model and effort only when the user asked for them; otherwise omit for that provider's defaults. The new chat inherits this chat's permission ceiling.
 
 It returns at once while the workspace starts. Give the user a one-line status naming the workspaces and END YOUR TURN. They appear in the sidebar shortly; do not poll or wait. Startup failures appear in Codemux notifications.";
 
@@ -31,6 +31,7 @@ struct LaunchArgs {
     branch: Option<String>,
     base: Option<String>,
     provider: Option<ProviderKind>,
+    target: Option<crate::agent_control::selection::ProviderSelection>,
     model: Option<String>,
     effort: Option<String>,
 }
@@ -57,8 +58,23 @@ impl LaunchArgs {
                 }
             }
         }
+        if let Some(target) = &input.target {
+            service::identifier(&target.instance_id, "target.instance_id", 256)
+                .map_err(|error| error.message)?;
+            if input.provider.is_some_and(|provider| Some(provider) != target_provider(target)) {
+                return Err("provider and target.instance_id name different providers.".into());
+            }
+            if input.model.is_some() && target.model.is_some() && input.model != target.model {
+                return Err("model and target.model disagree.".into());
+            }
+        }
         Ok(input)
     }
+}
+
+/// The provider an instance ID such as `hermes:coder` or `claude:work` names.
+fn target_provider(target: &crate::agent_control::selection::ProviderSelection) -> Option<ProviderKind> {
+    super::delegation::parse_provider(target.instance_id.split(':').next().unwrap_or_default())
 }
 
 fn caller_ceiling(caller: &HostCaller) -> Option<crate::agent_control::permissions::Ceiling> {
@@ -91,7 +107,7 @@ fn caller_workspace<R: Runtime>(
         .state::<DelegationState>()
         .is_running_child(&caller.thread_id);
     if !eligible(caller, is_child, &workspace) {
-        return Err("Workspace launch needs a main Claude or Codex chat outside Plan mode, in a local git workspace (not a delegated task or imported snapshot).".into());
+        return Err("Workspace launch needs a main chat outside Plan mode, in a local git workspace (not a delegated task or imported snapshot).".into());
     }
     let root = workspace.project_root.as_deref().unwrap_or(&workspace.cwd);
     let repo = crate::config::workspace_config::find_git_root(Path::new(root))
@@ -240,20 +256,64 @@ impl<R: Runtime> WorkspaceLaunchHost<R> {
     }
 
     fn offered_providers(&self, caller: &HostCaller) -> Vec<ProviderKind> {
-        offered_agents(caller, false, self.is_installed).into_iter().filter(|provider| {
-            caller_ceiling(caller).is_some_and(|ceiling| ceiling.inherited_workspace(*provider).is_ok())
-        }).collect()
+        // Hermes runs a configured profile, not a binary on PATH, and is
+        // offered only where the caller maps to its full-access mode.
+        let hermes = self.app.try_state::<crate::database::DatabaseStore>().is_some_and(|db| {
+            crate::agent_control::selection::profiles(&db).is_ok_and(|profiles| !profiles.is_empty())
+        });
+        offered_agents(caller, false, self.is_installed)
+            .into_iter()
+            .chain(hermes.then_some(ProviderKind::Hermes))
+            .filter(|provider| {
+                caller_ceiling(caller).is_some_and(|ceiling| ceiling.inherited_workspace(*provider).is_ok())
+            })
+            .collect()
+    }
+
+    /// The configured instance a launch runs. Hermes always names a profile:
+    /// the caller's own when it is a Hermes chat, otherwise an explicit target.
+    fn selection(
+        &self,
+        caller: &HostCaller,
+        provider: ProviderKind,
+        input: &LaunchArgs,
+    ) -> Result<Option<crate::agent_control::selection::ProviderSelection>, String> {
+        let mut target = match (&input.target, provider) {
+            (Some(target), _) => target.clone(),
+            (None, ProviderKind::Hermes) if caller.provider == ProviderKind::Hermes => {
+                let db = self.app.state::<crate::database::DatabaseStore>();
+                crate::agent_control::selection::ProviderSelection {
+                    instance_id: crate::agent_control::selection::current_instance(&db, &caller.thread_id, ProviderKind::Hermes)?,
+                    ..Default::default()
+                }
+            }
+            (None, ProviderKind::Hermes) => {
+                return Err("Hermes needs a profile: pass target.instance_id with a configured Hermes instance from orchestrator_capabilities.".into())
+            }
+            (None, _) => return Ok(None),
+        };
+        if target.model.is_none() {
+            target.model = input.model.clone();
+        }
+        Ok(Some(target))
     }
 
     fn launch(&self, caller: &HostCaller, arguments: &Value) -> Result<Value, String> {
         let input = LaunchArgs::parse(arguments)?;
         let (workspace, repo) = caller_workspace(&self.app, caller)?;
-        let provider = input.provider.unwrap_or(caller.provider);
+        let provider = input
+            .target
+            .as_ref()
+            .map(|target| target_provider(target).ok_or("Choose an exact target.instance_id from orchestrator_capabilities."))
+            .transpose()?
+            .or(input.provider)
+            .unwrap_or(caller.provider);
         caller_ceiling(caller).ok_or("unsupported_permission_ceiling: This chat's workspace permission policy is unknown")?
             .inherited_workspace(provider).map_err(|error| error.to_string())?;
         if !self.offered_providers(caller).contains(&provider) {
             return Err("Choose an installed provider offered by workspace_launch.".into());
         }
+        let target = self.selection(caller, provider, &input)?;
         if let Some(branch) = &input.branch {
             if git(&repo, &["check-ref-format", "--branch", branch])? != *branch {
                 return Err("Pass a literal new branch name, not a checkout shorthand.".into());
@@ -292,7 +352,7 @@ impl<R: Runtime> WorkspaceLaunchHost<R> {
         let operation = admission.receipt.operation_id;
         if control.thread_id().is_some() {control.admitted=Some(crate::agent_control::AdmittedAuthority::Operation {operation_id:operation.clone()});}
         tauri::async_runtime::spawn(async move {
-            let outcome = start(&app, &caller, input, provider, repo, branch, base, &thread).await;
+            let outcome = start(&app, &caller, input, provider, target, repo, branch, base, &thread).await;
             if outcome.is_err() {
                 let _ = app.state::<crate::database::DatabaseStore>().orchestration_launch_finished(&thread);
             }
@@ -322,6 +382,7 @@ async fn start<R: Runtime>(
     caller: &HostCaller,
     input: LaunchArgs,
     provider: ProviderKind,
+    target: Option<crate::agent_control::selection::ProviderSelection>,
     repo: PathBuf,
     branch: String,
     base: String,
@@ -330,10 +391,12 @@ async fn start<R: Runtime>(
     let title = input.title.clone();
     let outcome: Result<(), String> = async {
         let control = caller.control.clone().ok_or("stale_caller: workspace launch requires authenticated chat authority")?;
-        let prepared = service::PreparedWorkspaceChat::prepare(
+        let prepared = service::PreparedWorkspaceChat::prepare_selected(
             app,
             &control,
             provider,
+            target,
+            &repo.to_string_lossy(),
             input.title.clone(),
             input.message,
             input.model,
@@ -407,6 +470,7 @@ impl<R: Runtime> HostTools for WorkspaceLaunchHost<R> {
                     "branch": {"type":"string", "description":"New branch name. Omit for a unique kebab-case name from title."},
                     "base": {"type":"string", "description":"Base ref, e.g. main. Omit for this workspace's current HEAD."},
                     "provider": {"type":"string", "enum":agents.iter().map(|kind| provider_id(*kind)).collect::<Vec<_>>(), "description":"Installed agent. Omit to use this chat's provider."},
+                    "target": crate::agent_control::selection::schema(),
                     "model": {"type":"string", "description":"Exact advertised model id, only when the user requested it."},
                     "effort": {"type":"string", "description":"Advertised effort for the selected model, only when the user requested it."}
                 },

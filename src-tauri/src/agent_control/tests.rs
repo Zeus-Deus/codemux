@@ -2879,3 +2879,124 @@ async fn all_provider_queued_launch_keeps_delivery_authority_after_receipt_succe
     checkpoint.abort().await;
     assert!(provider.calls.snapshot().iter().all(|c|!matches!(c,mock_agent_provider::MockCall::SendTurn(..))));
 }
+
+/// Hermes runs a configured profile. workspace_launch carries the profile
+/// through preparation: a Hermes chat keeps its own, a full-access chat of
+/// another provider names one, and lower ceilings are never offered Hermes.
+#[tokio::test]
+async fn all_provider_workspace_launch_carries_hermes_profiles() {
+    use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, claude, root, workspace) = fixture().await;
+    claude.enable_session_listing();
+    app.manage(crate::commands::delegation::DelegationState::default());
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git").current_dir(root.path()).args(args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    };
+    git(&["init", "-b", "main"]);
+    git(&["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base"]);
+    app.manage(crate::terminal::PtyState::default());
+    app.manage(crate::presets::PresetStoreState::new(&app.state::<crate::database::DatabaseStore>()));
+    // A configured Hermes with a default and a `coder` profile; no process runs.
+    let hermes_home = tempfile::tempdir().unwrap();
+    let installation = hermes_home.path().join("hermes");
+    std::fs::write(&installation, "#!/bin/sh\n").unwrap();
+    let hermes_root = hermes_home.path().join("root");
+    std::fs::create_dir_all(hermes_root.join("profiles/coder")).unwrap();
+    for home in [hermes_root.clone(), hermes_root.join("profiles/coder")] {
+        std::fs::write(home.join("config.yaml"), "model: {provider: custom}\n").unwrap();
+    }
+    let db = app.state::<crate::database::DatabaseStore>();
+    db.set_setting("hermes.installation", installation.to_str().unwrap()).unwrap();
+    db.set_setting("hermes.root", hermes_root.to_str().unwrap()).unwrap();
+    let profiles = super::selection::profiles(&db).unwrap();
+    let coder = profiles.iter().find(|p| p.id == "coder").unwrap().clone();
+    let runtime = Arc::new(crate::agent_provider::hermes::HermesProvider::new(Arc::new(crate::database::DatabaseStore::new_in_memory())));
+    let catalog = json!({
+        "models":{"currentModelId":"openai:fixture","availableModels":[{"modelId":"openai:fixture","name":"Fixture"}]},
+        "modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"dont_ask","name":"Don't ask"}]},
+    });
+    for profile in &profiles {
+        runtime.remember_catalog_for_test(profile, catalog.clone()).await;
+    }
+    app.manage(runtime);
+    let hermes = Arc::new(mock_agent_provider::MockAgentProvider::new(ProviderKind::Hermes));
+    hermes.enable_session_listing();
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_hermes(hermes.clone()).await;
+    let mut caps = crate::agent_provider::claude::capabilities::claude_fallback_capabilities();
+    caps.permission_modes = vec![crate::agent_provider::PermissionModeOption {value:"dont_ask".into(),label:"Don't ask".into(),description:String::new(),is_default:true}];
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap().insert(ProviderKind::Hermes, caps);
+
+    let caller = |kind: ProviderKind, mode: &'static str| {
+        let (app, workspace, coder, cwd) = (&app, workspace.clone(), coder.clone(), root.path().to_path_buf());
+        async move {
+            let launched = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({"workspace_id":workspace,"client_request_id":format!("hermes-caller-{kind:?}-{mode}"),"provider":kind,"permission_mode":mode})).await.unwrap();
+            let receipt = settle_operation(app, &launched).await;
+            assert_eq!(receipt["state"], "succeeded", "{receipt}");
+            let thread = receipt["thread_id"].as_str().unwrap().to_string();
+            let app = app.handle();
+            if kind == ProviderKind::Hermes {
+                app.state::<crate::database::DatabaseStore>().save_hermes_binding(&crate::agent_provider::hermes::binding::Binding {
+                    schema_version: 1, profile: coder, thread_id: thread.clone(), workspace_id: Some(workspace.clone()), cwd,
+                    acp_session_id: None, current_native_id: None, root_native_id: None, model_override: None,
+                    resolved_model: None, permission_mode: Some(mode.into()), compatibility: String::new(), cleanup_pending: false,
+                }).unwrap();
+            }
+            let authority = crate::delegation::authority::NativeAuthority::with_policy(&thread, kind, Some(mode));
+            let generation = authority.begin(0);
+            assert!(authority.bind(generation, "native-run"));
+            let actor = crate::delegation::app::NativeActor {thread_id:thread.clone(),provider:kind,workspace_id:Some(workspace.clone()),session_id:format!("mock-{thread}"),permission_mode:Some(mode.into()),permit:authority.capture()};
+            let control = native::qualify(app, &actor).await.unwrap();
+            (HostCaller {control:Some(control),thread_id:thread,provider:kind,workspace_id:Some(workspace),permission_mode:Some(mode.into())}, authority)
+        }
+    };
+    let host = crate::commands::workspace_launch::WorkspaceLaunchHost::with_install_check(app.handle().clone(), |_| true);
+    let offered = |caller: &HostCaller| host.tools_for(caller)[0].input_schema["properties"]["provider"]["enum"].as_array().unwrap().contains(&json!("hermes"));
+    let launched_profile = |parent: String| {
+        let hermes = hermes.clone();
+        async move {
+            let input = tokio::time::timeout(std::time::Duration::from_secs(10), async { loop {
+                let child = hermes.calls.snapshot().iter().find_map(|c| match c {mock_agent_provider::MockCall::SendTurn(t,_) if t.0 != parent => Some(t.0.clone()), _ => None});
+                if let Some(input) = child.and_then(|child| hermes.start_inputs().into_iter().find(|i| i.thread_id.0 == child)) { break input; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }}).await.expect("the Hermes workspace chat started");
+            hermes.calls.0.lock().unwrap().clear();
+            input
+        }
+    };
+    let cleanup = |input: &crate::agent_provider::StartSessionInput| {
+        git(&["worktree", "remove", "--force", input.cwd.to_str().unwrap()]);
+        let _ = std::fs::remove_dir(input.cwd.parent().unwrap());
+    };
+
+    // A full-access Hermes chat omits provider and keeps its own profile.
+    let (hermes_caller, _a) = caller(ProviderKind::Hermes, "dont_ask").await;
+    assert!(offered(&hermes_caller));
+    let result = host.call(&hermes_caller, "mcp__codemux__workspace_launch", &json!({"title":"Hermes workspace","message":"A complete Hermes brief","branch":"hermes-own-profile"})).unwrap();
+    assert_eq!(result["isError"], false, "{result}");
+    let input = launched_profile(hermes_caller.thread_id.clone()).await;
+    assert_eq!(input.extra["hermes_profile"]["id"], "coder");
+    assert_eq!(input.permission_mode.as_deref(), Some("dont_ask"));
+    cleanup(&input);
+
+    // A lower ceiling is never offered Hermes and cannot name a profile.
+    let (lower, _b) = caller(ProviderKind::Claude, "default").await;
+    assert!(!offered(&lower));
+    let refused = host.call(&lower, "mcp__codemux__workspace_launch", &json!({"title":"Lower Hermes","message":"A complete brief","target":{"instance_id":"hermes:coder"}})).unwrap();
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(refused.to_string().contains("permission"), "{refused}");
+
+    // A full-access chat of another provider targets a configured profile.
+    let (full, _c) = caller(ProviderKind::Claude, "bypassPermissions").await;
+    assert!(offered(&full));
+    let missing = host.call(&full, "mcp__codemux__workspace_launch", &json!({"title":"No profile","message":"A complete brief","provider":"hermes"})).unwrap();
+    assert!(missing.to_string().contains("target.instance_id"), "{missing}");
+    let result = host.call(&full, "mcp__codemux__workspace_launch", &json!({"title":"Targeted Hermes","message":"A complete brief","branch":"hermes-targeted","target":{"instance_id":"hermes:default"}})).unwrap();
+    assert_eq!(result["isError"], false, "{result}");
+    assert_eq!(result["content"][0]["text"].as_str().map(|t| t.contains("\"provider\":\"hermes\"")), Some(true), "{result}");
+    let input = launched_profile(full.thread_id.clone()).await;
+    assert_eq!(input.extra["hermes_profile"]["id"], "default");
+    assert_eq!(input.permission_mode.as_deref(), Some("dont_ask"));
+    cleanup(&input);
+}

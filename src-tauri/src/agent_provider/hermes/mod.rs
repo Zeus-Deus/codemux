@@ -354,6 +354,10 @@ impl HermesProvider {
     /// fresh one, `probe` reads it again, never waiting on a busy profile;
     /// listing passes `false` and never starts a runtime or creates a Hermes
     /// session.
+    #[cfg(test)]
+    pub(crate) async fn remember_catalog_for_test(&self, profile: &Profile, catalog: Value) {
+        self.inner.remember_catalog(profile, catalog).await;
+    }
     pub(crate) async fn orchestration_catalog(
         &self,
         profile: Profile,

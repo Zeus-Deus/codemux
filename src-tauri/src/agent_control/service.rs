@@ -403,8 +403,19 @@ impl PreparedWorkspaceChat {
         app: &AppHandle<R>, caller: &ControlCaller, provider: ProviderKind,
         title: String, message: String, model: Option<String>, effort: Option<String>,
     ) -> Result<Self, ControlError> {
-        let input = Launch {
-            target: None,
+        Self::prepare_selected(app, caller, provider, None, "", title, message, model, effort).await
+    }
+
+    /// `target` selects a configured instance (a Hermes profile, an
+    /// account); `cwd` is where a cold instance catalog is discovered.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_selected<R: Runtime>(
+        app: &AppHandle<R>, caller: &ControlCaller, provider: ProviderKind,
+        target: Option<super::selection::ProviderSelection>, cwd: &str,
+        title: String, message: String, model: Option<String>, effort: Option<String>,
+    ) -> Result<Self, ControlError> {
+        let mut input = Launch {
+            target,
             resolved: None,
             selected_capabilities: None,
             workspace_id: String::new(), client_request_id: uuid::Uuid::new_v4().to_string(),
@@ -413,6 +424,7 @@ impl PreparedWorkspaceChat {
             context_window: None,
             service_tier: None, fast_mode: false, select: false, worktree: None,
         };
+        prepare_selection(app, &mut input, cwd).await?;
         validate_worker(app, caller, &input).await?;
         authorize_native(app, caller, false)?;
         Ok(Self(input))
