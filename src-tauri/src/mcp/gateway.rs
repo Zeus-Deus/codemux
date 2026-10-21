@@ -453,19 +453,12 @@ async fn handle_post(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let key = call_key(&headers, &id);
-            // OpenCode 2 names the calling session. Its native subagents run
-            // in child sessions and must not borrow the chat's authority.
-            if let (Some(binding), Some(session)) = (
-                &caller.native,
-                params
-                    .pointer("/_meta/ai.opencode~1sessionID")
-                    .and_then(Value::as_str),
-            ) {
-                if session != binding.session.session_id() {
+            if let Some(binding) = &caller.native {
+                if let Err(message) = calling_session_matches(binding, &params) {
                     return rpc_result(
                         id,
                         json!({
-                            "content": [{ "type": "text", "text": "provider_control_denied: Codemux tools act only for the chat's own session, not its native subagents" }],
+                            "content": [{ "type": "text", "text": message }],
                             "isError": true
                         }),
                     )
@@ -552,6 +545,31 @@ async fn handle_post(
             }
         }
         _ => rpc_error(id, -32601, format!("method not found: {method}")).into_response(),
+    }
+}
+
+/// OpenCode 2 names the calling session in `_meta`. Every OpenCode chat shares
+/// one server, and OpenCode's own permission rules (which a user's agent
+/// configuration can widen) are the only thing hiding one chat's tools from
+/// another. So an OpenCode call must name the session its token is bound to:
+/// a missing name, another chat's session or a native subagent's child
+/// session is refused. Other providers run one process per chat; a name they
+/// send is still checked.
+fn calling_session_matches(
+    binding: &super::thread_gateway::GatewayBinding,
+    params: &Value,
+) -> Result<(), &'static str> {
+    let named = params
+        .pointer("/_meta/ai.opencode~1sessionID")
+        .and_then(Value::as_str);
+    let bound = binding.session.session_id();
+    match named {
+        Some(session) if !bound.is_empty() && session == bound => Ok(()),
+        Some(_) => Err("provider_control_denied: Codemux tools act only for the chat's own session, not another chat or its native subagents"),
+        None if binding.session.caller().provider == crate::agent_provider::ProviderKind::OpenCode => {
+            Err("provider_control_denied: OpenCode did not name the calling session; OpenCode 2 or newer is required for agent collaboration")
+        }
+        None => Ok(()),
     }
 }
 
@@ -1253,10 +1271,16 @@ mod all_provider_tests {
                     .any(|t| t["name"] == "orchestrator_capabilities"),
                 "{listed}"
             );
+            // Each call names its chat's session, as OpenCode 2 does.
+            let sessions = [(a.bearer_token.clone(), "session-a"), (b.bearer_token.clone(), "session-b")];
             let invoke = |connection: McpGatewayConnection, name: &'static str, args: Value| {
                 let client = client.clone();
+                let session = sessions
+                    .iter()
+                    .find(|(token, _)| *token == connection.bearer_token)
+                    .map_or("replacement", |(_, session)| *session);
                 async move {
-                    client.post(connection.url).bearer_auth(connection.bearer_token).json(&json!({"id":2,"method":"tools/call","params":{"name":name,"arguments":args}})).send().await.unwrap()
+                    client.post(connection.url).bearer_auth(connection.bearer_token).json(&json!({"id":2,"method":"tools/call","params":{"name":name,"arguments":args,"_meta":{"ai.opencode/sessionID":session}}})).send().await.unwrap()
                 }
             };
             let reply: Value = invoke(
@@ -1562,5 +1586,72 @@ mod session_scope_tests {
         let own: Value = invoke("ses_parent").await.unwrap().json().await.unwrap();
         assert_ne!(own["result"]["isError"], true, "{own}");
         assert!(own.to_string().contains("ses_parent"), "{own}");
+    }
+
+    /// A user's OpenCode agent config (`agent.build.permission={"*":"allow"}`)
+    /// overrides the server-wide `codemux_*` deny, so chat A is offered chat
+    /// B's server and OpenCode sends B's token. The gateway alone must refuse.
+    #[tokio::test]
+    async fn opencode_calls_must_name_the_session_their_token_is_bound_to() {
+        let (gateway, chat_a, _a, _entered) = fixture(ProviderKind::OpenCode, false).await;
+        let b = GatewaySession::new("scope-b", ProviderKind::OpenCode, None, Some("default".into()));
+        b.bind_session("ses_b");
+        b.begin("turn-b", None).unwrap();
+        let chat_b = gateway.chat_connection(
+            "scope-b",
+            GatewayCaller { native: Some(GatewayBinding::new(b)), ..Default::default() },
+        );
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let invoke = |connection: &McpGatewayConnection, meta: Value| {
+            call(&client, connection, None, json!({"id":1,"method":"tools/call","params":{
+                "name":"thread_wait","arguments":{},"_meta":meta}}))
+            .send()
+        };
+        let denied = |reply: &Value| reply["result"]["isError"] == true
+            && reply.to_string().contains("provider_control_denied");
+        // A's session presenting B's credential.
+        let borrowed: Value = invoke(&chat_b, json!({"ai.opencode/sessionID":"ses_parent"}))
+            .await.unwrap().json().await.unwrap();
+        assert!(denied(&borrowed), "{borrowed}");
+        // OpenCode 1.x sends only a progress token: never trusted.
+        for meta in [json!({"progressToken":2}), json!(null)] {
+            let unnamed: Value = invoke(&chat_b, meta).await.unwrap().json().await.unwrap();
+            assert!(denied(&unnamed), "{unnamed}");
+            assert!(unnamed.to_string().contains("OpenCode 2 or newer is required"), "{unnamed}");
+        }
+        // Each chat still reaches its own tools.
+        let own_b: Value = invoke(&chat_b, json!({"ai.opencode/sessionID":"ses_b"}))
+            .await.unwrap().json().await.unwrap();
+        assert_ne!(own_b["result"]["isError"], true, "{own_b}");
+        assert!(own_b.to_string().contains("ses_b"), "{own_b}");
+        let own_a: Value = invoke(&chat_a, json!({"ai.opencode/sessionID":"ses_parent"}))
+            .await.unwrap().json().await.unwrap();
+        assert_ne!(own_a["result"]["isError"], true, "{own_a}");
+    }
+
+    #[tokio::test]
+    async fn an_unbound_opencode_credential_acts_for_no_session() {
+        let (gateway, _connection, _session, _entered) = fixture(ProviderKind::OpenCode, false).await;
+        let unbound = GatewaySession::new("scope-unbound", ProviderKind::OpenCode, None, None);
+        unbound.begin("turn", None).unwrap();
+        let connection = gateway.chat_connection(
+            "scope-unbound",
+            GatewayCaller { native: Some(GatewayBinding::new(unbound)), ..Default::default() },
+        );
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let reply: Value = call(&client, &connection, None, json!({"id":1,"method":"tools/call","params":{
+            "name":"thread_wait","arguments":{},"_meta":{"ai.opencode/sessionID":""}}}))
+            .send().await.unwrap().json().await.unwrap();
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+    }
+
+    #[tokio::test]
+    async fn one_process_providers_need_no_session_name() {
+        let (_gateway, connection, _session, _entered) = fixture(ProviderKind::Hermes, false).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let reply: Value = call(&client, &connection, None, json!({"id":1,"method":"tools/call","params":{
+            "name":"thread_wait","arguments":{}}}))
+            .send().await.unwrap().json().await.unwrap();
+        assert_ne!(reply["result"]["isError"], true, "{reply}");
     }
 }

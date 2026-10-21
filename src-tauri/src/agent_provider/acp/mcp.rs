@@ -266,8 +266,9 @@ mod tests {
 ///
 /// Native subagents (OpenCode child sessions, Hermes delegate children, like
 /// Claude Task agents) share their parent's process. Hermes children can use
-/// the parent's credential while its turn runs; OpenCode 2 tags each call with
-/// its session, so the gateway refuses calls from OpenCode child sessions.
+/// the parent's credential while its turn runs. OpenCode runs every chat on one
+/// server and names the calling session in each call, so the gateway refuses
+/// an OpenCode call from any session but the chat's own, child sessions included.
 #[derive(Debug)]
 pub(crate) struct ChatMcp {
     registry: McpRegistry,

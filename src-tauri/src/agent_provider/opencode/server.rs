@@ -55,8 +55,10 @@ use crate::execution::sanitize_gui_env_tokio;
 
 /// Upstream defaults plus one rule: every chat registers its Codemux tools
 /// as a `codemux_<id>` MCP server on this shared server, and only that chat's
-/// session is granted `codemux_<id>_*`. Other chats, catalog sessions and
-/// sessions with no grant see none of them.
+/// session is granted `codemux_<id>_*`, so other chats are not offered them.
+/// Agent rules in the user's config take precedence over this, so it is not
+/// what isolates chats: the gateway accepts a call only from the session its
+/// credential is bound to.
 pub(crate) const CONFIG_CONTENT: &str = r#"{"permission":{"codemux_*":"deny"}}"#;
 
 /// Crash recovery. Each server is recorded with the Codemux process that owns

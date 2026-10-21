@@ -283,58 +283,46 @@ impl OpenCodeSession {
                 source: Some(err.to_string()),
             })?;
 
-        // Shared MCP is best-effort: OpenCode only grew the runtime
-        // `POST /mcp` endpoint in 1.18.18, and older binaries must still be
-        // able to start a session — just without Codemux-configured servers.
-        // Failures surface as a RuntimeWarning instead of killing the session.
-        // Each chat registers its own `codemux_<id>` server on the shared
-        // OpenCode server; only this chat's session is granted its tools (see
-        // `server::CONFIG_CONTENT`).
-        let mut mcp = mcp_registry.map(|registry| {
-            crate::agent_provider::acp::mcp::ChatMcp::new(
-                registry,
-                &thread_id.0,
-                ProviderKind::OpenCode,
-                workspace_id,
-                Some("default".into()),
-                format!("codemux_{}", &Uuid::new_v4().simple().to_string()[..8]),
-                None,
-                crate::mcp::gateway::OPENCODE_NATIVE_SOURCES.to_vec(),
-                false,
-            )
-        });
-        let attached = match &mcp {
-            Some(chat) => {
-                async {
-                    let connection = chat
-                        .connection()
-                        .await
-                        .map_err(|message| ProviderError::RpcError { message })?;
-                    attach_mcp_connection(
-                        &http,
-                        &server_handle,
-                        directory.as_deref(),
-                        &chat.name,
-                        connection,
-                    )
-                    .await
-                }
-                .await
+        // Codemux tools are best-effort: a failure surfaces as a
+        // RuntimeWarning instead of killing the session. Each chat registers
+        // its own `codemux_<id>` server on the shared OpenCode server, and the
+        // gateway accepts a call only when OpenCode names this chat's session
+        // in it. OpenCode 1 never names the session, so it gets no server.
+        let mcp = match mcp_registry {
+            Some(_) if server_handle.api == super::api::OpenCodeApi::Legacy => {
+                let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                    thread_id: Some(thread_id.clone()),
+                    message: format!("Codemux tools are unavailable in this OpenCode session: {LEGACY_COLLABORATION}."),
+                    original_payload: None,
+                });
+                None
             }
-            None => Ok(()),
+            Some(registry) => match attach_chat_mcp(
+                &http,
+                &server_handle,
+                directory.as_deref(),
+                registry,
+                &thread_id,
+                workspace_id,
+            )
+            .await
+            {
+                Ok(chat) => Some(chat),
+                Err(error) => {
+                    eprintln!("[codemux::opencode] shared MCP gateway attach failed: {error}");
+                    let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                        thread_id: Some(thread_id.clone()),
+                        message: format!(
+                            "Codemux MCP servers are unavailable in this OpenCode session \
+                             (gateway attach failed: {error})."
+                        ),
+                        original_payload: None,
+                    });
+                    None
+                }
+            },
+            None => None,
         };
-        if let Err(error) = attached {
-            eprintln!("[codemux::opencode] shared MCP gateway attach failed: {error}");
-            let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
-                thread_id: Some(thread_id.clone()),
-                message: format!(
-                    "Codemux MCP servers are unavailable in this OpenCode session \
-                     (gateway attach failed: {error}). Update OpenCode to 1.18.18 or later."
-                ),
-                original_payload: None,
-            });
-            mcp = None;
-        }
 
         // Best-effort resume: readopt the persisted server-side session id when
         // it still exists on the OpenCode server (it persists sessions on disk,
@@ -2438,6 +2426,38 @@ impl Drop for OpenCodeSession {
     }
 }
 
+/// Why OpenCode 1 chats get no Codemux tools.
+pub(crate) const LEGACY_COLLABORATION: &str =
+    "OpenCode 2 or newer is required for agent collaboration";
+
+/// Register a chat's own `codemux_<id>` server on the shared server.
+async fn attach_chat_mcp(
+    http: &reqwest::Client,
+    server: &OpenCodeServerHandle,
+    directory: Option<&std::path::Path>,
+    registry: McpRegistry,
+    thread_id: &ThreadId,
+    workspace_id: Option<String>,
+) -> Result<crate::agent_provider::acp::mcp::ChatMcp, ProviderError> {
+    let chat = crate::agent_provider::acp::mcp::ChatMcp::new(
+        registry,
+        &thread_id.0,
+        ProviderKind::OpenCode,
+        workspace_id,
+        Some("default".into()),
+        format!("codemux_{}", &Uuid::new_v4().simple().to_string()[..8]),
+        None,
+        crate::mcp::gateway::OPENCODE_NATIVE_SOURCES.to_vec(),
+        false,
+    );
+    let connection = chat
+        .connection()
+        .await
+        .map_err(|message| ProviderError::RpcError { message })?;
+    attach_mcp_connection(http, server, directory, &chat.name, connection).await?;
+    Ok(chat)
+}
+
 /// Register one chat's Codemux MCP server, named `name`, with the live
 /// OpenCode server. The remote config is runtime-only: no provider config
 /// files are rewritten.
@@ -2450,118 +2470,84 @@ async fn attach_mcp_connection(
 ) -> Result<(), ProviderError> {
     let base = server.base_url.trim_end_matches('/');
     let authorization = format!("Bearer {}", connection.bearer_token);
-    if server.api == super::api::OpenCodeApi::V2 {
-        let mut request = http.put(format!(
-            "{base}/api/experimental/mcp/{}",
-            urlencoding::encode(name)
-        ));
-        if let Some(directory) = directory {
-            request = request.query(&[("location[directory]", directory.to_string_lossy())]);
-        }
-        let response = request
-            .basic_auth("opencode", Some(&server.server_password))
-            .json(&serde_json::json!({"config":{"type":"remote","url":connection.url,"disabled":false,"oauth":false,"headers":{"Authorization":authorization}}}))
-            .send()
-            .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("opencode_mcp_attach_failed: {e}"),
-            })?;
-        if !response.status().is_success() {
-            return Err(ProviderError::RpcError {
-                message: format!(
-                    "opencode_mcp_attach_http_status_{}",
-                    response.status().as_u16()
-                ),
-            });
-        }
-        // The runtime publishes a pending registration before its MCP
-        // initialize/list handshake completes. Do not start a tool-less turn.
-        for attempt in 0..40 {
-            let mut request = http.get(format!("{base}/api/mcp"));
-            if let Some(directory) = directory {
-                request = request.query(&[("location[directory]", directory.to_string_lossy())]);
-            }
-            let status: serde_json::Value = request
-                .basic_auth("opencode", Some(&server.server_password))
-                .send()
-                .await
-                .map_err(|e| ProviderError::RpcError {
-                    message: e.to_string(),
-                })?
-                .error_for_status()
-                .map_err(|e| ProviderError::RpcError {
-                    message: e.to_string(),
-                })?
-                .json()
-                .await
-                .map_err(|e| ProviderError::RpcError {
-                    message: e.to_string(),
-                })?;
-            if status["data"].as_array().is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|e| e["name"] == name && e["status"]["status"] == "connected")
-            }) {
-                return Ok(());
-            }
-            if attempt < 39 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
-        return Err(ProviderError::RpcError {
-            message: "Codemux MCP gateway was registered but is not connected".into(),
-        });
+    let mut request = http.put(format!(
+        "{base}/api/experimental/mcp/{}",
+        urlencoding::encode(name)
+    ));
+    if let Some(directory) = directory {
+        request = request.query(&[("location[directory]", directory.to_string_lossy())]);
     }
-    let url = format!("{base}/mcp");
-    let response = http
-        .post(url)
+    let response = request
         .basic_auth("opencode", Some(&server.server_password))
-        .json(&serde_json::json!({
-            "name": name,
-            "config": {
-                "type": "remote",
-                "url": connection.url,
-                "enabled": true,
-                "oauth": false,
-                "headers": { "Authorization": authorization }
-            }
-        }))
+        .json(&serde_json::json!({"config":{"type":"remote","url":connection.url,"disabled":false,"oauth":false,"headers":{"Authorization":authorization}}}))
         .send()
         .await
-        .map_err(|error| ProviderError::RpcError {
-            message: format!("opencode_mcp_attach_send_failed: {error}"),
+        .map_err(|e| ProviderError::RpcError {
+            message: format!("opencode_mcp_attach_failed: {e}"),
         })?;
     if !response.status().is_success() {
-        let status = response.status();
-        let detail = response.text().await.unwrap_or_default();
         return Err(ProviderError::RpcError {
             message: format!(
-                "opencode_mcp_attach_http_status_{}: {detail}",
-                status.as_u16()
+                "opencode_mcp_attach_http_status_{}",
+                response.status().as_u16()
             ),
         });
     }
-    Ok(())
+    // The runtime publishes a pending registration before its MCP
+    // initialize/list handshake completes. Do not start a tool-less turn.
+    for attempt in 0..40 {
+        let mut request = http.get(format!("{base}/api/mcp"));
+        if let Some(directory) = directory {
+            request = request.query(&[("location[directory]", directory.to_string_lossy())]);
+        }
+        let status: serde_json::Value = request
+            .basic_auth("opencode", Some(&server.server_password))
+            .send()
+            .await
+            .map_err(|e| ProviderError::RpcError {
+                message: e.to_string(),
+            })?
+            .error_for_status()
+            .map_err(|e| ProviderError::RpcError {
+                message: e.to_string(),
+            })?
+            .json()
+            .await
+            .map_err(|e| ProviderError::RpcError {
+                message: e.to_string(),
+            })?;
+        if status["data"].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e["name"] == name && e["status"]["status"] == "connected")
+        }) {
+            return Ok(());
+        }
+        if attempt < 39 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    Err(ProviderError::RpcError {
+        message: "Codemux MCP gateway was registered but is not connected".into(),
+    })
 }
 
 /// Allow `session` to use the tools of the server named `name`, replacing
-/// any earlier Codemux grant and keeping the session's other rules. OpenCode
-/// 2 child sessions copy these rules; the gateway refuses their calls by
-/// session id. OpenCode 1 child sessions start without them.
+/// any earlier Codemux grant and keeping the session's other rules. Agent
+/// rules in the user's OpenCode config can override this and the server-wide
+/// deny, so it only keeps other chats' tools out of the model's way; the
+/// gateway's session check is what isolates chats. Child sessions copy these
+/// rules; the gateway refuses their calls by session id.
 async fn grant_session_tools(
     http: &reqwest::Client,
     server: &OpenCodeServerHandle,
     session: &str,
     name: &str,
 ) -> Result<(), ProviderError> {
-    let v2 = server.api == super::api::OpenCodeApi::V2;
     let url = format!(
-        "{}{}",
+        "{}/api/session/{}",
         server.base_url.trim_end_matches('/'),
-        server.api.route(
-            &format!("/session/{}", urlencoding::encode(session)),
-            &format!("/api/session/{}", urlencoding::encode(session)),
-        )
+        urlencoding::encode(session)
     );
     let error = |e: reqwest::Error| ProviderError::RpcError {
         message: format!("opencode_tool_grant_failed: {e}"),
@@ -2577,31 +2563,21 @@ async fn grant_session_tools(
         .json()
         .await
         .map_err(error)?;
-    let (field, action, rules) = if v2 {
-        ("permissions", "action", &current["data"]["permissions"])
-    } else {
-        ("permission", "permission", &current["permission"])
-    };
-    let mut rules: Vec<serde_json::Value> = rules
+    let mut rules: Vec<serde_json::Value> = current["data"]["permissions"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|rule| {
-            !rule[action]
+            !rule["action"]
                 .as_str()
                 .is_some_and(|value| value.starts_with("codemux_"))
         })
         .cloned()
         .collect();
-    let tools = format!("{name}_*");
-    rules.push(if v2 {
-        serde_json::json!({"action": tools, "resource": "*", "effect": "allow"})
-    } else {
-        serde_json::json!({"permission": tools, "pattern": "*", "action": "allow"})
-    });
+    rules.push(serde_json::json!({"action": format!("{name}_*"), "resource": "*", "effect": "allow"}));
     http.patch(&url)
         .basic_auth("opencode", Some(&server.server_password))
-        .json(&serde_json::json!({ field: rules }))
+        .json(&serde_json::json!({ "permissions": rules }))
         .send()
         .await
         .map_err(error)?
@@ -2620,16 +2596,10 @@ async fn detach_mcp(
 ) {
     let base = server.base_url.trim_end_matches('/');
     let name = urlencoding::encode(name);
-    let request = if server.api == super::api::OpenCodeApi::V2 {
-        let request = http.delete(format!("{base}/api/experimental/mcp/{name}"));
-        match directory {
-            Some(directory) => {
-                request.query(&[("location[directory]", directory.to_string_lossy())])
-            }
-            None => request,
-        }
-    } else {
-        http.post(format!("{base}/mcp/{name}/disconnect"))
+    let request = http.delete(format!("{base}/api/experimental/mcp/{name}"));
+    let request = match directory {
+        Some(directory) => request.query(&[("location[directory]", directory.to_string_lossy())]),
+        None => request,
     };
     let _ = request
         .basic_auth("opencode", Some(&server.server_password))
@@ -3236,74 +3206,40 @@ pub(crate) mod tests {
         }
     }
 
+    /// Each chat's session is granted only its own server's tools; earlier
+    /// Codemux grants are replaced and the session's other rules kept.
     #[tokio::test]
-    async fn attaches_a_chat_gateway_through_opencode_runtime_api() {
+    async fn grants_a_session_only_its_own_chat_tools() {
         let mut server = Server::new_async().await;
-        let attach = server
-            .mock("POST", "/mcp")
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-                "name": "codemux_chat",
-                "config": {"type": "remote", "enabled": true, "oauth": false,
-                    "headers": {"Authorization": "Bearer test-token"}}
+        let rule = |a: &str, e: &str| serde_json::json!({"action":a,"resource":"*","effect":e});
+        let get = server
+            .mock("GET", "/api/session/ses_a")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({"data": {"permissions": [rule("bash", "ask"), rule("codemux_old_*", "allow")]}})
+                    .to_string(),
+            )
+            .create_async()
+            .await;
+        let patch = server
+            .mock("PATCH", "/api/session/ses_a")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "permissions": [rule("bash", "ask"), rule("codemux_new_*", "allow")]
             })))
             .with_status(200)
-            .with_header("content-type", "application/json")
             .with_body("{}")
             .create_async()
             .await;
         let handle = OpenCodeServerHandle {
             base_url: server.url(),
             server_password: "pw".into(),
-            api: super::super::api::OpenCodeApi::Legacy,
+            api: super::super::api::OpenCodeApi::V2,
         };
-        attach_mcp_connection(&reqwest::Client::new(), &handle, None, "codemux_chat", test_connection())
+        grant_session_tools(&reqwest::Client::new(), &handle, "ses_a", "codemux_new")
             .await
             .unwrap();
-        attach.assert_async().await;
-    }
-
-    /// Each chat's session is granted only its own server's tools; earlier
-    /// Codemux grants are replaced and the session's other rules kept.
-    #[tokio::test]
-    async fn grants_a_session_only_its_own_chat_tools() {
-        for api in [super::super::api::OpenCodeApi::V2, super::super::api::OpenCodeApi::Legacy] {
-            let v2 = api == super::super::api::OpenCodeApi::V2;
-            let mut server = Server::new_async().await;
-            let path = if v2 { "/api/session/ses_a" } else { "/session/ses_a" };
-            type Rule = fn(&str, &str) -> serde_json::Value;
-            let (field, rule): (&str, Rule) = if v2 {
-                ("permissions", |a, e| serde_json::json!({"action":a,"resource":"*","effect":e}))
-            } else {
-                ("permission", |a, e| serde_json::json!({"permission":a,"pattern":"*","action":e}))
-            };
-            let current = serde_json::json!({ field: [rule("bash", "ask"), rule("codemux_old_*", "allow")] });
-            let body = if v2 { serde_json::json!({"data": current}) } else { current };
-            let get = server
-                .mock("GET", path)
-                .with_status(200)
-                .with_body(body.to_string())
-                .create_async()
-                .await;
-            let patch = server
-                .mock("PATCH", path)
-                .match_body(mockito::Matcher::Json(serde_json::json!({
-                    field: [rule("bash", "ask"), rule("codemux_new_*", "allow")]
-                })))
-                .with_status(200)
-                .with_body("{}")
-                .create_async()
-                .await;
-            let handle = OpenCodeServerHandle {
-                base_url: server.url(),
-                server_password: "pw".into(),
-                api,
-            };
-            grant_session_tools(&reqwest::Client::new(), &handle, "ses_a", "codemux_new")
-                .await
-                .unwrap();
-            get.assert_async().await;
-            patch.assert_async().await;
-        }
+        get.assert_async().await;
+        patch.assert_async().await;
     }
 
     /// Closing a chat removes its registration from the shared server.
@@ -3320,45 +3256,42 @@ pub(crate) mod tests {
             .with_status(204)
             .create_async()
             .await;
-        let legacy = server
-            .mock("POST", "/mcp/codemux_chat/disconnect")
-            .with_status(200)
-            .with_body("true")
-            .create_async()
-            .await;
-        for api in [super::super::api::OpenCodeApi::V2, super::super::api::OpenCodeApi::Legacy] {
-            let handle = OpenCodeServerHandle {
-                base_url: server.url(),
-                server_password: "pw".into(),
-                api,
-            };
-            detach_mcp(&reqwest::Client::new(), &handle, Some(directory.path()), "codemux_chat").await;
-        }
+        let handle = OpenCodeServerHandle {
+            base_url: server.url(),
+            server_password: "pw".into(),
+            api: super::super::api::OpenCodeApi::V2,
+        };
+        detach_mcp(&reqwest::Client::new(), &handle, Some(directory.path()), "codemux_chat").await;
         v2.assert_async().await;
-        legacy.assert_async().await;
     }
 
-    /// An OpenCode binary without the runtime `POST /mcp` endpoint (pre
-    /// 1.18.18) must still get a working session — just without Codemux's
-    /// shared MCP servers — with the loss reported as a RuntimeWarning.
+    /// OpenCode 1 never names the calling session in MCP calls, so the gateway
+    /// could not tell one chat from another on the shared server. Its chats
+    /// start without Codemux tools and say why; nothing is registered.
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(opencode_path)]
-    async fn session_starts_when_gateway_attach_is_unsupported() {
+    async fn opencode_1_chats_get_no_codemux_tools_and_say_why() {
         use super::super::manager::write_fake_opencode_binary;
 
         let mut backend = Server::new_async().await;
         let attach = backend
             .mock("POST", "/mcp")
-            .with_status(404)
-            .with_body("not found")
+            .with_status(200)
+            .with_body("{}")
+            .expect(0)
+            .create_async()
+            .await;
+        let grant = backend
+            .mock("PATCH", mockito::Matcher::Any)
+            .expect(0)
             .create_async()
             .await;
         let create = backend
             .mock("POST", "/session")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"ses_no_mcp"}"#)
+            .with_body(r#"{"id":"ses_legacy"}"#)
             .create_async()
             .await;
 
@@ -3373,11 +3306,12 @@ pub(crate) mod tests {
         }
 
         let manager = Arc::new(OpenCodeServerManager::new());
+        let registry = McpRegistry::new();
         let (tx, mut rx) = broadcast::channel(64);
         let started = OpenCodeSession::start(
             manager.clone(),
-            Some(McpRegistry::new()),
-            ThreadId("t-mcp-degraded".into()),
+            Some(registry.clone()),
+            ThreadId("t-legacy".into()),
             None,
             None,
             None,
@@ -3394,67 +3328,78 @@ pub(crate) mod tests {
         }
         manager.stop().await;
 
-        let session = started.expect("session must start without the shared MCP gateway");
-        assert_eq!(session.provider_session_id.0, "ses_no_mcp");
+        let session = started.expect("an OpenCode 1 chat still starts");
+        assert_eq!(session.provider_session_id.0, "ses_legacy");
+        assert!(session.mcp.is_none(), "no Codemux server for an OpenCode 1 chat");
+        assert!(registry.started_gateway().is_none(), "no gateway credential was minted");
         attach.assert_async().await;
+        grant.assert_async().await;
         create.assert_async().await;
-        let mut warned = false;
+        let mut reasons = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if let ProviderRuntimeEvent::RuntimeWarning { message, .. } = event {
-                warned |= message.contains("gateway attach failed");
+                reasons.push(message);
             }
         }
-        assert!(warned, "a failed attach must surface as a RuntimeWarning");
+        assert!(
+            reasons.iter().any(|m| m.contains(LEGACY_COLLABORATION)),
+            "{reasons:?}"
+        );
         let _ = session.shutdown().await;
     }
 
     /// Two chats in one checkout share the one server, each with its own
-    /// registered server and a session granted only that server's tools.
-    /// Closing a chat removes its registration; the server keeps running.
-    #[cfg(unix)]
+    /// registered server and credential and a session granted only that
+    /// server's tools. A user agent rule (`agent.build.permission={"*":
+    /// "allow"}`) can still offer chat A chat B's server; OpenCode then sends
+    /// B's credential with A's session id, and the gateway refuses it.
     #[tokio::test]
-    #[serial_test::serial(opencode_path)]
-    async fn two_chats_in_one_directory_share_the_server_with_separate_tools() {
-        use super::super::manager::write_fake_opencode_binary;
+    async fn two_chats_in_one_directory_keep_their_tools_apart() {
         use std::sync::Mutex as StdMutex;
 
         let mut backend = Server::new_async().await;
-        let registered = Arc::new(StdMutex::new(Vec::<serde_json::Value>::new()));
+        let registered = Arc::new(StdMutex::new(Vec::<(String, serde_json::Value)>::new()));
         let seen = registered.clone();
         let attach = backend
-            .mock("POST", "/mcp")
+            .mock("PUT", mockito::Matcher::Regex(r"^/api/experimental/mcp/codemux_[0-9a-f]{8}".into()))
             .with_status(200)
             .with_body_from_request(move |request| {
-                seen.lock().unwrap().push(serde_json::from_slice(request.body().unwrap()).unwrap());
+                seen.lock().unwrap().push((
+                    request.path().rsplit('/').next().unwrap().to_string(),
+                    serde_json::from_slice(request.body().unwrap()).unwrap(),
+                ));
                 b"{}".to_vec()
             })
             .expect(2)
             .create_async()
             .await;
-        let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = created.clone();
-        let create = backend
-            .mock("POST", "/session")
+        let listed = registered.clone();
+        let status = backend
+            .mock("GET", mockito::Matcher::Regex(r"^/api/mcp".into()))
             .with_status(200)
-            .with_header("content-type", "application/json")
             .with_body_from_request(move |_| {
-                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                format!(r#"{{"id":"ses_{n}"}}"#).into_bytes()
+                let entries: Vec<_> = listed
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(name, _)| serde_json::json!({"name":name,"status":{"status":"connected"}}))
+                    .collect();
+                serde_json::json!({ "data": entries }).to_string().into_bytes()
             })
-            .expect(2)
+            .expect_at_least(1)
             .create_async()
             .await;
         let read = backend
-            .mock("GET", mockito::Matcher::Regex(r"^/session/ses_[12]$".into()))
+            .mock("GET", mockito::Matcher::Regex(r"^/api/session/ses_[ab]$".into()))
             .with_status(200)
-            .with_body(r#"{"permission":[]}"#)
+            .with_body(r#"{"data":{"permissions":[]}}"#)
             .expect(2)
             .create_async()
             .await;
         let grants = Arc::new(StdMutex::new(Vec::<(String, serde_json::Value)>::new()));
         let granted = grants.clone();
         let grant = backend
-            .mock("PATCH", mockito::Matcher::Regex(r"^/session/ses_[12]$".into()))
+            .mock("PATCH", mockito::Matcher::Regex(r"^/api/session/ses_[ab]$".into()))
             .with_status(200)
             .with_body_from_request(move |request| {
                 granted.lock().unwrap().push((
@@ -3466,98 +3411,70 @@ pub(crate) mod tests {
             .expect(2)
             .create_async()
             .await;
-        let detached = Arc::new(StdMutex::new(Vec::<String>::new()));
-        let gone = detached.clone();
-        let detach = backend
-            .mock("POST", mockito::Matcher::Regex(r"^/mcp/codemux_[0-9a-f]{8}/disconnect$".into()))
-            .with_status(200)
-            .with_body_from_request(move |request| {
-                gone.lock().unwrap().push(request.path().to_string());
-                b"true".to_vec()
-            })
-            .expect(2)
-            .create_async()
-            .await;
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write_fake_opencode_binary(tmp.path());
+        let handle = OpenCodeServerHandle {
+            base_url: backend.url(),
+            server_password: "pw".into(),
+            api: super::super::api::OpenCodeApi::V2,
+        };
         let checkout = tempfile::tempdir().expect("checkout");
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        // SAFETY: serial_test serialises this against every other opencode
-        // test that touches PATH / FAKE_OPENCODE_URL.
-        unsafe {
-            std::env::set_var("PATH", tmp.path());
-            std::env::set_var("FAKE_OPENCODE_URL", backend.url());
-        }
-        let manager = Arc::new(OpenCodeServerManager::new());
         let registry = McpRegistry::new();
-        let (tx, _rx) = broadcast::channel(64);
-        let mut sessions = Vec::new();
-        for thread in ["t-same-dir-a", "t-same-dir-b"] {
-            sessions.push(
-                OpenCodeSession::start(
-                    manager.clone(),
-                    Some(registry.clone()),
-                    ThreadId(thread.into()),
-                    None,
-                    None,
-                    None,
-                    tx.clone(),
-                    None,
-                    Some(checkout.path().to_path_buf()),
-                    Some("workspace".into()),
-                )
-                .await
-                .expect("start chat"),
-            );
+        let http = reqwest::Client::new();
+        let mut chats = Vec::new();
+        for (thread, session) in [("t-same-dir-a", "ses_a"), ("t-same-dir-b", "ses_b")] {
+            let chat = attach_chat_mcp(
+                &http,
+                &handle,
+                Some(checkout.path()),
+                registry.clone(),
+                &ThreadId(thread.into()),
+                Some("workspace".into()),
+            )
+            .await
+            .expect("attach");
+            chat.session.bind_session(session);
+            chat.session.begin("turn", None).unwrap();
+            grant_session_tools(&http, &handle, session, &chat.name).await.expect("grant");
+            chats.push(chat);
         }
-        unsafe {
-            std::env::set_var("PATH", original_path);
-            std::env::remove_var("FAKE_OPENCODE_URL");
-        }
-        let names: Vec<String> = sessions
-            .iter()
-            .map(|session| session.mcp.as_ref().expect("attached").name.clone())
-            .collect();
-        assert_ne!(names[0], names[1]);
-        let registered = registered.lock().unwrap().clone();
-        let tokens: Vec<_> = registered
-            .iter()
-            .map(|entry| entry["config"]["headers"]["Authorization"].clone())
-            .collect();
-        assert_eq!(
-            registered.iter().map(|entry| entry["name"].as_str().unwrap()).collect::<Vec<_>>(),
-            names
-        );
-        assert_ne!(tokens[0], tokens[1], "each chat has its own credential");
-        let mut grants = grants.lock().unwrap().clone();
-        grants.sort_by(|a, b| a.0.cmp(&b.0));
-        for ((path, body), (session, name)) in grants.iter().zip(sessions.iter().zip(&names)) {
-            assert_eq!(path, &format!("/session/{}", session.provider_session_id.0));
-            assert_eq!(
-                body,
-                &serde_json::json!({"permission":[{"permission":format!("{name}_*"),"pattern":"*","action":"allow"}]})
-            );
-        }
-        for session in &sessions {
-            let _ = session.shutdown().await;
-        }
-        let mut gone = detached.lock().unwrap().clone();
-        gone.sort();
-        let mut expected: Vec<_> = names.iter().map(|name| format!("/mcp/{name}/disconnect")).collect();
-        expected.sort();
-        assert_eq!(gone, expected);
-        assert_eq!(
-            manager.ensure_running().await.unwrap().base_url,
-            sessions[0].server_handle.base_url,
-            "closing chats leaves the one shared server running"
-        );
-        manager.stop().await;
         attach.assert_async().await;
-        create.assert_async().await;
+        status.assert_async().await;
         read.assert_async().await;
         grant.assert_async().await;
-        detach.assert_async().await;
+        assert_ne!(chats[0].name, chats[1].name);
+        let registered = registered.lock().unwrap().clone();
+        assert_eq!(
+            registered.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
+            [chats[0].name.clone(), chats[1].name.clone()]
+        );
+        let token = |i: usize| registered[i].1["config"]["headers"]["Authorization"].as_str().unwrap().to_string();
+        assert_ne!(token(0), token(1), "each chat has its own credential");
+        let mut grants = grants.lock().unwrap().clone();
+        grants.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((path, body), (session, chat)) in grants.iter().zip(["ses_a", "ses_b"].iter().zip(&chats)) {
+            assert_eq!(path, &format!("/api/session/{session}"));
+            assert_eq!(
+                body,
+                &serde_json::json!({"permissions":[{"action":format!("{}_*", chat.name),"resource":"*","effect":"allow"}]})
+            );
+        }
+
+        let url = registered[1].1["config"]["url"].as_str().unwrap().to_string();
+        let gateway = reqwest::Client::builder().no_proxy().build().unwrap();
+        let call = |authorization: String, session: &str| {
+            gateway
+                .post(&url)
+                .header("authorization", authorization)
+                .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                    "name":"thread_send","arguments":{},"_meta":{"ai.opencode/sessionID":session}}}))
+                .send()
+        };
+        let borrowed: serde_json::Value = call(token(1), "ses_a").await.unwrap().json().await.unwrap();
+        assert!(borrowed.to_string().contains("not another chat"), "{borrowed}");
+        let own: serde_json::Value = call(token(1), "ses_b").await.unwrap().json().await.unwrap();
+        assert!(
+            !own.to_string().contains("provider_control_denied: Codemux tools act only"),
+            "B's own session passes the session check: {own}"
+        );
     }
 
     /// Developer smoke test: Plan and back on a free OpenCode 2 model, each in
