@@ -361,7 +361,7 @@ function ServerRow({
                   · {sourceHeading(server.sources[0])}
                 </span>
               </TooltipTrigger>
-              <TooltipContent className="max-w-xs text-label">
+              <TooltipContent className="max-w-xs">
                 Same name as another server with a different config —
                 they are treated as separate.
               </TooltipContent>

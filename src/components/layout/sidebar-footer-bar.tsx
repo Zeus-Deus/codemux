@@ -217,7 +217,7 @@ function AppMenu({
             </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>
-        <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
+        <TooltipContent side={tooltipSide}>
           Menu
         </TooltipContent>
       </Tooltip>
@@ -365,7 +365,7 @@ function FooterDestination({
   return (
     <Tooltip>
       <TooltipTrigger asChild>{button}</TooltipTrigger>
-      <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
+      <TooltipContent side={tooltipSide}>
         {action.label}
       </TooltipContent>
     </Tooltip>
@@ -433,7 +433,7 @@ function SidebarBackButton({ collapsed }: { collapsed: boolean }) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>{button}</TooltipTrigger>
-      <TooltipContent side="right" sideOffset={4} className="text-label">
+      <TooltipContent side="right">
         Back
       </TooltipContent>
     </Tooltip>
@@ -546,15 +546,15 @@ export function SidebarFooterBar() {
                     <PopoverTrigger asChild>
                       <Button
                         variant="ghost"
-                        size="icon-xs"
+                        size="icon-sm"
                         aria-label="More footer destinations"
-                        className="size-7 shrink-0 text-muted-foreground"
+                        className="text-muted-foreground"
                       >
                         <MoreHorizontal className="size-4" />
                       </Button>
                     </PopoverTrigger>
                   </TooltipTrigger>
-                  <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
+                  <TooltipContent side={tooltipSide}>
                     More
                   </TooltipContent>
                 </Tooltip>

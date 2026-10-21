@@ -129,7 +129,7 @@ export function SidebarDevicesButton({
           )}
         </Button>
       </TooltipTrigger>
-      <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
+      <TooltipContent side={tooltipSide}>
         {tooltip}
       </TooltipContent>
     </Tooltip>

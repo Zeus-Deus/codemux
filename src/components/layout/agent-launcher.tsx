@@ -384,7 +384,7 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
             </button>
           </TooltipTrigger>
         </PopoverTrigger>
-        <TooltipContent side="bottom" sideOffset={4} shortcut="openLauncher">
+        <TooltipContent side="bottom" shortcut="openLauncher">
           Launch an agent
         </TooltipContent>
       </Tooltip>
@@ -587,7 +587,7 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
             </button>
           </TooltipTrigger>
         </PopoverTrigger>
-        <TooltipContent side="bottom" sideOffset={4} shortcut="openLauncher">
+        <TooltipContent side="bottom" shortcut="openLauncher">
           Launch an agent
         </TooltipContent>
       </Tooltip>

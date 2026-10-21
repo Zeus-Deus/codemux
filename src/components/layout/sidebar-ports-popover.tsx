@@ -75,7 +75,7 @@ function PortName({ name }: { name: string }) {
           {name}
         </span>
       </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-xs break-all text-label">
+      <TooltipContent side="top" className="max-w-xs break-all">
         {name}
       </TooltipContent>
     </Tooltip>
@@ -203,7 +203,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
             </Button>
           </PopoverTrigger>
         </TooltipTrigger>
-        <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
+        <TooltipContent side={tooltipSide}>
           {portCount > 0 ? `Ports · ${portCount} active` : "Ports · none active"}
         </TooltipContent>
       </Tooltip>
@@ -264,7 +264,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                               <Globe className="size-3" />
                             </button>
                           </TooltipTrigger>
-                          <TooltipContent side="top" sideOffset={4} className="text-label">
+                          <TooltipContent side="top">
                             Open in browser pane
                           </TooltipContent>
                         </Tooltip>
@@ -282,7 +282,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                               <Copy className="size-3" />
                             </button>
                           </TooltipTrigger>
-                          <TooltipContent side="top" sideOffset={4} className="text-label">
+                          <TooltipContent side="top">
                             Copy URL
                           </TooltipContent>
                         </Tooltip>
@@ -301,7 +301,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                                 <X className="size-3" />
                               </button>
                             </TooltipTrigger>
-                            <TooltipContent side="top" sideOffset={4} className="text-label">
+                            <TooltipContent side="top">
                               Kill process
                             </TooltipContent>
                           </Tooltip>

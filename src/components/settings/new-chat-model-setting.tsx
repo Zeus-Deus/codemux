@@ -70,7 +70,7 @@ export function NewChatModelSetting() {
     <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
       <Select value={custom ? "custom" : "auto"} onValueChange={setMode}>
         <SelectTrigger
-          className="h-9 w-[104px] bg-muted/35 text-label"
+          className="w-[104px] bg-muted/35 text-label"
           aria-label="Default model mode"
         >
           <SelectValue />

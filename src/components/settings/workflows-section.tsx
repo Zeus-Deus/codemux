@@ -65,14 +65,14 @@ function ProviderRow({ provider, capability }: { provider: WorkflowProviderKind;
     </div>
     {unavailable ? <span /> : catalog.length > 0 && !capability?.requires_model ? (
       <Select value={preference.model || DEFAULT_MODEL} onValueChange={(value) => setWorkflowProviderPreference(provider, { model: value === DEFAULT_MODEL ? "" : value })}>
-        <SelectTrigger aria-label={`${label} worker model`} className="h-8 w-full"><SelectValue /></SelectTrigger>
+        <SelectTrigger aria-label={`${label} worker model`} className="w-full"><SelectValue /></SelectTrigger>
         <SelectContent>
           <SelectItem value={DEFAULT_MODEL}>Default model</SelectItem>
           {catalog.map((model) => <SelectItem key={model.id} value={model.id}>{model.label}</SelectItem>)}
         </SelectContent>
       </Select>
     ) : (
-      <Input aria-label={`${label} worker model`} className="h-8" placeholder={provider === "opencode" ? "provider/model" : capability?.requires_model ? "Model (required)" : "Default model"} value={preference.model} onChange={(event) => setWorkflowProviderPreference(provider, { model: event.target.value })} />
+      <Input aria-label={`${label} worker model`}  placeholder={provider === "opencode" ? "provider/model" : capability?.requires_model ? "Model (required)" : "Default model"} value={preference.model} onChange={(event) => setWorkflowProviderPreference(provider, { model: event.target.value })} />
     )}
   </div>;
 }
@@ -137,7 +137,7 @@ export function WorkflowsSection() {
       <SubsectionHeader title="Defaults" />
       <SettingRow label="File changes" description="When edits are allowed, each agent works on its own copy. Nothing touches your checkout until you review and apply it." scope="device">
         <Select value={settings.allowWrites ? "allow" : "read_only"} onValueChange={(value) => set("workflows.file_changes", value)}>
-          <SelectTrigger className="h-9 w-56"><SelectValue /></SelectTrigger>
+          <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
           <SelectContent>
             <SelectItem value="read_only">Read-only</SelectItem>
             <SelectItem value="allow">Allow edits, review before applying</SelectItem>
@@ -155,7 +155,7 @@ export function WorkflowsSection() {
       </SettingRow>
       <Separator />
       <SettingRow label="Token budget" description="Stop admitting new agents once a run has used this many tokens. Leave empty for no cap." scope="device">
-        <Input type="number" min={1} inputMode="numeric" placeholder="No cap" className="h-9 w-40" value={settings.tokenBudget ?? ""} onChange={(event) => set("workflows.token_budget", event.target.value.trim())} />
+        <Input type="number" min={1} inputMode="numeric" placeholder="No cap" className="w-40" value={settings.tokenBudget ?? ""} onChange={(event) => set("workflows.token_budget", event.target.value.trim())} />
       </SettingRow>
       <Separator />
       <SettingRow label="Workflow button in the composer" description="Show a shortcut to the Workflows panel next to the message box. /workflow and the + menu work either way." scope="device">

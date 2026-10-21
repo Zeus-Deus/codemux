@@ -302,7 +302,7 @@ export function SidebarProjectGroup({
                   <Plus className="size-3.5 text-muted-foreground" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom" sideOffset={4} className="text-label">
+              <TooltipContent side="bottom">
                 {enableAgentChat ? "New workspace · Shift+click for CLI" : "New workspace"}
                 {newWsKeys ? ` · ${newWsKeys}` : ""}
               </TooltipContent>

@@ -984,7 +984,7 @@ function AutomationForm({
             value={draft.agent}
             onValueChange={(v) => patch({ agent: v, agentPicked: true })}
           >
-            <SelectTrigger className="h-9 text-body">
+            <SelectTrigger className="text-body">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -1008,7 +1008,7 @@ function AutomationForm({
               patch({ hostId: v === "local" ? null : Number(v) })
             }
           >
-            <SelectTrigger className="h-9 text-body">
+            <SelectTrigger className="text-body">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -1140,7 +1140,7 @@ function ScheduleField({
             value={draft.builder.frequency}
             onValueChange={(v) => patchBuilder({ frequency: v as Frequency })}
           >
-            <SelectTrigger className="h-9 w-32 text-body">
+            <SelectTrigger className="w-32 text-body">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -1155,7 +1155,7 @@ function ScheduleField({
               value={draft.builder.weekday}
               onValueChange={(v) => patchBuilder({ weekday: v })}
             >
-              <SelectTrigger className="h-9 w-36 text-body">
+              <SelectTrigger className="w-36 text-body">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -1243,7 +1243,7 @@ function ProjectField({
           }
         }}
       >
-        <SelectTrigger className="h-9 text-body">
+        <SelectTrigger className="text-body">
           <SelectValue placeholder="Choose a project…" />
         </SelectTrigger>
         {/* `popper` + a capped height keeps the menu anchored under

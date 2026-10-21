@@ -76,7 +76,7 @@ export function SidebarActionRow() {
                 <SquarePen className="size-[13px]" />
               </button>
             </TooltipTrigger>
-            <TooltipContent side="right" className="text-label">
+            <TooltipContent side="right">
               New agent{newAgentKeys ? ` · ${newAgentKeys}` : ""} · Shift+click for workspace dialog
             </TooltipContent>
           </Tooltip>
@@ -92,7 +92,7 @@ export function SidebarActionRow() {
                 <SearchIcon className="size-3.5" />
               </button>
             </TooltipTrigger>
-            <TooltipContent side="right" className="text-label">
+            <TooltipContent side="right">
               Search{paletteKeys ? ` · ${paletteKeys}` : ""}
             </TooltipContent>
           </Tooltip>
@@ -170,7 +170,7 @@ export function SidebarViewSwitch() {
               <Icon className="size-[15px]" />
             </TooltipTrigger>
           </ToggleGroupItem>
-          <TooltipContent side="bottom" sideOffset={4} className="text-label">
+          <TooltipContent side="bottom">
             {label}
             {toggleKeys ? ` · ${toggleKeys}` : ""}
           </TooltipContent>
@@ -204,7 +204,7 @@ export function SidebarHeaderActions() {
             <SearchIcon className="size-[15px]" />
           </button>
         </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={4} className="text-label">
+        <TooltipContent side="bottom">
           Search{paletteKeys ? ` · ${paletteKeys}` : ""}
         </TooltipContent>
       </Tooltip>
@@ -219,7 +219,7 @@ export function SidebarHeaderActions() {
             <SquarePen className="size-[15px]" />
           </button>
         </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={4} className="text-label">
+        <TooltipContent side="bottom">
           New chat in home directory{newAgentKeys ? ` · ${newAgentKeys}` : ""} · Shift+click for workspace dialog
         </TooltipContent>
       </Tooltip>

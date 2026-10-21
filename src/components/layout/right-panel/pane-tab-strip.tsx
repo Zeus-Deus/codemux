@@ -436,7 +436,7 @@ function CollapsedPaneActions({
             </button>
           </TooltipTrigger>
         </PopoverTrigger>
-        <TooltipContent side="bottom" sideOffset={4}>
+        <TooltipContent side="bottom">
           More actions
         </TooltipContent>
       </Tooltip>

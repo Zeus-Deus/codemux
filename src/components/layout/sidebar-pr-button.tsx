@@ -62,7 +62,7 @@ export function SidebarPullRequestsButton({
           )}
         </Button>
       </TooltipTrigger>
-      <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
+      <TooltipContent side={tooltipSide}>
         {count > 0
           ? `Pull requests — ${count} waiting on you`
           : "Pull requests"}

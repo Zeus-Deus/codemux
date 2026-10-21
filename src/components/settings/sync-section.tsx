@@ -22,6 +22,7 @@ import {
   pickSaveFileDialog,
 } from "@/tauri/commands";
 import { SyncStatusDisplay } from "./sync-status-display";
+import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 
 export function SyncSection() {
@@ -117,32 +118,34 @@ function SyncReadyRow() {
       </div>
 
       <div className="flex flex-wrap gap-2">
-        <button
+        <Button
           type="button"
+          variant="outline"
+          size="sm"
           onClick={handleExport}
           disabled={busy !== null}
-          className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5 text-label font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
           {busy === "export" ? (
             <Spinner className="size-3.5" aria-hidden />
           ) : (
-            <FileDown className="size-3.5" />
+            <FileDown />
           )}
           Export skills locally
-        </button>
-        <button
+        </Button>
+        <Button
           type="button"
+          variant="outline"
+          size="sm"
           onClick={handleImport}
           disabled={busy !== null}
-          className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5 text-label font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
           {busy === "import" ? (
             <Spinner className="size-3.5" aria-hidden />
           ) : (
-            <FileUp className="size-3.5" />
+            <FileUp />
           )}
           Import skills from backup
-        </button>
+        </Button>
       </div>
 
       {feedback && (

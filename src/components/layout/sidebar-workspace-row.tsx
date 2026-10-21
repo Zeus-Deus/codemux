@@ -1329,7 +1329,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                           {icon}
                         </button>
                       </TooltipTrigger>
-                      <TooltipContent side="bottom" sideOffset={4} className="text-label">
+                      <TooltipContent side="bottom">
                         {prHumanState
                           ? `${prHumanState} ${provider.shortNoun}`
                           : provider.nounTitle}
@@ -1416,7 +1416,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                         aria-label="Notifications muted"
                       />
                     </TooltipTrigger>
-                    <TooltipContent side="bottom" sideOffset={4} className="text-label">
+                    <TooltipContent side="bottom">
                       Agent notifications muted
                     </TooltipContent>
                   </Tooltip>
@@ -1633,7 +1633,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                               aria-label="Notifications muted"
                             />
                           </TooltipTrigger>
-                          <TooltipContent side="bottom" sideOffset={4} className="text-label">
+                          <TooltipContent side="bottom">
                             Agent notifications muted
                           </TooltipContent>
                         </Tooltip>

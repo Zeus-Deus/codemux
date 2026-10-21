@@ -591,7 +591,7 @@ function BrowserSection() {
               ).catch(console.error);
             }}
           >
-            <SelectTrigger className="w-48 h-9">
+            <SelectTrigger className="w-48">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -1140,7 +1140,7 @@ function PresetEditorSheet({
           <div className="space-y-2">
             <label className="text-body font-medium">Type</label>
             <Select value={structured ? "structured" : "raw"} onValueChange={handleModeChange}>
-              <SelectTrigger className="h-9">
+              <SelectTrigger>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -1161,7 +1161,7 @@ function PresetEditorSheet({
               <div className="space-y-2">
                 <label className="text-body font-medium">Agent</label>
                 <Select value={selectedAgentId} onValueChange={handleAgentChange}>
-                  <SelectTrigger className="h-9">
+                  <SelectTrigger>
                     <SelectValue placeholder="Select an agent" />
                   </SelectTrigger>
                   <SelectContent>
@@ -1301,7 +1301,7 @@ function PresetEditorSheet({
                   save({ launchMode: v });
                 }}
               >
-                <SelectTrigger className="h-9">
+                <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -2181,7 +2181,7 @@ export function SettingsView() {
             <div className="space-y-1">
               <SettingRow label="Default editor" description="Used when opening files from the file tree panel.">
                 <Select value={defaultEditor} onValueChange={setDefaultEditor}>
-                  <SelectTrigger className="w-48 h-9">
+                  <SelectTrigger className="w-48">
                     <SelectValue placeholder="Select editor" />
                   </SelectTrigger>
                   <SelectContent>
@@ -2254,7 +2254,7 @@ export function SettingsView() {
               <Separator />
               <SettingRow label="Cursor style" description="The shape of the cursor in terminal panes.">
                 <Select value={cursorStyle} onValueChange={setCursorStyle}>
-                  <SelectTrigger className="w-36 h-9">
+                  <SelectTrigger className="w-36">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -2267,7 +2267,7 @@ export function SettingsView() {
               <Separator />
               <SettingRow label="Color theme" description="How the terminal gets its colors." scope="device">
                 <Select value={terminalThemeMode} onValueChange={setTerminalThemeMode}>
-                  <SelectTrigger className="h-9 w-44">
+                  <SelectTrigger className="w-44">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -2517,7 +2517,7 @@ export function SettingsView() {
                       storeSet("ai_resolver_strategy", v);
                     }}
                   >
-                    <SelectTrigger className="w-48 h-9">
+                    <SelectTrigger className="w-48">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -2816,7 +2816,7 @@ export function SettingsView() {
               description="Lifecycle scripts and worktree files for each project. Changes save when you leave a field."
               action={
                 <Select value={scriptsRoot} onValueChange={setChosenProject}>
-                  <SelectTrigger aria-label="Project" className="h-9 w-48">
+                  <SelectTrigger aria-label="Project" className="w-48">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -2923,7 +2923,7 @@ export function SettingsView() {
                 }
               >
                 <Input
-                  className="font-mono text-body h-9"
+                  className="font-mono text-body"
                   placeholder="e.g. npm run dev"
                   value={runCommand}
                   disabled={!scriptsReady}

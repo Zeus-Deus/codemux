@@ -220,7 +220,7 @@ export function PeekShell({ content, workspaceId, allowExit = true }: {
               <PanelRightOpen className="size-3.5" aria-hidden />
             </button>
           </TooltipTrigger>
-          <TooltipContent side="bottom" sideOffset={4}>Open in side panel</TooltipContent>
+          <TooltipContent side="bottom">Open in side panel</TooltipContent>
         </Tooltip>}
         <button type="button" onClick={shown.close} aria-label="Close preview"
           className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground">
