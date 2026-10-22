@@ -96,6 +96,13 @@ import { Spinner } from "@/components/ui/spinner";
 
 export function CopyButton({ text, label }: { text: string; label: string }) {
   const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1400);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
   return (
     <Button
       type="button"
@@ -108,7 +115,6 @@ export function CopyButton({ text, label }: { text: string; label: string }) {
         const ok = await copyToClipboard(text);
         if (ok) {
           setCopied(true);
-          window.setTimeout(() => setCopied(false), 1400);
           toast.success("Copied to clipboard");
         } else {
           toast.error(COPY_FAILED_MESSAGE);

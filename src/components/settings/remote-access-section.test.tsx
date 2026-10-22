@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode } from "react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import type {
@@ -10,6 +11,11 @@ import type {
 } from "@/tauri/types";
 
 // ── Mocks ────────────────────────────────────────────────────────────
+
+vi.mock("@/lib/clipboard", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/clipboard")>(),
+  copyToClipboard: vi.fn(),
+}));
 
 vi.mock("@/lib/toast", () => ({
   toast: {
@@ -59,7 +65,8 @@ const opener = vi.hoisted(() => ({ openUrl: vi.fn(() => Promise.resolve()) }));
 vi.mock("@tauri-apps/plugin-opener", () => opener);
 
 import { toast } from "@/lib/toast";
-import { RemoteAccessSection } from "./remote-access-section";
+import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
+import { CopyButton, RemoteAccessSection } from "./remote-access-section";
 
 // ── Fixtures ─────────────────────────────────────────────────────────
 
@@ -200,6 +207,99 @@ beforeEach(() => {
 });
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+describe("CopyButton", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(copyToClipboard).mockReset().mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  function renderCopyButton() {
+    const view = render(
+      <StrictMode>
+        <CopyButton text="mock setup command" label="Copy setup command" />
+      </StrictMode>,
+    );
+    return {
+      ...view,
+      button: screen.getByRole("button", { name: "Copy setup command" }),
+    };
+  }
+
+  it("clears the reset timer when unmounted after a successful copy", async () => {
+    const { button, unmount } = renderCopyButton();
+    await act(async () => { fireEvent.click(button); });
+    expect(button.querySelector(".lucide-check")).toBeInTheDocument();
+    expect(vi.getTimerCount()).toBe(1);
+
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("still toasts success without scheduling a timer if clipboard resolves after unmount", async () => {
+    let resolveCopy!: (ok: boolean) => void;
+    vi.mocked(copyToClipboard).mockReturnValue(new Promise<boolean>((resolve) => {
+      resolveCopy = resolve;
+    }));
+    const { button, unmount } = renderCopyButton();
+    fireEvent.click(button);
+    expect(copyToClipboard).toHaveBeenCalledWith("mock setup command");
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+
+    unmount();
+    await act(async () => { resolveCopy(true); });
+    expect(toast.success).toHaveBeenCalledExactlyOnceWith("Copied to clipboard");
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not let a repeated copy reset a later success period early", async () => {
+    const { button } = renderCopyButton();
+    await act(async () => { fireEvent.click(button); });
+    act(() => { vi.advanceTimersByTime(1000); });
+    await act(async () => { fireEvent.click(button); });
+    act(() => { vi.advanceTimersByTime(400); });
+    expect(button.querySelector(".lucide-check")).not.toBeInTheDocument();
+
+    act(() => { vi.advanceTimersByTime(600); });
+    await act(async () => { fireEvent.click(button); });
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(button.querySelector(".lucide-check")).toBeInTheDocument();
+    act(() => { vi.advanceTimersByTime(900); });
+    expect(button.querySelector(".lucide-check")).not.toBeInTheDocument();
+    expect(toast.success).toHaveBeenCalledTimes(3);
+  });
+
+  it("shows successful copy feedback for 1400ms", async () => {
+    const { button } = renderCopyButton();
+    await act(async () => { fireEvent.click(button); });
+    expect(copyToClipboard).toHaveBeenCalledExactlyOnceWith("mock setup command");
+    expect(toast.success).toHaveBeenCalledExactlyOnceWith("Copied to clipboard");
+    expect(toast.error).not.toHaveBeenCalled();
+    act(() => { vi.advanceTimersByTime(1399); });
+    expect(button.querySelector(".lucide-check")).toBeInTheDocument();
+    act(() => { vi.advanceTimersByTime(1); });
+    expect(button.querySelector(".lucide-check")).not.toBeInTheDocument();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("reports a failed copy without showing success or scheduling a reset", async () => {
+    vi.mocked(copyToClipboard).mockResolvedValue(false);
+    const { button } = renderCopyButton();
+    await act(async () => { fireEvent.click(button); });
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith(COPY_FAILED_MESSAGE);
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(button.querySelector(".lucide-check")).not.toBeInTheDocument();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
 
 describe("RemoteAccessSection — disabled", () => {
   it("shows the header, an unchecked master toggle, and the exposure warning; hides the ways in and devices", async () => {
