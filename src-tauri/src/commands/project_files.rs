@@ -9,6 +9,7 @@
 //! ranking + 60s in-memory cache.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -669,7 +670,9 @@ fn read_file_for_attachment_blocking(
         .map_err(|e| format!("metadata read failed for {absolute_path}: {e}"))?;
     let bytes = metadata.len();
 
-    let raw = std::fs::read(path)
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("read failed for {absolute_path}: {e}"))?;
+    let raw = read_attachment_bytes(file)
         .map_err(|e| format!("read failed for {absolute_path}: {e}"))?;
 
     let language = path
@@ -745,6 +748,20 @@ fn read_file_for_attachment_blocking(
         truncated: true,
         outline: Some(outline),
     })
+}
+
+fn read_attachment_bytes(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    reader
+        .by_ref()
+        .take(BINARY_SNIFF_BYTES as u64)
+        .read_to_end(&mut raw)?;
+    // Binary attachments only expose metadata. Text still needs a full
+    // read for exact line counts and outlines beyond the preview.
+    if !is_binary(&raw) {
+        reader.read_to_end(&mut raw)?;
+    }
+    Ok(raw)
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
@@ -1237,6 +1254,34 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
+    #[test]
+    fn attachment_binary_sniff_does_not_read_the_remaining_file() {
+        struct UnreadableTail;
+        impl Read for UnreadableTail {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("the binary tail must not be read"))
+            }
+        }
+
+        let mut prefix = vec![b'x'; BINARY_SNIFF_BYTES];
+        prefix[BINARY_SNIFF_BYTES - 1] = 0;
+        let header = std::io::Cursor::new(&prefix);
+        let raw = read_attachment_bytes(header.chain(UnreadableTail)).unwrap();
+        assert_eq!(raw, prefix);
+        assert!(is_binary(&raw));
+    }
+
+    #[test]
+    fn attachment_text_reads_beyond_the_binary_sniff_window() {
+        let mut content = vec![b'x'; BINARY_SNIFF_BYTES + 100];
+        // Preserve the existing boundary: a NUL immediately after the
+        // sniff window does not classify an attachment as binary.
+        content[BINARY_SNIFF_BYTES] = 0;
+        let raw = read_attachment_bytes(std::io::Cursor::new(&content)).unwrap();
+        assert_eq!(raw, content);
+        assert!(!is_binary(&raw));
+    }
+
     #[tokio::test]
     async fn read_file_full_content_for_small_text_file() {
         let dir = tempdir().unwrap();
@@ -1268,6 +1313,7 @@ mod tests {
         let with_decls = format!(
             "{body}\nfn foo_fn() {{}}\nstruct BarStruct;\nenum Baz {{}}\n"
         );
+        assert!(body.len() > BINARY_SNIFF_BYTES);
         fs::write(&p, &with_decls).unwrap();
         let info =
             read_file_for_attachment(p.to_string_lossy().to_string(), None)
@@ -1279,7 +1325,7 @@ mod tests {
         let preview_line_count = info.content.lines().count();
         assert_eq!(preview_line_count, TRUNCATED_PREVIEW_LINES);
         // line_count reports the FULL file's lines.
-        assert!(info.line_count >= 1501);
+        assert_eq!(info.line_count, 1504);
         assert!(
             outline.iter().any(|e| e.kind == "fn" && e.name == "foo_fn"),
             "outline missed foo_fn: {outline:?}"
@@ -1313,12 +1359,22 @@ mod tests {
     async fn read_file_marks_binary_as_not_text() {
         let dir = tempdir().unwrap();
         let p = dir.path().join("bin.dat");
-        fs::write(&p, b"hello\x00world\x00\x00").unwrap();
-        let info =
-            read_file_for_attachment(p.to_string_lossy().to_string(), None)
-                .await
-                .unwrap();
+        let mut content = vec![b'x'; BINARY_SNIFF_BYTES * 2];
+        content[BINARY_SNIFF_BYTES - 1] = 0;
+        fs::write(&p, &content).unwrap();
+        let absolute_path = p.to_string_lossy().to_string();
+        let info = read_file_for_attachment(
+            absolute_path.clone(),
+            Some(dir.path().to_string_lossy().to_string()),
+        )
+        .await
+        .unwrap();
         assert!(!info.is_text);
+        assert_eq!(info.bytes, content.len() as u64);
+        assert_eq!(info.absolute_path, absolute_path);
+        assert_eq!(info.relative_path.as_deref(), Some("bin.dat"));
+        assert_eq!(info.language.as_deref(), Some("dat"));
+        assert_eq!(info.line_count, 0);
         assert!(info.content.is_empty());
         assert!(info.outline.is_none());
         assert!(!info.truncated);
