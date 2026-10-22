@@ -33,18 +33,26 @@ async fn cursor_discovery_uses_existing_credentials_without_requesting_login() {
 
 #[tokio::test]
 async fn cursor_discovery_reports_signed_out_without_requesting_login() {
-    let fixture_dir = tempfile::tempdir().expect("fixture directory");
+    // Hard-link rather than copy: a freshly written copy can fail to exec
+    // with ETXTBSY on Linux when a sibling test forks while it is still open
+    // for writing. The fixture keys off the link's name, not its contents.
+    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_fake_cursor_acp"));
+    let fixture_dir =
+        tempfile::tempdir_in(fixture.parent().expect("fixture directory")).expect("link directory");
     let binary = fixture_dir
         .path()
         .join(format!("signed-out{}", std::env::consts::EXE_SUFFIX));
-    std::fs::copy(env!("CARGO_BIN_EXE_fake_cursor_acp"), &binary).expect("copy signed-out fixture");
+    std::fs::hard_link(fixture, &binary).expect("link signed-out fixture");
 
     let error = harvest_cursor_capabilities(&binary)
         .await
         .expect_err("signed-out discovery must fail without requesting interactive authentication");
 
-    assert!(matches!(error, HarvestError::NotAuthenticated { hint }
-        if hint.contains("cursor-agent login")));
+    assert!(
+        matches!(&error, HarvestError::NotAuthenticated { hint }
+            if hint.contains("cursor-agent login")),
+        "unexpected discovery error: {error:?}"
+    );
 }
 
 fn start_input(
