@@ -24,6 +24,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::{watch, Mutex};
 
@@ -55,6 +56,8 @@ const CIRCUIT_WINDOW: Duration = Duration::from_secs(300);
 /// SSH. The first connect can be slow (DNS, key handshake); later
 /// reconnects are usually instant.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const STDERR_BYTE_LIMIT: u64 = 16 * 1024;
 
 /// Supervisor handle. Dropping it does NOT cancel the supervisor —
 /// the tunnel keeps running until `shutdown` is called or the
@@ -98,6 +101,7 @@ impl TunnelSupervisor {
                 local_socket,
                 remote_binary,
                 shutdown_rx,
+                Command::new("ssh"),
             )
             .await;
         });
@@ -135,6 +139,7 @@ async fn run_supervisor(
     local_socket: PathBuf,
     remote_binary: String,
     mut shutdown_rx: watch::Receiver<bool>,
+    mut cmd: Command,
 ) {
     eprintln!(
         "[tunnel-supervisor] start: ssh_target={ssh_target} \
@@ -146,6 +151,17 @@ async fn run_supervisor(
     // the cap.
     let mut failures: Vec<Instant> = Vec::new();
     let mut attempt: u32 = 0;
+    let opts = TunnelOptions {
+        ssh_target: &ssh_target,
+        remote_socket: &remote_socket,
+        local_socket: &local_socket,
+        remote_binary: &remote_binary,
+    };
+    let argv = build_tunnel_argv(&opts);
+    cmd.args(&argv)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
     loop {
         if *shutdown_rx.borrow() {
@@ -160,21 +176,11 @@ async fn run_supervisor(
         // is silently dropped, so the consumer sees Pending forever.
         let _ = inner.status_tx.send_replace(TunnelStatus::Pending);
 
-        let opts = TunnelOptions {
-            ssh_target: &ssh_target,
-            remote_socket: &remote_socket,
-            local_socket: &local_socket,
-            remote_binary: &remote_binary,
-        };
-        let argv = build_tunnel_argv(&opts);
-        crate::trace_cloud_push!("[tunnel-supervisor] attempt {} argv: ssh {}", attempt + 1, argv.join(" "));
-        let mut cmd = Command::new("ssh");
-        for arg in &argv {
-            cmd.arg(arg);
-        }
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        crate::trace_cloud_push!(
+            "[tunnel-supervisor] attempt {} argv: ssh {}",
+            attempt + 1,
+            argv.join(" ")
+        );
 
         let spawn_res = cmd.spawn();
         let mut child = match spawn_res {
@@ -234,21 +240,20 @@ async fn run_supervisor(
                 record_failure(&mut failures);
             }
             Err(reason) => {
-                // Capture SSH stderr verbatim so we can see WHY the
-                // tunnel failed. Most useful failures (host
-                // unreachable, permission denied, port-forwarding
-                // refused) write to stderr before SSH exits.
-                let mut stderr_dump = String::new();
-                if let Some(mut err_stream) = child.stderr.take() {
-                    use tokio::io::AsyncReadExt;
-                    let _ = err_stream.read_to_string(&mut stderr_dump).await;
+                // A live SSH won't close stderr. Kill and reap it before
+                // collecting diagnostics so a startup timeout can retry.
+                if let Err(error) = child.kill().await {
+                    eprintln!("[tunnel-supervisor] failed to stop ssh: {error}");
                 }
+                let stderr_dump = match child.stderr.take() {
+                    Some(stderr) => read_stderr_bounded(stderr).await,
+                    None => String::new(),
+                };
                 eprintln!(
                     "[tunnel-supervisor] tunnel did not come up: {reason}\n\
                      [tunnel-supervisor] ssh stderr: {}",
                     stderr_dump.trim()
                 );
-                let _ = child.kill().await;
                 record_failure(&mut failures);
             }
         }
@@ -269,6 +274,18 @@ async fn run_supervisor(
             return;
         }
     }
+}
+
+async fn read_stderr_bounded(stderr: impl AsyncRead + Unpin) -> String {
+    // Descendants may keep the pipe open after SSH exits. Keep partial
+    // diagnostics even if the drain times out or contains invalid UTF-8.
+    let mut bytes = Vec::new();
+    let _ = tokio::time::timeout(
+        STDERR_DRAIN_TIMEOUT,
+        stderr.take(STDERR_BYTE_LIMIT).read_to_end(&mut bytes),
+    )
+    .await;
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Sleep for `dur` unless a shutdown signal fires. Returns `true` if
@@ -300,14 +317,8 @@ async fn wait_for_socket(
     );
     loop {
         if let Ok(Some(status)) = child.try_wait() {
-            let mut stderr = String::new();
-            if let Some(mut err_stream) = child.stderr.take() {
-                use tokio::io::AsyncReadExt;
-                let _ = err_stream.read_to_string(&mut stderr).await;
-            }
             return Err(format!(
-                "ssh exited before tunnel came up (status={status}): {}",
-                stderr.trim()
+                "ssh exited before tunnel came up (status={status})"
             ));
         }
         if local_socket.exists() {
@@ -397,6 +408,147 @@ fn circuit_open(failures: &[Instant]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_timeout_reconnects_and_reaps_ssh() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_ssh = dir.path().join("ssh");
+        std::fs::write(
+            &fake_ssh,
+            "#!/bin/sh\necho $$ > \"$0.pid\"\nprintf 'connection stalled\\n' >&2\nexec /bin/sleep 300\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (status_tx, mut status_rx) = watch::channel(TunnelStatus::Pending);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let local_socket = dir.path().join("tunnel.sock");
+        let inner = Arc::new(SupervisorInner {
+            local_socket: local_socket.clone(),
+            status_tx,
+            shutdown_tx,
+            current_child: Mutex::new(None),
+        });
+        let supervisor = TunnelSupervisor {
+            inner: inner.clone(),
+        };
+        let mut cmd = Command::new(&fake_ssh);
+        // Keep a failing regression test from leaving its fake SSH alive
+        // when the supervisor task is aborted during cleanup.
+        cmd.kill_on_drop(true);
+        let mut task = tokio::spawn(run_supervisor(
+            inner,
+            "unused-host".into(),
+            "/unused/remote.sock".into(),
+            local_socket,
+            "/unused/codemux-remote".into(),
+            shutdown_rx,
+            cmd,
+        ));
+        let result = tokio::time::timeout(SPAWN_TIMEOUT + Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    *status_rx.borrow_and_update(),
+                    TunnelStatus::Reconnecting { .. } | TunnelStatus::CircuitOpen { .. }
+                ) {
+                    break;
+                }
+                status_rx.changed().await.unwrap();
+            }
+        })
+        .await;
+        let pid: i32 = std::fs::read_to_string(dir.path().join("ssh.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let reaped = unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        supervisor.shutdown().await;
+        if result.is_err() {
+            task.abort();
+            let _ = task.await;
+        } else {
+            tokio::time::timeout(Duration::from_secs(1), &mut task)
+                .await
+                .expect("supervisor must stop during reconnect backoff")
+                .unwrap();
+        }
+
+        result.expect("startup timeout must leave Pending within a bounded deadline");
+        assert!(
+            reaped,
+            "failed SSH must be killed and reaped before reconnecting"
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_drain_preserves_partial_invalid_utf8_without_eof() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer
+            .write_all(b"permission denied: \xff end\n")
+            .await
+            .unwrap();
+        let diagnostic = tokio::time::timeout(
+            STDERR_DRAIN_TIMEOUT + Duration::from_secs(1),
+            read_stderr_bounded(reader),
+        )
+        .await
+        .expect("an open stderr pipe must not block diagnostics");
+        assert_eq!(diagnostic, "permission denied: \u{fffd} end\n");
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn stderr_drain_stops_at_byte_limit_without_eof() {
+        let diagnostic = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_stderr_bounded(tokio::io::repeat(b'x')),
+        )
+        .await
+        .expect("continuous stderr must stop at the byte limit");
+        assert_eq!(diagnostic, "x".repeat(STDERR_BYTE_LIMIT as usize));
+    }
+
+    #[tokio::test]
+    async fn socket_wait_does_not_drain_stderr_after_ssh_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        // Keep the pipe open independently, as an SSH descendant can,
+        // while retaining both process handles for deterministic cleanup.
+        let mut holder = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf 'permission denied\\n' >&2; exec /bin/sleep 300",
+            ])
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        child.stderr = holder.stderr.take();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_socket(&dir.path().join("missing.sock"), &mut child, SPAWN_TIMEOUT),
+        )
+        .await;
+        let diagnostic = read_stderr_bounded(child.stderr.take().unwrap()).await;
+        holder.kill().await.unwrap();
+        child.wait().await.unwrap();
+
+        let reason = result
+            .expect("SSH exit must not wait for stderr EOF")
+            .unwrap_err();
+        assert!(reason.contains("ssh exited before tunnel came up"));
+        assert!(reason.contains('7'));
+        assert_eq!(diagnostic, "permission denied\n");
+    }
 
     #[test]
     fn backoff_grows_exponentially_capped_at_ceiling() {
