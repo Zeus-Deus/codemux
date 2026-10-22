@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 import { useEditorStore } from "./editor-store";
 
@@ -10,6 +10,88 @@ function tab() {
 
 beforeEach(() => {
   useEditorStore.setState({ tabs: {} });
+});
+
+describe("editor store dirty flags", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function spyOnStorageWrites() {
+    const storage = useEditorStore.persist.getOptions().storage;
+    if (!storage) throw new Error("Editor persistence is unavailable");
+    return vi.spyOn(storage, "setItem");
+  }
+
+  it.each([false, true])("skips repeated dirty=%s updates without persisting or notifying", (dirty) => {
+    const { initTab, setBaselineContent, requestReveal, setDirty } = useEditorStore.getState();
+    initTab(TAB, { filePath: "/work/codemux/docs/INDEX.md" });
+    setBaselineContent(TAB, "saved content");
+    requestReveal(TAB, 41, 2, 5);
+    setDirty(TAB, dirty);
+    const before = useEditorStore.getState();
+    const writes = spyOnStorageWrites();
+    const listener = vi.fn();
+    const unsubscribe = useEditorStore.subscribe(listener);
+
+    try {
+      for (let i = 0; i < 100; i++) setDirty(TAB, dirty);
+
+      expect.soft(writes.mock.calls.length).toBe(0);
+      expect.soft(listener.mock.calls.length).toBe(0);
+      expect(useEditorStore.getState()).toBe(before);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("persists and notifies once per dirty transition while preserving tab contents", () => {
+    const { initTab, setBaselineContent, requestReveal, setDirty } = useEditorStore.getState();
+    initTab(TAB, { filePath: "/work/codemux/docs/INDEX.md" });
+    initTab("other");
+    setBaselineContent(TAB, "saved content");
+    requestReveal(TAB, 41, 2, 5);
+    const before = useEditorStore.getState();
+    const writes = spyOnStorageWrites();
+    const listener = vi.fn();
+    const unsubscribe = useEditorStore.subscribe(listener);
+
+    try {
+      for (const [index, dirty] of [true, false].entries()) {
+        setDirty(TAB, dirty);
+
+        expect(tab()).toEqual({ ...before.tabs[TAB], isDirty: dirty });
+        expect(useEditorStore.getState().tabs.other).toBe(before.tabs.other);
+        expect(writes).toHaveBeenCalledTimes(index + 1);
+        expect(listener).toHaveBeenCalledTimes(index + 1);
+      }
+      expect(localStorage.getItem("codemux-editor")).toBe(JSON.stringify({
+        state: { tabs: {
+          [TAB]: { filePath: "/work/codemux/docs/INDEX.md", baselineContent: "", isDirty: false },
+          other: { filePath: null, baselineContent: "", isDirty: false },
+        } },
+        version: 0,
+      }));
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it.each([false, true])("creates a missing tab with defaults for dirty=%s", (dirty) => {
+    const writes = spyOnStorageWrites();
+    const listener = vi.fn();
+    const unsubscribe = useEditorStore.subscribe(listener);
+
+    try {
+      useEditorStore.getState().setDirty(TAB, dirty);
+
+      expect(tab()).toEqual({ filePath: null, baselineContent: "", isDirty: dirty });
+      expect(writes).toHaveBeenCalledOnce();
+      expect(listener).toHaveBeenCalledOnce();
+    } finally {
+      unsubscribe();
+    }
+  });
 });
 
 describe("editor store reveal requests", () => {
