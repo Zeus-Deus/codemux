@@ -1,24 +1,12 @@
-// Live sync-status hook for the Stage 5 dashboard.
-//
-// The Tauri side emits `skills-sync-state-changed` whenever
-// `skills_sync_now` is invoked (one event before the engine's
-// pull/push cycle and one after — see
-// `src-tauri/src/commands/skills_sync.rs`). This hook subscribes,
-// stitches the events together with the initial poll, and turns
-// the wire-format millis fields into JS Date objects so the
-// display component doesn't have to.
-//
-// `syncNow` is exposed so the "Sync now" button can call it
-// without dragging in the Tauri command import. The hook also
-// owns the optimistic `isSyncing` flag — flipped true on click,
-// reset by the next event payload — so the button's disabled
-// state is responsive even if the network is slow.
+// Combine live sync events with an initial snapshot and a refresh after
+// each manual command settles. Skipped syncs and IPC failures may emit
+// no completion event, so optimism tracks pending commands separately.
+// Convert wire-format millis fields to Dates for the display component.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@/tauri/events";
 
-import { useTauriEvent } from "./use-tauri-event";
 import {
   skillsSyncNow,
   skillsSyncStatus,
@@ -40,11 +28,7 @@ export interface SyncStatusUI {
   errorAt: Date | null;
 }
 
-/// Listen factory for the wrapper-emitted state events. Kept
-/// inline rather than in `events.ts` because Stage 5 is the only
-/// caller and the payload shape varies by state. Adapts the raw
-/// Tauri Event<T> to the (payload) callback the rest of the
-/// codebase's listeners take.
+// Adapt the wrapper's Tauri events to payload callbacks.
 const onSkillsSyncStateChanged = (
   cb: (payload: SkillsSyncStateSnapshot) => void,
 ): Promise<UnlistenFn> =>
@@ -89,66 +73,81 @@ export function useSkillsSyncStatus(): {
   isSyncing: boolean;
 } {
   const [status, setStatus] = useState<SyncStatusUI | null>(null);
-  const [optimisticSyncing, setOptimisticSyncing] = useState(false);
-  const cancelledRef = useRef(false);
+  const [pendingSyncs, setPendingSyncs] = useState(0);
+  const lifecycleRef = useRef<{ revision: number } | null>(null);
 
-  // Initial fetch on mount. The Tauri command is cheap (in-memory
-  // snapshot read), so a single round-trip is fine; no caching
-  // needed.
-  useEffect(() => {
-    cancelledRef.current = false;
-    skillsSyncStatus()
-      .then((snap) => {
-        if (cancelledRef.current) return;
-        setStatus(snapshotToUi(snap));
-      })
-      .catch((err) => {
-        // Tauri unavailable in tests / dev harness — surface as
-        // null so the display falls back to a skeleton.
-        // eslint-disable-next-line no-console
-        console.warn("[skills_sync] initial status fetch failed:", err);
-      });
-    return () => {
-      cancelledRef.current = true;
-    };
-  }, []);
-
-  // Live updates from the Tauri command wrapper. Every payload
-  // overwrites the local state — no merging, the engine is the
-  // source of truth.
-  useTauriEvent(
-    onSkillsSyncStateChanged,
-    (payload) => {
-      setStatus(snapshotToUi(payload));
-      // The wrapper's pre/post emits handle this transition for
-      // us: a "syncing" event clears the post-click optimism
-      // (stays true), and the post-cycle "idle"/"error" event
-      // turns it off. Belt-and-braces: also drop optimism when
-      // the engine reports anything other than syncing.
-      if (payload.state !== "syncing") {
-        setOptimisticSyncing(false);
-      }
-    },
-    [],
-  );
-
-  const syncNow = useCallback(async () => {
-    setOptimisticSyncing(true);
+  const refreshStatus = useCallback(async () => {
+    const lifecycle = lifecycleRef.current;
+    if (!lifecycle) return;
+    // A newer read or live event supersedes this snapshot. The lifecycle
+    // identity also rejects requests from before a Strict Mode remount.
+    const revision = ++lifecycle.revision;
     try {
-      await skillsSyncNow();
+      const snap = await skillsSyncStatus();
+      if (lifecycleRef.current === lifecycle && lifecycle.revision === revision) {
+        setStatus(snapshotToUi(snap));
+      }
     } catch (err) {
-      // The engine records the error in its state snapshot, which
-      // arrives via the post-cycle event and turns isSyncing
-      // off. No need to re-throw.
-      // eslint-disable-next-line no-console
-      console.warn("[skills_sync] sync_now failed:", err);
+      if (lifecycleRef.current === lifecycle && lifecycle.revision === revision) {
+        // Keep the last known state, or the skeleton before the first read.
+        // eslint-disable-next-line no-console
+        console.warn("[skills_sync] status fetch failed:", err);
+      }
     }
   }, []);
 
-  // The button shows a spinner whenever the engine OR the user's
-  // most recent click hasn't resolved yet. Either source is
-  // sufficient — they're additive.
-  const isSyncing = optimisticSyncing || status?.state === "syncing";
+  useEffect(() => {
+    const lifecycle = { revision: 0 };
+    lifecycleRef.current = lifecycle;
+    setPendingSyncs(0);
+    let unlisten: UnlistenFn | null = null;
+    let hasLiveStatus = false;
+    void onSkillsSyncStateChanged((payload) => {
+      if (lifecycleRef.current !== lifecycle) return;
+      hasLiveStatus = true;
+      lifecycle.revision += 1;
+      setStatus(snapshotToUi(payload));
+    }).then((fn) => {
+      if (lifecycleRef.current !== lifecycle) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+      // Subscribe before reading so a completion cannot fall in the gap.
+      // A live event already received during registration takes precedence.
+      if (!hasLiveStatus) void refreshStatus();
+    }).catch((err) => {
+      if (lifecycleRef.current !== lifecycle) return;
+      console.error("[skills_sync] listener registration failed:", err);
+      void refreshStatus();
+    });
+    return () => {
+      lifecycleRef.current = null;
+      unlisten?.();
+    };
+  }, [refreshStatus]);
+
+  const syncNow = useCallback(async () => {
+    const lifecycle = lifecycleRef.current;
+    if (!lifecycle) return;
+    setPendingSyncs((count) => count + 1);
+    try {
+      await skillsSyncNow();
+    } catch (err) {
+      if (lifecycleRef.current === lifecycle) {
+        // eslint-disable-next-line no-console
+        console.warn("[skills_sync] sync_now failed:", err);
+      }
+    } finally {
+      if (lifecycleRef.current === lifecycle) {
+        setPendingSyncs((count) => count - 1);
+        await refreshStatus();
+      }
+    }
+  }, [refreshStatus]);
+
+  // A settled command can still observe another sync in progress.
+  const isSyncing = pendingSyncs > 0 || status?.state === "syncing";
 
   return { status, syncNow, isSyncing };
 }
