@@ -1157,26 +1157,33 @@ impl OpenCodeSession {
                     .filter(|mcp| mcp.session.caller().permission_mode.as_deref() != Some(mode))
                     .map(|mcp| mcp.session.authority.policy_transition());
                 let switched = self.switch_native_agent(agent).await;
-                // A refused switch keeps the old policy. One whose answer was
-                // lost may still have landed, so a switch to Plan fails
-                // closed, and the next prompt re-reads the server's agent
-                // before applying its own.
-                let ambiguous = matches!(&switched, Err(ProviderError::RpcError { message })
-                    if message.starts_with("agent_send_failed"));
-                if ambiguous {
-                    *self.applied_agent.lock().await = None;
-                }
-                if let Some(mcp) = &self.mcp {
-                    if switched.is_ok() || (ambiguous && mode == "plan") {
-                        mcp.session.set_mode(Some(mode.into()));
-                    }
-                }
+                self.settle_agent_switch(agent, &switched).await;
                 switched?;
             }
             *self.agent.lock().await = Some(agent);
             Ok(())
         })
         .await
+    }
+
+    /// Publish a live switch's outcome to the gateway. A refused switch keeps
+    /// the old policy. One whose answer was lost may still have landed, so a
+    /// switch to Plan fails closed, and the next prompt re-reads the server's
+    /// agent and applies the selected one (Build when none was selected)
+    /// before it reopens the policy.
+    async fn settle_agent_switch(&self, agent: &'static str, switched: &Result<bool, ProviderError>) {
+        let ambiguous = matches!(switched, Err(ProviderError::RpcError { message })
+            if message.starts_with("agent_send_failed"));
+        if ambiguous {
+            *self.applied_agent.lock().await = None;
+            self.agent.lock().await.get_or_insert("build");
+        }
+        let mode = Self::gateway_mode(agent);
+        if let Some(mcp) = &self.mcp {
+            if switched.is_ok() || (ambiguous && mode == "plan") {
+                mcp.session.set_mode(Some(mode.into()));
+            }
+        }
     }
 
     /// The Codemux gateway policy mode an OpenCode agent runs under.
@@ -4151,6 +4158,84 @@ pub(crate) mod tests {
         switching.await.unwrap().unwrap();
         assert_eq!(gateway.caller().permission_mode.as_deref(), Some("plan"));
         gateway.authority.capture().wait_ready().await.unwrap();
+    }
+
+    /// A Plan switch whose answer is lost keeps Plan's policy, and the next
+    /// prompt reconciles the server's agent before reopening Build's.
+    #[tokio::test]
+    async fn a_lost_switch_answer_fails_closed_until_the_next_prompt_reconciles() {
+        let mut server = Server::new_async().await;
+        let _agents = server
+            .mock("GET", "/api/agent")
+            .with_status(200)
+            .with_body(r#"{"data":[]}"#)
+            .create_async()
+            .await;
+        let thread = "opencode-lost-agent-switch";
+        let mcp = crate::agent_provider::acp::mcp::ChatMcp::new(
+            McpRegistry::default(),
+            thread,
+            ProviderKind::OpenCode,
+            None,
+            Some("default".into()),
+            "codemux_lost".into(),
+            None,
+            vec![],
+            false,
+        );
+        let gateway = mcp.session.clone();
+        let (session, _, _, _) = mock_session_with_mcp(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+            thread,
+            Some(mcp),
+        )
+        .await;
+        // A fresh chat on its default agent switches to Plan; the switch
+        // lands, but its answer is lost in transit.
+        let lost = Err(ProviderError::RpcError {
+            message: "agent_send_failed: connection closed before message completed".into(),
+        });
+        session.settle_agent_switch("plan", &lost).await;
+        assert_eq!(gateway.caller().permission_mode.as_deref(), Some("plan"));
+        // A refused switch back changes nothing.
+        let refused = Err(ProviderError::RpcError { message: "agent_http_status_400".into() });
+        session.settle_agent_switch("build", &refused).await;
+        assert_eq!(gateway.caller().permission_mode.as_deref(), Some("plan"));
+        // The next prompt finds Plan on the server and switches back first.
+        let _current = server
+            .mock("GET", "/api/session/s/message")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"m","type":"agent-switched","agent":"plan"}]}"#)
+            .create_async()
+            .await;
+        let build = server
+            .mock("POST", "/api/session/s/agent")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"agent":"build"})))
+            .with_status(204)
+            .create_async()
+            .await;
+        let _prompt = server
+            .mock("POST", "/api/session/s/prompt")
+            .with_status(200)
+            .with_body(r#"{"data":{"id":"u","sessionID":"s","type":"user"}}"#)
+            .create_async()
+            .await;
+        let _inbox = server
+            .mock("GET", "/api/session/s/inbox")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"r","type":"synthetic","delivery":"steer"}]}"#)
+            .create_async()
+            .await;
+        session
+            .send_turn("hi".into(), vec![], None, None)
+            .await
+            .unwrap();
+        build.assert_async().await;
+        assert_eq!(gateway.caller().permission_mode.as_deref(), Some("default"));
     }
 
     #[tokio::test]
