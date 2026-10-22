@@ -53,8 +53,9 @@ struct PtySlot {
     #[allow(dead_code)]
     master: Box<dyn MasterPty + Send>,
     /// Writer half, separated because portable-pty's reader and
-    /// writer come off the master via separate calls.
-    writer: Box<dyn Write + Send>,
+    /// writer come off the master via separate calls. Lock per terminal so
+    /// input backpressure cannot block access to other slots.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Accumulated bytes from the child. Ring-buffered to a cap so
     /// long-running shells don't blow memory.
     buffer: Arc<Mutex<RingBuffer>>,
@@ -226,7 +227,7 @@ impl PtyManager {
         };
         let slot = PtySlot {
             master,
-            writer,
+            writer: Arc::new(Mutex::new(writer)),
             buffer,
             cwd: info.cwd.clone(),
             command: info.command.clone(),
@@ -240,14 +241,18 @@ impl PtyManager {
     /// callers wanting a newline-terminated command must include `\n`
     /// (or `\r`) themselves.
     pub fn write(&self, terminal_id: &str, data: &[u8]) -> Result<(), PtyError> {
-        let mut slots = self.slots.lock().unwrap();
-        let slot = slots
-            .get_mut(terminal_id)
-            .ok_or_else(|| PtyError::NotFound(terminal_id.to_string()))?;
-        slot.writer
+        let writer = {
+            let slots = self.slots.lock().unwrap();
+            let slot = slots
+                .get(terminal_id)
+                .ok_or_else(|| PtyError::NotFound(terminal_id.to_string()))?;
+            Arc::clone(&slot.writer)
+        };
+        let mut writer = writer.lock().unwrap();
+        writer
             .write_all(data)
             .map_err(|e| PtyError::Io(format!("pty write: {e}")))?;
-        slot.writer
+        writer
             .flush()
             .map_err(|e| PtyError::Io(format!("pty flush: {e}")))?;
         Ok(())
@@ -280,7 +285,7 @@ impl PtyManager {
             .collect()
     }
 
-    /// Terminate and reap the terminal's child, then release its PTY handles.
+    /// Remove the terminal, then terminate and reap its child.
     pub fn close(&self, terminal_id: &str) -> Result<(), PtyError> {
         // Release the manager lock before process termination can block.
         let mut slot = self.slots.lock().unwrap()
@@ -295,6 +300,153 @@ impl PtyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[derive(Debug, Clone)]
+    struct ExitedChild;
+
+    impl portable_pty::ChildKiller for ExitedChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            unreachable!()
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl portable_pty::Child for ExitedChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+        }
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            unreachable!()
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    fn stub_slot(writer: Box<dyn Write + Send>) -> PtySlot {
+        let mut buffer = RingBuffer::new(BUFFER_CAP);
+        buffer.push(b"slot output");
+        // Own an unused PTY handle without spawning a shell or touching user terminals.
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        PtySlot {
+            master: pair.master,
+            writer: Arc::new(Mutex::new(writer)),
+            buffer: Arc::new(Mutex::new(buffer)),
+            cwd: "/test".into(),
+            command: "stub".into(),
+            child: PtyChild(Box::new(ExitedChild)),
+        }
+    }
+
+    struct BlockingWriter {
+        entered: Option<mpsc::SyncSender<()>>,
+        release: mpsc::Receiver<()>,
+        block_on_flush: bool,
+    }
+
+    impl BlockingWriter {
+        fn block(&mut self) {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+                // Dropping the sender also releases the writer during test cleanup.
+                let _ = self.release.recv();
+            }
+        }
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if !self.block_on_flush {
+                self.block();
+            }
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.block_on_flush {
+                self.block();
+            }
+            Ok(())
+        }
+    }
+
+    fn assert_other_slot_progresses_while_writer_blocks(block_on_flush: bool) {
+        let mgr = Arc::new(PtyManager::new());
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        mgr.slots.lock().unwrap().insert(
+            "a".into(),
+            stub_slot(Box::new(BlockingWriter {
+                entered: Some(entered_tx),
+                release: release_rx,
+                block_on_flush,
+            })),
+        );
+        mgr.slots
+            .lock()
+            .unwrap()
+            .insert("b".into(), stub_slot(Box::new(std::io::sink())));
+
+        let writer_mgr = Arc::clone(&mgr);
+        let writer = std::thread::spawn(move || writer_mgr.write("a", b"input"));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer did not block");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let other_mgr = Arc::clone(&mgr);
+        let other = std::thread::spawn(move || {
+            let output = other_mgr.read("b", None).unwrap();
+            let tail = other_mgr.read("b", Some(6)).unwrap();
+            let listed = other_mgr.list();
+            other_mgr.write("b", b"other input").unwrap();
+            other_mgr.close("b").unwrap();
+            assert!(matches!(
+                other_mgr.read("b", None),
+                Err(PtyError::NotFound(_))
+            ));
+            assert!(matches!(
+                other_mgr.write("b", b"input"),
+                Err(PtyError::NotFound(_))
+            ));
+            let remaining = other_mgr.list();
+            done_tx.send((output, tail, listed, remaining)).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(5));
+        // Always release and join both workers before asserting, including on main.
+        drop(release_tx);
+        writer.join().unwrap().unwrap();
+        other.join().unwrap();
+
+        let (output, tail, listed, remaining) =
+            result.expect("slot B read/list/close blocked behind slot A's writer");
+        assert_eq!(output, b"slot output");
+        assert_eq!(tail, b"output");
+        assert_eq!(listed.len(), 2);
+        assert!(listed
+            .iter()
+            .any(|info| info.id == "b" && info.cwd == "/test" && info.command == "stub"));
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "a");
+    }
+
+    #[test]
+    fn blocked_write_does_not_block_other_slots() {
+        assert_other_slot_progresses_while_writer_blocks(false);
+    }
+
+    #[test]
+    fn blocked_flush_does_not_block_other_slots() {
+        assert_other_slot_progresses_while_writer_blocks(true);
+    }
 
     fn wait_for_output<F: Fn(&[u8]) -> bool>(mgr: &PtyManager, tid: &str, pred: F) -> Vec<u8> {
         for _ in 0..50 {
