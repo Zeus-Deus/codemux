@@ -14,6 +14,7 @@ import {
 import { useEffect, useId, useRef, useState } from "react";
 
 import { Spinner } from "@/components/ui/spinner";
+import { AnimatedHeight } from "@/components/ui/animated-height";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -322,7 +323,9 @@ export function ComposerStrip({
       data-testid="composer-strip"
       data-open={open || undefined}
       data-lead={goal ? "goal" : (lead?.kind ?? "queue")}
-      className="relative z-0 w-full px-5"
+      // Rises out from under the pill when something first docks here.
+      // Transform and opacity only, so the transcript never reflows for it.
+      className="relative z-0 w-full px-5 animate-in fade-in-0 slide-in-from-bottom-2 duration-250 ease-drawer"
     >
       <div className="relative -mb-[18px] overflow-hidden rounded-t-[14px] border border-b-0 border-border/70 bg-muted/20 pb-[18px]">
         {interrupted && (
@@ -392,26 +395,28 @@ export function ComposerStrip({
             )}
           </ul>
         ) : (
-          <ul
-            id={listId}
-            aria-label="Pending activity"
-            className={cn(
-              "relative flex flex-col gap-[3px]",
-              open &&
-                `${OPEN_MAX_HEIGHT} overflow-y-auto thin-scrollbar`,
-            )}
-          >
-            {(open ? rows : [{ row: lead.summary, kind: lead.kind }]).map(
-              ({ row, kind }, index) => (
-                <StripRowView
-                  key={row.id}
-                  row={row}
-                  kind={kind}
-                  trailing={index === 0 ? toggle : null}
-                />
-              ),
-            )}
-          </ul>
+          <AnimatedHeight>
+            <ul
+              id={listId}
+              aria-label="Pending activity"
+              className={cn(
+                "relative flex flex-col gap-[3px]",
+                open &&
+                  `${OPEN_MAX_HEIGHT} overflow-y-auto thin-scrollbar`,
+              )}
+            >
+              {(open ? rows : [{ row: lead.summary, kind: lead.kind }]).map(
+                ({ row, kind }, index) => (
+                  <StripRowView
+                    key={row.id}
+                    row={row}
+                    kind={kind}
+                    trailing={index === 0 ? toggle : null}
+                  />
+                ),
+              )}
+            </ul>
+          </AnimatedHeight>
         )}
       </div>
     </div>

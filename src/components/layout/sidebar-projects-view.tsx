@@ -10,6 +10,8 @@ import {
 import { cn } from "@/lib/utils";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Collapse } from "@/components/ui/collapse";
+import { PresenceList, PresenceRow } from "@/components/ui/presence";
 import {
   Tooltip,
   TooltipContent,
@@ -357,7 +359,7 @@ function FooterToggle({
       <ChevronRight
         aria-hidden
         className={cn(
-          "size-3.5 shrink-0 text-muted-foreground/70 transition-transform duration-150",
+          "size-3.5 shrink-0 text-muted-foreground/70 transition-transform duration-150 ease-drawer",
           open && "rotate-90",
         )}
       />
@@ -389,6 +391,9 @@ export function SidebarProjectsView() {
   const expandProjectRequest = useUIStore((s) => s.expandProjectRequest);
 
   const loadInbox = useSidebarInboxStore((s) => s.load);
+  // Rows only animate once the stored settled/snoozed lists have loaded, so
+  // hydration never plays as a burst of rows opening and closing at boot.
+  const rowMotion = useSidebarInboxStore((s) => s.loaded);
   const settled = useSidebarInboxStore((s) => s.settled);
   const snoozed = useSidebarInboxStore((s) => s.snoozed);
   const filter = useSidebarInboxStore((s) => s.filter);
@@ -569,34 +574,39 @@ export function SidebarProjectsView() {
   const renderRows = (
     rows: readonly ProjectsRow[],
     nested = false,
-  ): React.ReactNode =>
-    rows.map((row) => {
-      const ws = row.workspace;
-      const repo = repoByWorkspace.get(ws.workspace_id);
-      if (!repo) return null;
-      const Item = nested ? SidebarMenuSubItem : SidebarMenuItem;
-      return (
-        <Item key={ws.workspace_id}>
-          <ProjectRow
-            workspace={ws}
-            repo={repo}
-            status={statusOf(ws.workspace_id)}
-            isActive={ws.workspace_id === activeWorkspaceId}
-            unread={unreadOf(ws)}
-            meta={idleMeta(ws)}
-            parked={null}
-          />
-          {row.children.length > 0 && (
-            <SidebarMenuSub
-              data-ws-children={ws.workspace_id}
-              className="mx-0 ml-[15px] translate-x-0 gap-0 border-border/70 px-0 py-0 pl-1.5"
-            >
-              {renderRows(row.children, true)}
-            </SidebarMenuSub>
-          )}
-        </Item>
-      );
-    });
+  ): React.ReactNode => (
+    <PresenceList animate={rowMotion}>
+      {rows.map((row) => {
+        const ws = row.workspace;
+        const repo = repoByWorkspace.get(ws.workspace_id);
+        if (!repo) return null;
+        const Item = nested ? SidebarMenuSubItem : SidebarMenuItem;
+        return (
+          <Item key={ws.workspace_id}>
+            <PresenceRow>
+              <ProjectRow
+                workspace={ws}
+                repo={repo}
+                status={statusOf(ws.workspace_id)}
+                isActive={ws.workspace_id === activeWorkspaceId}
+                unread={unreadOf(ws)}
+                meta={idleMeta(ws)}
+                parked={null}
+              />
+              {row.children.length > 0 && (
+                <SidebarMenuSub
+                  data-ws-children={ws.workspace_id}
+                  className="mx-0 ml-[15px] translate-x-0 gap-0 border-border/70 px-0 py-0 pl-1.5"
+                >
+                  {renderRows(row.children, true)}
+                </SidebarMenuSub>
+              )}
+            </PresenceRow>
+          </Item>
+        );
+      })}
+    </PresenceList>
+  );
 
   const renderParkedRow = (ws: WorkspaceSnapshot) => {
     const repo = repoByWorkspace.get(ws.workspace_id);
@@ -610,18 +620,23 @@ export function SidebarProjectsView() {
         : null;
     return (
       <SidebarMenuItem key={ws.workspace_id}>
-        <ProjectRow
-          workspace={ws}
-          repo={repo}
-          status={statusOf(ws.workspace_id)}
-          isActive={ws.workspace_id === activeWorkspaceId}
-          unread={unreadOf(ws)}
-          meta={meta}
-          parked={snoozeEntry ? "snoozed" : "settled"}
-        />
+        <PresenceRow>
+          <ProjectRow
+            workspace={ws}
+            repo={repo}
+            status={statusOf(ws.workspace_id)}
+            isActive={ws.workspace_id === activeWorkspaceId}
+            unread={unreadOf(ws)}
+            meta={meta}
+            parked={snoozeEntry ? "snoozed" : "settled"}
+          />
+        </PresenceRow>
       </SidebarMenuItem>
     );
   };
+  const renderParkedRows = (list: readonly WorkspaceSnapshot[]) => (
+    <PresenceList animate={rowMotion}>{list.map(renderParkedRow)}</PresenceList>
+  );
 
   /** Parked rows a section lists inline: all of them when it has nothing
    *  live and is open, otherwise only the open workspace, which never hides. */
@@ -658,6 +673,7 @@ export function SidebarProjectsView() {
     const pending =
       open || quiet ? (pendingByProject.get(project.path) ?? []) : [];
     const parked = inlineParked(project, open);
+    const hasTail = pending.length > 0 || parked.length > 0;
     return (
       <SidebarMenuItem key={project.path} data-project-group={project.path}>
         <ProjectGroupHeader
@@ -673,17 +689,22 @@ export function SidebarProjectsView() {
           needsYou={!open && hasNeedsYou(project.rows)}
           onToggle={quiet ? setQuietOpen : setFolded}
         />
-        {(open || parked.length > 0 || pending.length > 0) && (
-          <SidebarMenu className="pb-1">
-            {open && renderRows(project.rows)}
-            {pending.map((pw) => (
-              <SidebarMenuItem key={pw.id}>
-                <PendingWorkspaceRow pending={pw} className="gap-2 px-2 py-2" />
-              </SidebarMenuItem>
-            ))}
-            {parked.map(renderParkedRow)}
+        {/* Live rows fold; the rows that show either way (a create in
+            flight, the open workspace, a quiet project's history) sit in
+            their own list below and enter or leave row by row. */}
+        <Collapse open={open}>
+          <SidebarMenu className={cn(!hasTail && "pb-1")}>
+            {renderRows(project.rows)}
           </SidebarMenu>
-        )}
+        </Collapse>
+        <SidebarMenu className={cn(hasTail && "pb-1")}>
+          {pending.map((pw) => (
+            <SidebarMenuItem key={pw.id}>
+              <PendingWorkspaceRow pending={pw} className="gap-2 px-2 py-2" />
+            </SidebarMenuItem>
+          ))}
+          {renderParkedRows(parked)}
+        </SidebarMenu>
       </SidebarMenuItem>
     );
   };
@@ -691,9 +712,8 @@ export function SidebarProjectsView() {
   const shelfSettledCount = model.shelf.filter((e) =>
     settledIds.has(e.workspace.workspace_id),
   ).length;
-  const shelfGroups = shelfOpen
-    ? groupShelf(model.shelf, shelfLimit, activeWorkspaceId)
-    : [];
+  // Grouped even while closed, so the shelf folds away with its rows.
+  const shelfGroups = groupShelf(model.shelf, shelfLimit, activeWorkspaceId);
   const shelfHidden =
     model.shelf.length -
     shelfGroups.reduce((n, g) => n + g.workspaces.length, 0);
@@ -737,7 +757,7 @@ export function SidebarProjectsView() {
             <ChatsHeader />
             <SidebarMenu>
               {renderRows(model.chats.rows)}
-              {inlineParked(model.chats, false).map(renderParkedRow)}
+              {renderParkedRows(inlineParked(model.chats, false))}
             </SidebarMenu>
           </SidebarGroup>
         )}
@@ -767,9 +787,9 @@ export function SidebarProjectsView() {
                   onToggle={() => setMoreOpen((v) => !v)}
                   data-more-projects-toggle=""
                 />
-                {moreOpen && (
+                <Collapse open={moreOpen}>
                   <SidebarMenu>{model.quietProjects.map(renderProject)}</SidebarMenu>
-                )}
+                </Collapse>
               </SidebarGroup>
             )}
             {model.shelf.length > 0 && (
@@ -782,28 +802,31 @@ export function SidebarProjectsView() {
                   )}
                   count={model.shelf.length}
                   onToggle={() => {
-                    setShelfOpen((v) => !v);
-                    setShelfLimit(SHELF_INITIAL_COUNT);
+                    // Reset paging on open, so a long shelf folds away whole.
+                    if (!shelfOpen) setShelfLimit(SHELF_INITIAL_COUNT);
+                    setShelfOpen(!shelfOpen);
                   }}
                   data-settled-shelf-toggle=""
                 />
-                {shelfGroups.map((g) => (
-                  <div key={g.path} data-shelf-group={g.path}>
-                    <div className="truncate pb-0.5 pl-[30px] pr-2 pt-1.5 text-label font-semibold text-muted-foreground/80">
-                      {g.name}
+                <Collapse open={shelfOpen}>
+                  {shelfGroups.map((g) => (
+                    <div key={g.path} data-shelf-group={g.path}>
+                      <div className="truncate pb-0.5 pl-[30px] pr-2 pt-1.5 text-label font-semibold text-muted-foreground/80">
+                        {g.name}
+                      </div>
+                      <SidebarMenu>{renderParkedRows(g.workspaces)}</SidebarMenu>
                     </div>
-                    <SidebarMenu>{g.workspaces.map(renderParkedRow)}</SidebarMenu>
-                  </div>
-                ))}
-                {shelfOpen && shelfHidden > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => setShelfLimit((n) => n + SHELF_PAGE_COUNT)}
-                    className="flex h-7 w-full items-center rounded-lg pl-[30px] text-left text-label text-muted-foreground/80 transition-colors duration-150 hover:text-foreground"
-                  >
-                    Show {Math.min(shelfHidden, SHELF_PAGE_COUNT)} more
-                  </button>
-                )}
+                  ))}
+                  {shelfHidden > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setShelfLimit((n) => n + SHELF_PAGE_COUNT)}
+                      className="flex h-7 w-full items-center rounded-lg pl-[30px] text-left text-label text-muted-foreground/80 transition-colors duration-150 hover:text-foreground"
+                    >
+                      Show {Math.min(shelfHidden, SHELF_PAGE_COUNT)} more
+                    </button>
+                  )}
+                </Collapse>
               </SidebarGroup>
             )}
           </div>
@@ -878,7 +901,7 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
         <ChevronRight
           aria-hidden
           className={cn(
-            "size-3.5 shrink-0 text-muted-foreground/70 transition-transform duration-150",
+            "size-3.5 shrink-0 text-muted-foreground/70 transition-transform duration-150 ease-drawer",
             !folded && "rotate-90",
           )}
         />

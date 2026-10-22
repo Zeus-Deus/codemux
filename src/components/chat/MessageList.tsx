@@ -314,6 +314,7 @@ export const MessageList = memo(function MessageList({
         for (const id of pinnedBy) next.delete(id);
       } else {
         next.add(turnId);
+        foldRevealUntil = performance.now() + FOLD_REVEAL_WINDOW_MS;
       }
       return next;
     });
@@ -2302,7 +2303,6 @@ function TurnFoldRow({
       </div>
     );
   }
-  const Icon = expanded ? ChevronDown : ChevronRight;
   return (
     <div className="flex items-center justify-between gap-3 border-b border-border/60 pb-2 pt-1">
       <button
@@ -2317,12 +2317,23 @@ function TurnFoldRow({
             · {failedCount} failed
           </span>
         ) : null}
-        <Icon className="size-3.5" aria-hidden />
+        <ChevronRight
+          className={cn("size-3.5 transition-transform duration-150 ease-drawer", expanded && "rotate-90")}
+          aria-hidden
+        />
       </button>
       {changesChip}
     </div>
   );
 }
+
+/** Rows that mount this soon after a turn fold opens are the ones it just
+ *  revealed, and fade in rather than appearing in one frame. Opacity only:
+ *  the virtualized list measures them at full height straight away, so the
+ *  scroll position never moves. Rows realized later by scrolling arrive
+ *  without the fade. Module-level because rows are recycled by the list. */
+const FOLD_REVEAL_WINDOW_MS = 250;
+let foldRevealUntil = 0;
 
 // Two-level memoization (issue #129). Level 1 is `SlotRowMemo`, the whole-row
 // wrapper below owns the activity/item branch. `reuseTranscriptSlots` keeps an untouched slot's object
@@ -2402,10 +2413,14 @@ function SlotRow({
             : slot.turnStart
               ? "mt-4"
               : "mt-2.5";
+  const [revealed] = useState(() => performance.now() < foldRevealUntil);
   return (
     <div
       data-message-id={slot.messageId}
-      className={marginClass}
+      className={cn(
+        marginClass,
+        revealed && "animate-in fade-in-0 duration-150 ease-drawer",
+      )}
     >
       {slot.body.kind === "activity" ? (
         <ActivityRowMemo

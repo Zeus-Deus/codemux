@@ -501,7 +501,8 @@ describe("SidebarProjectsView", () => {
     act(() => {
       useSidebarInboxStore.getState().settle("ws-1");
     });
-    expect(screen.queryByText("row")).toBeNull();
+    // The settled row plays a short exit before it unmounts.
+    await vi.waitFor(() => expect(screen.queryByText("row")).toBeNull());
     expect(screen.getByRole("button", { name: "Settled 1" })).toBeInTheDocument();
   });
 });

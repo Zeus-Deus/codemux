@@ -63,7 +63,7 @@ function TooltipContent({
           // Only a tooltip that waited out its delay fades in. One that opens
           // instantly mid-sweep (`instant-open`) hard-cuts, so dragging the
           // pointer along a toolbar never stacks fades on top of each other.
-          "duration-100 motion-safe:data-[state=delayed-open]:animate-in motion-safe:data-[state=delayed-open]:fade-in-0 motion-safe:data-[state=delayed-open]:zoom-in-95",
+          "origin-(--radix-tooltip-content-transform-origin) duration-100 ease-drawer motion-safe:data-[state=delayed-open]:animate-in motion-safe:data-[state=delayed-open]:fade-in-0 motion-safe:data-[state=delayed-open]:zoom-in-97",
           className
         )}
         {...props}

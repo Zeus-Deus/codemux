@@ -40,6 +40,10 @@ import { isRemoteClient } from "@/components/remote/is-remote-client";
 const LocalSessionImport = lazy(() => import("@/components/chat/LocalSessionImport").then(m => ({ default: m.LocalSessionImport })));
 const MobileShell = lazy(() => import("@/components/mobile/mobile-shell").then(m => ({ default: m.MobileShell })));
 
+/** A utility page (Settings, Automations, …) fades in over the workspace it
+ *  covers. Opacity only: the page is full size from its first frame. */
+const UTILITY_PAGE_ENTER = "animate-in fade-in-0 duration-150 ease-drawer";
+
 const loadSettingsView = () => import("@/components/settings/settings-view");
 const loadCommandPalette = () => import("@/components/overlays/command-palette");
 const loadFileSearchDialog = () => import("@/components/search/file-search-dialog");
@@ -315,9 +319,13 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   if (utilityPage && (mobile || !shellAvailable)) {
     return (
       <UtilityPageStandaloneContext.Provider value={true}>
-        <LazyBoundary label={utilityPageLabel(utilityPage)} className="h-screen">
-          <UtilityPageContent page={utilityPage} />
-        </LazyBoundary>
+        {/* LazyBoundary's className only styles its loading and error
+            states, so the entrance lives on a wrapper around the page. */}
+        <div className={cn("h-screen", UTILITY_PAGE_ENTER)}>
+          <LazyBoundary label={utilityPageLabel(utilityPage)} className="h-full">
+            <UtilityPageContent page={utilityPage} />
+          </LazyBoundary>
+        </div>
       </UtilityPageStandaloneContext.Provider>
     );
   }
@@ -383,7 +391,12 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
             <WorkspaceMain />
           </div>
           {utilityPage && (
-            <div className="absolute inset-0 z-20 flex flex-col bg-background">
+            <div
+              className={cn(
+                "absolute inset-0 z-20 flex flex-col bg-background",
+                UTILITY_PAGE_ENTER,
+              )}
+            >
               <LazyBoundary label={utilityPageLabel(utilityPage)} className="h-full">
                 <UtilityPageContent page={utilityPage} />
               </LazyBoundary>
