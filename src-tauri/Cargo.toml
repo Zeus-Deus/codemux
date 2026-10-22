@@ -337,3 +337,12 @@ path = "src/bin/codemux_remote.rs"
 test = false
 doctest = false
 bench = false
+
+# Full debuginfo made every dev/test executable ~1.1-1.4 GB. With 50+
+# integration-test binaries, linking all of that dominated `cargo test`
+# (a one-line edit relinked ~65 GB) and pushed local builds into swap.
+# Line tables keep file:line in panics and backtraces; for a debugger
+# session with variables, build with CARGO_PROFILE_DEV_DEBUG=full.
+# `test` inherits `dev`, so this covers test executables too.
+[profile.dev]
+debug = "line-tables-only"
