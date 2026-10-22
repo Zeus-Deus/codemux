@@ -34,8 +34,8 @@ import { randomUUID } from "@/lib/uuid";
  *
  * How it works: every `@tauri-apps/api` surface — `invoke()`, the event
  * system (`listen`/`emit`/`once`), the window/app plugins, and the
- * `plugin-opener` / `plugin-updater` / `plugin-process` / `plugin-dialog`
- * wrappers — ultimately funnels through `window.__TAURI_INTERNALS__`.
+ * `plugin-opener` / `plugin-updater` / `plugin-process` wrappers —
+ * ultimately funnels through `window.__TAURI_INTERNALS__`.
  * We install a faithful enough `__TAURI_INTERNALS__` (plus the event
  * plugin internals) so the unmodified `@tauri-apps/api` code routes
  * every call into the command router below. No module aliasing needed.

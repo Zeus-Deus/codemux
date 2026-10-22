@@ -1356,14 +1356,6 @@ mod tests {
 
     // ───── read_file_for_attachment tests (Step 8 Stage 2) ─────
 
-    fn write_lines(path: &Path, n: usize) {
-        let content = (1..=n)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(path, content).unwrap();
-    }
-
     #[test]
     fn attachment_binary_sniff_does_not_read_the_remaining_file() {
         struct UnreadableTail;
@@ -1713,14 +1705,6 @@ mod tests {
         // after the two preamble comments). The line-number map must
         // produce exactly that.
         assert_eq!(entry.line, 3);
-    }
-
-    /// Variable len(write_lines) helper isn't used by these tests but
-    /// is kept available for future fixtures (truncation by line count
-    /// vs. bytes is already covered above).
-    #[allow(dead_code)]
-    fn _unused_write_lines_marker(p: &Path, n: usize) {
-        write_lines(p, n);
     }
 
     // ───── list_project_folders + read_folder_for_attachment (Step 8 Stage 3) ─────
