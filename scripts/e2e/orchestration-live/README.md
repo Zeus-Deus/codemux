@@ -141,10 +141,18 @@ unknown or empty values are an error). Run only the scenarios you need.
     and fails loudly if not, or if a file that existed when `up.sh` ran
     (recorded in `<root>/credentials.present`) is gone. It never restores
     them: re-login instead.
-  - Hermes is not wired yet. It writes `auth.json` with temp + replace, so it
-    needs the Claude treatment (its storage dir bound, everything else in it
-    covered). Add that before any Hermes scenario.
-  - Only `claude`, `codex` and `node`/`npm`/`npx` are linked into
+  - Set `ORCH_LIVE_PROVIDERS=claude,codex,opencode,cursor,grok,hermes` to opt in
+    to the additional providers. OpenCode (`~/.local/share/opencode/auth.json`),
+    Cursor (`~/.config/cursor/auth.json`), Grok (`~/.grok/auth.json`, if present),
+    and Hermes (`~/.hermes/auth.json`) use directory mounts so atomic token
+    replacement reaches the real file. Existing non-auth entries are covered
+    by private run-local files/directories; Hermes runtime code and interpreter
+    are mounted read-only. Hermes uses a minimal private OpenAI Codex / Luna
+    configuration. No profile config or OAuth file is copied. Preflight checks
+    file identity and atomic rename support; down checks credential JSON and
+    that no non-auth top-level entries changed. Missing authentication remains
+    a recorded verification gap.
+  - Installed provider CLIs and `node`/`npm`/`npx` are linked into
     `<root>/bin` (the sandbox PATH). Other provider CLIs need a link there,
     a `--ro-bind` if they live outside `~/.local/share/mise` or `/usr`, and
     their own credential treatment.

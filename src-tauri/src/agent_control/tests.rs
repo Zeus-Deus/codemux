@@ -358,7 +358,8 @@ async fn mario_r7_true_errors_and_limits_remain_distinct_across_native_history()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mario_r4_child_unknown_and_empty_approvals_keep_selected_parent_wait_busy() {
-    use crate::agent_provider::{ProviderRuntimeEvent, RequestId, ThreadId, TurnId, TurnStatus, SessionStatus, SubagentSnapshot, SubagentStatus};
+    use crate::agent_provider::{ProviderRuntimeEvent, RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, ThreadId, TurnId, TurnStatus,
+    };
     use crate::commands::agent_chat::{forward_event, SubagentTracker};
     for callback_turn in ["child-b", "", "unknown-turn"] {
         let (app, provider, _root, workspace) = fixture().await;
@@ -968,7 +969,8 @@ async fn review_l5_identical_retry_recovers_receipt_after_pane_close() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_l6_selected_parent_wait_remains_busy_until_delegate_settles() {
-    use crate::agent_provider::{ProviderRuntimeEvent, ThreadId, TurnId, TurnStatus, SubagentSnapshot, SubagentStatus};
+    use crate::agent_provider::{ProviderRuntimeEvent, SubagentSnapshot, SubagentStatus, ThreadId, TurnId, TurnStatus,
+    };
     let (app, _, _root, workspace) = fixture().await;
     let receipt = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
         "workspace_id":workspace,"client_request_id":"review-l6-launch","provider":"claude","permission_mode":"default",
@@ -1004,7 +1006,7 @@ async fn review_l6_selected_parent_wait_remains_busy_until_delegate_settles() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_l2_receipt_admitted_send_cannot_restart_after_completed_native_stop() {
-    use crate::agent_provider::{ThreadId, ProviderKind, AgentProvider};
+    use crate::agent_provider::{AgentProvider, ProviderKind, ThreadId};
     let (app, provider, _root, workspace) = fixture().await;
     let launch = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
         "workspace_id":workspace,"client_request_id":"review-l2-launch","provider":"claude","permission_mode":"default",
@@ -1033,7 +1035,7 @@ async fn review_l2_receipt_admitted_send_cannot_restart_after_completed_native_s
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_s4_outside_approval_handle_survives_no_provider_id_recycling() {
-    use crate::agent_provider::{ProviderRuntimeEvent, ThreadId, TurnId, RequestId};
+    use crate::agent_provider::{ProviderRuntimeEvent, RequestId, ThreadId, TurnId};
     let (app, provider, _root, workspace) = fixture().await;
     let launch = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
         "workspace_id":workspace,"client_request_id":"review-s4-launch","provider":"claude","permission_mode":"default",
@@ -1117,6 +1119,48 @@ async fn capabilities_discover_provider_owned_models_and_operations() {
     assert_eq!(response["providers"][0]["capabilities"], serde_json::to_value(expected).unwrap());
     assert_eq!(response["providers"][0]["operations"]["supports_interrupt"], true);
     assert!(provider.calls.snapshot().is_empty(), "metadata must not launch a coding session");
+}
+
+/// Listing reads caches only. With every catalog cold it reports each
+/// built-in instance undiscovered and starts nothing: no OpenCode server, no
+/// CLI health check, no catalog harvest. A cached catalog is listed as is.
+#[tokio::test]
+async fn all_provider_listing_with_cold_caches_starts_nothing() {
+    use crate::agent_provider::ProviderKind::{self, *};
+    let (app, _provider, _root, workspace) = fixture().await;
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap().clear();
+    let registry = app.state::<crate::commands::agent_chat::ProviderRegistry>();
+    let mock = |kind: ProviderKind| Arc::new(mock_agent_provider::MockAgentProvider::new(kind));
+    registry.set_codex(mock(Codex)).await;
+    registry.set_cursor(mock(Cursor)).await;
+    registry.set_grok(mock(Grok)).await;
+    registry.set_opencode(mock(OpenCode)).await;
+    let opencode = Arc::new(crate::agent_provider::opencode::OpenCodeServerManager::new());
+    app.manage(opencode.clone());
+    app.manage(Arc::new(crate::agent_provider::claude::capabilities::ClaudeCapabilityCache::new()));
+    app.manage(Arc::new(crate::agent_provider::codex::capabilities::CodexCapabilityCache::new()));
+    app.manage(Arc::new(crate::agent_provider::cursor::capabilities::CursorCapabilityCache::new()));
+    app.manage(Arc::new(crate::agent_provider::grok::capabilities::GrokCapabilityCache::new()));
+    let trusted = ControlCaller::trusted();
+    let list = || execute(app.handle(), &trusted, "agent_capabilities", json!({"workspace_id":workspace}));
+
+    let cold = list().await.unwrap();
+    let providers = cold["providers"].as_array().unwrap();
+    assert_eq!(providers.len(), 5, "{cold}");
+    for entry in providers {
+        assert_eq!(entry["discovery_error"]["code"], "catalog_not_discovered", "{entry}");
+    }
+    assert!(!opencode.is_running_for_tests().await, "listing started an OpenCode server");
+
+    // An OpenCode 1 catalog the composer read earlier: listed, with the reason
+    // its chats cannot collaborate, still without a server.
+    let catalog = crate::agent_provider::opencode::capabilities::build_capabilities(vec![]);
+    opencode.remember_catalog(crate::agent_provider::opencode::api::OpenCodeApi::Legacy, catalog);
+    let warm = list().await.unwrap();
+    let entry = warm["providers"].as_array().unwrap().iter().find(|p| p["provider"] == "opencode").unwrap();
+    assert_eq!(entry["discovery_error"], serde_json::Value::Null, "{entry}");
+    assert_eq!(entry["collaboration_unavailable"], crate::agent_provider::opencode::session::LEGACY_COLLABORATION);
+    assert!(!opencode.is_running_for_tests().await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1527,7 +1571,7 @@ async fn orchestration_message_definite_error_survives_attention_and_cold_status
 
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn orchestration_message_controller_interrupt_selects_current_run_without_stop_fence() {
-    use crate::agent_provider::{ProviderRuntimeEvent,ThreadId,TurnId,SessionStatus};
+    use crate::agent_provider::{ProviderRuntimeEvent, SessionStatus, ThreadId, TurnId};
     let (app,provider,_root,workspace)=fixture().await;
     let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"interrupt-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
     let launched=settle_operation(&app,&receipt).await; let thread=launched["thread_id"].as_str().unwrap();
@@ -2078,8 +2122,8 @@ async fn native_callers_toggle_is_enforced_at_dispatch_but_suggestions_still_wor
 
 #[tokio::test]
 async fn native_callers_validate_every_explicit_delegate_mode_against_catalog() {
-    use crate::mcp::registry::{HostCaller,HostTools};
     use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller,HostTools};
     for (parent_mode,child_mode,expected_plan) in [("plan","plan",true),("bypassPermissions","read-only",false),("bypassPermissions","invented",false),("bypassPermissions","workspace-write",false)] {
         let (app,_,_root,workspace,thread,_authority,actor)=native_caller_fixture(parent_mode).await;
         let mut caps=crate::agent_provider::codex::capabilities::build_capabilities(vec![]);
@@ -2661,5 +2705,452 @@ async fn native_launch_catalog_steers_delegation_to_delegate_task() {
         assert!(description.starts_with("If the user asks to delegate work or wants results back, use delegate_task instead."), "{description}");
         assert!(description.contains("nested under yours"), "{description}");
         assert!(!description.contains("project-root"), "{description}");
+    }
+}
+
+#[tokio::test]
+async fn all_provider_target_validation_precedes_admission_and_preserves_instance_catalog() {
+    let (app, _, _root, workspace, _thread, _authority, actor) =
+        native_caller_fixture("bypassPermissions").await;
+    let db = app.state::<crate::database::DatabaseStore>();
+    db.set_setting(
+        "hermes.installation",
+        "/missing/orchestration-fixture-hermes",
+    )
+    .unwrap();
+    let before = db.control_thread_ids(&workspace, None, 100).unwrap();
+    for target in [
+        json!({"instance_id":"acp:missing"}),
+        json!({"instance_id":"hermes:missing"}),
+        json!({"instance_id":"claude:missing"}),
+        json!({"instance_id":"claude","model":"unadvertised-model"}),
+        json!({"instance_id":"claude","options":{"executable":"/bin/sh"}}),
+    ] {
+        let result = super::native::call(
+            app.handle().clone(),
+            actor.clone(),
+            "thread_launch".into(),
+            json!({"target":target,"title":"Unavailable selection"}),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(
+            db.control_thread_ids(&workspace, None, 100).unwrap(),
+            before,
+            "a readiness rejection must not publish a child pane/session"
+        );
+    }
+}
+
+#[tokio::test]
+async fn all_provider_host_catalog_uses_the_same_tools_in_every_mode() {
+    use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, _, _root, workspace, thread, _authority, _actor) =
+        native_caller_fixture("default").await;
+    let host = super::native::OrchestrationHost(app.handle().clone());
+    for provider in [
+        ProviderKind::OpenCode,
+        ProviderKind::Cursor,
+        ProviderKind::Grok,
+        ProviderKind::Hermes,
+        ProviderKind::Acp,
+    ] {
+        for mode in [
+            None,
+            Some("plan"),
+            Some("default"),
+            Some("agent"),
+            Some("supervised"),
+        ] {
+            let caller = HostCaller {
+                control: None,
+                thread_id: thread.clone(),
+                provider,
+                workspace_id: Some(workspace.clone()),
+                permission_mode: mode.map(str::to_string),
+            };
+            let names: Vec<_> = host
+                .tools_for(&caller)
+                .into_iter()
+                .map(|t| t.name)
+                .collect();
+            for name in [
+                "orchestrator_capabilities",
+                "thread_send",
+                "thread_launch",
+                "thread_wait",
+                "thread_interrupt",
+                "create_threads",
+            ] {
+                assert!(
+                    names.iter().any(|n| n == name),
+                    "{provider:?} {mode:?}: {names:?}"
+                );
+            }
+            assert!(!names.iter().any(|n| n == "thread_respond"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn all_provider_task_retry_keeps_the_admitted_selection_when_target_is_unavailable() {
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, _, _root, workspace, thread, _authority, actor) =
+        native_caller_fixture("bypassPermissions").await;
+    let caller = super::native::qualify(app.handle(), &actor).await.unwrap();
+    let db = app.state::<crate::database::DatabaseStore>();
+    let args = json!({"target":{"instance_id":"acp:removed-instance","model":null,"options":{}},"title":"Already admitted worker","task":"Review this previously admitted task without launching another worker","client_request_id":"admitted-selection","permission_mode":"supervised"});
+    let mut record = crate::database::delegation_tasks::TaskRecord::new(
+        "existing-selection-task".into(),
+        thread.clone(),
+        Some("existing-selection-child".into()),
+        "acp".into(),
+        args["title"].as_str().unwrap().into(),
+        args["task"].as_str().unwrap().into(),
+        1,
+    );
+    record.workspace_id = workspace.clone();
+    record.permission_mode = Some("supervised".into());
+    let payload = json!({"provider":"acp","title":args["title"],"task":args["task"],"model":null,"effort":null,"role":null,"mode":"async","wait_ms":20000,"permission_mode":"supervised","target":args["target"]});
+    db.admit_delegation_task(&record, Some("admitted-selection"), &payload)
+        .unwrap();
+    let host = crate::commands::delegation::DelegationHost::with_install_check(
+        app.handle().clone(),
+        |_| false,
+    );
+    let host_caller = HostCaller {
+        control: Some(caller),
+        thread_id: thread,
+        provider: crate::agent_provider::ProviderKind::Claude,
+        workspace_id: Some(workspace),
+        permission_mode: Some("bypassPermissions".into()),
+    };
+    let response = host
+        .call_async(
+            &host_caller,
+            "mcp__codemux__delegate_task",
+            &args,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(response["isError"], true, "{response}");
+    assert!(response.to_string().contains("existing-selection-task"));
+    let mut conflict = args;
+    conflict["task"] = json!("This is a different task with the same retry key");
+    let response = host
+        .call_async(
+            &host_caller,
+            "mcp__codemux__delegate_task",
+            &conflict,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response["isError"], true);
+    assert!(response.to_string().contains("client_request_id_conflict"));
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn all_provider_queued_launch_keeps_delivery_authority_after_receipt_success() {
+    let (app,provider,_root,_workspace,_thread,_authority,actor)=native_caller_fixture("default").await;
+    provider.queue_next_send();
+    let caller=native::qualify(app.handle(),&actor).await.unwrap();
+    let receipt=native::call(app.handle().clone(),actor,"thread_launch".into(),json!({"client_request_id":"deferred-launch","title":"Queued worker","message":"Run after the launch receipt succeeds"})).await.unwrap();
+    let launched=tokio::time::timeout(std::time::Duration::from_secs(15),async {
+        loop {
+            let status=service::operation_status(app.handle(),&caller,json!({"operation_id":receipt["operation_id"]})).unwrap();
+            if !matches!(status["state"].as_str(),Some("accepted"|"running")){break status;}
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(launched["state"],"succeeded");
+    let thread=launched["thread_id"].as_str().unwrap();
+    let input=provider.take_queued_input();
+    let checkpoint=input.turn_checkpoint.unwrap();
+    checkpoint.prepare().await;
+    checkpoint.verify_dispatch().expect("a succeeded launch does not revoke its queued first message");
+    app.state::<NativeControlState>().thread_gate(thread).cancel();
+    app.state::<crate::database::DatabaseStore>().stop_message_deliveries(thread).unwrap();
+    assert!(checkpoint.verify_dispatch().is_err(),"Stop still revokes the queued first message");
+    checkpoint.abort().await;
+    assert!(provider.calls.snapshot().iter().all(|c|!matches!(c,mock_agent_provider::MockCall::SendTurn(..))));
+}
+
+/// Hermes runs a configured profile. workspace_launch carries the profile
+/// through preparation: a Hermes chat keeps its own, a full-access chat of
+/// another provider names one, and lower ceilings are never offered Hermes.
+#[tokio::test]
+async fn all_provider_workspace_launch_carries_hermes_profiles() {
+    use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, claude, root, workspace) = fixture().await;
+    claude.enable_session_listing();
+    app.manage(crate::commands::delegation::DelegationState::default());
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git").current_dir(root.path()).args(args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    };
+    git(&["init", "-b", "main"]);
+    git(&["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base"]);
+    app.manage(crate::terminal::PtyState::default());
+    app.manage(crate::presets::PresetStoreState::new(&app.state::<crate::database::DatabaseStore>()));
+    // A configured Hermes with a default and a `coder` profile; no process runs.
+    let hermes_home = tempfile::tempdir().unwrap();
+    let installation = hermes_home.path().join("hermes");
+    std::fs::write(&installation, "#!/bin/sh\n").unwrap();
+    let hermes_root = hermes_home.path().join("root");
+    std::fs::create_dir_all(hermes_root.join("profiles/coder")).unwrap();
+    for home in [hermes_root.clone(), hermes_root.join("profiles/coder")] {
+        std::fs::write(home.join("config.yaml"), "model: {provider: custom}\n").unwrap();
+    }
+    let db = app.state::<crate::database::DatabaseStore>();
+    db.set_setting("hermes.installation", installation.to_str().unwrap()).unwrap();
+    db.set_setting("hermes.root", hermes_root.to_str().unwrap()).unwrap();
+    let profiles = super::selection::profiles(&db).unwrap();
+    let coder = profiles.iter().find(|p| p.id == "coder").unwrap().clone();
+    let runtime = Arc::new(crate::agent_provider::hermes::HermesProvider::new(Arc::new(crate::database::DatabaseStore::new_in_memory())));
+    let catalog = json!({
+        "models":{"currentModelId":"openai:fixture","availableModels":[{"modelId":"openai:fixture","name":"Fixture"}]},
+        "modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"dont_ask","name":"Don't ask"}]},
+    });
+    for profile in &profiles {
+        runtime.remember_catalog_for_test(profile, catalog.clone()).await;
+    }
+    app.manage(runtime);
+    let hermes = Arc::new(mock_agent_provider::MockAgentProvider::new(ProviderKind::Hermes));
+    hermes.enable_session_listing();
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_hermes(hermes.clone()).await;
+    let mut caps = crate::agent_provider::claude::capabilities::claude_fallback_capabilities();
+    caps.permission_modes = vec![crate::agent_provider::PermissionModeOption {value:"dont_ask".into(),label:"Don't ask".into(),description:String::new(),is_default:true}];
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap().insert(ProviderKind::Hermes, caps);
+
+    let caller = |kind: ProviderKind, mode: &'static str| {
+        let (app, workspace, coder, cwd) = (&app, workspace.clone(), coder.clone(), root.path().to_path_buf());
+        async move {
+            let launched = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({"workspace_id":workspace,"client_request_id":format!("hermes-caller-{kind:?}-{mode}"),"provider":kind,"permission_mode":mode})).await.unwrap();
+            let receipt = settle_operation(app, &launched).await;
+            assert_eq!(receipt["state"], "succeeded", "{receipt}");
+            let thread = receipt["thread_id"].as_str().unwrap().to_string();
+            let app = app.handle();
+            if kind == ProviderKind::Hermes {
+                app.state::<crate::database::DatabaseStore>().save_hermes_binding(&crate::agent_provider::hermes::binding::Binding {
+                    schema_version: 1, profile: coder, thread_id: thread.clone(), workspace_id: Some(workspace.clone()), cwd,
+                    acp_session_id: None, current_native_id: None, root_native_id: None, model_override: None,
+                    resolved_model: None, permission_mode: Some(mode.into()), compatibility: String::new(), cleanup_pending: false,
+                }).unwrap();
+            }
+            let authority = crate::delegation::authority::NativeAuthority::with_policy(&thread, kind, Some(mode));
+            let generation = authority.begin(0);
+            assert!(authority.bind(generation, "native-run"));
+            let actor = crate::delegation::app::NativeActor {thread_id:thread.clone(),provider:kind,workspace_id:Some(workspace.clone()),session_id:format!("mock-{thread}"),permission_mode:Some(mode.into()),permit:authority.capture()};
+            let control = native::qualify(app, &actor).await.unwrap();
+            (HostCaller {control:Some(control),thread_id:thread,provider:kind,workspace_id:Some(workspace),permission_mode:Some(mode.into())}, authority)
+        }
+    };
+    let host = crate::commands::workspace_launch::WorkspaceLaunchHost::with_install_check(app.handle().clone(), |_| true);
+    let offered = |caller: &HostCaller| host.tools_for(caller)[0].input_schema["properties"]["provider"]["enum"].as_array().unwrap().contains(&json!("hermes"));
+    let launched_profile = |parent: String| {
+        let hermes = hermes.clone();
+        async move {
+            let input = tokio::time::timeout(std::time::Duration::from_secs(10), async { loop {
+                let child = hermes.calls.snapshot().iter().find_map(|c| match c {mock_agent_provider::MockCall::SendTurn(t,_) if t.0 != parent => Some(t.0.clone()), _ => None});
+                if let Some(input) = child.and_then(|child| hermes.start_inputs().into_iter().find(|i| i.thread_id.0 == child)) { break input; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }}).await.expect("the Hermes workspace chat started");
+            hermes.calls.0.lock().unwrap().clear();
+            input
+        }
+    };
+    let cleanup = |input: &crate::agent_provider::StartSessionInput| {
+        git(&["worktree", "remove", "--force", input.cwd.to_str().unwrap()]);
+        let _ = std::fs::remove_dir(input.cwd.parent().unwrap());
+    };
+
+    // A full-access Hermes chat omits provider and keeps its own profile.
+    let (hermes_caller, _a) = caller(ProviderKind::Hermes, "dont_ask").await;
+    assert!(offered(&hermes_caller));
+    let result = host.call(&hermes_caller, "mcp__codemux__workspace_launch", &json!({"title":"Hermes workspace","message":"A complete Hermes brief","branch":"hermes-own-profile"})).unwrap();
+    assert_eq!(result["isError"], false, "{result}");
+    let input = launched_profile(hermes_caller.thread_id.clone()).await;
+    assert_eq!(input.extra["hermes_profile"]["id"], "coder");
+    assert_eq!(input.permission_mode.as_deref(), Some("dont_ask"));
+    cleanup(&input);
+
+    // A lower ceiling is never offered Hermes and cannot name a profile.
+    let (lower, _b) = caller(ProviderKind::Claude, "default").await;
+    assert!(!offered(&lower));
+    let refused = host.call(&lower, "mcp__codemux__workspace_launch", &json!({"title":"Lower Hermes","message":"A complete brief","target":{"instance_id":"hermes:coder"}})).unwrap();
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(refused.to_string().contains("permission"), "{refused}");
+
+    // A full-access chat of another provider targets a configured profile.
+    let (full, _c) = caller(ProviderKind::Claude, "bypassPermissions").await;
+    assert!(offered(&full));
+    let missing = host.call(&full, "mcp__codemux__workspace_launch", &json!({"title":"No profile","message":"A complete brief","provider":"hermes"})).unwrap();
+    assert!(missing.to_string().contains("target.instance_id"), "{missing}");
+    let result = host.call(&full, "mcp__codemux__workspace_launch", &json!({"title":"Targeted Hermes","message":"A complete brief","branch":"hermes-targeted","target":{"instance_id":"hermes:default"}})).unwrap();
+    assert_eq!(result["isError"], false, "{result}");
+    assert_eq!(result["content"][0]["text"].as_str().map(|t| t.contains("\"provider\":\"hermes\"")), Some(true), "{result}");
+    let input = launched_profile(full.thread_id.clone()).await;
+    assert_eq!(input.extra["hermes_profile"]["id"], "default");
+    assert_eq!(input.permission_mode.as_deref(), Some("dont_ask"));
+    cleanup(&input);
+}
+
+/// A Codex model advertising efforts and the premium service tiers.
+fn premium_codex_capabilities() -> crate::agent_provider::ProviderChatCapabilities {
+    let entry: crate::agent_provider::codex::protocol::ModelEntry = serde_json::from_value(json!({
+        "id": "premium-model", "model": "premium-model", "displayName": "Premium", "isDefault": true,
+        "defaultReasoningEffort": "medium",
+        "supportedReasoningEfforts": [
+            {"reasoningEffort": "low", "description": ""},
+            {"reasoningEffort": "high", "description": ""},
+        ],
+        "serviceTiers": [
+            {"id": "priority", "name": "Fast", "description": "Premium speed"},
+            {"id": "ultrafast", "name": "Ultrafast", "description": "Higher usage"},
+        ],
+    }))
+    .unwrap();
+    crate::agent_provider::codex::capabilities::build_capabilities(vec![entry])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_provider_premium_codex_tiers_start_through_the_guard() {
+    use crate::agent_provider::ProviderKind;
+    let (app, provider, _root, workspace, _thread, _authority, _actor) =
+        native_caller_provider_fixture(ProviderKind::Codex, "danger-full-access").await;
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap()
+        .insert(ProviderKind::Codex, premium_codex_capabilities());
+    for tier in ["priority", "ultrafast"] {
+        let receipt = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
+            "workspace_id": workspace, "client_request_id": format!("premium-{tier}"),
+            "provider": "codex", "permission_mode": "workspace-write",
+            "target": {"instance_id": "codex", "model": "premium-model", "options": {"service_tier": tier}},
+        })).await.unwrap();
+        let settled = settle_operation(&app, &receipt).await;
+        assert_eq!(settled["state"], "succeeded", "{tier}: {settled}");
+        let thread = settled["thread_id"].as_str().unwrap();
+        let record = app.state::<crate::database::DatabaseStore>().get_agent_chat_session(thread).unwrap();
+        assert_eq!(record.service_tier, tier);
+        assert!(provider.start_inputs().iter().any(|input| input.thread_id.0 == thread
+            && input.service_tier.as_deref() == Some(tier)));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_provider_inherited_launch_keeps_explicit_options() {
+    use crate::agent_provider::ProviderKind;
+    let (app, _provider, _root, _workspace, thread, _authority, actor) =
+        native_caller_provider_fixture(ProviderKind::Codex, "danger-full-access").await;
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap()
+        .insert(ProviderKind::Codex, premium_codex_capabilities());
+    let db = app.state::<crate::database::DatabaseStore>();
+    db.update_agent_chat_session_config(&thread, &crate::database::AgentChatSessionConfig {
+        model: Some(Some("premium-model".into())), effort: Some(Some("high".into())),
+        service_tier: Some("priority".into()), ..Default::default()
+    }).unwrap();
+    let launch = |args: serde_json::Value| {
+        let (app, actor) = (app.handle().clone(), actor.clone());
+        async move {
+            let receipt = native::call(app.clone(), actor.clone(), "thread_launch".into(), args).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let status = native::call(app.clone(), actor.clone(), "operation_status".into(), json!({"operation_id": receipt["operation_id"]})).await.unwrap();
+                    if !matches!(status["state"].as_str(), Some("accepted" | "running")) { break status; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap()
+        }
+    };
+    // Same model, nothing named: the caller's effort and tier carry over.
+    let inherited = launch(json!({"title": "Inherited options"})).await;
+    assert_eq!(inherited["state"], "succeeded", "{inherited}");
+    let record = db.get_agent_chat_session(inherited["thread_id"].as_str().unwrap()).unwrap();
+    assert_eq!((record.effort.as_deref(), record.service_tier.as_str()), (Some("high"), "priority"));
+    // Named options win over the caller's.
+    let explicit = launch(json!({"title": "Explicit options", "effort": "low", "service_tier": "ultrafast"})).await;
+    assert_eq!(explicit["state"], "succeeded", "{explicit}");
+    let record = db.get_agent_chat_session(explicit["thread_id"].as_str().unwrap()).unwrap();
+    assert_eq!((record.effort.as_deref(), record.service_tier.as_str()), (Some("low"), "ultrafast"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_provider_opencode_plan_child_starts_in_the_plan_agent() {
+    use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, _, _root, workspace, thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
+    let opencode = Arc::new(mock_agent_provider::MockAgentProvider::new(ProviderKind::OpenCode));
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_opencode(opencode.clone()).await;
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap().insert(
+        ProviderKind::OpenCode,
+        crate::agent_provider::opencode::capabilities::opencode_stage1_placeholder(),
+    );
+    let caller = HostCaller { control: Some(native::qualify(app.handle(), &actor).await.unwrap()), thread_id: thread, provider: ProviderKind::Claude, workspace_id: Some(workspace), permission_mode: Some("bypassPermissions".into()) };
+    let host = crate::commands::delegation::DelegationHost::with_install_check(app.handle().clone(), |_| true);
+    let result = host.call_async(&caller, "mcp__codemux__delegate_task", &json!({"target":{"instance_id":"opencode"},"permission_mode":"plan","title":"Plan child","task":"Plan the parser refactor without editing any files."}), None, None).await.unwrap();
+    assert_ne!(result["isError"], true, "{result}");
+    let calls = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let calls = opencode.calls.snapshot();
+            if calls.iter().any(|call| matches!(call, mock_agent_provider::MockCall::StartSession(_))) { break calls; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("the OpenCode child started");
+    let plan = calls.iter().position(|call| matches!(call, mock_agent_provider::MockCall::SetPermissionMode(_, mode) if mode == "plan"));
+    let start = calls.iter().position(|call| matches!(call, mock_agent_provider::MockCall::StartSession(_)));
+    assert!(plan.is_some() && plan < start, "plan is selected before the session starts: {calls:?}");
+}
+
+#[tokio::test]
+async fn all_provider_hermes_only_machine_still_offers_delegation() {
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, _, root, workspace) = fixture().await;
+    app.manage(crate::commands::delegation::DelegationState::default());
+    let db = app.state::<crate::database::DatabaseStore>();
+    db.set_setting("hermes.root", &root.path().join("missing").to_string_lossy()).unwrap();
+    let host = crate::commands::delegation::DelegationHost::with_install_check(app.handle().clone(), |_| false);
+    let caller = HostCaller { control: None, thread_id: "hermes-only".into(), provider: crate::agent_provider::ProviderKind::Hermes, workspace_id: Some(workspace), permission_mode: Some("dont_ask".into()) };
+    let names = |host: &crate::commands::delegation::DelegationHost<tauri::test::MockRuntime>| host.tools_for(&caller).into_iter().map(|t| t.name).collect::<Vec<_>>();
+    assert!(!names(&host).contains(&"delegate_task".to_string()), "nothing configured, nothing offered");
+    // A configured Hermes profile is reachable through `target`.
+    let hermes_root = tempfile::tempdir().unwrap();
+    db.set_setting("hermes.root", &hermes_root.path().to_string_lossy()).unwrap();
+    db.set_setting("hermes.installation", &std::env::current_exe().unwrap().to_string_lossy()).unwrap();
+    let names = names(&host);
+    for tool in ["delegate_task", "task_status", "task_cancel"] {
+        assert!(names.contains(&tool.to_string()), "{tool} missing: {names:?}");
+    }
+    let delegate = host.tools_for(&caller).into_iter().find(|t| t.name == "delegate_task").unwrap();
+    assert!(delegate.input_schema["properties"]["provider"].get("enum").is_none(), "no empty provider enum");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_provider_premium_codex_tiers_start_delegated_children() {
+    use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, provider, _root, workspace, thread, _authority, actor) =
+        native_caller_provider_fixture(ProviderKind::Codex, "danger-full-access").await;
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap()
+        .insert(ProviderKind::Codex, premium_codex_capabilities());
+    let caller = HostCaller { control: Some(native::qualify(app.handle(), &actor).await.unwrap()), thread_id: thread.clone(), provider: ProviderKind::Codex, workspace_id: Some(workspace), permission_mode: Some("danger-full-access".into()) };
+    let host = crate::commands::delegation::DelegationHost::with_install_check(app.handle().clone(), |_| true);
+    for tier in ["priority", "ultrafast"] {
+        let result = host.call_async(&caller, "mcp__codemux__delegate_task", &json!({"target":{"instance_id":"codex","model":"premium-model","options":{"service_tier":tier}},"title":format!("{tier} child"),"task":"Compute 17 plus 18 without using any tools."}), None, None).await.unwrap();
+        assert_ne!(result["isError"], true, "{tier}: {result}");
+        let task_id = serde_json::from_str::<serde_json::Value>(result["content"][0]["text"].as_str().unwrap()).unwrap()["task_id"].as_str().unwrap().to_string();
+        let child = app.state::<crate::database::DatabaseStore>().delegation_task(&task_id).unwrap().unwrap().child_thread_id.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if provider.start_inputs().iter().any(|input| input.thread_id.0 == child && input.service_tier.as_deref() == Some(tier)) { break; }
+                let task = app.state::<crate::database::DatabaseStore>().delegation_task(&task_id).unwrap().unwrap();
+                assert!(!task.status.terminal(), "{tier} child ended before starting: {task:?}");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap_or_else(|_| panic!("the {tier} child started"));
     }
 }

@@ -138,6 +138,15 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     if let Some(coordinator) = tauri::Manager::try_state::<crate::delegation::coordinator::Coordinator>(&app) {
         tauri::async_runtime::block_on(coordinator.shutdown())?;
     }
+    // Managed state need not drop on exit; stop OpenCode explicitly.
+    if let Some(manager) = tauri::Manager::try_state::<
+        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
+    >(&app)
+    {
+        if let Err(error) = tauri::async_runtime::block_on(manager.shutdown()) {
+            eprintln!("[codemux::opencode] shutdown incomplete: {error}");
+        }
+    }
     if let Err(error) = crate::active_workspace_persistence::flush_latest(app.handle()) {
         eprintln!("[codemux::selection] headless shutdown flush failed: {error}");
     }

@@ -60,7 +60,7 @@ pub fn native_tools() -> Vec<ToolDefinition> {
     respond["request_id"] = json!({"type": "string", "minLength": 1});
     respond["decision"] = json!({"type": "string", "enum": ["allow_once", "allow_always", "deny"]});
     vec![
-        tool("agent_capabilities", "Discover provider-owned model, effort, permission and operation capabilities for a workspace. Registered/configured is not launch readiness: inspect discovery_error. Hermes launch requires an existing native profile binding and is unavailable through this launch API. Values are opaque; do not invent model IDs or permission defaults.", json!({
+        tool("agent_capabilities", "Discover provider-owned model, effort, permission and operation capabilities for a workspace. Registered/configured is not launch readiness: inspect discovery_error. Configured account, Hermes profile and custom ACP IDs are advertised as provider_instance_id values; use target to select one. Values are opaque; do not invent model IDs or permission defaults.", json!({
             "workspace_id": {"type": "string", "minLength": 1},
             "provider": {"type": "string"},
         }), &["workspace_id"], true),
@@ -69,10 +69,12 @@ pub fn native_tools() -> Vec<ToolDefinition> {
             "cursor": {"type": "string"},
             "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
         }), &["workspace_id"], true),
-        tool("thread_launch", "Launch a CodeMux-owned native thread in an existing workspace. Creating worktrees and selecting Hermes profiles are unavailable through this API. Returns an operation receipt; use operation_status. Explicit permission_mode is mandatory (null only for providers without a mode). No raw environment or filesystem attachment inputs.", json!({
+        tool("thread_launch", "Launch a CodeMux-owned native thread in an existing workspace. Creating worktrees is unavailable. Select configured accounts, Hermes profiles and ACP instances through target. Returns an operation receipt; use operation_status. Explicit permission_mode is mandatory (null only for providers without a mode). No raw environment or filesystem attachment inputs.", json!({
             "workspace_id": {"type": "string", "minLength": 1},
             "client_request_id": {"type": "string", "minLength": 1, "maxLength": 128},
             "provider": {"type": "string"},
+            "target": super::selection::schema(),
+            "service_tier": {"type":["string","null"]},
             "model": {"type": ["string", "null"]},
             "permission_mode": {"type": ["string", "null"]},
             "effort": {"type": ["string", "null"]},

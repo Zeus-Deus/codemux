@@ -47,6 +47,9 @@ export function isIdleCompactionWarning(message: string): boolean {
 /** Explicit restriction emitted by the pinned Hermes adapter on session start. */
 const HERMES_USAGE_LIMIT_RECOVERY_PREFIX = "hermes-usage-limit-recovery: ";
 
+/** A chat started without Codemux's collaboration tools (OpenCode 1). */
+const COLLABORATION_UNAVAILABLE_PREFIX = "collaboration-unavailable: ";
+
 /** Defensive nested access: `originalPayload.rate_limit_info.status`. */
 function readRateLimitStatus(originalPayload: unknown): string | null {
   if (!originalPayload || typeof originalPayload !== "object") return null;
@@ -78,6 +81,8 @@ function readRateLimitStatus(originalPayload: unknown): string | null {
  *   could not be applied; the session uses Standard).
  * - `"hermes-usage-limit-recovery: <text>"` → `<text>` (the adapter's
  *   explicit compatibility restriction, persisted for reopened chats).
+ * - `"collaboration-unavailable: <text>"` → `<text>` (the chat runs
+ *   without Codemux's tools, and why).
  * - `"idle-compaction: <text>"` → `<text>` (an idle Claude chat was
  *   summarized on a plugin's request; rendered as info).
  * - anything else → null (SDK debug noise).
@@ -105,6 +110,9 @@ export function runtimeNoticeFromWarning(
   }
   if (message.startsWith(HERMES_USAGE_LIMIT_RECOVERY_PREFIX)) {
     return message.slice(HERMES_USAGE_LIMIT_RECOVERY_PREFIX.length);
+  }
+  if (message.startsWith(COLLABORATION_UNAVAILABLE_PREFIX)) {
+    return message.slice(COLLABORATION_UNAVAILABLE_PREFIX.length);
   }
   if (isIdleCompactionWarning(message)) {
     return message.slice(IDLE_COMPACTION_PREFIX.length);

@@ -73,7 +73,7 @@ function context(result, signal) {
      *  a pre-minted thread, a provider session, then the first turn. Every
      *  call goes through the paired browser's remote transport. Returns
      *  { threadId, paneId, tabId }. */
-    async startChat({ provider, model = null, effort = null, text, permissionMode = null }) {
+    async startChat({ provider, model = null, effort = null, text, permissionMode = null, extra = null }) {
       const threadId = randomUUID();
       const paneId = await driver.invoke("agent_chat_create_pane", {
         workspaceId: env.WORKSPACE_ID, provider, cwd: env.REPO,
@@ -84,7 +84,7 @@ function context(result, signal) {
         input: {
           thread_id: threadId, cwd: env.REPO, model, resume_cursor: null,
           permission_mode: permissionMode, effort, context_window: null,
-          service_tier: "default", additional_directories: [], env: null,
+          service_tier: "default", additional_directories: [], env: null, extra,
         },
       });
       await driver.invoke("agent_chat_send_turn", {

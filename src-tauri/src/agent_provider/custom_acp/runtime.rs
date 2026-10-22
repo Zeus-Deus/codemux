@@ -188,6 +188,7 @@ struct Session {
     launch: AcpLaunchConfig,
     child: Arc<JsonRpcChild>,
     caps: Mutex<Negotiation>,
+    mcp: Option<crate::agent_provider::acp::mcp::ChatMcp>,
     binding: Mutex<AcpBinding>,
     // Accessed under the binding owner. Only catalog updates are deferred;
     // callbacks stay live and inactive-turn load history remains suppressed.
@@ -219,6 +220,8 @@ struct Inner {
     events: broadcast::Sender<ProviderRuntimeEvent>,
     catalogs: broadcast::Sender<AcpCatalogChanged>,
     mcp_registry: Option<crate::mcp::registry::McpRegistry>,
+    /// Probe results by agent ID and definition revision.
+    probed: std::sync::Mutex<HashMap<(String, String), AcpCatalog>>,
 }
 pub struct GenericAcpProvider {
     inner: Arc<Inner>,
@@ -306,6 +309,7 @@ impl GenericAcpProvider {
                 events,
                 catalogs,
                 mcp_registry,
+                probed: Default::default(),
             }),
         }
     }
@@ -341,9 +345,12 @@ impl GenericAcpProvider {
         }
         Ok(session)
     }
+    /// Discover a definition's catalog in a throwaway session. Runs outside
+    /// the lifecycle lock so real chats can start and close meanwhile; a
+    /// definition edited during discovery is reported, never cached.
     pub async fn probe(&self, agent_id: &str, cwd: PathBuf) -> Result<AcpCatalog, ProviderError> {
-        let _lifecycle = self.inner.lifecycle.lock().await;
         let launch = self.launch(agent_id)?;
+        let revision = launch.agent.revision.clone();
         let session = Session::open(
             &self.inner,
             ThreadId(format!("acp-probe-{}", Uuid::new_v4())),
@@ -358,7 +365,26 @@ impl GenericAcpProvider {
         .await?;
         let catalog = session.binding.lock().await.catalog.clone();
         session.close().await?;
+        if self.launch(agent_id)?.agent.revision != revision {
+            return Err(invalid(
+                "stale_provider_selection: ACP definition changed during discovery",
+            ));
+        }
+        self.inner
+            .probed
+            .lock()
+            .unwrap()
+            .insert((agent_id.into(), revision), catalog.clone());
         Ok(catalog)
+    }
+    /// The last probe of this exact definition revision, without starting it.
+    pub fn probed_catalog(&self, agent_id: &str, revision: &str) -> Option<AcpCatalog> {
+        self.inner
+            .probed
+            .lock()
+            .unwrap()
+            .get(&(agent_id.to_string(), revision.to_string()))
+            .cloned()
     }
     pub async fn live_catalog(&self, thread: &ThreadId) -> Option<AcpCatalog> {
         let session = self.inner.sessions.lock().await.get(thread).cloned()?;
@@ -428,6 +454,11 @@ impl Session {
         !self.ended.load(Ordering::SeqCst) && self.child.is_alive()
     }
     fn emit(&self, event: ProviderRuntimeEvent) {
+        if let ProviderRuntimeEvent::TurnCompleted { turn_id, .. } = &event {
+            if let Some(mcp) = &self.mcp {
+                mcp.session.authority.finish(&turn_id.0);
+            }
+        }
         if self.visible {
             let _ = self.events.send(event);
         }
@@ -454,6 +485,13 @@ impl Session {
     }
     async fn publish_catalog(&self) -> Result<(), ProviderError> {
         let binding = self.binding.lock().await;
+        // Every accepted catalog mutation, solicited or not, keeps the
+        // gateway's ceiling on the fingerprint orchestration validates.
+        if let Some(mcp) = &self.mcp {
+            mcp.session.authority.transition_ceiling(
+                crate::agent_control::permissions::Ceiling::opaque_policy(&binding),
+            );
+        }
         if self.durable.load(Ordering::SeqCst) {
             self.store
                 .update_binding(&binding)
@@ -498,11 +536,30 @@ impl Session {
                 "ACP requires an existing absolute working directory",
             ));
         }
+        let mcp = tool_workspace.and_then(|workspace| {
+            inner.mcp_registry.clone().map(|registry| {
+                crate::agent_provider::acp::mcp::ChatMcp::new(
+                    registry,
+                    &thread.0,
+                    ProviderKind::Acp,
+                    workspace,
+                    Some("supervised".into()),
+                    crate::agent_provider::acp::mcp::SERVER_NAME.into(),
+                    None,
+                    vec![],
+                    false,
+                )
+            })
+        });
+        let mut environment = launch.environment.clone();
+        if let Some(mcp) = &mcp {
+            environment.extend(mcp.env().await);
+        }
         let child = Arc::new(
             JsonRpcChild::spawn_strict(SpawnConfig {
                 program: PathBuf::from(&launch.agent.executable),
                 args: launch.agent.args.clone(),
-                env: crate::agent_provider::acp::mcp::with_loopback_no_proxy(launch.environment.clone()),
+                env: crate::agent_provider::acp::mcp::with_loopback_no_proxy(environment),
                 cwd: Some(cwd.clone()),
                 default_timeout: RPC_TIMEOUT,
             })
@@ -539,6 +596,7 @@ impl Session {
             launch,
             child,
             caps: Mutex::new(Negotiation::default()),
+            mcp,
             binding: Mutex::new(binding),
             startup_catalog_updates: Mutex::new(Some(Vec::new())),
             mutation_catalog_updates: Mutex::new(None),
@@ -584,15 +642,8 @@ impl Session {
             let (native,intent,legacy_model)={let b=session.binding.lock().await;
                 let legacy=if b.session_id.is_some() && semantic_option(&b.catalog.config_options,"model").is_none() && !b.catalog.capabilities.models.is_empty() {b.catalog.current_model.clone()} else {None};
                 (b.session_id.clone(),b.config_values.clone(),legacy)};
-            let mcp_servers = match tool_workspace {
-                Some(workspace_id) => crate::agent_provider::acp::mcp::session_mcp_servers(
-                    inner.mcp_registry.as_ref(),
-                    &session.thread.0,
-                    crate::mcp::gateway::GatewayCaller { workspace_id, ..Default::default() },
-                    crate::agent_provider::acp::mcp::SERVER_NAME,
-                    crate::agent_provider::acp::mcp::Transport::negotiated(&initialized),
-                )
-                .await,
+            let mcp_servers = match &session.mcp {
+                Some(mcp) => mcp.servers(crate::agent_provider::acp::mcp::Transport::negotiated(&initialized)).await,
                 None => json!([]),
             };
             let mut params=json!({"cwd":cwd,"mcpServers":mcp_servers});
@@ -608,6 +659,10 @@ impl Session {
             let catalog={
                 let mut binding=session.binding.lock().await;
                 let catalog=catalog_from(&binding.agent_id,&session.launch.agent.name,&caps,&response).map_err(protocol)?;
+                if let Some(mcp) = &session.mcp {
+                    mcp.session.bind_session(&namespaced_session(&binding.agent_id, &binding.revision, &native).0);
+                    mcp.session.authority.set_ceiling(crate::agent_control::permissions::Ceiling::opaque_policy(&binding));
+                }
                 binding.session_id=Some(native);
                 catalog
             };
@@ -910,7 +965,17 @@ impl Session {
     }
     async fn set_config(&self, id: &str, value: Value) -> Result<AcpCatalog, ProviderError> {
         let _control = self.control.lock().await;
-        self.set_config_locked(id, value, None).await
+        // Any option may change the agent's reach, so the change is a policy
+        // transition and the ceiling follows the catalog the agent reports.
+        let Some(mcp) = &self.mcp else {
+            return self.set_config_locked(id, value, None).await;
+        };
+        let _transition = mcp.session.authority.policy_transition();
+        let result = self.set_config_locked(id, value, None).await;
+        let policy =
+            crate::agent_control::permissions::Ceiling::opaque_policy(&*self.binding.lock().await);
+        mcp.session.authority.set_ceiling(policy);
+        result
     }
     // Caller owns control; internal turn overrides must not re-enter the gate.
     async fn set_config_locked(&self, id: &str, value: Value, turn: Option<&TurnId>) -> Result<AcpCatalog, ProviderError> {
@@ -1523,6 +1588,9 @@ impl Session {
         let _ = self.child.shutdown().await;
     }
     async fn close(&self) -> Result<(), ProviderError> {
+        if let Some(mcp) = &self.mcp {
+            mcp.session.authority.revoke();
+        }
         if self.ended.swap(true, Ordering::SeqCst) {
             let _ = self.child.shutdown().await;
             return Ok(());
@@ -1793,7 +1861,11 @@ impl Session {
                     if let Some(checkpoint) = &input.turn_checkpoint { checkpoint.abort().await; }
                     Ok(json!({"stopReason":"cancelled"}))
                 } else {
-                let mut prompt = vec![json!({"type":"text","text":input.text})];
+                let text = match &self.mcp {
+                        Some(mcp) => mcp.prompt(&input.text),
+                        None => input.text.clone(),
+                    };
+                    let mut prompt = vec![json!({"type":"text","text":text})];
                 for image in &input.images {
                     prompt.push(json!({"type":"image","mimeType":image.media_type,"data":base64::engine::general_purpose::STANDARD.encode(&image.data)}));
                 }
@@ -1812,7 +1884,22 @@ impl Session {
                         // exact-turn admission. A revoked unsent prompt needs
                         // neither a frame nor a session/cancel notification.
                         if allowed {
-                            self.status(SessionStatus::Running { active_turn: turn.clone() }).await;
+                                let policy =
+                                    crate::agent_control::permissions::Ceiling::opaque_policy(
+                                        &*self.binding.lock().await,
+                                    );
+                                if let Some(mcp) = &self.mcp {
+                                    mcp.session.authority.set_ceiling(policy);
+                                    if mcp
+                                        .session
+                                        .begin(&turn.0, input.turn_checkpoint.as_ref())
+                                        .is_err()
+                                    {
+                                        dispatch_refused = true;
+                                        return false;
+                                    }
+                                }
+                                self.status(SessionStatus::Running { active_turn: turn.clone() }).await;
                             if !self.turn_admitted(&turn).await { return false; }
                             admitted.store(true, Ordering::SeqCst);
                             if let Some(id) = &queued_id {
@@ -2055,6 +2142,16 @@ impl AgentProvider for GenericAcpProvider {
             .or(explicit)
             .ok_or_else(|| invalid("Select a saved ACP agent before starting a conversation"))?;
         let mut launch = self.launch(id)?;
+        if input
+            .extra
+            .get("acp_revision")
+            .and_then(Value::as_str)
+            .is_some_and(|revision| revision != launch.agent.revision)
+        {
+            return Err(invalid(
+                "stale_provider_selection: ACP launch revision changed",
+            ));
+        }
         launch.environment = launch_environment(&launch.environment, input.env.as_ref());
         if saved.as_ref().is_some_and(|saved| {
             saved.revision != launch.agent.revision || saved.cwd != input.cwd.to_string_lossy()
@@ -2079,6 +2176,17 @@ impl AgentProvider for GenericAcpProvider {
             Some(input.workspace_id),
         )
         .await?;
+        if let Some(options) = input.extra.get("acp_options").and_then(Value::as_object) {
+            for (id, value) in options {
+                if matches!(id.as_str(), "effort" | "context_window" | "fast_mode") {
+                    continue;
+                }
+                if let Err(error) = session.set_config(id, value.clone()).await {
+                    let _ = session.close().await;
+                    return Err(error);
+                }
+            }
+        }
         let snapshot = session.snapshot().await;
         self.inner
             .sessions

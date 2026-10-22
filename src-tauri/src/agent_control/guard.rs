@@ -108,6 +108,25 @@ impl NativeControlGuard {
         input: &StartSessionInput,
     ) -> Result<(), String> {
         self.verify_target(self.provider, &input.thread_id.0)?;
+        if let Some(selection) = input.extra.get("orchestration_selection") {
+            let selection: super::selection::ResolvedSelection =
+                serde_json::from_value(selection.clone()).map_err(|e| e.to_string())?;
+            super::selection::verify(app, &selection).map_err(|e| e.to_string())?;
+            if crate::provider_accounts::supports(self.provider) {
+                let expected = selection.extra["provider_account_id"]
+                    .as_str()
+                    .ok_or("Missing selected provider account")?;
+                let actual = app
+                    .state::<crate::database::DatabaseStore>()
+                    .provider_account_binding(
+                        &input.thread_id.0,
+                        crate::commands::delegation::provider_id(self.provider),
+                    )?;
+                if actual.as_deref() != Some(expected) {
+                    return Err("stale_provider_selection: selected account changed".into());
+                }
+            }
+        }
         self.verify(app)?;
         permission_ceiling(
             &self.caller,
@@ -124,6 +143,10 @@ impl NativeControlGuard {
             || record.model != input.model
             || record.effort != input.effort
             || record.context_window != input.context_window
+            || input
+                .service_tier
+                .as_deref()
+                .is_some_and(|tier| tier != record.service_tier)
             || record.fast_mode != input.fast_mode
         {
             return Err("stale_session_configuration: guarded launch no longer matches persisted configuration".into());

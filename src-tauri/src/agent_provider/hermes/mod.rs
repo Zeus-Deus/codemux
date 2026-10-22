@@ -141,6 +141,7 @@ struct Chat {
     runtime: Arc<Runtime>,
     /// ACP `mcpServers` sent on every `session/new` and `session/load`.
     mcp_servers: Value,
+    mcp: Option<crate::agent_provider::acp::mcp::ChatMcp>,
     state: Mutex<ChatState>,
     finished: Notify,
 }
@@ -196,6 +197,27 @@ struct Runtime {
     commands: Mutex<HashMap<String, Vec<super::claude::slash_commands::ProviderSlashCommand>>>,
     queue: Mutex<Queue>,
     barrier: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    /// Gateway credentials this process holds, revoked when it goes away.
+    credentials: Credentials,
+}
+/// Hermes keeps each ACP MCP connection for its process lifetime, keyed by
+/// server name. Each chat keeps one name and token per process; a reopened
+/// chat's token follows its new session instead of adding another toolset.
+struct Credentials {
+    registry: Option<crate::mcp::registry::McpRegistry>,
+    prefix: String,
+}
+impl Credentials {
+    fn key(&self, thread: &str) -> String {
+        format!("{}{thread}", self.prefix)
+    }
+}
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        if let Some(gateway) = self.registry.as_ref().and_then(|r| r.started_gateway()) {
+            gateway.revoke(&self.prefix);
+        }
+    }
 }
 struct Inner {
     runtimes: Mutex<HashMap<String, Arc<Runtime>>>,
@@ -206,6 +228,19 @@ struct Inner {
     store: Arc<dyn BindingStore>,
     events: broadcast::Sender<ProviderRuntimeEvent>,
     mcp_registry: Option<crate::mcp::registry::McpRegistry>,
+    /// Profile catalogs by runtime key, each with the [`catalog_freshness`]
+    /// it was read under.
+    catalogs: Mutex<HashMap<String, (String, Value)>>,
+}
+/// A chat's new/load response as a profile catalog: the chat's own mode is not
+/// the profile's default. The effective model stays: launch validation needs
+/// it to prove the profile's routing is durable.
+fn profile_catalog(response: &Value) -> Value {
+    let mut catalog = response.clone();
+    if let Some(modes) = catalog.get_mut("modes").and_then(Value::as_object_mut) {
+        modes.remove("currentModeId");
+    }
+    catalog
 }
 /// Gateway server name for one chat. A Hermes process serves every chat on
 /// its profile and keeps ACP MCP servers by name, reusing a connected one, so a
@@ -238,6 +273,7 @@ impl HermesProvider {
                 store,
                 events,
                 mcp_registry,
+                catalogs: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -286,18 +322,67 @@ impl HermesProvider {
     /// Discovery creates an unprompted native session through the same owned runtime.
     /// Hermes has no standalone model-catalog RPC. It is not imported as a Codemux chat.
     pub async fn catalog(&self, profile: Profile) -> Result<Value, ProviderError> {
+        self.read_catalog(profile, true).await
+    }
+    /// [`Self::catalog`]; without `wait`, a profile busy with a turn is refused
+    /// instead of waited for: the caller may be a tool inside that very turn.
+    async fn read_catalog(&self, profile: Profile, wait: bool) -> Result<Value, ProviderError> {
         profile.validate().map_err(invalid)?;
         durable_profile(&profile)?;
         let runtime = self.inner.runtime(profile).await?;
-        let _guard = runtime.operation.lock().await;
-        runtime
+        let _guard = if wait {
+            runtime.operation.lock().await
+        } else {
+            runtime.operation.try_lock().map_err(|_| {
+                invalid("busy: this Hermes profile's configuration changed while it is running a turn; retry once the turn ends")
+            })?
+        };
+        let catalog = runtime
             .child
             .request(
                 "session/new",
                 json!({"cwd":runtime.profile.home,"mcpServers":[]}),
             )
             .await
-            .map_err(rpc)
+            .map_err(rpc)?;
+        self.inner.remember_catalog(&runtime.profile, catalog.clone()).await;
+        Ok(catalog)
+    }
+    /// The profile catalog for orchestration. A native tool runs while its
+    /// chat owns runtime.operation, so reuse the acknowledged catalog while
+    /// the profile, installation and configuration are unchanged. Without a
+    /// fresh one, `probe` reads it again, never waiting on a busy profile;
+    /// listing passes `false` and never starts a runtime or creates a Hermes
+    /// session.
+    #[cfg(test)]
+    pub(crate) async fn remember_catalog_for_test(&self, profile: &Profile, catalog: Value) {
+        self.inner.remember_catalog(profile, catalog).await;
+    }
+    pub(crate) async fn orchestration_catalog(
+        &self,
+        profile: Profile,
+        probe: bool,
+    ) -> Result<Option<Value>, ProviderError> {
+        profile.validate().map_err(invalid)?;
+        durable_profile(&profile)?;
+        let freshness = catalog_freshness(&profile)?;
+        let cached = {
+            let mut catalogs = self.inner.catalogs.lock().await;
+            let key = runtime_key(&profile);
+            match catalogs.get(&key) {
+                Some((read_under, catalog)) if *read_under == freshness => Some(catalog.clone()),
+                Some(_) => {
+                    catalogs.remove(&key);
+                    None
+                }
+                None => None,
+            }
+        };
+        match cached {
+            Some(catalog) => Ok(Some(catalog)),
+            None if probe => self.read_catalog(profile, false).await.map(Some),
+            None => Ok(None),
+        }
     }
     pub async fn disconnect(&self, profile: Profile) -> Result<(), ProviderError> {
         let key = runtime_key(&profile);
@@ -322,9 +407,29 @@ impl HermesProvider {
             runtime.child.shutdown().await.map_err(rpc)?;
             runtime.ownership.lock().unwrap().take();
             self.inner.runtimes.lock().await.remove(&key);
+            self.inner.catalogs.lock().await.remove(&key);
         }
         Ok(())
     }
+}
+/// What a profile catalog depends on: the profile directory's identity, the
+/// installation's size and mtime, and the size and mtime of the profile's
+/// configuration files. Contents (which hold secrets) are never read, and
+/// auth.json is left out: token refreshes rewrite it constantly.
+fn catalog_freshness(profile: &Profile) -> Result<String, ProviderError> {
+    let config: Vec<String> = ["config.yaml", ".env"]
+        .iter()
+        .map(|name| match std::fs::metadata(profile.home.join(name)) {
+            Ok(m) => format!("{}:{:?}", m.len(), m.modified().ok()),
+            Err(_) => "-".into(),
+        })
+        .collect();
+    Ok(format!(
+        "{}\0{}\0{}",
+        profile.identity,
+        installation_stamp(profile)?,
+        config.join(",")
+    ))
 }
 fn runtime_key(p: &Profile) -> String {
     format!(
@@ -337,6 +442,15 @@ fn runtime_key(p: &Profile) -> String {
 impl Inner {
     fn emit(&self, event: ProviderRuntimeEvent) {
         let _ = self.events.send(event);
+    }
+    async fn remember_catalog(&self, profile: &Profile, catalog: Value) {
+        let Ok(freshness) = catalog_freshness(profile) else {
+            return;
+        };
+        self.catalogs
+            .lock()
+            .await
+            .insert(runtime_key(profile), (freshness, catalog));
     }
     async fn runtime(self: &Arc<Self>, profile: Profile) -> Result<Arc<Runtime>, ProviderError> {
         let key = runtime_key(&profile);
@@ -403,6 +517,10 @@ impl Inner {
             commands: Mutex::new(HashMap::new()),
             queue: Mutex::new(Queue::default()),
             barrier,
+            credentials: Credentials {
+                registry: self.mcp_registry.clone(),
+                prefix: format!("hermes:{}:", Uuid::new_v4()),
+            },
         });
         let weak = Arc::downgrade(&runtime);
         let inner = Arc::downgrade(self);
@@ -434,6 +552,10 @@ impl Inner {
         Ok(runtime)
     }
     async fn fail_runtime(&self, runtime: &Runtime, message: &str) {
+        self.catalogs
+            .lock()
+            .await
+            .remove(&runtime_key(&runtime.profile));
         if !runtime.child.is_alive() {
             runtime.ownership.lock().unwrap().take();
         }
@@ -507,6 +629,13 @@ impl Inner {
             }
             ThreadId(binding.thread_id.clone())
         };
+        if text(update, "sessionUpdate") == Some("current_mode_update") {
+            if let Some(mcp) = &chat.mcp {
+                mcp.session
+                    .set_mode(text(update, "currentModeId").map(str::to_string));
+            }
+            return;
+        }
         let mut s = chat.state.lock().await;
         if s.replaying {
             return;
@@ -756,11 +885,14 @@ impl Inner {
                         return Err(error);
                     }
                 }
+                if let Some(mcp) = &chat.mcp {
+                    mcp.session.begin(&turn.0, job.input.turn_checkpoint.as_ref())?;
+                }
                 dispatched = true;
                 runtime.queue.lock().await.holds.entry(thread.clone()).or_default().settle(&job.id,true);
                 self.emit(ProviderRuntimeEvent::QueuedTurnDispatched {thread_id:thread.clone(),queued_id:job.id.clone(),turn_id:turn.clone(),text:job.input.display_text.clone().unwrap_or_else(||job.input.text.clone()),steered:false});
                 self.emit(ProviderRuntimeEvent::SessionStateChanged {thread_id:thread.clone(),status:SessionStatus::Running {active_turn:turn.clone()}});
-                let response = runtime.child.request_with_timeout("session/prompt",json!({"sessionId":binding.acp_session_id,"prompt":[{"type":"text","text":job.input.text}]}),Duration::from_secs(24*60*60)).await;
+                let response = runtime.child.request_with_timeout("session/prompt",json!({"sessionId":binding.acp_session_id,"prompt":[{"type":"text","text":match &chat.mcp {Some(mcp)=>mcp.prompt(&job.input.text),None=>job.input.text.clone()}}]}),Duration::from_secs(24*60*60)).await;
                 prompt_responded = matches!(&response, Ok(_) | Err(crate::json_rpc_child::RpcChildError::RpcError(_)));
                 if prompt_responded {
                     if let Some(checkpoint) = &job.input.turn_checkpoint { checkpoint.accepted(&turn).await; }
@@ -788,6 +920,9 @@ impl Inner {
             }
             if !dispatched {
                 runtime.queue.lock().await.holds.entry(thread.clone()).or_default().settle(&job.id,false);
+            }
+            if let Some(mcp) = &chat.mcp {
+                mcp.session.authority.finish(&turn.0);
             }
             let mut state = chat.state.lock().await;
             state.active_checkpoint = None;
@@ -1088,19 +1223,29 @@ impl AgentProvider for HermesProvider {
             } else {
                 None
             };
+        let mcp = self.inner.mcp_registry.clone().map(|registry| {
+            crate::agent_provider::acp::mcp::ChatMcp::new(
+                registry,
+                &input.thread_id.0,
+                ProviderKind::Hermes,
+                input.workspace_id.clone().or_else(|| binding.workspace_id.clone()),
+                Some(
+                    binding
+                        .permission_mode
+                        .clone()
+                        .unwrap_or_else(|| "default".into()),
+                ),
+                mcp_server_name(&input.thread_id.0),
+                Some(runtime.credentials.key(&input.thread_id.0)),
+                vec![],
+                false,
+            )
+        });
         // Hermes 0.21.5 advertises no `mcpCapabilities` but takes HTTP servers.
-        let mcp_servers = crate::agent_provider::acp::mcp::session_mcp_servers(
-            self.inner.mcp_registry.as_ref(),
-            &input.thread_id.0,
-            crate::mcp::gateway::GatewayCaller {
-                workspace_id: input.workspace_id.clone().or_else(|| binding.workspace_id.clone()),
-                native_sources: Vec::new(),
-                flat_tool_names: false,
-            },
-            &mcp_server_name(&input.thread_id.0),
-            crate::agent_provider::acp::mcp::Transport::Http,
-        )
-        .await;
+        let mcp_servers = match &mcp {
+            Some(mcp) => mcp.servers(crate::agent_provider::acp::mcp::Transport::Http).await,
+            None => json!([]),
+        };
         // Initialization has no worktree access. Commit the hold only immediately
         // before new/load can access it. Recheck after waiting on the profile gate:
         // deletion may have completed while initialization/another chat was busy.
@@ -1225,6 +1370,17 @@ impl AgentProvider for HermesProvider {
                 ));
             }
         }
+        if let Some(mcp) = &mcp {
+            mcp.session
+                .set_mode(binding.permission_mode.clone().or_else(|| {
+                    res.pointer("/modes/currentModeId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }));
+        }
+        self.inner
+            .remember_catalog(&binding.profile, profile_catalog(&res))
+            .await;
         let models: HashSet<String> = res
             .pointer("/models/availableModels")
             .and_then(Value::as_array)
@@ -1242,10 +1398,15 @@ impl AgentProvider for HermesProvider {
             status: SessionStatus::Ready,
             resume_cursor: Some(json!({"sessionId":sid,"binding":binding})),
         };
+        if let Some(mcp) = &mcp {
+            mcp.session
+                .bind_session(binding.acp_session_id.as_deref().unwrap_or_default());
+        }
         let chat = Arc::new(Chat {
             binding: Mutex::new(binding),
             runtime: runtime.clone(),
             mcp_servers,
+            mcp,
             state: Mutex::new(ChatState {
                 models,
                 modes,
@@ -1618,6 +1779,9 @@ impl AgentProvider for HermesProvider {
                 "repair_required: Hermes model selection was not confirmed",
             ));
         }
+        self.inner
+            .remember_catalog(&chat.runtime.profile, profile_catalog(&response))
+            .await;
         let mut b = chat.binding.lock().await;
         b.model_override = Some(model.clone());
         b.resolved_model = Some(model);
@@ -1640,6 +1804,12 @@ impl AgentProvider for HermesProvider {
                 "unsupported: edit policy is not advertised by Hermes",
             ));
         }
+        // Callbacks never span the provider RPC; a failed change keeps the
+        // old policy for later calls.
+        let _transition = chat
+            .mcp
+            .as_ref()
+            .map(|mcp| mcp.session.authority.policy_transition());
         let mut b = chat.binding.lock().await.clone();
         chat.runtime
             .child
@@ -1673,6 +1843,14 @@ impl AgentProvider for HermesProvider {
             return Err(invalid(
                 "repair_required: Hermes did not confirm the selected edit policy",
             ));
+        }
+        if let Some(mcp) = &chat.mcp {
+            mcp.session.set_mode(Some(mode.clone()));
+        }
+        if let Ok(catalog) = &checked {
+            self.inner
+                .remember_catalog(&b.profile, profile_catalog(catalog))
+                .await;
         }
         b.permission_mode = Some(mode);
         *chat.binding.lock().await = b.clone();

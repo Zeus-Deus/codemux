@@ -41,7 +41,7 @@ pub const OPENCODE_NATIVE_SOURCES: [McpConfigSource; 2] = [
 
 /// Connection details handed to a provider adapter. Tokens are generated in
 /// this process and never written to disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct McpGatewayConnection {
     pub url: String,
     pub bearer_token: String,
@@ -61,6 +61,7 @@ pub struct GatewayCaller {
     /// `<server>__<tool>` has exactly one `__` (`grok mcp doctor`), and
     /// registry names such as `mcp__docs__search` already contain it.
     pub flat_tool_names: bool,
+    pub(crate) native: Option<super::thread_gateway::GatewayBinding>,
 }
 
 /// `name` with every run of characters outside `[A-Za-z0-9-]` folded to one
@@ -103,10 +104,21 @@ fn presented_names(tools: &[McpTool], flat: bool) -> Vec<String> {
         .collect()
 }
 
-/// Per-chat tokens. A chat keeps its token for the life of this process:
-/// Hermes serves many chats from one process and keys ACP MCP servers by
-/// name, so a chat that reopens on the same process reuses the connection it
-/// registered first, token included.
+fn caller_names(tools: &[McpTool], caller: &GatewayCaller) -> Vec<String> {
+    let mut presented = tools.to_vec();
+    if caller.native.is_some() {
+        for tool in &mut presented {
+            if tool.prefixed_name.starts_with("mcp__codemux__") {
+                tool.prefixed_name = tool.name.clone();
+            }
+        }
+    }
+    presented_names(&presented, caller.flat_tool_names)
+}
+
+/// Per-chat tokens, keyed by the consumer's credential key. Reissuing a key
+/// keeps its token and replaces the caller, so a provider that keeps a
+/// connection open (Hermes) follows the chat's current session.
 #[derive(Default)]
 struct Grants {
     tokens: HashMap<String, String>,
@@ -123,6 +135,14 @@ pub struct McpGatewayRuntime {
 /// Environment the `codemux mcp-bridge` stdio proxy reads its target from.
 pub const BRIDGE_URL_ENV: &str = "CODEMUX_MCP_GATEWAY_URL";
 pub const BRIDGE_TOKEN_ENV: &str = "CODEMUX_MCP_GATEWAY_TOKEN";
+
+impl std::fmt::Debug for McpGatewayConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpGatewayConnection")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
 
 impl McpGatewayConnection {
     /// ACP `McpServerHttp` entry for this connection.
@@ -163,21 +183,51 @@ impl McpGatewayRuntime {
         self.connection.clone()
     }
 
-    /// Connection for one consumer, keyed by `key` (a chat's thread id).
-    /// Refreshes the caller each time so a reopened chat picks up its
-    /// current workspace.
+    /// Connection for one consumer, keyed by `key`. Refreshes the caller
+    /// each time so a reopened chat picks up its current workspace and session.
     pub fn chat_connection(&self, key: &str, caller: GatewayCaller) -> McpGatewayConnection {
+        if caller
+            .native
+            .as_ref()
+            .is_some_and(|binding| !binding.current())
+        {
+            // A closed session gets a credential nothing accepts.
+            return McpGatewayConnection {
+                url: self.connection.url.clone(),
+                bearer_token: new_token(),
+            };
+        }
         let mut grants = self.grants.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let token = grants
             .tokens
             .entry(key.to_string())
             .or_insert_with(new_token)
             .clone();
-        grants.callers.insert(token.clone(), caller);
+        let replaced = grants.callers.insert(token.clone(), caller);
+        // A replaced session revokes its authority on drop; not under the map.
+        drop(grants);
+        drop(replaced);
         McpGatewayConnection {
             url: self.connection.url.clone(),
             bearer_token: token,
         }
+    }
+
+    /// Forget every key that starts with `prefix`; their tokens stop working.
+    pub fn revoke(&self, prefix: &str) {
+        let mut grants = self.grants.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Grants { tokens, callers } = &mut *grants;
+        let mut revoked = Vec::new();
+        tokens.retain(|key, token| {
+            let keep = !key.starts_with(prefix);
+            if !keep {
+                revoked.extend(callers.remove(token));
+            }
+            keep
+        });
+        // Revoked sessions end their authority on drop; not under the map.
+        drop(grants);
+        drop(revoked);
     }
 }
 
@@ -189,10 +239,50 @@ impl Drop for McpGatewayRuntime {
 
 #[derive(Clone)]
 struct GatewayState {
+    calls: Arc<Mutex<HashMap<CallKey, tokio::sync::watch::Sender<bool>>>>,
     registry: McpRegistry,
     /// The shared token OpenCode's instance-global registration uses.
     bearer_token: Arc<str>,
     grants: Arc<Mutex<Grants>>,
+}
+
+/// Credential, `Mcp-Session-Id` and JSON-RPC id of an in-flight call: ids
+/// are unique only within one MCP session.
+type CallKey = (String, String, String);
+
+fn call_key(headers: &HeaderMap, request: &Value) -> CallKey {
+    let header = |name| {
+        headers
+            .get(name)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    (
+        header(axum::http::header::AUTHORIZATION.as_str()),
+        header(SESSION_HEADER),
+        request.to_string(),
+    )
+}
+
+const SESSION_HEADER: &str = "mcp-session-id";
+
+struct CallLease {
+    calls: Arc<Mutex<HashMap<CallKey, tokio::sync::watch::Sender<bool>>>>,
+    key: CallKey,
+}
+/// Ends a tracked invocation when its request is cancelled or dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for CallLease {
+    fn drop(&mut self) {
+        self.calls.lock().unwrap().remove(&self.key);
+    }
 }
 
 fn new_token() -> String {
@@ -213,6 +303,7 @@ pub async fn start_gateway(registry: McpRegistry) -> Result<McpGatewayRuntime, S
         registry,
         bearer_token: Arc::from(bearer_token.as_str()),
         grants: grants.clone(),
+        calls: Default::default(),
     };
     let app = router(state);
     let task = tokio::spawn(async move {
@@ -286,6 +377,9 @@ async fn handle_post(
     let Some(caller) = authenticate(&headers, &state) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    if let Some(binding) = &caller.native {
+        binding.session.mark_contacted();
+    }
     let workspace_id = caller.workspace_id.as_deref();
 
     let message: Value = match serde_json::from_slice(&body) {
@@ -303,6 +397,13 @@ async fn handle_post(
 
     // MCP notifications have no id and are acknowledged at the HTTP layer.
     if id.is_none() {
+        if method == "notifications/cancelled" {
+            if let Some(request) = params.get("requestId") {
+                if let Some(cancel) = state.calls.lock().unwrap().get(&call_key(&headers, request)) {
+                    let _ = cancel.send(true);
+                }
+            }
+        }
         return StatusCode::ACCEPTED.into_response();
     }
     let id = id.unwrap_or(Value::Null);
@@ -314,7 +415,8 @@ async fn handle_post(
                 .and_then(Value::as_str)
                 .unwrap_or("2025-11-25");
             let version = supported_protocol_version(requested);
-            rpc_result(
+            let session = uuid::Uuid::new_v4().simple().to_string();
+            let mut response = rpc_result(
                 id,
                 json!({
                     "protocolVersion": version,
@@ -327,12 +429,16 @@ async fn handle_post(
                     "instructions": "Tools configured in Codemux and shared with this agent session."
                 }),
             )
-            .into_response()
+            .into_response();
+            if let Ok(value) = session.parse() {
+                response.headers_mut().insert(SESSION_HEADER, value);
+            }
+            response
         }
         "ping" => rpc_result(id, json!({})).into_response(),
         "tools/list" => {
             let tools = caller_tools(&state, &caller).await;
-            let names = presented_names(&tools, caller.flat_tool_names);
+            let names = caller_names(&tools, &caller);
             let data: Vec<Value> = tools
                 .into_iter()
                 .zip(names)
@@ -350,35 +456,99 @@ async fn handle_post(
             let Some(requested) = params.get("name").and_then(Value::as_str) else {
                 return rpc_error(id, -32602, "tools/call requires params.name").into_response();
             };
-            // Map a presented name back to the registry's.
-            let resolved = if caller.flat_tool_names {
-                let tools = caller_tools(&state, &caller).await;
-                presented_names(&tools, true)
+            // Listing and dispatch share source exclusions and native policy.
+            let tools = caller_tools(&state, &caller).await;
+            let resolved = caller_names(&tools, &caller)
                     .into_iter()
                     .zip(tools)
                     .find(|(name, _)| name == requested)
-                    .map(|(_, tool)| tool.prefixed_name)
-            } else {
-                None
-            };
-            let name = resolved.as_deref().unwrap_or(requested);
+                    .map(|(_, tool)| tool.prefixed_name);
             let arguments = params
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let bridge = state
-                .registry
-                .call_plugin_bridge(name, arguments.clone(), workspace_id, &[])
-                .await;
-            let result = match bridge {
-                Some(result) => result,
-                None => {
-                    state
-                        .registry
-                        .dispatch_tool_call(name, arguments, workspace_id)
-                        .await
+            let key = call_key(&headers, &id);
+            if let Some(binding) = &caller.native {
+                if let Err(message) = calling_session_matches(binding, &params) {
+                    return rpc_result(
+                        id,
+                        json!({
+                            "content": [{ "type": "text", "text": message }],
+                            "isError": true
+                        }),
+                    )
+                    .into_response();
                 }
+            }
+            let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+            {
+                let mut calls = state.calls.lock().unwrap();
+                if calls.contains_key(&key) {
+                    return rpc_error(id, -32600, "request ID is already in flight")
+                        .into_response();
+                }
+                calls.insert(key.clone(), cancel);
+            }
+            let _lease = CallLease {
+                calls: state.calls.clone(),
+                key: key.clone(),
             };
+            let invocation = async {
+                let Some(name) = resolved else {
+                    return Err("provider_control_denied: tool is unavailable to this chat".into());
+                };
+                let Some(binding) = &caller.native else {
+                    return match state
+                        .registry
+                        .call_plugin_bridge(&name, arguments.clone(), workspace_id, &[])
+                        .await
+                    {
+                        Some(result) => result,
+                        None => {
+                            state
+                                .registry
+                                .dispatch_tool_call(&name, arguments, workspace_id)
+                                .await
+                        }
+                    };
+                };
+                // The call runs as a callback of the chat's authority, so Stop
+                // and permission transitions end it like any native callback.
+                let actor = binding.session.actor();
+                let permit = actor.permit.clone();
+                let registry = state.registry.clone();
+                let workspace = workspace_id.map(str::to_owned);
+                let current = binding.clone();
+                let call_id = id.to_string();
+                let job = tokio::spawn(async move {
+                    actor.permit.wait_ready().await?;
+                    if !current.current() {
+                        return Err("stale_caller: gateway credential was revoked".into());
+                    }
+                    match registry
+                        .call_plugin_bridge(&name, arguments.clone(), workspace.as_deref(), &[])
+                        .await
+                    {
+                        Some(result) => result,
+                        None => {
+                            registry
+                                .dispatch_native_tool_call_with_id(&name, arguments, actor, Some(call_id))
+                                .await
+                        }
+                    }
+                });
+                binding.session.authority.track(&permit, job.abort_handle());
+                let _abort = AbortOnDrop(job.abort_handle());
+                job.await.unwrap_or_else(|_| {
+                    Err("request_cancelled: Stop or a permission change revoked this chat's authority; the tool call ended".into())
+                })
+            };
+            let result = tokio::select! {
+                biased;
+                _=cancelled.changed()=>Err("request_cancelled: tool invocation ended; accepted work remains readable".into()),
+                result=invocation=>result,
+            };
+            state.calls.lock().unwrap().remove(&key);
             match result {
                 Ok(result) => rpc_result(id, result).into_response(),
                 Err(message) => rpc_result(
@@ -395,6 +565,31 @@ async fn handle_post(
     }
 }
 
+/// OpenCode 2 names the calling session in `_meta`. Every OpenCode chat shares
+/// one server, and OpenCode's own permission rules (which a user's agent
+/// configuration can widen) are the only thing hiding one chat's tools from
+/// another. So an OpenCode call must name the session its token is bound to:
+/// a missing name, another chat's session or a native subagent's child
+/// session is refused. Other providers run one process per chat; a name they
+/// send is still checked.
+fn calling_session_matches(
+    binding: &super::thread_gateway::GatewayBinding,
+    params: &Value,
+) -> Result<(), &'static str> {
+    let named = params
+        .pointer("/_meta/ai.opencode~1sessionID")
+        .and_then(Value::as_str);
+    let bound = binding.session.session_id();
+    match named {
+        Some(session) if !bound.is_empty() && session == bound => Ok(()),
+        Some(_) => Err("provider_control_denied: Codemux tools act only for the chat's own session, not another chat or its native subagents"),
+        None if binding.session.caller().provider == crate::agent_provider::ProviderKind::OpenCode => {
+            Err("provider_control_denied: OpenCode did not name the calling session; OpenCode 2 or newer is required for agent collaboration")
+        }
+        None => Ok(()),
+    }
+}
+
 /// Every tool the caller may list or call: its workspace's registry tools
 /// minus the sources its agent loads itself, plus the plugin bridge tools.
 async fn caller_tools(state: &GatewayState, caller: &GatewayCaller) -> Vec<McpTool> {
@@ -402,7 +597,14 @@ async fn caller_tools(state: &GatewayState, caller: &GatewayCaller) -> Vec<McpTo
         .registry
         .list_tools_for_workspace(&caller.native_sources, caller.workspace_id.as_deref())
         .await;
+    if let Some(binding) = &caller.native {
+        let host = binding.session.caller();
+        tools.retain(|tool| super::registry::native_tool_visible(tool, &host));
+        tools.extend(state.registry.host_tools(&host));
+    }
     tools.extend(super::registry::plugin_bridge_tools());
+    let mut seen = std::collections::HashSet::new();
+    tools.retain(|tool| seen.insert(tool.prefixed_name.clone()));
     tools
 }
 
@@ -425,10 +627,22 @@ fn authenticate(headers: &HeaderMap, state: &GatewayState) -> Option<GatewayCall
             workspace_id: None,
             native_sources: OPENCODE_NATIVE_SOURCES.to_vec(),
             flat_tool_names: false,
+            native: None,
         });
     }
-    let grants = state.grants.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    grants.callers.get(token).cloned()
+    // Release the grant map before asking the session's authority.
+    let caller = state
+        .grants
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .callers
+        .get(token)
+        .cloned()?;
+    caller
+        .native
+        .as_ref()
+        .is_none_or(|binding| binding.current())
+        .then_some(caller)
 }
 
 /// MCP's HTTP transport requires Origin validation to prevent DNS rebinding.
@@ -471,6 +685,7 @@ mod tests {
             registry: McpRegistry::new(),
             bearer_token: Arc::from("test-token"),
             grants: Arc::default(),
+            calls: Default::default(),
         }
     }
 
@@ -525,6 +740,7 @@ mod tests {
             registry,
             bearer_token: Arc::from("test-token"),
             grants: Arc::default(),
+            calls: Default::default(),
         };
 
         let response = router(state)
@@ -601,6 +817,7 @@ mod tests {
             registry,
             bearer_token: Arc::from(runtime.connection().bearer_token.as_str()),
             grants: runtime.grants.clone(),
+            calls: Default::default(),
         };
         let cursor = runtime.chat_connection(
             "thread-cursor",
@@ -608,6 +825,7 @@ mod tests {
                 workspace_id: Some("ws-1".into()),
                 native_sources: vec![McpConfigSource::CursorUser],
                 flat_tool_names: false,
+                native: None,
             },
         );
         let hermes = runtime.chat_connection("thread-hermes", GatewayCaller::default());
@@ -636,6 +854,7 @@ mod tests {
             workspace_id: Some("ws-2".into()),
             native_sources: vec![McpConfigSource::ClaudeUser],
             flat_tool_names: false,
+            native: None,
         };
         let second = runtime.chat_connection("thread", caller.clone());
         assert_eq!(first, second);
@@ -697,12 +916,15 @@ mod tests {
             registry,
             bearer_token: Arc::from(runtime.connection().bearer_token.as_str()),
             grants: runtime.grants.clone(),
+            calls: Default::default(),
         };
         let chat = |key: &str, workspace: &str| {
             runtime
                 .chat_connection(
                     key,
-                    GatewayCaller { workspace_id: Some(workspace.into()), native_sources: vec![], flat_tool_names: false },
+                    GatewayCaller { workspace_id: Some(workspace.into()), native_sources: vec![], flat_tool_names: false,
+                        native: None,
+                    },
                 )
                 .bearer_token
         };
@@ -774,6 +996,7 @@ mod tests {
             registry,
             bearer_token: Arc::from(runtime.connection().bearer_token.as_str()),
             grants: runtime.grants.clone(),
+            calls: Default::default(),
         };
         let token = runtime
             .chat_connection(
@@ -834,6 +1057,7 @@ mod tests {
             registry: registry.clone(),
             bearer_token: Arc::from("test-token"),
             grants: Arc::default(),
+            calls: Default::default(),
         });
         let response = app
             .clone()
@@ -882,6 +1106,7 @@ mod tests {
             registry: registry.clone(),
             bearer_token: Arc::from("test-token"),
             grants: Arc::default(),
+            calls: Default::default(),
         });
         for params in [
             json!({"name":"fixture__image","arguments":{}}),
@@ -915,6 +1140,7 @@ mod tests {
             registry: registry.clone(),
             bearer_token: Arc::from("test-token"),
             grants: Arc::default(),
+            calls: Default::default(),
         });
         for method in ["tools/list", "tools/call"] {
             let mut req = request(
@@ -972,5 +1198,541 @@ mod tests {
         assert!(std::str::from_utf8(&frame)
             .unwrap()
             .contains("notifications/tools/list_changed"));
+    }
+}
+
+#[cfg(test)]
+mod all_provider_tests {
+    use super::*;
+    use crate::{
+        agent_provider::ProviderKind,
+        mcp::{
+            registry::{HostCaller, HostTools},
+            runtime::prefix_tool_name,
+            thread_gateway::{GatewayBinding, GatewaySession},
+        },
+    };
+    struct Host;
+    impl HostTools for Host {
+        fn tools_for(&self, _: &HostCaller) -> Vec<McpTool> {
+            vec![McpTool {
+                name: "orchestrator_capabilities".into(),
+                prefixed_name: prefix_tool_name("codemux", "orchestrator_capabilities"),
+                description: None,
+                input_schema: json!({"type":"object"}),
+                server_id: "codemux".into(),
+            }]
+        }
+        fn call(&self, _: &HostCaller, _: &str, _: &Value) -> Option<Value> {
+            None
+        }
+    }
+    #[tokio::test]
+    async fn all_provider_gateway_identity_is_session_bound_survives_stop_and_rejects_hidden_tools() {
+        let registry = McpRegistry::new();
+        registry.set_host_tools(Arc::new(Host));
+        registry.set_native_delegation_handler(Arc::new(|actor,_,args,_|Box::pin(async move {
+            actor.permit.identity()?.verify(&actor.thread_id)?;
+            Ok(json!({"thread":actor.thread_id,"session":actor.session_id,"untrusted":args["thread_id"]}))
+        })));
+        let gateway = start_gateway(registry).await.unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (index, kind) in [
+            ProviderKind::OpenCode,
+            ProviderKind::Cursor,
+            ProviderKind::Grok,
+            ProviderKind::Hermes,
+            ProviderKind::Acp,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let first = GatewaySession::new(
+                &format!("all-provider-{index}-a"),
+                kind,
+                Some("same-workspace".into()),
+                Some("default".into()),
+            );
+            first.bind_session("session-a");
+            first.begin("turn-a", None).unwrap();
+            let second = GatewaySession::new(
+                &format!("all-provider-{index}-b"),
+                kind,
+                Some("same-workspace".into()),
+                Some("default".into()),
+            );
+            second.bind_session("session-b");
+            second.begin("turn-b", None).unwrap();
+            let connection = |session: &Arc<GatewaySession>| {
+                gateway.chat_connection(
+                    &session.caller().thread_id,
+                    GatewayCaller {
+                        native: Some(GatewayBinding::new(session.clone())),
+                        ..Default::default()
+                    },
+                )
+            };
+            let a = connection(&first);
+            let b = connection(&second);
+            assert_ne!(a.bearer_token, b.bearer_token);
+            let listed: Value = client
+                .post(&a.url)
+                .bearer_auth(&a.bearer_token)
+                .json(&json!({"id":1,"method":"tools/list"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(
+                listed["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["name"] == "orchestrator_capabilities"),
+                "{listed}"
+            );
+            // Each call names its chat's session, as OpenCode 2 does.
+            let sessions = [(a.bearer_token.clone(), "session-a"), (b.bearer_token.clone(), "session-b")];
+            let invoke = |connection: McpGatewayConnection, name: &'static str, args: Value| {
+                let client = client.clone();
+                let session = sessions
+                    .iter()
+                    .find(|(token, _)| *token == connection.bearer_token)
+                    .map_or("replacement", |(_, session)| *session);
+                async move {
+                    client.post(connection.url).bearer_auth(connection.bearer_token).json(&json!({"id":2,"method":"tools/call","params":{"name":name,"arguments":args,"_meta":{"ai.opencode/sessionID":session}}})).send().await.unwrap()
+                }
+            };
+            let reply: Value = invoke(
+                a.clone(),
+                "orchestrator_capabilities",
+                json!({"thread_id":second.caller().thread_id}),
+            )
+            .await
+            .json()
+            .await
+            .unwrap();
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            let body: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["thread"], first.caller().thread_id);
+            assert_eq!(body["session"], "session-a");
+            let hidden: Value = invoke(a.clone(), "thread_respond", json!({}))
+                .await
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(hidden["result"]["isError"], true);
+            // Stop keeps the credential; the turn fence refuses its calls
+            // until the next turn begins, so nothing is reissued or reloaded.
+            first.authority.invalidate();
+            let stopped: Value = invoke(a.clone(), "orchestrator_capabilities", json!({}))
+                .await
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(stopped["result"]["isError"], true, "{stopped}");
+            assert!(stopped.to_string().contains("revoked"), "{stopped}");
+            assert_eq!(connection(&first).bearer_token, a.bearer_token);
+            first.begin("after-stop", None).unwrap();
+            assert_eq!(
+                invoke(a.clone(), "orchestrator_capabilities", json!({}))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                invoke(b, "orchestrator_capabilities", json!({}))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            // Replacing the session revokes its credential.
+            let replacement = GatewaySession::new(
+                &first.caller().thread_id,
+                kind,
+                Some("same-workspace".into()),
+                Some("default".into()),
+            );
+            replacement.bind_session("replacement");
+            replacement.begin("new-run", None).unwrap();
+            assert_eq!(
+                invoke(a, "orchestrator_capabilities", json!({}))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let new = gateway.chat_connection(
+                &format!("replacement-{index}"),
+                GatewayCaller {
+                    native: Some(GatewayBinding::new(replacement.clone())),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                invoke(new, "orchestrator_capabilities", json!({}))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod all_provider_cancel_tests {
+    use super::*;
+    use crate::{
+        agent_provider::ProviderKind,
+        mcp::{
+            registry::{HostCaller, HostTools},
+            runtime::prefix_tool_name,
+            thread_gateway::{GatewayBinding, GatewaySession},
+        },
+    };
+    struct Host;
+    impl HostTools for Host {
+        fn tools_for(&self, _: &HostCaller) -> Vec<McpTool> {
+            vec![McpTool {
+                name: "thread_wait".into(),
+                prefixed_name: prefix_tool_name("codemux", "thread_wait"),
+                description: None,
+                input_schema: json!({}),
+                server_id: "codemux".into(),
+            }]
+        }
+        fn call(&self, _: &HostCaller, _: &str, _: &Value) -> Option<Value> {
+            None
+        }
+    }
+    #[tokio::test]
+    async fn all_provider_cancellation_is_bound_to_the_calling_credential() {
+        let registry = McpRegistry::new();
+        registry.set_host_tools(Arc::new(Host));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        registry.set_native_delegation_handler(Arc::new(move |_, _, _, _| {
+            let signal = signal.clone();
+            Box::pin(async move {
+                signal.notify_one();
+                std::future::pending().await
+            })
+        }));
+        let gateway = start_gateway(registry).await.unwrap();
+        let session = GatewaySession::new(
+            "cancel-native",
+            ProviderKind::Cursor,
+            None,
+            Some("agent".into()),
+        );
+        session.bind_session("s");
+        session.begin("turn", None).unwrap();
+        let connection = gateway.chat_connection(
+            "cancel-native",
+            GatewayCaller {
+                native: Some(GatewayBinding::new(session)),
+                ..Default::default()
+            },
+        );
+        let other = gateway.chat_connection("other", Default::default());
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let call = {
+            let client = client.clone();
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                client.post(connection.url).bearer_auth(connection.bearer_token).json(&json!({"id":19,"method":"tools/call","params":{"name":"thread_wait","arguments":{}}})).send().await.unwrap().json::<Value>().await.unwrap()
+            })
+        };
+        entered.notified().await;
+        let cancel = json!({"method":"notifications/cancelled","params":{"requestId":19}});
+        client
+            .post(&other.url)
+            .bearer_auth(other.bearer_token)
+            .json(&cancel)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            !call.is_finished(),
+            "another credential cannot cancel this call"
+        );
+        client
+            .post(&connection.url)
+            .bearer_auth(connection.bearer_token)
+            .json(&cancel)
+            .send()
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), call)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], true);
+        assert!(reply.to_string().contains("request_cancelled"));
+    }
+    /// A slow call runs under the chat's authority: Stop and a permission
+    /// transition answer it as cancelled at once, and never deliver its result.
+    #[tokio::test]
+    async fn all_provider_revocation_ends_in_flight_gateway_calls() {
+        let registry = McpRegistry::new();
+        registry.set_host_tools(Arc::new(Host));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (signal, gate) = (entered.clone(), release.clone());
+        registry.set_native_delegation_handler(Arc::new(move |_, _, args, _| {
+            let (signal, gate) = (signal.clone(), gate.clone());
+            Box::pin(async move {
+                if args["slow"] == true {
+                    signal.notify_one();
+                    gate.notified().await;
+                }
+                Ok(json!({"delivered": true}))
+            })
+        }));
+        let gateway = start_gateway(registry).await.unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for ending in ["stop", "permission", "none"] {
+            let thread = format!("revoke-in-flight-{ending}");
+            let session = GatewaySession::new(&thread, ProviderKind::OpenCode, None, Some("default".into()));
+            session.bind_session("ses");
+            session.begin("turn", None).unwrap();
+            let connection = gateway.chat_connection(
+                &thread,
+                GatewayCaller {
+                    native: Some(GatewayBinding::new(session.clone())),
+                    ..Default::default()
+                },
+            );
+            let call = {
+                let (client, connection) = (client.clone(), connection.clone());
+                tokio::spawn(async move {
+                    client.post(connection.url).bearer_auth(connection.bearer_token).json(&json!({"id":7,"method":"tools/call","params":{"name":"thread_wait","arguments":{"slow":true},"_meta":{"ai.opencode/sessionID":"ses"}}})).send().await.unwrap().json::<Value>().await.unwrap()
+                })
+            };
+            entered.notified().await;
+            match ending {
+                "stop" => session.authority.invalidate(),
+                "permission" => session.set_mode(Some("plan".into())),
+                _ => release.notify_one(),
+            }
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+                .await
+                .expect("the client was left waiting")
+                .unwrap();
+            if ending == "none" {
+                assert_ne!(reply["result"]["isError"], true, "{reply}");
+                assert!(reply.to_string().contains("delivered"), "{reply}");
+                continue;
+            }
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            assert!(reply.to_string().contains("request_cancelled"), "{reply}");
+            assert!(!reply.to_string().contains("delivered"), "{reply}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_scope_tests {
+    use super::*;
+    use crate::{
+        agent_provider::ProviderKind,
+        mcp::{
+            registry::{HostCaller, HostTools},
+            runtime::prefix_tool_name,
+            thread_gateway::{GatewayBinding, GatewaySession},
+        },
+    };
+    struct Host;
+    impl HostTools for Host {
+        fn tools_for(&self, _: &HostCaller) -> Vec<McpTool> {
+            vec![McpTool {
+                name: "thread_wait".into(),
+                prefixed_name: prefix_tool_name("codemux", "thread_wait"),
+                description: None,
+                input_schema: json!({}),
+                server_id: "codemux".into(),
+            }]
+        }
+        fn call(&self, _: &HostCaller, _: &str, _: &Value) -> Option<Value> {
+            None
+        }
+    }
+
+    async fn fixture(
+        provider: ProviderKind,
+        block: bool,
+    ) -> (McpGatewayRuntime, McpGatewayConnection, Arc<GatewaySession>, Arc<tokio::sync::Notify>) {
+        let registry = McpRegistry::new();
+        registry.set_host_tools(Arc::new(Host));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        registry.set_native_delegation_handler(Arc::new(move |actor, _, _, _| {
+            let signal = signal.clone();
+            Box::pin(async move {
+                signal.notify_one();
+                if block {
+                    std::future::pending::<()>().await;
+                }
+                Ok(json!({"session": actor.session_id}))
+            })
+        }));
+        let gateway = start_gateway(registry).await.unwrap();
+        let session = GatewaySession::new(
+            &format!("scope-{}", uuid::Uuid::new_v4()),
+            provider,
+            None,
+            Some("default".into()),
+        );
+        session.bind_session("ses_parent");
+        session.begin("turn", None).unwrap();
+        let connection = gateway.chat_connection(
+            "scope",
+            GatewayCaller {
+                native: Some(GatewayBinding::new(session.clone())),
+                ..Default::default()
+            },
+        );
+        (gateway, connection, session, entered)
+    }
+
+    fn call(
+        client: &reqwest::Client,
+        connection: &McpGatewayConnection,
+        mcp_session: Option<&str>,
+        body: Value,
+    ) -> reqwest::RequestBuilder {
+        let request = client
+            .post(&connection.url)
+            .bearer_auth(&connection.bearer_token)
+            .json(&body);
+        match mcp_session {
+            Some(id) => request.header(SESSION_HEADER, id),
+            None => request,
+        }
+    }
+
+    #[tokio::test]
+    async fn request_ids_are_scoped_to_their_mcp_session() {
+        let (_gateway, connection, session, entered) = fixture(ProviderKind::Hermes, true).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let initialized = call(&client, &connection, None, json!({"id":0,"method":"initialize","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert!(initialized.headers().get(SESSION_HEADER).is_some(), "initialize issues an MCP session");
+        assert!(session.contacted(), "any authenticated request counts as contact");
+        let wait = json!({"id":7,"method":"tools/call","params":{"name":"thread_wait","arguments":{}}});
+        let first = tokio::spawn(call(&client, &connection, Some("one"), wait.clone()).send());
+        entered.notified().await;
+        // The same id in another MCP session sharing the token is not a duplicate.
+        let second = tokio::spawn(call(&client, &connection, Some("two"), wait.clone()).send());
+        entered.notified().await;
+        let duplicate: Value = call(&client, &connection, Some("one"), wait)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(duplicate["error"]["code"], -32600, "{duplicate}");
+        // Cancellation names its own session's request only.
+        let cancel = json!({"method":"notifications/cancelled","params":{"requestId":7}});
+        call(&client, &connection, Some("two"), cancel).send().await.unwrap();
+        let reply: Value = tokio::time::timeout(std::time::Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(reply.to_string().contains("request_cancelled"), "{reply}");
+        assert!(!first.is_finished());
+        first.abort();
+    }
+
+    #[tokio::test]
+    async fn opencode_child_sessions_cannot_borrow_the_chat_credential() {
+        let (_gateway, connection, _session, _entered) = fixture(ProviderKind::OpenCode, false).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let invoke = |session: &str| {
+            call(&client, &connection, None, json!({"id":1,"method":"tools/call","params":{
+                "name":"thread_wait","arguments":{},"_meta":{"ai.opencode/sessionID":session}}}))
+            .send()
+        };
+        let child: Value = invoke("ses_child").await.unwrap().json().await.unwrap();
+        assert_eq!(child["result"]["isError"], true, "{child}");
+        assert!(child.to_string().contains("native subagents"), "{child}");
+        let own: Value = invoke("ses_parent").await.unwrap().json().await.unwrap();
+        assert_ne!(own["result"]["isError"], true, "{own}");
+        assert!(own.to_string().contains("ses_parent"), "{own}");
+    }
+
+    /// A user's OpenCode agent config (`agent.build.permission={"*":"allow"}`)
+    /// overrides the server-wide `codemux_*` deny, so chat A is offered chat
+    /// B's server and OpenCode sends B's token. The gateway alone must refuse.
+    #[tokio::test]
+    async fn opencode_calls_must_name_the_session_their_token_is_bound_to() {
+        let (gateway, chat_a, _a, _entered) = fixture(ProviderKind::OpenCode, false).await;
+        let b = GatewaySession::new("scope-b", ProviderKind::OpenCode, None, Some("default".into()));
+        b.bind_session("ses_b");
+        b.begin("turn-b", None).unwrap();
+        let chat_b = gateway.chat_connection(
+            "scope-b",
+            GatewayCaller { native: Some(GatewayBinding::new(b)), ..Default::default() },
+        );
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let invoke = |connection: &McpGatewayConnection, meta: Value| {
+            call(&client, connection, None, json!({"id":1,"method":"tools/call","params":{
+                "name":"thread_wait","arguments":{},"_meta":meta}}))
+            .send()
+        };
+        let denied = |reply: &Value| reply["result"]["isError"] == true
+            && reply.to_string().contains("provider_control_denied");
+        // A's session presenting B's credential.
+        let borrowed: Value = invoke(&chat_b, json!({"ai.opencode/sessionID":"ses_parent"}))
+            .await.unwrap().json().await.unwrap();
+        assert!(denied(&borrowed), "{borrowed}");
+        // OpenCode 1.x sends only a progress token: never trusted.
+        for meta in [json!({"progressToken":2}), json!(null)] {
+            let unnamed: Value = invoke(&chat_b, meta).await.unwrap().json().await.unwrap();
+            assert!(denied(&unnamed), "{unnamed}");
+            assert!(unnamed.to_string().contains("OpenCode 2 or newer is required"), "{unnamed}");
+        }
+        // Each chat still reaches its own tools.
+        let own_b: Value = invoke(&chat_b, json!({"ai.opencode/sessionID":"ses_b"}))
+            .await.unwrap().json().await.unwrap();
+        assert_ne!(own_b["result"]["isError"], true, "{own_b}");
+        assert!(own_b.to_string().contains("ses_b"), "{own_b}");
+        let own_a: Value = invoke(&chat_a, json!({"ai.opencode/sessionID":"ses_parent"}))
+            .await.unwrap().json().await.unwrap();
+        assert_ne!(own_a["result"]["isError"], true, "{own_a}");
+    }
+
+    #[tokio::test]
+    async fn an_unbound_opencode_credential_acts_for_no_session() {
+        let (gateway, _connection, _session, _entered) = fixture(ProviderKind::OpenCode, false).await;
+        let unbound = GatewaySession::new("scope-unbound", ProviderKind::OpenCode, None, None);
+        unbound.begin("turn", None).unwrap();
+        let connection = gateway.chat_connection(
+            "scope-unbound",
+            GatewayCaller { native: Some(GatewayBinding::new(unbound)), ..Default::default() },
+        );
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let reply: Value = call(&client, &connection, None, json!({"id":1,"method":"tools/call","params":{
+            "name":"thread_wait","arguments":{},"_meta":{"ai.opencode/sessionID":""}}}))
+            .send().await.unwrap().json().await.unwrap();
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+    }
+
+    #[tokio::test]
+    async fn one_process_providers_need_no_session_name() {
+        let (_gateway, connection, _session, _entered) = fixture(ProviderKind::Hermes, false).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let reply: Value = call(&client, &connection, None, json!({"id":1,"method":"tools/call","params":{
+            "name":"thread_wait","arguments":{}}}))
+            .send().await.unwrap().json().await.unwrap();
+        assert_ne!(reply["result"]["isError"], true, "{reply}");
     }
 }

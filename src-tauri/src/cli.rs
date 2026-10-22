@@ -169,6 +169,14 @@ pub enum CommandSet {
     /// starts this for agents that only take stdio MCP servers.
     #[command(hide = true)]
     McpBridge,
+    /// Call an injected chat MCP tool with the chat's own authority. Reads
+    /// the credential the agent process was started with.
+    McpCall {
+        tool: Option<String>,
+        arguments: Option<String>,
+        #[arg(long)]
+        list: bool,
+    },
     /// Run as the persistent PTY daemon (internal subcommand spawned by the
     /// Tauri app; long-lived process that owns agent PTYs so they survive
     /// the app being closed).
@@ -1020,6 +1028,14 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
         }
         Some(CommandSet::McpBridge) => {
             crate::mcp::bridge::run().await?;
+            Ok(true)
+        }
+        Some(CommandSet::McpCall {
+            tool,
+            arguments,
+            list,
+        }) => {
+            crate::mcp::bridge::call(tool, arguments, list).await?;
             Ok(true)
         }
         Some(CommandSet::PtyDaemon { socket }) => {

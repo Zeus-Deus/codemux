@@ -157,6 +157,19 @@ impl NativeAuthority {
         self.changed.notify_waiters();
         PolicyTransition { owner: self }
     }
+    pub(crate) fn set_ceiling(&self, ceiling: crate::agent_control::permissions::Ceiling) {
+        self.state.lock().unwrap().policy = Some(ceiling);
+        self.changed.notify_waiters();
+    }
+    /// A provider-reported policy change (including unsolicited notifications)
+    /// is a policy transition; an unchanged ceiling leaves callbacks running.
+    pub(crate) fn transition_ceiling(&self, ceiling: crate::agent_control::permissions::Ceiling) {
+        if self.state.lock().unwrap().policy == Some(ceiling) {
+            return;
+        }
+        let _transition = self.policy_transition();
+        self.set_ceiling(ceiling);
+    }
     pub fn effective_ceiling(
         thread: &str,
     ) -> Result<Option<crate::agent_control::permissions::Ceiling>, String> {
@@ -259,6 +272,12 @@ impl NativeAuthority {
             self.changed.notify_waiters();
         }
     }
+    pub(crate) fn finish_thread(thread: &str, turn: &str) {
+        let owner = RUNTIMES.lock().unwrap().get(thread).and_then(Weak::upgrade);
+        if let Some(owner) = owner {
+            owner.finish(turn);
+        }
+    }
     pub fn finish(&self, turn: &str) {
         let mut state = self.state.lock().unwrap();
         if state.turn.as_deref() == Some(turn) {
@@ -267,6 +286,9 @@ impl NativeAuthority {
             state.pending = false;
             self.changed.notify_waiters();
         }
+    }
+    pub(crate) fn session_live(&self) -> bool {
+        self.state.lock().unwrap().live
     }
     pub fn invalidate(&self) {
         let mut state = self.state.lock().unwrap();

@@ -99,4 +99,9 @@ describe("runtimeNoticeFromWarning", () => {
     expect(runtimeNoticeFromWarning("hermes-usage-limit-recovery: " + text, null)).toBe(text);
     expect(runtimeNoticeFromWarning(text, null)).toBeNull();
   });
+
+  it("says why a chat runs without Codemux tools", () => {
+    const text = "This chat runs without Codemux tools. OpenCode 2 or newer is required for agent collaboration.";
+    expect(runtimeNoticeFromWarning("collaboration-unavailable: " + text, null)).toBe(text);
+  });
 });

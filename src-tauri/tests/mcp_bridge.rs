@@ -148,3 +148,35 @@ async fn bridge_exits_when_the_agent_closes_stdin() {
         .unwrap();
     assert_eq!(health.status(), 200, "gateway stays healthy");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_provider_one_shot_cli_uses_gateway_auth_and_never_the_control_socket() {
+    let registry = McpRegistry::new();
+    let connection = registry
+        .gateway_chat_connection("one-shot", GatewayCaller::default())
+        .await
+        .unwrap();
+    let call = |token: String| {
+        let url = connection.url.clone();
+        tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_codemux"))
+                .args(["mcp-call", "--list"])
+                .env(BRIDGE_URL_ENV, url)
+                .env(BRIDGE_TOKEN_ENV, token)
+                .env("CODEMUX_SOCKET", "/missing/control-socket")
+                .output()
+                .unwrap()
+        })
+    };
+    let output = call(connection.bearer_token.clone()).await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(reply["result"]["tools"].is_array());
+    let output = call("wrong-token".into()).await.unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("401"));
+}

@@ -225,7 +225,8 @@ def configs() -> list[dict[str, Any]]:
         options[1]["options"].append({"value": "requested effort", "name": "Requested"})
     return options
 
-record({"launch_argv": sys.argv[1:], "launch_env": os.environ.get("FAKE_LITERAL")})
+record({"launch_argv": sys.argv[1:], "launch_env": os.environ.get("FAKE_LITERAL"),
+        "gateway_token": os.environ.get("CODEMUX_MCP_GATEWAY_TOKEN")})
 if mode.startswith(("ownership-", "review", "renewed-", "dynamic-renewed-")):
     record({"owned_pid": os.getpid()})
 recovered = False
@@ -545,7 +546,7 @@ for line in sys.stdin:
         if mode == "bad-update":
             send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": None}})
             continue
-        if mode == "notify-catalog":
+        if mode in ("notify-catalog", "notify-catalog-hold"):
             options = configs()
             next(option for option in options if option["id"] == "boolean selector")["currentValue"] = True
             send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "config_option_update", "configOptions": options}}})
@@ -556,7 +557,7 @@ for line in sys.stdin:
             # Same process, wrong session: MUST be cancelled without a UI approval.
             send({"jsonrpc": "2.0", "id": "wrong session", "method": "session/request_permission", "params": {"sessionId": "foreign native ID", "options": options, "toolCall": {"toolCallId": "foreign"}}})
             send({"jsonrpc": "2.0", "id": callback_id, "method": "session/request_permission", "params": {"sessionId": native_id, "options": options, "toolCall": {"toolCallId": "real-tool"}}})
-        elif mode in ("hold", "renewed-prompt-hold"):
+        elif mode in ("hold", "renewed-prompt-hold", "notify-catalog-hold"):
             prompt_id = request_id
             if mode == "renewed-prompt-hold":
                 with open(log_path + ".ready", "w", encoding="utf-8") as ready:
@@ -602,7 +603,7 @@ for line in sys.stdin:
     elif method == "session/cancel":
         # Permission-mode fixture deliberately does NOT settle from cancel alone:
         # client must immediately answer its pending permission callback.
-        if mode in ("hold", "renewed-prompt-hold") and prompt_id is not None:
+        if mode in ("hold", "renewed-prompt-hold", "notify-catalog-hold") and prompt_id is not None:
             result(prompt_id, {"stopReason": "cancelled"})
             prompt_id = None
     elif method == "session/close":

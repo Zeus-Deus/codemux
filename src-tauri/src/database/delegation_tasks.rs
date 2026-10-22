@@ -14,9 +14,11 @@ fn same_admission_payload(saved: &str, requested: &Value) -> bool {
         if let Some(object) = value.as_object_mut() {
             object.remove("mode");
             object.remove("wait_ms");
-            // Older admissions omitted this optional field entirely.
-            if object.get("permission_mode").is_some_and(Value::is_null) {
-                object.remove("permission_mode");
+            // Older admissions omitted these optional fields entirely.
+            for key in ["permission_mode", "target"] {
+                if object.get(key).is_some_and(Value::is_null) {
+                    object.remove(key);
+                }
             }
         }
     }
@@ -124,6 +126,8 @@ pub struct TaskRecord {
     pub latest_terminal_run_id: Option<String>,
     pub has_pending_child_runs: bool,
     pub provider: String,
+    #[serde(default)]
+    pub selection: Option<crate::agent_control::selection::ResolvedSelection>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
@@ -185,6 +189,7 @@ impl TaskRecord {
             latest_terminal_run_id: None,
             has_pending_child_runs: false,
             provider,
+            selection: None,
             model: None,
             effort: None,
             permission_mode: None,
@@ -638,7 +643,22 @@ impl DatabaseStore {
         }
         if task.backend == TaskBackend::Local {
             if let Some(child) = &task.child_thread_id {
-                tx.execute("INSERT INTO agent_chat_sessions (thread_id,workspace_id,cwd,provider,title,model,effort,permission_mode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(thread_id) DO NOTHING",params![child,task.workspace_id,task.cwd,task.provider,task.title,task.model,task.effort,task.permission_mode]).map_err(|e|e.to_string())?;
+                let options = task.selection.as_ref().map(|selection| &selection.options);
+                let context = options
+                    .and_then(|options| options.get("context_window"))
+                    .and_then(Value::as_str);
+                let fast = options
+                    .and_then(|options| options.get("fast_mode"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                // Stored as a session-config write would: the tier, else the
+                // legacy flag, and the flag always derived from the tier.
+                let tier = options
+                    .and_then(|options| options.get("service_tier"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(if fast { "fast" } else { "default" });
+                let fast = crate::database::legacy_fast_mode(tier);
+                tx.execute("INSERT INTO agent_chat_sessions (thread_id,workspace_id,cwd,provider,title,model,effort,permission_mode,context_window,fast_mode,service_tier) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(thread_id) DO NOTHING",params![child,task.workspace_id,task.cwd,task.provider,task.title,task.model,task.effort,task.permission_mode,context,fast,tier]).map_err(|e|e.to_string())?;
             }
         }
         tx.execute("INSERT INTO agent_delegation_tasks (task_id,parent_thread_id,child_thread_id,backend,client_request_id,admission_payload,record) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![task.task_id,task.parent_thread_id,task.child_thread_id,if task.backend==TaskBackend::Local {"local"}else{"ssh"},key,payload.to_string(),serde_json::to_string(&task).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
@@ -909,6 +929,20 @@ mod tests {
             retry["permission_mode"] = serde_json::json!(mode);
             assert!(db.delegation_retry("parent", "upgrade-key", &retry).unwrap_err().contains("client_request_id_conflict"));
         }
+    }
+
+    #[test]
+    fn legacy_admission_without_a_target_retries_as_the_same_task() {
+        let db = DatabaseStore::new_in_memory();
+        let task = TaskRecord::new("legacy-target".into(), "parent".into(), Some("child".into()), "codex".into(), "Review".into(), "Review the saved task".into(), 1);
+        // Payload shape saved before typed provider targets existed.
+        let old = serde_json::json!({"provider":"codex","title":"Review","task":"Review the saved task","model":null,"effort":null,"role":null,"mode":"async","wait_ms":20000,"permission_mode":null});
+        db.admit_delegation_task(&task, Some("target-key"), &old).unwrap();
+        let mut retry = old.clone();
+        retry["target"] = Value::Null;
+        assert_eq!(db.delegation_retry("parent", "target-key", &retry).unwrap().unwrap().task_id, task.task_id);
+        retry["target"] = serde_json::json!({"instance_id":"codex:account-b","model":null,"options":{}});
+        assert!(db.delegation_retry("parent", "target-key", &retry).unwrap_err().contains("client_request_id_conflict"));
     }
 
     #[test]
@@ -1534,4 +1568,50 @@ mod native_budget_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod all_provider_selection_tests {
+    use super::*;
+    #[test]
+    fn all_provider_task_selection_and_model_options_are_persisted_before_start() {
+        let db = crate::database::init_test_database();
+        let mut task = TaskRecord::new(
+            "selected-task".into(),
+            "parent".into(),
+            Some("selected-child".into()),
+            "codex".into(),
+            "Selected worker".into(),
+            "Review the selected configured worker options".into(),
+            1,
+        );
+        task.workspace_id = "workspace".into();
+        task.model = Some("fixture-model".into());
+        task.permission_mode = Some("workspace-write".into());
+        task.selection = Some(crate::agent_control::selection::ResolvedSelection {
+            instance_id: "codex:account-a".into(),
+            provider: crate::agent_provider::ProviderKind::Codex,
+            revision: None,
+            model: task.model.clone(),
+            options: std::collections::BTreeMap::from([
+                ("context_window".into(), serde_json::json!("1m")),
+                ("fast_mode".into(), serde_json::json!(true)),
+                ("service_tier".into(), serde_json::json!("priority")),
+            ]),
+            extra: serde_json::json!({"provider_account_id":"account-a"}),
+        });
+        db.admit_delegation_task(&task, Some("selected-task"), &serde_json::json!({}))
+            .unwrap();
+        let row = db.get_agent_chat_session("selected-child").unwrap();
+        assert_eq!(row.context_window.as_deref(), Some("1m"));
+        assert!(row.fast_mode);
+        assert_eq!(row.service_tier, "priority");
+        assert_eq!(
+            db.delegation_task("selected-task")
+                .unwrap()
+                .unwrap()
+                .selection,
+            task.selection
+        );
+    }
 }

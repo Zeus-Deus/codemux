@@ -558,7 +558,7 @@ async fn listed_tool_names(servers: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// A reopened chat keeps its token but acts for its current workspace: a
+/// A reopened chat rotates its credential and acts for its current workspace: a
 /// plugin server scoped to the old workspace disappears from its tools.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reopened_cursor_chat_takes_its_new_workspace() {
@@ -607,7 +607,9 @@ async fn a_reopened_cursor_chat_takes_its_new_workspace() {
     input.workspace_id = Some("ws-b".into());
     provider.start_session(input).await.expect("reopen in ws-b");
     let in_b = mcp_servers_seen(&provider, &mut events, thread_id).await;
-    assert_eq!(in_a[0]["headers"], in_b[0]["headers"], "same chat, same token");
+    assert_ne!(in_a[0]["headers"], in_b[0]["headers"],
+        "session replacement must rotate the chat token"
+    );
     let names = listed_tool_names(&in_b).await;
     assert!(!names.iter().any(|name| name.starts_with("fixture__")), "{names:?}");
     provider.stop_session(ThreadId(thread_id.into())).await.expect("stop");

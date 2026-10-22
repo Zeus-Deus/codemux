@@ -69,7 +69,9 @@ pub async fn harvest_opencode_capabilities(
     config.server_password = Some(handle.server_password);
     let client = OpenCodeClient::new(config)?;
     let providers = client.list_models().await?;
-    Ok(build_capabilities(providers))
+    let capabilities = build_capabilities(providers);
+    manager.remember_catalog(handle.api, capabilities.clone());
+    Ok(capabilities)
 }
 
 /// Pure constructor exposed for tests — wraps

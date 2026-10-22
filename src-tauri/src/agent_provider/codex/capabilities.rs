@@ -156,6 +156,32 @@ impl CodexCapabilityCache {
         *guard=Some(fresh.clone());Ok(fresh)
     }
 
+    /// An extra account's cached catalog while its home holds the same login.
+    /// Never harvests.
+    pub async fn cached_account(
+        &self,
+        account_id: &str,
+        home: &std::path::Path,
+    ) -> Option<ProviderChatCapabilities> {
+        let login = login_revision(home);
+        let accounts = self.accounts.lock().await;
+        let (read_under, cached) = accounts.get(account_id)?;
+        (read_under.is_some() && *read_under == login).then(|| cached.clone())
+    }
+
+    /// The default catalog cached under `owner`'s current credentials. Never
+    /// harvests or refreshes a login.
+    pub(crate) async fn cached_owned(
+        &self,
+        owner: &Arc<super::chatgpt::Owner>,
+    ) -> Option<ProviderChatCapabilities> {
+        self.inner.lock().await.as_ref()?;
+        let key = owner.cache_key().await.ok()?;
+        let guard = self.inner.lock().await;
+        let stored = self.key.lock().await;
+        (stored.as_ref() == Some(&key)).then(|| guard.clone()).flatten()
+    }
+
     /// Drop any cached value. The next call will re-harvest.
     pub async fn invalidate(&self) {
         let mut guard = self.inner.lock().await;

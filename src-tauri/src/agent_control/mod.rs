@@ -60,3 +60,5 @@ pub async fn execute<R: tauri::Runtime>(
 mod tests;
 #[cfg(test)]
 pub(crate) mod guard_tests;
+
+pub mod selection;

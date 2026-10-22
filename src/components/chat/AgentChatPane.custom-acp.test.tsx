@@ -66,6 +66,7 @@ beforeEach(() => {
         }
         startedDraft = true; return args!.input.thread_id;
       }
+      case "delegation_local_context": return { tasks: [], origin: null };
       case "agent_chat_get_session": return record;
       case "delegation_local_context": return { tasks: [], origin: null } satisfies DurableTaskContext;
       case "agent_chat_list_queued_turns": return [];

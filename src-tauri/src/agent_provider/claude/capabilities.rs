@@ -507,6 +507,11 @@ impl ClaudeCapabilityCache {
         result
     }
 
+    /// The cached catalog, without harvesting.
+    pub async fn cached(&self) -> Option<ProviderChatCapabilities> {
+        self.inner.lock().await.clone()
+    }
+
     /// Drop any cached value. The next call re-harvests.
     pub async fn invalidate(&self) {
         let mut guard = self.inner.lock().await;

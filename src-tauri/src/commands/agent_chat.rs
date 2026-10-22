@@ -1021,9 +1021,8 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
     )?;
     if let Some(tier) = input.service_tier.as_deref() {
         input.fast_mode = match tier {
-            "default" => false,
-            "fast" => true,
-            _ if provider == ProviderKind::Codex => false,
+            "default" | "fast" => crate::database::legacy_fast_mode(tier),
+            _ if provider == ProviderKind::Codex => crate::database::legacy_fast_mode(tier),
             _ => {
                 return Err("validation_error: provider does not support this service tier".into())
             }
@@ -3617,7 +3616,17 @@ async fn send_turn_context_reporting<R: Runtime>(
     }
     let machine = !context.is_human();
     let mut resumed_ids = Vec::new();
-    let result = send_turn_internal(app.clone(), provider, input.clone(), context, reached, &mut resumed_ids).await;
+    let result = async {
+        // A queued adapter may dispatch after the launch receipt succeeds.
+        // Once admitted, the durable message owns this dispatch authority.
+        if let Some(control) = context.control.as_mut() {
+            if matches!(control.caller.admitted, Some(crate::agent_control::AdmittedAuthority::Operation { .. })) {
+                control.verify(&app)?;
+                control.caller.admitted = Some(crate::agent_control::AdmittedAuthority::Delivery { delivery_id: id.clone() });
+            }
+        }
+        send_turn_internal(app.clone(), provider, input.clone(), context, reached, &mut resumed_ids).await
+    }.await;
     if result.is_err() { db.rehold_message_deliveries(&resumed_ids)?; }
     match &result {
         Ok(result) => {
@@ -5963,6 +5972,48 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
     Ok(capabilities)
 }
 
+/// The catalog [`list_chat_provider_capabilities`] last harvested, read from
+/// its caches only: never spawns a CLI, a server or a sidecar. `None` when
+/// nothing usable is cached.
+pub(crate) async fn cached_chat_provider_capabilities<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: ProviderKind,
+    account_id: Option<String>,
+) -> Result<Option<ProviderChatCapabilities>, String> {
+    use std::sync::Arc;
+    let mut capabilities = match provider {
+        ProviderKind::Claude => match app.try_state::<Arc<crate::agent_provider::claude::capabilities::ClaudeCapabilityCache>>() {
+            Some(cache) => cache.cached().await,
+            None => None,
+        },
+        ProviderKind::Codex => match app.try_state::<Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>>() {
+            Some(cache) => match account_id.filter(|id| id != crate::provider_accounts::DEFAULT_ACCOUNT_ID) {
+                Some(id) => match app.state::<DatabaseStore>().provider_account(&id)? {
+                    Some(account) => cache.cached_account(&account.id, std::path::Path::new(&account.home)).await,
+                    None => None,
+                },
+                None => cache.cached_owned(&crate::agent_provider::codex::chatgpt::owner()).await,
+            },
+            None => None,
+        },
+        ProviderKind::Cursor => app
+            .try_state::<Arc<crate::agent_provider::cursor::capabilities::CursorCapabilityCache>>()
+            .and_then(|cache| cache.cached()),
+        ProviderKind::Grok => app
+            .try_state::<Arc<crate::agent_provider::grok::capabilities::GrokCapabilityCache>>()
+            .and_then(|cache| cache.cached()),
+        ProviderKind::OpenCode => app
+            .try_state::<Arc<crate::agent_provider::opencode::OpenCodeServerManager>>()
+            .and_then(|manager| manager.cached_catalog())
+            .map(|(_, capabilities)| capabilities),
+        ProviderKind::Hermes | ProviderKind::Acp => None,
+    };
+    if let Some(capabilities) = capabilities.as_mut() {
+        capabilities.supports_steering = provider.supports_steering();
+    }
+    Ok(capabilities)
+}
+
 /// Probe the health of a chat provider's local runtime (binary present,
 /// runnable, authenticated) so the chat UI can surface a status banner
 /// BEFORE the user burns minutes on a session that can never work.
@@ -8203,6 +8254,11 @@ fn delivery_transition(event: &ProviderRuntimeEvent) -> bool {
 /// UUID carried by `ResumeCursorUpdated` so the history dropdown can
 /// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeEvent) {
+    if let ProviderRuntimeEvent::TurnCompleted { thread_id, turn_id, ..
+    } = &event
+    {
+        crate::delegation::authority::NativeAuthority::finish_thread(&thread_id.0, &turn_id.0);
+    }
     if let ProviderRuntimeEvent::TurnCompleted { thread_id, .. } = &event {
         if let Some(db) = app.try_state::<DatabaseStore>() { let _ = db.orchestration_launch_finished(&thread_id.0); }
     }

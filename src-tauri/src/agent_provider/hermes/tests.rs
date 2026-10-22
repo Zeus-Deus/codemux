@@ -10,8 +10,8 @@ impl BindingStore for crate::database::DatabaseStore {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_l3_native_stop_wakes_cold_hermes_profile_operation_wait() {
-    use tauri::Manager;
     use crate::commands::agent_chat::{self, ProviderRegistry};
+    use tauri::Manager;
     let binary = std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
     assert!(binary.is_file(), "synthetic ACP fixture required, never a real Hermes CLI");
@@ -38,6 +38,7 @@ async fn review_l3_native_stop_wakes_cold_hermes_profile_operation_wait() {
     let runtime = Arc::new(Runtime {
         fixture_start_wait:Notify::new(),child,ownership:std::sync::Mutex::new(None),installation_stamp:installation_stamp(&profile).unwrap(),profile:profile.clone(),
         operation:Mutex::new(()),routes:Mutex::new(HashMap::new()),commands:Mutex::new(HashMap::new()),queue:Mutex::new(Queue::default()),barrier,
+        credentials:test_credentials(None),
     });
     provider.inner.runtimes.lock().await.insert(runtime_key(&profile),runtime.clone());
     // Same actual runtime.operation mutex that A's foreground approval owns.
@@ -84,6 +85,9 @@ impl crate::agent_provider::types::TurnDispatchCheckpoint for ReviewDispatchAuth
     async fn abort(&self) { self.aborted.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
 }
 
+fn test_credentials(registry: Option<crate::mcp::registry::McpRegistry>) -> Credentials {
+    Credentials { registry, prefix: format!("hermes:{}:", uuid::Uuid::new_v4()) }
+}
 async fn review_pump_fixture() -> (tempfile::TempDir, HermesProvider, Arc<Runtime>, Arc<Chat>, tokio::task::JoinHandle<()>) {
     review_pump_fixture_with_binary(None).await
 }
@@ -105,10 +109,13 @@ async fn review_pump_fixture_with_binary(binary: Option<std::path::PathBuf>) -> 
     let (barrier, mut barriers) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
     let runtime = Arc::new(Runtime {fixture_start_wait:Notify::new(), child, ownership:std::sync::Mutex::new(None),
         installation_stamp:installation_stamp(&profile).unwrap(), profile:profile.clone(), operation:Mutex::new(()),
-        routes:Mutex::new(HashMap::new()), commands:Mutex::new(HashMap::new()), queue:Mutex::new(Queue::default()), barrier});
+        routes:Mutex::new(HashMap::new()), commands:Mutex::new(HashMap::new()), queue:Mutex::new(Queue::default()), barrier,
+        credentials:test_credentials(None)});
     let mut binding = test_binding(root.path()); binding.profile=profile; binding.acp_session_id=Some("review-session".into());
     binding.current_native_id=Some("existing-native".into());
-    let chat = Arc::new(Chat {binding:Mutex::new(binding), runtime:runtime.clone(), mcp_servers:json!([]), state:Mutex::new(ChatState::default()), finished:Notify::new()});
+    let chat = Arc::new(Chat {binding:Mutex::new(binding), runtime:runtime.clone(), mcp_servers:json!([]),
+        mcp: None,
+        state:Mutex::new(ChatState::default()), finished:Notify::new()});
     provider.inner.chats.lock().await.insert(ThreadId("thread".into()), chat.clone());
     runtime.routes.lock().await.insert("review-session".into(), Arc::downgrade(&chat));
     let inner = provider.inner.clone(); let r = runtime.clone();
@@ -1139,8 +1146,8 @@ fn hermes_offline_free_model_change_fails_without_mutating_binding() {
 #[cfg(unix)]
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn review_r2_hermes_child_exit_settles_delivery_attention() {
-    use tauri::Manager;
     use std::os::unix::fs::PermissionsExt;
+    use tauri::Manager;
     let peer=tempfile::tempdir().unwrap();
     let binary=peer.path().join("exit-peer.py");
     std::fs::write(&binary,"#!/usr/bin/env python3\nimport sys\nsys.stdin.readline()\nsys.exit(7)\n").unwrap();
@@ -1170,8 +1177,8 @@ async fn review_r2_hermes_child_exit_settles_delivery_attention() {
 #[cfg(unix)]
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn review_r2_hermes_cancellation_timeout_settles_delivery_attention() {
-    use tauri::Manager;
     use std::os::unix::fs::PermissionsExt;
+    use tauri::Manager;
     let peer=tempfile::tempdir().unwrap();
     let binary=peer.path().join("unanswered-peer.py");
     std::fs::write(&binary,"#!/usr/bin/env python3\nimport sys,pathlib\nsys.stdin.readline()\npathlib.Path(__file__).with_suffix('.ready').write_text('ready')\nfor line in sys.stdin: pass\n").unwrap();
@@ -1264,4 +1271,256 @@ async fn orchestration_message_hermes_failed_release_reholds_durable_rows_before
     assert!(runtime.queue.lock().await.jobs.iter().any(|job|job.id==b));
     assert!(!db.message_delivery("B").unwrap().unwrap().attempted);
     runtime.child.shutdown().await.unwrap();task.abort();let _=task.await;
+}
+
+#[tokio::test]
+async fn all_provider_hermes_capabilities_do_not_reacquire_the_active_profile_operation() {
+    let (_root, provider, runtime, _chat, task) = review_pump_fixture().await;
+    let key = runtime_key(&runtime.profile);
+    provider
+        .inner
+        .runtimes
+        .lock()
+        .await
+        .insert(key, runtime.clone());
+    let acknowledged = json!({"models":{"currentModelId":"openai:fixture-model","availableModels":[{"modelId":"openai:fixture-model","name":"Fixture"}]}});
+    provider
+        .inner
+        .remember_catalog(&runtime.profile, acknowledged.clone())
+        .await;
+    let held = runtime.operation.lock().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        provider.orchestration_catalog(runtime.profile.clone(), true),
+    )
+    .await;
+    drop(held);
+    runtime.child.shutdown().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    assert_eq!(
+        result
+            .expect("native discovery must not wait on its own profile operation")
+            .unwrap(),
+        Some(acknowledged)
+    );
+}
+
+/// A cached profile catalog is reused only while the profile's configuration
+/// is unchanged. Listing then reports it undiscovered; a targeted discovery
+/// reads the new catalog from the runtime.
+#[tokio::test]
+async fn a_changed_hermes_configuration_refreshes_the_cached_catalog() {
+    let (root, provider, runtime, _chat, task) = review_pump_fixture().await;
+    provider
+        .inner
+        .runtimes
+        .lock()
+        .await
+        .insert(runtime_key(&runtime.profile), runtime.clone());
+    let stale = json!({"sessionId":"before-edit","models":{"currentModelId":"openai:old","availableModels":[{"modelId":"openai:old","name":"Old"}]}});
+    provider.inner.remember_catalog(&runtime.profile, stale.clone()).await;
+    let listed = provider.orchestration_catalog(runtime.profile.clone(), false).await.unwrap();
+    std::fs::write(
+        root.path().join("config.yaml"),
+        "model: {provider: custom, default: another-model}\n",
+    )
+    .unwrap();
+    let after_edit = provider.orchestration_catalog(runtime.profile.clone(), false).await.unwrap();
+    let discovered = provider.orchestration_catalog(runtime.profile.clone(), true).await.unwrap();
+    let relisted = provider.orchestration_catalog(runtime.profile.clone(), false).await.unwrap();
+    runtime.child.shutdown().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    assert_eq!(listed, Some(stale.clone()), "an unchanged profile reuses its catalog");
+    assert_eq!(after_edit, None, "listing never serves a catalog read under the old configuration");
+    let discovered = discovered.expect("targeted discovery refreshes the catalog");
+    assert_ne!(discovered, stale, "the catalog was read again from the runtime");
+    assert_eq!(relisted, Some(discovered));
+}
+
+/// A Hermes chat's tool runs inside its turn, which holds the profile
+/// operation. Refreshing a stale catalog then must fail fast, not wait on it.
+#[tokio::test]
+async fn a_stale_catalog_never_waits_on_the_profile_turn() {
+    let (root, provider, runtime, _chat, task) = review_pump_fixture().await;
+    provider
+        .inner
+        .runtimes
+        .lock()
+        .await
+        .insert(runtime_key(&runtime.profile), runtime.clone());
+    let stale = json!({"models":{"currentModelId":"openai:old","availableModels":[]}});
+    provider.inner.remember_catalog(&runtime.profile, stale).await;
+    std::fs::write(root.path().join("config.yaml"), "model: {provider: custom, default: edited}\n").unwrap();
+    let held = runtime.operation.lock().await;
+    let refreshed = tokio::time::timeout(
+        Duration::from_secs(2),
+        provider.orchestration_catalog(runtime.profile.clone(), true),
+    )
+    .await;
+    drop(held);
+    // A token refresh alone keeps the catalog.
+    provider.inner.remember_catalog(&runtime.profile, json!({"kept":true})).await;
+    std::fs::write(root.path().join("auth.json"), "{}").unwrap();
+    let after_refresh = provider.orchestration_catalog(runtime.profile.clone(), false).await.unwrap();
+    runtime.child.shutdown().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    let error = refreshed.expect("must not wait on the turn's profile operation").unwrap_err();
+    assert!(error.to_string().contains("busy"), "{error}");
+    assert_eq!(after_refresh, Some(json!({"kept":true})));
+}
+
+#[tokio::test]
+async fn a_replaced_hermes_profile_or_installation_never_reuses_its_catalog() {
+    let root = tempfile::tempdir().unwrap();
+    let installation = root.path().join("hermes");
+    std::fs::write(&installation, "#!/bin/sh\n").unwrap();
+    let home = root.path().join("profiles/coder");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.yaml"), "model: {provider: custom}\n").unwrap();
+    let provider = HermesProvider::new(Arc::new(crate::database::init_test_database()));
+    let profile = profile::resolve(&installation, root.path(), "coder").unwrap();
+    let catalog = json!({"models":{"currentModelId":"openai:old","availableModels":[]}});
+    provider.inner.remember_catalog(&profile, catalog.clone()).await;
+    assert_eq!(provider.orchestration_catalog(profile.clone(), false).await.unwrap(), Some(catalog.clone()));
+
+    // Same pathname, different profile directory.
+    std::fs::rename(&home, root.path().join("profiles/coder-old")).unwrap();
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("config.yaml"), "model: {provider: custom}\n").unwrap();
+    let replaced = profile::resolve(&installation, root.path(), "coder").unwrap();
+    assert_ne!(replaced.identity, profile.identity);
+    assert_eq!(provider.orchestration_catalog(replaced.clone(), false).await.unwrap(), None);
+
+    // Same profile, reinstalled executable.
+    provider.inner.remember_catalog(&replaced, catalog.clone()).await;
+    std::fs::write(&installation, "#!/bin/sh\n# upgraded\n").unwrap();
+    assert_eq!(provider.orchestration_catalog(replaced, false).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn listing_a_cold_hermes_profile_starts_no_runtime_or_session() {
+    let (_root, provider, runtime, _chat, task) = review_pump_fixture().await;
+    let listed = provider
+        .orchestration_catalog(runtime.profile.clone(), false)
+        .await
+        .unwrap();
+    let started = provider.inner.runtimes.lock().await.len();
+    runtime.child.shutdown().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    assert_eq!(listed, None);
+    assert_eq!(started, 0, "listing must not start a Hermes runtime");
+}
+
+#[test]
+fn a_chat_response_never_becomes_the_profile_default() {
+    let chat = json!({
+        "sessionId": "s",
+        "modes": {"currentModeId": "dont_ask", "availableModes": [{"id": "default"}, {"id": "dont_ask"}]},
+        "models": {"currentModelId": "openai:gpt-5", "availableModels": [{"modelId": "openai:gpt-5"}]}
+    });
+    let catalog = profile_catalog(&chat);
+    assert!(catalog.pointer("/modes/currentModeId").is_none());
+    // Launch validation still sees the effective, durable model.
+    durable_catalog(&catalog).unwrap();
+    assert_eq!(catalog["modes"]["availableModes"], chat["modes"]["availableModes"]);
+    assert_eq!(catalog["models"]["availableModels"], chat["models"]["availableModels"]);
+}
+
+/// Stop leaves a Hermes chat's injected server alone: no `session/load`, so
+/// Hermes never adds a second toolset, and the one credential keeps working.
+/// Slash commands reach Hermes exactly as typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_keeps_one_hermes_toolset_and_its_credential() {
+    let (root, provider, runtime, old_chat, task) = review_pump_fixture().await;
+    // Native authorities are per thread; stay clear of other fixtures' "thread".
+    let thread = format!("hermes-stop-{}", Uuid::new_v4());
+    provider.inner.chats.lock().await.remove(&ThreadId("thread".into()));
+    let registry = crate::mcp::registry::McpRegistry::new();
+    let mcp = crate::agent_provider::acp::mcp::ChatMcp::new(
+        registry,
+        &thread,
+        ProviderKind::Hermes,
+        Some("workspace".into()),
+        Some("default".into()),
+        mcp_server_name(&thread),
+        Some(runtime.credentials.key(&thread)),
+        vec![],
+        false,
+    );
+    let servers = mcp.servers(crate::agent_provider::acp::mcp::Transport::Http).await;
+    mcp.session.bind_session("review-session");
+    let mut binding = old_chat.binding.lock().await.clone();
+    binding.thread_id = thread.clone();
+    let chat = Arc::new(Chat {
+        binding: Mutex::new(binding),
+        runtime: runtime.clone(),
+        mcp_servers: servers.clone(),
+        mcp: Some(mcp),
+        state: Mutex::new(ChatState::default()),
+        finished: Notify::new(),
+    });
+    provider.inner.chats.lock().await.insert(ThreadId(thread.clone()), chat.clone());
+    runtime.routes.lock().await.insert("review-session".into(), Arc::downgrade(&chat));
+    let mut rx = provider.inner.events.subscribe();
+    runtime.queue.lock().await.running = true;
+    provider.send_turn(turn(&thread, "review-hold")).await.unwrap();
+    let inner = provider.inner.clone();
+    let r = runtime.clone();
+    let pump = tokio::spawn(async move { inner.pump(r).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(rx.recv().await.unwrap(), ProviderRuntimeEvent::RequestOpened { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // Stop twice through the authority path the Stop command uses.
+    for _ in 0..2 {
+        crate::delegation::authority::NativeAuthority::user_activity_thread(&thread, true);
+        provider.interrupt_turn(ThreadId(thread.clone()), None).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(3), pump).await.unwrap().unwrap();
+    runtime.queue.lock().await.running = true;
+    provider.send_turn(turn(&thread, "/title Release notes")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), provider.inner.clone().pump(runtime.clone()))
+        .await
+        .unwrap();
+    let listed = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(servers[0]["url"].as_str().unwrap())
+        .header("authorization", servers[0]["headers"][0]["value"].as_str().unwrap())
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    let wire: Vec<Value> = std::fs::read_to_string(root.path().join("peer-wire.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|entry: &Value| entry["direction"] == "in")
+        .map(|entry| entry["message"].clone())
+        .collect();
+    runtime.child.shutdown().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    assert!(
+        !wire.iter().any(|m| m["method"] == "session/load"),
+        "Stop must not reload Hermes MCP servers: {wire:?}"
+    );
+    let prompts: Vec<_> = wire
+        .iter()
+        .filter(|m| m["method"] == "session/prompt")
+        .map(|m| m["params"]["prompt"][0]["text"].clone())
+        .collect();
+    assert_eq!(prompts.last(), Some(&json!("/title Release notes")), "{prompts:?}");
+    assert_eq!(listed, reqwest::StatusCode::OK, "the one credential still works after Stop");
 }

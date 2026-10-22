@@ -449,6 +449,14 @@ pub struct AgentChatSearchResult {
     pub created_at: String,
 }
 
+/// The legacy `fast_mode` flag a native service tier maps to. Premium tiers
+/// read as Fast; other tiers (for example Flex) must not look like premium
+/// Fast to a legacy client that cannot represent them. Persistence and
+/// session start share this so a guarded launch compares like with like.
+pub(crate) fn legacy_fast_mode(tier: &str) -> bool {
+    matches!(tier, "fast" | "priority" | "ultrafast")
+}
+
 /// Per-thread chat configuration written alongside an
 /// `agent_chat_sessions` row. Every field is a tri-state so callers
 /// (session start, the picker-driven update command, auto-resume) can
@@ -4112,11 +4120,7 @@ impl DatabaseStore {
             ("permission_mode", bind(&config.permission_mode)),
             (
                 "fast_mode",
-                // Other native tiers (for example Flex) must not look like
-                // premium Fast to a legacy client that cannot represent them.
-                bind_bool(tier.as_ref().map(|tier| {
-                    matches!(tier.as_str(), "fast" | "priority" | "ultrafast")
-                })),
+                bind_bool(tier.as_deref().map(legacy_fast_mode)),
             ),
         ];
         let mut set_clauses: Vec<String> = Vec::new();
