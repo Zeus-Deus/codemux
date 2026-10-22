@@ -71,6 +71,17 @@ pub struct FileMatch {
     pub score: u32,
 }
 
+struct FileCandidate<'a> {
+    path: &'a str,
+    absolute_path: &'a str,
+}
+
+impl AsRef<str> for FileCandidate<'_> {
+    fn as_ref(&self) -> &str {
+        self.path
+    }
+}
+
 struct CacheEntry {
     /// Relative paths (UTF-8 lossy). Pre-sorted alphabetically for the
     /// empty-query path.
@@ -186,27 +197,25 @@ fn list_project_files_blocking(
         Normalization::Smart,
     );
 
-    // Pre-build a path → index map so result lookup is O(1) instead
-    // of an O(N²) scan when the matcher returns many candidates.
-    let path_to_idx: HashMap<&str, usize> = paths
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.as_str(), i))
-        .collect();
-
     // `match_list` returns items already sorted by score (highest
-    // first) per nucleo-matcher's documented contract.
-    let scored = pattern.match_list(paths.iter().map(String::as_str), &mut matcher);
+    // first). Carry each path pair through matching to avoid rebuilding a
+    // project-sized lookup map for every keystroke.
+    let candidates = paths
+        .iter()
+        .zip(absolute)
+        .map(|(path, absolute_path)| FileCandidate {
+            path,
+            absolute_path,
+        });
+    let scored = pattern.match_list(candidates, &mut matcher);
 
     let results: Vec<FileMatch> = scored
         .into_iter()
         .take(limit)
-        .filter_map(|(matched_str, score)| {
-            path_to_idx.get(matched_str).map(|&idx| FileMatch {
-                path: paths[idx].clone(),
-                absolute_path: absolute[idx].clone(),
-                score,
-            })
+        .map(|(candidate, score)| FileMatch {
+            path: candidate.path.to_string(),
+            absolute_path: candidate.absolute_path.to_string(),
+            score,
         })
         .collect();
     Ok(results)
@@ -1123,6 +1132,107 @@ mod tests {
         );
         // Scores are non-zero on a non-empty query.
         assert!(results.iter().any(|m| m.score > 0));
+    }
+
+    #[tokio::test]
+    async fn fuzzy_results_preserve_ranking_limits_and_path_pairs() {
+        let dir = tempdir().unwrap();
+        seed_project(dir.path());
+        for path in ["a/Composer.tsx", "b/Composer.tsx", "comp.ts", "src/café.ts"] {
+            let absolute = dir.path().join(path);
+            fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+            fs::write(absolute, "// candidate\n").unwrap();
+        }
+        let cwd = dir.path().canonicalize().unwrap();
+        let cwd_string = cwd.to_string_lossy().into_owned();
+        let alphabetical = list_project_files(cwd_string.clone(), None, MAX_LIMIT)
+            .await
+            .unwrap();
+
+        for query in [" comp ", "Composer", "composer", "cafe", "src/comp", "zzznotreal"] {
+            let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+            let pattern = Pattern::parse(query.trim(), CaseMatching::Smart, Normalization::Smart);
+            let expected = pattern.match_list(
+                alphabetical.iter().map(|file| file.path.as_str()),
+                &mut matcher,
+            );
+            for limit in [0, 1, 2, MAX_LIMIT] {
+                let results = list_project_files(cwd_string.clone(), Some(query.into()), limit)
+                    .await
+                    .unwrap();
+                let actual: Vec<_> = results
+                    .iter()
+                    .map(|file| (file.path.as_str(), file.absolute_path.clone(), file.score))
+                    .collect();
+                let expected: Vec<_> = expected
+                    .iter()
+                    .take(limit)
+                    .map(|&(path, score)| {
+                        let absolute = cwd.join(path).canonicalize().unwrap();
+                        (path, absolute.to_string_lossy().into_owned(), score)
+                    })
+                    .collect();
+                assert_eq!(actual, expected, "query={query:?}, limit={limit}");
+            }
+        }
+
+        // Equal-score matches keep the cache's alphabetical order, including
+        // separate files that share a basename.
+        let results = list_project_files(cwd_string, Some("Composer".into()), MAX_LIMIT)
+            .await
+            .unwrap();
+        let a = results
+            .iter()
+            .position(|file| file.path == "a/Composer.tsx")
+            .unwrap();
+        let b = results
+            .iter()
+            .position(|file| file.path == "b/Composer.tsx")
+            .unwrap();
+        assert_eq!(results[a].score, results[b].score);
+        assert!(a < b);
+    }
+
+    #[tokio::test]
+    async fn fuzzy_results_preserve_duplicates_and_cap_the_limit() {
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let path = "src/Composer.tsx".to_string();
+        let absolute: Vec<_> = (0..=MAX_LIMIT)
+            .map(|i| {
+                cwd.join(format!("{i}/Composer.tsx"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        // Use distinct absolute paths to detect aliasing when relative names
+        // collide. Every cached candidate must retain its own path pair.
+        let entry = CacheEntry {
+            paths: vec![path.clone(); MAX_LIMIT + 1],
+            absolute: absolute.clone(),
+            scanned_at: Instant::now(),
+        };
+        CACHE
+            .lock()
+            .unwrap()
+            .insert(cwd.clone(), Arc::new(CacheSlot::from(Arc::new(entry))));
+
+        for limit in [1, MAX_LIMIT, usize::MAX] {
+            let results = list_project_files(
+                cwd.to_string_lossy().into_owned(),
+                Some("comp".into()),
+                limit,
+            )
+            .await
+            .unwrap();
+            assert_eq!(results.len(), limit.min(MAX_LIMIT));
+            for (file, absolute_path) in results.iter().zip(&absolute) {
+                assert_eq!(file.path, path);
+                assert_eq!(&file.absolute_path, absolute_path);
+                assert_eq!(file.score, results[0].score);
+                assert!(file.score > 0);
+            }
+        }
     }
 
     #[tokio::test]
