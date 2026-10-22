@@ -213,7 +213,7 @@ export class FrameInflater {
    * malformed (already logged) — callers drop the frame; the poison escalation
    * takes care of getting the connection back to a decodable state.
    */
-  decode(frame: ArrayBuffer): Uint8Array | null {
+  decode(frame: ArrayBuffer): Uint8Array<ArrayBuffer> | null {
     if (this.poisoned) return null;
     if (frame.byteLength < COMPRESSED_HEADER_LEN) {
       this.poison("compressed frame is shorter than its header");

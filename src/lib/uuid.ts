@@ -22,7 +22,7 @@ const HEX: string[] = Array.from({ length: 256 }, (_, i) =>
  *  `Math.random` is a last-resort fallback for environments that expose
  *  neither `randomUUID` nor `getRandomValues`; the id shape is identical
  *  either way, only the entropy quality differs. */
-function fillRandomBytes(bytes: Uint8Array): void {
+function fillRandomBytes(bytes: Uint8Array<ArrayBuffer>): void {
   if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
     crypto.getRandomValues(bytes);
     return;

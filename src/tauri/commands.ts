@@ -1630,7 +1630,7 @@ export const pasteClipboardImageToFile = (): Promise<string> =>
 /// WebKit hands the serialized `Vec<u8>` back as a `number[]`, so we
 /// rewrap it in a `Uint8Array` before returning.
 export interface ClipboardImagePayload {
-  bytes: Uint8Array;
+  bytes: Uint8Array<ArrayBuffer>;
   mime: string;
 }
 export const pasteClipboardImage = async (): Promise<ClipboardImagePayload> => {
@@ -1901,7 +1901,7 @@ export const discardStagedChatImage = (path: string) =>
  *  the JSON byte array into a `Uint8Array` the caller can Blob-URL. */
 export const readChatImage = async (
   path: string,
-): Promise<{ bytes: Uint8Array; media_type: string }> => {
+): Promise<{ bytes: Uint8Array<ArrayBuffer>; media_type: string }> => {
   const res = await invoke<{ bytes: number[]; media_type: string }>(
     "agent_chat_read_image",
     { path },
@@ -1914,7 +1914,7 @@ export const readChatImage = async (
  * this only after that URL fails to load. */
 export const readLocalChatImage = async (
   path: string,
-): Promise<{ bytes: Uint8Array; media_type: string }> => {
+): Promise<{ bytes: Uint8Array<ArrayBuffer>; media_type: string }> => {
   const res = await invoke<{ bytes: number[]; media_type: string }>(
     "agent_chat_read_local_image",
     { path },
