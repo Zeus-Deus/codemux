@@ -276,7 +276,7 @@ doctest = false
 bench = false
 required-features = ["test-fixtures"]
 
-# Test helper binary used by `tests/codex_adapter.rs` — simulates the
+# Test helper binary used by `tests/integration/codex_adapter.rs` — simulates the
 # `codex app-server` JSON-RPC peer. Gated like fake_rpc_child above.
 [[bin]]
 name = "fake_codex_app_server"
@@ -286,7 +286,7 @@ doctest = false
 bench = false
 required-features = ["test-fixtures"]
 
-# Test helper binary used by `tests/cursor_adapter.rs` — simulates
+# Test helper binary used by `tests/integration/cursor_adapter.rs` — simulates
 # `cursor-agent acp`. Gated like fake_rpc_child above.
 [[bin]]
 name = "fake_cursor_acp"
@@ -296,7 +296,7 @@ doctest = false
 bench = false
 required-features = ["test-fixtures"]
 
-# Test helper binary used by `tests/grok_adapter.rs` — simulates the
+# Test helper binary used by `tests/integration/grok_adapter.rs` — simulates the
 # official `grok --no-auto-update agent --no-leader stdio` ACP process.
 # Gated like the other fake provider executables above.
 [[bin]]
@@ -307,7 +307,7 @@ doctest = false
 bench = false
 required-features = ["test-fixtures"]
 
-# Test helper binary used by `tests/claude_adapter.rs` — simulates the
+# Test helper binary used by `tests/integration/claude_adapter.rs` — simulates the
 # claude-agent sidecar without involving the real SDK. Gated like
 # fake_rpc_child above.
 [[bin]]

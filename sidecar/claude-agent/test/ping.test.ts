@@ -3,7 +3,7 @@
 // Each test spawns `bun run src/main.ts` as a subprocess, exchanges
 // JSON-RPC messages over stdio, and asserts the response shape. The
 // compiled binary is exercised separately from the Rust side (see
-// `src-tauri/tests/sidecar_ping.rs`) — running these via `bun run` keeps
+// `src-tauri/tests/integration/sidecar_ping.rs`) — running these via `bun run` keeps
 // the test loop fast.
 
 import { describe, expect, test } from "bun:test";

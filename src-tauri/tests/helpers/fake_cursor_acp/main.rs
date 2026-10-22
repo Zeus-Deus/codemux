@@ -1,7 +1,7 @@
 //! Test helper binary: a minimal stand-in for `cursor-agent acp`.
 //!
 //! Speaks just enough of the Agent Client Protocol (plus Cursor's
-//! extensions) for `tests/cursor_adapter.rs` to drive the adapter's turn
+//! extensions) for `tests/integration/cursor_adapter.rs` to drive the adapter's turn
 //! lifecycle without an installed, authenticated Cursor CLI.
 //!
 //! Methods understood:

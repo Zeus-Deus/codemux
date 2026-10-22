@@ -1,4 +1,4 @@
-//! Fake `codex app-server` fixture used by `tests/codex_adapter.rs`.
+//! Fake `codex app-server` fixture used by `tests/integration/codex_adapter.rs`.
 //!
 //! Reads newline-delimited JSON-RPC from stdin and reacts with a canned
 //! script that exercises the adapter's event wiring. The script is loaded

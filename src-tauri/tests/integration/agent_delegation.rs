@@ -14,7 +14,7 @@
 
 #![cfg(unix)]
 
-#[path = "helpers/mock_agent_provider.rs"]
+#[path = "../helpers/mock_agent_provider.rs"]
 mod mock_agent_provider;
 
 use std::sync::Arc;
@@ -49,7 +49,7 @@ use codemux_lib::observability::{FeatureFlags, ObservabilityStore};
 use codemux_lib::presets::LaunchMode;
 use codemux_lib::state::{AppStateStore, WorkspaceSnapshot};
 
-use crate::mock_agent_provider::{MockAgentProvider, MockCall};
+use self::mock_agent_provider::{MockAgentProvider, MockCall};
 
 /// The tool's registry name; Codex's model-visible spelling maps back to it.
 const DELEGATE_TOOL: &str = "mcp__codemux__delegate_task";
