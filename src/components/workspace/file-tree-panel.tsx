@@ -234,11 +234,12 @@ export function FileTreePanel({
     }
   }, [activeNode, activePath, focusTrail]);
   const scrollActiveIntoView = useCallback(() => {
-    if (activeId && document.activeElement === treeRef.current) {
+    if (activeId && !pointerFocus.current && document.activeElement === treeRef.current) {
       document.getElementById(activeId)?.firstElementChild?.scrollIntoView({ block: "nearest" });
     }
   }, [activeId]);
-  useEffect(scrollActiveIntoView, [scrollActiveIntoView]);
+  // Newly loaded children can move an active sibling without changing its ID.
+  useEffect(scrollActiveIntoView, [scrollActiveIntoView, visibleNodes]);
   const focusItem = useCallback((path: string) => {
     const node = visibleNodes.find(({ entry }) => entry.path === path);
     if (node) setFocusTrail([...node.ancestors, path]);
@@ -331,6 +332,7 @@ export function FileTreePanel({
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.altKey || event.ctrlKey || event.metaKey || event.nativeEvent.isComposing) return;
     if (!activeNode) return;
+    pointerFocus.current = false;
     const index = visibleNodes.indexOf(activeNode);
     let target: VisibleNode | undefined;
     switch (event.key) {
@@ -366,6 +368,8 @@ export function FileTreePanel({
     event.preventDefault();
     event.stopPropagation();
     if (target) setFocusTrail([...target.ancestors, target.entry.path]);
+    // Boundary keys still reveal focus after the user wheel-scrolls away.
+    if (!target || target.entry.path === activePath) scrollActiveIntoView();
   };
 
   // The folder label, hidden-files toggle and Refresh that used to sit in
@@ -385,10 +389,9 @@ export function FileTreePanel({
           className="group/files px-[5px] pb-1 pt-[3px] outline-none"
           onKeyDown={handleKeyDown}
           onPointerDownCapture={() => { pointerFocus.current = true; }}
-          onFocus={() => {
-            if (!pointerFocus.current) scrollActiveIntoView();
-            pointerFocus.current = false;
-          }}
+          onPointerUpCapture={() => { pointerFocus.current = false; }}
+          onPointerCancelCapture={() => { pointerFocus.current = false; }}
+          onFocus={scrollActiveIntoView}
           onBlur={() => { pointerFocus.current = false; }}
         >
           {rootEntries.map((entry) => (

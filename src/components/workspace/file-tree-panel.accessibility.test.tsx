@@ -234,6 +234,54 @@ describe("FileTreePanel accessibility", () => {
     }
   });
 
+  it.each(["Home", "End"])("reveals the active row when %s keeps the same active descendant", async (key) => {
+    const user = userEvent.setup();
+    render(<FileTreePanel workspace={workspace} />);
+    await screen.findByRole("treeitem", { name: "src" });
+    await user.tab();
+    await user.keyboard(`{${key}}`);
+    const row = activeItem().firstElementChild;
+    // Wheel scrolling does not change aria-activedescendant. A boundary
+    // command must still reveal that same row when it is out of view.
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    try {
+      await user.keyboard(`{${key}}`);
+      expect(activeItem().firstElementChild).toBe(row);
+      expect(scroll).toHaveBeenCalledWith({ block: "nearest" });
+      expect(scroll.mock.contexts.every((node) => node === row)).toBe(true);
+    } finally {
+      scroll.mockRestore();
+    }
+  });
+
+  it("reveals an active sibling pushed down by late-loading children without taking outside focus", async () => {
+    const user = userEvent.setup();
+    let resolve!: (entries: FileEntry[]) => void;
+    const pending = new Promise<FileEntry[]>((res) => { resolve = res; });
+    listDirectory.mockImplementation((path: string) => path === "/p" ? Promise.resolve(roots) : pending);
+    render(<><FileTreePanel workspace={workspace} /><button>Outside</button></>);
+    await screen.findByRole("treeitem", { name: "src" });
+    await user.tab();
+    await user.keyboard("{ArrowRight}{End}");
+    const file = activeItem();
+    expect(file).toHaveAccessibleName("README.md");
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    try {
+      await act(async () => resolve(listings["/p/src"]));
+      expect(activeItem()).toBe(file);
+      expect(scroll).toHaveBeenCalledWith({ block: "nearest" });
+      expect(scroll.mock.contexts.every((node) => node === file.firstElementChild)).toBe(true);
+      await user.click(screen.getByRole("button", { name: "Outside" }));
+      scroll.mockClear();
+      act(() => setShowHidden(true));
+      await screen.findByRole("treeitem", { name: "src" });
+      expect(scroll).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Outside" })).toHaveFocus();
+    } finally {
+      scroll.mockRestore();
+    }
+  });
+
   it("keeps focus on refresh, falls back to a surviving ancestor, then handles removal and empty results", async () => {
     const user = userEvent.setup();
     const view = render(<FileTreePanel workspace={workspace} />);
