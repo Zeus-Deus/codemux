@@ -41,21 +41,23 @@ export function startEnvironmentRuntime(opts: EnvironmentRuntimeOptions): Enviro
   const now = opts.now ?? Date.now;
   const connections = new Map<string, { device: RegisteredDevice; connection: EnvironmentConnection }>();
   let stopped = false;
+  let refreshing: Promise<void> | null = null;
 
   const disconnect = (id: string) => {
     connections.get(id)?.connection.close();
     connections.delete(id);
   };
 
-  const refresh = async () => {
+  const refreshCatalog = async () => {
     let devices: RegisteredDevice[];
     try {
       devices = await opts.registry.listDevices();
     } catch (error) {
+      if (stopped) return;
       // Signed out or no account: there is no catalog to show.
       if (error instanceof DeviceRegistryError && error.kind === "unauthorized") {
         for (const id of [...connections.keys()]) disconnect(id);
-        if (!stopped) useEnvironmentsStore.getState().setCatalog([]);
+        useEnvironmentsStore.getState().setCatalog([]);
       }
       return;
     }
@@ -92,12 +94,23 @@ export function startEnvironmentRuntime(opts: EnvironmentRuntimeOptions): Enviro
     }
   };
 
+  const refresh = (): Promise<void> => {
+    if (stopped) return Promise.resolve();
+    // Share the pending request so overlapping refreshes cannot apply catalogs
+    // out of order and reconnect a machine that has since been removed.
+    refreshing ??= refreshCatalog().finally(() => {
+      refreshing = null;
+    });
+    return refreshing;
+  };
+
   void refresh();
   const timer = setInterval(() => void refresh(), CATALOG_REFRESH_MS);
 
   return {
     refresh,
     stop: () => {
+      if (stopped) return;
       stopped = true;
       clearInterval(timer);
       for (const id of [...connections.keys()]) disconnect(id);
