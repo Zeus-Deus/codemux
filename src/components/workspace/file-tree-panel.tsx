@@ -10,7 +10,7 @@
  * It has no header either. Refresh and show-hidden-files live in the
  * right-panel deck's single row of chrome (`right-panel/pane-actions.tsx`).
  */
-import { memo, useState, useEffect, useCallback } from "react";
+import { memo, useState, useEffect, useCallback, useRef } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ChevronRight, Folder } from "lucide-react";
 import { FileTypeIcon } from "@/components/icons/file-type-icon";
@@ -167,15 +167,35 @@ export function FileTreePanel({
   const [dirContents, setDirContents] = useState<Map<string, FileEntry[]>>(new Map());
   const [loadingDirs, setLoadingDirs] = useState<Set<string>>(new Set());
   const [rootEntries, setRootEntries] = useState<FileEntry[]>([]);
+  const rootCwd = useRef(cwd);
+  const loadGeneration = useRef(0);
+  const pendingDirs = useRef(new Set<string>());
   // Load root on mount, when showHidden changes, or when the pane bar's
   // Refresh bumps `refreshKey`.
   useEffect(() => {
-    if (!cwd) return;
+    const generation = ++loadGeneration.current;
+    pendingDirs.current.clear();
     setDirContents(new Map());
     setExpandedDirs(new Set());
-    listDirectory(cwd, showHidden)
-      .then(setRootEntries)
-      .catch(() => setRootEntries([]));
+    setLoadingDirs(new Set());
+    // Keep current-root rows during reload so Refresh/show-hidden cannot
+    // flash "No files". A different root must not show the old root's rows.
+    if (rootCwd.current !== cwd) {
+      rootCwd.current = cwd;
+      setRootEntries([]);
+    }
+    if (cwd) {
+      listDirectory(cwd, showHidden)
+        .then((entries) => {
+          if (loadGeneration.current === generation) setRootEntries(entries);
+        })
+        .catch(() => {
+          if (loadGeneration.current === generation) setRootEntries([]);
+        });
+    }
+    // Directory reads cannot be aborted. Ignore replies from a previous
+    // workspace, hidden-files setting, refresh, or unmounted tree.
+    return () => { loadGeneration.current++; };
   }, [cwd, showHidden, refreshKey]);
 
   const toggleDir = useCallback(
@@ -191,19 +211,28 @@ export function FileTreePanel({
       next.add(path);
       setExpandedDirs(next);
 
-      if (!dirContents.has(path)) {
+      if (!dirContents.has(path) && !pendingDirs.current.has(path)) {
+        const generation = loadGeneration.current;
+        pendingDirs.current.add(path);
         setLoadingDirs((prev) => new Set(prev).add(path));
         try {
           const entries = await listDirectory(path, showHidden);
-          setDirContents((prev) => new Map(prev).set(path, entries));
+          if (loadGeneration.current === generation) {
+            setDirContents((prev) => new Map(prev).set(path, entries));
+          }
         } catch {
-          setDirContents((prev) => new Map(prev).set(path, []));
+          if (loadGeneration.current === generation) {
+            setDirContents((prev) => new Map(prev).set(path, []));
+          }
         } finally {
-          setLoadingDirs((prev) => {
-            const n = new Set(prev);
-            n.delete(path);
-            return n;
-          });
+          if (loadGeneration.current === generation) {
+            pendingDirs.current.delete(path);
+            setLoadingDirs((prev) => {
+              const n = new Set(prev);
+              n.delete(path);
+              return n;
+            });
+          }
         }
       }
     },
