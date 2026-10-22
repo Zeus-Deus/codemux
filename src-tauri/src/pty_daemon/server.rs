@@ -597,20 +597,28 @@ async fn handle_request(
                     };
                 }
             };
-            let mut writer = session.writer.lock().await;
-            if let Err(error) = writer.write_all(&bytes) {
-                return ServerResponse::Error {
+            // Acquire in request order before entering the blocking pool.
+            // The owned guard keeps later input serialized even if this
+            // request is cancelled while the synchronous PTY write runs.
+            let mut writer = Arc::clone(&session.writer).lock_owned().await;
+            match tokio::task::spawn_blocking(move || {
+                writer
+                    .write_all(&bytes)
+                    .map_err(|error| format!("pty write: {error}"))?;
+                writer.flush().map_err(|error| format!("pty flush: {error}"))
+            })
+            .await
+            {
+                Ok(Ok(())) => ServerResponse::Written { request_id },
+                Ok(Err(message)) => ServerResponse::Error {
                     request_id,
-                    message: format!("pty write: {error}"),
-                };
-            }
-            if let Err(error) = writer.flush() {
-                return ServerResponse::Error {
+                    message,
+                },
+                Err(error) => ServerResponse::Error {
                     request_id,
-                    message: format!("pty flush: {error}"),
-                };
+                    message: format!("pty write task: {error}"),
+                },
             }
-            ServerResponse::Written { request_id }
         }
         ClientRequest::Resize {
             request_id,
@@ -1276,6 +1284,206 @@ mod tests {
             existing.rx.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn daemon_write_does_not_block_other_sessions() {
+        use super::*;
+
+        struct BlockingWriter {
+            entered: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+            block_flush: bool,
+        }
+
+        impl BlockingWriter {
+            fn block(&mut self) -> std::io::Result<()> {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                    self.release
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(std::io::Error::other)?;
+                }
+                Ok(())
+            }
+        }
+
+        impl std::io::Write for BlockingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if !self.block_flush {
+                    self.block()?;
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.block_flush {
+                    self.block()?;
+                }
+                Ok(())
+            }
+        }
+
+        // Exercise both synchronous operations on the remote daemon's
+        // current-thread runtime.
+        for block_flush in [false, true] {
+            let (state, session_a) = output_test_session(2).await;
+            let (_, session_b) = output_test_session(2).await;
+            state
+                .lock()
+                .await
+                .sessions
+                .insert("session-b".into(), session_b);
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, wait_for_release) = std::sync::mpsc::channel();
+            *session_a.writer.lock().await = Box::new(BlockingWriter {
+                entered: Some(entered),
+                release: wait_for_release,
+                block_flush,
+            });
+
+            // An OS thread releases A even when a regression freezes the
+            // entire runtime; a Tokio timeout alone cannot bound this test.
+            let (progress, completed) = std::sync::mpsc::channel();
+            let watchdog = std::thread::spawn(move || {
+                let independent = completed.recv_timeout(Duration::from_secs(3)).is_ok();
+                let _ = release.send(());
+                independent
+            });
+            let writing_state = state.clone();
+            let writing = tokio::spawn(async move {
+                handle_request(
+                    ClientRequest::Write {
+                        request_id: 1,
+                        session_id: session_a.session_id.clone(),
+                        data_b64: base64::engine::general_purpose::STANDARD.encode(b"blocked"),
+                    },
+                    writing_state,
+                    &mut HashMap::new(),
+                )
+                .await
+            });
+            let started = tokio::time::timeout(Duration::from_secs(5), started).await;
+            let response = handle_request(
+                ClientRequest::Write {
+                    request_id: 2,
+                    session_id: "session-b".into(),
+                    data_b64: base64::engine::general_purpose::STANDARD.encode(b"independent"),
+                },
+                state.clone(),
+                &mut HashMap::new(),
+            )
+            .await;
+            // Close must not wait for the writer either. PID zero is the
+            // fixture's sentinel; this never signals a real process.
+            let closed = handle_request(
+                ClientRequest::Close {
+                    request_id: 3,
+                    session_id: "output-test".into(),
+                },
+                state,
+                &mut HashMap::new(),
+            )
+            .await;
+            let _ = progress.send(());
+            let blocked_response = tokio::time::timeout(Duration::from_secs(5), writing).await;
+            let independent = watchdog.join().unwrap();
+            started.unwrap().unwrap();
+            assert!(matches!(closed, ServerResponse::Closed { request_id: 3 }));
+            assert!(matches!(
+                response,
+                ServerResponse::Written { request_id: 2 }
+            ));
+            assert!(matches!(
+                blocked_response.unwrap().unwrap(),
+                ServerResponse::Written { request_id: 1 }
+            ));
+            assert!(
+                independent,
+                "session B stalled behind session A (flush={block_flush})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_write_keeps_input_order_after_cancellation() {
+        use super::*;
+
+        struct RecordingWriter {
+            entered: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+            recorded: Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+
+        impl std::io::Write for RecordingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                    self.release
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(std::io::Error::other)?;
+                }
+                self.recorded.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.recorded.lock().unwrap().push(b'|');
+                Ok(())
+            }
+        }
+
+        let (state, session) = output_test_session(2).await;
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, wait_for_release) = std::sync::mpsc::channel();
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        *session.writer.lock().await = Box::new(RecordingWriter {
+            entered: Some(entered),
+            release: wait_for_release,
+            recorded: recorded.clone(),
+        });
+        let writing_state = state.clone();
+        let session_id = session.session_id.clone();
+        let writing = tokio::spawn(async move {
+            handle_request(
+                ClientRequest::Write {
+                    request_id: 1,
+                    session_id,
+                    data_b64: base64::engine::general_purpose::STANDARD.encode(b"first"),
+                },
+                writing_state,
+                &mut HashMap::new(),
+            )
+            .await
+        });
+        let started = tokio::time::timeout(Duration::from_secs(5), started).await;
+        writing.abort();
+        let cancelled = writing.await;
+        let retained_lock = session.writer.try_lock().is_err();
+        let next = tokio::spawn(async move {
+            handle_request(
+                ClientRequest::Write {
+                    request_id: 2,
+                    session_id: session.session_id.clone(),
+                    data_b64: base64::engine::general_purpose::STANDARD.encode(b"second"),
+                },
+                state,
+                &mut HashMap::new(),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        let _ = release.send(());
+        let response = tokio::time::timeout(Duration::from_secs(5), next).await;
+
+        started.unwrap().unwrap();
+        assert!(matches!(cancelled, Err(error) if error.is_cancelled()));
+        assert!(retained_lock, "cancellation released the in-flight writer");
+        assert!(matches!(
+            response.unwrap().unwrap(),
+            ServerResponse::Written { request_id: 2 }
+        ));
+        assert_eq!(*recorded.lock().unwrap(), b"first|second|");
     }
 
     #[tokio::test]
