@@ -451,17 +451,24 @@ fn enrich_with_adapter_captures(
 /// is left as-is.
 pub fn refresh_stale_scrollback_metadata(store: &crate::state::AppStateStore) {
     let snapshot = store.snapshot();
+    let wanted: HashSet<&str> = snapshot
+        .terminal_sessions
+        .iter()
+        .filter(|session| !session.adapter_captures.is_empty())
+        .map(|session| session.session_id.0.as_str())
+        .collect();
+    let mut metadata = find_scrollback_meta_for_sessions(&wanted);
     for session in &snapshot.terminal_sessions {
         let captures = &session.adapter_captures;
         if captures.is_empty() {
             continue;
         }
-        // Locate the existing metadata file for this session on disk.
-        let Some((ws_id, pane_id, mut meta)) =
-            find_scrollback_meta_for_session(&session.session_id.0)
+        let Some((ws_id, pane_id, stored_meta)) =
+            metadata.get_mut(&session.session_id.0)
         else {
             continue;
         };
+        let mut meta = stored_meta.clone();
         // Merge snapshot captures into the metadata (snapshot wins on conflict).
         let mut changed = false;
         for (key, value) in captures {
@@ -482,6 +489,9 @@ pub fn refresh_stale_scrollback_metadata(store: &crate::state::AppStateStore) {
                         "[codemux::scrollback] Failed to refresh metadata for {}/{}: {e}",
                         ws_id, pane_id
                     );
+                } else {
+                    // Repeated snapshot entries merge in order and can retry failed writes.
+                    *stored_meta = meta;
                 }
             }
             Err(e) => {
@@ -982,6 +992,85 @@ mod tests {
     }
 
     #[test]
+    fn refresh_updates_multiple_sessions_preserving_selection() {
+        let pid = std::process::id();
+        let ws_a = format!("test-ws-refresh-batch-a-{pid}");
+        let ws_b = format!("test-ws-refresh-batch-b-{pid}");
+        let sid_a = format!("sess-refresh-batch-a-{pid}");
+        let sid_b = format!("sess-refresh-batch-b-{pid}");
+        let sid_empty = format!("sess-refresh-batch-empty-{pid}");
+        let sid_missing = format!("sess-refresh-batch-missing-{pid}");
+        let sid_other = format!("sess-refresh-batch-other-{pid}");
+
+        let mut saved = Vec::new();
+        for (ws, pane, sid) in [
+            (&ws_a, "pane-a", &sid_a),
+            (&ws_b, "pane-duplicate", &sid_a),
+            (&ws_b, "pane-b", &sid_b),
+            (&ws_b, "pane-empty", &sid_empty),
+            (&ws_b, "pane-other", &sid_other),
+        ] {
+            let mut payload = test_payload_with_session(ws, pane, sid);
+            payload.adapter_captures = HashMap::from([
+                ("session_id".into(), "old".into()),
+                ("disk_only".into(), "preserved".into()),
+            ]);
+            save_scrollback(&payload).unwrap();
+            saved.push((payload, fs::read(meta_path(ws, pane)).unwrap()));
+        }
+
+        // Duplicate metadata must use the same first match as a single lookup,
+        // without depending on the filesystem's directory iteration order.
+        let (selected_ws, selected_pane, _) = find_scrollback_meta_for_session(&sid_a).unwrap();
+        let store = store_with_session(
+            &ws_a,
+            &sid_a,
+            HashMap::from([
+                ("session_id".into(), "first".into()),
+                ("first_only".into(), "retained".into()),
+            ]),
+        );
+        let mut snapshot = store.snapshot();
+        for (sid, captures) in [
+            (&sid_b, HashMap::from([("session_id".into(), "fresh-b".into())])),
+            (&sid_missing, HashMap::from([("session_id".into(), "missing".into())])),
+            (&sid_empty, HashMap::new()),
+            // Repeated snapshot entries still merge in snapshot order.
+            (&sid_a, HashMap::from([("session_id".into(), "last".into())])),
+        ] {
+            snapshot.terminal_sessions.extend(
+                store_with_session(&ws_b, sid, captures).snapshot().terminal_sessions,
+            );
+        }
+        store.replace_snapshot(snapshot);
+
+        refresh_stale_scrollback_metadata(&store);
+
+        for (payload, original_meta) in saved {
+            let restored = load_scrollback(&payload.workspace_id, &payload.pane_id).unwrap();
+            assert_eq!(restored.data, payload.data);
+            let mut expected_meta: serde_json::Value = serde_json::from_slice(&original_meta).unwrap();
+            let actual_meta = serde_json::to_value(&restored.meta).unwrap();
+            expected_meta["adapter_captures"] = actual_meta["adapter_captures"].clone();
+            assert_eq!(actual_meta, expected_meta);
+            assert_eq!(restored.meta.adapter_captures["disk_only"], "preserved");
+            if payload.workspace_id == selected_ws && payload.pane_id == selected_pane {
+                assert_eq!(restored.meta.adapter_captures["session_id"], "last");
+                assert_eq!(restored.meta.adapter_captures["first_only"], "retained");
+            } else if payload.session_id == sid_b {
+                assert_eq!(restored.meta.adapter_captures["session_id"], "fresh-b");
+            } else {
+                assert_eq!(
+                    fs::read(meta_path(&payload.workspace_id, &payload.pane_id)).unwrap(),
+                    original_meta,
+                );
+            }
+        }
+        remove_workspace_scrollback(&ws_a);
+        remove_workspace_scrollback(&ws_b);
+    }
+
+    #[test]
     fn refresh_keeps_existing_when_snapshot_has_no_captures() {
         let pid = std::process::id();
         let ws = format!("test-ws-rfrsh-keep-{pid}");
@@ -1032,6 +1121,9 @@ mod tests {
         let original_meta_json = std::fs::read_to_string(meta_path(&ws, "pane-1")).unwrap();
         let original: ScrollbackMeta = serde_json::from_str(&original_meta_json).unwrap();
         let original_saved_at = original.saved_at;
+        // A redundant refresh would replace this compact JSON with pretty JSON.
+        let original_meta_json = serde_json::to_string(&original).unwrap();
+        fs::write(meta_path(&ws, "pane-1"), &original_meta_json).unwrap();
 
         // Store with identical captures
         let mut captures = HashMap::new();
@@ -1044,6 +1136,7 @@ mod tests {
         let after_meta_json = std::fs::read_to_string(meta_path(&ws, "pane-1")).unwrap();
         let after: ScrollbackMeta = serde_json::from_str(&after_meta_json).unwrap();
         assert_eq!(after.saved_at, original_saved_at);
+        assert_eq!(after_meta_json, original_meta_json);
 
         remove_workspace_scrollback(&ws);
     }
