@@ -67,13 +67,16 @@ export const useEditorStore = create<EditorStore>()(
           },
         })),
 
-      setDirty: (tabId, dirty) =>
+      setDirty: (tabId, dirty) => {
+        // Persist writes even when an updater returns the unchanged state.
+        if (get().tabs[tabId]?.isDirty === dirty) return;
         set((s) => ({
           tabs: {
             ...s.tabs,
             [tabId]: { ...(s.tabs[tabId] ?? DEFAULT_TAB), isDirty: dirty },
           },
-        })),
+        }));
+      },
 
       requestReveal: (tabId, line, column, endColumn) =>
         set((s) => {
