@@ -3,7 +3,26 @@ import {
   isBinaryExtension,
   isImageExtension,
   isVideoExtension,
+  loadLanguage,
 } from "./editor-languages";
+
+describe("loadLanguage", () => {
+  it.each([
+    "ts", "tsx", "js", "mjs", "cjs", "jsx", "rs", "json", "jsonc",
+    "css", "scss", "less", "html", "htm", "svelte", "vue", "md", "mdx",
+    "py", "go", "yaml", "yml",
+  ])("loads the supported .%s extension case-insensitively", async (ext) => {
+    expect(await loadLanguage(`notes.${ext}`)).not.toBeNull();
+    expect(await loadLanguage(`notes.${ext.toUpperCase()}`)).not.toBeNull();
+  });
+
+  it.each(["notes.txt", "notes.constructor", "notes.CONSTRUCTOR", "notes.__proto__", "README", "notes.", ""])(
+    "returns null for an unsupported extension: %s",
+    async (filename) => {
+      expect(await loadLanguage(filename)).toBeNull();
+    },
+  );
+});
 
 describe("isImageExtension", () => {
   it("returns true for common raster image extensions", () => {

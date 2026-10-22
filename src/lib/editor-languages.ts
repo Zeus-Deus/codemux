@@ -29,11 +29,9 @@ const LANG_MAP: Record<string, LanguageLoader> = {
 
 export async function loadLanguage(filename: string): Promise<Extension | null> {
   const ext = filename.split(".").pop()?.toLowerCase();
-  if (!ext) return null;
-  const loader = LANG_MAP[ext];
-  if (!loader) return null;
+  if (!ext || !Object.prototype.hasOwnProperty.call(LANG_MAP, ext)) return null;
   try {
-    return await loader();
+    return await LANG_MAP[ext]();
   } catch {
     return null;
   }
