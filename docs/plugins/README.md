@@ -277,8 +277,9 @@ The app itself ships plugins in `src/plugins/<id>/`:
 
 `src/plugins/example` uses every area and is off by default. `src/plugins/thread-backdrop` (Official, on by default) is a complete real plugin: an engraving typed out in faint monospace behind a new thread, built on `LANDING_BACKDROP_AREA`, `ctx.host.theme`, `PLATES` and `onCalmChange`.
 
-[Computer use](./computer-use.md) is an optional Official plugin for a chosen
-application window. It starts off and requires a separate workspace opt-in.
+[Computer use](./computer-use.md) is an Official plugin enabled by default for a
+chosen application window. Control requires a separate workspace opt-in and a
+fresh window selection; saved plugin on/off choices take precedence.
 
 ## Decisions
 

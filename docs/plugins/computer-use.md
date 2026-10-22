@@ -1,9 +1,12 @@
 # Computer use
 
-Computer use is an optional Official plugin. It starts off. Use a structured
-tool, such as browser tools or app-specific plugin tools, whenever one is available.
+Computer use is an Official plugin enabled by default. A saved on/off choice in
+Settings → Extensions → Plugins takes precedence. Enabling the plugin makes its
+settings available; it does not start the driver or grant window control. Use a
+structured tool, such as browser tools or app-specific plugin tools, whenever one
+is available.
 
-Enable **Computer use** in Settings → Plugins, then open its settings. Check the
+Open **Computer use** in Settings under Plugin settings. Check the
 installation, allow access in the current local workspace, choose an application
 window, and select **Enable for this window**. The workspace choice is saved on
 this device. The selected window and active control are never restored after a
