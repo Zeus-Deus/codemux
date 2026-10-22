@@ -275,13 +275,12 @@ export function freezePlan(
 
   // Order among the rows that survived, before and after. A row whose
   // neighbours changed is one the poll would have moved.
-  const heldOrder = held.map((entry) => entry.key);
   const nextOrder = next.filter((entry) => seen.has(entry.key)).map((e) => e.key);
-  for (let i = 0; i < heldOrder.length; i++) {
-    if (heldOrder[i] !== nextOrder[i]) moved.add(heldOrder[i]);
-    const before = snapshot.find((e) => e.key === heldOrder[i]);
-    const after = nextByKey.get(heldOrder[i]);
-    if (before && after && before.groupId !== after.groupId) moved.add(heldOrder[i]);
+  for (let i = 0; i < held.length; i++) {
+    const before = held[i];
+    if (before.key !== nextOrder[i]) moved.add(before.key);
+    const after = nextByKey.get(before.key);
+    if (after && before.groupId !== after.groupId) moved.add(before.key);
   }
 
   return { entries: [...held, ...arrived], moved };

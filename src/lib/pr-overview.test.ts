@@ -6,6 +6,7 @@ import {
   badgeKeys,
   badgeLabel,
   freezePlan,
+  GROUP_ORDER,
   groupForRow,
   groupRows,
   matchesPrSearch,
@@ -202,7 +203,13 @@ describe("rule 03 — the ordering freeze", () => {
     const after = plan("c", "a", "b");
     const frozen = freezePlan(after, before);
     expect(frozen.entries.map((e) => e.key)).toEqual(["a", "b", "c"]);
-    expect(frozen.moved.size).toBeGreaterThan(0);
+    expect(frozen.moved).toEqual(new Set(["a", "b", "c"]));
+  });
+
+  it("does not mark the middle row of a reversal as moved", () => {
+    const frozen = freezePlan(plan("c", "b", "a"), plan("a", "b", "c"));
+    expect(frozen.entries.map((entry) => entry.key)).toEqual(["a", "b", "c"]);
+    expect(frozen.moved).toEqual(new Set(["a", "c"]));
   });
 
   it("marks a row that changed group without moving it", () => {
@@ -226,9 +233,106 @@ describe("rule 03 — the ordering freeze", () => {
     expect(frozen.entries.map((e) => e.key)).toEqual(["a"]);
   });
 
+  it("compares surviving rows after deletions while holding their old groups", () => {
+    const before: PlanEntry[] = [
+      { key: "gone", groupId: "review" },
+      { key: "a", groupId: "watching" },
+      { key: "b", groupId: "yours" },
+    ];
+    const after: PlanEntry[] = [
+      { key: "new", groupId: "review" },
+      { key: "a", groupId: "review" },
+      { key: "b", groupId: "yours" },
+    ];
+    expect(freezePlan(after, before)).toEqual({
+      entries: [before[1], before[2], after[0]],
+      moved: new Set(["new", "a"]),
+    });
+  });
+
+  it.each([64, 128])("reads snapshot keys linearly for %i held rows", (size) => {
+    const next = plan(...Array.from({ length: size }, (_, i) => String(i)));
+    let keyReads = 0;
+    const snapshot = next.map(({ key, groupId }) => ({
+      get key() {
+        keyReads++;
+        return key;
+      },
+      groupId,
+    }));
+
+    const frozen = freezePlan(next, snapshot);
+
+    expect(frozen.moved.size).toBe(0);
+    // A linear work budget catches rescanning the snapshot per held row
+    // without depending on machine speed or a wall-clock threshold.
+    expect(keyReads).toBeLessThanOrEqual(8 * size);
+  });
+
+  it("matches a declarative reference across 1,000 generated poll plans", () => {
+    let seed = 0x6f726465;
+    const randomInt = (limit: number) => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return Math.floor((seed / 0x1_0000_0000) * limit);
+    };
+    const shuffled = (entries: PlanEntry[]) => {
+      for (let i = entries.length - 1; i > 0; i--) {
+        const j = randomInt(i + 1);
+        [entries[i], entries[j]] = [entries[j], entries[i]];
+      }
+      return entries;
+    };
+    const generatedEntry = (number: number): PlanEntry => ({
+      key: rowKey({ projectRoot: number % 2 ? ROOT : OTHER_ROOT, number: Math.floor(number / 2) }),
+      groupId: GROUP_ORDER[randomInt(GROUP_ORDER.length)],
+    });
+
+    for (let sample = 0; sample < 1_000; sample++) {
+      const count = randomInt(25);
+      const snapshot = sample % 11 === 0 ? null : shuffled(
+        Array.from({ length: count }, (_, i) => generatedEntry(i)),
+      );
+      const next = shuffled([
+        ...Array.from({ length: count }, (_, i) => generatedEntry(i))
+          .filter(() => randomInt(3) !== 0),
+        ...Array.from({ length: randomInt(8) }, (_, i) => generatedEntry(count + i)),
+      ]);
+      // The reference uses searches to express the contract independently
+      // of freezePlan's lookup map and held-entry loop.
+      const survivors = snapshot?.filter((before) => next.some((after) => after.key === before.key)) ?? [];
+      const polledSurvivors = next.filter((after) => survivors.some((before) => before.key === after.key));
+      const arrivals = snapshot === null ? next : next.filter((after) => !snapshot.some((before) => before.key === after.key));
+      const changed = survivors.filter((before, index) => {
+        const nextIndex = polledSurvivors.findIndex((after) => after.key === before.key);
+        return nextIndex !== index || polledSurvivors[nextIndex].groupId !== before.groupId;
+      });
+      const expectedEntries = snapshot === null ? next : [...survivors, ...arrivals];
+      const expectedMoved = snapshot === null ? [] : [...arrivals, ...changed].map((entry) => entry.key);
+
+      next.forEach(Object.freeze);
+      snapshot?.forEach(Object.freeze);
+      Object.freeze(next);
+      Object.freeze(snapshot);
+
+      const frozen = freezePlan(next, snapshot);
+      expect(frozen.entries, `entries in sample ${sample}`).toEqual(expectedEntries);
+      expect([...frozen.moved], `moved in sample ${sample}`).toEqual(expectedMoved);
+      frozen.entries.forEach((entry, index) => expect(entry).toBe(expectedEntries[index]));
+    }
+  });
+
   it("applies the new order with no snapshot to hold", () => {
     const after = plan("c", "a");
     expect(freezePlan(after, null)).toEqual({ entries: after, moved: new Set() });
+  });
+
+  it("marks every row as an arrival with an empty snapshot", () => {
+    const after = plan("c", "a");
+    expect(freezePlan(after, [])).toEqual({ entries: after, moved: new Set(["c", "a"]) });
+  });
+
+  it("drops all rows without marking moves when the next plan is empty", () => {
+    expect(freezePlan([], plan("a", "b"))).toEqual({ entries: [], moved: new Set() });
   });
 
   it("round-trips through planOf/applyPlan", () => {
