@@ -647,7 +647,10 @@ fn collect_summary(
 /// behavior. The renderer passes `false` on the slow poll it runs while the
 /// monitor popover is closed, where only the host share and the severity dot
 /// are on screen and a per-process walk every 15 s is pure waste.
-#[tauri::command]
+///
+/// Dispatch collection off the main thread. Keep the body synchronous so its
+/// monitor guards are released before the command wrapper awaits the response.
+#[tauri::command(async)]
 pub fn get_resource_metrics(
     detail: Option<bool>,
     monitor: State<'_, ResourceMonitorState>,
@@ -681,6 +684,95 @@ pub fn get_resource_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_ipc_dispatch_returns_while_collection_is_blocked() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use tauri::ipc::{CallbackFn, InvokeResponse, InvokeResponseBody};
+        use tauri::test::{mock_builder, mock_context, noop_assets, INVOKE_KEY};
+        use tauri::webview::InvokeRequest;
+        use tauri::Manager;
+
+        let app = mock_builder()
+            .manage(ResourceMonitorState::default())
+            .manage(PtyState::default())
+            .manage(AppStateStore::default())
+            .invoke_handler(tauri::generate_handler![get_resource_metrics])
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        let view = tauri::WebviewWindowBuilder::new(&app, "metrics", Default::default())
+            .build()
+            .unwrap();
+        let request = InvokeRequest {
+            cmd: "get_resource_metrics".into(),
+            callback: CallbackFn(0),
+            error: CallbackFn(1),
+            url: view.url().unwrap(),
+            // Omitted detail must still collect a detailed snapshot.
+            body: serde_json::json!({}).into(),
+            headers: Default::default(),
+            invoke_key: INVOKE_KEY.into(),
+        };
+        let monitor = app.state::<ResourceMonitorState>();
+        let system = monitor.system.lock().unwrap();
+        let (dispatched_tx, dispatched_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        let dispatcher_view = view.clone();
+
+        // Exercise the production command's generated IPC wrapper. Holding the
+        // collector lock makes inline dispatch block without relying on scan speed.
+        let dispatcher = std::thread::spawn(move || {
+            dispatcher_view.as_ref().clone().on_message(
+                request,
+                Box::new(move |_, _, response, _, _| {
+                    response_tx.send(response).unwrap();
+                }),
+            );
+            dispatched_tx.send(()).unwrap();
+        });
+        let dispatched = dispatched_rx.recv_timeout(Duration::from_secs(5));
+        let pending = response_rx.try_recv();
+        // Always unblock and join before asserting, including on the sync path.
+        drop(system);
+        dispatcher.join().unwrap();
+        assert!(
+            dispatched.is_ok(),
+            "metrics IPC blocked its dispatcher while waiting for the collector lock"
+        );
+        assert!(matches!(pending, Err(mpsc::TryRecvError::Empty)));
+
+        let response = response_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let InvokeResponse::Ok(InvokeResponseBody::Json(body)) = response else {
+            panic!("metrics IPC did not return a JSON snapshot");
+        };
+        let snapshot: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(snapshot["collected_at"].as_u64().unwrap() > 0);
+        assert!(snapshot["host"]["total_memory"].as_u64().unwrap() > 0);
+        assert!(snapshot["app"]["main"]["memory"].is_u64());
+        assert_eq!(snapshot["workspaces"], serde_json::json!([]));
+
+        let summary = tauri::test::get_ipc_response(
+            &view,
+            InvokeRequest {
+                cmd: "get_resource_metrics".into(),
+                callback: CallbackFn(0),
+                error: CallbackFn(1),
+                url: view.url().unwrap(),
+                body: serde_json::json!({ "detail": false }).into(),
+                headers: Default::default(),
+                invoke_key: INVOKE_KEY.into(),
+            },
+        )
+        .unwrap();
+        let InvokeResponseBody::Json(body) = summary else {
+            panic!("metrics summary IPC did not return JSON");
+        };
+        let summary: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(summary["collected_at"], snapshot["collected_at"]);
+        assert_eq!(summary["app"], snapshot["app"]);
+        assert_eq!(summary["total_memory"], snapshot["total_memory"]);
+    }
 
     fn pid(n: u32) -> Pid {
         Pid::from_u32(n)
