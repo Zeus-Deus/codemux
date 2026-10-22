@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { FileEntry, WorkspaceSnapshot } from "@/tauri/types";
 import { DEFAULT_SETTINGS, useSyncedSettingsStore } from "@/stores/synced-settings-store";
@@ -225,6 +225,9 @@ describe("FileTreePanel accessibility", () => {
       expect(screen.getByRole("tree")).toHaveFocus();
       expect(scroll).not.toHaveBeenCalled();
       await user.pointer({ keys: "[/MouseLeft]" });
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      });
       expect(activeItem()).toBe(src);
       expect(src).toHaveAttribute("aria-expanded", "true");
       expect(scroll).toHaveBeenCalledWith({ block: "nearest" });
@@ -277,6 +280,35 @@ describe("FileTreePanel accessibility", () => {
       await screen.findByRole("treeitem", { name: "src" });
       expect(scroll).not.toHaveBeenCalled();
       expect(screen.getByRole("button", { name: "Outside" })).toHaveFocus();
+    } finally {
+      scroll.mockRestore();
+    }
+  });
+
+  it.each(["cancel", "padding", "outside"])("replays a deferred reveal after pointer %s without row activation", async (ending) => {
+    const user = userEvent.setup();
+    let resolve!: (entries: FileEntry[]) => void;
+    const pending = new Promise<FileEntry[]>((res) => { resolve = res; });
+    listDirectory.mockImplementation((path: string) => path === "/p" ? Promise.resolve(roots) : pending);
+    const onOpenFile = vi.fn();
+    render(<FileTreePanel workspace={workspace} onOpenFile={onOpenFile} />);
+    const src = await screen.findByRole("treeitem", { name: "src" });
+    await user.tab();
+    await user.keyboard("{ArrowRight}{End}");
+    const file = activeItem();
+    const tree = screen.getByRole("tree");
+    await user.pointer({ target: within(src).getByText("src"), keys: "[MouseLeft>]" });
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    try {
+      await act(async () => resolve(listings["/p/src"]));
+      expect(scroll).not.toHaveBeenCalled();
+      if (ending === "cancel") fireEvent.pointerCancel(tree);
+      else await user.pointer({ target: ending === "padding" ? tree : document.body, keys: "[/MouseLeft]" });
+      await waitFor(() => expect(scroll).toHaveBeenCalledWith({ block: "nearest" }));
+      expect(scroll.mock.contexts.every((node) => node === file.firstElementChild)).toBe(true);
+      expect(activeItem()).toBe(file);
+      expect(tree).toHaveFocus();
+      expect(onOpenFile).not.toHaveBeenCalled();
     } finally {
       scroll.mockRestore();
     }

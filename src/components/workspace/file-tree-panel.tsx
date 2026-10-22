@@ -201,6 +201,7 @@ export function FileTreePanel({
   const treeId = useId();
   const treeRef = useRef<HTMLDivElement>(null);
   const pointerFocus = useRef(false);
+  const revealFrame = useRef<number | null>(null);
   const [focusTrail, setFocusTrail] = useState<string[]>([]);
   const visibleNodes = useMemo(() => {
     const nodes: VisibleNode[] = [];
@@ -234,12 +235,38 @@ export function FileTreePanel({
     }
   }, [activeNode, activePath, focusTrail]);
   const scrollActiveIntoView = useCallback(() => {
-    if (activeId && !pointerFocus.current && document.activeElement === treeRef.current) {
-      document.getElementById(activeId)?.firstElementChild?.scrollIntoView({ block: "nearest" });
+    const tree = treeRef.current;
+    const id = tree?.getAttribute("aria-activedescendant");
+    if (id && !pointerFocus.current && document.activeElement === tree) {
+      document.getElementById(id)?.firstElementChild?.scrollIntoView({ block: "nearest" });
     }
-  }, [activeId]);
+  }, []);
   // Newly loaded children can move an active sibling without changing its ID.
-  useEffect(scrollActiveIntoView, [scrollActiveIntoView, visibleNodes]);
+  useEffect(scrollActiveIntoView, [scrollActiveIntoView, activeId, visibleNodes]);
+  const scheduleReveal = useCallback(() => {
+    if (revealFrame.current !== null) cancelAnimationFrame(revealFrame.current);
+    // Wait for click activation to commit its new active descendant before
+    // revealing it. Cancellation/padding releases still replay skipped work.
+    revealFrame.current = requestAnimationFrame(() => {
+      revealFrame.current = null;
+      scrollActiveIntoView();
+    });
+  }, [scrollActiveIntoView]);
+  useEffect(() => {
+    const finishPointer = () => {
+      if (!pointerFocus.current) return;
+      pointerFocus.current = false;
+      scheduleReveal();
+    };
+    // A press can finish outside the tree without moving DOM focus.
+    document.addEventListener("pointerup", finishPointer, true);
+    document.addEventListener("pointercancel", finishPointer, true);
+    return () => {
+      document.removeEventListener("pointerup", finishPointer, true);
+      document.removeEventListener("pointercancel", finishPointer, true);
+      if (revealFrame.current !== null) cancelAnimationFrame(revealFrame.current);
+    };
+  }, [scheduleReveal]);
   const focusItem = useCallback((path: string) => {
     const node = visibleNodes.find(({ entry }) => entry.path === path);
     if (node) setFocusTrail([...node.ancestors, path]);
@@ -248,7 +275,8 @@ export function FileTreePanel({
     pointerFocus.current = true;
     treeRef.current?.focus({ preventScroll: true });
     pointerFocus.current = false;
-  }, [visibleNodes]);
+    scheduleReveal();
+  }, [visibleNodes, scheduleReveal]);
   // Load root on mount, when showHidden changes, or when the pane bar's
   // Refresh bumps `refreshKey`.
   useEffect(() => {
@@ -332,7 +360,6 @@ export function FileTreePanel({
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.altKey || event.ctrlKey || event.metaKey || event.nativeEvent.isComposing) return;
     if (!activeNode) return;
-    pointerFocus.current = false;
     const index = visibleNodes.indexOf(activeNode);
     let target: VisibleNode | undefined;
     switch (event.key) {
@@ -365,6 +392,7 @@ export function FileTreePanel({
         break;
       default: return;
     }
+    pointerFocus.current = false;
     event.preventDefault();
     event.stopPropagation();
     if (target) setFocusTrail([...target.ancestors, target.entry.path]);
@@ -389,8 +417,6 @@ export function FileTreePanel({
           className="group/files px-[5px] pb-1 pt-[3px] outline-none"
           onKeyDown={handleKeyDown}
           onPointerDownCapture={() => { pointerFocus.current = true; }}
-          onPointerUpCapture={() => { pointerFocus.current = false; }}
-          onPointerCancelCapture={() => { pointerFocus.current = false; }}
           onFocus={scrollActiveIntoView}
           onBlur={() => { pointerFocus.current = false; }}
         >
