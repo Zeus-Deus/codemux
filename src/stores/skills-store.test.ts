@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, renderHook } from "@testing-library/react";
 
 import type { Skill } from "@/tauri/commands";
 
@@ -269,6 +270,8 @@ describe("skills-store · disable toggle (Stage 5)", () => {
     listSkillsMock.mockReset();
   });
 
+  afterEach(cleanup);
+
   it("disabledIds defaults to an empty array", () => {
     expect(useSkillsStore.getState().disabledIds).toEqual([]);
   });
@@ -320,6 +323,59 @@ describe("skills-store · disable toggle (Stage 5)", () => {
     });
     const active = selectActiveSkills(useSkillsStore.getState());
     expect(active.map((s) => s.name)).toEqual(["b"]);
+  });
+
+  it("keeps each project's filtered snapshot stable while another project is read", async () => {
+    listSkillsMock
+      .mockResolvedValueOnce([makeSkill("user")])
+      .mockResolvedValueOnce([makeSkill("user"), makeSkill("project")]);
+    await useSkillsStore.getState().loadSkills(null);
+    await useSkillsStore.getState().loadSkills("/project");
+    useSkillsStore.getState().setSkillsDisabled(["id-user"], true);
+    const state = useSkillsStore.getState();
+    const home = selectActiveSkills(state, null);
+    const project = selectActiveSkills(state, "/project");
+
+    expect(selectActiveSkills(state, null)).toBe(home);
+    expect(selectActiveSkills(state, "/project")).toBe(project);
+    expect(home).toEqual([]);
+    expect(project.map((skill) => skill.name)).toEqual(["project"]);
+
+    useSkillsStore.getState().setSkillsDisabled(["id-project"], true);
+    expect(selectActiveSkills(useSkillsStore.getState(), "/project")).toEqual([]);
+    listSkillsMock.mockResolvedValueOnce([makeSkill("replacement")]);
+    await useSkillsStore.getState().loadSkills("/project", true);
+    expect(
+      selectActiveSkills(useSkillsStore.getState(), "/project").map((skill) => skill.name),
+    ).toEqual(["replacement"]);
+    expect(selectActiveSkills(state, null)).toBe(home);
+    expect(selectActiveSkills(state, "/project")).toBe(project);
+  });
+
+  it("supports a mounted selector with disabled skills and bulk preference updates", () => {
+    useSkillsStore.setState({
+      skills: [makeSkill("a"), makeSkill("b"), makeSkill("c")],
+      disabledIds: ["id-a"],
+    });
+    const renders = vi.fn();
+    const { result } = renderHook(() => {
+      renders();
+      return useSkillsStore(selectActiveSkills);
+    });
+    expect(result.current.map((skill) => skill.name)).toEqual(["b", "c"]);
+    const previous = result.current;
+    const renderCount = renders.mock.calls.length;
+
+    act(() => useSkillsStore.setState({ loading: true }));
+    expect(result.current).toBe(previous);
+    expect(renders).toHaveBeenCalledTimes(renderCount);
+
+    act(() => useSkillsStore.getState().setSkillsDisabled(["id-b", "id-c"], true));
+    expect(result.current).toEqual([]);
+    act(() => useSkillsStore.getState().setSkillsDisabled(["id-a", "id-b"], false));
+    expect(result.current.map((skill) => skill.name)).toEqual(["a", "b"]);
+    act(() => useSkillsStore.setState({ skills: [makeSkill("c"), makeSkill("d")] }));
+    expect(result.current.map((skill) => skill.name)).toEqual(["d"]);
   });
 
   it("selectActiveSkills uses worktree-stable preference ids", () => {

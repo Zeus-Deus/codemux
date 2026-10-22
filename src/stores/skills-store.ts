@@ -283,6 +283,10 @@ export const useSkillsStore = create<SkillsState>()(
 );
 
 const EMPTY_SKILLS: Skill[] = [];
+// Composers from several projects can read this selector in the same render.
+// Both inputs are replaced rather than mutated; weak keys keep each snapshot
+// stable without retaining superseded inventories or preferences.
+const activeSkillsCache = new WeakMap<Skill[], WeakMap<string[], Skill[]>>();
 
 /**
  * Selector returning skills the user has NOT disabled. Used by every
@@ -303,7 +307,16 @@ export const selectActiveSkills = (
     ? s.skills
     : s.inventoryCache[contextKey]?.skills ?? EMPTY_SKILLS;
   if (s.disabledIds.length === 0) return skills;
-  return skills.filter(
-    (skill) => !s.disabledIds.includes(skill.preferenceId ?? skill.id),
-  );
+  let byDisabledIds = activeSkillsCache.get(skills);
+  if (!byDisabledIds) {
+    byDisabledIds = new WeakMap();
+    activeSkillsCache.set(skills, byDisabledIds);
+  }
+  let active = byDisabledIds.get(s.disabledIds);
+  if (!active) {
+    const disabled = new Set(s.disabledIds);
+    active = skills.filter((skill) => !disabled.has(skill.preferenceId ?? skill.id));
+    byDisabledIds.set(s.disabledIds, active);
+  }
+  return active;
 };
