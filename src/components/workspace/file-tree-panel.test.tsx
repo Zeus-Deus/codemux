@@ -1,7 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import type { FileEntry, WorkspaceSnapshot } from "@/tauri/types";
@@ -47,6 +47,13 @@ function setShowHidden(showHidden: boolean) {
   useSyncedSettingsStore.setState({
     settings: { ...DEFAULT_SETTINGS, file_tree: { show_hidden_files: showHidden } },
   });
+}
+
+function findSourceFolder() {
+  return waitFor(() =>
+    screen.queryByRole("treeitem", { name: "src" })
+    ?? screen.getByRole("button", { name: /^src(?: Loading)?$/ }),
+  );
 }
 
 beforeEach(() => {
@@ -249,7 +256,7 @@ describe("FileTreePanel", () => {
     listDirectory.mockResolvedValueOnce([entry({ name: "src", is_dir: true })])
       .mockReturnValue(children.promise);
     render(<FileTreePanel workspace={workspace()} />);
-    const folder = await screen.findByRole("button", { name: /^src/ });
+    const folder = await findSourceFolder();
 
     await userEvent.click(folder);
     await userEvent.click(folder);
@@ -270,9 +277,9 @@ describe("FileTreePanel", () => {
     listDirectory.mockResolvedValueOnce(root).mockReturnValueOnce(previous.promise)
       .mockResolvedValueOnce(root).mockReturnValueOnce(current.promise);
     const view = render(<FileTreePanel workspace={workspace()} />);
-    await userEvent.click(await screen.findByRole("button", { name: /^src/ }));
+    await userEvent.click(await findSourceFolder());
     view.rerender(<FileTreePanel workspace={workspace()} refreshKey={1} />);
-    const folder = await screen.findByRole("button", { name: /^src/ });
+    const folder = await findSourceFolder();
     await userEvent.click(folder);
 
     await act(async () => {
