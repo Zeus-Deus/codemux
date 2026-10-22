@@ -870,8 +870,9 @@ impl JsonRpcChild {
     }
 
     /// Opt-in authority check under the acquired writer, before the first byte.
-    /// Once admitted, retain the ordinary owned write/response future: cancellation
-    /// must not abandon a partially written frame or its ACK settlement.
+    /// Writer acquisition and admission precede the shared write/response deadline.
+    /// Callers should retain admitted requests through authority revocation; dropping
+    /// a request or expiring its deadline retires any partially written stream.
     pub(crate) async fn request_with_sequence_guarded<G, F>(
         &self, method: &str, params: Value, timeout: Duration, admit: G,
     ) -> Result<(Value, u64), RpcChildError>
@@ -900,15 +901,9 @@ impl JsonRpcChild {
             "method": method,
             "params": params,
         });
-        if let Err(err) = self.write_line_guarded(&request, admit).await {
-            // Roll back the pending entry so it does not leak.
-            if let Ok(mut map) = self.pending.lock() {
-                map.remove(id);
-            }
-            return Err(err);
-        }
+        let started = self.write_line_guarded_timed(&request, admit, Some(timeout)).await?;
 
-        match tokio::time::timeout(timeout, rx).await {
+        match tokio::time::timeout_at(started + timeout, rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(err))) => Err(err),
             Ok(Err(_canceled)) => Err(self.exit_or_shutdown()),
@@ -1170,6 +1165,15 @@ impl JsonRpcChild {
     }
     async fn write_line_guarded<G, F>(&self, value: &Value, admit: G) -> Result<(), RpcChildError>
     where G: FnOnce() -> F, F: std::future::Future<Output = bool> {
+        self.write_line_guarded_timed(value, admit, None).await.map(|_| ())
+    }
+
+    /// Return the transport start so requests retain one budget through the ACK.
+    /// Notifications keep their existing unbounded write policy.
+    async fn write_line_guarded_timed<G, F>(
+        &self, value: &Value, admit: G, timeout: Option<Duration>,
+    ) -> Result<tokio::time::Instant, RpcChildError>
+    where G: FnOnce() -> F, F: std::future::Future<Output = bool> {
         #[cfg(test)]
         let schedule = self.callback_write_gate.lock().unwrap().clone();
         #[cfg(test)]
@@ -1199,27 +1203,54 @@ impl JsonRpcChild {
             }
         }
         let writer = guard.as_mut().ok_or(RpcChildError::AlreadyShutdown)?;
-        // Only the test-only partial-write gate trims the encoded frame.
-        #[cfg_attr(not(test), allow(unused_mut))]
-        let mut line = encode_frame(value, self.managed_group.is_some())?;
+        let line = encode_frame(value, self.managed_group.is_some())?;
         if !admit().await { return Err(RpcChildError::CancelledBeforeWrite); }
         // A guarded writer can quarantine a partial frame while this caller
         // waits for stdin. Never append another frame to that broken stream.
         if !self.alive.load(Ordering::SeqCst) { return Err(self.exit_or_shutdown()); }
-        #[cfg(test)]
-        if let Some(gate) = &prompt_schedule {
-            if gate.partial {
-                // A real prefix of the owned frame reaches ChildStdin. Park
-                // only scheduling, retaining the same writer and request.
-                writer.write_all(&line[..1]).await.map_err(RpcChildError::IoError)?;
-                gate.partial_written.notify_one();
-                gate.finish_frame.notified().await;
-                line.drain(..1);
+        let started = tokio::time::Instant::now();
+        let write = async {
+            // Count successful writes: cancellation before any byte is harmless,
+            // but a real prefix must quarantine before the writer is released.
+            let mut frame = PartialFrame {
+                started: false,
+                complete: false,
+                alive: self.alive.clone(),
+                shutdown_tx: self.shutdown_tx.clone(),
+                shutdown_started: self.shutdown_started.clone(),
+            };
+            let mut offset = 0;
+            while offset < line.len() {
+                let bytes = &line[offset..];
+                #[cfg(test)]
+                let bytes = if offset == 0 && prompt_schedule.as_ref().is_some_and(|gate| gate.partial) {
+                    &bytes[..1]
+                } else { bytes };
+                let n = writer.write(bytes).await.map_err(RpcChildError::IoError)?;
+                if n == 0 {
+                    return Err(RpcChildError::IoError(std::io::ErrorKind::WriteZero.into()));
+                }
+                frame.started = true;
+                offset += n;
+                #[cfg(test)]
+                if let Some(gate) = &prompt_schedule {
+                    if gate.partial && offset == 1 {
+                        gate.partial_written.notify_one();
+                        gate.finish_frame.notified().await;
+                    }
+                }
             }
-        }
-        writer.write_all(&line).await.map_err(RpcChildError::IoError)?;
-        writer.flush().await.map_err(RpcChildError::IoError)?;
-        Ok(())
+            frame.complete = true;
+            writer.flush().await.map_err(RpcChildError::IoError)
+        };
+        match timeout {
+            Some(timeout) => tokio::time::timeout_at(started + timeout, write).await.map_err(|_| RpcChildError::Timeout {
+                method: value["method"].as_str().unwrap_or("write").to_owned(),
+                elapsed: timeout,
+            })?,
+            None => write.await,
+        }?;
+        Ok(started)
     }
 
     async fn write_line_dispatch_guarded(
@@ -1434,6 +1465,7 @@ if sys.argv[1]=='pause':
     while not os.path.exists('read') and time.monotonic()<deadline: time.sleep(.005)
 for line in sys.stdin:
     q=json.loads(line)
+    time.sleep(q['params'].get('delay',0))
     print(json.dumps({'jsonrpc':'2.0','id':q['id'],'result':{'bytes':len(q['params'].get('text',''))}}),flush=True)
 "#.into(), if pause_read { "pause" } else { "read" }.into()],
             cwd: Some(dir.path().to_owned()),
@@ -1498,6 +1530,128 @@ for line in sys.stdin:
         assert!(child.pending.lock().unwrap().inner.is_empty());
         child.shutdown().await.unwrap();
         reaped(pid);
+    }
+
+    async fn stalled_request_times_out(strict: bool) {
+        let (child, _dir, pid) = peer(strict, true).await;
+        let timeout = Duration::from_millis(200);
+        let result = tokio::time::timeout(Duration::from_secs(2), child.request_with_timeout(
+            "stalled", json!({"text": "x".repeat(4 * 1024 * 1024)}), timeout,
+        )).await;
+        let retired = !child.is_alive();
+        let pending_empty = child.pending.lock().unwrap().inner.is_empty();
+        let writer_released = child.writer.try_lock().is_ok();
+        // Clean up even on the unfixed implementation's outer timeout.
+        child.shutdown().await.unwrap();
+        reaped(pid);
+        assert!(matches!(result, Ok(Err(RpcChildError::Timeout { method, elapsed }))
+            if method == "stalled" && elapsed == timeout), "stalled stdin outlived the request deadline");
+        assert!(retired, "timing out a partial frame must retire the stream");
+        assert!(pending_empty, "timed-out request retained its correlation ID");
+        assert!(writer_released, "timed-out write retained the writer lock");
+    }
+
+    #[tokio::test]
+    async fn rpc_deadline_bounds_stalled_tolerant_stdin() { stalled_request_times_out(false).await; }
+
+    #[tokio::test]
+    async fn rpc_deadline_bounds_stalled_strict_stdin() { stalled_request_times_out(true).await; }
+
+    async fn admission_wait_preserves_budget(allow: bool) {
+        let (child, _dir, pid) = peer(true, false).await;
+        let writer = child.writer.lock().await;
+        let checked = AtomicBool::new(false);
+        let release = tokio::sync::Notify::new();
+        let request = child.request_with_sequence_guarded(
+            "queued", json!({"text": "ok"}), Duration::from_millis(100), || async {
+                checked.store(true, Ordering::SeqCst);
+                release.notified().await;
+                allow
+            },
+        );
+        tokio::pin!(request);
+        assert!(tokio::time::timeout(Duration::from_millis(200), request.as_mut()).await.is_err());
+        assert!(!checked.load(Ordering::SeqCst), "authority must be checked under the acquired writer");
+        drop(writer);
+        assert!(tokio::time::timeout(Duration::from_millis(200), request.as_mut()).await.is_err(), "admission waits do not consume the transport budget");
+        assert!(checked.load(Ordering::SeqCst));
+        assert!(child.is_alive(), "no request bytes crossed stdin");
+        release.notify_one();
+        let result = request.await;
+        assert!(child.pending.lock().unwrap().inner.is_empty());
+        let next = child.request("next", json!({"text": "ok"})).await;
+        child.shutdown().await.unwrap();
+        reaped(pid);
+        if allow {
+            assert_eq!(result.unwrap().0["bytes"], json!(2));
+        } else {
+            assert!(matches!(result, Err(RpcChildError::CancelledBeforeWrite)));
+        }
+        assert_eq!(next.unwrap()["bytes"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn rpc_deadline_excludes_waits_before_acceptance() { admission_wait_preserves_budget(true).await; }
+
+    #[tokio::test]
+    async fn rpc_deadline_excludes_waits_before_denial() { admission_wait_preserves_budget(false).await; }
+
+    #[tokio::test]
+    async fn rpc_deadline_is_shared_by_write_and_response() {
+        let (child, dir, pid) = peer(true, true).await;
+        let gate = Arc::new(PromptWriteGate { partial: true, ..Default::default() });
+        *child.prompt_write_gate.lock().unwrap() = Some(gate.clone());
+        gate.release.notify_one();
+        let request = child.request_with_sequence("session/prompt", json!({"delay": 0.3}), Duration::from_millis(450));
+        tokio::pin!(request);
+        tokio::select! {
+            _ = gate.partial_written.notified() => {},
+            result = request.as_mut() => panic!("request settled before the partial-write barrier: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("partial-write barrier not reached"),
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(dir.path().join("read"), b"release").unwrap();
+        gate.finish_frame.notify_one();
+        let result = request.await;
+        assert!(child.pending.lock().unwrap().inner.is_empty());
+        assert!(child.is_alive(), "a complete frame awaiting its response must not retire the child");
+        // The late response has its old ID and must not satisfy this request.
+        let next = child.request("next", json!({"text": "next"})).await;
+        child.shutdown().await.unwrap();
+        reaped(pid);
+        assert!(matches!(result, Err(RpcChildError::Timeout { .. })), "write and response received separate timeout budgets: {result:?}");
+        assert_eq!(next.unwrap()["bytes"], json!(4));
+    }
+
+    #[tokio::test]
+    async fn rpc_deadline_cancelled_partial_frame_retires_before_queued_writer() {
+        let (child, _dir, pid) = peer(true, true).await;
+        let gate = Arc::new(PromptWriteGate { partial: true, ..Default::default() });
+        *child.prompt_write_gate.lock().unwrap() = Some(gate.clone());
+        gate.release.notify_one();
+        let queued = child.request("queued", json!({}));
+        tokio::pin!(queued);
+        {
+            let partial = child.request("session/prompt", json!({"text": "partial"}));
+            tokio::pin!(partial);
+            tokio::select! {
+                _ = gate.partial_written.notified() => {},
+                result = partial.as_mut() => panic!("request settled before the partial-write barrier: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("partial-write barrier not reached"),
+            }
+            assert!(child.writer.try_lock().is_err());
+            assert!(futures_util::poll!(&mut queued).is_pending());
+            assert_eq!(child.pending.lock().unwrap().inner.len(), 2);
+        } // Drop the actual request after a real prefix crossed ChildStdin.
+        let retired = !child.is_alive();
+        assert_eq!(child.pending.lock().unwrap().inner.len(), 1, "cancelled request must release only its own correlation ID");
+        let result = tokio::time::timeout(Duration::from_millis(200), queued.as_mut()).await;
+        drop(queued);
+        child.shutdown().await.unwrap();
+        reaped(pid);
+        assert!(retired, "partial-frame cancellation must quarantine synchronously");
+        assert!(matches!(result, Ok(Err(RpcChildError::AlreadyShutdown | RpcChildError::ChildExited { .. }))), "queued writer reused a truncated stream: {result:?}");
+        assert!(child.pending.lock().unwrap().inner.is_empty());
     }
 }
 
