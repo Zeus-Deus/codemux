@@ -69,7 +69,7 @@ export function RemoteConnectionChip({ compact = false }: { compact?: boolean })
           )}
         </div>
       </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4}>
+      <TooltipContent side="bottom">
         {tooltip}
       </TooltipContent>
     </Tooltip>

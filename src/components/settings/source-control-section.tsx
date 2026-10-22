@@ -381,7 +381,7 @@ function CustomHostsEditor() {
               >
                 <SelectTrigger
                   id="custom-host-kind"
-                  className="h-8 w-[7.5rem] text-body"
+                  className="w-[7.5rem] text-body"
                 >
                   <SelectValue />
                 </SelectTrigger>

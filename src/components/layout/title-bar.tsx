@@ -108,7 +108,7 @@ function IdeLauncher() {
             </span>
           </button>
         </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={4}>
+        <TooltipContent side="bottom">
           {defaultEditor ? `Open in ${defaultEditor.name}` : "Open in editor"}
         </TooltipContent>
       </Tooltip>
@@ -163,7 +163,7 @@ function SidebarToggleButton({
           <PanelLeft className="size-3.5" />
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4} shortcut="toggleSidebar">
+      <TooltipContent side="bottom" shortcut="toggleSidebar">
         Toggle sidebar
       </TooltipContent>
     </Tooltip>
@@ -300,7 +300,7 @@ function PinnedPresetTile({
           <PresetIcon icon={preset.icon} className="size-3.5" />
         </button>
       </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4}>
+      <TooltipContent side="bottom">
         {preset.name}
       </TooltipContent>
     </Tooltip>

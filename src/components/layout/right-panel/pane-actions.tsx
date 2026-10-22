@@ -70,7 +70,7 @@ export function PaneActionButton({
           />
         </button>
       </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4} shortcut={shortcut}>
+      <TooltipContent side="bottom" shortcut={shortcut}>
         {label}
       </TooltipContent>
     </Tooltip>

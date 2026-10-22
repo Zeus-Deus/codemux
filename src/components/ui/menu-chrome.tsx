@@ -5,25 +5,23 @@ import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
  * Shared chrome for the app's popup menus (workspace right-click, the footer
  * gear menu, the sidebar project menu and their submenus).
  *
- * These menus deliberately read as one surface with the command palette —
- * same radius, hairline border and elevation (`.cm-menu-surface` in
- * `globals.css`), same 13px label rhythm, same mono keycaps. The geometry
- * lives here as class constants rather than in the shadcn primitives because
- * those primitives back ~20 other menus (model pickers, tab menus, resource
- * rows) whose dense lists should NOT grow to 32px rows. The container surface
- * is unified globally; the row rhythm is opt-in per menu.
+ * These menus share the primitives' surface (`.cm-menu-surface` in
+ * `globals.css`) and row metrics: 28px rows, 8px side padding, a radius
+ * concentric with the surface's corner. What the constants add is the quiet
+ * 14px leading icon, the section labels and the mono keycaps.
  *
  * Every colour here is a design token or a token alpha mix.
  */
 
-/** One 32px menu row: 8px radius, 9px side padding, 10px gap, 13px label, and
- *  a 14px muted icon in the leading slot. */
+/** One 28px menu row (the primitives' row height, fixed rather than a
+ *  minimum so a row never grows), with a 14px muted icon in the leading
+ *  slot. */
 export const MENU_ROW =
-  "h-8 gap-2.5 whitespace-nowrap rounded-md px-[9px] text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
+  "h-7 gap-2 whitespace-nowrap rounded-sm px-2 text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
 
 /** A 36px row carrying a title plus a mono state line (the device list). */
 export const MENU_ROW_TWO_LINE_COMPACT =
-  "h-9 gap-2.5 whitespace-nowrap rounded-md px-[9px] text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
+  "h-9 gap-2 whitespace-nowrap rounded-sm px-2 text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
 
 /**
  * The destructive tail row. Radix's highlight convention is a surface change,
@@ -40,7 +38,7 @@ export const MENU_ROW_DESTRUCTIVE = cn(
 
 /** The 1px rule that still separates the destructive tail (and the gear
  *  menu's groups) where a section label would be too loud. */
-export const MENU_SEPARATOR = "mx-[5px] my-1.5 h-px bg-border";
+export const MENU_SEPARATOR = "mx-2 my-1 h-px bg-border";
 
 /**
  * A group heading inside a menu. Replaces bare dividers within a menu body:
@@ -49,7 +47,7 @@ export const MENU_SEPARATOR = "mx-[5px] my-1.5 h-px bg-border";
  * navigation skips it.
  */
 export const MENU_SECTION_LABEL =
-  "flex h-6 items-center px-[9px] text-label font-medium text-muted-foreground/80";
+  "flex h-6 items-center px-2 text-label font-medium text-muted-foreground/80";
 
 /** Trailing metadata on a row (a username, a device state, a hint). */
 export const MENU_ROW_META =

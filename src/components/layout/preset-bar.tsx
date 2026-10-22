@@ -546,7 +546,7 @@ function PresetButton({
       <TooltipTrigger asChild>
         {disabled ? <span className="inline-flex">{button}</span> : button}
       </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4} className="text-label">
+      <TooltipContent side="bottom">
         {tooltip}
       </TooltipContent>
     </Tooltip>

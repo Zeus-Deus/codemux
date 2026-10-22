@@ -1821,7 +1821,7 @@ export function RemoteAccessSection() {
                     }}
                     aria-label="Server port"
                     aria-invalid={portDraft !== "" && !portValidation.valid}
-                    className="h-9 w-28 font-mono"
+                    className="w-28 font-mono"
                   />
                   <Button
                     type="button"

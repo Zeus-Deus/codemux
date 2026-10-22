@@ -23,6 +23,7 @@ import { useSkillsSyncStatus } from "@/hooks/use-skills-sync-status";
 import { useTickEvery } from "@/hooks/use-tick-every";
 import { relativeTime } from "@/lib/relative-time";
 import { useAuthStore } from "@/stores/auth-store";
+import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 
 export type SyncStateKind = "idle" | "syncing" | "error";
@@ -114,19 +115,20 @@ export function SyncStatusDisplay() {
             </div>
           )}
         </div>
-        <button
+        <Button
           type="button"
+          variant="outline"
+          size="sm"
           onClick={syncNow}
           disabled={isSyncing}
-          className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-label font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
           {isSyncing ? (
             <Spinner className="size-3.5" aria-hidden />
           ) : (
-            <RefreshCw className="size-3.5" />
+            <RefreshCw />
           )}
           {buttonLabel}
-        </button>
+        </Button>
       </div>
 
       {status.state === "error" && status.lastError && (

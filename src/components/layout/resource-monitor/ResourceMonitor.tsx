@@ -174,7 +174,7 @@ export function ResourceMonitor({
             </Button>
           </PopoverTrigger>
         </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={4}>
+        <TooltipContent side="bottom">
           {snapshot
             ? `Resources · ${formatMemory(snapshot.total_memory)}`
             : "Resource monitor"}

@@ -457,7 +457,7 @@ function BaseBranchInput({ value, onCommit }: { value: string; onCommit: (v: str
         }
       }}
       placeholder="main"
-      className="w-36 h-9 font-mono"
+      className="w-36 font-mono"
     />
   );
 }
@@ -591,7 +591,7 @@ function BrowserSection() {
               ).catch(console.error);
             }}
           >
-            <SelectTrigger className="w-48 h-9">
+            <SelectTrigger className="w-48">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -672,7 +672,7 @@ function BrowserSection() {
 // the composer's rounded-full pills. tailwind-merge lets these override the
 // pickers' built-in pill classes (rounded-full, text-label, etc.).
 const LAUNCH_FIELD_TRIGGER =
-  "h-9 w-full justify-between rounded-lg border-input bg-transparent px-3 text-body font-normal text-foreground dark:bg-input/30 dark:hover:bg-input/50";
+  "h-8 w-full justify-between rounded-lg border-input bg-transparent px-3 text-body font-normal text-foreground dark:bg-input/30 dark:hover:bg-input/50";
 
 /** Wrap a string as a double-quoted shell argument. */
 function quotePrompt(value: string): string {
@@ -1120,7 +1120,6 @@ function PresetEditorSheet({
               onChange={(e) => setName(e.target.value)}
               onBlur={() => name !== preset.name && save()}
               placeholder="e.g. Git Pull"
-              className="h-9"
             />
           </div>
 
@@ -1132,7 +1131,6 @@ function PresetEditorSheet({
               onChange={(e) => setDescription(e.target.value)}
               onBlur={() => save()}
               placeholder="Optional description"
-              className="h-9"
             />
           </div>
 
@@ -1140,7 +1138,7 @@ function PresetEditorSheet({
           <div className="space-y-2">
             <label className="text-body font-medium">Type</label>
             <Select value={structured ? "structured" : "raw"} onValueChange={handleModeChange}>
-              <SelectTrigger className="h-9">
+              <SelectTrigger>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -1161,7 +1159,7 @@ function PresetEditorSheet({
               <div className="space-y-2">
                 <label className="text-body font-medium">Agent</label>
                 <Select value={selectedAgentId} onValueChange={handleAgentChange}>
-                  <SelectTrigger className="h-9">
+                  <SelectTrigger>
                     <SelectValue placeholder="Select an agent" />
                   </SelectTrigger>
                   <SelectContent>
@@ -1258,7 +1256,7 @@ function PresetEditorSheet({
                       onChange={(e) => handleCommandChange(i, e.target.value)}
                       onBlur={handleCommandBlur}
                       placeholder="e.g. bun run dev"
-                      className="h-9 flex-1 font-mono text-body"
+                      className="flex-1 font-mono text-body"
                     />
                     {commands.length > 1 && (
                       <Button
@@ -1301,7 +1299,7 @@ function PresetEditorSheet({
                   save({ launchMode: v });
                 }}
               >
-                <SelectTrigger className="h-9">
+                <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -2181,7 +2179,7 @@ export function SettingsView() {
             <div className="space-y-1">
               <SettingRow label="Default editor" description="Used when opening files from the file tree panel.">
                 <Select value={defaultEditor} onValueChange={setDefaultEditor}>
-                  <SelectTrigger className="w-48 h-9">
+                  <SelectTrigger className="w-48">
                     <SelectValue placeholder="Select editor" />
                   </SelectTrigger>
                   <SelectContent>
@@ -2254,7 +2252,7 @@ export function SettingsView() {
               <Separator />
               <SettingRow label="Cursor style" description="The shape of the cursor in terminal panes.">
                 <Select value={cursorStyle} onValueChange={setCursorStyle}>
-                  <SelectTrigger className="w-36 h-9">
+                  <SelectTrigger className="w-36">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -2267,7 +2265,7 @@ export function SettingsView() {
               <Separator />
               <SettingRow label="Color theme" description="How the terminal gets its colors." scope="device">
                 <Select value={terminalThemeMode} onValueChange={setTerminalThemeMode}>
-                  <SelectTrigger className="h-9 w-44">
+                  <SelectTrigger className="w-44">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -2517,7 +2515,7 @@ export function SettingsView() {
                       storeSet("ai_resolver_strategy", v);
                     }}
                   >
-                    <SelectTrigger className="w-48 h-9">
+                    <SelectTrigger className="w-48">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -2816,7 +2814,7 @@ export function SettingsView() {
               description="Lifecycle scripts and worktree files for each project. Changes save when you leave a field."
               action={
                 <Select value={scriptsRoot} onValueChange={setChosenProject}>
-                  <SelectTrigger aria-label="Project" className="h-9 w-48">
+                  <SelectTrigger aria-label="Project" className="w-48">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -2923,7 +2921,7 @@ export function SettingsView() {
                 }
               >
                 <Input
-                  className="font-mono text-body h-9"
+                  className="font-mono text-body"
                   placeholder="e.g. npm run dev"
                   value={runCommand}
                   disabled={!scriptsReady}

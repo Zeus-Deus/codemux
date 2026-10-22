@@ -252,8 +252,7 @@ export function WebhookPanel({
           <Button
             type="button"
             variant="ghost"
-            size="icon"
-            className="size-7"
+            size="icon-sm"
             disabled={!credentials}
             aria-label={revealed ? "Hide token" : "Show token"}
             onClick={() => setRevealed((v) => !v)}
@@ -263,8 +262,7 @@ export function WebhookPanel({
           <Button
             type="button"
             variant="ghost"
-            size="icon"
-            className="size-7"
+            size="icon-sm"
             disabled={!credentials}
             aria-label="Copy webhook URL"
             onClick={() => void copy()}
@@ -274,8 +272,7 @@ export function WebhookPanel({
           <Button
             type="button"
             variant="ghost"
-            size="icon"
-            className="size-7"
+            size="icon-sm"
             disabled={!credentials || busy}
             aria-label="Issue a new URL"
             title="Issue a new URL"
@@ -430,7 +427,7 @@ function SignatureEditor({
         <div className="space-y-1.5">
           <Label className="text-label text-muted-foreground">Sender</Label>
           <Select value={preset} onValueChange={choosePreset}>
-            <SelectTrigger className="h-8 text-body-sm">
+            <SelectTrigger className="text-body-sm">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -483,7 +480,7 @@ function SignatureEditor({
               value={encoding}
               onValueChange={(v) => setEncoding(v as WebhookSignature["encoding"])}
             >
-              <SelectTrigger className="h-8 text-body-sm">
+              <SelectTrigger className="text-body-sm">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>

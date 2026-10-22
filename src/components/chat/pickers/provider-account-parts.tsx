@@ -74,7 +74,7 @@ export function AccountListHeader({ view, providerLabel }: { view: ThreadAccount
             <span className="sr-only">{explainer}</span>
           </div>
         </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={4} aria-hidden>
+        <TooltipContent side="bottom" aria-hidden>
           {explainer}
         </TooltipContent>
       </Tooltip>

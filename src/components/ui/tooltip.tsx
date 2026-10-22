@@ -36,13 +36,16 @@ function TooltipShortcut({ actionId }: { actionId: string }) {
   const keys = useShortcutLabel(actionId)
   if (!keys) return null
   return (
-    <Kbd className="bg-background/15 text-background/75">{keys}</Kbd>
+    <Kbd>{keys}</Kbd>
   )
 }
 
+/** A tooltip is a small popover: the popover surface, border and bevel at
+ *  the control-label size, with no arrow. An inverted chip shouted over the
+ *  quiet surfaces around it, and an arrow can't carry the border. */
 function TooltipContent({
   className,
-  sideOffset = 0,
+  sideOffset = 4,
   shortcut,
   children,
   ...props
@@ -56,7 +59,7 @@ function TooltipContent({
         data-slot="tooltip-content"
         sideOffset={sideOffset}
         className={cn(
-          "z-50 inline-flex w-fit max-w-xs items-center gap-1.5 rounded-md bg-foreground px-3 py-1.5 text-label text-background has-data-[slot=kbd]:pr-1.5 **:data-[slot=kbd]:relative **:data-[slot=kbd]:isolate **:data-[slot=kbd]:z-50 **:data-[slot=kbd]:rounded-sm",
+          "z-50 inline-flex w-fit max-w-xs items-center gap-1.5 rounded-md border border-border bg-popover px-2 py-1 text-label text-popover-foreground shadow-md/5 inset-shadow-bevel has-data-[slot=kbd]:pr-1 **:data-[slot=kbd]:relative **:data-[slot=kbd]:isolate **:data-[slot=kbd]:z-50 **:data-[slot=kbd]:rounded-sm",
           // Only a tooltip that waited out its delay fades in. One that opens
           // instantly mid-sweep (`instant-open`) hard-cuts, so dragging the
           // pointer along a toolbar never stacks fades on top of each other.
@@ -67,7 +70,6 @@ function TooltipContent({
       >
         {children}
         {shortcut && <TooltipShortcut actionId={shortcut} />}
-        <TooltipPrimitive.Arrow className="z-50 size-2.5 translate-y-[calc(-50%_-_2px)] rotate-45 rounded-sm bg-foreground fill-foreground" />
       </TooltipPrimitive.Content>
     </TooltipPrimitive.Portal>
   )
@@ -88,7 +90,7 @@ function ShortcutTooltip({
   return (
     <Tooltip>
       <TooltipTrigger asChild>{children}</TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4} shortcut={shortcut}>
+      <TooltipContent side="bottom" shortcut={shortcut}>
         {label}
       </TooltipContent>
     </Tooltip>

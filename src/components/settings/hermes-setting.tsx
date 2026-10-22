@@ -47,7 +47,7 @@ export function HermesDefaultProfileSetting() {
   const profiles = useHermesProfiles();
   const unlisted = id && !profiles?.some(p => p.id === id);
   return <Select value={id || AUTOMATIC} onValueChange={v => set(HERMES_DEFAULT_PROFILE_SETTING, v === AUTOMATIC ? "" : v)}>
-    <SelectTrigger aria-label="Default Hermes profile" className="h-8 w-44">
+    <SelectTrigger aria-label="Default Hermes profile" className="w-44">
       <SelectValue />
     </SelectTrigger>
     <SelectContent>

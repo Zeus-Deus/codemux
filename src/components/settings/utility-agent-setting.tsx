@@ -67,7 +67,7 @@ export function UtilityAgentSetting() {
         value={mode}
         onValueChange={(value) => setMode(value as UtilityAgentMode)}
       >
-        <SelectTrigger className="h-9 w-[104px] bg-surface-1 text-label">
+        <SelectTrigger className="w-[104px] bg-surface-1 text-label">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
@@ -78,7 +78,7 @@ export function UtilityAgentSetting() {
 
       {mode === "auto" ? (
         <div
-          className="flex h-9 min-w-[220px] items-center gap-2 rounded-md border border-hairline-strong bg-surface-1 px-3"
+          className="flex h-8 min-w-[220px] items-center gap-2 rounded-md border border-hairline-strong bg-surface-1 px-3"
           data-testid="utility-agent-auto-resolution"
         >
           {auto ? (
@@ -136,7 +136,7 @@ export function UtilityAgentSetting() {
             selectedContext={null}
             defaultContext={null}
             onContextChange={() => undefined}
-            triggerClassName="h-9 rounded-md bg-surface-1"
+            triggerClassName="h-8 rounded-md bg-surface-1"
           />
         </>
       )}

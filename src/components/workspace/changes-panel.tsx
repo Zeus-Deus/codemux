@@ -285,7 +285,7 @@ function FileRow({
           </span>
         </div>
       </TooltipTrigger>
-      <TooltipContent side="left" className="text-label">
+      <TooltipContent side="left">
         {file.path}
       </TooltipContent>
     </Tooltip>

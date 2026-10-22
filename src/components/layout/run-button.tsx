@@ -222,7 +222,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
             {shortcutBadge}
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={4}>
+        <TooltipContent side="bottom">
           {isConfigured ? runCommand : "Configure run command"}
         </TooltipContent>
       </Tooltip>
@@ -239,7 +239,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
             <Settings className="size-4" />
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={4}>
+        <TooltipContent side="bottom">
           {isConfigured ? "Edit run command" : "Configure run command"}
         </TooltipContent>
       </Tooltip>

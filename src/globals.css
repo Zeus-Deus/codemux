@@ -108,6 +108,17 @@
     --radius-2xl: calc(var(--radius) + 8px);
     --radius-3xl: calc(var(--radius) + 14px);
     --radius-4xl: calc(var(--radius) + 22px);
+    /* Controls (buttons, toggles) sit one step tighter than fields and
+     * surfaces, so a button inside a card or input group reads as nested. */
+    --radius-control: calc(var(--radius) - 2px);
+    /* Control and surface elevation → inset-shadow-bevel,
+     * inset-shadow-highlight, inset-shadow-pressed, shadow-popup and
+     * shadow-dialog. Values live in the "Control craft" block below. */
+    --inset-shadow-bevel: var(--control-bevel);
+    --inset-shadow-highlight: var(--control-highlight);
+    --inset-shadow-pressed: var(--control-pressed);
+    --shadow-popup: var(--popup-shadow);
+    --shadow-dialog: var(--dialog-shadow);
 }
 
 /*
@@ -325,6 +336,42 @@
   --status-attention:  oklch(0.55 0.19 22);
   --status-monitoring: oklch(0.55 0.09 196);
   --status-remote:     oklch(0.55 0.10 232);
+}
+
+/*
+ * Control craft. The light a control catches is what makes it read as
+ * pressable rather than printed:
+ *
+ *   bevel      outlined controls and fields. Light scheme: a 1px shade
+ *              along the bottom edge. Dark scheme: a 1px light along the top,
+ *              because a bottom shade disappears into a dark canvas.
+ *   highlight  filled controls: a 1px light along the top of the fill.
+ *   pressed    the highlight swapped for a 1px shade, so a press reads as
+ *              the surface going in.
+ *
+ * Shadows are literal black (a cast shadow is an absence of light, not a
+ * themed surface); their alpha is scheme-aware. The negative spread keeps
+ * popup shadows under the surface instead of fogging the content beside it.
+ * Inner top highlights on surfaces are lights, so they derive from
+ * --foreground and flip with the scheme on their own.
+ */
+:root {
+  --control-bevel: inset 0 -1px oklch(0 0 0 / 4%);
+  --control-highlight: inset 0 1px oklch(1 0 0 / 16%);
+  --control-pressed: inset 0 1px oklch(0 0 0 / 8%);
+  --popup-shadow:
+    0 16px 40px -18px oklch(0 0 0 / 55%),
+    inset 0 1px 0 color-mix(in oklch, var(--foreground) 4%, transparent);
+  --dialog-shadow: 0 24px 64px -24px oklch(0 0 0 / 65%);
+}
+.dark {
+  --control-bevel: inset 0 1px oklch(1 0 0 / 6%);
+  --popup-shadow:
+    0 18px 44px -18px oklch(0 0 0 / 80%),
+    inset 0 1px 0 color-mix(in oklch, var(--foreground) 5%, transparent);
+  --dialog-shadow:
+    0 24px 72px -20px oklch(0 0 0 / 90%),
+    inset 0 1px 0 color-mix(in oklch, var(--foreground) 4%, transparent);
 }
 
 /*
@@ -1318,17 +1365,10 @@ body.pane-resizing iframe {
 
 /* ── Popup-menu surface ────────────────────────────────────────────────
  * Every dropdown/context menu sits on the same surface language as the
- * command palette: one radius, one hairline border, one elevation. The
- * radius and the elevation are the two things Tailwind can't express as a
- * token utility here, so they live as a class instead of being re-typed
- * per menu.
- *
- * The drop shadow is deliberately literal black: a cast shadow is an
- * absence of light, not a themed surface, so it is the same documented
- * exception the titlebar overlap surface already takes. The alpha is
- * scheme-aware because a 58%-black plume that reads as "lifted" over a
- * dark app reads as "smeared" over a white one. The inner top highlight
- * IS token-derived (foreground alpha), since that one is a light. */
+ * other floating surfaces (popovers, hover cards, select lists): the theme
+ * radius, one hairline border and the shared `--popup-shadow` elevation (see
+ * "Control craft"). Rows inside use a 4px inset and a radius 4px tighter
+ * than the surface, so the highlight sits concentric with the corner. */
 @keyframes cm-menu-in {
   from {
     opacity: 0;
@@ -1340,34 +1380,11 @@ body.pane-resizing iframe {
   }
 }
 
-.cm-menu-surface {
-  border-radius: 13px;
-  box-shadow:
-    0 26px 70px oklch(0 0 0 / 0.22),
-    inset 0 1px 0 color-mix(in oklch, var(--foreground) 5%, transparent);
-  animation: cm-menu-in 0.14s ease-out;
-}
-
-/* Submenus are a step less elevated — they cascade off a surface that is
- * already lifted, so repeating the parent's plume double-darkens the seam. */
+.cm-menu-surface,
 .cm-menu-surface-sub {
-  border-radius: 12px;
-  box-shadow:
-    0 22px 60px oklch(0 0 0 / 0.22),
-    inset 0 1px 0 color-mix(in oklch, var(--foreground) 5%, transparent);
+  border-radius: var(--radius);
+  box-shadow: var(--popup-shadow);
   animation: cm-menu-in 0.14s ease-out;
-}
-
-.dark .cm-menu-surface {
-  box-shadow:
-    0 26px 70px oklch(0 0 0 / 0.58),
-    inset 0 1px 0 color-mix(in oklch, var(--foreground) 5%, transparent);
-}
-
-.dark .cm-menu-surface-sub {
-  box-shadow:
-    0 22px 60px oklch(0 0 0 / 0.58),
-    inset 0 1px 0 color-mix(in oklch, var(--foreground) 5%, transparent);
 }
 
 @media (prefers-reduced-motion: reduce) {

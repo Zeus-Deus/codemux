@@ -835,7 +835,7 @@ function ChatsHeader() {
             <Plus />
           </SidebarGroupAction>
         </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={4} className="text-label">
+        <TooltipContent side="bottom">
           New chat in home directory{keys ? ` · ${keys}` : ""}
         </TooltipContent>
       </Tooltip>
@@ -920,7 +920,7 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
             <Plus />
           </SidebarMenuAction>
         </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={4} className="text-label">
+        <TooltipContent side="bottom">
           New chat in {name} · Shift+click for workspace dialog
           {newKeys ? ` · ${newKeys}` : ""}
         </TooltipContent>

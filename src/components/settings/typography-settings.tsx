@@ -536,7 +536,7 @@ function FontSizePicker({
 }) {
   return (
     <Select value={String(value)} onValueChange={(next) => onChange(Number(next))}>
-      <SelectTrigger className="h-8 w-[76px] bg-background/75 text-body-sm" aria-label={label}>
+      <SelectTrigger className="w-[76px] bg-background/75 text-body-sm" aria-label={label}>
         <SelectValue>{value}px</SelectValue>
       </SelectTrigger>
       <SelectContent align="end">
