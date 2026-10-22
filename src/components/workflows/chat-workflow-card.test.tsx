@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { Profiler } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { DEFAULT_WORKFLOW_LIMITS, type WorkflowRunSnapshot, type WorkflowTaskSnapshot } from "@/tauri/workflows";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
@@ -44,7 +45,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   useWorkflowUIStore.setState({ selectedRuns: {} });
 });
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("ChatWorkflowCard", () => {
   it("shows live progress per phase and stops the run", async () => {
@@ -94,5 +98,97 @@ describe("ChatWorkflowCard", () => {
     mocks.get.mockRejectedValue(new Error("Workflow run not found."));
     mount();
     expect(await screen.findByText("This workflow is no longer available on this device.")).toBeInTheDocument();
+  });
+
+  describe("elapsed labels", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(60_000);
+    });
+
+    function mountSnapshot(snapshot: WorkflowRunSnapshot) {
+      mocks.get.mockResolvedValue(snapshot);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } } });
+      const key = ["workflows", "ws", "run", "run-1"];
+      client.setQueryData(key, snapshot);
+      const onRender = vi.fn();
+      const view = render(<QueryClientProvider client={client}>
+        <Profiler id="workflow" onRender={onRender}>
+          <ChatWorkflowCard runId="run-1" workspaceId="ws" threadId="thread-1" />
+        </Profiler>
+      </QueryClientProvider>);
+      return { client, key, onRender, view };
+    }
+
+    it.each(["running", "paused", "stopping", "unknown"] as const)("advances %s labels without committing the card", async (status) => {
+      const { onRender } = mountSnapshot(run({ status, tasks: [
+        ...run().tasks,
+        task("work-3", "Needs confirmation", "unknown"),
+        task("work-4", "Waiting for input", "waiting"),
+        task("work-5", "Failed worker", "failed"),
+        task("work-6", "Queued worker", "queued"),
+      ] }));
+      const pill = screen.getByTestId("chat-workflow-status");
+      expect(pill).toHaveTextContent("0m 59s");
+      const commits = onRender.mock.calls.length;
+      expect(commits).toBeGreaterThan(0);
+
+      await act(() => vi.advanceTimersByTimeAsync(3000));
+
+      expect(pill).toHaveTextContent("1m 02s");
+      for (const title of ["Test coverage", "Needs confirmation", "Waiting for input"]) {
+        expect(screen.getByText(title).closest("li")).toHaveTextContent("1m 02s");
+      }
+      expect(screen.getByText("Session handling").closest("li")).toHaveTextContent("1m 02s");
+      expect(screen.getByText("Failed worker").closest("li")).toHaveTextContent("failed");
+      expect(screen.getByText("Queued worker").closest("li")).toHaveTextContent("queued");
+      expect(onRender).toHaveBeenCalledTimes(commits);
+    });
+
+    it("uses attempt history for durations even when current_attempt differs", async () => {
+      const live = task("work-1", "Live history", "unknown");
+      live.current_attempt = { ...live.attempts[0], finished_at_ms: 30_000, status: "succeeded" };
+      live.attempts = [
+        { ...live.attempts[0], id: "old-generation", generation: 0, started_at_ms: 0, finished_at_ms: 500 },
+        { ...live.attempts[0], id: "first-attempt", finished_at_ms: 30_000, status: "failed" },
+        { ...live.attempts[0], started_at_ms: 31_000 },
+      ];
+      const settled = task("work-2", "Settled history", "succeeded");
+      settled.current_attempt = { ...settled.attempts[0], finished_at_ms: null, status: "running" };
+      const replaced = task("work-3", "Replacement generation", "queued");
+      replaced.generation = 2;
+      replaced.attempts = live.attempts;
+      mountSnapshot(run({ tasks: [live, settled, replaced] }));
+      expect(screen.getByText("Live history").closest("li")).toHaveTextContent("0m 59s");
+
+      await act(() => vi.advanceTimersByTimeAsync(5000));
+
+      expect(screen.getByText("Live history").closest("li")).toHaveTextContent("1m 04s");
+      expect(screen.getByText("Settled history").closest("li")).toHaveTextContent("1m 02s");
+      expect(screen.getByText("Replacement generation").closest("li")).toHaveTextContent("queued");
+    });
+
+    it.each(["completed", "failed", "cancelled"] as const)("paints settled durations and stops ticking when the run becomes %s", async (status) => {
+      const { client, key, onRender } = mountSnapshot(run());
+      await act(() => vi.advanceTimersByTimeAsync(3000));
+      expect(screen.getByText("Test coverage").closest("li")).toHaveTextContent("1m 02s");
+      const settled = task("work-2", "Test coverage", "succeeded");
+      settled.attempts[0].finished_at_ms = 62_000;
+      const snapshot = run({ status, revision: 4, updated_at_ms: 66_000, tasks: [settled] });
+      mocks.get.mockResolvedValue(snapshot);
+      act(() => client.setQueryData(key, snapshot));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      const pill = screen.getByTestId("chat-workflow-status");
+      expect(pill).toHaveAttribute("data-status", status);
+      expect(pill).toHaveTextContent("1m 05s");
+      expect(screen.getByText("Test coverage").closest("li")).toHaveTextContent("1m 01s");
+      const commits = onRender.mock.calls.length;
+
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+
+      expect(pill).toHaveTextContent("1m 05s");
+      expect(screen.getByText("Test coverage").closest("li")).toHaveTextContent("1m 01s");
+      expect(onRender).toHaveBeenCalledTimes(commits);
+    });
   });
 });
