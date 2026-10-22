@@ -696,12 +696,33 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\n(trap '' TERM; exec sleep 600) &\necho $! > \"$(dirname \"$0\")/pid\"\n{banner}\nwait\n"
+                "#!/bin/sh\n[ \"$1\" = probe ] && exit 0\n(trap '' TERM; exec sleep 600) &\necho $! > \"$(dirname \"$0\")/pid\"\n{banner}\nwait\n"
             ),
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        wait_until_executable(&script);
         (dir, script)
+    }
+
+    /// A sibling test thread that forks while the script's write handle is
+    /// open keeps that handle until it execs, so executing the fresh script
+    /// can fail with ETXTBSY. Once one exec succeeds no writer is left.
+    #[cfg(target_os = "linux")]
+    fn wait_until_executable(script: &Path) {
+        const ETXTBSY: i32 = 26;
+        for _ in 0..50 {
+            match std::process::Command::new(script).arg("probe").status() {
+                Err(error) if error.raw_os_error() == Some(ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                result => {
+                    assert!(result.unwrap().success(), "fixture probe failed");
+                    return;
+                }
+            }
+        }
+        panic!("fixture script stayed busy: {}", script.display());
     }
 
     /// Wait for the descendant to stop; on failure kill it (we started it)
