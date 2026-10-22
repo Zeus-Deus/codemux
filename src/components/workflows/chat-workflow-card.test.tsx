@@ -171,20 +171,23 @@ describe("ChatWorkflowCard", () => {
     it.each(["completed", "failed", "cancelled"] as const)("paints settled durations and stops ticking when the run becomes %s", async (status) => {
       const { client, key, onRender } = mountSnapshot(run());
       await act(() => vi.advanceTimersByTimeAsync(3000));
-      const snapshot = run({ status, revision: 4, updated_at_ms: 66_000, tasks: [task("work-2", "Test coverage", "succeeded")] });
+      expect(screen.getByText("Test coverage").closest("li")).toHaveTextContent("1m 02s");
+      const settled = task("work-2", "Test coverage", "succeeded");
+      settled.attempts[0].finished_at_ms = 62_000;
+      const snapshot = run({ status, revision: 4, updated_at_ms: 66_000, tasks: [settled] });
       mocks.get.mockResolvedValue(snapshot);
       act(() => client.setQueryData(key, snapshot));
       await act(() => vi.advanceTimersByTimeAsync(0));
       const pill = screen.getByTestId("chat-workflow-status");
       expect(pill).toHaveAttribute("data-status", status);
       expect(pill).toHaveTextContent("1m 05s");
-      expect(screen.getByText("Test coverage").closest("li")).toHaveTextContent("1m 02s");
+      expect(screen.getByText("Test coverage").closest("li")).toHaveTextContent("1m 01s");
       const commits = onRender.mock.calls.length;
 
       await act(() => vi.advanceTimersByTimeAsync(10_000));
 
       expect(pill).toHaveTextContent("1m 05s");
-      expect(screen.getByText("Test coverage").closest("li")).toHaveTextContent("1m 02s");
+      expect(screen.getByText("Test coverage").closest("li")).toHaveTextContent("1m 01s");
       expect(onRender).toHaveBeenCalledTimes(commits);
     });
   });
