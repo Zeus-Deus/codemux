@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, ChevronDown, Circle, Copy, CornerDownLeft, PanelRight, Square, Workflow as WorkflowIcon, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { ChatMarkdown } from "@/components/chat/ChatMarkdown";
+import { TickingText } from "@/components/chat/TickingText";
 import { modelLabel } from "@/lib/agent-chat/capability-defaults";
 import { formatElapsed } from "@/lib/agent-chat/subagents";
 import { chatWorkflowPhase, type ChatWorkflowPhase } from "@/lib/workflows/chat-workflow";
@@ -24,17 +25,6 @@ const PHASES: { key: ChatWorkflowPhase; title: string }[] = [
 ];
 const ACTIVE = new Set(["running", "paused", "stopping", "unknown"]);
 const LIVE_TASK = new Set(["running", "waiting", "stopping"]);
-
-/** Live clock for elapsed labels while something is running. */
-function useNow(active: boolean): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!active) return;
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [active]);
-  return now;
-}
 
 function routeName(run: WorkflowRunSnapshot, task: WorkflowTaskSnapshot): string {
   const routeId = currentTaskAttempt(task)?.route_id ?? task.spec.route_id ?? run.spec.routes[0]?.id;
@@ -74,8 +64,8 @@ function headline(run: WorkflowRunSnapshot): string {
   return "Planning the work";
 }
 
-function StatusPill({ run, now }: { run: WorkflowRunSnapshot; now: number }) {
-  const elapsed = formatElapsed((ACTIVE.has(run.status) ? now : run.updated_at_ms) - run.created_at_ms);
+function StatusPill({ run }: { run: WorkflowRunSnapshot }) {
+  const active = ACTIVE.has(run.status);
   const tone = run.status === "completed" ? "border-status-open/35 bg-status-open/8 text-status-open"
     : run.status === "failed" || run.status === "unknown" ? "border-status-attention/35 bg-status-attention/8 text-status-attention"
       : run.status === "cancelled" ? "border-hairline-strong text-muted-foreground"
@@ -83,7 +73,7 @@ function StatusPill({ run, now }: { run: WorkflowRunSnapshot; now: number }) {
   const label = { running: "Running", paused: "Paused", stopping: "Stopping", unknown: "Needs you", completed: "Done", failed: "Failed", cancelled: "Stopped" }[run.status];
   return <span data-testid="chat-workflow-status" data-status={run.status} className={cn("inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-label", tone)}>
     {run.status === "running" || run.status === "stopping" ? <Spinner className="size-3" aria-hidden /> : run.status === "completed" ? <Check className="size-3" aria-hidden /> : null}
-    {label}<span className="font-mono text-caption tabular-nums opacity-80">{elapsed}</span>
+    {label}<TickingText active={active} className="font-mono text-caption opacity-80" compute={(now) => formatElapsed((active ? now : run.updated_at_ms) - run.created_at_ms)} />
   </span>;
 }
 
@@ -114,7 +104,6 @@ export function ChatWorkflowCard({ runId, workspaceId, threadId }: { runId: stri
   });
   const run = query.data;
   const active = !!run && ACTIVE.has(run.status);
-  const now = useNow(active);
   const [expanded, setExpanded] = useState(false);
   const cancel = useMutation({
     mutationFn: () => workflowCancel(runId),
@@ -164,7 +153,7 @@ export function ChatWorkflowCard({ runId, workspaceId, threadId }: { runId: stri
         <h3 className="truncate text-body font-semibold text-foreground" title={run.spec.goal}>{run.spec.title}</h3>
         <p className="truncate text-label text-muted-foreground">Workflow · {headline(run)}</p>
       </div>
-      <StatusPill run={run} now={now} />
+      <StatusPill run={run} />
     </header>
 
     {PHASES.map(({ key, title }, index) => {
@@ -188,9 +177,11 @@ export function ChatWorkflowCard({ runId, workspaceId, threadId }: { runId: stri
             <span className="flex justify-center"><TaskIcon task={task} /></span>
             <span className="truncate text-foreground/90" title={task.error ?? task.spec.title}>{task.spec.title}</span>
             <span className="truncate text-label text-muted-foreground">{routeName(run, task)}</span>
-            <span className={cn("min-w-14 text-right font-mono text-caption tabular-nums", task.status === "succeeded" ? "text-status-open" : LIVE_TASK.has(task.status) ? "text-status-working" : "text-muted-foreground")}>
-              {task.status === "failed" ? "failed" : taskDuration(task, now) ?? "queued"}
-            </span>
+            <TickingText
+              active={active && task.status !== "failed"}
+              className={cn("min-w-14 text-right font-mono text-caption", task.status === "succeeded" ? "text-status-open" : LIVE_TASK.has(task.status) ? "text-status-working" : "text-muted-foreground")}
+              compute={(now) => task.status === "failed" ? "failed" : taskDuration(task, now) ?? "queued"}
+            />
           </li>)}
         </ul>}
       </div>;
