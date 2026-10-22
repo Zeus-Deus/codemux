@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { create } from "zustand";
+import { shallow } from "zustand/shallow";
 
 import { workspacesSyncList, type WorkspaceSyncView } from "@/tauri/commands";
 
@@ -27,7 +28,7 @@ import { workspacesSyncList, type WorkspaceSyncView } from "@/tauri/commands";
  *   non-React callers — it short-circuits once the first load has
  *   resolved, so it's safe to call from anywhere.
  *
- * Falls back to an empty list on error — never throws, so the UI
+ * Keeps the previous rows (initially empty) on error — never throws, so the UI
  * never breaks when the user is signed out or the DB momentarily
  * can't be read.
  */
@@ -66,7 +67,17 @@ export const useWorkspacesSyncStore = create<WorkspacesSyncStore>(
       set({ loading: true, error: null });
       inFlight = workspacesSyncList()
         .then((rows) => {
-          set({ rows, loading: false, loaded: true, error: null });
+          set((state) => ({
+            // IPC returns fresh objects. Nested fields must retain their
+            // references too, so future metadata changes stay visible.
+            rows: state.rows.length === rows.length
+              && state.rows.every((row, index) => shallow(row, rows[index]))
+              ? state.rows
+              : rows,
+            loading: false,
+            loaded: true,
+            error: null,
+          }));
         })
         .catch((err: unknown) => {
           const message = typeof err === "string" ? err : String(err);
@@ -94,15 +105,15 @@ function ensurePolling() {
 
 /** Hook for components that just want the rows. Auto-inits on first
  *  call and ref-counts to drive the 5 s polling interval — when no
- *  subscriber is mounted, the poll skips so we don't wake the Rust
- *  side unnecessarily.
+ *  subscriber is mounted, the interval is stopped.
  *
  *  Subscriber lifecycle is managed via a `useEffect`: mount
  *  increments the global counter, kicks a fresh `refresh()` (so
  *  re-opening the overview always reflects rows the background
  *  `hosts_inventory` poller or a peer device inserted while the
  *  overview was closed — `init()` no-ops after the first call), and
- *  arms the polling interval; unmount decrements. Strict Mode's
+ *  arms the polling interval; unmount decrements and clears the
+ *  interval after the last subscriber leaves. Strict Mode's
  *  double-mount cleanly increments/decrements in pairs, so the
  *  counter stays accurate. */
 export function useWorkspacesSync(): WorkspaceSyncView[] {
@@ -160,4 +171,8 @@ export function incrementWorkspacesSyncSubscribers() {
 }
 export function decrementWorkspacesSyncSubscribers() {
   subscriberCount = Math.max(0, subscriberCount - 1);
+  if (subscriberCount === 0 && pollHandle !== null) {
+    clearInterval(pollHandle);
+    pollHandle = null;
+  }
 }
