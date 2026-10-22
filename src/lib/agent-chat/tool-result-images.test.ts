@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import nativeImageResultRaw from "./__fixtures__/opencode-native-image-tool-result.json?raw";
+import { LAZY_TOOL_RESULT_KEY } from "./lazy-tool-result";
 import {
   extractToolResultImages,
   hasToolResultImages,
@@ -129,6 +130,61 @@ describe("extractToolResultImages", () => {
   });
 
   it.each([
+    {
+      name: "extraction",
+      project: extractToolResultImages,
+      expected: [{ src: "data:image/png;base64,AAAA", mediaType: "image/png" }],
+    },
+    {
+      name: "pointer projection",
+      project: toolResultImagePointers,
+      expected: [{ pointer: "/result/content/0", src: "data:image/png;base64,AAAA" }],
+    },
+  ])("normalizes each image once during $name", ({ project, expected }) => {
+    const readData = vi.fn(() => "AAAA");
+    const image = {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: "image/png",
+        get data() { return readData(); },
+      },
+    };
+
+    expect(project({ result: { content: [image] } })).toEqual(expected);
+    expect(readData).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves traversal order and pointers across only the result containers", () => {
+    const image = (name: string) => ({
+      type: "image_url",
+      image_url: `https://example.test/${name}.png`,
+    });
+    const content = {
+      contentItems: [image("last")],
+      metadata: { content: [image("metadata")] },
+      content: [image("middle")],
+      result: {
+        arguments: { content: [image("argument")] },
+        content: [
+          { type: "image_url", image_url: "javascript:alert(1)" },
+          image("first"),
+        ],
+      },
+    };
+    const sources = ["first", "middle", "last"].map((name) => ({
+      src: `https://example.test/${name}.png`,
+    }));
+
+    expect(extractToolResultImages(content)).toEqual(sources);
+    expect(toolResultImagePointers(content)).toEqual([
+      { pointer: "/result/content/1", ...sources[0] },
+      { pointer: "/content/0", ...sources[1] },
+      { pointer: "/contentItems/0", ...sources[2] },
+    ]);
+  });
+
+  it.each([
     { type: "inputImage", imageUrl: "file:///private.png" },
     { type: "inputImage", imageUrl: 42 },
     { type: "image", data: "AAAA", mimeType: "application/pdf" },
@@ -170,6 +226,40 @@ describe("hasToolResultImages", () => {
     ).toBe(true);
     expect(hasToolResultImages([{ type: "text", text: "x" }])).toBe(false);
     expect(hasToolResultImages("x")).toBe(false);
+  });
+
+  it("stops at the first renderable image in nested arrays and envelopes", () => {
+    const readLaterContent = vi.fn(() => []);
+    const content = {
+      result: { content: [
+        { type: "image_url", image_url: "file:///private.png" },
+        { type: "image_url", image_url: "https://example.test/first.png" },
+        { get content() { return readLaterContent(); } },
+      ] },
+      get content() { return readLaterContent(); },
+      get contentItems() { return readLaterContent(); },
+    };
+
+    expect(hasToolResultImages(content)).toBe(true);
+    expect(readLaterContent).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("uses lazy image metadata when has_images is %s", (hasImages) => {
+    const readContent = vi.fn(() => []);
+    const content = {
+      [LAZY_TOOL_RESULT_KEY]: {
+        row_id: 42,
+        bytes: 40_000,
+        preview: "tool result",
+        line_count: 10,
+        has_images: hasImages,
+        images: hasImages ? [{ pointer: "/result/content/0" }] : [],
+      },
+      get content() { return readContent(); },
+    };
+
+    expect(hasToolResultImages(content)).toBe(hasImages);
+    expect(readContent).not.toHaveBeenCalled();
   });
 });
 

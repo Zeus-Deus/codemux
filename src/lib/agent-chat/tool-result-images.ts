@@ -133,31 +133,36 @@ export function isRenderableImageBlock(entry: unknown): boolean {
  */
 export function extractToolResultImages(content: unknown): ToolResultImage[] {
   const out: ToolResultImage[] = [];
-  visitImageContent(content, (entry) => {
-    const image = imageFromEntry(entry);
-    if (image) out.push(image);
+  visitImageContent(content, (image) => {
+    out.push(image);
+    return false;
   });
   return out;
 }
 
 /** Provider envelopes wrap blocks under these result containers. Never scan
- *  arbitrary arguments or metadata for things that merely look like images. */
+ *  arbitrary arguments or metadata for things that merely look like images.
+ *  Returning true from the visitor stops the walk, for presence checks. */
 function visitImageContent(
   content: unknown,
-  visit: (entry: unknown, pointer: string) => void,
+  visit: (image: ToolResultImage, pointer: string) => boolean,
   pointer = "",
-) {
-  if (isRenderableImageBlock(content)) {
-    visit(content, pointer);
+): boolean {
+  const image = imageFromEntry(content);
+  if (image) {
+    return visit(image, pointer);
   } else if (Array.isArray(content)) {
-    content.forEach((entry, index) =>
+    return content.some((entry, index) =>
       visitImageContent(entry, visit, `${pointer}/${index}`),
     );
   } else if (isRecord(content)) {
     for (const key of ["result", "content", "contentItems"]) {
-      if (key in content) visitImageContent(content[key], visit, `${pointer}/${key}`);
+      if (key in content && visitImageContent(content[key], visit, `${pointer}/${key}`)) {
+        return true;
+      }
     }
   }
+  return false;
 }
 
 /** Mirrors the Rust wire projection for the browser mock. */
@@ -165,9 +170,7 @@ export function toolResultImagePointers(
   content: unknown,
 ): { pointer: string; src?: string }[] {
   const pointers: { pointer: string; src?: string }[] = [];
-  visitImageContent(content, (entry, pointer) => {
-    const image = imageFromEntry(entry);
-    if (!image) return;
+  visitImageContent(content, (image, pointer) => {
     const src = image.src;
     const match = /^data:image\/(?:png|jpe?g|gif|webp);base64,([^]*)$/i.exec(src);
     const materializable = match &&
@@ -175,6 +178,7 @@ export function toolResultImagePointers(
     pointers.push(
       src.length <= 32 * 1024 || !materializable ? { pointer, src } : { pointer },
     );
+    return false;
   });
   return pointers;
 }
@@ -202,7 +206,5 @@ export function withoutToolResultImages(content: unknown): unknown {
 export function hasToolResultImages(content: unknown): boolean {
   const stub = lazyToolResultStub(content);
   if (stub) return stub.has_images;
-  let found = false;
-  visitImageContent(content, () => { found = true; });
-  return found;
+  return visitImageContent(content, () => true);
 }
