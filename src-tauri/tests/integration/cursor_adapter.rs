@@ -375,8 +375,8 @@ async fn cursor_stop_is_never_lost_whenever_it_lands() {
 }
 
 /// Run manually with:
-/// `cargo test -j 2 --manifest-path src-tauri/Cargo.toml --test cursor_adapter \
-///   cursor_real_session_resumes_across_fast_tier_changes -- --ignored --nocapture`
+/// `cargo test -j 2 --manifest-path src-tauri/Cargo.toml --test integration \
+///   cursor_adapter::cursor_real_session_resumes_across_fast_tier_changes -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires real cursor-agent CLI + Cursor auth; run manually"]
 async fn cursor_real_session_resumes_across_fast_tier_changes() {

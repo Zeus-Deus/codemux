@@ -2,7 +2,7 @@
 //! frontmatter or compatibility classifier issues on real-world data.
 //!
 //! Ignored by default so CI doesn't depend on the host's skill collection.
-//! Run with: `cargo test --test skills_real_disk_smoke -- --ignored --nocapture`
+//! Run with: `cargo test --test integration skills_real_disk_smoke:: -- --ignored --nocapture`
 
 use codemux_lib::skills::{paths::enumerate_scan_paths, scanner::scan_directory, SkillScope};
 

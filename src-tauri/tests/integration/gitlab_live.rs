@@ -6,7 +6,7 @@
 //! ```text
 //! CODEMUX_GITLAB_TEST_TOKEN=<personal access token> \
 //!   cargo test --manifest-path src-tauri/Cargo.toml \
-//!   --test gitlab_live -- --ignored --nocapture
+//!   --test integration gitlab_live:: -- --ignored --nocapture
 //! ```
 //!
 //! `CODEMUX_GITLAB_TEST_HOST` overrides the default `localhost:8929`.

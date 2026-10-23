@@ -16,7 +16,7 @@ use std::{
 use tokio::sync::watch;
 
 const CHAT_WORKFLOW_SCRIPT: &str =
-    include_str!("../../src/lib/workflows/chat-workflow.script.js");
+    include_str!("../../../src/lib/workflows/chat-workflow.script.js");
 
 /// Plays every agent: a fixed plan, one summary per subtask, then a report
 /// that echoes what it was given. Records each dispatch for assertions.

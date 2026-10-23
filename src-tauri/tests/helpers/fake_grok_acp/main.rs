@@ -1,4 +1,4 @@
-//! Process-boundary Grok ACP fixture for `tests/grok_adapter.rs`.
+//! Process-boundary Grok ACP fixture for `tests/integration/grok_adapter.rs`.
 //!
 //! This deliberately validates the wire contract instead of merely returning
 //! canned JSON. A wrong CLI invocation, auth choice, session/new shape, or

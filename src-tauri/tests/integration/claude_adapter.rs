@@ -2343,8 +2343,8 @@ async fn auth_probe_unauthenticated_matches_common_patterns() {
 // --------------------------------------------------------------------------
 
 /// Run manually with:
-/// `cargo test --manifest-path src-tauri/Cargo.toml --test claude_adapter \
-///   claude_real_session -- --ignored --nocapture`
+/// `cargo test --manifest-path src-tauri/Cargo.toml --test integration \
+///   claude_adapter::claude_real_session -- --ignored --nocapture`
 ///
 /// The test only runs if the developer has
 /// `CODEMUX_CLAUDE_SIDECAR_PATH` set (or a bundled binary) AND a

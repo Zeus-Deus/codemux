@@ -1,4 +1,4 @@
-//! Fake claude-agent sidecar used by `tests/claude_adapter.rs`.
+//! Fake claude-agent sidecar used by `tests/integration/claude_adapter.rs`.
 //!
 //! Reads newline-delimited JSON-RPC from stdin. Responds to the same
 //! method names the real sidecar exposes, but with canned responses

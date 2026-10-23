@@ -1,7 +1,7 @@
 //! Real native commands + in-memory production DB + credential-free ACP child.
 //! MockRuntime only: no production Builder, windows, servers or account setup.
 #![cfg(unix)]
-#[path = "helpers/custom_acp_python.rs"]
+#[path = "../helpers/custom_acp_python.rs"]
 mod test_python;
 
 use codemux_lib::{
@@ -323,7 +323,7 @@ async fn correction_cold_failed_model_is_not_acknowledged_without_a_live_session
     f.resume().await;
 }
 
-#[path = "helpers/mock_agent_provider.rs"]
+#[path = "../helpers/mock_agent_provider.rs"]
 #[allow(dead_code)]
 mod builtin_fixture;
 #[tokio::test]

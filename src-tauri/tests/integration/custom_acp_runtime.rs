@@ -1,5 +1,5 @@
 //! Credential-free process qualification; parent owns execution of this lane.
-#[path = "helpers/custom_acp_python.rs"]
+#[path = "../helpers/custom_acp_python.rs"]
 mod test_python;
 
 use codemux_lib::agent_provider::{

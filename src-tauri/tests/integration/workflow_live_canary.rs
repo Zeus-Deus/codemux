@@ -583,7 +583,7 @@ async fn workflow_live_native_coordination() {
 }
 
 const CHAT_WORKFLOW_SCRIPT: &str =
-    include_str!("../../src/lib/workflows/chat-workflow.script.js");
+    include_str!("../../../src/lib/workflows/chat-workflow.script.js");
 
 /// Paid end-to-end check of `/workflow`: the app's planner program on the
 /// production script engine, scheduler, live driver and Claude adapter. A
