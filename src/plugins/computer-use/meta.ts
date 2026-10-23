@@ -5,5 +5,5 @@ export default {
   name: "Computer use",
   description: "Let agents work in a chosen application window, with a live view and Stop control.",
   version: "0.1.0",
-  defaultEnabled: false,
+  defaultEnabled: true,
 } satisfies BundledPluginMeta;
