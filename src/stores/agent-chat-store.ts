@@ -126,7 +126,7 @@ export interface Attachment {
    *  built from these bytes. */
   resolvedImage?: {
     mime: string;
-    bytes: Uint8Array;
+    bytes: Uint8Array<ArrayBuffer>;
   };
   /** Image-only: reference to the backend staging file the bytes were
    *  written to at attach time (`agent_chat_stage_image`). Populated

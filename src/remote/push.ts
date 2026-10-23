@@ -65,7 +65,7 @@ export async function currentSubscription(): Promise<PushSubscription | null> {
     )?.pushManager.getSubscription() ?? null
   );
 }
-export function decodeApplicationKey(value: string): Uint8Array {
+export function decodeApplicationKey(value: string): Uint8Array<ArrayBuffer> {
   const raw = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
   return Uint8Array.from(raw, (c) => c.charCodeAt(0));
 }

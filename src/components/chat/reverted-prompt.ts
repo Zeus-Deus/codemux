@@ -27,7 +27,9 @@ export function findRevertedUserMessage(
   return null;
 }
 
-function dataUrlBytes(src: string): { bytes: Uint8Array; mime: string } | null {
+function dataUrlBytes(
+  src: string,
+): { bytes: Uint8Array<ArrayBuffer>; mime: string } | null {
   const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(src);
   if (!match || !match[2]) return null;
   const binary = atob(match[3]);

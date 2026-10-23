@@ -538,7 +538,7 @@ describe("Composer image attach (Step 8 Stage 6)", () => {
           // Allocating a real 5MB Uint8Array makes the test slow on
           // CI; use a length-only stub. The total-bytes computation
           // reads `bytes.length` only.
-          bytes: { length: bytes } as unknown as Uint8Array,
+          bytes: { length: bytes } as unknown as Uint8Array<ArrayBuffer>,
         },
       };
     }
