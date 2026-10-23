@@ -772,7 +772,7 @@ export function SidebarProjectsView() {
         )}
 
         {(model.quietProjects.length > 0 || model.shelf.length > 0) && (
-          <div className="mt-2 flex flex-col gap-1 border-t border-border/70 pt-2">
+          <div className="mt-auto flex flex-col gap-1 border-t border-border/70 pt-2">
             {model.quietProjects.length > 0 && (
               <SidebarGroup
                 role="region"
