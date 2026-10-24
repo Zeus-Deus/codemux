@@ -54,7 +54,7 @@ import {
 
 import { useBackgroundBrowserSession } from "@/components/browser/background-browser-indicator";
 import { Slot } from "@/contrib/react/slot";
-import { useContributions } from "@/contrib/react/use-contributions";
+import { useHasComposerStatus } from "@/contrib/react/use-composer-status";
 import { COMPOSER_STATUS_AREA } from "@/sdk/areas";
 import { openDelegatedChat } from "@/components/chat/delegation-actions";
 import { TickingText } from "@/components/chat/TickingText";
@@ -117,6 +117,7 @@ import { RunButton } from "../run-button";
 import { PrWatchRow } from "./pr-watch-row";
 import {
   DETAILS_CHEVRON,
+  DETAILS_DIFF_STAT,
   DETAILS_ICON,
   DETAILS_LABEL,
   DETAILS_MENU_ICON,
@@ -216,10 +217,12 @@ const TOGGLE_SELECTOR = "[data-testid='workspace-details-toggle']";
 const CARD_SCROLL = "thin-scrollbar overflow-y-auto border border-border bg-popover";
 
 /** The pinned card is part of the canvas, not a menu over it: a quieter
- *  lift than the popover's menu plume (`cm-menu-surface`). */
+ *  lift than the popover's menu plume (`cm-menu-surface`), but the same
+ *  theme radius and raised-surface lines, so the card reads as one object
+ *  in both modes. */
 const PINNED_SURFACE = cn(
   CARD_SCROLL,
-  "rounded-xl shadow-[0_6px_24px_-10px_oklch(0_0_0/0.3)] dark:shadow-[0_8px_28px_-12px_oklch(0_0_0/0.6)]",
+  "cm-raised-surface rounded-lg shadow-[0_6px_24px_-10px_oklch(0_0_0/0.3)] dark:shadow-[0_8px_28px_-12px_oklch(0_0_0/0.6)]",
 );
 
 const POPOVER_SURFACE = cn(CARD_SCROLL, "cm-menu-surface");
@@ -480,7 +483,7 @@ function Section({
       data-testid={testId}
       className={cn(
         "flex flex-col gap-px p-1.5 empty:hidden",
-        separated && "border-t border-border/65",
+        separated && "border-t border-border",
       )}
     >
       {title && (
@@ -517,7 +520,7 @@ function WorkspaceSection({
             the checkout kind rides on the right with its own glyph. */}
         <Monitor className={DETAILS_ICON} />
         <span className={DETAILS_LABEL}>{deviceName}</span>
-        <span className={cn(DETAILS_TRAILING, "font-sans")}>
+        <span className={DETAILS_TRAILING}>
           {isWorktree ? (
             <FolderGit2 className="size-3.5" aria-hidden />
           ) : (
@@ -726,7 +729,7 @@ function BranchRow({
       title={`${branch} — click to copy`}
     >
       <GitBranch className={DETAILS_ICON} />
-      <span className={cn(DETAILS_LABEL, "font-mono text-label")}>{branch}</span>
+      <span className={DETAILS_LABEL}>{branch}</span>
       {(ahead > 0 || behind > 0) && (
         <span className={DETAILS_TRAILING}>
           {behind > 0 && (
@@ -782,7 +785,7 @@ function PullRequestRow({
       <span className={DETAILS_LABEL}>
         {provider.nounTitle} {ref}
       </span>
-      <span className={cn(DETAILS_TRAILING, "font-sans", prStatusTextClass(prState))}>
+      <span className={cn(DETAILS_TRAILING, prStatusTextClass(prState))}>
         {humanizePrState(workspace.pr_state)}
       </span>
     </button>
@@ -811,7 +814,7 @@ function IssueRow({ workspace }: { workspace: WorkspaceSnapshot }) {
         >
           <CircleDot className={cn(DETAILS_ICON, open && "text-success")} />
           <span className={DETAILS_LABEL}>Issue #{issue.number}</span>
-          <span className={cn(DETAILS_TRAILING, "font-sans", open && "text-success")}>
+          <span className={cn(DETAILS_TRAILING, open && "text-success")}>
             {open ? "Open" : "Closed"}
           </span>
         </button>
@@ -993,7 +996,7 @@ function DiffStat({
   }
   return (
     <span
-      className={DETAILS_TRAILING}
+      className={cn(DETAILS_TRAILING, DETAILS_DIFF_STAT)}
       aria-label={`${additions} ${additions === 1 ? "line" : "lines"} added, ${deletions} removed`}
     >
       <span className="text-success/80">+{additions}</span>
@@ -1025,9 +1028,10 @@ function LiveSection({
   const session = useBackgroundBrowserSession(workspaceId);
   const peekOpen = useBrowserPeekStore((s) => s.openWorkspaceId === workspaceId);
   const togglePeek = useBrowserPeekStore((s) => s.toggle);
-  const statusContributions = useContributions(COMPOSER_STATUS_AREA);
   const { threadId } = useActiveChatTasks(workspace);
-  const hasStatus = statusContributions.some((c) => c.render);
+  // Plugin chips render nothing while idle; only title the section when one
+  // is actually showing, never over an empty slot.
+  const hasStatus = useHasComposerStatus({ workspaceId, threadId });
   if (!session && !hasStatus) return null;
   const host = pageHost(session?.current_url);
 
@@ -1169,7 +1173,6 @@ function AgentsSection({
           <span
             className={cn(
               DETAILS_TRAILING,
-              "font-sans",
               workflowRun.status === "running" && "text-status-working",
               workflowRun.status === "failed" && "text-danger",
             )}

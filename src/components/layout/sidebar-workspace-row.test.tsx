@@ -614,7 +614,7 @@ describe("Muted indicator on the workspace row", () => {
 });
 
 describe("Archive context-menu items", () => {
-  it("renders 'Archive Workspace' and forwards clicks to onArchiveRequest", async () => {
+  it("renders 'Archive workspace' and forwards clicks to onArchiveRequest", async () => {
     const onArchive = vi.fn();
     const ws = makeWorkspace({ worktree_path: null });
     render(
@@ -627,12 +627,12 @@ describe("Archive context-menu items", () => {
     await flushDefaultBranchFetch();
 
     await userEvent.click(
-      screen.getByRole("menuitem", { name: /Archive Workspace/i }),
+      screen.getByRole("menuitem", { name: /Archive workspace/i }),
     );
     expect(onArchive).toHaveBeenCalledTimes(1);
   });
 
-  it("offers 'Delete Worktree…' only for deletable worktrees", async () => {
+  it("offers 'Delete worktree…' only for deletable worktrees", async () => {
     const ws = makeWorkspace({
       worktree_path: "/home/user/.codemux/worktrees/myapp/feature-x",
       protected: false,
@@ -647,11 +647,11 @@ describe("Archive context-menu items", () => {
     await flushDefaultBranchFetch();
 
     expect(
-      screen.getByRole("menuitem", { name: /Delete Worktree…/i }),
+      screen.getByRole("menuitem", { name: /Delete worktree…/i }),
     ).toBeInTheDocument();
   });
 
-  it("hides 'Delete Worktree…' for the primary workspace and the protected root", async () => {
+  it("hides 'Delete worktree…' for the primary workspace and the protected root", async () => {
     const primary = render(
       <WorkspaceContextMenuItems
         workspace={makeWorkspace({ worktree_path: null })}
@@ -661,7 +661,7 @@ describe("Archive context-menu items", () => {
     );
     await flushDefaultBranchFetch();
     expect(
-      screen.queryByRole("menuitem", { name: /Delete Worktree…/i }),
+      screen.queryByRole("menuitem", { name: /Delete worktree…/i }),
     ).not.toBeInTheDocument();
     primary.unmount();
     cleanup();
@@ -678,7 +678,7 @@ describe("Archive context-menu items", () => {
     );
     await flushDefaultBranchFetch();
     expect(
-      screen.queryByRole("menuitem", { name: /Delete Worktree…/i }),
+      screen.queryByRole("menuitem", { name: /Delete worktree…/i }),
     ).not.toBeInTheDocument();
   });
 });
@@ -751,7 +751,7 @@ describe("Hover-reveal archive button", () => {
 
     expect(mockArchiveWorkspace).not.toHaveBeenCalled();
     // Query by heading role — the (inline-mocked) context menu also
-    // renders a "Delete Worktree…" item, so plain text would be
+    // renders a "Delete worktree…" item, so plain text would be
     // ambiguous.
     expect(
       await screen.findByRole("heading", { name: /Delete worktree/i }),
@@ -900,7 +900,7 @@ describe("Remote / attach-only rows: close instead of archive", () => {
     );
   });
 
-  it("the context menu offers 'Close workspace' (no Archive, no Delete Worktree…) for attach/remote rows", async () => {
+  it("the context menu offers 'Close workspace' (no Archive, no Delete worktree…) for attach/remote rows", async () => {
     const onArchive = vi.fn();
     render(
       <WorkspaceContextMenuItems
@@ -915,10 +915,10 @@ describe("Remote / attach-only rows: close instead of archive", () => {
     await flushDefaultBranchFetch();
 
     expect(
-      screen.queryByRole("menuitem", { name: /Archive Workspace/i }),
+      screen.queryByRole("menuitem", { name: /Archive workspace/i }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("menuitem", { name: /Delete Worktree…/i }),
+      screen.queryByRole("menuitem", { name: /Delete worktree…/i }),
     ).not.toBeInTheDocument();
 
     await userEvent.click(

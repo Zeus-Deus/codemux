@@ -27,8 +27,23 @@ export function ProjectMiniAvatar({ name, path }: { name: string; path: string }
       cacheBust={appearance.imageVersion}
       size="sm"
       shape="square"
-      className="font-bold"
     />
+  );
+}
+
+/** One row recipe for the whole menu: the pinned reset, the project list and
+ *  the create actions share height, type size and icon column. */
+const FILTER_ROW = "h-8 gap-2 rounded-md px-2 text-body";
+const FILTER_ICON = "size-3.5 shrink-0 text-muted-foreground";
+
+/** A row's workspace count. Zero says nothing a missing number doesn't, so
+ *  it is left out rather than printed down the whole column. */
+function FilterCount({ count }: { count: number }) {
+  if (count <= 0) return null;
+  return (
+    <span className="shrink-0 text-label tabular-nums text-muted-foreground">
+      {count}
+    </span>
   );
 }
 
@@ -58,16 +73,11 @@ function ProjectFilterItem({
       // radio role is what tells assistive tech which one that is.
       role="menuitemradio"
       aria-checked={active}
-      className={cn(
-        "h-8 gap-2 rounded-md px-2 text-label",
-        active && "font-medium text-foreground",
-      )}
+      className={cn(FILTER_ROW, active && "font-medium text-foreground")}
     >
       <ProjectMiniAvatar name={name} path={path} />
       <span className="min-w-0 flex-1 truncate">{name}</span>
-      <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
-        {count}
-      </span>
+      <FilterCount count={count} />
       <span className="size-4 shrink-0" aria-hidden>
         {active && <Check className="size-4" />}
       </span>
@@ -132,9 +142,9 @@ export function SidebarProjectFilter({
           aria-label="Filter by project"
           data-project-filter
           className={cn(
-            "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2.5",
-            "border border-transparent bg-transparent text-label font-semibold text-foreground/80",
-            "transition-colors duration-150 hover:border-border/60 hover:bg-surface-2",
+            "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2.5 data-[state=open]:bg-surface-2",
+            "bg-transparent text-label font-semibold text-foreground/80",
+            "transition-colors duration-150 hover:bg-surface-2",
           )}
         >
           {filter === null ? (
@@ -167,28 +177,23 @@ export function SidebarProjectFilter({
         {/* "All projects" is the reset, so it stays pinned above the
             scroll area — scrolling to the top to clear a filter is the
             kind of small tax that makes a long list feel like work. */}
-        <div className="shrink-0 border-b border-border/60 p-1.5">
+        <div className="shrink-0 border-b border-border p-1">
           <DropdownMenuItem
             onClick={() => setFilter(null)}
             aria-label="All projects"
             role="menuitemradio"
             aria-checked={filter === null}
-            className={cn(
-              "h-8 gap-2 rounded-md px-2 text-label",
-              filter === null && "font-medium text-foreground",
-            )}
+            className={cn(FILTER_ROW, filter === null && "font-medium text-foreground")}
           >
-            <Folder className="size-3.5 shrink-0 text-muted-foreground" />
+            <Folder className={FILTER_ICON} />
             <span className="min-w-0 flex-1 truncate">All projects</span>
-            <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
-              {counts.total}
-            </span>
+            <FilterCount count={counts.total} />
             <span className="size-4 shrink-0" aria-hidden>
               {filter === null && <Check className="size-4" />}
             </span>
           </DropdownMenuItem>
         </div>
-        <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto p-1.5">
+        <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto p-1">
           {projectGroups.map((group) => (
             <ProjectFilterItem
               key={group.projectPath}
@@ -204,20 +209,20 @@ export function SidebarProjectFilter({
             pinned reset above it. Single-line rows sized like the
             project rows; the labels themselves carry the difference
             (adopt what's on disk vs start or clone a new repo). */}
-        <div className="shrink-0 border-t border-border/60 p-1.5">
+        <div className="shrink-0 border-t border-border p-1">
           <DropdownMenuItem
             onClick={() => openProject()}
-            className="h-8 gap-2 rounded-md px-2 text-label"
+            className={FILTER_ROW}
           >
-            <FolderOpen className="size-3.5 shrink-0 text-muted-foreground" />
+            <FolderOpen className={FILTER_ICON} />
             <span className="min-w-0 flex-1 truncate">Open existing project</span>
             <MenuKeycap actionId="openProject" />
           </DropdownMenuItem>
           <DropdownMenuItem
             onClick={() => setShowNewProjectScreen(true)}
-            className="h-8 gap-2 rounded-md px-2 text-label"
+            className={FILTER_ROW}
           >
-            <FolderPlus className="size-3.5 shrink-0 text-muted-foreground" />
+            <FolderPlus className={FILTER_ICON} />
             <span className="min-w-0 flex-1 truncate">Create or clone project</span>
           </DropdownMenuItem>
         </div>

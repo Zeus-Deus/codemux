@@ -3,7 +3,7 @@ import { cn } from "@/lib/utils";
 
 import vscodeIcon from "@/assets/editor-icons/vscode.svg";
 import vscodiumIcon from "@/assets/editor-icons/vscodium.svg";
-import cursorIcon from "@/assets/editor-icons/cursor.png";
+import cursorIcon from "@/assets/editor-icons/cursor.svg";
 import zedIcon from "@/assets/editor-icons/zed.png";
 import intellijIcon from "@/assets/editor-icons/intellij.svg";
 import golandIcon from "@/assets/editor-icons/goland.svg";
@@ -40,6 +40,10 @@ const ICON_MAP: Record<string, string> = {
   studio: intellijIcon,
 };
 
+// Flat light-ink marks, drawn for a dark scheme: the light scheme inverts
+// them to dark ink rather than shipping a second asset.
+const LIGHT_INK_MARKS = new Set(["cursor"]);
+
 export function EditorIcon({ id, className }: EditorIconProps) {
   const icon = ICON_MAP[id];
   if (icon) {
@@ -47,7 +51,11 @@ export function EditorIcon({ id, className }: EditorIconProps) {
       <img
         src={icon}
         alt=""
-        className={cn("shrink-0 object-contain", className)}
+        className={cn(
+          "shrink-0 object-contain",
+          LIGHT_INK_MARKS.has(id) && "invert dark:invert-0",
+          className,
+        )}
       />
     );
   }

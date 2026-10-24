@@ -3,13 +3,15 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 
 /** shadcn/ui Kbd (radix-nova), on app tokens: one keycap style for every
- *  shortcut hint. A filled chip rather than an outline, sans figures. */
+ *  shortcut hint. A filled chip rather than an outline, sans figures. The
+ *  fill is neutral ink (`surface-3`), not `muted`, which tinted themes
+ *  shift toward their accent. */
 function Kbd({ className, ...props }: React.ComponentProps<"kbd">) {
   return (
     <kbd
       data-slot="kbd"
       className={cn(
-        "pointer-events-none inline-flex h-5 w-fit min-w-5 shrink-0 items-center justify-center gap-1 rounded-sm bg-muted px-1 font-sans text-caption font-medium text-muted-foreground select-none [&_svg:not([class*='size-'])]:size-3",
+        "pointer-events-none inline-flex h-5 w-fit min-w-5 shrink-0 items-center justify-center gap-1 rounded-sm bg-surface-3 px-1 font-sans text-caption font-medium text-muted-foreground select-none [&_svg:not([class*='size-'])]:size-3",
         className,
       )}
       {...props}

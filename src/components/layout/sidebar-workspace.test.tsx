@@ -176,8 +176,8 @@ describe("SidebarProjectGroup", () => {
       </TooltipProvider>,
     );
     const avatar = screen.getByText("M").closest("div");
-    // Should have muted classes, no inline style for color
-    expect(avatar).toHaveClass("bg-muted");
+    // Neutral ink fill, no inline style for color
+    expect(avatar).toHaveClass("bg-surface-3");
     expect(avatar).toHaveClass("text-muted-foreground");
     expect(avatar?.style.color).toBeFalsy();
   });

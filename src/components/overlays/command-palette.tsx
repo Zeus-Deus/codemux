@@ -139,7 +139,7 @@ import {
   rankThemeGroup,
   themeRowValue,
   workspacePathText,
-  workspaceRowSubtitle,
+  workspaceRowBranch,
   workspaceSearchText,
 } from "./command-palette-model";
 import { Eyebrow } from "@/components/ui/eyebrow";
@@ -1266,17 +1266,17 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
       <div className="flex h-[52px] flex-none items-center gap-2.5 border-b border-hairline pr-3.5 pl-4">
         <Search className="size-4 shrink-0 text-muted-foreground/70" />
         {commandsOnly && (
-          <span className="flex h-[22px] flex-none items-center rounded-sm bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
+          <span className="flex h-[22px] flex-none items-center rounded-sm bg-accent-ember/15 px-2 text-caption font-medium text-accent-ember">
             Commands
           </span>
         )}
         {prsOnly && (
-          <span className="flex h-[22px] flex-none items-center rounded-md bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
+          <span className="flex h-[22px] flex-none items-center rounded-sm bg-accent-ember/15 px-2 text-caption font-medium text-accent-ember">
             Pull requests
           </span>
         )}
         {previewTheme && (
-          <span className="flex h-[22px] flex-none items-center rounded-sm bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
+          <span className="flex h-[22px] flex-none items-center rounded-sm bg-accent-ember/15 px-2 text-caption font-medium text-accent-ember">
             Themes
           </span>
         )}
@@ -1457,15 +1457,15 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
 
       {/* Footer — while a theme is previewing it explains the preview instead
           of the palette, because that is the only moment Esc does something
-          other than close. */}
-      <div className="flex h-[34px] flex-none items-center gap-3.5 border-t border-hairline bg-surface-1 px-3.5">
+          other than close. Narrow screens wrap whole hints onto a second
+          row instead of squeezing a label or pushing the count out. */}
+      <div className="flex min-h-[34px] flex-none flex-wrap items-center gap-x-3.5 gap-y-1.5 border-t border-hairline bg-surface-1 px-3.5 py-1.5">
         {previewTheme ? (
           <>
             <KeyHint keys="↑↓" label="preview" />
             <KeyHint keys="↵" label="keep it" />
             <KeyHint keys="esc" label={`back to ${appliedTheme.label}`} />
-            <span className="flex-1" />
-            <span className="font-mono text-caption text-muted-foreground/70">
+            <span className="ml-auto text-caption text-muted-foreground/70">
               {previewTheme.id === OMARCHY_THEME_ID ? "follows this desktop" : "syncs to your account"}
             </span>
           </>
@@ -1475,8 +1475,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <KeyHint keys="↵" label="open" />
             <KeyHint keys={COMMAND_MODE_PREFIX} label="commands" />
             <KeyHint keys={PR_MODE_PREFIX.trim()} label="pull requests" />
-            <span className="flex-1" />
-            <span className="font-mono text-caption text-muted-foreground/70 tabular-nums">
+            <span className="ml-auto text-caption text-muted-foreground/70 tabular-nums">
               {resultCountLabel(totalShown)}
             </span>
           </>
@@ -1509,7 +1508,7 @@ function GroupHeader({
         {label}
       </Eyebrow>
       <span className="h-px flex-1 bg-border/60" />
-      <span className="font-mono text-caption text-muted-foreground/50 tabular-nums">{count}</span>
+      <span className="text-caption text-muted-foreground/60 tabular-nums">{count}</span>
     </div>
   );
 }
@@ -1531,7 +1530,7 @@ function PaletteItem({
       value={value}
       onSelect={onSelect}
       className={cn(
-        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-selected:bg-accent",
+        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-selected:bg-surface-3",
         className,
       )}
     >
@@ -1541,11 +1540,23 @@ function PaletteItem({
 }
 
 /** The "press enter" affordance that replaces a row's keybind hint while the
- *  row is selected — the palette's one moving part. */
+ *  row is selected — the palette's one moving part. The shared neutral
+ *  keycap, like the footer's: the row's fill already says which one it is. */
 function EnterBadge() {
+  return <Kbd className="hidden group-data-selected/pal-row:inline-flex">↵</Kbd>;
+}
+
+/** "project · branch" under a row's title: the name is prose, the branch is
+ *  code, so only the branch is mono. One truncating run of inline spans, so a
+ *  long name ellipsizes inside the 220px budget instead of spilling past it,
+ *  and the run still shrinks beside the title in a narrow (mobile) palette. */
+function RowLocation({ name, branch }: { name: string | undefined; branch: string | null }) {
+  if (!name && !branch) return null;
   return (
-    <span className="hidden flex-none rounded-sm border border-accent-ember/30 bg-accent-ember/10 px-1.5 py-0.5 font-mono text-caption text-accent-ember group-data-selected/pal-row:inline-flex">
-      ↵
+    <span className="min-w-0 max-w-[220px] truncate text-label text-muted-foreground/70">
+      {name}
+      {name && branch && <span className="mx-1.5">·</span>}
+      {branch && <span className="font-mono">{branch}</span>}
     </span>
   );
 }
@@ -1597,12 +1608,10 @@ function WorkspaceItem({
         >
           {row.workspace.title}
         </span>
-        <span className="max-w-[220px] flex-none truncate font-mono text-label text-muted-foreground/70">
-          {workspaceRowSubtitle(row.workspace, row.projectName)}
-        </span>
+        <RowLocation name={row.projectName} branch={workspaceRowBranch(row.workspace)} />
       </span>
       {current && (
-        <span className="flex-none font-mono text-label text-muted-foreground/70">
+        <span className="flex-none text-label text-muted-foreground/70">
           current
         </span>
       )}
@@ -1618,7 +1627,7 @@ function WorkspaceItem({
         </span>
       )}
       {!row.status && idleFor && (
-        <span className="flex-none font-mono text-label text-muted-foreground/70">
+        <span className="flex-none text-label tabular-nums text-muted-foreground/70">
           {idleFor}
         </span>
       )}
@@ -1647,7 +1656,7 @@ function ProjectItem({
           {shortenPath(row.group.projectPath, homeDir)}
         </span>
       </span>
-      <span className="flex-none font-mono text-label text-muted-foreground/70">
+      <span className="flex-none text-label tabular-nums text-muted-foreground/70">
         {row.activeCount > 0 ? `${row.activeCount} active` : "idle"}
       </span>
       <EnterBadge />
@@ -1669,9 +1678,7 @@ function ConversationItem({
   const Icon =
     row.role === "user" ? UserRound : row.role === "assistant" ? Bot : MessageSquareText;
   const roleLabel = row.role === "user" ? "You" : row.role === "assistant" ? "Agent" : "Title";
-  const location = [workspace?.title, workspace?.git_branch]
-    .filter((part): part is string => !!part)
-    .join(" · ");
+  const branch = workspace?.git_branch ?? null;
   return (
     <PaletteItem
       value={`conversation:${row.thread_id}:${row.message_id ?? "title"}`}
@@ -1686,11 +1693,7 @@ function ConversationItem({
           <span className="truncate text-body-sm font-medium text-foreground/90">
             {row.session_title || "Untitled chat"}
           </span>
-          {location && (
-            <span className="truncate font-mono text-caption text-muted-foreground/60">
-              {location}
-            </span>
-          )}
+          <RowLocation name={workspace?.title} branch={branch} />
         </span>
         <span className="flex min-w-0 items-baseline gap-1.5 text-label text-muted-foreground">
           <span className="flex-none font-medium text-muted-foreground/75">{roleLabel}</span>
@@ -1753,7 +1756,7 @@ function ThemeItemRow({
       </span>
       <ThemeSchemeBadge scheme={row.theme.scheme} />
       {applied && (
-        <span className="flex-none font-mono text-label text-muted-foreground/70">
+        <span className="flex-none text-label text-muted-foreground/70">
           current
         </span>
       )}

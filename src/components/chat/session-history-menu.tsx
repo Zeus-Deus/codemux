@@ -101,13 +101,13 @@ export interface SessionHistoryListProps {
   /** Close the surrounding menu after an action. */
   closeMenu: () => void;
   /** Optional item (e.g. "Restore checkpoint") rendered at the top of the
-   *  menu, just below the New Chat row and above the history separator.
+   *  menu, just below the New chat row and above the history separator.
    *  Provide a full `DropdownMenuItem` node. */
   footerItem?: React.ReactNode;
 }
 
 /**
- * The New Chat row + grouped session list. Renders INSIDE a
+ * The New chat row + grouped session list. Renders INSIDE a
  * `DropdownMenuContent`, so both consumers wrap it in their own
  * `DropdownMenu`. One source of truth for the list markup + row
  * behavior (delete-on-hover, current indicator, resume-on-click).
@@ -134,7 +134,7 @@ export function SessionHistoryList({
         data-testid="session-selector-new-chat"
       >
         <Plus className="size-3.5" />
-        New Chat
+        New chat
       </DropdownMenuItem>
       {footerItem}
       <DropdownMenuSeparator />

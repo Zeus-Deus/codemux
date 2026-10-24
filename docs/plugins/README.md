@@ -96,7 +96,7 @@ Import the constants from `@codemux/sdk`.
 | `COMPOSER_ACTIONS_AREA` | Rows in the composer "+" menu | `data: { label, description?, icon?, run({ workspaceId, threadId, composer }) }` |
 | `COMPOSER_ACCESSORY_AREA` | Above the composer footer | `render({ workspaceId, threadId })` |
 | `COMPOSER_FOOTER_AREA` | Below the composer card | `render({ workspaceId, threadId })` |
-| `COMPOSER_STATUS_AREA` | Workspace details → Live on desktop; the existing status cluster on phones; adds no composer row | `render({ workspaceId, threadId })`; keep content compact |
+| `COMPOSER_STATUS_AREA` | Workspace details → Live on desktop; the existing status cluster on phones; adds no composer row | `render({ workspaceId, threadId })`; keep content compact. A chip that renders `null` while idle should also pass `data: { subscribe, isVisible }` (`ComposerStatusData`) so the Live heading hides with it |
 | `TITLEBAR_ACTIONS_AREA` | The action island in regular, covered, utility-page and standalone Settings chrome | `render()` (stop `pointerdown` on controls so the window doesn't drag) |
 | `SIDEBAR_SECTION_AREA` | Between the workspace list and the sidebar footer | `render()` |
 | `SIDEBAR_EMPTY_STATE_AREA` | Replaces the empty-sidebar plate (first one wins) | `render()` |

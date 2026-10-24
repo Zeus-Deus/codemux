@@ -1,6 +1,6 @@
 import { useEffect, useState, type MouseEvent } from "react";
 import { Slot } from "@/contrib/react/slot";
-import { useContributions } from "@/contrib/react/use-contributions";
+import { useHasComposerStatus } from "@/contrib/react/use-composer-status";
 import { COMPOSER_STATUS_AREA } from "@/sdk/areas";
 import { AppWindow, ArrowDown, ArrowUp, ChevronUp } from "lucide-react";
 import { openExternalUrl, type LinkGesture } from "@/lib/open-url";
@@ -81,7 +81,10 @@ export function WorkspaceStatusCluster({
   threadId?: string | null;
 } = {}) {
   const workspace = useActiveWorkspace();
-  const statusContributions = useContributions(COMPOSER_STATUS_AREA);
+  const hasStatus = useHasComposerStatus({
+    workspaceId: workspace?.workspace_id ?? null,
+    threadId: threadId ?? null,
+  });
   const homeDir = useHomeDir();
   const hosts = useHosts();
   const backgroundBrowserSession = useBackgroundBrowserSession(
@@ -126,7 +129,7 @@ export function WorkspaceStatusCluster({
     !showNoGit &&
     !backgroundBrowserSession &&
     !workspace.linked_issue &&
-    !statusContributions.some((c) => c.render)
+    !hasStatus
   )
     return null;
 

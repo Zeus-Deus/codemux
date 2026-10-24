@@ -48,4 +48,24 @@ describe("SidebarProjectFilter", () => {
     expect(screen.getByRole("menuitemradio", { name: "All projects" }))
       .toHaveAttribute("aria-checked", "false");
   });
+
+  it("prints a project's count only when it has workspaces", async () => {
+    const user = userEvent.setup();
+    render(
+      <SidebarProjectFilter
+        projectGroups={[
+          { projectName: "Alpha", projectPath: "/alpha", workspaces: [] },
+          { projectName: "Beta", projectPath: "/beta", workspaces: [] },
+        ]}
+        counts={{ map: new Map([["/alpha", 3], ["/beta", 0]]), total: 3 }}
+        filter={null}
+        filterName={null}
+        setFilter={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Filter by project" }));
+    expect(screen.getByRole("menuitemradio", { name: "Alpha" })).toHaveTextContent(/^AAlpha3$/);
+    expect(screen.getByRole("menuitemradio", { name: "Beta" })).toHaveTextContent(/^BBeta$/);
+    expect(screen.getByRole("menuitemradio", { name: "All projects" })).toHaveTextContent(/^All projects3$/);
+  });
 });

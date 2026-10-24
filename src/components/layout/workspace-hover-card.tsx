@@ -415,12 +415,13 @@ export function WorkspaceHoverCardBody({
 
       <div className="flex flex-col gap-0.5 p-1.5">
         {isGit && workspace.git_branch && (
-          <DetailRow label="Branch" value={workspace.git_branch} muted />
+          <DetailRow label="Branch" value={workspace.git_branch} muted code />
         )}
         {isGit && hasUncommitted && (
           <DetailRow
             label="Uncommitted"
             value={`+${workspace.git_additions} −${workspace.git_deletions}`}
+            code
           />
         )}
         {isGit && workspace.git_changed_files > 0 && (
@@ -459,6 +460,7 @@ export function WorkspaceHoverCardBody({
             <DetailRow
               label={scProvider.nounTitle}
               value={`${providerRef(scProvider, workspace.pr_number)} · ${prState}`}
+              code
               valueClassName={prStatusTextClass(workspace.pr_state) ?? undefined}
             />
           )
@@ -476,12 +478,14 @@ export function WorkspaceHoverCardBody({
             label={`${scProvider.shortNoun} branch`}
             value={prHeadBranch!}
             muted
+            code
           />
         )}
         {issue && (
           <DetailRow
             label="Issue"
             value={`#${issue.number} · ${issue.state}`}
+            code
             valueClassName={
               issue.state === "Open" ? "text-success" : "text-muted-foreground"
             }
@@ -495,6 +499,7 @@ export function WorkspaceHoverCardBody({
               .map((p) => `:${p.port}`)
               .join(" ")
               .concat(ports.length > 3 ? ` +${ports.length - 3}` : "")}
+            code
             valueClassName="text-status-remote"
           />
         )}
@@ -673,7 +678,7 @@ function PrSetRows({
           </li>
         ))}
         {hidden > 0 && (
-          <li className="px-2 py-1 text-right font-mono text-label text-muted-foreground">
+          <li className="px-2 py-1 text-right text-label tabular-nums text-muted-foreground">
             +{hidden} more
           </li>
         )}
@@ -687,6 +692,7 @@ function DetailRow({
   value,
   valueClassName,
   muted,
+  code,
 }: {
   label: string;
   value: React.ReactNode;
@@ -694,6 +700,9 @@ function DetailRow({
    *  Falls back to `muted` when omitted. */
   valueClassName?: string;
   muted?: boolean;
+  /** A code-like value (branch, diff stat, PR/issue ref, port): mono.
+   *  Everything else (counts, states, places) stays sans. */
+  code?: boolean;
 }) {
   return (
     // The label is short and known; the value can be a long worktree branch.
@@ -705,7 +714,8 @@ function DetailRow({
       </span>
       <span
         className={cn(
-          "min-w-0 flex-1 truncate text-right font-mono text-label tabular-nums",
+          "min-w-0 flex-1 truncate text-right text-label tabular-nums",
+          code && "font-mono",
           valueClassName ?? (muted ? "text-muted-foreground" : "text-foreground"),
         )}
       >

@@ -30,7 +30,12 @@
  * the three defaults. Tabs never shrink. Each one keeps its icon and a label
  * that is capped and truncated, and the row scrolls sideways (a plain
  * vertical wheel pans it) with a soft fade on whichever edge is clipped.
- * Tabs reorder by drag, same gesture as the titlebar tabs.
+ * Panning alone left the clipped tabs hard to find at the default width,
+ * where the row shows about one and a half, so while any tab is out of
+ * view the row also lists them all: in its "…" once the pane actions have
+ * folded there, or behind an "All tabs" chevron beside the tabs while they
+ * sit inline. The active tab is kept in view when it is picked and when
+ * the panel narrows. Tabs reorder by drag, same gesture as the titlebar tabs.
  *
  * **Narrow panels.** In the titlebar band the row shares its width with the
  * fixed top-right cluster and the native window buttons (~174px). The row
@@ -55,6 +60,7 @@ import {
   type ReactNode,
 } from "react";
 import {
+  ChevronDown,
   ChevronsLeftRight,
   Ellipsis,
   PanelRight,
@@ -145,36 +151,8 @@ function DeckTabChip({
   onClose: () => void;
 }) {
   const Icon = tab.icon;
-  const ref = useRef<HTMLDivElement>(null);
-
-  // Once the tabs and the pane actions share one row, a deck of four or
-  // five panes overflows at the panel's default width — and the tab you
-  // just selected is exactly the one that must not be the clipped one.
-  useEffect(() => {
-    if (!active) return;
-    ref.current?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
-  }, [active]);
-
-  const badge = tab.badge != null && (
-    <span
-      className={cn(
-        // A row, not a run of inline text: a badge can be a count plus a
-        // status icon (Review), which must sit beside the count, not under it.
-        "inline-flex items-center gap-1 font-mono text-caption tabular-nums",
-        tab.badgeTone === "attention"
-          ? "text-status-attention"
-          : active && tab.accentBadgeWhenActive
-            ? "text-accent-ember"
-            : "text-foreground/38",
-      )}
-    >
-      {tab.badge}
-    </span>
-  );
-
   return (
     <div
-      ref={ref}
       {...reorderProps}
       data-testid={tab.testId}
       data-state={active ? "active" : "inactive"}
@@ -214,10 +192,117 @@ function DeckTabChip({
         className="flex h-full min-w-0 items-center gap-[7px] whitespace-nowrap pl-[5px] pr-[9px] text-body-sm"
       >
         <span className="max-w-[140px] truncate">{tab.label}</span>
-        {badge}
+        <TabBadge tab={tab} active={active} />
       </button>
     </div>
   );
+}
+
+function TabBadge({ tab, active }: { tab: DeckTab; active: boolean }) {
+  if (tab.badge == null) return null;
+  return (
+    <span
+      className={cn(
+        // A row, not a run of inline text: a badge can be a count plus a
+        // status icon (Review), which must sit beside the count, not under it.
+        "inline-flex items-center gap-1 font-mono text-caption tabular-nums",
+        tab.badgeTone === "attention"
+          ? "text-status-attention"
+          : active && tab.accentBadgeWhenActive
+            ? "text-accent-ember"
+            : "text-foreground/38",
+      )}
+    >
+      {tab.badge}
+    </span>
+  );
+}
+
+/**
+ * Every open tab as a vertical list, for a row too narrow to show them all.
+ * The strip itself still scrolls; this is the way to reach a tab that sits
+ * behind the fade without panning for it. Arrow keys move between rows.
+ */
+function OverflowTabList({
+  tabs,
+  activeTab,
+  onSelect,
+}: {
+  tabs: DeckTab[];
+  activeTab: RightPanelTab | null;
+  onSelect: (id: RightPanelTab) => void;
+}) {
+  return (
+    <div
+      role="group"
+      aria-label="Open tabs"
+      data-testid="right-panel-tab-list"
+      className="flex min-w-[180px] flex-col gap-px"
+    >
+      {tabs.map((tab) => {
+        const Icon = tab.icon;
+        const active = tab.id === activeTab;
+        return (
+          <button
+            key={tab.id}
+            type="button"
+            data-overflow-tab={tab.id}
+            aria-current={active ? "true" : undefined}
+            aria-label={
+              tab.attribution ? `${tab.label} — ${tab.attribution}` : undefined
+            }
+            title={tab.attribution ? `${tab.label} — ${tab.attribution}` : tab.label}
+            onClick={() => onSelect(tab.id)}
+            className={cn(
+              "flex h-7 items-center gap-2 rounded-md px-2 text-left text-body-sm outline-hidden",
+              "transition-colors duration-100 focus-visible:bg-surface-2",
+              active
+                ? "bg-surface-3 font-semibold text-foreground"
+                : "font-medium text-foreground/70 hover:bg-surface-2 hover:text-foreground",
+            )}
+          >
+            <Icon className="size-[13px] shrink-0" />
+            <span className="min-w-0 max-w-[220px] flex-1 truncate">
+              {tab.label}
+            </span>
+            <TabBadge tab={tab} active={active} />
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Up/Down/Home/End between the rows of an {@link OverflowTabList} inside
+ *  `container`. Keys a focused control already handled (an action's own
+ *  menu trigger opens on ArrowDown) are left alone. */
+function moveTabListFocus(
+  event: React.KeyboardEvent<HTMLElement>,
+  container: HTMLElement | null,
+) {
+  if (event.defaultPrevented || !container) return;
+  const rows = [
+    ...container.querySelectorAll<HTMLButtonElement>("[data-overflow-tab]"),
+  ];
+  if (rows.length === 0) return;
+  const at = rows.indexOf(document.activeElement as HTMLButtonElement);
+  const next =
+    event.key === "ArrowDown"
+      ? at < 0
+        ? 0
+        : Math.min(at + 1, rows.length - 1)
+      : event.key === "ArrowUp"
+        ? at < 0
+          ? rows.length - 1
+          : Math.max(at - 1, 0)
+        : event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? rows.length - 1
+            : null;
+  if (next === null) return;
+  event.preventDefault();
+  rows[next].focus();
 }
 
 /** Width of the edge fade that marks clipped tabs. */
@@ -241,6 +326,9 @@ function rowBudgets(remPx: number, legacy: boolean) {
     inline: 27 + dragGap + 6 + legacyControls,
     // The drag gap, the "…" and two row gaps; the "+" is in the popover.
     folded: dragGap + 1.5 * remPx + 4 + legacyControls,
+    // What an inline row adds for the "All tabs" button and its row gap
+    // while the tabs overflow. A folded row lists them in its "…" instead.
+    tabList: 1.5 * remPx + 2,
   };
 }
 
@@ -295,10 +383,17 @@ const COLLAPSE_HYSTERESIS_PX = 4;
  *
  * They stay inline only if that leaves the tabs at least what folding would
  * give them (capped at `TAB_FLOOR_PX`), with a few px of hysteresis.
+ *
+ * It also says whether the tabs overflow beside inline actions, in which
+ * case the inline row carries an "All tabs" button too and budgets for it.
+ * That comes from the measured widths, not from the scroller's current
+ * overflow: the button narrows the scroller, so reading the overflow back
+ * would let the button decide its own presence.
  */
 function useCollapsedActions({
   headerRef,
   actionsRef,
+  tabsRef,
   actionsKey,
   actionsShape,
   hasActions,
@@ -306,22 +401,45 @@ function useCollapsedActions({
 }: {
   headerRef: React.RefObject<HTMLElement | null>;
   actionsRef: React.RefObject<HTMLDivElement | null>;
+  /** The tab run's content, whose width is the tabs' natural width. */
+  tabsRef: React.RefObject<HTMLDivElement | null>;
   actionsKey: string;
   actionsShape: string;
   hasActions: boolean;
-  budgets: { inline: number; folded: number };
+  budgets: { inline: number; folded: number; tabList: number };
 }) {
-  const [collapsed, setCollapsed] = useState(false);
+  const [layout, setLayout] = useState({ collapsed: false, tabsOverflow: false });
   const natural = useRef<{ key: string; shape: string; width: number } | null>(
     null,
   );
   const popoverOpen = useRef(false);
 
   const measure = useCallback(() => {
+    const commit = (collapsed: (prev: boolean) => boolean, tabsOverflow?: boolean) =>
+      setLayout((prev) => {
+        const next = {
+          collapsed: collapsed(prev.collapsed),
+          tabsOverflow: tabsOverflow ?? prev.tabsOverflow,
+        };
+        return next.collapsed === prev.collapsed &&
+          next.tabsOverflow === prev.tabsOverflow
+          ? prev
+          : next;
+      });
     const header = headerRef.current;
-    // No actions, or no layout to measure (jsdom): keep them inline.
-    if (!hasActions || !header || header.clientWidth === 0) {
-      setCollapsed(false);
+    // No layout to measure (jsdom): keep everything inline.
+    if (!header || header.clientWidth === 0) {
+      commit(() => false, false);
+      return;
+    }
+    const style = getComputedStyle(header);
+    const row =
+      header.clientWidth -
+      (parseFloat(style.paddingLeft) || 0) -
+      (parseFloat(style.paddingRight) || 0);
+    const tabs = tabsRef.current?.scrollWidth ?? 0;
+    if (!hasActions) {
+      commit(() => false, tabs > row - budgets.inline);
       return;
     }
     const inline = actionsRef.current;
@@ -337,34 +455,42 @@ function useCollapsedActions({
       known?.key !== actionsKey ||
       (known.shape !== actionsShape && !popoverOpen.current)
     ) {
-      setCollapsed(false);
+      commit(() => false);
       return;
     }
     const width = known.width;
-    const style = getComputedStyle(header);
-    const row =
-      header.clientWidth -
-      (parseFloat(style.paddingLeft) || 0) -
-      (parseFloat(style.paddingRight) || 0);
+    const tabsOverflow = tabs > row - budgets.inline - width;
     const floor = Math.min(TAB_FLOOR_PX, row - budgets.folded);
-    const room = row - budgets.inline - floor;
-    setCollapsed((prev) =>
-      prev ? width > room - COLLAPSE_HYSTERESIS_PX : width > room,
+    const room =
+      row - budgets.inline - (tabsOverflow ? budgets.tabList : 0) - floor;
+    commit(
+      (prev) => (prev ? width > room - COLLAPSE_HYSTERESIS_PX : width > room),
+      tabsOverflow,
     );
-  }, [actionsKey, actionsRef, actionsShape, budgets, hasActions, headerRef]);
+  }, [
+    actionsKey,
+    actionsRef,
+    actionsShape,
+    budgets,
+    hasActions,
+    headerRef,
+    tabsRef,
+  ]);
 
   // Every commit: a pane switch, or actions that changed width in place.
-  // `setCollapsed` bails out when nothing changed.
+  // `setLayout` bails out when nothing changed.
   useLayoutEffect(measure);
 
+  const { collapsed } = layout;
   useLayoutEffect(() => {
     const header = headerRef.current;
     if (!header || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(measure);
     observer.observe(header);
     if (actionsRef.current) observer.observe(actionsRef.current);
+    if (tabsRef.current) observer.observe(tabsRef.current);
     return () => observer.disconnect();
-  }, [actionsRef, collapsed, headerRef, measure]);
+  }, [actionsRef, collapsed, headerRef, measure, tabsRef]);
 
   // An inline row has no popover; a pane switch can unmount an open one.
   useLayoutEffect(() => {
@@ -380,36 +506,44 @@ function useCollapsedActions({
     [measure],
   );
 
-  return { collapsed, onPopoverOpenChange };
+  return { collapsed, tabsOverflow: layout.tabsOverflow, onPopoverOpenChange };
 }
 
-/** The "+" and the pane actions folded behind one "…" button, for a row too
- *  narrow to hold them inline. The popover renders the very same nodes, so
- *  each keeps its own behavior, label, tooltip and menu. */
-function CollapsedPaneActions({
-  openPane,
-  actions,
+/**
+ * What didn't fit in the row, behind one button. Folded (`folded` given),
+ * it is the "…" holding the "+" and the pane actions — the very same nodes,
+ * so each keeps its own behavior, label, tooltip and menu — plus every open
+ * tab while some are scrolled out of view. With the actions inline and only
+ * the tabs overflowing, it is a plain "All tabs" list.
+ */
+function RowOverflowMenu({
+  folded,
+  tabList,
   onOpenChange,
 }: {
-  openPane: ReactNode;
-  actions: ReactNode;
-  onOpenChange: (open: boolean) => void;
+  folded?: { openPane: ReactNode; actions: ReactNode };
+  tabList?: {
+    tabs: DeckTab[];
+    activeTab: RightPanelTab | null;
+    onSelect: (id: RightPanelTab) => void;
+  };
+  onOpenChange?: (open: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [tooltipOpen, setTooltipOpen] = useState(false);
   // A pointer open lands focus on the popover itself, not its first action,
   // whose tooltip would otherwise pop up under the cursor. A keyboard open
-  // keeps the default: straight to the first action.
+  // goes straight to the first action, or to the active tab in a bare list.
   const openedByPointer = useRef(false);
   const contentRef = useRef<HTMLDivElement>(null);
+  const setOpenState = (next: boolean) => {
+    setOpen(next);
+    onOpenChange?.(next);
+  };
+  const label = folded ? "Pane actions" : "All tabs";
+  const Icon = folded ? Ellipsis : ChevronDown;
   return (
-    <Popover
-      open={open}
-      onOpenChange={(next) => {
-        setOpen(next);
-        onOpenChange(next);
-      }}
-    >
+    <Popover open={open} onOpenChange={setOpenState}>
       {/* Popover outside the tooltip, so the button keeps the popover's
           `data-state`, and no tooltip while the popover is up. */}
       <Tooltip open={tooltipOpen && !open} onOpenChange={setTooltipOpen}>
@@ -417,8 +551,12 @@ function CollapsedPaneActions({
           <TooltipTrigger asChild>
             <button
               type="button"
-              aria-label="Pane actions"
-              data-testid="right-panel-pane-actions-more"
+              aria-label={label}
+              data-testid={
+                folded
+                  ? "right-panel-pane-actions-more"
+                  : "right-panel-tabs-overflow"
+              }
               onPointerDown={() => {
                 openedByPointer.current = true;
               }}
@@ -432,30 +570,62 @@ function CollapsedPaneActions({
                 "data-[state=open]:bg-surface-3 data-[state=open]:text-foreground",
               )}
             >
-              <Ellipsis className="size-[13px]" />
+              <Icon className="size-[13px]" />
             </button>
           </TooltipTrigger>
         </PopoverTrigger>
         <TooltipContent side="bottom">
-          More actions
+          {folded ? (tabList ? "More tabs and actions" : "More actions") : label}
         </TooltipContent>
       </Tooltip>
       <PopoverContent
         align="end"
-        aria-label="Pane actions"
-        data-testid="right-panel-pane-actions-popover"
+        collisionPadding={8}
+        aria-label={label}
+        data-testid={
+          folded
+            ? "right-panel-pane-actions-popover"
+            : "right-panel-tabs-overflow-popover"
+        }
         ref={contentRef}
         tabIndex={-1}
         onOpenAutoFocus={(event) => {
-          if (!openedByPointer.current) return;
-          event.preventDefault();
-          contentRef.current?.focus();
+          if (openedByPointer.current) {
+            event.preventDefault();
+            contentRef.current?.focus();
+          } else if (!folded) {
+            event.preventDefault();
+            contentRef.current
+              ?.querySelector<HTMLElement>('[aria-current="true"], [data-overflow-tab]')
+              ?.focus();
+          }
         }}
-        className="flex w-auto items-center gap-[2px] rounded-lg px-1.5 py-1"
+        onKeyDown={(event) => moveTabListFocus(event, contentRef.current)}
+        className="thin-scrollbar flex max-h-(--radix-popover-content-available-height) w-auto max-w-(--radix-popover-content-available-width) flex-col gap-1 overflow-y-auto rounded-lg p-1"
       >
-        {openPane}
-        <div className="mx-[3px] h-[15px] w-px shrink-0 bg-border/60" aria-hidden />
-        {actions}
+        {folded && (
+          <div className="flex items-center gap-[2px] px-0.5">
+            {folded.openPane}
+            <div
+              className="mx-[3px] h-[15px] w-px shrink-0 bg-border/60"
+              aria-hidden
+            />
+            {folded.actions}
+          </div>
+        )}
+        {folded && tabList && (
+          <div className="mx-1 h-px bg-border/60" aria-hidden />
+        )}
+        {tabList && (
+          <OverflowTabList
+            tabs={tabList.tabs}
+            activeTab={tabList.activeTab}
+            onSelect={(id) => {
+              tabList.onSelect(id);
+              setOpenState(false);
+            }}
+          />
+        )}
       </PopoverContent>
     </Popover>
   );
@@ -600,21 +770,59 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     () => rowBudgets(remPx, !inTitlebar),
     [inTitlebar, remPx],
   );
-  const { collapsed: actionsCollapsed, onPopoverOpenChange } =
-    useCollapsedActions({
-      headerRef,
-      actionsRef,
-      actionsKey: activeTab ?? "",
-      actionsShape: actionsShape(actions),
-      hasActions: actions != null,
-      budgets,
-    });
+  const {
+    collapsed: actionsCollapsed,
+    tabsOverflow,
+    onPopoverOpenChange,
+  } = useCollapsedActions({
+    headerRef,
+    actionsRef,
+    tabsRef: contentRef,
+    actionsKey: activeTab ?? "",
+    actionsShape: actionsShape(actions),
+    hasActions: actions != null,
+    budgets,
+  });
+  // An inline row grows an "All tabs" button once the tabs overflow beside
+  // it; a folded row lists them in its "…" whenever any are out of view.
+  const inlineTabList = !actionsCollapsed && tabsOverflow;
   // The scroller's floor: `TAB_FLOOR_PX`, or whatever the rest of the row
   // leaves once the reserve has taken its share, so the row never runs into
   // the reserve.
   const scrollerMinWidth = `min(${TAB_FLOOR_PX}px, calc(100% - ${
-    actionsCollapsed ? budgets.folded : budgets.inline
+    actionsCollapsed
+      ? budgets.folded
+      : budgets.inline + (inlineTabList ? budgets.tabList : 0)
   }px))`;
+
+  // The active tab must never be the clipped one: not when it is picked
+  // (from the strip or the tab list, where it may already be active but
+  // scrolled away), and not when the panel narrows under it.
+  const revealTab = useCallback(
+    (id: RightPanelTab | null) => {
+      if (id == null) return;
+      containerRef.current
+        ?.querySelector<HTMLElement>(`[data-tab-id="${CSS.escape(id)}"]`)
+        ?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    },
+    [containerRef],
+  );
+  useEffect(() => revealTab(activeTab), [activeTab, revealTab]);
+  useLayoutEffect(() => {
+    const scroller = containerRef.current;
+    if (!scroller || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => revealTab(activeTab));
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [activeTab, containerRef, revealTab]);
+  const tabList = {
+    tabs,
+    activeTab,
+    onSelect: (id: RightPanelTab) => {
+      onSelect(id);
+      revealTab(id);
+    },
+  };
 
   // The "+": inline after the tabs, or first in the "…" popover once the
   // row has folded.
@@ -767,6 +975,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
         )}
       </div>
 
+      {inlineTabList && <RowOverflowMenu tabList={tabList} />}
       {!actionsCollapsed && openPaneMenu}
     </>
   );
@@ -787,12 +996,13 @@ export const PaneTabStrip = memo(function PaneTabStrip({
   // The active pane's controls. The panel-level controls (expand, close)
   // live in the fixed top-right cluster in GUI chrome, which the band's
   // right padding clears. Never clipped: too narrow to sit inline beside
-  // the tabs' floor, they fold into "…" together with the "+".
+  // the tabs' floor, they fold into "…" together with the "+" (and the
+  // tab list, while tabs are out of view).
   const paneActions =
     actions == null ? null : actionsCollapsed ? (
-      <CollapsedPaneActions
-        openPane={openPaneMenu}
-        actions={actions}
+      <RowOverflowMenu
+        folded={{ openPane: openPaneMenu, actions }}
+        tabList={edges.start || edges.end ? tabList : undefined}
         onOpenChange={onPopoverOpenChange}
       />
     ) : (

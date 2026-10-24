@@ -178,7 +178,7 @@ describe("SessionSelector", () => {
     expect(onSelect).not.toHaveBeenCalled();
   });
 
-  it("fires onNewChat when the New Chat footer is clicked", () => {
+  it("fires onNewChat when the New chat footer is clicked", () => {
     const onNewChat = vi.fn();
     render(
       <SessionSelector

@@ -277,7 +277,7 @@ describe("TitleBarTabs", () => {
     expect(screen.getByText("Agent Chat")).toBeInTheDocument();
   });
 
-  it("opens the history dropdown with grouped sessions + New Chat", async () => {
+  it("opens the history dropdown with grouped sessions + New chat", async () => {
     const nowSpy = vi
       .spyOn(Date, "now")
       .mockReturnValue(new Date("2026-04-24T15:00:00Z").getTime());
