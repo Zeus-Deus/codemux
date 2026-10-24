@@ -1,11 +1,14 @@
 import type { TasksSnapshot } from "@/tauri/events";
 
-/** Counts + run state behind the composer's `Tasks N/M` chip. */
+/** Counts + run state behind the composer strip's Tasks row. */
 export interface TaskChipSummary {
   completed: number;
   total: number;
-  /** Whether the chip should present as LIVE (amber + spinner). */
+  /** Whether the row should present as LIVE (spinner). */
   running: boolean;
+  /** The step the plan is on: the one in progress, else the next one
+   *  pending, else (all done) the last one. */
+  current: string;
 }
 
 /**
@@ -24,10 +27,15 @@ export function taskChipSummary(
   streaming: boolean,
 ): TaskChipSummary | null {
   if (!tasks || tasks.tasks.length === 0) return null;
+  const list = tasks.tasks;
+  const current =
+    list.find((task) => task.status === "in_progress") ??
+    list.find((task) => task.status === "pending") ??
+    list[list.length - 1];
   return {
-    completed: tasks.tasks.filter((task) => task.status === "completed").length,
-    total: tasks.tasks.length,
-    running:
-      streaming && tasks.tasks.some((task) => task.status === "in_progress"),
+    completed: list.filter((task) => task.status === "completed").length,
+    total: list.length,
+    running: streaming && list.some((task) => task.status === "in_progress"),
+    current: current.title,
   };
 }

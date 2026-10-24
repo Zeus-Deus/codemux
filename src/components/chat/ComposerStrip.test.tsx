@@ -1131,3 +1131,35 @@ describe("ComposerStrip — remote tasks", () => {
     );
   });
 });
+
+describe("ComposerStrip — tasks", () => {
+  const summary = { completed: 2, total: 5, running: false, current: "Write the migration" };
+
+  it("gives the plan its own row: current step, count and one segment per step", () => {
+    const onToggle = vi.fn();
+    render(<ComposerStrip occupants={[]} tasks={{ summary, open: false, onToggle }} />);
+    const row = screen.getByTestId("composer-strip-tasks");
+    expect(row).toHaveTextContent("Tasks");
+    expect(row).toHaveTextContent("Write the migration");
+    expect(row).toHaveTextContent("2/5");
+    expect(row).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(row);
+    expect(onToggle).toHaveBeenCalledOnce();
+  });
+
+  it("stays above the occupants instead of folding into their +n", () => {
+    render(
+      <ComposerStrip
+        occupants={[]}
+        queue={<div data-testid="queue-section" />}
+        tasks={{ summary, open: true, onToggle: vi.fn() }}
+      />,
+    );
+    const row = screen.getByTestId("composer-strip-tasks");
+    expect(row).toHaveAttribute("aria-pressed", "true");
+    expect(
+      row.compareDocumentPosition(screen.getByTestId("queue-section")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+});

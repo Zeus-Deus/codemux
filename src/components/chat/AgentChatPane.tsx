@@ -4176,6 +4176,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const childInput = childInputOccupant(durableTasks.tasks, !!pendingUserInput || !!pendingApprovalOccupant, openDelegatedChat, openRemoteTask);
   const remoteTasksRow = conversationWritable &&
     remoteTasksOccupant(remoteTasks, () => void remoteTasks.retrySubscription());
+  const tasksOpen = rightPanelTab === "tasks";
+  const stripTasks = useMemo(
+    () =>
+      taskSummary && paneWorkspaceId
+        ? { summary: taskSummary, open: tasksOpen, onToggle: handleTasksClick }
+        : null,
+    [taskSummary, paneWorkspaceId, tasksOpen, handleTasksClick],
+  );
   // A subagent drill-in keeps only the remote-task failure: the design shows
   // the rest in the conversation view, but the parent stays subscribed and
   // its Retry still applies. Keyed by thread so the open list never leaks
@@ -4186,6 +4194,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     <ComposerStrip
       key={threadId ?? "no-thread"}
       goal={stripGoal}
+      tasks={stripTasks}
       occupants={[
         pendingApprovalOccupant,
         errorOccupant,
@@ -4370,9 +4379,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       submitWhenEmpty={queueEditor.editingHasImages}
       stripSlot={conversationWritable ? stripEl : <>{stripEl}{conversationCheckNotice}</>}
       paneDragActive={paneDragDepth > 0}
-      tasks={taskSummary}
-      tasksOpen={rightPanelTab === "tasks"}
-      onTasksClick={handleTasksClick}
       provider={provider}
       workspaceId={paneWorkspaceId}
       threadId={threadId ?? (provider === "acp" ? pendingAcpThreadId : null)}

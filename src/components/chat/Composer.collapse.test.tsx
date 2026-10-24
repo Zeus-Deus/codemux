@@ -24,6 +24,7 @@ import {
   FOOTER_MIN_GAP_PX,
   footerMinGapFor,
   MIN_TEXTAREA_PX,
+  OPEN_TEXTAREA_PX,
   nextFooterFit,
   type FooterFit,
 } from "./Composer";
@@ -97,8 +98,14 @@ describe("Composer pill collapse", () => {
     expect(getByTestId("composer-gap")).toHaveTextContent(
       "Reply or steer the agent…",
     );
-    // No context ring on the collapsed row.
-    expect(queryByTestId("context-usage-trigger")).toBeNull();
+    // The ring rests in the chin under the pill, not on the pill's row.
+    expect(getByTestId("composer-chin")).toContainElement(
+      getByTestId("context-usage-trigger"),
+    );
+    expect(
+      getByTestId("composer-controls-row").querySelector('[data-testid="context-usage-trigger"]'),
+    ).toBeNull();
+    expect(queryByTestId("composer-chin")).not.toBeNull();
   });
 
   it("expands for draft text and keeps the ring in the expanded card", () => {
@@ -161,25 +168,39 @@ describe("Composer pill collapse", () => {
     expect(getByRole("button", { name: "Message delivery: Queue" })).toBeInTheDocument();
   });
 
-  it("keeps model and access in the pill", () => {
-    const { getByRole, getByTestId } = renderComposer({
-      permissionModes: [
-        { value: "bypassPermissions", label: "Full access", description: "", is_default: true },
-      ],
-    });
-    expect(getByTestId("composer-controls-row")).toContainElement(
-      getByRole("button", { name: /Full access/ }),
+  it("rests model and access in the chin, and opens them into the card", () => {
+    const permissionModes = [
+      { value: "bypassPermissions", label: "Full access", description: "", is_default: true },
+    ];
+    const resting = renderComposer({ permissionModes });
+    expect(resting.getByTestId("composer-chin")).toContainElement(
+      resting.getByRole("button", { name: /Full access/ }),
+    );
+    cleanup();
+
+    const open = renderComposer({ permissionModes, draft: "x" });
+    expect(open.queryByTestId("composer-chin")).toBeNull();
+    expect(open.getByTestId("composer-controls-row")).toContainElement(
+      open.getByRole("button", { name: /Full access/ }),
     );
   });
 
-  it("uses the 94px textarea floor only on drafts", () => {
+  it("stays open with its settings inside when a strip sits under the card", () => {
+    const { wrapper, queryByTestId } = renderComposer({
+      belowComposerSlot: <div>project · branch</div>,
+    });
+    expect(wrapper()).toHaveAttribute("data-expanded");
+    expect(queryByTestId("composer-chin")).toBeNull();
+  });
+
+  it("uses the 94px textarea floor on drafts and two lines on a live card", () => {
     const draft = renderComposer({ isDraft: true });
     expect(draft.wrapper()).toHaveAttribute("data-expanded");
     expect(draft.textarea().style.minHeight).toBe(`${MIN_TEXTAREA_PX}px`);
     cleanup();
 
     const live = renderComposer({ draft: "x" });
-    expect(live.textarea().style.minHeight).toBe("0px");
+    expect(live.textarea().style.minHeight).toBe(`${OPEN_TEXTAREA_PX}px`);
     expect(live.textarea().style.maxHeight).toBe("220px");
   });
 

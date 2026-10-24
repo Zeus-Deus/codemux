@@ -5,15 +5,19 @@ import { MessageDeliveryPicker } from "./MessageDeliveryPicker";
 import {
   ArrowUp,
   Network,
-  Check,
   CornerDownRight,
   ListEnd,
-  ListTodo,
-  LoaderCircle,
   Plus,
   Square,
 } from "lucide-react";
-import type { PointerEvent as ReactPointerEvent, ReactNode, Ref } from "react";
+import {
+  useLayoutEffect,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+  type Ref,
+} from "react";
 
 import { cn } from "@/lib/utils";
 import type { ChatMode } from "@/stores/agent-chat-store";
@@ -26,7 +30,7 @@ import type {
 
 import { ContextUsageMeter } from "./ContextUsageMeter";
 import { useStopTooltip } from "./composer-interrupt";
-import { FOOTER_SEPARATOR, type PickerPlacement } from "./pickers/footer-trigger";
+import { type PickerPlacement } from "./pickers/footer-trigger";
 import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
@@ -109,9 +113,6 @@ interface Props {
   contextUsage?: ContextUsageSnapshot | null;
   contextUsageSeedMaxTokens?: number | null;
   contextUsageProviderLabel?: string | null;
-  tasks?: { completed: number; total: number; running?: boolean } | null;
-  tasksOpen?: boolean;
-  onTasksClick?: () => void;
   onWorkflowsClick?: () => void;
   workflowsOpen?: boolean;
   /** Content for the flexible gap between the attach button and the
@@ -122,25 +123,28 @@ interface Props {
   onGapPointerDown?: (e: ReactPointerEvent<HTMLDivElement>) => void;
   /** The gap element, measured by the composer to fit the row. */
   gapRef?: Ref<HTMLDivElement>;
-  /** The context ring lives in the expanded card only. Defaults to true. */
-  showContextMeter?: boolean;
+  /** The resting pill: the row keeps only the placeholder, `+` and
+   *  send / stop, and `ComposerChin` under the card carries the session
+   *  settings, workflows toggle and context ring. */
+  collapsed?: boolean;
   /** Width ladder: model label shortens to its leaf name. */
   modelLeafLabel?: boolean;
   /** Width ladder: provider/model control keeps only its provider mark. */
   modelIconOnly?: boolean;
   /** Width ladder: effort drops its text label. */
   effortIconOnly?: boolean;
-  /** Width ladder: access, tasks and delivery drop their text labels. */
+  /** Width ladder: access and delivery drop their text labels. */
   accessIconOnly?: boolean;
   /** Width ladder: effort + access leave the row for the `+` menu. */
   configInMenu?: boolean;
 }
 
 /**
- * The composer's single controls row. Identical geometry in the collapsed
- * pill and the expanded card, so nothing moves horizontally when the
- * textarea opens above it: attach pinned left, send pinned right, a
- * flexible gap in between, with model / effort / access beside send.
+ * The composer's controls row. Expanded, the session settings lead on the
+ * left and `+` / send close on the right. Collapsed to the pill, the row
+ * keeps only the placeholder, `+` and send / stop; the settings drop into
+ * `ComposerChin` under the card at the same x, so the model picker opens
+ * from one place in both states.
  */
 export function ComposerFooter({
   hermesThreadId, hermesProjectPath, customAgentsAllowed = true,
@@ -182,15 +186,12 @@ export function ComposerFooter({
   contextUsage = null,
   contextUsageSeedMaxTokens = null,
   contextUsageProviderLabel = null,
-  tasks = null,
-  tasksOpen = false,
-  onTasksClick,
   onWorkflowsClick,
   workflowsOpen = false,
   gap = null,
   onGapPointerDown,
   gapRef,
-  showContextMeter = true,
+  collapsed = false,
   modelLeafLabel = false,
   modelIconOnly = false,
   effortIconOnly = false,
@@ -203,46 +204,66 @@ export function ComposerFooter({
     <>
     <div
       data-testid="composer-controls-row"
-      className="flex h-[42px] shrink-0 items-center gap-1 px-1"
+      data-collapsed={collapsed || undefined}
+      className={cn(
+        "flex h-[42px] shrink-0 items-center gap-1 pr-1",
+        // Expanded, the first trigger sits where it does in the chin
+        // (20px inset + 1px border + 4px padding, minus the card border).
+        collapsed ? "pl-1" : "pl-6",
+      )}
     >
-      {onAttachClick && (
-        <button
-          type="button"
-          onClick={onAttachClick}
-          disabled={attachDisabled}
-          data-testid="composer-attach-button"
-          data-open={attachOpen || undefined}
-          className={cn(
-            ROUND_CONTROL,
-            // Transparent base border keeps the diameter fixed so the open
-            // state's ember border causes no 1px shift.
-            "border border-transparent",
-            "bg-muted/60 text-muted-foreground hover:bg-muted hover:text-foreground",
-            "data-[open=true]:border-accent-ember/45 data-[open=true]:bg-accent-ember/15 data-[open=true]:text-accent-ember data-[open=true]:hover:bg-accent-ember/15 data-[open=true]:hover:text-accent-ember",
-            "disabled:opacity-40 disabled:pointer-events-none",
-          )}
-          aria-label="Attach"
-          aria-expanded={attachOpen}
-          title="Attach (file, folder, mode, …)"
-        >
-          <Plus className="size-4" />
-        </button>
+      {!collapsed && (
+        <div className="flex min-w-0 items-center">
+          <ComposerSettings
+            hermesThreadId={hermesThreadId}
+            hermesProjectPath={hermesProjectPath}
+            customAgentsAllowed={customAgentsAllowed}
+            provider={provider}
+            model={model}
+            permissionMode={permissionMode}
+            effort={effort}
+            contextWindow={contextWindow}
+            serviceTier={serviceTier}
+            activeModel={activeModel}
+            effortLabelMap={effortLabelMap}
+            permissionModes={permissionModes}
+            ultrathinkInBodyText={ultrathinkInBodyText}
+            showProviderPicker={showProviderPicker}
+            mode={mode}
+            onProviderModelChange={onProviderModelChange}
+            onModelChange={onModelChange}
+            onPermissionModeChange={onPermissionModeChange}
+            onEffortChange={onEffortChange}
+            onContextWindowChange={onContextWindowChange}
+            onServiceTierChange={onServiceTierChange}
+            configurationDisabled={configurationDisabled}
+            modelPickerOpenSignal={modelPickerOpenSignal}
+            permissionPickerOpenSignal={permissionPickerOpenSignal}
+            placement="footer"
+            modelLeafLabel={modelLeafLabel}
+            modelIconOnly={modelIconOnly}
+            effortIconOnly={effortIconOnly}
+            accessIconOnly={accessIconOnly}
+            configInMenu={configInMenu}
+          />
+        </div>
       )}
 
       <div
         ref={gapRef}
         data-testid="composer-gap"
         onPointerDown={onGapPointerDown}
-        // Reserve the meter's space even while collapsed, so it cannot
-        // overlap settings or shift them when the composer expands.
-        className="flex h-full min-w-[50px] flex-1 cursor-text items-center gap-2 pl-2"
+        // Collapsed, the placeholder starts where the textarea's text
+        // does once the card opens.
+        className={cn(
+          "flex h-full min-w-[50px] flex-1 cursor-text items-center gap-2",
+          collapsed ? "pl-4" : "pl-2",
+        )}
       >
         <div className="flex min-w-0 flex-1 items-center">{gap}</div>
-        {/* The ring rides the gap's trailing edge rather than the right
-            cluster, so it can appear in the expanded card without nudging
-            the pinned controls off their collapsed x positions. Its own
+        {/* The ring rides the gap's trailing edge, beside `+`. Its own
             clicks must not fall through to the gap's focus handler. */}
-        {showContextMeter && (
+        {!collapsed && (
           <div
             className="flex shrink-0 items-center"
             onPointerDown={(e) => e.stopPropagation()}
@@ -257,91 +278,30 @@ export function ComposerFooter({
       </div>
 
       <div className="flex min-w-0 items-center gap-1">
-        {onWorkflowsClick && (
-          <button type="button" data-testid="composer-workflows-toggle" aria-label="Open dynamic workflows" aria-pressed={workflowsOpen} title="Dynamic workflows" onClick={onWorkflowsClick} className={cn("inline-flex size-[28px] shrink-0 items-center justify-center rounded-lg transition-colors duration-100", workflowsOpen ? "bg-surface-3 text-foreground" : "text-muted-foreground hover:bg-muted/60 hover:text-foreground")}><Network className="size-3.5" aria-hidden /></button>
+        {onWorkflowsClick && !collapsed && (
+          <WorkflowsToggle open={workflowsOpen} onClick={onWorkflowsClick} />
         )}
-        {tasks && tasks.total > 0 && onTasksClick && (
-          <>
-            {/* Reports run state rather than reading as a setting: amber +
-                spinner while a step is in flight, green + check when the
-                plan is complete, muted checklist before the run starts. */}
-            <button
-              type="button"
-              onClick={onTasksClick}
-              data-testid="composer-tasks-toggle"
-              aria-pressed={tasksOpen}
-              aria-label={
-                accessIconOnly
-                  ? `Tasks: ${tasks.completed} of ${tasks.total} complete`
-                  : undefined
-              }
-              className={cn(
-                "inline-flex h-[30px] shrink-0 items-center gap-1.5 rounded-md border-0 px-2 text-body-sm font-medium leading-none transition-colors duration-150",
-                accessIconOnly && "w-[30px] justify-center px-0",
-                tasks.running
-                  ? "bg-status-working/8 text-status-working hover:bg-status-working/15"
-                  : tasks.completed === tasks.total
-                    ? "bg-status-open/8 text-status-open hover:bg-status-open/15"
-                    : tasksOpen
-                      ? "bg-accent-ember/15 text-accent-ember"
-                      : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-              )}
-              title={`${tasks.completed} of ${tasks.total} tasks complete`}
-            >
-              {tasks.running ? (
-                <LoaderCircle className="size-3.5 animate-spin" aria-hidden />
-              ) : tasks.completed === tasks.total ? (
-                <Check className="size-3.5" aria-hidden />
-              ) : (
-                <ListTodo className="size-3.5" aria-hidden />
-              )}
-              {!accessIconOnly && (
-                <>
-                  <span>Tasks</span>
-                  <span className="text-label tabular-nums opacity-70">
-                    {tasks.completed}/{tasks.total}
-                  </span>
-                </>
-              )}
-            </button>
-            <span className={FOOTER_SEPARATOR} aria-hidden />
-          </>
-        )}
-
-        <ComposerSettings
-          hermesThreadId={hermesThreadId}
-          hermesProjectPath={hermesProjectPath}
-          customAgentsAllowed={customAgentsAllowed}
-          provider={provider}
-          model={model}
-          permissionMode={permissionMode}
-          effort={effort}
-          contextWindow={contextWindow}
-          serviceTier={serviceTier}
-          activeModel={activeModel}
-          effortLabelMap={effortLabelMap}
-          permissionModes={permissionModes}
-          ultrathinkInBodyText={ultrathinkInBodyText}
-          showProviderPicker={showProviderPicker}
-          mode={mode}
-          onProviderModelChange={onProviderModelChange}
-          onModelChange={onModelChange}
-          onPermissionModeChange={onPermissionModeChange}
-          onEffortChange={onEffortChange}
-          onContextWindowChange={onContextWindowChange}
-          onServiceTierChange={onServiceTierChange}
-          configurationDisabled={configurationDisabled}
-          modelPickerOpenSignal={modelPickerOpenSignal}
-          permissionPickerOpenSignal={permissionPickerOpenSignal}
-          placement="footer"
-          modelLeafLabel={modelLeafLabel}
-          modelIconOnly={modelIconOnly}
-          effortIconOnly={effortIconOnly}
-          accessIconOnly={accessIconOnly}
-          configInMenu={configInMenu}
-        />
-
         {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} iconOnly={accessIconOnly} />}
+        {onAttachClick && (
+          <button
+            type="button"
+            onClick={onAttachClick}
+            disabled={attachDisabled}
+            data-testid="composer-attach-button"
+            data-open={attachOpen || undefined}
+            className={cn(
+              ROUND_CONTROL,
+              "text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground",
+              "data-[open=true]:bg-accent-ember/15 data-[open=true]:text-accent-ember data-[open=true]:hover:bg-accent-ember/15 data-[open=true]:hover:text-accent-ember",
+              "disabled:opacity-40 disabled:pointer-events-none",
+            )}
+            aria-label="Attach"
+            aria-expanded={attachOpen}
+            title="Attach (file, folder, mode, …)"
+          >
+            <Plus className="size-4" />
+          </button>
+        )}
         {streaming && onDeliveryChange && hasDraft ? (
           // One action slot, as in t3code: with a draft, the slot sends it
           // (queue / steer / interrupt); otherwise it's Stop.
@@ -394,6 +354,129 @@ export function ComposerFooter({
     </div>
     <ChatGptPlanUsage provider={provider} />
     </>
+  );
+}
+
+function WorkflowsToggle({ open, onClick }: { open: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      data-testid="composer-workflows-toggle"
+      aria-label="Open dynamic workflows"
+      aria-pressed={open}
+      title="Dynamic workflows"
+      onClick={onClick}
+      className={cn(
+        "inline-flex size-[30px] shrink-0 items-center justify-center rounded-md transition-colors duration-100",
+        open ? "bg-surface-3 text-foreground" : "text-muted-foreground hover:bg-surface-2 hover:text-foreground",
+      )}
+    >
+      <Network className="size-3.5" aria-hidden />
+    </button>
+  );
+}
+
+type ComposerChinProps = Omit<
+  ComposerSettingsProps,
+  | "placement"
+  | "modelLeafLabel"
+  | "modelIconOnly"
+  | "effortIconOnly"
+  | "accessIconOnly"
+  | "configInMenu"
+> &
+  Pick<
+    Props,
+    | "contextUsage"
+    | "contextUsageSeedMaxTokens"
+    | "contextUsageProviderLabel"
+    | "onWorkflowsClick"
+    | "workflowsOpen"
+  >;
+
+/** Chin label steps, as in the controls row but without the last one:
+ *  the chin has no `+` menu to hand effort and access to. */
+const CHIN_COMPACT_STEPS = 4;
+
+/**
+ * The drawer under the resting pill: session settings on the left, the
+ * workflows toggle and context ring on the right. It mirrors the strip
+ * docked above the pill — 20px inset, 14px outer corners, an 18px seam
+ * tucked under the card — and uses the controls row's own triggers, so a
+ * picker opens from the same place whether the composer rests or not.
+ *
+ * Too narrow for every label, it drops them in the controls row's order
+ * (model leaf name, access, effort, model) rather than moving anything
+ * out of reach.
+ */
+export function ComposerChin({
+  contextUsage = null,
+  contextUsageSeedMaxTokens = null,
+  contextUsageProviderLabel = null,
+  onWorkflowsClick,
+  workflowsOpen = false,
+  ...settings
+}: ComposerChinProps) {
+  const rowRef = useRef<HTMLDivElement>(null);
+  const [level, setLevel] = useState(0);
+  const fitKey = [
+    settings.provider,
+    settings.model,
+    settings.effort,
+    settings.contextWindow,
+    settings.serviceTier,
+    settings.permissionMode,
+    contextUsage ? "ring" : "",
+  ].join("|");
+  // New labels may fit again: re-fit from full width.
+  useLayoutEffect(() => setLevel(0), [fitKey]);
+  // Each step re-renders and re-measures before paint, so an overflowing
+  // intermediate state never shows.
+  useLayoutEffect(() => {
+    const row = rowRef.current;
+    if (row && row.scrollWidth > row.clientWidth && level < CHIN_COMPACT_STEPS) {
+      setLevel(level + 1);
+    }
+  });
+  useLayoutEffect(() => {
+    const row = rowRef.current;
+    if (!row || typeof ResizeObserver === "undefined") return;
+    let width = row.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (row.clientWidth === width) return;
+      width = row.clientWidth;
+      setLevel(0);
+    });
+    observer.observe(row);
+    return () => observer.disconnect();
+  }, []);
+  const ladder = {
+    modelLeafLabel: level >= 1,
+    accessIconOnly: level >= 2,
+    effortIconOnly: level >= 3,
+    modelIconOnly: level >= 4,
+  };
+
+  return (
+    <div data-testid="composer-chin" className="relative z-0 w-full px-5">
+      <div
+        ref={rowRef}
+        className="-mt-[18px] flex h-[52px] min-w-0 items-center gap-1 overflow-hidden rounded-b-[14px] border border-t-0 border-border/70 bg-muted/20 pt-[18px] pr-1 pl-1"
+      >
+        <div className="flex min-w-0 items-center">
+          <ComposerSettings {...settings} {...ladder} placement="footer" />
+        </div>
+        <div className="min-w-0 flex-1" />
+        {onWorkflowsClick && (
+          <WorkflowsToggle open={workflowsOpen} onClick={onWorkflowsClick} />
+        )}
+        <ContextUsageMeter
+          usage={contextUsage}
+          seedMaxTokens={contextUsageSeedMaxTokens}
+          providerLabel={contextUsageProviderLabel}
+        />
+      </div>
+    </div>
   );
 }
 

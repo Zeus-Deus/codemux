@@ -22,7 +22,7 @@ vi.mock("./pickers/MultiProviderModelPicker", () => ({
   ),
 }));
 
-import { ComposerFooter } from "./ComposerFooter";
+import { ComposerChin, ComposerFooter } from "./ComposerFooter";
 
 type FooterProps = ComponentProps<typeof ComposerFooter>;
 
@@ -126,7 +126,7 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     expect(attach.className).toContain("rounded-full");
   });
 
-  it("pins attach left and the session controls + send right, around a flexible gap", () => {
+  it("leads with the session settings and closes with + and send, around a flexible gap", () => {
     renderFooter({ onAttachClick: vi.fn(), gap: <span>gap text</span> });
     const row = screen.getByTestId("composer-controls-row");
     const gap = screen.getByTestId("composer-gap");
@@ -134,20 +134,36 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     const send = screen.getByRole("button", { name: "Send" });
     expect(gap.className).toContain("flex-1");
     expect(gap).toHaveTextContent("gap text");
-    expect(row.firstElementChild).toBe(attach);
-    expect(attach.nextElementSibling).toBe(gap);
-    expect(gap.nextElementSibling).toContain(send);
-    expect(gap.nextElementSibling).toContain(
+    expect(row.firstElementChild).toContainElement(
       screen.getByRole("button", { name: /Full access/i }),
     );
+    expect(row.firstElementChild?.nextElementSibling).toBe(gap);
+    const right = gap.nextElementSibling;
+    expect(right).toContainElement(attach);
+    expect(attach.nextElementSibling).toBe(send);
   });
 
-  it("drops the context ring when told to (collapsed pill)", () => {
+  it("collapsed, keeps only the placeholder, + and send; the chin takes the rest", () => {
     renderFooter({
+      collapsed: true,
+      onAttachClick: vi.fn(),
+      onWorkflowsClick: vi.fn(),
+      gap: <span>placeholder</span>,
       contextUsage: { used_tokens: 44_000, max_tokens: 200_000 },
-      showContextMeter: false,
     });
+    const row = screen.getByTestId("composer-controls-row");
+    expect(row.firstElementChild).toBe(screen.getByTestId("composer-gap"));
+    expect(screen.queryByRole("button", { name: /Full access/i })).toBeNull();
     expect(screen.queryByTestId("context-usage-trigger")).toBeNull();
+    expect(screen.queryByTestId("composer-workflows-toggle")).toBeNull();
+    expect(screen.getByTestId("composer-attach-button")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send" })).toBeInTheDocument();
+  });
+
+  it("draws + as a ghost control, with no resting fill", () => {
+    renderFooter({ onAttachClick: vi.fn() });
+    const attach = screen.getByTestId("composer-attach-button");
+    expect(attach.className.split(/\s+/).some((c) => c.startsWith("bg-"))).toBe(false);
   });
 
   it("width ladder: access goes icon-only, then both leave the row", () => {
@@ -237,57 +253,6 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     expect(onProviderModelChange).toHaveBeenCalledWith("codex", "gpt-5.4");
     expect(onModelChange).not.toHaveBeenCalled();
   });
-
-  it("reveals the Tasks toggle only for a non-empty provider plan", () => {
-    const onTasksClick = vi.fn();
-    const { rerender } = renderFooter();
-    expect(screen.queryByTestId("composer-tasks-toggle")).toBeNull();
-
-    rerender(
-      <TooltipProvider>
-        <ComposerFooter
-          {...baseProps()}
-          tasks={{ completed: 2, total: 5 }}
-          onTasksClick={onTasksClick}
-        />
-      </TooltipProvider>,
-    );
-    const toggle = screen.getByTestId("composer-tasks-toggle");
-    expect(toggle).toHaveTextContent("Tasks");
-    expect(toggle).toHaveTextContent("2/5");
-    fireEvent.click(toggle);
-    expect(onTasksClick).toHaveBeenCalledOnce();
-  });
-
-  it("marks the Tasks toggle pressed while its panel is open", () => {
-    renderFooter({
-      tasks: { completed: 0, total: 3 },
-      tasksOpen: true,
-      onTasksClick: vi.fn(),
-    });
-    expect(screen.getByTestId("composer-tasks-toggle")).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
-  });
-
-  it.each([
-    ["waiting", { completed: 0, total: 3, running: false }],
-    ["running", { completed: 1, total: 3, running: true }],
-    ["complete", { completed: 3, total: 3, running: false }],
-  ])("keeps the %s Tasks treatment borderless", (_state, tasks) => {
-    renderFooter({ tasks, onTasksClick: vi.fn() });
-
-    const toggle = screen.getByTestId("composer-tasks-toggle");
-    const classes = toggle.className.split(/\s+/);
-    expect(toggle).toHaveClass("border-0");
-    expect(
-      classes.some((className) =>
-        className === "border" ||
-        (className.startsWith("border-") && className !== "border-0"),
-      ),
-    ).toBe(false);
-  });
 });
 
 describe("ComposerFooter — context-window meter", () => {
@@ -327,12 +292,11 @@ describe("ComposerFooter — context-window meter", () => {
     expect(stop.parentElement?.contains(meter)).toBe(false);
   });
 
-  it("matches the send button's circle shape", () => {
+  it("takes the session triggers' 30px hover plate, not the send circle", () => {
     renderFooter({ contextUsage: { used_tokens: 1_000, max_tokens: 200_000 } });
     const meter = screen.getByTestId("context-usage-trigger");
-    const send = screen.getByRole("button", { name: "Send" });
-    expect(geometryFingerprint(meter)).toBe(geometryFingerprint(send));
-    expect(meter.className).toContain("rounded-full");
+    expect(meter).toHaveClass("size-[30px]", "rounded-md");
+    expect(meter.className).not.toContain("rounded-full");
   });
 
   it("uses the capability seed when the snapshot has no window", () => {
@@ -393,3 +357,45 @@ describe("provider steering capability", () => {
   });
 });
 
+
+describe("ComposerChin", () => {
+  function chinProps(): ComponentProps<typeof ComposerChin> {
+    const { streaming: _s, canSubmit: _c, onSubmit: _o, onStop: _t, controlsDisabled: _d, ...settings } = baseProps();
+    return settings;
+  }
+
+  function renderChin(props: Partial<ComponentProps<typeof ComposerChin>> = {}) {
+    return render(
+      <TooltipProvider>
+        <ComposerChin {...chinProps()} {...props} />
+      </TooltipProvider>,
+    );
+  }
+
+  it("carries the session settings, workflows toggle and context ring", () => {
+    const onWorkflowsClick = vi.fn();
+    renderChin({
+      onWorkflowsClick,
+      contextUsage: { used_tokens: 44_000, max_tokens: 200_000 },
+    });
+    const chin = screen.getByTestId("composer-chin");
+    expect(chin).toContainElement(screen.getByRole("button", { name: /Full access/i }));
+    expect(chin).toContainElement(screen.getByTestId("context-usage-trigger"));
+    fireEvent.click(screen.getByTestId("composer-workflows-toggle"));
+    expect(onWorkflowsClick).toHaveBeenCalledOnce();
+  });
+
+  it("drops labels instead of overflowing a narrow chin", () => {
+    // jsdom has no layout: report every element as overflowing.
+    const scroll = vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockReturnValue(500);
+    const client = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(300);
+    try {
+      renderChin();
+      const access = screen.getByRole("button", { name: /Access: Full access/i });
+      expect(access).not.toHaveTextContent("Full access");
+    } finally {
+      scroll.mockRestore();
+      client.mockRestore();
+    }
+  });
+});
