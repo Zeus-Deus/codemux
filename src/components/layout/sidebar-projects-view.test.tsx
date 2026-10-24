@@ -508,44 +508,46 @@ describe("SidebarProjectsView", () => {
 });
 
 describe("SidebarViewSwitch", () => {
-  it("defaults to Activity and switches views with persistence", async () => {
+  it("uses one Projects toggle that defaults off and persists both views", () => {
     __resetSidebarViewStoreForTests();
     render(
       <TooltipProvider>
         <SidebarViewSwitch />
       </TooltipProvider>,
     );
-    const activity = screen.getByRole("radio", { name: "Activity view" });
-    const projects = screen.getByRole("radio", { name: "Projects view" });
-    expect(activity).toHaveAttribute("aria-checked", "true");
-    expect(projects).toHaveAttribute("aria-checked", "false");
+    const projects = screen.getByRole("button", { name: "Projects view" });
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+    expect(projects).toHaveAttribute("aria-pressed", "false");
+    expect(projects).toHaveAttribute("data-state", "off");
 
     fireEvent.click(projects);
     expect(useSidebarViewStore.getState().view).toBe("projects");
-    expect(projects).toHaveAttribute("aria-checked", "true");
+    expect(projects).toHaveAttribute("aria-pressed", "true");
+    expect(projects).toHaveAttribute("data-state", "on");
     expect(dbSetUiState).toHaveBeenCalledWith("sidebar.view", "projects");
+
+    fireEvent.click(projects);
+    expect(useSidebarViewStore.getState().view).toBe("activity");
+    expect(projects).toHaveAttribute("aria-pressed", "false");
+    expect(projects).toHaveAttribute("data-state", "off");
+    expect(dbSetUiState).toHaveBeenCalledWith("sidebar.view", "activity");
   });
 
-  it("is one labelled group whose selection never clears", () => {
+  it("reflects view changes made outside the button, including the keyboard shortcut", () => {
     __resetSidebarViewStoreForTests();
+    useSidebarViewStore.setState({ loaded: true, view: "projects" });
     render(
       <TooltipProvider>
         <SidebarViewSwitch />
       </TooltipProvider>,
     );
-    // ToggleGroup type=single: role=group holding role=radio items, the
-    // selected one also marked data-state=on (the raised segment).
-    const group = screen.getByRole("group", { name: "Sidebar view" });
-    const activity = within(group).getByRole("radio", { name: "Activity view" });
-    expect(activity).toHaveAttribute("data-state", "on");
+    const projects = screen.getByRole("button", { name: "Projects view" });
+    expect(projects).toHaveAttribute("aria-pressed", "true");
 
-    // Pressing the selected view again must not leave no view selected.
-    fireEvent.click(activity);
-    expect(useSidebarViewStore.getState().view).toBe("activity");
-    expect(activity).toHaveAttribute("aria-checked", "true");
-    expect(
-      within(group).getByRole("radio", { name: "Projects view" }),
-    ).toHaveAttribute("data-state", "off");
+    act(() => useSidebarViewStore.getState().toggleView());
+    expect(projects).toHaveAttribute("aria-pressed", "false");
+    act(() => useSidebarViewStore.getState().toggleView());
+    expect(projects).toHaveAttribute("aria-pressed", "true");
   });
 });
 
