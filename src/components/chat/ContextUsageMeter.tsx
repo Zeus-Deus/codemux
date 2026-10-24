@@ -22,9 +22,12 @@ import type { ContextUsageSnapshot } from "@/tauri/events";
  *  hitting the wall. */
 const WARN_PERCENT = 90;
 
-/** Donut geometry. `r` and the stroke width are tuned so a `size-5`
- *  ring sits optically level with the send button's icon weight. */
-const RING_RADIUS = 9.75;
+/** Donut geometry: a 14px ring with a 2px stroke, the size of the
+ *  session-config icons beside it, so it reads as a status mark rather
+ *  than a control. */
+const RING_SIZE = 14;
+const RING_STROKE = 2;
+const RING_RADIUS = (RING_SIZE - RING_STROKE) / 2;
 const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
 
 interface Props {
@@ -43,8 +46,7 @@ interface Props {
 /**
  * Context-window occupancy indicator for the composer.
  *
- * A donut ring sized to the send button, click-opening a popover with
- * the exact numbers. The ring is deliberately quiet — this is ambient
+ * A small donut ring, click-opening a popover with the exact numbers. The ring is deliberately quiet — this is ambient
  * telemetry, not an alert — until usage crosses {@link WARN_PERCENT},
  * where it recolours to the danger token.
  *
@@ -97,35 +99,33 @@ export function ContextUsageMeter({
                 data-testid="context-usage-trigger"
                 aria-label={label}
                 className={cn(
-                  // Same circle diameter as the attach / send buttons
-                  // so the footer's right cluster stays on one optical
-                  // baseline.
-                  "inline-flex h-[34px] w-[34px] items-center justify-center rounded-full",
+                  // The footer triggers' 30px hover plate.
+                  "inline-flex size-[30px] shrink-0 items-center justify-center rounded-md",
                   "text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground",
                   "outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
                   warning && "text-danger hover:text-danger",
                 )}
               >
                 <svg
-                  viewBox="0 0 24 24"
-                  className="size-5 -rotate-90"
+                  viewBox={`0 0 ${RING_SIZE} ${RING_SIZE}`}
+                  className="size-3.5 -rotate-90"
                   aria-hidden="true"
                   focusable="false"
                 >
                   <circle
-                    cx="12"
-                    cy="12"
+                    cx={RING_SIZE / 2}
+                    cy={RING_SIZE / 2}
                     r={RING_RADIUS}
                     fill="none"
-                    strokeWidth="3"
+                    strokeWidth={RING_STROKE}
                     className="stroke-current text-muted-foreground/25"
                   />
                   <circle
-                    cx="12"
-                    cy="12"
+                    cx={RING_SIZE / 2}
+                    cy={RING_SIZE / 2}
                     r={RING_RADIUS}
                     fill="none"
-                    strokeWidth="3"
+                    strokeWidth={RING_STROKE}
                     strokeLinecap="round"
                     stroke="currentColor"
                     strokeDasharray={RING_CIRCUMFERENCE}

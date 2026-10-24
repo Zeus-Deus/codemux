@@ -25,7 +25,7 @@ describe("taskChipSummary", () => {
   it("reports live progress while the thread streams", () => {
     expect(
       taskChipSummary(snapshot("completed", "in_progress", "pending"), true),
-    ).toEqual({ completed: 1, total: 3, running: true });
+    ).toEqual({ completed: 1, total: 3, running: true, current: "Task 1" });
   });
 
   it("keeps the counts but drops the spinner once the run is over", () => {
@@ -33,7 +33,7 @@ describe("taskChipSummary", () => {
     // the turn ends, so only `streaming` can settle the chip.
     expect(
       taskChipSummary(snapshot("completed", "in_progress", "pending"), false),
-    ).toEqual({ completed: 1, total: 3, running: false });
+    ).toEqual({ completed: 1, total: 3, running: false, current: "Task 1" });
   });
 
   it("still reads complete when every row is done", () => {
@@ -41,6 +41,13 @@ describe("taskChipSummary", () => {
       completed: 2,
       total: 2,
       running: false,
+      current: "Task 1",
     });
+  });
+
+  it("names the next pending step when nothing is in progress", () => {
+    expect(
+      taskChipSummary(snapshot("completed", "pending", "pending"), true)?.current,
+    ).toBe("Task 1");
   });
 });

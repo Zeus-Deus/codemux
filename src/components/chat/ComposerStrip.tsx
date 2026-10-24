@@ -9,6 +9,7 @@ import {
   Clock,
   EllipsisVertical,
   Hourglass,
+  ListTodo,
   MessageCircleQuestion,
 } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
@@ -27,6 +28,7 @@ import {
   formatGoalAge,
   type ThreadGoal,
 } from "@/lib/agent-chat/goal";
+import type { TaskChipSummary } from "@/lib/agent-chat/task-summary";
 import { cn } from "@/lib/utils";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
@@ -226,6 +228,7 @@ export function ComposerStrip({
   occupants,
   goal = null,
   queue = null,
+  tasks = null,
 }: {
   occupants: ReadonlyArray<StripOccupant | null | undefined | false>;
   goal?: StripGoal | null;
@@ -233,6 +236,9 @@ export function ComposerStrip({
    *  never competes for the occupant slot: queued turns stay listed while
    *  anything else is going on. */
   queue?: React.ReactNode;
+  /** The provider's plan. Like the queue it has its own row, drawn above
+   *  everything else, so it never folds into another occupant's `+n`. */
+  tasks?: StripTasks | null;
 }) {
   const all = occupants
     .filter((o): o is StripOccupant => !!o && o.rows.length > 0)
@@ -281,7 +287,7 @@ export function ComposerStrip({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [anyOpen]);
 
-  if (total === 0 && !goal && !queue) return null;
+  if (total === 0 && !goal && !queue && !tasks) return null;
   const pinnedRows = pinned.flatMap((occupant) =>
     occupant.rows.map((row) => ({ row, kind: occupant.kind })),
   );
@@ -350,6 +356,10 @@ export function ComposerStrip({
             aria-hidden
           />
         )}
+        {tasks && <TasksRowView tasks={tasks} />}
+        {tasks && (queue || goal || total > 0) ? (
+          <div className="relative mx-2 h-px bg-border/60" aria-hidden />
+        ) : null}
         {queue}
         {queue && (goal || total > 0) ? (
           <div className="relative mx-2 h-px bg-border/60" aria-hidden />
@@ -420,6 +430,84 @@ export function ComposerStrip({
         )}
       </div>
     </div>
+  );
+}
+
+export interface StripTasks {
+  summary: TaskChipSummary;
+  /** Whether the Tasks panel the row opens is showing. */
+  open: boolean;
+  onToggle: () => void;
+}
+
+/** Past this many steps the progress bar fills continuously instead of
+ *  drawing one segment per step. */
+const MAX_TASK_SEGMENTS = 8;
+
+/**
+ * The plan's row: the step it is on, `done/total`, and a progress bar.
+ * The whole row opens the Tasks panel, which lists every step.
+ */
+function TasksRowView({ tasks }: { tasks: StripTasks }) {
+  const { completed, total, running, current } = tasks.summary;
+  const done = completed === total;
+  return (
+    <button
+      type="button"
+      data-testid="composer-strip-tasks"
+      aria-pressed={tasks.open}
+      aria-label={`Tasks: ${completed} of ${total} complete. ${current}`}
+      title={tasks.open ? "Hide tasks" : "Show tasks"}
+      onClick={tasks.onToggle}
+      className={cn(
+        "relative flex w-full shrink-0 items-center gap-2.5 px-2 text-left outline-none transition-colors duration-150 hover:bg-surface-1 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
+        STRIP_ROW_HEIGHT,
+      )}
+    >
+      <span className="flex size-5 shrink-0 items-center justify-center">
+        {running ? (
+          <Spinner className="size-3.5 text-muted-foreground" role="presentation" aria-hidden />
+        ) : done ? (
+          <Check className="size-4 text-status-open" aria-hidden />
+        ) : (
+          <ListTodo className="size-3.5 text-muted-foreground" aria-hidden />
+        )}
+      </span>
+      <span className="shrink-0 text-body-sm font-semibold text-foreground/80">
+        Tasks
+      </span>
+      <span className="min-w-0 flex-1 truncate text-label text-muted-foreground">
+        {current}
+      </span>
+      <span className="shrink-0 text-label tabular-nums text-muted-foreground">
+        {completed}/{total}
+      </span>
+      <TaskProgress completed={completed} total={total} />
+    </button>
+  );
+}
+
+function TaskProgress({ completed, total }: { completed: number; total: number }) {
+  const fill = completed === total ? "bg-status-open" : "bg-foreground/55";
+  if (total > MAX_TASK_SEGMENTS) {
+    return (
+      <span className="h-[3px] w-12 shrink-0 overflow-hidden rounded-full bg-surface-3" aria-hidden>
+        <span
+          className={cn("block h-full rounded-full", fill)}
+          style={{ width: `${(completed / total) * 100}%` }}
+        />
+      </span>
+    );
+  }
+  return (
+    <span className="flex shrink-0 items-center gap-0.5" aria-hidden>
+      {Array.from({ length: total }, (_, i) => (
+        <span
+          key={i}
+          className={cn("h-[3px] w-2 rounded-full", i < completed ? fill : "bg-surface-3")}
+        />
+      ))}
+    </span>
   );
 }
 

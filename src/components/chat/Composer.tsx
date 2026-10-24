@@ -122,7 +122,7 @@ import { HooksManager } from "./HooksManager";
 import { ProviderCommandsDialog } from "./ProviderCommandsDialog";
 import { useUIStore } from "@/stores/ui-store";
 import { ComposerCommandMenu } from "./ComposerCommandMenu";
-import { ComposerFooter } from "./ComposerFooter";
+import { ComposerChin, ComposerFooter } from "./ComposerFooter";
 import { ModeTab, type ActivePillMode } from "./pickers/ModeTab";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
@@ -295,12 +295,6 @@ interface Props {
   contextUsageSeedMaxTokens?: number | null;
   /** Display name of the agent for the meter's auto-compaction note. */
   contextUsageProviderLabel?: string | null;
-  /** Provider-authored plan summary. Non-null reveals the Tasks toggle;
-   *  `running` tints the chip amber with a spinner while a step is in
-   *  flight (green check once completed === total). */
-  tasks?: { completed: number; total: number; running?: boolean } | null;
-  tasksOpen?: boolean;
-  onTasksClick?: () => void;
   /** Step 8 Stage 1 — staged attachments rendered as a chip strip
    *  inside the composer card, above the textarea. Empty array hides
    *  the strip. Defaults to `[]` so existing call sites keep working
@@ -402,10 +396,15 @@ const MAX_ROWS_APPROX_PX = 20 + 10 * 20; // ~10 rows (200px of text + py-2.5)
 
 /** Draft-surface resting height of the (empty) textarea box, padding
  *  included. Reserves ~4 lines so a new thread reads as a spacious prompt
- *  card. A live thread's composer has no such floor: it rests as a 44px
- *  pill and grows from a single line. The auto-grow effect only ever grows
- *  past the floor, never below it. */
+ *  card. A live thread's composer rests as a 44px pill and opens to
+ *  `OPEN_TEXTAREA_PX`. The auto-grow effect only ever grows past the
+ *  floor, never below it. */
 export const MIN_TEXTAREA_PX = 94;
+
+/** A live thread's open card reserves two lines (2 × 22.75px + py-2.5),
+ *  so it reads as a place to write rather than the pill with a second
+ *  row. A phone-width composer never collapses and keeps no floor. */
+export const OPEN_TEXTAREA_PX = 66;
 
 /** The pill never collapses within this window after a send, so the card
  *  doesn't snap shut under the message that was just sent. */
@@ -548,9 +547,6 @@ export function Composer({
   contextUsage = null,
   contextUsageSeedMaxTokens = null,
   contextUsageProviderLabel = null,
-  tasks = null,
-  tasksOpen = false,
-  onTasksClick,
   stagedAttachments = EMPTY_ATTACHMENTS,
   onRemoveAttachment,
   onToggleExpandPr,
@@ -2939,29 +2935,6 @@ export function Composer({
   // mid-flight (`busy`).
   const busy = streaming || sending;
   const delivery = parseMessageDelivery(draft);
-  // Anything that changes the controls' natural widths. A change re-fits
-  // from step 0, so a shorter label can win its text back.
-  const footerKey = [
-    provider,
-    model,
-    effort,
-    contextWindow,
-    serviceTier,
-    permissionMode,
-    busy,
-    delivery.delivery,
-    streaming && draft.trim().length > 0,
-    tasks ? `${tasks.completed}/${tasks.total}` : "",
-    // The ring appearing adds width inside the gap without resizing it,
-    // so no observer would notice.
-    contextUsage ? "ring" : "",
-  ].join("|");
-  // Layout effect: each fit step re-renders and re-measures before paint,
-  // so the row never flashes an overflowing intermediate state.
-  useLayoutEffect(() => {
-    committedFitRef.current = footerFit;
-    fitFooter(footerKey);
-  }, [fitFooter, footerKey, footerFit]);
   const steeringUnavailable = streaming && delivery.delivery === "steer" && !supportsSteering;
   const discoveringCommands = draftLeadsWithSlash && providerCommandsEntry.loading && !providerCommandsEntry.loaded;
   const canSubmit = !remoteDisconnected && (provider !== "acp" || (acp.ready && !acp.busy && customAgentsAllowed && !unsupportedAcpImages)) && sessionReady && !sending && !discoveringCommands && (delivery.text.length > 0 || submitWhenEmpty) && !steeringUnavailable;
@@ -2986,9 +2959,38 @@ export function Composer({
     attachOpen ||
     sendHold ||
     !!errorMessage ||
-    continueChipVisible;
+    continueChipVisible ||
+    // A strip under the card (a new chat's project · branch row) takes
+    // the chin's place, so the card stays open with its settings inside.
+    !!belowComposerSlot;
+  // Anything that changes the controls' natural widths. A change re-fits
+  // from step 0, so a shorter label can win its text back.
+  const footerKey = [
+    provider,
+    model,
+    effort,
+    contextWindow,
+    serviceTier,
+    permissionMode,
+    busy,
+    delivery.delivery,
+    streaming && draft.trim().length > 0,
+    // The ring appearing adds width inside the gap without resizing it,
+    // so no observer would notice.
+    contextUsage ? "ring" : "",
+    // The settings join the row only while the card is open.
+    expanded,
+  ].join("|");
+  // Layout effect: each fit step re-renders and re-measures before paint,
+  // so the row never flashes an overflowing intermediate state.
+  useLayoutEffect(() => {
+    committedFitRef.current = footerFit;
+    fitFooter(footerKey);
+  }, [fitFooter, footerKey, footerFit]);
   const dropTarget = !expanded && (paneDragActive || isDragging);
-  const textareaMinPx = minTextareaPx ?? (isDraft ? MIN_TEXTAREA_PX : 0);
+  const textareaMinPx =
+    minTextareaPx ??
+    (isDraft ? MIN_TEXTAREA_PX : collapseDisabled ? 0 : OPEN_TEXTAREA_PX);
   const placeholderText =
     sessionReady || sessionAwaitingIntent
       ? (placeholderOverride ?? placeholderForMode(mode, isDraft))
@@ -3219,6 +3221,44 @@ export function Composer({
     if (mentionAnchor !== null) closeMention();
   };
 
+  // Shared by the controls row and the chin, which show the same pickers.
+  const sessionSettings = {
+    hermesThreadId: threadId,
+    hermesProjectPath: cwd,
+    customAgentsAllowed,
+    provider,
+    model,
+    permissionMode,
+    effort,
+    contextWindow,
+    serviceTier,
+    activeModel,
+    effortLabelMap,
+    permissionModes,
+    ultrathinkInBodyText,
+    showProviderPicker,
+    mode,
+    onProviderModelChange,
+    onModelChange,
+    onPermissionModeChange,
+    onEffortChange,
+    onContextWindowChange,
+    onServiceTierChange,
+    configurationDisabled: !configurationEnabled,
+    modelPickerOpenSignal,
+    permissionPickerOpenSignal,
+  };
+  const chinExtras = {
+    contextUsage,
+    contextUsageSeedMaxTokens,
+    contextUsageProviderLabel,
+    workflowsOpen,
+    onWorkflowsClick:
+      workspaceId && workflowsAvailable && workflowButton
+        ? () => useUIStore.getState().setRightPanelTab(workspaceId, "workflows")
+        : undefined,
+  };
+
   return (
     <div className={cn(CHAT_COLUMN_OUTER, "pb-3")}>
       {/* `data-composer-dock`: the floating browser peek keeps clear of it. */}
@@ -3437,7 +3477,7 @@ export function Composer({
               {errorMessage && (
                 <div
                   role="alert"
-                  className="px-3 pt-2 text-label text-destructive/90 leading-tight"
+                  className="px-5 pt-2 text-label text-destructive/90 leading-tight"
                 >
                   <span>Send failed: {errorMessage}. </span>
                   <span className="text-muted-foreground/80">
@@ -3445,9 +3485,9 @@ export function Composer({
                   </span>
                 </div>
               )}
-              {unsupportedAcpImages && <p role="alert" className="px-3 pt-2 text-body-sm text-muted-foreground">This custom agent does not advertise image support. Remove image attachments to send a text prompt.</p>}
-              {provider === "acp" && !customAgentsAllowed && <p role="alert" className="px-3 pt-2 text-body-sm text-muted-foreground">Custom agents are local-workspace only. Create a local chat to use this harness.</p>}
-              {provider === "acp" && (acp.error || acp.loading || acp.warning) && <p role={acp.error ? "alert" : "status"} className="px-3 pt-2 text-body-sm text-muted-foreground">{acp.error ?? acp.warning ?? "Restoring custom agent identity…"}</p>}
+              {unsupportedAcpImages && <p role="alert" className="px-5 pt-2 text-body-sm text-muted-foreground">This custom agent does not advertise image support. Remove image attachments to send a text prompt.</p>}
+              {provider === "acp" && !customAgentsAllowed && <p role="alert" className="px-5 pt-2 text-body-sm text-muted-foreground">Custom agents are local-workspace only. Create a local chat to use this harness.</p>}
+              {provider === "acp" && (acp.error || acp.loading || acp.warning) && <p role={acp.error ? "alert" : "status"} className="px-5 pt-2 text-body-sm text-muted-foreground">{acp.error ?? acp.warning ?? "Restoring custom agent identity…"}</p>}
               {/* Strip above the textarea hosts image / PR / session
                   attachment chips. File / folder chips render INSIDE the
                   textarea via the mirror overlay below; images can't live
@@ -3463,7 +3503,7 @@ export function Composer({
                 (interrupted && !streaming && !sending && !!onContinueRun)) && (
                 <div
                   data-testid="composer-attachment-strip"
-                  className="flex flex-wrap gap-1.5 px-3 pt-2"
+                  className="flex flex-wrap gap-1.5 px-5 pt-2"
                 >
                   {/* A leading `/name` the runtime will execute. The
                       inline token in the mirror below can only carry
@@ -3560,7 +3600,7 @@ export function Composer({
               {showImageSizeWarning && (
                 <div
                   data-testid="composer-image-size-warning"
-                  className="px-3 pt-1 text-caption text-warning"
+                  className="px-5 pt-1 text-caption text-warning"
                 >
                   Total image size: {(totalImageBytes / 1024 / 1024).toFixed(1)} MB
                   — consider reducing for faster requests
@@ -3572,7 +3612,7 @@ export function Composer({
               {showCountSoftWarning && (
                 <div
                   data-testid="composer-attachment-count-warning"
-                  className="px-3 pt-1 text-caption text-warning"
+                  className="px-5 pt-1 text-caption text-warning"
                 >
                   {stagedCount} attachments — consider trimming for cleaner prompts
                 </div>
@@ -3580,7 +3620,7 @@ export function Composer({
               {showCountHardWarning && (
                 <div
                   data-testid="composer-attachment-count-hardcap"
-                  className="px-3 pt-1 text-caption text-destructive"
+                  className="px-5 pt-1 text-caption text-destructive"
                 >
                   {stagedCount} attachments — limit reached. Remove some to add
                   more.
@@ -3844,19 +3884,8 @@ export function Composer({
           ) : null}
           <Slot area={COMPOSER_ACCESSORY_AREA} props={{ workspaceId, threadId }} variant="block" />
           <ComposerFooter
-            hermesThreadId={threadId}
-            hermesProjectPath={cwd}
-            customAgentsAllowed={customAgentsAllowed}
-            provider={provider}
-            model={model}
-            permissionMode={permissionMode}
-            effort={effort}
-            contextWindow={contextWindow}
-            serviceTier={serviceTier}
-            activeModel={activeModel}
-            effortLabelMap={effortLabelMap}
-            permissionModes={permissionModes}
-            ultrathinkInBodyText={ultrathinkInBodyText}
+            {...sessionSettings}
+            {...chinExtras}
             streaming={busy}
             delivery={delivery.delivery}
             supportsSteering={supportsSteering}
@@ -3868,34 +3897,15 @@ export function Composer({
             } : undefined}
             canSubmit={canSubmit}
             hasDraft={delivery.text.length > 0}
-            showProviderPicker={showProviderPicker}
             showStopButton={showStopButton}
-            mode={mode}
-            onProviderModelChange={onProviderModelChange}
-            onModelChange={onModelChange}
-            onPermissionModeChange={onPermissionModeChange}
-            onEffortChange={onEffortChange}
-            onContextWindowChange={onContextWindowChange}
-            onServiceTierChange={onServiceTierChange}
             onSubmit={() => submit()}
             onBackgroundSubmit={onBackgroundSubmit ? () => submit(true) : undefined}
             onStop={onStop}
             controlsDisabled={!sessionReady}
-            configurationDisabled={!configurationEnabled}
             onAttachClick={handleAttachClick}
             // The workflows panel in the `+` menu works without a session.
             attachDisabled={!sessionReady && !(workspaceId && workflowsAvailable)}
             attachOpen={attachOpen}
-            modelPickerOpenSignal={modelPickerOpenSignal}
-            permissionPickerOpenSignal={permissionPickerOpenSignal}
-            contextUsage={contextUsage}
-            contextUsageSeedMaxTokens={contextUsageSeedMaxTokens}
-            contextUsageProviderLabel={contextUsageProviderLabel}
-            tasks={tasks}
-            tasksOpen={tasksOpen}
-            onTasksClick={onTasksClick}
-            workflowsOpen={workflowsOpen}
-            onWorkflowsClick={workspaceId && workflowsAvailable && workflowButton ? () => useUIStore.getState().setRightPanelTab(workspaceId, "workflows") : undefined}
             gap={
               !expanded ? (
                 <span
@@ -3920,7 +3930,7 @@ export function Composer({
               ) : null
             }
             onGapPointerDown={handleGapPointerDown}
-            showContextMeter={expanded}
+            collapsed={!expanded}
             gapRef={footerGapRef}
             modelLeafLabel={footerLadder.leafModelLabel}
             modelIconOnly={footerLadder.modelIconOnly}
@@ -3929,6 +3939,9 @@ export function Composer({
             configInMenu={footerLadder.configInMenu}
           />
         </div>
+        {/* The resting pill's settings drawer. Its seam tucks under the
+            card, so it reads as a layer sliding out from beneath it. */}
+        {!expanded && <ComposerChin {...sessionSettings} {...chinExtras} />}
         {/* No gap here — the scope strip / context strip attaches
             flush to the card's bottom edge so it reads as a layer
             sliding out from beneath the card. Slot content owns any
@@ -3985,7 +3998,7 @@ function formatMcpRowStatus(
 /** Box and type metrics shared by the textarea and the mirror painted
  *  behind it. One constant so the two layers can't drift apart and
  *  desync the caret from the painted text (or the argument ghost). */
-const COMPOSER_TEXT_LAYOUT = "px-3 py-2.5 conversation-text leading-relaxed";
+const COMPOSER_TEXT_LAYOUT = "px-5 py-2.5 conversation-text leading-relaxed";
 
 /** Muted colour of the textarea's native placeholder, reused for the
  *  argument ghost so both hints read the same. Keep in step with the

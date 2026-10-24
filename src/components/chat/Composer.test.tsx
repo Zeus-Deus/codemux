@@ -347,12 +347,14 @@ describe("Composer", () => {
       );
     });
 
-    it("renders nothing extra when belowComposerSlot is omitted", () => {
+    it("renders only the resting chin when belowComposerSlot is omitted", () => {
       const { container } = renderComposer();
       const wrapper = container.querySelector(
         '[data-testid="composer-wrapper"]',
       )!;
-      expect(wrapper.nextElementSibling).toBeNull();
+      const chin = wrapper.nextElementSibling;
+      expect(chin).toHaveAttribute("data-testid", "composer-chin");
+      expect(chin?.nextElementSibling).toBeNull();
     });
   });
 
