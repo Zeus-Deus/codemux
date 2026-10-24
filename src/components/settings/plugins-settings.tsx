@@ -65,15 +65,15 @@ export function usePluginSettingsPages() {
 }
 
 type SetupSource = NonNullable<PluginSettingsPage["status"]>;
-const NO_SETUP: SetupSource = { get: () => null, subscribe: () => () => {} };
 
-/** The first setup status any of the plugin's settings pages reports. */
-function setupSourceOf(pages: readonly { data?: unknown }[]): SetupSource {
+/** The first setup status any of the plugin's settings pages reports, with
+ *  the page that reports it so a failure is attributed to that plugin. */
+function setupSourceOf(pages: readonly { id: string; data?: unknown }[]): { id: string; source: SetupSource } | null {
   for (const page of pages) {
     const status = (page.data as { status?: SetupSource } | undefined)?.status;
-    if (status) return status;
+    if (status) return { id: page.id, source: status };
   }
-  return NO_SETUP;
+  return null;
 }
 
 function SetupStatus({ source }: { source: SetupSource }) {
@@ -127,7 +127,7 @@ interface RowActions {
   update: (source: InstallSource) => void;
   remove: (record: PluginRecord) => void;
   hasSettings: boolean;
-  setup: SetupSource;
+  setup: { id: string; source: SetupSource } | null;
 }
 
 function PluginRow({ record, actions }: { record: PluginRecord; actions: RowActions }) {
@@ -157,7 +157,13 @@ function PluginRow({ record, actions }: { record: PluginRecord; actions: RowActi
           <p className="mt-0.5 text-body-sm text-muted-foreground">{record.description}</p>
         )}
         {status && <p className="mt-0.5 text-body-sm text-muted-foreground">{status}</p>}
-        {on && !paused && !record.inert && record.status !== "error" && <SetupStatus source={actions.setup} />}
+        {/* Plugin code runs in get/subscribe: a throw stays in this slot, so
+            the row, its switch and every other row keep working. */}
+        {actions.setup && on && !paused && !record.inert && record.status !== "error" && (
+          <ContribBoundary id={actions.setup.id} variant="chip">
+            <SetupStatus source={actions.setup.source} />
+          </ContribBoundary>
+        )}
         {record.status === "error" && record.error && (
           <p className="mt-1 break-words text-body-sm text-destructive" role="alert">
             {record.error}

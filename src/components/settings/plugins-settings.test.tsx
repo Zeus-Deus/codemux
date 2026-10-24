@@ -68,4 +68,21 @@ describe("plugin rows", () => {
     expect(screen.getByText("Ready to use")).toHaveAttribute("data-plugin-setup", "ready");
     expect(document.querySelector('[data-plugin-row="plain"] [data-plugin-setup]')).toBeNull();
   });
+
+  it.each([
+    ["get", { get: () => { throw new Error("status broke"); }, subscribe: () => () => {} }],
+    ["subscribe", { get: () => null, subscribe: () => { throw new Error("subscribe broke"); } }],
+  ])("contains a setup status whose %s throws to that plugin's slot", async (_name, status) => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    setup(status);
+    render(<PluginsSettings onOpenSettings={() => {}} />);
+    expect(document.querySelector('[data-plugin-error="demo:settings"]')).toHaveTextContent("failed");
+    expect(screen.getByRole("switch", { name: "Turn off Plain" })).toBeChecked();
+    expect(screen.getByRole("button", { name: "Settings" })).toBeVisible();
+    // The failing plugin can still be turned off.
+    await userEvent.setup().click(screen.getByRole("switch", { name: "Turn off Demo" }));
+    expect(usePluginsStore.getState().decisions.demo).toBe(false);
+    expect(screen.getByRole("switch", { name: "Turn on Demo" })).not.toBeChecked();
+    error.mockRestore();
+  });
 });

@@ -121,6 +121,10 @@ export function ComputerSettings({ controller, peek, showWorkspace, initialComma
   const checking = state.phase === "detecting" || (driver.status === "unchecked" && state.phase === "idle");
   const canInstall = (driver.status === "missing" || driver.status === "incompatible") && managed?.supported === true;
   const unsupported = (driver.status === "missing" || driver.status === "incompatible") && managed?.supported === false;
+  // Any problem the doctor reports stays in view, even on a ready driver;
+  // only an all-clear report folds away under Advanced.
+  const doctorNeedsAttention = !!state.doctor && (driver.status === "needs-setup" || !state.doctor.ok
+    || state.doctor.probes.some((probe) => probe.status !== "ok"));
   const applyCommand = (next: string) => {
     const value = next.trim();
     setCommand(value);
@@ -169,7 +173,7 @@ export function ComputerSettings({ controller, peek, showWorkspace, initialComma
           Some steps happen in your operating system’s settings, such as allowing screen recording or accessibility access.
           Follow the items below, then check again.
         </Notice>}
-        {driver.status === "needs-setup" && state.doctor && <DoctorDiagnostics report={state.doctor} />}
+        {doctorNeedsAttention && state.doctor && <DoctorDiagnostics report={state.doctor} />}
         {state.phase !== "installing" && !checking && <div style={row}>
           {canInstall && <Button size="sm" disabled={busy || controlling} onClick={install}>
             <icons.Download />{state.installError ? "Retry installation" : driver.status === "incompatible" ? "Install compatible driver" : "Install driver"}
@@ -207,7 +211,7 @@ export function ComputerSettings({ controller, peek, showWorkspace, initialComma
             {saved && <div><Button variant="ghost" size="sm" disabled={busy || controlling} onClick={() => applyCommand("")}>
               <icons.RotateCcw />Use automatic detection
             </Button></div>}
-            {state.doctor && driver.status !== "needs-setup" && <DoctorDiagnostics report={state.doctor} />}
+            {state.doctor && !doctorNeedsAttention && <DoctorDiagnostics report={state.doctor} />}
             <p style={{ ...muted, margin: 0 }}>
               Manual installation: <a href={INSTALL_URL} target="_blank" rel="noreferrer" style={{ color: color("primary"), textDecoration: "underline" }}>official installation guide</a>
             </p>

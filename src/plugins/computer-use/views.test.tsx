@@ -242,6 +242,32 @@ describe("computer-use driver setup page", () => {
     await controller.dispose();
   });
 
+  it("shows doctor warnings on a ready driver without opening Advanced", async () => {
+    const doctor = { ok: true, probes: [
+      { label: "X11 connection", status: "ok", message: "Connected to the desktop session." },
+      { label: "Accessibility bus", status: "warn", message: "AT-SPI bus is not running." },
+    ] };
+    const controller = new ComputerUseController(setupServices({ which: async (command) => command === "cua-driver" ? "/usr/bin/cua-driver" : null, doctor }));
+    renderSettings(controller);
+    expect(await screen.findByText("Driver ready")).toBeVisible();
+    expect(screen.getByText("AT-SPI bus is not running.")).toBeVisible();
+    expect(screen.getByLabelText("Warning")).toBeVisible();
+    // Listed once, outside the collapsed Advanced section.
+    expect(screen.getAllByLabelText("Driver diagnostics")).toHaveLength(1);
+    expect(screen.getByLabelText("cua-driver executable")).not.toBeVisible();
+    await controller.dispose();
+  });
+
+  it("keeps an all-clear report collapsed under Advanced on a ready driver", async () => {
+    const controller = new ComputerUseController(setupServices({ which: async (command) => command === "cua-driver" ? "/usr/bin/cua-driver" : null }));
+    renderSettings(controller);
+    expect(await screen.findByText("Driver ready")).toBeVisible();
+    expect(screen.getByText("All diagnostics passed")).not.toBeVisible();
+    await userEvent.setup().click(screen.getByText(/^Advanced/));
+    expect(screen.getByText("All diagnostics passed")).toBeVisible();
+    await controller.dispose();
+  });
+
   it("checks a custom path under Advanced and restores automatic detection", async () => {
     const onCommand = vi.fn();
     const services = setupServices({ which: async (command) => command === "/opt/cua/cua-driver" || command === "cua-driver" ? command === "cua-driver" ? "/usr/bin/cua-driver" : command : null });

@@ -204,9 +204,17 @@ export class ComputerUseController {
 
   /** The executable's version, or why it can't be used. */
   private async readVersion(executable: string, signal: AbortSignal): Promise<{ version: string | null; problem: string | null }> {
-    const result = await this.services.process.run({
-      command: executable, args: ["--version"], timeoutMs: 5_000, maxOutputBytes: 16_384, env: DRIVER_ENV,
-    });
+    let result: Awaited<ReturnType<ComputerUseServices["process"]["run"]>>;
+    try {
+      result = await this.services.process.run({
+        command: executable, args: ["--version"], timeoutMs: 5_000, maxOutputBytes: 16_384, env: DRIVER_ENV,
+      });
+    } catch (error) {
+      // A candidate that can't be launched is unusable, not fatal: detection
+      // moves on to the next location. Cancellation still ends it.
+      this.check(signal);
+      return { version: null, problem: `Couldn’t run ${executable}: ${error instanceof Error ? error.message : String(error)}` };
+    }
     this.check(signal);
     const version = parseVersion(result.stdout);
     if (result.code !== 0 || !version || result.cancelled || result.truncated || result.pipesHeldOpen || result.timedOut) {

@@ -592,6 +592,60 @@ describe("computer-use driver setup", () => {
     await controller.dispose();
   });
 
+  it("skips an existing install that can't be launched and uses the managed copy", async () => {
+    const fake = fakeDesktop();
+    const run = fake.services.process.run;
+    fake.services.process.run = vi.fn(async (options) => {
+      if (options.command === "/demo/cua-driver") throw new Error("Permission denied (os error 13)");
+      return run(options);
+    });
+    fake.services.tools.status = async () => ({ id: "cua-driver", version: "0.21.0", supported: true, unsupportedReason: null, executable: managedPath });
+    const controller = new ComputerUseController(fake.services);
+    await controller.detect();
+    expect(controller.getState()).toMatchObject({ phase: "idle", error: null, executable: managedPath,
+      driver: { status: "ready", source: "managed", message: null } });
+    await controller.dispose();
+  });
+
+  it("offers the managed install when the only existing install can't be launched", async () => {
+    const fake = fakeDesktop();
+    fake.services.process.which = vi.fn(async (command) => command === "cua-driver" ? "/demo/cua-driver" : null);
+    fake.services.process.run = vi.fn(async () => { throw new Error("Permission denied (os error 13)"); });
+    const controller = new ComputerUseController(fake.services);
+    await controller.detect();
+    expect(controller.getState()).toMatchObject({ phase: "idle", error: null, executable: "/demo/cua-driver",
+      managed: { supported: true }, driver: { status: "incompatible", source: "system",
+        message: "Couldn’t run /demo/cua-driver: Permission denied (os error 13)" } });
+    await controller.dispose();
+  });
+
+  it("does not treat a launch failure as a result once the check is replaced", async () => {
+    const fake = fakeDesktop();
+    fake.services.process.which = vi.fn(async (command) => command === "cua-driver" ? "/demo/cua-driver" : command === "/opt/cua-driver" ? command : null);
+    const run = fake.services.process.run;
+    let reject: (error: Error) => void = () => {};
+    let first = true;
+    fake.services.process.run = vi.fn((options) => {
+      if (!first) return run(options);
+      first = false;
+      return new Promise<never>((_resolve, fail) => { reject = fail; });
+    });
+    const status = vi.spyOn(fake.services.tools, "status");
+    const controller = new ComputerUseController(fake.services);
+    const statuses: string[] = [];
+    controller.subscribe(() => statuses.push(controller.getState().driver.status));
+    // A custom path has no later location whose check would catch the cancellation.
+    const stale = controller.detect("/opt/cua-driver");
+    await vi.waitFor(() => expect(fake.services.process.run).toHaveBeenCalledOnce());
+    const current = controller.detect();
+    reject(new Error("Permission denied (os error 13)"));
+    await Promise.all([stale, current]);
+    expect(status).not.toHaveBeenCalled();
+    expect(statuses).not.toContain("incompatible");
+    expect(controller.getState().driver).toEqual({ status: "ready", source: "system", message: null });
+    await controller.dispose();
+  });
+
   it("reports an incompatible install and installs the pinned driver with progress", async () => {
     const fake = fakeDesktop();
     versions({ "/demo/cua-driver": "0.20.0" })(fake);

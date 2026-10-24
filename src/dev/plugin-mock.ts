@@ -21,14 +21,15 @@ export default {
 
 /**
  * Computer use driver fixtures, chosen with `?computerUse=`: `missing`
- * (default), `ready`, `incompatible`, `setup` (an OS permission is missing),
- * `failed` (the first install download fails) or `unsupported` (no managed
- * install on this platform). Paths and versions are example data.
+ * (default), `ready`, `warning` (ready, with a doctor warning), `incompatible`,
+ * `setup` (an OS permission is missing), `failed` (the first install download
+ * fails) or `unsupported` (no managed install on this platform). Paths and
+ * versions are example data.
  */
 function computerUseMock(push: (channel: unknown, message: unknown) => void): Record<string, Handler> {
   const scenario = new URLSearchParams(location.search).get("computerUse") ?? "missing";
   const managed = "/mock/codemux-dev/tools/cua-driver/0.21.0-linux-x86_64/cua-driver";
-  let installed = scenario === "ready";
+  let installed = scenario === "ready" || scenario === "warning";
   let attempts = 0;
   const system = scenario === "incompatible" || scenario === "setup" ? "/usr/local/bin/cua-driver" : null;
   const result = (stdout: string, code = 0) => ({ code, stdout, stderr: "", timedOut: false, truncated: false, pipesHeldOpen: false, cancelled: false });
@@ -36,6 +37,10 @@ function computerUseMock(push: (channel: unknown, message: unknown) => void): Re
   const permission = { ok: false, probes: [
     { label: "display server", status: "ok", message: "X11 session available." },
     { label: "screen capture", status: "error", message: "Screen capture permission is not granted.", detail: "Allow screen capture for Codemux, then check again." },
+  ] };
+  const warning = { ok: true, probes: [
+    { label: "display server", status: "ok", message: "X11 session available." },
+    { label: "accessibility bus", status: "warn", message: "AT-SPI bus is not running; some applications may not expose their controls." },
   ] };
   return {
     plugins_host_acquire: () => null,
@@ -50,7 +55,7 @@ function computerUseMock(push: (channel: unknown, message: unknown) => void): Re
       const input = a.input as { command: string; args?: string[] };
       await new Promise((resolve) => setTimeout(resolve, 250));
       if (input.args?.[0] === "--version") return result(`cua-driver ${input.command === system && scenario === "incompatible" ? "0.19.2" : "0.21.0"}\n`);
-      return result(JSON.stringify(scenario === "setup" ? permission : healthy));
+      return result(JSON.stringify(scenario === "setup" ? permission : scenario === "warning" ? warning : healthy));
     },
     plugins_fs: (a) => {
       const operation = a.operation as { kind: string; name?: string };
