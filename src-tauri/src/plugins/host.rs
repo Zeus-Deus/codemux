@@ -12,6 +12,8 @@ use tokio::sync::{watch, Notify};
 mod data;
 #[path = "host_process.rs"]
 pub mod process;
+#[path = "host_tools.rs"]
+mod tools;
 
 #[derive(Default)]
 pub struct PluginHostState {
@@ -239,6 +241,43 @@ pub async fn plugins_fs<R: Runtime>(
             return Err("Plugin has been disposed".into());
         }
         data::execute(&plugin_id, operation)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn plugins_tool_status<R: Runtime>(
+    app: AppHandle<R>,
+    host: State<'_, PluginHostState>,
+    plugin_id: String,
+    token: String,
+    tool: String,
+) -> Result<tools::ToolStatus, String> {
+    super::commands::gui(&app)?;
+    let _permit = host.begin(&plugin_id, &token)?;
+    tools::status(&tool)
+}
+/// Install an app-pinned helper program; returns its executable path.
+#[tauri::command]
+pub async fn plugins_tool_install<R: Runtime>(
+    app: AppHandle<R>,
+    host: State<'_, PluginHostState>,
+    plugin_id: String,
+    token: String,
+    tool: String,
+    on_progress: tauri::ipc::Channel<tools::InstallProgress>,
+) -> Result<String, String> {
+    super::commands::gui(&app)?;
+    let permit = host.begin(&plugin_id, &token)?;
+    let cancelled = permit.cancellation();
+    // Finish (or clean up) even if the renderer stops awaiting.
+    tokio::spawn(async move {
+        let _permit = permit;
+        tools::install(&tool, cancelled, |progress| {
+            let _ = on_progress.send(progress);
+        })
+        .await
     })
     .await
     .map_err(|e| e.to_string())?

@@ -2714,6 +2714,8 @@ fn build_core_app<R: tauri::Runtime>(
             plugins::host::plugins_process_which,
             plugins::host::plugins_os_info,
             plugins::host::plugins_fs,
+            plugins::host::plugins_tool_status,
+            plugins::host::plugins_tool_install,
             plugins::mcp::plugins_mcp_register,
             plugins::mcp::plugins_mcp_unregister,
             plugins::mcp::plugins_mcp_list_tools,

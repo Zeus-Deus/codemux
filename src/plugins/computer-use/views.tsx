@@ -1,6 +1,6 @@
 import { useEffect, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
-import { Badge, Button, icons, Input, Switch, host, PeekChip, type Host, type PeekRenderProps } from "@codemux/sdk";
-import { ComputerUseController, type ComputerUseState } from "./controller";
+import { Badge, Button, buttonVariants, icons, Input, Spinner, Switch, host, PeekChip, type Host, type PeekRenderProps, type PluginSetupStatus } from "@codemux/sdk";
+import { ComputerUseController, DRIVER_VERSION, type ComputerUseState, type DriverState, type InstallStage } from "./controller";
 import { INSTALL_URL, isLinuxWayland, type DoctorProbe, type DoctorReport } from "./model";
 
 const color = (role: Parameters<typeof host.theme.cssVar>[0]) => `var(${host.theme.cssVar(role)})`;
@@ -34,9 +34,67 @@ export function DoctorDiagnostics({ report }: { report: DoctorReport }) {
   </div>;
   return <div aria-label="Driver diagnostics">
     {healthy ? <>
-      <div style={{ ...row, gap: 8 }}><DiagnosticIcon status="ok" /><span>Driver ready</span></div>
+      <div style={{ ...row, gap: 8 }}><DiagnosticIcon status="ok" /><span>All diagnostics passed</span></div>
       <details style={{ ...muted, marginTop: 8 }}><summary style={{ cursor: "pointer" }}>Details</summary><div style={{ paddingTop: 12 }}>{probes}</div></details>
     </> : probes}
+  </div>;
+}
+
+const SOURCE_LABEL: Record<NonNullable<DriverState["source"]>, string> = {
+  system: "Found on this computer",
+  managed: "Installed by Codemux",
+  custom: "Custom path",
+};
+
+/** One-line setup state for the plugin's Extensions row. */
+export function setupStatus(state: Pick<ComputerUseState, "driver" | "phase">): PluginSetupStatus {
+  if (state.phase === "installing") return { label: "Installing driver…", tone: "neutral" };
+  switch (state.driver.status) {
+    case "unchecked": return { label: "Checking driver…", tone: "neutral" };
+    case "ready": return { label: "Ready to use", tone: "ready" };
+    case "missing": return { label: "Setup needed · driver not installed", tone: "attention" };
+    case "incompatible": return { label: "Setup needed · compatible driver required", tone: "attention" };
+    case "needs-setup": return { label: "Setup needed · finish driver setup", tone: "attention" };
+    case "error": return { label: "Setup needed · driver check failed", tone: "attention" };
+  }
+}
+
+function driverHeadline(state: ComputerUseState): { title: string; detail: string | null } {
+  if (state.phase === "installing") return { title: "Installing the driver…", detail: null };
+  if (state.phase === "detecting" || state.driver.status === "unchecked") return { title: "Checking for the driver…", detail: null };
+  const { status, message, source } = state.driver;
+  if (status === "ready") return { title: "Driver ready", detail: source === "managed" ? "Installed and checked by Codemux." : source === "custom" ? "Your custom path passed the version and diagnostic checks." : "A compatible installation was found automatically." };
+  if (status === "missing") return { title: "Driver not installed", detail: message ?? (state.managed?.supported === false
+    ? `${state.managed.unsupportedReason ?? "Codemux can’t install the driver here."} Install it with the official guide, then check again.`
+    : "Install the driver to let agents work in a window you choose.") };
+  if (status === "incompatible") return { title: "Compatible driver needed", detail: message };
+  if (status === "needs-setup") return { title: "Driver setup needed", detail: message };
+  return { title: "Couldn’t check the driver", detail: message };
+}
+
+const INSTALL_STEPS = ["Download", "Verify", "Check"] as const;
+
+function InstallProgress({ install }: { install: InstallStage }) {
+  const step = install.stage === "downloading" ? 0 : install.stage === "verifying" ? 1 : 2;
+  const percent = install.stage === "downloading" && install.total > 0 ? Math.min(100, Math.round((install.received / install.total) * 100)) : null;
+  const mb = (bytes: number) => (bytes / 1_000_000).toFixed(1);
+  const label = install.stage === "downloading"
+    ? install.total > 0 ? `Downloading… ${mb(install.received)} of ${mb(install.total)} MB` : "Downloading…"
+    : install.stage === "verifying" ? "Verifying the download…" : "Checking the driver…";
+  return <div aria-label="Installation progress" style={{ display: "grid", gap: 8 }}>
+    <ol style={{ ...row, gap: 14, listStyle: "none", margin: 0, padding: 0 }}>
+      {INSTALL_STEPS.map((name, i) => <li key={name} aria-current={i === step ? "step" : undefined}
+        style={{ ...row, gap: 6, fontSize: 13, color: color(i <= step ? "foreground" : "mutedForeground") }}>
+        {i < step ? <icons.CheckCircle2 className="size-3.5 text-status-open" aria-label="Done" />
+          : i === step ? <icons.CircleDot className="size-3.5" aria-hidden /> : <icons.Circle className="size-3.5" aria-hidden />}
+        {name}
+      </li>)}
+    </ol>
+    <div role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent ?? undefined}
+      style={{ height: 4, borderRadius: 2, background: color("border"), overflow: "hidden" }}>
+      <div style={{ height: "100%", width: `${percent ?? (step === 0 ? 0 : 100)}%`, background: color("primary"), transition: "width 150ms linear" }} />
+    </div>
+    <Notice>{label}</Notice>
   </div>;
 }
 
@@ -50,10 +108,34 @@ export function ComputerSettings({ controller, peek, showWorkspace, initialComma
 }) {
   const state = useComputer(controller);
   const [command, setCommand] = useState(initialCommand);
+  const [saved, setSaved] = useState(initialCommand);
   const [selected, setSelected] = useState("");
-  const busy = ["detecting", "discovering", "starting", "stopping"].includes(state.phase);
+  // Check the driver whenever setup opens; refresh() leaves active control alone.
+  useEffect(() => { void controller.refresh(initialCommand); }, [controller, initialCommand]);
+  const busy = ["detecting", "installing", "discovering", "starting", "stopping"].includes(state.phase);
   const controlling = state.phase === "active" || state.phase === "starting" || state.phase === "stopping";
   const target = state.windows.find((window) => `${window.pid}:${window.windowId}` === selected);
+  const { driver, managed } = state;
+  const ready = driver.status === "ready";
+  const headline = driverHeadline(state);
+  const checking = state.phase === "detecting" || (driver.status === "unchecked" && state.phase === "idle");
+  const canInstall = (driver.status === "missing" || driver.status === "incompatible") && managed?.supported === true;
+  const unsupported = (driver.status === "missing" || driver.status === "incompatible") && managed?.supported === false;
+  const applyCommand = (next: string) => {
+    const value = next.trim();
+    setCommand(value);
+    setSaved(value);
+    onCommand(value);
+    void controller.detect(value);
+  };
+  const install = () => {
+    // A managed install replaces a custom path; the user's own binary stays.
+    if (saved) { setCommand(""); setSaved(""); onCommand(""); }
+    void controller.install();
+  };
+  const recheck = <Button size="sm" variant="outline" disabled={busy || controlling} onClick={() => { void controller.detect(saved); }}>
+    <icons.RefreshCw />Check again
+  </Button>;
   return (
     <div data-computer-use="settings" style={{ maxWidth: 720, fontSize: 14 }}>
       <p style={{ ...muted, margin: "0 0 4px" }}>
@@ -61,33 +143,88 @@ export function ComputerSettings({ controller, peek, showWorkspace, initialComma
         Choose a window each time you enable control.
       </p>
       <section style={section} aria-label="Driver installation">
-        <div style={row}><strong>cua-driver</strong>{state.version && <Badge variant="outline">{state.version}</Badge>}</div>
-        <div style={{ ...row, flexWrap: "nowrap" }}>
-          <Input aria-label="cua-driver executable" placeholder="cua-driver (from PATH)" value={command}
-            disabled={busy || controlling} onChange={(event) => setCommand(event.target.value)} />
-          <Button variant="outline" size="sm" disabled={busy || controlling || state.workspace?.local === false}
-            onClick={() => { onCommand(command.trim()); void controller.detect(command); }}>
-            <icons.RefreshCw />{state.phase === "detecting" ? "Checking…" : "Check installation"}
-          </Button>
+        <div style={{ ...row, justifyContent: "space-between" }}>
+          <div style={{ ...row, flexWrap: "nowrap", minWidth: 0 }}>
+            <icons.Cpu className="size-4 shrink-0" aria-hidden style={{ color: color("mutedForeground") }} />
+            <div style={{ minWidth: 0 }}>
+              <strong>Computer use driver</strong>
+              <p style={{ ...muted, margin: 0 }}>cua-driver · {state.version === DRIVER_VERSION ? state.version : `requires ${DRIVER_VERSION}`}</p>
+            </div>
+          </div>
+          {ready && driver.source && <Badge variant="outline">{SOURCE_LABEL[driver.source]}</Badge>}
         </div>
-        <Notice>
-          Requires cua-driver 0.21.0. <a href={INSTALL_URL} target="_blank" rel="noreferrer" style={{ color: color("primary"), textDecoration: "underline" }}>Official installation guide</a>
-        </Notice>
-        {state.executable && <p style={{ ...muted, margin: 0, overflowWrap: "anywhere" }}>
-          Executable: <code aria-label="Resolved cua-driver executable">{state.executable}</code>
+        <div role="status" aria-live="polite" style={{ display: "grid", gap: 4 }}>
+          <div style={{ ...row, gap: 8 }}>
+            {busy && !controlling ? <Spinner className="size-4" /> : ready ? <DiagnosticIcon status="ok" />
+              : driver.status === "error" ? <DiagnosticIcon status="error" /> : <DiagnosticIcon status="warn" />}
+            <span data-driver-status={driver.status}>{headline.title}</span>
+          </div>
+          {headline.detail && !checking && state.phase !== "installing" && <p style={{ ...muted, margin: 0, overflowWrap: "anywhere" }}>{headline.detail}</p>}
+        </div>
+        {state.install && <InstallProgress install={state.install} />}
+        {state.installError && state.phase !== "installing" && <p role="alert" style={{ ...muted, margin: 0, color: "var(--destructive)", overflowWrap: "anywhere" }}>
+          {state.installError}
         </p>}
-        {state.doctor && <DoctorDiagnostics report={state.doctor} />}
+        {driver.status === "needs-setup" && <Notice>
+          Some steps happen in your operating system’s settings, such as allowing screen recording or accessibility access.
+          Follow the items below, then check again.
+        </Notice>}
+        {driver.status === "needs-setup" && state.doctor && <DoctorDiagnostics report={state.doctor} />}
+        {state.phase !== "installing" && !checking && <div style={row}>
+          {canInstall && <Button size="sm" disabled={busy || controlling} onClick={install}>
+            <icons.Download />{state.installError ? "Retry installation" : driver.status === "incompatible" ? "Install compatible driver" : "Install driver"}
+          </Button>}
+          {unsupported && <a href={INSTALL_URL} target="_blank" rel="noreferrer" className={buttonVariants({ size: "sm" })}>
+            <icons.ExternalLink />Open installation guide
+          </a>}
+          {(!canInstall || driver.status === "incompatible") && recheck}
+          {canInstall && driver.status === "incompatible" && <span style={muted}>Your existing installation stays in place.</span>}
+        </div>}
+        {canInstall && state.phase !== "installing" && <Notice>
+          Downloads cua-driver {DRIVER_VERSION} from its official release, verifies the checksum and keeps it in Codemux’s data folder.
+          It doesn’t change PATH or other installations.
+        </Notice>}
+        {unsupported && driver.status === "incompatible" && managed?.unsupportedReason && <Notice>
+          {managed.unsupportedReason} Install {DRIVER_VERSION} with the official guide, then check again.
+        </Notice>}
+        <details style={{ ...muted }}>
+          <summary style={{ cursor: "pointer" }}>Advanced · custom path and diagnostics</summary>
+          <div style={{ display: "grid", gap: 10, paddingTop: 12 }}>
+            {state.executable && <p style={{ ...muted, margin: 0, overflowWrap: "anywhere" }}>
+              Executable: <code aria-label="Resolved cua-driver executable">{state.executable}</code>
+            </p>}
+            <label htmlFor="computer-use-executable" style={muted}>Driver executable path</label>
+            <div style={{ ...row, flexWrap: "nowrap" }}>
+              <Input id="computer-use-executable" aria-label="cua-driver executable" placeholder="Detect automatically"
+                value={command} spellCheck={false} disabled={busy || controlling} onChange={(event) => setCommand(event.target.value)} />
+              <Button variant="outline" size="sm" disabled={busy || controlling || !command.trim()} onClick={() => applyCommand(command)}>
+                Use this path
+              </Button>
+            </div>
+            <p style={{ ...muted, margin: 0 }}>
+              Leave empty to detect automatically. A custom path must pass the same version and diagnostic checks.
+            </p>
+            {saved && <div><Button variant="ghost" size="sm" disabled={busy || controlling} onClick={() => applyCommand("")}>
+              <icons.RotateCcw />Use automatic detection
+            </Button></div>}
+            {state.doctor && driver.status !== "needs-setup" && <DoctorDiagnostics report={state.doctor} />}
+            <p style={{ ...muted, margin: 0 }}>
+              Manual installation: <a href={INSTALL_URL} target="_blank" rel="noreferrer" style={{ color: color("primary"), textDecoration: "underline" }}>official installation guide</a>
+            </p>
+          </div>
+        </details>
       </section>
       <section style={section} aria-label="Workspace access">
         <div style={{ ...row, justifyContent: "space-between", flexWrap: "nowrap" }}>
           <div><strong>Allow in this workspace</strong><p style={{ ...muted, margin: "4px 0 0" }}>{state.workspace?.title ?? "Open a local workspace to continue."}</p></div>
           <Switch aria-label="Allow computer use in this workspace" checked={state.optedIn}
-            disabled={!state.workspace?.local || state.phase === "stopping"} onCheckedChange={onOptIn} />
+            disabled={!state.workspace?.local || state.phase === "stopping" || (!state.optedIn && !ready)} onCheckedChange={onOptIn} />
         </div>
         {state.workspace?.local === false && <Notice>Computer use is available only in local workspaces.</Notice>}
+        {state.workspace?.local && !ready && !checking && state.phase !== "installing" && <Notice>Finish driver setup to choose a window.</Notice>}
         {state.optedIn && state.workspace?.local && <>
           <div style={row}>
-            <Button size="sm" variant="outline" disabled={busy || controlling || !state.doctor?.ok}
+            <Button size="sm" variant="outline" disabled={busy || controlling || !ready || !state.doctor?.ok}
               onClick={() => { setSelected(""); void controller.discover(); }}>
               <icons.AppWindow />{state.phase === "discovering" ? "Finding windows…" : "Choose application window"}
             </Button>

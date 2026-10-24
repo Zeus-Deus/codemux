@@ -65,7 +65,7 @@ export default {
 | Member | |
 |---|---|
 | `ctx.register(contribution)` / `ctx.registerMany([...])` | Add contributions; returns a disposer. Ids are local to your plugin. |
-| `ctx.registerSettingsPage({ title, render })` | A page under Settings → PLUGIN SETTINGS. |
+| `ctx.registerSettingsPage({ title, render, status? })` | A page under Settings → Plugin settings, opened from a visible **Settings** button on the plugin's Extensions row. Optional `status: { get, subscribe }` returns `{ label, tone: "ready" \| "attention" \| "neutral" }` for that row, separate from on/off; `get` must return the same object until it changes. |
 | `ctx.onDispose(fn)` | Runs when the plugin turns off, reloads or is removed. |
 | `ctx.setTimeout`, `ctx.setInterval`, `ctx.addEventListener` | Like the globals, but cleaned up for you on unload. |
 | `ctx.storage.get(key, fallback)` / `.set(key, value)` / `.remove(key)` | JSON in the device-local settings DB under `plugin.<id>.<key>`. Never synced. |
@@ -567,6 +567,23 @@ local AppData; Linux XDG data home (default `~/.local/share`); macOS
 `~/Library/Application Support` for both data directories. No general environment
 reader is exposed. `dataDir` here is the OS directory, whereas `fs.dataDir()` is
 the plugin's private directory beneath the app's data directory.
+
+`ctx.host.tools` installs helper programs whose release Codemux pins. Today the
+only tool is `cua-driver` 0.21.0, used by Computer use:
+
+```ts
+const status = await ctx.host.tools.status("cua-driver");
+// { id, version, supported, unsupportedReason, executable }
+const executable = await ctx.host.tools.install("cua-driver", (progress) => {
+  // { stage: "downloading", received, total } | { stage: "verifying" } | { stage: "validating" }
+});
+```
+
+The plugin chooses only the tool id. The archive URL, size, SHA-256 and copied
+files are fixed in the app; the install is verified, version-checked in a
+staging folder, and then renamed into `<app data>/tools/<id>/<version>-<platform>/`.
+It never changes PATH or another installation. `supported` is false, with a
+reason, where Codemux can't install the tool (cua-driver on macOS).
 
 On Linux the GUI inherits its launcher's PATH; it does not import a login shell's
 PATH. A desktop session may omit `~/.local/bin`, so an integration can fall back

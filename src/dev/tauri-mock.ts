@@ -4893,7 +4893,7 @@ const handlers: Record<string, Handler> = {
   get_home_dir: () => MOCK_HOME_DIR,
   get_feature_flags: () => FEATURE_FLAGS,
   // Empty by default: plugins never alter a clean core-only UI.
-  ...pluginMockHandlers(),
+  ...pluginMockHandlers(pushPluginChannel),
   ...automationMockHandlers(),
   ...workflowMockHandlers((event) => emitEvent("workflow-changed", event)),
   get_package_format: () =>
@@ -8888,6 +8888,17 @@ async function showOpenerToast(url: unknown): Promise<void> {
 const updateMockScenario = new URLSearchParams(location.search).get("updateMock");
 if (updateMockScenario) {
   (window as { __CODEMUX_MOCK_UPDATER__?: boolean }).__CODEMUX_MOCK_UPDATER__ = true;
+}
+
+/** Ordered frames for plugin host channels (tool install progress). */
+const pluginChannelIndexes = new WeakMap<object, number>();
+function pushPluginChannel(channel: unknown, message: unknown): void {
+  const id = (channel as { id?: number } | undefined)?.id;
+  const cb = typeof id === "number" ? callbacks.get(id) : undefined;
+  if (!cb || typeof channel !== "object" || channel === null) return;
+  const index = pluginChannelIndexes.get(channel) ?? 0;
+  pluginChannelIndexes.set(channel, index + 1);
+  cb.fn({ index, message } as unknown as never);
 }
 
 async function mockUpdaterDownload(channel: unknown): Promise<void> {

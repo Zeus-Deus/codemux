@@ -38,6 +38,10 @@ function fakeDesktop() {
       }),
     },
     os: { info: async () => ({ platform: "linux", arch: "x86_64", homeDir: "/home/demo", configDir: null, dataDir: null, localDataDir: null }) },
+    tools: {
+      status: async () => ({ id: "cua-driver", version: "0.21.0", supported: true, unsupportedReason: null, executable: null }),
+      install: async () => "/app-data/tools/cua-driver/0.21.0-linux-x86_64/cua-driver",
+    },
     fs: {
       dataDir: async () => "/plugin-data/computer-use",
       listDir: async () => [...files].map(([name, kind]) => ({ name, kind })),
@@ -305,6 +309,9 @@ describe("computer-use lifecycle", () => {
       expect(controller.getState().expiresAt).toBe(now + CONTROL_LIFETIME_MS);
       await vi.advanceTimersByTimeAsync(CONTROL_LIFETIME_MS);
       expect(controller.getState().phase).toBe("expired");
+      // Opening setup again must not hide the expiry notice.
+      await controller.refresh();
+      expect(controller.getState()).toMatchObject({ phase: "expired", error: expect.stringContaining("expired after 10 minutes") });
       expect(controller.getState().target).toBeNull();
       expect(controller.getState().windows).toEqual([]);
       expect(fake.registrations.every((row) => row.stopped)).toBe(true);
@@ -323,8 +330,8 @@ describe("computer-use lifecycle", () => {
     expect(fake.services.process.run).toHaveBeenCalledTimes(2);
     for (const [options] of vi.mocked(fake.services.process.run).mock.calls) expect(options.env?.CUA_DRIVER_RS_TELEMETRY_ENABLED).toBe("0");
     expect(controller.getState().doctor?.ok).toBe(false);
-    expect(controller.getState().error).toContain("doctor exited with code 1");
-    expect(controller.getState().phase).toBe("error");
+    expect(controller.getState().driver).toMatchObject({ status: "needs-setup", message: expect.stringContaining("doctor exited with code 1") });
+    expect(controller.getState().phase).toBe("idle");
     await controller.dispose();
   });
 
@@ -376,7 +383,7 @@ describe("computer-use lifecycle", () => {
     await controller.detect("/missing/cua-driver");
     expect(directories).not.toHaveBeenCalled();
     expect(run).not.toHaveBeenCalled();
-    expect(controller.getState().error).toContain("No executable was found at /missing/cua-driver");
+    expect(controller.getState().driver).toMatchObject({ status: "missing", source: "custom", message: expect.stringContaining("No executable was found at /missing/cua-driver") });
     await controller.dispose();
   });
 
@@ -389,7 +396,8 @@ describe("computer-use lifecycle", () => {
     await controller.detect();
     expect(fake.services.process.which).toHaveBeenCalledExactlyOnceWith("cua-driver");
     expect(run).not.toHaveBeenCalled();
-    expect(controller.getState().error).toContain("Install it or enter its executable path");
+    expect(controller.getState().driver.status).toBe("missing");
+    expect(controller.getState().managed).toEqual({ supported: true, unsupportedReason: null });
     await controller.dispose();
   });
 
@@ -424,7 +432,7 @@ describe("computer-use lifecycle", () => {
     const controller = new ComputerUseController(fake.services);
     await controller.setWorkspace({ id: "workspace-a", title: "Demo", local: true }, true);
     await controller.detect();
-    expect(controller.getState().error).toContain("0.22.0 has not been validated");
+    expect(controller.getState().driver).toMatchObject({ status: "incompatible", message: expect.stringContaining("Found cua-driver 0.22.0") });
     await controller.discover();
     expect(fake.registrations).toHaveLength(0);
     await controller.dispose();
@@ -440,7 +448,8 @@ describe("computer-use lifecycle", () => {
     await controller.setWorkspace({ id: "workspace-a", title: "Demo", local: true }, true);
     await controller.detect();
     expect(controller.getState().doctor).toBeNull();
-    expect(controller.getState().error).not.toBeNull();
+    expect(controller.getState().driver.status).toBe(stage === "doctor" ? "error" : "incompatible");
+    expect(controller.getState().driver.message).not.toBeNull();
     await controller.discover();
     expect(fake.registrations).toHaveLength(0);
     await controller.dispose();
@@ -547,6 +556,150 @@ describe("computer-use lifecycle", () => {
     expect(controller.getState().phase).toBe("idle");
     expect(controller.getState().windows).toEqual([]);
     expect(controller.getState().target).toBeNull();
+    await controller.dispose();
+  });
+});
+
+describe("computer-use driver setup", () => {
+  const managedPath = "/app-data/tools/cua-driver/0.21.0-linux-x86_64/cua-driver";
+  const versions = (map: Record<string, string>) => (fake: ReturnType<typeof fakeDesktop>) => {
+    const run = fake.services.process.run;
+    fake.services.process.run = vi.fn(async (options) => options.args?.[0] === "--version"
+      ? { code: 0, stdout: `cua-driver ${map[options.command] ?? "0.21.0"}\n`, stderr: "", timedOut: false, truncated: false, pipesHeldOpen: false, cancelled: false }
+      : run(options));
+  };
+
+  it("keeps a compatible existing install ahead of Codemux's managed copy", async () => {
+    const fake = fakeDesktop();
+    fake.services.tools.status = vi.fn(async () => ({ id: "cua-driver", version: "0.21.0", supported: true, unsupportedReason: null, executable: managedPath }));
+    const controller = new ComputerUseController(fake.services);
+    await controller.detect();
+    expect(controller.getState().driver).toEqual({ status: "ready", source: "system", message: null });
+    expect(controller.getState().executable).toBe("/demo/cua-driver");
+    expect(fake.services.tools.status).not.toHaveBeenCalled();
+    await controller.dispose();
+  });
+
+  it("uses the managed copy when the existing install is another version, without touching it", async () => {
+    const fake = fakeDesktop();
+    versions({ "/demo/cua-driver": "0.20.0" })(fake);
+    fake.services.process.which = vi.fn(async (command) => command === "cua-driver" ? "/demo/cua-driver" : command === managedPath ? managedPath : null);
+    fake.services.tools.status = async () => ({ id: "cua-driver", version: "0.21.0", supported: true, unsupportedReason: null, executable: managedPath });
+    const controller = new ComputerUseController(fake.services);
+    await controller.detect();
+    expect(controller.getState().driver).toEqual({ status: "ready", source: "managed", message: null });
+    expect(controller.getState().executable).toBe(managedPath);
+    await controller.dispose();
+  });
+
+  it("reports an incompatible install and installs the pinned driver with progress", async () => {
+    const fake = fakeDesktop();
+    versions({ "/demo/cua-driver": "0.20.0" })(fake);
+    let installed = false;
+    fake.services.process.which = vi.fn(async (command) => command === "cua-driver" ? "/demo/cua-driver" : null);
+    fake.services.tools.status = async () => ({ id: "cua-driver", version: "0.21.0", supported: true, unsupportedReason: null, executable: installed ? managedPath : null });
+    const stages: string[] = [];
+    fake.services.tools.install = vi.fn(async (_tool, onProgress) => {
+      onProgress?.({ stage: "downloading", received: 10, total: 20 });
+      onProgress?.({ stage: "verifying" });
+      onProgress?.({ stage: "validating" });
+      installed = true;
+      return managedPath;
+    });
+    const controller = new ComputerUseController(fake.services);
+    controller.subscribe(() => { const stage = controller.getState().install?.stage; if (stage && stages[stages.length - 1] !== stage) stages.push(stage); });
+    await controller.setWorkspace({ id: "workspace-a", title: "Demo", local: true }, false);
+    await controller.detect();
+    expect(controller.getState().driver.status).toBe("incompatible");
+    expect(controller.getState().managed?.supported).toBe(true);
+    await controller.install();
+    expect(fake.services.tools.install).toHaveBeenCalledExactlyOnceWith("cua-driver", expect.any(Function));
+    expect(stages).toEqual(["downloading", "verifying", "validating", "checking"]);
+    expect(controller.getState()).toMatchObject({ phase: "idle", install: null, installError: null, executable: managedPath,
+      driver: { status: "ready", source: "managed" } });
+    // Installing grants nothing: no opt-in, no window, no driver child.
+    expect(controller.getState()).toMatchObject({ optedIn: false, target: null, windows: [] });
+    expect(fake.registrations).toHaveLength(0);
+    await controller.dispose();
+  });
+
+  it("keeps a failed install retryable and the driver state honest", async () => {
+    const fake = fakeDesktop();
+    fake.services.process.which = vi.fn(async () => null);
+    let attempts = 0;
+    fake.services.tools.install = vi.fn(async () => {
+      if (++attempts === 1) throw new Error("The download failed: HTTP 503. Check your connection and try again.");
+      return managedPath;
+    });
+    const controller = new ComputerUseController(fake.services);
+    await controller.detect();
+    await controller.install();
+    expect(controller.getState()).toMatchObject({ phase: "idle", install: null, driver: { status: "missing" },
+      installError: expect.stringContaining("HTTP 503") });
+    fake.services.process.which = vi.fn(async (command) => command === managedPath ? managedPath : null);
+    fake.services.tools.status = async () => ({ id: "cua-driver", version: "0.21.0", supported: true, unsupportedReason: null, executable: managedPath });
+    await controller.install();
+    expect(controller.getState()).toMatchObject({ installError: null, driver: { status: "ready", source: "managed" } });
+    await controller.dispose();
+  });
+
+  it("records an unsupported platform without claiming readiness", async () => {
+    const fake = fakeDesktop();
+    fake.services.process.which = vi.fn(async () => null);
+    fake.services.os.info = async () => ({ platform: "macos", arch: "aarch64", homeDir: "/Users/demo", configDir: null, dataDir: null, localDataDir: null });
+    fake.services.tools.status = async () => ({ id: "cua-driver", version: "0.21.0", supported: false, unsupportedReason: "Codemux can’t install the driver on macOS.", executable: null });
+    const controller = new ComputerUseController(fake.services);
+    await controller.detect();
+    expect(controller.getState().driver.status).toBe("missing");
+    expect(controller.getState().managed).toEqual({ supported: false, unsupportedReason: "Codemux can’t install the driver on macOS." });
+    await controller.dispose();
+  });
+
+  it("checks on opening setup but never disturbs active control", async () => {
+    const fake = fakeDesktop();
+    const controller = new ComputerUseController(fake.services);
+    await controller.enable(await chooseWindow(controller));
+    const run = vi.spyOn(fake.services.process, "run");
+    await controller.refresh();
+    await controller.install();
+    expect(run).not.toHaveBeenCalled();
+    expect(controller.getState().phase).toBe("active");
+    expect(fake.registrations.some((row) => !row.stopped && row.options.scope !== "plugin")).toBe(true);
+    await controller.stop();
+    await controller.refresh(undefined, true);
+    expect(run).not.toHaveBeenCalled();
+    await controller.refresh();
+    expect(run).toHaveBeenCalled();
+    await controller.dispose();
+  });
+
+  it("lets a workspace switch leave a running install alone", async () => {
+    const fake = fakeDesktop();
+    fake.services.process.which = vi.fn(async () => null);
+    const download = deferred();
+    fake.services.tools.install = async () => { await download.promise; return managedPath; };
+    fake.services.tools.status = async () => ({ id: "cua-driver", version: "0.21.0", supported: true, unsupportedReason: null, executable: null });
+    const controller = new ComputerUseController(fake.services);
+    const installing = controller.install();
+    await controller.setWorkspace({ id: "workspace-b", title: "B", local: true }, false);
+    expect(controller.getState().phase).toBe("installing");
+    fake.services.process.which = vi.fn(async (command) => command === managedPath ? managedPath : null);
+    fake.services.tools.status = async () => ({ id: "cua-driver", version: "0.21.0", supported: true, unsupportedReason: null, executable: managedPath });
+    download.resolve();
+    await installing;
+    expect(controller.getState().driver.status).toBe("ready");
+    await controller.dispose();
+  });
+
+  it("refuses to choose a window until the driver is ready", async () => {
+    const fake = fakeDesktop();
+    fake.services.process.which = vi.fn(async () => null);
+    const controller = new ComputerUseController(fake.services);
+    await controller.setWorkspace({ id: "workspace-a", title: "Demo", local: true }, true);
+    await controller.detect();
+    await controller.discover();
+    expect(fake.registrations).toHaveLength(0);
+    expect(controller.getState().error).toContain("Check the cua-driver installation first");
     await controller.dispose();
   });
 });
