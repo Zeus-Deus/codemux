@@ -662,7 +662,7 @@ mod tests {
         let cua = tool("cua-driver").unwrap();
         let missing = status_at(root.path(), cua, "linux", "x86_64");
         assert!(missing.supported && missing.executable.is_none());
-        let dir = root.path().join("cua-driver/0.21.0-linux-x86_64");
+        let dir = root.path().join("cua-driver").join("0.21.0-linux-x86_64");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("cua-driver"), "bin").unwrap();
         let installed = status_at(root.path(), cua, "linux", "x86_64");
