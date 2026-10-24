@@ -68,6 +68,24 @@ export interface ComposerActionData {
   run: (ctx: { workspaceId: string | null; threadId: string | null; composer: ComposerApi }) => void;
 }
 
+/** What every `COMPOSER_STATUS_AREA` render receives. */
+export interface ComposerStatusProps {
+  workspaceId: string | null;
+  threadId: string | null;
+}
+
+/**
+ * Optional `data` for `COMPOSER_STATUS_AREA`. A chip that renders nothing
+ * while idle says so here, so a host can leave out the section around it
+ * (Workspace details → Live) instead of titling an empty slot. `isVisible`
+ * must agree with when `render` draws something; `subscribe` fires when that
+ * may have changed. Without it the chip always counts as shown.
+ */
+export interface ComposerStatusData {
+  subscribe: (onChange: () => void) => () => void;
+  isVisible: (props: ComposerStatusProps) => boolean;
+}
+
 export interface ToolCallView {
   tool_name: string;
   tool_use_id: string;

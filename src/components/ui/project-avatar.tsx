@@ -83,7 +83,9 @@ export function ProjectAvatar({
         "flex items-center justify-center shrink-0 font-medium select-none",
         SIZE_CLASSES[size],
         shapeClass,
-        !hasColor && "bg-muted text-muted-foreground border-border",
+        // Neutral ink rather than `muted`, which tinted themes shift toward
+        // their accent: an uncoloured project should not look coloured.
+        !hasColor && "bg-surface-3 text-muted-foreground border-border",
         className,
       )}
       style={

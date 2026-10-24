@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { PEEK_AREA, type Host } from "@codemux/sdk";
 import { registry } from "@/contrib/registry";
 import { ComputerUseController, type ComputerUseServices } from "./controller";
-import { ComputerChatChip, ComputerIndicator, ComputerPreview, ComputerSettings, DoctorDiagnostics } from "./views";
+import { ComputerChatChip, ComputerIndicator, ComputerPreview, ComputerSettings, DoctorDiagnostics, computerChipVisible } from "./views";
 
 vi.mock("@/lib/toast", () => ({ toast: { error: vi.fn(), info: vi.fn(), success: vi.fn(), warning: vi.fn() } }));
 vi.mock("@/tauri/commands", () => ({ dbDeleteSetting: vi.fn(async () => {}) }));
@@ -130,8 +130,11 @@ describe("computer-use status controls", () => {
     const unregister = registry.register({ id: "computer-use:live", source: "test", area: PEEK_AREA, render: () => null });
     const { rerender } = render(<ComputerChatChip controller={controller} workspaceId="other" />);
     expect(screen.queryByRole("button", { name: "View Computer preview" })).toBeNull();
+    // The status area's visibility data must agree, or Live titles nothing.
+    expect(computerChipVisible(controller.getState(), "other")).toBe(false);
     rerender(<ComputerChatChip controller={controller} workspaceId="demo" />);
     expect(screen.getByRole("button", { name: "View Computer preview" })).toBeVisible();
+    expect(computerChipVisible(controller.getState(), "demo")).toBe(true);
     unregister();
     release();
     await controller.dispose();

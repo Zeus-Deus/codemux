@@ -1400,6 +1400,30 @@ body.pane-resizing iframe {
   box-shadow: var(--popup-shadow);
 }
 
+/* ── Raised-surface lines ──────────────────────────────────────────────
+ * A theme solves `--border` against the canvas, but floating surfaces sit
+ * on `--popover`, which derived palettes lift and tint (an amber accent on a
+ * graphite canvas puts a #2c2c2e border on a #3b2b19 popover: 1.03:1, so
+ * the outline and every divider inside vanish). Inside a raised surface the
+ * border is re-based on the surface's own ink instead, so the outline and
+ * its dividers hold the same contrast on any palette. The default dark
+ * scheme already used white at 10%, so it is unchanged there.
+ *
+ * Redefining the variable rather than the utilities keeps caller overrides
+ * (`border-status-*`, `border-transparent`) winning, and leaves `--input`
+ * alone so form fields keep their own outline. */
+[data-slot="popover-content"],
+[data-slot="hover-card-content"],
+[data-slot="select-content"],
+[data-slot="tooltip-content"],
+[data-slot="dialog-content"],
+[data-slot="alert-dialog-content"],
+.cm-menu-surface,
+.cm-menu-surface-sub,
+.cm-raised-surface {
+  --border: color-mix(in oklch, var(--popover-foreground) 10%, transparent);
+}
+
 /* A lone chat's transcript scrolls under the floating titlebar, but text
  * dissolves before it reaches the controls: fully clear through the band's
  * control row, then fading in below it. The controls stay frameless on the

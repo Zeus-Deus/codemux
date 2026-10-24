@@ -1685,7 +1685,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     // Un-settle entry plus the standard workspace actions.
     expect(await screen.findByText("Un-settle workspace")).toBeInTheDocument();
     expect(screen.getByText("Rename workspace")).toBeInTheDocument();
-    expect(screen.getByText("Archive Workspace")).toBeInTheDocument();
+    expect(screen.getByText("Archive workspace")).toBeInTheDocument();
 
     // Choosing Un-settle returns the row to the active card list.
     fireEvent.click(screen.getByText("Un-settle workspace"));

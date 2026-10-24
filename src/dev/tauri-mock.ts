@@ -4085,6 +4085,17 @@ const OMARCHY_THEME: ThemeColors = {
   color12: "#7aa2f7", color13: "#bb9af7", color14: "#7dcfff", color15: "#c0caf5",
 };
 
+// A neutral graphite canvas with a warm accent (?omarchy=amber): the case
+// where accent-tinted raised surfaces drift away from a canvas-solved border.
+const OMARCHY_AMBER_THEME: ThemeColors = {
+  accent: "#ff9f0a", cursor: "#f2f2f7", foreground: "#f2f2f7", background: "#1c1c1e",
+  selection_foreground: "#f2f2f7", selection_background: "#3a3a3c",
+  color0: "#1c1c1e", color1: "#ff453a", color2: "#32d74b", color3: "#ffd60a",
+  color4: "#0a84ff", color5: "#bf5af2", color6: "#64d2ff", color7: "#d1d1d6",
+  color8: "#48484a", color9: "#ff6961", color10: "#30db5b", color11: "#ffd426",
+  color12: "#409cff", color13: "#da8fff", color14: "#70d7ff", color15: "#f2f2f7",
+};
+
 function resourceMetrics(): ResourceMetricsSnapshot {
   return {
     app: {
@@ -5073,7 +5084,9 @@ const handlers: Record<string, Handler> = {
 
   // ── Theme / appearance ──
   get_current_theme: () => THEME,
-  get_omarchy_theme: () => new URLSearchParams(location.search).get("omarchy") === "dark"
+  get_omarchy_theme: () => new URLSearchParams(location.search).get("omarchy") === "amber"
+    ? { name: "Graphite Amber", scheme: "dark", colors: OMARCHY_AMBER_THEME }
+    : new URLSearchParams(location.search).get("omarchy") === "dark"
     ? {
       name: "Tokyo Night", scheme: "dark", colors: OMARCHY_THEME,
       surfaces: { dark_background: "#13141c", selection: "#292e42", muted: "#414868" },

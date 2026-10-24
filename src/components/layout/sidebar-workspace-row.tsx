@@ -147,7 +147,7 @@ interface Props {
 /** Destructive delete confirmation for deletable worktrees. Archiving
  *  replaced the old hide/close paths, so this dialog only ever opens for
  *  a worktree the user explicitly asked to delete (shift-click on the
- *  archive button, or the context menu's "Delete Worktree…").
+ *  archive button, or the context menu's "Delete worktree…").
  *
  *  Escalation state machine (shared `useForceDelete` hook): the first
  *  Delete issues `closeWorkspaceWithWorktree(..., forceDelete: false)`.
@@ -848,7 +848,7 @@ export function WorkspaceContextMenuItems({
         onClick={() => runWorkspaceSetup(workspace.workspace_id).catch(console.error)}
       >
         <RotateCcw />
-        <span className="flex-1">Re-run Setup</span>
+        <span className="flex-1">Re-run setup</span>
       </ContextMenuItem>
       <ContextMenuItem className={MENU_ROW} onClick={handleToggleMute}>
         <BellOff />
@@ -926,7 +926,7 @@ export function WorkspaceContextMenuItems({
       <ContextMenuItem className={MENU_ROW} onClick={onArchiveRequest}>
         <Archive />
         <span className="flex-1 text-muted-foreground">
-          {isAttachOrRemote ? "Close workspace" : "Archive Workspace"}
+          {isAttachOrRemote ? "Close workspace" : "Archive workspace"}
         </span>
       </ContextMenuItem>
       {canDelete && (
@@ -935,7 +935,7 @@ export function WorkspaceContextMenuItems({
           onClick={onDeleteRequest}
         >
           <Trash2 />
-          <span className="flex-1">Delete Worktree…</span>
+          <span className="flex-1">Delete worktree…</span>
         </ContextMenuItem>
       )}
     </ContextMenuContent>

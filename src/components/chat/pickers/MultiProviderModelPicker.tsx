@@ -875,8 +875,8 @@ export function MultiProviderModelPicker({
   );
 }
 
-/** The rail's `bg-muted/30` over the popover, so its fades melt into it. */
-const RAIL_SURFACE = "color-mix(in oklab, var(--muted) 30%, var(--popover))";
+/** The rail's `bg-surface-1` over the popover, so its fades melt into it. */
+const RAIL_SURFACE = "color-mix(in oklch, var(--foreground) 3%, var(--popover))";
 
 function ProviderRail({
   providers,
@@ -911,7 +911,7 @@ function ProviderRail({
   const railEdges = useScrollEdges(railRef);
   return (
     <TooltipProvider delayDuration={200}>
-      <div className="flex min-h-0 flex-col border-r bg-muted/30">
+      <div className="flex min-h-0 flex-col border-r bg-surface-1">
         <div className="relative flex min-h-0 flex-1 flex-col">
           <div
             ref={railRef}
@@ -946,7 +946,7 @@ function ProviderRail({
                         aria-pressed={selected === "favorites"}
                         className={cn(
                           "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
-                          "hover:bg-muted",
+                          "hover:bg-surface-2",
                           selected === "favorites" &&
                             "bg-background text-foreground shadow-sm",
                         )}
@@ -1015,7 +1015,7 @@ function ProviderRail({
                         aria-pressed={isSelected}
                         className={cn(
                           "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
-                          "hover:bg-muted",
+                          "hover:bg-surface-2",
                           isSelected && "bg-background text-foreground shadow-sm",
                           isUnavailable &&
                             !isSelected &&
@@ -1066,7 +1066,7 @@ function ProviderRail({
                         aria-pressed={isSelected}
                         className={cn(
                           "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
-                          "hover:bg-muted",
+                          "hover:bg-surface-2",
                           isSelected && "bg-background text-foreground shadow-sm",
                         )}
                       >
@@ -1263,7 +1263,7 @@ function ModelRow({
       data-favorite={isFavorite || undefined}
       className={cn(
         "group flex w-full cursor-pointer items-start gap-2 px-3 py-2",
-        "data-[active=true]:bg-accent/40",
+        "data-[active=true]:bg-surface-2",
       )}
     >
       <div className="min-w-0 flex-1 text-left">
@@ -1282,7 +1282,7 @@ function ModelRow({
           aria-hidden
           data-testid="model-row-jump-chip"
           // A keyboard shortcut is noise on a touch screen.
-          className="pointer-events-none mt-0.5 inline-flex h-4 shrink-0 select-none items-center self-start rounded-sm bg-muted px-1.5 font-sans text-caption font-medium text-muted-foreground pointer-coarse:hidden"
+          className="pointer-events-none mt-0.5 inline-flex h-4 shrink-0 select-none items-center self-start rounded-sm bg-surface-3 px-1.5 font-sans text-caption font-medium text-muted-foreground pointer-coarse:hidden"
         >
           {jumpLabel}
         </kbd>
@@ -1318,7 +1318,7 @@ function ModelRow({
           // Always visible (not hover-revealed): a dim outline star on
           // every row keeps the favoriting affordance discoverable and
           // the row layout stable.
-          "shrink-0 rounded-sm p-1 transition-colors duration-150 hover:bg-accent",
+          "shrink-0 rounded-sm p-1 transition-colors duration-150 hover:bg-surface-3",
           isFavorite
             ? "text-status-working"
             : "text-muted-foreground/40 hover:text-foreground focus-visible:text-foreground",

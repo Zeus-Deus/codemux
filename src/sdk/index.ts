@@ -34,6 +34,8 @@ export type { Host } from "./host";
 export type {
   ComposerActionData,
   ComposerApi,
+  ComposerStatusData,
+  ComposerStatusProps,
   KeybindData,
   LandingBackdropProps,
   NotifyKind,

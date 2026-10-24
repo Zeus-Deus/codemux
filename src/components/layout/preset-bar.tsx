@@ -422,11 +422,11 @@ function PresetBarImpl({
           <DropdownMenuSeparator />
           <DropdownMenuItem onClick={() => requestNewPreset()}>
             <Plus className="size-4" />
-            <span>New Preset</span>
+            <span>New preset</span>
           </DropdownMenuItem>
           <DropdownMenuItem onClick={() => setShowSettings(true, "presets")}>
             <Settings className="size-4" />
-            <span>Manage Presets</span>
+            <span>Manage presets</span>
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>

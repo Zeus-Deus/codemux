@@ -73,7 +73,6 @@ function TargetWatchRow({
       <span
         className={cn(
           DETAILS_TRAILING,
-          "font-sans",
           load === "failed" ? "text-danger" : PR_WATCH_TONE_CLASS[view.tone],
         )}
       >
@@ -112,7 +111,7 @@ function OtherChatWatchRow({ threadId }: { threadId: string }) {
     >
       <Eye className={DETAILS_ICON} />
       <span className={DETAILS_LABEL}>Watch #{watch.pr_number} · other chat</span>
-      <span className={cn(DETAILS_TRAILING, "font-sans", PR_WATCH_TONE_CLASS[view.tone])}>
+      <span className={cn(DETAILS_TRAILING, PR_WATCH_TONE_CLASS[view.tone])}>
         {busy ? <Spinner className="size-3" /> : view.label}
       </span>
     </button>

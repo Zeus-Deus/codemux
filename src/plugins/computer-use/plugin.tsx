@@ -1,6 +1,6 @@
-import { PEEK_AREA, COMPOSER_STATUS_AREA, TITLEBAR_ACTIONS_AREA, definePlugin, icons, type PeekRenderProps } from "@codemux/sdk";
+import { PEEK_AREA, COMPOSER_STATUS_AREA, TITLEBAR_ACTIONS_AREA, definePlugin, icons, type ComposerStatusData, type ComposerStatusProps, type PeekRenderProps } from "@codemux/sdk";
 import { ComputerUseController } from "./controller";
-import { ComputerChatChip, ComputerIndicator, ComputerPreview, ComputerSettings } from "./views";
+import { ComputerChatChip, ComputerIndicator, ComputerPreview, ComputerSettings, computerChipVisible } from "./views";
 
 export default definePlugin({
   id: "computer-use",
@@ -30,8 +30,12 @@ export default definePlugin({
     });
     ctx.register({
       id: "status", area: COMPOSER_STATUS_AREA,
-      render: ({ workspaceId }: { workspaceId: string | null; threadId: string | null }) =>
+      render: ({ workspaceId }: ComposerStatusProps) =>
         <ComputerChatChip controller={controller} workspaceId={workspaceId} />,
+      data: {
+        subscribe: controller.subscribe,
+        isVisible: ({ workspaceId }) => computerChipVisible(controller.getState(), workspaceId),
+      } satisfies ComposerStatusData,
     });
     ctx.registerSettingsPage({
       title: "Computer use",

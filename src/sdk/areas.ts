@@ -22,7 +22,7 @@ export const APPEARANCE_EXTRA_AREA = "appearance.extra";
 export const COMPOSER_ACTIONS_AREA = "composer.actions";
 /** render({ workspaceId, threadId }). Above the composer footer. */
 export const COMPOSER_ACCESSORY_AREA = "composer.accessory";
-/** render({ workspaceId, threadId }). Compact chips in Workspace details → Live on desktop, or the phone status cluster. */
+/** render({ workspaceId, threadId }), optional data: ComposerStatusData. Compact chips in Workspace details → Live on desktop, or the phone status cluster. */
 export const COMPOSER_STATUS_AREA = "composer.status";
 /** render({ workspaceId, threadId }). Below the composer card. */
 export const COMPOSER_FOOTER_AREA = "composer.footer";

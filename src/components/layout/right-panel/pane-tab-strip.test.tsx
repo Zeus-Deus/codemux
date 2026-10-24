@@ -1,7 +1,14 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import { FileText, FolderTree, GitBranch } from "lucide-react";
+import userEvent from "@testing-library/user-event";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -479,6 +486,181 @@ describe("PaneTabStrip — overflow", () => {
         );
       } finally {
         document.documentElement.style.fontSize = "";
+        restore();
+      }
+    });
+  });
+
+  // Panning alone left the tabs behind the fade hard to find: at the
+  // default width the row shows about one and a half. While any are out of
+  // view the row lists them all, so every open tab is one pick away.
+  describe("tab list while tabs are out of view", () => {
+    const actions = <button type="button">Refresh</button>;
+    const listRow = (list: HTMLElement, label: string) =>
+      within(list).getByText(label).closest("button") as HTMLButtonElement;
+
+    it("lists every open tab in the folded \u2026 and selects a hidden one", async () => {
+      const restore = stubLayout({
+        header: 300,
+        tabs: 300,
+        scroller: 100,
+        actions: 120,
+      });
+      try {
+        const { onSelect } = renderStrip({ actions });
+        // Every tab keeps its full label in the strip itself.
+        expect(screen.getByText("README.md")).toBeInTheDocument();
+
+        fireEvent.click(screen.getByLabelText("Pane actions"));
+        const popover = await screen.findByTestId(
+          "right-panel-pane-actions-popover",
+        );
+        const list = within(popover).getByRole("group", { name: "Open tabs" });
+        expect(
+          within(list)
+            .getAllByRole("button")
+            .map((row) => row.textContent),
+        ).toEqual(["Files", "Changes4", "README.md"]);
+        expect(listRow(list, "Files")).toHaveAttribute("aria-current", "true");
+        // The pane actions are still there, ahead of the list.
+        expect(within(popover).getByText("Refresh")).toBeInTheDocument();
+
+        fireEvent.click(listRow(list, "README.md"));
+        expect(onSelect).toHaveBeenCalledWith("doc:/p/README.md");
+        expect(
+          screen.queryByTestId("right-panel-pane-actions-popover"),
+        ).toBeNull();
+      } finally {
+        restore();
+      }
+    });
+
+    it("leaves the list out of the \u2026 while every tab is in view", async () => {
+      const restore = stubLayout({
+        header: 300,
+        tabs: 100,
+        scroller: 100,
+        actions: 400,
+      });
+      try {
+        renderStrip({ actions });
+        fireEvent.click(screen.getByLabelText("Pane actions"));
+        const popover = await screen.findByTestId(
+          "right-panel-pane-actions-popover",
+        );
+        expect(within(popover).queryByRole("group")).toBeNull();
+      } finally {
+        restore();
+      }
+    });
+
+    it("adds an All tabs button beside inline actions, budgeted in the row", async () => {
+      const restore = stubLayout({
+        header: 2000,
+        tabs: 2500,
+        scroller: 400,
+        actions: 50,
+      });
+      try {
+        const { onSelect } = renderStrip({ actions });
+        // The actions stay inline; only the tabs needed help.
+        expect(screen.getByTestId("right-panel-pane-actions")).toHaveTextContent(
+          "Refresh",
+        );
+        expect(screen.queryByLabelText("Pane actions")).toBeNull();
+        // The "+", the drag gap, the row gaps and the 24px button + its gap.
+        expect(screen.getByTestId("right-panel-tabs-scroll").style.minWidth).toBe(
+          "min(140px, calc(100% - 75px))",
+        );
+
+        // A keyboard open lands on the active tab; arrows walk the list.
+        fireEvent.click(screen.getByLabelText("All tabs"));
+        const popover = await screen.findByTestId(
+          "right-panel-tabs-overflow-popover",
+        );
+        const list = within(popover).getByRole("group", { name: "Open tabs" });
+        expect(listRow(list, "Files")).toHaveFocus();
+        fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
+        expect(listRow(list, "Changes")).toHaveFocus();
+        fireEvent.keyDown(document.activeElement!, { key: "End" });
+        expect(listRow(list, "README.md")).toHaveFocus();
+
+        fireEvent.click(listRow(list, "Changes"));
+        expect(onSelect).toHaveBeenCalledWith("changes");
+      } finally {
+        restore();
+      }
+    });
+
+    it("starts keyboard navigation from the active tab when it is not first", async () => {
+      const restore = stubLayout({
+        header: 2000,
+        tabs: 2500,
+        scroller: 400,
+        actions: 50,
+      });
+      try {
+        const user = userEvent.setup();
+        const { onSelect } = renderStrip({
+          actions,
+          activeTab: "doc:/p/README.md",
+        });
+        screen.getByLabelText("All tabs").focus();
+        await user.keyboard("{Enter}");
+        const popover = await screen.findByTestId(
+          "right-panel-tabs-overflow-popover",
+        );
+        const list = within(popover).getByRole("group", { name: "Open tabs" });
+        expect(listRow(list, "README.md")).toHaveFocus();
+        await user.keyboard("{ArrowUp}");
+        expect(listRow(list, "Changes")).toHaveFocus();
+        await user.keyboard("{Enter}");
+        expect(onSelect).toHaveBeenCalledWith("changes");
+        expect(screen.queryByTestId("right-panel-tabs-overflow-popover")).toBeNull();
+      } finally {
+        restore();
+      }
+    });
+
+    it("shows no All tabs button while the tabs fit", () => {
+      const restore = stubLayout({
+        header: 2000,
+        tabs: 300,
+        scroller: 300,
+        actions: 50,
+      });
+      try {
+        renderStrip({ actions });
+        expect(screen.queryByLabelText("All tabs")).toBeNull();
+      } finally {
+        restore();
+      }
+    });
+
+    // Picking the tab that is already active must still bring it back into
+    // view — the user may have panned it behind the fade.
+    it("scrolls a picked tab into view even when it is already active", async () => {
+      const restore = stubLayout({ header: 2000, tabs: 2500, scroller: 400 });
+      const scrollIntoView = vi.fn();
+      Object.defineProperty(Element.prototype, "scrollIntoView", {
+        value: scrollIntoView,
+        configurable: true,
+      });
+      try {
+        const { chip } = renderStrip();
+        scrollIntoView.mockClear();
+        fireEvent.click(screen.getByLabelText("All tabs"));
+        const popover = await screen.findByTestId(
+          "right-panel-tabs-overflow-popover",
+        );
+        fireEvent.click(
+          listRow(within(popover).getByRole("group"), "Files"),
+        );
+        expect(scrollIntoView).toHaveBeenCalled();
+        expect(scrollIntoView.mock.contexts).toContain(chip("files"));
+      } finally {
+        delete (Element.prototype as { scrollIntoView?: unknown })
+          .scrollIntoView;
         restore();
       }
     });

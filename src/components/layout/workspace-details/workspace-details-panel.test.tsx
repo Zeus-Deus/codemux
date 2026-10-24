@@ -1,4 +1,5 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
+import { useSyncExternalStore } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -65,6 +66,7 @@ import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 import { useUIStore } from "@/stores/ui-store";
 import { registry } from "@/contrib/registry";
 import { COMPOSER_STATUS_AREA } from "@/sdk/areas";
+import type { ComposerStatusData } from "@/sdk/host";
 import type { AgentBrowserSession, AppStateSnapshot } from "@/tauri/types";
 import {
   WorkspaceDetailsHost,
@@ -205,6 +207,43 @@ it("shows plugin contributions in Live without a browser and follows the focused
   view.rerender(<TooltipProvider><WorkspaceDetailsHost workspaceId="ws-1" columnWidth={1600} rightInset={0} edgeGap={4} remPx={16} /></TooltipProvider>);
   expect(within(screen.getByTestId("workspace-details-live")).getByRole("button", { name: "ws-1:" })).toBeInTheDocument();
   act(dispose);
+  expect(screen.queryByTestId("workspace-details-live")).toBeNull();
+});
+
+it("leaves Live out while every plugin chip is idle and shows it once one turns active", () => {
+  // A chip that renders nothing until a session starts, as computer use does.
+  let active = false;
+  const listeners = new Set<() => void>();
+  const status = {
+    subscribe: (fn: () => void) => {
+      listeners.add(fn);
+      return () => { listeners.delete(fn); };
+    },
+    isVisible: () => active,
+  } satisfies ComposerStatusData;
+  const Chip = () => {
+    const shown = useSyncExternalStore(status.subscribe, () => active);
+    return shown ? <button>Computer</button> : null;
+  };
+  contributionDisposers.push(registry.register({
+    id: "demo:status", source: "plugin:demo", area: COMPOSER_STATUS_AREA, render: Chip, data: status,
+  }));
+  renderToggle();
+  expect(screen.queryByTestId("workspace-details-live")).toBeNull();
+  expect(screen.queryByText("Live")).toBeNull();
+
+  act(() => {
+    active = true;
+    for (const fn of listeners) fn();
+  });
+  const live = screen.getByTestId("workspace-details-live");
+  expect(within(live).getByText("Live")).toBeInTheDocument();
+  expect(within(live).getByRole("button", { name: "Computer" })).toBeInTheDocument();
+
+  act(() => {
+    active = false;
+    for (const fn of listeners) fn();
+  });
   expect(screen.queryByTestId("workspace-details-live")).toBeNull();
 });
 

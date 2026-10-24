@@ -1,6 +1,6 @@
 import { useEffect, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
 import { Badge, Button, icons, Input, Switch, host, PeekChip, type Host, type PeekRenderProps } from "@codemux/sdk";
-import { ComputerUseController } from "./controller";
+import { ComputerUseController, type ComputerUseState } from "./controller";
 import { INSTALL_URL, isLinuxWayland, type DoctorProbe, type DoctorReport } from "./model";
 
 const color = (role: Parameters<typeof host.theme.cssVar>[0]) => `var(${host.theme.cssVar(role)})`;
@@ -145,11 +145,17 @@ export function ComputerIndicator({ controller, peek, showWorkspace }: { control
   </div>;
 }
 
+/** Whether the chat chip draws anything for this workspace: only while a
+ *  window is chosen there. Shared with the status area's visibility data. */
+export function computerChipVisible(state: ComputerUseState, workspaceId: string | null): boolean {
+  return !!state.target && state.workspace?.id === workspaceId;
+}
+
 export function ComputerChatChip({ controller, workspaceId }: {
   controller: ComputerUseController; workspaceId: string | null;
 }) {
   const state = useComputer(controller);
-  if (!state.target || state.workspace?.id !== workspaceId) return null;
+  if (!computerChipVisible(state, workspaceId)) return null;
   return <PeekChip peekId="computer-use:live" label="Computer" icon={icons.Monitor}
     status={state.phase === "error" ? "error" : state.phase === "stopping" ? "stale" : state.phase === "starting" ? "connecting" : "live"} />;
 }

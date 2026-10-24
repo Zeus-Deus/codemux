@@ -31,7 +31,7 @@ export interface SessionSelectorProps {
    *  fresh one with the record's `sdk_session_id` passed through as
    *  the SDK `resume` field. */
   onSelect: (record: AgentChatSessionRecord) => void;
-  /** Called when the user clicks "New Chat" at the top of the
+  /** Called when the user clicks "New chat" at the top of the
    *  dropdown. */
   onNewChat: () => void;
   /**
@@ -43,7 +43,7 @@ export interface SessionSelectorProps {
   /** Same purpose as `sessionsOverride` — skips the delete invoke so
    *  tests can assert behaviour without a real backend. */
   onDeleteOverride?: (threadId: string) => void;
-  /** Extra rows under New Chat (see `SessionHistoryList.footerItem`). */
+  /** Extra rows under New chat (see `SessionHistoryList.footerItem`). */
   footerItem?: React.ReactNode;
 }
 
@@ -74,7 +74,7 @@ export function SessionSelector({
   const triggerLabel = active
     ? sessionDisplayTitle(active)
     : activeThreadId
-    ? "New Chat"
+    ? "New chat"
     : "History";
 
   return (

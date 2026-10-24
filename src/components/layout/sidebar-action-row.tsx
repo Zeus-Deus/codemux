@@ -51,8 +51,8 @@ export function SidebarActionRow() {
   const handleNewAgent = useNewAgentAction();
 
   // Collapsed icon rail header: just the two create/find affordances,
-  // centered and each labelled by a right-side tooltip. New agent is a neutral
-  // ghost matching the expanded header's pencil; Search opens the command palette.
+  // centered and each labelled by a right-side tooltip. Both are the same
+  // quiet ghost as the expanded header's icons; Search opens the command palette.
   // Automations / Workspaces now live in the footer, and Open / New project
   // live at the bottom of the expanded inbox's project menu — none of them belong here anymore.
   if (state === "collapsed") {
@@ -71,7 +71,7 @@ export function SidebarActionRow() {
                 type="button"
                 aria-label="New agent"
                 onClick={handleNewAgent}
-                className="flex size-7 items-center justify-center rounded-lg border border-border/60 bg-surface-1 text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
+                className="flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
               >
                 <SquarePen className="size-[13px]" />
               </button>
@@ -147,7 +147,9 @@ export function SidebarViewSwitch() {
 
 /** View switch + Search + New agent, sized to sit at the end of the expanded
  *  sidebar's project-filter row. Search is icon-only here: the palette
- *  shortcut moves into its tooltip so the project name keeps the row's width. */
+ *  shortcut moves into its tooltip so the project name keeps the row's width.
+ *  No outlines: the switch is grouped by its fill and the two actions are
+ *  plain ghosts, so the row reads as one calm toolbar. */
 export function SidebarHeaderActions() {
   const { getKeysForAction } = useResolvedKeybinds();
   const newAgentKeys = getKeysForAction("newAgent");
@@ -179,7 +181,7 @@ export function SidebarHeaderActions() {
             type="button"
             aria-label="New agent"
             onClick={handleNewAgent}
-            className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border/60 bg-surface-1 text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
+            className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
           >
             <SquarePen className="size-[15px]" />
           </button>

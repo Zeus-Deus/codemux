@@ -159,24 +159,23 @@ export function workspacePathText(workspace: {
 }
 
 /**
- * The mono sub-label on a workspace row.
+ * The branch to print after the project name under a workspace row, or null.
  *
  * The avatar carries a project letter but not which project, so the project
- * name is the default context. The branch is appended only when the title
+ * name is always the context. The branch is added only when the title
  * doesn't already imply it — most Codemux workspaces are named after their
  * branch, and printing `workflow-approval  demo/workflow-approval` spends the
  * row's whole sub-label saying the same thing twice.
  */
-export function workspaceRowSubtitle(
+export function workspaceRowBranch(
   workspace: { title: string; git_branch: string | null },
-  projectName: string,
-): string {
+): string | null {
   const branch = workspace.git_branch;
-  if (!branch) return projectName;
+  if (!branch) return null;
   const leaf = branch.slice(branch.lastIndexOf("/") + 1).toLowerCase();
   const title = workspace.title.toLowerCase();
-  if (title === branch.toLowerCase() || title === leaf) return projectName;
-  return `${projectName} · ${branch}`;
+  if (title === branch.toLowerCase() || title === leaf) return null;
+  return branch;
 }
 
 /** Ordering inputs for the resting (unsearched) workspace list. */

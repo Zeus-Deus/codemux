@@ -14,7 +14,7 @@ import {
   resultCountLabel,
   themeRowValue,
   workspacePathText,
-  workspaceRowSubtitle,
+  workspaceRowBranch,
   workspaceSearchText,
   type WorkspaceOrder,
 } from "./command-palette-model";
@@ -122,35 +122,25 @@ describe("workspace search haystacks", () => {
   });
 });
 
-describe("workspaceRowSubtitle", () => {
-  it("shows the project when the title already says the branch", () => {
+describe("workspaceRowBranch", () => {
+  it("omits the branch when the title already says it", () => {
     expect(
-      workspaceRowSubtitle(
-        { title: "workflow-approval", git_branch: "demo/workflow-approval" },
-        "codemux",
-      ),
-    ).toBe("codemux");
+      workspaceRowBranch({ title: "workflow-approval", git_branch: "demo/workflow-approval" }),
+    ).toBeNull();
   });
 
-  it("also collapses an exact title/branch match", () => {
-    expect(workspaceRowSubtitle({ title: "main", git_branch: "main" }, "codemux")).toBe(
-      "codemux",
-    );
+  it("also omits an exact title/branch match", () => {
+    expect(workspaceRowBranch({ title: "main", git_branch: "main" })).toBeNull();
   });
 
-  it("adds the branch when it carries information the title doesn't", () => {
+  it("keeps the branch when it carries information the title doesn't", () => {
     expect(
-      workspaceRowSubtitle(
-        { title: "Workspace 80", git_branch: "fix/103-model-dropdown" },
-        "codemux",
-      ),
-    ).toBe("codemux · fix/103-model-dropdown");
+      workspaceRowBranch({ title: "Workspace 80", git_branch: "fix/103-model-dropdown" }),
+    ).toBe("fix/103-model-dropdown");
   });
 
-  it("falls back to the project name on a non-git workspace", () => {
-    expect(workspaceRowSubtitle({ title: "scratch", git_branch: null }, "notes")).toBe(
-      "notes",
-    );
+  it("has no branch on a non-git workspace", () => {
+    expect(workspaceRowBranch({ title: "scratch", git_branch: null })).toBeNull();
   });
 });
 
