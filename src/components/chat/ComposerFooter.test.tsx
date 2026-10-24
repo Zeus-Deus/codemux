@@ -385,6 +385,29 @@ describe("ComposerChin", () => {
     expect(onWorkflowsClick).toHaveBeenCalledOnce();
   });
 
+  it("drops labels when the settings group overflows inside a row that still fits", () => {
+    // The settings group shrinks first, so its triggers can spill over the
+    // trailing controls while the row as a whole reports no overflow.
+    const settingsOverflow = function (this: HTMLElement) {
+      return this.dataset.testid === "composer-chin-settings" ? 400 : 300;
+    };
+    const scroll = vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockImplementation(settingsOverflow);
+    const client = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(300);
+    try {
+      renderChin({
+        onWorkflowsClick: vi.fn(),
+        contextUsage: { used_tokens: 44_000, max_tokens: 200_000 },
+      });
+      const access = screen.getByRole("button", { name: /Access: Full access/i });
+      expect(access).not.toHaveTextContent("Full access");
+      expect(screen.getByTestId("composer-workflows-toggle")).toBeInTheDocument();
+      expect(screen.getByTestId("context-usage-trigger")).toBeInTheDocument();
+    } finally {
+      scroll.mockRestore();
+      client.mockRestore();
+    }
+  });
+
   it("drops labels instead of overflowing a narrow chin", () => {
     // jsdom has no layout: report every element as overflowing.
     const scroll = vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockReturnValue(500);

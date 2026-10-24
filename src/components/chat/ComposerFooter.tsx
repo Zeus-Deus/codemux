@@ -31,6 +31,7 @@ import type {
 import { ContextUsageMeter } from "./ContextUsageMeter";
 import { useStopTooltip } from "./composer-interrupt";
 import { type PickerPlacement } from "./pickers/footer-trigger";
+import { SCOPE_STRIP, SCOPE_STRIP_INSET } from "./pickers/ThreadScopeRow";
 import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
@@ -418,6 +419,7 @@ export function ComposerChin({
   ...settings
 }: ComposerChinProps) {
   const rowRef = useRef<HTMLDivElement>(null);
+  const settingsRef = useRef<HTMLDivElement>(null);
   const [level, setLevel] = useState(0);
   const fitKey = [
     settings.provider,
@@ -431,10 +433,16 @@ export function ComposerChin({
   // New labels may fit again: re-fit from full width.
   useLayoutEffect(() => setLevel(0), [fitKey]);
   // Each step re-renders and re-measures before paint, so an overflowing
-  // intermediate state never shows.
+  // intermediate state never shows. The settings group shrinks before the
+  // trailing controls do, so its own overflow — triggers spilling over the
+  // ring while the row as a whole still fits — counts as well.
   useLayoutEffect(() => {
-    const row = rowRef.current;
-    if (row && row.scrollWidth > row.clientWidth && level < CHIN_COMPACT_STEPS) {
+    const overflows = (el: HTMLElement | null) =>
+      !!el && el.scrollWidth > el.clientWidth;
+    if (
+      level < CHIN_COMPACT_STEPS &&
+      (overflows(rowRef.current) || overflows(settingsRef.current))
+    ) {
       setLevel(level + 1);
     }
   });
@@ -458,12 +466,20 @@ export function ComposerChin({
   };
 
   return (
-    <div data-testid="composer-chin" className="relative z-0 w-full px-5">
+    <div data-testid="composer-chin" className={cn(SCOPE_STRIP_INSET, "relative z-0")}>
       <div
         ref={rowRef}
-        className="-mt-[18px] flex h-[52px] min-w-0 items-center gap-1 overflow-hidden rounded-b-[14px] border border-t-0 border-border/70 bg-muted/20 pt-[18px] pr-1 pl-1"
+        // The scope strip's chin, with its top 18px tucked under the card.
+        className={cn(
+          SCOPE_STRIP,
+          "-mt-[18px] h-[52px] min-w-0 justify-start gap-1 overflow-hidden pt-[18px] pr-1 pb-1 pl-1",
+        )}
       >
-        <div className="flex min-w-0 items-center">
+        <div
+          ref={settingsRef}
+          data-testid="composer-chin-settings"
+          className="flex min-w-0 items-center"
+        >
           <ComposerSettings {...settings} {...ladder} placement="footer" />
         </div>
         <div className="min-w-0 flex-1" />

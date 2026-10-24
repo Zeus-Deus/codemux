@@ -491,7 +491,7 @@ function TaskProgress({ completed, total }: { completed: number; total: number }
   const fill = completed === total ? "bg-status-open" : "bg-foreground/55";
   if (total > MAX_TASK_SEGMENTS) {
     return (
-      <span className="h-[3px] w-12 shrink-0 overflow-hidden rounded-full bg-foreground/12" aria-hidden>
+      <span className="h-[3px] w-12 shrink-0 overflow-hidden rounded-full bg-surface-3" aria-hidden>
         <span
           className={cn("block h-full rounded-full", fill)}
           style={{ width: `${(completed / total) * 100}%` }}
@@ -504,7 +504,7 @@ function TaskProgress({ completed, total }: { completed: number; total: number }
       {Array.from({ length: total }, (_, i) => (
         <span
           key={i}
-          className={cn("h-[3px] w-2 rounded-full", i < completed ? fill : "bg-foreground/12")}
+          className={cn("h-[3px] w-2 rounded-full", i < completed ? fill : "bg-surface-3")}
         />
       ))}
     </span>
