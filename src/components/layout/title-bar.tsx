@@ -26,9 +26,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { resolveRightPanelWidth } from "@/lib/right-panel-width";
 import {
-  PANEL_CLUSTER_GAP,
   RIGHT_PANEL_RESIZER_REACH,
-  WINDOW_CONTROLS_INSET,
   panelClusterRight,
   topRightReserve,
 } from "@/lib/titlebar-geometry";
@@ -703,14 +701,9 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         <WorkspaceDetailsHost
           workspaceId={activeWorkspaceId}
           rightInset={rightPanelOpen ? panelBandWidth : 0}
-          // Its right edge continues the line of the controls above it:
-          // the window buttons' edge, the web client's cluster inset, or
-          // the band's own 8px stop before an open panel.
-          edgeGap={
-            ((rightPanelOpen ? 8 : remoteClient ? PANEL_CLUSTER_GAP : WINDOW_CONTROLS_INSET) *
-              remPx) /
-            16
-          }
+          // Match the 10px gap from the titlebar buttons' bottom (34px)
+          // to the card's top (44px), scaled with the interface size.
+          edgeGap={(10 * remPx) / 16}
           remPx={remPx}
           columnWidth={
             (rightPanelRowWidth > 0

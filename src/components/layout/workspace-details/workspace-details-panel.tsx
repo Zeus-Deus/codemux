@@ -241,8 +241,8 @@ export function WorkspaceDetailsHost({
   columnWidth: number;
   /** Distance from the window's right edge to the column's right edge. */
   rightInset: number;
-  /** The card's inset from the column's right edge — the title bar lines
-   *  it up with the end of the control run above it. */
+  /** The card's inset from the column's right edge, matching its gap
+   *  below the titlebar buttons. */
   edgeGap: number;
   /** The live root font size (`useRootFontPx`). */
   remPx: number;

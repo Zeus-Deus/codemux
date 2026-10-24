@@ -553,14 +553,14 @@ describe("TitleBar GUI chrome — floating placement", () => {
 // left, to the *left edge* of a 40px empty strip above the panel's own tabs.
 // Nothing about a panel control should depend on the panel's width.
 describe("TitleBar GUI chrome — workspace details card", () => {
-  it("hands the host the workspace column and lines its edge up with the window buttons", () => {
+  it("hands the host the workspace column and matches the gap below the titlebar buttons", () => {
     state.enableAgentChat = true;
     state.rightPanelRowWidth = 1600;
     const { getByTestId } = renderBar();
     const host = getByTestId("workspace-details-host");
     expect(host).toHaveAttribute("data-column-width", "1600");
     expect(host).toHaveAttribute("data-right-inset", "0");
-    expect(host).toHaveAttribute("data-edge-gap", "4");
+    expect(host).toHaveAttribute("data-edge-gap", "10");
   });
 
   it("moves the card's corner to the open panel's edge", () => {
@@ -572,7 +572,7 @@ describe("TitleBar GUI chrome — workspace details card", () => {
     // 320px stored, drawn at the 360px minimum.
     expect(host).toHaveAttribute("data-column-width", "1240");
     expect(host).toHaveAttribute("data-right-inset", "360");
-    expect(host).toHaveAttribute("data-edge-gap", "8");
+    expect(host).toHaveAttribute("data-edge-gap", "10");
   });
 
   it("has no card while the panel is fully expanded", () => {
