@@ -8,6 +8,7 @@ import {
   within,
 } from "@testing-library/react";
 import { FileText, FolderTree, GitBranch } from "lucide-react";
+import userEvent from "@testing-library/user-event";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -586,6 +587,36 @@ describe("PaneTabStrip — overflow", () => {
 
         fireEvent.click(listRow(list, "Changes"));
         expect(onSelect).toHaveBeenCalledWith("changes");
+      } finally {
+        restore();
+      }
+    });
+
+    it("starts keyboard navigation from the active tab when it is not first", async () => {
+      const restore = stubLayout({
+        header: 2000,
+        tabs: 2500,
+        scroller: 400,
+        actions: 50,
+      });
+      try {
+        const user = userEvent.setup();
+        const { onSelect } = renderStrip({
+          actions,
+          activeTab: "doc:/p/README.md",
+        });
+        screen.getByLabelText("All tabs").focus();
+        await user.keyboard("{Enter}");
+        const popover = await screen.findByTestId(
+          "right-panel-tabs-overflow-popover",
+        );
+        const list = within(popover).getByRole("group", { name: "Open tabs" });
+        expect(listRow(list, "README.md")).toHaveFocus();
+        await user.keyboard("{ArrowUp}");
+        expect(listRow(list, "Changes")).toHaveFocus();
+        await user.keyboard("{Enter}");
+        expect(onSelect).toHaveBeenCalledWith("changes");
+        expect(screen.queryByTestId("right-panel-tabs-overflow-popover")).toBeNull();
       } finally {
         restore();
       }

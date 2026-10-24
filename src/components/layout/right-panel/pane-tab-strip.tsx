@@ -595,9 +595,11 @@ function RowOverflowMenu({
             contentRef.current?.focus();
           } else if (!folded) {
             event.preventDefault();
-            contentRef.current
-              ?.querySelector<HTMLElement>('[aria-current="true"], [data-overflow-tab]')
-              ?.focus();
+            const content = contentRef.current;
+            (
+              content?.querySelector<HTMLElement>('[aria-current="true"]') ??
+              content?.querySelector<HTMLElement>("[data-overflow-tab]")
+            )?.focus();
           }
         }}
         onKeyDown={(event) => moveTabListFocus(event, contentRef.current)}
