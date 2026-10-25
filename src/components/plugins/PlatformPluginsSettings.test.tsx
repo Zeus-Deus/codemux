@@ -24,7 +24,7 @@ import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { resetPlatformPluginsForTests, usePlatformPluginsStore } from "./platform-adapter";
 import { PlatformPluginsSection } from "./PlatformPluginsSettings";
-import { usePluginSettingsDrafts } from "./plugin-settings-drafts";
+import { editPluginSettings, usePluginSettingsDrafts } from "./plugin-settings-drafts";
 import { readPluginCatalogue } from "./wire";
 
 function show(installations: PluginInstallation[], extra: Partial<PluginCatalogue> = {}) {
@@ -80,7 +80,7 @@ function configurable(overrides: Partial<PluginInstallation> = {}) {
 beforeEach(() => {
   requests.length = 0;
   respond = () => undefined;
-  usePluginSettingsDrafts.setState({ drafts: {} });
+  usePluginSettingsDrafts.setState({ drafts: {}, saving: {} });
 });
 afterEach(() => {
   cleanup();
@@ -352,6 +352,41 @@ describe("inline settings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(called("updateSettings")).toEqual([{ installationId: "inst-board", values: { label: "Sprint board" } }]));
     await waitFor(() => expect(screen.queryByText("Unsaved changes")).toBeNull());
+  });
+
+  it("keeps a slow Save in flight across a plugin switch, without dropping an edit made after it", async () => {
+    const [, lens] = lineup();
+    let finish: () => void = () => {};
+    respond = (method) =>
+      method === "updateSettings"
+        ? new Promise((resolve) => {
+            finish = () => resolve(configurable({ settings: { label: "Sprint board" } }));
+          })
+        : undefined;
+    show([configurable(), lens!]);
+    const label = () => screen.getByRole("textbox", { name: "Board label" }) as HTMLInputElement;
+    fireEvent.click(screen.getByRole("button", { name: "Workflow Board" }));
+    fireEvent.change(label(), { target: { value: "Sprint board" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(called("updateSettings")).toHaveLength(1));
+
+    // Switching away and back remounts the form; the Save is still running.
+    fireEvent.click(screen.getByRole("button", { name: "Repository Lens" }));
+    fireEvent.click(screen.getByRole("button", { name: "Workflow Board" }));
+    expect(screen.getByRole("button", { name: "Saving…" })).toBeTruthy();
+    expect(label().disabled).toBe(true);
+
+    // Even an edit that lands while it runs is newer than what was sent, so it stays.
+    act(() =>
+      editPluginSettings(configurable(), {
+        draft: { label: "Newer", limit: "10", compact: false, token: "" },
+        clearedSecrets: new Set(),
+      }),
+    );
+    await act(async () => finish());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeTruthy());
+    expect(label().value).toBe("Newer");
+    expect(screen.getByText("Unsaved changes")).toBeTruthy();
   });
 
   it("follows the stored values while nothing is edited, and reverts an edit", () => {

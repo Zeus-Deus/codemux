@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { ToolCallItem } from "@/lib/agent-chat/types";
 import type { PluginCardReference } from "./contract";
 import { pluginCardFromToolItem, resolvePluginCardPresentation } from "./cards";
 import { installation, manifest } from "./test-fixtures";
@@ -12,13 +13,54 @@ const card: PluginCardReference = {
   dataOwner: "owner-1",
 };
 
-const call = (overrides: Record<string, unknown> = {}) => ({
+const call = (overrides: Partial<ToolCallItem> = {}): ToolCallItem => ({
+  kind: "tool_call",
+  id: "item-1",
+  seq: 1,
+  tool_use_id: "call-1",
   tool_name: "mcp__codemux__plugin_invoke",
   input: {},
-  status: "done" as const,
+  status: "done",
   result_content: { card },
+  approval_request_id: null,
   ...overrides,
 });
+
+// What Codemux's transport returns for a plugin result (`mcp_result`): the
+// result as one JSON text block, echoed as structuredContent.
+const mcpResult = (value: Record<string, unknown>) => ({
+  isError: false,
+  content: [{ type: "text", text: JSON.stringify(value) }],
+  structuredContent: value,
+});
+
+// Codex app-server items as recorded: `input` is the started item, the result
+// the completed one.
+const dynamicCall = (completed: Record<string, unknown>) => {
+  const started = {
+    type: "dynamicToolCall",
+    id: "call_dyn",
+    tool: "codemux_mcp__codemux__plugin_invoke",
+    arguments: '{"pluginId":"realm","action":"deploy"}',
+    contentItems: null,
+    success: null,
+    status: "inProgress",
+  };
+  return call({ tool_name: "dynamicToolCall", input: started, result_content: { ...started, ...completed } });
+};
+const mcpCall = (completed: Record<string, unknown>, server = "codemux") => {
+  const started = {
+    type: "mcpToolCall",
+    id: "call_mcp",
+    server,
+    tool: "plugin_invoke",
+    arguments: { pluginId: "realm", action: "deploy" },
+    result: null,
+    error: null,
+    status: "inProgress",
+  };
+  return call({ tool_name: "mcpToolCall", input: started, result_content: { ...started, ...completed } });
+};
 
 describe("pluginCardFromToolItem", () => {
   it("reads the card from the result object, structuredContent, JSON text and MCP content blocks", () => {
@@ -33,11 +75,70 @@ describe("pluginCardFromToolItem", () => {
     ).toEqual(card);
   });
 
-  it("matches Codex envelopes and server-prefixed names, not same-named tools elsewhere", () => {
+  it("reads recorded Codex dynamic-tool envelopes from their contentItems", () => {
     expect(
-      pluginCardFromToolItem(call({ tool_name: "mcpToolCall", input: { tool: "codemux_mcp__codemux__plugin_invoke" } })),
+      pluginCardFromToolItem(
+        dynamicCall({
+          status: "completed",
+          success: true,
+          contentItems: [{ type: "inputText", text: JSON.stringify({ message: "Deployed", card }) }],
+        }),
+      ),
     ).toEqual(card);
+    // A result with images keeps the JSON block first; the image block is skipped.
+    expect(
+      pluginCardFromToolItem(
+        dynamicCall({
+          status: "completed",
+          success: true,
+          contentItems: [
+            { type: "inputText", text: JSON.stringify({ card }) },
+            { type: "inputImage", imageUrl: "data:image/png;base64,AA==" },
+          ],
+        }),
+      ),
+    ).toEqual(card);
+  });
+
+  it("reads recorded Codex MCP envelopes from their server-scoped result", () => {
+    expect(pluginCardFromToolItem(mcpCall({ status: "completed", result: mcpResult({ card }) }))).toEqual(card);
+    // Structured content alone, without an echoing text block.
+    expect(
+      pluginCardFromToolItem(
+        mcpCall({
+          status: "completed",
+          result: { content: [{ type: "text", text: "Deployed" }], structuredContent: { card } },
+        }),
+      ),
+    ).toEqual(card);
+  });
+
+  it("matches only Codemux's plugin_invoke, not same-named tools elsewhere", () => {
     expect(pluginCardFromToolItem(call({ tool_name: "mcp__other__plugin_invoke" }))).toBeUndefined();
+    expect(pluginCardFromToolItem(mcpCall({ status: "completed", result: mcpResult({ card }) }, "other"))).toBeUndefined();
+    const elsewhere = dynamicCall({
+      status: "completed",
+      success: true,
+      contentItems: [{ type: "inputText", text: JSON.stringify({ card }) }],
+    });
+    expect(
+      pluginCardFromToolItem({
+        ...elsewhere,
+        input: { ...(elsewhere.input as object), tool: "codemux_mcp__other__plugin_invoke" },
+      }),
+    ).toBeUndefined();
+  });
+
+  it("rejects failed Codex envelopes even when the blocks carry a card", () => {
+    const blocks = [{ type: "inputText", text: JSON.stringify({ card }) }];
+    expect(pluginCardFromToolItem(dynamicCall({ status: "completed", success: false, contentItems: blocks }))).toBeUndefined();
+    expect(pluginCardFromToolItem(dynamicCall({ status: "failed", success: null, contentItems: blocks }))).toBeUndefined();
+    expect(
+      pluginCardFromToolItem(mcpCall({ status: "completed", result: { ...mcpResult({ card }), isError: true } })),
+    ).toBeUndefined();
+    expect(
+      pluginCardFromToolItem(mcpCall({ status: "failed", result: mcpResult({ card }), error: { message: "server gone" } })),
+    ).toBeUndefined();
   });
 
   it("has no card while running, on error, or when the reference is malformed or oversized", () => {

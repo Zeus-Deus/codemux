@@ -40,9 +40,17 @@ vi.mock("@/hooks/use-project-actions", () => ({ useProjectActions: () => ({ open
 vi.mock("@/stores/hosts-store", () => ({ useHosts: () => [] }));
 
 let workspaces: WorkspaceSnapshot[] = [];
+let paneStatuses: Record<string, string> = {};
+let archived: unknown[] = [];
 function appStoreState() {
   return {
-    appState: { workspaces, pane_statuses: {}, active_workspace_id: "", detected_ports: [] } as unknown as AppStateSnapshot,
+    appState: {
+      workspaces,
+      archived_workspaces: archived,
+      pane_statuses: paneStatuses,
+      active_workspace_id: "",
+      detected_ports: [],
+    } as unknown as AppStateSnapshot,
     homeDir: "/home/u",
     pendingActiveWorkspaceId: null,
   };
@@ -72,9 +80,9 @@ vi.mock("@/stores/app-store", () => {
 
 import { SidebarProjectsView } from "@/components/layout/sidebar-projects-view";
 import { __resetSidebarViewStoreForTests, useSidebarViewStore } from "@/components/layout/sidebar-view-store";
-import { __resetSidebarInboxStoreForTests } from "@/stores/sidebar-inbox-store";
+import { __resetSidebarInboxStoreForTests, useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import { resetPlatformPluginsForTests } from "./platform-adapter";
-import { resetPluginSidebarLayoutForTests } from "./plugin-sidebar-layout";
+import { PLUGIN_TREE_HOST_POLL_MS, resetPluginSidebarLayoutForTests } from "./plugin-sidebar-layout";
 
 const APP = "/home/u/projects/app";
 
@@ -144,6 +152,8 @@ beforeEach(() => {
   useSidebarViewStore.setState({ loaded: true, view: "projects", pluginLayout: "inst-1/tree:work" });
   persistedSettled = null;
   workspaces = [workspace("ws-1", "t-1"), workspace("ws-2", "t-2")];
+  paneStatuses = {};
+  archived = [];
 });
 afterEach(() => cleanup());
 
@@ -162,6 +172,130 @@ describe("plugin trees in the Projects view", () => {
     const other = within(tree).getByRole("button", { name: /Other chats/ }).closest("[data-plugin-tree-section]") as HTMLElement;
     expect(within(other).getByText("Title ws-2")).toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Projects" })).toBeNull();
+  });
+
+  it("reads the tree again shortly after host-owned workspaces, chats or activity change", async () => {
+    // The plugin never signals: like the Projects Tree, it reads host metadata on each read.
+    let reads = 0;
+    readTree = async () => {
+      reads += 1;
+      return {
+        nodes: [
+          { id: "g", kind: "group", title: "Shipping" },
+          ...workspaces.map((ws, i) => ({
+            id: `n${i}`,
+            kind: "thread",
+            threadId: ws.surfaces[0]!.root.kind === "agent_chat" ? ws.surfaces[0]!.root.thread_id : "",
+            parentId: "g",
+          })),
+        ],
+      };
+    };
+    const view = await renderView();
+    const rerender = async () => {
+      view.rerender(
+        <TooltipProvider>
+          <SidebarProjectsView />
+        </TooltipProvider>,
+      );
+      await act(async () => {
+        await Promise.resolve();
+      });
+    };
+    const shipping = () =>
+      within(screen.getByRole("region", { name: "Work" }))
+        .getByRole("button", { name: /Shipping/ })
+        .closest("[data-plugin-tree-section]") as HTMLElement;
+    // The layout menu only needs the choice, so the Projects view is the one reader.
+    const mounted = reads;
+    expect(mounted).toBe(1);
+
+    // A new chat appears, then its agent starts working: one burst, one read.
+    workspaces = [...workspaces, workspace("ws-3", "t-3")];
+    await rerender();
+    expect(within(screen.getByRole("region", { name: "Work" })).getByText("Title ws-3").closest("[data-plugin-tree-section]")).not.toBe(shipping());
+    paneStatuses = { "pane-ws-3": "working" };
+    await rerender();
+    await vi.waitFor(() => expect(within(shipping()).getByText("Title ws-3")).toBeInTheDocument(), { timeout: 2_000 });
+    expect(reads).toBe(mounted + 1);
+
+    // A change the tree doesn't arrange (a git count) reads nothing.
+    workspaces = workspaces.map((ws) => ({ ...ws, git_ahead: ws.git_ahead + 1 }));
+    await rerender();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 900));
+    });
+    expect(reads).toBe(mounted + 1);
+  });
+
+  it("refreshes metadata-only changes periodically while visible and after returning from the background", async () => {
+    vi.useFakeTimers();
+    let visibility: DocumentVisibilityState = "visible";
+    const visibilityState = vi.spyOn(document, "visibilityState", "get").mockImplementation(() => visibility);
+    let reads = 0;
+    let title = "Original thread metadata";
+    readTree = async () => {
+      reads += 1;
+      return { nodes: [{ id: "g", kind: "group", title }, { id: "n1", kind: "thread", threadId: "t-1", parentId: "g" }] };
+    };
+    try {
+      const view = await renderView();
+      expect(reads).toBe(1);
+      title = "Renamed thread metadata";
+      await act(async () => vi.advanceTimersByTimeAsync(PLUGIN_TREE_HOST_POLL_MS - 1));
+      expect(reads).toBe(1);
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+      expect(reads).toBe(2);
+      expect(screen.getByRole("button", { name: /Renamed thread metadata/ })).toBeInTheDocument();
+      visibility = "hidden";
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+        await vi.advanceTimersByTimeAsync(PLUGIN_TREE_HOST_POLL_MS);
+      });
+      expect(reads).toBe(2);
+      title = "Updated while hidden";
+      visibility = "visible";
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+        await Promise.resolve();
+      });
+      expect(reads).toBe(3);
+      expect(screen.getByRole("button", { name: /Updated while hidden/ })).toBeInTheDocument();
+      view.unmount();
+      await act(async () => vi.advanceTimersByTimeAsync(PLUGIN_TREE_HOST_POLL_MS));
+      expect(reads).toBe(3);
+    } finally {
+      cleanup();
+      visibilityState.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the empty project headings a tree asks for, archived-only projects included, within the filter", async () => {
+    const LIB = "/home/u/projects/lib";
+    archived = [{ workspace_id: "ws-gone", cwd: LIB, project_root: LIB, project_uid: "proj-lib" }];
+    readTree = async () => ({
+      nodes: [
+        { id: "g", kind: "group", title: "Pinned" },
+        { id: "n1", kind: "thread", threadId: "t-1", parentId: "g" },
+        { id: "n2", kind: "thread", threadId: "t-2", parentId: "g" },
+        // Every app chat is pinned, so its heading has no rows; lib has only archived work.
+        { id: "p-app", kind: "project", projectId: "proj-app" },
+        { id: "p-lib", kind: "project", projectId: "proj-lib" },
+        { id: "p-unknown", kind: "project", projectId: "proj-nowhere" },
+      ],
+    });
+    await renderView();
+    const sections = () =>
+      [...screen.getByRole("region", { name: "Work" }).querySelectorAll("[data-plugin-tree-section]")].map((section) =>
+        section.getAttribute("data-plugin-tree-section"),
+      );
+    expect(sections()).toEqual(["tree:g", `project:${APP}`, `project:${LIB}`]);
+    expect(within(screen.getByRole("region", { name: "Work" })).getByText("lib")).toBeInTheDocument();
+
+    // Filtered to one project, only its own empty heading stays.
+    act(() => useSidebarInboxStore.setState({ filter: APP }));
+    expect(sections()).toEqual(["tree:g", `project:${APP}`]);
   });
 
   it("falls back to the built-in grouping with a notice when the tree can't be read", async () => {

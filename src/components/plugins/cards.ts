@@ -3,6 +3,7 @@
  * transcript. The recorded summary is the durable record and always renders;
  * the plugin's live view mounts only while this host can serve it now.
  */
+import { nativeToolCall } from "@/lib/agent-chat/native-tool-call";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 import {
   MAX_PLUGIN_CARD_BYTES,
@@ -14,29 +15,44 @@ import {
 import { isPluginActive, pluginInactiveReason } from "./model";
 
 // Claude sees Codemux tools as `mcp__codemux__plugin_invoke` (or with the
-// server prefix repeated), Codex as `codemux_mcp__codemux__plugin_invoke`;
-// all end in the server-scoped name after `__`. A same-named tool on another
-// MCP server does not match.
+// server prefix repeated), Codex as `codemux_mcp__codemux__plugin_invoke` for
+// dynamic calls and `mcp__codemux__plugin_invoke` for native MCP calls; all end
+// in the server-scoped name after `__`. A same-named tool on another MCP server
+// does not match.
 const TOOL_NAME = /(?:^|__)codemux__plugin_invoke$/;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-/** The tool's own name. Codex wraps dynamic tool calls in an `{ tool, arguments }` envelope. */
-function toolName(item: Pick<ToolCallItem, "tool_name" | "input">): string {
-  const input = item.input;
-  if (
-    (item.tool_name === "dynamicToolCall" || item.tool_name === "mcpToolCall") &&
-    isRecord(input) &&
-    typeof input.tool === "string"
-  ) {
-    return input.tool;
+/** Codex's settled envelope reports a failed call outside the result blocks. */
+function codexEnvelopeFailed(content: unknown): boolean {
+  if (!isRecord(content)) return false;
+  if (content.status === "failed") return true;
+  if (content.type === "dynamicToolCall") return content.success === false;
+  if (content.type === "mcpToolCall") {
+    return (content.error !== null && content.error !== undefined) || (isRecord(content.result) && content.result.isError === true);
   }
-  return item.tool_name;
+  return false;
 }
 
-export const isPluginInvokeTool = (item: Pick<ToolCallItem, "tool_name" | "input">) =>
-  TOOL_NAME.test(toolName(item));
+/**
+ * The called tool's name and recorded output. Codex wraps calls in native item
+ * envelopes (`dynamicToolCall` with `contentItems`, `mcpToolCall` with a
+ * server-scoped `result`); the shared parser unwraps them.
+ */
+function invocation(item: ToolCallItem): { name: string; output: unknown; failed: boolean } {
+  const native = nativeToolCall(item);
+  if (native?.kind === "tool") {
+    return {
+      name: native.name,
+      output: native.output,
+      failed: native.error !== null || codexEnvelopeFailed(item.result_content),
+    };
+  }
+  return { name: item.tool_name, output: item.result_content, failed: false };
+}
+
+export const isPluginInvokeTool = (item: ToolCallItem) => TOOL_NAME.test(invocation(item).name);
 
 const IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const encoder = new TextEncoder();
@@ -89,14 +105,14 @@ function parseJson(text: string): unknown {
 /**
  * The invoke result object inside whatever the provider recorded: the object
  * itself, `{ structuredContent }`, a JSON string, or an MCP content array (or
- * `{ content: [...] }`) whose text block is that JSON.
+ * `{ content: [...] }`) whose text block or string entry is that JSON.
  */
 function resultObject(content: unknown, depth = 0): Record<string, unknown> | undefined {
   if (depth > 3 || content === null || content === undefined) return undefined;
   if (typeof content === "string") return resultObject(parseJson(content), depth + 1);
   if (Array.isArray(content)) {
     for (const block of content) {
-      const text = isRecord(block) && typeof block.text === "string" ? block.text : null;
+      const text = typeof block === "string" ? block : isRecord(block) && typeof block.text === "string" ? block.text : null;
       const found = text === null ? undefined : resultObject(text, depth + 1);
       if (found?.card !== undefined) return found;
     }
@@ -109,8 +125,6 @@ function resultObject(content: unknown, depth = 0): Record<string, unknown> | un
   return undefined;
 }
 
-type CardSource = Pick<ToolCallItem, "tool_name" | "input" | "status" | "result_content">;
-
 /** Parsed once per recorded result: the transcript asks about every tool row on each pass. */
 const cardCache = new WeakMap<object, { readonly content: unknown; readonly card: PluginCardReference | undefined }>();
 
@@ -118,11 +132,12 @@ const cardCache = new WeakMap<object, { readonly content: unknown; readonly card
  * The card a completed `plugin_invoke` call carries, if any. The host stamped
  * its provenance; this only decides whether to ask for the view.
  */
-export function pluginCardFromToolItem(item: CardSource): PluginCardReference | undefined {
-  if (item.status !== "done" || !isPluginInvokeTool(item)) return undefined;
+export function pluginCardFromToolItem(item: ToolCallItem): PluginCardReference | undefined {
+  if (item.status !== "done") return undefined;
   const cached = cardCache.get(item);
   if (cached !== undefined && cached.content === item.result_content) return cached.card;
-  const result = resultObject(item.result_content);
+  const call = invocation(item);
+  const result = !TOOL_NAME.test(call.name) || call.failed ? undefined : resultObject(call.output);
   const card = result === undefined || result.isError === true ? undefined : readCardReference(result.card);
   cardCache.set(item, { content: item.result_content, card });
   return card;

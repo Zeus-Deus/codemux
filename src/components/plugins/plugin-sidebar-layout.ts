@@ -7,9 +7,12 @@
  * only while that installation is active and offers it with its capability
  * granted. Otherwise the sidebar shows its own grouping, and the choice waits.
  */
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { create } from "zustand";
 import { useSidebarViewStore } from "@/components/layout/sidebar-view-store";
+import { getWorkspaceStatus } from "@/lib/pane-status";
+import { useAppStore } from "@/stores/app-store";
+import type { AppStateSnapshot } from "@/tauri/types";
 import type { PluginInstallation, PluginNativeTree, PluginSidebarView, PluginTreeNode } from "./contract";
 import { MAX_PLUGIN_TREE_NODES } from "./contract";
 import { isPluginActive, newPluginOperationId, pluginRunnableInstallations } from "./model";
@@ -20,6 +23,7 @@ import {
   usePlatformChangeRevision,
   usePlatformCatalogue,
 } from "./platform-adapter";
+import { pluginProjectIdOf, workspaceChats } from "./workspace-context";
 
 interface LayoutOptionFields {
   readonly key: string;
@@ -160,6 +164,88 @@ function report(
   });
 }
 
+/**
+ * How long host changes gather before the chosen tree is read again. Not reset
+ * by later changes, so a steady stream of snapshots still refreshes the tree
+ * within this long, and costs at most one read per window.
+ */
+export const PLUGIN_TREE_HOST_REFRESH_MS = 750;
+/** Thread metadata and time-based grouping can change without a workspace delta. */
+export const PLUGIN_TREE_HOST_POLL_MS = 30_000;
+
+/**
+ * The host-owned facts a tree arranges that the plugin is never told about:
+ * which chats each workspace holds, its project, title and nesting, and
+ * whether its agent is busy (a turn that ends moves the chat's activity).
+ */
+function hostTreeFingerprint(appState: AppStateSnapshot | null | undefined): string {
+  if (!appState) return "";
+  const statuses = appState.pane_statuses ?? {};
+  return appState.workspaces
+    .map((ws) =>
+      [
+        ws.workspace_id,
+        pluginProjectIdOf(ws),
+        ws.parent_workspace_id ?? "",
+        ws.title,
+        ws.last_active_at ?? "",
+        ws.pinned_at ?? "",
+        workspaceChats(ws)
+          .map((chat) => `${chat.threadId}:${statuses[chat.paneId] ?? ""}`)
+          .join(","),
+        getWorkspaceStatus(ws.surfaces, statuses) ?? "",
+      ].join("\u0001"),
+    )
+    .join("\u0002");
+}
+
+/** Counts settled host changes while `enabled`; the mount read already covers the first state seen. */
+function useHostTreeRevision(enabled: boolean): number {
+  const fingerprint = useAppStore((state) => (enabled ? hostTreeFingerprint(state.appState) : null));
+  const [revision, setRevision] = useState(0);
+  const latest = useRef(fingerprint);
+  latest.current = fingerprint;
+  const seen = useRef<string | null>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (fingerprint === null) {
+      seen.current = null;
+      if (timer.current !== null) clearTimeout(timer.current);
+      timer.current = null;
+      return;
+    }
+    if (seen.current === null) {
+      seen.current = fingerprint;
+      return;
+    }
+    if (fingerprint === seen.current || timer.current !== null) return;
+    timer.current = setTimeout(() => {
+      timer.current = null;
+      seen.current = latest.current;
+      if (document.visibilityState !== "hidden") setRevision((value) => value + 1);
+    }, PLUGIN_TREE_HOST_REFRESH_MS);
+  }, [fingerprint]);
+  useEffect(() => {
+    if (!enabled) return;
+    const refresh = () => {
+      if (document.visibilityState !== "hidden") setRevision((value) => value + 1);
+    };
+    const poll = setInterval(refresh, PLUGIN_TREE_HOST_POLL_MS);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      clearInterval(poll);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [enabled]);
+  useEffect(
+    () => () => {
+      if (timer.current !== null) clearTimeout(timer.current);
+    },
+    [],
+  );
+  return revision;
+}
+
 export interface PluginSidebarLayoutState {
   readonly options: ReadonlyArray<PluginSidebarLayoutOption>;
   /** The remembered choice when it can be shown now. */
@@ -172,10 +258,22 @@ export interface PluginSidebarLayoutState {
   readonly notice: string | null;
 }
 
+/** The offered layouts and the remembered one when it can be shown now. Reads nothing. */
+export function usePluginSidebarLayoutChoice(): Pick<PluginSidebarLayoutState, "options" | "selected"> {
+  const { catalogue } = usePlatformCatalogue();
+  const remembered = useSidebarViewStore((state) => state.pluginLayout);
+  const options = pluginSidebarLayoutOptions(pluginRunnableInstallations(catalogue));
+  return { options, selected: options.find((option) => option.key === remembered) ?? null };
+}
+
 /**
  * Reads the chosen tree while the Projects view shows it: on mount, when the
- * plugin's generation changes, and when the plugin signals `tree:<id>`.
- * Never per row. Declared views need no reads.
+ * plugin's generation changes, when the plugin signals `tree:<id>`, and shortly
+ * after the host's own workspaces, chats or activity change (a plugin is not
+ * told about those). A visible tree also refreshes every 30 seconds for
+ * metadata-only changes and time-based grouping. Never per row. Declared views need no reads. Only the
+ * Projects view calls this; anything else that only needs the choice uses
+ * `usePluginSidebarLayoutChoice`, so each trigger costs one read.
  */
 export function usePluginSidebarLayout(): PluginSidebarLayoutState {
   const { catalogue } = usePlatformCatalogue();
@@ -192,6 +290,7 @@ export function usePluginSidebarLayout(): PluginSidebarLayoutState {
       ? null
       : { installationId, generation, topic: pluginTreeTopic(treeId) },
   );
+  const hostRevision = useHostTreeRevision(installationId !== null && generation !== null && treeId !== null);
 
   useEffect(() => {
     if (remembered === null || installationId === null || generation === null || treeId === null) return;
@@ -210,7 +309,7 @@ export function usePluginSidebarLayout(): PluginSidebarLayoutState {
     return () => {
       cancelled = true;
     };
-  }, [remembered, installationId, generation, treeId, revision]);
+  }, [remembered, installationId, generation, treeId, revision, hostRevision]);
 
   const snapshot = useTreeSnapshotStore((state) => state.snapshot);
   const current =

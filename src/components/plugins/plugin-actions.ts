@@ -22,6 +22,8 @@ import {
   findThreadLocation,
   parsePluginComposerKey,
   pluginComposerKey,
+  workspaceActiveThreadId,
+  workspaceById,
 } from "./workspace-context";
 
 /** What the user acted on, fixed before anything is awaited. */
@@ -81,39 +83,54 @@ function phoneLayout(): boolean {
   );
 }
 
-/** Side panels open beside the chat they were asked from; anything else opens as a page. */
-export function openPlatformView(
+/** Whether the captured chat is the one its workspace shows, with that workspace on screen. */
+function threadOnScreen(target: Pick<PluginInvocationTarget, "workspaceId" | "threadId">): boolean {
+  if (selectActiveWorkspaceId(useAppStore.getState()) !== target.workspaceId) return false;
+  return target.threadId === null || workspaceActiveThreadId(workspaceById(target.workspaceId)) === target.threadId;
+}
+
+/**
+ * Side panels open beside the chat they were asked from; anything else opens
+ * as a page. A side panel takes its context from the chat its workspace shows,
+ * so when the user has since moved, even to another chat in the same
+ * workspace, that chat is shown first, and nothing opens if it can't be.
+ */
+export async function openPlatformView(
   target: Pick<PluginInvocationTarget, "installation" | "workspaceId" | "threadId">,
   viewId: string,
-): void {
+): Promise<void> {
   const view = target.installation.manifest.views.find((entry) => entry.id === viewId);
   if (!view || view.placement === "conversation") return;
+  const besideChat = view.placement === "side-panel" && target.workspaceId !== null;
+  let workspaceId = target.workspaceId;
+  if (besideChat && target.threadId !== null && !threadOnScreen(target)) {
+    const revealed = await revealThread(target.threadId);
+    if (revealed === null) return;
+    workspaceId = revealed;
+  }
   const ui = useUIStore.getState();
+  // Settings replaces the whole app, and a utility page the workspace.
+  if (ui.showSettings) ui.setShowSettings(false);
   // A phone has no right panel: the side panel opens full screen beside the
   // same chat (`PlatformPluginPage` gives it the active chat's context).
-  if (view.placement === "side-panel" && target.workspaceId !== null && !phoneLayout()) {
-    // Opened later from an offer: show the chat it belongs beside, not a panel in a hidden workspace.
-    if (target.threadId !== null && selectActiveWorkspaceId(useAppStore.getState()) !== target.workspaceId) {
-      revealThread(target.threadId);
-    }
-    ui.setRightPanelTab(
-      target.workspaceId,
-      `plugin:${platformSidePanelId(target.installation.installationId, view.id)}` as never,
-    );
+  if (besideChat && workspaceId !== null && !phoneLayout()) {
+    ui.closeUtilityPages();
+    if (ui.showNewProjectScreen) ui.setShowNewProjectScreen(false);
+    ui.setRightPanelTab(workspaceId, `plugin:${platformSidePanelId(target.installation.installationId, view.id)}` as never);
     return;
   }
-  // Settings replaces the whole app; a page opens in the shell behind it.
-  if (ui.showSettings) ui.setShowSettings(false);
   ui.setShowPluginPage(platformPageId(target.installation.installationId, view.id));
 }
 
-function revealThread(threadId: string): void {
+/** Shows a chat; resolves to its workspace once it is on screen, or null when it can't be. */
+async function revealThread(threadId: string): Promise<string | null> {
   const location = findThreadLocation(threadId);
   if (location === null) {
     toast.info("That chat is not open.");
-    return;
+    return null;
   }
-  void openNotificationTarget({ workspace_id: location.workspace.workspace_id, pane_id: location.paneId });
+  const workspaceId = location.workspace.workspace_id;
+  return (await openNotificationTarget({ workspace_id: workspaceId, pane_id: location.paneId })) ? workspaceId : null;
 }
 
 /** Only http(s) URLs open anywhere; the host and the view bridge check too. */
@@ -173,10 +190,10 @@ function runNavigation(target: PluginInvocationTarget, step: Extract<PluginInten
   const { intent } = step;
   switch (intent.type) {
     case "thread.reveal":
-      revealThread(intent.threadId);
+      void revealThread(intent.threadId);
       return;
     case "view.open":
-      openPlatformView(target, intent.viewId);
+      void openPlatformView(target, intent.viewId);
       return;
     case "preview.open":
       void openPluginPreview(target, intent.url, step.mode);
@@ -230,7 +247,7 @@ export function applyPluginIntents(
       if (!step.visible && composer) {
         toast.info(`${name} added text to a draft`, {
           description: "It is in the composer of the chat you started from.",
-          action: { label: "Open chat", onClick: () => revealThread(composer.threadId) },
+          action: { label: "Open chat", onClick: () => void revealThread(composer.threadId) },
         });
       }
       continue;

@@ -141,7 +141,7 @@ function StatusChip({
             <button
               type="button"
               aria-description={description}
-              onClick={() => openPlatformView({ installation, workspaceId, threadId: value.threadId }, viewId)}
+              onClick={() => void openPlatformView({ installation, workspaceId, threadId: value.threadId }, viewId)}
             >
               {content}
             </button>

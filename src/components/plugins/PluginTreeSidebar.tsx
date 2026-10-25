@@ -12,17 +12,19 @@ import { SidebarMenu } from "@/components/ui/sidebar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ProjectsModel, ProjectsRow } from "@/components/layout/sidebar-projects-model";
 import { useSidebarViewStore } from "@/components/layout/sidebar-view-store";
-import type { ProjectGroup } from "@/stores/app-store";
+import { useHomeDir, type ProjectGroup } from "@/stores/app-store";
+import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 import { cn } from "@/lib/utils";
 import type { PluginTreeNode } from "./contract";
+import { usePluginKnownProjects } from "./known-projects";
 import {
   buildPluginTreeLayout,
   togglePluginTreeFold,
   type PluginTreeRow,
   type PluginTreeSection,
 } from "./native-tree";
-import { usePluginSidebarLayout } from "./plugin-sidebar-layout";
+import { usePluginSidebarLayoutChoice } from "./plugin-sidebar-layout";
 import { PluginBoundary } from "./PluginBoundary";
 import { pluginProjectIdOf, workspaceChats } from "./workspace-context";
 
@@ -40,6 +42,9 @@ const foldPrefix = (treeKey: string) => `${treeKey}\0`;
  * The chosen plugin tree laid over the Projects view's live rows, or null to
  * show the built-in grouping. Rows come from the host's own model (with its
  * filter), so the tree can only arrange what the sidebar already lists.
+ * Project headings resolve against every project Codemux knows, archived-only
+ * ones too, and one the tree asks for stays even with no rows, unless the
+ * sidebar is filtered to another project.
  */
 export function usePluginTreeLayout(input: {
   readonly nodes: ReadonlyArray<PluginTreeNode> | null;
@@ -50,6 +55,9 @@ export function usePluginTreeLayout(input: {
   readonly activeWorkspaceId: string;
 }): PluginTreeLayout | null {
   const folds = useSidebarViewStore((state) => state.pluginTreeFolds);
+  const filter = useSidebarInboxStore((state) => state.filter);
+  const knownProjects = usePluginKnownProjects();
+  const homeDir = useHomeDir();
   const { nodes, treeKey, model, projectGroups, allWorkspaces, activeWorkspaceId } = input;
   return useMemo(() => {
     if (nodes === null || treeKey === null) return null;
@@ -70,6 +78,15 @@ export function usePluginTreeLayout(input: {
     for (const group of projectGroups) {
       for (const ws of group.workspaces) groupByProjectId.set(pluginProjectIdOf(ws), group);
     }
+    // A project only archived workspaces hold gets a heading of its own; one
+    // whose root an open group already shows shares that group's heading.
+    const groupByPath = new Map(projectGroups.map((group) => [group.projectPath, group]));
+    for (const known of knownProjects) {
+      if (groupByProjectId.has(known.id)) continue;
+      const group = groupByPath.get(known.root) ?? { projectName: known.title, projectPath: known.root, workspaces: [] };
+      groupByPath.set(known.root, group);
+      groupByProjectId.set(known.id, group);
+    }
     const prefix = foldPrefix(treeKey);
     const scopedFolds = new Set(folds.filter((key) => key.startsWith(prefix)).map((key) => key.slice(prefix.length)));
     return buildPluginTreeLayout<ProjectGroup, WorkspaceSnapshot>({
@@ -84,11 +101,12 @@ export function usePluginTreeLayout(input: {
         const group = groupByProjectId.get(projectId);
         return group ? { key: group.projectPath, project: group } : null;
       },
-      showsEmptyProject: () => false,
+      // As in the built-in grouping, the home folder is the Chats section, not a project.
+      showsEmptyProject: (group) => group.projectPath !== homeDir && (filter === null || group.projectPath === filter),
       folds: scopedFolds,
       routeKey: activeWorkspaceId || null,
     });
-  }, [nodes, treeKey, model, projectGroups, allWorkspaces, activeWorkspaceId, folds]);
+  }, [nodes, treeKey, model, projectGroups, allWorkspaces, activeWorkspaceId, folds, filter, knownProjects, homeDir]);
 }
 
 export function togglePluginTreeSection(treeKey: string, sectionKey: string, collapsedByDefault: boolean): void {
@@ -221,7 +239,7 @@ export function PluginSidebarLayoutMenu() {
 }
 
 function SidebarLayoutMenu() {
-  const { options, selected } = usePluginSidebarLayout();
+  const { options, selected } = usePluginSidebarLayoutChoice();
   const remembered = useSidebarViewStore((state) => state.pluginLayout);
   const setPluginLayout = useSidebarViewStore((state) => state.setPluginLayout);
   if (options.length === 0 && remembered === null) return null;

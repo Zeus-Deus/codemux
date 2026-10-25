@@ -167,6 +167,14 @@ describe("sources, settings and failures", () => {
       ok: true,
       source: { kind: "git", url: "https://github.com/a/b.git", ref: "v1.2" },
     });
+    expect(parsePluginSourceInput("https://github.com/a/b.git#feature%2Fx")).toEqual({
+      ok: true,
+      source: { kind: "git", url: "https://github.com/a/b.git", ref: "feature/x" },
+    });
+    // A malformed escape is feedback, not a thrown submit.
+    for (const malformed of ["https://example.com/repo.git#%", "https://example.com/repo.git#v1%E0%A4%A", "https://example.com/r#%zz"]) {
+      expect(parsePluginSourceInput(malformed)).toEqual({ ok: false, message: "The ref after # has an invalid % escape." });
+    }
     expect(parsePluginSourceInput("http://github.com/a/b").ok).toBe(false);
     expect(parsePluginSourceInput("https://me:pw@github.com/a/b").ok).toBe(false);
     expect(parsePluginSourceInput("relative/dir").ok).toBe(false);

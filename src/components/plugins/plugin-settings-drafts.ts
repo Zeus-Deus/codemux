@@ -19,7 +19,10 @@ export interface PluginSettingsDraftEntry {
 
 export const usePluginSettingsDrafts = create<{
   readonly drafts: Readonly<Record<string, PluginSettingsDraftEntry>>;
-}>(() => ({ drafts: {} }));
+  /** Installations with a Save in flight. Shared, so a form remounted by
+   *  switching plugins still waits for its Save instead of taking new edits. */
+  readonly saving: Readonly<Record<string, true>>;
+}>(() => ({ drafts: {}, saving: {} }));
 
 const entryFor = (
   drafts: Readonly<Record<string, PluginSettingsDraftEntry>>,
@@ -62,7 +65,27 @@ export function editPluginSettings(
   );
 }
 
-export function discardPluginSettings(installationId: string): void {
+/** Whether a Save is in flight for the installation. */
+export function usePluginSettingsSaving(installationId: string): boolean {
+  return usePluginSettingsDrafts((state) => state.saving[installationId] === true);
+}
+
+export function setPluginSettingsSaving(installationId: string, saving: boolean): void {
+  usePluginSettingsDrafts.setState((state) => {
+    if (saving === (state.saving[installationId] === true)) return state;
+    const next = { ...state.saving };
+    if (saving) next[installationId] = true;
+    else delete next[installationId];
+    return { saving: next };
+  });
+}
+
+/**
+ * Drops the installation's draft. Given the draft a Save submitted, drops it
+ * only while it is still that draft: an edit made since is newer and stays.
+ */
+export function discardPluginSettings(installationId: string, submitted?: PluginSettingsDraftEntry | null): void {
+  if (submitted !== undefined && usePluginSettingsDrafts.getState().drafts[installationId] !== submitted) return;
   setDraft(installationId, null);
 }
 

@@ -12,7 +12,9 @@ import {
   discardPluginSettings,
   editPluginSettings,
   pluginSettingsView,
+  setPluginSettingsSaving,
   usePluginSettingsDraft,
+  usePluginSettingsSaving,
 } from "./plugin-settings-drafts";
 
 /** Compact geometry on a phone, where buttons grow to 44px; the hit area stays that large. */
@@ -35,7 +37,7 @@ export function PlatformPluginSettingsForm({ installation }: { installation: Plu
   const dirty = entry !== null;
   const [errors, setErrors] = useState<Readonly<Record<string, string>>>({});
   const [error, setError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
+  const saving = usePluginSettingsSaving(installationId);
 
   const edit = (key: string, value: string | boolean, cleared = clearedSecrets) => {
     editPluginSettings(installation, { draft: { ...draft, [key]: value }, clearedSecrets: cleared });
@@ -63,15 +65,16 @@ export function PlatformPluginSettingsForm({ installation }: { installation: Plu
       revert();
       return;
     }
-    setSaving(true);
+    const submitted = entry;
+    setPluginSettingsSaving(installationId, true);
     setError(null);
     try {
       await platformUpdateSettings(installationId, patch.values);
-      discardPluginSettings(installationId);
+      discardPluginSettings(installationId, submitted);
     } catch (cause) {
       setError(`Couldn't save: ${pluginFailure(cause).message}`);
     } finally {
-      setSaving(false);
+      setPluginSettingsSaving(installationId, false);
     }
   };
 

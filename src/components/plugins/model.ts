@@ -760,7 +760,12 @@ export function parsePluginSourceInput(raw: string): PluginSourceParseResult {
     }
     if (url.protocol !== "https:") return { ok: false, message: "Git sources must use https." };
     if (url.username !== "" || url.password !== "") return { ok: false, message: "Remove credentials from the URL." };
-    const ref = decodeURIComponent(url.hash.slice(1)).trim();
+    let ref: string;
+    try {
+      ref = decodeURIComponent(url.hash.slice(1)).trim();
+    } catch {
+      return { ok: false, message: "The ref after # has an invalid % escape." };
+    }
     url.hash = "";
     return { ok: true, source: { kind: "git", url: url.toString(), ...(ref === "" ? {} : { ref }) } };
   }

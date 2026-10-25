@@ -24,7 +24,7 @@ const configurable = (overrides: Parameters<typeof installation>[0] = {}) =>
 const entry = (subject = configurable()) =>
   usePluginSettingsDrafts.getState().drafts[subject.installationId] ?? null;
 
-beforeEach(() => usePluginSettingsDrafts.setState({ drafts: {} }));
+beforeEach(() => usePluginSettingsDrafts.setState({ drafts: {}, saving: {} }));
 
 describe("plugin settings drafts", () => {
   it("keeps an edit against the values it started from, and drops one that changes nothing", () => {
@@ -42,6 +42,16 @@ describe("plugin settings drafts", () => {
     editPluginSettings(configurable(), { draft: { label: "Board", token: "" }, clearedSecrets: new Set(["token"]) });
     expect(entry()?.clearedSecrets.has("token")).toBe(true);
     discardPluginSettings("inst-1");
+    expect(entry()).toBeNull();
+  });
+
+  it("drops a saved draft only while it is still the one that was submitted", () => {
+    editPluginSettings(configurable(), { draft: { label: "Sprint", token: "" }, clearedSecrets: new Set() });
+    const submitted = entry();
+    editPluginSettings(configurable(), { draft: { label: "Newer", token: "" }, clearedSecrets: new Set() });
+    discardPluginSettings("inst-1", submitted);
+    expect(entry()?.draft.label).toBe("Newer");
+    discardPluginSettings("inst-1", entry());
     expect(entry()).toBeNull();
   });
 
