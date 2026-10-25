@@ -43,10 +43,16 @@ export function model(value) {
   return result;
 }
 export function choices(input, defaults, canWorktree) {
-  const runtimeMode = input.runtimeMode ?? defaults.runtimeMode;
-  const nativePermissionMode = input.nativePermissionMode ?? defaults.nativePermissionMode;
-  if (nativePermissionMode !== undefined) text(nativePermissionMode, 128, "native permission mode");
-  if (!["approval-required", "auto-accept-edits", "full-access"].includes(runtimeMode) && !nativePermissionMode)
+  const permissions = input.runtimeMode !== undefined || input.nativePermissionMode !== undefined
+    ? input : defaults;
+  const runtimeMode = permissions.runtimeMode;
+  const nativePermissionMode = permissions.nativePermissionMode === undefined ? undefined
+    : text(permissions.nativePermissionMode, 128, "native permission mode");
+  if (runtimeMode !== undefined && nativePermissionMode !== undefined)
+    fail("Select runtimeMode or nativePermissionMode, not both.");
+  if (runtimeMode !== undefined && !["approval-required", "auto-accept-edits", "full-access"].includes(runtimeMode))
+    fail("Unsupported runtime mode.");
+  if (runtimeMode === undefined && nativePermissionMode === undefined)
     fail("Unsupported runtime mode.");
   const interactionMode = input.interactionMode ?? defaults.interactionMode;
   if (!["default", "plan"].includes(interactionMode)) fail("Unsupported interaction mode.");

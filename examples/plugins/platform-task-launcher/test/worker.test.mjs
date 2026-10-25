@@ -27,6 +27,8 @@ test('native model options, permission mode and worktree choices remain frozen; 
   assert.equal(result.data.plan.tasks[0].launch.receipt.result.accepted,true);
   await f.invoke('view:launcher:start',{...input,nativePermissionMode:'danger-full-access'},{operationId:'another-client-operation'});
   const state=await host.read();assert.equal(state.dispatches.length,1);assert.deepEqual(state.dispatches[0].input.workspaceStrategy,input.workspaceStrategy);
+  assert.equal(state.dispatches[0].input.nativePermissionMode,'workspace-write');
+  assert.equal(Object.hasOwn(state.dispatches[0].input,'runtimeMode'),false);
   assert.deepEqual(state.dispatches[0].input.modelSelection.options,[{id:'effort',value:'xhigh'},{id:'service_tier',value:'priority'}]);
   assert.equal(state.dispatches[0].input.idempotencyKey,`launch-${task.id}`);
 });

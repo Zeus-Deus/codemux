@@ -31,6 +31,62 @@ const INSTALLATION: &str = "native-acceptance";
 const SOURCE: &str = "acceptance-source";
 const MODEL: &str = "fixture-model";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn platform_native_launcher_explicit_mode_replaces_inherited_portable_mode() {
+    if isolated("platform_native_launcher_explicit_mode_replaces_inherited_portable_mode") {
+        return;
+    }
+    let f = Fixture::new().await;
+    let mut request = f.request("launcher-native-mode");
+    // Execute the shipped example's normalization, then admit its actual output
+    // through the native workflow, whose modes are mutually exclusive.
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            r#"import {pathToFileURL} from 'node:url';
+const {choices} = await import(pathToFileURL(process.argv[1]).href);
+process.stdout.write(JSON.stringify(choices(JSON.parse(process.argv[2]), JSON.parse(process.argv[3]), false)));"#,
+        ])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../examples/plugins/platform-task-launcher/validation.mjs"
+        ))
+        .arg(json!({"nativePermissionMode":"acceptEdits"}).to_string())
+        .arg(
+            json!({
+                "modelSelection":request["modelSelection"],
+                "runtimeMode":"auto-accept-edits",
+                "interactionMode":"default"
+            })
+            .to_string(),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let selected: Value = serde_json::from_slice(&output.stdout).unwrap();
+    request
+        .as_object_mut()
+        .unwrap()
+        .extend(selected.as_object().unwrap().clone());
+    let (accepted, release_ack) = f.provider.hold_next_ack();
+    let receipt = f.create(&caller(&f.record), request.clone()).await.unwrap();
+    f.milestone(&receipt, &accepted).await;
+    assert_eq!(request["nativePermissionMode"], "acceptEdits");
+    assert!(request.get("runtimeMode").is_none());
+    assert_eq!(f.starts().len(), 1);
+    assert_eq!(
+        f.starts()[0].permission_mode.as_deref(),
+        Some("acceptEdits")
+    );
+    release_ack.notify_one();
+    assert_eq!(f.settled(&receipt).await["state"], "succeeded");
+}
+
 /// Worktree placement and layout emits use test-only path overrides, including on
 /// Windows where Known Folders ignore HOME. Set paths only on a new process.
 fn isolated(name: &str) -> bool {
