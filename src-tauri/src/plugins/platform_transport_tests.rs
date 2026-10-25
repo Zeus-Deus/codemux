@@ -2,6 +2,12 @@ use super::*;
 use std::time::Duration;
 
 pub(crate) fn fixture() -> (tauri::App<tauri::test::MockRuntime>, tempfile::TempDir) {
+    fixture_with_timeout(Duration::from_secs(1))
+}
+
+fn fixture_with_timeout(
+    invocation_timeout: Duration,
+) -> (tauri::App<tauri::test::MockRuntime>, tempfile::TempDir) {
     let app = tauri::test::mock_app();
     let root = tempfile::tempdir().unwrap();
     let platform = Arc::new(PluginPlatform {
@@ -10,7 +16,7 @@ pub(crate) fn fixture() -> (tauri::App<tauri::test::MockRuntime>, tempfile::Temp
         packages: PlatformPackageStore::new(root.path().join("platform/packages")),
         management: ManagementStore::new(root.path().join("platform/management")),
         supervisor: PluginSupervisor::new(PluginRuntimeConfig {
-            invocation_timeout: Duration::from_secs(1),
+            invocation_timeout,
             ..Default::default()
         }),
         mutations: tokio::sync::Mutex::new(()),
@@ -85,6 +91,317 @@ async fn invoke(
     operation: &str,
 ) -> Result<Value, String> {
     call(app,"invoke",json!({"installationId":installation["installationId"],"generation":installation["generation"],"handler":"action:run","operationId":operation})).await
+}
+
+fn event_source(root: &Path, name: &str, version: &str, body: &str) -> PathBuf {
+    let directory = source(root, name, version, body);
+    let path = directory.join("codemux-plugin.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("events.run-finalized"));
+    std::fs::write(path, manifest.to_string()).unwrap();
+    directory
+}
+
+async fn event_fixture(
+    name: &str,
+    body: &str,
+    invocation_timeout: Duration,
+) -> (
+    tauri::App<tauri::test::MockRuntime>,
+    tempfile::TempDir,
+    Value,
+    String,
+) {
+    let (app, root) = fixture_with_timeout(invocation_timeout);
+    let workspace = app
+        .state::<crate::state::AppStateStore>()
+        .create_empty_workspace_at_path(root.path().join("event-project"))
+        .0;
+    let project = super::super::platform_workflow::project_id(
+        &app.state::<crate::state::AppStateStore>()
+            .find_workspace(&workspace)
+            .unwrap(),
+    );
+    app.state::<crate::database::DatabaseStore>()
+        .upsert_agent_chat_session("event-thread", &workspace, None, "claude")
+        .unwrap();
+    let installed = install(&app, &event_source(root.path(), name, "1.0.0", body)).await;
+    let active = call(&app, "consent", json!({"installationId":installed["installationId"],"digest":installed["digest"],
+        "grants":{"capabilities":["storage","ui","ui.conversation-cards","events.run-finalized"],"projectIds":[project]}})).await.unwrap();
+    let active = call(
+        &app,
+        "setEnabled",
+        json!({"installationId":active["installationId"],"enabled":true}),
+    )
+    .await
+    .unwrap();
+    (app, root, active, project)
+}
+
+fn commit_event(
+    app: &tauri::App<tauri::test::MockRuntime>,
+    platform: &PluginPlatform,
+    project: &str,
+) {
+    let db = app.state::<crate::database::DatabaseStore>();
+    db.control_append_user_message("event-thread", &json!({"type":"user_message","text":"Human turn","message_id":"human","client_nonce":"human"}).to_string(), "event-run", false).unwrap();
+    db.append_agent_chat_message("event-thread", &json!({"type":"turn_completed","thread_id":"event-thread","turn_id":"event-run","status":{"kind":"success"}}).to_string()).unwrap();
+    assert_eq!(
+        platform
+            .service
+            .events
+            .recover_thread(&db, project, "event-thread")
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn platform_transport_changed_digest_promotion_keeps_deliver_choice_under_durable_hold() {
+    for interrupt in [false, true] {
+        let (app, root, active, project) = event_fixture("promotion-observer",
+            "export function activate(ctx){ctx.events.onRunFinalized(async()=>{await ctx.storage.set('version',1);});}", Duration::from_secs(1)).await;
+        let platform = app
+            .state::<PluginPlatformState>()
+            .get(app.handle())
+            .unwrap();
+        let id = active["installationId"].as_str().unwrap();
+        commit_event(&app, &platform, &project);
+        platform
+            .service
+            .events
+            .pause(
+                &platform.service.store,
+                id,
+                "Previous delivery needs review".into(),
+            )
+            .unwrap();
+        let before = platform.service.store.read(id).unwrap();
+        let backlog = platform.service.events.backlog(&before).unwrap();
+        assert_eq!(backlog["count"], 1);
+        event_source(root.path(), "promotion-observer", "2.0.0",
+            "export function activate(ctx){ctx.events.onRunFinalized(async()=>{await ctx.storage.set('version',2);});}");
+        let staged = call(&app, "refresh", json!({"installationId":id}))
+            .await
+            .unwrap();
+        assert_ne!(staged["pendingUpdate"]["digest"], active["digest"]);
+        let params = json!({"installationId":id,"digest":staged["pendingUpdate"]["digest"],"grants":active["grants"],
+            "eventBacklog":{"policy":"deliver","throughSequence":backlog["throughSequence"]}});
+        if interrupt {
+            let pointer = root
+                .path()
+                .join("platform/packages/active")
+                .join(format!("{id}.json"));
+            let saved = std::fs::read(&pointer).unwrap();
+            std::fs::remove_file(&pointer).unwrap();
+            std::fs::create_dir(&pointer).unwrap();
+            assert!(call(&app, "consent", params.clone()).await.is_err());
+            let persisted = PlatformService::open(root.path().join("platform/state"));
+            let held = persisted.store.read(id).unwrap();
+            assert!(held
+                .unavailable_reason
+                .as_deref()
+                .unwrap()
+                .contains("incomplete"));
+            assert!(!held.event_backlog_choice_required);
+            assert!(held.delivery_error.is_none());
+            assert_eq!(held.event_cursor, before.event_cursor);
+            assert!(platform
+                .admit_invocation(
+                    app.handle(),
+                    &ControlCaller::trusted(),
+                    id,
+                    &held.generation,
+                    "action:run"
+                )
+                .is_err());
+            drain_events(app.handle(), &platform).await;
+            assert!(!platform
+                .service
+                .store
+                .read(id)
+                .unwrap()
+                .storage
+                .contains_key("version"));
+            std::fs::remove_dir(&pointer).unwrap();
+            std::fs::write(pointer, saved).unwrap();
+        }
+        let promoted = call(&app, "consent", params).await.unwrap();
+        assert_eq!(promoted["status"], "idle");
+        let record = platform.service.store.read(id).unwrap();
+        assert!(!record.event_backlog_choice_required);
+        assert!(record.delivery_error.is_none());
+        assert_eq!(record.event_cursor, before.event_cursor);
+        assert_eq!(
+            platform.service.events.backlog(&record).unwrap()["count"],
+            1
+        );
+        drain_events(app.handle(), &platform).await;
+        let delivered = platform.service.store.read(id).unwrap();
+        assert_eq!(delivered.storage.get("version"), Some(&json!(2)));
+        assert_eq!(delivered.acknowledged_deliveries.len(), 1);
+        app.state::<PluginPlatformState>().shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn platform_transport_event_queue_backpressure_retries_without_pausing_or_advancing_cursor() {
+    for exhaust_retries in [false, true] {
+        let (app, _root, active, project) = event_fixture("busy-observer",
+            "export function activate(ctx){ctx.handle('action:run',async()=>{await ctx.storage.get('gate');return {};});ctx.events.onRunFinalized(async()=>{await ctx.storage.set('observed',((await ctx.storage.get('observed'))??0)+1);});}", Duration::from_secs(10)).await;
+        let platform = app
+            .state::<PluginPlatformState>()
+            .get(app.handle())
+            .unwrap();
+        let id = active["installationId"].as_str().unwrap();
+        commit_event(&app, &platform, &project);
+        let before = platform.service.store.read(id).unwrap();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let host: PluginHostCallback = Arc::new({
+            let release = release.clone();
+            move |_| {
+                let release = release.clone();
+                Box::pin(async move {
+                    release.acquire_owned().await.unwrap().forget();
+                    Ok(Value::Null)
+                })
+            }
+        });
+        let input = PluginExecutionInput {
+            installation_id: id.into(),
+            generation: before.generation.clone(),
+            directory: platform
+                .packages
+                .snapshot_directory(&before.digest)
+                .unwrap(),
+            entry: before.manifest.entry.clone(),
+            data_directory: platform.service.store.data_directory(id).unwrap(),
+            handler: "action:run".into(),
+            operation_id: "queued".into(),
+            input: Value::Null,
+            caller: json!({"kind":"client"}),
+            context: None,
+            capabilities: before.grants.capabilities.clone(),
+        };
+        let queued = futures_util::future::join_all((0..8).map(|index| {
+            let mut input = input.clone();
+            input.operation_id = format!("queued-{index}");
+            platform
+                .supervisor
+                .invoke(input, host.clone(), RuntimeCancellation::default())
+        }));
+        tokio::pin!(queued);
+        // Poll every admission once, filling all running-plus-queued permits.
+        assert!(futures_util::poll!(&mut queued).is_pending());
+        assert_eq!(
+            platform
+                .supervisor
+                .invoke(input, host, RuntimeCancellation::default())
+                .await
+                .unwrap_err()
+                .reason,
+            "busy"
+        );
+        let drain = drain_events(app.handle(), &platform);
+        tokio::pin!(drain);
+        if exhaust_retries {
+            tokio::time::timeout(Duration::from_secs(4), &mut drain)
+                .await
+                .unwrap();
+        } else {
+            assert!(tokio::time::timeout(Duration::from_millis(100), &mut drain)
+                .await
+                .is_err());
+        }
+        // Neither local retry nor exhaustion requires a durable recovery decision.
+        let persisted = PlatformService::open(platform.service.store.root().into());
+        let held = persisted.store.read(id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&held).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        release.add_permits(8);
+        let resume = async {
+            if exhaust_retries {
+                // The next automatic sweep uses the same retained delivery.
+                drain_events(app.handle(), &platform).await;
+            } else {
+                drain.await;
+            }
+        };
+        let (results, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(queued, resume)
+        })
+        .await
+        .unwrap();
+        assert!(results.into_iter().all(|result| result.is_ok()));
+        let delivered = platform.service.store.read(id).unwrap();
+        assert!(delivered.delivery_error.is_none());
+        assert!(!delivered.event_backlog_choice_required);
+        assert_eq!(delivered.storage.get("observed"), Some(&json!(1)));
+        assert_eq!(delivered.acknowledged_deliveries.len(), 1);
+        assert!(delivered.event_cursor > before.event_cursor);
+        drain_events(app.handle(), &platform).await;
+        assert_eq!(
+            platform
+                .service
+                .store
+                .read(id)
+                .unwrap()
+                .storage
+                .get("observed"),
+            Some(&json!(1))
+        );
+        app.state::<PluginPlatformState>().shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn platform_transport_executed_event_errors_still_pause_without_automatic_retry() {
+    for failure in [
+        "throw new Error('busy: Plugin invocation queue is full');",
+        "while(true){}",
+    ] {
+        let body = format!("export function activate(ctx){{ctx.events.onRunFinalized(async()=>{{await ctx.storage.set('attempts',((await ctx.storage.get('attempts'))??0)+1);{failure}}});}}");
+        let (app, _root, active, project) =
+            event_fixture("failed-observer", &body, Duration::from_secs(1)).await;
+        let platform = app
+            .state::<PluginPlatformState>()
+            .get(app.handle())
+            .unwrap();
+        let id = active["installationId"].as_str().unwrap();
+        commit_event(&app, &platform, &project);
+        let before = platform.service.store.read(id).unwrap();
+        drain_events(app.handle(), &platform).await;
+        let paused = platform.service.store.read(id).unwrap();
+        assert!(paused.event_backlog_choice_required);
+        assert!(paused
+            .delivery_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with(if failure.starts_with("throw") {
+                "operation_failed:"
+            } else {
+                "timeout:"
+            })));
+        assert_eq!(paused.event_cursor, before.event_cursor);
+        assert!(paused.acknowledged_deliveries.is_empty());
+        assert_eq!(paused.storage.get("attempts"), Some(&json!(1)));
+        drain_events(app.handle(), &platform).await;
+        assert_eq!(
+            platform
+                .service
+                .store
+                .read(id)
+                .unwrap()
+                .storage
+                .get("attempts"),
+            Some(&json!(1))
+        );
+        app.state::<PluginPlatformState>().shutdown().await;
+    }
 }
 
 #[tokio::test]

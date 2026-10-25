@@ -405,6 +405,108 @@ async fn platform_committed_events_replay_same_identity_after_restart_until_ack_
 }
 
 #[tokio::test]
+async fn platform_fork_event_recovery_skips_copied_history_and_keeps_new_completions_across_restart(
+) {
+    for initialized in [false, true] {
+        let (app, root, workspace, project) = fixture();
+        let platform_root = root.path().join("platform");
+        let service = PlatformService::open(platform_root.clone());
+        let record = install(&service, "sample", vec![project.clone()]);
+        let db = app.state::<DatabaseStore>();
+        db.upsert_agent_chat_session("source", &workspace, None, "claude")
+            .unwrap();
+        // More than one recovery page of copied, effect-eligible human runs.
+        for run in 0..23 {
+            db.control_append_user_message("source", &json!({"type":"user_message","text":"human work","message_id":format!("human-{run}"),"client_nonce":format!("human-{run}")}).to_string(), &format!("old-{run}"), false).unwrap();
+            db.append_agent_chat_message("source", &json!({"type":"turn_completed","thread_id":"source","turn_id":format!("old-{run}"),"status":{"kind":"success"}}).to_string()).unwrap();
+        }
+        db.create_agent_chat_fork(&crate::database::chat_fork::NewChatFork {
+            thread_id: "fork",
+            source: &db.get_agent_chat_session("source").unwrap(),
+            sdk_session_id: "native-fork",
+            workspace_id: &workspace,
+            cwd: root.path().to_str().unwrap(),
+            title: "Fork",
+            cut_before: None,
+            image_dirs: None,
+        })
+        .unwrap();
+        let boundary = db
+            .agent_chat_fork_origin("fork")
+            .unwrap()
+            .boundary_message_id
+            .unwrap();
+        if initialized {
+            assert_eq!(
+                service
+                    .events
+                    .recover_thread(&db, &project, "fork")
+                    .unwrap(),
+                0
+            );
+            assert!(service
+                .events
+                .next(&record, &caller(&record))
+                .unwrap()
+                .is_none());
+            let journal = rusqlite::Connection::open(platform_root.join("events.sqlite")).unwrap();
+            assert_eq!(
+                journal
+                    .query_row(
+                        "SELECT row_id FROM captured WHERE thread_id='fork'",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                boundary
+            );
+            // An existing cursor below the copied boundary must also be clamped.
+            journal
+                .execute("UPDATE captured SET row_id=0 WHERE thread_id='fork'", [])
+                .unwrap();
+        }
+        db.control_append_user_message("fork", &json!({"type":"user_message","text":"new human work","message_id":"new-human","client_nonce":"new-human"}).to_string(), "new-run", false).unwrap();
+        db.append_agent_chat_message("fork", &json!({"type":"turn_completed","thread_id":"fork","turn_id":"new-run","status":{"kind":"success"}}).to_string()).unwrap();
+        drop(service);
+        let service = PlatformService::open(platform_root);
+        assert_eq!(
+            service
+                .events
+                .recover_thread(&db, &project, "fork")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            service
+                .events
+                .recover_thread(&db, &project, "fork")
+                .unwrap(),
+            0
+        );
+        let owner = caller(&record);
+        let event = service.events.next(&record, &owner).unwrap().unwrap();
+        assert_eq!(event.thread_id, "fork");
+        assert_eq!(event.run_id, "new-run");
+        assert!(event.effects_allowed);
+        assert_eq!(service.events.backlog(&record).unwrap()["count"], 1);
+        service
+            .dispatch(
+                app.handle(),
+                &owner,
+                "events.ack",
+                json!({"deliveryId":event.delivery_id}),
+            )
+            .await
+            .unwrap();
+        assert!(service
+            .events
+            .next(&service.store.read("sample").unwrap(), &owner)
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
 async fn platform_send_retries_across_generation_and_restart_recover_core_receipt_and_reject_changed_inputs(
 ) {
     let (app, root, workspace, project) = fixture();

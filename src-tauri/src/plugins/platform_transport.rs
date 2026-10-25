@@ -329,6 +329,12 @@ impl PluginPlatform {
             review.manifest.clone(),
             digest,
         )?;
+        // Registration can require a new backlog choice for a changed digest. Keep
+        // the reviewed decision while the durable transition hold still blocks code.
+        let latest = self.service.events.latest()?;
+        self.service
+            .store
+            .update(id, |record| apply_recovery(record, params, latest))?;
         self.service.consent_pending(id, digest, grants)?;
         if let Some(restore) = restore {
             self.service.store.update(id, |record| {
@@ -1736,7 +1742,9 @@ async fn drain_installation<R: Runtime>(
     platform: &Arc<PluginPlatform>,
     id: String,
 ) {
-    for delivered in 0..16 {
+    let mut delivered = 0;
+    let mut busy_retries = 0;
+    while delivered < 16 {
         if execution_disabled(app)
             || app
                 .state::<PluginPlatformState>()
@@ -1822,6 +1830,7 @@ async fn drain_installation<R: Runtime>(
             .await
         {
             Ok(_) => {
+                busy_retries = 0;
                 let delivery_owner = owner.for_delivery(event.delivery_id.clone());
                 if let Err(error) = platform
                     .service
@@ -1840,9 +1849,20 @@ async fn drain_installation<R: Runtime>(
                     changed(app, &id);
                     break;
                 }
-                if delivered == 15 {
+                delivered += 1;
+                if delivered == 16 {
                     app.state::<PluginPlatformState>().wake.notify_one();
                 }
+            }
+            // Only this supervisor admission error proves the handler never ran.
+            // Handler/host failures use operation_failed even if their text says busy.
+            Err(error) if error == "busy: Plugin invocation queue is full" => {
+                if busy_retries == 5 {
+                    // The periodic sweep will retry the unchanged durable cursor.
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50 << busy_retries)).await;
+                busy_retries += 1;
             }
             Err(error) => {
                 let _ = platform

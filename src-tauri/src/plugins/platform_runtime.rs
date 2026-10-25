@@ -23,7 +23,7 @@ use tokio::{
 };
 
 const MAX_MESSAGE: usize = 1_048_576;
-const MAX_MESSAGES: usize = 10_000;
+const MAX_MESSAGES_PER_INVOCATION: usize = 10_000;
 const MAX_HOST_CALLS: usize = 4096;
 pub const PLUGIN_HOST_PATH_ENV: &str = "CODEMUX_PLUGIN_HOST_PATH";
 
@@ -497,19 +497,15 @@ impl WorkerProcess {
         let (sender, messages) = mpsc::channel(32);
         let reader = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
-            for _ in 0..MAX_MESSAGES {
+            // Backpressure bounds idle/background output. Invocation budgets belong to the
+            // consumer so retaining a healthy worker does not exhaust a lifetime allowance.
+            loop {
                 let message = read_message(&mut reader).await;
                 let failed = message.is_err();
                 if sender.send(message).await.is_err() || failed {
                     return;
                 }
             }
-            let _ = sender
-                .send(Err(PluginRuntimeError::new(
-                    "invalid_result",
-                    "Plugin IPC message budget exceeded",
-                )))
-                .await;
         });
         // Drain rather than accumulate; a chatty stderr cannot hold a pipe or allocate host memory.
         let stderr = tokio::spawn(async move {
@@ -602,6 +598,7 @@ impl WorkerProcess {
         self.send(json!({"type":"invoke","invocationId":invocation_id,"operationId":input.operation_id,"handler":input.handler,"input":input.input,"caller":input.caller,"context":input.context})).await?;
         let mut calls = HashSet::new();
         let mut logs = 0;
+        let mut messages = 0;
         type HostResponse = Pin<Box<dyn Future<Output = (String, Result<Value>)> + Send>>;
         let mut pending: FuturesUnordered<HostResponse> = FuturesUnordered::new();
         loop {
@@ -618,6 +615,13 @@ impl WorkerProcess {
                     self.send(response).await?;continue;
                 }
             };
+            messages += 1;
+            if messages > MAX_MESSAGES_PER_INVOCATION {
+                return Err(PluginRuntimeError::new(
+                    "invalid_result",
+                    "Plugin invocation IPC message budget exceeded",
+                ));
+            }
             let kind = message.get("type").and_then(Value::as_str);
             if kind == Some("log") && valid_log(&message) && logs < 100 {
                 logs += 1;
@@ -1009,6 +1013,8 @@ mod tests {
         std::fs::write(&entry,r#"import {writeSync} from 'node:fs'; import {spawn} from 'node:child_process';
 export function activate(ctx){let denied=false;ctx.storage.get('activation').catch(()=>denied=true);
 ctx.handle('action:echo',async(input,i)=>({data:{input,denied,caller:i.caller,operationId:i.operationId,value:await ctx.storage.get('key')}}));
+ctx.handle('action:traffic',async input=>{for(let n=0;n<input.count;n++)await ctx.storage.get('traffic');return {data:{pid:process.pid}};});
+ctx.handle('action:log-flood',input=>{const line=JSON.stringify({type:'log',level:'info',message:'flood'})+'\n';for(let n=0;n<input.count;n++)writeSync(1,line);return {};});
 ctx.handle('action:spin',async()=>{await ctx.storage.get('entered');while(true){}});
 ctx.handle('action:forget',()=>{void ctx.storage.get('forgotten');return {message:'done'};});
 ctx.handle('action:descendant',async()=>{const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});await ctx.storage.set('descendant',child.pid);while(true){}});
@@ -1063,6 +1069,74 @@ ctx.handle('action:malformed',()=>{writeSync(1,'invalid\n');return {}});}"#).unw
         assert_eq!(output["data"]["operationId"], "operation");
         assert_eq!(output["data"]["value"], "host-value");
         assert_eq!(output["data"]["denied"], true);
+        supervisor.shutdown().await;
+    }
+    #[tokio::test]
+    async fn retained_worker_stays_healthy_beyond_ten_thousand_lifetime_frames() {
+        let (_temp, mut config, mut input) = fixture();
+        config.invocation_timeout = Duration::from_secs(20);
+        let supervisor = PluginSupervisor::new(config);
+        input.handler = "action:traffic".into();
+        input.input = json!({"count": MAX_HOST_CALLS});
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback: PluginHostCallback = {
+            let calls = calls.clone();
+            let host = host();
+            Arc::new(move |call| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                host(call)
+            })
+        };
+        let mut pids = HashSet::new();
+        // Three valid invocations emit 12,291 frames, excluding startup and host replies.
+        for _ in 0..3 {
+            let output = supervisor
+                .invoke(
+                    input.clone(),
+                    callback.clone(),
+                    RuntimeCancellation::default(),
+                )
+                .await
+                .unwrap();
+            pids.insert(output["data"]["pid"].as_u64().unwrap());
+        }
+        assert_eq!(
+            pids.len(),
+            1,
+            "Healthy invocations must retain the same worker"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3 * MAX_HOST_CALLS);
+        let slot = supervisor.slot(&input).unwrap();
+        assert_eq!(slot.failures.load(Ordering::SeqCst), 0);
+        input.handler = "action:echo".into();
+        assert!(supervisor
+            .invoke(input, host(), RuntimeCancellation::default())
+            .await
+            .is_ok());
+        supervisor.shutdown().await;
+    }
+    #[tokio::test]
+    async fn single_invocation_stdout_flood_is_rejected_and_worker_is_reaped() {
+        let (_temp, config, mut input) = fixture();
+        let supervisor = PluginSupervisor::new(config);
+        input.handler = "action:log-flood".into();
+        input.input = json!({"count": MAX_MESSAGES_PER_INVOCATION + 1});
+        assert_eq!(
+            supervisor
+                .invoke(input.clone(), host(), RuntimeCancellation::default())
+                .await
+                .unwrap_err()
+                .reason,
+            "invalid_result"
+        );
+        let slot = supervisor.slot(&input).unwrap();
+        assert_eq!(slot.failures.load(Ordering::SeqCst), 1);
+        assert!(slot.process.lock().await.is_none());
+        input.handler = "action:echo".into();
+        assert!(supervisor
+            .invoke(input, host(), RuntimeCancellation::default())
+            .await
+            .is_ok());
         supervisor.shutdown().await;
     }
     #[tokio::test]

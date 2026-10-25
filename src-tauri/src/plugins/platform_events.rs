@@ -104,7 +104,7 @@ impl PlatformEvents {
     ) -> Result<usize, String> {
         let _gate = self.gate.lock().map_err(|_| "Plugin event lock failed")?;
         let mut connection = self.connection()?;
-        let cursor: i64 = connection
+        let captured_cursor: i64 = connection
             .query_row(
                 "SELECT row_id FROM captured WHERE thread_id=?1",
                 params![thread],
@@ -113,6 +113,13 @@ impl PlatformEvents {
             .optional()
             .map_err(|e| e.to_string())?
             .unwrap_or(0);
+        // A fork's copied transcript is historical even when this journal has never
+        // seen the thread. Recheck its boundary on every sweep, including stale cursors.
+        let cursor = captured_cursor.max(
+            db.agent_chat_fork_origin(thread)
+                .and_then(|origin| origin.boundary_message_id)
+                .unwrap_or(0),
+        );
         let mut before = i64::MAX;
         let mut through = cursor;
         let mut finalized = Vec::new();
@@ -190,7 +197,7 @@ impl PlatformEvents {
             let delivery = super::platform_store::digest(&json!([thread, run]));
             count+=tx.execute("INSERT OR IGNORE INTO finalized(delivery_id,thread_id,project_id,run_id,outcome,summary) VALUES(?1,?2,?3,?4,?5,?6)",params![format!("run-{delivery}"),thread,project,run,outcome,format!("Run {outcome} (committed history row {row}).")]).map_err(|e|e.to_string())?;
         }
-        if through > cursor {
+        if through > captured_cursor {
             tx.execute("INSERT INTO captured(thread_id,row_id) VALUES(?1,?2) ON CONFLICT(thread_id) DO UPDATE SET row_id=MAX(row_id,excluded.row_id)",params![thread,through]).map_err(|e|e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
