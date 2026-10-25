@@ -24,6 +24,10 @@ pub async fn execute<R: tauri::Runtime>(
 ) -> Result<serde_json::Value, ControlError> {
     use tauri::Manager;
     service::authorize(app, caller)?;
+    if matches!(tool,"plugin_list"|"plugin_invoke") {
+        return crate::plugins::platform_transport::agent_request(app,caller.clone(),tool,args).await
+            .map_err(|error|ControlError::new("plugin_operation_failed",error));
+    }
     match tool {
         "thread_launch" => return service::launch(app, caller, args).await,
         "operation_status" => return service::operation_status(app, caller, args),

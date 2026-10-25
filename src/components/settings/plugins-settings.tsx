@@ -28,6 +28,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { useContributions } from "@/contrib/react/use-contributions";
 import { ContribBoundary, ContribRender } from "@/contrib/react/boundary";
 import { SETTINGS_PAGES_AREA } from "@/sdk/areas";
+import { PlatformPluginsSection } from "@/components/plugins/PlatformPluginsSettings";
 
 const TIER_LABEL: Record<PluginTier, string> = {
   official: "Official",
@@ -323,6 +324,7 @@ export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId
         </div>
       )}
       {!disabledByEnv && <PluginCatalog onInstall={installer.installFrom} />}
+      <PlatformPluginsSection />
       {installer.dialog}
       {confirmDialog}
     </div>

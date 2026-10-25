@@ -64,6 +64,8 @@ import { StreamingMarker } from "./StreamingMarker";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { SignInNotice } from "./SignInNotice";
 import { HtmlRenderFrame } from "./HtmlRenderFrame";
+import { pluginCardFromToolItem } from "@/components/plugins/cards";
+import { PluginConversationCard } from "@/components/plugins/PluginConversationCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { TurnChangesChip } from "./TurnChangesChip";
 import { TurnDiffDialog } from "./TurnDiffDialog";
@@ -2095,10 +2097,13 @@ function renderAssistantBody(
           </ContribBoundary>
         );
       }
+      const pluginCard = pluginCardFromToolItem(item);
       return isTaskSummaryTool(item) ? (
         <TaskSummaryCard item={item} workspaceId={handlers.workspaceId} />
       ) : isInlineHtmlRender(item) ? (
         <HtmlRenderFrame item={item} />
+      ) : pluginCard ? (
+        <PluginConversationCard card={pluginCard} workspaceId={handlers.workspaceId ?? null} />
       ) : (
         <ToolCallCard
           item={item}

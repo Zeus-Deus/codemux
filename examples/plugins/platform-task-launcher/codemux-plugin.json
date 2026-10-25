@@ -1,0 +1,58 @@
+{
+  "id": "examples.platform-task-launcher",
+  "name": "Task Launcher",
+  "description": "Agents propose immutable task plans. People review and start independent threads.",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "entry": "plugin.mjs",
+  "capabilities": [
+    "storage",
+    "threads.read",
+    "workflow.query",
+    "threads.create",
+    "ui",
+    "ui.conversation-cards",
+    "ui.changes"
+  ],
+  "optionalCapabilities": [
+    "worktrees.create"
+  ],
+  "actions": [
+    {
+      "id": "propose",
+      "title": "Propose tasks",
+      "description": "Propose up to six tasks from your verified current thread. A person reviews each task before starting it.",
+      "placements": [],
+      "agentCallable": true
+    },
+    {
+      "id": "open",
+      "title": "Open task launcher",
+      "placements": [
+        "thread-menu"
+      ]
+    }
+  ],
+  "views": [
+    {
+      "id": "launcher",
+      "title": "Task proposal",
+      "entry": "view.html",
+      "placement": "conversation"
+    },
+    {
+      "id": "tasks",
+      "title": "Tasks",
+      "entry": "view.html",
+      "placement": "side-panel"
+    }
+  ],
+  "threadStatus": [
+    {
+      "id": "tasks",
+      "title": "Tasks",
+      "viewId": "tasks"
+    }
+  ],
+  "settings": []
+}

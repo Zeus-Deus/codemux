@@ -368,7 +368,11 @@ async fn mcp<R: Runtime>(
                 // before each mutation and after any admission await.
                 match agent_control::execute(app, caller, name, arguments).await {
                     Ok(value) => {
-                        json!({"isError":false,"content":[{"type":"text","text":value.to_string()}],"structuredContent":if value.is_object() { value } else { json!({"result":value}) }})
+                        if name=="plugin_invoke" {
+                            crate::plugins::platform_transport::mcp_result(value)
+                        }else{
+                            json!({"isError":false,"content":[{"type":"text","text":value.to_string()}],"structuredContent":if value.is_object() { value } else { json!({"result":value}) }})
+                        }
                     }
                     Err(error) => tool_error(error.code, &error.message),
                 }

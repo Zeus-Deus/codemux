@@ -20,6 +20,7 @@ import { ChatMarkdownPassiveContext } from "./chat-markdown-passive";
 import { RemoteTaskContext, type RemoteTaskScope } from "./remote-task-context";
 import { ChatProviderContext } from "./chat-provider-context";
 import { ChatForkContext } from "./ChatFork";
+import { PluginTranscriptThreadContext } from "@/components/plugins/PluginConversationCard";
 import type { SendAnchorRequest } from "./send-scroll-state";
 
 interface Props {
@@ -171,6 +172,7 @@ export const ChatTranscript = memo(function ChatTranscript({
       <AsyncQuestionThreadContext.Provider value={passive ? null : (threadKey ?? null)}>
       <ChatProviderContext.Provider value={provider ?? null}>
       <ChatForkContext.Provider value={chatFork}>
+      <PluginTranscriptThreadContext.Provider value={threadKey ?? null}>
       <MessageList
         messages={messages}
         showThinking={showThinking}
@@ -202,6 +204,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         cwd={cwd}
         onReadingBackChange={onReadingBackChange}
       />
+      </PluginTranscriptThreadContext.Provider>
       </ChatForkContext.Provider>
       </ChatProviderContext.Provider>
       </AsyncQuestionThreadContext.Provider>

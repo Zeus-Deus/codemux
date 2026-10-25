@@ -1,0 +1,14 @@
+{
+  "id": "examples.platform-workflow-board", "name": "Workflow Board", "version": "1.0.0",
+  "description": "Durable committed-run observations, saved notes, and optional completion reviews.",
+  "apiVersion": 1, "entry": "plugin.mjs",
+  "capabilities": ["ui", "storage", "settings", "threads.read", "events.run-finalized"],
+  "optionalCapabilities": ["threads.send", "ui.changes"],
+  "actions": [
+    {"id":"open-board","title":"Open workflow board","placements":["palette","thread-menu"]},
+    {"id":"save-selection","title":"Save selection to workflow board","placements":["message-selection"]}
+  ],
+  "views": [{"id":"board","title":"Workflow Board","entry":"view.html","placement":"page"}],
+  "settings": [{"key":"autoFollowup","label":"Request a completion review automatically","type":"boolean","default":false,
+    "description":"Requires threads.send grant and verified run provenance. Plugin-originated turns are excluded by the host."}]
+}

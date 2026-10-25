@@ -1,0 +1,27 @@
+{
+  "name": "@codemux/plugin-sdk",
+  "version": "1.0.0",
+  "description": "Dependency-free author API for Codemux isolated v1 plugins",
+  "license": "Elastic-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE.md",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs"
+  },
+  "types": "./dist/index.d.ts",
+  "main": "./dist/index.js"
+}

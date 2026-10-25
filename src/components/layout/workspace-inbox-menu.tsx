@@ -10,6 +10,7 @@ import {
 import { ConfirmPushDialog } from "@/components/overlays/confirm-push-dialog";
 import { ProjectImageDialog } from "@/components/overlays/project-image-dialog";
 import { ProjectAppearanceMenu } from "./project-appearance-menu";
+import { PluginThreadMenuItems } from "@/components/plugins/PluginActionMenus";
 import { useProjectAppearance } from "./use-project-appearance";
 import { WorkspaceMenuOpenContext } from "./workspace-menu-open-context";
 import { useProjectAppearanceStore } from "@/stores/project-appearance-store";
@@ -177,6 +178,7 @@ export function WorkspaceInboxMenu({
                   onRequestImageDialog={() => setShowImageDialog(true)}
                 />
               }
+              pluginMenu={<PluginThreadMenuItems workspace={workspace} />}
               onArchiveRequest={() => void handleArchiveOrClose()}
               onDeleteRequest={() => setShowDeleteDialog(true)}
               onRequestPushConfirm={(host) => setPendingPushHost(host)}

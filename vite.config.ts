@@ -21,6 +21,9 @@ export default defineConfig({
       "sidecar/**",
       // Author CLI suites use node:test and run from build-examples.sh.
       "packages/plugin-cli/tests/**",
+      // Isolated plugin author suites exercise real Node/Bun subprocesses.
+      "packages/plugin-sdk/test/**",
+      "examples/plugins/platform-*/test/**",
       // Agent worktrees carry stale full copies of the repo; without this
       // exclude Vitest crawls in and runs every copy's suite too.
       "**/.claude/**",

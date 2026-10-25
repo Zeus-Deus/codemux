@@ -149,12 +149,20 @@ export function buildProjectsModel(input: {
   /** Project paths that must stay in the main list (a workspace is being
    *  created there). */
   forcePaths?: ReadonlySet<string>;
+  /** How long a project with nothing live stays in the main list; null keeps
+   *  every project there. Defaults to `RECENT_PROJECT_MS`. A plugin's
+   *  declared sidebar view sets it. */
+  quietAfterMs?: number | null;
+  /** Projects with no workspaces that still get a heading (a declared view
+   *  that shows empty projects). Ones already grouped are ignored. */
+  emptyProjects?: readonly { name: string; path: string }[];
   now: number;
 }): ProjectsModel {
   const { projectGroups, homeDir, storedIndex, parkedIds, filter, now } = input;
   const liveOverride = input.liveOverride ?? new Set<string>();
   const parkedAt = input.parkedAt ?? new Map<string, number>();
   const forcePaths = input.forcePaths ?? new Set<string>();
+  const quietAfterMs = input.quietAfterMs === undefined ? RECENT_PROJECT_MS : input.quietAfterMs;
   const newestFirst = (a: WorkspaceSnapshot, b: WorkspaceSnapshot) =>
     (storedIndex.get(b.workspace_id) ?? 0) -
     (storedIndex.get(a.workspace_id) ?? 0);
@@ -215,8 +223,18 @@ export function buildProjectsModel(input: {
       s.rows.length > 0 ||
       holdsActive(s) ||
       forcePaths.has(s.path) ||
-      (s.lastActiveAt !== null && now - s.lastActiveAt < RECENT_PROJECT_MS);
+      quietAfterMs === null ||
+      (s.lastActiveAt !== null && now - s.lastActiveAt < quietAfterMs);
     (shown ? projects : quietProjects).push(s);
+  }
+  if (filter === null) {
+    const grouped = new Set(projectGroups.map((group) => group.projectPath));
+    for (const empty of input.emptyProjects ?? []) {
+      if (grouped.has(empty.path) || empty.path === homeDir) continue;
+      const s = section(empty.name, empty.path, []);
+      // Nothing dates an empty project, so only a view that never folds keeps it up.
+      (quietAfterMs === null || forcePaths.has(s.path) ? projects : quietProjects).push(s);
+    }
   }
 
   let chats: ProjectsSection | null = null;

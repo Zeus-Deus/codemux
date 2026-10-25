@@ -127,6 +127,7 @@ import { computeSnoozePresets } from "./sidebar-snooze";
 import { getTimeFormat } from "@/stores/settings-store";
 import { useUIStore } from "@/stores/ui-store";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { PluginThreadMenuItems } from "@/components/plugins/PluginActionMenus";
 
 /** Attach-in-place and remote (pushed-to-host) workspaces can't be
  *  archived — the backend refuses — so their removal affordance is the
@@ -481,6 +482,7 @@ export function WorkspaceContextMenuItems({
   snoozeAction,
   unreadAction,
   projectMenu,
+  pluginMenu,
   onArchiveRequest,
   onDeleteRequest,
   onRequestPushConfirm,
@@ -501,6 +503,9 @@ export function WorkspaceContextMenuItems({
    *  here so this module stays workspace-scoped and free of project-appearance
    *  concerns. */
   projectMenu?: React.ReactNode;
+  /** Optional plugin actions for the workspace's chat, as a slot for the
+   *  same reason. Renders nothing while no plugin offers one. */
+  pluginMenu?: React.ReactNode;
   /** Remove the row non-destructively. For local workspaces this
    *  archives (restorable from Settings → Archive); for attach-in-place
    *  and remote (host-backed) workspaces — which the backend refuses to
@@ -921,6 +926,8 @@ export function WorkspaceContextMenuItems({
           }}
         />
       )}
+
+      {pluginMenu}
 
       <ContextMenuSeparator className={MENU_SEPARATOR} />
       <ContextMenuItem className={MENU_ROW} onClick={onArchiveRequest}>
@@ -1687,6 +1694,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
         {contextMenuOpen && (
           <WorkspaceContextMenuItems
             workspace={workspace}
+            pluginMenu={<PluginThreadMenuItems workspace={workspace} />}
             onArchiveRequest={() => void handleArchiveOrClose()}
             onDeleteRequest={() => setShowDeleteDialog(true)}
             onRequestPushConfirm={(host) => setPendingPushHost(host)}

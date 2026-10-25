@@ -163,6 +163,14 @@ jobs:
           bun run typecheck
           bun test
 
+      - name: Plugin host worker tests
+        run: node --test sidecar/plugin-host/worker.test.mjs
+
+      - name: Plugin SDK typecheck and executable examples
+        run: |
+          npm run check:plugin-sdk
+          npm run test:plugin-sdk
+
       - name: Hermes managed library boundary tests
         if: matrix.os == 'ubuntu-latest'
         shell: bash
@@ -397,6 +405,15 @@ jobs:
       - name: Stage managed workflow sidecar
         shell: bash
         run: bash scripts/build-managed-workflow-sidecar.sh --strict
+
+      - name: Build and verify bundled plugin host
+        shell: bash
+        run: |
+          bash scripts/build-plugin-host.sh --strict
+          TARGET="$(rustc -vV | awk '/^host:/ {print $2}')"
+          case "$TARGET" in *windows*) SUFFIX=.exe ;; *) SUFFIX= ;; esac
+          CODEMUX_PLUGIN_HOST_TEST_BINARY="./src-tauri/binaries/codemux-plugin-host-$TARGET$SUFFIX" node --test sidecar/plugin-host/worker.test.mjs
+          CODEMUX_PLUGIN_HOST_TEST_BINARY="./src-tauri/binaries/codemux-plugin-host-$TARGET$SUFFIX" npm run test:plugin-sdk
 
       - name: Managed workflow bundled native readiness
         if: runner.os == 'Linux'
