@@ -31,17 +31,22 @@ const INSTALLATION: &str = "native-acceptance";
 const SOURCE: &str = "acceptance-source";
 const MODEL: &str = "fixture-model";
 
-/// HOME controls core worktree placement; layout emits and legacy preset migration
-/// also need isolation. Change these only on a new process, never in parallel tests.
+/// Worktree placement and layout emits use test-only path overrides, including on
+/// Windows where Known Folders ignore HOME. Set paths only on a new process.
 fn isolated(name: &str) -> bool {
     if let Some(root) = std::env::var_os("CODEMUX_PLATFORM_ACCEPTANCE_ROOT") {
-        assert_eq!(dirs::home_dir().unwrap(), Path::new(&root));
+        assert_eq!(
+            Path::new(&std::env::var_os("CODEMUX_TEST_WORKTREE_HOME").unwrap()),
+            Path::new(&root)
+        );
         assert!(
             Path::new(&std::env::var_os("CODEMUX_TEST_LAYOUT_PATH").unwrap()).starts_with(&root)
         );
         return false;
     }
     let root = tempfile::tempdir().unwrap();
+    let profile = root.path().join("profile");
+    std::fs::create_dir(&profile).unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .current_dir(root.path())
@@ -52,12 +57,17 @@ fn isolated(name: &str) -> bool {
         ])
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", root.path())
-        .env("USERPROFILE", root.path())
+        // Keep HOME different so Unix runs exercise the explicit override too.
+        .env("HOME", &profile)
+        .env("USERPROFILE", &profile)
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .env("XDG_DATA_HOME", root.path().join("data"))
         .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .env("TMPDIR", root.path())
+        .env("TEMP", root.path())
+        .env("TMP", root.path())
         .env("CODEMUX_PLATFORM_ACCEPTANCE_ROOT", root.path())
+        .env("CODEMUX_TEST_WORKTREE_HOME", root.path())
         .env("CODEMUX_TEST_LAYOUT_PATH", root.path().join("layout.json"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", root.path().join("gitconfig"))
@@ -68,6 +78,12 @@ fn isolated(name: &str) -> bool {
         .env("GIT_COMMITTER_EMAIL", "acceptance@example.invalid");
     if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") {
         command.env("LD_LIBRARY_PATH", path);
+    }
+    #[cfg(windows)]
+    for key in ["SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
     }
     let output = command.output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -168,6 +184,18 @@ impl Fixture {
             .unwrap()
             .insert(ProviderKind::Claude, caps);
         app.manage(PtyState::default());
+        // Seed SQLite before loading so a Windows Known Folder cannot trigger
+        // migration (and deletion) of the user's legacy preset file.
+        crate::presets::save_presets(
+            &app.state::<DatabaseStore>(),
+            &crate::presets::PresetStore {
+                schema_version: 2,
+                presets: Vec::new(),
+                default_preset_id: None,
+                bar_visible: true,
+            },
+        )
+        .unwrap();
         app.manage(PresetStoreState::new(&app.state::<DatabaseStore>()));
         let platform = PlatformService::open(root.path().join("platform"));
         platform
@@ -303,7 +331,9 @@ impl Fixture {
 
     fn worktree_path(&self, branch: &str) -> std::path::PathBuf {
         let path = crate::git::conventional_worktree_path(self.root.path(), branch).unwrap();
-        assert!(path.starts_with(std::env::var_os("CODEMUX_PLATFORM_ACCEPTANCE_ROOT").unwrap()));
+        let root =
+            std::path::PathBuf::from(std::env::var_os("CODEMUX_PLATFORM_ACCEPTANCE_ROOT").unwrap());
+        assert!(path.starts_with(root.join(".codemux").join("worktrees")));
         path
     }
 

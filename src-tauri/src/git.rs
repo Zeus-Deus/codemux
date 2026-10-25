@@ -2773,7 +2773,13 @@ pub fn conventional_worktree_path(repo_path: &Path, branch: &str) -> Option<Path
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
     let sanitized_branch = sanitize_branch_for_worktree_path(branch);
-    let home = dirs::home_dir()
+    let home = dirs::home_dir();
+    // Subprocess fixtures cannot redirect Windows Known Folders through HOME.
+    #[cfg(test)]
+    let home = std::env::var_os("CODEMUX_TEST_WORKTREE_HOME")
+        .map(PathBuf::from)
+        .or(home);
+    let home = home
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
     Some(
