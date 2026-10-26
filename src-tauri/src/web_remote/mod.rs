@@ -189,13 +189,8 @@ struct UpdateAvailability {
 }
 
 /// A running server instance. Sending `true` on `shutdown` unbinds every
-/// listener it owns (one per bound address). `port` and `scope` are kept for
-/// diagnostics / introspection.
+/// listener it owns (one per bound address).
 pub(crate) struct RunningServer {
-    #[allow(dead_code)]
-    port: u16,
-    #[allow(dead_code)]
-    scope: String,
     /// Flips to `true` to trigger graceful shutdown on all listeners.
     shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -1050,8 +1045,6 @@ async fn bind_listeners<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) ->
             return Err("the LAN listener was turned off".to_string());
         }
         *shared.runtime.lock().unwrap() = Some(RunningServer {
-            port,
-            scope,
             shutdown: shutdown_tx,
         });
     }

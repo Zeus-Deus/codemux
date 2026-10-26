@@ -82,10 +82,8 @@ import {
   type ProjectsSection,
 } from "./sidebar-projects-model";
 
-/** Start a chat in a project — the same path the old project group's `+`
- *  took (`SidebarProjectGroup.handlePlusClick`) and Ctrl+Shift+N takes: a
- *  lazy project draft when agent chat is on, otherwise (or with Shift) the
- *  New Workspace dialog. */
+/** Start a chat in a project, matching Ctrl+Shift+N: a lazy project draft
+ *  when agent chat is on, otherwise (or with Shift) the New Workspace dialog. */
 async function newChatInProject(projectPath: string, shiftKey: boolean) {
   const ui = useUIStore.getState();
   const flags = useFeatureFlags.getState();

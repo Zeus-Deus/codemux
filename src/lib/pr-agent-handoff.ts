@@ -29,8 +29,6 @@ import { toast } from "@/lib/toast";
 
 // ── Task shapes ───────────────────────────────────────────────────────
 
-export type HandoffKind = "failing-check" | "review-thread" | "conflicts";
-
 /** The failing check, plus whatever of its log we already had. */
 export interface FailingCheckTask {
   kind: "failing-check";

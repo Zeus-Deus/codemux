@@ -71,10 +71,6 @@ pub struct CodexSubagentDemux {
     async_message_ids: HashSet<String>,
     /// Every thread id known to be a sub-agent of this session.
     subagents: HashSet<String>,
-    /// child thread id → the thread that spawned it (parent thread or a
-    /// higher sub-agent). Retained for diagnostics / future nested UI.
-    #[allow(dead_code)]
-    child_to_parent: HashMap<String, String>,
     /// Context-window accounting for the parent thread. Per-session and
     /// mutated across messages, exactly like the sub-agent maps, so it
     /// rides the `&mut` the translator already receives.
@@ -221,7 +217,6 @@ impl CodexSubagentDemux {
             parent_thread_id: parent_thread_id.into(),
             async_message_ids: HashSet::new(),
             subagents: HashSet::new(),
-            child_to_parent: HashMap::new(),
             context: ContextUsageTracker::default(),
             usage_totals: HashMap::new(),
             pending_baseline: None,
@@ -265,13 +260,11 @@ impl CodexSubagentDemux {
     /// session: every later parent item is routed as a child transcript
     /// and the parent's `turn/completed` becomes a `SubagentUpdated`
     /// instead of a `TurnCompleted`, so the run never settles.
-    fn register(&mut self, child: &str, parent: &str) {
+    fn register(&mut self, child: &str, _parent: &str) {
         if child.is_empty() || child == self.parent_thread_id {
             return;
         }
         self.subagents.insert(child.to_string());
-        self.child_to_parent
-            .insert(child.to_string(), parent.to_string());
     }
 
     /// Whether `thread_id` is a known sub-agent of this session.

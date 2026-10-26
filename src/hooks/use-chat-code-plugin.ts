@@ -44,14 +44,6 @@ function getSnapshot(): ThemeColors {
   return getSyntaxThemeSnapshot();
 }
 
-/** Test-only: drops the listener and resets the palette to the fallback. */
-export function resetChatCodePluginStore() {
-  unsubscribeSyntax?.();
-  unsubscribeSyntax = null;
-  cachedPlugin = null;
-  subscribers.clear();
-}
-
 let cachedPlugin: { key: string; plugin: CodeHighlighterPlugin } | null = null;
 
 export function useChatCodePlugin(): CodeHighlighterPlugin {

@@ -37,8 +37,6 @@ pub const DELEGATION_RESULTS_PREFIX: &str = "[Codemux: delegated task results]";
 pub const DELEGATED_ROW_PREFIX: &str = "delegate:";
 const TOOL_NAME: &str = "delegate_task";
 
-const MAX_RUNNING_PER_PARENT: usize = 3;
-const MAX_PER_ROUND: u32 = 6;
 const MIN_TASK_CHARS: usize = 20;
 const MAX_TITLE_CHARS: usize = 60;
 const START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -101,7 +99,6 @@ enum StopReason {
     TabClosed,
     /// A worktree task's workspace was closed or archived.
     WorkspaceClosed,
-    Restarted,
     Parent,
     AppClosed,
 }
@@ -116,9 +113,6 @@ impl StopReason {
             }
             Self::WorkspaceClosed => {
                 "The user closed its chat or workspace. Its branch keeps whatever it committed."
-            }
-            Self::Restarted => {
-                "Its chat was restarted or replaced before it finished; partial work is in its workspace."
             }
             Self::Parent => "Stopped together with this chat.",
             Self::AppClosed => "Codemux closed before this task finished.",

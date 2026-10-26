@@ -86,19 +86,6 @@ export function toolIcon(toolName: string): LucideIcon {
   return ICON_BY_TOOL[toolName] ?? Wrench;
 }
 
-const ICON_BY_CATEGORY: Record<ToolCategory, LucideIcon> = {
-  search: Search,
-  file: FileText,
-  terminal: Terminal,
-  web: Globe,
-  agent: Bot,
-  other: Wrench,
-};
-
-export function categoryIcon(category: ToolCategory): LucideIcon {
-  return ICON_BY_CATEGORY[category];
-}
-
 /** Tailwind classes for the 22px tinted icon chip. Search stays sky, web
  *  goes violet, everything else neutral — a subtle ~15% wash. */
 export function categoryTint(category: ToolCategory): string {

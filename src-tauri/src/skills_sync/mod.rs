@@ -259,12 +259,6 @@ impl SyncEngine {
             match self.push_one(local, &mut mapping, token, &home).await {
                 Ok(PushOutcome::Pushed) => result.pushed_count += 1,
                 Ok(PushOutcome::Skipped) => {}
-                Ok(PushOutcome::Conflict) => {
-                    // Currently treated identically to Pushed —
-                    // last-write-wins resolution happened on the
-                    // pull pass above. Counter is here for Stage 6.
-                    result.conflict_count += 1;
-                }
                 Err(err) => {
                     eprintln!("[skills_sync] push '{}' failed: {err}", local.display());
                     result.error_count += 1;
@@ -512,10 +506,6 @@ impl Default for SyncEngine {
 enum PushOutcome {
     Pushed,
     Skipped,
-    /// Reserved for Stage 6's richer conflict reporting; currently
-    /// unused but the discriminator stays so the counter survives.
-    #[allow(dead_code)]
-    Conflict,
 }
 
 /// Identity of a skill across the sync boundary.

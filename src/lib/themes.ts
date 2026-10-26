@@ -1236,4 +1236,3 @@ export function themeToSyntaxColors(theme: ThemeDefinition): ThemeColors {
 }
 
 export const THEME_ROLE_VARIABLES = ROLE_VARIABLES;
-export const THEME_ANSI_VARIABLES = ANSI_VARIABLES;

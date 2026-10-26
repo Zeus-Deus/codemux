@@ -5,11 +5,6 @@ export interface DiffLine {
   newLine: number | null;
 }
 
-export interface DiffHunk {
-  header: string;
-  lines: DiffLine[];
-}
-
 export interface SplitLine {
   left: DiffLine | null;
   right: DiffLine | null;
@@ -91,26 +86,6 @@ export function parseDiff(text: string): DiffLine[] {
     }
   }
   return lines;
-}
-
-/** Group parsed diff lines into hunks for navigation. */
-export function groupHunks(lines: DiffLine[]): DiffHunk[] {
-  const hunks: DiffHunk[] = [];
-  let current: DiffHunk | null = null;
-
-  for (const line of lines) {
-    if (line.type === "hunk-header") {
-      current = { header: line.content, lines: [line] };
-      hunks.push(current);
-    } else if (current) {
-      current.lines.push(line);
-    } else {
-      // Lines before first hunk header (shouldn't normally happen)
-      current = { header: "", lines: [line] };
-      hunks.push(current);
-    }
-  }
-  return hunks;
 }
 
 /**

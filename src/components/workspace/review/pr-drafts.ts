@@ -244,10 +244,6 @@ export function getDiffSnapshot(key: DraftKey, headOid: string): string | null {
 
 /** Files you've marked read, per PR. A collapsed file is a file you
  *  have decided about, which is why this is not persisted either. */
-export function isFileViewed(key: DraftKey, path: string): boolean {
-  return viewedFiles.get(key)?.has(path) ?? false;
-}
-
 export function toggleFileViewed(key: DraftKey, path: string): void {
   const set = new Set(viewedFiles.get(key) ?? EMPTY_SET);
   if (set.has(path)) set.delete(path);
