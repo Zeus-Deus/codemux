@@ -379,7 +379,9 @@ pub(crate) fn with_parent_admission<R: Runtime, T>(
     state.with_canonical_snapshot(|snapshot| db.with_delegation_admission(thread, |record, event_id, host| {
         if record.imported_from.is_some() { return Err("Imported conversations are read-only".into()); }
         let workspace = snapshot.workspaces.iter().find(|w|w.workspace_id.0==record.workspace_id).ok_or("Parent workspace is closed")?;
-        if workspace.imported_snapshot_only==Some(true) || workspace.attach_only { return Err("Parent workspace is read-only".into()); }
+        // Attach-only also describes live host workspaces: their files stay on
+        // the host, but their chats can still own tasks. Only imports are read-only.
+        if workspace.is_local_import_snapshot_only() { return Err("Parent workspace is read-only".into()); }
         let pane = workspace.surfaces.iter().find_map(|s|find_agent_chat_pane_id(&s.root,thread)).ok_or("Parent is no longer bound to an open pane")?;
         let (provider,bound) = workspace.surfaces.iter().find_map(|s|crate::state::agent_chat_thread_pair_for_pane(&s.root,&pane.0)).ok_or("Parent binding disappeared")?;
         if bound!=thread || serde_json::to_value(provider).map_err(|e|e.to_string())?.as_str()!=Some(&record.provider) { return Err("Parent database/pane/provider ownership mismatch".into()); }

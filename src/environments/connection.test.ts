@@ -323,6 +323,23 @@ describe("openEnvironmentConnection", () => {
     peer.connection.close();
   });
 
+  it("clears a resync failure after a successful retry without reconnecting", async () => {
+    const peer = machineConnection(snapshot(10, ["chat"]));
+    await settle();
+    peer.heartbeat(11);
+    await settle();
+    peer.machine.send({ t: "err", id: peer.requests[1].id, error: "temporarily unavailable" });
+    await settle();
+    expect(useEnvironmentsStore.getState().environments[device.deviceId].error).toBe("temporarily unavailable");
+    peer.heartbeat(11);
+    await settle();
+    peer.reply(2, snapshot(11, ["recovered"]));
+    await settle();
+    expect(state()?.workspaces[0].title).toBe("recovered");
+    expect(useEnvironmentsStore.getState().environments[device.deviceId]).toMatchObject({ status: "connected", error: null });
+    peer.connection.close();
+  });
+
   it("keeps retrying after a failed resync and ignores responses after close", async () => {
     const peer = machineConnection(snapshot(10, ["chat"]));
     await settle();
