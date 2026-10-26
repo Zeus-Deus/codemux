@@ -124,6 +124,7 @@ export function openEnvironmentConnection(
       .then((snapshot) => {
         if (closed || epoch !== fetchEpoch) return;
         acceptSnapshot(snapshot as AppStateSnapshot);
+        update({ error: null });
         succeeded = true;
       })
       .catch((error: unknown) => {
