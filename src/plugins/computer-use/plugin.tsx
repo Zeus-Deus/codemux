@@ -1,6 +1,6 @@
 import { PEEK_AREA, COMPOSER_STATUS_AREA, TITLEBAR_ACTIONS_AREA, definePlugin, icons, type ComposerStatusData, type ComposerStatusProps, type PeekRenderProps } from "@codemux/sdk";
 import { ComputerUseController } from "./controller";
-import { ComputerChatChip, ComputerIndicator, ComputerPreview, ComputerSettings, computerChipVisible } from "./views";
+import { ComputerChatChip, ComputerIndicator, ComputerPreview, ComputerSettings, computerChipVisible, setupStatus } from "./views";
 
 export default definePlugin({
   id: "computer-use",
@@ -37,8 +37,22 @@ export default definePlugin({
         isVisible: ({ workspaceId }) => computerChipVisible(controller.getState(), workspaceId),
       } satisfies ComposerStatusData,
     });
+    // The Extensions row shows readiness; the first look there checks the driver once.
+    let status = setupStatus(controller.getState());
+    const getStatus = () => {
+      const next = setupStatus(controller.getState());
+      if (next.label !== status.label || next.tone !== status.tone) status = next;
+      return status;
+    };
     ctx.registerSettingsPage({
       title: "Computer use",
+      status: {
+        get: getStatus,
+        subscribe: (fn) => {
+          void controller.refresh(ctx.storage.get("executable", ""), true);
+          return controller.subscribe(fn);
+        },
+      },
       render: () => <ComputerSettings controller={controller} peek={peek} showWorkspace={ctx.host.showWorkspace}
         initialCommand={ctx.storage.get("executable", "")}
         onCommand={(command) => ctx.storage.set("executable", command)}

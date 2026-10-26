@@ -39,11 +39,24 @@ export interface PluginStorage {
   remove(key: string): void;
 }
 
+/** Setup state a plugin shows on its Extensions row. It is separate from
+ *  the on/off switch: an enabled plugin can still need setup. */
+export interface PluginSetupStatus {
+  label: string;
+  tone: "ready" | "attention" | "neutral";
+}
+
 export interface PluginSettingsPage {
   /** Local id; defaults to `settings`. */
   id?: string;
   title: string;
   render: () => ReactNode;
+  /** Optional setup status for the plugin's Extensions row. `get` must return
+   *  the same object until it changes; `subscribe` reports changes. */
+  status?: {
+    get: () => PluginSetupStatus | null;
+    subscribe: (fn: () => void) => () => void;
+  };
 }
 
 export interface PluginContext {
@@ -145,7 +158,7 @@ export function createPluginContext(pluginId: string, tier: PluginTier, owner: O
             area: SETTINGS_PAGES_AREA,
             title: page.title,
             render: page.render,
-            data: { pluginId },
+            data: { pluginId, status: page.status },
           }),
         ),
       ),

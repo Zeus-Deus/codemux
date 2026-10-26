@@ -1,4 +1,4 @@
-import { randomUUID, type Host, type PluginContext } from "@codemux/sdk";
+import { randomUUID, type Host, type PluginContext, type PluginToolProgress, type PluginToolStatus } from "@codemux/sdk";
 
 import {
   connectionFailure, controlFiles, controlInstructions, discoveryFiles, parseDoctor, parseVersion,
@@ -11,6 +11,7 @@ export interface ComputerUseServices {
   process: Host["process"];
   os: Host["os"];
   fs: Pick<Host["fs"], "dataDir" | "listDir" | "writeDataFile" | "removeDataFile">;
+  tools: Pick<Host["tools"], "status" | "install">;
   mcp: Pick<Host["mcp"], "listTools" | "callTool" | "getStatus" | "onStatus" | "onActivity">;
   registerMcpServer: PluginContext["registerMcpServer"];
 }
@@ -21,13 +22,34 @@ export interface Workspace {
   local: boolean;
 }
 
+export const DRIVER_TOOL = "cua-driver";
+export const DRIVER_VERSION = "0.21.0";
+
+/** Whether the driver can be used, separate from the plugin being on. */
+export type DriverStatus = "unchecked" | "missing" | "incompatible" | "needs-setup" | "ready" | "error";
+
+export interface DriverState {
+  status: DriverStatus;
+  /** Plain explanation for anything but `ready`. */
+  message: string | null;
+  /** Where the checked executable came from. */
+  source: "custom" | "managed" | "system" | null;
+}
+
+export type InstallStage = PluginToolProgress | { stage: "checking" };
+
 export interface ComputerUseState {
   workspace: Workspace | null;
   optedIn: boolean;
+  driver: DriverState;
+  /** Codemux-managed install support on this computer, once known. */
+  managed: Pick<PluginToolStatus, "supported" | "unsupportedReason"> | null;
+  install: InstallStage | null;
+  installError: string | null;
   executable: string | null;
   version: string | null;
   doctor: DoctorReport | null;
-  phase: "idle" | "detecting" | "discovering" | "choosing" | "starting" | "active" | "stopping" | "expired" | "error";
+  phase: "idle" | "detecting" | "installing" | "discovering" | "choosing" | "starting" | "active" | "stopping" | "expired" | "error";
   expiresAt: number | null;
   windows: WindowTarget[];
   target: WindowTarget | null;
@@ -46,6 +68,9 @@ interface Resource {
 
 class Cancelled extends Error {}
 
+const DRIVER_ENV = { CUA_DRIVER_EMBEDDED: "1", CUA_DRIVER_RS_TELEMETRY_ENABLED: "0" };
+type Candidate = { path: string; source: NonNullable<DriverState["source"]> };
+
 const driverFile = /^cua-(?:discovery|view|control)-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.(?:yaml|json)$/;
 // Incarnations can overlap during reload. Keep pending writes and registrations
 // protected until their disposer confirms exit; a new page revokes old owners.
@@ -53,7 +78,8 @@ const liveFiles = new Set<string>();
 
 export class ComputerUseController {
   private state: ComputerUseState = {
-    workspace: null, optedIn: false, executable: null, version: null, doctor: null,
+    workspace: null, optedIn: false, driver: { status: "unchecked", message: null, source: null },
+    managed: null, install: null, installError: null, executable: null, version: null, doctor: null,
     phase: "idle", expiresAt: null, windows: [], target: null, activeCalls: 0, frame: null, error: null,
   };
   private readonly listeners = new Set<() => void>();
@@ -123,6 +149,11 @@ export class ComputerUseController {
   setWorkspace(workspace: Workspace | null, optedIn: boolean): Promise<void> {
     if (this.state.workspace?.id === workspace?.id && this.state.workspace?.local === workspace?.local && this.state.optedIn === optedIn) return Promise.resolve();
     this.update({ workspace, optedIn, windows: [], frame: null });
+    // Checking or installing the driver is machine-wide; a workspace switch
+    // must not cancel it.
+    if (this.resources.size === 0 && (this.state.phase === "detecting" || this.state.phase === "installing")) {
+      return Promise.resolve();
+    }
     if (this.resources.size === 0 && this.state.phase === "idle") {
       this.abort.abort();
       return Promise.resolve();
@@ -130,74 +161,195 @@ export class ComputerUseController {
     return this.stop();
   }
 
-  private async findExecutable(command: string | undefined, signal: AbortSignal): Promise<string> {
-    const requested = command?.trim();
-    const found = await this.services.process.which(requested || "cua-driver");
+  /** Executables to try in order: PATH, then the official installers'
+   *  standard locations, then Codemux's managed copy. */
+  private async *candidates(signal: AbortSignal): AsyncGenerator<Candidate> {
+    const onPath = await this.services.process.which("cua-driver");
     this.check(signal);
-    if (found) return found;
-    if (requested && requested !== "cua-driver") throw new Error(`No executable was found at ${requested}. Check the path, then try again.`);
+    if (onPath) yield { path: onPath, source: "system" };
     const os = await this.services.os.info();
     this.check(signal);
     const userBin = os.homeDir ? `${os.homeDir.replace(/\/+$/, "")}/.local/bin/cua-driver` : null;
-    const candidates: string[] = [];
+    const standard: string[] = [];
     if (os.platform === "windows" && os.localDataDir) {
-      candidates.push(`${os.localDataDir.replace(/[\\/]+$/, "")}\\Programs\\Cua\\cua-driver\\bin\\cua-driver.exe`);
+      standard.push(`${os.localDataDir.replace(/[\\/]+$/, "")}\\Programs\\Cua\\cua-driver\\bin\\cua-driver.exe`);
     } else if (os.platform === "macos") {
-      candidates.push("/Applications/CuaDriver.app/Contents/MacOS/cua-driver");
-      if (userBin) candidates.push(userBin);
+      standard.push("/Applications/CuaDriver.app/Contents/MacOS/cua-driver");
+      if (userBin) standard.push(userBin);
     } else if (os.platform === "linux" && userBin) {
-      candidates.push(userBin);
+      standard.push(userBin);
     }
-    for (const candidate of candidates) {
+    for (const candidate of standard) {
       const executable = await this.services.process.which(candidate);
       this.check(signal);
-      if (executable) return executable;
+      if (executable) yield { path: executable, source: "system" };
     }
-    throw new Error("cua-driver was not found. Install it or enter its executable path, then check again.");
+    const managed = await this.managedStatus(signal);
+    if (managed?.executable) yield { path: managed.executable, source: "managed" };
   }
 
+  private async managedStatus(signal: AbortSignal): Promise<PluginToolStatus | null> {
+    let status: PluginToolStatus | null = null;
+    try {
+      status = await this.services.tools.status(DRIVER_TOOL);
+    } catch (error) {
+      this.check(signal);
+      this.update({ managed: { supported: false, unsupportedReason: `Codemux can’t install the driver here: ${error instanceof Error ? error.message : String(error)}` } });
+      return null;
+    }
+    this.check(signal);
+    this.update({ managed: { supported: status.supported, unsupportedReason: status.unsupportedReason } });
+    return status;
+  }
+
+  /** The executable's version, or why it can't be used. */
+  private async readVersion(executable: string, signal: AbortSignal): Promise<{ version: string | null; problem: string | null }> {
+    let result: Awaited<ReturnType<ComputerUseServices["process"]["run"]>>;
+    try {
+      result = await this.services.process.run({
+        command: executable, args: ["--version"], timeoutMs: 5_000, maxOutputBytes: 16_384, env: DRIVER_ENV,
+      });
+    } catch (error) {
+      // A candidate that can't be launched is unusable, not fatal: detection
+      // moves on to the next location. Cancellation still ends it.
+      this.check(signal);
+      return { version: null, problem: `Couldn’t run ${executable}: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    this.check(signal);
+    const version = parseVersion(result.stdout);
+    if (result.code !== 0 || !version || result.cancelled || result.truncated || result.pipesHeldOpen || result.timedOut) {
+      return { version, problem: result.stderr.trim() || "Could not read the cua-driver version." };
+    }
+    if (version !== DRIVER_VERSION) {
+      return { version, problem: `Found cua-driver ${version}. Computer use needs version ${DRIVER_VERSION}, the version its safety limits were checked with.` };
+    }
+    return { version, problem: null };
+  }
+
+  /** Detection failures belong to the driver state, not the control error. */
+  private async runDetection(command: string | undefined, signal: AbortSignal): Promise<void> {
+    try {
+      await this.detectDriver(command, signal);
+    } catch (error) {
+      if (error instanceof Cancelled || signal.aborted || this.disposed) throw error;
+      this.update({ phase: "idle", driver: { status: "error", source: null, message: error instanceof Error ? error.message : String(error) } });
+    }
+  }
+
+  private async detectDriver(command: string | undefined, signal: AbortSignal): Promise<void> {
+    this.update({ phase: "detecting", error: null, executable: null, version: null, doctor: null });
+    const requested = command?.trim();
+    const custom = !!requested && requested !== "cua-driver";
+    let chosen: (Candidate & { version: string }) | null = null;
+    let found: { candidate: Candidate; version: string | null; problem: string } | null = null;
+    if (custom) {
+      const path = await this.services.process.which(requested);
+      this.check(signal);
+      if (!path) {
+        this.update({ phase: "idle", driver: { status: "missing", source: "custom",
+          message: `No executable was found at ${requested}. Check the path, or use automatic detection.` } });
+        if (!this.state.managed) await this.managedStatus(signal);
+        return;
+      }
+      const { version, problem } = await this.readVersion(path, signal);
+      if (problem) found = { candidate: { path, source: "custom" }, version, problem };
+      else if (version) chosen = { path, source: "custom", version };
+    } else {
+      const seen = new Set<string>();
+      for await (const candidate of this.candidates(signal)) {
+        if (seen.has(candidate.path)) continue;
+        seen.add(candidate.path);
+        const { version, problem } = await this.readVersion(candidate.path, signal);
+        if (!problem && version) { chosen = { ...candidate, version }; break; }
+        found ??= { candidate, version, problem: problem ?? "Could not read the cua-driver version." };
+      }
+    }
+    if (!chosen) {
+      if (custom || found) {
+        this.update({ phase: "idle", executable: found?.candidate.path ?? null, version: found?.version ?? null,
+          driver: { status: "incompatible", source: found?.candidate.source ?? "custom", message: found?.problem ?? null } });
+      } else {
+        this.update({ phase: "idle", driver: { status: "missing", source: null, message: null } });
+      }
+      if (!this.state.managed) await this.managedStatus(signal);
+      return;
+    }
+    const { path: executable, version, source } = chosen;
+    this.update({ executable, version });
+    const result = await this.services.process.run({
+      command: executable, args: ["doctor", "--json"], timeoutMs: 15_000, maxOutputBytes: 262_144, env: DRIVER_ENV,
+    });
+    this.check(signal);
+    const doctor = parseDoctor(result.stdout);
+    if (!doctor || result.cancelled || result.truncated || result.pipesHeldOpen || result.timedOut) {
+      this.update({ phase: "idle", driver: { status: "error", source,
+        message: result.stderr.trim() || "cua-driver did not return a complete diagnostic report." } });
+      return;
+    }
+    if (result.code !== 0 || !doctor.ok) {
+      this.update({ phase: "idle", doctor: { ...doctor, ok: false }, driver: { status: "needs-setup", source,
+        message: result.code !== 0
+          ? result.stderr.trim() || `cua-driver doctor exited with code ${result.code ?? "unknown"}. Review its diagnostics.`
+          : "The driver is installed but isn’t ready yet." } });
+      return;
+    }
+    this.update({ phase: "idle", doctor, driver: { status: "ready", source, message: null } });
+  }
+
+  private canCheck() {
+    return this.resources.size === 0 && ["idle", "expired", "error"].includes(this.state.phase);
+  }
+
+  /** Check the driver. Pass the saved custom path, if any. */
   detect(command?: string): Promise<void> {
     return this.schedule(async (signal) => {
       await this.releaseAll();
       this.check(signal);
-      this.update({ phase: "detecting", error: null, executable: null, version: null, doctor: null });
-      const executable = await this.findExecutable(command, signal);
+      await this.runDetection(command, signal);
+    });
+  }
+
+  /** Re-check on opening setup. Runs only from a plain idle state, so it
+   *  never disturbs control, a check under way, or an expiry/error notice.
+   *  With `onlyOnce`, skip a driver already checked. */
+  refresh(command?: string, onlyOnce = false): Promise<void> {
+    if (this.resources.size > 0 || this.state.phase !== "idle" || (onlyOnce && this.state.driver.status !== "unchecked")) {
+      return Promise.resolve();
+    }
+    this.update({ phase: "detecting" });
+    return this.detect(command);
+  }
+
+  /** Install the pinned driver into Codemux's data folder, then check it.
+   *  This never opts a workspace in, chooses a window or starts control. */
+  install(): Promise<void> {
+    if (!this.canCheck()) return Promise.resolve();
+    this.update({ phase: "installing", install: { stage: "downloading", received: 0, total: 0 }, installError: null, error: null });
+    return this.schedule(async (signal) => {
+      await this.releaseAll();
       this.check(signal);
-      this.update({ executable });
-      const versionResult = await this.services.process.run({
-        command: executable, args: ["--version"], timeoutMs: 5_000, maxOutputBytes: 16_384,
-        workspaceId: this.state.workspace?.id, env: { CUA_DRIVER_EMBEDDED: "1", CUA_DRIVER_RS_TELEMETRY_ENABLED: "0" },
-      });
-      this.check(signal);
-      const version = parseVersion(versionResult.stdout);
-      if (versionResult.code !== 0 || !version || versionResult.cancelled || versionResult.truncated || versionResult.pipesHeldOpen || versionResult.timedOut) {
-        throw new Error(versionResult.stderr || "Could not read the cua-driver version.");
-      }
-      if (version !== "0.21.0") throw new Error(`cua-driver ${version} has not been validated with this plugin. Use version 0.21.0.`);
-      const result = await this.services.process.run({
-        command: executable, args: ["doctor", "--json"], timeoutMs: 15_000, maxOutputBytes: 262_144,
-        env: { CUA_DRIVER_RS_TELEMETRY_ENABLED: "0", CUA_DRIVER_EMBEDDED: "1" }, workspaceId: this.state.workspace?.id,
-      });
-      this.check(signal);
-      const doctor = parseDoctor(result.stdout);
-      if (!doctor || result.cancelled || result.truncated || result.pipesHeldOpen || result.timedOut) {
-        throw new Error(result.stderr || "cua-driver did not return a complete diagnostic report.");
-      }
-      if (result.code !== 0) {
-        this.update({ executable, version, doctor: { ...doctor, ok: false }, phase: "error",
-          error: result.stderr || `cua-driver doctor exited with code ${result.code ?? "unknown"}. Review its diagnostics.` });
+      try {
+        await this.services.tools.install(DRIVER_TOOL, (progress) => {
+          if (!signal.aborted && !this.disposed) this.update({ install: progress });
+        });
+      } catch (error) {
+        this.check(signal);
+        this.update({ phase: "idle", install: null, installError: error instanceof Error ? error.message : String(error) });
         return;
       }
-      this.update({ executable, version, doctor, phase: "idle", error: doctor.ok ? null : "cua-driver reported a setup problem. Review its diagnostics." });
+      this.check(signal);
+      this.update({ install: { stage: "checking" } });
+      await this.runDetection(undefined, signal);
+      this.update({ install: null });
     });
   }
 
   private authorized() {
-    const { workspace, optedIn, executable } = this.state;
+    const { workspace, optedIn, executable, driver } = this.state;
     if (!workspace || !optedIn) throw new Error("Allow computer use in this workspace first.");
     if (!workspace.local) throw new Error("Computer use is available only in local workspaces.");
-    if (!executable) throw new Error("Check the cua-driver installation first.");
-    if (this.state.doctor?.ok !== true) throw new Error("Resolve the driver setup problems before enabling computer use.");
+    if (!executable || driver.status === "unchecked") throw new Error("Check the cua-driver installation first.");
+    if (driver.status !== "ready" || this.state.doctor?.ok !== true) throw new Error("Finish the driver setup before enabling computer use.");
     return { workspace, executable };
   }
 

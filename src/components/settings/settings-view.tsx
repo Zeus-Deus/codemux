@@ -3124,11 +3124,16 @@ export function SettingsView() {
             onChange={(e) => setActivePage(e.target.value)}
           >
             {pages.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
-            {pluginNavItems.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+            {pluginNavItems.length > 0 && (
+              <optgroup label="Plugin settings">
+                {pluginNavItems.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+              </optgroup>
+            )}
           </select>
         )}
-        {/* Left nav: one quiet row per page, no group captions, so the
-            whole list reads at a glance. It shares the app sidebar's
+        {/* Left nav: one quiet row per page. Only plugin-owned pages get a
+            caption, so it's clear they come from a plugin; the list still
+            reads at a glance. It shares the app sidebar's
             width, so opening Settings doesn't shift the content edge, and
             resizing either one resizes both. */}
         {!mobile && (
@@ -3156,7 +3161,14 @@ export function SettingsView() {
                 ))}
               </div>
               {pluginNavItems.length > 0 && (
-                <div className="mx-3 mt-3 space-y-px border-t border-hairline pt-3">
+                <div
+                  role="group"
+                  aria-labelledby="settings-nav-plugin-settings"
+                  className="mx-3 mt-3 space-y-px border-t border-hairline pt-3"
+                >
+                  <div id="settings-nav-plugin-settings" className="px-2.5 pb-1 text-caption text-muted-foreground">
+                    Plugin settings
+                  </div>
                   {pluginNavItems.map((item) => (
                     <SettingsNavItem
                       key={item.id}

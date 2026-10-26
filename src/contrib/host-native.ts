@@ -1,5 +1,5 @@
 /** Bounded desktop services owned by one plugin incarnation. */
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import type { Owner } from "./lifetime";
 import { pluginPageEpoch } from "./mcp";
 import { randomUUID } from "@/lib/uuid";
@@ -48,6 +48,20 @@ export interface PluginOsInfo {
   dataDir: string | null;
   localDataDir: string | null;
 }
+/** A helper program whose release Codemux pins (today only `cua-driver`). */
+export interface PluginToolStatus {
+  id: string;
+  version: string;
+  /** False when Codemux can't install it on this platform; see the reason. */
+  supported: boolean;
+  unsupportedReason: string | null;
+  /** The Codemux-managed executable, when installed. */
+  executable: string | null;
+}
+export type PluginToolProgress =
+  | { stage: "downloading"; received: number; total: number }
+  | { stage: "verifying" }
+  | { stage: "validating" };
 type Auth = { pluginId: string; token: string };
 const owners = new WeakMap<Owner, Promise<Auth>>();
 async function ownerAuth(owner: Owner | null): Promise<Auth> {
@@ -124,6 +138,26 @@ export function createNativeHost(ownerNow: () => Owner | null) {
           ...(await ownerAuth(ownerNow())),
           command,
         }),
+    },
+    /** App-pinned helper programs. The release, checksum and files are fixed
+     *  by Codemux; installs go to its own data folder, never PATH, and are
+     *  validated before they replace an earlier managed copy. */
+    tools: {
+      status: async (tool: string): Promise<PluginToolStatus> =>
+        invoke("plugins_tool_status", { ...(await ownerAuth(ownerNow())), tool }),
+      /** Resolves with the installed executable path. */
+      install: async (
+        tool: string,
+        onProgress?: (progress: PluginToolProgress) => void,
+      ): Promise<string> => {
+        const channel = new Channel<PluginToolProgress>();
+        if (onProgress) channel.onmessage = onProgress;
+        return invoke("plugins_tool_install", {
+          ...(await ownerAuth(ownerNow())),
+          tool,
+          onProgress: channel,
+        });
+      },
     },
     fs: {
       exists: (path: string, options?: PluginLocalContext) =>

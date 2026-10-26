@@ -777,6 +777,8 @@ mod plugins_boundary_tests {
             "plugins_process_which",
             "plugins_os_info",
             "plugins_fs",
+            "plugins_tool_status",
+            "plugins_tool_install",
             "plugins_future_command",
         ] {
             dispatch_invoke(

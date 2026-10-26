@@ -2,15 +2,19 @@
 
 Computer use is an Official plugin enabled by default. A saved on/off choice in
 Settings → Extensions → Plugins takes precedence. Enabling the plugin makes its
-settings available; it does not start the driver or grant window control. Use a
+settings available; it does not install or start the driver or grant window
+control. Use a
 structured tool, such as browser tools or app-specific plugin tools, whenever one
 is available.
 
-Open **Computer use** in Settings under Plugin settings. Check the
-installation, allow access in the current local workspace, choose an application
-window, and select **Enable for this window**. The workspace choice is saved on
-this device. The selected window and active control are never restored after a
-restart. Switching workspaces stops control. Control expires after ten minutes; the UI
+Open **Computer use** from its **Settings** button in Settings → Extensions →
+Plugins, or under **Plugin settings** in the Settings navigation. The plugin's
+row shows whether the driver is ready, separately from its on/off switch.
+Opening the page checks for the driver automatically. When it is ready, allow
+access in the current local workspace, choose an application window, and select
+**Enable for this window**. The workspace choice is saved on this device. The
+selected window and active control are never restored after a restart.
+Switching workspaces stops control. Control expires after ten minutes; the UI
 shows the deadline, stops the children, and requires another window selection.
 The UI deadline starts before child startup, so it precedes the driver’s
 ten-minute lifetime and idle limits.
@@ -20,18 +24,58 @@ progress may not have the newly enabled tools; Claude refreshes them between
 turns. In Codex, enabled computer-use calls have no per-tool approval and run
 unprompted in the opted-in workspace.
 
-Install cua-driver yourself using the [official installation guide](https://cua.ai/docs/cua-driver/quickstart).
-Codemux does not run the installer or grant operating-system permissions. This
-plugin currently requires version **0.21.0**, whose policy and exact-window
-manifest were evaluated. A different version needs another compatibility check.
-Doctor warnings remain visible even when the driver's overall result is `ok`.
-The installation diagnostics show the resolved executable path. Detection checks
-PATH first, then the standard installation locations: `~/.local/bin/cua-driver`
-on Linux, `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin\cua-driver.exe` on Windows,
-and `/Applications/CuaDriver.app/Contents/MacOS/cua-driver` followed by
+## Driver setup
+
+This plugin requires cua-driver **0.21.0**, whose policy and exact-window
+manifest were evaluated. A different version needs another compatibility check
+and is reported as incompatible rather than ready.
+
+Detection checks PATH first, then the standard installation locations:
+`~/.local/bin/cua-driver` on Linux,
+`%LOCALAPPDATA%\Programs\Cua\cua-driver\bin\cua-driver.exe` on Windows, and
+`/Applications/CuaDriver.app/Contents/MacOS/cua-driver` followed by
 `~/.local/bin/cua-driver` on macOS. The [macOS installer](https://github.com/trycua/cua/blob/70db98d1bcd92890d778f4978e0eb107a4b66c1b/libs/cua-driver/scripts/_install-rust.sh#L933)
-links the user-bin path into that application bundle. An explicit custom path
-takes precedence; Codemux does not change PATH or run an installer.
+links the user-bin path into that application bundle. Codemux's own managed copy
+is checked last, so a compatible existing installation keeps being used.
+
+When the driver is missing or another version, **Install driver** (or **Install
+compatible driver**) downloads the pinned 0.21.0 release archive for this
+platform from the [official release](https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.21.0).
+Codemux, not the plugin, pins each archive's URL, size and SHA-256 from the
+release's `checksums.txt`. The install:
+
+1. downloads over HTTPS into a temporary file under Codemux's data folder
+   (`tools/cua-driver/` beside `plugin-data/`);
+2. verifies the size and checksum;
+3. copies only the listed files from the archive into a staging folder, runs
+   `cua-driver --version` there and requires `cua-driver 0.21.0`;
+4. renames the staging folder to `tools/cua-driver/0.21.0-<platform>/`, then
+   runs the normal diagnostics.
+
+A failure leaves any earlier managed copy in place and offers **Retry
+installation**. The install never changes PATH, never writes outside that
+folder, and never replaces a driver you installed yourself. It does not allow a
+workspace, choose a window, start a daemon or grant operating-system
+permissions.
+
+Managed installation covers Linux and Windows on x86_64 and ARM64, using the
+release's `-binary` archives (the same files the official installers copy).
+It is not available on macOS: the official installer places the signed
+`CuaDriver.app` in `/Applications`, and macOS attributes its Accessibility and
+Screen Recording permissions to that bundle. A copy unpacked elsewhere would
+not keep that identity, and replacing the bundle would overwrite the user's own
+install. On macOS the page links to the [official installation guide](https://cua.ai/docs/cua-driver/quickstart)
+and checks again afterwards.
+
+When the driver runs but its diagnostics report a problem, often a missing
+operating-system permission, the page shows each failing item and a **Check
+again** button. Doctor warnings remain visible even when the driver's overall
+result is `ok`.
+
+**Advanced** holds an optional custom executable path, the resolved executable
+and the full diagnostics. A custom path takes precedence and must pass the same
+version and diagnostic checks; **Use automatic detection** clears it. Installing
+the managed driver also clears a saved custom path.
 
 The title-bar indicator shows when control is enabled and when an agent is
 calling its tools. On desktop, the **Computer** chip sits beside Browser in **Workspace details →
