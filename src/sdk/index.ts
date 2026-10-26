@@ -24,6 +24,7 @@ export type {
   PluginContext,
   PluginContribution,
   PluginSettingsPage,
+  PluginSetupStatus,
   PluginStorage,
 } from "@/contrib/plugin";
 export type { Contribution } from "@/contrib/types";
@@ -63,4 +64,6 @@ export type {
   PluginDirectoryEntry,
   PluginReadTextOptions,
   PluginOsInfo,
+  PluginToolStatus,
+  PluginToolProgress,
 } from "@/contrib/host-native";
