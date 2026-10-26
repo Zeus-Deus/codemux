@@ -526,6 +526,122 @@ async fn native_commands_are_dispatched_against_real_pane_and_db_ownership() {
     .is_err());
 }
 
+#[tokio::test]
+async fn remote_parent_workspace_lists_tasks_and_preserves_import_protection() {
+    use crate::{database::DatabaseStore, state::AppStateStore};
+    use tauri::Manager;
+
+    let app = tauri::test::mock_app();
+    let state = AppStateStore::default();
+    let db = DatabaseStore::new_in_memory();
+    let host = db.insert_host("Fixture", "fixture-host").unwrap();
+    let ws = state.create_remote_attach_workspace(
+        "Host workspace".into(),
+        host.id,
+        "/fixture/host-checkout".into(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let pane = state
+        .create_agent_chat_pane(
+            &ws.0,
+            Some(ProviderKind::Codex),
+            None,
+            None,
+            Some("remote-parent".into()),
+        )
+        .unwrap();
+    db.upsert_agent_chat_session(
+        "remote-parent",
+        &ws.0,
+        Some("/fixture/host-checkout"),
+        "codex",
+    )
+    .unwrap();
+    db.update_agent_chat_session_config(
+        "remote-parent",
+        &crate::database::AgentChatSessionConfig {
+            permission_mode: crate::database::AgentChatSessionConfig::set("workspace-write"),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = std::sync::Arc::new(Journal::open(dir.path()).unwrap());
+    app.manage(state);
+    app.manage(db);
+    app.manage(store.clone());
+
+    let parent = super::app::parent_for_pane(app.handle(), &pane.0).unwrap();
+    let (_, mut grant, input) = fixture();
+    grant.host_id = host.id;
+    store.put_grant(&ws.0, &grant).unwrap();
+    let task = store.admit(&parent, &grant, "checkout", &input).unwrap();
+    let args = serde_json::json!({"paneId":pane.0});
+    let list = super::app::invoke(app.handle(), "delegation_list", args.clone())
+        .await
+        .unwrap();
+    assert_eq!(list[0]["id"], task.id);
+    assert_eq!(list[0]["parent_workspace_id"], ws.0);
+
+    let state = app.state::<AppStateStore>();
+    let live = state.snapshot();
+    let mut legacy = live.clone();
+    legacy
+        .workspaces
+        .iter_mut()
+        .find(|w| w.workspace_id == ws)
+        .unwrap()
+        .imported_snapshot_only = None;
+    state.replace_snapshot(legacy);
+    assert!(
+        super::app::invoke(app.handle(), "delegation_list", args.clone())
+            .await
+            .is_ok()
+    );
+
+    // Import provenance must keep winning even if mutable host metadata looks live.
+    for legacy_import in [false, true] {
+        let mut imported = live.clone();
+        let workspace = imported
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id == ws)
+            .unwrap();
+        workspace.imported_snapshot_only = if legacy_import { None } else { Some(true) };
+        if legacy_import {
+            workspace.host_id = None;
+            workspace.remote_cwd = None;
+        }
+        state.replace_snapshot(imported);
+        assert_eq!(
+            super::app::invoke(app.handle(), "delegation_list", args.clone())
+                .await
+                .unwrap_err(),
+            "Parent workspace is read-only"
+        );
+        assert!(super::app::parent_for_pane(app.handle(), &pane.0).is_err());
+    }
+
+    state.replace_snapshot(live);
+    // A host parent still cannot delegate above its current permission ceiling.
+    app.state::<DatabaseStore>()
+        .update_agent_chat_session_config(
+            "remote-parent",
+            &crate::database::AgentChatSessionConfig {
+                permission_mode: crate::database::AgentChatSessionConfig::set("read-only"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let parent = super::app::parent_for_pane(app.handle(), &pane.0).unwrap();
+    assert!(super::app::validate_grant(app.handle(), &parent, &grant)
+        .unwrap_err()
+        .contains("permission ceiling"));
+}
+
 use super::*;
 use crate::agent_provider::ProviderKind;
 use crate::remote_task_protocol::{TaskEvent, TaskRead as RemoteRead, TaskSnapshot, TaskStatus};
