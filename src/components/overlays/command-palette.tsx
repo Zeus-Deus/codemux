@@ -1513,7 +1513,11 @@ function GroupHeader({
   );
 }
 
-/** Shared row chrome: the 40px selectable line every group renders. */
+/** Shared row chrome: the 40px selectable line every group renders. The
+ *  selected row takes the theme's highlight surface, so a themed palette
+ *  stays dark and its color lands on the row you are about to open. Its
+ *  text inks are rebound to that surface's own foreground, since a theme may
+ *  pair a light highlight with dark text; every label inherits the swap. */
 function PaletteItem({
   value,
   onSelect,
@@ -1530,7 +1534,7 @@ function PaletteItem({
       value={value}
       onSelect={onSelect}
       className={cn(
-        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-selected:bg-surface-3",
+        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-selected:bg-accent data-selected:[--foreground:var(--accent-foreground)] data-selected:[--muted-foreground:color-mix(in_oklch,var(--accent-foreground)_70%,var(--accent))]",
         className,
       )}
     >
