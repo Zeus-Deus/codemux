@@ -1,9 +1,14 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render as rtlRender } from "@testing-library/react";
+import type { ReactElement } from "react";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 import { AttachmentChip } from "./AttachmentChip";
 import type { Attachment } from "@/stores/agent-chat-store";
+
+// The app mounts one TooltipProvider at the root; tests supply it the same way.
+const render = (ui: ReactElement) => rtlRender(ui, { wrapper: TooltipProvider });
 
 afterEach(() => cleanup());
 

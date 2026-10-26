@@ -31,15 +31,40 @@ function DialogClose({
   return <DialogPrimitive.Close data-slot="dialog-close" {...props} />
 }
 
+/**
+ * How a dialog enters and leaves. `default` zooms in over a blurred backdrop:
+ * right for dialogs that interrupt to ask something. `quick` is for overlays
+ * summoned from the keyboard many times a day (the command palette, the
+ * search overlays): a 100ms opacity fade over a plain dim, no movement and
+ * no blur to composite, so the panel is there by the time the user types.
+ */
+type DialogMotion = "default" | "quick"
+
+const OVERLAY_MOTION: Record<DialogMotion, string> = {
+  default:
+    "duration-250 ease-out data-closed:duration-150 supports-backdrop-filter:backdrop-blur-xs",
+  quick: "duration-100 ease-out",
+}
+
+const CONTENT_MOTION: Record<DialogMotion, string> = {
+  default:
+    "duration-250 ease-drawer data-closed:duration-150 data-closed:ease-out data-open:zoom-in-97 data-closed:zoom-out-97",
+  quick: "duration-100 ease-out",
+}
+
 function DialogOverlay({
   className,
+  motion = "default",
   ...props
-}: React.ComponentProps<typeof DialogPrimitive.Overlay>) {
+}: React.ComponentProps<typeof DialogPrimitive.Overlay> & {
+  motion?: DialogMotion
+}) {
   return (
     <DialogPrimitive.Overlay
       data-slot="dialog-overlay"
       className={cn(
-        "fixed inset-0 isolate z-50 bg-background/60 duration-250 ease-out data-closed:duration-150 supports-backdrop-filter:backdrop-blur-xs data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0",
+        "fixed inset-0 isolate z-50 bg-background/60 data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0",
+        OVERLAY_MOTION[motion],
         className
       )}
       {...props}
@@ -70,33 +95,26 @@ function DialogOverlay({
 export const DIALOG_CRISP_POSITION =
   "inset-x-0 top-24 mx-auto translate-x-0 translate-y-0"
 
-/**
- * Motion for dialogs anchored near the top of the window (the command
- * palette and the search overlays): they drop in from above and lift away,
- * instead of the centered dialog's zoom, which reads as growing out of the
- * middle of the screen. The `!` cancels the default zoom, whose variable
- * would otherwise win or lose on stylesheet order.
- */
-export const DIALOG_TOP_ANCHORED_MOTION =
-  "data-open:zoom-in-100! data-closed:zoom-out-100! data-open:slide-in-from-top-2 data-closed:slide-out-to-top-2"
-
 function DialogContent({
   className,
   children,
   showCloseButton = true,
   overlayClassName,
+  motion = "default",
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean
   overlayClassName?: string
+  motion?: DialogMotion
 }) {
   return (
     <DialogPortal>
-      <DialogOverlay className={overlayClassName} />
+      <DialogOverlay motion={motion} className={overlayClassName} />
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl border border-border bg-popover p-(--dialog-pad) text-body shadow-dialog [--dialog-pad:--spacing(5)] duration-250 ease-drawer data-closed:duration-150 data-closed:ease-out outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-97 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-97",
+          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl border border-border bg-popover p-(--dialog-pad) text-body shadow-dialog [--dialog-pad:--spacing(5)] outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0",
+          CONTENT_MOTION[motion],
           className
         )}
         {...props}

@@ -5,7 +5,6 @@ import {
   DialogTitle,
   DialogDescription,
   DIALOG_CRISP_POSITION,
-  DIALOG_TOP_ANCHORED_MOTION,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -195,15 +194,16 @@ export function ContentSearchDialog() {
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       {/* Same treatment as its sibling `file-search-dialog.tsx`: crisp
-       *  transform-free positioning, and no inherited `×` (this app's
-       *  overlays close on Escape or a backdrop click). */}
+       *  transform-free positioning, quick keyboard-overlay motion, and no
+       *  inherited `×` (this app's overlays close on Escape or a backdrop
+       *  click). */}
       <DialogContent
         className={cn(
           DIALOG_CRISP_POSITION,
-          DIALOG_TOP_ANCHORED_MOTION,
           "flex max-h-[80vh] flex-col gap-0 overflow-hidden p-0",
         )}
         showCloseButton={false}
+        motion="quick"
         onKeyDown={handleKeyDown}
       >
         <DialogTitle className="sr-only">Search in Files</DialogTitle>

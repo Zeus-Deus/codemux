@@ -16,7 +16,6 @@ import { Spinner } from "@/components/ui/spinner";
 import {
   Tooltip,
   TooltipContent,
-  TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
@@ -411,93 +410,91 @@ export function AttachmentChip({
   );
 
   return (
-    <TooltipProvider delayDuration={250}>
-      <Tooltip
-        open={tooltipOpen && !lightboxOpen}
-        onOpenChange={setTooltipOpen}
+    <Tooltip
+      open={tooltipOpen && !lightboxOpen}
+      onOpenChange={setTooltipOpen}
+    >
+      <TooltipTrigger asChild>{chip}</TooltipTrigger>
+      <TooltipContent
+        side="top"
+        data-testid="attachment-chip-tooltip"
+        className="flex-col items-start gap-0.5 py-2"
       >
-        <TooltipTrigger asChild>{chip}</TooltipTrigger>
-        <TooltipContent
-          side="top"
-          data-testid="attachment-chip-tooltip"
-          className="flex-col items-start gap-0.5 py-2"
-        >
-          {/* The 30px chip thumbnail only carries colour/shape; hover
-              gives a preview big enough to actually read. */}
-          {showPreview && (
-            <img
-              src={previewUrl}
-              alt=""
-              aria-hidden
-              data-testid="attachment-chip-tooltip-preview"
-              className="mb-1 max-h-[180px] max-w-[260px] rounded-sm border border-hairline-strong object-contain"
-            />
-          )}
-          <div className="font-mono text-label truncate max-w-[260px]">
-            {metadata.label}
+        {/* The 30px chip thumbnail only carries colour/shape; hover
+            gives a preview big enough to actually read. */}
+        {showPreview && (
+          <img
+            src={previewUrl}
+            alt=""
+            aria-hidden
+            data-testid="attachment-chip-tooltip-preview"
+            className="mb-1 max-h-[180px] max-w-[260px] rounded-sm border border-hairline-strong object-contain"
+          />
+        )}
+        <div className="font-mono text-label truncate max-w-[260px]">
+          {metadata.label}
+        </div>
+        <div className="text-caption opacity-80">
+          {metadata.isLoading
+            ? "Resolving…"
+            : tokenEstimate > 0
+              ? `~${tokenEstimate.toLocaleString()} tokens`
+              : "—"}
+        </div>
+        {attachment.kind === "file" &&
+          typeof metadata.lineCount === "number" && (
+          <div className="text-caption opacity-70">
+            {metadata.lineCount.toLocaleString()} lines
+            {typeof metadata.bytes === "number"
+              ? ` · ${metadata.bytes.toLocaleString()} bytes`
+              : ""}
           </div>
-          <div className="text-caption opacity-80">
-            {metadata.isLoading
-              ? "Resolving…"
-              : tokenEstimate > 0
-                ? `~${tokenEstimate.toLocaleString()} tokens`
-                : "—"}
+        )}
+        {attachment.kind === "image" &&
+          typeof metadata.bytes === "number" && (
+          <div className="text-caption opacity-70">
+            {(metadata.bytes / 1024).toLocaleString(undefined, {
+              maximumFractionDigits: 1,
+            })}{" "}
+            KB
           </div>
-          {attachment.kind === "file" &&
-            typeof metadata.lineCount === "number" && (
-            <div className="text-caption opacity-70">
-              {metadata.lineCount.toLocaleString()} lines
-              {typeof metadata.bytes === "number"
-                ? ` · ${metadata.bytes.toLocaleString()} bytes`
+        )}
+        {showPreview && (
+          <div className="text-caption opacity-60">Click to expand</div>
+        )}
+        {attachment.kind === "session" && (
+          <>
+            <div className="text-caption opacity-80">
+              {metadata.sourceProvider
+                ? sessionProviderLabel(metadata.sourceProvider)
+                : "Agent chat"}
+              {typeof metadata.includedMessageCount === "number" &&
+              typeof metadata.messageCount === "number"
+                ? ` · ${metadata.includedMessageCount}/${metadata.messageCount} messages`
                 : ""}
             </div>
-          )}
-          {attachment.kind === "image" &&
-            typeof metadata.bytes === "number" && (
             <div className="text-caption opacity-70">
-              {(metadata.bytes / 1024).toLocaleString(undefined, {
-                maximumFractionDigits: 1,
-              })}{" "}
-              KB
+              {metadata.handoffKind === "summary"
+                ? `Utility summary${metadata.summaryCached ? " · cached" : ""}`
+                : utilitySummaryFallbackLabel(metadata.summaryError)}
             </div>
-          )}
-          {showPreview && (
-            <div className="text-caption opacity-60">Click to expand</div>
-          )}
-          {attachment.kind === "session" && (
-            <>
-              <div className="text-caption opacity-80">
-                {metadata.sourceProvider
-                  ? sessionProviderLabel(metadata.sourceProvider)
-                  : "Agent chat"}
-                {typeof metadata.includedMessageCount === "number" &&
-                typeof metadata.messageCount === "number"
-                  ? ` · ${metadata.includedMessageCount}/${metadata.messageCount} messages`
-                  : ""}
-              </div>
-              <div className="text-caption opacity-70">
-                {metadata.handoffKind === "summary"
-                  ? `Utility summary${metadata.summaryCached ? " · cached" : ""}`
-                  : utilitySummaryFallbackLabel(metadata.summaryError)}
-              </div>
-              {metadata.handoffKind === "summary" &&
-                metadata.summarizerModel && (
-                  <div className="max-w-[280px] truncate font-mono text-micro opacity-60">
-                    {metadata.summarizerModel}
-                    {metadata.summarizerEffort
-                      ? ` · ${metadata.summarizerEffort}`
-                      : ""}
-                  </div>
-                )}
-              {metadata.fullHistoryAvailable && (
-                <div className="text-caption opacity-70">
-                  Full visible history available on demand
+            {metadata.handoffKind === "summary" &&
+              metadata.summarizerModel && (
+                <div className="max-w-[280px] truncate font-mono text-micro opacity-60">
+                  {metadata.summarizerModel}
+                  {metadata.summarizerEffort
+                    ? ` · ${metadata.summarizerEffort}`
+                    : ""}
                 </div>
               )}
-            </>
-          )}
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+            {metadata.fullHistoryAvailable && (
+              <div className="text-caption opacity-70">
+                Full visible history available on demand
+              </div>
+            )}
+          </>
+        )}
+      </TooltipContent>
+    </Tooltip>
   );
 }

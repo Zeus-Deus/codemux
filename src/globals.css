@@ -1136,25 +1136,18 @@ body.pane-resizing iframe {
 }
 
 /* The sidebar card's hover-revealed action cluster (Pin · Snooze · Settle)
- * drops into place from just above the eyebrow instead of hard-cutting in.
- * Deliberately shorter and shallower than `rise-in`: that one announces a row
- * arriving, this one only softens chrome appearing under the pointer, and
- * anything longer feels like lag on a control the user is already aiming at.
- * The cluster is toggled by `display`, and an element leaving `display: none`
- * restarts its animation — so the reveal replays on every hover with no state
- * and no re-render. */
+ * fades in instead of hard-cutting. Opacity only and on the quick step: it
+ * replays on every hover across the list, so any movement or longer ease
+ * reads as lag on a control the user is already aiming at. The cluster is
+ * toggled by `display`, and an element leaving `display: none` restarts its
+ * animation — so the reveal needs no state and no re-render. */
 @keyframes cm-row-in {
   from {
     opacity: 0;
-    transform: translateY(-5px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
   }
 }
 .row-in {
-  animation: cm-row-in 0.13s ease;
+  animation: cm-row-in var(--motion-quick) ease-out;
 }
 
 /* Desktop sidebar toggle. The layout still snaps in one frame (tweening the
@@ -1189,26 +1182,28 @@ body.pane-resizing iframe {
 
 /* A workspace card arriving in the sidebar inbox — the "creating" stand-in
  * for a just-sent first prompt, or a workspace that appeared from anywhere
- * else. It opens its own row (max-height) so the cards below slide down
- * instead of jumping, while the card itself settles in from just above.
- * 7rem clears a full card (~90px) without a long dead tail on the ease. */
+ * else. It opens its own row so the cards below slide down instead of
+ * jumping, while the card fades in. The row opens on a one-track grid
+ * (0fr → 1fr), which tracks the card's real height instead of a max-height
+ * guess with a dead tail at the end of the ease. The grid item must be a
+ * plain wrapper with no margin of its own: a margin would hold the row open
+ * at 0fr. */
 @keyframes cm-card-in {
   from {
+    grid-template-rows: 0fr;
     opacity: 0;
-    max-height: 0;
-    transform: translateY(-6px) scale(0.985);
-  }
-  60% {
-    opacity: 1;
   }
   to {
+    grid-template-rows: 1fr;
     opacity: 1;
-    max-height: 7rem;
-    transform: none;
   }
 }
 .card-in {
-  animation: cm-card-in 0.34s cubic-bezier(0.2, 0, 0, 1) both;
+  display: grid;
+  animation: cm-card-in var(--motion-base) var(--ease-drawer) both;
+}
+.card-in > * {
+  min-height: 0;
 }
 @media (prefers-reduced-motion: reduce) {
   .card-in {

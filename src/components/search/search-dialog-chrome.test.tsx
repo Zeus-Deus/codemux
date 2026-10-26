@@ -9,7 +9,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
-import { DIALOG_CRISP_POSITION, DIALOG_TOP_ANCHORED_MOTION } from "@/components/ui/dialog";
+import { DIALOG_CRISP_POSITION } from "@/components/ui/dialog";
 import { useUIStore } from "@/stores/ui-store";
 
 vi.mock("@/tauri/commands", () => ({
@@ -67,17 +67,16 @@ describe("search dialogs — crisp positioning", () => {
     }
   });
 
-  // Top-anchored like the command palette, so they drop in from above
-  // instead of zooming out of the middle of the window.
+  // Keyboard overlays like the command palette: a quick fade, no zoom or
+  // slide, so the field is there by the time the user types.
   it.each([
     ["file search", "showFileSearch", FileSearchDialog],
     ["content search", "showContentSearch", ContentSearchDialog],
-  ] as const)("drops the %s in from the top", (_name, flag, Dialog) => {
+  ] as const)("fades the %s in quickly without moving it", (_name, flag, Dialog) => {
     useUIStore.setState({ [flag]: true });
     render(<Dialog />);
-    for (const cls of DIALOG_TOP_ANCHORED_MOTION.split(" ")) {
-      expect(contentEl()).toHaveClass(cls);
-    }
+    expect(contentEl()).toHaveClass("duration-100");
+    expect(contentEl().className).not.toMatch(/zoom-|slide-/);
   });
 
   // `DIALOG_CRISP_POSITION` is only correct if every offset in it is a whole

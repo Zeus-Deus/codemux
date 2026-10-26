@@ -1,11 +1,15 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import type { ComponentProps } from "react";
+import { cleanup, fireEvent, render as rtlRender, screen } from "@testing-library/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import type { ComponentProps, ReactElement } from "react";
 
 import type { ContextUsageSnapshot } from "@/tauri/events";
 
 import { ContextUsageMeter } from "./ContextUsageMeter";
+
+// The app mounts one TooltipProvider at the root; tests supply it the same way.
+const render = (ui: ReactElement) => rtlRender(ui, { wrapper: TooltipProvider });
 
 type MeterProps = ComponentProps<typeof ContextUsageMeter>;
 

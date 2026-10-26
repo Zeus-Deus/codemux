@@ -6,7 +6,6 @@ import {
 import {
   Tooltip,
   TooltipContent,
-  TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
@@ -89,114 +88,112 @@ export function ContextUsageMeter({
       : usedText;
 
   return (
-    <TooltipProvider delayDuration={250}>
-      <Popover>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <PopoverTrigger asChild>
-              <button
-                type="button"
-                data-testid="context-usage-trigger"
-                aria-label={label}
-                className={cn(
-                  // The footer triggers' 30px hover plate.
-                  "inline-flex size-[30px] shrink-0 items-center justify-center rounded-md",
-                  "text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground",
-                  "outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
-                  warning && "text-danger hover:text-danger",
-                )}
-              >
-                <svg
-                  viewBox={`0 0 ${RING_SIZE} ${RING_SIZE}`}
-                  className="size-3.5 -rotate-90"
-                  aria-hidden="true"
-                  focusable="false"
-                >
-                  <circle
-                    cx={RING_SIZE / 2}
-                    cy={RING_SIZE / 2}
-                    r={RING_RADIUS}
-                    fill="none"
-                    strokeWidth={RING_STROKE}
-                    className="stroke-current text-muted-foreground/25"
-                  />
-                  <circle
-                    cx={RING_SIZE / 2}
-                    cy={RING_SIZE / 2}
-                    r={RING_RADIUS}
-                    fill="none"
-                    strokeWidth={RING_STROKE}
-                    strokeLinecap="round"
-                    stroke="currentColor"
-                    strokeDasharray={RING_CIRCUMFERENCE}
-                    strokeDashoffset={dashOffset}
-                    className="transition-[stroke-dashoffset] duration-500 ease-out motion-reduce:transition-none"
-                  />
-                </svg>
-              </button>
-            </PopoverTrigger>
-          </TooltipTrigger>
-          <TooltipContent side="top" sideOffset={6}>
-            {percentText !== null
-              ? `Context window · ${percentText} used`
-              : `Context window · ${usedText} tokens used`}
-          </TooltipContent>
-        </Tooltip>
-
-        <PopoverContent side="top" align="end" className="w-64 p-3">
-          <div className="flex items-baseline justify-between gap-2">
-            <span className="text-label font-medium text-muted-foreground">
-              Context Window
-            </span>
-            <span
-              className="font-mono text-label tabular-nums text-foreground"
-              data-testid="context-usage-readout"
+    <Popover>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              data-testid="context-usage-trigger"
+              aria-label={label}
+              className={cn(
+                // The footer triggers' 30px hover plate.
+                "inline-flex size-[30px] shrink-0 items-center justify-center rounded-md",
+                "text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground",
+                "outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+                warning && "text-danger hover:text-danger",
+              )}
             >
-              {readout}
+              <svg
+                viewBox={`0 0 ${RING_SIZE} ${RING_SIZE}`}
+                className="size-3.5 -rotate-90"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <circle
+                  cx={RING_SIZE / 2}
+                  cy={RING_SIZE / 2}
+                  r={RING_RADIUS}
+                  fill="none"
+                  strokeWidth={RING_STROKE}
+                  className="stroke-current text-muted-foreground/25"
+                />
+                <circle
+                  cx={RING_SIZE / 2}
+                  cy={RING_SIZE / 2}
+                  r={RING_RADIUS}
+                  fill="none"
+                  strokeWidth={RING_STROKE}
+                  strokeLinecap="round"
+                  stroke="currentColor"
+                  strokeDasharray={RING_CIRCUMFERENCE}
+                  strokeDashoffset={dashOffset}
+                  className="transition-[stroke-dashoffset] duration-500 ease-out motion-reduce:transition-none"
+                />
+              </svg>
+            </button>
+          </PopoverTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="top" sideOffset={6}>
+          {percentText !== null
+            ? `Context window · ${percentText} used`
+            : `Context window · ${usedText} tokens used`}
+        </TooltipContent>
+      </Tooltip>
+
+      <PopoverContent side="top" align="end" className="w-64 p-3">
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="text-label font-medium text-muted-foreground">
+            Context Window
+          </span>
+          <span
+            className="font-mono text-label tabular-nums text-foreground"
+            data-testid="context-usage-readout"
+          >
+            {readout}
+          </span>
+        </div>
+
+        {usedPercentage !== null && (
+          <div
+            className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-2"
+            role="progressbar"
+            aria-label="Context window used"
+            aria-valuenow={Math.round(usedPercentage)}
+            aria-valuemin={0}
+            aria-valuemax={100}
+          >
+            <div
+              className={cn(
+                "h-full rounded-full transition-[width] duration-300",
+                warning ? "bg-danger/80" : "bg-foreground/40",
+              )}
+              style={{ width: `${usedPercentage}%` }}
+            />
+          </div>
+        )}
+
+        {totalProcessedTokens !== null && (
+          <div
+            className="mt-2.5 flex items-baseline justify-between gap-2"
+            data-testid="context-usage-total-processed"
+          >
+            <span className="text-label text-muted-foreground">
+              Total processed
+            </span>
+            <span className="font-mono text-label tabular-nums text-foreground">
+              {formatContextTokens(totalProcessedTokens)}
             </span>
           </div>
+        )}
 
-          {usedPercentage !== null && (
-            <div
-              className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-2"
-              role="progressbar"
-              aria-label="Context window used"
-              aria-valuenow={Math.round(usedPercentage)}
-              aria-valuemin={0}
-              aria-valuemax={100}
-            >
-              <div
-                className={cn(
-                  "h-full rounded-full transition-[width] duration-300",
-                  warning ? "bg-danger/80" : "bg-foreground/40",
-                )}
-                style={{ width: `${usedPercentage}%` }}
-              />
-            </div>
-          )}
-
-          {totalProcessedTokens !== null && (
-            <div
-              className="mt-2.5 flex items-baseline justify-between gap-2"
-              data-testid="context-usage-total-processed"
-            >
-              <span className="text-label text-muted-foreground">
-                Total processed
-              </span>
-              <span className="font-mono text-label tabular-nums text-foreground">
-                {formatContextTokens(totalProcessedTokens)}
-              </span>
-            </div>
-          )}
-
-          {compactsAutomatically && (
-            <p className="mt-2.5 text-label leading-snug text-muted-foreground">
-              {providerLabel ?? "The agent"} automatically compacts its context
-              when needed.
-            </p>
-          )}
-        </PopoverContent>
-      </Popover>
-    </TooltipProvider>
+        {compactsAutomatically && (
+          <p className="mt-2.5 text-label leading-snug text-muted-foreground">
+            {providerLabel ?? "The agent"} automatically compacts its context
+            when needed.
+          </p>
+        )}
+      </PopoverContent>
+    </Popover>
   );
 }

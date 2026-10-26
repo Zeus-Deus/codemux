@@ -1802,7 +1802,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
         queued: { queuedId: "q-1" },
       },
     ];
-    const { container } = render(<AgentChatPane pane={pane} />);
+    const { container } = render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
     await act(async () => {});
     fireEvent.click(
       container.querySelector('[data-testid="send-queued-now"]')!,
@@ -1839,7 +1839,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
       new Error("boom") as never,
     );
 
-    const { container } = render(<AgentChatPane pane={pane} />);
+    const { container } = render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
     await act(async () => {});
     fireEvent.click(
       container.querySelector('[data-testid="send-queued-now"]')!,

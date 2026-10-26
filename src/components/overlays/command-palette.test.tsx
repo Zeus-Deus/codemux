@@ -114,7 +114,6 @@ vi.mock("@/lib/agent-chat/conversation-search", () => ({
 }));
 
 
-import { DIALOG_TOP_ANCHORED_MOTION } from "@/components/ui/dialog";
 import { CommandPalette, PALETTE_COMMANDS } from "./command-palette";
 import { KEYBIND_REGISTRY } from "@/lib/keybind-registry";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
@@ -553,10 +552,14 @@ describe("command palette — conversation search", () => {
     expect(document.querySelector("[cmdk-list]")).toHaveClass("max-h-[max(96px,calc(var(--mobile-height,100dvh)-220px))]");
   });
 
-  it("drops in from the top it is anchored to instead of zooming from the middle", () => {
+  it("fades in quickly without moving or blurring the backdrop", () => {
     renderPalette();
     const dialog = document.querySelector<HTMLElement>('[data-slot="dialog-content"]')!;
-    for (const cls of DIALOG_TOP_ANCHORED_MOTION.split(" ")) expect(dialog).toHaveClass(cls);
+    const overlay = document.querySelector<HTMLElement>('[data-slot="dialog-overlay"]')!;
+    expect(dialog).toHaveClass("duration-100", "data-open:fade-in-0");
+    expect(dialog.className).not.toMatch(/zoom-|slide-|duration-250/);
+    expect(overlay).toHaveClass("duration-100");
+    expect(overlay.className).not.toMatch(/backdrop-blur/);
   });
 
   it("reserves the result viewport even for a single match", async () => {

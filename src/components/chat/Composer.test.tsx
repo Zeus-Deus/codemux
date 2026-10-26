@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState, type ComponentProps } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -228,10 +228,9 @@ describe("Composer", () => {
 
     it("names the stop key in the Stop button's tooltip", () => {
       const { container } = renderComposer({ streaming: true });
-      expect(container.querySelector('button[aria-label="Stop"]')).toHaveAttribute(
-        "title",
-        "Stop (Esc)",
-      );
+      // Focus opens the app tooltip at once; hover would wait out its delay.
+      fireEvent.focus(container.querySelector('button[aria-label="Stop"]')!);
+      expect(screen.getByRole("tooltip")).toHaveTextContent("Stop (Esc)");
     });
   });
 

@@ -5,7 +5,6 @@ import {
   DialogTitle,
   DialogDescription,
   DIALOG_CRISP_POSITION,
-  DIALOG_TOP_ANCHORED_MOTION,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { Eyebrow } from "@/components/ui/eyebrow";
@@ -222,8 +221,9 @@ export function FileSearchDialog() {
        *  which landed on the search input's top-right corner because the
        *  content here is `p-0` rather than the `p-4` that button assumes. */}
       <DialogContent
-        className={cn(DIALOG_CRISP_POSITION, DIALOG_TOP_ANCHORED_MOTION, "gap-0 overflow-hidden p-0")}
+        className={cn(DIALOG_CRISP_POSITION, "gap-0 overflow-hidden p-0")}
         showCloseButton={false}
+        motion="quick"
         onKeyDown={handleKeyDown}
       >
         <DialogTitle className="sr-only">Search Files</DialogTitle>

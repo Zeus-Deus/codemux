@@ -603,100 +603,98 @@ export function MultiProviderModelPicker({
 
   return (
     <Popover open={open} onOpenChange={(v) => !disabled && setOpen(v)}>
-      <TooltipProvider delayDuration={250}>
-        <Tooltip open={!showReveal && tooltipOpen && !open} onOpenChange={setTooltipOpen}>
-          {/* Popover outside the tooltip: Radix spreads incoming props
-              after its own `data-state`, so the outer trigger's state is the
-              one the button keeps, and the reveal and open styling key on
-              the popover's. */}
-          <PopoverTrigger asChild>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                disabled={disabled}
-                data-testid="multi-provider-model-picker-trigger"
-                // Composer footer control: quiet ghost text (shared
-                // FOOTER_TRIGGER recipe), the leading ProviderLogo standing
-                // in for a tinted dot. Hairline pipes between footer
-                // controls — not per-pill borders — carry the separation.
-                className={cn(
-                  "group/model",
+      <Tooltip open={!showReveal && tooltipOpen && !open} onOpenChange={setTooltipOpen}>
+        {/* Popover outside the tooltip: Radix spreads incoming props
+            after its own `data-state`, so the outer trigger's state is the
+            one the button keeps, and the reveal and open styling key on
+            the popover's. */}
+        <PopoverTrigger asChild>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              disabled={disabled}
+              data-testid="multi-provider-model-picker-trigger"
+              // Composer footer control: quiet ghost text (shared
+              // FOOTER_TRIGGER recipe), the leading ProviderLogo standing
+              // in for a tinted dot. Hairline pipes between footer
+              // controls — not per-pill borders — carry the separation.
+              className={cn(
+                "group/model",
+                inContextRow
+                  ? cn(CONTEXT_ROW_TRIGGER, "shrink")
+                  : cn(
+                      FOOTER_TRIGGER,
+                      iconOnly ? FOOTER_TRIGGER_ICON_ONLY : "min-w-[60px] shrink",
+                    ),
+                showReveal && [
+                  "relative z-10 transition-[color,background-color,margin] duration-150 ease-out motion-reduce:transition-none",
+                  "hover:-ml-(--model-reveal-w) focus-visible:-ml-(--model-reveal-w) data-[state=open]:-ml-(--model-reveal-w)",
+                  // Opaque, so the open pill covers what it overlaps: the
+                  // hover tint over the surface the pill sits on.
                   inContextRow
-                    ? cn(CONTEXT_ROW_TRIGGER, "shrink")
-                    : cn(
-                        FOOTER_TRIGGER,
-                        iconOnly ? FOOTER_TRIGGER_ICON_ONLY : "min-w-[60px] shrink",
-                      ),
-                  showReveal && [
-                    "relative z-10 transition-[color,background-color,margin] duration-150 ease-out motion-reduce:transition-none",
-                    "hover:-ml-(--model-reveal-w) focus-visible:-ml-(--model-reveal-w) data-[state=open]:-ml-(--model-reveal-w)",
-                    // Opaque, so the open pill covers what it overlaps: the
-                    // hover tint over the surface the pill sits on.
-                    inContextRow
-                      ? "hover:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_20%,var(--background)))] focus-visible:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_20%,var(--background)))]"
-                      : "hover:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_40%,var(--background)))] focus-visible:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_40%,var(--background)))]",
-                  ],
-                )}
-                style={
-                  showReveal
-                    ? ({ "--model-reveal-w": `${revealWidth}px` } as CSSProperties)
-                    : undefined
-                }
-                aria-label={iconOnly ? `Model: ${triggerLabel}` : undefined}
-              >
-                {currentAccount ? (
-                  <span className="relative mr-1 inline-flex shrink-0">
-                    <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
-                    <AccountBadge account={currentAccount} current />
-                  </span>
-                ) : (
+                    ? "hover:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_20%,var(--background)))] focus-visible:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_20%,var(--background)))]"
+                    : "hover:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_40%,var(--background)))] focus-visible:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_40%,var(--background)))]",
+                ],
+              )}
+              style={
+                showReveal
+                  ? ({ "--model-reveal-w": `${revealWidth}px` } as CSSProperties)
+                  : undefined
+              }
+              aria-label={iconOnly ? `Model: ${triggerLabel}` : undefined}
+            >
+              {currentAccount ? (
+                <span className="relative mr-1 inline-flex shrink-0">
                   <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
-                )}
-                {!iconOnly && (
-                  <>
-                    <span className="flex min-w-0 items-center">
-                      {showReveal && (
-                        <span
-                          ref={revealRef}
-                          data-testid="multi-provider-model-picker-reveal"
-                          className={cn(
-                            "inline-flex w-0 shrink-0 overflow-hidden whitespace-nowrap opacity-0 transition-[width,opacity] duration-150 ease-out motion-reduce:transition-none",
-                            "group-hover/model:w-(--model-reveal-w) group-hover/model:opacity-70",
-                            "group-focus-visible/model:w-(--model-reveal-w) group-focus-visible/model:opacity-70",
-                            "group-data-[state=open]/model:w-(--model-reveal-w) group-data-[state=open]/model:opacity-70",
-                          )}
-                        >
-                          {triggerReveal}
-                          <span aria-hidden className="mx-1 opacity-60">
-                            ·
-                          </span>
+                  <AccountBadge account={currentAccount} current />
+                </span>
+              ) : (
+                <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
+              )}
+              {!iconOnly && (
+                <>
+                  <span className="flex min-w-0 items-center">
+                    {showReveal && (
+                      <span
+                        ref={revealRef}
+                        data-testid="multi-provider-model-picker-reveal"
+                        className={cn(
+                          "inline-flex w-0 shrink-0 overflow-hidden whitespace-nowrap opacity-0 transition-[width,opacity] duration-150 ease-out motion-reduce:transition-none",
+                          "group-hover/model:w-(--model-reveal-w) group-hover/model:opacity-70",
+                          "group-focus-visible/model:w-(--model-reveal-w) group-focus-visible/model:opacity-70",
+                          "group-data-[state=open]/model:w-(--model-reveal-w) group-data-[state=open]/model:opacity-70",
+                        )}
+                      >
+                        {triggerReveal}
+                        <span aria-hidden className="mx-1 opacity-60">
+                          ·
                         </span>
-                      )}
-                      <span className="max-w-[180px] truncate">
-                        {leafLabel
-                          ? leafModelName(triggerLabel, sessionProviderLabel(provider))
-                          : triggerLabel}
                       </span>
-                    </span>
-                    {!inContextRow && (
-                      <ChevronDown className="size-3 shrink-0 opacity-50" />
                     )}
-                  </>
-                )}
-              </button>
-            </TooltipTrigger>
-          </PopoverTrigger>
-          <TooltipContent
-            side="top"
-            sideOffset={6}
-            aria-label={triggerTitle}
-            className="flex-col items-start gap-0.5"
-          >
-            <span>{triggerLabel}</span>
-            {triggerDetails && <span className="opacity-70">{triggerDetails}</span>}
-          </TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+                    <span className="max-w-[180px] truncate">
+                      {leafLabel
+                        ? leafModelName(triggerLabel, sessionProviderLabel(provider))
+                        : triggerLabel}
+                    </span>
+                  </span>
+                  {!inContextRow && (
+                    <ChevronDown className="size-3 shrink-0 opacity-50" />
+                  )}
+                </>
+              )}
+            </button>
+          </TooltipTrigger>
+        </PopoverTrigger>
+        <TooltipContent
+          side="top"
+          sideOffset={6}
+          aria-label={triggerTitle}
+          className="flex-col items-start gap-0.5"
+        >
+          <span>{triggerLabel}</span>
+          {triggerDetails && <span className="opacity-70">{triggerDetails}</span>}
+        </TooltipContent>
+      </Tooltip>
       <PopoverContent
         // Fixed 400×360 (48px provider rail + fluid list) however many
         // providers, accounts and models there are: the rail and the list

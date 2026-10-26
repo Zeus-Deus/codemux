@@ -53,7 +53,6 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { CommandDialog } from "@/components/ui/command";
-import { DIALOG_TOP_ANCHORED_MOTION } from "@/components/ui/dialog";
 import {
   ThemeAnsiDots,
   ThemeCoins,
@@ -589,12 +588,12 @@ export function CommandPalette({ open, onOpenChange }: Props) {
       onOpenChange={onOpenChange}
       title="Command palette"
       description="Search workspaces, conversations, projects, and commands."
+      // Summoned from the keyboard many times a day, so it fades in at once
+      // rather than dropping in.
+      motion="quick"
       // Mobile's generic dialog rule centers at mid-screen; this top-anchored
       // palette must instead leave room for its reserved results and keyboard.
-      className={cn(
-        "top-24 w-full gap-0 border border-border p-0 sm:max-w-[640px] in-[[data-mobile]]:top-[calc(var(--mobile-top,0px)+12px)]! in-[[data-mobile]]:p-0!",
-        DIALOG_TOP_ANCHORED_MOTION,
-      )}
+      className="top-24 w-full gap-0 border border-border p-0 sm:max-w-[640px] in-[[data-mobile]]:top-[calc(var(--mobile-top,0px)+12px)]! in-[[data-mobile]]:p-0!"
     >
       {/* Radix unmounts dialog content while closed, so the body's stores,
           clock, and avatar loads cost nothing until the palette opens. */}
