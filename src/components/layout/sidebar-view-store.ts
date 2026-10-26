@@ -15,11 +15,29 @@ export const SIDEBAR_VIEW_UI_STATE_KEY = "sidebar.view";
  *  a JSON array of project paths. One blob rather than one key per project so
  *  the view reads its whole fold state in a single round trip. */
 export const SIDEBAR_FOLDED_PROJECTS_UI_STATE_KEY = "sidebar.projects.folded";
+/** Persisted UI-state key for the plugin layout the Projects view uses: a
+ *  native tree (`<installationId>/tree:<treeId>`) or declared view
+ *  (`<installationId>/<viewId>`), or empty for the built-in grouping. Kept while the
+ *  plugin is off or unavailable, so turning it back on restores it. */
+export const SIDEBAR_PLUGIN_LAYOUT_UI_STATE_KEY = "sidebar.pluginLayout";
+/** Persisted UI-state key for the person's folds in plugin trees: a JSON
+ *  array of section keys (`+key` records an unfold against the default). */
+export const SIDEBAR_PLUGIN_TREE_FOLDS_UI_STATE_KEY = "sidebar.pluginTree.folds";
 
 export const DEFAULT_SIDEBAR_VIEW: SidebarView = "activity";
 
 export function parseSidebarView(raw: string | null | undefined): SidebarView {
   return raw === "projects" ? "projects" : DEFAULT_SIDEBAR_VIEW;
+}
+
+function parseStringList(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
+  } catch {
+    return [];
+  }
 }
 
 function parseFolded(raw: string | null | undefined): Record<string, true> {
@@ -45,10 +63,19 @@ interface SidebarViewStore {
   view: SidebarView;
   /** Project paths whose group is folded in the Projects view. */
   folded: Record<string, true>;
+  /** The plugin layout the Projects view uses, or null for the built-in
+   *  grouping. Only a choice: the view falls back to the built-in grouping
+   *  whenever the plugin cannot serve it. */
+  pluginLayout: string | null;
+  /** Fold entries for plugin tree sections. */
+  pluginTreeFolds: string[];
   load: () => Promise<void>;
   setView: (view: SidebarView) => void;
   toggleView: () => void;
   setFolded: (projectPath: string, folded: boolean) => void;
+  /** Choose a plugin layout (switching to Projects), or null for the built-in grouping. */
+  setPluginLayout: (key: string | null) => void;
+  setPluginTreeFolds: (folds: string[]) => void;
 }
 
 let loadPromise: Promise<void> | null = null;
@@ -64,13 +91,17 @@ export const useSidebarViewStore = create<SidebarViewStore>((set, get) => ({
   loaded: false,
   view: DEFAULT_SIDEBAR_VIEW,
   folded: {},
+  pluginLayout: null,
+  pluginTreeFolds: [],
 
   load: () => {
     if (loadPromise) return loadPromise;
     loadPromise = Promise.all([
       dbGetUiState(SIDEBAR_VIEW_UI_STATE_KEY).catch(() => null),
       dbGetUiState(SIDEBAR_FOLDED_PROJECTS_UI_STATE_KEY).catch(() => null),
-    ]).then(([rawView, rawFolded]) => {
+      dbGetUiState(SIDEBAR_PLUGIN_LAYOUT_UI_STATE_KEY).catch(() => null),
+      dbGetUiState(SIDEBAR_PLUGIN_TREE_FOLDS_UI_STATE_KEY).catch(() => null),
+    ]).then(([rawView, rawFolded, rawLayout, rawTreeFolds]) => {
       // A choice made before the read resolved (a click or the shortcut in
       // the first frames) wins over the stored value.
       if (get().loaded) return;
@@ -78,6 +109,8 @@ export const useSidebarViewStore = create<SidebarViewStore>((set, get) => ({
         loaded: true,
         view: parseSidebarView(rawView),
         folded: parseFolded(rawFolded),
+        pluginLayout: rawLayout ? rawLayout : null,
+        pluginTreeFolds: parseStringList(rawTreeFolds),
       });
     });
     return loadPromise;
@@ -102,6 +135,17 @@ export const useSidebarViewStore = create<SidebarViewStore>((set, get) => ({
     set({ folded: next });
     persistFolded(next);
   },
+
+  setPluginLayout: (key) => {
+    set({ pluginLayout: key, loaded: true, ...(key !== null ? { view: "projects" as const } : {}) });
+    dbSetUiState(SIDEBAR_PLUGIN_LAYOUT_UI_STATE_KEY, key ?? "").catch(console.error);
+    if (key !== null) dbSetUiState(SIDEBAR_VIEW_UI_STATE_KEY, "projects").catch(console.error);
+  },
+
+  setPluginTreeFolds: (folds) => {
+    set({ pluginTreeFolds: folds });
+    dbSetUiState(SIDEBAR_PLUGIN_TREE_FOLDS_UI_STATE_KEY, JSON.stringify(folds)).catch(console.error);
+  },
 }));
 
 /** Test-only: reset the load memoization and store state. */
@@ -111,5 +155,7 @@ export function __resetSidebarViewStoreForTests(): void {
     loaded: false,
     view: DEFAULT_SIDEBAR_VIEW,
     folded: {},
+    pluginLayout: null,
+    pluginTreeFolds: [],
   });
 }

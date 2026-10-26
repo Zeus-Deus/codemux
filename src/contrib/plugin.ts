@@ -12,10 +12,11 @@ import { pluginStorage } from "./storage";
 import type { PluginTier } from "./plugins-store";
 import { bindOwner, ownedDisposer, type Owner } from "./lifetime";
 import { createHost, type Host } from "@/sdk/host";
+import { apiVersion, rendererPluginCompatibility, type RendererPluginCapability, type RendererPluginRequirements } from "@/sdk/compatibility";
 
 export const SETTINGS_PAGES_AREA = "settings.pages";
 
-export interface CodemuxPlugin {
+export interface CodemuxPlugin extends RendererPluginRequirements {
   /** `[a-z0-9-]{1,64}`; equals the folder name. */
   id: string;
   name?: string;
@@ -59,6 +60,10 @@ export interface PluginSettingsPage {
 }
 
 export interface PluginContext {
+  readonly apiVersion: typeof apiVersion;
+  readonly capabilities: readonly RendererPluginCapability[];
+  /** Aborted before disposal on disable, reload, registration failure or removal. */
+  readonly signal: AbortSignal;
   readonly id: string;
   /** `plugin:<id>` */
   readonly source: string;
@@ -126,7 +131,7 @@ function createLifetime(owner: Owner) {
   };
 }
 
-export function createPluginContext(pluginId: string, tier: PluginTier, owner: Owner): PluginContext {
+export function createPluginContext(pluginId: string, tier: PluginTier, owner: Owner, requirements: RendererPluginRequirements = {}): PluginContext {
   const source = `plugin:${pluginId}`;
   const scope = (c: PluginContribution): Contribution => ({
     ...c,
@@ -136,6 +141,9 @@ export function createPluginContext(pluginId: string, tier: PluginTier, owner: O
   // Unregistering early releases the disposer from the owner too.
   const track = (dispose: () => void) => ownedDisposer(owner, dispose);
   return {
+    apiVersion,
+    capabilities: rendererPluginCompatibility(requirements).capabilities,
+    signal: owner.signal,
     id: pluginId,
     source,
     tier,

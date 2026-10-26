@@ -1,0 +1,37 @@
+{
+  "id": "examples.platform-projects-tree",
+  "name": "Projects Tree",
+  "description": "Native project headings with pinned work, nested launches, and folded quiet projects.",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "entry": "plugin.mjs",
+  "capabilities": [
+    "settings",
+    "threads.read",
+    "workflow.query",
+    "ui.native-trees",
+    "ui.changes"
+  ],
+  "nativeTrees": [
+    {
+      "id": "projects",
+      "title": "Projects"
+    }
+  ],
+  "actions": [],
+  "views": [],
+  "settings": [
+    {
+      "key": "emptyProjects",
+      "label": "Show empty projects",
+      "type": "boolean",
+      "default": true
+    },
+    {
+      "key": "quietAfterDays",
+      "label": "Fold quiet projects after days",
+      "type": "number",
+      "default": 3
+    }
+  ]
+}

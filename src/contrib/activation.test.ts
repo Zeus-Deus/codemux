@@ -22,6 +22,34 @@ afterEach(() => {
 });
 
 describe("plugin activation", () => {
+  it("holds an incompatible plugin without registering it or changing enable intent", () => {
+    const register = vi.fn();
+    usePluginsStore.setState({ decisions: { demo: true } });
+    expect(activatePlugin({ id: "demo", apiVersion: 99, register }, record)).toBe(false);
+    expect(register).not.toHaveBeenCalled();
+    expect(usePluginsStore.getState().records.demo.error).toContain("API version 99");
+    expect(usePluginsStore.getState().decisions.demo).toBe(true);
+  });
+
+  it("aborts the plugin's signal before disposal and ignores late registrations", () => {
+    let signal: AbortSignal | undefined;
+    let registerLate: (() => void) | undefined;
+    const cleanup = vi.fn(() => expect(signal?.aborted).toBe(true));
+    activatePlugin({ id: "demo", register(ctx) {
+      signal = ctx.signal;
+      expect(ctx.apiVersion).toBe(1);
+      expect(ctx.capabilities).toContain("ui.react");
+      registerLate = () => { ctx.register({ id: "late", area: "test.aborted" }); };
+      ctx.onDispose(cleanup);
+    } }, record);
+    expect(signal?.aborted).toBe(false);
+    unloadPlugin("demo");
+    registerLate?.();
+    expect(signal?.aborted).toBe(true);
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(registry.getArea("test.aborted")).toEqual([]);
+  });
+
   it("scopes ids and removes everything on unload", () => {
     const cleanup = vi.fn();
     const plugin: CodemuxPlugin = {

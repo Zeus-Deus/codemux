@@ -150,6 +150,8 @@ interface UIStore {
   showSettings: boolean;
   settingsSection: string | null;
   settingsNavigationVersion: number;
+  /** One-shot installation selection for plugin settings. Never persisted. */
+  pendingPluginSettingsSelection: string | null;
   /** Set to request creating a new preset and opening its editor. The
    *  Presets settings view consumes and clears it. Not persisted. */
   pendingPresetCreate: boolean;
@@ -292,6 +294,7 @@ interface UIStore {
     projectDir?: string | null,
   ) => void;
   setShowSettings: (show: boolean, section?: string | null) => void;
+  openPluginSettings: (installationId?: string | null) => void;
   /** Open Settings ▸ Presets and request creating a new preset. */
   requestNewPreset: () => void;
   /** Clear the pending-create request after the settings view handles it. */
@@ -384,6 +387,7 @@ export const useUIStore = create<UIStore>()(
       newWorkspaceDraft: null,
       showSettings: false,
       settingsSection: null,
+      pendingPluginSettingsSelection: null,
       settingsNavigationVersion: 0,
       pendingPresetCreate: false,
       showAutomations: false,
@@ -675,6 +679,14 @@ export const useUIStore = create<UIStore>()(
         set((state) => ({
           showSettings: show,
           settingsSection: show ? (section ?? null) : null,
+          pendingPluginSettingsSelection: null,
+          settingsNavigationVersion: state.settingsNavigationVersion + 1,
+        })),
+      openPluginSettings: (installationId = null) =>
+        set((state) => ({
+          showSettings: true,
+          settingsSection: "plugins",
+          pendingPluginSettingsSelection: installationId,
           settingsNavigationVersion: state.settingsNavigationVersion + 1,
         })),
       requestNewPreset: () =>

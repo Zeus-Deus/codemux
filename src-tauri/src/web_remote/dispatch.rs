@@ -244,6 +244,26 @@ pub async fn dispatch_invoke<R: Runtime>(
     cmd: String,
     mut args: Value,
 ) {
+    if cmd == "plugins_platform_request" {
+        let shared = app.state::<super::WebRemoteState>().shared();
+        let result = match shared.connections.session_for_connection(conn_id) {
+            Some(session) => {
+                match (args.get("method").and_then(Value::as_str), args.get("params")) {
+                    (Some(method), Some(params)) => crate::plugins::platform_transport::request(
+                        app, crate::agent_control::ControlCaller::remote(session), method, params.clone(),
+                    ).await,
+                    _ => Err("invalid_input: Plugin request requires method and params".into()),
+                }
+            }
+            None => Err("stale_caller: Remote connection is no longer active".into()),
+        };
+        let frame = match result {
+            Ok(value) => Message::Text(json!({"t":"ok","id":id,"data":value}).to_string()),
+            Err(error) => err_text(id,&error),
+        };
+        let _=out.send(frame);
+        return;
+    }
     // Deny before channel rewriting or native invocation.
     if cmd.starts_with("plugins_") || plugin_mcp_command(&cmd, &args) {
         let _ = out.send(err_text(id, "REMOTE_UNSUPPORTED: plugins require the desktop app"));
@@ -789,5 +809,56 @@ mod provenance_tests {
             assert_eq!(remote_input_source(&json!({"input":{"input_source":claimed}})), "web");
         }
         assert_eq!(remote_input_source(&json!({"input":{"input_source":"phone"}})), "phone");
+    }
+}
+
+#[cfg(test)]
+mod platform_transport_remote_tests {
+    use super::*;
+    use crate::{agent_control::ControlCaller, database::DatabaseStore, plugins::platform_transport};
+    use platform_transport::tests::{fixture, source, install, enable};
+
+    #[tokio::test]
+    async fn platform_remote_keeps_transport_identity_and_revokes_host_calls_after_disconnect_or_revoke() {
+        for disconnect in [false, true] {
+            let (app, root) = fixture();
+            app.manage(crate::web_remote::WebRemoteState::default());
+            let shared = app.state::<crate::web_remote::WebRemoteState>().shared();
+            let db = app.state::<DatabaseStore>();
+            db.web_remote_insert_session("remote",None,None,"fixture-hash",true).unwrap();
+            let (close, _) = tokio::sync::watch::channel(false);
+            let (out, _frames) = crate::web_remote::server::outbound_channel(close.clone());
+            let conn = shared.connections.register("remote",crate::web_remote::server::Transport::Lan,out,close);
+            let directory = source(root.path(),"remote-worker","1.0.0",r#"export function activate(ctx){ctx.handle('action:run',async(input,i)=>{if(input?.hold)await new Promise(resolve=>setTimeout(resolve,150));if(input?.write)await ctx.storage.set('saved',true);return {data:{caller:i.caller,saved:await ctx.storage.get('saved')}};});}"#);
+            let active = enable(&app,&install(&app,&directory).await).await;
+            let params = |operation: &str, input: Value| json!({"installationId":active["installationId"],"generation":active["generation"],"handler":"action:run","operationId":operation,"input":input,"caller":{"kind":"agent","threadId":"forged"},"principal":"local"});
+            let identity = platform_transport::request(app.handle(),ControlCaller::remote("remote".into()),"invoke",params("identity",json!({}))).await.unwrap();
+            assert_eq!(identity["data"]["caller"],json!({"kind":"client"}));
+            let invoke = platform_transport::request(app.handle(),ControlCaller::remote("remote".into()),"invoke",params("revoked",json!({"hold":true,"write":true})));
+            let revoke = async {
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                if disconnect { shared.connections.unregister(conn); } else { db.web_remote_revoke_session("remote").unwrap(); }
+            };
+            let (result,_) = tokio::join!(invoke,revoke);
+            let error = result.unwrap_err();
+            // An uncaught worker host-call error retains the native denial message;
+            // the supervisor classifies the handler's failure as operation_failed.
+            assert!(error.contains("stale_caller") || error.contains("remote client disconnected or its session was revoked"), "{error}");
+            if disconnect {
+                let (close,_) = tokio::sync::watch::channel(false);
+                let (out,_frames) = crate::web_remote::server::outbound_channel(close.clone());
+                shared.connections.register("remote",crate::web_remote::server::Transport::Lan,out,close);
+            } else {
+                // A new authenticated session may inspect the same host-owned storage.
+                db.web_remote_insert_session("fresh",None,None,"fresh-hash",true).unwrap();
+                let (close,_) = tokio::sync::watch::channel(false);
+                let (out,_frames) = crate::web_remote::server::outbound_channel(close.clone());
+                shared.connections.register("fresh",crate::web_remote::server::Transport::Lan,out,close);
+            }
+            let session = if disconnect {"remote"} else {"fresh"};
+            let after = platform_transport::request(app.handle(),ControlCaller::remote(session.into()),"invoke",params("inspect",json!({}))).await.unwrap();
+            assert!(after["data"]["saved"].is_null());
+            app.state::<platform_transport::PluginPlatformState>().shutdown().await;
+        }
     }
 }

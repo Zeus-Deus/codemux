@@ -7,6 +7,7 @@ import { pluginLabel, pluginIdOf } from "@/contrib/attribution";
 import { RIGHT_PANEL_AREA } from "@/sdk/areas";
 import type { RightPaneData } from "@/sdk/host";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { PLATFORM_CONTRIBUTION_SOURCE, platformPluginLabel } from "@/components/plugins/platform-adapter";
 /**
  * The right panel — a **pane deck**.
  *
@@ -333,13 +334,19 @@ export const RightPanel = memo(function RightPanel({
   const pluginPaneContributions = useContributions(RIGHT_PANEL_AREA);
   const pluginPanes = useMemo(
     () =>
-      isRemoteClient()
-        ? []
-        : pluginPaneContributions.map((c) => ({
+      // Renderer plugins run only on the desktop; isolated platform plugins
+      // run in the host and serve their views to remote clients too.
+      (isRemoteClient()
+        ? pluginPaneContributions.filter((c) => c.source === PLATFORM_CONTRIBUTION_SOURCE)
+        : pluginPaneContributions
+      ).map((c) => ({
             pane: `plugin:${c.id}` as `plugin:${string}:${string}`,
             contribution: c,
             title: c.title ?? c.id,
-            pluginName: pluginLabel(pluginIdOf(c.id)),
+            pluginName:
+              c.source === PLATFORM_CONTRIBUTION_SOURCE
+                ? platformPluginLabel(pluginIdOf(c.id))
+                : pluginLabel(pluginIdOf(c.id)),
             icon: (c.data as RightPaneData | undefined)?.icon ?? Puzzle,
           })),
     [pluginPaneContributions],

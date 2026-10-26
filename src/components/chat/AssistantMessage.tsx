@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, useContext } from "react";
 
 import { ChatForkButton } from "@/components/chat/ChatFork";
 import { MessageCopyButton } from "@/components/chat/MessageCopyButton";
@@ -10,6 +10,8 @@ import type { AssistantMessageItem } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 
 import { ChatMarkdown } from "./ChatMarkdown";
+import { PluginMessageActions } from "@/components/plugins/PluginActionMenus";
+import { PluginTranscriptThreadContext } from "@/components/plugins/PluginConversationCard";
 
 /**
  * Assistant prose (design D4). No bubble, no avatar (the avatar lives in
@@ -44,9 +46,11 @@ export const AssistantMessage = memo(function AssistantMessage({
   referenceCwd?: string | null;
   referencePaths?: readonly string[];
 }) {
+  const threadId = useContext(PluginTranscriptThreadContext);
   return (
     <div
       data-testid="assistant-message"
+      data-plugin-message-root=""
       className={cn(
         MESSAGE_GROUP_CLASS,
         "conversation-text leading-relaxed text-foreground break-words",
@@ -66,6 +70,12 @@ export const AssistantMessage = memo(function AssistantMessage({
         <div className={cn(MESSAGE_ACTION_ROW_CLASS, "mt-1")}>
           <MessageCopyButton text={item.text} label="Copy response" />
           <ChatForkButton itemId={item.id} />
+          <PluginMessageActions
+            messageId={item.id}
+            text={item.text}
+            workspaceId={workspaceId ?? null}
+            threadId={threadId}
+          />
         </div>
       ) : null}
     </div>

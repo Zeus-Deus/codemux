@@ -11,6 +11,8 @@
     "test": "vitest run",
     "verify": "cargo check --manifest-path src-tauri/Cargo.toml && cargo test --manifest-path src-tauri/Cargo.toml && npm run check && npm run test",
     "test:watch": "vitest run --watch",
+    "check:plugin-sdk": "tsc --project packages/plugin-sdk/tsconfig.json --noEmit && tsc --project packages/plugin-sdk/tsconfig.test.json --noEmit",
+    "test:plugin-sdk": "node --test packages/plugin-sdk/test/*.test.mjs examples/plugins/platform-*/test/*.test.mjs",
     "tauri": "node scripts/tauri.mjs",
     "tauri:dev:x11": "GDK_BACKEND=x11 npm run tauri -- dev --config src-tauri/tauri.conf.dev.json",
     "tauri:dev": "npm run tauri -- dev --config src-tauri/tauri.conf.dev.json",

@@ -1,0 +1,6 @@
+{
+  "id":"examples.platform-frozen-v1","name":"Frozen isolated v1 acceptance artifact","version":"1.0.0","apiVersion":1,"entry":"plugin.mjs",
+  "capabilities":["storage","ui","ui.conversation-cards"],"optionalCapabilities":["future.example-capability"],
+  "actions":[{"id":"snapshot","title":"Read frozen snapshot","placements":["palette"]},{"id":"wait","title":"Cancellation fixture","placements":[]}],
+  "views":[{"id":"snapshot","title":"Frozen snapshot","entry":"view.html","placement":"conversation"}],"settings":[]
+}

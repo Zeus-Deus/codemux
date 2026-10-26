@@ -54,6 +54,7 @@ import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
 import { createProviderAccountsMock, mockAccountQuota, withAccountUsage } from "./provider-accounts-mock";
 import { pluginMockHandlers } from "./plugin-mock";
+import { platformPluginMockHandlers } from "./platform-plugin-mock";
 import { seedEnvironmentsFromSearch } from "./environments-mock";
 import { automationMockHandlers } from "./automations-mock";
 import {
@@ -2385,6 +2386,19 @@ function mockChatTranscript(threadId = MOCK_CHAT_THREAD_ID): string[] {
         text: "Keep going on the importer.",
       });
     }
+  }
+
+  if (new URLSearchParams(location.search).get("platformPlugins") === "demo") {
+    const turnId = "seed-plugin-card";
+    push({ type: "user_message", thread_id: T, client_nonce: "seed-plugin-card", text: "Review the plugin task proposal." });
+    push({ type: "item_completed", thread_id: T, turn_id: turnId, item: {
+      kind: "tool_use", tool_name: "mcp__codemux__plugin_invoke", tool_use_id: "seed-plugin-invoke", input: { actionId: "open" },
+    } });
+    push({ type: "item_completed", thread_id: T, turn_id: turnId, item: {
+      kind: "tool_result", tool_use_id: "seed-plugin-invoke", is_error: false,
+      content: JSON.stringify({ card: { viewId: "tasks", summary: "Two tasks are ready for your review. No chats have been started.", installationId: "mock-workflow-board", generation: "mock-generation-1", dataOwner: "mock-data-owner", data: { taskCount: 2 } } }),
+    } });
+    push({ type: "turn_completed", thread_id: T, turn_id: turnId, status: { kind: "success" }, usage: null });
   }
 
   // `?visual=1` seeds a turn where the agent answers with an `html_render`
@@ -4824,6 +4838,29 @@ const handlers: Record<string, Handler> = {
   // Without a daemon the pane sits in its connecting/retry state —
   // the same UI as a dead daemon in the real app.
   start_browser_stream: () => "ws://127.0.0.1:9777",
+  create_browser_pane: (a) => {
+    const loc = findSurfaceForPane(a.paneId);
+    if (!loc) throw new Error("Pane is not open");
+    const n = ++mockTabSeq;
+    const paneId = `pane-mock-browser-${n}`;
+    const browserId = `browser-mock-${n}`;
+    const url = typeof a.url === "string" ? a.url : "about:blank";
+    appState = {
+      ...appState,
+      browser_sessions: [...appState.browser_sessions, {
+        browser_id: browserId, title: "Preview", current_url: url,
+        history: [url], history_index: 0, is_loading: false, last_error: null,
+      }],
+    };
+    patchSurface(loc.surface, {
+      root: replacePaneNode(loc.surface.root, a.paneId, (found) => ({
+        kind: "split", pane_id: `split-mock-browser-${n}`, direction: "horizontal",
+        child_sizes: [0.5, 0.5], children: [found, { kind: "browser", pane_id: paneId, browser_id: browserId, title: "Preview" }],
+      })),
+      active_pane_id: paneId,
+    });
+    return paneId;
+  },
   // Toolbar/viewport/inspector commands shell out to the CLI in the
   // real app; the mock accepts and ignores them.
   agent_browser_run: () => null,
@@ -4894,6 +4931,7 @@ const handlers: Record<string, Handler> = {
   get_feature_flags: () => FEATURE_FLAGS,
   // Empty by default: plugins never alter a clean core-only UI.
   ...pluginMockHandlers(pushPluginChannel),
+  ...platformPluginMockHandlers(),
   ...automationMockHandlers(),
   ...workflowMockHandlers((event) => emitEvent("workflow-changed", event)),
   get_package_format: () =>

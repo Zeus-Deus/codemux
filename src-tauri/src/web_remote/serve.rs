@@ -135,6 +135,14 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     // Mirror the GUI's `RunEvent::Exit` cleanup, then let `app` drop normally
     // so managed provider/server state gets its destructors. A success-path
     // `process::exit` would skip those destructors and leak child processes.
+    if let Some(platform) =
+        tauri::Manager::try_state::<crate::plugins::platform_transport::PluginPlatformState>(&app)
+    {
+        let _ = tauri::async_runtime::block_on(tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            platform.shutdown(),
+        ));
+    }
     if let Some(coordinator) = tauri::Manager::try_state::<crate::delegation::coordinator::Coordinator>(&app) {
         tauri::async_runtime::block_on(coordinator.shutdown())?;
     }

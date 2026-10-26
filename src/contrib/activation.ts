@@ -7,6 +7,7 @@
 import { toast } from "@/lib/toast";
 import { Owner, runAs } from "./lifetime";
 import { createPluginContext, type CodemuxPlugin } from "./plugin";
+import { rendererPluginCompatibility } from "@/sdk/compatibility";
 import {
   patchPlugin,
   pluginActive,
@@ -51,6 +52,11 @@ export function reportPluginError(name: string, title: string, error: unknown): 
  */
 export function activatePlugin(plugin: CodemuxPlugin, record: Omit<PluginRecord, "status">): boolean {
   unloadPlugin(plugin.id);
+  const compatibility = rendererPluginCompatibility(plugin);
+  if (!compatibility.available) {
+    publishPlugin({ ...record, status: "error", error: compatibility.error });
+    return false;
+  }
   // Set BEFORE register() so a throw midway is disposable. A disposer added
   // after this incarnation ended (a late async registration, a timer started
   // after unload) runs immediately instead of leaking.
@@ -65,7 +71,7 @@ export function activatePlugin(plugin: CodemuxPlugin, record: Omit<PluginRecord,
 
   let result: unknown;
   try {
-    result = runAs(owner, () => plugin.register(createPluginContext(plugin.id, record.tier, owner)));
+    result = runAs(owner, () => plugin.register(createPluginContext(plugin.id, record.tier, owner, plugin)));
   } catch (error) {
     fail(error);
     return false;

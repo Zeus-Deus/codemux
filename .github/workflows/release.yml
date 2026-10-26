@@ -133,6 +133,10 @@ jobs:
         shell: bash
         run: bash scripts/build-managed-workflow-sidecar.sh --strict
 
+      - name: Build bundled plugin host
+        shell: bash
+        run: bash scripts/build-plugin-host.sh --strict
+
       - name: Managed workflow bundled native readiness
         if: runner.os == 'Linux'
         shell: bash

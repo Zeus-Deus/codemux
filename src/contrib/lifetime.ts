@@ -17,11 +17,16 @@
 export class Owner {
   private live = new Set<() => void>();
   private done = false;
+  private controller = new AbortController();
 
   constructor(readonly pluginId: string) {}
 
   get ended(): boolean {
     return this.done;
+  }
+
+  get signal(): AbortSignal {
+    return this.controller.signal;
   }
 
   /** Live disposers (diagnostics and tests). */
@@ -48,6 +53,7 @@ export class Owner {
   end(): void {
     if (this.done) return;
     this.done = true;
+    this.controller.abort();
     const disposers = [...this.live].reverse();
     this.live.clear();
     for (const dispose of disposers) safely(this.pluginId, dispose, "disposer failed during unload");

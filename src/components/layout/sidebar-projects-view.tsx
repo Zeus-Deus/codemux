@@ -81,6 +81,10 @@ import {
   type ProjectsRow,
   type ProjectsSection,
 } from "./sidebar-projects-model";
+import { usePluginSidebarLayout } from "@/components/plugins/plugin-sidebar-layout";
+import { usePluginKnownProjects } from "@/components/plugins/known-projects";
+import { pluginTreeRowKeys } from "@/components/plugins/native-tree";
+import { PluginTreeSections, usePluginTreeLayout } from "@/components/plugins/PluginTreeSidebar";
 
 /** Start a chat in a project — the same path the old project group's `+`
  *  took (`SidebarProjectGroup.handlePlusClick`) and Ctrl+Shift+N takes: a
@@ -331,6 +335,8 @@ function shelfLabel(settled: number, snoozed: number): string {
   return "Settled & snoozed";
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 /** Settled-shelf paging: recent history first, the deep tail on request. */
 const SHELF_INITIAL_COUNT = 10;
 const SHELF_PAGE_COUNT = 25;
@@ -467,6 +473,24 @@ export function SidebarProjectsView() {
     return map;
   }, [allWorkspaces]);
 
+  // A plugin's declared view only changes the grouping's rules: when quiet
+  // projects fold away, and whether projects without workspaces get a heading.
+  const pluginLayout = usePluginSidebarLayout();
+  const declared = pluginLayout.view;
+  // Empty projects come from every project Codemux knows (open and archived
+  // workspaces), the registry plugins see, never a truncated recent list.
+  const knownProjects = usePluginKnownProjects();
+  const showEmptyProjects = declared?.emptyProjects === "show";
+  const quietAfterMs = declared ? (declared.quietAfterDays === undefined ? null : declared.quietAfterDays * DAY_MS) : undefined;
+  const emptyProjects = useMemo(() => {
+    if (!showEmptyProjects) return undefined;
+    const byRoot = new Map<string, { name: string; path: string }>();
+    for (const project of knownProjects) {
+      if (!byRoot.has(project.root)) byRoot.set(project.root, { name: project.title, path: project.root });
+    }
+    return [...byRoot.values()];
+  }, [showEmptyProjects, knownProjects]);
+
   const model = useMemo(
     () =>
       buildProjectsModel({
@@ -479,6 +503,8 @@ export function SidebarProjectsView() {
         parkedAt,
         activeWorkspaceId,
         forcePaths: pendingPaths,
+        quietAfterMs,
+        emptyProjects,
         now,
       }),
     [
@@ -491,9 +517,23 @@ export function SidebarProjectsView() {
       parkedAt,
       activeWorkspaceId,
       pendingPaths,
+      quietAfterMs,
+      emptyProjects,
       now,
     ],
   );
+
+  // A plugin tree, when one is chosen and served, arranges the same live rows;
+  // until then (or when it can't be read) the built-in grouping shows.
+  const treeKey = pluginLayout.selected?.kind === "tree" ? pluginLayout.selected.key : null;
+  const treeLayout = usePluginTreeLayout({
+    nodes: pluginLayout.nodes,
+    treeKey,
+    model,
+    projectGroups,
+    allWorkspaces,
+    activeWorkspaceId,
+  });
 
   // Interned `{name, path}` per project so memoized rows keep a stable `repo`.
   const repoIntern = useRef(new Map<string, InboxRepo>());
@@ -538,7 +578,7 @@ export function SidebarProjectsView() {
   }, [expandProjectRequest, folded, setFolded]);
 
   // Alt+1..9 targets the visible live rows in this view's order.
-  const jumpKey = visibleLiveIds(model, folded).join(" ");
+  const jumpKey = (treeLayout ? pluginTreeRowKeys(treeLayout.sections) : visibleLiveIds(model, folded)).join(" ");
   useEffect(() => {
     setJumpTargets(jumpKey ? jumpKey.split(" ") : []);
   }, [jumpKey]);
@@ -747,7 +787,45 @@ export function SidebarProjectsView() {
           </p>
         )}
 
-        {model.chats && (
+        {pluginLayout.notice && (
+          <p role="status" data-plugin-tree-notice className="px-2 pb-1 text-label text-muted-foreground">
+            {pluginLayout.notice}
+          </p>
+        )}
+
+        {treeLayout && treeKey && (
+          <SidebarGroup className="p-0">
+            {/* Creates in flight are live work; the tree can't place them yet. */}
+            {pendingWorkspaces.length > 0 && (
+              <SidebarMenu className="pb-1">
+                {pendingWorkspaces.map((pw) => (
+                  <SidebarMenuItem key={pw.id}>
+                    <PendingWorkspaceRow pending={pw} className="gap-2 px-2 py-2" />
+                  </SidebarMenuItem>
+                ))}
+              </SidebarMenu>
+            )}
+            <PluginTreeSections
+              layout={treeLayout}
+              treeKey={treeKey}
+              title={pluginLayout.selected?.title ?? "Plugin layout"}
+              renderRows={renderRows}
+              renderProjectHeader={({ group, count, folded: treeFolded, rows, onToggle }) => (
+                <ProjectGroupHeader
+                  name={group.projectName}
+                  path={group.projectPath}
+                  count={count}
+                  meta={null}
+                  folded={treeFolded}
+                  needsYou={treeFolded && hasNeedsYou(rows)}
+                  onToggle={onToggle}
+                />
+              )}
+            />
+          </SidebarGroup>
+        )}
+
+        {!treeLayout && model.chats && (
           <SidebarGroup
             role="region"
             aria-label="Chats"
@@ -762,7 +840,7 @@ export function SidebarProjectsView() {
           </SidebarGroup>
         )}
 
-        {model.projects.length > 0 && (
+        {!treeLayout && model.projects.length > 0 && (
           <SidebarGroup role="region" aria-label="Projects" className="p-0">
             <SidebarGroupLabel className="h-7 pt-1">
               <Eyebrow>Projects</Eyebrow>
@@ -771,9 +849,9 @@ export function SidebarProjectsView() {
           </SidebarGroup>
         )}
 
-        {(model.quietProjects.length > 0 || model.shelf.length > 0) && (
+        {((!treeLayout && model.quietProjects.length > 0) || model.shelf.length > 0) && (
           <div className="mt-auto flex flex-col gap-1 border-t border-border/70 pt-2">
-            {model.quietProjects.length > 0 && (
+            {!treeLayout && model.quietProjects.length > 0 && (
               <SidebarGroup
                 role="region"
                 aria-label="More projects"

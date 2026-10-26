@@ -9,6 +9,7 @@
  * - React state helpers: zustand's `create`, React Query hooks
  */
 export * from "./areas";
+export { apiVersion, RENDERER_PLUGIN_CAPABILITIES, type RendererPluginCapability } from "./compatibility";
 export { host } from "./host";
 export { randomUUID } from "@/lib/uuid";
 export * from "./ui";

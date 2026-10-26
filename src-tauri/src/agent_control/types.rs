@@ -12,6 +12,8 @@ pub enum ControlAccess {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CallerPrincipal {
     LocalController,
+    /// Established by the web-remote transport, never accepted from request arguments.
+    RemoteClient { session_id: String },
     #[default]
     OutsideClient,
     Thread {
@@ -97,6 +99,17 @@ impl ControlCaller {
             identity: CallerPrincipal::LocalController,
             created_by: crate::agent_provider::message::CreatedBy::User,
             principal: "local".into(),
+            access: ControlAccess::FullAccess,
+            grant_id: None,
+        }
+    }
+
+    pub(crate) fn remote(session_id: String) -> Self {
+        Self {
+            admitted: None,
+            principal: format!("web-remote:{session_id}"),
+            identity: CallerPrincipal::RemoteClient { session_id },
+            created_by: crate::agent_provider::message::CreatedBy::User,
             access: ControlAccess::FullAccess,
             grant_id: None,
         }

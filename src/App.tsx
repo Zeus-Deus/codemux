@@ -24,6 +24,8 @@ import { useEnvironmentRuntime } from "@/environments/use-environment-runtime";
 import { useSmoothScrollingInit } from "@/hooks/use-smooth-scrolling";
 import { useRendererModeInit } from "@/hooks/use-renderer-mode";
 import { AppShell } from "@/components/layout/app-shell";
+import { ContribBoundary } from "@/contrib/react/boundary";
+import { PlatformPluginContributions } from "@/components/plugins/PlatformPluginContributions";
 import { RemoteConnectionBanner } from "@/components/remote/remote-connection-indicator";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Toaster } from "@/components/ui/sonner";
@@ -286,6 +288,12 @@ function App() {
       {/* App-level so the size shortcuts answer on Settings and the other
           full-screen pages too, which replace the shell. */}
       <InterfaceSizeHud />
+      {/* Isolated platform plugins: palette actions, side panels, chat
+          statuses and the start page. Boundaried, so a fault here only
+          costs plugin UI. Renders nothing visible itself. */}
+      <ContribBoundary id="platform-plugins" variant="silent">
+        <PlatformPluginContributions />
+      </ContribBoundary>
       {/* Plugin floating UI and headless components. Nothing without one. */}
       <Slot area={APP_OVERLAY_AREA} variant="silent" />
       <Toaster />

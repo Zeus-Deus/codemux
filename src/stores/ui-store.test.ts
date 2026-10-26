@@ -575,6 +575,17 @@ it("distinguishes repeated requests for the same mounted Settings page", () => {
   expect(persisted.state).not.toHaveProperty("settingsNavigationVersion");
 });
 
+it("opens a plugin's settings without persisting its one-shot selection", () => {
+  useUIStore.getState().openPluginSettings("installation-one");
+  expect(useUIStore.getState().showSettings).toBe(true);
+  expect(useUIStore.getState().settingsSection).toBe("plugins");
+  expect(useUIStore.getState().pendingPluginSettingsSelection).toBe("installation-one");
+  const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
+  expect(persisted.state).not.toHaveProperty("pendingPluginSettingsSelection");
+  useUIStore.getState().setShowSettings(false);
+  expect(useUIStore.getState().pendingPluginSettingsSelection).toBeNull();
+});
+
 describe("ui-store — forgetting plugin panes", () => {
   const brief = "plugin:test-plugin:brief" as const;
   const other = "plugin:other-plugin:view" as const;

@@ -4,6 +4,7 @@
  * Tauri door and are UNSTABLE: commands may change between releases.
  */
 import { createMcpHost } from "@/contrib/mcp";
+import { apiVersion, RENDERER_PLUGIN_CAPABILITIES } from "./compatibility";
 import { createNativeHost } from "@/contrib/host-native";
 import { createPeekHost } from "@/contrib/peek";
 import type { ComponentType, ReactNode } from "react";
@@ -243,6 +244,7 @@ export function createHost(bound: Owner | null) {
   };
 
   const api = {
+    api: Object.freeze({ version: apiVersion, capabilities: RENDERER_PLUGIN_CAPABILITIES }),
     mcp: createMcpHost(ownerNow, subscription),
     peek: createPeekHost(ownerNow, subscription),
     ...createNativeHost(ownerNow),

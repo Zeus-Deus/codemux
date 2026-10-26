@@ -94,6 +94,20 @@ pub fn native_tools() -> Vec<ToolDefinition> {
         tool("operation_status", "Read an admitted mutation's durable receipt, scoped to its calling client. Accepted/running is not completion. needs_attention is an uncertain prior dispatch: inspect its thread instead of resending.", json!({
             "operation_id": {"type": "string", "minLength": 1},
         }), &["operation_id"], true),
+    ].into_iter().chain(plugin_tools()).collect()
+}
+
+pub fn plugin_tools() -> Vec<ToolDefinition> {
+    vec![
+        tool("plugin_list", "List enabled compatible plugin actions explicitly exposed to agents. This never installs, enables or starts plugin code. Retain installationId and generation; changed or disabled installations revoke that generation.", json!({}), &[], true),
+        tool("plugin_invoke", "Invoke an agent-callable plugin action. Use a stable operationId per intended action and reuse it for retries. Caller identity comes from the host, independently of requested context. Client intents are returned as data; they never navigate another person's interface. Plugin thread effects retain the caller's permission ceiling and project grants.", json!({
+            "installationId":{"type":"string","minLength":1,"maxLength":128},
+            "generation":{"type":"string","minLength":1,"maxLength":128},
+            "actionId":{"type":"string","minLength":1,"maxLength":128},
+            "operationId":{"type":"string","minLength":1,"maxLength":128},
+            "input":{},
+            "context":{"type":"object","properties":{"projectId":{"type":"string"},"threadId":{"type":"string"},"messageId":{"type":"string"},"selection":{"type":"string","maxLength":64000}},"additionalProperties":false}
+        }), &["installationId","generation","actionId","operationId"], false),
     ]
 }
 
@@ -121,7 +135,7 @@ pub fn is_native_tool(name: &str) -> bool {
 }
 
 pub fn is_read_only(name: &str) -> bool {
-    matches!(name, "workspace_list" | "agent_capabilities" | "thread_list" | "thread_read" | "thread_status" | "thread_wait" | "operation_status")
+    matches!(name, "workspace_list" | "agent_capabilities" | "thread_list" | "thread_read" | "thread_status" | "thread_wait" | "operation_status" | "plugin_list")
 }
 
 #[cfg(test)]

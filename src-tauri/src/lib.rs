@@ -530,6 +530,10 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                let _ = tauri::async_runtime::block_on(tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    app.state::<plugins::platform_transport::PluginPlatformState>().shutdown(),
+                ));
                 tauri::async_runtime::block_on(
                     app.state::<plugins::host::PluginHostState>().shutdown(),
                 );
@@ -619,6 +623,7 @@ fn build_core_app<R: tauri::Runtime>(
         // display-coupled behavior on it.
         .manage(mode)
         .manage(plugins::commands::PluginsState::default())
+        .manage(plugins::platform_transport::PluginPlatformState::default())
         .manage(state::AppStateStore::default())
         // Live per-host reachability for the Devices page. Filled by
         // `hosts_inventory` (Unix only); on Windows every host reads as
@@ -1421,6 +1426,7 @@ fn build_core_app<R: tauri::Runtime>(
                                 std::sync::Arc::new(commands::workspace_launch::WorkspaceLaunchHost::new(registry_handle.clone())),
                                 std::sync::Arc::new(commands::pr_watch::PrWatchHost::new(registry_handle.clone())),
                                 std::sync::Arc::new(agent_control::native::OrchestrationHost(registry_handle.clone())),
+                                std::sync::Arc::new(plugins::platform_transport::PluginToolsHost(registry_handle.clone())),
                             ]),
                         ));
 
@@ -1563,7 +1569,11 @@ fn build_core_app<R: tauri::Runtime>(
                         // fails or someone else comments. Started after the
                         // providers so a wake can always be dispatched.
                         pr_watch::spawn(registry_handle.clone());
+                        plugins::platform_transport::start(registry_handle.clone());
                     });
+                } else {
+                    // Metadata/event recovery also works when provider execution is disabled.
+                    plugins::platform_transport::start(app.handle().clone());
                 }
             }
 
@@ -2698,6 +2708,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::workflows::workflow_integrate_artifact,
             commands::workflows::workflow_artifact_preview,
             plugins::commands::plugins_root,
+            plugins::platform_transport::plugins_platform_request,
             plugins::commands::plugins_list,
             plugins::commands::plugins_read_source,
             plugins::commands::plugins_watch,
