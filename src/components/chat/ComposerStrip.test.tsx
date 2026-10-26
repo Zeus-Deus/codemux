@@ -27,6 +27,7 @@ import {
   type StripOccupant,
   type StripRow,
 } from "./ComposerStrip";
+import { COMPOSER_STRIP_SURFACE } from "./composer-surface";
 import {
   approvalOccupant,
   queuedMessages,
@@ -138,7 +139,7 @@ describe("ComposerStrip — shell", () => {
     expect(shell.className).toContain("-mb-[18px]");
     expect(shell.className).toContain("pb-[18px]");
     // Same neutral surface as the scope strip; never tinted per occupant.
-    expect(shell.className).toContain("bg-muted/20");
+    expect(shell.className).toContain(COMPOSER_STRIP_SURFACE);
     expect(shell.className).not.toContain("rounded-t-[19px]");
     const row = rows()[0];
     expect(row.firstElementChild?.className).toContain(STRIP_ROW_HEIGHT);
