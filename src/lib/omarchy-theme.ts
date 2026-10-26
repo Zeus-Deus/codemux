@@ -91,9 +91,9 @@ function capContrast(color: string, surface: string, max: number): string {
  * text, recessed sidebar (`dark_background`), and selection-colored sidebar
  * highlights, over raised surfaces generated the way T3 Code generates them.
  * Those surfaces climb an OKLCH lightness ramp off the canvas carrying the
- * *accent's* hue, so a warm accent on a cool canvas gives warm cards, menus,
- * and composer instead of a monochrome shell. Missing shades fall back to
- * derived ones.
+ * *accent's* hue, so a warm accent on a cool canvas gives warm cards, menu
+ * highlights, and composer instead of a monochrome shell. Menus themselves
+ * stay dark in the canvas's family. Missing shades fall back to derived ones.
  */
 export function omarchyToTheme({ name, scheme, colors: c, surfaces = {} }: OmarchyTheme): ThemeDefinition {
   const dark = scheme === "dark";
@@ -108,7 +108,12 @@ export function omarchyToTheme({ name, scheme, colors: c, surfaces = {} }: Omarc
   const surfaceAt = (delta: number, chroma = tint) =>
     oklchToHex({ L: Math.min(0.98, Math.max(0.05, canvas.L + step * delta)), C: chroma, h: hue });
   const card = surfaceAt(0.05);
-  const popover = surfaceAt(0.075);
+  // Menus and the command palette float over everything, so they stay dark
+  // and in the canvas's own family; the accent belongs on their highlighted
+  // rows (`accent` below), not on the whole sheet.
+  const popover = dark
+    ? oklchToHex({ L: Math.min(0.98, canvas.L + 0.03), C: canvas.C, h: canvas.h })
+    : background;
   const secondary = surfaceAt(dark ? 0.1 : 0.06, Math.min(0.09, tone.C * 0.5));
   const muted = surfaceAt(dark ? 0.06 : 0.04, Math.min(0.06, tone.C * 0.35));
   const accent = surfaceAt(dark ? 0.13 : 0.08, Math.min(0.11, tone.C * 0.55));

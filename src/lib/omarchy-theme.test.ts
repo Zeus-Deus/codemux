@@ -50,26 +50,35 @@ it("layers the shell with Omarchy's own shades and derives them when absent", ()
     expect(contrastRatio(roles.mutedForeground, surface)).toBeGreaterThanOrEqual(4.5);
   }
   expect(contrastRatio(roles.sidebarAccentForeground, roles.sidebarAccent)).toBeGreaterThanOrEqual(4.5);
-  // Raised surfaces climb T3 Code's ramp off the canvas: card < muted < popover < secondary < accent.
+  // Raised surfaces climb T3 Code's ramp off the canvas: card < muted < secondary < accent.
   const lift = (color: string) => contrastRatio(color, roles.background);
   expect(lift(roles.card)).toBeLessThan(lift(roles.muted));
-  expect(lift(roles.muted)).toBeLessThan(lift(roles.popover));
-  expect(lift(roles.popover)).toBeLessThan(lift(roles.secondary));
+  expect(lift(roles.muted)).toBeLessThan(lift(roles.secondary));
   expect(lift(roles.secondary)).toBeLessThan(lift(roles.accent));
+  // Menus sit just off the canvas, darker than every raised surface, so the highlight reads on them.
+  expect(lift(roles.popover)).toBeGreaterThan(1);
+  expect(lift(roles.popover)).toBeLessThan(lift(roles.card));
 
   const derived = omarchyToTheme({ name: "Bare", scheme: "dark", colors }).roles;
   expect(derived.sidebar).not.toBe(derived.background);
   expect(contrastRatio(derived.sidebar, "#000000")).toBeLessThan(contrastRatio(derived.background, "#000000"));
 });
 
-it("tints raised surfaces with the accent's hue, as T3 Code does", () => {
+it("tints raised surfaces with the accent's hue, as T3 Code does, but keeps menus dark", () => {
   // Retro 82: a warm orange accent on a navy canvas gives warm cards, not navy ones.
   const colors = { ...fallbackTheme, background: "#05182e", foreground: "#f6dcac", accent: "#faa968" };
   const { roles } = omarchyToTheme({ name: "Retro 82", scheme: "dark", colors });
   const accentHue = hexToOklch(colors.accent).h;
-  for (const surface of [roles.card, roles.popover, roles.secondary, roles.accent]) {
+  for (const surface of [roles.card, roles.secondary, roles.accent]) {
     expect(Math.abs(hexToOklch(surface).h - accentHue)).toBeLessThan(8);
   }
+  // Starship: an orange accent must not brown the command palette and menus;
+  // they stay in the canvas's family and the orange moves to the highlight.
+  const starship = { ...fallbackTheme, background: "#1c1c1e", foreground: "#f5f5f7", accent: "#ff9f0a" };
+  const menus = omarchyToTheme({ name: "Starship", scheme: "dark", colors: starship }).roles;
+  expect(hexToOklch(menus.popover).C).toBeLessThan(0.01);
+  expect(contrastRatio(menus.popover, starship.background)).toBeLessThan(1.25);
+  expect(Math.abs(hexToOklch(menus.accent).h - hexToOklch(starship.accent).h)).toBeLessThan(8);
   expect(roles.background).toBe(colors.background);
   expect(roles.foreground).toBe(colors.foreground);
 
