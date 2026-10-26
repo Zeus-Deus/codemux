@@ -1078,15 +1078,3 @@ export const selectThread =
   (threadId: string | null) =>
   (state: AgentChatStore): ChatThreadSlice | null =>
     threadId == null ? null : (state.threads[threadId] ?? null);
-
-export const selectMessages =
-  (threadId: string | null) =>
-  (state: AgentChatStore): ChatViewItem[] => {
-    if (threadId == null) return EMPTY_ITEMS;
-    return state.threads[threadId]?.messages ?? EMPTY_ITEMS;
-  };
-
-// Frozen so a null-thread read is reference-stable AND provably read-only:
-// every `?? EMPTY_ITEMS` fallback has to hand back the same array or the
-// identity checks the memoized transcript rows rely on are defeated.
-const EMPTY_ITEMS = Object.freeze([]) as unknown as ChatViewItem[];

@@ -273,10 +273,6 @@ export async function onDiskChange(id: string | null): Promise<void> {
   await adoptDisk(entry, true);
 }
 
-export function knownDiskPlugins(): readonly DiskPluginEntry[] {
-  return [...known.values()];
-}
-
 /** Test-only. */
 export function resetRuntimeLoaderForTests(): void {
   known.clear();

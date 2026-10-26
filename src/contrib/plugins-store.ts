@@ -164,10 +164,6 @@ export function replaceDecisions(decisions: Record<string, boolean>): void {
   usePluginsStore.setState({ decisions: { ...decisions, ...Object.fromEntries(unsaved) } });
 }
 
-export function hasHandle(id: string): boolean {
-  return handles.has(id);
-}
-
 /** Native persistence for decisions; installed by the loader at boot. */
 let persistDecision: (id: string, enabled: boolean) => Promise<void> = async () => {};
 
@@ -224,15 +220,6 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<vo
   } else {
     handle.deactivate();
     patchPlugin(id, { status: "disabled", error: undefined });
-  }
-}
-
-/** Deactivate every live plugin (kill switch, safe-mode pause, tests). */
-export function deactivateAll(filter: (r: PluginRecord) => boolean = () => true): void {
-  for (const record of Object.values(usePluginsStore.getState().records)) {
-    if (!filter(record)) continue;
-    handles.get(record.id)?.deactivate();
-    if (record.status === "loaded") patchPlugin(record.id, { status: "disabled" });
   }
 }
 

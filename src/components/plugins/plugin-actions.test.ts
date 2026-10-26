@@ -17,6 +17,7 @@ vi.mock("@/hooks/use-mobile-layout", () => ({ mobileLayoutAvailable: () => phone
 
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
+import { markComposerFocused, registerComposer } from "@/contrib/composer-registry";
 import type { PaneNodeSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 import { applyPluginIntents, capturePluginTarget, parsePlatformPageId, platformPageId, pluginPreviewUrl } from "./plugin-actions";
 import { installation, manifest } from "./test-fixtures";
@@ -50,6 +51,29 @@ beforeEach(() => {
   useUIStore.setState({ showSettings: false, showPluginPage: null, showUsage: false, rightPanelTabs: {} } as never);
 });
 afterEach(() => vi.clearAllMocks());
+
+it("inserts a plugin result into the invoking chat after another composer gains focus", () => {
+  const insertOrigin = vi.fn();
+  const insertOther = vi.fn();
+  const unregisterOrigin = registerComposer("origin", {
+    workspaceId: "ws-1", threadId: "thread-1", getDraft: () => "", insertText: insertOrigin, focus: vi.fn(),
+  });
+  const unregisterOther = registerComposer("other", {
+    workspaceId: "ws-2", threadId: "thread-2", getDraft: () => "", insertText: insertOther, focus: vi.fn(),
+  });
+  try {
+    const captured = target();
+    showWorkspace("ws-2");
+    markComposerFocused("other");
+    applyPluginIntents(captured, [{ type: "composer.insert", text: "Plugin result" }]);
+    expect(insertOrigin).toHaveBeenCalledWith("Plugin result");
+    expect(insertOther).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+  } finally {
+    unregisterOrigin();
+    unregisterOther();
+  }
+});
 
 describe("preview.open", () => {
   it("opens in a Codemux browser pane beside the invoking chat while the user is still there", async () => {

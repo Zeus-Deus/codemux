@@ -70,10 +70,6 @@ type SyncedSettingsStore = SyncedSettingsState & SyncedSettingsActions;
 
 export { DEFAULT_SETTINGS };
 
-const EMPTY_CUSTOM_THEMES: unknown[] = [];
-/** Stable identity so the selector doesn't re-render on every read. */
-const EMPTY_CUSTOM_HOSTS: Record<string, string> = {};
-
 // Each optimistic write increments this. Async responses only apply if
 // the generation matches, preventing stale backend responses from
 // reverting a newer optimistic update.
@@ -394,12 +390,6 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
 
 // ── React hook selectors (trigger re-renders on specific value change) ──
 
-export const selectAppearanceTheme = (s: SyncedSettingsState): string =>
-  s.settings.appearance.theme || "default";
-
-export const selectCustomThemes = (s: SyncedSettingsState): unknown[] =>
-  s.settings.appearance.custom_themes ?? EMPTY_CUSTOM_THEMES;
-
 export const selectTerminalCursorStyle = (s: SyncedSettingsState): string =>
   s.settings.terminal.cursor_style;
 
@@ -415,10 +405,6 @@ export const selectNotificationSoundEnabled = (s: SyncedSettingsState): boolean 
 export const selectDesktopNotificationsEnabled = (s: SyncedSettingsState): boolean =>
   s.settings.notifications.desktop_enabled;
 
-/** Self-hosted instances the user has classified, host → product. */
-export const selectCustomHosts = (s: SyncedSettingsState): Record<string, string> =>
-  s.settings.source_control?.custom_hosts ?? EMPTY_CUSTOM_HOSTS;
-
 /** True when host pull-request links should keep going to the browser
  *  instead of opening the Pull Requests page. */
 export const selectOpenPrLinksInBrowser = (s: SyncedSettingsState): boolean =>
@@ -432,9 +418,6 @@ export const selectShowHiddenFiles = (s: SyncedSettingsState): boolean =>
 
 export const selectShowResourceMonitor = (s: SyncedSettingsState): boolean =>
   s.settings.appearance.show_resource_monitor;
-
-export const selectAgentCheckpointsEnabled = (s: SyncedSettingsState): boolean =>
-  s.settings.agent_chat?.checkpoints_enabled ?? false;
 
 export const selectBackgroundBrowserDesktopViewport = (s: SyncedSettingsState): boolean =>
   s.settings.agent_chat?.background_browser_desktop_viewport ?? true;

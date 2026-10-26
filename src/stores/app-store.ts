@@ -818,12 +818,6 @@ export function useActiveWorkspaceProjectRoot(): string | null {
   return useAppStore((s) => selectActiveWorkspace(s)?.project_root ?? null);
 }
 
-/** Primitive: the active workspace's git branch, or null. Used for
- *  the search-trigger label in the title bar. */
-export function useActiveWorkspaceBranch(): string | null {
-  return useAppStore((s) => selectActiveWorkspace(s)?.git_branch ?? null);
-}
-
 /** Subscribe to the cached home directory. Null until the initial
  *  `getHomeDir()` Tauri call resolves at App mount. */
 export function useHomeDir(): string | null {
@@ -903,13 +897,6 @@ export function getSessionWorkspaceId(sessionId: string): string | null {
   const { appState } = useAppStore.getState();
   const index = getCachedSessionWorkspaceIndex(appState);
   return index.get(sessionId) ?? null;
-}
-
-/** React hook variant — subscribes to `appState` and returns the cached
- *  index. Re-renders only when the snapshot reference changes (which is
- *  also when the index would actually differ). */
-export function useSessionWorkspaceIndex(): Map<string, string> {
-  return useAppStore((s) => getCachedSessionWorkspaceIndex(s.appState));
 }
 
 /** The cwd of the workspace owning a given terminal session, or null.

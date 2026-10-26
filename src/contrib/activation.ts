@@ -24,10 +24,6 @@ export function liveDisposers(id: string): number {
   return loaded.get(id)?.size ?? 0;
 }
 
-export function isLoaded(id: string): boolean {
-  return loaded.has(id);
-}
-
 export function unloadPlugin(id: string): void {
   const owner = loaded.get(id);
   // Released BEFORE disposers run, each in its own try/catch: a throwing

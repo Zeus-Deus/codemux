@@ -272,17 +272,6 @@ export function workLogTotals(entries: readonly WorkEntry[]): WorkLogTotals {
   return { label: parts.join(" · "), failed };
 }
 
-/** Live one-liner for the working header: the currently running step
- *  (running tool / streaming thought) if any, else the last step. */
-export function deriveLiveAction(steps: ActivityStep[]): string {
-  const current =
-    [...steps].reverse().find((s) => stepStatus(s) === "running") ??
-    steps[steps.length - 1];
-  if (!current) return "Working…";
-  const { verb, summary } = describeStep(current);
-  return summary ? `${verb} ${summary}` : verb;
-}
-
 export interface ActivityCounts {
   total: number;
   done: number;

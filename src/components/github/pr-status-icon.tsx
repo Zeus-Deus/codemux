@@ -16,16 +16,6 @@ const STATE_TO_ICON: Record<PrStatusState, IconSpec> = {
   draft: { Icon: GitPullRequestDraft, colorCls: "text-muted-foreground" },
 };
 
-/** Tinted background + text-color pair for the sidebar PR pill — matches
- *  the icon color at low opacity so the row reads "this PR is merged/open/…"
- *  at a glance. */
-const STATE_TO_TONE: Record<PrStatusState, string> = {
-  merged: "text-accent-violet bg-accent-violet/15",
-  open: "text-status-open bg-status-open/15",
-  closed: "text-destructive bg-destructive/15",
-  draft: "text-muted-foreground bg-muted-foreground/15",
-};
-
 /** Deferred-color variant of `STATE_TO_ICON` for the sidebar's parked rows.
  *  A settled row is history: it rests grayed out and only lights up under the
  *  pointer (or keyboard focus), so its PR badge starts neutral and picks the
@@ -33,8 +23,8 @@ const STATE_TO_TONE: Record<PrStatusState, string> = {
  *  differs. The variants name the settled row's own group (`group/settled` in
  *  `sidebar-inbox.tsx`) and are written out in full because Tailwind only
  *  sees class names that appear literally in the source. Keep the hues in
- *  lockstep with `STATE_TO_ICON` / `STATE_TO_TONE` above —
- *  they are one palette wearing three sets of chrome, and a state that drifts
+ *  lockstep with `STATE_TO_ICON` above —
+ *  they are one palette, and a state that drifts
  *  here shows up as a PR that changes color when you point at it. */
 const STATE_TO_SETTLED_HOVER: Record<PrStatusState, string> = {
   merged:
@@ -73,12 +63,6 @@ export function prStatusRecededCardHoverClass(
   const normalized = normalizePrState(state);
   if (!normalized) return null;
   return STATE_TO_RECEDED_CARD_HOVER[normalized];
-}
-
-export function prStatusToneClass(state: string | null | undefined): string | null {
-  const normalized = normalizePrState(state);
-  if (!normalized) return null;
-  return STATE_TO_TONE[normalized];
 }
 
 /** Text-only color for a PR state — no background/border, for a value

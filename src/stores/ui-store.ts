@@ -223,7 +223,7 @@ interface UIStore {
   /** One-shot request to expand a specific project group by path. Set by the
    *  "Needs you" strip before it scrolls to a blocked row (a row inside a
    *  collapsed group isn't in the DOM, so the jump would otherwise no-op).
-   *  The matching {@link SidebarProjectGroup} consumes it — expands + persists
+   *  {@link SidebarProjectsView} consumes it — expands + persists
    *  — and clears it. Transient (not persisted). */
   expandProjectRequest: string | null;
   /** One-shot request to drill into a subagent in the chat transcript,
@@ -283,7 +283,6 @@ interface UIStore {
   setRightPanelRowWidth: (width: number) => void;
   /** Toggle full-expand. No-op while the panel is collapsed. */
   toggleRightPanelMaximized: (workspaceId: string) => void;
-  setWorkspaceDetailsOpen: (open: boolean) => void;
   setWorkspaceDetailsMode: (mode: "pinned" | "popover") => void;
   setWorkspaceDetailsPopoverOpen: (open: boolean) => void;
   setWorkspaceDetailsHosted: (hosted: boolean) => void;
@@ -650,7 +649,6 @@ export const useUIStore = create<UIStore>()(
           return { rightPanelMaximized: !state.rightPanelMaximized };
         }),
 
-      setWorkspaceDetailsOpen: (open) => set({ workspaceDetailsOpen: open }),
       setWorkspaceDetailsMode: (mode) =>
         set((state) =>
           state.workspaceDetailsMode === mode

@@ -12,22 +12,3 @@ export function useContributions(area: string): readonly Contribution[] {
   const getSnapshot = useCallback(() => registry.getArea(area), [area]);
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
-
-/** `data` payloads of an area, typed. Same stability rules as above. */
-export function useContributionData<T>(area: string): readonly { c: Contribution; data: T }[] {
-  const items = useContributions(area);
-  return useMemoData<T>(items);
-}
-
-const dataCache = new WeakMap<readonly Contribution[], readonly { c: Contribution; data: unknown }[]>();
-const EMPTY: readonly never[] = Object.freeze([]);
-
-function useMemoData<T>(items: readonly Contribution[]): readonly { c: Contribution; data: T }[] {
-  if (items.length === 0) return EMPTY;
-  let cached = dataCache.get(items);
-  if (!cached) {
-    cached = items.filter((c) => c.data !== undefined).map((c) => ({ c, data: c.data }));
-    dataCache.set(items, cached);
-  }
-  return cached as readonly { c: Contribution; data: T }[];
-}

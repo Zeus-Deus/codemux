@@ -4,14 +4,6 @@ import { render, screen, fireEvent, act, cleanup } from "@testing-library/react"
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
-const setShowNewWorkspaceDialogMock = vi.fn();
-const clearExpandProjectRequestMock = vi.fn();
-let enableAgentChatFlag = false;
-let enableLazyFlag = false;
-// Drives the mocked useUIStore's `expandProjectRequest`; tests flip it then
-// rerender to simulate the "Needs you" strip asking a group to expand.
-let expandProjectRequestValue: string | null = null;
-
 const mockOpenUrl = vi.fn().mockResolvedValue(undefined);
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: (...args: unknown[]) => mockOpenUrl(...args),
@@ -67,9 +59,6 @@ beforeEach(() => {
     settledAt: {},
     lastSeenAt: {},
   });
-  // No pending expand request by default; the expand-on-request suite opts in.
-  expandProjectRequestValue = null;
-  clearExpandProjectRequestMock.mockClear();
 });
 
 // Flush pending microtasks + unmount before the next test so late-resolving
@@ -89,9 +78,6 @@ vi.mock("@/stores/ui-store", () => ({
   useUIStore: vi.fn((selector) => {
     const state = {
       showNewWorkspaceDialog: false,
-      setShowNewWorkspaceDialog: setShowNewWorkspaceDialogMock,
-      expandProjectRequest: expandProjectRequestValue,
-      clearExpandProjectRequest: clearExpandProjectRequestMock,
     };
     return selector(state);
   }),
@@ -100,23 +86,16 @@ vi.mock("@/stores/ui-store", () => ({
 vi.mock("@/stores/feature-flags", () => ({
   useFeatureFlags: vi.fn((selector) => {
     const state = {
-      enableAgentChat: enableAgentChatFlag,
-      enableLazyWorkspaceCreation: enableLazyFlag,
+      enableAgentChat: false,
+      enableLazyWorkspaceCreation: false,
       loaded: true,
     };
     return selector(state);
   }),
 }));
 
-import { SidebarProjectGroup } from "./sidebar-project-group";
 import { SidebarWorkspaceRow } from "./sidebar-workspace-row";
-import {
-  activateWorkspace,
-  agentChatCreatePane,
-  createEmptyWorkspace,
-  dbGetUiState,
-  dbSetUiState,
-} from "@/tauri/commands";
+import { activateWorkspace } from "@/tauri/commands";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 
 function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSnapshot {
@@ -147,293 +126,6 @@ function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSna
     ...overrides,
   };
 }
-
-describe("SidebarProjectGroup", () => {
-  it("shows letter avatar with first letter of project name", () => {
-    render(
-      <TooltipProvider>
-        <SidebarProjectGroup
-          projectName="codemux"
-          projectPath="/home/user/codemux"
-          workspaces={[]}
-          activeWorkspaceId=""
-        />
-      </TooltipProvider>,
-    );
-    // First letter uppercase
-    expect(screen.getByText("C")).toBeInTheDocument();
-  });
-
-  it("default avatar has neutral styling (no custom color)", () => {
-    render(
-      <TooltipProvider>
-        <SidebarProjectGroup
-          projectName="myproject"
-          projectPath="/home/user/myproject"
-          workspaces={[]}
-          activeWorkspaceId=""
-        />
-      </TooltipProvider>,
-    );
-    const avatar = screen.getByText("M").closest("div");
-    // Neutral ink fill, no inline style for color
-    expect(avatar).toHaveClass("bg-surface-3");
-    expect(avatar).toHaveClass("text-muted-foreground");
-    expect(avatar?.style.color).toBeFalsy();
-  });
-
-  describe("+ button click behavior", () => {
-    const PROJECT_PATH = "/home/user/myproject";
-
-    function renderGroup() {
-      const utils = render(
-        <TooltipProvider>
-          <SidebarProjectGroup
-            projectName="myproject"
-            projectPath={PROJECT_PATH}
-            workspaces={[]}
-            activeWorkspaceId=""
-          />
-        </TooltipProvider>,
-      );
-      const plus = utils.container.querySelector(
-        'button[aria-label="New workspace"]',
-      ) as HTMLElement;
-      return { ...utils, plus };
-    }
-
-    beforeEach(() => {
-      setShowNewWorkspaceDialogMock.mockClear();
-      vi.mocked(createEmptyWorkspace).mockClear();
-      vi.mocked(createEmptyWorkspace).mockResolvedValue("ws-new");
-      vi.mocked(activateWorkspace).mockClear();
-      vi.mocked(agentChatCreatePane).mockClear();
-      enableAgentChatFlag = false;
-      enableLazyFlag = false;
-      useChatDraftStore.setState({
-        draftsById: {},
-        activeHomeDraftId: null,
-        projectDraftIdByPath: {},
-        activeDraftId: null,
-      });
-    });
-
-    it("flag OFF + plain click → opens NewWorkspaceDialog", () => {
-      enableAgentChatFlag = false;
-      const { plus } = renderGroup();
-      fireEvent.click(plus);
-      expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(true, PROJECT_PATH);
-      expect(createEmptyWorkspace).not.toHaveBeenCalled();
-      expect(agentChatCreatePane).not.toHaveBeenCalled();
-    });
-
-    it("flag OFF + Shift+click → opens NewWorkspaceDialog", () => {
-      enableAgentChatFlag = false;
-      const { plus } = renderGroup();
-      fireEvent.click(plus, { shiftKey: true });
-      expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(true, PROJECT_PATH);
-      expect(createEmptyWorkspace).not.toHaveBeenCalled();
-      expect(agentChatCreatePane).not.toHaveBeenCalled();
-    });
-
-    it("flag ON + plain click → creates empty workspace + activates + opens chat pane (no terminal pane)", async () => {
-      enableAgentChatFlag = true;
-      const { plus } = renderGroup();
-      fireEvent.click(plus);
-      await vi.waitFor(() => {
-        expect(agentChatCreatePane).toHaveBeenCalled();
-      });
-      // createEmptyWorkspace (not createWorkspace) — the empty variant
-      // doesn't spawn a terminal session, so agent_chat_create_pane
-      // mounts its own fresh surface containing only the chat pane.
-      // No skipSetup arg: projects SHOULD get setup scripts + MCP
-      // config; only the home-chat path opts out.
-      expect(createEmptyWorkspace).toHaveBeenCalledWith(PROJECT_PATH);
-      const call = vi.mocked(createEmptyWorkspace).mock.calls[0];
-      expect(call[1]).toBeUndefined();
-      expect(activateWorkspace).toHaveBeenCalledWith("ws-new");
-      expect(agentChatCreatePane).toHaveBeenCalledWith("ws-new", null, PROJECT_PATH);
-      expect(setShowNewWorkspaceDialogMock).not.toHaveBeenCalled();
-    });
-
-    it("flag ON + Shift+click → opens dialog, does NOT call chat commands", () => {
-      enableAgentChatFlag = true;
-      const { plus } = renderGroup();
-      fireEvent.click(plus, { shiftKey: true });
-      expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(true, PROJECT_PATH);
-      expect(createEmptyWorkspace).not.toHaveBeenCalled();
-      expect(agentChatCreatePane).not.toHaveBeenCalled();
-    });
-
-    it("flag ON + createEmptyWorkspace rejects → falls back to dialog", async () => {
-      enableAgentChatFlag = true;
-      vi.mocked(createEmptyWorkspace).mockRejectedValueOnce(new Error("boom"));
-      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const { plus } = renderGroup();
-      fireEvent.click(plus);
-      await vi.waitFor(() => {
-        expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(true, PROJECT_PATH);
-      });
-      expect(agentChatCreatePane).not.toHaveBeenCalled();
-      errSpy.mockRestore();
-    });
-
-    describe("lazy workspace creation (Stage C §10)", () => {
-      it("lazy ON + plain click → creates project draft, no Tauri commands called", () => {
-        enableAgentChatFlag = true;
-        enableLazyFlag = true;
-        const { plus } = renderGroup();
-        fireEvent.click(plus);
-
-        const state = useChatDraftStore.getState();
-        expect(state.projectDraftIdByPath[PROJECT_PATH]).toBeTruthy();
-        expect(state.activeDraftId).toBe(state.projectDraftIdByPath[PROJECT_PATH]);
-        const draft = state.draftsById[state.activeDraftId!];
-        expect(draft.target).toEqual({
-          kind: "project",
-          projectPath: PROJECT_PATH,
-        });
-        expect(createEmptyWorkspace).not.toHaveBeenCalled();
-        expect(agentChatCreatePane).not.toHaveBeenCalled();
-        expect(setShowNewWorkspaceDialogMock).not.toHaveBeenCalled();
-      });
-
-      it("lazy ON + plain click reuses the existing project draft on a second click", () => {
-        enableAgentChatFlag = true;
-        enableLazyFlag = true;
-        const { plus } = renderGroup();
-        fireEvent.click(plus);
-        const firstId =
-          useChatDraftStore.getState().projectDraftIdByPath[PROJECT_PATH];
-        fireEvent.click(plus);
-        expect(
-          useChatDraftStore.getState().projectDraftIdByPath[PROJECT_PATH],
-        ).toBe(firstId);
-        expect(
-          Object.keys(useChatDraftStore.getState().draftsById),
-        ).toHaveLength(1);
-      });
-
-      it("lazy ON + Shift+click still opens the dialog (eager path preserved)", () => {
-        enableAgentChatFlag = true;
-        enableLazyFlag = true;
-        const { plus } = renderGroup();
-        fireEvent.click(plus, { shiftKey: true });
-        expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(
-          true,
-          PROJECT_PATH,
-        );
-        expect(useChatDraftStore.getState().activeDraftId).toBeNull();
-      });
-
-      it("lazy OFF + plain click falls through to the legacy eager path", async () => {
-        enableAgentChatFlag = true;
-        enableLazyFlag = false;
-        const { plus } = renderGroup();
-        fireEvent.click(plus);
-        await vi.waitFor(() => {
-          expect(createEmptyWorkspace).toHaveBeenCalled();
-        });
-        expect(useChatDraftStore.getState().activeDraftId).toBeNull();
-      });
-    });
-  });
-});
-
-describe("SidebarProjectGroup — expand on request (Needs-you jump)", () => {
-  const PATH = "/home/user/collapsed-proj";
-
-  const flush = async () => {
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-  };
-
-  const renderGroup = (ws: WorkspaceSnapshot) =>
-    render(
-      <TooltipProvider>
-        <SidebarProjectGroup
-          projectName="Collapsed"
-          projectPath={PATH}
-          workspaces={[ws]}
-          activeWorkspaceId=""
-        />
-      </TooltipProvider>,
-    );
-
-  beforeEach(() => {
-    vi.mocked(dbGetUiState).mockReset();
-    // Group loads collapsed from persisted UI state; other keys resolve null.
-    vi.mocked(dbGetUiState).mockImplementation((key: string) =>
-      Promise.resolve(key === `collapsed:project:${PATH}` ? "true" : null),
-    );
-    vi.mocked(dbSetUiState).mockReset();
-    vi.mocked(dbSetUiState).mockResolvedValue(undefined);
-  });
-
-  it("expands + persists a collapsed group when a matching request arrives, then clears it", async () => {
-    const ws = makeWorkspace({ workspace_id: "ws-hidden", title: "Hidden Row" });
-    const utils = renderGroup(ws);
-    // Persisted collapsed state loads → the row is hidden.
-    await flush();
-    expect(screen.queryByText("Hidden Row")).not.toBeInTheDocument();
-
-    // A jump targets this group.
-    expandProjectRequestValue = PATH;
-    await act(async () => {
-      utils.rerender(
-        <TooltipProvider>
-          <SidebarProjectGroup
-            projectName="Collapsed"
-            projectPath={PATH}
-            workspaces={[ws]}
-            activeWorkspaceId=""
-          />
-        </TooltipProvider>,
-      );
-    });
-
-    // Group expands (row now rendered), persists the new state, and clears the
-    // one-shot request.
-    expect(screen.getByText("Hidden Row")).toBeInTheDocument();
-    expect(dbSetUiState).toHaveBeenCalledWith(
-      `collapsed:project:${PATH}`,
-      "false",
-    );
-    expect(clearExpandProjectRequestMock).toHaveBeenCalledWith(PATH);
-  });
-
-  it("ignores an expand request that targets a different project path", async () => {
-    const ws = makeWorkspace({ workspace_id: "ws-hidden", title: "Hidden Row" });
-    const utils = renderGroup(ws);
-    await flush();
-    expect(screen.queryByText("Hidden Row")).not.toBeInTheDocument();
-
-    // Request names a different group → this one stays collapsed and does not
-    // consume (clear) the request.
-    expandProjectRequestValue = "/home/user/some-other-proj";
-    await act(async () => {
-      utils.rerender(
-        <TooltipProvider>
-          <SidebarProjectGroup
-            projectName="Collapsed"
-            projectPath={PATH}
-            workspaces={[ws]}
-            activeWorkspaceId=""
-          />
-        </TooltipProvider>,
-      );
-    });
-
-    expect(screen.queryByText("Hidden Row")).not.toBeInTheDocument();
-    expect(dbSetUiState).not.toHaveBeenCalledWith(
-      `collapsed:project:${PATH}`,
-      "false",
-    );
-    expect(clearExpandProjectRequestMock).not.toHaveBeenCalled();
-  });
-});
 
 describe("SidebarWorkspaceRow", () => {
   it("shows Laptop icon for primary checkout (no worktree_path)", () => {

@@ -107,7 +107,7 @@ import type { RightPanelTab } from "@/stores/ui-store";
 import { TabDropIndicator } from "../tab-drop-indicator";
 import { middleClickCloseProps } from "../tab-strip-actions";
 import { PaneActionButton } from "./pane-actions";
-import { isPluginPane, PANE_REGISTRY, type PaneMeta } from "./pane-registry";
+import { isPluginPane } from "./pane-registry";
 import type { SurfaceAction } from "./surface-actions";
 import { PanelHeader } from "@/components/ui/panel-header";
 import { useRootFontPx } from "@/hooks/use-root-font-px";
@@ -1070,8 +1070,3 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     </PanelHeader>
   );
 });
-
-/** Registry order, for the `+` menu's pane list. */
-export function orderPanes(ids: readonly string[]): PaneMeta[] {
-  return PANE_REGISTRY.filter((meta) => ids.includes(meta.id));
-}

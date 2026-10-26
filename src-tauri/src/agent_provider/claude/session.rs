@@ -30,10 +30,10 @@ use crate::agent_provider::{
 use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 
 use super::protocol::{
-    InterruptParams, RespondToRequestParams, RespondToUserInputParams, SendTurnImage,
+    InterruptParams, RespondToRequestParams, SendTurnImage,
     SendTurnParams, SetModelParams, SetPermissionModeParams, SidecarDecision, SidecarNotification,
     StartSessionParams, StartSessionResponse, StopSessionParams, StopSessionResponse,
-    METHOD_INTERRUPT, METHOD_RESPOND_TO_REQUEST, METHOD_RESPOND_TO_USER_INPUT, METHOD_SEND_TURN,
+    METHOD_INTERRUPT, METHOD_RESPOND_TO_REQUEST, METHOD_SEND_TURN,
     METHOD_SET_MODEL, METHOD_SET_PERMISSION_MODE, METHOD_START_SESSION, METHOD_STOP_SESSION,
 };
 use super::translate::{translate_notification_with, SubagentDemux};
@@ -1772,46 +1772,6 @@ impl ClaudeSession {
                 message: format!("respond-to-request RPC failed: {e}"),
             }),
         }
-    }
-
-    /// Reserved for the AskUserQuestion flow. Unused until the UI
-    /// surfaces that path.
-    #[allow(dead_code)]
-    pub async fn respond_to_user_input(
-        &self,
-        request_id: RequestId,
-        answers: Vec<Value>,
-    ) -> Result<(), ProviderError> {
-        let params = RespondToUserInputParams {
-            thread_id: self.thread_id.0.clone(),
-            request_id: request_id.0,
-            answers,
-        };
-        self.sidecar
-            .request(
-                METHOD_RESPOND_TO_USER_INPUT,
-                serde_json::to_value(&params).unwrap(),
-            )
-            .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("respond-to-user-input RPC failed: {e}"),
-            })?;
-        Ok(())
-    }
-
-    /// Exposed for the trait-level init-result call. Currently
-    /// invoked only from ad-hoc paths; trait does not require it.
-    #[allow(dead_code)]
-    pub async fn initialization_result(&self) -> Result<Value, ProviderError> {
-        self.sidecar
-            .request(
-                super::protocol::METHOD_INITIALIZATION_RESULT,
-                json!({ "threadId": self.thread_id.0 }),
-            )
-            .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("initialization-result RPC failed: {e}"),
-            })
     }
 
     /// Close the session: send `stop-session` (with tight timeout),

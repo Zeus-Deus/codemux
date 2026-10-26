@@ -19,8 +19,6 @@ export default defineConfig({
       "**/dist/**",
       "**/src-tauri/**",
       "sidecar/**",
-      // Author CLI suites use node:test and run from build-examples.sh.
-      "packages/plugin-cli/tests/**",
       // Isolated plugin author suites exercise real Node/Bun subprocesses.
       "packages/plugin-sdk/test/**",
       "examples/plugins/platform-*/test/**",

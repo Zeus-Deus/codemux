@@ -609,5 +609,3 @@ export function emptyThreadState(): ChatThreadState {
     usageLimit: null,
   };
 }
-
-export type AnyProviderEvent = ProviderRuntimeEvent;
