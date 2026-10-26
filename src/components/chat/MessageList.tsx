@@ -504,6 +504,10 @@ export const MessageList = memo(function MessageList({
   // advance stand down, and each frame cancels any drift of the toggle by
   // nudging the offset. Holds the stop function while active.
   const disclosureHoldRef = useRef<(() => void) | null>(null);
+  /** Bumped by every `claimScroll` (a send, a thread switch, the jump pill).
+   *  A disclosure hold started under an older claim stands down without
+   *  touching the viewport, so it never fights or revokes the newer intent. */
+  const claimEpochRef = useRef(0);
   const [disclosureHold, setDisclosureHold] = useState(false);
   useEffect(() => () => disclosureHoldRef.current?.(), [threadKey]);
 
@@ -512,6 +516,7 @@ export const MessageList = memo(function MessageList({
    *  are monotonic per-send facts, and a stale settle handshake left in
    *  flight no-ops on its own nonce guard. */
   const claimScroll = useCallback((mode: SendScrollMode) => {
+    claimEpochRef.current += 1;
     modeRef.current = mode;
     isAtEndRef.current = true;
     followGenerationRef.current = userScrollGenerationRef.current;
@@ -608,6 +613,7 @@ export const MessageList = memo(function MessageList({
       tailGlide.cancel();
       const top = toggle.getBoundingClientRect().top;
       const until = performance.now() + DISCLOSURE_SETTLE_MS;
+      const epoch = claimEpochRef.current;
       let frame: number | null = null;
       const stop = () => {
         if (frame !== null) cancelAnimationFrame(frame);
@@ -617,6 +623,10 @@ export const MessageList = memo(function MessageList({
       };
       const pin = () => {
         frame = null;
+        if (claimEpochRef.current !== epoch) {
+          stop();
+          return;
+        }
         if (toggle.isConnected) {
           const drift = toggle.getBoundingClientRect().top - top;
           if (Math.abs(drift) >= 0.5) viewport.scrollTop += drift;
@@ -1225,14 +1235,17 @@ export const MessageList = memo(function MessageList({
 
   // With the end pin handed to the glide, two of its jobs move here: layout
   // growth that arrives with no data change (a highlighted code block, a late
-  // image) schedules the advance, and a reader who scrolls back down to the
-  // edge is caught again, as the pin's threshold would have done.
+  // image, a footer notice such as the stalled-run controls) schedules the
+  // advance, and a reader who scrolls back down to the edge is caught again,
+  // as the pin's threshold would have done.
   useEffect(() => {
     const state = listRef.current?.getState();
     if (!state) return;
-    const offGrowth = state.listen("totalSize", () => {
+    const onGrowth = () => {
       if (glideFollowRef.current && ownsScroll()) scheduleAdvance();
-    });
+    };
+    const offGrowth = state.listen("totalSize", onGrowth);
+    const offFooter = state.listen("footerSize", onGrowth);
     const offEdge = state.listen("isWithinMaintainScrollAtEndThreshold", (atEdge) => {
       if (!atEdge || !glideReplacesPinRef.current || ownsScroll()) return;
       if (disclosureHoldRef.current) return;
@@ -1242,6 +1255,7 @@ export const MessageList = memo(function MessageList({
     });
     return () => {
       offGrowth();
+      offFooter();
       offEdge();
     };
   }, [hideJumpToLatest, ownsScroll, scheduleAdvance, threadKey]);
