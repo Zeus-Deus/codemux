@@ -2529,6 +2529,40 @@ describe("MessageList new-turn scroll contract", () => {
     expect(lastListProps.current?.anchoredEndSpace).toBeDefined();
   });
 
+  it("follows footer-only growth once the eased follower holds a spent anchor", async () => {
+    render(
+      <MessageList
+        messages={[userTurn, sentTurn, answer]}
+        sendAnchor={anchor(1)}
+        streaming
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    settleGlide();
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onSizeChanged?.(0);
+    });
+    await flushFrames();
+    // Spent anchor, but the streaming turn keeps the eased follower in
+    // place of the built-in pin.
+    expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
+    Object.defineProperty(viewport(), "scrollHeight", { configurable: true, value: 800 });
+    Object.defineProperty(viewport(), "clientHeight", { configurable: true, value: 500 });
+    // A footer notice (the stalled-run controls) grows the list; rows, the
+    // spacer and the near-end signal are all unchanged.
+    listState.isAtEnd = false;
+    act(() => emitListEvent("footerSize", 120));
+    await waitFor(() => expect(viewport().scrollTop).toBeGreaterThan(0));
+  });
+
   it("re-runs the advance decision when the reserved space resizes with no data change", async () => {
     // A late-loading image grows a row without any slot rebuild. While an
     // anchor is mounted the built-in end pin is off, so the spacer's resize

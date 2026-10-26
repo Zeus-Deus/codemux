@@ -1139,8 +1139,12 @@ export const MessageList = memo(function MessageList({
       void list.scrollToEnd({ animated: false });
       return;
     }
+    // Bound to the claim that started it: a newer send or jump re-claims
+    // the viewport and this glide stands down.
+    const epoch = claimEpochRef.current;
     tailGlide.follow(() => {
-      if (!ownsScroll() || modeRef.current !== "following-end") return null;
+      if (!ownsScroll() || claimEpochRef.current !== epoch) return null;
+      if (modeRef.current === "free-scrolling") return null;
       const current = listRef.current?.getScrollableNode();
       return current ? current.scrollHeight - current.clientHeight : null;
     });
@@ -1167,6 +1171,13 @@ export const MessageList = memo(function MessageList({
     // branch's instant `scrollToEnd` is the harsher of the two cuts.
     if (glideInFlight()) return;
     if (modeRef.current === "anchoring-turn") {
+      // A spent anchor hands the tail to the built-in end pin, which also
+      // reveals footer growth (the stalled-run controls). While the eased
+      // follower stands in for that pin, follow the real end the same way.
+      if (endPinReleased && glideFollowRef.current) {
+        if (!state.isAtEnd) followEnd(list);
+        return;
+      }
       const anchorIndex = anchorIndexRef.current;
       // Not measured yet — `onReady` owns the first positioning.
       if (anchorIndex === null) return;
