@@ -4128,6 +4128,9 @@ async fn send_turn_internal<R: Runtime>(
                 &provenance,
                 Some(&input.text),
             );
+            if row_id.is_some() {
+                crate::plugins::platform_transport::committed(&app, &thread_id_for_persist);
+            }
             bind_turn_checkpoint_transcript(
                 &app,
                 &db,
@@ -8548,6 +8551,9 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 &pending.provenance,
                 pending.replay.as_ref().map(|r|r.prompt.as_str()),
             );
+            if row_id.is_some() {
+                crate::plugins::platform_transport::committed(app, &thread_id.0);
+            }
             bind_turn_checkpoint_transcript(
                 app,
                 &db,
@@ -8671,6 +8677,9 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                     match appended {
                         Ok(row_id) => {
                             persisted_id = row_id;
+                            if row_id.is_some() && matches!(&event, ProviderRuntimeEvent::TurnCompleted { .. }) {
+                                crate::plugins::platform_transport::committed(app, &thread_id.0);
+                            }
                             if let (Some(row_id), false) = (row_id, planned.is_empty()) {
                                 super::reply_images::spawn_copies(app, row_id);
                                 retained_images = planned;

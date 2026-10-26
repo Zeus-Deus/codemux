@@ -1,0 +1,17 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Workflow Board</title><style>
+:root{color-scheme:light dark;font:14px/1.5 system-ui;background:Canvas;color:CanvasText}body{max-width:760px;margin:24px auto;padding:0 16px}h1{font-size:20px}textarea{box-sizing:border-box;width:100%;min-height:80px;font:inherit}button{font:inherit;margin:6px 6px 6px 0}li{padding:12px 0;border-bottom:1px solid GrayText;white-space:pre-wrap}#status{color:GrayText}
+</style><h1>Workflow Board</h1><p>Committed run observations and saved notes. Automatic follow-ups are off until enabled in plugin settings.</p>
+<form id="add"><label for="note">Note</label><textarea id="note" maxlength="8000" required></textarea><button>Save note</button></form>
+<button id="refresh">Refresh</button><p id="status" role="status"></p><ol id="items"></ol><button id="more" hidden>More notes</button>
+<script>
+const bridge=window.codemux;let busy=false,nextCursor=null;
+const status=document.getElementById('status'),list=document.getElementById('items');
+async function call(name,input){if(busy)return;busy=true;try{const result=await bridge.invoke(name,input);render(result.data,name==='list'&&input?.cursor>0);status.textContent='';}catch(error){status.textContent=error.message||'Board unavailable. Notes remain stored.';}finally{busy=false;}}
+function render(data,append=false){if(!data||!Array.isArray(data.items))return;nextCursor=data.nextCursor??null;document.getElementById('more').hidden=nextCursor===null;if(!append)list.replaceChildren();for(const item of data.items){const row=document.createElement('li');row.textContent=item.text;
+for(const [label,name] of [['Open thread','review'],['Remove note','remove']]){if(name==='review'&&!item.threadId)continue;const button=document.createElement('button');button.textContent=label;button.onclick=()=>call(name,{id:item.id});row.append(document.createElement('br'),button);}list.append(row);}}
+document.getElementById('add').onsubmit=event=>{event.preventDefault();call('add',{text:document.getElementById('note').value});};
+document.getElementById('refresh').onclick=()=>call('list',{});
+document.getElementById('more').onclick=()=>call('list',{cursor:nextCursor});
+if(bridge){bridge.ready.then(()=>call('list',{}));bridge.onContext(()=>call('list',{}));if(bridge.onChanged)bridge.onChanged(()=>call('list',{}));}else status.textContent='Open this page from Codemux.';
+</script></html>

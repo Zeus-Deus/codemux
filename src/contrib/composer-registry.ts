@@ -32,6 +32,13 @@ export function focusedComposer(): ComposerHandle | null {
   return composers.size === 1 ? [...composers.values()][0]! : null;
 }
 
+export function composerFor(workspaceId: string | null, threadId: string | null): ComposerHandle | null {
+  for (const handle of composers.values()) {
+    if (handle.workspaceId === workspaceId && handle.threadId === threadId) return handle;
+  }
+  return null;
+}
+
 /** A new line unless the draft is empty
  *  or already ends with one. */
 export function appendText(draft: string, text: string): string {

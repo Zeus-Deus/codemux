@@ -9,3 +9,7 @@
 # A CRLF checkout leaves a stray \r on every line and the anchoring
 # verdicts stop matching the ones captured from a real force-push.
 *.patch text eol=lf
+
+# Frozen plugin compatibility artifacts are verified by their exact bytes.
+examples/plugins/frozen-v1/plugin.js text eol=lf
+examples/plugins/platform-frozen-v1/plugin.mjs text eol=lf

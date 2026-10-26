@@ -36,7 +36,7 @@ function readFonts(): string {
 
 /** The active app theme and fonts, as handed to HTML renders. Stable until
  *  the theme or a font stack changes. */
-function useHtmlRenderTheme(): HtmlRenderTheme {
+export function useHtmlRenderTheme(): HtmlRenderTheme {
   const theme = useSyncExternalStore(subscribeActiveTheme, getActiveTheme);
   const fonts = useSyncExternalStore(subscribeRootStyle, readFonts);
   return useMemo(() => {

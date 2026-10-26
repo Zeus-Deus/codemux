@@ -43,9 +43,10 @@ impl EventHub {
     pub fn subscribe<R: Runtime>(&self, app: &AppHandle<R>, conn_id: u64, event: &str, out: OutboundTx) {
         // Desktop-only surfaces: plugin file changes and the plugin chat tap
         // never reach a web client.
-        if event.starts_with("plugins_")
+        if !matches!(event,"plugins_platform_changed"|"plugins_platform_catalogue_changed")
+            && (event.starts_with("plugins_")
             || event.starts_with("plugin_")
-            || event.starts_with("plugin-")
+            || event.starts_with("plugin-"))
         {
             return;
         }
@@ -209,5 +210,15 @@ mod plugins_boundary_tests {
             hub.subscribe(app.handle(), 1, name, out.clone());
             assert_eq!(hub.subscriber_count(name), 0);
         }
+    }
+
+    #[test]
+    fn platform_contribution_signals_are_available_without_legacy_plugin_streams() {
+        let app=tauri::test::mock_app();let hub=EventHub::default();
+        let (out,_)=crate::web_remote::server::test_outbound();
+        for event in ["plugins_platform_changed","plugins_platform_catalogue_changed"] {
+            hub.subscribe(app.handle(),1,event,out.clone());assert_eq!(hub.subscriber_count(event),1);
+        }
+        hub.subscribe(app.handle(),1,"plugin_agent_event",out);assert_eq!(hub.subscriber_count("plugin_agent_event"),0);
     }
 }

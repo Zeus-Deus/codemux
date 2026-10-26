@@ -1,0 +1,58 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Task Launcher</title><style>
+:root{color-scheme:light dark;font:13px/1.5 system-ui;color:CanvasText;background:Canvas}body{margin:0;padding:14px;max-width:880px}h1{font-size:17px;margin:0}h2{font-size:14px}p{white-space:pre-wrap;overflow-wrap:anywhere}label{display:block;margin:8px 0}input,select,button{font:inherit;max-width:100%}button{margin:6px 8px 0 0}fieldset{border:1px solid GrayText;padding:10px}article{padding:10px 0;border-bottom:1px solid GrayText}.muted{color:GrayText}#error{color:var(--color-text-danger,CanvasText)}[hidden]{display:none!important}input[type=text]{width:100%;box-sizing:border-box}
+</style><h1 id="title">Task proposal</h1><p id="summary" class="muted"></p><p id="error" role="status"></p>
+<button id="refresh">Refresh proposal</button><button id="catalog">Load model choices</button><button id="more" hidden>More models</button>
+<fieldset id="settings" hidden><legend>Launch settings</legend>
+<label>Model <select id="model"></select></label><div id="options"></div>
+<label>Native permission mode <select id="mode"></select></label>
+<label>Interaction <select id="interaction"><option value="default">Normal</option><option value="plan">Plan</option></select></label>
+<label>Checkout <select id="workspace"><option value="root">Project folder</option><option value="worktree">New worktree</option></select></label>
+<div id="worktree" hidden><label>Base ref <input id="base" type="text" value="main" maxlength="256"></label><label>Branch (optional) <input id="branch" type="text" maxlength="256"></label>
+<label><input id="origin" type="checkbox">Fetch the base branch from origin first</label></div>
+<p class="muted">Each task uses these settings when you choose Start. Accepted commands may still be queued or running.</p></fieldset>
+<main id="tasks"></main>
+<script>
+// The host owns caller identity, installation/generation, cards and operation IDs.
+// A lost start response triggers a read; the view never resends a start request.
+const bridge=window.codemux,$=id=>document.getElementById(id);let data=null,context=null,busy=false,models=[],cursor=0,model=null,optionValues={},generation=0,readSequence=0,scopeKey=null;
+const el=(tag,text)=>{const node=document.createElement(tag);if(text!==undefined)node.textContent=text;return node;};
+const planId=()=>context?.card?.data?.planId??data?.plan?.id;
+async function call(name,input){return bridge.invoke(name,input);}
+async function read(){if(!bridge)return;const scope=generation,sequence=++readSequence;try{const result=await call('read',planId()?{planId:planId()}:{});if(scope!==generation||sequence!==readSequence)return;data=result.data;render();}catch(error){if(scope===generation&&sequence===readSequence)$('error').textContent=error.message||'Proposal unavailable. The recorded summary remains below.';}}
+async function mutation(name,input){if(busy)return;const scope=generation;busy=true;render();try{const result=await call(name,input);if(scope!==generation)return;data=result.data;$('error').textContent='';}
+catch(error){if(scope!==generation)return;$('error').textContent=error.message||'Outcome unavailable. Inspect the recorded launch state before continuing.';await read();}
+finally{if(scope===generation){busy=false;render();}}}
+function selectModel(index,selection){const selected=models[index];if(!selected)return;model=structuredClone(selection||selected.modelSelection);
+const saved=data?.plan?.defaults?.modelSelection;
+const options=model.options||(saved?.instanceId===model.instanceId&&saved?.model===model.model?saved.options:[])||[];
+optionValues=Array.isArray(options)?Object.fromEntries(options.map(option=>[option.id,option.value])):{...options};
+$('mode').replaceChildren();for(const mode of selected.permissionModes||[]){const option=el('option',mode);option.value=mode;$('mode').append(option);}
+const savedMode=data?.plan?.defaults?.nativePermissionMode;if((selected.permissionModes||[]).includes(savedMode))$('mode').value=savedMode;
+$('options').replaceChildren();
+for(const descriptor of selected.options||[]){let input;
+if(descriptor.type==='boolean'){input=el('input');input.type='checkbox';input.checked=optionValues[descriptor.id]??descriptor.currentValue??false;input.onchange=()=>optionValues[descriptor.id]=input.checked;}
+else if(descriptor.type==='select'){input=el('select');const inherited=el('option','Provider default');inherited.value='';input.append(inherited);for(const choice of descriptor.options||[]){const option=el('option',choice.label||choice.id);option.value=choice.id;input.append(option);}input.value=optionValues[descriptor.id]??'';input.onchange=()=>{if(input.value)optionValues[descriptor.id]=input.value;else delete optionValues[descriptor.id];};}
+else continue;const label=el('label',descriptor.label+' ');label.append(input);$('options').append(label);}}
+async function loadModels(){if(busy||cursor===null)return;const scope=generation,current=model&&structuredClone(model),currentOptions={...optionValues},currentMode=$('mode').value;busy=true;render();try{const result=await call('models',{cursor});if(scope!==generation)return;for(const item of result.data.models){if(!models.some(existing=>existing.modelSelection.instanceId===item.modelSelection.instanceId&&existing.modelSelection.model===item.modelSelection.model))models.push(item);}cursor=result.data.nextCursor;
+$('model').replaceChildren();models.forEach((item,index)=>{const option=el('option',(item.title||item.modelSelection.model)+' · '+item.providerTitle);option.value=String(index);$('model').append(option);});
+const saved=current||data?.plan?.defaults?.modelSelection;const index=Math.max(0,models.findIndex(item=>item.modelSelection.instanceId===saved?.instanceId&&item.modelSelection.model===saved?.model));$('model').value=String(index);selectModel(index);if(current&&current.instanceId===model?.instanceId&&current.model===model?.model){optionValues=currentOptions;model.options=Object.entries(currentOptions).map(([id,value])=>({id,value}));selectModel(index,model);if((models[index].permissionModes||[]).includes(currentMode))$('mode').value=currentMode;}
+}catch(error){if(scope===generation)$('error').textContent=error.message||'Could not load models.';}finally{if(scope===generation){busy=false;render();}}}
+function choices(task){if(!model||!$('mode').value)throw new Error('Choose an advertised model and permission mode first.');
+const workspaceStrategy=$('workspace').value==='root'?{type:'root'}:{type:'worktree',baseRef:$('base').value,...($('branch').value?{branch:$('branch').value}:{}),startFromOrigin:$('origin').checked};
+return {planId:data.plan.id,taskId:task.id,modelSelection:{...model,options:Object.entries(optionValues).map(([id,value])=>({id,value}))},nativePermissionMode:$('mode').value,interactionMode:$('interaction').value,workspaceStrategy};}
+function render(){const plan=data?.plan;$('title').textContent=plan?.title||'Task proposal';$('summary').textContent=context?.card?.summary||'A person reviews each task before starting it.';
+$('settings').hidden=!plan;$('more').hidden=cursor===null||models.length===0;$('refresh').disabled=busy;$('catalog').disabled=busy||!plan;$('more').disabled=busy;
+for(const control of $('settings').querySelectorAll('input,select'))control.disabled=busy;
+$('workspace').querySelector('[value=worktree]').disabled=data?.canWorktree!==true;$('tasks').replaceChildren();
+for(const task of plan?.tasks||[]){const row=el('article'),launch=task.launch;row.append(el('h2',task.title),el('p',task.prompt),el('p',launch.state==='accepted'?'Command accepted; agent work may still be running.':launch.state));
+if(launch.diagnostic)row.append(el('p',launch.diagnostic));
+if(launch.receipt)row.append(el('p','Native operation '+launch.receipt.operation_id+' · '+launch.receipt.state));
+const button=(label,fn,disabled=false)=>{const node=el('button',label);node.disabled=busy||disabled;node.onclick=fn;row.append(node);};
+if(launch.state==='proposed')button('Start',()=>{try{mutation('start',choices(task));}catch(error){$('error').textContent=error.message;}},!data.canStart||!model);
+if(['pending','uncertain'].includes(launch.state)){button('Inspect receipt',()=>mutation('inspect',{planId:plan.id,taskId:task.id}));button('Mark abandoned…',()=>{if(confirm('A thread may already exist. This retires the proposal without cancelling or deleting it. Proposing it again may duplicate the work.'))mutation('acknowledge',{planId:plan.id,taskId:task.id,confirmUncertain:true});});}
+if(launch.threadId&&bridge.intent)button('Open thread',()=>bridge.intent({type:'thread.reveal',threadId:launch.threadId}).catch(error=>$('error').textContent=error.message));$('tasks').append(row);}}
+$('refresh').onclick=read;$('catalog').onclick=loadModels;$('more').onclick=loadModels;$('model').onchange=()=>{selectModel(Number($('model').value));render();};$('workspace').onchange=()=>{$('worktree').hidden=$('workspace').value!=='worktree';};
+function applyContext(value){const key=JSON.stringify([value.thread?.threadId,value.card?.data?.planId]);context=value;if(key!==scopeKey){scopeKey=key;generation++;readSequence++;busy=false;data=null;models=[];model=null;cursor=0;optionValues={};$('error').textContent='';$('model').replaceChildren();$('mode').replaceChildren();$('options').replaceChildren();render();read();}else render();}
+if(bridge){bridge.ready.then(applyContext);bridge.onContext(applyContext);if(bridge.onChanged)bridge.onChanged(()=>{if(!busy)read();});}else $('error').textContent='Open this proposal inside Codemux.';
+</script></html>

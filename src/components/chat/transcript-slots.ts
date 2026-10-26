@@ -27,6 +27,7 @@ function isSuggestToolCall(item: ChatViewItem): boolean {
   return isSuggestToolCallGuard(item);
 }
 import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
+import { pluginCardFromToolItem } from "@/components/plugins/cards";
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 
 import { isTaskSummaryTool } from "./TaskSummaryCard";
@@ -154,6 +155,7 @@ function isQuietObservationalTool(step: ActivityStep): boolean {
  *  - TodoWrite / task-summary calls — `TaskSummaryCard` stays a visible
  *    checklist.
  *  - `html_render` pages — the page is part of the reply, not process.
+ *  - plugin cards (`plugin_invoke` results carrying one) — likewise.
  *  - `delegate_task` calls — they render as the delegation card.
  *  - `suggest_tasks` calls — they render as the suggested-tasks card.
  *  - `workspace_launch` calls — the hand-off stays visible beside the reply.
@@ -166,6 +168,7 @@ function isGroupableTool(item: ChatViewItem): item is ToolCallItem {
     item.approval_request_id == null &&
     !isTaskSummaryTool(item) &&
     !isInlineHtmlRender(item) &&
+    pluginCardFromToolItem(item) === undefined &&
     !isDelegateToolCall(item) &&
     !isSuggestToolCall(item) &&
     !isWorkspaceLaunchCall(item)
@@ -268,10 +271,11 @@ function isFoldableSettledItem(
     case "reasoning":
       return true;
     case "tool_call":
-      // An `html_render` page stays beside the answer it belongs to.
+      // An `html_render` page, or a plugin's card, stays beside the answer it belongs to.
       return !(
         (item.approval_request_id && pendingRequestIds.has(item.approval_request_id)) ||
-        isInlineHtmlRender(item)
+        isInlineHtmlRender(item) ||
+        pluginCardFromToolItem(item) !== undefined
       );
     case "subagent_run":
       return subagentRunSettled(item);

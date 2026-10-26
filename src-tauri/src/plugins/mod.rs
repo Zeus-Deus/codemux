@@ -20,6 +20,18 @@ pub mod paths;
 pub mod registry;
 pub mod tap;
 pub mod watch;
+pub mod platform;
+pub mod platform_authority;
+pub mod platform_events;
+pub mod platform_management;
+pub mod platform_manifest;
+pub mod platform_package;
+pub mod platform_runtime;
+pub mod platform_store;
+pub mod platform_transport;
+pub mod platform_workflow;
+#[cfg(test)]
+mod platform_acceptance_tests;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

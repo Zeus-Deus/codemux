@@ -28,6 +28,9 @@ pub struct PluginsState {
 }
 
 impl PluginsState {
+    pub(super) fn execution_paused(&self) -> bool {
+        self.safe_mode().status().paused
+    }
     fn registry(&self) -> &Result<Registry, String> {
         self.registry.get_or_init(|| {
             let dir = super::app_data_dir().ok_or("App data directory is unavailable")?;
@@ -245,6 +248,8 @@ pub fn plugins_startup_checkpoint<R: Runtime>(
 pub fn plugins_resume<R: Runtime>(app: AppHandle<R>, state: State<'_, PluginsState>) -> Result<(), String> {
     gui(&app)?;
     state.safe_mode().resume();
+    super::platform_transport::wake(&app);
+    let _ = app.emit("plugins_platform_catalogue_changed", ());
     Ok(())
 }
 

@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { FolderOpen, Github, MoreHorizontal, RefreshCw } from "lucide-react";
+import { useMemo, useState, useSyncExternalStore } from "react";
+import { FolderOpen, Github, MoreHorizontal, RefreshCw, Settings2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -28,6 +28,9 @@ import { Spinner } from "@/components/ui/spinner";
 import { useContributions } from "@/contrib/react/use-contributions";
 import { ContribBoundary, ContribRender } from "@/contrib/react/boundary";
 import { SETTINGS_PAGES_AREA } from "@/sdk/areas";
+import { PlatformPluginsSection } from "@/components/plugins/PlatformPluginsSettings";
+import type { PluginSettingsPage, PluginSetupStatus } from "@/contrib/plugin";
+import { cn } from "@/lib/utils";
 
 const TIER_LABEL: Record<PluginTier, string> = {
   official: "Official",
@@ -60,6 +63,35 @@ export function usePluginSettingsPages() {
     }
     return byPlugin;
   }, [pages]);
+}
+
+type SetupSource = NonNullable<PluginSettingsPage["status"]>;
+
+/** The first setup status any of the plugin's settings pages reports, with
+ *  the page that reports it so a failure is attributed to that plugin. */
+function setupSourceOf(pages: readonly { id: string; data?: unknown }[]): { id: string; source: SetupSource } | null {
+  for (const page of pages) {
+    const status = (page.data as { status?: SetupSource } | undefined)?.status;
+    if (status) return { id: page.id, source: status };
+  }
+  return null;
+}
+
+function SetupStatus({ source }: { source: SetupSource }) {
+  const status: PluginSetupStatus | null = useSyncExternalStore(source.subscribe, source.get, source.get);
+  if (!status) return null;
+  return (
+    <p className="mt-1 flex items-center gap-1.5 text-body-sm text-muted-foreground" data-plugin-setup={status.tone}>
+      <span
+        aria-hidden
+        className={cn(
+          "size-1.5 shrink-0 rounded-full",
+          status.tone === "ready" ? "bg-status-open" : status.tone === "attention" ? "bg-warning" : "bg-muted-foreground",
+        )}
+      />
+      {status.label}
+    </p>
+  );
 }
 
 /** Settings → <plugin>: every settings page the plugin registered. */
@@ -96,6 +128,7 @@ interface RowActions {
   update: (source: InstallSource) => void;
   remove: (record: PluginRecord) => void;
   hasSettings: boolean;
+  setup: { id: string; source: SetupSource } | null;
 }
 
 function PluginRow({ record, actions }: { record: PluginRecord; actions: RowActions }) {
@@ -125,6 +158,13 @@ function PluginRow({ record, actions }: { record: PluginRecord; actions: RowActi
           <p className="mt-0.5 text-body-sm text-muted-foreground">{record.description}</p>
         )}
         {status && <p className="mt-0.5 text-body-sm text-muted-foreground">{status}</p>}
+        {/* Plugin code runs in get/subscribe: a throw stays in this slot, so
+            the row, its switch and every other row keep working. */}
+        {actions.setup && on && !paused && !record.inert && record.status !== "error" && (
+          <ContribBoundary id={actions.setup.id} variant="chip">
+            <SetupStatus source={actions.setup.source} />
+          </ContribBoundary>
+        )}
         {record.status === "error" && record.error && (
           <p className="mt-1 break-words text-body-sm text-destructive" role="alert">
             {record.error}
@@ -137,7 +177,13 @@ function PluginRow({ record, actions }: { record: PluginRecord; actions: RowActi
         )}
       </div>
       <div className="flex shrink-0 items-center gap-1">
-        {(record.file || actions.hasSettings) && (
+        {actions.hasSettings && !record.inert && (
+          <Button size="sm" variant="ghost" onClick={() => actions.openSettings(record.id)}>
+            <Settings2 />
+            Settings
+          </Button>
+        )}
+        {record.file && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button size="icon-sm" variant="ghost" aria-label={`${record.name} actions`}>
@@ -145,9 +191,6 @@ function PluginRow({ record, actions }: { record: PluginRecord; actions: RowActi
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              {actions.hasSettings && !record.inert && (
-                <DropdownMenuItem onSelect={() => actions.openSettings(record.id)}>Settings</DropdownMenuItem>
-              )}
               {record.file && (
                 <DropdownMenuItem
                   onSelect={() =>
@@ -231,6 +274,7 @@ export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId
     update: installer.installFrom,
     remove: (r) => void remove(r),
     hasSettings: settingsPages.has(record.id) && !!onOpenSettings,
+    setup: setupSourceOf(settingsPages.get(record.id) ?? []),
   });
   const disabledByEnv = usePluginsStore((s) => s.disabledByEnv);
   const paused = usePluginsStore((s) => s.paused);
@@ -323,6 +367,7 @@ export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId
         </div>
       )}
       {!disabledByEnv && <PluginCatalog onInstall={installer.installFrom} />}
+      <PlatformPluginsSection />
       {installer.dialog}
       {confirmDialog}
     </div>

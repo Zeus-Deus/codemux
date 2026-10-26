@@ -32,6 +32,8 @@ import { useMountedOnceOpen } from "@/hooks/use-mounted-once-open";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
 import { UtilityPageStandaloneContext } from "./utility-page";
 import { PluginPage } from "@/contrib/react/plugin-page";
+import { PlatformPluginPage } from "@/components/plugins/PlatformPluginViews";
+import { parsePlatformPageId } from "@/components/plugins/plugin-actions";
 import { markStartup } from "@/lib/perf/interaction-trace";
 import { scheduleSequentialIdlePrefetch } from "@/lib/idle-prefetch";
 
@@ -465,7 +467,12 @@ function utilityPageLabel(page: UtilityPage): string {
 }
 
 function UtilityPageContent({ page }: { page: UtilityPage }) {
-  if (page.startsWith("plugin:")) return <PluginPage id={page.slice("plugin:".length)} />;
+  if (page.startsWith("plugin:")) {
+    const id = page.slice("plugin:".length);
+    const platform = parsePlatformPageId(id);
+    if (platform) return <PlatformPluginPage {...platform} />;
+    return <PluginPage id={id} />;
+  }
   if (page === "automations") return <AutomationsView />;
   if (page === "devices") return <DevicesView />;
   if (page === "usage") return <UsageView />;

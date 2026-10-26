@@ -33,6 +33,8 @@ pub(crate) fn tool_name(name: &str) -> Option<&str> {
             || matches!(
                 *n,
                 "delegate_task"
+                    | "plugin_list"
+                    | "plugin_invoke"
                     | "task_status"
                     | "task_cancel"
                     | "workspace_launch"
@@ -176,6 +178,11 @@ pub(crate) async fn call_with_id<R: Runtime>(
     app: AppHandle<R>, actor: crate::delegation::app::NativeActor,
     name: String, mut args: Value, call_id: Option<String>,
 ) -> Result<Value, String> {
+    if matches!(name.as_str(),"plugin_list"|"plugin_invoke") {
+        let caller=qualify_for(&app,&actor,false).await.map_err(|error|error.to_string())?;
+        let result=crate::plugins::platform_transport::agent_request(&app,caller,&name,args).await?;
+        return Ok(crate::plugins::platform_transport::mcp_result(result));
+    }
     if name == "suggest_tasks" {
         actor.permit.wait_ready().await?;
         actor.permit.identity()?.verify(&actor.thread_id)?;

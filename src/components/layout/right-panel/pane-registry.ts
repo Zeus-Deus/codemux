@@ -143,9 +143,9 @@ export function docPanePath(id: RightPanelTab): string | null {
   return id.startsWith(DOC_PREFIX) ? id.slice(DOC_PREFIX.length) : null;
 }
 
-/** A plugin pane: `plugin:<pluginId>:<localId>`. */
+/** Renderer ids retain their grammar; @ reserves the isolated installation namespace. */
 export function isPluginPane(id: string): id is `plugin:${string}:${string}` {
-  return /^plugin:[a-z0-9-]{1,64}:[^:]+$/.test(id);
+  return /^plugin:(?:[a-z0-9-]{1,64}|@[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}):[^:]+$/.test(id);
 }
 
 export function isCorePane(id: RightPanelTab): id is RightPanelCorePane {

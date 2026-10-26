@@ -72,6 +72,15 @@ describe("breadcrumb paths", () => {
 });
 
 describe("plugin pane IDs", () => {
+  it("accepts full isolated installation ids without widening renderer plugin ids", () => {
+    const installationId = `plugin-${"a".repeat(64)}`;
+    const pane = `plugin:@${installationId}:view.inspector` as const;
+    expect(isPluginPane(pane)).toBe(true);
+    expect(isCorePane(pane)).toBe(false);
+    expect(isPluginPane(`plugin:${installationId}:view.inspector`)).toBe(false);
+    expect(isPluginPane("plugin:@../escape:view.inspector")).toBe(false);
+  });
+
   it("does not classify plugin panes, empty sentinels or unknown IDs as core", () => {
     expect(isPluginPane("plugin:project-brief:brief")).toBe(true);
     expect(isCorePane("plugin:project-brief:brief")).toBe(false);

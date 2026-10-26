@@ -47,8 +47,8 @@ pub(crate) fn permission_ceiling(caller: &ControlCaller, provider: ProviderKind,
     }
     if caller.access == ControlAccess::FullAccess { return Ok(()); }
     let supervised = match provider {
-        ProviderKind::Claude => matches!(mode, Some("default" | "acceptEdits")),
-        ProviderKind::Codex => matches!(mode, Some("read-only" | "workspace-write")),
+        ProviderKind::Claude => matches!(mode, Some("default" | "acceptEdits" | "plan")),
+        ProviderKind::Codex => matches!(mode, Some("read-only" | "workspace-write" | "plan")),
         ProviderKind::Cursor | ProviderKind::Grok => matches!(mode, Some("ask" | "plan")),
         ProviderKind::Hermes | ProviderKind::Acp | ProviderKind::OpenCode => false,
     };
@@ -70,6 +70,15 @@ pub(crate) fn authorize_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &
 }
 
 fn authorize_with_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, orchestration: bool, retry_held: bool) -> Result<(), ControlError> {
+    if let super::CallerPrincipal::RemoteClient { session_id } = &caller.identity {
+        let approved = app.state::<DatabaseStore>().web_remote_get_session(session_id)
+            .is_some_and(|session| session.approved && !session.revoked);
+        let connected = app.try_state::<crate::web_remote::WebRemoteState>()
+            .is_some_and(|state| state.shared().connections.session_live(session_id));
+        if !approved || !connected {
+            return Err(ControlError::new("stale_caller", "The remote client disconnected or its session was revoked"));
+        }
+    }
     if let super::CallerPrincipal::Thread { thread_id, provider,
         provider_instance_id, authority, ceiling, .. } = &caller.identity {
         let db = app.state::<DatabaseStore>();

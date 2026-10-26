@@ -13,6 +13,7 @@ import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
 import { cn } from "@/lib/utils";
 import { useSidebarViewStore } from "./sidebar-view-store";
+import { PluginSidebarLayoutMenu } from "@/components/plugins/PluginTreeSidebar";
 
 /** The "New agent" gesture shared by the sidebar header and its empty state:
  *  a home-directory chat draft when agent chat is on, otherwise (or with
@@ -160,6 +161,7 @@ export function SidebarHeaderActions() {
   return (
     <>
       <SidebarViewSwitch />
+      <PluginSidebarLayoutMenu />
       <Tooltip>
         <TooltipTrigger asChild>
           <button

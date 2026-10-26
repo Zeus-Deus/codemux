@@ -2396,8 +2396,8 @@ mod tests {
         // (workspace_archive / workspace_unarchive /
         // workspace_archive_list), then 57 → 58 with html_render. Keep
         // this number in sync with register_tools() when adding new entries.
-        // Native control adds eleven.
-        assert_eq!(tools.len(), 73);
+        // Native control adds eleven, plus two isolated plugin tools.
+        assert_eq!(tools.len(), 75);
         let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
@@ -2614,8 +2614,9 @@ mod tests {
         // then 44 → 52 with the eight automation tools, then 52 → 55
         // with the workspace-archive tools, then 55 → 57 with attached
         // conversation history, then 57 → 58 with html_render. See
-        // tool_registry_has_all_tools for the canonical count (native control adds eleven).
-        assert_eq!(tools.len(), 73);
+        // tool_registry_has_all_tools for the canonical count (native control
+        // adds eleven, plus two isolated plugin tools).
+        assert_eq!(tools.len(), 75);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());
@@ -3417,6 +3418,8 @@ mod tests {
             "thread_stop",
             "thread_respond",
             "operation_status",
+            "plugin_list",
+            "plugin_invoke",
         ] {
             assert!(names.contains(name), "native control tool {name} is missing from MCP discovery");
         }

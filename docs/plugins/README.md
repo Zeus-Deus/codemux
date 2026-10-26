@@ -1,16 +1,22 @@
 # Writing Codemux plugins
 
-A plugin is one ES module that the Codemux window loads into its own
+Codemux supports renderer plugins for native React UI and
+[isolated API v1 packages](#isolated-author-platform-api-v1) for backend actions,
+thread workflows and views shared with remote clients. Existing renderer
+plugins keep their format and behavior. The following sections document that
+renderer API; isolated packages use the standalone `@codemux/plugin-sdk`.
+
+A renderer plugin is one ES module that the Codemux window loads into its own
 renderer. It can add palette commands, shortcuts, right-panel panes, pages,
 settings pages, composer actions, title-bar buttons, sidebar sections, landing
 art, tool-call renderers, themes and overlays, and it can read chat events from
 every thread.
 
-Plugins are **not sandboxed**. A plugin can do anything the app can: read your
+Renderer plugins are **not sandboxed**. A plugin can do anything the app can: read your
 projects, run commands through the app's IPC, talk to the network. Safety comes
 from the rails around it, not from isolation:
 
-- **On/off switch:** each plugin has one in Settings → Plugins.
+- **On/off switch:** each plugin has one in Settings → Extensions → Plugins.
 - **Label:** every plugin is labelled Official, Unverified or Local.
 - **Install warning:** shown before anything is written.
 - **Error isolation:** a crashing contribution shows a "Plugin X failed" chip; the rest of the app keeps working.
@@ -21,7 +27,7 @@ Install only plugins you trust.
 
 ## Quick start
 
-1. Open Settings → Plugins → **Open plugins folder**. The folder is
+1. Open Settings → Extensions → Plugins → **Open plugins folder**. The folder is
    `<data dir>/codemux/plugins` (`~/.local/share/codemux/plugins` on Linux,
    `%APPDATA%\codemux\plugins` on Windows).
 2. Make a folder whose name is the plugin id, e.g. `hello/`, and put a
@@ -56,8 +62,10 @@ export default {
 | Field | |
 |---|---|
 | `id` | `[a-z0-9-]{1,64}`, equal to the folder name. |
-| `name`, `description`, `version` | Shown in Settings → Plugins. |
+| `name`, `description`, `version` | Shown in Settings → Extensions → Plugins. |
 | `minCodemux` | Refuse to load on an older app, e.g. `"0.25.0"`. |
+| `apiVersion` | Optional renderer API version, currently `1`. An unsupported version leaves this plugin unavailable and preserves its enable choice. Omit it for legacy compatibility. |
+| `capabilities`, `optionalCapabilities` | Optional required and optional renderer features from `RENDERER_PLUGIN_CAPABILITIES`. Unknown required features prevent registration; unknown optional features are omitted from `ctx.capabilities`. These describe compatibility, not permissions. |
 | `register(ctx)` | Called when the plugin turns on. May be async. A throw or rejection rolls back everything it registered. |
 
 `ctx` (`PluginContext`):
@@ -65,12 +73,14 @@ export default {
 | Member | |
 |---|---|
 | `ctx.register(contribution)` / `ctx.registerMany([...])` | Add contributions; returns a disposer. Ids are local to your plugin. |
-| `ctx.registerSettingsPage({ title, render })` | A page under Settings → PLUGIN SETTINGS. |
+| `ctx.registerSettingsPage({ title, render, status? })` | A page under Settings → Plugin settings, opened from a visible **Settings** button on the plugin's Extensions row. Optional `status: { get, subscribe }` returns `{ label, tone: "ready" \| "attention" \| "neutral" }` for that row, separate from on/off; `get` must return the same object until it changes. |
 | `ctx.onDispose(fn)` | Runs when the plugin turns off, reloads or is removed. |
 | `ctx.setTimeout`, `ctx.setInterval`, `ctx.addEventListener` | Like the globals, but cleaned up for you on unload. |
 | `ctx.storage.get(key, fallback)` / `.set(key, value)` / `.remove(key)` | JSON in the device-local settings DB under `plugin.<id>.<key>`. Never synced. |
 | `ctx.host` | The host API bound to this plugin. Use it for subscriptions made after an `await` or in your own async callbacks; they are removed when the plugin turns off. |
 | `ctx.id`, `ctx.source` (`plugin:<id>`), `ctx.tier` | Who you are. |
+| `ctx.apiVersion`, `ctx.capabilities` | The renderer API version and compatible requested features. With no requirements, legacy plugins see all current renderer features. `host.api` exposes the host's version and supported capabilities. |
+| `ctx.signal` | Aborted before cleanup on disable, reload, removal or registration failure. Pass it to asynchronous work you own. |
 
 A contribution is `{ id, area, title?, order?, when?, enabled?, render?, data? }`.
 
@@ -568,9 +578,92 @@ local AppData; Linux XDG data home (default `~/.local/share`); macOS
 reader is exposed. `dataDir` here is the OS directory, whereas `fs.dataDir()` is
 the plugin's private directory beneath the app's data directory.
 
+`ctx.host.tools` installs helper programs whose release Codemux pins. Today the
+only tool is `cua-driver` 0.21.0, used by Computer use:
+
+```ts
+const status = await ctx.host.tools.status("cua-driver");
+// { id, version, supported, unsupportedReason, executable }
+const executable = await ctx.host.tools.install("cua-driver", (progress) => {
+  // { stage: "downloading", received, total } | { stage: "verifying" } | { stage: "validating" }
+});
+```
+
+The plugin chooses only the tool id. The archive URL, size, SHA-256 and copied
+files are fixed in the app; the install is verified, version-checked in a
+staging folder, and then renamed into `<app data>/tools/<id>/<version>-<platform>/`.
+It never changes PATH or another installation. `supported` is false, with a
+reason, where Codemux can't install the tool (cua-driver on macOS).
+
 On Linux the GUI inherits its launcher's PATH; it does not import a login shell's
 PATH. A desktop session may omit `~/.local/bin`, so an integration can fall back
 to `homeDir/.local/bin` when `which` misses a newly installed CLI. On Windows,
 `which` accepts non-directory reparse points, including zero-byte App Execution
 Aliases, and `run` passes that path through to CreateProcess. Classification and
 PATHEXT lookup have unit coverage; Windows execution remains untested live.
+
+## Isolated author platform (API v1)
+
+External backend plugins use **`codemux-plugin.json`** and the standalone
+[`@codemux/plugin-sdk`](../../packages/plugin-sdk/README.md). This is separate
+from the React renderer `@codemux/sdk` described above. Existing React plugins,
+MCP registrations and saved history keep their current behavior.
+
+A package exports `activate(ctx)` from a JavaScript entry and registers
+`action:*`, `view:*:*`, `status:*`, native-tree or committed-run handlers. It
+runs in its own supervised worker; the UI consumes native contributions or
+sandboxed single-document HTML views through `window.codemux`. Dependencies
+must already be bundled or relative: installing a package never executes its
+install/build hooks. Worker isolation is a reliability boundary, not an OS
+filesystem or network sandbox.
+
+Use plugin settings to review a local directory or Git snapshot, then consent
+to that exact digest and explicit capability/project grants. Updates stage a
+new snapshot for review. Unsupported API versions/required features, broken
+workers and damaged plugin records make that installation unavailable; the
+core app and conversation summaries remain readable. Enabled intent, settings,
+private data and receipts are retained across updates and normal removal.
+Deletion of plugin data is a separate explicit action. Disabled/incompatible
+observer gaps need an explicit replay/skip choice.
+
+`capabilities` declares required requests;
+`optionalCapabilities` permits graceful fallback. Discover the live granted
+`ctx.capabilities`, not method presence. Host services can be called **only
+inside a live invocation**, including tree/event callbacks; await them before
+returning. `invocation.signal` tracks that invocation, while `ctx.signal`
+tracks worker lifetime. Cancellation cannot roll back a native command already
+admitted. Caller identity comes from frozen `invocation.caller`, never from
+input or target `context`.
+
+Native mutations return snake_case operation receipts: accepted/queued work is
+not finished work. Persist a stable request before dispatch, inspect a known
+receipt using `workflow.query({query:"operation", operationId})`, and retain
+uncertain outcomes rather than launching again. Model options use canonical
+`{id,value}` selections from the native catalog. Native permission modes,
+worktree decisions, event provenance, stable effect identity and recovery are
+covered in the [SDK author contract](../../packages/plugin-sdk/README.md).
+
+Executable packages:
+
+- [Workflow Board](../../examples/plugins/platform-workflow-board/README.md):
+  durable, deduplicated committed-run observations and opt-in follow-ups.
+- [Projects Tree](../../examples/plugins/platform-projects-tree/README.md):
+  paged metadata, bounded scans and native project/thread rows.
+- [Task Launcher](../../examples/plugins/platform-task-launcher/README.md):
+  verified agent proposals, host-stamped cards, human launch choices and
+  durable pending/uncertain journals that prevent duplicate creates.
+- [Frozen isolated v1](../../examples/plugins/platform-frozen-v1/README.md):
+  hash-pinned worker artifact exercised unchanged against source and compiled
+  hosts, independently of SDK rebuilds.
+
+Focused verification from the repository root:
+
+```sh
+node node_modules/typescript/bin/tsc -p packages/plugin-sdk/tsconfig.json
+node --test packages/plugin-sdk/test/*.test.mjs examples/plugins/platform-*/test/*.test.mjs
+CODEMUX_PLUGIN_HOST_TEST_BINARY=./src-tauri/binaries/codemux-plugin-host-x86_64-unknown-linux-gnu node --test examples/plugins/platform-*/test/*.test.mjs
+```
+
+These executable worker tests use persisted deterministic domain fixtures.
+Native platform tests separately prove application authority, committed-event
+capture and host card stamping; worker tests do not claim to launch real agents.

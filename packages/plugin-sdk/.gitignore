@@ -1,0 +1,3 @@
+# Published SDK ships its checked-in JS/declarations; installation never compiles it.
+!dist/
+!dist/**
