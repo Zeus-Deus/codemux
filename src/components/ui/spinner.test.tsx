@@ -20,4 +20,12 @@ describe("Spinner", () => {
     expect(spinner).toHaveClass("size-3");
     expect(spinner).not.toHaveClass("size-4");
   });
+
+  it("waits before showing unless the caller already waited", () => {
+    // globals.css keys the show delay off data-delayed.
+    render(<Spinner label="Waiting" />);
+    render(<Spinner label="Shown" immediate />);
+    expect(screen.getByRole("status", { name: "Waiting" })).toHaveAttribute("data-delayed");
+    expect(screen.getByRole("status", { name: "Shown" })).not.toHaveAttribute("data-delayed");
+  });
 });

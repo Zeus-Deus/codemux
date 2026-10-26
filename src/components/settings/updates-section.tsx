@@ -5,6 +5,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { useDelayedPending } from "@/hooks/use-delayed-pending";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -90,6 +91,7 @@ export function UpdatesSection() {
     plan.skipped.push({ machine: LOCAL, label: "Codemux", reason: "Installed by a package manager. Update it there." });
   }
   const loading = Object.values(known).some((m) => m.loading) || Object.keys(known).length === 0;
+  const showLoading = useDelayedPending(loading);
   const appPending = app.available;
   const total = plan.items.length + (appPending ? 1 : 0);
 
@@ -125,7 +127,7 @@ export function UpdatesSection() {
               onClick={() => void refreshAll(hostIds, true)}
               aria-label="Check for updates"
             >
-              {loading ? <Spinner className="size-3.5" aria-hidden /> : <RefreshCw className="size-3.5" />}
+              {showLoading ? <Spinner immediate className="size-3.5" aria-hidden /> : <RefreshCw className="size-3.5" />}
               Check
             </Button>
             <Button

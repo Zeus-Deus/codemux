@@ -160,6 +160,23 @@
   --motion-slow: 250ms;
 }
 
+/* Spinners hold back `--motion-slow` before they appear, so a wait that
+ * settles quickly shows nothing at all. The element is laid out from the
+ * first frame and only its opacity waits, so nothing shifts when it shows.
+ * `<Spinner immediate />` skips the wait; `SPINNER_DELAY_MS` in
+ * `spinner.tsx` mirrors it for `useDelayedPending`. Unlayered, so it wins
+ * over the `animate-spin` utility it extends. */
+@keyframes cm-spinner-reveal {
+  from {
+    opacity: 0;
+  }
+}
+[data-slot="spinner"][data-delayed] {
+  animation:
+    spin 1s linear infinite,
+    cm-spinner-reveal var(--motion-quick) ease-out var(--motion-slow) backwards;
+}
+
 :root {
     /* Keep the runtime choices one level below Tailwind's theme names.
      * `@theme inline` then compiles font-sans/font-mono utilities against
@@ -493,6 +510,11 @@
   [data-slot="spinner"] {
     animation: cm-spinner-breathe 1.5s ease-in-out infinite !important;
   }
+  [data-slot="spinner"][data-delayed] {
+    animation:
+      cm-spinner-reveal 0s var(--motion-slow) backwards,
+      cm-spinner-breathe 1.5s ease-in-out var(--motion-slow) infinite !important;
+  }
 }
 :root.reduce-motion *,
 :root.reduce-motion *::before,
@@ -504,6 +526,11 @@
 }
 :root.reduce-motion [data-slot="spinner"] {
   animation: cm-spinner-breathe 1.5s ease-in-out infinite !important;
+}
+:root.reduce-motion [data-slot="spinner"][data-delayed] {
+  animation:
+    cm-spinner-reveal 0s var(--motion-slow) backwards,
+    cm-spinner-breathe 1.5s ease-in-out var(--motion-slow) infinite !important;
 }
 
 .pane-drop-overlay {

@@ -52,7 +52,6 @@ import {
   FileText,
   FileVideo,
   ListFilter,
-  Loader2,
   PanelRight as PanelRightIcon,
   RefreshCw,
   Search,
@@ -212,7 +211,7 @@ function ReviewTabBadge({
         </span>
       )}
       {status === "pending" && (
-        <Loader2 className="size-3 animate-spin text-status-working" />
+        <Spinner className="size-3 text-status-working" role="presentation" aria-hidden />
       )}
       {status === "success" && <Check className="size-3 text-status-open" />}
       {status === "failure" && <X className="size-3 text-status-attention" />}

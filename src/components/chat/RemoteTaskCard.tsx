@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { AlertCircle, CheckCircle2, Circle, LoaderCircle, Server, Square } from 'lucide-react';
+import { AlertCircle, CheckCircle2, Circle, Server, Square } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Spinner } from '@/components/ui/spinner';
 import { delegationCancel, delegationRead, type LocalTask, type TaskStatus } from '@/lib/delegation';
 import { delegationTaskReadBoundary, isDelegationPaneOwner, qualifiesDelegationTaskRead, refreshDelegationTasks, upsertDelegationTask, type TaskReadBoundary } from '@/stores/delegation-store';
 
@@ -22,8 +23,8 @@ export function deliveryExplanation(task: LocalTask): string {
   return task.delivery?.reason ? reasons[task.delivery.reason] : 'Parent delivery is unavailable. Refresh the saved task state.';
 }
 export function RemoteTaskStatus({ task }: { task: LocalTask }) {
-  const Icon = task.status === 'completed' ? CheckCircle2 : task.status === 'cancelled' ? Square : ['failed', 'interrupted', 'awaiting_approval'].includes(task.status) ? AlertCircle : isRemoteTaskActive(task) ? LoaderCircle : Circle;
-  return <span className="inline-flex items-center gap-1.5 text-body-sm font-medium"><Icon aria-hidden className={`size-3.5 ${['starting', 'running', 'stopping'].includes(task.status) ? 'motion-safe:animate-spin' : ''}`} />{remoteTaskStatusLabel[task.status]}</span>;
+  const Icon = task.status === 'completed' ? CheckCircle2 : task.status === 'cancelled' ? Square : ['failed', 'interrupted', 'awaiting_approval'].includes(task.status) ? AlertCircle : Circle;
+  return <span className="inline-flex items-center gap-1.5 text-body-sm font-medium">{['starting', 'running', 'stopping'].includes(task.status) ? <Spinner className="size-3.5" role="presentation" aria-hidden /> : <Icon aria-hidden className="size-3.5" />}{remoteTaskStatusLabel[task.status]}</span>;
 }
 export function RemoteTaskCard({ task, paneId, writable, onOpen }: RemoteTaskCardProps) {
   const key = JSON.stringify([paneId, task.parent_thread_id, task.id]);

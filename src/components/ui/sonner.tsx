@@ -1,7 +1,8 @@
 import { useSyncExternalStore } from "react"
 import { Toaster as Sonner, type ToasterProps } from "sonner"
 import { useAppTheme } from "@/hooks/use-app-theme"
-import { CircleCheckIcon, InfoIcon, TriangleAlertIcon, OctagonXIcon, Loader2Icon } from "lucide-react"
+import { CircleCheckIcon, InfoIcon, TriangleAlertIcon, OctagonXIcon } from "lucide-react"
+import { Spinner } from "@/components/ui/spinner"
 
 function subscribeVisibility(onChange: () => void) {
   document.addEventListener("visibilitychange", onChange)
@@ -34,7 +35,7 @@ const Toaster = ({ ...props }: ToasterProps) => {
           <OctagonXIcon className="size-4" />
         ),
         loading: (
-          <Loader2Icon className="size-4 animate-spin" />
+          <Spinner immediate role="presentation" aria-hidden />
         ),
       }}
       style={

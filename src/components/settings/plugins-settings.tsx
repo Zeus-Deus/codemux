@@ -25,6 +25,7 @@ import {
 } from "@/contrib/plugins-store";
 import { SectionHeader, SubsectionHeader } from "./settings-primitives";
 import { Spinner } from "@/components/ui/spinner";
+import { useDelayedPending } from "@/hooks/use-delayed-pending";
 import { useContributions } from "@/contrib/react/use-contributions";
 import { ContribBoundary, ContribRender } from "@/contrib/react/boundary";
 import { SETTINGS_PAGES_AREA } from "@/sdk/areas";
@@ -280,6 +281,7 @@ export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId
   const paused = usePluginsStore((s) => s.paused);
   const pausedReason = usePluginsStore((s) => s.pausedReason);
   const [reloading, setReloading] = useState(false);
+  const showReloading = useDelayedPending(reloading);
   const rows = useMemo(
     () =>
       Object.values(records).sort(
@@ -323,7 +325,7 @@ export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId
           Open plugins folder
         </Button>
         <Button size="sm" variant="outline" disabled={reloading || disabledByEnv} onClick={() => void reload()}>
-          {reloading ? <Spinner /> : <RefreshCw />}
+          {showReloading ? <Spinner immediate /> : <RefreshCw />}
           Reload plugins
         </Button>
       </div>

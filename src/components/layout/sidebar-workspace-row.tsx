@@ -15,6 +15,7 @@ import {
   ContextMenuSubContent,
 } from "@/components/ui/context-menu";
 import { groupEditors } from "@/lib/editor-groups";
+import { useDelayedPending } from "@/hooks/use-delayed-pending";
 import { useElapsedSeconds } from "@/hooks/use-elapsed-seconds";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import {
@@ -45,7 +46,6 @@ import {
   AlertTriangle,
   BellOff,
   Cloud,
-  Loader2,
   Mail,
   MonitorSmartphone,
   Pencil,
@@ -128,6 +128,7 @@ import { getTimeFormat } from "@/stores/settings-store";
 import { useUIStore } from "@/stores/ui-store";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { PluginThreadMenuItems } from "@/components/plugins/PluginActionMenus";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Attach-in-place and remote (pushed-to-host) workspaces can't be
  *  archived — the backend refuses — so their removal affordance is the
@@ -1112,8 +1113,9 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
         : null,
   );
   const sidebarElapsedSec = useElapsedSeconds(inFlightStartedAt);
-  const icon = isPushOrPullInFlight ? (
-    <Loader2 className="size-3.5 shrink-0 text-muted-foreground animate-spin" />
+  const showPushPullSpinner = useDelayedPending(isPushOrPullInFlight);
+  const icon = showPushPullSpinner ? (
+    <Spinner immediate className="size-3.5 text-muted-foreground" role="presentation" aria-hidden />
   ) : isRemote ? (
     <Cloud className="size-3.5 shrink-0 text-muted-foreground" />
   ) : isPrimary ? (
