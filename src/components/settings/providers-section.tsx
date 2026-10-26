@@ -4,6 +4,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { useDelayedPending } from "@/hooks/use-delayed-pending";
 import { Switch } from "@/components/ui/switch";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { cn } from "@/lib/utils";
@@ -134,6 +135,7 @@ export function ProvidersSection() {
         : { tone: "pending", label: "Not tested yet" };
 
   const [checking, setChecking] = useState(false);
+  const showChecking = useDelayedPending(checking);
   const checkAll = () => {
     setChecking(true);
     void Promise.all(probed.map((p) => refreshHealth(p, { force: true }))).finally(() => setChecking(false));
@@ -146,7 +148,7 @@ export function ProvidersSection() {
         description="The agents Codemux can run, and the accounts they use."
         action={
           <Button variant="ghost" size="sm" className="text-muted-foreground" disabled={checking} onClick={checkAll}>
-            {checking ? <Spinner className="size-3.5" aria-hidden /> : <RefreshCw />}
+            {showChecking ? <Spinner immediate className="size-3.5" aria-hidden /> : <RefreshCw />}
             Check all
           </Button>
         }
@@ -331,6 +333,7 @@ function BuiltInDetail({
   const refresh = useProviderHealth((s) => s.refresh);
   const caps = useProviderCapabilities((s) => selectCapabilities(s, id));
   const [checking, setChecking] = useState(false);
+  const showChecking = useDelayedPending(checking);
   const ready = enabled && report?.installed;
   // Opening a provider's page is the intent that lets its catalog load.
   useEffect(() => {
@@ -354,7 +357,7 @@ function BuiltInDetail({
         switchTitle={lockedReason}
         actions={enabled && (
           <Button variant="ghost" size="sm" className="text-muted-foreground" disabled={checking} onClick={check}>
-            {checking ? <Spinner className="size-3.5" aria-hidden /> : <RefreshCw />}
+            {showChecking ? <Spinner immediate className="size-3.5" aria-hidden /> : <RefreshCw />}
             Check
           </Button>
         )}

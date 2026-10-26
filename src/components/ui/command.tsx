@@ -39,12 +39,14 @@ function CommandDialog({
   children,
   className,
   showCloseButton = false,
+  motion,
   ...props
 }: React.ComponentProps<typeof Dialog> & {
   title?: string
   description?: string
   className?: string
   showCloseButton?: boolean
+  motion?: React.ComponentProps<typeof DialogContent>["motion"]
 }) {
   return (
     <Dialog {...props}>
@@ -54,6 +56,7 @@ function CommandDialog({
           className
         )}
         showCloseButton={showCloseButton}
+        motion={motion}
       >
         {/* Inside the content so a dialog kept mounted while closed leaves
             no stray heading in the page. */}

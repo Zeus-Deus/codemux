@@ -81,6 +81,7 @@ import type {
 } from "@/tauri/types";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { Spinner } from "@/components/ui/spinner";
+import { useDelayedPending } from "@/hooks/use-delayed-pending";
 
 /** Which file sections the panel lists. Driven by the deck's pane-bar
  *  filter; `"all"` is the historic behavior. */
@@ -435,6 +436,7 @@ export function ChangesPanel({
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo | null>(null);
   const [mergeState, setMergeState] = useState<MergeState | null>(null);
   const [busy, setBusy] = useState<"commit" | "push" | "pull" | "sync" | "fetch" | "merge" | "amend" | "undo" | "stash" | "stash-pop" | null>(null);
+  const committing = useDelayedPending(busy === "commit");
   const [editing, setEditing] = useState(false);
   const [editedMsg, setEditedMsg] = useState("");
   const [pushAfterCommit, setPushAfterCommit] = useState(false);
@@ -937,7 +939,7 @@ export function ChangesPanel({
                 onClick={() => finalizeCommit(generatedMsg)}
                 disabled={busy !== null}
               >
-                {busy === "commit" ? <Spinner className="size-3" /> : "Commit"}
+                {committing ? <Spinner immediate className="size-3" /> : "Commit"}
               </Button>
               <Button
                 size="xs"
@@ -989,7 +991,7 @@ export function ChangesPanel({
                 onClick={() => finalizeCommit(editedMsg)}
                 disabled={!editedMsg.trim() || busy !== null}
               >
-                {busy === "commit" ? <Spinner className="size-3" /> : "Commit"}
+                {committing ? <Spinner immediate className="size-3" /> : "Commit"}
               </Button>
               <Button
                 size="icon-xs"

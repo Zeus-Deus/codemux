@@ -1,5 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { Activity } from "react";
+import { MotionConfig } from "motion/react";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   act,
@@ -60,10 +61,11 @@ const {
   lastListProps,
   listState,
   emitIsAtEnd,
+  emitListEvent,
   scrollDoubleTo,
   resetListDouble,
 } = vi.hoisted(() => {
-  const listeners = new Map<string, Set<(value: boolean) => void>>();
+  const listeners = new Map<string, Set<(value: unknown) => void>>();
   const ROW_HEIGHT = 100;
   const state = {
     isAtEnd: false,
@@ -83,7 +85,7 @@ const {
       return this.rowHeight;
     },
     elementAtIndex: () => null,
-    listen(type: string, cb: (value: boolean) => void) {
+    listen(type: string, cb: (value: unknown) => void) {
       let set = listeners.get(type);
       if (!set) {
         set = new Set();
@@ -93,7 +95,7 @@ const {
       return () => set!.delete(cb);
     },
   };
-  const notify = (type: string, value: boolean) => {
+  const notify = (type: string, value: unknown) => {
     for (const cb of [...(listeners.get(type) ?? [])]) cb(value);
   };
   return {
@@ -109,6 +111,8 @@ const {
       notify("isNearEnd", value);
       notify("isAtEnd", value);
     },
+    /** Any other list signal (`footerSize`, `totalSize`, …). */
+    emitListEvent: (type: string, value: unknown) => notify(type, value),
     /** Move the viewport and let `isNearEnd` fall out of the real 0.5
      *  threshold against the modeled content height — the only way to
      *  exercise a mid-glide near-end transition, which is where the follow
@@ -431,6 +435,114 @@ const noopHandlers = {
   onAcceptPlan: vi.fn(),
   onRejectPlan: vi.fn(),
 };
+
+const nextFrames = (count = 2) =>
+  act(
+    () =>
+      new Promise<void>((resolve) => {
+        const step = (left: number) =>
+          left === 0 ? resolve() : requestAnimationFrame(() => step(left - 1));
+        step(count);
+      }),
+  );
+
+describe("MessageList transcript continuity", () => {
+  it("hands the end pin to the eased follower while a turn streams", async () => {
+    const messages = [readCall(0, "/a")];
+    const view = renderList(messages, { streaming: true });
+    expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
+    view.rerender(<MessageList messages={messages} streaming={false} {...noopHandlers} />);
+    // The glide lingers past the turn so the settle's own growth eases too.
+    expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
+    await waitFor(() =>
+      expect(lastListProps.current?.maintainScrollAtEnd).toMatchObject({ animated: false }),
+    );
+  });
+
+  it("keeps the instant end pin under reduced motion", () => {
+    render(
+      <MotionConfig reducedMotion="always">
+        <MessageList messages={[readCall(0, "/a")]} streaming {...noopHandlers} />
+      </MotionConfig>,
+    );
+    expect(lastListProps.current?.maintainScrollAtEnd).toMatchObject({ animated: false });
+  });
+
+  it("holds the tail while a disclosure toggle settles", async () => {
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const view = renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    await nextFrames();
+    const viewport = view.container.querySelector('[data-slot="transcript-list"]')!;
+    const toggle = document.createElement("button");
+    toggle.setAttribute("aria-expanded", "false");
+    viewport.appendChild(toggle);
+    act(() => toggle.click());
+    expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
+    // The list leaving the end mid-settle is the row growing, not a reason
+    // to drag the reader to the tail.
+    scrollToEndSpy.mockClear();
+    act(() => emitIsAtEnd(false));
+    await nextFrames(3);
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+    // Still at the live edge once it settles (jsdom has no overflow), so the
+    // pin comes back and follow is kept.
+    await waitFor(() =>
+      expect(lastListProps.current?.maintainScrollAtEnd).toMatchObject({ animated: false }),
+    );
+    act(() => emitIsAtEnd(true));
+    act(() => emitIsAtEnd(false));
+    await waitFor(() => expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false }));
+  });
+
+  it("releases follow when a disclosure pushes the live edge out of view", async () => {
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const view = renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    await nextFrames();
+    const viewport = view.container.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
+    Object.defineProperty(viewport, "scrollHeight", { configurable: true, value: 1500 });
+    Object.defineProperty(viewport, "clientHeight", { configurable: true, value: 500 });
+    const toggle = document.createElement("button");
+    toggle.setAttribute("aria-expanded", "false");
+    viewport.appendChild(toggle);
+    act(() => toggle.click());
+    await waitFor(() =>
+      expect(lastListProps.current?.maintainScrollAtEnd).toMatchObject({ animated: false }),
+    );
+    scrollToEndSpy.mockClear();
+    act(() => emitIsAtEnd(false));
+    await nextFrames(3);
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+  });
+
+  it("follows footer-only growth while the eased follower holds the tail", async () => {
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const view = renderList([readCall(0, "/a")], { streaming: true });
+    await nextFrames();
+    const viewport = view.container.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
+    Object.defineProperty(viewport, "scrollHeight", { configurable: true, value: 800 });
+    Object.defineProperty(viewport, "clientHeight", { configurable: true, value: 500 });
+    // A footer notice (the stalled-run controls) grows the list with no row
+    // or data change, so only the footer size reports it.
+    listState.isAtEnd = false;
+    act(() => emitListEvent("footerSize", 120));
+    await waitFor(() => expect(viewport.scrollTop).toBeGreaterThan(0));
+  });
+
+  it("ignores popup triggers, which do not resize their row", async () => {
+    const view = renderList([readCall(0, "/a")]);
+    await nextFrames();
+    const viewport = view.container.querySelector('[data-slot="transcript-list"]')!;
+    const trigger = document.createElement("button");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.setAttribute("aria-haspopup", "menu");
+    viewport.appendChild(trigger);
+    act(() => trigger.click());
+    expect(lastListProps.current?.maintainScrollAtEnd).toMatchObject({ animated: false });
+  });
+});
 
 describe("MessageList dispatch", () => {
   it("opens a relative file from the agent's cross-project tool directory", async () => {
@@ -1661,6 +1773,36 @@ describe("MessageList new-turn scroll contract", () => {
     });
   });
 
+  it("lets a send made during a disclosure hold keep the viewport", async () => {
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const view = render(<MessageList messages={[userTurn]} {...noopHandlers} />);
+    await flushFrames(2);
+    // Tall content, so the hold would end with the live edge out of view.
+    Object.defineProperty(viewport(), "scrollHeight", { configurable: true, value: 1500 });
+    Object.defineProperty(viewport(), "clientHeight", { configurable: true, value: 500 });
+    const toggle = document.createElement("button");
+    toggle.setAttribute("aria-expanded", "false");
+    viewport().appendChild(toggle);
+    act(() => toggle.click());
+    // A prepared follow-up goes out before the toggle settles.
+    view.rerender(
+      <MessageList messages={[userTurn, sentTurn]} sendAnchor={anchor(1)} {...noopHandlers} />,
+    );
+    await act(() => new Promise<void>((r) => setTimeout(r, 450)));
+    await flushFrames(2);
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    // The stale hold neither revoked the send's claim nor cleared its anchor.
+    expect(scrollToIndexSpy).toHaveBeenCalledWith(expect.objectContaining({ index: 1 }));
+  });
+
   it("positions instantly when the reader prefers reduced motion", async () => {
     const originalMatchMedia = window.matchMedia;
     window.matchMedia = ((query: string) => ({
@@ -2385,6 +2527,40 @@ describe("MessageList new-turn scroll contract", () => {
     });
     // The anchor itself is untouched: it still outlives the turn.
     expect(lastListProps.current?.anchoredEndSpace).toBeDefined();
+  });
+
+  it("follows footer-only growth once the eased follower holds a spent anchor", async () => {
+    render(
+      <MessageList
+        messages={[userTurn, sentTurn, answer]}
+        sendAnchor={anchor(1)}
+        streaming
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    settleGlide();
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onSizeChanged?.(0);
+    });
+    await flushFrames();
+    // Spent anchor, but the streaming turn keeps the eased follower in
+    // place of the built-in pin.
+    expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
+    Object.defineProperty(viewport(), "scrollHeight", { configurable: true, value: 800 });
+    Object.defineProperty(viewport(), "clientHeight", { configurable: true, value: 500 });
+    // A footer notice (the stalled-run controls) grows the list; rows, the
+    // spacer and the near-end signal are all unchanged.
+    listState.isAtEnd = false;
+    act(() => emitListEvent("footerSize", 120));
+    await waitFor(() => expect(viewport().scrollTop).toBeGreaterThan(0));
   });
 
   it("re-runs the advance decision when the reserved space resizes with no data change", async () => {

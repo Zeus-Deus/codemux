@@ -20,6 +20,7 @@ import {
 } from "react";
 
 import { cn } from "@/lib/utils";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChatMode } from "@/stores/agent-chat-store";
 import type { ContextUsageSnapshot } from "@/tauri/events";
 import type {
@@ -50,6 +51,21 @@ const DELIVERY_SEND_TITLE: Record<MessageDelivery, string> = {
 };
 
 const ROUND_CONTROL = COMPOSER_ROUND_CONTROL;
+
+/** The footer's tooltip, placed like the context meter's. The app Tooltip
+ *  rather than a native `title`, so sweeping along the row opens each label
+ *  at once after the first instead of waiting out the OS delay on every
+ *  button. */
+function FooterTooltip({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{children}</TooltipTrigger>
+      <TooltipContent side="top" sideOffset={6}>
+        {label}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
 
 interface Props {
   hermesThreadId?: string | null;
@@ -284,6 +300,7 @@ export function ComposerFooter({
         )}
         {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} iconOnly={accessIconOnly} />}
         {onAttachClick && (
+          <FooterTooltip label="Attach (file, folder, mode, …)">
           <button
             type="button"
             onClick={onAttachClick}
@@ -298,20 +315,20 @@ export function ComposerFooter({
             )}
             aria-label="Attach"
             aria-expanded={attachOpen}
-            title="Attach (file, folder, mode, …)"
           >
             <Plus className="size-4" />
           </button>
+          </FooterTooltip>
         )}
         {streaming && onDeliveryChange && hasDraft ? (
           // One action slot, as in t3code: with a draft, the slot sends it
           // (queue / steer / interrupt); otherwise it's Stop.
+          <FooterTooltip label={DELIVERY_SEND_TITLE[delivery]}>
           <button
             type="button"
             onClick={onSubmit}
             disabled={!canSubmit}
             aria-label={DELIVERY_SEND_LABEL[delivery]}
-            title={DELIVERY_SEND_TITLE[delivery]}
             className={cn(
               ROUND_CONTROL,
               COMPOSER_SEND,
@@ -319,7 +336,9 @@ export function ComposerFooter({
           >
             {delivery === "queue" ? <ListEnd className="size-4" /> : delivery === "steer" ? <CornerDownRight className="size-4" /> : <ArrowUp className="size-4" />}
           </button>
+          </FooterTooltip>
         ) : streaming && showStopButton ? (
+          <FooterTooltip label={stopTooltip}>
           <button
             type="button"
             onClick={onStop}
@@ -329,11 +348,12 @@ export function ComposerFooter({
               "transition-[transform,background-color,color] duration-150 hover:scale-105 hover:bg-destructive active:scale-100",
             )}
             aria-label="Stop"
-            title={stopTooltip}
           >
             <Square className="size-3" fill="currentColor" />
           </button>
+          </FooterTooltip>
         ) : (
+          <FooterTooltip label={onBackgroundSubmit ? "Send (Ctrl+Enter or Ctrl-click to send in background)" : "Send"}>
           <button
             type="button"
             onClick={(e) => {
@@ -346,10 +366,10 @@ export function ComposerFooter({
               COMPOSER_SEND,
             )}
             aria-label="Send"
-            title={onBackgroundSubmit ? "Send (Ctrl+Enter or Ctrl-click to send in background)" : "Send"}
           >
             <ArrowUp className="size-4" />
           </button>
+          </FooterTooltip>
         )}
       </div>
     </div>
@@ -360,12 +380,12 @@ export function ComposerFooter({
 
 function WorkflowsToggle({ open, onClick }: { open: boolean; onClick: () => void }) {
   return (
+    <FooterTooltip label="Dynamic workflows">
     <button
       type="button"
       data-testid="composer-workflows-toggle"
       aria-label="Open dynamic workflows"
       aria-pressed={open}
-      title="Dynamic workflows"
       onClick={onClick}
       className={cn(
         "inline-flex size-[30px] shrink-0 items-center justify-center rounded-md transition-colors duration-100",
@@ -374,6 +394,7 @@ function WorkflowsToggle({ open, onClick }: { open: boolean; onClick: () => void
     >
       <Network className="size-3.5" aria-hidden />
     </button>
+    </FooterTooltip>
   );
 }
 

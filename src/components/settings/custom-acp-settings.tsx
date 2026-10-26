@@ -3,6 +3,7 @@ import { Plus, Pencil, Trash2, FlaskConical } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import { useDelayedPending } from "@/hooks/use-delayed-pending";
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import { acpDeleteAgent, acpSaveAgent, type AcpAgent, type AcpAgentInput } from "@/tauri/custom-acp";
 import { acpCatalogKey, useCustomAcp } from "@/stores/custom-acp-store";
@@ -35,6 +36,7 @@ export function CustomAcpDetail({
   const [environment, setEnvironment] = useState<EnvRow[]>([]);
   const [deleting, setDeleting] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const probing = useDelayedPending(busy !== null && busy === agentId);
   const [error, setError] = useState<string | null>(null);
   const [probeError, setProbeError] = useState<string | null>(null);
   useEffect(() => { let alive = true; void useCustomAcp.getState().loadAgents().catch(e => { if (alive) setError(String(e)); }); return () => { alive = false; }; }, []);
@@ -140,7 +142,7 @@ export function CustomAcpDetail({
       switchDisabled={editor !== null || inert}
       switchTitle={editor ? "Save or cancel your edits first." : undefined}
       actions={agent && !editor && <Button variant="ghost" size="sm" className="text-muted-foreground" aria-label={`Probe ${agent.name}`} disabled={inert || !agent.enabled} onClick={() => void probe(agent.id)}>
-        {busy === agent.id ? <Spinner className="size-3.5" aria-hidden /> : <FlaskConical />}Test
+        {probing ? <Spinner immediate className="size-3.5" aria-hidden /> : <FlaskConical />}Test
       </Button>}
     />
     {error && <div className="px-5 pb-3"><p role="alert" className="text-body-sm text-destructive">{error} <button type="button" className="underline" onClick={() => { setError(null); void useCustomAcp.getState().loadAgents(true).catch(e => setError(String(e))); }}>Refresh</button></p></div>}

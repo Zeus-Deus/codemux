@@ -89,7 +89,8 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     fireEvent.click(send, { altKey: true });
     expect(onSubmit).toHaveBeenCalledTimes(2);
     expect(onBackgroundSubmit).toHaveBeenCalledOnce();
-    expect(send.title).toContain("Ctrl-click");
+    fireEvent.focus(send);
+    expect(screen.getByRole("tooltip")).toHaveTextContent("Ctrl-click");
   });
 
   it("does NOT render the legacy '+ Mode' dropdown trigger", () => {

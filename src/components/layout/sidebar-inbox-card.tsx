@@ -830,7 +830,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
       >
         {/* Hover details live on the inner card, not on the animation wrapper
             above — that wrapper is already the ContextMenuTrigger, and two
-            `asChild` triggers must not compose onto the same node. */}
+            `asChild` triggers must not compose onto the same node. The plain
+            div is the `card-in` grid row: it carries no margin, so the row
+            can close fully while the card's own margin stays inside it. */}
+        <div>
         <WorkspaceHoverCard
           workspace={workspace}
           repo={repo}
@@ -1337,6 +1340,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
               </div>
             </div>
         </WorkspaceHoverCard>
+        </div>
       </div>
   );
 

@@ -109,7 +109,7 @@ const SETTLE_ANIM_MS = 200;
 const ROW_IN_MS = 400;
 
 /** How long a newly appeared card keeps its arrival class — the longest
- *  arrival keyframe (`card-in`, 340ms) plus margin. Cleared afterwards so a
+ *  arrival animation (`rise-in`, 0.2s) plus margin. Cleared afterwards so a
  *  later remount (filter switch, un-settle) never replays it. */
 const ARRIVE_MS = 600;
 

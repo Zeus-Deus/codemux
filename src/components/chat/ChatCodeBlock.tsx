@@ -497,8 +497,8 @@ function ChatFencedCode({
 }: ComponentProps<"code"> & ExtraProps) {
   const { defaultWrap, highlighter } = useChatCodeRenderer();
   const isIncomplete = useIsCodeFenceIncomplete();
-  // The message's own streaming flag: Streamdown only reports an open fence
-  // when it is told the text is animating, which `ChatMarkdown` does not do.
+  // The message's own streaming flag throttles highlighting for every fence in
+  // a live message, not just the open one Streamdown reports as incomplete.
   const streaming = useChatMarkdownStreaming();
   const language = extractFenceLanguage(className);
   const meta = node?.properties?.metastring;

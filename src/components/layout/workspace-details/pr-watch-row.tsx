@@ -1,6 +1,7 @@
 import { Eye } from "lucide-react";
 
 import { Spinner } from "@/components/ui/spinner";
+import { useDelayedPending } from "@/hooks/use-delayed-pending";
 import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
 import { usePrWatch } from "@/hooks/use-pr-watch";
 import {
@@ -47,6 +48,7 @@ function TargetWatchRow({
   threadId: string | null;
 }) {
   const { watch, load, busy, toggle } = usePrWatch(threadId);
+  const showBusy = useDelayedPending(busy);
   if (!canWatchPr(workspace) && watch?.status !== "active") return null;
 
   const view = describePrWatch(watch);
@@ -76,8 +78,8 @@ function TargetWatchRow({
           load === "failed" ? "text-danger" : PR_WATCH_TONE_CLASS[view.tone],
         )}
       >
-        {busy ? (
-          <Spinner className="size-3" />
+        {showBusy ? (
+          <Spinner immediate className="size-3" />
         ) : load === "failed" ? (
           "Retry"
         ) : loaded ? (
@@ -97,6 +99,7 @@ function TargetWatchRow({
  */
 function OtherChatWatchRow({ threadId }: { threadId: string }) {
   const { watch, busy, toggle } = usePrWatch(threadId);
+  const showBusy = useDelayedPending(busy);
   if (watch?.status !== "active") return null;
   const view = describePrWatch(watch);
   return (
@@ -112,7 +115,7 @@ function OtherChatWatchRow({ threadId }: { threadId: string }) {
       <Eye className={DETAILS_ICON} />
       <span className={DETAILS_LABEL}>Watch #{watch.pr_number} · other chat</span>
       <span className={cn(DETAILS_TRAILING, PR_WATCH_TONE_CLASS[view.tone])}>
-        {busy ? <Spinner className="size-3" /> : view.label}
+        {showBusy ? <Spinner immediate className="size-3" /> : view.label}
       </span>
     </button>
   );

@@ -1,6 +1,8 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
+import type { ReactElement } from "react";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import userEvent from "@testing-library/user-event";
 
 // Intent-driven discovery starts only after the popover opens. Keep requests
@@ -37,6 +39,9 @@ import { useSettingsStore } from "@/stores/settings-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 
 import { MultiProviderModelPicker } from "./MultiProviderModelPicker";
+
+// The app mounts one TooltipProvider at the root; tests supply it the same way.
+const render = (ui: ReactElement) => rtlRender(ui, { wrapper: TooltipProvider });
 
 // ── Fixtures ───────────────────────────────────────────────────────
 

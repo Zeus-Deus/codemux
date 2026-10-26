@@ -1,6 +1,8 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render as rtlRender, renderHook, screen, waitFor } from "@testing-library/react";
+import type { ReactElement } from "react";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 const { thread, switchThread } = vi.hoisted(() => ({
   thread: { current: { account_id: "codex-work", bound: false } },
@@ -34,6 +36,9 @@ import { useUIStore } from "@/stores/ui-store";
 import { MultiProviderModelPicker } from "./MultiProviderModelPicker";
 import { useUsageLimitOccupant } from "../use-composer-strip-occupants";
 import { useThreadAccount } from "../use-thread-account";
+
+// The app mounts one TooltipProvider at the root; tests supply it the same way.
+const render = (ui: ReactElement) => rtlRender(ui, { wrapper: TooltipProvider });
 
 const account = (over: Partial<ProviderAccount>): ProviderAccount => ({
   id: "default",

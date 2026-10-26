@@ -34,7 +34,7 @@ import {
 } from "lucide-react";
 
 import { AnimatedHeight } from "@/components/ui/animated-height";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
 import { editQueuedTurn, reorderQueuedTurns } from "@/lib/agent-chat/queue-edits";
 import { applyEvent } from "@/lib/agent-chat/reducer";
@@ -372,9 +372,7 @@ export function QueuedTurnsList({
   if (queued.length === 0) return null;
   const count = queued.length;
 
-  // Its own provider, so the list works wherever the strip is mounted.
   return (
-    <TooltipProvider delayDuration={300}>
     <div
       ref={rootRef}
       role="region"
@@ -595,7 +593,6 @@ export function QueuedTurnsList({
         </ol>
       </AnimatedHeight>
     </div>
-    </TooltipProvider>
   );
 }
 

@@ -5,7 +5,6 @@ import {
   ChevronRight,
   Download,
   ListFilter,
-  Loader2,
   RefreshCw,
   SlidersHorizontal,
 } from "lucide-react";
@@ -20,6 +19,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { escapeClaimedElsewhere } from "@/lib/escape-guard";
 import { ProviderLogo } from "@/components/chat/provider-logo";
@@ -498,7 +498,7 @@ export function UsageSection({
               : `${summary ? rangeLabel(summary) : "Loading…"} · this machine · ${
                   scanning ? "reading provider history" : refreshing ? "refreshing" : "live"
                 }`}
-            {busy && <Loader2 className="size-3 animate-spin" aria-hidden />}
+            {busy && <Spinner className="size-3" aria-hidden />}
           </p>
         </div>
         <div className="ml-auto flex flex-wrap items-center justify-end gap-2">

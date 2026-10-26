@@ -3,6 +3,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { useDelayedPending } from "@/hooks/use-delayed-pending";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 
@@ -18,6 +19,7 @@ export function ChatGptConnection({ onboarding = false }: { onboarding?: boolean
   const refresh = useChatGptStore((s) => s.refresh);
   const disconnect = useChatGptStore((s) => s.disconnect);
   const enterLocal = useChatGptStore((s) => s.enterLocal);
+  const starting = useDelayedPending(busy || loading);
   if (isRemoteClient()) return null;
   const pending = status?.phase === "pending";
   const connected = status?.phase === "connected";
@@ -48,7 +50,7 @@ export function ChatGptConnection({ onboarding = false }: { onboarding?: boolean
           </div>}
       </div> : <>
         <Button className="w-full gap-2.5" size="lg" disabled={busy || loading} onClick={() => void start(null)}>
-          {busy || loading ? <Spinner className="size-4" aria-hidden /> : <span aria-hidden="true"><ProviderLogo provider="codex" className="size-4 brightness-0 invert dark:invert-0" /></span>}
+          {starting ? <Spinner immediate className="size-4" aria-hidden /> : <span aria-hidden="true"><ProviderLogo provider="codex" className="size-4 brightness-0 invert dark:invert-0" /></span>}
           Continue with ChatGPT
         </Button>
         {onboarding && <p className="text-label leading-relaxed text-center text-muted-foreground">

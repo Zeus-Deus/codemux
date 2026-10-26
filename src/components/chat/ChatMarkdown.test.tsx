@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { MotionConfig } from "motion/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -300,6 +301,38 @@ describe("streaming code blocks", () => {
 
     rerender(markdownTree(fenced("python", "let x = 1;")));
     expect(tokenColors(container)).toEqual(["inherit"]);
+  });
+});
+
+describe("streaming text fade", () => {
+  const reply = `Streaming words arrive here.\n\n${fenced("tsx", "const w = 1;")}`;
+  const faded = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll("[data-sd-animate]"));
+
+  it("fades prose that arrives while streaming, never code", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const { container } = render(markdownTree(reply, true));
+    act(() => vi.advanceTimersByTime(0));
+    // One span per word; the whitespace between them stays plain text.
+    expect(faded(container).map((span) => span.textContent)).toEqual(
+      expect.arrayContaining(["Streaming", "words", "arrive", "here."]),
+    );
+    expect(container.querySelector("[data-chat-code-block] [data-sd-animate]")).toBeNull();
+  });
+
+  it("renders settled and reopened text without the fade", () => {
+    const { container } = renderMarkdown(reply);
+    expect(faded(container)).toHaveLength(0);
+  });
+
+  it("skips the fade under reduced motion", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const { container } = render(
+      <MotionConfig reducedMotion="always">{markdownTree(reply, true)}</MotionConfig>,
+    );
+    act(() => vi.advanceTimersByTime(0));
+    expect(container.textContent).toContain("Streaming words arrive here.");
+    expect(faded(container)).toHaveLength(0);
   });
 });
 

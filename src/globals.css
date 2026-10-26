@@ -160,6 +160,23 @@
   --motion-slow: 250ms;
 }
 
+/* Spinners hold back `--motion-slow` before they appear, so a wait that
+ * settles quickly shows nothing at all. The element is laid out from the
+ * first frame and only its opacity waits, so nothing shifts when it shows.
+ * `<Spinner immediate />` skips the wait; `SPINNER_DELAY_MS` in
+ * `spinner.tsx` mirrors it for `useDelayedPending`. Unlayered, so it wins
+ * over the `animate-spin` utility it extends. */
+@keyframes cm-spinner-reveal {
+  from {
+    opacity: 0;
+  }
+}
+[data-slot="spinner"][data-delayed] {
+  animation:
+    spin 1s linear infinite,
+    cm-spinner-reveal var(--motion-quick) ease-out var(--motion-slow) backwards;
+}
+
 :root {
     /* Keep the runtime choices one level below Tailwind's theme names.
      * `@theme inline` then compiles font-sans/font-mono utilities against
@@ -493,6 +510,11 @@
   [data-slot="spinner"] {
     animation: cm-spinner-breathe 1.5s ease-in-out infinite !important;
   }
+  [data-slot="spinner"][data-delayed] {
+    animation:
+      cm-spinner-reveal 0s var(--motion-slow) backwards,
+      cm-spinner-breathe 1.5s ease-in-out var(--motion-slow) infinite !important;
+  }
 }
 :root.reduce-motion *,
 :root.reduce-motion *::before,
@@ -504,6 +526,11 @@
 }
 :root.reduce-motion [data-slot="spinner"] {
   animation: cm-spinner-breathe 1.5s ease-in-out infinite !important;
+}
+:root.reduce-motion [data-slot="spinner"][data-delayed] {
+  animation:
+    cm-spinner-reveal 0s var(--motion-slow) backwards,
+    cm-spinner-breathe 1.5s ease-in-out var(--motion-slow) infinite !important;
 }
 
 .pane-drop-overlay {
@@ -922,6 +949,23 @@ body.pane-resizing iframe {
   outline-offset: 2px;
 }
 
+/* Words that arrived in the latest streamed frame. Streamdown wraps them in
+ * `[data-sd-animate]` spans (with the per-span duration and easing as custom
+ * properties) only while `ChatMarkdown` marks the message as streaming, and
+ * never inside code, so settled and reopened text renders without them.
+ * Opacity only; the global reduced-motion rules collapse it like any other
+ * animation, and `ChatMarkdown` stops emitting the spans there anyway. */
+@keyframes chat-stream-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.chat-markdown [data-sd-animate] {
+  animation: chat-stream-fade-in var(--sd-duration, var(--motion-base))
+    var(--sd-easing, ease-out) var(--sd-delay, 0ms) both;
+}
+
 /* A fence whose closing ``` has not arrived yet is still filling in, and its
  * copy action would only capture the partial snippet. `data-incomplete` (from
  * Streamdown's incomplete-fence signal) softens the title so the card reads as
@@ -1119,25 +1163,18 @@ body.pane-resizing iframe {
 }
 
 /* The sidebar card's hover-revealed action cluster (Pin · Snooze · Settle)
- * drops into place from just above the eyebrow instead of hard-cutting in.
- * Deliberately shorter and shallower than `rise-in`: that one announces a row
- * arriving, this one only softens chrome appearing under the pointer, and
- * anything longer feels like lag on a control the user is already aiming at.
- * The cluster is toggled by `display`, and an element leaving `display: none`
- * restarts its animation — so the reveal replays on every hover with no state
- * and no re-render. */
+ * fades in instead of hard-cutting. Opacity only and on the quick step: it
+ * replays on every hover across the list, so any movement or longer ease
+ * reads as lag on a control the user is already aiming at. The cluster is
+ * toggled by `display`, and an element leaving `display: none` restarts its
+ * animation — so the reveal needs no state and no re-render. */
 @keyframes cm-row-in {
   from {
     opacity: 0;
-    transform: translateY(-5px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
   }
 }
 .row-in {
-  animation: cm-row-in 0.13s ease;
+  animation: cm-row-in var(--motion-quick) ease-out;
 }
 
 /* Desktop sidebar toggle. The layout still snaps in one frame (tweening the
@@ -1172,26 +1209,28 @@ body.pane-resizing iframe {
 
 /* A workspace card arriving in the sidebar inbox — the "creating" stand-in
  * for a just-sent first prompt, or a workspace that appeared from anywhere
- * else. It opens its own row (max-height) so the cards below slide down
- * instead of jumping, while the card itself settles in from just above.
- * 7rem clears a full card (~90px) without a long dead tail on the ease. */
+ * else. It opens its own row so the cards below slide down instead of
+ * jumping, while the card fades in. The row opens on a one-track grid
+ * (0fr → 1fr), which tracks the card's real height instead of a max-height
+ * guess with a dead tail at the end of the ease. The grid item must be a
+ * plain wrapper with no margin of its own: a margin would hold the row open
+ * at 0fr. */
 @keyframes cm-card-in {
   from {
+    grid-template-rows: 0fr;
     opacity: 0;
-    max-height: 0;
-    transform: translateY(-6px) scale(0.985);
-  }
-  60% {
-    opacity: 1;
   }
   to {
+    grid-template-rows: 1fr;
     opacity: 1;
-    max-height: 7rem;
-    transform: none;
   }
 }
 .card-in {
-  animation: cm-card-in 0.34s cubic-bezier(0.2, 0, 0, 1) both;
+  display: grid;
+  animation: cm-card-in var(--motion-base) var(--ease-drawer) both;
+}
+.card-in > * {
+  min-height: 0;
 }
 @media (prefers-reduced-motion: reduce) {
   .card-in {

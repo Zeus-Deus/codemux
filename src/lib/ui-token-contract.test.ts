@@ -178,15 +178,12 @@ const CATEGORIES: Category[] = [
   {
     label: "hand-rolled spinners (use <Spinner />, which carries role=status and the reduced-motion hook)",
     pattern: /\banimate-spin\b/g,
-    budget: 29,
+    budget: 22,
     why:
-      "the primitive itself and sonner's toast loader; refresh icons that " +
-      "spin in place inside a button carrying aria-busy (9); the review " +
-      "folder's 6-10px border-ring status glyphs (7) and the terminal " +
-      "overlay's ring; the slow decorative spin on the sidebar creating " +
-      "card; and spinners in files with open PRs at the time of the sweep " +
-      "(TasksPanel, ComposerFooter, pr-row, pr-list, usage-section x2, " +
-      "right-panel, sidebar-inbox, sidebar-workspace-row)",
+      "the primitive itself; refresh icons that spin in place inside a " +
+      "busy button (12); the 6-10px border-ring status glyphs of the review " +
+      "folder (6) and pr-row, and the terminal overlay's ring; and the slow " +
+      "decorative spin on the sidebar creating card",
   },
   {
     label: "settings page titles styled by hand (use SectionHeader)",

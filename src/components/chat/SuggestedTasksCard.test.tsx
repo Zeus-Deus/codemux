@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 import type { SubagentView, ToolCallItem, UserMessageItem } from "@/lib/agent-chat/types";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
@@ -129,6 +130,8 @@ function renderCard(views: Array<SubagentView | null> = [null, null], thread: st
         <SuggestedTasksCard call={call()} views={views} />
       </ChatProviderContext.Provider>
     </AsyncQuestionThreadContext.Provider>,
+    // The app mounts one TooltipProvider at the root.
+    { wrapper: TooltipProvider },
   );
 }
 

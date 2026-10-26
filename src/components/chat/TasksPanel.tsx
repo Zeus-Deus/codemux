@@ -1,7 +1,8 @@
-import { Check, CircleCheck, Copy, LoaderCircle } from "lucide-react";
+import { Check, CircleCheck, Copy } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import type { TaskSnapshotItem, TasksSnapshot } from "@/tauri/events";
 import { withTimeFormat } from "@/lib/time-format";
@@ -50,8 +51,9 @@ function StatusGlyph({ task }: { task: TaskSnapshotItem }) {
   }
   if (task.status === "in_progress") {
     return (
-      <LoaderCircle
-        className="size-[15px] animate-spin text-status-working"
+      <Spinner
+        className="size-[15px] text-status-working"
+        role="presentation"
         aria-hidden
       />
     );

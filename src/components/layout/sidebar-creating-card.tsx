@@ -74,6 +74,8 @@ export const SidebarCreatingCard = memo(function SidebarCreatingCard({
       data-creating-card={draft.draftId}
       className="card-in overflow-hidden"
     >
+      {/* The `card-in` grid row: no margin of its own, so it closes fully. */}
+      <div>
       <div
         role="status"
         aria-label={`Creating workspace: ${title}`}
@@ -108,6 +110,7 @@ export const SidebarCreatingCard = memo(function SidebarCreatingCard({
           {step}
         </div>
         <CardProgressSweep />
+      </div>
       </div>
     </div>
   );
