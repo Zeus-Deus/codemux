@@ -3922,11 +3922,6 @@ export function Composer({
                 <span className="truncate text-label leading-none text-muted-foreground/70">
                   {steeringUnavailable ? "Steer unavailable" : `Enter to ${delivery.delivery}`}
                 </span>
-              ) : onBackgroundSubmit ? (
-                // A keyboard shortcut is noise on a phone's touch keyboard.
-                <span className="truncate text-label leading-none text-muted-foreground/70 pointer-coarse:hidden">
-                  Ctrl+Enter to send in background
-                </span>
               ) : null
             }
             onGapPointerDown={handleGapPointerDown}
