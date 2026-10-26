@@ -922,6 +922,23 @@ body.pane-resizing iframe {
   outline-offset: 2px;
 }
 
+/* Words that arrived in the latest streamed frame. Streamdown wraps them in
+ * `[data-sd-animate]` spans (with the per-span duration and easing as custom
+ * properties) only while `ChatMarkdown` marks the message as streaming, and
+ * never inside code, so settled and reopened text renders without them.
+ * Opacity only; the global reduced-motion rules collapse it like any other
+ * animation, and `ChatMarkdown` stops emitting the spans there anyway. */
+@keyframes chat-stream-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.chat-markdown [data-sd-animate] {
+  animation: chat-stream-fade-in var(--sd-duration, var(--motion-base))
+    var(--sd-easing, ease-out) var(--sd-delay, 0ms) both;
+}
+
 /* A fence whose closing ``` has not arrived yet is still filling in, and its
  * copy action would only capture the partial snippet. `data-incomplete` (from
  * Streamdown's incomplete-fence signal) softens the title so the card reads as

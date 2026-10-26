@@ -20,6 +20,7 @@ import {
   type AnchoredEndSpaceConfig,
   type LegendListRef,
 } from "@legendapp/list/react";
+import { useReducedMotionConfig } from "motion/react";
 import {
   memo,
   useCallback,
@@ -108,6 +109,7 @@ import {
   type TranscriptSlot,
 } from "./transcript-slots";
 import { TickingText } from "./TickingText";
+import { createTailGlide, type TailGlide } from "./tail-glide";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { withTimeFormat } from "@/lib/time-format";
 
@@ -463,6 +465,48 @@ export const MessageList = memo(function MessageList({
     [],
   );
 
+  // Eased tail-follow (see tail-glide.ts). While a turn streams the glide,
+  // not LegendList's instant end pin, keeps the reader on the live edge, so
+  // new content slides up instead of arriving in per-frame steps. It lingers
+  // briefly past the turn so the settle's own growth (the reply's action
+  // row) glides too. Reduced motion keeps the instant pin throughout.
+  const tailGlideRef = useRef<TailGlide | null>(null);
+  tailGlideRef.current ??= createTailGlide(() =>
+    listRef.current?.getScrollableNode(),
+  );
+  const tailGlide = tailGlideRef.current;
+  const reduceMotion = useReducedMotionConfig() ?? false;
+  const [glideLinger, setGlideLinger] = useState(false);
+  const streamedRef = useRef(false);
+  useEffect(() => {
+    if (streaming) {
+      streamedRef.current = true;
+      return;
+    }
+    if (!streamedRef.current) return;
+    streamedRef.current = false;
+    setGlideLinger(true);
+    const timer = window.setTimeout(() => setGlideLinger(false), TAIL_GLIDE_LINGER_MS);
+    return () => {
+      window.clearTimeout(timer);
+      setGlideLinger(false);
+    };
+  }, [streaming]);
+  const glideFollow = (streaming || glideLinger) && !reduceMotion;
+  const glideFollowRef = useRef(glideFollow);
+  glideFollowRef.current = glideFollow;
+  // A thread switch or unmount lands instantly; never carry a glide across.
+  useEffect(() => () => tailGlide.cancel(), [tailGlide, threadKey]);
+
+  // Disclosure hold. Expanding or collapsing a row (a tool card, a turn's
+  // "Worked for" fold, reasoning) must leave the toggle the reader clicked
+  // under their pointer. For a short settle window the end pin and the tail
+  // advance stand down, and each frame cancels any drift of the toggle by
+  // nudging the offset. Holds the stop function while active.
+  const disclosureHoldRef = useRef<(() => void) | null>(null);
+  const [disclosureHold, setDisclosureHold] = useState(false);
+  useEffect(() => () => disclosureHoldRef.current?.(), [threadKey]);
+
   /** Pure ref writes only — callable from the render-phase intent block.
    *  Deliberately does not touch the positioned/settled nonce records: those
    *  are monotonic per-send facts, and a stale settle handshake left in
@@ -530,6 +574,8 @@ export const MessageList = memo(function MessageList({
   /** A real reader gesture (or a deliberate jump elsewhere in the
    *  transcript) permanently retires the current live-follow claim. */
   const cancelFollowForUserNavigation = useCallback(() => {
+    tailGlide.cancel();
+    disclosureHoldRef.current?.();
     userScrollGenerationRef.current += 1;
     followGenerationRef.current = null;
     modeRef.current = "free-scrolling";
@@ -548,7 +594,49 @@ export const MessageList = memo(function MessageList({
     } else {
       scheduleJumpToLatest();
     }
-  }, [hideJumpToLatest, scheduleJumpToLatest]);
+  }, [hideJumpToLatest, scheduleJumpToLatest, tailGlide]);
+
+  /** Start a disclosure hold for `toggle` (see `disclosureHoldRef`). When it
+   *  ends with the live edge pushed out of view, the reader is reading the
+   *  row they opened, so follow is released like any other navigation; the
+   *  next token must not drag them back to the tail. */
+  const holdDisclosure = useCallback(
+    (toggle: HTMLElement) => {
+      const viewport = listRef.current?.getScrollableNode();
+      if (!viewport) return;
+      disclosureHoldRef.current?.();
+      tailGlide.cancel();
+      const top = toggle.getBoundingClientRect().top;
+      const until = performance.now() + DISCLOSURE_SETTLE_MS;
+      let frame: number | null = null;
+      const stop = () => {
+        if (frame !== null) cancelAnimationFrame(frame);
+        frame = null;
+        if (disclosureHoldRef.current === stop) disclosureHoldRef.current = null;
+        setDisclosureHold(false);
+      };
+      const pin = () => {
+        frame = null;
+        if (toggle.isConnected) {
+          const drift = toggle.getBoundingClientRect().top - top;
+          if (Math.abs(drift) >= 0.5) viewport.scrollTop += drift;
+        }
+        if (performance.now() < until) {
+          frame = requestAnimationFrame(pin);
+          return;
+        }
+        stop();
+        const maxScroll = viewport.scrollHeight - viewport.clientHeight;
+        if (ownsScroll() && viewport.scrollTop < maxScroll - 1) {
+          cancelFollowForUserNavigation();
+        }
+      };
+      disclosureHoldRef.current = stop;
+      setDisclosureHold(true);
+      frame = requestAnimationFrame(pin);
+    },
+    [cancelFollowForUserNavigation, ownsScroll, tailGlide],
+  );
 
   // Apply a send's navigation intent synchronously, during the same render
   // that first sees it — not in an effect. The composer's optimistic row and
@@ -725,19 +813,33 @@ export const MessageList = memo(function MessageList({
       viewport.addEventListener("pointerdown", onPointerDown, {
         passive: true,
       });
+      // Capture phase, so the toggle's position is read before its row
+      // re-renders. Popup triggers also carry `aria-expanded` but open an
+      // overlay rather than resizing the row.
+      const onDisclosureClick = (event: MouseEvent) => {
+        const target = event.target as Element | null;
+        const toggle = target?.closest?.("[aria-expanded]:not([aria-haspopup])");
+        if (toggle instanceof HTMLElement && viewport.contains(toggle)) {
+          holdDisclosure(toggle);
+        }
+      };
       viewport.addEventListener("keydown", onKeyDown);
+      viewport.addEventListener("click", onDisclosureClick, { capture: true });
       removeListeners = () => {
         viewport.removeEventListener("wheel", onGesture);
         viewport.removeEventListener("touchmove", onGesture);
         viewport.removeEventListener("pointerdown", onPointerDown);
         viewport.removeEventListener("keydown", onKeyDown);
+        viewport.removeEventListener("click", onDisclosureClick, {
+          capture: true,
+        });
       };
     });
     return () => {
       cancelAnimationFrame(frame);
       removeListeners?.();
     };
-  }, [cancelFollowForUserNavigation, threadKey]);
+  }, [cancelFollowForUserNavigation, holdDisclosure, threadKey]);
 
   /** LegendList has measured the anchored row and reserved the end space
    *  below it. Position the row exactly once per send nonce — as a smooth
@@ -1011,6 +1113,29 @@ export const MessageList = memo(function MessageList({
     slots,
   ]);
 
+  // Whether the glide currently stands in for LegendList's own end pin.
+  const glideReplacesPinRef = useRef(false);
+  glideReplacesPinRef.current =
+    glideFollow && !(anchoredEndSpace && !endPinReleased);
+
+  /** Reveal the live edge: eased while a turn streams, instant otherwise or
+   *  when the edge is more than a viewport away (that is a reposition, not
+   *  following). */
+  const followEnd = (list: LegendListRef) => {
+    const node = list.getScrollableNode();
+    const gap = node ? node.scrollHeight - node.clientHeight - node.scrollTop : 0;
+    if (!glideFollowRef.current || !node || gap > node.clientHeight) {
+      tailGlide.cancel();
+      void list.scrollToEnd({ animated: false });
+      return;
+    }
+    tailGlide.follow(() => {
+      if (!ownsScroll() || modeRef.current !== "following-end") return null;
+      const current = listRef.current?.getScrollableNode();
+      return current ? current.scrollHeight - current.clientHeight : null;
+    });
+  };
+
   // The advance decision. Re-assigned every render so the scheduler always
   // runs the latest closure (the accepted mutable-ref pattern used for the
   // slot cache above). Every guard re-checks that we still own the viewport,
@@ -1020,6 +1145,8 @@ export const MessageList = memo(function MessageList({
   // actually outgrows the viewport.
   advanceRef.current = () => {
     if (!ownsScroll()) return;
+    // A disclosure toggle is settling; the reader's row stays put.
+    if (disclosureHoldRef.current) return;
     const list = listRef.current;
     if (!list) return;
     const state = list.getState();
@@ -1039,6 +1166,22 @@ export const MessageList = memo(function MessageList({
         anchorOffset: sendAnchorOffset,
       });
       if (!metrics || metrics.scrollDeltaToRevealEnd <= 1) return;
+      if (glideFollowRef.current) {
+        tailGlide.follow(() => {
+          const current = listRef.current;
+          const index = anchorIndexRef.current;
+          if (!ownsScroll() || modeRef.current !== "anchoring-turn") return null;
+          if (!current || index === null) return null;
+          return (
+            getAnchoredTurnMetrics({
+              state: current.getState(),
+              anchorIndex: index,
+              anchorOffset: sendAnchorOffset,
+            })?.targetScrollToRevealEnd ?? null
+          );
+        });
+        return;
+      }
       void list.scrollToOffset({
         offset: state.scroll + metrics.scrollDeltaToRevealEnd,
         animated: false,
@@ -1051,12 +1194,12 @@ export const MessageList = memo(function MessageList({
     // its narrow pin threshold. Follow intent is still ours (reader gestures
     // release it above), so recover that missed pin without driving it twice.
     if (!anchoredEndSpace || endPinReleased) {
-      if (!state.isAtEnd) void list.scrollToEnd({ animated: false });
+      if (!state.isAtEnd) followEnd(list);
       return;
     }
     // Without this the reserved blank space would be a scroll target.
     if (!realContentOverflowsViewport(state, sendAnchorOffset)) return;
-    void list.scrollToEnd({ animated: false });
+    followEnd(list);
   };
 
   // Advance the viewport as the answer streams in.
@@ -1079,6 +1222,29 @@ export const MessageList = memo(function MessageList({
       scheduleAdvance();
     });
   }, [ownsScroll, scheduleAdvance, threadKey]);
+
+  // With the end pin handed to the glide, two of its jobs move here: layout
+  // growth that arrives with no data change (a highlighted code block, a late
+  // image) schedules the advance, and a reader who scrolls back down to the
+  // edge is caught again, as the pin's threshold would have done.
+  useEffect(() => {
+    const state = listRef.current?.getState();
+    if (!state) return;
+    const offGrowth = state.listen("totalSize", () => {
+      if (glideFollowRef.current && ownsScroll()) scheduleAdvance();
+    });
+    const offEdge = state.listen("isWithinMaintainScrollAtEndThreshold", (atEdge) => {
+      if (!atEdge || !glideReplacesPinRef.current || ownsScroll()) return;
+      if (disclosureHoldRef.current) return;
+      modeRef.current = "following-end";
+      followGenerationRef.current = userScrollGenerationRef.current;
+      hideJumpToLatest();
+    });
+    return () => {
+      offGrowth();
+      offEdge();
+    };
+  }, [hideJumpToLatest, ownsScroll, scheduleAdvance, threadKey]);
 
   /** The pill is the deliberate way back to the live edge, so it re-claims
    *  follow rather than cancelling it. Animated for the same reason the send
@@ -1477,11 +1643,18 @@ export const MessageList = memo(function MessageList({
         // yank and the pin comes back, so item/footer layout growth the
         // anchor does not model (a late-loading image) still reveals the tail
         // for the rest of the thread's life.
+        // The eased follower and a settling disclosure toggle take the end pin
+        // the same way (see `glideFollow` and `disclosureHoldRef`).
         maintainScrollAtEnd={
-          anchoredEndSpace && !endPinReleased ? false : MAINTAIN_SCROLL_AT_END
+          (anchoredEndSpace && !endPinReleased) || glideFollow || disclosureHold
+            ? false
+            : MAINTAIN_SCROLL_AT_END
         }
         maintainScrollAtEndThreshold={0.03}
-        maintainVisibleContentPosition={{ data: true, size: false }}
+        // `size`: a row resizing above the viewport (a re-measured history
+        // row, a code block finishing its highlight) shifts the rows below
+        // it, and the list compensates so the text being read stays put.
+        maintainVisibleContentPosition={MAINTAIN_VISIBLE_CONTENT_POSITION}
         aria-busy={showThinking || undefined}
         data-slot="transcript-list"
         // `scrollbar-gutter: stable both-edges` (not plain `stable`):
@@ -1614,6 +1787,15 @@ function prefersReducedMotion(): boolean {
     window.matchMedia("(prefers-reduced-motion: reduce)").matches
   );
 }
+
+/** How long a disclosure toggle holds the viewport: the 150ms open/collapse
+ *  plus a few frames for the list to measure the row at its new height. */
+const DISCLOSURE_SETTLE_MS = 400;
+
+/** How long the eased follower keeps the tail after a turn stops streaming. */
+const TAIL_GLIDE_LINGER_MS = 600;
+
+const MAINTAIN_VISIBLE_CONTENT_POSITION = { data: true, size: true } as const;
 
 /** Hoisted so a re-render never hands LegendList a fresh config object. */
 const MAINTAIN_SCROLL_AT_END = {

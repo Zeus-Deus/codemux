@@ -145,12 +145,16 @@ it("restores a pending jump pill after reconnecting away from the live edge", as
   viewport.scrollTop = 400;
   fireEvent.scroll(viewport);
   await frames(5);
-  expect(viewport.scrollTop).toBe(400);
+  // Rows realized above the reader measure under their estimate, and size
+  // anchoring compensates so the visible text holds still. The contract is
+  // that reconnecting keeps whatever offset that settled on.
+  const settled = viewport.scrollTop;
+  expect(Math.abs(settled - 400)).toBeLessThan(112);
   view.rerender(tree("hidden", props));
   await frames(20);
   view.rerender(tree("visible", props));
   await frames(20);
-  expect(viewport.scrollTop).toBe(400);
+  expect(viewport.scrollTop).toBe(settled);
   expect(screen.queryByRole("button", { name: "Jump to latest" })).toBeInTheDocument();
 });
 

@@ -4,10 +4,17 @@ import {
   type ComponentProps,
   type ReactNode,
 } from "react";
+import { useReducedMotionConfig } from "motion/react";
 import type { ExtraProps } from "streamdown";
-import { defaultRemarkPlugins, Streamdown, type Components } from "streamdown";
+import {
+  defaultRemarkPlugins,
+  Streamdown,
+  type AnimateOptions,
+  type Components,
+} from "streamdown";
 
 import { useChatCodePlugin } from "@/hooks/use-chat-code-plugin";
+import { DURATION } from "@/lib/motion";
 import {
   CHAT_LINK_FAVICON_TAG,
   rehypeRichExternalLinks,
@@ -227,6 +234,19 @@ const passiveMarkdownComponents: Components = {
 };
 const passiveRehypePlugins = [rehypeSelectionSafeText];
 
+// Newly streamed words fade in over one `base` beat (styled by
+// `.chat-markdown [data-sd-animate]` in globals.css). Streamdown wraps words
+// only while `isAnimating` and never inside code; a word keeps its span across
+// later frames, so it fades exactly once, and a reopened message renders
+// plain. No stagger: words land in per-frame batches, and staggering a batch
+// would make the tail of a long frame trail behind the stream.
+const streamFade: AnimateOptions = {
+  animation: "fadeIn",
+  duration: DURATION.base * 1000,
+  easing: "ease-out",
+  stagger: 0,
+};
+
 const rehypePlugins = [
   rehypeRichExternalLinks,
   rehypeLocalImageLinks,
@@ -235,10 +255,11 @@ const rehypePlugins = [
 ];
 
 /**
- * `streaming` marks markdown that is still arriving token by token. Only the
- * link favicons care today: a bare URL is autolinked on every frame as it
- * types out, so decorating an in-flight message would request icons for
- * hostname prefixes that never resolve (see `MarkdownLinkFavicon`).
+ * `streaming` marks markdown that is still arriving token by token. Newly
+ * arrived words fade in while it is set (see `streamFade`). Link favicons care
+ * too: a bare URL is autolinked on every frame as it types out, so decorating
+ * an in-flight message would request icons for hostname prefixes that never
+ * resolve (see `MarkdownLinkFavicon`).
  */
 export function ChatMarkdown({
   children,
@@ -262,6 +283,7 @@ export function ChatMarkdown({
   const code = useChatCodePlugin();
   const plugins = useMemo(() => ({ code }), [code]);
   const wrap = useSettingsStore(selectChatCodeWrap);
+  const reduceMotion = useReducedMotionConfig();
   const inheritedFileContext = useChatFileLinkContext();
   // Absolute paths the message itself names are fallback candidates too:
   // "`/tmp/shots/a.png`, plus `b.gif` in the same folder" must open b.gif.
@@ -309,6 +331,8 @@ export function ChatMarkdown({
                 components={passive ? passiveMarkdownComponents : markdownComponents}
                 controls={controls}
                 lineNumbers={false}
+                isAnimating={streaming}
+                animated={streaming && !reduceMotion ? streamFade : undefined}
               >
                 {children}
               </Streamdown>

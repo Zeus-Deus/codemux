@@ -141,7 +141,7 @@ describe("MessageList virtualization & memoization", () => {
       estimatedItemSize: 112,
       initialScrollAtEnd: true,
       recycleItems: false,
-      maintainVisibleContentPosition: { data: true, size: false },
+      maintainVisibleContentPosition: { data: true, size: true },
     });
   });
 
