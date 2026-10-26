@@ -2,6 +2,8 @@ import { ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { PermissionModeOption } from "@/tauri/types";
 import { useFullAccessNoticeStore } from "@/stores/full-access-notice-store";
+import { cn } from "@/lib/utils";
+import { COMPOSER_STRIP_SURFACE } from "./composer-surface";
 
 /**
  * Provider-native values for "run every tool without asking" (Claude,
@@ -49,7 +51,10 @@ export function FullAccessNotice({
     <div className="relative z-0 px-5">
       <div
         role="note"
-        className="-mb-[18px] flex items-start gap-2 rounded-t-[14px] border border-b-0 border-border/70 bg-muted/20 px-3 pt-2 pb-[26px] text-body-sm text-muted-foreground"
+        className={cn(
+          "-mb-[18px] flex items-start gap-2 rounded-t-[14px] border border-b-0 border-border/70 px-3 pt-2 pb-[26px] text-body-sm text-muted-foreground",
+          COMPOSER_STRIP_SURFACE,
+        )}
       >
         <ShieldAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
         <p className="min-w-0 flex-1 leading-relaxed">

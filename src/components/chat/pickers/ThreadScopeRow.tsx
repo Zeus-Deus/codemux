@@ -25,6 +25,7 @@ import { checkIsGitRepo, listBranchesDetailed } from "@/tauri/commands";
 import type { BranchDetail, WorkspaceSnapshot } from "@/tauri/types";
 
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
+import { COMPOSER_STRIP_SURFACE } from "../composer-surface";
 import { RunContextControl } from "./RunContextControl";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
@@ -45,7 +46,8 @@ const GHOST_BTN =
  *  silhouette survives the first send. */
 export const SCOPE_STRIP_INSET = "w-full px-5";
 export const SCOPE_STRIP =
-  "flex w-full items-center justify-between gap-2.5 rounded-b-[14px] border border-t-0 border-border/70 bg-muted/20 px-2 py-1";
+  "flex w-full items-center justify-between gap-2.5 rounded-b-[14px] border border-t-0 border-border/70 px-2 py-1 " +
+  COMPOSER_STRIP_SURFACE;
 
 function formatRelativeTime(unixSeconds: number): string {
   const now = Math.floor(Date.now() / 1000);

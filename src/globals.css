@@ -1444,6 +1444,12 @@ body.pane-resizing iframe {
   border-radius: 22px;
 }
 
+/* The new-chat landing has no transcript behind the composer, only its
+ * backdrop art, so the art shows around the card and strips. */
+[data-landing-backdrop-host] .composer-overlay-card {
+  background-color: transparent;
+}
+
 /* The sidebar empty state's engraved plate (sidebar-empty-state.tsx).
  * It prints in once, then drifts and catches a slow pass of light. Hovering
  * the call to action wakes it: brighter ink, quicker light. The two idle

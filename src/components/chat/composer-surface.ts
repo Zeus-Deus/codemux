@@ -15,6 +15,13 @@ export const COMPOSER_CARD =
   "transition-[box-shadow,border-color,background-color] duration-150 " +
   "focus-within:bg-[color-mix(in_oklab,var(--muted)_60%,var(--background))] focus-within:shadow-[0_16px_38px_-14px] focus-within:shadow-black/60";
 
+/** The strips docked above and below the card: one tonal step under the
+ *  card, pre-composited over the pane background like the card itself. It
+ *  stays opaque where nothing else backs it, so whatever sits behind the
+ *  composer (the landing's backdrop art) never shows through the labels. */
+export const COMPOSER_STRIP_SURFACE =
+  "bg-[color-mix(in_oklab,var(--muted)_20%,var(--background))]";
+
 /** 34px circle shared by attach / send / stop so the row's two ends sit on
  *  one optical baseline, concentric with the 44px pill (5px inset). */
 export const COMPOSER_ROUND_CONTROL =

@@ -32,6 +32,7 @@ import type { TaskChipSummary } from "@/lib/agent-chat/task-summary";
 import { cn } from "@/lib/utils";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
+import { COMPOSER_STRIP_SURFACE } from "./composer-surface";
 import { ProviderLogo } from "./provider-logo";
 import { TickingText } from "./TickingText";
 import { Eyebrow } from "@/components/ui/eyebrow";
@@ -333,7 +334,12 @@ export function ComposerStrip({
       // Transform and opacity only, so the transcript never reflows for it.
       className="relative z-0 w-full px-5 animate-in fade-in-0 slide-in-from-bottom-2 duration-250 ease-drawer"
     >
-      <div className="relative -mb-[18px] overflow-hidden rounded-t-[14px] border border-b-0 border-border/70 bg-muted/20 pb-[18px]">
+      <div
+        className={cn(
+          "relative -mb-[18px] overflow-hidden rounded-t-[14px] border border-b-0 border-border/70 pb-[18px]",
+          COMPOSER_STRIP_SURFACE,
+        )}
+      >
         {interrupted && (
           <>
             <span
