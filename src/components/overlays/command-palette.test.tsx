@@ -422,6 +422,17 @@ describe("command palette — stable async sections", () => {
     await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", "ws:ws-2"));
   });
 
+  it("pairs the selected row's highlight fill with the theme's highlight text", async () => {
+    // A theme may pair a light highlight with dark text, so the fill alone
+    // would leave the row's foreground labels unreadable on it.
+    renderPalette();
+    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).not.toBeNull());
+    const row = document.querySelector('[cmdk-item][aria-selected="true"]')!;
+    expect(row.className).toContain("data-selected:bg-accent");
+    expect(row.className).toContain("data-selected:[--foreground:var(--accent-foreground)]");
+    expect(row.className).toContain("data-selected:[--muted-foreground:");
+  });
+
   it.each(["keyboard", "pointer"])("preserves a deliberate %s selection when inbox shelves arrive", async (inputKind) => {
     useSidebarInboxStore.setState({ loaded: false });
     let resolveInbox!: (raw: string | null) => void;
