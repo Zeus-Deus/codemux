@@ -208,9 +208,9 @@ export function ComposerFooter({
       data-collapsed={collapsed || undefined}
       className={cn(
         "flex h-[42px] shrink-0 items-center gap-1 pr-1",
-        // Expanded, the first trigger sits where it does in the chin
-        // (20px inset + 1px border + 4px padding, minus the card border).
-        collapsed ? "pl-1" : "pl-6",
+        // Expanded, the first trigger's icon lines up with the textarea's
+        // text (20px), less the trigger's own 8px padding.
+        collapsed ? "pl-1" : "pl-3",
       )}
     >
       {!collapsed && (
