@@ -50,7 +50,11 @@ import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { useHomeDir } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
-import { useUIStore, type AddProjectTab } from "@/stores/ui-store";
+import {
+  selectProjectsLocation,
+  useUIStore,
+  type AddProjectTab,
+} from "@/stores/ui-store";
 
 const TABS: { value: AddProjectTab; label: string; icon: typeof FolderOpen }[] = [
   { value: "open", label: "Open", icon: FolderOpen },
@@ -193,7 +197,7 @@ function OpenTab() {
  *  `~/Projects`. */
 function useProjectsLocation() {
   const homeDir = useHomeDir();
-  const picked = useUIStore((s) => s.projectsLocation);
+  const picked = useUIStore(selectProjectsLocation);
   const location = picked ?? defaultProjectsLocation(homeDir);
   const change = async () => {
     const folder = await pickFolder("Projects location");

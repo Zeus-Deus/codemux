@@ -35,6 +35,7 @@ vi.mock("@/tauri/commands", async (importOriginal) => ({
 }));
 
 import { AddProjectSheet } from "./add-project-sheet";
+import { setRemoteViewHost } from "@/remote/client-view";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
@@ -48,7 +49,7 @@ beforeEach(() => {
   pickFolderMock.mockReset().mockResolvedValue(null);
   useAppStore.setState({ homeDir: "/home/user" });
   useFeatureFlags.setState({ enableAgentChat: true, enableLazyWorkspaceCreation: true });
-  useUIStore.setState({ addProjectSheet: null, projectsLocation: null });
+  useUIStore.setState({ addProjectSheet: null, projectsLocation: null, remoteProjectsLocations: {} });
 });
 
 function openSheet(tab: "open" | "clone" | "new") {
@@ -110,6 +111,38 @@ describe("AddProjectSheet", () => {
       fireEvent.click(screen.getByRole("button", { name: "Change" }));
       await vi.waitFor(() => expect(useUIStore.getState().projectsLocation).toBe("/mnt/work"));
       expect(destination()).toBe("/mnt/work/app");
+    });
+
+    it("keeps a location picked on one remote host off the others and the desktop", async () => {
+      useUIStore.setState({ projectsLocation: "/home/user/Code" });
+      pickFolderMock.mockResolvedValue("/srv/a");
+      const remote = window as { __CODEMUX_REMOTE__?: boolean };
+      remote.__CODEMUX_REMOTE__ = true;
+      const typeRepo = () =>
+        fireEvent.change(screen.getByLabelText("Repository"), {
+          target: { value: "acme/app" },
+        });
+      try {
+        setRemoteViewHost("https://host-a.example");
+        openSheet("clone");
+        typeRepo();
+        expect(destination()).toBe("~/Projects/app");
+        fireEvent.click(screen.getByRole("button", { name: "Change" }));
+        await vi.waitFor(() => expect(destination()).toBe("/srv/a/app"));
+        cleanup();
+
+        setRemoteViewHost("https://host-b.example");
+        openSheet("clone");
+        typeRepo();
+        expect(destination()).toBe("~/Projects/app");
+        cleanup();
+      } finally {
+        delete remote.__CODEMUX_REMOTE__;
+        setRemoteViewHost("local");
+      }
+      openSheet("clone");
+      typeRepo();
+      expect(destination()).toBe("~/Code/app");
     });
 
     it("shows a failed clone inline and stays open", async () => {

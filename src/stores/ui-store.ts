@@ -12,6 +12,8 @@ import type {
   PendingWorkspace,
 } from "@/tauri/types";
 import { selectUtilityPage } from "@/lib/utility-pages";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { remoteViewHost } from "@/remote/client-view";
 
 /** Panes the right-panel deck can host that aren't tied to a file path. */
 export type RightPanelCorePane =
@@ -220,9 +222,14 @@ interface UIStore {
   /** Open tab of the Add project sheet, or null while it is closed.
    *  Transient; never persisted. */
   addProjectSheet: AddProjectTab | null;
-  /** Folder the user picked for new and cloned projects. Null means the
-   *  default, `~/Projects`. Persisted so the choice sticks. */
+  /** Folder the user picked for new and cloned projects on this desktop.
+   *  Null means the default, `~/Projects`. Persisted so the choice sticks.
+   *  Read it through {@link selectProjectsLocation}. */
   projectsLocation: string | null;
+  /** The same choice per remote host. Web clients share one origin, and so
+   *  this storage, across hosts, and a folder on one host means nothing on
+   *  another. Keyed by {@link remoteViewHost}. */
+  remoteProjectsLocations: Record<string, string>;
   onboardingProjectDir: string | null;
   hasSeenOnboarding: boolean;
   /** Whether this device is past its first run: a project has been open
@@ -346,6 +353,7 @@ interface UIStore {
   openThemeStudio: (request: ThemeStudioRequest) => void;
   closeThemeStudio: () => void;
   setAddProjectSheet: (tab: AddProjectTab | null) => void;
+  /** Remember `dir` for this desktop, or for the remote host in view. */
   setProjectsLocation: (dir: string) => void;
   setOnboardingProjectDir: (dir: string | null) => void;
   setSidebarToggleFn: (fn: (() => void) | null) => void;
@@ -424,6 +432,7 @@ export const useUIStore = create<UIStore>()(
       setShowLocalSessionImport: (show) => set({ showLocalSessionImport: show }),
       addProjectSheet: null,
       projectsLocation: null,
+      remoteProjectsLocations: {},
       onboardingProjectDir: null,
       hasSeenOnboarding: false,
       firstRunDone: false,
@@ -813,7 +822,17 @@ export const useUIStore = create<UIStore>()(
 
       setAddProjectSheet: (tab) => set({ addProjectSheet: tab }),
 
-      setProjectsLocation: (dir) => set({ projectsLocation: dir }),
+      setProjectsLocation: (dir) =>
+        set((s) =>
+          isRemoteClient()
+            ? {
+                remoteProjectsLocations: {
+                  ...s.remoteProjectsLocations,
+                  [remoteViewHost()]: dir,
+                },
+              }
+            : { projectsLocation: dir },
+        ),
 
       setOnboardingProjectDir: (dir) =>
         set((s) =>
@@ -878,6 +897,7 @@ export const useUIStore = create<UIStore>()(
         hasSeenOnboarding: state.hasSeenOnboarding,
         firstRunDone: state.firstRunDone,
         projectsLocation: state.projectsLocation,
+        remoteProjectsLocations: state.remoteProjectsLocations,
         dismissedSubagentAttention: state.dismissedSubagentAttention,
         workspaceDetailsOpen: state.workspaceDetailsOpen,
       }),
@@ -907,3 +927,12 @@ export const useUIStore = create<UIStore>()(
     },
   ),
 );
+
+/** The folder picked for new and cloned projects where they will be made:
+ *  this desktop's choice, or the remote host in view's. Null means the
+ *  default, `~/Projects`. */
+export function selectProjectsLocation(s: UIStore): string | null {
+  return isRemoteClient()
+    ? (s.remoteProjectsLocations[remoteViewHost()] ?? null)
+    : s.projectsLocation;
+}

@@ -38,7 +38,7 @@ vi.mock("@/tauri/commands", async (importOriginal) => ({
 }));
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
-import { useFirstRunSession } from "./first-run-agents";
+import { PAST_PROJECTS_RETRY_MS, useFirstRunSession } from "./first-run-agents";
 
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -408,6 +408,9 @@ describe("ChatHomeLanding", () => {
           provider, status: "ready", installed: true, message: null, version: null,
         }));
       });
+      /** The first-run check's lookups; the landing lists its own six. */
+      const pastProjectsLookups = () =>
+        recentProjectsMock.mock.calls.filter(([limit]) => limit === 10).length;
 
       it("keeps onboarding after a restart mid-setup left only Home open", async () => {
         await start([{ workspace_type: "home", cwd: "/home/me" }]);
@@ -434,6 +437,52 @@ describe("ChatHomeLanding", () => {
         expect(useUIStore.getState().firstRunDone).toBe(true);
         expect(screen.queryByTestId("agent-status-line")).toBeNull();
         expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
+      });
+
+      it("retries a failed lookup before onboarding and finds a returning user", async () => {
+        vi.useFakeTimers();
+        let lookups = 0;
+        recentProjectsMock.mockImplementation(async (limit: number) => {
+          if (limit === 10 && lookups++ === 0) throw new Error("ipc unavailable");
+          return [{ path: "/w/parser", name: "parser", last_opened_at: "2026-10-01T10:00:00Z" }];
+        });
+        useFirstRunSession.setState({ pastProjectsChecked: false });
+        useAppStore.setState({ appState: null });
+        useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
+        await vi.advanceTimersByTimeAsync(0);
+        // The failure is not taken as "no projects": onboarding waits.
+        expect(useFirstRunSession.getState().pastProjectsChecked).toBe(false);
+        render(<ChatHomeLanding composer={<div />} agents={{ selected: "claude" }} />);
+        expect(screen.queryByTestId("agent-status-line")).toBeNull();
+
+        await vi.advanceTimersByTimeAsync(PAST_PROJECTS_RETRY_MS[0]);
+        expect(pastProjectsLookups()).toBe(2);
+        expect(useUIStore.getState().firstRunDone).toBe(true);
+        expect(useFirstRunSession.getState().pastProjectsChecked).toBe(true);
+        expect(screen.queryByTestId("agent-status-line")).toBeNull();
+      });
+
+      it("offers onboarding once every retry of the lookup has failed", async () => {
+        vi.useFakeTimers();
+        recentProjectsMock.mockRejectedValue(new Error("ipc unavailable"));
+        useFirstRunSession.setState({ pastProjectsChecked: false });
+        useAppStore.setState({ appState: null });
+        useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
+        for (const delay of PAST_PROJECTS_RETRY_MS) {
+          await vi.advanceTimersByTimeAsync(0);
+          expect(useFirstRunSession.getState().pastProjectsChecked).toBe(false);
+          await vi.advanceTimersByTimeAsync(delay);
+        }
+        expect(pastProjectsLookups()).toBe(PAST_PROJECTS_RETRY_MS.length + 1);
+        expect(useFirstRunSession.getState().pastProjectsChecked).toBe(true);
+        expect(useUIStore.getState().firstRunDone).toBe(false);
+
+        vi.useRealTimers();
+        render(<ChatHomeLanding composer={<div />} agents={{ selected: "claude" }} />);
+        await act(async () => {
+          await new Promise((r) => setTimeout(r, 0));
+        });
+        expect(screen.getByTestId("agent-status-line")).toBeInTheDocument();
       });
 
       it("shows no onboarding until recent projects answer", async () => {

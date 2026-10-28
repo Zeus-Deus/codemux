@@ -10,7 +10,8 @@ vi.mock("@/tauri/commands", () => ({
   undockBrowserFromRightPanel: (...args: unknown[]) => mocks.undock(...args),
 }));
 
-import { RIGHT_PANEL_EMPTY, useUIStore } from "./ui-store";
+import { setRemoteViewHost } from "@/remote/client-view";
+import { RIGHT_PANEL_EMPTY, selectProjectsLocation, useUIStore } from "./ui-store";
 
 const STORAGE_KEY = "codemux-ui";
 
@@ -38,6 +39,7 @@ beforeEach(() => {
     showCommandPalette: false,
     addProjectSheet: null,
     projectsLocation: null,
+    remoteProjectsLocations: {},
     onboardingProjectDir: null,
     hasSeenOnboarding: false,
     sidebarToggleFn: null,
@@ -167,6 +169,37 @@ describe("ui-store — onboarding state", () => {
       useUIStore.getState().setProjectsLocation("/home/user/Code");
       const persisted = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!);
       expect(persisted.state.projectsLocation).toBe("/home/user/Code");
+    });
+
+    // Web clients share one origin, and so this storage, across hosts.
+    it("remembers the projects location per remote host, apart from the desktop's", () => {
+      const location = () => selectProjectsLocation(useUIStore.getState());
+      useUIStore.getState().setProjectsLocation("/home/me/Code");
+      const remote = window as { __CODEMUX_REMOTE__?: boolean };
+      remote.__CODEMUX_REMOTE__ = true;
+      try {
+        setRemoteViewHost("https://host-a.example");
+        // A desktop choice is no default for a remote host.
+        expect(location()).toBeNull();
+        useUIStore.getState().setProjectsLocation("/srv/a/projects");
+        expect(location()).toBe("/srv/a/projects");
+
+        setRemoteViewHost("https://host-b.example");
+        expect(location()).toBeNull();
+        useUIStore.getState().setProjectsLocation("/srv/b/projects");
+
+        setRemoteViewHost("https://host-a.example");
+        expect(location()).toBe("/srv/a/projects");
+        const persisted = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!);
+        expect(persisted.state.remoteProjectsLocations).toEqual({
+          "https://host-a.example": "/srv/a/projects",
+          "https://host-b.example": "/srv/b/projects",
+        });
+      } finally {
+        delete remote.__CODEMUX_REMOTE__;
+        setRemoteViewHost("local");
+      }
+      expect(location()).toBe("/home/me/Code");
     });
 
     // The rail-or-expanded choice is half of one preference with the width;

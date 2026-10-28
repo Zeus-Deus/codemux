@@ -73,7 +73,41 @@ function isSetupRequired(error: unknown): boolean {
 
 const isHome = (w: { workspace_type?: string }) => w.workspace_type === "home";
 
-let pastProjectsCheck: Promise<void> | null = null;
+/** Waits before each retry of a recent-projects lookup that failed. While
+ *  they run, onboarding stays hidden; once every retry has failed it shows,
+ *  since "Continue anyway" covers a returning user it was wrong about. */
+export const PAST_PROJECTS_RETRY_MS = [2_000, 4_000, 8_000] as const;
+
+/** A lookup is in flight or waiting to retry. */
+let pastProjectsBusy = false;
+let pastProjectsFailures = 0;
+
+function settlePastProjects() {
+  pastProjectsBusy = false;
+  pastProjectsFailures = 0;
+  useFirstRunSession.setState({ pastProjectsChecked: true });
+}
+
+function checkPastProjects() {
+  pastProjectsBusy = true;
+  dbGetRecentProjects(10)
+    .then((rows) => {
+      // Home is a chat location that may be listed, not a project.
+      const workspaces = useAppStore.getState().appState?.workspaces ?? [];
+      const homePaths = new Set(
+        [useAppStore.getState().homeDir, ...workspaces.map((w) => w.cwd)].filter(Boolean),
+      );
+      if ((rows ?? []).some((row) => !homePaths.has(row.path))) {
+        useUIStore.setState({ firstRunDone: true });
+      }
+      settlePastProjects();
+    })
+    .catch(() => {
+      const delay = PAST_PROJECTS_RETRY_MS[pastProjectsFailures++];
+      if (delay === undefined || useUIStore.getState().firstRunDone) settlePastProjects();
+      else setTimeout(checkPastProjects, delay);
+    });
+}
 
 /**
  * Keep `firstRunDone` current. Any project workspace ends the first run.
@@ -87,23 +121,8 @@ function trackFirstRun(appState: AppStateSnapshot | null) {
     useUIStore.setState({ firstRunDone: true });
     return;
   }
-  if (pastProjectsCheck || useFirstRunSession.getState().pastProjectsChecked) return;
-  pastProjectsCheck = dbGetRecentProjects(10)
-    .then((rows) => {
-      // Home is a chat location that may be listed, not a project.
-      const homePaths = new Set(
-        [useAppStore.getState().homeDir, ...workspaces.map((w) => w.cwd)].filter(Boolean),
-      );
-      if ((rows ?? []).some((row) => !homePaths.has(row.path))) {
-        useUIStore.setState({ firstRunDone: true });
-      }
-    })
-    // Unknown history: offer onboarding, which only helps.
-    .catch(() => {})
-    .finally(() => {
-      pastProjectsCheck = null;
-      useFirstRunSession.setState({ pastProjectsChecked: true });
-    });
+  if (pastProjectsBusy || useFirstRunSession.getState().pastProjectsChecked) return;
+  checkPastProjects();
 }
 trackFirstRun(useAppStore.getState().appState);
 useAppStore.subscribe((s) => trackFirstRun(s.appState));
