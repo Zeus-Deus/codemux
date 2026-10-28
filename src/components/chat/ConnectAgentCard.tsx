@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
+import { ChatGptConnectionErrors } from "@/components/auth/chatgpt-connection";
 import { Button } from "@/components/ui/button";
 import { installProvider, signInToProvider } from "@/lib/agent-chat/provider-sign-in";
-import { toast } from "@/lib/toast";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { providerReadiness } from "@/stores/provider-health-store";
 import { useUIStore } from "@/stores/ui-store";
@@ -129,9 +129,16 @@ function AgentRow({
   }
 
   // A ChatGPT plan signs Codex in without a separate account; the CLI is
-  // still what runs, so Install stays next to it.
+  // still what runs, so Install stays next to it. Sign-in finishes in the
+  // browser, so its errors arrive later, through the store.
   let planAction: ReactNode = null;
+  let planErrors: ReactNode = null;
   if (provider === "codex" && readiness !== "ready") {
+    planErrors = (
+      <div className="flex flex-col items-start gap-1 pt-2 pl-14 empty:hidden">
+        <ChatGptConnectionErrors />
+      </div>
+    );
     if (chatGpt === "connected") {
       detail = `${detail} · ChatGPT plan connected`;
     } else if (chatGpt === "pending") {
@@ -143,7 +150,7 @@ function AgentRow({
       );
     } else {
       planAction = (
-        <Button variant="ghost" size="sm" onClick={() => void startChatGptPlan()}>
+        <Button variant="ghost" size="sm" onClick={() => void useChatGptStore.getState().start(null)}>
           Use ChatGPT plan
         </Button>
       );
@@ -161,17 +168,12 @@ function AgentRow({
       detail={detail}
       title={report.message ?? undefined}
       testId={`connect-agent-${provider}`}
+      below={planErrors}
     >
       {planAction}
       {action}
     </Row>
   );
-}
-
-async function startChatGptPlan(): Promise<void> {
-  await useChatGptStore.getState().start(null);
-  const error = useChatGptStore.getState().error;
-  if (error) toast.failure("Couldn't start ChatGPT sign-in", error);
 }
 
 function Row({
@@ -180,6 +182,7 @@ function Row({
   detail,
   title,
   testId,
+  below,
   children,
 }: {
   logo: ReactNode;
@@ -187,16 +190,21 @@ function Row({
   detail: string;
   title?: string;
   testId?: string;
+  /** Under the row, aligned with its text. */
+  below?: ReactNode;
   children: ReactNode;
 }) {
   return (
-    <li className="flex items-center gap-3 px-4 py-3" data-testid={testId}>
-      <span className="flex w-11 shrink-0 justify-center">{logo}</span>
-      <div className="min-w-0 flex-1" title={title}>
-        <div className="text-body font-medium text-foreground">{name}</div>
-        <div className="truncate text-body-sm text-muted-foreground">{detail}</div>
+    <li className="px-4 py-3" data-testid={testId}>
+      <div className="flex items-center gap-3">
+        <span className="flex w-11 shrink-0 justify-center">{logo}</span>
+        <div className="min-w-0 flex-1" title={title}>
+          <div className="text-body font-medium text-foreground">{name}</div>
+          <div className="truncate text-body-sm text-muted-foreground">{detail}</div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">{children}</div>
       </div>
-      <div className="flex shrink-0 items-center gap-1.5">{children}</div>
+      {below}
     </li>
   );
 }

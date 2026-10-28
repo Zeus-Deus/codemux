@@ -1003,6 +1003,28 @@ describe("chat-draft-store", () => {
         });
       });
 
+      it("puts an OpenCode draft on OpenCode's own default until its catalog arrives", () => {
+        const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+        settle(["opencode"]);
+        expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+          provider: "opencode",
+          model: null,
+          bootstrapModel: true,
+          automaticProvider: true,
+        });
+        expect(useChatDraftStore.getState().getOrCreateProjectDraft("/repo").model).toBeNull();
+
+        useProviderCapabilities.setState({
+          opencode: claudeCaps([{ id: "opencode/big-pickle", label: "Big Pickle" }]),
+        });
+        reseedBootstrapDrafts();
+        expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+          provider: "opencode",
+          model: "opencode/big-pickle",
+          bootstrapModel: false,
+        });
+      });
+
       it("does not move a draft back to the fallback while nothing is known to run", () => {
         const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
         settle(["opencode"]);
@@ -1032,6 +1054,38 @@ describe("chat-draft-store", () => {
         const { draftsById } = useChatDraftStore.getState();
         expect(draftsById[picked.draftId]).toMatchObject({ provider: "claude", automaticProvider: false });
         expect(draftsById[model.draftId]).toMatchObject({ provider: "claude", automaticProvider: false });
+      });
+
+      it("keeps a draft whose permissions or other agent settings the user changed", () => {
+        settle(["codex"]);
+        const store = useChatDraftStore.getState();
+        const draft = store.getOrCreateHomeDraft();
+        expect(draft).toMatchObject({ provider: "codex", automaticProvider: true });
+        store.updateDraftConfig(draft.draftId, { permissionMode: "read-only" });
+        const plan = store.getOrCreateProjectDraft("/repo");
+        store.updateDraftConfig(plan.draftId, { mode: "plan" });
+
+        settle(["claude", "codex"]);
+        const { draftsById } = useChatDraftStore.getState();
+        expect(draftsById[draft.draftId]).toMatchObject({
+          provider: "codex",
+          permissionMode: "read-only",
+          automaticProvider: false,
+        });
+        expect(draftsById[plan.draftId]).toMatchObject({ provider: "codex", mode: "plan" });
+      });
+
+      it("still follows the probes after the app corrects a setting itself", () => {
+        settle(["codex"]);
+        const store = useChatDraftStore.getState();
+        const draft = store.getOrCreateHomeDraft();
+        store.updateDraftConfig(draft.draftId, { serviceTier: "default" }, { automatic: true });
+
+        settle(["claude", "codex"]);
+        expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+          provider: "claude",
+          automaticProvider: true,
+        });
       });
 
       it("leaves drafts alone while a default is saved, and device drafts always", () => {

@@ -9,6 +9,7 @@ import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { emptyHealthSlot, useProviderHealth } from "@/stores/provider-health-store";
+import { useProviderAccounts } from "@/stores/provider-accounts-store";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
@@ -205,15 +206,28 @@ describe("resolveNewChatModelDefaults", () => {
     it("starts on the first ready agent in order", () => {
       probed({ claude: "missing", codex: "signed-out", opencode: "ready", grok: "ready" });
       expect(firstUsableProvider()).toBe("opencode");
-      expect(resolveNewChatModelDefaults()).toEqual({
-        provider: "opencode",
-        model: defaultModelId("opencode"),
-        effort: null,
-      });
+      expect(resolveNewChatModelDefaults().provider).toBe("opencode");
       probed({ codex: "ready" });
       expect(resolveNewChatModelDefaults().provider).toBe("codex");
       probed({ claude: "ready" });
       expect(resolveNewChatModelDefaults().provider).toBe("claude");
+    });
+
+    it("starts on the catalog default, never a hardcoded model the user may lack", () => {
+      useProviderCapabilities.setState({ claude: null, codex: null, opencode: null });
+      probed({ claude: "missing", codex: "missing", opencode: "ready" });
+      // OpenCode's bootstrap id routes through Anthropic; before the catalog
+      // is harvested the session starts on OpenCode's own default instead.
+      expect(defaultModelId("opencode")).toBe("anthropic/claude-sonnet-4-6");
+      expect(resolveNewChatModelDefaults()).toEqual({ provider: "opencode", model: null, effort: null });
+      useProviderCapabilities.setState({ opencode: caps([model("opencode/big-pickle")]) });
+      expect(resolveNewChatModelDefaults().model).toBe("opencode/big-pickle");
+      // Codex has no provider-native alias either; Claude keeps "default".
+      probed({ codex: "ready" });
+      expect(resolveNewChatModelDefaults()).toEqual({ provider: "codex", model: null, effort: null });
+      probed({ claude: "ready" });
+      expect(resolveNewChatModelDefaults().model).toBe("default");
+      useProviderCapabilities.setState({ opencode: null });
     });
 
     it("keeps Claude when nothing is known or ready", () => {
@@ -230,6 +244,29 @@ describe("resolveNewChatModelDefaults", () => {
       expect(firstUsableProvider()).toBe("claude");
       probed({ claude: "missing", cursor: "unverified" });
       expect(resolveNewChatModelDefaults().provider).toBe("cursor");
+    });
+
+    it("counts a signed-out CLI whose default extra account is signed in", () => {
+      probed({ claude: "signed-out", codex: "ready" });
+      // Until the account list loads, the probe's answer stands.
+      expect(firstUsableProvider()).toBe("codex");
+      const account = (signedIn: boolean | null) => ({
+        id: "work", provider: "claude" as const, label: "Work", home: "/a/work",
+        login_command: "claude login",
+        identity: { signed_in: signedIn, email: null, organization: null, plan: null },
+      });
+      useProviderAccounts.setState({ accounts: [account(true)], defaults: { claude: "work" } });
+      expect(firstUsableProvider()).toBe("claude");
+      // The CLI's own login as the default, or a signed-out extra account, don't count.
+      useProviderAccounts.setState({ defaults: {} });
+      expect(firstUsableProvider()).toBe("codex");
+      useProviderAccounts.setState({ accounts: [account(false)], defaults: { claude: "work" } });
+      expect(firstUsableProvider()).toBe("codex");
+      // An account whose sign-in couldn't be told is likely fine, but not ready.
+      useProviderAccounts.setState({ accounts: [account(null)] });
+      probed({ codex: "missing" });
+      expect(firstUsableProvider()).toBe("claude");
+      useProviderAccounts.setState({ accounts: null, defaults: {} });
     });
 
     it("does not trust a cached answer whose last probe failed", () => {

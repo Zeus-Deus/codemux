@@ -62,7 +62,10 @@ import {
 } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useHostsStore } from "@/stores/hosts-store";
-import { selectModel } from "@/stores/provider-capabilities-store";
+import {
+  refreshProviderCapabilitiesForIntent,
+  selectModel,
+} from "@/stores/provider-capabilities-store";
 import { selectedAcpCatalog, useCustomAcp } from "@/stores/custom-acp-store";
 import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import {
@@ -183,7 +186,7 @@ function DraftChatSurfaceInner({
     if (!activeModel || draft.promoting) return;
     const resolved = resolveServiceTier(activeModel, draft.serviceTier);
     if (resolved !== (draft.serviceTier ?? "default")) {
-      updateDraftConfig(draft.draftId, { serviceTier: resolved });
+      updateDraftConfig(draft.draftId, { serviceTier: resolved }, { automatic: true });
     }
   }, [activeModel, draft.draftId, draft.serviceTier, draft.promoting, updateDraftConfig]);
 
@@ -200,7 +203,7 @@ function DraftChatSurfaceInner({
   // the first-send materialization path.
   useEffect(() => {
     if (normalizedMode !== draft.mode) {
-      updateDraftConfig(draft.draftId, { mode: normalizedMode });
+      updateDraftConfig(draft.draftId, { mode: normalizedMode }, { automatic: true });
     }
   }, [draft.draftId, draft.mode, normalizedMode, updateDraftConfig]);
 
@@ -1564,6 +1567,15 @@ function DraftChatSurfaceInner({
 
   // Opening a project from the empty home points this draft at it, the same
   // as picking it in the location control below the composer.
+  // A draft that starts without a model (an automatic pick made before the
+  // provider's catalog was known) waits for that catalog to choose one.
+  // Nothing else asks for it until a picker opens, so fetch it here; it
+  // shares the picker's single flight.
+  const waitingForCatalog = draft.bootstrapModel === true && !draft.model;
+  useEffect(() => {
+    if (waitingForCatalog) void refreshProviderCapabilitiesForIntent(draft.provider);
+  }, [waitingForCatalog, draft.provider]);
+
   const handleProjectOpened = useCallback(
     (projectPath: string) =>
       updateDraftTarget(draft.draftId, { kind: "project", projectPath }),

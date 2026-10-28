@@ -5,8 +5,14 @@ import {
 } from "@/stores/provider-capabilities-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useChatGptStore } from "@/stores/chatgpt-store";
-import { providerReadiness, useProviderHealth } from "@/stores/provider-health-store";
-import type { AgentChatProviderKind } from "@/tauri/types";
+import {
+  providerReadiness,
+  useProviderHealth,
+  type ProviderReadiness,
+} from "@/stores/provider-health-store";
+import { defaultAccountSignedIn, useProviderAccounts } from "@/stores/provider-accounts-store";
+import type { ProviderAccount } from "@/tauri/commands";
+import type { AgentChatProviderKind, ProviderHealthReport } from "@/tauri/types";
 import { defaultModelId } from "./capability-defaults";
 import { DEFAULT_CAPABLE_PROVIDERS, disabledProviders } from "./provider-enablement";
 
@@ -31,19 +37,42 @@ export const AUTOMATIC_PROVIDER_ORDER: ReadonlyArray<AgentChatProviderKind> = [
   "grok",
 ];
 
+/** Whether a probe found the CLI installed but signed out of its own
+ *  login: the one answer a signed-in extra account overrides. */
+export function cliSignedOut(report: ProviderHealthReport): boolean {
+  return providerReadiness(report) === "not_ready" && !!report.login_command;
+}
+
+/** `providerReadiness`, counting the account new chats on `provider` start
+ *  on: a CLI signed out of its own login still runs a chat on a signed-in
+ *  extra account set as the default. Until the account list loads
+ *  (`accounts` null) the probe's answer stands. */
+export function newChatReadiness(
+  provider: AgentChatProviderKind,
+  report: ProviderHealthReport,
+  accounts: ProviderAccount[] | null,
+  defaults: Record<string, string>,
+): ProviderReadiness {
+  if (!accounts || !cliSignedOut(report)) return providerReadiness(report);
+  const signedIn = defaultAccountSignedIn(accounts, defaults, provider);
+  return signedIn === true ? "ready" : signedIn === null ? "unverified" : "not_ready";
+}
+
 /** The first provider in `AUTOMATIC_PROVIDER_ORDER` that is switched on and
- *  whose cached health report is ready; failing that, the first installed
- *  one whose probe couldn't tell (readiness "unverified", e.g. Claude when
- *  its sign-in can't be checked). Null when none is known to be usable.
- *  Reads the cache only: choosing a default is not reason to probe. */
+ *  whose cached health report is ready (or that starts on a signed-in extra
+ *  account, `newChatReadiness`); failing that, the first installed one
+ *  whose probe couldn't tell (readiness "unverified", e.g. Claude when its
+ *  sign-in can't be checked). Null when none is known to be usable. Reads
+ *  the caches only: choosing a default is not reason to probe. */
 export function firstUsableProvider(
   off: ReadonlySet<AgentChatProviderKind> = disabledProviders(),
 ): AgentChatProviderKind | null {
   const slots = useProviderHealth.getState().slots;
+  const { accounts, defaults } = useProviderAccounts.getState();
   const readiness = (provider: AgentChatProviderKind) => {
     const slot = slots[provider];
     if (off.has(provider) || slot.lastProbeFailed || !slot.report) return null;
-    return providerReadiness(slot.report);
+    return newChatReadiness(provider, slot.report, accounts, defaults);
   };
   return AUTOMATIC_PROVIDER_ORDER.find((p) => readiness(p) === "ready") ??
     AUTOMATIC_PROVIDER_ORDER.find((p) => readiness(p) === "unverified") ??
@@ -69,7 +98,8 @@ export interface NewChatModelDefaults {
  *
  * Unset ("Automatic") uses a connected ChatGPT plan's live Codex catalog,
  * otherwise the first agent this machine's health probes found ready
- * (`firstUsableProvider`), otherwise Claude on its first model. A saved model the provider no longer
+ * (`firstUsableProvider`), otherwise Claude, on that provider's catalog
+ * default (`automaticModelId`). A saved model the provider no longer
  * offers falls back to that provider's default model, and a saved effort is only kept while the
  * model still lists it. Before capabilities load, the saved ids are
  * trusted as-is, since they came from a capability list in the first place.
@@ -95,7 +125,7 @@ export function resolveNewChatModelDefaults(): NewChatModelDefaults {
       : AUTOMATIC_NEW_CHAT_PROVIDER);
     return {
       provider: fallback,
-      model: defaultModelId(fallback),
+      model: automaticModelId(fallback),
       effort: null,
     };
   }
@@ -125,6 +155,20 @@ export function resolveNewChatModelDefaults(): NewChatModelDefaults {
         ? savedEffort
         : null,
   };
+}
+
+/** The model an automatically picked provider starts on: the head of its
+ *  harvested catalog, else the provider's own "default" alias where it has
+ *  one, else null, which starts the session on the agent's own default.
+ *  Never a hardcoded concrete id: that model may need credentials the user
+ *  doesn't have (OpenCode routes `anthropic/…` through Anthropic). The
+ *  draft re-resolves to the catalog once it is harvested
+ *  (`reseedBootstrapDrafts`). */
+function automaticModelId(provider: AgentChatProviderKind): string | null {
+  const harvested = selectCapabilities(useProviderCapabilities.getState(), provider)?.models[0]?.id;
+  if (harvested) return harvested;
+  const fallback = defaultModelId(provider);
+  return fallback === "default" ? fallback : null;
 }
 
 /** The provider saved in Settings → Agent → New chats, or null when new

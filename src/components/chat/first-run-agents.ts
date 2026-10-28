@@ -1,14 +1,18 @@
 import { useEffect, useMemo, useRef } from "react";
 import { create } from "zustand";
-import { AUTOMATIC_PROVIDER_ORDER } from "@/lib/agent-chat/new-chat-defaults";
+import {
+  AUTOMATIC_PROVIDER_ORDER,
+  cliSignedOut,
+  newChatReadiness,
+} from "@/lib/agent-chat/new-chat-defaults";
 import { useDisabledProviders } from "@/lib/agent-chat/provider-enablement";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { dbGetRecentProjects } from "@/tauri/commands";
 import { useCustomAcp } from "@/stores/custom-acp-store";
 import { useHermes } from "@/stores/hermes-store";
+import { useProviderAccounts } from "@/stores/provider-accounts-store";
 import {
-  providerReadiness,
   useProbedProviderHealth,
   useProviderHealth,
   type ProviderReadiness,
@@ -53,6 +57,9 @@ interface FirstRunSession {
   /** When a Hermes profile or custom agent listing last failed, and why.
    *  A listing that succeeded is kept by its own store. */
   listFailed: Partial<Record<ExtraList, ListFailure>>;
+  /** The provider account listing failed, so no extra account is known to
+   *  stand in for a signed-out CLI. */
+  accountsFailed: boolean;
   /** "Continue anyway" on the Connect an agent card, for this session. */
   connectDismissed: boolean;
 }
@@ -61,6 +68,7 @@ interface FirstRunSession {
 export const useFirstRunSession = create<FirstRunSession>(() => ({
   pastProjectsChecked: false,
   listFailed: {},
+  accountsFailed: false,
   connectDismissed: false,
 }));
 
@@ -163,7 +171,9 @@ export interface FirstRunAgents {
   /** Every probe has settled since this surface opened: safe to describe.
    *  Stays true through later re-checks, so the description doesn't blink. */
   known: boolean;
-  /** Agents ready to run, in new-chat order. */
+  /** Agents ready to run, in new-chat order. A CLI signed out of its own
+   *  login counts when new chats on it start on a signed-in extra account
+   *  (`newChatReadiness`). */
   ready: AgentChatProviderKind[];
   /** Installed agents whose probe couldn't tell whether they can run (for
    *  example a sign-in it can't check), in new-chat order. Likely fine, so
@@ -189,7 +199,7 @@ export function useFirstRunAgents(active: boolean): FirstRunAgents {
   // answer on screen until the new one lands.
   const settledOnce = useRef(false);
   if (providers.every((p) => health[p]?.pending === false)) settledOnce.current = true;
-  const known = settledOnce.current;
+  const settled = settledOnce.current;
 
   // Hermes and custom ACP agents aren't probed, but someone who set one up
   // can run chats, so their lists keep the connect card away. A list is
@@ -221,7 +231,17 @@ export function useFirstRunAgents(active: boolean): FirstRunAgents {
     };
     if (hermesOn && !useHermes.getState().profiles) list("hermes", () => useHermes.getState().loadProfiles());
     if (acpOn && !useCustomAcp.getState().agents) list("acp", () => useCustomAcp.getState().loadAgents());
+    if (!useProviderAccounts.getState().accounts) {
+      useProviderAccounts.getState().load().then(
+        () => useFirstRunSession.setState({ accountsFailed: false }),
+        () => useFirstRunSession.setState({ accountsFailed: true }),
+      );
+    }
   }, [active, hermesOn, acpOn]);
+  // Extra Claude and Codex accounts sign in apart from the CLI's own login.
+  const accounts = useProviderAccounts((s) => s.accounts);
+  const accountDefaults = useProviderAccounts((s) => s.defaults);
+  const accountsFailed = useFirstRunSession((s) => s.accountsFailed);
   const connectDismissed = useFirstRunSession((s) => s.connectDismissed);
   const hermesAbsent = useFirstRunSession((s) => !!s.listFailed.hermes?.absent);
   const hermesKnown = useHermes((s) => !hermesOn || s.profiles !== null) || hermesAbsent;
@@ -237,8 +257,16 @@ export function useFirstRunAgents(active: boolean): FirstRunAgents {
       const report = health[provider]?.report;
       if (report) reports[provider] = report;
     }
+    // A signed-out Claude or Codex CLI may still run on an extra account:
+    // unknown until the account list answers, and a failed listing counts
+    // as no account, as it does when the composer sends.
+    const accountsPending = !accounts && !accountsFailed && providers.some(
+      (p) => (p === "claude" || p === "codex") && reports[p] && cliSignedOut(reports[p]),
+    );
     const withReadiness = (readiness: ProviderReadiness) =>
-      providers.filter((p) => reports[p] && providerReadiness(reports[p]) === readiness);
+      providers.filter((p) =>
+        reports[p] && newChatReadiness(p, reports[p], accounts, accountDefaults) === readiness,
+      );
     const ready = withReadiness("ready");
     const unverified = withReadiness("unverified");
     // Only conclusive answers gate: not installed, or installed and unable
@@ -247,12 +275,17 @@ export function useFirstRunAgents(active: boolean): FirstRunAgents {
       !connectDismissed &&
       providers.length > 0 &&
       providers.every((p) => reports[p]) &&
+      !accountsPending &&
       ready.length === 0 &&
       unverified.length === 0 &&
       extrasListed &&
       !hasExtraAgent;
+    const known = settled && !accountsPending;
     return { providers, reports, known, ready, unverified, needsAgent };
-  }, [providers, health, known, connectDismissed, extrasListed, hasExtraAgent]);
+  }, [
+    providers, health, settled, connectDismissed, extrasListed, hasExtraAgent,
+    accounts, accountDefaults, accountsFailed,
+  ]);
 }
 
 /** "Continue anyway": show the normal landing for the rest of the session,

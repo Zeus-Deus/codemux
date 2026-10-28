@@ -46,6 +46,8 @@ import { useUIStore } from "@/stores/ui-store";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { useCustomAcp } from "@/stores/custom-acp-store";
 import { useHermes, type HermesProfile } from "@/stores/hermes-store";
+import { useProviderAccounts } from "@/stores/provider-accounts-store";
+import type { ProviderAccount } from "@/tauri/commands";
 import { useProjectPickerHintStore } from "@/stores/project-picker-hint-store";
 import { emptyHealthSlot, HEALTH_REPROBE_MS, useProviderHealth } from "@/stores/provider-health-store";
 import type { AgentChatProviderKind, ProviderHealthReport, AppStateSnapshot } from "@/tauri/types";
@@ -65,15 +67,20 @@ beforeEach(() => {
     },
   });
   // A fresh window session on a device that has never had a project open.
-  useFirstRunSession.setState({ pastProjectsChecked: true, listFailed: {}, connectDismissed: false });
+  useFirstRunSession.setState({
+    pastProjectsChecked: true, listFailed: {}, accountsFailed: false, connectDismissed: false,
+  });
   useUIStore.setState({ firstRunDone: false });
   // A fresh machine: Hermes is enabled but not installed, so listing its
   // profiles fails the way the backend does, and no custom agent is set up.
+  // Only the CLIs' own sign-ins exist.
   invokeMock.mockReset().mockImplementation(async (cmd: string) => {
     if (cmd === "hermes_profiles") throw HERMES_NOT_INSTALLED;
     if (cmd === "acp_agents") return [];
+    if (cmd === "provider_accounts_list") return { accounts: [], defaults: {} };
     throw new Error(`unmocked command ${cmd}`);
   });
+  useProviderAccounts.setState({ accounts: null, defaults: {} });
   useHermes.setState({ profiles: null });
   useCustomAcp.setState({ agents: null });
   useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot, homeDir: null });
@@ -700,6 +707,35 @@ describe("ChatHomeLanding", () => {
         expect(start).toHaveBeenCalledWith(null);
       });
 
+      it("shows a ChatGPT sign-in that fails after it started, with a way to refresh", async () => {
+        const status = (phase: "pending" | "error", error: string | null) => ({
+          phase, attemptId: phase === "pending" ? "a1" : null, email: null, error,
+          profiles: [], activeProfileId: null, welcomePending: false, installed: true,
+        });
+        const refresh = vi.fn().mockResolvedValue(undefined);
+        const start = vi.fn(async () => {
+          useChatGptStore.setState({ status: status("pending", null) });
+        });
+        useChatGptStore.setState({ start, refresh, status: null, error: null, subscriptionError: null, busy: false });
+        await renderWithAgents();
+        const codex = screen.getByTestId("connect-agent-codex");
+        await act(async () => {
+          fireEvent.click(within(codex).getByRole("button", { name: "Use ChatGPT plan" }));
+        });
+        expect(codex).toHaveTextContent("Finish signing in in your browser");
+        expect(within(codex).queryByRole("alert")).toBeNull();
+
+        // The browser flow expires well after `start` resolved.
+        act(() => useChatGptStore.setState({ status: status("error", "The sign-in request expired.") }));
+        expect(within(codex).getByRole("alert")).toHaveTextContent("The sign-in request expired.");
+        expect(within(codex).getByRole("button", { name: "Use ChatGPT plan" })).toBeInTheDocument();
+        fireEvent.click(within(codex).getByRole("button", { name: "Refresh connection" }));
+        expect(refresh).toHaveBeenCalled();
+
+        act(() => useChatGptStore.setState({ status: null }));
+        expect(within(codex).queryByRole("alert")).toBeNull();
+      });
+
       it("re-checks when the window regains focus and returns to the composer once one is ready", async () => {
         vi.useFakeTimers({ toFake: ["Date"] });
         await renderWithAgents();
@@ -802,6 +838,47 @@ describe("ChatHomeLanding", () => {
         useCustomAcp.setState({ agents: [{ ...agent, enabled: true }] });
         await renderWithAgents();
         expect(screen.queryByTestId("connect-agent")).toBeNull();
+      });
+
+      describe("with an extra Claude account set as the default", () => {
+        const workAccount = (signedIn: boolean | null): ProviderAccount => ({
+          id: "work", provider: "claude", label: "Work", home: "/accounts/work",
+          login_command: "claude login",
+          identity: { signed_in: signedIn, email: null, organization: null, plan: null },
+        });
+        function listAccounts(answer: () => Promise<unknown>) {
+          const base = invokeMock.getMockImplementation()!;
+          invokeMock.mockImplementation(async (cmd: string, ...rest: unknown[]) =>
+            cmd === "provider_accounts_list" ? answer() : base(cmd, ...rest),
+          );
+        }
+
+        it("keeps the composer when that account is signed in", async () => {
+          listAccounts(async () => ({ accounts: [workAccount(true)], defaults: { claude: "work" } }));
+          await renderWithAgents();
+          expect(screen.queryByTestId("connect-agent")).toBeNull();
+          expect(screen.getByTestId("composer")).toBeInTheDocument();
+          expect(screen.getByTestId("agent-status-line")).toHaveTextContent("Claude Code is ready·Set up");
+          expect(screen.getByTestId("agent-status-line")).not.toHaveTextContent("needs sign-in");
+        });
+
+        it("still asks to connect one when that account is signed out too", async () => {
+          listAccounts(async () => ({ accounts: [workAccount(false)], defaults: { claude: "work" } }));
+          await renderWithAgents();
+          expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+        });
+
+        it("waits for the account list before asking, and asks if it fails", async () => {
+          let fail!: (error: Error) => void;
+          listAccounts(() => new Promise((_, reject) => { fail = reject; }));
+          await renderWithAgents();
+          expect(screen.queryByTestId("connect-agent")).toBeNull();
+          expect(screen.getByTestId("composer")).toBeInTheDocument();
+          expect(screen.getByTestId("agent-status-line")).toBeEmptyDOMElement();
+          await act(async () => fail(new Error("accounts unavailable")));
+          await flush();
+          expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+        });
       });
 
       it("stays a first run while the only workspace is the Home one sign-in opened", async () => {

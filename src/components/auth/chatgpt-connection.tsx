@@ -71,18 +71,40 @@ export function ChatGptConnectionCard({ onboarding = false }: { onboarding?: boo
   return null;
 }
 
-/** Saved connections, the Codex CLI requirement and connection errors. */
-export function ChatGptConnectionNotes() {
+/** Whether the ChatGPT connection has an error to show. */
+function useChatGptHasError(): boolean {
+  return useChatGptStore((s) => Boolean(s.error || s.status?.error || s.subscriptionError));
+}
+
+/** Connection errors, from starting sign-in through the browser flow
+ *  failing or expiring, with a way to read the connection again. Nothing
+ *  while there is no error. */
+export function ChatGptConnectionErrors() {
   const status = useChatGptStore((s) => s.status);
   const busy = useChatGptStore((s) => s.busy);
   const error = useChatGptStore((s) => s.error);
   const subscriptionError = useChatGptStore((s) => s.subscriptionError);
-  const start = useChatGptStore((s) => s.start);
   const refresh = useChatGptStore((s) => s.refresh);
+  const hasError = useChatGptHasError();
+  if (isRemoteClient() || !hasError) return null;
+  return (
+    <>
+      {(error || status?.error) && <p role="alert" className="text-body-sm leading-relaxed text-destructive">{error ?? status?.error}</p>}
+      {subscriptionError && <p role="alert" className="text-label text-muted-foreground">{subscriptionError}</p>}
+      <Button variant="ghost" size="sm" disabled={busy} onClick={() => void refresh()}>Refresh connection</Button>
+    </>
+  );
+}
+
+/** Saved connections, the Codex CLI requirement and connection errors. */
+export function ChatGptConnectionNotes() {
+  const status = useChatGptStore((s) => s.status);
+  const busy = useChatGptStore((s) => s.busy);
+  const start = useChatGptStore((s) => s.start);
+  const hasError = useChatGptHasError();
   if (isRemoteClient()) return null;
   const pending = status?.phase === "pending";
   const connected = status?.phase === "connected";
-  const hasError = Boolean(error || status?.error || subscriptionError);
   const hasProfiles = !pending && Boolean(status?.profiles.length);
   if (!hasProfiles && status?.installed !== false && !hasError) return null;
   return (
@@ -96,9 +118,7 @@ export function ChatGptConnectionNotes() {
       {status?.installed === false && <p className="text-label leading-relaxed text-muted-foreground">
         Codex CLI is required to start coding. <button className="underline underline-offset-4" onClick={() => void openUrl("https://developers.openai.com/codex/cli/")}>Installation guide</button>
       </p>}
-      {(error || status?.error) && <p role="alert" className="text-body-sm leading-relaxed text-destructive">{error ?? status?.error}</p>}
-      {subscriptionError && <p role="alert" className="text-label text-muted-foreground">{subscriptionError}</p>}
-      {hasError && <Button variant="ghost" size="sm" disabled={busy} onClick={() => void refresh()}>Refresh connection</Button>}
+      <ChatGptConnectionErrors />
     </div>
   );
 }

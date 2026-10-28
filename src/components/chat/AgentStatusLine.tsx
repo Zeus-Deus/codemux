@@ -42,7 +42,9 @@ export function AgentStatusLine({
   // not called out; most people never meant to install every one.
   const needSetup = providers.filter((p) => {
     const report = reports[p];
-    return report && providerReadiness(report) === "not_ready";
+    return report && providerReadiness(report) === "not_ready" &&
+      // Runs on a signed-in extra account despite the CLI's own login.
+      !ready.includes(p) && !unverified.includes(p);
   });
   let setupText: string | null = null;
   if (needSetup.length === 1) {

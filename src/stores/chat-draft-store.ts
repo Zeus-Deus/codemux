@@ -14,6 +14,7 @@ import {
 } from "@/lib/agent-chat/new-chat-defaults";
 import { normalizeChatModeForProvider } from "@/lib/agent-chat/mode-compatibility";
 import { useProviderHealth } from "@/stores/provider-health-store";
+import { useProviderAccounts } from "@/stores/provider-accounts-store";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { getNewChatCheckout, useSettingsStore } from "@/stores/settings-store";
 import { useAppStore } from "@/stores/app-store";
@@ -183,6 +184,10 @@ export interface ChatDraftStore {
         | "lockedToHome"
       >
     >,
+    /** `automatic` marks a correction the app made (healing a value the
+     *  provider no longer supports), not the user's choice, so the draft
+     *  keeps following the automatic provider. */
+    options?: { automatic?: boolean },
   ) => void;
   updateDraftInput: (draftId: DraftId, input: string) => void;
 
@@ -301,6 +306,17 @@ function discardDraftRuntime(draft: ChatDraft): void {
   }
   chat.resetThread(draft.threadId);
 }
+
+/** Draft fields the composer's agent controls set. */
+const AGENT_CONFIG_KEYS = [
+  "provider",
+  "model",
+  "effort",
+  "contextWindow",
+  "serviceTier",
+  "permissionMode",
+  "mode",
+] as const satisfies ReadonlyArray<keyof ChatDraft>;
 
 type NewChatConfig = Pick<
   ChatDraft,
@@ -557,7 +573,7 @@ export const useChatDraftStore = create<ChatDraftStore>()(
           return patch as ChatDraftStore;
         }),
 
-      updateDraftConfig: (draftId, config) =>
+      updateDraftConfig: (draftId, config, options) =>
         set((s) => {
           const existing = s.draftsById[draftId];
           if (!existing) return s;
@@ -585,7 +601,11 @@ export const useChatDraftStore = create<ChatDraftStore>()(
                 ...("model" in config
                   ? { bootstrapModel: false }
                   : {}),
-                ...("provider" in config || "model" in config
+                // Any agent setting the user changes pins the draft:
+                // following the probes to another provider would
+                // replace it with that provider's defaults.
+                ...(!options?.automatic &&
+                AGENT_CONFIG_KEYS.some((key) => key in config)
                   ? { automaticProvider: false }
                   : {}),
               },
@@ -941,10 +961,17 @@ export function useReseedBootstrapDrafts(): void {
     const unsubscribeHealth = useProviderHealth.subscribe((state, previous) => {
       if (state.slots !== previous.slots) reseedAutomaticProviderDrafts();
     });
+    // A signed-in default account can make a signed-out CLI usable.
+    const unsubscribeAccounts = useProviderAccounts.subscribe((state, previous) => {
+      if (state.accounts !== previous.accounts || state.defaults !== previous.defaults) {
+        reseedAutomaticProviderDrafts();
+      }
+    });
     return () => {
       unsubscribeCapabilities();
       unsubscribeApp();
       unsubscribeHealth();
+      unsubscribeAccounts();
     };
   }, []);
 }
