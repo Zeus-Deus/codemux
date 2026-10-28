@@ -26,26 +26,27 @@ export function projectNameError(name: string): string | null {
   return null;
 }
 
-/** GitHub `owner/repo`: an owner (letters, digits, hyphens) and a repo name,
- *  nothing else. Anything with a colon, a leading dot or slash, or more
- *  segments is a URL, an SSH alias or a path, and belongs to git as typed. */
+/** GitHub `owner/repo`: an owner (letters, digits, hyphens, so never a
+ *  dotted host) and a repo name, nothing else. Anything with a colon, a
+ *  leading dot or slash, or more segments is a URL, an SSH alias or a path,
+ *  and belongs to git as typed. */
 const GITHUB_SHORTHAND = /^[A-Za-z0-9][A-Za-z0-9-]*\/[\w-][\w.-]*$/;
+/** The same `owner/repo` after a literal, scheme-less `github.com/`. */
+const GITHUB_HOST_PATH = /^github\.com\/([A-Za-z0-9][A-Za-z0-9-]*\/[\w-][\w.-]*)$/i;
 
 /**
  * Turn what the user typed into the address handed to `git clone`, or null
  * when nothing was typed. Only GitHub `owner/repo` shorthand and a
- * scheme-less `host.tld/owner/repo` are rewritten; every other address
- * (SSH host aliases, local paths, `file://`, `insteadOf` prefixes) goes to
- * git unchanged and git says whether it is a repository.
+ * scheme-less `github.com/owner/repo` are rewritten; every other address
+ * (other hosts, SSH host aliases, local paths, `file://`, `insteadOf`
+ * prefixes such as `corp.example/team/repo`) goes to git unchanged and git
+ * says whether it is a repository.
  */
 export function normalizeCloneUrl(input: string): string | null {
   const value = input.trim();
   if (!value) return null;
-  if (GITHUB_SHORTHAND.test(value)) {
-    return `https://github.com/${value.replace(/\.git$/i, "")}.git`;
-  }
-  // `github.com/acme/app` would otherwise be read as a relative local path.
-  if (/^[\w-]+(\.[\w-]+)+\/[^\s:]+$/.test(value)) return `https://${value}`;
+  const repo = GITHUB_SHORTHAND.test(value) ? value : GITHUB_HOST_PATH.exec(value)?.[1];
+  if (repo) return `https://github.com/${repo.replace(/\.git$/i, "")}.git`;
   return value;
 }
 

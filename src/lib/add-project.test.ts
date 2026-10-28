@@ -41,8 +41,9 @@ describe("normalizeCloneUrl", () => {
     expect(normalizeCloneUrl("ssh://git@host:2222/a/b")).toBe("ssh://git@host:2222/a/b");
   });
 
-  it("adds https to a scheme-less host path", () => {
-    expect(normalizeCloneUrl("github.com/acme/app")).toBe("https://github.com/acme/app");
+  it("adds https to a scheme-less github.com path", () => {
+    expect(normalizeCloneUrl("github.com/acme/app")).toBe("https://github.com/acme/app.git");
+    expect(normalizeCloneUrl("GitHub.com/acme/app.git")).toBe("https://github.com/acme/app.git");
   });
 
   it("passes every other address to git unchanged", () => {
@@ -57,6 +58,11 @@ describe("normalizeCloneUrl", () => {
       "git://example.org/repo.git",
       "C:\\repos\\app",
       "group/sub/repo",
+      "corp.example/team/repo.git",
+      "gitlab.com/acme/app",
+      "github.com.evil.example/acme/app",
+      "github.com/acme/app/tree/main",
+      "acme.io/app",
     ]) {
       expect(normalizeCloneUrl(address)).toBe(address);
     }

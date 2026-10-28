@@ -3,7 +3,8 @@ import { useState } from "react";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
-const { openProjectMock, openAddProjectMock, openProjectAtPathMock, recentProjectsMock, listDirectoryMock, toastErrorMock, mockProbe, signInMock, installMock } = vi.hoisted(() => ({
+const { openProjectMock, openAddProjectMock, openProjectAtPathMock, recentProjectsMock, listDirectoryMock, toastErrorMock, mockProbe, signInMock, installMock, invokeMock } = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
   mockProbe: vi.fn(),
   signInMock: vi.fn(),
   installMock: vi.fn(),
@@ -13,6 +14,11 @@ const { openProjectMock, openAddProjectMock, openProjectAtPathMock, recentProjec
   openProjectAtPathMock: vi.fn(),
   recentProjectsMock: vi.fn(),
   toastErrorMock: vi.fn(),
+}));
+// Hermes profiles and custom agents are listed straight through `invoke`.
+vi.mock("@tauri-apps/api/core", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@tauri-apps/api/core")>()),
+  invoke: invokeMock,
 }));
 vi.mock("@/lib/toast", () => ({ toast: { error: toastErrorMock, success: vi.fn() } }));
 vi.mock("@/lib/agent-chat/provider-sign-in", () => ({
@@ -57,7 +63,12 @@ beforeEach(() => {
     },
   });
   // A fresh window session: the next app state is its first snapshot.
-  useFirstRunSession.setState({ startedEmpty: null, extrasListed: false, connectDismissed: false });
+  useFirstRunSession.setState({ startedEmpty: null, listFailedAt: {}, connectDismissed: false });
+  // A machine with no Hermes profiles and no custom agents.
+  invokeMock.mockReset().mockImplementation(async (cmd: string) => {
+    if (cmd === "hermes_profiles" || cmd === "acp_agents") return [];
+    throw new Error(`unmocked command ${cmd}`);
+  });
   useHermes.setState({ profiles: null });
   useCustomAcp.setState({ agents: null });
   useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot, homeDir: null });
@@ -371,6 +382,27 @@ describe("ChatHomeLanding", () => {
       expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
     });
 
+    it("gives a returning user with every workspace closed the tiles, not onboarding", async () => {
+      // Nothing could run here, which would ask a first run to connect one.
+      mockProbe.mockImplementation(async (provider: AgentChatProviderKind) => ({
+        provider, status: "error", installed: false, message: "Not on PATH.", version: null,
+      }));
+      useFirstRunSession.setState({ startedEmpty: null });
+      useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
+      useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
+      render(<ChatHomeLanding composer={<div data-testid="composer" />} agents={{ selected: "claude" }} />);
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+      });
+      expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
+      expect(screen.getByTestId("composer")).toBeInTheDocument();
+      expect(screen.queryByTestId("connect-agent")).toBeNull();
+      expect(screen.queryByTestId("agent-status-line")).toBeNull();
+      expect(mockProbe).not.toHaveBeenCalled();
+      expect(invokeMock).not.toHaveBeenCalledWith("hermes_profiles");
+      expect(invokeMock).not.toHaveBeenCalledWith("acp_agents");
+    });
+
     it("hides the project actions once a workspace exists", () => {
       useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
       render(<ChatHomeLanding composer={<div />} />);
@@ -607,6 +639,45 @@ describe("ChatHomeLanding", () => {
         first.unmount();
         await renderWithAgents();
         expect(screen.queryByTestId("connect-agent")).toBeNull();
+      });
+
+      it("stays away while a Hermes or custom agent listing failed, and retries it later", async () => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        invokeMock.mockImplementation(async (cmd: string) => {
+          if (cmd === "hermes_profiles") throw new Error("hermes is busy");
+          if (cmd === "acp_agents") return [];
+          throw new Error(`unmocked command ${cmd}`);
+        });
+        const first = await renderWithAgents();
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+        expect(screen.getByTestId("composer")).toBeInTheDocument();
+        expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "hermes_profiles")).toHaveLength(1);
+        first.unmount();
+
+        // Opened again soon after: the failure is remembered, not retried.
+        const second = await renderWithAgents();
+        expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "hermes_profiles")).toHaveLength(1);
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+        second.unmount();
+
+        // Half a minute later it is listed again; an empty answer is conclusive.
+        invokeMock.mockImplementation(async (cmd: string) =>
+          cmd === "hermes_profiles" || cmd === "acp_agents" ? [] : Promise.reject(new Error(cmd)),
+        );
+        vi.setSystemTime(Date.now() + 31_000);
+        await renderWithAgents();
+        expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "hermes_profiles")).toHaveLength(2);
+        expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+      });
+
+      it("stays away while the custom agent listing failed", async () => {
+        invokeMock.mockImplementation(async (cmd: string) => {
+          if (cmd === "hermes_profiles") return [];
+          throw new Error("acp listing failed");
+        });
+        await renderWithAgents();
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+        expect(screen.getByTestId("composer")).toBeInTheDocument();
       });
 
       it("stays away for someone with a Hermes profile", async () => {

@@ -9,7 +9,12 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 import { AgentStatusLine } from "./AgentStatusLine";
 import { ConnectAgentCard } from "./ConnectAgentCard";
 import { FirstProjectActions } from "./FirstProjectActions";
-import { useFirstRun, useFirstRunAgents, useReprobeOnReturn } from "./first-run-agents";
+import {
+  useFirstRun,
+  useFirstRunAgents,
+  useReprobeOnReturn,
+  useShowProjectActions,
+} from "./first-run-agents";
 import { LocalSessionImportEntry } from "./LocalSessionImportEntry";
 import { ProjectPickerHint } from "./ProjectPickerHint";
 
@@ -43,11 +48,12 @@ interface Props {
  * On a new-thread draft the headline is also where the project is
  * chosen; the scope strip under the composer doesn't repeat it.
  *
- * With no project open yet, project tiles sit under the composer: this
+ * With no project open, project tiles sit under the composer: this
  * landing replaces the full-screen Open Project page under lazy workspace
- * creation, so it has to offer the same ways in. On that first run a status
- * line says which agents can run here; when none can, the headline and
- * composer give way to a card that connects one.
+ * creation, so it has to offer the same ways in. On a first run (the
+ * session started with nothing open) a status line also says which agents
+ * can run here; when none can, the headline and composer give way to a card
+ * that connects one.
  */
 export function ChatHomeLanding({
   composer,
@@ -59,6 +65,7 @@ export function ChatHomeLanding({
   workspaceId = null,
 }: Props) {
   const firstRun = useFirstRun();
+  const showProjectActions = useShowProjectActions();
   const checkAgents = !!agents && firstRun && !isRemoteClient();
   const firstRunAgents = useFirstRunAgents(checkAgents);
   const connectAgent = checkAgents && firstRunAgents.needsAgent;
@@ -177,7 +184,7 @@ export function ChatHomeLanding({
               chat-column.ts), so the landing card lines up with the
               mid-conversation composer at every pane width. */}
           {composer}
-          {firstRun && (
+          {showProjectActions && (
             <FirstProjectActions onProjectOpened={onProjectOpened} />
           )}
           <Slot area={LANDING_BELOW_COMPOSER_AREA} props={{ workspaceId }} variant="block" />
