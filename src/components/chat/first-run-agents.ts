@@ -90,7 +90,9 @@ function settlePastProjects() {
 
 function checkPastProjects() {
   pastProjectsBusy = true;
-  dbGetRecentProjects(10)
+  // Started inside a promise so a synchronous throw takes the retry path too.
+  Promise.resolve()
+    .then(() => dbGetRecentProjects(10))
     .then((rows) => {
       // Home is a chat location that may be listed, not a project.
       const workspaces = useAppStore.getState().appState?.workspaces ?? [];
