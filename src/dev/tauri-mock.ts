@@ -5001,8 +5001,11 @@ const handlers: Record<string, Handler> = {
   db_delete_setting: () => undefined,
   // A few folders "opened before", so the zero-project landings (try
   // `?fixture=session-import`) and the project picker have recents to show.
+  // `?agents=none|opencode-only` is a fresh machine: no recent projects either.
   db_get_recent_projects: (a) =>
-    MOCK_RECENT_PROJECTS.slice(0, typeof a.limit === "number" ? a.limit : undefined),
+    agentsFixture === "none" || agentsFixture === "opencode-only"
+      ? []
+      : MOCK_RECENT_PROJECTS.slice(0, typeof a.limit === "number" ? a.limit : undefined),
   db_add_recent_project: () => undefined,
   // Opening a project (folder picker or a recent row) adds a main-checkout
   // workspace for that folder and returns its id, like the backend.

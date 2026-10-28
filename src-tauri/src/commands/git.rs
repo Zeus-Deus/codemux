@@ -110,35 +110,50 @@ fn claim_new_project_dir(repo_path: &Path) -> Result<bool, String> {
     }
 }
 
+/// Make the empty `.git` that `git init` then fills in. `create_dir` fails
+/// if anything is already there, so a `.git` another process put in the
+/// folder after it was claimed is refused, and a rollback only ever removes
+/// a `.git` this call made.
+fn claim_git_dir(repo_path: &Path) -> Result<(), String> {
+    std::fs::create_dir(repo_path.join(".git")).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("{} already exists and isn't empty. Pick another name.", repo_path.display())
+        } else {
+            format!("Failed to create the repository: {e}")
+        }
+    })
+}
+
 /// One project creation at a time, so two requests can't claim and init the
 /// same folder together, and a rollback never races another creation.
 static NEW_PROJECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Create `repo_path` (missing or empty) and run `init` in it. When `init`
-/// fails, undo only what this call made so a retry finds the folder as it
-/// was. Without this, a failed initial commit (no git identity, signing
-/// error) leaves a `.git` that makes every retry hit "isn't empty".
+/// Create `repo_path` (missing or empty) and an empty `.git` in it, then run
+/// `init` there. When `init` fails, undo only what this call made so a retry
+/// finds the folder as it was. Without this, a failed initial commit (no git
+/// identity, signing error) leaves a `.git` that makes every retry hit
+/// "isn't empty".
 fn create_new_project(
     repo_path: &Path,
     init: impl FnOnce(&Path) -> Result<String, String>,
 ) -> Result<(), String> {
     let _guard = NEW_PROJECT_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let created_dir = claim_new_project_dir(repo_path)?;
-    // The folder was empty a moment ago, so a `.git` here now was put there
-    // by someone else and is theirs to keep.
-    let git_dir = repo_path.join(".git");
-    let owns_git_dir = std::fs::symlink_metadata(&git_dir).is_err();
+    if let Err(err) = claim_git_dir(repo_path) {
+        roll_back_new_project(repo_path, created_dir, false);
+        return Err(err);
+    }
     if let Err(err) = init(repo_path) {
-        roll_back_new_project(repo_path, created_dir, owns_git_dir);
+        roll_back_new_project(repo_path, created_dir, true);
         return Err(err);
     }
     Ok(())
 }
 
-/// Remove what a failed `create_new_project` made: the `.git` that `git
-/// init` wrote, then the folder itself if this call created it and it is
-/// empty again. The folder is never removed recursively: anything else in
-/// it was put there by someone else.
+/// Remove what a failed `create_new_project` made: the `.git` it claimed
+/// and `git init` filled in, then the folder itself if this call created it
+/// and it is empty again. The folder is never removed recursively: anything
+/// else in it was put there by someone else.
 fn roll_back_new_project(repo_path: &Path, created_dir: bool, owns_git_dir: bool) {
     if owns_git_dir {
         let git_dir = repo_path.join(".git");
@@ -1048,8 +1063,8 @@ mod clone_progress_tests {
 #[cfg(test)]
 mod project_location_tests {
     use super::{
-        create_new_project, ensure_new_project_dir, new_project_path, require_absolute_location,
-        roll_back_new_project,
+        claim_git_dir, claim_new_project_dir, create_new_project, ensure_new_project_dir,
+        new_project_path, require_absolute_location,
     };
     use std::path::Path;
 
@@ -1106,11 +1121,38 @@ mod project_location_tests {
         assert!(!repo.exists());
         assert!(dir.path().join("Projects").is_dir(), "a missing parent is created and kept");
         create_new_project(&repo, |p| {
-            std::fs::create_dir(p.join(".git")).unwrap();
+            assert!(p.join(".git").is_dir(), "init runs in the claimed `.git`");
             Ok(String::new())
         })
         .unwrap();
         assert!(repo.join(".git").is_dir());
+    }
+
+    #[test]
+    fn git_init_fills_in_the_claimed_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("app");
+        create_new_project(&repo, crate::git::git_init_no_commit).unwrap();
+        assert!(repo.join(".git").join("HEAD").is_file());
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "--absolute-git-dir"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            Path::new(String::from_utf8_lossy(&out.stdout).trim()).canonicalize().unwrap(),
+            repo.join(".git").canonicalize().unwrap()
+        );
+
+        // A real init followed by a failure is undone completely.
+        let failed = dir.path().join("failed");
+        assert!(create_new_project(&failed, |p| {
+            crate::git::git_init_no_commit(p)?;
+            Err("Author identity unknown".into())
+        })
+        .is_err());
+        assert!(!failed.exists());
     }
 
     #[test]
@@ -1127,14 +1169,32 @@ mod project_location_tests {
     }
 
     #[test]
-    fn failed_init_never_removes_a_git_dir_it_did_not_make() {
+    fn a_git_dir_someone_else_made_is_refused_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git").join("HEAD"), "theirs").unwrap();
+        let ran = std::cell::Cell::new(false);
+        assert!(create_new_project(&repo, |_| {
+            ran.set(true);
+            Err("Author identity unknown".into())
+        })
+        .is_err());
+        assert!(!ran.get());
+        assert_eq!(std::fs::read_to_string(repo.join(".git").join("HEAD")).unwrap(), "theirs");
+    }
+
+    #[test]
+    fn a_git_dir_that_appears_after_the_folder_is_claimed_is_never_rolled_back() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("app");
         std::fs::create_dir(&repo).unwrap();
-        // Init fails before writing anything, after another process made `.git`.
+        // Another process makes `.git` between the empty-folder check and
+        // the `.git` claim.
+        claim_new_project_dir(&repo).unwrap();
         std::fs::create_dir(repo.join(".git")).unwrap();
         std::fs::write(repo.join(".git").join("HEAD"), "theirs").unwrap();
-        roll_back_new_project(&repo, false, false);
+        assert!(claim_git_dir(&repo).unwrap_err().contains("isn't empty"));
         assert_eq!(std::fs::read_to_string(repo.join(".git").join("HEAD")).unwrap(), "theirs");
     }
 

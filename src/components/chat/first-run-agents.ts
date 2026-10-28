@@ -3,6 +3,8 @@ import { create } from "zustand";
 import { AUTOMATIC_PROVIDER_ORDER } from "@/lib/agent-chat/new-chat-defaults";
 import { useDisabledProviders } from "@/lib/agent-chat/provider-enablement";
 import { useAppStore } from "@/stores/app-store";
+import { useUIStore } from "@/stores/ui-store";
+import { dbGetRecentProjects } from "@/tauri/commands";
 import { useCustomAcp } from "@/stores/custom-acp-store";
 import { useHermes } from "@/stores/hermes-store";
 import {
@@ -36,57 +38,99 @@ const RELIST_MIN_MS = 30_000;
 
 type ExtraList = "hermes" | "acp";
 
+interface ListFailure {
+  at: number;
+  /** The listing failed because the agent isn't set up on this machine
+   *  (Hermes answers `setup_required:` when its executable or root is
+   *  missing), which is a conclusive "nothing to run here". */
+  absent: boolean;
+}
+
 interface FirstRunSession {
-  /** Whether the first app state this session saw had no workspaces; null
-   *  until one arrives. */
-  startedEmpty: boolean | null;
-  /** When a Hermes profile or custom agent listing last failed. A listing
-   *  that succeeded is kept by its own store. */
-  listFailedAt: Partial<Record<ExtraList, number>>;
+  /** Whether the check for projects opened before this device kept a
+   *  first-run flag has answered; first-run onboarding waits for it. */
+  pastProjectsChecked: boolean;
+  /** When a Hermes profile or custom agent listing last failed, and why.
+   *  A listing that succeeded is kept by its own store. */
+  listFailed: Partial<Record<ExtraList, ListFailure>>;
   /** "Continue anyway" on the Connect an agent card, for this session. */
   connectDismissed: boolean;
 }
 
 /** First-run facts that hold for the whole window session. */
 export const useFirstRunSession = create<FirstRunSession>(() => ({
-  startedEmpty: null,
-  listFailedAt: {},
+  pastProjectsChecked: false,
+  listFailed: {},
   connectDismissed: false,
 }));
 
-function noteFirstSnapshot(appState: AppStateSnapshot | null) {
-  if (!appState || useFirstRunSession.getState().startedEmpty !== null) return;
-  useFirstRunSession.setState({ startedEmpty: (appState.workspaces ?? []).length === 0 });
+/** Commands reject with the backend's error string; its code prefix says
+ *  why. */
+function isSetupRequired(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith("setup_required:");
 }
-noteFirstSnapshot(useAppStore.getState().appState);
-useAppStore.subscribe((s) => noteFirstSnapshot(s.appState));
+
+const isHome = (w: { workspace_type?: string }) => w.workspace_type === "home";
+
+let pastProjectsCheck: Promise<void> | null = null;
 
 /**
- * Whether this is a first run: the session started with nothing open and
- * nothing but Home has been opened since. Signing an agent in or installing
- * one opens a terminal in the Home workspace, so a lone Home workspace still
- * counts. A session that started with any workspace is past its first run,
- * even after the user closes them all. First-run onboarding (the agent
- * status line and the Connect an agent card) shows only then.
+ * Keep `firstRunDone` current. Any project workspace ends the first run.
+ * Before the flag existed nothing recorded it, so while it is still unset
+ * one look at recent projects tells a returning user from a new one.
  */
-export function useFirstRun(): boolean {
-  const startedEmpty = useFirstRunSession((s) => s.startedEmpty);
-  return useAppStore(
-    (s) =>
-      !!s.appState &&
-      startedEmpty === true &&
-      (s.appState.workspaces ?? []).every((w) => w.workspace_type === "home"),
-  );
+function trackFirstRun(appState: AppStateSnapshot | null) {
+  if (!appState || useUIStore.getState().firstRunDone) return;
+  const workspaces = appState.workspaces ?? [];
+  if (workspaces.some((w) => !isHome(w))) {
+    useUIStore.setState({ firstRunDone: true });
+    return;
+  }
+  if (pastProjectsCheck || useFirstRunSession.getState().pastProjectsChecked) return;
+  pastProjectsCheck = dbGetRecentProjects(10)
+    .then((rows) => {
+      // Home is a chat location that may be listed, not a project.
+      const homePaths = new Set(
+        [useAppStore.getState().homeDir, ...workspaces.map((w) => w.cwd)].filter(Boolean),
+      );
+      if ((rows ?? []).some((row) => !homePaths.has(row.path))) {
+        useUIStore.setState({ firstRunDone: true });
+      }
+    })
+    // Unknown history: offer onboarding, which only helps.
+    .catch(() => {})
+    .finally(() => {
+      pastProjectsCheck = null;
+      useFirstRunSession.setState({ pastProjectsChecked: true });
+    });
+}
+trackFirstRun(useAppStore.getState().appState);
+useAppStore.subscribe((s) => trackFirstRun(s.appState));
+
+/** Whether no project workspace is open: nothing at all, or only Home. */
+function useOnlyHomeOpen(): boolean {
+  return useAppStore((s) => !!s.appState && (s.appState.workspaces ?? []).every(isHome));
 }
 
-/** Whether the landing offers the ways to get a project: on a first run,
- *  and whenever no workspace is open at all. */
+/**
+ * Whether this is a first run: no project has ever been open on this
+ * device. Signing an agent in or installing one opens a terminal in the
+ * Home workspace, so a lone Home workspace still counts, including after a
+ * restart mid-setup. First-run onboarding (the agent status line and the
+ * Connect an agent card) shows only then.
+ */
+export function useFirstRun(): boolean {
+  const onlyHome = useOnlyHomeOpen();
+  const done = useUIStore((s) => s.firstRunDone);
+  const checked = useFirstRunSession((s) => s.pastProjectsChecked);
+  return onlyHome && !done && checked;
+}
+
+/** Whether the landing offers the ways to get a project: whenever no
+ *  project workspace is open, on a first run or after closing them all. */
 export function useShowProjectActions(): boolean {
-  const firstRun = useFirstRun();
-  const noWorkspaces = useAppStore(
-    (s) => !!s.appState && (s.appState.workspaces ?? []).length === 0,
-  );
-  return firstRun || noWorkspaces;
+  return useOnlyHomeOpen();
 }
 
 export interface FirstRunAgents {
@@ -128,26 +172,38 @@ export function useFirstRunAgents(active: boolean): FirstRunAgents {
 
   // Hermes and custom ACP agents aren't probed, but someone who set one up
   // can run chats, so their lists keep the connect card away. A list is
-  // known once its store holds one; until then, including after a failed
-  // listing, the card stays away rather than hide a composer that may work.
+  // known once its store holds one, or once Hermes reports it isn't set up
+  // here (the usual answer on a fresh machine, where it is enabled but not
+  // installed). Any other failed listing leaves it unknown, and the card
+  // stays away rather than hide a composer that may work.
   const hermesOn = !disabled.has("hermes");
   const acpOn = !disabled.has("acp");
   useEffect(() => {
     if (!active) return;
     const list = (kind: ExtraList, load: () => Promise<unknown>) => {
-      const failedAt = useFirstRunSession.getState().listFailedAt[kind];
-      if (failedAt !== undefined && Date.now() - failedAt < RELIST_MIN_MS) return;
-      load().catch(() =>
-        useFirstRunSession.setState((s) => ({
-          listFailedAt: { ...s.listFailedAt, [kind]: Date.now() },
-        })),
+      const failed = useFirstRunSession.getState().listFailed[kind];
+      if (failed && Date.now() - failed.at < RELIST_MIN_MS) return;
+      load().then(
+        () =>
+          useFirstRunSession.setState((s) => {
+            const { [kind]: _cleared, ...listFailed } = s.listFailed;
+            return { listFailed };
+          }),
+        (error: unknown) =>
+          useFirstRunSession.setState((s) => ({
+            listFailed: {
+              ...s.listFailed,
+              [kind]: { at: Date.now(), absent: isSetupRequired(error) },
+            },
+          })),
       );
     };
     if (hermesOn && !useHermes.getState().profiles) list("hermes", () => useHermes.getState().loadProfiles());
     if (acpOn && !useCustomAcp.getState().agents) list("acp", () => useCustomAcp.getState().loadAgents());
   }, [active, hermesOn, acpOn]);
   const connectDismissed = useFirstRunSession((s) => s.connectDismissed);
-  const hermesKnown = useHermes((s) => !hermesOn || s.profiles !== null);
+  const hermesAbsent = useFirstRunSession((s) => !!s.listFailed.hermes?.absent);
+  const hermesKnown = useHermes((s) => !hermesOn || s.profiles !== null) || hermesAbsent;
   const acpKnown = useCustomAcp((s) => !acpOn || s.agents !== null);
   const extrasListed = hermesKnown && acpKnown;
   const hasHermesProfile = useHermes((s) => hermesOn && (s.profiles?.length ?? 0) > 0);

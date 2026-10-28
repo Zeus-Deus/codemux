@@ -225,6 +225,10 @@ interface UIStore {
   projectsLocation: string | null;
   onboardingProjectDir: string | null;
   hasSeenOnboarding: boolean;
+  /** Whether this device is past its first run: a project has been open
+   *  here. Ends the agent status line and the Connect an agent card for
+   *  good, across restarts and closing every workspace. Persisted. */
+  firstRunDone: boolean;
   /** Callback ref set by AppShell after SidebarProvider mounts */
   sidebarToggleFn: (() => void) | null;
   /** One-shot request to expand a specific project group by path. Set by the
@@ -422,6 +426,7 @@ export const useUIStore = create<UIStore>()(
       projectsLocation: null,
       onboardingProjectDir: null,
       hasSeenOnboarding: false,
+      firstRunDone: false,
       sidebarToggleFn: null,
       expandProjectRequest: null,
       subagentEnterRequest: null,
@@ -871,6 +876,7 @@ export const useUIStore = create<UIStore>()(
         lastSelectedAgentId: state.lastSelectedAgentId,
         lastModelSelections: state.lastModelSelections,
         hasSeenOnboarding: state.hasSeenOnboarding,
+        firstRunDone: state.firstRunDone,
         projectsLocation: state.projectsLocation,
         dismissedSubagentAttention: state.dismissedSubagentAttention,
         workspaceDetailsOpen: state.workspaceDetailsOpen,

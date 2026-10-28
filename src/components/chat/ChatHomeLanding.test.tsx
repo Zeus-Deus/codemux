@@ -49,6 +49,8 @@ import { useHermes, type HermesProfile } from "@/stores/hermes-store";
 import { useProjectPickerHintStore } from "@/stores/project-picker-hint-store";
 import { emptyHealthSlot, HEALTH_REPROBE_MS, useProviderHealth } from "@/stores/provider-health-store";
 import type { AgentChatProviderKind, ProviderHealthReport, AppStateSnapshot } from "@/tauri/types";
+/** What `hermes_profiles` rejects with when Hermes isn't installed. */
+const HERMES_NOT_INSTALLED = "setup_required: install official Hermes with ACP dependencies";
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
@@ -62,11 +64,14 @@ beforeEach(() => {
       opencode: emptyHealthSlot(),
     },
   });
-  // A fresh window session: the next app state is its first snapshot.
-  useFirstRunSession.setState({ startedEmpty: null, listFailedAt: {}, connectDismissed: false });
-  // A machine with no Hermes profiles and no custom agents.
+  // A fresh window session on a device that has never had a project open.
+  useFirstRunSession.setState({ pastProjectsChecked: true, listFailed: {}, connectDismissed: false });
+  useUIStore.setState({ firstRunDone: false });
+  // A fresh machine: Hermes is enabled but not installed, so listing its
+  // profiles fails the way the backend does, and no custom agent is set up.
   invokeMock.mockReset().mockImplementation(async (cmd: string) => {
-    if (cmd === "hermes_profiles" || cmd === "acp_agents") return [];
+    if (cmd === "hermes_profiles") throw HERMES_NOT_INSTALLED;
+    if (cmd === "acp_agents") return [];
     throw new Error(`unmocked command ${cmd}`);
   });
   useHermes.setState({ profiles: null });
@@ -353,31 +358,16 @@ describe("ChatHomeLanding", () => {
       expect(list).not.toHaveTextContent("/home/me");
     });
 
-    it("treats a lone Home workspace as a first run only when the session started empty", () => {
-      useAppStore.setState({
-        appState: { workspaces: [{ workspace_type: "home" }] } as unknown as AppStateSnapshot,
-      });
+    it("offers the project actions with nothing open or only Home open", () => {
       const view = render(<ChatHomeLanding composer={<div />} />);
       expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
       view.unmount();
 
-      // A returning user: the session opened on a project, which they then
-      // closed, leaving Home.
-      useFirstRunSession.setState({ startedEmpty: null });
-      useAppStore.setState({
-        appState: { workspaces: [{ workspace_type: "project" }] } as unknown as AppStateSnapshot,
-      });
+      // A returning user who closed every project, leaving Home.
+      useUIStore.setState({ firstRunDone: true });
       useAppStore.setState({
         appState: { workspaces: [{ workspace_type: "home" }] } as unknown as AppStateSnapshot,
       });
-      render(<ChatHomeLanding composer={<div />} />);
-      expect(screen.queryByRole("button", { name: /Open folder/ })).toBeNull();
-    });
-
-    it("still offers the project actions whenever no workspace is open", () => {
-      useFirstRunSession.setState({ startedEmpty: null });
-      useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
-      useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
       render(<ChatHomeLanding composer={<div />} />);
       expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
     });
@@ -387,9 +377,9 @@ describe("ChatHomeLanding", () => {
       mockProbe.mockImplementation(async (provider: AgentChatProviderKind) => ({
         provider, status: "error", installed: false, message: "Not on PATH.", version: null,
       }));
-      useFirstRunSession.setState({ startedEmpty: null });
       useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
       useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
+      expect(useUIStore.getState().firstRunDone).toBe(true);
       render(<ChatHomeLanding composer={<div data-testid="composer" />} agents={{ selected: "claude" }} />);
       await act(async () => {
         await new Promise((r) => setTimeout(r, 0));
@@ -401,6 +391,70 @@ describe("ChatHomeLanding", () => {
       expect(mockProbe).not.toHaveBeenCalled();
       expect(invokeMock).not.toHaveBeenCalledWith("hermes_profiles");
       expect(invokeMock).not.toHaveBeenCalledWith("acp_agents");
+    });
+
+    describe("on an app start before the first-run flag is known", () => {
+      async function start(workspaces: unknown[]) {
+        useFirstRunSession.setState({ pastProjectsChecked: false });
+        useAppStore.setState({ appState: null });
+        useAppStore.setState({ appState: { workspaces } as unknown as AppStateSnapshot });
+        render(<ChatHomeLanding composer={<div />} agents={{ selected: "claude" }} />);
+        await act(async () => {
+          await new Promise((r) => setTimeout(r, 0));
+        });
+      }
+      beforeEach(() => {
+        mockProbe.mockImplementation(async (provider: AgentChatProviderKind) => ({
+          provider, status: "ready", installed: true, message: null, version: null,
+        }));
+      });
+
+      it("keeps onboarding after a restart mid-setup left only Home open", async () => {
+        await start([{ workspace_type: "home", cwd: "/home/me" }]);
+        expect(useUIStore.getState().firstRunDone).toBe(false);
+        expect(screen.getByTestId("agent-status-line")).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
+      });
+
+      it("ignores Home in recent projects", async () => {
+        useAppStore.setState({ homeDir: "/home/me" });
+        recentProjectsMock.mockResolvedValue([
+          { path: "/home/me", name: "me", last_opened_at: "2026-10-01T10:00:00Z" },
+        ]);
+        await start([{ workspace_type: "home", cwd: "/home/me" }]);
+        expect(useUIStore.getState().firstRunDone).toBe(false);
+        expect(screen.getByTestId("agent-status-line")).toBeInTheDocument();
+      });
+
+      it("treats someone with recent projects as returning", async () => {
+        recentProjectsMock.mockResolvedValue([
+          { path: "/w/parser", name: "parser", last_opened_at: "2026-10-01T10:00:00Z" },
+        ]);
+        await start([]);
+        expect(useUIStore.getState().firstRunDone).toBe(true);
+        expect(screen.queryByTestId("agent-status-line")).toBeNull();
+        expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
+      });
+
+      it("shows no onboarding until recent projects answer", async () => {
+        recentProjectsMock.mockReturnValue(new Promise(() => {}));
+        await start([]);
+        expect(screen.queryByTestId("agent-status-line")).toBeNull();
+        expect(mockProbe).not.toHaveBeenCalled();
+      });
+    });
+
+    it("ends the first run for good once a project opens", () => {
+      useAppStore.setState({
+        appState: { workspaces: [{ workspace_type: "home" }] } as unknown as AppStateSnapshot,
+      });
+      expect(useUIStore.getState().firstRunDone).toBe(false);
+      useAppStore.setState({
+        appState: {
+          workspaces: [{ workspace_type: "home" }, { workspace_type: "project" }],
+        } as unknown as AppStateSnapshot,
+      });
+      expect(useUIStore.getState().firstRunDone).toBe(true);
     });
 
     it("hides the project actions once a workspace exists", () => {
