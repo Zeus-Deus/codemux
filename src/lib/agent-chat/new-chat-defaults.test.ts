@@ -17,7 +17,7 @@ import type {
 } from "@/tauri/types";
 import { defaultModelId } from "./capability-defaults";
 import {
-  firstReadyProvider,
+  firstUsableProvider,
   isAutomaticNewChatProvider,
   resolveNewChatModelDefaults,
 } from "./new-chat-defaults";
@@ -66,16 +66,19 @@ function resetHealth() {
 }
 
 /** Cache a probe answer for each provider: "ready", "signed-out",
- *  "missing", or "failed" (the probe itself failed at the IPC layer). */
+ *  "unverified" (installed, sign-in can't be checked), "missing", or
+ *  "failed" (the probe itself failed at the IPC layer). */
 function probed(
-  answers: Partial<Record<AgentChatProviderKind, "ready" | "signed-out" | "missing" | "failed">>,
+  answers: Partial<
+    Record<AgentChatProviderKind, "ready" | "signed-out" | "unverified" | "missing" | "failed">
+  >,
 ) {
   useProviderHealth.setState((state) => {
     const slots = { ...state.slots };
     for (const [provider, answer] of Object.entries(answers) as [AgentChatProviderKind, string][]) {
       const report: ProviderHealthReport = {
         provider,
-        status: answer === "ready" ? "ready" : "error",
+        status: answer === "ready" ? "ready" : answer === "unverified" ? "warning" : "error",
         installed: answer !== "missing",
         message: null,
         version: null,
@@ -201,7 +204,7 @@ describe("resolveNewChatModelDefaults", () => {
 
     it("starts on the first ready agent in order", () => {
       probed({ claude: "missing", codex: "signed-out", opencode: "ready", grok: "ready" });
-      expect(firstReadyProvider()).toBe("opencode");
+      expect(firstUsableProvider()).toBe("opencode");
       expect(resolveNewChatModelDefaults()).toEqual({
         provider: "opencode",
         model: defaultModelId("opencode"),
@@ -214,15 +217,24 @@ describe("resolveNewChatModelDefaults", () => {
     });
 
     it("keeps Claude when nothing is known or ready", () => {
-      expect(firstReadyProvider()).toBeNull();
+      expect(firstUsableProvider()).toBeNull();
       expect(resolveNewChatModelDefaults().provider).toBe("claude");
       probed({ claude: "signed-out", codex: "missing", opencode: "missing" });
       expect(resolveNewChatModelDefaults().provider).toBe("claude");
     });
 
+    it("prefers a ready agent to one it can't verify, but uses that over nothing", () => {
+      probed({ claude: "unverified", codex: "signed-out", opencode: "ready" });
+      expect(firstUsableProvider()).toBe("opencode");
+      probed({ opencode: "missing" });
+      expect(firstUsableProvider()).toBe("claude");
+      probed({ claude: "missing", cursor: "unverified" });
+      expect(resolveNewChatModelDefaults().provider).toBe("cursor");
+    });
+
     it("does not trust a cached answer whose last probe failed", () => {
       probed({ claude: "missing", codex: "failed", cursor: "ready" });
-      expect(firstReadyProvider()).toBe("cursor");
+      expect(firstUsableProvider()).toBe("cursor");
     });
 
     it("skips agents turned off in Settings → Providers", () => {

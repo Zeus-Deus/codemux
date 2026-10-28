@@ -6,7 +6,7 @@ import { useChatGptStore } from "@/stores/chatgpt-store";
 import { providerReadiness } from "@/stores/provider-health-store";
 import { useUIStore } from "@/stores/ui-store";
 import type { AgentChatProviderKind, ProviderHealthReport } from "@/tauri/types";
-import { AGENT_NAME, type FirstRunAgents } from "./first-run-agents";
+import { AGENT_NAME, dismissConnectAgent, type FirstRunAgents } from "./first-run-agents";
 import { ProviderLogo } from "./provider-logo";
 
 /** The agents a fresh machine is offered, each with a one-click way in.
@@ -19,7 +19,8 @@ const openProvidersSettings = () => useUIStore.getState().setShowSettings(true, 
  * First-run landing when no agent on this machine can run yet: one row per
  * agent with the step that fixes it (sign in, or install), plus the way to
  * the rest of them. The landing re-checks as the user comes back, and
- * switches to the normal composer as soon as one agent is ready.
+ * switches to the normal composer as soon as one agent can run, or when the
+ * user continues anyway.
  */
 export function ConnectAgentCard({ agents }: { agents: FirstRunAgents }) {
   const rows = CARD_PROVIDERS.filter((p) => agents.providers.includes(p));
@@ -64,6 +65,15 @@ export function ConnectAgentCard({ agents }: { agents: FirstRunAgents }) {
           you press Enter.
         </p>
       </div>
+      {/* Detection can be wrong (an agent on a PATH the probe can't see, a
+          sign-in it can't read), so the card is never a dead end. */}
+      <button
+        type="button"
+        onClick={dismissConnectAgent}
+        className="rounded-sm text-body-sm text-muted-foreground underline decoration-muted-foreground/50 underline-offset-4 transition-colors duration-100 hover:text-foreground hover:decoration-foreground"
+      >
+        Continue anyway
+      </button>
     </div>
   );
 }

@@ -32,11 +32,14 @@ vi.mock("@/tauri/commands", async (importOriginal) => ({
 }));
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { useFirstRunSession } from "./first-run-agents";
 
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 import { useChatGptStore } from "@/stores/chatgpt-store";
+import { useCustomAcp } from "@/stores/custom-acp-store";
+import { useHermes, type HermesProfile } from "@/stores/hermes-store";
 import { useProjectPickerHintStore } from "@/stores/project-picker-hint-store";
 import { emptyHealthSlot, HEALTH_REPROBE_MS, useProviderHealth } from "@/stores/provider-health-store";
 import type { AgentChatProviderKind, ProviderHealthReport, AppStateSnapshot } from "@/tauri/types";
@@ -53,6 +56,10 @@ beforeEach(() => {
       opencode: emptyHealthSlot(),
     },
   });
+  // A fresh window session: the next app state is its first snapshot.
+  useFirstRunSession.setState({ startedEmpty: null, extrasListed: false, connectDismissed: false });
+  useHermes.setState({ profiles: null });
+  useCustomAcp.setState({ agents: null });
   useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot, homeDir: null });
   toastErrorMock.mockReset();
   useFeatureFlags.setState({ enableAgentChat: true });
@@ -335,6 +342,35 @@ describe("ChatHomeLanding", () => {
       expect(list).not.toHaveTextContent("/home/me");
     });
 
+    it("treats a lone Home workspace as a first run only when the session started empty", () => {
+      useAppStore.setState({
+        appState: { workspaces: [{ workspace_type: "home" }] } as unknown as AppStateSnapshot,
+      });
+      const view = render(<ChatHomeLanding composer={<div />} />);
+      expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
+      view.unmount();
+
+      // A returning user: the session opened on a project, which they then
+      // closed, leaving Home.
+      useFirstRunSession.setState({ startedEmpty: null });
+      useAppStore.setState({
+        appState: { workspaces: [{ workspace_type: "project" }] } as unknown as AppStateSnapshot,
+      });
+      useAppStore.setState({
+        appState: { workspaces: [{ workspace_type: "home" }] } as unknown as AppStateSnapshot,
+      });
+      render(<ChatHomeLanding composer={<div />} />);
+      expect(screen.queryByRole("button", { name: /Open folder/ })).toBeNull();
+    });
+
+    it("still offers the project actions whenever no workspace is open", () => {
+      useFirstRunSession.setState({ startedEmpty: null });
+      useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
+      useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
+      render(<ChatHomeLanding composer={<div />} />);
+      expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
+    });
+
     it("hides the project actions once a workspace exists", () => {
       useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
       render(<ChatHomeLanding composer={<div />} />);
@@ -355,6 +391,12 @@ describe("ChatHomeLanding", () => {
       login_command: `${provider} login`,
     });
     const MISSING: Answer = { status: "error", installed: false, message: "Not on PATH." };
+    // Installed, but the probe couldn't check the sign-in.
+    const UNVERIFIED: Answer = {
+      status: "warning",
+      installed: true,
+      message: "Couldn't verify sign-in.",
+    };
     let health: Partial<Record<AgentChatProviderKind, Answer>>;
 
     beforeEach(() => {
@@ -465,6 +507,21 @@ describe("ChatHomeLanding", () => {
       );
     });
 
+    it("calls an agent it can't verify installed, and keeps the composer", async () => {
+      health = { claude: UNVERIFIED, codex: MISSING, cursor: MISSING, grok: MISSING, opencode: MISSING };
+      await renderWithAgents();
+      expect(screen.queryByTestId("connect-agent")).toBeNull();
+      expect(screen.getByTestId("composer")).toBeInTheDocument();
+      expect(screen.getByTestId("agent-status-line")).toHaveTextContent("Claude Code is installed");
+      expect(screen.getByTestId("agent-status-line")).not.toHaveTextContent("ready");
+    });
+
+    it("names only ready agents when some are ready and others unverified", async () => {
+      health = { claude: UNVERIFIED, codex: READY, cursor: MISSING, grok: MISSING, opencode: MISSING };
+      await renderWithAgents();
+      expect(screen.getByTestId("agent-status-line")).toHaveTextContent("Codex is ready·Set up");
+    });
+
     describe("when no agent can run", () => {
       beforeEach(() => {
         health = {
@@ -539,6 +596,37 @@ describe("ChatHomeLanding", () => {
         health = { ...health, opencode: READY };
         await renderWithAgents();
         expect(mockProbe).toHaveBeenCalledTimes(10);
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+      });
+
+      it("can be continued past for the session when detection is wrong", async () => {
+        const first = await renderWithAgents();
+        fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+        expect(screen.getByTestId("composer")).toBeInTheDocument();
+        first.unmount();
+        await renderWithAgents();
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+      });
+
+      it("stays away for someone with a Hermes profile", async () => {
+        useHermes.setState({ profiles: [{ id: "work" } as HermesProfile] });
+        await renderWithAgents();
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+        expect(screen.getByTestId("composer")).toBeInTheDocument();
+      });
+
+      it("stays away for someone with an enabled custom agent, not a disabled one", async () => {
+        const agent = {
+          id: "a", name: "Mine", executable: "mine", args: [], environment: {},
+          enabled: false, auth_method: null, revision: "1",
+        };
+        useCustomAcp.setState({ agents: [agent] });
+        const view = await renderWithAgents();
+        expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+        view.unmount();
+        useCustomAcp.setState({ agents: [{ ...agent, enabled: true }] });
+        await renderWithAgents();
         expect(screen.queryByTestId("connect-agent")).toBeNull();
       });
 

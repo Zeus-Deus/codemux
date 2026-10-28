@@ -1,3 +1,4 @@
+import { cn } from "@/lib/utils";
 import { providerReadiness } from "@/stores/provider-health-store";
 import { useUIStore } from "@/stores/ui-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
@@ -20,17 +21,22 @@ export function AgentStatusLine({
   agents: FirstRunAgents;
   selected: AgentChatProviderKind;
 }) {
-  const { providers, reports, known, ready } = agents;
+  const { providers, reports, known, ready, unverified } = agents;
   const openSettings = () => useUIStore.getState().setShowSettings(true, "providers");
 
-  let readyText: string | null = null;
-  if (ready.length > 0) {
-    const lead = ready.includes(selected) ? selected : ready[0];
-    readyText =
-      ready.length === 1 ? `${AGENT_NAME[lead]} is ready`
-        : ready.length === 2
-          ? `${AGENT_NAME[lead]} and ${AGENT_NAME[ready.find((p) => p !== lead)!]} are ready`
-          : `${AGENT_NAME[lead]} and ${ready.length - 1} more are ready`;
+  // Lead with the agents known to run. Agents whose sign-in the probe can't
+  // check are only called installed, and only when nothing is known ready.
+  const anyReady = ready.length > 0;
+  const named = anyReady ? ready : unverified;
+  let leadText: string | null = null;
+  if (named.length > 0) {
+    const verb = anyReady ? "ready" : "installed";
+    const lead = named.includes(selected) ? selected : named[0];
+    leadText =
+      named.length === 1 ? `${AGENT_NAME[lead]} is ${verb}`
+        : named.length === 2
+          ? `${AGENT_NAME[lead]} and ${AGENT_NAME[named.find((p) => p !== lead)!]} are ${verb}`
+          : `${AGENT_NAME[lead]} and ${named.length - 1} more are ${verb}`;
   }
   // Installed but unable to run: usually signed out. A missing agent is
   // not called out; most people never meant to install every one.
@@ -53,13 +59,19 @@ export function AgentStatusLine({
       data-testid="agent-status-line"
       className="flex min-h-7 w-full items-center justify-center px-4"
     >
-      {known && readyText && (
+      {known && leadText && (
         <p
           role="status"
           className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-body-sm text-muted-foreground motion-safe:animate-in motion-safe:fade-in motion-safe:duration-150"
         >
-          <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-success" />
-          <span className="text-foreground/80">{readyText}</span>
+          <span
+            aria-hidden
+            className={cn(
+              "size-1.5 shrink-0 rounded-full",
+              anyReady ? "bg-success" : "bg-muted-foreground/60",
+            )}
+          />
+          <span className="text-foreground/80">{leadText}</span>
           {setupText && (
             <>
               {SEPARATOR}

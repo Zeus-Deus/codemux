@@ -440,7 +440,7 @@ function DraftChatSurfaceInner({
   const firstRun = useFirstRun();
   const firstRunAgents = useFirstRunAgents(false);
   const connectAgentShown = !pending && threadHostId === null && firstRun &&
-    !isRemoteClient() && firstRunAgents.noneReady;
+    !isRemoteClient() && firstRunAgents.needsAgent;
   // Once this surface has accepted a first send, every composer replacement
   // in the handoff (centered -> docked, or docked -> retry after failure)
   // should reclaim the caret. This state dies with the draft surface, so it

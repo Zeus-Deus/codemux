@@ -61,7 +61,7 @@ export function ChatHomeLanding({
   const firstRun = useFirstRun();
   const checkAgents = !!agents && firstRun && !isRemoteClient();
   const firstRunAgents = useFirstRunAgents(checkAgents);
-  const connectAgent = checkAgents && firstRunAgents.noneReady;
+  const connectAgent = checkAgents && firstRunAgents.needsAgent;
   useReprobeOnReturn(firstRunAgents.providers, connectAgent);
   // "or start without a project" unmounts once clicked, and the "No
   // project" picker takes its slot; focus follows so keyboard users

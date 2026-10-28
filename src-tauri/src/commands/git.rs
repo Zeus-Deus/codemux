@@ -1,5 +1,5 @@
 use crate::git::{BaseBranchDiff, CommitFileEntry, ConflictCheckResult, GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, MergeIntoBaseResult, MergeState, ResolverBranchInfo, WorktreeInfo};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // Every command here shells out via `crate::git::*` → `Command::new("git")`.
 // They MUST run on Tokio's blocking pool: a sync `#[tauri::command]` runs on
@@ -51,12 +51,26 @@ fn require_absolute_location(path: &str) -> Result<(), String> {
     }
 }
 
-/// A new project's name becomes exactly one folder under its location.
-fn validate_project_name(name: &str) -> Result<(), String> {
-    if name.trim().is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
-        return Err(format!("\"{name}\" isn't a valid folder name"));
+/// A new project's name becomes exactly one folder directly under
+/// `location`. Returns that folder. `Path::join` with anything but a plain
+/// name (`..`, `/abs`, or a Windows prefix like `D:app`) would leave the
+/// location, so the joined result is checked as well as the name.
+fn new_project_path(location: &Path, name: &str) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let invalid = || format!("\"{name}\" isn't a valid folder name");
+    if name.trim().is_empty() || name.contains(['/', '\\']) {
+        return Err(invalid());
     }
-    Ok(())
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => {}
+        _ => return Err(invalid()),
+    }
+    let repo_path = location.join(name);
+    if !repo_path.is_absolute() || repo_path.parent() != Some(location) {
+        return Err(invalid());
+    }
+    Ok(repo_path)
 }
 
 /// The new-project flow commits everything in the folder, so it may only
@@ -75,6 +89,31 @@ fn ensure_new_project_dir(repo_path: &Path) -> Result<(), String> {
     }
 }
 
+/// Create `repo_path` (missing or empty) and run `init` in it. When `init`
+/// fails, undo what this call made so a retry finds the folder as it was:
+/// the folder itself if it was missing, else the `.git` that `git init`
+/// left behind (the folder was empty, so nothing else in it is the user's).
+/// Without this, a failed initial commit (no git identity, signing error)
+/// leaves a `.git` that makes every retry hit "isn't empty".
+fn create_new_project(
+    repo_path: &Path,
+    init: impl FnOnce(&Path) -> Result<String, String>,
+) -> Result<(), String> {
+    ensure_new_project_dir(repo_path)?;
+    let existed = repo_path.exists();
+    std::fs::create_dir_all(repo_path).map_err(|e| format!("Failed to create directory: {e}"))?;
+    if let Err(err) = init(repo_path) {
+        let leftover = if existed { repo_path.join(".git") } else { repo_path.to_path_buf() };
+        if let Err(e) = std::fs::remove_dir_all(&leftover) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("create_empty_repo: couldn't clean up {}: {e}", leftover.display());
+            }
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn create_empty_repo(parent_dir: String, name: String) -> Result<String, String> {
     // A literal `~` is never expanded by the filesystem, so without this
@@ -83,13 +122,9 @@ pub async fn create_empty_repo(parent_dir: String, name: String) -> Result<Strin
     // no terminal can `chdir` into.
     let parent_dir = crate::project::expand_tilde(&parent_dir);
     require_absolute_location(&parent_dir)?;
-    validate_project_name(&name)?;
+    let repo_path = new_project_path(Path::new(&parent_dir), &name)?;
     tokio::task::spawn_blocking(move || {
-        let repo_path = Path::new(&parent_dir).join(&name);
-        ensure_new_project_dir(&repo_path)?;
-        std::fs::create_dir_all(&repo_path)
-            .map_err(|e| format!("Failed to create directory: {e}"))?;
-        crate::git::git_init_repo(&repo_path)?;
+        create_new_project(&repo_path, crate::git::git_init_repo)?;
         Ok(repo_path.display().to_string())
     })
     .await
@@ -971,21 +1006,35 @@ mod clone_progress_tests {
 
 #[cfg(test)]
 mod project_location_tests {
-    use super::{ensure_new_project_dir, require_absolute_location, validate_project_name};
+    use super::{create_new_project, ensure_new_project_dir, new_project_path, require_absolute_location};
+    use std::path::Path;
 
     #[test]
     fn relative_locations_are_refused() {
-        assert!(require_absolute_location("/home/u/Projects/app").is_ok());
+        let absolute = std::env::temp_dir().join("Projects");
+        assert!(require_absolute_location(absolute.to_str().unwrap()).is_ok());
         assert!(require_absolute_location("app").is_err());
         assert!(require_absolute_location("Projects/app").is_err());
         assert!(require_absolute_location("~/Projects").is_err());
     }
 
     #[test]
-    fn names_are_single_folders() {
-        assert!(validate_project_name("my-app").is_ok());
-        for bad in ["", "  ", ".", "..", "a/b", "a\\b"] {
-            assert!(validate_project_name(bad).is_err(), "{bad:?} should be refused");
+    fn names_are_single_folders_under_the_location() {
+        let location = std::env::temp_dir().join("Projects");
+        assert_eq!(new_project_path(&location, "my-app").unwrap(), location.join("my-app"));
+        for bad in ["", "  ", ".", "..", "a/b", "a\\b", "/abs"] {
+            assert!(new_project_path(&location, bad).is_err(), "{bad:?} should be refused");
+        }
+        // A relative location never yields a project path, whatever the name.
+        assert!(new_project_path(Path::new("Projects"), "app").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_prefixed_names_are_refused() {
+        let location = std::env::temp_dir().join("Projects");
+        for bad in ["D:app", "C:", r"\\server\share"] {
+            assert!(new_project_path(&location, bad).is_err(), "{bad:?} should be refused");
         }
     }
 
@@ -996,5 +1045,53 @@ mod project_location_tests {
         assert!(ensure_new_project_dir(dir.path()).is_ok());
         std::fs::write(dir.path().join("notes.txt"), "keep me").unwrap();
         assert!(ensure_new_project_dir(dir.path()).is_err());
+    }
+
+    /// Stands in for `git init` succeeding and the initial commit failing.
+    fn init_then_fail(path: &Path) -> Result<String, String> {
+        std::fs::create_dir_all(path.join(".git").join("objects")).unwrap();
+        std::fs::write(path.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        Err("Author identity unknown".into())
+    }
+
+    #[test]
+    fn failed_init_removes_the_folder_it_created_so_a_retry_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("app");
+        assert_eq!(create_new_project(&repo, init_then_fail).unwrap_err(), "Author identity unknown");
+        assert!(!repo.exists());
+        create_new_project(&repo, |p| {
+            std::fs::create_dir(p.join(".git")).unwrap();
+            Ok(String::new())
+        })
+        .unwrap();
+        assert!(repo.join(".git").is_dir());
+    }
+
+    #[test]
+    fn failed_init_in_an_existing_empty_folder_removes_only_its_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("app");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(create_new_project(&repo, init_then_fail).is_err());
+        assert!(repo.is_dir(), "the user's folder stays");
+        assert!(std::fs::read_dir(&repo).unwrap().next().is_none());
+        assert!(ensure_new_project_dir(&repo).is_ok(), "a retry may claim it again");
+    }
+
+    #[test]
+    fn unrelated_non_empty_folders_are_never_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("app");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("notes.txt"), "keep me").unwrap();
+        let ran = std::cell::Cell::new(false);
+        assert!(create_new_project(&repo, |_| {
+            ran.set(true);
+            Ok(String::new())
+        })
+        .is_err());
+        assert!(!ran.get());
+        assert_eq!(std::fs::read_to_string(repo.join("notes.txt")).unwrap(), "keep me");
     }
 }

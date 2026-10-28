@@ -8,7 +8,7 @@ import {
 import {
   AUTOMATIC_PROVIDER_ORDER,
   NEW_CHAT_SETTING_KEYS,
-  firstReadyProvider,
+  firstUsableProvider,
   isAutomaticNewChatProvider,
   resolveNewChatModelDefaults,
 } from "@/lib/agent-chat/new-chat-defaults";
@@ -890,10 +890,10 @@ export function reseedAutomaticProviderDrafts(): void {
   // back to an earlier one), so wait for every probe in flight.
   if (AUTOMATIC_PROVIDER_ORDER.some((p) => slots[p].inFlight || slots[p].queuedForce)) return;
   if (!isAutomaticNewChatProvider()) return;
-  // Only move towards an agent known to run. With nothing known (an app
-  // start, before any probe) the automatic pick is the blind fallback, and
-  // moving a draft there would just undo the last move.
-  if (useChatGptStore.getState().status?.phase !== "connected" && !firstReadyProvider()) return;
+  // Only move towards an agent the probes found usable. With nothing known
+  // (an app start, before any probe) the automatic pick is the blind
+  // fallback, and moving a draft there would just undo the last move.
+  if (useChatGptStore.getState().status?.phase !== "connected" && !firstUsableProvider()) return;
   const appState = useAppStore.getState().appState;
   useChatDraftStore.setState((state) => {
     let draftsById: Record<DraftId, ChatDraft> | null = null;

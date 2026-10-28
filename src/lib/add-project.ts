@@ -26,22 +26,27 @@ export function projectNameError(name: string): string | null {
   return null;
 }
 
+/** GitHub `owner/repo`: an owner (letters, digits, hyphens) and a repo name,
+ *  nothing else. Anything with a colon, a leading dot or slash, or more
+ *  segments is a URL, an SSH alias or a path, and belongs to git as typed. */
+const GITHUB_SHORTHAND = /^[A-Za-z0-9][A-Za-z0-9-]*\/[\w-][\w.-]*$/;
+
 /**
- * Turn what the user typed into something `git clone` accepts, or null when
- * it isn't recognisably a repository. `owner/repo` is GitHub shorthand and a
- * scheme-less `host/owner/repo` gets https.
+ * Turn what the user typed into the address handed to `git clone`, or null
+ * when nothing was typed. Only GitHub `owner/repo` shorthand and a
+ * scheme-less `host.tld/owner/repo` are rewritten; every other address
+ * (SSH host aliases, local paths, `file://`, `insteadOf` prefixes) goes to
+ * git unchanged and git says whether it is a repository.
  */
 export function normalizeCloneUrl(input: string): string | null {
   const value = input.trim();
   if (!value) return null;
-  if (/^[\w.-]+\/[\w.-]+$/.test(value)) {
+  if (GITHUB_SHORTHAND.test(value)) {
     return `https://github.com/${value.replace(/\.git$/i, "")}.git`;
   }
-  if (/^(https?|ssh|git|file):\/\/\S+$/i.test(value)) return value;
-  // scp-style ssh: git@github.com:owner/repo.git
-  if (/^[\w.-]+@[\w.-]+:\S+$/.test(value)) return value;
-  if (/^[\w-]+(\.[\w-]+)+\/\S+$/.test(value)) return `https://${value}`;
-  return null;
+  // `github.com/acme/app` would otherwise be read as a relative local path.
+  if (/^[\w-]+(\.[\w-]+)+\/[^\s:]+$/.test(value)) return `https://${value}`;
+  return value;
 }
 
 /** The folder a clone lands in unless renamed: the repository's last path

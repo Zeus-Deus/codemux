@@ -45,10 +45,27 @@ describe("normalizeCloneUrl", () => {
     expect(normalizeCloneUrl("github.com/acme/app")).toBe("https://github.com/acme/app");
   });
 
-  it("rejects things that are not repositories", () => {
+  it("passes every other address to git unchanged", () => {
+    for (const address of [
+      "work-git:team/repo.git",
+      "gh:acme/app",
+      "/srv/git/repo.git",
+      "./repos/app",
+      "../app",
+      "~/src/app.git",
+      "file:///srv/git/repo.git",
+      "git://example.org/repo.git",
+      "C:\\repos\\app",
+      "group/sub/repo",
+    ]) {
+      expect(normalizeCloneUrl(address)).toBe(address);
+    }
+  });
+
+  it("only rejects an empty address", () => {
     expect(normalizeCloneUrl("")).toBeNull();
-    expect(normalizeCloneUrl("hello")).toBeNull();
-    expect(normalizeCloneUrl("a b/c")).toBeNull();
+    expect(normalizeCloneUrl("   ")).toBeNull();
+    expect(normalizeCloneUrl("hello")).toBe("hello");
   });
 });
 
@@ -57,6 +74,12 @@ describe("cloneFolderName", () => {
     expect(cloneFolderName("https://github.com/acme/field-notes.git")).toBe("field-notes");
     expect(cloneFolderName("git@github.com:acme/app.git")).toBe("app");
     expect(cloneFolderName("acme/parser/")).toBe("parser");
+    expect(cloneFolderName("work-git:team/repo.git")).toBe("repo");
+    expect(cloneFolderName("work-git:repo")).toBe("repo");
+    expect(cloneFolderName("/srv/git/repo.git/")).toBe("repo");
+    expect(cloneFolderName("file:///srv/git/notes.git")).toBe("notes");
+    expect(cloneFolderName("git://example.org/tools.git")).toBe("tools");
+    expect(cloneFolderName("C:\\repos\\app")).toBe("app");
     expect(cloneFolderName("")).toBe("");
   });
 });

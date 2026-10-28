@@ -123,14 +123,18 @@ describe("AddProjectSheet", () => {
       expect(useUIStore.getState().addProjectSheet).toBe("clone");
     });
 
-    it("refuses input that isn't a repository", () => {
+    it("hands SSH host aliases to git unchanged", async () => {
       openSheet("clone");
       fireEvent.change(screen.getByLabelText("Repository"), {
-        target: { value: "hello" },
+        target: { value: "work-git:team/repo.git" },
       });
+      expect(destination()).toBe("~/Projects/repo");
       fireEvent.click(screen.getByRole("button", { name: /Clone/ }));
-      expect(screen.getByRole("alert")).toHaveTextContent("Enter a git URL");
-      expect(cloneProjectFlowMock).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(cloneProjectFlowMock).toHaveBeenCalled());
+      expect(cloneProjectFlowMock).toHaveBeenCalledWith(
+        "work-git:team/repo.git",
+        "/home/user/Projects/repo",
+      );
     });
   });
 

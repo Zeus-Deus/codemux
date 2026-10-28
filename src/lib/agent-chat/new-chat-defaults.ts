@@ -32,17 +32,22 @@ export const AUTOMATIC_PROVIDER_ORDER: ReadonlyArray<AgentChatProviderKind> = [
 ];
 
 /** The first provider in `AUTOMATIC_PROVIDER_ORDER` that is switched on and
- *  whose cached health report is ready, or null when none is known to be.
+ *  whose cached health report is ready; failing that, the first installed
+ *  one whose probe couldn't tell (readiness "unverified", e.g. Claude when
+ *  its sign-in can't be checked). Null when none is known to be usable.
  *  Reads the cache only: choosing a default is not reason to probe. */
-export function firstReadyProvider(
+export function firstUsableProvider(
   off: ReadonlySet<AgentChatProviderKind> = disabledProviders(),
 ): AgentChatProviderKind | null {
   const slots = useProviderHealth.getState().slots;
-  return AUTOMATIC_PROVIDER_ORDER.find((provider) => {
+  const readiness = (provider: AgentChatProviderKind) => {
     const slot = slots[provider];
-    return !off.has(provider) && !slot.lastProbeFailed && !!slot.report &&
-      providerReadiness(slot.report) === "ready";
-  }) ?? null;
+    if (off.has(provider) || slot.lastProbeFailed || !slot.report) return null;
+    return providerReadiness(slot.report);
+  };
+  return AUTOMATIC_PROVIDER_ORDER.find((p) => readiness(p) === "ready") ??
+    AUTOMATIC_PROVIDER_ORDER.find((p) => readiness(p) === "unverified") ??
+    null;
 }
 
 export const NEW_CHAT_SETTING_KEYS = {
@@ -64,7 +69,7 @@ export interface NewChatModelDefaults {
  *
  * Unset ("Automatic") uses a connected ChatGPT plan's live Codex catalog,
  * otherwise the first agent this machine's health probes found ready
- * (`firstReadyProvider`), otherwise Claude on its first model. A saved model the provider no longer
+ * (`firstUsableProvider`), otherwise Claude on its first model. A saved model the provider no longer
  * offers falls back to that provider's default model, and a saved effort is only kept while the
  * model still lists it. Before capabilities load, the saved ids are
  * trusted as-is, since they came from a capability list in the first place.
@@ -85,7 +90,7 @@ export function resolveNewChatModelDefaults(): NewChatModelDefaults {
     }
     // Settings keeps at least one of these on (`setProviderEnabled`), so the
     // final fallback is reachable only through a hand-edited setting.
-    const fallback = firstReadyProvider(off) ?? (off.has(AUTOMATIC_NEW_CHAT_PROVIDER)
+    const fallback = firstUsableProvider(off) ?? (off.has(AUTOMATIC_NEW_CHAT_PROVIDER)
       ? NEW_CHAT_DEFAULT_PROVIDERS.find((p) => !off.has(p)) ?? AUTOMATIC_NEW_CHAT_PROVIDER
       : AUTOMATIC_NEW_CHAT_PROVIDER);
     return {
