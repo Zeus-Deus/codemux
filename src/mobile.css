@@ -423,22 +423,12 @@ html[data-mobile] [data-mobile-automations] :is(.grid-cols-2, .grid-cols-3) {
 html[data-mobile] [data-mobile-automations] form {
   min-width: 0;
 }
-html[data-mobile] [data-mobile-new-project] {
-  height: var(--mobile-height, 100dvh);
-  top: var(--mobile-top, 0px);
-  padding-top: env(safe-area-inset-top);
+/* The sheet is pinned near the top on desktop so switching tabs never
+   re-centres it; on a phone that pin sits under the keyboard's reach. */
+html[data-mobile] [data-mobile-add-project] {
+  top: calc(var(--mobile-top, 0px) + 12px);
 }
-html[data-mobile] [data-mobile-new-project] > div.absolute {
-  position: static;
-  padding: 8px 12px;
-}
-html[data-mobile] [data-mobile-new-project] > div:last-child {
-  min-height: 0;
-  overflow-y: auto;
-  align-items: flex-start;
-  padding-block: 16px;
-}
-html[data-mobile] [data-mobile-new-project] .grid-cols-2 {
+html[data-mobile] [data-mobile-add-project] [role="radiogroup"] {
   grid-template-columns: minmax(0, 1fr);
 }
 html[data-mobile] #root > .h-screen {

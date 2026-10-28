@@ -42,11 +42,11 @@ vi.mock("@/stores/app-store", () => ({
 
 // ── UI-store mock — records setOnboardingProjectDir calls ──
 const setOnboardingProjectDirMock = vi.fn();
-const setShowCloneDialogMock = vi.fn();
+const setAddProjectSheetMock = vi.fn();
 vi.mock("@/stores/ui-store", () => ({
   useUIStore: Object.assign(
     vi.fn((selector: (s: unknown) => unknown) =>
-      selector({ setShowCloneDialog: setShowCloneDialogMock }),
+      selector({ setAddProjectSheet: setAddProjectSheetMock }),
     ),
     {
       getState: () => ({
@@ -69,7 +69,7 @@ describe("useProjectActions — onboarding gate", () => {
     enableLazyFlag = false;
     workspaceCount = 0;
     setOnboardingProjectDirMock.mockClear();
-    setShowCloneDialogMock.mockClear();
+    setAddProjectSheetMock.mockClear();
     vi.mocked(pickFolderDialog).mockResolvedValue("/projects/newthing");
     vi.mocked(checkIsGitRepo).mockResolvedValue(true);
     vi.mocked(gitCloneRepo).mockResolvedValue("/projects/cloned");

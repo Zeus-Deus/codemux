@@ -1,6 +1,5 @@
 import { useMobileNavigationStore } from "@/stores/mobile-navigation-store";
 import { MobileWorkspaceActions } from "./mobile-workspace-actions";
-import { CloneDialog } from "@/components/overlays/clone-dialog";
 import { BrowserPeekOverlay } from "@/components/browser/BrowserPeekOverlay";
 import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 import { useEffect, useRef, useState, type ReactNode } from "react";
@@ -176,8 +175,8 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
     <div className="mobile-actions">
       {appAction("All commands", Search, () => ui().setShowCommandPalette(true))}
       {appAction("New workspace", Plus, () => startChat())}
-      {appAction("New project", FolderPlus, () => ui().setShowNewProjectScreen(true))}
-      {appAction("Clone repository", GitFork, () => ui().setShowCloneDialog(true))}
+      {appAction("New project", FolderPlus, () => ui().setAddProjectSheet("new"))}
+      {appAction("Clone repository", GitFork, () => ui().setAddProjectSheet("clone"))}
       {workspace && !draft && !home && (
         <MobileWorkspaceActions
           key={workspace.workspace_id}
@@ -508,7 +507,6 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
           <MobileInstall />
         </DialogContent>
       </Dialog>
-      <CloneDialog />
       <Dialog
         open={!!peek}
         onOpenChange={(open) => {

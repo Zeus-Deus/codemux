@@ -3652,6 +3652,25 @@ if (new URLSearchParams(location.search).get("providerHealth") === "mixed") {
   } satisfies Partial<Record<MockProviderKind, ProviderHealthReport>>);
 }
 
+// `?agents=none`: a fresh machine where no agent can run yet (Claude Code
+// installed but signed out, the rest missing), for the first-run "Connect an
+// agent" card. `?agents=opencode-only` leaves just OpenCode ready, for the
+// status line under the landing. Pair with `?fixture=session-import` for
+// the zero-project landing.
+const agentsFixture = new URLSearchParams(location.search).get("agents");
+if (agentsFixture === "none" || agentsFixture === "opencode-only") {
+  const missing = (provider: MockProviderKind, name: string): ProviderHealthReport => ({
+    provider, status: "error", installed: false, message: `${name} is not installed or not on PATH.`, version: null,
+  });
+  Object.assign(mockProviderHealth, {
+    claude: { provider: "claude", status: "error", installed: true, message: "Claude Code is not signed in. Run `claude auth login`.", version: "0.0.0-mock", login_command: "claude auth login" },
+    codex: missing("codex", "Codex CLI (`codex`)"),
+    cursor: missing("cursor", "Cursor Agent CLI (`cursor-agent`)"),
+    grok: missing("grok", "Grok CLI (`grok`)"),
+    ...(agentsFixture === "none" ? { opencode: missing("opencode", "OpenCode CLI (`opencode`)") } : {}),
+  } satisfies Partial<Record<MockProviderKind, ProviderHealthReport>>);
+}
+
 /** Inject (or clear, with `null`) a provider health failure, then nudge
  *  the frontend store to re-probe immediately so the chat surfaces'
  *  status banner reflects it without waiting out the TTL. */
@@ -4700,6 +4719,12 @@ function streamMockSideAnswer(sideId: string, question: string, first: boolean):
 // so a watch stays `active` until stopped.
 const prWatches = new Map<string, PrWatchStatus>();
 
+/** `~/x` → the mock home, as the backend's `expand_tilde` does. */
+function expandMockTilde(path: string): string {
+  if (path === "~") return MOCK_HOME_DIR;
+  return path.startsWith("~/") ? `${MOCK_HOME_DIR}${path.slice(1)}` : path;
+}
+
 const handlers: Record<string, Handler> = {
   follow_up_providers: () => [
     { id: "claude", label: "Claude", installed: true },
@@ -5011,12 +5036,20 @@ const handlers: Record<string, Handler> = {
   // the Linux "no file picker backend" preflight rejection (issue
   // #95) and visually verify the error toast in the browser:
   //   sessionStorage.setItem("codemux-mock-no-file-picker", "1")
-  pick_folder_dialog: () => {
+  // `?pick=1` makes the folder picker answer instead: the Add project
+  // sheet's location picker gets ~/Code, every other picker a project
+  // folder (~/Code/sample-app), so Open and Change can be clicked through.
+  pick_folder_dialog: (a) => {
     if (sessionStorage.getItem("codemux-mock-no-file-picker")) {
       return Promise.reject(
         "NO_FILE_PICKER_BACKEND: cannot open a file dialog (dev mock simulation). " +
           "The XDG desktop portal is unavailable and zenity is not installed.",
       );
+    }
+    if (new URLSearchParams(window.location.search).get("pick") === "1") {
+      return a.title === "Projects location"
+        ? `${MOCK_HOME_DIR}/Code`
+        : `${MOCK_HOME_DIR}/Code/sample-app`;
     }
     return null;
   },
@@ -5885,8 +5918,30 @@ const handlers: Record<string, Handler> = {
     emitAppState();
     return undefined;
   },
-  agent_chat_provider_health: (a) => {
+  // Types the install command like the backend (nothing runs), then treats
+  // the user as having pressed Enter: the next probe finds the agent
+  // installed, and still signed out where it needs an account.
+  open_provider_install_terminal: (a) => {
+    const tabId = handlers.create_tab({ workspaceId: a.workspaceId, kind: "terminal" });
+    const ws = findWorkspace(a.workspaceId);
+    const tab = ws?.tabs.find((t) => t.tab_id === tabId);
+    if (tab) tab.title = "Install";
     const provider = String(a.provider) as MockProviderKind;
+    const login = provider === "claude" ? "claude auth login" : provider === "codex" ? "codex login" : null;
+    if (login) {
+      mockProviderHealth[provider] = { provider, status: "error", installed: true, message: `Not signed in. Run \`${login}\`.`, version: "0.0.0-mock", login_command: login };
+    } else {
+      delete mockProviderHealth[provider];
+    }
+    emitAppState();
+    return undefined;
+  },
+  agent_chat_provider_health: async (a) => {
+    const provider = String(a.provider) as MockProviderKind;
+    // `?probeDelay=<ms>` holds every answer back, to see the landing while
+    // the first probes are still out.
+    const delay = Number(new URLSearchParams(location.search).get("probeDelay") ?? 0);
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
     return (
       mockProviderHealth[provider] ?? {
         provider,
@@ -7721,11 +7776,16 @@ const handlers: Record<string, Handler> = {
   refresh_workspace_git_info: () => undefined,
 
   // Fake `git clone` that streams realistic `git-clone-progress` events
-  // over ~5s, then resolves with the target dir — so the New Project /
-  // Clone progress UI is demoable in `npm run dev` without a real remote.
+  // over ~5s, then resolves with the target dir — so the Add project
+  // sheet's clone progress UI is demoable in `npm run dev` without a real remote.
   // Mirrors src-tauri/src/commands/git.rs:GitCloneProgress (camelCase).
+  // Like the backend it expands `~` and refuses relative targets; a URL
+  // containing "fail" fails partway through, to show the inline error.
   git_clone_repo: async (a) => {
-    const targetDir = String(a.targetDir ?? `${MOCK_HOME_DIR}/projects/cloned`);
+    const targetDir = expandMockTilde(String(a.targetDir ?? `${MOCK_HOME_DIR}/projects/cloned`));
+    if (!targetDir.startsWith("/")) {
+      throw `Choose an absolute location for the project, not "${targetDir}"`;
+    }
     const emit = (phase: string, percent: number | null, detail: string) =>
       emitEvent("git-clone-progress", {
         targetDir,
@@ -7745,6 +7805,9 @@ const handlers: Record<string, Handler> = {
       );
       await sleep(300);
     }
+    if (String(a.url ?? "").includes("fail")) {
+      throw "git clone failed: remote: Repository not found.\nfatal: repository not found";
+    }
     // Receiving objects climbs 5%→96% with a throughput detail line.
     for (const pct of [5, 23, 47, 68, 84, 96]) {
       const mib = ((pct / 100) * 42).toFixed(2);
@@ -7758,6 +7821,20 @@ const handlers: Record<string, Handler> = {
     emit("Resolving deltas", 100, "Resolving deltas: 100% (1420/1420), done.");
     await sleep(300);
     return targetDir;
+  },
+  // New empty project: same location rules as the backend; a name
+  // containing "fail" is refused as an existing folder.
+  create_empty_repo: async (a) => {
+    const parentDir = expandMockTilde(String(a.parentDir ?? ""));
+    const name = String(a.name ?? "");
+    if (!parentDir.startsWith("/")) {
+      throw `Choose an absolute location for the project, not "${parentDir}"`;
+    }
+    await new Promise((r) => setTimeout(r, 400));
+    if (name.includes("fail")) {
+      throw `${parentDir}/${name} already exists and isn't empty. Pick another name.`;
+    }
+    return `${parentDir}/${name}`;
   },
 
   // Project onboarding's setup checklist. The default `null` fallback

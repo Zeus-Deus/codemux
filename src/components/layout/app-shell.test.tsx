@@ -16,7 +16,7 @@ let showSettingsFlag = false;
 let showImportFlag = false;
 let showAutomationsFlag = false;
 let showDevicesFlag = false;
-let showNewProjectScreenFlag = false;
+let addProjectSheetFlag: "open" | "clone" | "new" | null = null;
 let commandPaletteOpenFlag = false;
 let renderPluginPeekFlag = false;
 // Appearance state: the machine-local legacy palette key, the synced theme id,
@@ -81,8 +81,8 @@ vi.mock("@/components/overlays/command-palette", async (importOriginal) => ({
   ...await importOriginal<typeof import("@/components/overlays/command-palette")>(),
   CommandPalette: () => null,
 }));
-vi.mock("@/components/overlays/new-project-screen", () => ({
-  NewProjectScreen: () => <div data-testid="new-project-screen" />,
+vi.mock("@/components/overlays/add-project-sheet", () => ({
+  AddProjectSheet: () => <div data-testid="add-project-sheet" />,
 }));
 vi.mock("@/components/search/file-search-dialog", () => ({
   FileSearchDialog: () => null,
@@ -152,7 +152,7 @@ vi.mock("@/stores/ui-store", () => ({
         showLocalSessionImport: showImportFlag,
         showAutomations: showAutomationsFlag,
         showDevices: showDevicesFlag,
-        showNewProjectScreen: showNewProjectScreenFlag,
+        addProjectSheet: addProjectSheetFlag,
         showCommandPalette: commandPaletteOpenFlag,
         setShowCommandPalette: vi.fn(),
         setSidebarToggleFn: vi.fn(),
@@ -164,7 +164,7 @@ vi.mock("@/stores/ui-store", () => ({
       getState: () => ({
         setSidebarToggleFn: vi.fn(),
         showSettings: showSettingsFlag,
-        showNewProjectScreen: showNewProjectScreenFlag,
+        addProjectSheet: addProjectSheetFlag,
         setShowSettings: (show: boolean) => { showSettingsFlag = show; },
         setShowAutomations: (show: boolean) => { showAutomationsFlag = show; },
         closeUtilityPages: () => { showAutomationsFlag = false; showDevicesFlag = false; },
@@ -248,7 +248,7 @@ function resetMockState() {
   showImportFlag = false;
   showAutomationsFlag = false;
   showDevicesFlag = false;
-  showNewProjectScreenFlag = false;
+  addProjectSheetFlag = null;
   commandPaletteOpenFlag = false;
   renderPluginPeekFlag = false;
   localSettings = {};
@@ -312,6 +312,16 @@ describe("AppShell rendering gates", () => {
     view.rerender(<AppShell />);
     expect(view.getByTestId("import-overlay")).toBe(overlay);
   });
+  it("opens the Add project sheet over the empty page and keeps it across Settings", async () => {
+    addProjectSheetFlag = "clone";
+    const view = render(<AppShell />);
+    const sheet = await view.findByTestId("add-project-sheet");
+    expect(view.getByTestId("empty-state")).toBeInTheDocument();
+    showSettingsFlag = true;
+    view.rerender(<AppShell />);
+    expect(view.getByTestId("add-project-sheet")).toBe(sheet);
+  });
+
   it("renders EmptyState when there are no workspaces and no active draft", () => {
     hasWorkspacesFlag = false;
     enableLazyFlag = false;

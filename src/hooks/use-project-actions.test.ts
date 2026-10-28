@@ -10,6 +10,7 @@ vi.mock("@/tauri/commands", () => ({
   initGitRepo: vi.fn().mockResolvedValue(undefined),
   dbAddRecentProject: vi.fn().mockResolvedValue(undefined),
   gitCloneRepo: vi.fn(),
+  createEmptyRepo: vi.fn(),
   createEmptyWorkspace: vi.fn().mockResolvedValue("ws-new"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
 }));
@@ -21,7 +22,15 @@ import {
   createEmptyWorkspace,
   activateWorkspace,
 } from "@/tauri/commands";
-import { openProjectAtPath, useProjectActions } from "./use-project-actions";
+import {
+  createProjectFlow,
+  openProjectAtPath,
+  pointHomeDraftAt,
+  useProjectActions,
+} from "./use-project-actions";
+import { createEmptyRepo } from "@/tauri/commands";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
 import { dbAddRecentProject } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -263,5 +272,77 @@ describe("openProjectAtPath", () => {
     expect(vi.mocked(dbAddRecentProject)).toHaveBeenCalledWith("/home/user/parser", "parser");
     expect(mockCreateEmptyWorkspace).toHaveBeenCalledWith("/home/user/parser");
     expect(mockActivateWorkspace).toHaveBeenCalledWith("ws-new");
+  });
+});
+
+describe("createProjectFlow", () => {
+  it("creates the repo and opens it like any other project", async () => {
+    vi.mocked(createEmptyRepo).mockResolvedValue("/home/user/Projects/habits");
+    useAppStore.setState({ appState: makeAppState([makeWs("ws-existing")]) });
+
+    const result = await createProjectFlow("/home/user/Projects", "habits");
+
+    expect(createEmptyRepo).toHaveBeenCalledWith("/home/user/Projects", "habits");
+    expect(mockCreateEmptyWorkspace).toHaveBeenCalledWith("/home/user/Projects/habits");
+    expect(mockActivateWorkspace).toHaveBeenCalledWith("ws-new");
+    expect(result).toEqual({ path: "/home/user/Projects/habits", name: "habits" });
+  });
+
+  it("opens on a focused chat draft holding the description, without sending it", async () => {
+    vi.mocked(createEmptyRepo).mockResolvedValue("/home/user/Projects/habits");
+    useAppStore.setState({ appState: makeAppState([makeWs("ws-existing")]) });
+    // The draft must be on screen before the workspace is activated, or the
+    // empty-workspace hook launches a second, blank chat there.
+    let activeDraftAtActivation: string | null = "unset";
+    mockActivateWorkspace.mockImplementation(async () => {
+      activeDraftAtActivation = useChatDraftStore.getState().activeDraftId;
+    });
+
+    await createProjectFlow("/home/user/Projects", "habits", "A habit tracker");
+
+    const drafts = useChatDraftStore.getState();
+    const draft = drafts.activeDraftId ? drafts.draftsById[drafts.activeDraftId] : null;
+    expect(draft?.target).toEqual({ kind: "existing_workspace", workspaceId: "ws-new" });
+    expect(draft?.inputDraft).toBe("A habit tracker");
+    expect(draft?.checkoutMode).toBe("current");
+    expect(draft?.promoting).toBe(false);
+    expect(activeDraftAtActivation).toBe(drafts.activeDraftId);
+    expect(useDraftComposerFocusStore.getState().request?.draftId).toBe(draft?.draftId);
+  });
+});
+
+describe("pointHomeDraftAt", () => {
+  it("aims the home draft on screen at the new project", () => {
+    const drafts = useChatDraftStore.getState();
+    const draft = drafts.getOrCreateHomeDraft();
+    drafts.setActiveDraft(draft.draftId);
+    pointHomeDraftAt("/home/user/Projects/app");
+    expect(useChatDraftStore.getState().draftsById[draft.draftId].target).toEqual({
+      kind: "project",
+      projectPath: "/home/user/Projects/app",
+    });
+  });
+
+  it("also aims a home-only draft, since adding a project is explicit", () => {
+    const drafts = useChatDraftStore.getState();
+    const draft = drafts.getOrCreateHomeDraft({ lockedToHome: true });
+    drafts.setActiveDraft(draft.draftId);
+    pointHomeDraftAt("/home/user/Projects/app");
+    expect(useChatDraftStore.getState().draftsById[draft.draftId].target).toEqual({
+      kind: "project",
+      projectPath: "/home/user/Projects/app",
+    });
+  });
+
+  it("leaves a draft already aimed at a workspace alone", () => {
+    const drafts = useChatDraftStore.getState();
+    const draft = drafts.getOrCreateHomeDraft();
+    drafts.updateDraftTarget(draft.draftId, { kind: "existing_workspace", workspaceId: "ws-1" });
+    drafts.setActiveDraft(draft.draftId);
+    pointHomeDraftAt("/home/user/Projects/app");
+    expect(useChatDraftStore.getState().draftsById[draft.draftId].target).toEqual({
+      kind: "existing_workspace",
+      workspaceId: "ws-1",
+    });
   });
 });

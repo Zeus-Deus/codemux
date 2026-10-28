@@ -575,6 +575,35 @@ pub fn open_provider_login_terminal<R: tauri::Runtime>(
     Ok(())
 }
 
+/// Open a terminal tab in `workspace_id` with `provider`'s install command
+/// typed at the prompt but not run: installing changes the machine, so the
+/// user reads the command and presses Enter themselves.
+///
+/// Like sign-in, the command comes from a fixed per-provider table.
+#[tauri::command]
+pub fn open_provider_install_terminal<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppStateStore>,
+    pty_state: State<'_, PtyState>,
+    workspace_id: String,
+    provider: crate::agent_provider::ProviderKind,
+) -> Result<(), String> {
+    let command = crate::agent_provider::health::provider_install_command(provider)
+        .ok_or_else(|| format!("{provider:?} has no install command"))?;
+    let (tab_id, session_id) = state.create_tab(&workspace_id, crate::state::TabKind::Terminal)?;
+    let _ = state.rename_tab(&workspace_id, &tab_id, "Install".into());
+    if let Some(session_id) = session_id {
+        terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
+        let sessions = pty_state.sessions.clone();
+        let command = command.to_string();
+        std::thread::spawn(move || {
+            wait_and_write(&sessions, &session_id.0, &command, 120, b"");
+        });
+    }
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
 /// Get the active terminal session ID for a specific workspace.
 fn active_session_for_workspace(state: &AppStateStore, workspace_id: &str) -> Option<String> {
     let snapshot = state.snapshot();
@@ -662,9 +691,13 @@ fn write_command_to_pty(
 /// Keep the command and Enter atomic at the PTY. Combining them also avoids
 /// a second daemon round trip because writes wait for acknowledgement.
 fn build_pty_command_payload(command: &str) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(command.len() + PTY_COMMAND_TERMINATOR.len());
+    build_pty_payload(command, PTY_COMMAND_TERMINATOR)
+}
+
+fn build_pty_payload(command: &str, terminator: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(command.len() + terminator.len());
     payload.extend_from_slice(command.as_bytes());
-    payload.extend_from_slice(PTY_COMMAND_TERMINATOR);
+    payload.extend_from_slice(terminator);
     payload
 }
 
@@ -693,6 +726,18 @@ fn wait_and_write_command(
     session_id: &str,
     command: &str,
     settle_ms: u64,
+) {
+    wait_and_write(sessions, session_id, command, settle_ms, PTY_COMMAND_TERMINATOR);
+}
+
+/// `wait_and_write_command` with the byte(s) written after the command as a
+/// parameter: an empty `terminator` leaves the command typed but not run.
+fn wait_and_write(
+    sessions: &Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
+    session_id: &str,
+    command: &str,
+    settle_ms: u64,
+    terminator: &[u8],
 ) {
     // Phase 1: poll until the PTY writer is available (shell process spawned).
     //
@@ -844,7 +889,7 @@ fn wait_and_write_command(
     // not two), so the command and Enter reach the PTY together in one
     // daemon round trip. See `PTY_COMMAND_TERMINATOR` for why CR is the
     // right terminator byte on both Linux and Windows.
-    let payload = build_pty_command_payload(&command_to_write);
+    let payload = build_pty_payload(&command_to_write, terminator);
     match terminal::write_pty_input_sync(sessions, session_id, &payload) {
         Ok(()) => eprintln!(
             "[codemux::presets] wrote preset/resume command to {session_id} \
@@ -1061,6 +1106,26 @@ mod tests {
             &recorded[0][..],
             b"claude --dangerously-skip-permissions\r"
         );
+    }
+
+    #[test]
+    fn typed_install_command_is_written_without_enter() {
+        let sessions = make_sessions();
+        let calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let mut guard = sessions.lock().unwrap();
+            let mut runtime = crate::terminal::SessionRuntime::new("sess");
+            runtime.writer = Some(Box::new(RecordingWriter {
+                calls: calls.clone(),
+            }));
+            runtime.pending_output.push_back(b"$ ".to_vec());
+            guard.insert("sess".into(), runtime);
+        }
+
+        wait_and_write(&sessions, "sess", "npm install -g @openai/codex", 30, b"");
+
+        assert_eq!(*calls.lock().unwrap(), vec![b"npm install -g @openai/codex".to_vec()]);
     }
 
     #[test]

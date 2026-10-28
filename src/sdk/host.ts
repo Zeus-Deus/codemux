@@ -278,7 +278,7 @@ export function createHost(bound: Owner | null) {
       const ui = useUIStore.getState();
       if (ui.showSettings) ui.setShowSettings(false);
       ui.closeUtilityPages();
-      if (ui.showNewProjectScreen) ui.setShowNewProjectScreen(false);
+      if (ui.addProjectSheet) ui.setAddProjectSheet(null);
       if (ui.rightPanelMaximized) useUIStore.setState({ rightPanelMaximized: false });
       return true;
     },

@@ -8,8 +8,19 @@ vi.mock("@/tauri/commands", () => ({
 import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useChatGptStore } from "@/stores/chatgpt-store";
-import type { ChatModelInfo, ProviderChatCapabilities } from "@/tauri/types";
-import { resolveNewChatModelDefaults } from "./new-chat-defaults";
+import { emptyHealthSlot, useProviderHealth } from "@/stores/provider-health-store";
+import type {
+  AgentChatProviderKind,
+  ChatModelInfo,
+  ProviderChatCapabilities,
+  ProviderHealthReport,
+} from "@/tauri/types";
+import { defaultModelId } from "./capability-defaults";
+import {
+  firstReadyProvider,
+  isAutomaticNewChatProvider,
+  resolveNewChatModelDefaults,
+} from "./new-chat-defaults";
 
 function model(id: string, effort_levels: string[] = []): ChatModelInfo {
   return {
@@ -44,6 +55,44 @@ function choose(settings: Record<string, string>) {
   useSettingsStore.setState({ settings });
 }
 
+function resetHealth() {
+  useProviderHealth.setState({
+    slots: {
+      claude: emptyHealthSlot(), codex: emptyHealthSlot(), cursor: emptyHealthSlot(),
+      grok: emptyHealthSlot(), hermes: emptyHealthSlot(), acp: emptyHealthSlot(),
+      opencode: emptyHealthSlot(),
+    },
+  });
+}
+
+/** Cache a probe answer for each provider: "ready", "signed-out",
+ *  "missing", or "failed" (the probe itself failed at the IPC layer). */
+function probed(
+  answers: Partial<Record<AgentChatProviderKind, "ready" | "signed-out" | "missing" | "failed">>,
+) {
+  useProviderHealth.setState((state) => {
+    const slots = { ...state.slots };
+    for (const [provider, answer] of Object.entries(answers) as [AgentChatProviderKind, string][]) {
+      const report: ProviderHealthReport = {
+        provider,
+        status: answer === "ready" ? "ready" : "error",
+        installed: answer !== "missing",
+        message: null,
+        version: null,
+        login_command: answer === "signed-out" ? `${provider} login` : null,
+      };
+      slots[provider] = {
+        ...emptyHealthSlot(),
+        report,
+        fetchedAt: 1,
+        lastAttemptAt: 1,
+        lastProbeFailed: answer === "failed",
+      };
+    }
+    return { slots };
+  });
+}
+
 describe("resolveNewChatModelDefaults", () => {
   beforeEach(() => {
     useChatGptStore.setState({ status: null });
@@ -57,6 +106,7 @@ describe("resolveNewChatModelDefaults", () => {
     useChatGptStore.setState({ status: null });
     useSettingsStore.setState({ settings: {} });
     useProviderCapabilities.setState({ claude: null, codex: null });
+    resetHealth();
   });
 
   it("starts on Claude's default model when nothing is chosen", () => {
@@ -141,5 +191,58 @@ describe("resolveNewChatModelDefaults", () => {
       "chat.default_model": "profile_default",
     });
     expect(resolveNewChatModelDefaults().provider).toBe("claude");
+  });
+
+  describe("Automatic, from the health probes", () => {
+    beforeEach(() => {
+      choose({});
+      resetHealth();
+    });
+
+    it("starts on the first ready agent in order", () => {
+      probed({ claude: "missing", codex: "signed-out", opencode: "ready", grok: "ready" });
+      expect(firstReadyProvider()).toBe("opencode");
+      expect(resolveNewChatModelDefaults()).toEqual({
+        provider: "opencode",
+        model: defaultModelId("opencode"),
+        effort: null,
+      });
+      probed({ codex: "ready" });
+      expect(resolveNewChatModelDefaults().provider).toBe("codex");
+      probed({ claude: "ready" });
+      expect(resolveNewChatModelDefaults().provider).toBe("claude");
+    });
+
+    it("keeps Claude when nothing is known or ready", () => {
+      expect(firstReadyProvider()).toBeNull();
+      expect(resolveNewChatModelDefaults().provider).toBe("claude");
+      probed({ claude: "signed-out", codex: "missing", opencode: "missing" });
+      expect(resolveNewChatModelDefaults().provider).toBe("claude");
+    });
+
+    it("does not trust a cached answer whose last probe failed", () => {
+      probed({ claude: "missing", codex: "failed", cursor: "ready" });
+      expect(firstReadyProvider()).toBe("cursor");
+    });
+
+    it("skips agents turned off in Settings → Providers", () => {
+      probed({ claude: "ready", codex: "ready" });
+      choose({ "providers.disabled": "claude" });
+      expect(resolveNewChatModelDefaults().provider).toBe("codex");
+    });
+
+    it("never overrides a saved default or a connected ChatGPT plan", () => {
+      probed({ claude: "missing", opencode: "ready" });
+      choose({ "chat.default_provider": "claude" });
+      expect(isAutomaticNewChatProvider()).toBe(false);
+      expect(resolveNewChatModelDefaults().provider).toBe("claude");
+      choose({});
+      expect(isAutomaticNewChatProvider()).toBe(true);
+      useChatGptStore.setState({ status: {
+        phase: "connected", attemptId: null, email: null, error: null,
+        profiles: [], activeProfileId: "plan", welcomePending: false, installed: true,
+      } });
+      expect(resolveNewChatModelDefaults().provider).toBe("codex");
+    });
   });
 });

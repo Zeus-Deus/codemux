@@ -28,7 +28,6 @@ vi.mock("./mobile-session-sheet", () => ({
 }));
 vi.mock("./mobile-workspace-actions", () => ({ MobileWorkspaceActions: () => null }));
 vi.mock("./mobile-install", () => ({ MobileInstall: () => null }));
-vi.mock("@/components/overlays/clone-dialog", () => ({ CloneDialog: () => null }));
 vi.mock("@/components/browser/BrowserPeekOverlay", () => ({ BrowserPeekOverlay: () => null }));
 vi.mock("@/components/chat/WorkspaceStatusCluster", () => ({ WorkspaceStatusCluster: () => null }));
 

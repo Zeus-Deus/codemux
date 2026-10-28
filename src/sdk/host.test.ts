@@ -312,10 +312,10 @@ describe("host.showWorkspace", () => {
     expect(host.workspace.current()?.workspace_id).toBe("ws-1");
   });
 
-  it("leaves the full New Project page", () => {
-    useUIStore.getState().setShowNewProjectScreen(true);
+  it("closes the Add project sheet", () => {
+    useUIStore.getState().setAddProjectSheet("new");
     expect(host.showWorkspace()).toBe(true);
-    expect(useUIStore.getState().showNewProjectScreen).toBe(false);
+    expect(useUIStore.getState().addProjectSheet).toBeNull();
     expect(host.workspace.current()?.workspace_id).toBe("ws-1");
   });
 

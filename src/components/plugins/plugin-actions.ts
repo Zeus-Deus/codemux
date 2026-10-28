@@ -115,7 +115,7 @@ export async function openPlatformView(
   // same chat (`PlatformPluginPage` gives it the active chat's context).
   if (besideChat && workspaceId !== null && !phoneLayout()) {
     ui.closeUtilityPages();
-    if (ui.showNewProjectScreen) ui.setShowNewProjectScreen(false);
+    if (ui.addProjectSheet) ui.setAddProjectSheet(null);
     ui.setRightPanelTab(workspaceId, `plugin:${platformSidePanelId(target.installation.installationId, view.id)}` as never);
     return;
   }

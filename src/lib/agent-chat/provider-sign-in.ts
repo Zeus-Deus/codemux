@@ -3,6 +3,7 @@ import { useChatDraftStore } from "@/stores/chat-draft-store";
 import {
   activateWorkspace,
   getOrCreateHomeWorkspace,
+  openProviderInstallTerminal,
   openProviderLoginTerminal,
 } from "@/tauri/commands";
 import type { AgentChatProviderKind } from "@/tauri/types";
@@ -42,5 +43,25 @@ export async function signInToProvider(
     toast.success(`Copied — run \`${loginCommand}\` in a terminal`);
   } catch {
     toast.error(`Run \`${loginCommand}\` in a terminal to sign in`);
+  }
+}
+
+/**
+ * Open a terminal tab in the home workspace with `provider`'s official
+ * install command typed at the prompt. Nothing runs until the user presses
+ * Enter there; the backend owns the command, as it does for sign-in.
+ */
+export async function installProvider(
+  provider: AgentChatProviderKind,
+  name: string,
+): Promise<void> {
+  try {
+    const target = await getOrCreateHomeWorkspace();
+    await openProviderInstallTerminal(target, provider);
+    useChatDraftStore.getState().setActiveDraft(null);
+    await activateWorkspace(target);
+  } catch (error) {
+    console.warn(`[provider-sign-in] install terminal for ${provider} failed:`, error);
+    toast.error(`Couldn't open a terminal to install ${name}`);
   }
 }

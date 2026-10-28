@@ -19,7 +19,6 @@ import {
   useHomeDir,
   useProjectGroupedWorkspaces,
 } from "@/stores/app-store";
-import { useUIStore } from "@/stores/ui-store";
 import { useHosts } from "@/stores/hosts-store";
 import { basename } from "@/lib/path";
 import { dbGetRecentProjects, dbGetUiState } from "@/tauri/commands";
@@ -140,10 +139,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
   const selectedAvatar = value
     ? projectAvatars[value] ?? EMPTY_AVATAR
     : EMPTY_AVATAR;
-  const { openProject } = useProjectActions();
-  const setShowNewProjectScreen = useUIStore(
-    (s) => s.setShowNewProjectScreen,
-  );
+  const { openProject, openAddProject } = useProjectActions();
 
   const handleOpenProject = async () => {
     setOpen(false);
@@ -258,7 +254,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
               type="button"
               onClick={() => {
                 setOpen(false);
-                setShowNewProjectScreen(true);
+                openAddProject("new");
               }}
               className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-label text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors duration-150"
             >

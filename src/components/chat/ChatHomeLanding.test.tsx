@@ -1,20 +1,26 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { useState } from "react";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
-const { openProjectMock, openCloneDialogMock, openProjectAtPathMock, recentProjectsMock, listDirectoryMock, toastErrorMock, mockProbe } = vi.hoisted(() => ({
+const { openProjectMock, openAddProjectMock, openProjectAtPathMock, recentProjectsMock, listDirectoryMock, toastErrorMock, mockProbe, signInMock, installMock } = vi.hoisted(() => ({
   mockProbe: vi.fn(),
+  signInMock: vi.fn(),
+  installMock: vi.fn(),
   openProjectMock: vi.fn(),
   listDirectoryMock: vi.fn(),
-  openCloneDialogMock: vi.fn(),
+  openAddProjectMock: vi.fn(),
   openProjectAtPathMock: vi.fn(),
   recentProjectsMock: vi.fn(),
   toastErrorMock: vi.fn(),
 }));
 vi.mock("@/lib/toast", () => ({ toast: { error: toastErrorMock, success: vi.fn() } }));
+vi.mock("@/lib/agent-chat/provider-sign-in", () => ({
+  signInToProvider: signInMock,
+  installProvider: installMock,
+}));
 vi.mock("@/hooks/use-project-actions", () => ({
-  useProjectActions: () => ({ openProject: openProjectMock, openCloneDialog: openCloneDialogMock }),
+  useProjectActions: () => ({ openProject: openProjectMock, openAddProject: openAddProjectMock }),
   openProjectAtPath: openProjectAtPathMock,
 }));
 vi.mock("@/tauri/commands", async (importOriginal) => ({
@@ -30,6 +36,7 @@ import { ChatHomeLanding } from "./ChatHomeLanding";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
+import { useChatGptStore } from "@/stores/chatgpt-store";
 import { useProjectPickerHintStore } from "@/stores/project-picker-hint-store";
 import { emptyHealthSlot, HEALTH_REPROBE_MS, useProviderHealth } from "@/stores/provider-health-store";
 import type { AgentChatProviderKind, ProviderHealthReport, AppStateSnapshot } from "@/tauri/types";
@@ -53,7 +60,7 @@ beforeEach(() => {
   useProjectPickerHintStore.setState({ seen: false });
   delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
   openProjectMock.mockReset().mockResolvedValue({ success: false });
-  openCloneDialogMock.mockReset();
+  openAddProjectMock.mockReset();
   openProjectAtPathMock.mockReset().mockResolvedValue({ success: true, path: "/work/parser", name: "parser" });
   recentProjectsMock.mockReset().mockResolvedValue([]);
   listDirectoryMock.mockReset().mockResolvedValue([]);
@@ -250,14 +257,16 @@ describe("ChatHomeLanding", () => {
   });
 
   describe("with no project open", () => {
-    it("offers Open project and Clone repository under the composer", async () => {
+    it("offers Open folder, Clone repository and New project under the composer", async () => {
       openProjectMock.mockResolvedValue({ success: true, path: "/work/api", name: "api" });
       const onProjectOpened = vi.fn();
       render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
-      fireEvent.click(screen.getByRole("button", { name: /Open project/ }));
+      fireEvent.click(screen.getByRole("button", { name: /Open folder/ }));
       await vi.waitFor(() => expect(onProjectOpened).toHaveBeenCalledWith("/work/api"));
-      fireEvent.click(screen.getByRole("button", { name: "Clone repository" }));
-      expect(openCloneDialogMock).toHaveBeenCalledOnce();
+      fireEvent.click(screen.getByRole("button", { name: /Clone repository/ }));
+      expect(openAddProjectMock).toHaveBeenCalledWith("clone");
+      fireEvent.click(screen.getByRole("button", { name: /New project/ }));
+      expect(openAddProjectMock).toHaveBeenCalledWith("new");
     });
 
     it("reopens a recent project without the folder picker", async () => {
@@ -301,7 +310,7 @@ describe("ChatHomeLanding", () => {
       openProjectMock.mockRejectedValue(new Error("workspace limit reached"));
       const onProjectOpened = vi.fn();
       render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
-      fireEvent.click(screen.getByRole("button", { name: /Open project/ }));
+      fireEvent.click(screen.getByRole("button", { name: /Open folder/ }));
       await vi.waitFor(() =>
         expect(toastErrorMock).toHaveBeenCalledWith(
           "Couldn't open the project: workspace limit reached",
@@ -329,76 +338,89 @@ describe("ChatHomeLanding", () => {
     it("hides the project actions once a workspace exists", () => {
       useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
       render(<ChatHomeLanding composer={<div />} />);
-      expect(screen.queryByRole("button", { name: /Open project/ })).toBeNull();
-      expect(screen.queryByRole("button", { name: "Clone repository" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /Open folder/ })).toBeNull();
+      expect(screen.queryByRole("button", { name: /Clone repository/ })).toBeNull();
       expect(recentProjectsMock).not.toHaveBeenCalled();
     });
   });
 });
 
-  describe("first-run agent strip", () => {
-    const HEALTH: Partial<Record<AgentChatProviderKind, Partial<ProviderHealthReport>>> = {
-      claude: { status: "ready", installed: true },
-      codex: {
-        status: "error",
-        installed: true,
-        message: "Codex CLI is not authenticated. Run `codex login` and retry.",
-      },
-      cursor: { status: "error", installed: false, message: "Not on PATH." },
-      grok: { status: "error", installed: false, message: "Not on PATH." },
-      opencode: { status: "ready", installed: true },
-    };
+  describe("first-run agents", () => {
+    type Answer = Partial<ProviderHealthReport>;
+    const READY: Answer = { status: "ready", installed: true };
+    const SIGNED_OUT = (provider: string): Answer => ({
+      status: "error",
+      installed: true,
+      message: `${provider} is not signed in.`,
+      login_command: `${provider} login`,
+    });
+    const MISSING: Answer = { status: "error", installed: false, message: "Not on PATH." };
+    let health: Partial<Record<AgentChatProviderKind, Answer>>;
 
     beforeEach(() => {
+      health = {
+        claude: READY,
+        codex: SIGNED_OUT("codex"),
+        cursor: MISSING,
+        grok: MISSING,
+        opencode: READY,
+      };
       mockProbe.mockImplementation(async (provider: AgentChatProviderKind) => ({
         provider,
         message: null,
         version: null,
-        ...HEALTH[provider],
+        ...health[provider],
       }));
+      signInMock.mockReset().mockResolvedValue(undefined);
+      installMock.mockReset().mockResolvedValue(undefined);
+      useUIStore.setState({ showSettings: false, settingsSection: null });
     });
 
-    async function renderWithAgents(onSelect = vi.fn()) {
-      const view = render(
-        <ChatHomeLanding
-          composer={<div />}
-          agents={{ selected: "claude", onSelect }}
-        />,
-      );
+    async function flush() {
       await act(async () => {
         await new Promise((r) => setTimeout(r, 0));
       });
-      return { view, onSelect };
     }
 
-    it("shows each agent's readiness once every probe has answered", async () => {
-      const { onSelect } = await renderWithAgents();
+    async function renderWithAgents(selected: AgentChatProviderKind = "claude") {
+      const view = render(
+        <ChatHomeLanding
+          composer={<div data-testid="composer" />}
+          agents={{ selected }}
+        />,
+      );
+      await flush();
+      return view;
+    }
+
+    it("sums up what can run in one line once every probe has answered", async () => {
+      await renderWithAgents("opencode");
       expect(mockProbe).toHaveBeenCalledTimes(5);
       expect(mockProbe).not.toHaveBeenCalledWith("hermes");
-      expect(screen.getByTestId("agent-chip-claude")).toHaveAttribute(
-        "data-readiness",
-        "ready",
+      expect(screen.getByTestId("agent-status-line")).toHaveTextContent(
+        "OpenCode and Claude Code are ready·Codex needs sign-in·Set up",
       );
-      expect(screen.getByTestId("agent-chip-claude")).toHaveAttribute(
-        "aria-pressed",
-        "true",
-      );
-      const codex = screen.getByTestId("agent-chip-codex");
-      expect(codex).toHaveAttribute("data-readiness", "not_ready");
-      expect(codex).toHaveAttribute("title", expect.stringContaining("codex login"));
-      expect(screen.getByTestId("agent-chip-cursor")).toBeDisabled();
-
-      fireEvent.click(screen.getByTestId("agent-chip-opencode"));
-      expect(onSelect).toHaveBeenCalledWith("opencode");
+      fireEvent.click(screen.getByRole("button", { name: "Set up" }));
+      expect(useUIStore.getState()).toMatchObject({ showSettings: true, settingsSection: "providers" });
     });
 
-    it("reserves its row but stays empty while a probe is still running", async () => {
+    it("counts several agents that need setup", async () => {
+      health = { ...health, opencode: MISSING, cursor: SIGNED_OUT("cursor") };
+      await renderWithAgents();
+      expect(screen.getByTestId("agent-status-line")).toHaveTextContent(
+        "Claude Code is ready·2 more need setup·Set up",
+      );
+    });
+
+    it("reserves its line, and keeps the composer, while a probe is still running", async () => {
       mockProbe.mockImplementation(() => new Promise(() => {}));
       await renderWithAgents();
-      expect(screen.getByTestId("agent-availability-strip")).toBeEmptyDOMElement();
+      expect(screen.getByTestId("agent-status-line")).toBeEmptyDOMElement();
+      expect(screen.getByTestId("composer")).toBeInTheDocument();
+      expect(screen.queryByTestId("connect-agent")).toBeNull();
     });
 
-    it("shows its chips after a cache expires while another opening probe is outstanding", async () => {
+    it("waits for a cache that expired while another opening probe is outstanding", async () => {
       vi.useFakeTimers({ toFake: ["Date"] });
       const openedAt = Date.now();
       const missingClaude: ProviderHealthReport = {
@@ -432,25 +454,116 @@ describe("ChatHomeLanding", () => {
         await codex;
       });
       expect(mockProbe).toHaveBeenCalledWith("claude");
-      expect(screen.getByTestId("agent-availability-strip")).toBeEmptyDOMElement();
+      expect(screen.getByTestId("agent-status-line")).toBeEmptyDOMElement();
 
       await act(async () => {
         resolveClaude(missingClaude);
         await claude;
       });
-      expect(screen.getByTestId("agent-chip-codex")).toHaveAttribute("data-readiness", "ready");
-      expect(screen.getByTestId("agent-chip-claude")).toBeDisabled();
+      expect(screen.getByTestId("agent-status-line")).toHaveTextContent(
+        "Codex and 3 more are ready",
+      );
+    });
+
+    describe("when no agent can run", () => {
+      beforeEach(() => {
+        health = {
+          claude: SIGNED_OUT("claude"),
+          codex: MISSING,
+          cursor: MISSING,
+          grok: MISSING,
+          opencode: MISSING,
+        };
+      });
+
+      it("asks to connect one in place of the headline and composer", async () => {
+        await renderWithAgents();
+        expect(screen.getByRole("heading", { name: "Connect an agent to start" })).toBeInTheDocument();
+        expect(screen.queryByTestId("composer")).toBeNull();
+        expect(screen.queryByRole("button", { name: /Open folder/ })).toBeNull();
+        expect(screen.getByTestId("connect-agent-claude")).toHaveTextContent("Installed · not signed in");
+        expect(screen.getByTestId("connect-agent-codex")).toHaveTextContent("Not installed");
+        expect(screen.getByTestId("connect-agent-opencode")).toHaveTextContent(
+          "Not installed · has free models",
+        );
+      });
+
+      it("signs in, installs, or opens the agent list", async () => {
+        await renderWithAgents();
+        fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+        expect(signInMock).toHaveBeenCalledWith("claude", "claude login", null);
+        const opencode = screen.getByTestId("connect-agent-opencode");
+        fireEvent.click(within(opencode).getByRole("button", { name: "Install" }));
+        expect(installMock).toHaveBeenCalledWith("opencode", "OpenCode");
+        fireEvent.click(screen.getByRole("button", { name: "Browse agents" }));
+        expect(useUIStore.getState()).toMatchObject({ showSettings: true, settingsSection: "providers" });
+      });
+
+      it("offers a ChatGPT plan for Codex", async () => {
+        const start = vi.fn().mockResolvedValue(undefined);
+        useChatGptStore.setState({ start, status: null, error: null });
+        await renderWithAgents();
+        const codex = screen.getByTestId("connect-agent-codex");
+        fireEvent.click(within(codex).getByRole("button", { name: "Use ChatGPT plan" }));
+        expect(start).toHaveBeenCalledWith(null);
+      });
+
+      it("re-checks when the window regains focus and returns to the composer once one is ready", async () => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        await renderWithAgents();
+        expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+        expect(mockProbe).toHaveBeenCalledTimes(5);
+
+        // Too soon after the last answer: no CLI spawned.
+        await act(async () => {
+          window.dispatchEvent(new Event("focus"));
+        });
+        expect(mockProbe).toHaveBeenCalledTimes(5);
+
+        health = { ...health, claude: READY };
+        vi.setSystemTime(Date.now() + 11_000);
+        await act(async () => {
+          window.dispatchEvent(new Event("focus"));
+        });
+        await flush();
+        expect(mockProbe).toHaveBeenCalledTimes(10);
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+        expect(screen.getByTestId("composer")).toBeInTheDocument();
+        expect(screen.getByTestId("agent-status-line")).toHaveTextContent("Claude Code is ready");
+      });
+
+      it("re-checks straight away when opened again over a no-agent answer", async () => {
+        const first = await renderWithAgents();
+        expect(mockProbe).toHaveBeenCalledTimes(5);
+        first.unmount();
+        health = { ...health, opencode: READY };
+        await renderWithAgents();
+        expect(mockProbe).toHaveBeenCalledTimes(10);
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+      });
+
+      it("stays a first run while the only workspace is the Home one sign-in opened", async () => {
+        const view = await renderWithAgents();
+        useAppStore.setState({
+          appState: { workspaces: [{ workspace_type: "home" }] } as unknown as AppStateSnapshot,
+        });
+        view.rerender(
+          <ChatHomeLanding composer={<div />} agents={{ selected: "claude" }} />,
+        );
+        expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+      });
     });
 
     it("only appears on a first run, and only where the composer can switch", async () => {
       useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
-      const { view } = await renderWithAgents();
-      expect(screen.queryByTestId("agent-availability-strip")).toBeNull();
+      const view = await renderWithAgents();
+      expect(screen.queryByTestId("agent-status-line")).toBeNull();
       expect(mockProbe).not.toHaveBeenCalled();
       view.unmount();
 
       useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
       render(<ChatHomeLanding composer={<div />} />);
-      expect(screen.queryByTestId("agent-availability-strip")).toBeNull();
+      expect(screen.queryByTestId("agent-status-line")).toBeNull();
+      expect(mockProbe).not.toHaveBeenCalled();
     });
   });

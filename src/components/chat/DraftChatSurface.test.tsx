@@ -995,7 +995,7 @@ describe("DraftChatSurface", () => {
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       const { getByRole } = renderSurface();
-      fireEvent.click(getByRole("button", { name: /Open project/ }));
+      fireEvent.click(getByRole("button", { name: /Open folder/ }));
       await vi.waitFor(() =>
         expect(useChatDraftStore.getState().draftsById[draft.draftId]?.target).toEqual({
           kind: "project",
@@ -1687,7 +1687,7 @@ describe("DraftChatSurface", () => {
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
 
       const { queryByTestId } = renderSurface();
-      expect(queryByTestId("agent-availability-strip")).toBeNull();
+      expect(queryByTestId("agent-status-line")).toBeNull();
     });
 
     it("passes the draft's device to the row and persists a pick", () => {

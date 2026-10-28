@@ -41,6 +41,9 @@ export type RightPanelCorePane =
  */
 export const RIGHT_PANEL_EMPTY = "empty";
 
+/** Tabs of the Add project sheet. */
+export type AddProjectTab = "open" | "clone" | "new";
+
 /** What the Theme Studio should open on — one of its two tabs, or an
  *  existing custom theme to reopen. */
 export type ThemeStudioRequest =
@@ -214,8 +217,12 @@ interface UIStore {
   localSessionImportOfferDismissed: boolean;
   dismissLocalSessionImportOffer: () => void;
   setShowLocalSessionImport: (show: boolean) => void;
-  showCloneDialog: boolean;
-  showNewProjectScreen: boolean;
+  /** Open tab of the Add project sheet, or null while it is closed.
+   *  Transient; never persisted. */
+  addProjectSheet: AddProjectTab | null;
+  /** Folder the user picked for new and cloned projects. Null means the
+   *  default, `~/Projects`. Persisted so the choice sticks. */
+  projectsLocation: string | null;
   onboardingProjectDir: string | null;
   hasSeenOnboarding: boolean;
   /** Callback ref set by AppShell after SidebarProvider mounts */
@@ -334,8 +341,8 @@ interface UIStore {
   takeCommandPaletteQuery: () => string | null;
   openThemeStudio: (request: ThemeStudioRequest) => void;
   closeThemeStudio: () => void;
-  setShowCloneDialog: (show: boolean) => void;
-  setShowNewProjectScreen: (show: boolean) => void;
+  setAddProjectSheet: (tab: AddProjectTab | null) => void;
+  setProjectsLocation: (dir: string) => void;
   setOnboardingProjectDir: (dir: string | null) => void;
   setSidebarToggleFn: (fn: (() => void) | null) => void;
   /** Ask the project group at `projectPath` to expand (see
@@ -411,8 +418,8 @@ export const useUIStore = create<UIStore>()(
       localSessionImportOfferDismissed: false,
       dismissLocalSessionImportOffer: () => set({ localSessionImportOfferDismissed: true }),
       setShowLocalSessionImport: (show) => set({ showLocalSessionImport: show }),
-      showCloneDialog: false,
-      showNewProjectScreen: false,
+      addProjectSheet: null,
+      projectsLocation: null,
       onboardingProjectDir: null,
       hasSeenOnboarding: false,
       sidebarToggleFn: null,
@@ -799,9 +806,9 @@ export const useUIStore = create<UIStore>()(
       openThemeStudio: (request) => set({ themeStudio: request }),
       closeThemeStudio: () => set({ themeStudio: null }),
 
-      setShowCloneDialog: (show) => set({ showCloneDialog: show }),
+      setAddProjectSheet: (tab) => set({ addProjectSheet: tab }),
 
-      setShowNewProjectScreen: (show) => set({ showNewProjectScreen: show }),
+      setProjectsLocation: (dir) => set({ projectsLocation: dir }),
 
       setOnboardingProjectDir: (dir) =>
         set((s) =>
@@ -864,6 +871,7 @@ export const useUIStore = create<UIStore>()(
         lastSelectedAgentId: state.lastSelectedAgentId,
         lastModelSelections: state.lastModelSelections,
         hasSeenOnboarding: state.hasSeenOnboarding,
+        projectsLocation: state.projectsLocation,
         dismissedSubagentAttention: state.dismissedSubagentAttention,
         workspaceDetailsOpen: state.workspaceDetailsOpen,
       }),

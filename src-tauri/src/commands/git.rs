@@ -40,16 +40,53 @@ pub async fn init_git_repo_no_commit(path: String) -> Result<String, String> {
         .map_err(|e| format!("init_git_repo_no_commit task join failed: {e}"))?
 }
 
+/// Project locations must be absolute once `~` is expanded. A relative path
+/// resolves against the app process's cwd, which is never where the user
+/// meant the project to go.
+fn require_absolute_location(path: &str) -> Result<(), String> {
+    if Path::new(path).is_absolute() {
+        Ok(())
+    } else {
+        Err(format!("Choose an absolute location for the project, not \"{path}\""))
+    }
+}
+
+/// A new project's name becomes exactly one folder under its location.
+fn validate_project_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        return Err(format!("\"{name}\" isn't a valid folder name"));
+    }
+    Ok(())
+}
+
+/// The new-project flow commits everything in the folder, so it may only
+/// claim a folder that is missing or empty, never a user's existing files.
+fn ensure_new_project_dir(repo_path: &Path) -> Result<(), String> {
+    match std::fs::read_dir(repo_path) {
+        Ok(mut entries) => match entries.next() {
+            Some(_) => Err(format!(
+                "{} already exists and isn't empty. Pick another name.",
+                repo_path.display()
+            )),
+            None => Ok(()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Can't use {}: {e}", repo_path.display())),
+    }
+}
+
 #[tauri::command]
 pub async fn create_empty_repo(parent_dir: String, name: String) -> Result<String, String> {
-    // The New Project screen lets the user *type* the location (placeholder
-    // `~/Projects`). A literal `~` is never expanded by the filesystem, so
-    // without this `create_dir_all` would make a phantom directory named `~`
-    // under the process cwd and the workspace would store a broken `~/...`
-    // path that no terminal can `chdir` into.
+    // A literal `~` is never expanded by the filesystem, so without this
+    // `create_dir_all` would make a phantom directory named `~` under the
+    // process cwd and the workspace would store a broken `~/...` path that
+    // no terminal can `chdir` into.
     let parent_dir = crate::project::expand_tilde(&parent_dir);
+    require_absolute_location(&parent_dir)?;
+    validate_project_name(&name)?;
     tokio::task::spawn_blocking(move || {
         let repo_path = Path::new(&parent_dir).join(&name);
+        ensure_new_project_dir(&repo_path)?;
         std::fs::create_dir_all(&repo_path)
             .map_err(|e| format!("Failed to create directory: {e}"))?;
         crate::git::git_init_repo(&repo_path)?;
@@ -618,10 +655,11 @@ pub async fn git_clone_repo<R: tauri::Runtime>(
     // the old absolute 120s cap that killed legitimate slow clones.)
     const STALL: Duration = Duration::from_secs(120);
 
-    // The clone target is built from a hand-typed location in the New Project
-    // screen; a literal `~` would clone into a phantom `~` directory under the
-    // process cwd. Expand it so the repo lands where the user expects.
+    // A literal `~` would clone into a phantom `~` directory under the
+    // process cwd, and so would any other relative target. Expand the one,
+    // refuse the other.
     let target_dir = crate::project::expand_tilde(&target_dir);
+    require_absolute_location(&target_dir)?;
 
     // Record pre-existence so a stall-kill only removes a dir WE created —
     // never a directory the user already had.
@@ -928,5 +966,35 @@ mod clone_progress_tests {
             parse_clone_progress("fatal: repository 'https://x/y.git' not found"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod project_location_tests {
+    use super::{ensure_new_project_dir, require_absolute_location, validate_project_name};
+
+    #[test]
+    fn relative_locations_are_refused() {
+        assert!(require_absolute_location("/home/u/Projects/app").is_ok());
+        assert!(require_absolute_location("app").is_err());
+        assert!(require_absolute_location("Projects/app").is_err());
+        assert!(require_absolute_location("~/Projects").is_err());
+    }
+
+    #[test]
+    fn names_are_single_folders() {
+        assert!(validate_project_name("my-app").is_ok());
+        for bad in ["", "  ", ".", "..", "a/b", "a\\b"] {
+            assert!(validate_project_name(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn only_missing_or_empty_folders_can_become_new_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ensure_new_project_dir(&dir.path().join("missing")).is_ok());
+        assert!(ensure_new_project_dir(dir.path()).is_ok());
+        std::fs::write(dir.path().join("notes.txt"), "keep me").unwrap();
+        assert!(ensure_new_project_dir(dir.path()).is_err());
     }
 }

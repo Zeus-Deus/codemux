@@ -36,8 +36,8 @@ beforeEach(() => {
     pendingWorkspaces: [],
     lastSelectedAgentId: null,
     showCommandPalette: false,
-    showCloneDialog: false,
-    showNewProjectScreen: false,
+    addProjectSheet: null,
+    projectsLocation: null,
     onboardingProjectDir: null,
     hasSeenOnboarding: false,
     sidebarToggleFn: null,
@@ -163,6 +163,12 @@ describe("ui-store — onboarding state", () => {
       expect(persisted.state.hasSeenOnboarding).toBe(true);
     });
 
+    it("remembers the location picked for new projects", () => {
+      useUIStore.getState().setProjectsLocation("/home/user/Code");
+      const persisted = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!);
+      expect(persisted.state.projectsLocation).toBe("/home/user/Code");
+    });
+
     // The rail-or-expanded choice is half of one preference with the width;
     // forgetting it made rail users collapse the sidebar on every launch.
     it("persists the sidebar's collapsed state alongside its width", () => {
@@ -190,8 +196,7 @@ describe("ui-store — onboarding state", () => {
         showFileSearch: true,
         showContentSearch: true,
         showCommandPalette: true,
-        showCloneDialog: true,
-        showNewProjectScreen: true,
+        addProjectSheet: "clone",
         showNewWorkspaceDialog: true,
         showPullRequests: true,
       });
@@ -203,8 +208,7 @@ describe("ui-store — onboarding state", () => {
       expect(persisted.state.showFileSearch).toBeUndefined();
       expect(persisted.state.showContentSearch).toBeUndefined();
       expect(persisted.state.showCommandPalette).toBeUndefined();
-      expect(persisted.state.showCloneDialog).toBeUndefined();
-      expect(persisted.state.showNewProjectScreen).toBeUndefined();
+      expect(persisted.state.addProjectSheet).toBeUndefined();
       expect(persisted.state.showNewWorkspaceDialog).toBeUndefined();
       expect(persisted.state.showPullRequests).toBeUndefined();
       // A badge that stays cleared across restarts is a badge that stops

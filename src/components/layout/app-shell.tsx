@@ -75,8 +75,8 @@ const UsageView = lazy(() =>
 const CommandPalette = lazy(() =>
   loadCommandPalette().then((module) => ({ default: module.CommandPalette })),
 );
-const NewProjectScreen = lazy(() =>
-  import("@/components/overlays/new-project-screen").then((module) => ({ default: module.NewProjectScreen })),
+const AddProjectSheet = lazy(() =>
+  import("@/components/overlays/add-project-sheet").then((module) => ({ default: module.AddProjectSheet })),
 );
 const FileSearchDialog = lazy(() =>
   loadFileSearchDialog().then((module) => ({ default: module.FileSearchDialog })),
@@ -91,10 +91,15 @@ const BrowserPeekOverlay = lazy(() =>
 export function AppShell(props: { onFirstPaint?: () => void } = {}) {
   const showImport = useUIStore((s) => s.showLocalSessionImport);
   const mobile = useMobileLayout();
+  const addProjectOpen = useUIStore((s) => s.addProjectSheet !== null);
+  const addProjectMounted = useMountedOnceOpen(addProjectOpen);
   // A stable sibling of all route gates: native import emits workspaces before
   // its promise returns, so placing this under EmptyState would lose results.
+  // The Add project sheet sits here too, so every route (landing, legacy
+  // empty page, mobile, the full shell) opens the same one.
   return <>
     {showImport && !mobile && !isRemoteClient() && <LazyBoundary label="recent chat import" presentation="overlay"><LocalSessionImport /></LazyBoundary>}
+    {addProjectMounted && <LazyBoundary label="Add project" className="fixed inset-0 z-50 h-screen" presentation="overlay" open={addProjectOpen}><AddProjectSheet /></LazyBoundary>}
     <AppShellContent {...props} />
   </>;
 }
@@ -123,7 +128,6 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const [bootFadeDone, setBootFadeDone] = useState(false);
   const showSettings = useUIStore((s) => s.showSettings);
   const utilityPage = useUIStore(selectUtilityPage);
-  const showNewProjectScreen = useUIStore((s) => s.showNewProjectScreen);
   const commandPaletteOpen = useUIStore((s) => s.showCommandPalette);
   const fileSearchOpen = useUIStore((s) => s.showFileSearch);
   const contentSearchOpen = useUIStore((s) => s.showContentSearch);
@@ -329,15 +333,6 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
           </LazyBoundary>
         </div>
       </UtilityPageStandaloneContext.Provider>
-    );
-  }
-
-  // Full-screen new project — replaces entire app including sidebar
-  if (showNewProjectScreen) {
-    return (
-      <LazyBoundary label="New project" className="h-screen">
-        <NewProjectScreen />
-      </LazyBoundary>
     );
   }
 

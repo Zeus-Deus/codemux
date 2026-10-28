@@ -26,6 +26,7 @@ import { useAuthStore } from "@/stores/auth-store";
 import { resendVerificationEmail } from "@/tauri/commands";
 
 import { useChatGptStore } from "@/stores/chatgpt-store";
+import type { ChatGptStatus } from "@/tauri/chatgpt";
 
 const startChatGpt = vi.fn();
 const enterLocal = vi.fn();
@@ -57,15 +58,81 @@ function passwordInput() {
   return screen.getByPlaceholderText("Password") as HTMLInputElement;
 }
 
+function openEmailForm() {
+  fireEvent.click(screen.getByRole("button", { name: "Continue with email" }));
+}
+
+function chatGptStatus(overrides: Partial<ChatGptStatus>): ChatGptStatus {
+  return {
+    phase: "disconnected", attemptId: null, email: null, error: null, profiles: [],
+    activeProfileId: null, welcomePending: false, installed: true, ...overrides,
+  };
+}
+
 describe("LoginScreen", () => {
-  it("offers ChatGPT plan setup separately from cloud account sign-in", () => {
+  it("offers three sign-in buttons with the email form folded away", () => {
     render(<LoginScreen />);
-    expect(screen.getByText(/GitHub or email connects your CodeMux account for sync/i)).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Many agents, one desk." })).toBeVisible();
+    expect(screen.getByText("Sign in to sync threads and settings across your devices.")).toBeVisible();
+    expect(screen.queryByPlaceholderText("Email")).not.toBeInTheDocument();
+
     fireEvent.click(screen.getByRole("button", { name: "Continue with ChatGPT" }));
     expect(startChatGpt).toHaveBeenCalledWith(null);
     expect(startOAuthFlow).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Continue locally with another provider" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue with GitHub" }));
+    expect(startOAuthFlow).toHaveBeenCalledOnce();
+
+    openEmailForm();
+    expect(screen.getByPlaceholderText("Email")).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Continue with email" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue without an account" }));
     expect(enterLocal).toHaveBeenCalledOnce();
+  });
+
+  it("returns a local user to the workbench", () => {
+    useChatGptStore.setState({ localMode: true });
+    render(<LoginScreen />);
+    fireEvent.click(screen.getByRole("button", { name: "Back to workbench" }));
+    expect(enterLocal).toHaveBeenCalledOnce();
+  });
+
+  it("shows a GitHub sign-in error while the email form is folded", () => {
+    useAuthStore.setState({ error: "Sign-in timed out" });
+    render(<LoginScreen />);
+    expect(screen.getByRole("alert")).toHaveTextContent("Sign-in timed out");
+    expect(screen.queryByPlaceholderText("Email")).not.toBeInTheDocument();
+  });
+
+  it("gives the column to a pending ChatGPT connection", () => {
+    useChatGptStore.setState({ status: chatGptStatus({ phase: "pending", attemptId: "attempt" }) });
+    render(<LoginScreen />);
+    expect(screen.getByText("Finish in your browser")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Cancel sign-in" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: /^Continue with (GitHub|ChatGPT|email)$/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue without an account" })).toBeDisabled();
+  });
+
+  it("keeps account sign-in beside a connected ChatGPT plan", () => {
+    useChatGptStore.setState({
+      status: chatGptStatus({ phase: "connected", email: "dev@example.com" }),
+    });
+    render(<LoginScreen />);
+    expect(screen.getByText("ChatGPT connected")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Continue to Codemux" }));
+    expect(enterLocal).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Continue with GitHub" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Continue with email" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Continue with ChatGPT" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue without an account" })).not.toBeInTheDocument();
+  });
+
+  it("still requires the Codex CLI note when it is missing", () => {
+    useChatGptStore.setState({ status: chatGptStatus({ installed: false }) });
+    render(<LoginScreen />);
+    expect(screen.getByText(/Codex CLI is required/)).toBeVisible();
   });
 
   it("replaces the form with a cancellable wait while GitHub sign-in is open", () => {
@@ -84,7 +151,9 @@ describe("LoginScreen", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(useAuthStore.getState().oauthPending).toBe(false);
-    expect(screen.getByPlaceholderText("Email")).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "Continue with email" }),
+    ).toBeEnabled();
     expect(
       screen.getByRole("button", { name: /continue with github/i }),
     ).toBeEnabled();
@@ -92,6 +161,7 @@ describe("LoginScreen", () => {
 
   it("toggles password visibility", () => {
     render(<LoginScreen />);
+    openEmailForm();
     expect(passwordInput().type).toBe("password");
 
     fireEvent.click(screen.getByRole("button", { name: "Show password" }));
@@ -103,6 +173,7 @@ describe("LoginScreen", () => {
 
   it("states the password rule and requires a name on sign-up only", () => {
     render(<LoginScreen />);
+    openEmailForm();
     expect(passwordInput()).not.toHaveAttribute("minlength");
 
     fireEvent.click(screen.getByRole("button", { name: /sign up/i }));
@@ -175,6 +246,7 @@ describe("LoginScreen", () => {
   it("holds Resend for a cooldown right after sign-up sent the first email", async () => {
     signUpEmail.mockResolvedValue(undefined);
     render(<LoginScreen />);
+    openEmailForm();
     fireEvent.click(screen.getByRole("button", { name: /sign up/i }));
     fireEvent.change(screen.getByPlaceholderText("Name"), {
       target: { value: "Ada" },
