@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 
 import { agentSecretRequestAnswer } from "@/tauri/commands";
 import type { SecretRequest } from "@/tauri/types";
-import { SecretRequestPanel } from "./SecretRequestCard";
+import { SecretRequestPanel, unencryptedConnection } from "./SecretRequestCard";
 
 vi.mock("@/tauri/commands", () => ({ agentSecretRequestAnswer: vi.fn() }));
 
@@ -62,5 +62,25 @@ describe("secret request card", () => {
     fireEvent.change(screen.getByLabelText("Fly.io API token"), { target: { value: "sk-secret" } });
     fireEvent.click(screen.getByRole("button", { name: "Save securely" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not save it. Try again.");
+  });
+
+  it("blocks entry only on remote pages served as plain HTTP across the network", () => {
+    const at = (protocol: string, hostname: string) => ({ protocol, hostname });
+    expect(unencryptedConnection(false, at("http:", "192.168.1.5"))).toBe(false);
+    for (const [protocol, host] of [
+      ["https:", "app.codemux.org"],
+      ["https:", "192.168.1.5"],
+      ["http:", "localhost"],
+      ["http:", "127.0.0.1"],
+      ["http:", "[::1]"],
+      ["http:", "100.101.102.103"],
+      ["http:", "desk.tail1234.ts.net"],
+      ["http:", "[fd7a:115c:a1e0::1]"],
+    ]) {
+      expect(unencryptedConnection(true, at(protocol, host)), host).toBe(false);
+    }
+    for (const host of ["192.168.1.5", "10.0.0.2", "100.128.0.1", "desk.local"]) {
+      expect(unencryptedConnection(true, at("http:", host)), host).toBe(true);
+    }
   });
 });

@@ -206,7 +206,8 @@ impl Registry {
     }
 
     /// Cancel the chat's open requests that `turn_id` asked, or whose turn
-    /// is unknown.
+    /// is unknown. An empty `turn_id` (a Stop, or a completion that lost its
+    /// turn) cancels all of them.
     fn cancel_turn(&mut self, thread_id: &str, turn_id: &str) -> bool {
         let open: Vec<String> = self
             .entries
@@ -214,7 +215,7 @@ impl Registry {
             .filter(|(_, e)| {
                 e.is_open()
                     && e.view.thread_id == thread_id
-                    && e.turn_id.as_deref().is_none_or(|turn| turn == turn_id)
+                    && (turn_id.is_empty() || e.turn_id.as_deref().is_none_or(|turn| turn == turn_id))
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -621,6 +622,10 @@ mod tests {
         assert!(reg.cancel_turn("chat", "t2"));
         assert!(!reg.cancel_turn("chat", "t2"));
         assert_eq!(outcome(&reg, &live), Some(Outcome::Cancelled));
+        // A completion that lost its turn id, or a Stop, ends them all.
+        let (next, _) = id_of(reg.open("chat", Some("t3"), &args("Next"), REQUEST_LIFETIME_MS).unwrap());
+        assert!(reg.cancel_turn("chat", ""));
+        assert_eq!(outcome(&reg, &next), Some(Outcome::Cancelled));
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 import { useId, useRef, useState, type FormEvent } from "react";
 import { KeyRound, ShieldCheck } from "lucide-react";
 
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useEaseInOnce } from "@/hooks/use-ease-in-once";
 import { cn } from "@/lib/utils";
 import { agentSecretRequestAnswer } from "@/tauri/commands";
@@ -14,6 +15,33 @@ import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
  *  must not claim the agent never can. */
 export const SECRET_PRIVACY_NOTE =
   "Kept out of chat, in a private file this agent's commands can read for 24 hours";
+
+/** Shown instead of the field where typing the secret would send it across
+ *  the network unencrypted. */
+export const UNENCRYPTED_NOTE =
+  "This connection isn't encrypted, so the secret can't be entered here. Use the Codemux desktop app, or connect over Tailscale or the relay.";
+
+/**
+ * Whether a remote page reaches Codemux over plain HTTP across the network.
+ * A LAN client talks to its own origin, so the page's address decides: HTTPS
+ * (the relay, or a TLS proxy), this machine, or the tailnet (WireGuard) keep
+ * the value private. The desktop app never sends it over a network.
+ */
+export function unencryptedConnection(
+  remote: boolean,
+  location: Pick<Location, "protocol" | "hostname">,
+): boolean {
+  if (!remote || location.protocol === "https:") return false;
+  const host = location.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const v4 = /^(\d+)\.(\d+)\.\d+\.\d+$/.exec(host);
+  const loopback =
+    host === "localhost" || host === "::1" || (v4 !== null && v4[1] === "127");
+  const tailnet =
+    host.endsWith(".ts.net") ||
+    host.startsWith("fd7a:115c:a1e0:") ||
+    (v4 !== null && v4[1] === "100" && Number(v4[2]) >= 64 && Number(v4[2]) <= 127);
+  return !(loopback || tailnet);
+}
 
 // Masking a text field keeps password managers from offering to save a
 // secret that is not a login. Without the property, fall back to a password
@@ -53,12 +81,13 @@ function SecretRequestCard({
   const [error, setError] = useState<string | null>(null);
   // Enter and a click can both submit before a render.
   const inFlight = useRef(false);
+  const unencrypted = unencryptedConnection(isRemoteClient(), window.location);
 
   const send = async (
     answer: { type: "save"; secret: string } | { type: "decline" },
   ) => {
     if (inFlight.current) return;
-    if (answer.type === "save" && !answer.secret.trim()) return;
+    if (answer.type === "save" && (unencrypted || !answer.secret.trim())) return;
     inFlight.current = true;
     setSubmitting(true);
     setError(null);
@@ -133,12 +162,12 @@ function SecretRequestCard({
               data-bwignore
               placeholder={request.placeholder ?? "Paste the secret"}
               value={secret}
-              disabled={submitting}
+              disabled={submitting || unencrypted}
               aria-invalid={error !== null || undefined}
               aria-describedby={error !== null ? `${privacyId} ${errorId}` : privacyId}
               onChange={(event) => setSecret(event.currentTarget.value)}
             />
-            <Button type="submit" disabled={submitting || !secret.trim()}>
+            <Button type="submit" disabled={submitting || unencrypted || !secret.trim()}>
               Save securely
             </Button>
           </div>
@@ -153,7 +182,7 @@ function SecretRequestCard({
               className="flex min-w-0 items-center gap-1.5 text-caption text-muted-foreground"
             >
               <ShieldCheck className="size-3.5 shrink-0" aria-hidden />
-              {SECRET_PRIVACY_NOTE}
+              {unencrypted ? UNENCRYPTED_NOTE : SECRET_PRIVACY_NOTE}
             </p>
             <Button
               type="button"
