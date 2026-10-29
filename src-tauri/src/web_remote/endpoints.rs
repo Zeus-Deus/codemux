@@ -118,6 +118,22 @@ fn is_tailnet_v4(addr: Ipv4Addr) -> bool {
     o[0] == 100 && (0x40..=0x7f).contains(&o[1])
 }
 
+/// Whether a peer reaches the LAN listener over a link that already keeps
+/// its traffic private: this machine itself (or a TLS proxy on it) or the
+/// tailnet, which WireGuard encrypts. Anything else is plain HTTP on the
+/// network.
+pub(super) fn is_private_link(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || is_tailnet_v4(v4),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            v6.is_loopback()
+                || (s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0)
+                || v6.to_ipv4_mapped().is_some_and(|v4| is_private_link(IpAddr::V4(v4)))
+        }
+    }
+}
+
 /// RFC 1918 private IPv4 ranges (plus 169.254/16 link-local, which is still
 /// LAN-reachable on the local segment). Excludes the tailnet range (checked
 /// earlier). Used to decide *whether* a v4 address is surfaced at all; its
@@ -458,6 +474,16 @@ fn tailscale_status() -> Option<TailscaleStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_links_are_this_machine_and_the_tailnet() {
+        for ip in ["127.0.0.1", "::1", "100.101.102.103", "fd7a:115c:a1e0::1", "::ffff:127.0.0.1"] {
+            assert!(is_private_link(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["192.168.1.5", "10.0.0.2", "203.0.113.9", "fe80::1", "::ffff:192.168.1.5"] {
+            assert!(!is_private_link(ip.parse().unwrap()), "{ip}");
+        }
+    }
 
     #[test]
     fn tailnet_range_detection() {

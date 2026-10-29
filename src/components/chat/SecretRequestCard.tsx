@@ -66,8 +66,8 @@ function SecretRequestCard({
       await agentSecretRequestAnswer(request.id, answer);
       setSecret("");
     } catch (cause) {
-      // Only the backend's own messages reach the user; they never hold
-      // the value.
+      // Commands reject with Codemux's own message, which never holds the
+      // value; anything else gets generic copy.
       setError(
         typeof cause === "string" && cause.trim()
           ? cause
@@ -93,7 +93,9 @@ function SecretRequestCard({
         ease && "animate-in fade-in-0 slide-in-from-bottom-2 duration-150 ease-out",
       )}
     >
-      <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
+      {/* Inset like the composer's strip and chin, so the card lines up
+          with them instead of overhanging. */}
+      <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD, "px-5")}>
         <form
           data-testid="secret-request-card"
           autoComplete="off"

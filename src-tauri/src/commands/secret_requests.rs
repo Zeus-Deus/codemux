@@ -84,6 +84,9 @@ enum Outcome {
 
 struct Entry {
     view: SecretRequestView,
+    /// The turn that asked, when the provider names it: only its end
+    /// cancels the card.
+    turn_id: Option<String>,
     outcome: watch::Sender<Option<Outcome>>,
 }
 
@@ -93,8 +96,8 @@ impl Entry {
     }
 }
 
-/// Every chat's requests, open and answered. An answered one stays until the
-/// agent collects its outcome, or until it would have expired.
+/// Every chat's requests, open and answered. An answered one stays until it
+/// would have expired, so every call waiting on it reads the same outcome.
 #[derive(Default)]
 struct Registry {
     entries: HashMap<String, Entry>,
@@ -136,7 +139,7 @@ fn bounded(field: &str, value: Option<&str>, max: usize) -> Result<Option<String
 impl Registry {
     /// Continue `request_id`, reuse the chat's open card with the same label
     /// (an agent retrying without its id), or open a new card.
-    fn open(&mut self, thread_id: &str, args: &ToolArgs, now_ms: i64) -> Result<Opened, String> {
+    fn open(&mut self, thread_id: &str, turn_id: Option<&str>, args: &ToolArgs, now_ms: i64) -> Result<Opened, String> {
         self.prune(now_ms);
         if let Some(id) = args.request_id.as_deref() {
             return match self.entries.get(id) {
@@ -171,6 +174,7 @@ impl Registry {
                     placeholder,
                     expires_at_ms: now_ms + REQUEST_LIFETIME_MS,
                 },
+                turn_id: turn_id.map(str::to_string),
                 outcome: tx,
             },
         );
@@ -182,13 +186,6 @@ impl Registry {
         let entry = self.entries.get(id).filter(|e| e.is_open())?;
         entry.outcome.send_replace(Some(outcome));
         Some(entry.view.thread_id.clone())
-    }
-
-    /// The outcome a waiter collects, removing the settled request.
-    fn take(&mut self, id: &str) -> Option<Outcome> {
-        let outcome = self.entries.get(id)?.outcome.borrow().clone()?;
-        self.entries.remove(id);
-        Some(outcome)
     }
 
     /// Expire the open requests past their lifetime. Returns their chats.
@@ -208,11 +205,17 @@ impl Registry {
             .retain(|_, e| e.is_open() || e.view.expires_at_ms > now_ms);
     }
 
-    fn cancel_thread(&mut self, thread_id: &str) -> bool {
+    /// Cancel the chat's open requests that `turn_id` asked, or whose turn
+    /// is unknown.
+    fn cancel_turn(&mut self, thread_id: &str, turn_id: &str) -> bool {
         let open: Vec<String> = self
             .entries
             .iter()
-            .filter(|(_, e)| e.is_open() && e.view.thread_id == thread_id)
+            .filter(|(_, e)| {
+                e.is_open()
+                    && e.view.thread_id == thread_id
+                    && e.turn_id.as_deref().is_none_or(|turn| turn == turn_id)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in &open {
@@ -303,10 +306,17 @@ fn emit<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
     );
 }
 
-/// The chat's turn ended: nobody is left to receive its answers.
-pub fn end_thread<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
-    if registry().cancel_thread(thread_id) {
+/// A chat's turn ended: nobody is left to receive its answers.
+pub fn end_turn<R: Runtime>(app: &AppHandle<R>, thread_id: &str, turn_id: &str) {
+    if registry().cancel_turn(thread_id, turn_id) {
         emit(app, thread_id);
+    }
+}
+
+fn expire_and_emit<R: Runtime>(app: &AppHandle<R>) {
+    let expired = registry().expire(now_ms());
+    for thread in expired {
+        emit(app, &thread);
     }
 }
 
@@ -341,6 +351,7 @@ pub fn agent_secret_request_answer<R: Runtime>(
     request_id: String,
     answer: SecretAnswer,
 ) -> Result<(), String> {
+    expire_and_emit(&app);
     let thread_id = answer_request(&request_id, answer, secrets_dir())?;
     emit(&app, &thread_id);
     Ok(())
@@ -348,14 +359,15 @@ pub fn agent_secret_request_answer<R: Runtime>(
 
 fn answer_request(id: &str, answer: SecretAnswer, dir: Option<PathBuf>) -> Result<String, String> {
     const ENDED: &str = "This request has ended. Ask the agent again if it still needs it.";
-    if !registry().entries.get(id).is_some_and(Entry::is_open) {
+    let live = |entry: &Entry| entry.is_open() && entry.view.expires_at_ms > now_ms();
+    if !registry().entries.get(id).is_some_and(live) {
         return Err(ENDED.into());
     }
     let outcome = match answer {
         SecretAnswer::Decline => Outcome::Declined,
         SecretAnswer::Save { secret } => {
-            let secret = secret.trim();
-            if secret.is_empty() {
+            // Stored exactly as typed: a password may begin or end with a space.
+            if secret.trim().is_empty() {
                 return Err("Enter the secret, or decline.".into());
             }
             if secret.len() > MAX_SECRET_BYTES {
@@ -363,14 +375,23 @@ fn answer_request(id: &str, answer: SecretAnswer, dir: Option<PathBuf>) -> Resul
             }
             let dir = dir.ok_or("Codemux has no private folder to save secrets in.")?;
             sweep_dir(&dir, SystemTime::now());
-            Outcome::Saved(write_private_file(&dir, secret)?)
+            Outcome::Saved(write_private_file(&dir, &secret)?)
         }
     };
     let saved = match &outcome {
         Outcome::Saved(path) => Some(path.clone()),
         _ => None,
     };
-    let settled = registry().settle(id, outcome);
+    // Rechecked under the same lock as the settle: it may have expired or
+    // ended while the file was written.
+    let settled = {
+        let mut reg = registry();
+        if reg.entries.get(id).is_some_and(live) {
+            reg.settle(id, outcome)
+        } else {
+            None
+        }
+    };
     match settled {
         Some(thread_id) => Ok(thread_id),
         // It ended while the file was written: nobody receives this path.
@@ -444,16 +465,22 @@ impl<R: Runtime> SecretRequestHost<R> {
         Self { app }
     }
 
-    async fn answer(&self, caller: &HostCaller, arguments: &Value) -> Value {
+    async fn answer(&self, caller: &HostCaller, turn_id: Option<&str>, arguments: &Value) -> Value {
         let args: ToolArgs = match serde_json::from_value(arguments.clone()) {
             Ok(args) => args,
             Err(error) => return result_text(json!(format!("Pass label and reason, or request_id: {error}")), true),
         };
         let thread_id = caller.thread_id.as_str();
-        let opened = registry().open(thread_id, &args, now_ms());
+        let opened = registry().open(thread_id, turn_id, &args, now_ms());
         let (id, mut rx) = match opened {
             Ok(Opened::Created(id, rx)) => {
                 emit(&self.app, thread_id);
+                // Closes the card on time even when the agent stops waiting.
+                let app = self.app.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(REQUEST_LIFETIME_MS as u64)).await;
+                    expire_and_emit(&app);
+                });
                 (id, rx)
             }
             Ok(Opened::Existing(id, rx)) => (id, rx),
@@ -462,11 +489,10 @@ impl<R: Runtime> SecretRequestHost<R> {
         let deadline = registry().entries.get(&id).map_or(0, |e| e.view.expires_at_ms);
         let wait = CALL_WAIT.min(Duration::from_millis((deadline - now_ms()).max(0) as u64));
         let _ = tokio::time::timeout(wait, rx.wait_for(Option::is_some)).await;
-        let expired = registry().expire(now_ms());
-        for thread in expired {
-            emit(&self.app, &thread);
-        }
-        match registry().take(&id) {
+        expire_and_emit(&self.app);
+        // Every call waiting on this request reads the same outcome.
+        let outcome = rx.borrow().clone();
+        match outcome {
             Some(outcome) => result_text(outcome_result(outcome), false),
             None => result_text(
                 json!({"status": "waiting", "request_id": id, "note": "The card is still open. Call request_secret again with this request_id to keep waiting; do not ask in chat."}),
@@ -496,7 +522,7 @@ impl<R: Runtime> HostTools for SecretRequestHost<R> {
         name: &'a str,
         args: &'a Value,
         _call_id: Option<&'a str>,
-        _run_id: Option<&'a str>,
+        run_id: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send + 'a>> {
         Box::pin(async move {
             if name != REQUEST_SECRET_REGISTRY_NAME {
@@ -505,7 +531,7 @@ impl<R: Runtime> HostTools for SecretRequestHost<R> {
             if self.tools_for(caller).is_empty() {
                 return Some(result_text(json!("request_secret is not available to this chat."), true));
             }
-            Some(self.answer(caller, args).await)
+            Some(self.answer(caller, run_id, args).await)
         })
     }
 
@@ -529,6 +555,10 @@ mod tests {
         }
     }
 
+    fn outcome(reg: &Registry, id: &str) -> Option<Outcome> {
+        reg.entries.get(id)?.outcome.borrow().clone()
+    }
+
     fn id_of(opened: Opened) -> (String, bool) {
         match opened {
             Opened::Created(id, _) => (id, true),
@@ -539,13 +569,13 @@ mod tests {
     #[test]
     fn a_retry_reuses_the_open_card_and_an_id_continues_it() {
         let mut reg = Registry::default();
-        let (id, created) = id_of(reg.open("chat", &args("API key"), 0).unwrap());
+        let (id, created) = id_of(reg.open("chat", None, &args("API key"), 0).unwrap());
         assert!(created);
-        assert_eq!(id_of(reg.open("chat", &args("API key"), 1).unwrap()), (id.clone(), false));
+        assert_eq!(id_of(reg.open("chat", None, &args("API key"), 1).unwrap()), (id.clone(), false));
         let resume = ToolArgs { request_id: Some(id.clone()), ..args("") };
-        assert_eq!(id_of(reg.open("chat", &resume, 2).unwrap()), (id.clone(), false));
+        assert_eq!(id_of(reg.open("chat", None, &resume, 2).unwrap()), (id.clone(), false));
         // Another chat can neither see nor continue it.
-        assert!(reg.open("other", &resume, 2).is_err());
+        assert!(reg.open("other", None, &resume, 2).is_err());
         assert!(reg.open_for("other").is_empty());
         assert_eq!(reg.open_for("chat").len(), 1);
     }
@@ -553,39 +583,50 @@ mod tests {
     #[test]
     fn label_and_reason_are_required_and_bounded() {
         let mut reg = Registry::default();
-        assert!(reg.open("chat", &ToolArgs { label: None, ..args("x") }, 0).is_err());
-        assert!(reg.open("chat", &ToolArgs { reason: Some(" ".into()), ..args("x") }, 0).is_err());
-        assert!(reg.open("chat", &args(&"x".repeat(MAX_LABEL_CHARS + 1)), 0).is_err());
+        assert!(reg.open("chat", None, &ToolArgs { label: None, ..args("x") }, 0).is_err());
+        assert!(reg.open("chat", None, &ToolArgs { reason: Some(" ".into()), ..args("x") }, 0).is_err());
+        assert!(reg.open("chat", None, &args(&"x".repeat(MAX_LABEL_CHARS + 1)), 0).is_err());
     }
 
     #[test]
-    fn settled_requests_leave_the_ui_and_are_collected_once() {
+    fn settled_requests_leave_the_ui_and_every_waiter_reads_one_outcome() {
         let mut reg = Registry::default();
-        let (id, _) = id_of(reg.open("chat", &args("Token"), 0).unwrap());
+        let Opened::Created(id, first) = reg.open("chat", None, &args("Token"), 0).unwrap() else { panic!() };
+        let Opened::Existing(_, second) = reg.open("chat", None, &args("Token"), 1).unwrap() else { panic!() };
         assert_eq!(reg.settle(&id, Outcome::Declined), Some("chat".into()));
         assert!(reg.open_for("chat").is_empty());
         // A second answer cannot overwrite the first.
         assert_eq!(reg.settle(&id, Outcome::Cancelled), None);
-        assert_eq!(reg.take(&id), Some(Outcome::Declined));
-        assert_eq!(reg.take(&id), None);
+        assert_eq!(*first.borrow(), Some(Outcome::Declined));
+        assert_eq!(*second.borrow(), Some(Outcome::Declined));
+        // A later call resuming the id still reads it, until it would have expired.
+        let resume = ToolArgs { request_id: Some(id.clone()), ..args("") };
+        assert!(matches!(reg.open("chat", None, &resume, 2).unwrap(), Opened::Existing(..)));
+        reg.prune(REQUEST_LIFETIME_MS);
+        assert!(reg.open("chat", None, &resume, REQUEST_LIFETIME_MS).is_err());
     }
 
     #[test]
-    fn requests_expire_and_end_with_the_turn() {
+    fn requests_expire_and_end_with_their_own_turn() {
         let mut reg = Registry::default();
-        let (old, _) = id_of(reg.open("chat", &args("Old"), 0).unwrap());
-        let (live, _) = id_of(reg.open("chat", &args("Live"), REQUEST_LIFETIME_MS).unwrap());
+        let (old, _) = id_of(reg.open("chat", Some("t1"), &args("Old"), 0).unwrap());
+        let (live, _) = id_of(reg.open("chat", Some("t2"), &args("Live"), REQUEST_LIFETIME_MS).unwrap());
+        let (unknown, _) = id_of(reg.open("chat", None, &args("Unknown"), REQUEST_LIFETIME_MS).unwrap());
         assert_eq!(reg.expire(REQUEST_LIFETIME_MS), vec!["chat".to_string()]);
-        assert_eq!(reg.take(&old), Some(Outcome::Expired));
-        assert!(reg.cancel_thread("chat"));
-        assert!(!reg.cancel_thread("chat"));
-        assert_eq!(reg.take(&live), Some(Outcome::Cancelled));
+        assert_eq!(outcome(&reg, &old), Some(Outcome::Expired));
+        // An earlier turn ending late leaves the next turn's card alone.
+        assert!(reg.cancel_turn("chat", "t1"));
+        assert_eq!(outcome(&reg, &live), None);
+        assert_eq!(outcome(&reg, &unknown), Some(Outcome::Cancelled));
+        assert!(reg.cancel_turn("chat", "t2"));
+        assert!(!reg.cancel_turn("chat", "t2"));
+        assert_eq!(outcome(&reg, &live), Some(Outcome::Cancelled));
     }
 
     #[tokio::test]
     async fn a_waiting_call_wakes_on_the_answer() {
         let mut reg = Registry::default();
-        let Opened::Created(id, mut rx) = reg.open("chat", &args("Key"), 0).unwrap() else { panic!() };
+        let Opened::Created(id, mut rx) = reg.open("chat", None, &args("Key"), 0).unwrap() else { panic!() };
         let tx = reg.entries[&id].outcome.clone();
         tokio::spawn(async move { tx.send_replace(Some(Outcome::Declined)) });
         tokio::time::timeout(Duration::from_secs(5), rx.wait_for(Option::is_some))
@@ -616,14 +657,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = {
             let mut reg = registry();
-            id_of(reg.open("answer-chat", &args("Key"), now_ms()).unwrap()).0
+            id_of(reg.open("answer-chat", None, &args("Key"), now_ms()).unwrap()).0
         };
         let blank = answer_request(&id, SecretAnswer::Save { secret: "  ".into() }, Some(dir.path().into()));
         assert!(blank.is_err());
-        let saved = answer_request(&id, SecretAnswer::Save { secret: " sk-1\n".into() }, Some(dir.path().into()));
+        let saved = answer_request(&id, SecretAnswer::Save { secret: " pass word ".into() }, Some(dir.path().into()));
         assert_eq!(saved.unwrap(), "answer-chat");
-        let Some(Outcome::Saved(path)) = registry().take(&id) else { panic!("expected a saved file") };
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "sk-1");
+        let Some(Outcome::Saved(path)) = outcome(&registry(), &id) else { panic!("expected a saved file") };
+        // Exactly as typed.
+        assert_eq!(std::fs::read_to_string(path).unwrap(), " pass word ");
         // An ended request writes nothing.
         assert!(answer_request(&id, SecretAnswer::Save { secret: "sk-2".into() }, Some(dir.path().into())).is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);

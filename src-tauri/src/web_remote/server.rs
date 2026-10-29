@@ -222,6 +222,9 @@ struct ConnInfo {
 pub struct ConnectionRegistry {
     conns: Mutex<HashMap<u64, ConnInfo>>,
     next: AtomicU64,
+    /// LAN sockets from peers whose traffic crosses the network unencrypted
+    /// ([`super::endpoints::is_private_link`]).
+    plaintext: Mutex<std::collections::HashSet<u64>>,
 }
 
 impl ConnectionRegistry {
@@ -250,6 +253,16 @@ impl ConnectionRegistry {
 
     pub(super) fn unregister(&self, id: u64) {
         self.conns.lock().unwrap().remove(&id);
+        self.plaintext.lock().unwrap().remove(&id);
+    }
+
+    pub(super) fn mark_plaintext(&self, id: u64) {
+        self.plaintext.lock().unwrap().insert(id);
+    }
+
+    /// Whether the socket's traffic crosses the network unencrypted.
+    pub(super) fn is_plaintext(&self, id: u64) -> bool {
+        self.plaintext.lock().unwrap().contains(&id)
     }
 
     pub(super) fn session_for_connection(&self, id: u64) -> Option<String> {
@@ -638,6 +651,7 @@ async fn withdraw<R: Runtime>(State(app): State<AppHandle<R>>, headers: HeaderMa
 
 async fn ws_upgrade<R: Runtime>(
     State(app): State<AppHandle<R>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
@@ -673,7 +687,8 @@ async fn ws_upgrade<R: Runtime>(
 
     let app_for_socket = app.clone();
     ws.on_upgrade(move |socket| {
-        handle_socket(app_for_socket, session_id, socket, compress_frames)
+        let plaintext = !super::endpoints::is_private_link(peer.ip());
+        handle_socket(app_for_socket, session_id, socket, compress_frames, plaintext)
     })
 }
 
@@ -771,6 +786,7 @@ async fn handle_socket<R: Runtime>(
     session_id: String,
     socket: WebSocket,
     compress_frames: bool,
+    plaintext: bool,
 ) {
     let shared = app.state::<WebRemoteState>().shared();
     app.state::<crate::database::DatabaseStore>()
@@ -782,6 +798,9 @@ async fn handle_socket<R: Runtime>(
     let conn_id = shared
         .connections
         .register(&session_id, Transport::Lan, out_tx.clone(), close_tx.clone());
+    if plaintext {
+        shared.connections.mark_plaintext(conn_id);
+    }
     super::emit_state_changed(&app);
 
     // Writer: the single owner of the sink; every producer feeds `out_tx`.

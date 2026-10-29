@@ -8262,10 +8262,10 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     {
         crate::delegation::authority::NativeAuthority::finish_thread(&thread_id.0, &turn_id.0);
     }
-    if let ProviderRuntimeEvent::TurnCompleted { thread_id, .. } = &event {
+    if let ProviderRuntimeEvent::TurnCompleted { thread_id, turn_id, .. } = &event {
         if let Some(db) = app.try_state::<DatabaseStore>() { let _ = db.orchestration_launch_finished(&thread_id.0); }
         // A secret card outliving its turn would hand its answer to no one.
-        crate::commands::secret_requests::end_thread(app, &thread_id.0);
+        crate::commands::secret_requests::end_turn(app, &thread_id.0, &turn_id.0);
     }
     if let ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, queued_id } = &event {
         if app.state::<DatabaseStore>().is_disposed_delivery_queue(&thread_id.0, queued_id).unwrap_or(false) {
