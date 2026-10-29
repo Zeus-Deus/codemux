@@ -206,17 +206,27 @@ impl Registry {
     }
 
     /// Cancel the chat's open requests that `turn_id` asked, or whose turn
-    /// is unknown. An empty `turn_id` (a Stop, or a completion that lost its
-    /// turn) cancels all of them.
+    /// is unknown. A completion without its turn's id may arrive after the
+    /// next turn asked, so it cancels nothing.
     fn cancel_turn(&mut self, thread_id: &str, turn_id: &str) -> bool {
+        if turn_id.is_empty() {
+            return false;
+        }
+        self.cancel_where(|e| {
+            e.view.thread_id == thread_id && e.turn_id.as_deref().is_none_or(|turn| turn == turn_id)
+        })
+    }
+
+    /// Cancel every open request in the chat: the user stopped it.
+    fn cancel_all(&mut self, thread_id: &str) -> bool {
+        self.cancel_where(|e| e.view.thread_id == thread_id)
+    }
+
+    fn cancel_where(&mut self, matches: impl Fn(&Entry) -> bool) -> bool {
         let open: Vec<String> = self
             .entries
             .iter()
-            .filter(|(_, e)| {
-                e.is_open()
-                    && e.view.thread_id == thread_id
-                    && (turn_id.is_empty() || e.turn_id.as_deref().is_none_or(|turn| turn == turn_id))
-            })
+            .filter(|(_, e)| e.is_open() && matches(e))
             .map(|(id, _)| id.clone())
             .collect();
         for id in &open {
@@ -310,6 +320,13 @@ fn emit<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
 /// A chat's turn ended: nobody is left to receive its answers.
 pub fn end_turn<R: Runtime>(app: &AppHandle<R>, thread_id: &str, turn_id: &str) {
     if registry().cancel_turn(thread_id, turn_id) {
+        emit(app, thread_id);
+    }
+}
+
+/// The user stopped the chat: end every card it has open.
+pub fn stop_thread<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
+    if registry().cancel_all(thread_id) {
         emit(app, thread_id);
     }
 }
@@ -622,9 +639,12 @@ mod tests {
         assert!(reg.cancel_turn("chat", "t2"));
         assert!(!reg.cancel_turn("chat", "t2"));
         assert_eq!(outcome(&reg, &live), Some(Outcome::Cancelled));
-        // A completion that lost its turn id, or a Stop, ends them all.
+        // A completion that lost its id, arriving after the next turn asked,
+        // leaves that card alone; a Stop ends them all.
         let (next, _) = id_of(reg.open("chat", Some("t3"), &args("Next"), REQUEST_LIFETIME_MS).unwrap());
-        assert!(reg.cancel_turn("chat", ""));
+        assert!(!reg.cancel_turn("chat", ""));
+        assert_eq!(outcome(&reg, &next), None);
+        assert!(reg.cancel_all("chat"));
         assert_eq!(outcome(&reg, &next), Some(Outcome::Cancelled));
     }
 

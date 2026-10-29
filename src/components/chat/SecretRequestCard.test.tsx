@@ -76,6 +76,8 @@ describe("secret request card", () => {
       ["http:", "100.101.102.103"],
       ["http:", "desk.tail1234.ts.net"],
       ["http:", "[fd7a:115c:a1e0::1]"],
+      ["http:", "localhost."],
+      ["http:", "Desk.Tail1234.ts.net."],
     ]) {
       expect(unencryptedConnection(true, at(protocol, host)), host).toBe(false);
     }

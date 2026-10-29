@@ -5148,11 +5148,10 @@ async fn interrupt_turn_inner<R: Runtime>(
     feature_flag_on(&observability)?;
     // A stopped turn's secret cards would hand their answers to no one, and
     // its completion may arrive without the turn's id.
-    crate::commands::secret_requests::end_turn(
-        &app,
-        &thread_id.0,
-        turn_id.as_ref().map_or("", |turn| turn.0.as_str()),
-    );
+    match &turn_id {
+        Some(turn) => crate::commands::secret_requests::end_turn(&app, &thread_id.0, &turn.0),
+        None => crate::commands::secret_requests::stop_thread(&app, &thread_id.0),
+    }
     let native_gate = native_thread_gate(&app, &thread_id.0);
     // A selected interrupt applies only to an already-running turn. The
     // provider must first match that identity; it is not a blanket Stop of

@@ -32,7 +32,10 @@ export function unencryptedConnection(
   location: Pick<Location, "protocol" | "hostname">,
 ): boolean {
   if (!remote || location.protocol === "https:") return false;
-  const host = location.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const host = location.hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.$/, "");
   const v4 = /^(\d+)\.(\d+)\.\d+\.\d+$/.exec(host);
   const loopback =
     host === "localhost" || host === "::1" || (v4 !== null && v4[1] === "127");
