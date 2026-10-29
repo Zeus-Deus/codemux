@@ -73,15 +73,13 @@ describe("secret request card", () => {
       ["http:", "localhost"],
       ["http:", "127.0.0.1"],
       ["http:", "[::1]"],
-      ["http:", "100.101.102.103"],
-      ["http:", "desk.tail1234.ts.net"],
-      ["http:", "[fd7a:115c:a1e0::1]"],
-      ["http:", "localhost."],
-      ["http:", "Desk.Tail1234.ts.net."],
+      ["http:", "LocalHost."],
+      ["https:", "desk.tail1234.ts.net"],
     ]) {
       expect(unencryptedConnection(true, at(protocol, host)), host).toBe(false);
     }
-    for (const host of ["192.168.1.5", "10.0.0.2", "100.128.0.1", "desk.local"]) {
+    // Shared address space (any CGNAT or VPN network) proves no encryption.
+    for (const host of ["192.168.1.5", "10.0.0.2", "100.101.102.104", "desk.tail1234.ts.net", "[fd7a:115c:a1e0::1]"]) {
       expect(unencryptedConnection(true, at("http:", host)), host).toBe(true);
     }
   });

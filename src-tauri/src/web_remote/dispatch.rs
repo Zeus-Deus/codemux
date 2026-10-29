@@ -302,7 +302,7 @@ pub async fn dispatch_invoke<R: Runtime>(
         && args.pointer("/answer/type").and_then(Value::as_str) != Some("decline")
         && app.state::<super::WebRemoteState>().shared().connections.is_plaintext(conn_id)
     {
-        let _ = out.send(err_text(id, "This connection is not encrypted, so the secret was not sent. Enter it in the Codemux desktop app, or connect over Tailscale or the relay."));
+        let _ = out.send(err_text(id, "This connection is not encrypted, so the secret was not sent. Enter it in the Codemux desktop app, or connect over HTTPS or the relay."));
         return;
     }
     if !super::policy::allowed(&cmd) {

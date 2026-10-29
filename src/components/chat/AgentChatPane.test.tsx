@@ -490,9 +490,11 @@ vi.mock("@/tauri/events", async (importOriginal) => ({
   onAgentChatTurnCheckpointReverted: vi.fn().mockResolvedValue(() => {}),
   onAgentChatTurnCheckpointsInvalidated: vi.fn().mockResolvedValue(() => {}),
   onAgentChatQueuedTurnsChanged: vi.fn().mockResolvedValue(() => {}),
+  onSecretRequestsChanged: vi.fn().mockResolvedValue(() => {}),
 }));
 
 vi.mock("@/tauri/commands", () => ({
+  agentSecretRequests: vi.fn().mockResolvedValue([]),
   agentChatDeliveryAttention: vi.fn().mockResolvedValue([]),
   agentChatAcknowledgeDelivery: vi.fn().mockResolvedValue(undefined),
   agentChatRetryDelivery: vi.fn().mockResolvedValue(undefined),

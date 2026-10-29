@@ -19,13 +19,14 @@ export const SECRET_PRIVACY_NOTE =
 /** Shown instead of the field where typing the secret would send it across
  *  the network unencrypted. */
 export const UNENCRYPTED_NOTE =
-  "This connection isn't encrypted, so the secret can't be entered here. Use the Codemux desktop app, or connect over Tailscale or the relay.";
+  "This connection isn't encrypted, so the secret can't be entered here. Use the Codemux desktop app, or connect over HTTPS or the relay.";
 
 /**
  * Whether a remote page reaches Codemux over plain HTTP across the network.
- * A LAN client talks to its own origin, so the page's address decides: HTTPS
- * (the relay, or a TLS proxy), this machine, or the tailnet (WireGuard) keep
- * the value private. The desktop app never sends it over a network.
+ * A LAN client talks to its own origin, so the page's address decides. Only
+ * HTTPS (the relay, or a TLS proxy) or this machine prove the value stays
+ * private: an address range, a VPN's included, says nothing about whether
+ * the link is encrypted. The desktop app never sends it over a network.
  */
 export function unencryptedConnection(
   remote: boolean,
@@ -39,11 +40,7 @@ export function unencryptedConnection(
   const v4 = /^(\d+)\.(\d+)\.\d+\.\d+$/.exec(host);
   const loopback =
     host === "localhost" || host === "::1" || (v4 !== null && v4[1] === "127");
-  const tailnet =
-    host.endsWith(".ts.net") ||
-    host.startsWith("fd7a:115c:a1e0:") ||
-    (v4 !== null && v4[1] === "100" && Number(v4[2]) >= 64 && Number(v4[2]) <= 127);
-  return !(loopback || tailnet);
+  return !loopback;
 }
 
 // Masking a text field keeps password managers from offering to save a

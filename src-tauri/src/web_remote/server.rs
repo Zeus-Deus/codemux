@@ -222,8 +222,8 @@ struct ConnInfo {
 pub struct ConnectionRegistry {
     conns: Mutex<HashMap<u64, ConnInfo>>,
     next: AtomicU64,
-    /// LAN sockets from peers whose traffic crosses the network unencrypted
-    /// ([`super::endpoints::is_private_link`]).
+    /// LAN sockets from peers other than this machine, whose traffic may
+    /// cross the network unencrypted ([`super::endpoints::is_local_peer`]).
     plaintext: Mutex<std::collections::HashSet<u64>>,
 }
 
@@ -687,7 +687,7 @@ async fn ws_upgrade<R: Runtime>(
 
     let app_for_socket = app.clone();
     ws.on_upgrade(move |socket| {
-        let plaintext = !super::endpoints::is_private_link(peer.ip());
+        let plaintext = !super::endpoints::is_local_peer(peer.ip());
         handle_socket(app_for_socket, session_id, socket, compress_frames, plaintext)
     })
 }
