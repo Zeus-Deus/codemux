@@ -1425,6 +1425,7 @@ fn build_core_app<R: tauri::Runtime>(
                                 std::sync::Arc::new(commands::delegation::DelegationHost::new(registry_handle.clone())),
                                 std::sync::Arc::new(commands::workspace_launch::WorkspaceLaunchHost::new(registry_handle.clone())),
                                 std::sync::Arc::new(commands::pr_watch::PrWatchHost::new(registry_handle.clone())),
+                                std::sync::Arc::new(commands::secret_requests::SecretRequestHost::new(registry_handle.clone())),
                                 std::sync::Arc::new(agent_control::native::OrchestrationHost(registry_handle.clone())),
                                 std::sync::Arc::new(plugins::platform_transport::PluginToolsHost(registry_handle.clone())),
                             ]),
@@ -2046,6 +2047,7 @@ fn build_core_app<R: tauri::Runtime>(
             // removal of merged / long-retired worktrees. See
             // `worktree_cleanup` for the safety rules.
             worktree_cleanup::spawn_sweeper(app.handle().clone());
+            commands::secret_requests::spawn_sweeper();
 
             let sweep_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -3206,6 +3208,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::pr_watch::pr_watch_start,
             commands::pr_watch::pr_watch_stop,
             commands::pr_watch::pr_watch_status,
+            commands::secret_requests::agent_secret_requests,
+            commands::secret_requests::agent_secret_request_answer,
             // Webhook-triggered automations and the private secret store.
             commands::automations_webhook_credentials,
             commands::automations_rotate_webhook_token,

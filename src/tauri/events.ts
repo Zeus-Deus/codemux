@@ -848,6 +848,17 @@ export const onPrWatchChanged = (
   cb: EventCallback<PrWatchChangedPayload>,
 ): Promise<UnlistenFn> =>
   listen<PrWatchChangedPayload>("pr-watch-changed", (e) => cb(e.payload));
+
+export interface SecretRequestsChangedPayload {
+  thread_id: string;
+  requests: import("./types").SecretRequest[];
+}
+
+/** A chat's open secret cards changed: one opened, was answered, or ended. */
+export const onSecretRequestsChanged = (
+  cb: EventCallback<SecretRequestsChangedPayload>,
+): Promise<UnlistenFn> =>
+  listen<SecretRequestsChangedPayload>("secret-requests-changed", (e) => cb(e.payload));
 /** A background worktree sweep finished: `removed` when automatic cleanup is
  *  on, otherwise `available` lists worktrees newly found removable. */
 export interface WorktreeCleanupEvent {

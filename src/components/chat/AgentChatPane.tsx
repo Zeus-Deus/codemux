@@ -209,6 +209,8 @@ import {
   ComposerPendingInputPanel,
   USER_INPUT_SKIPPED_MESSAGE,
 } from "./ComposerPendingInputPanel";
+import { SecretRequestPanel } from "./SecretRequestCard";
+import { useSecretRequests } from "@/hooks/use-secret-requests";
 import { questionAnswerText } from "./QuestionForm";
 import type { SendAnchorRequest } from "./send-scroll-state";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
@@ -3967,6 +3969,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     });
   }, [pendingUserInput, handleRespond]);
 
+  const secretRequests = useSecretRequests(threadId);
   const pendingInputPanelEl =
     pendingUserInput && pendingUserInput.kind === "permission_request" ? (
       <ComposerPendingInputPanel
@@ -4576,6 +4579,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             }
           >
             {conversationWritable && pendingInputPanelEl}
+            {conversationWritable && (
+              <SecretRequestPanel requests={secretRequests} />
+            )}
             {conversationWritable && threadId && (
               <AsyncQuestionPanel
                 threadId={threadId}

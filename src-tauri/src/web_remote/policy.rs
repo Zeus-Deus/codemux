@@ -18,6 +18,10 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "pr_watch_start"
             | "pr_watch_stop"
             | "pr_watch_status"
+            // The card for a secret a chat on this computer asked for; the
+            // value goes to a private file, never back to the client.
+            | "agent_secret_requests"
+            | "agent_secret_request_answer"
             | "create_preset"
             | "update_preset"
             | "delete_preset"

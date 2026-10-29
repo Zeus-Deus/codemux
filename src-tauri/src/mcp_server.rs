@@ -955,7 +955,7 @@ pub const SUGGEST_TASKS_REGISTRY_NAME: &str = "mcp__codemux__suggest_tasks";
 
 /// Codemux's session instructions per tool, in the order they are appended.
 /// A chat gets a block only when it lists that tool.
-const TOOL_GUIDANCE: [(&str, &str); 3] = [
+const TOOL_GUIDANCE: [(&str, &str); 4] = [
     (HTML_RENDER_REGISTRY_NAME, HTML_RENDER_GUIDANCE),
     (
         SUGGEST_TASKS_REGISTRY_NAME,
@@ -964,6 +964,10 @@ const TOOL_GUIDANCE: [(&str, &str); 3] = [
     (
         crate::commands::pr_watch::PR_WATCH_REGISTRY_NAME,
         crate::commands::pr_watch::PR_WATCH_GUIDANCE,
+    ),
+    (
+        crate::commands::secret_requests::REQUEST_SECRET_REGISTRY_NAME,
+        crate::commands::secret_requests::REQUEST_SECRET_GUIDANCE,
     ),
 ];
 

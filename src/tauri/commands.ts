@@ -3898,6 +3898,16 @@ export const prWatchStop = (threadId: string) =>
 export const prWatchStatus = (threadId: string) =>
   invoke<import("./types").PrWatchStatus | null>("pr_watch_status", { threadId });
 
+/** A chat's open secret cards (`request_secret`). Never carries values. */
+export const agentSecretRequests = (threadId: string) =>
+  invoke<import("./types").SecretRequest[]>("agent_secret_requests", { threadId });
+
+/** Save a secret into the agent's private file, or decline the card. */
+export const agentSecretRequestAnswer = (
+  requestId: string,
+  answer: { type: "save"; secret: string } | { type: "decline" },
+) => invoke<void>("agent_secret_request_answer", { requestId, answer });
+
 /** Check that a chat could be forked from this point, without forking it.
  *  `beforeMessageId` is the user message row that starts the first turn the
  *  fork leaves out; `null` forks from the latest message. */

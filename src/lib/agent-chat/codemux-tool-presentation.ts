@@ -1,4 +1,4 @@
-import { Bot, CircleStop, List, MessageSquareText, Search, Send, Timer, type LucideIcon } from "lucide-react";
+import { Bot, CircleStop, KeyRound, List, MessageSquareText, Search, Send, Timer, type LucideIcon } from "lucide-react";
 import type { ToolCallItem } from "./types";
 import { toolPresentation } from "./native-tool-call";
 
@@ -16,6 +16,7 @@ const tools: Record<string, Presentation> = {
   thread_list: { present: "List chats", progressive: "Listing chats", past: "Listed chats", icon: List },
   thread_search: { present: "Search chats", progressive: "Searching chats", past: "Searched chats", icon: Search },
   thread_interrupt: { present: "Interrupt chat run", progressive: "Interrupting chat run", past: "Requested chat run interruption", icon: CircleStop },
+  request_secret: { present: "Ask for a secret", progressive: "Waiting for a secret", past: "Asked for a secret", icon: KeyRound },
 };
 export function codemuxToolName(name: string): string {
   for (const prefix of ["codemux_mcp__codemux__", "mcp__codemux__"]) {
@@ -31,7 +32,7 @@ export function orchestrationSummary(item: ToolCallItem): { verb: string; target
   const presentation = codemuxToolPresentation(presented.name);
   if (!presentation) return null;
   const input = presented.input && typeof presented.input === "object" ? presented.input as Record<string, unknown> : {};
-  const target = [input.title, input.query].find((v): v is string => typeof v === "string") ?? "";
+  const target = [input.title, input.query, input.label].find((v): v is string => typeof v === "string") ?? "";
   return { verb: item.status === "running" ? presentation.progressive : item.status === "done" ? presentation.past : presentation.present, target };
 }
 

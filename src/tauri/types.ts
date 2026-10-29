@@ -1885,6 +1885,16 @@ export interface WebRemoteEndpoint {
 export type PrWatchState = "active" | "exhausted" | "ended";
 
 /** A chat's watch on a pull request (`pr_watch_status`). */
+/** An open `request_secret` card (`commands/secret_requests.rs`). */
+export interface SecretRequest {
+  id: string;
+  thread_id: string;
+  label: string;
+  reason: string;
+  placeholder: string | null;
+  expires_at_ms: number;
+}
+
 export interface PrWatchStatus {
   thread_id: string;
   workspace_id: string;
