@@ -40,6 +40,7 @@ pub mod workspace_launch;
 pub mod workspaces_sync;
 pub mod workflows;
 pub mod pr_watch;
+pub mod secret_requests;
 pub mod turn_diff;
 pub mod chat_fork;
 pub mod queued_turns;

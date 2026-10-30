@@ -3889,6 +3889,120 @@ function streamMockDelegatedTask(
   );
 }
 
+// ── Secret requests (`request_secret`) ──────────────────────────────
+//
+// `window.__codemuxChatMock.requestSecret()` plays a turn whose agent asks
+// for an API token. Saving or declining the card settles the tool call and
+// ends the turn, like the real host tool.
+
+const mockSecretRequests = new Map<string, import("@/tauri/types").SecretRequest>();
+const mockSecretTurns = new Map<string, { threadId: string; turnId: string; toolUseId: string }>();
+
+function emitMockSecretRequests(threadId: string): void {
+  emitEvent("secret-requests-changed", {
+    thread_id: threadId,
+    requests: [...mockSecretRequests.values()].filter((r) => r.thread_id === threadId),
+  });
+}
+
+function streamMockSecretRequest(
+  threadId: string = MOCK_CHAT_THREAD_ID,
+  opts: { label?: string; reason?: string; placeholder?: string } = {},
+): string {
+  const turnId = `live-secret-${++mockChatTurnSeq}`;
+  const toolUseId = `${turnId}-t0`;
+  const id = `secret-${mockChatTurnSeq}`;
+  const label = opts.label ?? "Fly.io API token";
+  const reason =
+    opts.reason ??
+    "To deploy the preview app. Create one at fly.io/user/personal_access_tokens with deploy access.";
+  const send = (event: unknown) => emitChatEvent(threadId, event);
+  chatActiveTurns.set(threadId, turnId);
+  send({ type: "user_message", thread_id: threadId, client_nonce: `${turnId}-nonce`, text: "Deploy the preview app to Fly." });
+  send({ type: "session_state_changed", thread_id: threadId, status: { status: "running", active_turn: turnId } });
+  send({
+    type: "item_completed",
+    thread_id: threadId,
+    turn_id: turnId,
+    item: { kind: "assistant_text", text: "Deploying needs a Fly.io token, and this machine has none. I'll ask for it privately." },
+  });
+  send({
+    type: "item_completed",
+    thread_id: threadId,
+    turn_id: turnId,
+    item: {
+      kind: "tool_use",
+      tool_name: "mcp__codemux__request_secret",
+      tool_use_id: toolUseId,
+      input: { label, reason, placeholder: opts.placeholder ?? "fo1_…" },
+    },
+  });
+  mockSecretRequests.set(id, {
+    id,
+    thread_id: threadId,
+    label,
+    reason,
+    placeholder: opts.placeholder ?? "fo1_…",
+    expires_at_ms: Date.now() + 15 * 60_000,
+  });
+  mockSecretTurns.set(id, { threadId, turnId, toolUseId });
+  emitMockSecretRequests(threadId);
+  return id;
+}
+
+function answerMockSecretRequest(requestId: string, answer: { type: string; secret?: string }): void {
+  const request = mockSecretRequests.get(requestId);
+  const turn = mockSecretTurns.get(requestId);
+  if (!request || !turn) throw "This request has ended. Ask the agent again if it still needs it.";
+  if (answer.type === "save" && !answer.secret?.trim()) throw "Enter the secret, or decline.";
+  mockSecretRequests.delete(requestId);
+  mockSecretTurns.delete(requestId);
+  emitMockSecretRequests(turn.threadId);
+  const saved = answer.type === "save";
+  const send = (event: unknown) => emitChatEvent(turn.threadId, event);
+  const file = "/run/user/1000/codemux/secrets/3f9c2a7e5b8d4e61a0c9f2b7d6e1a4c8";
+  setTimeout(() => {
+    send({
+      type: "item_completed",
+      thread_id: turn.threadId,
+      turn_id: turn.turnId,
+      item: {
+        kind: "tool_result",
+        tool_use_id: turn.toolUseId,
+        is_error: false,
+        content: JSON.stringify(saved ? { status: "saved", file } : { status: "declined" }),
+      },
+    });
+    if (saved) {
+      send({
+        type: "item_completed",
+        thread_id: turn.threadId,
+        turn_id: turn.turnId,
+        item: { kind: "tool_use", tool_name: "Bash", tool_use_id: `${turn.turnId}-t1`, input: { command: `FLY_API_TOKEN="$(cat '${file}')" fly deploy --app preview-web` } },
+      });
+      send({
+        type: "item_completed",
+        thread_id: turn.threadId,
+        turn_id: turn.turnId,
+        item: { kind: "tool_result", tool_use_id: `${turn.turnId}-t1`, is_error: false, content: "==> Monitoring deployment\n  1 desired, 1 placed, 1 healthy\nv12 deployed successfully" },
+      });
+    }
+    send({
+      type: "item_completed",
+      thread_id: turn.threadId,
+      turn_id: turn.turnId,
+      item: {
+        kind: "assistant_text",
+        text: saved
+          ? "Deployed v12 to preview-web. The token stayed out of this chat; I only read it inside the deploy command."
+          : "Okay, I won't deploy. Run `fly deploy --app preview-web` yourself when you're ready.",
+      },
+    });
+    send({ type: "turn_completed", thread_id: turn.threadId, turn_id: turn.turnId, status: { kind: "success" }, usage: null });
+    chatActiveTurns.delete(turn.threadId);
+  }, 400);
+}
+
 // Expose the stream triggers for browser-console / automation use.
 (
   window as unknown as {
@@ -3904,6 +4018,7 @@ function streamMockDelegatedTask(
       sessionError: typeof sessionErrorMockRun;
       signedOut: typeof signedOutMockRun;
       setProviderHealth: typeof setMockProviderHealth;
+      requestSecret: typeof streamMockSecretRequest;
     };
   }
 ).__codemuxChatMock = {
@@ -3918,6 +4033,7 @@ function streamMockDelegatedTask(
   sessionError: sessionErrorMockRun,
   signedOut: signedOutMockRun,
   setProviderHealth: setMockProviderHealth,
+  requestSecret: streamMockSecretRequest,
 };
 
 // Expose the terminal flood + serialize triggers for browser-console /
@@ -8542,6 +8658,10 @@ const handlers: Record<string, Handler> = {
     return removed;
   },
   pr_watch_status: (a) => prWatches.get(a.threadId as string) ?? null,
+  agent_secret_requests: (a) =>
+    [...mockSecretRequests.values()].filter((r) => r.thread_id === (a.threadId as string)),
+  agent_secret_request_answer: (a) =>
+    answerMockSecretRequest(a.requestId as string, a.answer as { type: string; secret?: string }),
   // Chat forks: same validation order and messages as `commands::chat_fork`.
   agent_chat_fork_check: (a) => {
     mockForkPlan(a.sourceThreadId as string, (a.beforeMessageId as number | null) ?? null);

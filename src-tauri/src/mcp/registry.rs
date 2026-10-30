@@ -449,6 +449,12 @@ impl McpRegistry {
         if name == "mcp__codemux__delegate_task" {
             return Some(serde_json::json!({"content":[{"type":"text","text":"Native caller runtime/turn authority was revoked"}],"isError":true}));
         }
+        // Adapters that do not name the turn (Claude) still have the actor's.
+        let actor_turn = actor
+            .filter(|_| run_id.is_none())
+            .and_then(|actor| actor.permit.identity().ok())
+            .and_then(|identity| identity.run_id);
+        let run_id = run_id.or(actor_turn.as_deref());
         self.host.get()?.call_async(caller, name, args, call_id, run_id).await
     }
 

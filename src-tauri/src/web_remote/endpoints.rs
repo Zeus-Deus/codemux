@@ -118,6 +118,17 @@ fn is_tailnet_v4(addr: Ipv4Addr) -> bool {
     o[0] == 100 && (0x40..=0x7f).contains(&o[1])
 }
 
+/// Whether a peer is this machine itself (directly, or through a proxy on
+/// it). Every other LAN peer may be on plain HTTP across the network: an
+/// address range, the tailnet's shared CGNAT space included, does not prove
+/// the link is encrypted.
+pub(super) fn is_local_peer(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    }
+}
+
 /// RFC 1918 private IPv4 ranges (plus 169.254/16 link-local, which is still
 /// LAN-reachable on the local segment). Excludes the tailnet range (checked
 /// earlier). Used to decide *whether* a v4 address is surfaced at all; its
@@ -458,6 +469,17 @@ fn tailscale_status() -> Option<TailscaleStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_this_machine_counts_as_a_local_peer() {
+        for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            assert!(is_local_peer(ip.parse().unwrap()), "{ip}");
+        }
+        // Shared CGNAT space and the tailnet's prefix prove no encryption.
+        for ip in ["192.168.1.5", "10.0.0.2", "203.0.113.9", "fe80::1", "100.101.102.103", "fd7a:115c:a1e0::1", "::ffff:192.168.1.5"] {
+            assert!(!is_local_peer(ip.parse().unwrap()), "{ip}");
+        }
+    }
 
     #[test]
     fn tailnet_range_detection() {

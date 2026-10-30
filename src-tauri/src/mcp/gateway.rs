@@ -520,10 +520,19 @@ async fn handle_post(
                 let workspace = workspace_id.map(str::to_owned);
                 let current = binding.clone();
                 let call_id = id.to_string();
+                let host_caller = binding.session.caller();
                 let job = tokio::spawn(async move {
                     actor.permit.wait_ready().await?;
                     if !current.current() {
                         return Err("stale_caller: gateway credential was revoked".into());
+                    }
+                    // Waits for the user in a card, so it needs the
+                    // asynchronous host route rather than native dispatch.
+                    if name == crate::commands::secret_requests::REQUEST_SECRET_REGISTRY_NAME {
+                        return registry
+                            .host_call_native(&host_caller, &name, &arguments, Some(&call_id), None, Some(&actor))
+                            .await
+                            .ok_or_else(|| "request_secret is unavailable".to_string());
                     }
                     match registry
                         .call_plugin_bridge(&name, arguments.clone(), workspace.as_deref(), &[])
