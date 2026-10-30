@@ -1,20 +1,32 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { useState } from "react";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
-const { openProjectMock, openCloneDialogMock, openProjectAtPathMock, recentProjectsMock, listDirectoryMock, toastErrorMock, mockProbe } = vi.hoisted(() => ({
+const { openProjectMock, openAddProjectMock, openProjectAtPathMock, recentProjectsMock, listDirectoryMock, toastErrorMock, mockProbe, signInMock, installMock, invokeMock } = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
   mockProbe: vi.fn(),
+  signInMock: vi.fn(),
+  installMock: vi.fn(),
   openProjectMock: vi.fn(),
   listDirectoryMock: vi.fn(),
-  openCloneDialogMock: vi.fn(),
+  openAddProjectMock: vi.fn(),
   openProjectAtPathMock: vi.fn(),
   recentProjectsMock: vi.fn(),
   toastErrorMock: vi.fn(),
 }));
+// Hermes profiles and custom agents are listed straight through `invoke`.
+vi.mock("@tauri-apps/api/core", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@tauri-apps/api/core")>()),
+  invoke: invokeMock,
+}));
 vi.mock("@/lib/toast", () => ({ toast: { error: toastErrorMock, success: vi.fn() } }));
+vi.mock("@/lib/agent-chat/provider-sign-in", () => ({
+  signInToProvider: signInMock,
+  installProvider: installMock,
+}));
 vi.mock("@/hooks/use-project-actions", () => ({
-  useProjectActions: () => ({ openProject: openProjectMock, openCloneDialog: openCloneDialogMock }),
+  useProjectActions: () => ({ openProject: openProjectMock, openAddProject: openAddProjectMock }),
   openProjectAtPath: openProjectAtPathMock,
 }));
 vi.mock("@/tauri/commands", async (importOriginal) => ({
@@ -26,13 +38,21 @@ vi.mock("@/tauri/commands", async (importOriginal) => ({
 }));
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { PAST_PROJECTS_RETRY_MS, useFirstRunSession } from "./first-run-agents";
 
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
+import { useChatGptStore } from "@/stores/chatgpt-store";
+import { useCustomAcp } from "@/stores/custom-acp-store";
+import { useHermes, type HermesProfile } from "@/stores/hermes-store";
+import { useProviderAccounts } from "@/stores/provider-accounts-store";
+import type { ProviderAccount } from "@/tauri/commands";
 import { useProjectPickerHintStore } from "@/stores/project-picker-hint-store";
 import { emptyHealthSlot, HEALTH_REPROBE_MS, useProviderHealth } from "@/stores/provider-health-store";
 import type { AgentChatProviderKind, ProviderHealthReport, AppStateSnapshot } from "@/tauri/types";
+/** What `hermes_profiles` rejects with when Hermes isn't installed. */
+const HERMES_NOT_INSTALLED = "setup_required: install official Hermes with ACP dependencies";
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
@@ -46,6 +66,23 @@ beforeEach(() => {
       opencode: emptyHealthSlot(),
     },
   });
+  // A fresh window session on a device that has never had a project open.
+  useFirstRunSession.setState({
+    pastProjectsChecked: true, listFailed: {}, accountsFailed: false, connectDismissed: false,
+  });
+  useUIStore.setState({ firstRunDone: false });
+  // A fresh machine: Hermes is enabled but not installed, so listing its
+  // profiles fails the way the backend does, and no custom agent is set up.
+  // Only the CLIs' own sign-ins exist.
+  invokeMock.mockReset().mockImplementation(async (cmd: string) => {
+    if (cmd === "hermes_profiles") throw HERMES_NOT_INSTALLED;
+    if (cmd === "acp_agents") return [];
+    if (cmd === "provider_accounts_list") return { accounts: [], defaults: {} };
+    throw new Error(`unmocked command ${cmd}`);
+  });
+  useProviderAccounts.setState({ accounts: null, defaults: {} });
+  useHermes.setState({ profiles: null });
+  useCustomAcp.setState({ agents: null });
   useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot, homeDir: null });
   toastErrorMock.mockReset();
   useFeatureFlags.setState({ enableAgentChat: true });
@@ -53,7 +90,7 @@ beforeEach(() => {
   useProjectPickerHintStore.setState({ seen: false });
   delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
   openProjectMock.mockReset().mockResolvedValue({ success: false });
-  openCloneDialogMock.mockReset();
+  openAddProjectMock.mockReset();
   openProjectAtPathMock.mockReset().mockResolvedValue({ success: true, path: "/work/parser", name: "parser" });
   recentProjectsMock.mockReset().mockResolvedValue([]);
   listDirectoryMock.mockReset().mockResolvedValue([]);
@@ -250,14 +287,16 @@ describe("ChatHomeLanding", () => {
   });
 
   describe("with no project open", () => {
-    it("offers Open project and Clone repository under the composer", async () => {
+    it("offers Open folder, Clone repository and New project under the composer", async () => {
       openProjectMock.mockResolvedValue({ success: true, path: "/work/api", name: "api" });
       const onProjectOpened = vi.fn();
       render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
-      fireEvent.click(screen.getByRole("button", { name: /Open project/ }));
+      fireEvent.click(screen.getByRole("button", { name: /Open folder/ }));
       await vi.waitFor(() => expect(onProjectOpened).toHaveBeenCalledWith("/work/api"));
-      fireEvent.click(screen.getByRole("button", { name: "Clone repository" }));
-      expect(openCloneDialogMock).toHaveBeenCalledOnce();
+      fireEvent.click(screen.getByRole("button", { name: /Clone repository/ }));
+      expect(openAddProjectMock).toHaveBeenCalledWith("clone");
+      fireEvent.click(screen.getByRole("button", { name: /New project/ }));
+      expect(openAddProjectMock).toHaveBeenCalledWith("new");
     });
 
     it("reopens a recent project without the folder picker", async () => {
@@ -301,7 +340,7 @@ describe("ChatHomeLanding", () => {
       openProjectMock.mockRejectedValue(new Error("workspace limit reached"));
       const onProjectOpened = vi.fn();
       render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
-      fireEvent.click(screen.getByRole("button", { name: /Open project/ }));
+      fireEvent.click(screen.getByRole("button", { name: /Open folder/ }));
       await vi.waitFor(() =>
         expect(toastErrorMock).toHaveBeenCalledWith(
           "Couldn't open the project: workspace limit reached",
@@ -326,79 +365,246 @@ describe("ChatHomeLanding", () => {
       expect(list).not.toHaveTextContent("/home/me");
     });
 
+    it("offers the project actions with nothing open or only Home open", () => {
+      const view = render(<ChatHomeLanding composer={<div />} />);
+      expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
+      view.unmount();
+
+      // A returning user who closed every project, leaving Home.
+      useUIStore.setState({ firstRunDone: true });
+      useAppStore.setState({
+        appState: { workspaces: [{ workspace_type: "home" }] } as unknown as AppStateSnapshot,
+      });
+      render(<ChatHomeLanding composer={<div />} />);
+      expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
+    });
+
+    it("gives a returning user with every workspace closed the tiles, not onboarding", async () => {
+      // Nothing could run here, which would ask a first run to connect one.
+      mockProbe.mockImplementation(async (provider: AgentChatProviderKind) => ({
+        provider, status: "error", installed: false, message: "Not on PATH.", version: null,
+      }));
+      useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
+      useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
+      expect(useUIStore.getState().firstRunDone).toBe(true);
+      render(<ChatHomeLanding composer={<div data-testid="composer" />} agents={{ selected: "claude" }} />);
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+      });
+      expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
+      expect(screen.getByTestId("composer")).toBeInTheDocument();
+      expect(screen.queryByTestId("connect-agent")).toBeNull();
+      expect(screen.queryByTestId("agent-status-line")).toBeNull();
+      expect(mockProbe).not.toHaveBeenCalled();
+      expect(invokeMock).not.toHaveBeenCalledWith("hermes_profiles");
+      expect(invokeMock).not.toHaveBeenCalledWith("acp_agents");
+    });
+
+    describe("on an app start before the first-run flag is known", () => {
+      async function start(workspaces: unknown[]) {
+        useFirstRunSession.setState({ pastProjectsChecked: false });
+        useAppStore.setState({ appState: null });
+        useAppStore.setState({ appState: { workspaces } as unknown as AppStateSnapshot });
+        render(<ChatHomeLanding composer={<div />} agents={{ selected: "claude" }} />);
+        await act(async () => {
+          await new Promise((r) => setTimeout(r, 0));
+        });
+      }
+      beforeEach(() => {
+        mockProbe.mockImplementation(async (provider: AgentChatProviderKind) => ({
+          provider, status: "ready", installed: true, message: null, version: null,
+        }));
+      });
+      /** The first-run check's lookups; the landing lists its own six. */
+      const pastProjectsLookups = () =>
+        recentProjectsMock.mock.calls.filter(([limit]) => limit === 10).length;
+
+      it("keeps onboarding after a restart mid-setup left only Home open", async () => {
+        await start([{ workspace_type: "home", cwd: "/home/me" }]);
+        expect(useUIStore.getState().firstRunDone).toBe(false);
+        expect(screen.getByTestId("agent-status-line")).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
+      });
+
+      it("ignores Home in recent projects", async () => {
+        useAppStore.setState({ homeDir: "/home/me" });
+        recentProjectsMock.mockResolvedValue([
+          { path: "/home/me", name: "me", last_opened_at: "2026-10-01T10:00:00Z" },
+        ]);
+        await start([{ workspace_type: "home", cwd: "/home/me" }]);
+        expect(useUIStore.getState().firstRunDone).toBe(false);
+        expect(screen.getByTestId("agent-status-line")).toBeInTheDocument();
+      });
+
+      it("treats someone with recent projects as returning", async () => {
+        recentProjectsMock.mockResolvedValue([
+          { path: "/w/parser", name: "parser", last_opened_at: "2026-10-01T10:00:00Z" },
+        ]);
+        await start([]);
+        expect(useUIStore.getState().firstRunDone).toBe(true);
+        expect(screen.queryByTestId("agent-status-line")).toBeNull();
+        expect(screen.getByRole("button", { name: /Open folder/ })).toBeInTheDocument();
+      });
+
+      it("retries a failed lookup before onboarding and finds a returning user", async () => {
+        vi.useFakeTimers();
+        let lookups = 0;
+        recentProjectsMock.mockImplementation(async (limit: number) => {
+          if (limit === 10 && lookups++ === 0) throw new Error("ipc unavailable");
+          return [{ path: "/w/parser", name: "parser", last_opened_at: "2026-10-01T10:00:00Z" }];
+        });
+        useFirstRunSession.setState({ pastProjectsChecked: false });
+        useAppStore.setState({ appState: null });
+        useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
+        await vi.advanceTimersByTimeAsync(0);
+        // The failure is not taken as "no projects": onboarding waits.
+        expect(useFirstRunSession.getState().pastProjectsChecked).toBe(false);
+        render(<ChatHomeLanding composer={<div />} agents={{ selected: "claude" }} />);
+        expect(screen.queryByTestId("agent-status-line")).toBeNull();
+
+        await vi.advanceTimersByTimeAsync(PAST_PROJECTS_RETRY_MS[0]);
+        expect(pastProjectsLookups()).toBe(2);
+        expect(useUIStore.getState().firstRunDone).toBe(true);
+        expect(useFirstRunSession.getState().pastProjectsChecked).toBe(true);
+        expect(screen.queryByTestId("agent-status-line")).toBeNull();
+      });
+
+      it("offers onboarding once every retry of the lookup has failed", async () => {
+        vi.useFakeTimers();
+        recentProjectsMock.mockRejectedValue(new Error("ipc unavailable"));
+        useFirstRunSession.setState({ pastProjectsChecked: false });
+        useAppStore.setState({ appState: null });
+        useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
+        for (const delay of PAST_PROJECTS_RETRY_MS) {
+          await vi.advanceTimersByTimeAsync(0);
+          expect(useFirstRunSession.getState().pastProjectsChecked).toBe(false);
+          await vi.advanceTimersByTimeAsync(delay);
+        }
+        expect(pastProjectsLookups()).toBe(PAST_PROJECTS_RETRY_MS.length + 1);
+        expect(useFirstRunSession.getState().pastProjectsChecked).toBe(true);
+        expect(useUIStore.getState().firstRunDone).toBe(false);
+
+        vi.useRealTimers();
+        render(<ChatHomeLanding composer={<div />} agents={{ selected: "claude" }} />);
+        await act(async () => {
+          await new Promise((r) => setTimeout(r, 0));
+        });
+        expect(screen.getByTestId("agent-status-line")).toBeInTheDocument();
+      });
+
+      it("shows no onboarding until recent projects answer", async () => {
+        recentProjectsMock.mockReturnValue(new Promise(() => {}));
+        await start([]);
+        expect(screen.queryByTestId("agent-status-line")).toBeNull();
+        expect(mockProbe).not.toHaveBeenCalled();
+      });
+    });
+
+    it("ends the first run for good once a project opens", () => {
+      useAppStore.setState({
+        appState: { workspaces: [{ workspace_type: "home" }] } as unknown as AppStateSnapshot,
+      });
+      expect(useUIStore.getState().firstRunDone).toBe(false);
+      useAppStore.setState({
+        appState: {
+          workspaces: [{ workspace_type: "home" }, { workspace_type: "project" }],
+        } as unknown as AppStateSnapshot,
+      });
+      expect(useUIStore.getState().firstRunDone).toBe(true);
+    });
+
     it("hides the project actions once a workspace exists", () => {
       useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
       render(<ChatHomeLanding composer={<div />} />);
-      expect(screen.queryByRole("button", { name: /Open project/ })).toBeNull();
-      expect(screen.queryByRole("button", { name: "Clone repository" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /Open folder/ })).toBeNull();
+      expect(screen.queryByRole("button", { name: /Clone repository/ })).toBeNull();
       expect(recentProjectsMock).not.toHaveBeenCalled();
     });
   });
 });
 
-  describe("first-run agent strip", () => {
-    const HEALTH: Partial<Record<AgentChatProviderKind, Partial<ProviderHealthReport>>> = {
-      claude: { status: "ready", installed: true },
-      codex: {
-        status: "error",
-        installed: true,
-        message: "Codex CLI is not authenticated. Run `codex login` and retry.",
-      },
-      cursor: { status: "error", installed: false, message: "Not on PATH." },
-      grok: { status: "error", installed: false, message: "Not on PATH." },
-      opencode: { status: "ready", installed: true },
+  describe("first-run agents", () => {
+    type Answer = Partial<ProviderHealthReport>;
+    const READY: Answer = { status: "ready", installed: true };
+    const SIGNED_OUT = (provider: string): Answer => ({
+      status: "error",
+      installed: true,
+      message: `${provider} is not signed in.`,
+      login_command: `${provider} login`,
+    });
+    const MISSING: Answer = { status: "error", installed: false, message: "Not on PATH." };
+    // Installed, but the probe couldn't check the sign-in.
+    const UNVERIFIED: Answer = {
+      status: "warning",
+      installed: true,
+      message: "Couldn't verify sign-in.",
     };
+    let health: Partial<Record<AgentChatProviderKind, Answer>>;
 
     beforeEach(() => {
+      health = {
+        claude: READY,
+        codex: SIGNED_OUT("codex"),
+        cursor: MISSING,
+        grok: MISSING,
+        opencode: READY,
+      };
       mockProbe.mockImplementation(async (provider: AgentChatProviderKind) => ({
         provider,
         message: null,
         version: null,
-        ...HEALTH[provider],
+        ...health[provider],
       }));
+      signInMock.mockReset().mockResolvedValue(undefined);
+      installMock.mockReset().mockResolvedValue(undefined);
+      useUIStore.setState({ showSettings: false, settingsSection: null });
     });
 
-    async function renderWithAgents(onSelect = vi.fn()) {
-      const view = render(
-        <ChatHomeLanding
-          composer={<div />}
-          agents={{ selected: "claude", onSelect }}
-        />,
-      );
+    async function flush() {
       await act(async () => {
         await new Promise((r) => setTimeout(r, 0));
       });
-      return { view, onSelect };
     }
 
-    it("shows each agent's readiness once every probe has answered", async () => {
-      const { onSelect } = await renderWithAgents();
+    async function renderWithAgents(selected: AgentChatProviderKind = "claude") {
+      const view = render(
+        <ChatHomeLanding
+          composer={<div data-testid="composer" />}
+          agents={{ selected }}
+        />,
+      );
+      await flush();
+      return view;
+    }
+
+    it("sums up what can run in one line once every probe has answered", async () => {
+      await renderWithAgents("opencode");
       expect(mockProbe).toHaveBeenCalledTimes(5);
       expect(mockProbe).not.toHaveBeenCalledWith("hermes");
-      expect(screen.getByTestId("agent-chip-claude")).toHaveAttribute(
-        "data-readiness",
-        "ready",
+      expect(screen.getByTestId("agent-status-line")).toHaveTextContent(
+        "OpenCode and Claude Code are ready·Codex needs sign-in·Set up",
       );
-      expect(screen.getByTestId("agent-chip-claude")).toHaveAttribute(
-        "aria-pressed",
-        "true",
-      );
-      const codex = screen.getByTestId("agent-chip-codex");
-      expect(codex).toHaveAttribute("data-readiness", "not_ready");
-      expect(codex).toHaveAttribute("title", expect.stringContaining("codex login"));
-      expect(screen.getByTestId("agent-chip-cursor")).toBeDisabled();
-
-      fireEvent.click(screen.getByTestId("agent-chip-opencode"));
-      expect(onSelect).toHaveBeenCalledWith("opencode");
+      fireEvent.click(screen.getByRole("button", { name: "Set up" }));
+      expect(useUIStore.getState()).toMatchObject({ showSettings: true, settingsSection: "providers" });
     });
 
-    it("reserves its row but stays empty while a probe is still running", async () => {
+    it("counts several agents that need setup", async () => {
+      health = { ...health, opencode: MISSING, cursor: SIGNED_OUT("cursor") };
+      await renderWithAgents();
+      expect(screen.getByTestId("agent-status-line")).toHaveTextContent(
+        "Claude Code is ready·2 more need setup·Set up",
+      );
+    });
+
+    it("reserves its line, and keeps the composer, while a probe is still running", async () => {
       mockProbe.mockImplementation(() => new Promise(() => {}));
       await renderWithAgents();
-      expect(screen.getByTestId("agent-availability-strip")).toBeEmptyDOMElement();
+      expect(screen.getByTestId("agent-status-line")).toBeEmptyDOMElement();
+      expect(screen.getByTestId("composer")).toBeInTheDocument();
+      expect(screen.queryByTestId("connect-agent")).toBeNull();
     });
 
-    it("shows its chips after a cache expires while another opening probe is outstanding", async () => {
+    it("waits for a cache that expired while another opening probe is outstanding", async () => {
       vi.useFakeTimers({ toFake: ["Date"] });
       const openedAt = Date.now();
       const missingClaude: ProviderHealthReport = {
@@ -432,25 +638,271 @@ describe("ChatHomeLanding", () => {
         await codex;
       });
       expect(mockProbe).toHaveBeenCalledWith("claude");
-      expect(screen.getByTestId("agent-availability-strip")).toBeEmptyDOMElement();
+      expect(screen.getByTestId("agent-status-line")).toBeEmptyDOMElement();
 
       await act(async () => {
         resolveClaude(missingClaude);
         await claude;
       });
-      expect(screen.getByTestId("agent-chip-codex")).toHaveAttribute("data-readiness", "ready");
-      expect(screen.getByTestId("agent-chip-claude")).toBeDisabled();
+      expect(screen.getByTestId("agent-status-line")).toHaveTextContent(
+        "Codex and 3 more are ready",
+      );
+    });
+
+    it("calls an agent it can't verify installed, and keeps the composer", async () => {
+      health = { claude: UNVERIFIED, codex: MISSING, cursor: MISSING, grok: MISSING, opencode: MISSING };
+      await renderWithAgents();
+      expect(screen.queryByTestId("connect-agent")).toBeNull();
+      expect(screen.getByTestId("composer")).toBeInTheDocument();
+      expect(screen.getByTestId("agent-status-line")).toHaveTextContent("Claude Code is installed");
+      expect(screen.getByTestId("agent-status-line")).not.toHaveTextContent("ready");
+    });
+
+    it("names only ready agents when some are ready and others unverified", async () => {
+      health = { claude: UNVERIFIED, codex: READY, cursor: MISSING, grok: MISSING, opencode: MISSING };
+      await renderWithAgents();
+      expect(screen.getByTestId("agent-status-line")).toHaveTextContent("Codex is ready·Set up");
+    });
+
+    describe("when no agent can run", () => {
+      beforeEach(() => {
+        health = {
+          claude: SIGNED_OUT("claude"),
+          codex: MISSING,
+          cursor: MISSING,
+          grok: MISSING,
+          opencode: MISSING,
+        };
+      });
+
+      it("asks to connect one in place of the headline and composer", async () => {
+        await renderWithAgents();
+        expect(screen.getByRole("heading", { name: "Connect an agent to start" })).toBeInTheDocument();
+        expect(screen.queryByTestId("composer")).toBeNull();
+        expect(screen.queryByRole("button", { name: /Open folder/ })).toBeNull();
+        expect(screen.getByTestId("connect-agent-claude")).toHaveTextContent("Installed · not signed in");
+        expect(screen.getByTestId("connect-agent-codex")).toHaveTextContent("Not installed");
+        expect(screen.getByTestId("connect-agent-opencode")).toHaveTextContent(
+          "Not installed · has free models",
+        );
+      });
+
+      it("signs in, installs, or opens the agent list", async () => {
+        await renderWithAgents();
+        fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+        expect(signInMock).toHaveBeenCalledWith("claude", "claude login", null);
+        const opencode = screen.getByTestId("connect-agent-opencode");
+        fireEvent.click(within(opencode).getByRole("button", { name: "Install" }));
+        expect(installMock).toHaveBeenCalledWith("opencode", "OpenCode");
+        fireEvent.click(screen.getByRole("button", { name: "Browse agents" }));
+        expect(useUIStore.getState()).toMatchObject({ showSettings: true, settingsSection: "providers" });
+      });
+
+      it("offers a ChatGPT plan for Codex", async () => {
+        const start = vi.fn().mockResolvedValue(undefined);
+        useChatGptStore.setState({ start, status: null, error: null });
+        await renderWithAgents();
+        const codex = screen.getByTestId("connect-agent-codex");
+        fireEvent.click(within(codex).getByRole("button", { name: "Use ChatGPT plan" }));
+        expect(start).toHaveBeenCalledWith(null);
+      });
+
+      it("shows a ChatGPT sign-in that fails after it started, with a way to refresh", async () => {
+        const status = (phase: "pending" | "error", error: string | null) => ({
+          phase, attemptId: phase === "pending" ? "a1" : null, email: null, error,
+          profiles: [], activeProfileId: null, welcomePending: false, installed: true,
+        });
+        const refresh = vi.fn().mockResolvedValue(undefined);
+        const start = vi.fn(async () => {
+          useChatGptStore.setState({ status: status("pending", null) });
+        });
+        useChatGptStore.setState({ start, refresh, status: null, error: null, subscriptionError: null, busy: false });
+        await renderWithAgents();
+        const codex = screen.getByTestId("connect-agent-codex");
+        await act(async () => {
+          fireEvent.click(within(codex).getByRole("button", { name: "Use ChatGPT plan" }));
+        });
+        expect(codex).toHaveTextContent("Finish signing in in your browser");
+        expect(within(codex).queryByRole("alert")).toBeNull();
+
+        // The browser flow expires well after `start` resolved.
+        act(() => useChatGptStore.setState({ status: status("error", "The sign-in request expired.") }));
+        expect(within(codex).getByRole("alert")).toHaveTextContent("The sign-in request expired.");
+        expect(within(codex).getByRole("button", { name: "Use ChatGPT plan" })).toBeInTheDocument();
+        fireEvent.click(within(codex).getByRole("button", { name: "Refresh connection" }));
+        expect(refresh).toHaveBeenCalled();
+
+        act(() => useChatGptStore.setState({ status: null }));
+        expect(within(codex).queryByRole("alert")).toBeNull();
+      });
+
+      it("re-checks when the window regains focus and returns to the composer once one is ready", async () => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        await renderWithAgents();
+        expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+        expect(mockProbe).toHaveBeenCalledTimes(5);
+
+        // Too soon after the last answer: no CLI spawned.
+        await act(async () => {
+          window.dispatchEvent(new Event("focus"));
+        });
+        expect(mockProbe).toHaveBeenCalledTimes(5);
+
+        health = { ...health, claude: READY };
+        vi.setSystemTime(Date.now() + 11_000);
+        await act(async () => {
+          window.dispatchEvent(new Event("focus"));
+        });
+        await flush();
+        expect(mockProbe).toHaveBeenCalledTimes(10);
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+        expect(screen.getByTestId("composer")).toBeInTheDocument();
+        expect(screen.getByTestId("agent-status-line")).toHaveTextContent("Claude Code is ready");
+      });
+
+      it("re-checks straight away when opened again over a no-agent answer", async () => {
+        const first = await renderWithAgents();
+        expect(mockProbe).toHaveBeenCalledTimes(5);
+        first.unmount();
+        health = { ...health, opencode: READY };
+        await renderWithAgents();
+        expect(mockProbe).toHaveBeenCalledTimes(10);
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+      });
+
+      it("can be continued past for the session when detection is wrong", async () => {
+        const first = await renderWithAgents();
+        fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+        expect(screen.getByTestId("composer")).toBeInTheDocument();
+        first.unmount();
+        await renderWithAgents();
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+      });
+
+      it("stays away while a Hermes or custom agent listing failed, and retries it later", async () => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        invokeMock.mockImplementation(async (cmd: string) => {
+          if (cmd === "hermes_profiles") throw new Error("hermes is busy");
+          if (cmd === "acp_agents") return [];
+          throw new Error(`unmocked command ${cmd}`);
+        });
+        const first = await renderWithAgents();
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+        expect(screen.getByTestId("composer")).toBeInTheDocument();
+        expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "hermes_profiles")).toHaveLength(1);
+        first.unmount();
+
+        // Opened again soon after: the failure is remembered, not retried.
+        const second = await renderWithAgents();
+        expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "hermes_profiles")).toHaveLength(1);
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+        second.unmount();
+
+        // Half a minute later it is listed again; an empty answer is conclusive.
+        invokeMock.mockImplementation(async (cmd: string) =>
+          cmd === "hermes_profiles" || cmd === "acp_agents" ? [] : Promise.reject(new Error(cmd)),
+        );
+        vi.setSystemTime(Date.now() + 31_000);
+        await renderWithAgents();
+        expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "hermes_profiles")).toHaveLength(2);
+        expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+      });
+
+      it("stays away while the custom agent listing failed", async () => {
+        invokeMock.mockImplementation(async (cmd: string) => {
+          if (cmd === "hermes_profiles") return [];
+          throw new Error("acp listing failed");
+        });
+        await renderWithAgents();
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+        expect(screen.getByTestId("composer")).toBeInTheDocument();
+      });
+
+      it("stays away for someone with a Hermes profile", async () => {
+        useHermes.setState({ profiles: [{ id: "work" } as HermesProfile] });
+        await renderWithAgents();
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+        expect(screen.getByTestId("composer")).toBeInTheDocument();
+      });
+
+      it("stays away for someone with an enabled custom agent, not a disabled one", async () => {
+        const agent = {
+          id: "a", name: "Mine", executable: "mine", args: [], environment: {},
+          enabled: false, auth_method: null, revision: "1",
+        };
+        useCustomAcp.setState({ agents: [agent] });
+        const view = await renderWithAgents();
+        expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+        view.unmount();
+        useCustomAcp.setState({ agents: [{ ...agent, enabled: true }] });
+        await renderWithAgents();
+        expect(screen.queryByTestId("connect-agent")).toBeNull();
+      });
+
+      describe("with an extra Claude account set as the default", () => {
+        const workAccount = (signedIn: boolean | null): ProviderAccount => ({
+          id: "work", provider: "claude", label: "Work", home: "/accounts/work",
+          login_command: "claude login",
+          identity: { signed_in: signedIn, email: null, organization: null, plan: null },
+        });
+        function listAccounts(answer: () => Promise<unknown>) {
+          const base = invokeMock.getMockImplementation()!;
+          invokeMock.mockImplementation(async (cmd: string, ...rest: unknown[]) =>
+            cmd === "provider_accounts_list" ? answer() : base(cmd, ...rest),
+          );
+        }
+
+        it("keeps the composer when that account is signed in", async () => {
+          listAccounts(async () => ({ accounts: [workAccount(true)], defaults: { claude: "work" } }));
+          await renderWithAgents();
+          expect(screen.queryByTestId("connect-agent")).toBeNull();
+          expect(screen.getByTestId("composer")).toBeInTheDocument();
+          expect(screen.getByTestId("agent-status-line")).toHaveTextContent("Claude Code is ready·Set up");
+          expect(screen.getByTestId("agent-status-line")).not.toHaveTextContent("needs sign-in");
+        });
+
+        it("still asks to connect one when that account is signed out too", async () => {
+          listAccounts(async () => ({ accounts: [workAccount(false)], defaults: { claude: "work" } }));
+          await renderWithAgents();
+          expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+        });
+
+        it("waits for the account list before asking, and asks if it fails", async () => {
+          let fail!: (error: Error) => void;
+          listAccounts(() => new Promise((_, reject) => { fail = reject; }));
+          await renderWithAgents();
+          expect(screen.queryByTestId("connect-agent")).toBeNull();
+          expect(screen.getByTestId("composer")).toBeInTheDocument();
+          expect(screen.getByTestId("agent-status-line")).toBeEmptyDOMElement();
+          await act(async () => fail(new Error("accounts unavailable")));
+          await flush();
+          expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+        });
+      });
+
+      it("stays a first run while the only workspace is the Home one sign-in opened", async () => {
+        const view = await renderWithAgents();
+        useAppStore.setState({
+          appState: { workspaces: [{ workspace_type: "home" }] } as unknown as AppStateSnapshot,
+        });
+        view.rerender(
+          <ChatHomeLanding composer={<div />} agents={{ selected: "claude" }} />,
+        );
+        expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+      });
     });
 
     it("only appears on a first run, and only where the composer can switch", async () => {
       useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
-      const { view } = await renderWithAgents();
-      expect(screen.queryByTestId("agent-availability-strip")).toBeNull();
+      const view = await renderWithAgents();
+      expect(screen.queryByTestId("agent-status-line")).toBeNull();
       expect(mockProbe).not.toHaveBeenCalled();
       view.unmount();
 
       useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
       render(<ChatHomeLanding composer={<div />} />);
-      expect(screen.queryByTestId("agent-availability-strip")).toBeNull();
+      expect(screen.queryByTestId("agent-status-line")).toBeNull();
+      expect(mockProbe).not.toHaveBeenCalled();
     });
   });

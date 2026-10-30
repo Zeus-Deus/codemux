@@ -62,9 +62,12 @@ import {
 } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useHostsStore } from "@/stores/hosts-store";
-import { selectModel } from "@/stores/provider-capabilities-store";
+import {
+  refreshProviderCapabilitiesForIntent,
+  selectModel,
+} from "@/stores/provider-capabilities-store";
 import { selectedAcpCatalog, useCustomAcp } from "@/stores/custom-acp-store";
-import { capabilityDefaults, defaultModelId } from "@/lib/agent-chat/capability-defaults";
+import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import {
   getGithubIssueByPath,
   getGithubPrByPath,
@@ -83,6 +86,7 @@ import type {
 } from "@/tauri/types";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { useFirstRun, useFirstRunAgents } from "./first-run-agents";
 import { useNativeCapabilities } from "./use-native-capabilities";
 import { FullAccessNotice } from "./FullAccessNotice";
 import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
@@ -182,7 +186,7 @@ function DraftChatSurfaceInner({
     if (!activeModel || draft.promoting) return;
     const resolved = resolveServiceTier(activeModel, draft.serviceTier);
     if (resolved !== (draft.serviceTier ?? "default")) {
-      updateDraftConfig(draft.draftId, { serviceTier: resolved });
+      updateDraftConfig(draft.draftId, { serviceTier: resolved }, { automatic: true });
     }
   }, [activeModel, draft.draftId, draft.serviceTier, draft.promoting, updateDraftConfig]);
 
@@ -199,7 +203,7 @@ function DraftChatSurfaceInner({
   // the first-send materialization path.
   useEffect(() => {
     if (normalizedMode !== draft.mode) {
-      updateDraftConfig(draft.draftId, { mode: normalizedMode });
+      updateDraftConfig(draft.draftId, { mode: normalizedMode }, { automatic: true });
     }
   }, [draft.draftId, draft.mode, normalizedMode, updateDraftConfig]);
 
@@ -433,6 +437,13 @@ function DraftChatSurfaceInner({
   // multi-second workspace/session bring-up. Cleared on failure (restore
   // composer); on success the surface unmounts as the live pane flips in.
   const [pending, setPending] = useState<DraftPendingState | null>(null);
+  // The landing's "Connect an agent" card already says what each agent
+  // needs, so the selected one's status banner would only repeat it. The
+  // landing runs the probes; this only reads their answers.
+  const firstRun = useFirstRun();
+  const firstRunAgents = useFirstRunAgents(false);
+  const connectAgentShown = !pending && threadHostId === null && firstRun &&
+    !isRemoteClient() && firstRunAgents.needsAgent;
   // Once this surface has accepted a first send, every composer replacement
   // in the handoff (centered -> docked, or docked -> retry after failure)
   // should reclaim the caret. This state dies with the draft surface, so it
@@ -1279,18 +1290,6 @@ function DraftChatSurfaceInner({
     [draft.draftId, draft.mode, draft.provider, updateDraftConfig],
   );
 
-  const landingAgents = useMemo(
-    () => ({
-      selected: draft.provider,
-      onSelect: (provider: ChatDraft["provider"]) => {
-        if (provider !== draft.provider) {
-          handleProviderModelChange(provider, defaultModelId(provider));
-        }
-      },
-    }),
-    [draft.provider, handleProviderModelChange],
-  );
-
   const handleModelChange = useCallback(
     (next: string) => {
       const nextModel = capabilities?.models.find((item) => item.id === next);
@@ -1568,6 +1567,15 @@ function DraftChatSurfaceInner({
 
   // Opening a project from the empty home points this draft at it, the same
   // as picking it in the location control below the composer.
+  // A draft that starts without a model (an automatic pick made before the
+  // provider's catalog was known) waits for that catalog to choose one.
+  // Nothing else asks for it until a picker opens, so fetch it here; it
+  // shares the picker's single flight.
+  const waitingForCatalog = draft.bootstrapModel === true && !draft.model;
+  useEffect(() => {
+    if (waitingForCatalog) void refreshProviderCapabilitiesForIntent(draft.provider);
+  }, [waitingForCatalog, draft.provider]);
+
   const handleProjectOpened = useCallback(
     (projectPath: string) =>
       updateDraftTarget(draft.draftId, { kind: "project", projectPath }),
@@ -1584,10 +1592,12 @@ function DraftChatSurfaceInner({
           user the selected provider can't run BEFORE they compose and
           send a first message into a session that will never start.
           Renders as a floating top overlay; needs `relative` above. */}
-      <ProviderStatusNotice
-        provider={draft.provider}
-        workspaceId={sessionWorkspaceId}
-      />
+      {!connectAgentShown && (
+        <ProviderStatusNotice
+          provider={draft.provider}
+          workspaceId={sessionWorkspaceId}
+        />
+      )}
       <ProviderUpdateNotice provider={draft.provider} threadId={draft.threadId} remote={threadHostId !== null} />
       <div className="flex-1 min-h-0 overflow-hidden">
         {pending ? (
@@ -1598,7 +1608,7 @@ function DraftChatSurfaceInner({
           // and a failed send brings the landing back.
           <ChatHomeLanding
             composer={composerEl}
-            agents={threadHostId === null ? landingAgents : undefined}
+            agents={threadHostId === null ? { selected: draft.provider } : undefined}
             onProjectOpened={handleProjectOpened}
             projectName={scopeProjectPath ? basename(scopeProjectPath) : null}
             projectPicker={(trigger) => (

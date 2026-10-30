@@ -2,33 +2,28 @@ import { useRef, type ReactElement, type ReactNode } from "react";
 import { LandingBackdropHost } from "@/contrib/react/landing-backdrop";
 import { Slot } from "@/contrib/react/slot";
 import { LANDING_BELOW_COMPOSER_AREA } from "@/sdk/areas";
-import { ChevronDown, FolderOpen, GitBranch } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { MenuKeycap } from "@/components/ui/menu-chrome";
-import {
-  RecentProjectList,
-  describeError,
-  useRecentProjects,
-} from "@/components/layout/recent-projects";
-import { toast } from "@/lib/toast";
-import { useProjectActions } from "@/hooks/use-project-actions";
-import { useAppStore } from "@/stores/app-store";
+import { ChevronDown, FolderOpen } from "lucide-react";
 import { useProjectPickerHintStore } from "@/stores/project-picker-hint-store";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import type { AgentChatProviderKind } from "@/tauri/types";
-import { AgentAvailabilityStrip } from "./AgentAvailabilityStrip";
+import { AgentStatusLine } from "./AgentStatusLine";
+import { ConnectAgentCard } from "./ConnectAgentCard";
+import { FirstProjectActions } from "./FirstProjectActions";
+import {
+  useFirstRun,
+  useFirstRunAgents,
+  useReprobeOnReturn,
+  useShowProjectActions,
+} from "./first-run-agents";
 import { LocalSessionImportEntry } from "./LocalSessionImportEntry";
 import { ProjectPickerHint } from "./ProjectPickerHint";
 
 interface Props {
   composer: ReactNode;
-  /** The composer's provider and how to switch it. Given only by the
-   *  draft surface; with it, a first run (no workspaces yet) shows which
-   *  agents are installed and signed in on this machine. */
-  agents?: {
-    selected: AgentChatProviderKind;
-    onSelect: (provider: AgentChatProviderKind) => void;
-  };
+  /** The composer's provider. Given only by the draft surface for a
+   *  thread on this machine; with it, a first run (no projects yet) says
+   *  which agents are ready here, and asks to connect one when none is. */
+  agents?: { selected: AgentChatProviderKind };
   /** A project was opened from the zero-project actions below. */
   onProjectOpened?: (projectPath: string) => void;
   /** Project the new thread will run in. `undefined` keeps the generic
@@ -53,9 +48,12 @@ interface Props {
  * On a new-thread draft the headline is also where the project is
  * chosen; the scope strip under the composer doesn't repeat it.
  *
- * With no project open yet, a quiet row of project actions sits under the
- * composer: this landing replaces the full-screen Open Project page under
- * lazy workspace creation, so it has to offer the same ways in.
+ * With no project open, project tiles sit under the composer: this
+ * landing replaces the full-screen Open Project page under lazy workspace
+ * creation, so it has to offer the same ways in. On a first run (the
+ * session started with nothing open) a status line also says which agents
+ * can run here; when none can, the headline and composer give way to a card
+ * that connects one.
  */
 export function ChatHomeLanding({
   composer,
@@ -66,9 +64,12 @@ export function ChatHomeLanding({
   onStartWithoutProject,
   workspaceId = null,
 }: Props) {
-  const noWorkspaces = useAppStore(
-    (s) => s.appState !== null && (s.appState.workspaces?.length ?? 0) === 0,
-  );
+  const firstRun = useFirstRun();
+  const showProjectActions = useShowProjectActions();
+  const checkAgents = !!agents && firstRun && !isRemoteClient();
+  const firstRunAgents = useFirstRunAgents(checkAgents);
+  const connectAgent = checkAgents && firstRunAgents.needsAgent;
+  useReprobeOnReturn(firstRunAgents.providers, connectAgent);
   // "or start without a project" unmounts once clicked, and the "No
   // project" picker takes its slot; focus follows so keyboard users
   // don't drop back to the document body.
@@ -160,6 +161,10 @@ export function ChatHomeLanding({
     <LandingBackdropHost>
     <div className="@container flex h-full w-full flex-col items-center overflow-x-hidden overflow-y-auto">
       <div className="my-auto flex w-full flex-col items-center gap-8 pt-6 pb-12">
+        {connectAgent ? (
+          <ConnectAgentCard agents={firstRunAgents} />
+        ) : (
+        <>
         <div className="flex flex-col items-center gap-2 px-4" data-backdrop-calm>
           <h1 className="text-3xl font-medium tracking-tight text-foreground text-center">
             {headline}
@@ -179,55 +184,19 @@ export function ChatHomeLanding({
               chat-column.ts), so the landing card lines up with the
               mid-conversation composer at every pane width. */}
           {composer}
-          {noWorkspaces && (
+          {showProjectActions && (
             <FirstProjectActions onProjectOpened={onProjectOpened} />
           )}
           <Slot area={LANDING_BELOW_COMPOSER_AREA} props={{ workspaceId }} variant="block" />
         </div>
-        {agents && noWorkspaces && !isRemoteClient() && (
-          <AgentAvailabilityStrip selected={agents.selected} onSelect={agents.onSelect} />
+        {checkAgents && (
+          <AgentStatusLine agents={firstRunAgents} selected={agents.selected} />
+        )}
+        </>
         )}
         <LocalSessionImportEntry firstRun />
       </div>
     </div>
     </LandingBackdropHost>
-  );
-}
-
-function FirstProjectActions({
-  onProjectOpened,
-}: {
-  onProjectOpened?: (projectPath: string) => void;
-}) {
-  const { openProject, openCloneDialog } = useProjectActions();
-  const recentProjects = useRecentProjects(true);
-
-  const handleOpenProject = async () => {
-    try {
-      const result = await openProject();
-      if (result.success && result.path) onProjectOpened?.(result.path);
-    } catch (err) {
-      toast.error(`Couldn't open the project: ${describeError(err)}`);
-    }
-  };
-
-  return (
-    <div className="flex w-full max-w-[400px] flex-col items-center gap-3 px-4">
-      <div className="flex flex-wrap items-center justify-center gap-2">
-        <Button variant="outline" size="sm" onClick={() => void handleOpenProject()}>
-          <FolderOpen />
-          Open project
-          <MenuKeycap actionId="openProject" className="ml-1" />
-        </Button>
-        <Button variant="outline" size="sm" onClick={openCloneDialog}>
-          <GitBranch />
-          Clone repository
-        </Button>
-      </div>
-      <RecentProjectList
-        projects={recentProjects}
-        onOpened={onProjectOpened}
-      />
-    </div>
   );
 }

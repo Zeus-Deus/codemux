@@ -68,6 +68,24 @@ pub fn provider_login_command(provider: ProviderKind) -> Option<&'static str> {
     }
 }
 
+/// The official install command for the agents a first run offers to set
+/// up. It is typed into a terminal and left for the user to run, never run
+/// for them. `None` for agents installed some other way.
+pub fn provider_install_command(provider: ProviderKind) -> Option<&'static str> {
+    match provider {
+        #[cfg(windows)]
+        ProviderKind::Claude => Some("irm https://claude.ai/install.ps1 | iex"),
+        #[cfg(not(windows))]
+        ProviderKind::Claude => Some("curl -fsSL https://claude.ai/install.sh | bash"),
+        ProviderKind::Codex => Some("npm install -g @openai/codex"),
+        #[cfg(windows)]
+        ProviderKind::OpenCode => Some("npm install -g opencode-ai"),
+        #[cfg(not(windows))]
+        ProviderKind::OpenCode => Some("curl -fsSL https://opencode.ai/install | bash"),
+        ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Hermes | ProviderKind::Acp => None,
+    }
+}
+
 impl ProviderHealthReport {
     fn ready(provider: ProviderKind, version: Option<String>) -> Self {
         Self {
@@ -550,6 +568,14 @@ mod tests {
             None,
         ));
         assert_eq!(ready.status, ProviderHealthStatus::Ready);
+    }
+
+    #[test]
+    fn first_run_agents_have_an_install_command() {
+        for provider in [ProviderKind::Claude, ProviderKind::Codex, ProviderKind::OpenCode] {
+            assert!(provider_install_command(provider).is_some(), "{provider:?}");
+        }
+        assert!(provider_install_command(ProviderKind::Hermes).is_none());
     }
 
     #[test]

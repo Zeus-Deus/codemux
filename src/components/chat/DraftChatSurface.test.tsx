@@ -122,6 +122,7 @@ const STUB_CAP_STATE = {
   opencodeError: null,
   refresh: vi.fn(),
 };
+const refreshCapabilitiesForIntent = vi.hoisted(() => vi.fn((..._args: unknown[]) => Promise.resolve()));
 vi.mock("@/stores/provider-capabilities-store", () => ({
   useProviderCapabilities: Object.assign(
     vi.fn((selector?: (s: unknown) => unknown) =>
@@ -135,6 +136,8 @@ vi.mock("@/stores/provider-capabilities-store", () => ({
   selectCapabilities: () => null,
   selectError: () => null,
   selectModel: () => null,
+  refreshProviderCapabilitiesForIntent: (...args: unknown[]) =>
+    refreshCapabilitiesForIntent(...args),
 }));
 
 // Picker favorites store — drafts now use the multi-provider picker
@@ -493,6 +496,21 @@ describe("DraftChatSurface", () => {
       expect(markPaneReady).toHaveBeenCalledWith("agent-chat", {
         target: undefined,
       });
+    });
+
+    it("fetches the catalog for a draft still waiting on its first model", () => {
+      const store = useChatDraftStore.getState();
+      const draft = store.getOrCreateHomeDraft();
+      useChatDraftStore.setState((s) => ({
+        draftsById: {
+          ...s.draftsById,
+          [draft.draftId]: { ...s.draftsById[draft.draftId], provider: "opencode", model: null, bootstrapModel: true },
+        },
+      }));
+      store.setActiveDraft(draft.draftId);
+      refreshCapabilitiesForIntent.mockClear();
+      renderSurface();
+      expect(refreshCapabilitiesForIntent).toHaveBeenCalledWith("opencode");
     });
 
     it("scopes the pane-ready mark to the targeted workspace for existing_workspace drafts", () => {
@@ -995,7 +1013,7 @@ describe("DraftChatSurface", () => {
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       const { getByRole } = renderSurface();
-      fireEvent.click(getByRole("button", { name: /Open project/ }));
+      fireEvent.click(getByRole("button", { name: /Open folder/ }));
       await vi.waitFor(() =>
         expect(useChatDraftStore.getState().draftsById[draft.draftId]?.target).toEqual({
           kind: "project",
@@ -1687,7 +1705,7 @@ describe("DraftChatSurface", () => {
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
 
       const { queryByTestId } = renderSurface();
-      expect(queryByTestId("agent-availability-strip")).toBeNull();
+      expect(queryByTestId("agent-status-line")).toBeNull();
     });
 
     it("passes the draft's device to the row and persists a pick", () => {

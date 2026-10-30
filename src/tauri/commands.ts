@@ -429,6 +429,13 @@ export const openProviderLoginTerminal = (
   provider: AgentChatProviderKind,
 ) => invoke("open_provider_login_terminal", { workspaceId, provider });
 
+/** Opens a terminal tab with `provider`'s install command typed at the
+ *  prompt and not run. Claude Code, Codex and OpenCode only. */
+export const openProviderInstallTerminal = (
+  workspaceId: string,
+  provider: AgentChatProviderKind,
+) => invoke("open_provider_install_terminal", { workspaceId, provider });
+
 /** Gemini launch-time model list. Backend serves a live harvest when
  *  `GEMINI_API_KEY` is set, otherwise the maintained fallback. Either
  *  way it returns quickly; failure inside the live path is caught by

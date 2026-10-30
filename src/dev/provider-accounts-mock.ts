@@ -69,6 +69,18 @@ if (typeof window !== "undefined" && new URLSearchParams(window.location.search)
   );
 }
 const defaults: Record<string, string> = { claude: "claude-work-3f9a1c", codex: "codex-work-5c1d22" };
+// `?agents=none|opencode-only`: a fresh machine has no extra accounts, and
+// the CLIs' own sign-ins follow the health fixture (signed out).
+const freshMachine =
+  typeof window !== "undefined" &&
+  ["none", "opencode-only"].includes(new URLSearchParams(window.location.search).get("agents") ?? "");
+if (freshMachine) {
+  accounts = accounts
+    .filter((a) => a.id === "default")
+    .map((a) => ({ ...a, identity: { signed_in: false, email: null, organization: null, plan: null } }));
+  delete defaults.claude;
+  delete defaults.codex;
+}
 const bindings = new Map<string, string>();
 let seq = 0;
 

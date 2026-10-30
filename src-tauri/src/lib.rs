@@ -3088,6 +3088,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::reorder_presets,
             commands::apply_preset,
             commands::open_provider_login_terminal,
+            commands::open_provider_install_terminal,
             commands::get_workspace_config,
             commands::has_codemuxinclude,
             commands::run_workspace_setup,

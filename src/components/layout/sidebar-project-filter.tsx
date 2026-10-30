@@ -10,7 +10,6 @@ import {
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { MenuKeycap } from "@/components/ui/menu-chrome";
 import type { ProjectGroup } from "@/stores/app-store";
-import { useUIStore } from "@/stores/ui-store";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { useProjectAppearance } from "./use-project-appearance";
 
@@ -129,8 +128,7 @@ export function SidebarProjectFilter({
   filterName,
   setFilter,
 }: SidebarProjectFilterProps) {
-  const setShowNewProjectScreen = useUIStore((s) => s.setShowNewProjectScreen);
-  const { openProject } = useProjectActions();
+  const { openProject, openAddProject } = useProjectActions();
   // Whether the dropdown is open — drives the trigger chevron rotation.
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
 
@@ -219,7 +217,7 @@ export function SidebarProjectFilter({
             <MenuKeycap actionId="openProject" />
           </DropdownMenuItem>
           <DropdownMenuItem
-            onClick={() => setShowNewProjectScreen(true)}
+            onClick={() => openAddProject("new")}
             className={FILTER_ROW}
           >
             <FolderPlus className={FILTER_ICON} />

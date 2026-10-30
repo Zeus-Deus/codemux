@@ -5,7 +5,6 @@ import { SidebarActionRow } from "./sidebar-action-row";
 import { SidebarWorkspaceList } from "./sidebar-workspace-list";
 import { SidebarSetupBanner } from "./sidebar-setup-banner";
 import { SidebarFooterBar } from "./sidebar-footer-bar";
-import { CloneDialog } from "@/components/overlays/clone-dialog";
 import { NewWorkspaceDialog } from "@/components/overlays/new-workspace-dialog";
 import { useUIStore } from "@/stores/ui-store";
 
@@ -37,7 +36,6 @@ export function AppSidebar() {
         open={showNewWorkspaceDialog}
         onOpenChange={setShowNewWorkspaceDialog}
       />
-      <CloneDialog />
     </Sidebar>
   );
 }

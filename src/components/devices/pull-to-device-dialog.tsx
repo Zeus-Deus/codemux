@@ -90,8 +90,8 @@ function markFirstPullSeen() {
  *      stay open during the rsync.
  *   4. Toast on completion with the option to open the new workspace.
  *
- * Mirrors the existing `CloneDialog` shape (sm:max-w-[460px] popover)
- * and the in-flight signalling pattern used by push-to-host.
+ * A 460px popover dialog, with the in-flight signalling pattern used by
+ * push-to-host.
  */
 export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
   const setShowDevices = useUIStore(

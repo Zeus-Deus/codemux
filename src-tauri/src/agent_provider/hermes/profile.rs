@@ -176,6 +176,19 @@ pub fn discover(installation: &Path, root: &Path) -> Result<Vec<Profile>, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The first-run landing reads `setup_required:` as "Hermes isn't set up
+    /// here" and may then ask to connect an agent; other failures stay unknown.
+    #[test]
+    fn hermes_not_installed_is_setup_required() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = std::env::current_exe().unwrap();
+        let missing_root = tmp.path().join(".hermes");
+        assert!(discover(&binary, &missing_root).unwrap_err().starts_with("setup_required:"));
+        let missing_binary = Path::new("codemux-test-no-such-hermes");
+        assert!(discover(missing_binary, tmp.path()).unwrap_err().starts_with("setup_required:"));
+        let missing_path = tmp.path().join("bin/hermes");
+        assert!(discover(&missing_path, tmp.path()).unwrap_err().starts_with("setup_required:"));
+    }
     #[test]
     fn hermes_profile_identity_and_tombstones() {
         let tmp = tempfile::tempdir().unwrap();

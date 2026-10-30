@@ -4,6 +4,7 @@ import { act, renderHook } from "@testing-library/react";
 import {
   chatDraftHasUserContent,
   partializeChatDraftStoreState,
+  reseedAutomaticProviderDrafts,
   reseedBootstrapDrafts,
   selectActiveDraft,
   selectDraftForWorkspace,
@@ -17,7 +18,13 @@ import { useSettingsStore } from "./settings-store";
 import { useAppStore } from "./app-store";
 import { createSeedAppState } from "@/dev/mock-fixtures";
 import { useProviderCapabilities } from "./provider-capabilities-store";
-import type { ChatModelInfo, ProviderChatCapabilities } from "@/tauri/types";
+import { emptyHealthSlot, useProviderHealth } from "./provider-health-store";
+import type {
+  AgentChatProviderKind,
+  ChatModelInfo,
+  ProviderChatCapabilities,
+  ProviderHealthReport,
+} from "@/tauri/types";
 
 function claudeCaps(
   models: Array<Pick<ChatModelInfo, "id" | "label"> & Partial<ChatModelInfo>>,
@@ -947,6 +954,153 @@ describe("chat-draft-store", () => {
       expect(useChatDraftStore.getState().getOrCreateHomeDraft().provider).not.toBe("claude");
       // Untouched drafts on other providers keep their pick.
       expect(draftsById[other.draftId].provider).toBe("codex");
+    });
+
+    describe("following the health probes", () => {
+      function settle(ready: AgentChatProviderKind[], inFlight: AgentChatProviderKind[] = []) {
+        const slots = { ...useProviderHealth.getState().slots };
+        for (const provider of ["claude", "codex", "opencode", "cursor", "grok"] as const) {
+          const report: ProviderHealthReport = {
+            provider,
+            status: ready.includes(provider) ? "ready" : "error",
+            installed: ready.includes(provider),
+            message: null,
+            version: null,
+          };
+          slots[provider] = {
+            ...emptyHealthSlot(),
+            report,
+            fetchedAt: 1,
+            inFlight: inFlight.includes(provider) ? new Promise(() => {}) : null,
+          };
+        }
+        useProviderHealth.setState({ slots });
+        reseedAutomaticProviderDrafts();
+      }
+
+      afterEach(() => {
+        const slots = { ...useProviderHealth.getState().slots };
+        for (const provider of Object.keys(slots) as AgentChatProviderKind[]) {
+          slots[provider] = emptyHealthSlot();
+        }
+        useProviderHealth.setState({ slots });
+      });
+
+      it("moves a first-run draft to the first ready agent once every probe settles", () => {
+        const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+        expect(draft).toMatchObject({ provider: "claude", automaticProvider: true });
+        useChatDraftStore.getState().updateDraftInput(draft.draftId, "typed early");
+
+        settle(["opencode"], ["codex"]);
+        expect(useChatDraftStore.getState().draftsById[draft.draftId].provider).toBe("claude");
+
+        settle(["opencode"]);
+        expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+          provider: "opencode",
+          automaticProvider: true,
+          inputDraft: "typed early",
+          threadId: draft.threadId,
+        });
+      });
+
+      it("puts an OpenCode draft on OpenCode's own default until its catalog arrives", () => {
+        const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+        settle(["opencode"]);
+        expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+          provider: "opencode",
+          model: null,
+          bootstrapModel: true,
+          automaticProvider: true,
+        });
+        expect(useChatDraftStore.getState().getOrCreateProjectDraft("/repo").model).toBeNull();
+
+        useProviderCapabilities.setState({
+          opencode: claudeCaps([{ id: "opencode/big-pickle", label: "Big Pickle" }]),
+        });
+        reseedBootstrapDrafts();
+        expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+          provider: "opencode",
+          model: "opencode/big-pickle",
+          bootstrapModel: false,
+        });
+      });
+
+      it("does not move a draft back to the fallback while nothing is known to run", () => {
+        const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+        settle(["opencode"]);
+        expect(useChatDraftStore.getState().draftsById[draft.draftId].provider).toBe("opencode");
+        // An app restart: the cache is empty again.
+        useProviderHealth.setState((state) => {
+          const slots = { ...state.slots };
+          for (const provider of Object.keys(slots) as AgentChatProviderKind[]) {
+            slots[provider] = emptyHealthSlot();
+          }
+          return { slots };
+        });
+        reseedAutomaticProviderDrafts();
+        expect(useChatDraftStore.getState().draftsById[draft.draftId].provider).toBe("opencode");
+        settle([]);
+        expect(useChatDraftStore.getState().draftsById[draft.draftId].provider).toBe("opencode");
+      });
+
+      it("leaves drafts the user picked a provider or model on", () => {
+        const store = useChatDraftStore.getState();
+        const picked = store.getOrCreateHomeDraft();
+        store.updateDraftConfig(picked.draftId, { provider: "claude" });
+        const model = store.getOrCreateProjectDraft("/repo");
+        store.updateDraftConfig(model.draftId, { model: "default" });
+
+        settle(["codex"]);
+        const { draftsById } = useChatDraftStore.getState();
+        expect(draftsById[picked.draftId]).toMatchObject({ provider: "claude", automaticProvider: false });
+        expect(draftsById[model.draftId]).toMatchObject({ provider: "claude", automaticProvider: false });
+      });
+
+      it("keeps a draft whose permissions or other agent settings the user changed", () => {
+        settle(["codex"]);
+        const store = useChatDraftStore.getState();
+        const draft = store.getOrCreateHomeDraft();
+        expect(draft).toMatchObject({ provider: "codex", automaticProvider: true });
+        store.updateDraftConfig(draft.draftId, { permissionMode: "read-only" });
+        const plan = store.getOrCreateProjectDraft("/repo");
+        store.updateDraftConfig(plan.draftId, { mode: "plan" });
+
+        settle(["claude", "codex"]);
+        const { draftsById } = useChatDraftStore.getState();
+        expect(draftsById[draft.draftId]).toMatchObject({
+          provider: "codex",
+          permissionMode: "read-only",
+          automaticProvider: false,
+        });
+        expect(draftsById[plan.draftId]).toMatchObject({ provider: "codex", mode: "plan" });
+      });
+
+      it("still follows the probes after the app corrects a setting itself", () => {
+        settle(["codex"]);
+        const store = useChatDraftStore.getState();
+        const draft = store.getOrCreateHomeDraft();
+        store.updateDraftConfig(draft.draftId, { serviceTier: "default" }, { automatic: true });
+
+        settle(["claude", "codex"]);
+        expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+          provider: "claude",
+          automaticProvider: true,
+        });
+      });
+
+      it("leaves drafts alone while a default is saved, and device drafts always", () => {
+        const device = useChatDraftStore.getState().getOrCreateProjectDraft("/repo");
+        useChatDraftStore.getState().updateDraftConfig(device.draftId, { hostId: 2 });
+        useSettingsStore.setState({ settings: { "chat.default_provider": "claude" } });
+        const saved = useChatDraftStore.getState().getOrCreateHomeDraft();
+        expect(saved.automaticProvider).toBe(false);
+        settle(["codex"]);
+        expect(useChatDraftStore.getState().draftsById[saved.draftId].provider).toBe("claude");
+
+        useSettingsStore.setState({ settings: {} });
+        settle(["codex"]);
+        expect(useChatDraftStore.getState().draftsById[device.draftId].provider).toBe("claude");
+      });
     });
   });
 

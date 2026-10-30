@@ -1,6 +1,7 @@
 import { useEffect, useState, type ComponentProps, type ReactNode } from "react";
 import { Eye, EyeOff, Github, Mail } from "lucide-react";
-import { ChatGptConnection } from "./chatgpt-connection";
+import "@fontsource/instrument-serif/latin-400.css";
+import { ChatGptConnectButton, ChatGptConnectionCard, ChatGptConnectionNotes } from "./chatgpt-connection";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -31,6 +32,7 @@ export function LoginScreen() {
   const localMode = useChatGptStore((s) => s.localMode);
   const enterLocal = useChatGptStore((s) => s.enterLocal);
   const connecting = useChatGptStore((s) => s.busy || s.loading || s.status?.phase === "pending");
+  const chatGptPhase = useChatGptStore((s) => s.status?.phase);
   const isSigningIn = useAuthStore((s) => s.isSigningIn);
   const oauthPending = useAuthStore((s) => s.oauthPending);
   const error = useAuthStore((s) => s.error);
@@ -41,6 +43,7 @@ export function LoginScreen() {
   const clearError = useAuthStore((s) => s.clearError);
 
   const [view, setView] = useState<View>("signin");
+  const [emailExpanded, setEmailExpanded] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
@@ -195,140 +198,175 @@ export function LoginScreen() {
     );
   } else {
     const isSignup = view === "signup";
-    body = (
-      <>
-        <div className="text-center mb-6">
-          <p className="text-body text-muted-foreground">
-            {isSignup ? "Create your account" : "Your next build starts here"}
-          </p>
-        </div>
-
-        <div className="w-full mb-6">
-          <ChatGptConnection onboarding />
-        </div>
-        <p className="text-label text-muted-foreground text-center leading-relaxed mb-4">
-          GitHub or email connects your CodeMux account for sync.
-        </p>
-
-        <Button
-          variant="outline"
-          size="lg"
-          className="w-full gap-2.5 mb-4"
-          onClick={() => void startOAuthFlow()}
-          disabled={isSigningIn}
-        >
-          <Github className="size-4" />
-          Continue with GitHub
-        </Button>
-
-        <div className="relative w-full mb-4">
-          <div className="absolute inset-0 flex items-center">
-            <span className="w-full border-t border-border" />
-          </div>
-          <div className="relative flex justify-center">
-            <span className="bg-background px-2 text-label text-muted-foreground">
-              or
-            </span>
-          </div>
-        </div>
-
-        <form onSubmit={handleSubmit} className="w-full space-y-3">
-          {isSignup && (
-            <Input
-              type="text"
-              placeholder="Name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              disabled={isSigningIn}
-              autoComplete="name"
-              required
-            />
-          )}
+    // Sign-up, and an error only the email form can explain, open the form
+    // without a click; otherwise it waits behind "Continue with email".
+    const emailOpen = emailExpanded || isSignup || Boolean(isEmailNotVerified);
+    const chatGptPending = chatGptPhase === "pending";
+    const chatGptConnected = chatGptPhase === "connected";
+    const emailForm = (
+      <form onSubmit={handleSubmit} className="w-full space-y-3 pt-2">
+        {isSignup && (
           <Input
-            type="email"
-            placeholder="Email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            type="text"
+            placeholder="Name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
             disabled={isSigningIn}
-            autoComplete="email"
+            autoComplete="name"
+            autoFocus
             required
           />
-          <div className="space-y-1.5">
-            <PasswordInput
-              placeholder="Password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              disabled={isSigningIn}
-              autoComplete={isSignup ? "new-password" : "current-password"}
-              // Only new passwords are held to the rule; existing accounts
-              // may predate it and must still be able to sign in.
-              minLength={isSignup ? MIN_PASSWORD_LENGTH : undefined}
-              aria-describedby={isSignup ? "login-password-hint" : undefined}
-              required
-            />
-            {isSignup && (
-              <p id="login-password-hint" className="text-label text-muted-foreground">
-                At least {MIN_PASSWORD_LENGTH} characters
-              </p>
-            )}
-          </div>
-
-          {!isSignup && (
-            <div className="flex justify-end">
-              <button
-                type="button"
-                className="text-label text-muted-foreground hover:text-foreground transition-colors duration-150"
-                onClick={() => switchView("forgot-password")}
-              >
-                Forgot password?
-              </button>
-            </div>
-          )}
-
-          {error &&
-            (isEmailNotVerified ? (
-              <div className="flex flex-col items-center text-center space-y-1">
-                <p className="text-body text-muted-foreground">
-                  Your email hasn't been verified yet.
-                </p>
-                <p className="text-body text-muted-foreground">
-                  Check your inbox for the verification link.
-                </p>
-                <ResendVerification resend={resend} />
-              </div>
-            ) : (
-              <p className="text-destructive text-body text-center">{error}</p>
-            ))}
-
-          <Button
-            type="submit"
-            className={primaryButtonClass}
-            size="lg"
+        )}
+        <Input
+          type="email"
+          placeholder="Email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          disabled={isSigningIn}
+          autoComplete="email"
+          // Focus follows the click that opened the form.
+          autoFocus={emailExpanded && !isSignup}
+          required
+        />
+        <div className="space-y-1.5">
+          <PasswordInput
+            placeholder="Password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
             disabled={isSigningIn}
-          >
-            {isSigningIn && <Spinner className="size-4 mr-1.5" aria-hidden />}
-            {isSignup ? "Create account" : "Sign in"}
-          </Button>
-        </form>
+            autoComplete={isSignup ? "new-password" : "current-password"}
+            // Only new passwords are held to the rule; existing accounts
+            // may predate it and must still be able to sign in.
+            minLength={isSignup ? MIN_PASSWORD_LENGTH : undefined}
+            aria-describedby={isSignup ? "login-password-hint" : undefined}
+            required
+          />
+          {isSignup && (
+            <p id="login-password-hint" className="text-label text-muted-foreground">
+              At least {MIN_PASSWORD_LENGTH} characters
+            </p>
+          )}
+        </div>
+
+        {!isSignup && (
+          <div className="flex justify-end">
+            <button
+              type="button"
+              className="text-label text-muted-foreground hover:text-foreground transition-colors duration-150"
+              onClick={() => switchView("forgot-password")}
+            >
+              Forgot password?
+            </button>
+          </div>
+        )}
+
+        {error &&
+          (isEmailNotVerified ? (
+            <div className="flex flex-col items-center text-center space-y-1">
+              <p className="text-body text-muted-foreground">
+                Your email hasn't been verified yet.
+              </p>
+              <p className="text-body text-muted-foreground">
+                Check your inbox for the verification link.
+              </p>
+              <ResendVerification resend={resend} />
+            </div>
+          ) : (
+            <p className="text-destructive text-body text-center">{error}</p>
+          ))}
 
         <Button
-          variant="ghost"
-          className="mt-3 w-full text-muted-foreground"
-          disabled={connecting || isSigningIn}
-          onClick={() => void enterLocal()}
+          type="submit"
+          className={primaryButtonClass}
+          size="lg"
+          disabled={isSigningIn}
         >
-          {localMode ? "Back to workbench" : "Continue locally with another provider"}
+          {isSigningIn && <Spinner className="size-4 mr-1.5" aria-hidden />}
+          {isSignup ? "Create account" : "Sign in"}
         </Button>
+      </form>
+    );
 
-        <button
-          type="button"
-          className={linkButtonClass}
-          onClick={() => switchView(isSignup ? "signin" : "signup")}
-        >
-          {isSignup
-            ? "Already have an account? Sign in"
-            : "Don't have an account? Sign up"}
-        </button>
+    body = (
+      <>
+        {/* Pending takes the column until the browser hands back or the
+            user cancels. Connected stays above the account buttons: this
+            screen is also how a local user reaches cloud sign-in. */}
+        {chatGptPending ? (
+          <ChatGptConnectionCard onboarding />
+        ) : (
+          <div className="flex w-full flex-col gap-2">
+            {chatGptConnected && (
+              <div className="mb-2 w-full">
+                <ChatGptConnectionCard onboarding />
+              </div>
+            )}
+            <Button
+              // One filled button at a time: GitHub leads until the email
+              // form or the ChatGPT card brings its own primary action.
+              variant={emailOpen || chatGptConnected ? "outline" : "default"}
+              size="lg"
+              className={cn(
+                "w-full gap-2.5",
+                !emailOpen && !chatGptConnected && primaryButtonClass,
+              )}
+              onClick={() => void startOAuthFlow()}
+              disabled={isSigningIn}
+            >
+              <Github className="size-4" />
+              Continue with GitHub
+            </Button>
+            {!chatGptConnected && <ChatGptConnectButton variant="outline" />}
+            {emailOpen ? (
+              emailForm
+            ) : (
+              <Button
+                variant="outline"
+                size="lg"
+                className="w-full gap-2.5"
+                onClick={() => setEmailExpanded(true)}
+              >
+                <Mail className="size-4" />
+                Continue with email
+              </Button>
+            )}
+          </div>
+        )}
+
+        {/* The email form shows its own errors; GitHub's land here. */}
+        {error && !emailOpen && (
+          <p role="alert" className="mt-3 text-destructive text-body text-center">
+            {error}
+          </p>
+        )}
+
+        <div className="mt-3 w-full empty:hidden">
+          <ChatGptConnectionNotes />
+        </div>
+
+        {emailOpen && (
+          <button
+            type="button"
+            className={linkButtonClass}
+            onClick={() => switchView(isSignup ? "signin" : "signup")}
+          >
+            {isSignup
+              ? "Already have an account? Sign in"
+              : "Don't have an account? Sign up"}
+          </button>
+        )}
+
+        {/* Connected already offers "Continue to Codemux". */}
+        {!chatGptConnected && (
+          <button
+            type="button"
+            className={cn(linkButtonClass, "mt-6 disabled:pointer-events-none disabled:opacity-64")}
+            disabled={connecting || isSigningIn}
+            onClick={() => void enterLocal()}
+          >
+            {localMode ? "Back to workbench" : "Continue without an account"}
+          </button>
+        )}
       </>
     );
   }
@@ -341,8 +379,8 @@ export function LoginScreen() {
       <div className="h-8 w-full shrink-0" />
 
       <div className="flex flex-1 items-center justify-center overflow-y-auto py-6">
-        <div className="flex flex-col items-center w-full max-w-sm px-6">
-          <Wordmark className="mb-6" />
+        <div className="flex flex-col items-center w-full max-w-md px-6">
+          <Wordmark className="mb-8" />
           {/* Keyed so each view change replays the entrance instead of
               hard-cutting the layout. */}
           <div
@@ -350,10 +388,38 @@ export function LoginScreen() {
             data-testid="login-view"
             className="flex w-full flex-col items-center motion-safe:animate-in fade-in-0 slide-in-from-bottom-1 duration-150"
           >
-            {body}
+            {!oauthPending && (view === "signin" || view === "signup") && (
+              <Headline
+                subline={
+                  view === "signup"
+                    ? "Create an account to sync threads and settings across your devices."
+                    : "Sign in to sync threads and settings across your devices."
+                }
+              />
+            )}
+            {/* The headline may run wider; the controls keep a narrow column. */}
+            <div className="flex w-full max-w-[340px] flex-col items-center">
+              {body}
+            </div>
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+function Headline({ subline }: { subline: string }) {
+  return (
+    <div className="mb-8 flex flex-col items-center gap-2.5 text-center">
+      <h1
+        // The sidebar's serif voice, upright here, at display size in rem so
+        // it still follows the interface size.
+        style={{ fontFamily: "'Instrument Serif', Georgia, serif" }}
+        className="text-[2.375rem] font-normal leading-[1.05] tracking-[-0.01em] text-foreground"
+      >
+        Many agents, one desk.
+      </h1>
+      <p className="text-body text-muted-foreground text-balance">{subline}</p>
     </div>
   );
 }

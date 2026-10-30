@@ -2,14 +2,11 @@ import { LocalSessionImportEntry } from "@/components/chat/LocalSessionImportEnt
 import { FolderOpen, GitBranch, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { MenuKeycap } from "@/components/ui/menu-chrome";
-import { CloneDialog } from "@/components/overlays/clone-dialog";
 import { WindowChrome } from "@/components/layout/window-chrome";
-import { openProjectAtPath, useProjectActions } from "@/hooks/use-project-actions";
+import { openDroppedFolder, useProjectActions } from "@/hooks/use-project-actions";
 import { useFolderDrop } from "@/hooks/use-folder-drop";
-import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
-import { listDirectory } from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
 import wordmark from "@/assets/codemux-wordmark.svg";
 import {
@@ -18,29 +15,14 @@ import {
   useRecentProjects,
 } from "./recent-projects";
 
-/** Open a folder dropped from the file manager; a dropped file is refused. */
-async function openDroppedFolder(path: string): Promise<void> {
-  try {
-    // Fails for anything that is not a readable directory.
-    await listDirectory(path);
-  } catch {
-    toast.error(`${basename(path)} is not a folder. Drop a project folder to open it.`);
-    return;
-  }
-  try {
-    await openProjectAtPath(path);
-  } catch (err) {
-    toast.error(`Couldn't open ${basename(path)}: ${describeError(err)}`);
-  }
-}
-
 export function EmptyState() {
-  const { openProject, openCloneDialog } = useProjectActions();
-  const setShowNewProjectScreen = useUIStore(
-    (s) => s.setShowNewProjectScreen,
-  );
+  const { openProject, openAddProject } = useProjectActions();
   const recentProjects = useRecentProjects(true);
-  const dragging = useFolderDrop((path) => void openDroppedFolder(path));
+  const dragging = useFolderDrop((path) => {
+    // The Add project sheet takes drops itself while it is open.
+    if (useUIStore.getState().addProjectSheet) return;
+    void openDroppedFolder(path);
+  });
 
   const handleOpenProject = async () => {
     try {
@@ -100,7 +82,7 @@ export function EmptyState() {
               variant="ghost"
               size="sm"
               className="text-muted-foreground hover:text-foreground"
-              onClick={openCloneDialog}
+              onClick={() => openAddProject("clone")}
             >
               <GitBranch />
               Clone repository
@@ -109,18 +91,16 @@ export function EmptyState() {
               variant="ghost"
               size="sm"
               className="text-muted-foreground hover:text-foreground"
-              onClick={() => setShowNewProjectScreen(true)}
+              onClick={() => openAddProject("new")}
             >
               <Plus />
-              New Project
+              New project
             </Button>
           </div>
         </div>
 
         <div className="mt-6"><LocalSessionImportEntry firstRun /></div>
       </div>
-      {/* The sidebar normally hosts this dialog; this page renders without it. */}
-      <CloneDialog />
     </div>
   );
 }

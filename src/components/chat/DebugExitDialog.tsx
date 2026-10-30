@@ -11,8 +11,8 @@ import { Button } from "@/components/ui/button";
 // Overlay-manager note: the codemux-ui skill mentions a global
 // overlay manager at `src/stores/overlay.ts`, but that file does
 // not exist in this codebase yet. Other dialogs in
-// `src/components/overlays/` (CloneDialog, NewWorkspaceDialog) use
-// a per-feature `useUIStore` boolean as their open/close source of
+// `src/components/overlays/` (AddProjectSheet, NewWorkspaceDialog) use
+// a per-feature `useUIStore` flag as their open/close source of
 // truth; this dialog uses `open` as a prop driven by the caller's
 // Promise wrapper (`confirmDebugExit` in AgentChatPane) for the
 // same effect. Radix's Dialog primitive handles the singleton

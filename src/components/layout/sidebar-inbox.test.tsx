@@ -63,8 +63,9 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 const openProjectMock = vi.hoisted(() => vi.fn());
+const openAddProjectMock = vi.hoisted(() => vi.fn());
 vi.mock("@/hooks/use-project-actions", () => ({
-  useProjectActions: () => ({ openProject: openProjectMock }),
+  useProjectActions: () => ({ openProject: openProjectMock, openAddProject: openAddProjectMock }),
 }));
 
 // Record the status each row hands its hover card (the card content itself is
@@ -710,13 +711,11 @@ describe("SidebarInbox — project filter", () => {
     );
     expect(openProjectMock).toHaveBeenCalledTimes(1);
 
-    useUIStore.setState({ showNewProjectScreen: false });
     await openFilterMenu();
     await userEvent.click(
       await screen.findByRole("menuitem", { name: "Create or clone project" }),
     );
-    expect(useUIStore.getState().showNewProjectScreen).toBe(true);
-    useUIStore.setState({ showNewProjectScreen: false });
+    expect(openAddProjectMock).toHaveBeenCalledWith("new");
   });
 
   it("puts Search and New agent in the same row as the project menu", async () => {

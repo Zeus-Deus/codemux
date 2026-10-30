@@ -6,9 +6,16 @@ import {
   defaultModelId,
 } from "@/lib/agent-chat/capability-defaults";
 import {
+  AUTOMATIC_PROVIDER_ORDER,
   NEW_CHAT_SETTING_KEYS,
+  firstUsableProvider,
+  isAutomaticNewChatProvider,
   resolveNewChatModelDefaults,
 } from "@/lib/agent-chat/new-chat-defaults";
+import { normalizeChatModeForProvider } from "@/lib/agent-chat/mode-compatibility";
+import { useProviderHealth } from "@/stores/provider-health-store";
+import { useProviderAccounts } from "@/stores/provider-accounts-store";
+import { useChatGptStore } from "@/stores/chatgpt-store";
 import { getNewChatCheckout, useSettingsStore } from "@/stores/settings-store";
 import { useAppStore } from "@/stores/app-store";
 import { discardStagedImage } from "@/lib/agent-chat/image-staging";
@@ -43,6 +50,11 @@ export interface ChatDraft {
    *  Explicit picks clear this persisted marker. Missing means a legacy
    *  draft of unknown provenance, whose model must be preserved. */
   bootstrapModel?: boolean;
+  /** True while the provider is the automatic new-chat pick rather than
+   *  the user's: no default is saved and nobody has picked a provider or
+   *  model on this draft. Such a draft follows the health probes to the
+   *  first ready agent (`reseedAutomaticProviderDrafts`). */
+  automaticProvider?: boolean;
   effort: string | null;
   contextWindow: string | null;
   serviceTier?: string;
@@ -172,6 +184,10 @@ export interface ChatDraftStore {
         | "lockedToHome"
       >
     >,
+    /** `automatic` marks a correction the app made (healing a value the
+     *  provider no longer supports), not the user's choice, so the draft
+     *  keeps following the automatic provider. */
+    options?: { automatic?: boolean },
   ) => void;
   updateDraftInput: (draftId: DraftId, input: string) => void;
 
@@ -291,11 +307,23 @@ function discardDraftRuntime(draft: ChatDraft): void {
   chat.resetThread(draft.threadId);
 }
 
+/** Draft fields the composer's agent controls set. */
+const AGENT_CONFIG_KEYS = [
+  "provider",
+  "model",
+  "effort",
+  "contextWindow",
+  "serviceTier",
+  "permissionMode",
+  "mode",
+] as const satisfies ReadonlyArray<keyof ChatDraft>;
+
 type NewChatConfig = Pick<
   ChatDraft,
   | "provider"
   | "model"
   | "bootstrapModel"
+  | "automaticProvider"
   | "effort"
   | "contextWindow"
   | "serviceTier"
@@ -327,6 +355,7 @@ function newChatConfig(): NewChatConfig {
     provider: choice.provider,
     model: defaults.model,
     bootstrapModel: !savedModel && !roster?.length,
+    automaticProvider: isAutomaticNewChatProvider(),
     effort: choice.effort ?? defaults.effort,
     contextWindow: defaults.contextWindow,
     serviceTier: "default",
@@ -544,7 +573,7 @@ export const useChatDraftStore = create<ChatDraftStore>()(
           return patch as ChatDraftStore;
         }),
 
-      updateDraftConfig: (draftId, config) =>
+      updateDraftConfig: (draftId, config, options) =>
         set((s) => {
           const existing = s.draftsById[draftId];
           if (!existing) return s;
@@ -571,6 +600,13 @@ export const useChatDraftStore = create<ChatDraftStore>()(
                 ...config,
                 ...("model" in config
                   ? { bootstrapModel: false }
+                  : {}),
+                // Any agent setting the user changes pins the draft:
+                // following the probes to another provider would
+                // replace it with that provider's defaults.
+                ...(!options?.automatic &&
+                AGENT_CONFIG_KEYS.some((key) => key in config)
+                  ? { automaticProvider: false }
                   : {}),
               },
             },
@@ -862,21 +898,80 @@ export function reseedBootstrapDrafts(): void {
   });
 }
 
+/** Move drafts still on the automatic provider to the one new chats would
+ *  start on now, once the health probes have settled. A first-run draft is
+ *  seeded before any probe answers, so without this it would stay on the
+ *  fallback even when that agent turns out not to be installed. Drafts the
+ *  user picked a provider or model on are left alone, and so are device
+ *  drafts: the probes describe this computer only. */
+export function reseedAutomaticProviderDrafts(): void {
+  const slots = useProviderHealth.getState().slots;
+  // Moving on a partial answer could hop twice (to a later agent, then
+  // back to an earlier one), so wait for every probe in flight.
+  if (AUTOMATIC_PROVIDER_ORDER.some((p) => slots[p].inFlight || slots[p].queuedForce)) return;
+  if (!isAutomaticNewChatProvider()) return;
+  // Only move towards an agent the probes found usable. With nothing known
+  // (an app start, before any probe) the automatic pick is the blind
+  // fallback, and moving a draft there would just undo the last move.
+  if (useChatGptStore.getState().status?.phase !== "connected" && !firstUsableProvider()) return;
+  const appState = useAppStore.getState().appState;
+  useChatDraftStore.setState((state) => {
+    let draftsById: Record<DraftId, ChatDraft> | null = null;
+    let config: NewChatConfig | null = null;
+    for (const draft of Object.values(state.draftsById)) {
+      if (draft.automaticProvider !== true || !isReusableDraft(draft)) continue;
+      if (draft.target.kind === "existing_workspace") {
+        const workspaceId = draft.target.workspaceId;
+        const workspace = appState?.workspaces.find(
+          (w) => w.workspace_id === workspaceId,
+        );
+        if (!workspace || workspace.host_id != null) continue;
+      } else if (draft.hostId != null) {
+        continue;
+      }
+      config ??= newChatConfig();
+      if (config.provider === draft.provider) continue;
+      // The checkout choice is not provider-specific; keep the user's.
+      const { checkoutMode: _checkout, ...providerConfig } = config;
+      draftsById ??= { ...state.draftsById };
+      draftsById[draft.draftId] = {
+        ...draft,
+        ...providerConfig,
+        mode: normalizeChatModeForProvider(config.provider, draft.mode),
+      };
+    }
+    return draftsById ? { draftsById } : state;
+  });
+}
+
 /** Keep placeholder drafts in step with the capability roster for the
  *  lifetime of the app shell: once for a roster already restored from
- *  storage, then on every harvest. */
+ *  storage, then on every harvest. Drafts on the automatic provider follow
+ *  the health probes the same way. */
 export function useReseedBootstrapDrafts(): void {
   useEffect(() => {
     reseedBootstrapDrafts();
+    reseedAutomaticProviderDrafts();
     const unsubscribeCapabilities = useProviderCapabilities.subscribe(
       reseedBootstrapDrafts,
     );
     const unsubscribeApp = useAppStore.subscribe((state, previous) => {
       if (state.appState !== previous.appState) reseedBootstrapDrafts();
     });
+    const unsubscribeHealth = useProviderHealth.subscribe((state, previous) => {
+      if (state.slots !== previous.slots) reseedAutomaticProviderDrafts();
+    });
+    // A signed-in default account can make a signed-out CLI usable.
+    const unsubscribeAccounts = useProviderAccounts.subscribe((state, previous) => {
+      if (state.accounts !== previous.accounts || state.defaults !== previous.defaults) {
+        reseedAutomaticProviderDrafts();
+      }
+    });
     return () => {
       unsubscribeCapabilities();
       unsubscribeApp();
+      unsubscribeHealth();
+      unsubscribeAccounts();
     };
   }, []);
 }

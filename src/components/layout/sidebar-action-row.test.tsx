@@ -23,7 +23,6 @@ if (typeof window !== "undefined" && !window.matchMedia) {
 }
 
 const setShowDialogMock = vi.fn();
-const setShowNewProjectScreenMock = vi.fn();
 const setShowCommandPaletteMock = vi.fn();
 const openProjectMock = vi.fn();
 let enableAgentChatFlag = false;
@@ -34,7 +33,6 @@ vi.mock("@/stores/ui-store", () => ({
     const state = {
       showNewWorkspaceDialog: false,
       setShowNewWorkspaceDialog: setShowDialogMock,
-      setShowNewProjectScreen: setShowNewProjectScreenMock,
       setShowCommandPalette: setShowCommandPaletteMock,
     };
     return selector(state);
@@ -103,7 +101,6 @@ function renderCollapsedRow() {
 describe("SidebarActionRow — New agent button", () => {
   beforeEach(() => {
     setShowDialogMock.mockClear();
-    setShowNewProjectScreenMock.mockClear();
     openProjectMock.mockClear();
     enableAgentChatFlag = false;
     enableLazyFlag = false;

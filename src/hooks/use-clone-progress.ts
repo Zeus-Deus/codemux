@@ -9,8 +9,8 @@ import {
  * True when a `git-clone-progress` payload's `targetDir` refers to the
  * clone this UI started with `targetDir`.
  *
- * The frontend routinely hands git a `~`-relative path (the New Project
- * Location placeholder is `~/Projects`), but the backend runs
+ * The frontend can hand git a `~`-relative path (the Add project sheet
+ * does until the home dir is known), but the backend runs
  * `expand_tilde` before echoing the dir back in the event — so
  * `~/projects/repo` comes back as `/home/user/projects/repo`. A plain
  * equality/endsWith check on the tilde form never matches (the `~` is
