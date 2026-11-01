@@ -1,5 +1,4 @@
 import { cn } from "@/lib/utils";
-import { providerReadiness } from "@/stores/provider-health-store";
 import { useUIStore } from "@/stores/ui-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { AGENT_NAME, type FirstRunAgents } from "./first-run-agents";
@@ -42,7 +41,7 @@ export function AgentStatusLine({
   // not called out; most people never meant to install every one.
   const needSetup = providers.filter((p) => {
     const report = reports[p];
-    return report && providerReadiness(report) === "not_ready" &&
+    return report?.installed &&
       // Runs on a signed-in extra account despite the CLI's own login.
       !ready.includes(p) && !unverified.includes(p);
   });

@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef } from "react";
 import { create } from "zustand";
 import {
   AUTOMATIC_PROVIDER_ORDER,
-  cliSignedOut,
   newChatReadiness,
 } from "@/lib/agent-chat/new-chat-defaults";
 import { useDisabledProviders } from "@/lib/agent-chat/provider-enablement";
@@ -257,11 +256,10 @@ export function useFirstRunAgents(active: boolean): FirstRunAgents {
       const report = health[provider]?.report;
       if (report) reports[provider] = report;
     }
-    // A signed-out Claude or Codex CLI may still run on an extra account:
-    // unknown until the account list answers, and a failed listing counts
-    // as no account, as it does when the composer sends.
+    // An extra account can change a healthy CLI's readiness too. Wait for
+    // the account list before describing either provider as ready.
     const accountsPending = !accounts && !accountsFailed && providers.some(
-      (p) => (p === "claude" || p === "codex") && reports[p] && cliSignedOut(reports[p]),
+      (p) => (p === "claude" || p === "codex") && reports[p]?.installed,
     );
     const withReadiness = (readiness: ProviderReadiness) =>
       providers.filter((p) =>

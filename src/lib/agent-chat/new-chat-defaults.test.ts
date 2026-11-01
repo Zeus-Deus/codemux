@@ -20,6 +20,7 @@ import { defaultModelId } from "./capability-defaults";
 import {
   firstUsableProvider,
   isAutomaticNewChatProvider,
+  newChatReadiness,
   resolveNewChatModelDefaults,
 } from "./new-chat-defaults";
 
@@ -272,6 +273,40 @@ describe("resolveNewChatModelDefaults", () => {
     it("does not trust a cached answer whose last probe failed", () => {
       probed({ claude: "missing", codex: "failed", cursor: "ready" });
       expect(firstUsableProvider()).toBe("cursor");
+    });
+
+    it.each(["claude", "codex"] as const)("uses %s's default account sign-in instead of its healthy CLI login", (provider) => {
+      probed({ [provider]: "ready", opencode: "ready" });
+      const account = (signedIn: boolean | null) => ({
+        id: "work", provider, label: "Work", home: "/accounts/work",
+        login_command: `${provider} login`,
+        identity: { signed_in: signedIn, email: null, organization: null, plan: null },
+      });
+      const report = useProviderHealth.getState().slots[provider].report!;
+      useProviderAccounts.setState({ accounts: [account(false)], defaults: { [provider]: "work" } });
+      expect(newChatReadiness(provider, report, [account(false)], { [provider]: "work" })).toBe("not_ready");
+      expect(firstUsableProvider()).toBe("opencode");
+      useProviderAccounts.setState({ accounts: [account(null)] });
+      expect(newChatReadiness(provider, report, [account(null)], { [provider]: "work" })).toBe("unverified");
+      expect(firstUsableProvider()).toBe("opencode");
+      useProviderAccounts.setState({ accounts: [account(true)] });
+      expect(firstUsableProvider()).toBe(provider);
+      // Removed or CLI-default accounts fall back to the CLI's own sign-in.
+      useProviderAccounts.setState({ accounts: [], defaults: { [provider]: "removed" } });
+      expect(firstUsableProvider()).toBe(provider);
+      useProviderAccounts.setState({ accounts: null, defaults: {} });
+    });
+
+    it("does not let an extra account make a missing or broken CLI ready", () => {
+      const account = {
+        id: "work", provider: "claude" as const, label: "Work", home: "/accounts/work",
+        login_command: "claude login",
+        identity: { signed_in: true, email: null, organization: null, plan: null },
+      };
+      probed({ claude: "missing" });
+      const missing = useProviderHealth.getState().slots.claude.report!;
+      expect(newChatReadiness("claude", missing, [account], { claude: "work" })).toBe("not_installed");
+      expect(newChatReadiness("claude", { ...missing, installed: true }, [account], { claude: "work" })).toBe("not_ready");
     });
 
     it("skips agents turned off in Settings → Providers", () => {

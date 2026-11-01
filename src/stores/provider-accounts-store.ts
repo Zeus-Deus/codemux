@@ -116,17 +116,18 @@ export function accountName(account: ProviderAccount | undefined | null): string
 /** Whether new chats on `provider` start on a signed-in extra account: the
  *  app-wide default, when that isn't the CLI's own login. Such a chat runs
  *  even while the CLI itself is signed out (see `startsOnSignedInAccount`).
- *  Null when that account's sign-in couldn't be told. Needs the loaded
- *  account list. */
+ *  Null when that account's sign-in couldn't be told; undefined when no
+ *  extra account resolves, so the CLI's own sign-in applies. Needs the
+ *  loaded account list. */
 export function defaultAccountSignedIn(
   accounts: ProviderAccount[],
   defaults: Record<string, string>,
   provider: string,
-): boolean | null {
+): boolean | null | undefined {
   const id = defaults[provider];
-  if (!id || id === DEFAULT_ACCOUNT_ID) return false;
+  if (!id || id === DEFAULT_ACCOUNT_ID) return undefined;
   const account = accountsFor(accounts, provider).find((a) => a.id === id);
-  return account ? account.identity.signed_in : false;
+  return account?.identity.signed_in;
 }
 
 /** Attach the account picked for a not-yet-started chat to its start. The

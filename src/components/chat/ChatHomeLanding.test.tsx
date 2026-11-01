@@ -868,6 +868,35 @@ describe("ChatHomeLanding", () => {
           expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
         });
 
+        it("asks to set up the default account even when the CLI itself is ready", async () => {
+          health = { ...health, claude: READY };
+          listAccounts(async () => ({ accounts: [workAccount(false)], defaults: { claude: "work" } }));
+          await renderWithAgents();
+          const row = screen.getByTestId("connect-agent-claude");
+          expect(row).toHaveTextContent("Default account · not signed in");
+          fireEvent.click(within(row).getByRole("button", { name: "Set up" }));
+          expect(useUIStore.getState()).toMatchObject({ showSettings: true, settingsSection: "providers" });
+          expect(signInMock).not.toHaveBeenCalled();
+        });
+
+        it("does not call a signed-out default account ready when another agent works", async () => {
+          health = { ...health, claude: READY, opencode: READY };
+          listAccounts(async () => ({ accounts: [workAccount(false)], defaults: { claude: "work" } }));
+          await renderWithAgents("opencode");
+          expect(screen.getByTestId("agent-status-line")).toHaveTextContent("OpenCode is ready·Claude Code needs setup·Set up");
+        });
+
+        it("waits for accounts before calling a healthy CLI ready", async () => {
+          health = { ...health, claude: READY };
+          let resolve!: (value: unknown) => void;
+          listAccounts(() => new Promise((done) => { resolve = done; }));
+          await renderWithAgents();
+          expect(screen.getByTestId("agent-status-line")).toBeEmptyDOMElement();
+          await act(async () => resolve({ accounts: [workAccount(false)], defaults: { claude: "work" } }));
+          await flush();
+          expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+        });
+
         it("waits for the account list before asking, and asks if it fails", async () => {
           let fail!: (error: Error) => void;
           listAccounts(() => new Promise((_, reject) => { fail = reject; }));
