@@ -10,7 +10,7 @@ import { useUIStore } from "@/stores/ui-store";
 import { dbGetRecentProjects } from "@/tauri/commands";
 import { useCustomAcp } from "@/stores/custom-acp-store";
 import { useHermes } from "@/stores/hermes-store";
-import { useProviderAccounts } from "@/stores/provider-accounts-store";
+import { defaultAccountSignedIn, useProviderAccounts } from "@/stores/provider-accounts-store";
 import {
   useProbedProviderHealth,
   useProviderHealth,
@@ -59,6 +59,8 @@ interface FirstRunSession {
   /** The provider account listing failed, so no extra account is known to
    *  stand in for a signed-out CLI. */
   accountsFailed: boolean;
+  /** Last account identity probe started by setup, for the focus floor. */
+  accountsProbedAt: number;
   /** "Continue anyway" on the Connect an agent card, for this session. */
   connectDismissed: boolean;
 }
@@ -68,6 +70,7 @@ export const useFirstRunSession = create<FirstRunSession>(() => ({
   pastProjectsChecked: false,
   listFailed: {},
   accountsFailed: false,
+  accountsProbedAt: 0,
   connectDismissed: false,
 }));
 
@@ -316,6 +319,19 @@ export function useReprobeOnReturn(
         if (slot.inFlight || slot.queuedForce) continue;
         if (Date.now() - Math.max(slot.fetchedAt, slot.lastAttemptAt) < minAgeMs) continue;
         void refresh(provider, { force: true });
+      }
+      const accounts = useProviderAccounts.getState();
+      const hasExtraDefault = providers.some((provider) =>
+        accounts.accounts && defaultAccountSignedIn(accounts.accounts, accounts.defaults, provider) !== undefined,
+      );
+      if (hasExtraDefault && Date.now() - useFirstRunSession.getState().accountsProbedAt >= minAgeMs) {
+        useFirstRunSession.setState({ accountsProbedAt: Date.now() });
+        // Listing alone cannot see a Codex keyring sign-in. Probe identities
+        // after terminal/browser setup; the store coalesces other readers.
+        void accounts.refresh().then(
+          () => useFirstRunSession.setState({ accountsFailed: false }),
+          () => useFirstRunSession.setState({ accountsFailed: true }),
+        );
       }
     };
     reprobe(activeOnMount.current ? 0 : REPROBE_MIN_MS);

@@ -53,6 +53,7 @@ interface ProviderAccountsStore {
 export const pickKey = (provider: string, threadId: string) => `${provider}:${threadId}`;
 
 let loadFlight: Promise<void> | null = null;
+let refreshFlight: Promise<void> | null = null;
 
 function accept(state: ProviderAccountsState): void {
   useProviderAccounts.setState({ accounts: state.accounts, defaults: state.defaults });
@@ -72,7 +73,12 @@ export const useProviderAccounts = create<ProviderAccountsStore>((set, get) => (
       });
     await loadFlight;
   },
-  refresh: async () => accept(await providerAccountsRefresh()),
+  refresh: () => {
+    refreshFlight ??= providerAccountsRefresh()
+      .then(accept)
+      .finally(() => { refreshFlight = null; });
+    return refreshFlight;
+  },
   add: async (provider, label) => {
     const account = await providerAccountAdd(provider, label);
     await get().load(true);
