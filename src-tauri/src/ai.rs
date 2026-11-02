@@ -145,7 +145,11 @@ pub(crate) async fn run_resolver_cli(
     repo_path: &Path,
     timeout: Duration,
 ) -> Result<Output, ResolverRunError> {
-    let child = crate::execution::host_command_tokio(program)
+    let mut command = crate::execution::host_command_tokio(program);
+    if program == "claude" {
+        crate::claude_env::apply_claude_cli_env(&mut command, repo_path);
+    }
+    let child = command
         .args(args)
         .current_dir(repo_path)
         .stdin(Stdio::null())

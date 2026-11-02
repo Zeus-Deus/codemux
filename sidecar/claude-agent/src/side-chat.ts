@@ -24,6 +24,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 
 import { AsyncPromptQueue } from "./async-queue.ts";
+import { claudeProcessEnv } from "./claude-env.ts";
 import type { EventEmitter, QueryFactory } from "./session.ts";
 
 export interface SideChatStartInput {
@@ -103,7 +104,7 @@ export function buildSideChatOptions(input: SideChatStartInput): Options {
       preset: "claude_code",
       ...(input.appendSystemPrompt ? { append: input.appendSystemPrompt } : {}),
     },
-    env: process.env as Record<string, string | undefined>,
+    env: claudeProcessEnv({ cwd: input.cwd }),
   };
   if (input.model) options.model = input.model;
   const effort = sideChatCliEffort(input.effort);

@@ -19,6 +19,7 @@ import {
   query,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { claudeProcessEnv } from "../claude-env.ts";
 
 export interface ListModelsInput {
   cwd: string;
@@ -61,7 +62,7 @@ export async function listModels(
     options: {
       cwd: input.cwd,
       pathToClaudeCodeExecutable: input.pathToClaudeCodeExecutable,
-      env: process.env as Record<string, string | undefined>,
+      env: claudeProcessEnv({ cwd: input.cwd }),
       // Minimal init — no project / user setting sources, no plugins,
       // no streaming chrome. Plenty for `supportedModels()` to resolve.
       settingSources: [],

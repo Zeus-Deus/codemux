@@ -13,6 +13,7 @@
 // "no limits available" rather than as an empty quota.
 
 import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { claudeProcessEnv } from "../claude-env.ts";
 
 export interface GetUsageInput {
   cwd: string;
@@ -76,7 +77,7 @@ export async function getUsage(input: GetUsageInput): Promise<unknown> {
     options: {
       cwd: input.cwd,
       pathToClaudeCodeExecutable: input.pathToClaudeCodeExecutable,
-      env: process.env as Record<string, string | undefined>,
+      env: claudeProcessEnv({ cwd: input.cwd }),
       settingSources: [],
       includePartialMessages: false,
     },

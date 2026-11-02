@@ -426,7 +426,11 @@ async fn run_inner(
     let (program, args) = agent_command(&automation.agent, &automation.prompt)
         .map_err(|error| (Some(workdir.clone()), error))?;
 
-    let status = crate::execution::host_command_tokio(&program)
+    let mut command = crate::execution::host_command_tokio(&program);
+    if program == "claude" {
+        crate::claude_env::apply_claude_cli_env(&mut command, &worktree_dir);
+    }
+    let status = command
         .args(&args)
         .current_dir(&worktree_dir)
         .status()
