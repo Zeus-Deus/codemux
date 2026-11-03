@@ -18,7 +18,7 @@ use axum::{
     routing::any,
     Json, Router,
 };
-use protocol::{MAX_MCP_BODY, MAX_OAUTH_BODY, PROTOCOL};
+use protocol::{MAX_MCP_BODY, MAX_OAUTH_BODY};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -362,7 +362,9 @@ async fn mcp<R: Runtime>(
     }
     let result = match rpc.method.as_str() {
         "initialize" => {
-            json!({"protocolVersion":PROTOCOL,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"CodeMux","version":env!("CARGO_PKG_VERSION")},"instructions":agent_control::INSTRUCTIONS})
+            // Echo the offer when Codemux speaks it, else the latest revision.
+            let version = crate::mcp::protocol::negotiate(rpc.params["protocolVersion"].as_str());
+            json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"CodeMux","version":env!("CARGO_PKG_VERSION")},"instructions":agent_control::INSTRUCTIONS})
         }
         "ping" => json!({}),
         "tools/list" => json!({"tools":agent_control::registry::tools_for(caller)}),
@@ -689,6 +691,7 @@ mod receipt_mock;
 mod tests {
     use super::*;
     use crate::agent_control::ControlAccess;
+    use crate::mcp::protocol::LATEST_PROTOCOL_VERSION;
     use tauri::Manager;
     use tower::ServiceExt;
 
@@ -751,7 +754,7 @@ mod tests {
             .header("host", format!("127.0.0.1:{}", f.port))
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
-            .header("mcp-protocol-version", PROTOCOL);
+            .header("mcp-protocol-version", LATEST_PROTOCOL_VERSION);
         if let Some(token) = token {
             r = r.header("authorization", format!("Bearer {token}"));
         }
@@ -2050,36 +2053,36 @@ mod tests {
     async fn mario_r6_initialize_negotiates_valid_versions_but_headers_stay_strict() {
         let f = fixture().await;
         let token = grant(&f);
-        for version in ["2024-11-05", "2025-03-26", "2030-01-01", PROTOCOL] {
-            let body = json!({"jsonrpc":"2.0","id":"version-negotiation","method":"initialize","params":{
+        let initialize = |version: Value| {
+            json!({"jsonrpc":"2.0","id":"version-negotiation","method":"initialize","params":{
                 "protocolVersion":version,"capabilities":{},"clientInfo":{"name":"synthetic","version":"1"}
-            }});
-            let mut r = request(&f, "/mcp", "POST", &body.to_string(), Some(&token));
+            }})
+            .to_string()
+        };
+        // A supported offer is echoed; any other version string negotiates
+        // the latest revision instead of failing.
+        for (offer, answer) in [
+            ("2024-11-05", "2024-11-05"),
+            ("2025-03-26", "2025-03-26"),
+            ("2025-06-18", "2025-06-18"),
+            ("2025-11-25", "2025-11-25"),
+            ("2030-01-01", LATEST_PROTOCOL_VERSION),
+            ("2026-07-28", LATEST_PROTOCOL_VERSION),
+            ("wrong", LATEST_PROTOCOL_VERSION),
+            ("2025-02-30", LATEST_PROTOCOL_VERSION),
+            ("2025-6-18", LATEST_PROTOCOL_VERSION),
+        ] {
+            let mut r = request(&f, "/mcp", "POST", &initialize(json!(offer)), Some(&token));
             r.headers_mut().remove("mcp-protocol-version");
             let response = invoke(&f, r).await;
             assert_eq!(response.status(), StatusCode::OK);
             let response = value(response).await;
-            assert_eq!(response["result"]["protocolVersion"],PROTOCOL,"A valid unsupported offer must negotiate the server's supported version: {response}");
+            assert_eq!(response["result"]["protocolVersion"], answer, "{offer}: {response}");
             assert!(response.get("error").is_none());
         }
-        for invalid in [
-            Value::Null,
-            json!(1),
-            json!(""),
-            json!("wrong"),
-            json!("2025-02-30"),
-            json!("2025-6-18"),
-            json!("x".repeat(4096)),
-        ] {
-            let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-                "protocolVersion":invalid,"capabilities":{},"clientInfo":{"name":"synthetic","version":"1"}
-            }});
+        for invalid in [Value::Null, json!(1), json!(""), json!("x".repeat(4096))] {
             let response = value(
-                invoke(
-                    &f,
-                    request(&f, "/mcp", "POST", &body.to_string(), Some(&token)),
-                )
-                .await,
+                invoke(&f, request(&f, "/mcp", "POST", &initialize(invalid), Some(&token))).await,
             )
             .await;
             assert_eq!(response["error"]["code"], -32602);
@@ -2091,14 +2094,18 @@ mod tests {
             -32602
         );
         let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
-        for version in [None, Some("2024-11-05"), Some("null")] {
+        for (version, status) in [
+            (None, StatusCode::OK),
+            (Some("2024-11-05"), StatusCode::OK),
+            (Some("null"), StatusCode::BAD_REQUEST),
+        ] {
             let mut r = request(&f, "/mcp", "POST", ping, Some(&token));
             r.headers_mut().remove("mcp-protocol-version");
             if let Some(version) = version {
                 r.headers_mut()
                     .insert("mcp-protocol-version", version.parse().unwrap());
             }
-            assert_eq!(invoke(&f, r).await.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(invoke(&f, r).await.status(), status, "{version:?}");
         }
         assert_eq!(
             invoke(&f, request(&f, "/mcp", "POST", ping, Some(&token)))
@@ -2124,7 +2131,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!response.headers().contains_key("mcp-session-id"));
         let init = value(response).await;
-        assert_eq!(init["result"]["protocolVersion"], PROTOCOL);
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(
             init["result"]["capabilities"],
             json!({"tools":{"listChanged":false}})
@@ -2564,5 +2571,74 @@ mod tests {
         assert!(html.contains("Settings → Connections → Outside assistants"), "{html}");
         assert!(html.contains("<code>codemux connector pending</code>"), "{html}");
         assert!(!html.contains("Outside agents") && !html.contains("Settings → MCP"), "stale path: {html}");
+    }
+
+    // ── Protocol versions and envelopes ──────────────────────────────────
+
+    #[tokio::test]
+    async fn connector_accepts_initialize_with_a_protocol_header() {
+        let f = fixture().await;
+        let token = grant(&f);
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"hermes","version":"1"}}}"#;
+        for header in ["2025-11-25", "2026-07-28"] {
+            let mut r = request(&f, "/mcp", "POST", body, Some(&token));
+            r.headers_mut().insert("mcp-protocol-version", header.parse().unwrap());
+            let response = invoke(&f, r).await;
+            assert_eq!(response.status(), StatusCode::OK, "{header}");
+            assert_eq!(value(response).await["result"]["protocolVersion"], "2025-11-25");
+        }
+    }
+
+    #[tokio::test]
+    async fn connector_accepts_2025_11_25_client_info_fields() {
+        let f = fixture().await;
+        let token = grant(&f);
+        let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}},"clientInfo":{
+            "name":"claude-code","version":"2.1.0","title":"Claude Code","description":"An outside assistant",
+            "websiteUrl":"https://client.example","icons":[{"src":"https://client.example/icon.png","mimeType":"image/png"}]
+        }}});
+        let response = value(invoke(&f, request(&f, "/mcp", "POST", &body.to_string(), Some(&token))).await).await;
+        assert_eq!(response["result"]["protocolVersion"], "2025-11-25", "{response}");
+        assert_eq!(response["result"]["serverInfo"]["name"], "CodeMux");
+    }
+
+    #[tokio::test]
+    async fn connector_rejects_modern_protocol_header_with_a_legacy_error_body() {
+        let f = fixture().await;
+        let token = grant(&f);
+        let mut r = request(&f, "/mcp", "POST", r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, Some(&token));
+        r.headers_mut().insert("mcp-protocol-version", "2026-07-28".parse().unwrap());
+        let response = invoke(&f, r).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = value(response).await;
+        assert!(!body.to_string().contains("-32022"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn connector_acks_unknown_notifications() {
+        let f = fixture().await;
+        let token = grant(&f);
+        for body in [
+            r#"{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"p","progress":1}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#,
+        ] {
+            let response = invoke(&f, request(&f, "/mcp", "POST", body, Some(&token))).await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "{body}");
+            assert!(axum::body::to_bytes(response.into_body(), 100).await.unwrap().is_empty());
+        }
+        // A request method without an id is still not a notification.
+        let response = invoke(&f, request(&f, "/mcp", "POST", r#"{"jsonrpc":"2.0","method":"tools/list"}"#, Some(&token))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn tools_list_refuses_a_cursor_it_never_issued() {
+        let f = fixture().await;
+        let token = grant(&f);
+        let body = r#"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{"cursor":"page-2"}}"#;
+        let response = value(invoke(&f, request(&f, "/mcp", "POST", body, Some(&token))).await).await;
+        assert_eq!(response["id"], 4);
+        assert_eq!(response["error"], json!({"code":-32602,"message":"Invalid cursor"}));
     }
 }

@@ -555,7 +555,6 @@ pub mod protocol {
     use axum::http::{HeaderMap, StatusCode};
     use serde_json::{json, Value};
 
-    pub const PROTOCOL: &str = "2025-06-18";
     pub const MAX_MCP_BODY: usize = 131_072;
     pub const MAX_OAUTH_BODY: usize = 16_384;
 
@@ -664,11 +663,17 @@ pub mod protocol {
         if !has("application/json") || !has("text/event-stream") {
             return Err(StatusCode::NOT_ACCEPTABLE);
         }
-        match header_value(headers, "mcp-protocol-version") {
-            Ok(Some(PROTOCOL)) => Ok(()),
-            Ok(None) if initialize => Ok(()),
-            _ => Err(StatusCode::BAD_REQUEST),
+        // `initialize` negotiates in its body, so its header (Hermes sends
+        // one) is not checked. Later requests may omit it (2025-03-26) or
+        // name any revision Codemux speaks.
+        let version = header_value(headers, crate::mcp::protocol::PROTOCOL_VERSION_HEADER)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        if initialize {
+            return Ok(());
         }
+        crate::mcp::protocol::http_version(version)
+            .map(|_| ())
+            .map_err(|_| StatusCode::BAD_REQUEST)
     }
 
     struct StrictValue(Value);
@@ -843,7 +848,9 @@ pub mod protocol {
                                 .get("reason")
                                 .is_none_or(|r| r.as_str().is_some_and(|s| s.len() <= 256))
                     }
-                    _ => false,
+                    // A receiver must ignore notifications it does not know.
+                    // None carries authority here: the reply is a bare 202.
+                    method => method.starts_with("notifications/"),
                 };
                 return if valid {
                     Ok(())
@@ -853,21 +860,25 @@ pub mod protocol {
             }
             let valid = match self.method.as_str() {
                 "initialize" => {
+                    // Any offered version string is negotiated (the reply
+                    // names one Codemux speaks); newer clientInfo fields such
+                    // as description, icons or websiteUrl are accepted.
                     keys(
                         &self.params,
                         &["protocolVersion", "capabilities", "clientInfo", "_meta"],
-                    ) && self.params["protocolVersion"].as_str().is_some_and(|version| {
-                        version.len() == 10
-                            && chrono::NaiveDate::parse_from_str(version, "%Y-%m-%d")
-                                .is_ok_and(|date| date.format("%Y-%m-%d").to_string() == version)
-                    })
+                    ) && label(&self.params["protocolVersion"])
                         && self.params["capabilities"].is_object()
-                        && keys(&self.params["clientInfo"], &["name", "version", "title"])
+                        && self.params["clientInfo"].is_object()
                         && label(&self.params["clientInfo"]["name"])
                         && label(&self.params["clientInfo"]["version"])
                         && self.params["clientInfo"].get("title").is_none_or(label)
                 }
-                "ping" | "tools/list" => keys(&self.params, &["_meta"]),
+                "ping" => keys(&self.params, &["_meta"]),
+                // Codemux never paginates, so no cursor is one it handed out.
+                "tools/list" if self.params.get("cursor").is_some() => {
+                    return Err((-32602, "Invalid cursor"))
+                }
+                "tools/list" => keys(&self.params, &["_meta"]),
                 "tools/call" => {
                     keys(&self.params, &["name", "arguments", "_meta"])
                         && label(&self.params["name"])
@@ -936,7 +947,10 @@ pub mod protocol {
                 header::ACCEPT,
                 "application/json, text/event-stream".parse().unwrap(),
             );
-            h.insert("mcp-protocol-version", PROTOCOL.parse().unwrap());
+            h.insert(
+                "mcp-protocol-version",
+                crate::mcp::protocol::LATEST_PROTOCOL_VERSION.parse().unwrap(),
+            );
             h
         }
         #[test]
@@ -973,11 +987,22 @@ pub mod protocol {
                 header::ACCEPT,
                 "application/json, text/event-stream".parse().unwrap(),
             );
-            h.insert("mcp-protocol-version", "2024-11-05".parse().unwrap());
-            assert_eq!(mcp_headers(&h, false), Err(StatusCode::BAD_REQUEST));
+            // Every revision Codemux speaks is accepted; a missing header
+            // means 2025-03-26.
+            for version in crate::mcp::protocol::SUPPORTED_PROTOCOL_VERSIONS {
+                h.insert("mcp-protocol-version", version.parse().unwrap());
+                assert_eq!(mcp_headers(&h, false), Ok(()), "{version}");
+            }
             h.remove("mcp-protocol-version");
-            assert_eq!(mcp_headers(&h, true), Ok(()));
-            assert_eq!(mcp_headers(&h, false), Err(StatusCode::BAD_REQUEST));
+            assert_eq!(mcp_headers(&h, false), Ok(()));
+            for unsupported in ["2026-07-28", "null", "wrong"] {
+                h.insert("mcp-protocol-version", unsupported.parse().unwrap());
+                assert_eq!(mcp_headers(&h, false), Err(StatusCode::BAD_REQUEST), "{unsupported}");
+                // initialize negotiates in its body, whatever the header says.
+                assert_eq!(mcp_headers(&h, true), Ok(()), "{unsupported}");
+            }
+            h.append("mcp-protocol-version", "2025-11-25".parse().unwrap());
+            assert_eq!(mcp_headers(&h, true), Err(StatusCode::BAD_REQUEST), "duplicate header");
         }
         #[test]
         fn strict_json_and_form_reject_ambiguous_duplicate_members() {
@@ -1009,14 +1034,26 @@ pub mod protocol {
         fn methods_validate_initialize_and_disallow_notification_mutations() {
             for v in [
                 json!({"jsonrpc":"2.0","method":"tools/call","params":{"name":"thread_stop","arguments":{}}}),
-                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"wrong","capabilities":{},"clientInfo":{"name":"agent","version":"1"}}}),
+                json!({"jsonrpc":"2.0","method":"initialize","params":{}}),
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"","capabilities":{},"clientInfo":{"name":"agent","version":"1"}}}),
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"version":"1","description":"no name"}}}),
                 json!({"jsonrpc":"2.0","id":1,"method":"ping","params":{"unexpected":true}}),
+                json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":null}}),
             ] {
-                assert!(Rpc::parse(v).unwrap().validate_method().is_err());
+                assert!(Rpc::parse(v.clone()).unwrap().validate_method().is_err(), "{v}");
             }
-            let n =
-                Rpc::parse(json!({"jsonrpc":"2.0","method":"notifications/initialized"})).unwrap();
-            assert!(n.validate_method().is_ok());
+            for v in [
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                json!({"jsonrpc":"2.0","method":"notifications/roots/list_changed"}),
+                json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":1,"progress":1}}),
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"wrong","capabilities":{},"clientInfo":{
+                    "name":"agent","version":"1","title":"Agent","description":"An agent","websiteUrl":"https://agent.example","icons":[]}}}),
+            ] {
+                assert!(Rpc::parse(v.clone()).unwrap().validate_method().is_ok(), "{v}");
+            }
+            let list = |params| Rpc::parse(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":params})).unwrap();
+            assert_eq!(list(json!({"cursor":"next"})).validate_method(), Err((-32602, "Invalid cursor")));
+            assert!(list(json!({"_meta":{}})).validate_method().is_ok());
         }
         #[test]
         fn escaped_neutralizes_html_metacharacters() {
