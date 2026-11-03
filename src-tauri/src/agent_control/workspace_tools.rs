@@ -165,9 +165,12 @@ pub(super) async fn create_worktree<R: Runtime>(app: &AppHandle<R>, caller: &Con
     } else {
         local_folder(&input.repo_path)?
     };
-    let owned = app.clone();
+    let (owned, requester) = (app.clone(), caller.clone());
     service::run_receipted(app, caller, "worktree_create", &args, true, None, move |reserved| async move {
         let request = input.into_request(None, reserved).await.map_err(request_error)?;
+        // Resolving the base may have fetched from origin: a grant revoked
+        // meanwhile gets no checkout and no setup scripts.
+        service::authorize(&owned, &requester)?;
         let created = WorkspaceService::new(&owned)
             .create_worktree(request)
             .await
