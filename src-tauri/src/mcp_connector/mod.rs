@@ -227,7 +227,8 @@ pub(crate) fn changed<R: Runtime>(app: &AppHandle<R>) {
 }
 /// Some caller may have lost its authority (revoked, disabled, address
 /// changed, listener stopped): tell the UI, and wake every parked wait so it
-/// re-checks its grant and ends instead of sleeping out its timeout.
+/// re-checks its grant. A wait whose grant no longer holds ends at once
+/// instead of sleeping out its timeout; a listener stop alone ends none.
 pub(crate) fn authority_changed<R: Runtime>(app: &AppHandle<R>) {
     changed(app);
     crate::agent_control::wait::signal_all();
