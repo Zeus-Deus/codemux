@@ -587,25 +587,34 @@ where
             continue;
         }
 
-        let envelope: ControlEnvelope = serde_json::from_str(&line)
-            .map_err(|error| format!("Invalid control request JSON: {error}"))?;
-        let caller = crate::control_identity::resolve_socket_caller(envelope.client, peer_pid);
-        let request = envelope.request;
-        let response = if !may_park(&request) {
-            dispatch_request_as(&app, &caller, request).await
-        } else {
-            let work = dispatch_request_as(&app, &caller, request);
-            tokio::pin!(work);
-            tokio::select! {
-                response = &mut work => response,
-                // `next_line` is cancel safe: no line is lost here.
-                next = lines.next_line() => match next {
-                    Ok(Some(line)) => {
-                        pipelined = Some(line);
-                        work.await
+        let response = match serde_json::from_str::<ControlEnvelope>(&line) {
+            // A line this server cannot read (for example an access level a
+            // newer client knows) is answered, so the client can say why.
+            Err(error) => control_response(Err(crate::agent_control::ControlError::new(
+                crate::agent_control::ErrorCode::InvalidArguments,
+                format!("Invalid control request JSON: {error}"),
+            )
+            .to_string())),
+            Ok(envelope) => {
+                let caller = crate::control_identity::resolve_socket_caller(envelope.client, peer_pid);
+                let request = envelope.request;
+                if !may_park(&request) {
+                    dispatch_request_as(&app, &caller, request).await
+                } else {
+                    let work = dispatch_request_as(&app, &caller, request);
+                    tokio::pin!(work);
+                    tokio::select! {
+                        response = &mut work => response,
+                        // `next_line` is cancel safe: no line is lost here.
+                        next = lines.next_line() => match next {
+                            Ok(Some(line)) => {
+                                pipelined = Some(line);
+                                work.await
+                            }
+                            Ok(None) | Err(_) => return Ok(()),
+                        },
                     }
-                    Ok(None) | Err(_) => return Ok(()),
-                },
+                }
             }
         };
         let payload = serde_json::to_string(&response)
@@ -2553,6 +2562,25 @@ mod tests {
         assert_eq!(first.data.unwrap()["timed_out"], true, "replies keep request order");
         let second = reply(&mut replies).await;
         assert!(second.ok, "the pipelined line was kept: {:?}", second.error);
+        drop((replies, writer));
+        assert_eq!(served.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn socket_answers_a_line_it_cannot_read() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        let (served, mut replies, mut writer) = connect(&app);
+        // A newer client may send an access level this server does not know.
+        let lines = "{\"command\":\"status\",\"client\":{\"access\":\"root\"}}\nnot json\n{\"command\":\"status\"}\n";
+        writer.write_all(lines.as_bytes()).await.unwrap();
+        for _ in 0..2 {
+            let refused = reply(&mut replies).await;
+            assert!(refused_with(&refused, "invalid_arguments"), "{:?}", refused.error);
+            assert!(refused.error.unwrap().contains("Invalid control request JSON"));
+            assert_eq!(refused.protocol_version, CONTROL_PROTOCOL_VERSION);
+        }
+        assert!(reply(&mut replies).await.ok, "the connection keeps serving");
         drop((replies, writer));
         assert_eq!(served.await.unwrap(), Ok(()));
     }
