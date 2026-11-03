@@ -33,7 +33,7 @@ pub(super) async fn spawn_child(
             });
         }
     }
-    let (args, env) = if let Some(grant) = grant {
+    let (mut args, env) = if let Some(grant) = grant {
         grant.launch(env)
     } else {
         if let Some(home) = spawn.codex_home.as_ref() {
@@ -41,6 +41,7 @@ pub(super) async fn spawn_child(
         }
         (vec!["app-server".into()], env)
     };
+    switch_off_user_codemux_server(&mut args, &env);
     let config = SpawnConfig {
         program: spawn.codex_binary.clone(),
         args,
@@ -64,6 +65,38 @@ pub(super) async fn spawn_child(
             message: "Cannot start Codex app-server".into(),
             source: Some(e.to_string()),
         })
+}
+
+/// The MCP server name a user gives Codemux when setting up an outside agent.
+const USER_CODEMUX_SERVER: &str = "codemux";
+
+/// A regular in-app session reads the user's `config.toml`, so a user-level
+/// `codemux` MCP server (set up for outside agents) would run inside the chat
+/// with the owner's reach, around the chat's own ceiling. The chat already
+/// gets Codemux's tools as host tools, so the session switches that entry
+/// off. Only a declared entry is overridden, so a session without one starts
+/// exactly as before.
+fn switch_off_user_codemux_server(args: &mut Vec<String>, env: &HashMap<String, String>) {
+    let home = env
+        .get("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::provider_accounts::homes::default_home(crate::agent_provider::ProviderKind::Codex));
+    let declared = home
+        .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok())
+        .is_some_and(|config| codex_config_declares_codemux(&config));
+    if declared {
+        // The key is quoted exactly as `managed_codex_args` quotes server names.
+        let key = serde_json::to_string(USER_CODEMUX_SERVER).unwrap_or_default();
+        args.extend(["-c".into(), format!("mcp_servers.{key}.enabled=false")]);
+    }
+}
+
+/// Whether a Codex `config.toml` declares a top-level `[mcp_servers.codemux]`.
+fn codex_config_declares_codemux(config_toml: &str) -> bool {
+    toml::from_str::<toml::Table>(config_toml)
+        .ok()
+        .and_then(|config| Some(config.get("mcp_servers")?.as_table()?.contains_key(USER_CODEMUX_SERVER)))
+        .unwrap_or(false)
 }
 
 /// Preserve opaque IDs and ordering, including all pages. No bundled/default fallback here.
@@ -318,5 +351,44 @@ impl CodexSession {
             message: "Codex child retirement could not be confirmed".into(),
             source: Some(error.to_string()),
         })
+    }
+}
+
+#[cfg(test)]
+mod user_codemux_server_tests {
+    use super::*;
+
+    #[test]
+    fn codex_config_declares_codemux_reads_only_the_mcp_servers_table() {
+        for (config, declared) in [
+            ("[mcp_servers.codemux]\ncommand = \"codemux\"\nargs = [\"mcp\"]\n", true),
+            ("[mcp_servers.\"codemux\"]\ncommand = \"codemux\"\n", true),
+            ("mcp_servers = { codemux = { command = \"codemux\" } }\n", true),
+            ("[mcp_servers.codemux]\nenabled = false\n", true),
+            ("[mcp_servers.other]\ncommand = \"codemux\"\n", false),
+            ("[mcp_servers.codemux-dev]\ncommand = \"codemux\"\n", false),
+            ("[profiles.work.mcp_servers.codemux]\ncommand = \"codemux\"\n", false),
+            ("# [mcp_servers.codemux]\nmodel = \"codemux\"\n", false),
+            ("mcp_servers = \"codemux\"\n", false),
+            ("[mcp_servers.codemux\n", false),
+            ("", false),
+        ] {
+            assert_eq!(codex_config_declares_codemux(config), declared, "{config:?}");
+        }
+    }
+
+    #[test]
+    fn in_app_codex_switches_off_a_user_codemux_server() {
+        let home = tempfile::tempdir().unwrap();
+        let env = HashMap::from([("CODEX_HOME".to_string(), home.path().to_string_lossy().into_owned())]);
+        let mut args = vec!["app-server".to_string()];
+        switch_off_user_codemux_server(&mut args, &env);
+        assert_eq!(args, ["app-server"], "no config: nothing to switch off");
+        std::fs::write(home.path().join("config.toml"), "[mcp_servers.other]\ncommand = \"x\"\n").unwrap();
+        switch_off_user_codemux_server(&mut args, &env);
+        assert_eq!(args, ["app-server"], "only a declared codemux entry is overridden");
+        std::fs::write(home.path().join("config.toml"), "[mcp_servers.codemux]\ncommand = \"codemux\"\nargs = [\"mcp\"]\n").unwrap();
+        switch_off_user_codemux_server(&mut args, &env);
+        assert_eq!(args, ["app-server", "-c", "mcp_servers.\"codemux\".enabled=false"]);
     }
 }
