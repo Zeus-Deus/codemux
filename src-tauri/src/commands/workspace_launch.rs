@@ -157,6 +157,18 @@ fn resolve_base(
     .map_err(|error| format!("Cannot resolve base {}: {error}", base.unwrap_or("HEAD")))
 }
 
+/// The base a new workspace records: the caller's base only when it is a
+/// literal branch name. `HEAD`, relative revisions such as `HEAD~2` and
+/// commit ids name something else once read from the new worktree, so the
+/// resolved commit is recorded for them instead.
+fn base_label(repo: &Path, base: Option<&str>) -> Option<String> {
+    let base = base?;
+    let literal = base != "HEAD"
+        && !crate::git::is_object_id(base)
+        && git(repo, &["check-ref-format", "--branch", base]).is_ok_and(|name| name == base);
+    literal.then(|| base.to_string())
+}
+
 #[derive(Default)]
 struct LaunchState {
     pending: Mutex<HashMap<(PathBuf, String), String>>,
@@ -340,6 +352,10 @@ impl<R: Runtime> WorkspaceLaunchHost<R> {
             "base": input.base.as_deref().unwrap_or(&base), "provider": provider,
             "note": "The workspace appears in the sidebar shortly. Give the user a one-line status and end your turn.",
         });
+        let base = crate::workspace_service::WorktreeBase::Commit {
+            label: base_label(&repo, input.base.as_deref()),
+            sha: base,
+        };
         let app = self.app.clone();
         let mut caller = caller.clone();
         let control = caller.control.as_mut().ok_or("stale_caller: workspace launch requires authenticated chat authority")?;
@@ -385,7 +401,7 @@ async fn start<R: Runtime>(
     target: Option<crate::agent_control::selection::ProviderSelection>,
     repo: PathBuf,
     branch: String,
-    base: String,
+    base: crate::workspace_service::WorktreeBase,
     thread: &str,
 ) -> Result<(), String> {
     let title = input.title.clone();
@@ -411,18 +427,15 @@ async fn start<R: Runtime>(
                 "A worktree path already exists for '{branch}'. Choose a new branch."
             ));
         }
-        // `base` is the commit resolved before admission; the workspace
-        // records the base the caller named, when it named one.
+        // `base` is the commit resolved before admission, labelled with the
+        // branch the caller named, if any.
         let created = super::workspace::create_worktree_from_request(
             app.clone(),
             crate::workspace_service::WorktreeRequest {
                 repo_path: repo.to_string_lossy().into_owned(),
                 branch,
                 new_branch: true,
-                base: crate::workspace_service::WorktreeBase::Commit {
-                    sha: base,
-                    label: input.base,
-                },
+                base,
                 layout: crate::state::WorkspacePresetLayout::Empty,
                 preset: None,
                 pr_number: None,
@@ -636,6 +649,20 @@ mod tests {
                 "existing".into()
             ])))
             .is_err());
+    }
+
+    #[test]
+    fn workspace_launch_records_only_literal_branch_names_as_the_base() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-b", "main"]).unwrap();
+        for literal in ["main", "release/1.x", "origin/main"] {
+            assert_eq!(base_label(repo.path(), Some(literal)).as_deref(), Some(literal));
+        }
+        let sha = "0123456789abcdef".repeat(4);
+        for other in ["HEAD", "HEAD~2", "main^", "@{-1}", &sha[..40]] {
+            assert_eq!(base_label(repo.path(), Some(other)), None, "{other}");
+        }
+        assert_eq!(base_label(repo.path(), None), None);
     }
 
     #[test]
