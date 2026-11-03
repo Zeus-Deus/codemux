@@ -1818,17 +1818,15 @@ async fn orchestration_message_controller_queue_release_refreshes_only_stop_fenc
     assert!(checkpoint.authorize_dispatch().is_err());
 }
 
-/// A connector client holding a live grant, as `validate_caller` sees it. The
-/// connector is served by the web-remote listener, so this enables web remote
-/// on a free loopback port; call `crate::web_remote::web_remote_disable` when done.
+/// A connector client holding a live grant, as `validate_caller` sees it. This
+/// starts the connector's own listener on a free loopback port; call
+/// `connector_off` when done.
 pub(super) async fn connector_caller(app: &tauri::App<tauri::test::MockRuntime>, client_id: &str, grant_id: &str, access: ControlAccess) -> ControlCaller {
     app.manage(crate::mcp_connector::McpConnectorState::default());
-    app.manage(crate::web_remote::WebRemoteState::default());
     let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port=listener.local_addr().unwrap().port();drop(listener);
-    crate::web_remote::web_remote_set_config(app.handle().clone(),Some(port),None,Some("loopback".into()),Some(false),Some(false),Some(false),Some(true)).await.unwrap();
-    crate::web_remote::web_remote_enable(app.handle().clone()).await.unwrap();
-    crate::mcp_connector::agent_connector_set_config(app.handle().clone(),true,None).unwrap();
+    let status=crate::mcp_connector::agent_connector_set_config(app.handle().clone(),true,None,Some(port)).unwrap();
+    assert!(status.listener_running,"{:?}",status.bind_error);
     let db=app.state::<crate::database::DatabaseStore>();
     let now=chrono::Utc::now().timestamp_millis();
     db.mcp_register_client(crate::database::mcp_connector::NewMcpClient {id:client_id.into(),name:"Synthetic connector client".into(),redirects:vec!["https://client.example/cb".into()],created_at:now},now).unwrap();
@@ -1837,6 +1835,11 @@ pub(super) async fn connector_caller(app: &tauri::App<tauri::test::MockRuntime>,
     let caller=ControlCaller::outside(client_id.into(),grant_id.into(),access);
     crate::mcp_connector::validate_caller(app.handle(),&caller).unwrap();
     caller
+}
+
+/// Stops the listener `connector_caller` started.
+pub(super) fn connector_off(app: &tauri::App<tauri::test::MockRuntime>) {
+    crate::mcp_connector::agent_connector_set_config(app.handle().clone(),false,None,None).unwrap();
 }
 
 #[tokio::test]
@@ -1877,7 +1880,7 @@ async fn orchestration_message_saved_replay_rechecks_revoked_caller_before_rearm
             assert!(db.get_queued_turn(thread,"saved-D").is_none(),"a refused saved item must not block later replay");
             assert!(provider.calls.snapshot().iter().any(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(_,text) if text=="allowed saved D")));
         }
-        crate::web_remote::web_remote_disable(app.handle().clone()).unwrap();
+        connector_off(&app);
     }
 }
 

@@ -1,4 +1,5 @@
-//! HTTP MCP on the existing Axum listener. No paired-browser credentials.
+//! HTTP MCP and OAuth on the connector's own loopback listener (listener.rs).
+//! No paired-browser credentials.
 use super::{
     callback_origin, changed, live, now_ms, parse_access, scope, validate_caller, McpConnectorState,
 };
@@ -23,7 +24,6 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager, Runtime};
 
 const TOKEN_TTL_MS: i64 = 3_600_000;
-
 pub fn router<R: Runtime>() -> Router<AppHandle<R>> {
     Router::new()
         .route("/mcp", any(entry::<R>))
@@ -594,36 +594,44 @@ mod tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = crate::web_remote::web_remote_disable(self.app.handle().clone());
+            let _ = configure(self.app.handle(), false, None, None);
         }
+    }
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+    fn configure<R: Runtime>(
+        app: &AppHandle<R>,
+        enabled: bool,
+        public_origin: Option<&str>,
+        port: Option<u16>,
+    ) -> Result<super::super::ConnectorStatus, String> {
+        super::super::apply_config(
+            app,
+            super::super::ConfigUpdate {
+                enabled,
+                public_origin: public_origin.map(str::to_owned),
+                port,
+            },
+        )
+    }
+    /// The connector on its own listener, on a free loopback port.
+    fn listen<R: Runtime>(app: &AppHandle<R>) -> u16 {
+        let port = free_port();
+        let status = configure(app, true, None, Some(port)).unwrap();
+        assert!(status.listener_running, "{:?}", status.bind_error);
+        port
     }
     async fn fixture() -> Fixture {
         // Parent-owned native qualification only: synthetic in-memory app and
         // its explicitly loopback-only listener, never the user's instance.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
         let app = tauri::test::mock_app();
         app.manage(crate::database::DatabaseStore::new_in_memory());
         app.manage(crate::state::AppStateStore::default());
         app.manage(crate::web_remote::WebRemoteState::default());
         app.manage(McpConnectorState::default());
-        crate::web_remote::web_remote_set_config(
-            app.handle().clone(),
-            Some(port),
-            None,
-            Some("loopback".into()),
-            Some(false),
-            Some(false),
-            Some(false),
-            Some(true),
-        )
-        .await
-        .unwrap();
-        crate::web_remote::web_remote_enable(app.handle().clone())
-            .await
-            .unwrap();
-        super::super::agent_connector_set_config(app.handle().clone(), true, None).unwrap();
+        let port = listen(app.handle());
         Fixture { app, port }
     }
     fn request(
@@ -1105,25 +1113,7 @@ mod tests {
             crate::agent_control::guard_tests::fixture(provider.clone(), "receipt-worker").await;
         app.manage(crate::web_remote::WebRemoteState::default());
         app.manage(McpConnectorState::default());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        crate::web_remote::web_remote_set_config(
-            app.handle().clone(),
-            Some(port),
-            None,
-            Some("loopback".into()),
-            Some(false),
-            Some(false),
-            Some(false),
-            Some(true),
-        )
-        .await
-        .unwrap();
-        crate::web_remote::web_remote_enable(app.handle().clone())
-            .await
-            .unwrap();
-        super::super::agent_connector_set_config(app.handle().clone(), true, None).unwrap();
+        let port = listen(app.handle());
         let f = Fixture { app, port };
         let _seed = grant(&f);
         let first_token =
@@ -1469,21 +1459,7 @@ mod tests {
                     .1
                     .into_owned();
             }
-            let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = reservation.local_addr().unwrap().port();
-            drop(reservation);
-            crate::web_remote::web_remote_set_config(
-                f.app.handle().clone(),
-                Some(port),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+            let port = listen(f.app.handle());
             let new_issuer = format!("http://127.0.0.1:{port}");
             let ingress = Ingress {
                 resource: format!("{new_issuer}/mcp"),
@@ -1566,12 +1542,7 @@ mod tests {
         for public in [false, true] {
             let f = fixture().await;
             let issuer = if public {
-                super::super::agent_connector_set_config(
-                    f.app.handle().clone(),
-                    true,
-                    Some("https://mcp.example".into()),
-                )
-                .unwrap();
+                configure(f.app.handle(), true, Some("https://mcp.example"), None).unwrap();
                 "https://mcp.example".to_string()
             } else {
                 format!("http://127.0.0.1:{}", f.port)
@@ -1597,23 +1568,11 @@ mod tests {
                 )
                 .unwrap();
             if public {
-                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                let port = listener.local_addr().unwrap().port();
-                drop(listener);
-                crate::web_remote::web_remote_set_config(
-                    f.app.handle().clone(),
-                    Some(port),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
+                // A new proxy target: the issuer is still the public origin.
+                configure(f.app.handle(), true, Some("https://mcp.example"), Some(free_port()))
+                    .unwrap();
             } else {
-                crate::web_remote::web_remote_disable(f.app.handle().clone()).unwrap();
+                super::super::listener::stop(f.app.handle());
             }
             assert_eq!(
                 super::super::agent_connector_status(f.app.handle().clone())
@@ -1947,7 +1906,7 @@ mod tests {
         super::super::agent_connector_revoke(f.app.handle().clone(), "fixture-client".into())
             .unwrap();
         assert!(validate_caller(f.app.handle(), &caller).is_err());
-        super::super::agent_connector_set_config(f.app.handle().clone(), false, None).unwrap();
+        configure(f.app.handle(), false, None, None).unwrap();
         assert!(validate_caller(f.app.handle(), &caller).is_err());
     }
 
@@ -2116,7 +2075,7 @@ mod tests {
             write["result"]["structuredContent"]["error"]["code"],
             "access_denied"
         );
-        super::super::agent_connector_set_config(f.app.handle().clone(), false, None).unwrap();
+        configure(f.app.handle(), false, None, None).unwrap();
         assert_eq!(
             invoke(
                 &f,
@@ -2207,6 +2166,32 @@ mod tests {
                     .status(),
                 StatusCode::BAD_REQUEST
             );
+        }
+    }
+
+    // ── The own listener ──
+
+    #[tokio::test]
+    async fn connector_routes_are_not_served_by_the_web_remote_router() {
+        let f = fixture().await;
+        let token = grant(&f);
+        let routes = crate::web_remote::server::router(f.app.handle().clone());
+        let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let token_form = "grant_type=authorization_code&client_id=fixture-client";
+        for (path, method, body) in [
+            ("/mcp", "POST", ping),
+            ("/.well-known/oauth-authorization-server", "GET", ""),
+            ("/.well-known/oauth-protected-resource/mcp", "GET", ""),
+            ("/oauth/mcp/register", "POST", r#"{"redirect_uris":["https://client.example/cb"]}"#),
+            ("/oauth/mcp/token", "POST", token_form),
+        ] {
+            let response = routes.clone().oneshot(request(&f, path, method, body, Some(&token))).await.unwrap();
+            assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE), "{path}");
+            let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            for leaked in ["\"issuer\"", "access_token", "\"jsonrpc\"", "client_id"] {
+                assert!(!text.contains(leaked), "web remote served {path}: {leaked}");
+            }
         }
     }
 }

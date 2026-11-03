@@ -2,7 +2,7 @@
 //! `thread_wait`/`thread_status` against the shared fixtures. They call
 //! `super::wait` directly; the registry routes to the same functions.
 use super::outcome::RunState;
-use super::tests::{connector_caller, fixture, mock_agent_provider, native_caller_fixture, settle_operation};
+use super::tests::{connector_caller, connector_off, fixture, mock_agent_provider, native_caller_fixture, settle_operation};
 use super::wait::{self, Change};
 use super::{execute, ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlState};
 use crate::agent_provider::{
@@ -574,15 +574,12 @@ async fn wait_ends_promptly_when_an_outside_grant_is_revoked() {
     let waiter = spawn_wait(&app, &caller, target(&workspace, busy, json!({"timeout_ms": 5000})));
     parked().await;
     let started = Instant::now();
+    // The revoke itself wakes the wait (the connector's authority hook).
     crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "wait-client".into()).unwrap();
-    // The connector does not raise signal_all on authority changes yet, so
-    // this checks only the wait's side. Delete this line once it does: the
-    // test then covers the connector's hook too.
-    wait::signal_all();
     let ended = waiter.await.unwrap().unwrap_err();
     assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
     assert_eq!(ended.code, ErrorCode::GrantRevoked, "{ended}");
-    crate::web_remote::web_remote_disable(app.handle().clone()).unwrap();
+    connector_off(&app);
 }
 
 #[tokio::test]

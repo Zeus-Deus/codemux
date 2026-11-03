@@ -538,6 +538,8 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Stop taking outside-assistant connections first.
+                mcp_connector::listener::stop(app);
                 let _ = tauri::async_runtime::block_on(tokio::time::timeout(
                     std::time::Duration::from_secs(3),
                     app.state::<plugins::platform_transport::PluginPlatformState>().shutdown(),
@@ -2666,6 +2668,9 @@ fn build_core_app<R: tauri::Runtime>(
             // Restore web remote-access: if the user left it enabled, this
             // re-binds the server on boot (non-fatal if the port is taken).
             crate::web_remote::restore_on_boot(app.handle());
+            // The outside-assistant connector has its own loopback listener;
+            // bind it if it was left on (non-fatal if the port is taken).
+            crate::mcp_connector::restore_on_boot(app.handle());
 
             // Dev/test-only: an automated end-to-end harness can set
             // `CODEMUX_WEB_REMOTE_E2E=1` to have the server come up and a

@@ -904,7 +904,7 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
             #[derive(Deserialize)] #[serde(deny_unknown_fields)]
             struct Args { enabled: bool, public_origin: Option<String> }
             serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
-                .and_then(|args|crate::mcp_connector::agent_connector_set_config(app.clone(),args.enabled,args.public_origin))
+                .and_then(|args|crate::mcp_connector::agent_connector_set_config(app.clone(),args.enabled,args.public_origin,None))
                 .and_then(|status|serde_json::to_value(status).map_err(|e|e.to_string()))
         }
         "agent_connector_approve" => {
