@@ -238,10 +238,16 @@ pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
     // are already on the remote, and the daemon itself doesn't need
     // .mcp.json. The agent on the remote can still be configured by
     // hand. We log so the host pane can show a soft warning later.
+    //
+    // rsync `--delete` has just mirrored the local `.mcp.json` to the
+    // host, so the local copy is what the host holds: the provisioning
+    // merges into it without another SSH round trip.
+    let pushed_mcp_json = std::fs::read_to_string(opts.local_worktree.join(".mcp.json")).ok();
     if let Err(error) = crate::ssh::bootstrap::provision_workspace_mcp_config(
         opts.ssh_target,
         opts.remote_path,
         "~/.local/bin/codemux-remote",
+        pushed_mcp_json.as_deref(),
         opts.step_timeout,
     )
     .await
