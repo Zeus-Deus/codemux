@@ -129,6 +129,7 @@ pub enum RefreshOutcome {
 
 /// A personal token to issue. `token_hash` is `credential_hash(token)`.
 pub struct NewPersonalToken {
+    /// Trimmed by the store before the label rule applies.
     pub label: String,
     pub access: String,
     pub resource: String,
@@ -149,7 +150,7 @@ pub struct IssuedPersonalToken {
 
 /// Personal-token labels: 1-64 ASCII letters, digits, spaces and `._@-`,
 /// starting with a letter or digit and with no trailing space. Unique without
-/// regard to case.
+/// regard to case. Pass the trimmed label, as `mcp_issue_personal_token` does.
 pub fn personal_label_valid(label: &str) -> bool {
     let mut chars = label.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
@@ -500,7 +501,9 @@ impl DatabaseStore {
         &self,
         t: NewPersonalToken,
     ) -> Result<IssuedPersonalToken, String> {
-        if !personal_label_valid(&t.label) {
+        // A pasted label's surrounding whitespace is not part of its name.
+        let label = t.label.trim();
+        if !personal_label_valid(label) {
             return Err("Token labels are 1-64 letters, digits, spaces or . _ @ -, starting with a letter or digit".into());
         }
         let lifetime = t.expires_at.saturating_sub(t.now);
@@ -516,7 +519,7 @@ impl DatabaseStore {
         let existing: Option<String> = tx
             .query_row(
                 "SELECT client_id FROM agent_mcp_personal_clients WHERE label=?1",
-                [&t.label],
+                [label],
                 |r| r.get(0),
             )
             .optional()
@@ -541,14 +544,14 @@ impl DatabaseStore {
                         "{PERSONAL_CLIENT_PREFIX}{}",
                         crate::mcp_connector::oauth::opaque()
                     ),
-                    name: t.label.clone(),
+                    name: label.to_string(),
                     redirects: Vec::new(),
                     created_at: t.now,
                 };
                 register_client_tx(&tx, &client, t.now, &protected)?;
                 tx.execute(
                     "INSERT INTO agent_mcp_personal_clients(client_id,label) VALUES(?1,?2)",
-                    params![client.id, t.label],
+                    params![client.id, label],
                 )
                 .map_err(|_| "Token persistence failed")?;
                 (client.id, false)
@@ -1768,8 +1771,8 @@ mod tests {
         );
         for bad in [
             "".to_string(),
-            " hermes".into(),
-            "hermes ".into(),
+            "   ".into(),
+            " -hermes ".into(),
             "-hermes".into(),
             ".hermes".into(),
             "a".repeat(65),
@@ -1797,6 +1800,20 @@ mod tests {
             db.mcp_issue_personal_token(personal(&good, &format!("token-{good}"), 3))
                 .unwrap_or_else(|e| panic!("refused {good:?}: {e}"));
         }
+        // Surrounding whitespace is trimmed, so a pasted label names one bot.
+        let padded = db
+            .mcp_issue_personal_token(personal(" hermes ", "token-padded", 4))
+            .unwrap();
+        let stored = by_hash(&db, "token-padded", 5).unwrap();
+        assert_eq!(
+            (stored.label.as_deref(), stored.client_name.as_str()),
+            (Some("hermes"), "hermes")
+        );
+        let reissued = db
+            .mcp_issue_personal_token(personal("Hermes\n", "token-padded-2", 5))
+            .unwrap();
+        assert_eq!(reissued.client_id, padded.client_id);
+        assert!(reissued.replaced);
         // The store itself refuses a second spelling for another client.
         db.mcp_register_client(client("other"), 0).unwrap();
         assert!(db
