@@ -19,7 +19,7 @@ pub struct ProviderSelection {
     #[serde(alias = "provider_instance_id")]
     pub instance_id: String,
     pub model: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::service::null_as_default")]
     pub options: BTreeMap<String, Value>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

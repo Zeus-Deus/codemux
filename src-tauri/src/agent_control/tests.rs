@@ -3364,7 +3364,8 @@ async fn dispatch_validates_arguments_on_socket_routes() {
     assert!(listed["workspaces"].as_array().unwrap().iter().any(|w| w["workspace_id"] == workspace), "{listed}");
 }
 
-/// A null optional argument means "absent" on every route, as serde's `Option` does.
+/// A null optional argument means "absent" on every route, as serde's `Option`
+/// does, and a defaulted one takes its default.
 #[tokio::test]
 async fn dispatch_accepts_null_optionals_everywhere() {
     let (app, _provider, _root, workspace, thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
@@ -3376,6 +3377,29 @@ async fn dispatch_accepts_null_optionals_everywhere() {
         "workspace_id":null,"thread_id":thread,"cursor":null,"text_offset":null,"max_chars":null,
     })).await.unwrap();
     assert!(in_app["messages"].is_array(), "{in_app}");
+    // Defaulted handler arguments read null as their default too, so these
+    // calls get past argument parsing to the missing thread or workspace.
+    let owner = ControlCaller::trusted();
+    let error = execute(app.handle(), &owner, "thread_send", json!({
+        "workspace_id":workspace,"thread_id":"missing-thread","client_request_id":"null-delivery","message":"Null delivery","delivery":null,
+    })).await.unwrap_err();
+    assert_eq!(error.code, "thread_not_found", "{error}");
+    let error = execute(app.handle(), &owner, "thread_launch", json!({
+        "workspace_id":"missing-workspace","client_request_id":"null-flags","provider":"claude","permission_mode":"default",
+        "fast_mode":null,"select":null,
+    })).await.unwrap_err();
+    assert_eq!(error.code, "workspace_not_found", "{error}");
+    let error = execute(app.handle(), &owner, "thread_launch", json!({
+        "workspace_id":"missing-workspace","client_request_id":"null-options","provider":"claude","permission_mode":"default",
+        "target":{"instance_id":"claude","model":null,"options":null},
+    })).await.unwrap_err();
+    assert_eq!(error.code, "workspace_not_found", "{error}");
+    // thread_send fingerprints its parsed arguments, so a null delivery keys
+    // the same receipt as an omitted one.
+    let parsed: service::ThreadSendArgs = service::parse(json!({
+        "workspace_id":workspace,"thread_id":thread,"client_request_id":"null-delivery","message":"Null delivery","delivery":null,
+    })).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap()["delivery"], "auto");
 }
 
 /// orchestrator_capabilities advertises instances as provider_instance_id, so

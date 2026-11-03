@@ -14,6 +14,12 @@ pub(crate) fn parse<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, C
     serde_json::from_value(value).map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))
 }
 
+/// For a defaulted argument: `null` means absent, as the schema check treats
+/// every optional `null`. Pair it with `#[serde(default)]`.
+pub(super) fn null_as_default<'de, D: serde::Deserializer<'de>, T: Deserialize<'de> + Default>(value: D) -> Result<T, D::Error> {
+    Option::<T>::deserialize(value).map(Option::unwrap_or_default)
+}
+
 pub(crate) fn identifier(value: &str, name: &str, maximum: usize) -> Result<(), ControlError> {
     if value.is_empty() || value.len() > maximum || value.trim() != value || value.chars().any(char::is_control) {
         return Err(ControlError::new(ErrorCode::InvalidArguments, format!("{name} must be a nonempty unchanged identifier (max {maximum} bytes)")));
@@ -192,10 +198,10 @@ pub(super) struct Launch {
     effort: Option<String>,
     context_window: Option<String>,
     service_tier: Option<String>,
-    #[serde(default)] fast_mode: bool,
+    #[serde(default, deserialize_with = "null_as_default")] fast_mode: bool,
     title: Option<String>,
     message: Option<String>,
-    #[serde(default)] select: bool,
+    #[serde(default, deserialize_with = "null_as_default")] select: bool,
     worktree: Option<Value>,
 }
 
@@ -669,12 +675,20 @@ pub(super) struct ThreadSendArgs {
     thread_id: String,
     client_request_id: String,
     message: String,
-    #[serde(default = "auto_delivery")]
+    /// Stays a plain value, so the re-serialized fingerprint says "auto"
+    /// whether delivery was omitted or null.
+    #[serde(default = "auto_delivery", deserialize_with = "null_as_auto")]
     delivery: crate::agent_provider::types::MessageDelivery,
 }
 
 fn auto_delivery() -> crate::agent_provider::types::MessageDelivery {
     crate::agent_provider::types::MessageDelivery::Auto
+}
+
+/// `MessageDelivery`'s own default is queue, so a null delivery needs the
+/// argument default instead of [`null_as_default`].
+fn null_as_auto<'de, D: serde::Deserializer<'de>>(value: D) -> Result<crate::agent_provider::types::MessageDelivery, D::Error> {
+    Option::deserialize(value).map(|delivery| delivery.unwrap_or_else(auto_delivery))
 }
 
 pub(super) async fn thread_send<R: Runtime>(
