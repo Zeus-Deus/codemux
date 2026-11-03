@@ -2,6 +2,7 @@
 pub mod catalog;
 mod types;
 pub(crate) mod error;
+pub(crate) mod schema;
 pub(crate) mod permissions;
 pub(crate) mod native;
 mod state;

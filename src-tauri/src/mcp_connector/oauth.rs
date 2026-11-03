@@ -808,72 +808,6 @@ pub mod protocol {
         }
     }
 
-    // This evaluates the deliberately small schema vocabulary used by the native
-    // catalog, not arbitrary client-supplied schemas. Unknown keys are rejected at
-    // each object boundary; native typed deserialization remains a second gate.
-    pub fn schema_valid(schema: &Value, value: &Value) -> bool {
-        let matches_type = |t: &str| match t {
-            "object" => value.is_object(),
-            "array" => value.is_array(),
-            "string" => value.is_string(),
-            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-            "boolean" => value.is_boolean(),
-            "null" => value.is_null(),
-            _ => false,
-        };
-        let types = &schema["type"];
-        if !types.as_str().is_some_and(matches_type)
-            && !types
-                .as_array()
-                .is_some_and(|a| a.iter().any(|t| t.as_str().is_some_and(matches_type)))
-        {
-            return false;
-        }
-        if schema
-            .get("enum")
-            .is_some_and(|e| !e.as_array().is_some_and(|a| a.contains(value)))
-        {
-            return false;
-        }
-        if let Some(o) = value.as_object() {
-            let properties = schema.get("properties").and_then(Value::as_object);
-            if schema
-                .get("required")
-                .and_then(Value::as_array)
-                .is_some_and(|required| {
-                    required
-                        .iter()
-                        .any(|k| !k.as_str().is_some_and(|k| o.contains_key(k)))
-                })
-            {
-                return false;
-            }
-            for (k, v) in o {
-                match properties.and_then(|p| p.get(k)) {
-                    Some(s) if schema_valid(s, v) => {}
-                    None if schema["additionalProperties"] != false => {}
-                    _ => return false,
-                }
-            }
-        }
-        if let Some(s) = value.as_str() {
-            let length = s.chars().count() as u64;
-            if schema["minLength"].as_u64().is_some_and(|min| length < min)
-                || schema["maxLength"].as_u64().is_some_and(|max| length > max)
-            {
-                return false;
-            }
-        }
-        if let Some(n) = value.as_f64() {
-            if schema["minimum"].as_f64().is_some_and(|min| n < min)
-                || schema["maximum"].as_f64().is_some_and(|max| n > max)
-            {
-                return false;
-            }
-        }
-        true
-    }
-
     pub fn escaped(value: &str) -> String {
         value
             .replace('&', "&amp;")
@@ -1010,19 +944,7 @@ pub mod protocol {
             assert!(n.validate_method().is_ok());
         }
         #[test]
-        fn schema_rejects_unknown_args_wrong_types_and_nested_authority() {
-            let s = json!({"type":"object","additionalProperties":false,"required":["target"],"properties":{"target":{"type":"string","minLength":1},"timeout":{"type":"integer","minimum":1,"maximum":20},"nested":{"type":"object","additionalProperties":false,"properties":{"branch":{"type":"string"}}}}});
-            assert!(schema_valid(&s, &json!({"target":"known","timeout":10})));
-            for v in [
-                json!({}),
-                json!({"target":""}),
-                json!({"target":"known","access":"full_access"}),
-                json!({"target":"known","timeout":1.5}),
-                json!({"target":"known","timeout":21}),
-                json!({"target":"known","nested":{"env":{"API_KEY":"no"}}}),
-            ] {
-                assert!(!schema_valid(&s, &v));
-            }
+        fn escaped_neutralizes_html_metacharacters() {
             assert_eq!(escaped("<script>\"&'"), "&lt;script&gt;&quot;&amp;&#39;");
         }
     }

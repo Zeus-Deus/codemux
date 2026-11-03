@@ -354,7 +354,7 @@ async fn mcp<R: Runtime>(
             let Some(tool) = tools.iter().find(|t| t.name == name) else {
                 return rpc_error(id, -32602, "Unknown tool", StatusCode::OK);
             };
-            if !protocol::schema_valid(&tool.input_schema, &arguments) {
+            if agent_control::schema::check(&tool.input_schema, &arguments).is_err() {
                 return rpc_error(id, -32602, "Invalid tool arguments", StatusCode::OK);
             }
             if caller.access == ControlAccess::ReadOnly && tool.annotations["readOnlyHint"] != true
