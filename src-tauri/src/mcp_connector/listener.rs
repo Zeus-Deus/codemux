@@ -23,6 +23,21 @@ const REBIND_PAUSE: Duration = Duration::from_millis(20);
 pub(crate) struct Listener {
     running: Option<Running>,
     pub(crate) bind_error: Option<String>,
+    /// Port of the listener we last stopped, cleared by the next bind. Disable
+    /// then enable is two reconciles; this is how the second knows the socket
+    /// in its way may still be our own (axum drops it just after the stop).
+    last_stopped: Option<u16>,
+}
+impl Listener {
+    /// Tell the running listener to stop and remember its port.
+    fn take_running(&mut self) -> bool {
+        let Some(running) = self.running.take() else {
+            return false;
+        };
+        let _ = running.shutdown.send(true);
+        self.last_stopped = Some(running.configured);
+        true
+    }
 }
 
 struct Running {
@@ -53,16 +68,13 @@ pub(crate) fn reconcile<R: Runtime>(app: &AppHandle<R>) {
             return;
         }
     }
-    let stopped = listener.running.take().map(|running| {
-        let _ = running.shutdown.send(true);
-        running.configured
-    });
+    listener.take_running();
     state.bound_port.store(0, Ordering::SeqCst);
     listener.bind_error = None;
     let Some(port) = want else {
         return;
     };
-    match bind(port, stopped == Some(port)) {
+    match bind(port, listener.last_stopped.take() == Some(port)) {
         Ok(std) => {
             let bound = std.local_addr().map(|a| a.port()).unwrap_or(port);
             let (shutdown, mut rx) = tokio::sync::watch::channel(false);
@@ -128,12 +140,9 @@ pub(crate) fn stop<R: Runtime>(app: &AppHandle<R>) {
             return;
         };
         listener.bind_error = None;
-        let running = listener.running.take();
-        if let Some(running) = &running {
-            let _ = running.shutdown.send(true);
-        }
+        let stopped = listener.take_running();
         state.bound_port.store(0, Ordering::SeqCst);
-        running.is_some()
+        stopped
     };
     if stopped {
         super::authority_changed(app);

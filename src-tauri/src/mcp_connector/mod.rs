@@ -803,9 +803,44 @@ mod tests {
             validate_caller(handle, &caller).unwrap_err().code,
             ErrorCode::ConnectorDisabled
         );
-        set(handle, true, None, None).unwrap();
+        let resumed = set(handle, true, None, None).unwrap();
+        assert!(resumed.listener_running, "{:?}", resumed.bind_error);
+        assert_eq!(resumed.port, port);
         assert!(validate_caller(handle, &caller).is_ok());
         set(handle, false, None, None).unwrap();
+    }
+
+    #[test]
+    fn enabling_right_after_a_stop_waits_for_the_old_socket_to_close() {
+        for how in ["disable", "stop"] {
+            let app = app();
+            let handle = app.handle();
+            let port = free_port();
+            assert!(set(handle, true, None, Some(port)).unwrap().listener_running, "{how}");
+            match how {
+                "disable" => assert!(!set(handle, false, None, None).unwrap().listener_running),
+                _ => listener::stop(handle),
+            }
+            // Stand in for the old socket axum has not dropped yet: hold the
+            // port, and let go of it a moment after the enable starts.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let lingering = loop {
+                match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                    Ok(held) => break held,
+                    Err(_) => assert!(Instant::now() < deadline, "{how}: the stopped listener kept its port"),
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(40));
+                drop(lingering);
+            });
+            let resumed = set(handle, true, None, None).unwrap();
+            release.join().unwrap();
+            assert!(resumed.listener_running, "{how}: {:?}", resumed.bind_error);
+            assert_eq!(resumed.port, port, "{how}");
+            set(handle, false, None, None).unwrap();
+        }
     }
 
     #[test]
