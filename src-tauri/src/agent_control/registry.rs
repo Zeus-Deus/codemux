@@ -46,6 +46,15 @@ pub enum Scope {
     Plugin,
 }
 
+/// MCP behaviour hints for a tool that is not read-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Effect {
+    /// It may end or release work in a way that cannot be undone.
+    pub destructive: bool,
+    /// Repeating the identical call changes nothing more (receipts and keys).
+    pub idempotent: bool,
+}
+
 /// How a successful result becomes MCP content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Presentation {
@@ -70,6 +79,7 @@ pub struct ToolSpec {
     access: Access,
     audience: Audience,
     scope: Scope,
+    effect: Effect,
     waits: bool,
     collaboration: bool,
     presentation: Presentation,
@@ -82,29 +92,30 @@ impl ToolSpec {
         access: Access,
         audience: Audience,
         scope: Scope,
+        effect: Effect,
         def: fn(&CallerView) -> Option<Definition>,
     ) -> Self {
-        Self { name, access, audience, scope, waits: false, collaboration: true, presentation: Presentation::Json, def }
+        Self { name, access, audience, scope, effect, waits: false, collaboration: true, presentation: Presentation::Json, def }
     }
 
     pub const fn read(name: &'static str, audience: Audience, scope: Scope, def: fn(&CallerView) -> Option<Definition>) -> Self {
-        Self::new(name, Access::Read, audience, scope, def)
+        Self::new(name, Access::Read, audience, scope, Effect { destructive: false, idempotent: true }, def)
     }
 
-    pub const fn write(name: &'static str, audience: Audience, scope: Scope, def: fn(&CallerView) -> Option<Definition>) -> Self {
-        Self::new(name, Access::Write, audience, scope, def)
+    pub const fn write(name: &'static str, audience: Audience, scope: Scope, effect: Effect, def: fn(&CallerView) -> Option<Definition>) -> Self {
+        Self::new(name, Access::Write, audience, scope, effect, def)
     }
 
-    pub const fn starts_threads(name: &'static str, audience: Audience, scope: Scope, def: fn(&CallerView) -> Option<Definition>) -> Self {
-        Self::new(name, Access::StartsThreads, audience, scope, def)
+    pub const fn starts_threads(name: &'static str, audience: Audience, scope: Scope, effect: Effect, def: fn(&CallerView) -> Option<Definition>) -> Self {
+        Self::new(name, Access::StartsThreads, audience, scope, effect, def)
     }
 
-    pub const fn machine(name: &'static str, audience: Audience, scope: Scope, def: fn(&CallerView) -> Option<Definition>) -> Self {
-        Self::new(name, Access::Machine, audience, scope, def)
+    pub const fn machine(name: &'static str, audience: Audience, scope: Scope, effect: Effect, def: fn(&CallerView) -> Option<Definition>) -> Self {
+        Self::new(name, Access::Machine, audience, scope, effect, def)
     }
 
-    pub const fn admin(name: &'static str, audience: Audience, scope: Scope, def: fn(&CallerView) -> Option<Definition>) -> Self {
-        Self::new(name, Access::Admin, audience, scope, def)
+    pub const fn admin(name: &'static str, audience: Audience, scope: Scope, effect: Effect, def: fn(&CallerView) -> Option<Definition>) -> Self {
+        Self::new(name, Access::Admin, audience, scope, effect, def)
     }
 
     /// The call may park for a time the client chooses. Transports budget such
@@ -139,6 +150,10 @@ impl ToolSpec {
 
     pub fn scope(&self) -> Scope {
         self.scope
+    }
+
+    pub fn effect(&self) -> Effect {
+        self.effect
     }
 
     pub fn may_wait(&self) -> bool {
@@ -239,7 +254,16 @@ pub fn list(view: &CallerView) -> Vec<Listed> {
 }
 
 fn annotations(spec: &ToolSpec) -> Value {
-    json!({"readOnlyHint": spec.access == Access::Read, "openWorldHint": false})
+    if spec.access == Access::Read {
+        json!({"readOnlyHint": true, "openWorldHint": false})
+    } else {
+        json!({
+            "readOnlyHint": false,
+            "destructiveHint": spec.effect.destructive,
+            "idempotentHint": spec.effect.idempotent,
+            "openWorldHint": false,
+        })
+    }
 }
 
 /// The outside catalog for `caller`: HTTP `tools/list` and socket `tools_list`.
@@ -503,6 +527,24 @@ mod tests {
     }
 
     #[test]
+    fn annotations_follow_access() {
+        for tool in list(&CallerView::outside(FullAccess)) {
+            let (spec, annotations) = (tool.spec, &tool.definition.annotations);
+            if spec.access == Access::Read {
+                assert_eq!(*annotations, json!({"readOnlyHint": true, "openWorldHint": false}), "{}", spec.name);
+            } else {
+                assert_eq!(*annotations, json!({"readOnlyHint": false, "destructiveHint": spec.effect.destructive,
+                    "idempotentHint": spec.effect.idempotent, "openWorldHint": false}), "{}", spec.name);
+            }
+        }
+        let destructive: Vec<&str> = list(&CallerView::outside(FullAccess)).into_iter()
+            .filter(|tool| tool.definition.annotations["destructiveHint"] == true).map(|tool| tool.spec.name).collect();
+        assert_eq!(destructive, ["thread_interrupt", "thread_stop", "thread_respond", "plugin_invoke"]);
+        assert!(list(&CallerView::outside(FullAccess)).iter().all(|tool| tool.definition.annotations["idempotentHint"] != false),
+            "every outside mutation is keyed, so a retry is safe");
+    }
+
+    #[test]
     fn mcp_results_have_one_shape() {
         let object = mcp_result("thread_list", Ok(json!({"threads": []})));
         assert_eq!(object, json!({"isError": false, "content": [{"type": "text", "text": "{\"threads\":[]}"}], "structuredContent": {"threads": []}}));
@@ -568,7 +610,6 @@ mod tests {
                 "thread_send" => typed::<service::ThreadSendArgs>,
                 "thread_read" => typed::<service::ThreadReadArgs>,
                 "thread_status" => typed::<service::Target>,
-                "thread_wait" => typed::<service::WaitArgs>,
                 "thread_interrupt" => typed::<service::InterruptArgs>,
                 "thread_stop" => typed::<service::StopArgs>,
                 "thread_respond" => typed::<service::RespondArgs>,
@@ -576,8 +617,9 @@ mod tests {
                 _ => return None,
             })
         };
-        // The plugin layer checks its own fields by hand.
-        const UNTYPED: &[&str] = &["plugin_list", "plugin_invoke"];
+        // The plugin layer checks its own fields by hand. thread_wait's
+        // arguments (`since`) belong to its event-driven handler in wait.rs.
+        const UNTYPED: &[&str] = &["plugin_list", "plugin_invoke", "thread_wait"];
         for tool in list(&CallerView::outside(FullAccess)) {
             let name = tool.spec.name;
             if UNTYPED.contains(&name) {
