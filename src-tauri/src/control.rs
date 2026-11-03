@@ -281,6 +281,59 @@ pub fn control_socket_path() -> Option<PathBuf> {
     Some(fallback_dir.join(&socket_file))
 }
 
+/// Where a client looks for the app's socket, in order: the first one that
+/// exists is used. The server binds only [`control_socket_path`].
+#[cfg(unix)]
+pub(crate) fn control_socket_candidates() -> Vec<PathBuf> {
+    let uid = unsafe { libc::getuid() };
+    socket_candidates(
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        std::path::Path::new("/run/user"),
+        uid,
+        control_socket_path,
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn control_socket_candidates() -> Vec<PathBuf> {
+    control_socket_path().into_iter().collect()
+}
+
+/// MCP clients such as Codex and Hermes start servers with an env allow-list
+/// that drops `XDG_RUNTIME_DIR`, while the app still listens in the systemd
+/// runtime dir. So when the variable is unset, try `/run/user/<uid>` (only if
+/// that uid owns it) before the server's own fallback. When it is set, use
+/// only it: tests point it at a temp dir to stay away from a real app.
+#[cfg(unix)]
+fn socket_candidates(
+    xdg_runtime_dir: Option<PathBuf>,
+    run_user: &std::path::Path,
+    uid: u32,
+    bind_path: impl FnOnce() -> Option<PathBuf>,
+) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let socket_file = format!("{SOCKET_BASENAME}.sock");
+    if let Some(runtime_dir) = xdg_runtime_dir {
+        return vec![runtime_dir.join(socket_file)];
+    }
+    let runtime_dir = run_user.join(uid.to_string());
+    let mut candidates = Vec::new();
+    if fs::metadata(&runtime_dir).is_ok_and(|meta| meta.is_dir() && meta.uid() == uid) {
+        candidates.push(runtime_dir.join(&socket_file));
+    }
+    candidates.extend(bind_path());
+    candidates
+}
+
+/// The first candidate that exists, else the last one, so a connection error
+/// names where the server would listen.
+fn first_existing(mut candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    match candidates.iter().position(|path| path.exists()) {
+        Some(index) => Some(candidates.swap_remove(index)),
+        None => candidates.pop(),
+    }
+}
+
 /// Build the Windows named-pipe path for the given username.
 ///
 /// Extracted from `control_socket_path()` so tests can drive it with
@@ -540,7 +593,7 @@ pub async fn send_control_request_as(
     request: ControlRequest,
     client: Option<&ControlClient>,
 ) -> Result<ControlResponse, String> {
-    let socket_path = control_socket_path()
+    let socket_path = first_existing(control_socket_candidates())
         .ok_or_else(|| "Control socket path unavailable".to_string())?;
     send_control_request_to(&socket_path, request, client, &SERVER_ENFORCES_ACCESS).await
 }
@@ -2351,6 +2404,47 @@ mod tests {
         }
         let notify = dispatch_request_as(app.handle(), &supervised, request("notify", serde_json::json!({"message":"x"}))).await;
         assert!(notify.ok, "supervised clients keep ordinary writes: {:?}", notify.error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_candidates_fall_back_to_run_user_only_when_xdg_is_unset() {
+        use std::os::unix::fs::MetadataExt;
+        let run_user = tempfile::tempdir().unwrap();
+        let uid = fs::metadata(run_user.path()).unwrap().uid();
+        let socket_file = format!("{SOCKET_BASENAME}.sock");
+        let fallback = PathBuf::from("/fallback-dir/codemux.sock");
+        let bind = || Some(fallback.clone());
+
+        let xdg = PathBuf::from("/xdg/runtime");
+        let only_xdg = socket_candidates(Some(xdg.clone()), run_user.path(), uid, || panic!("the bind path is not consulted"));
+        assert_eq!(only_xdg, vec![xdg.join(&socket_file)], "a set XDG_RUNTIME_DIR is the only candidate");
+
+        assert_eq!(socket_candidates(None, run_user.path(), uid, bind), vec![fallback.clone()], "no runtime dir yet");
+        let own = run_user.path().join(uid.to_string());
+        fs::create_dir(&own).unwrap();
+        assert_eq!(
+            socket_candidates(None, run_user.path(), uid, bind),
+            vec![own.join(&socket_file), fallback.clone()],
+            "the systemd runtime dir comes before the /tmp fallback"
+        );
+        let foreign = run_user.path().join((uid + 1).to_string());
+        fs::create_dir(&foreign).unwrap();
+        assert_eq!(
+            socket_candidates(None, run_user.path(), uid + 1, bind),
+            vec![fallback.clone()],
+            "a runtime dir the uid does not own is never used"
+        );
+    }
+
+    #[test]
+    fn clients_connect_to_the_first_socket_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let (missing, present, last) = (dir.path().join("a.sock"), dir.path().join("b.sock"), dir.path().join("c.sock"));
+        std::fs::write(&present, b"").unwrap();
+        assert_eq!(first_existing(vec![missing.clone(), present.clone(), last.clone()]), Some(present));
+        assert_eq!(first_existing(vec![missing, last.clone()]), Some(last), "nothing exists: the server's bind path");
+        assert_eq!(first_existing(Vec::new()), None);
     }
 
     #[cfg(unix)]
