@@ -718,6 +718,17 @@ fn ask(app: &App, thread: &str, turn: &str, question: &str) {
     forward_event(app.handle(), Event::TurnCompleted { thread_id: id(turn).0, turn_id: id(turn).1, status: TurnStatus::Success, usage: None });
 }
 
+/// Run `turn` on `thread` to its end with one reply: the run an answer
+/// continues.
+fn reply(app: &App, thread: &str, turn: &str, text: &str) {
+    let (thread_id, turn_id) = (ThreadId(thread.into()), TurnId(turn.into()));
+    forward_event(app.handle(), Event::SessionStateChanged { thread_id: thread_id.clone(), status: SessionStatus::Running { active_turn: turn_id.clone() } });
+    forward_event(app.handle(), Event::ItemCompleted {
+        thread_id: thread_id.clone(), turn_id: turn_id.clone(), item: CompletedItem::AssistantText { text: text.into() }, subagent_id: None,
+    });
+    forward_event(app.handle(), Event::TurnCompleted { thread_id, turn_id, status: TurnStatus::Success, usage: None });
+}
+
 fn answer(workspace: &str, thread: &str, key: &str, question: &str) -> Value {
     json!({"workspace_id": workspace, "thread_id": thread, "client_request_id": key, "question_id": question, "answers": ["SQLite"]})
 }
@@ -753,10 +764,21 @@ async fn outside_answer_resolves_a_question_and_the_wait_returns_done() {
     assert_eq!(answered["resolution"]["status"], "answered");
     assert_eq!(answered["resolution"]["answers"], json!(["SQLite"]));
     assert_eq!(answered["turn_id"], "native-turn");
-    let done = waiter.await.unwrap().unwrap();
-    assert_eq!(done["state"], "done", "{done}");
-    assert_eq!(done["final_text"], "I need one decision before I continue.");
-    assert_eq!(done["pending"]["questions"], json!([]));
+    let woken = waiter.await.unwrap().unwrap();
+    assert_eq!(woken["pending"]["questions"], json!([]), "the answer wakes the waiter: {woken}");
+
+    // The run that asked is over; the answer's result comes from the run
+    // thread_answer names. Until that run ends, waiting on it is not done.
+    let mut follow = target.clone();
+    follow["turn_id"] = answered["turn_id"].clone();
+    follow["timeout_ms"] = json!(200);
+    let continuing = call(&app, &bot, "thread_wait", follow.clone()).await.unwrap();
+    assert_eq!((continuing["state"].clone(), continuing["timed_out"].clone()), (json!("running"), json!(true)), "{continuing}");
+    reply(&app, &thread, "native-turn", "SQLite it is: the schema is in place.");
+    follow["timeout_ms"] = json!(5000);
+    let done = call(&app, &bot, "thread_wait", follow).await.unwrap();
+    assert_eq!((done["state"].clone(), done["turn_id"].clone()), (json!("done"), json!("native-turn")), "{done}");
+    assert_eq!(done["final_text"], "SQLite it is: the schema is in place.");
 
     // One submission per key: a retry replays, a new key finds it closed.
     let retry = call(&app, &bot, "thread_answer", answer(&workspace, &thread, "answer-1", "storage")).await.unwrap();
