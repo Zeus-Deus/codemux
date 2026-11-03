@@ -387,11 +387,27 @@ pub fn control_socket_path() -> Option<PathBuf> {
 
 /// Blocking check: is another Codemux control server currently listening?
 /// Safe to call from sync contexts (e.g. before the Tauri runtime spins up).
+///
+/// For a server's own "is another instance running" check: it probes only the
+/// path this process would bind. Clients use [`control_server_reachable`].
 pub fn control_server_is_running() -> bool {
     match control_socket_path() {
         Some(path) => transport::sync_liveness_probe(&path),
         None => false,
     }
+}
+
+/// Blocking check: does a Codemux app or `codemux serve` answer where clients
+/// look for one ([`control_socket_candidates`])? This is what
+/// [`send_control_request`] would reach, including the `/run/user/<uid>`
+/// socket when an MCP client stripped `XDG_RUNTIME_DIR`. A stale socket file
+/// does not count.
+pub fn control_server_reachable() -> bool {
+    any_answers(&control_socket_candidates())
+}
+
+fn any_answers(candidates: &[PathBuf]) -> bool {
+    candidates.iter().any(|path| transport::sync_liveness_probe(path))
 }
 
 /// Resolve "default" or empty browser_id to the first active browser session's actual ID.
@@ -2715,6 +2731,21 @@ mod tests {
             }
         });
         (server, seen)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reachable_means_a_candidate_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.sock");
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        let live = dir.path().join("live.sock");
+        let (server, _) = spawn_line_server(&live, CONTROL_PROTOCOL_VERSION);
+        assert!(!any_answers(&[]));
+        assert!(!any_answers(&[missing.clone(), stale.clone()]), "a stale socket file is not a running app");
+        assert!(any_answers(&[missing, stale, live]));
+        server.abort();
     }
 
     #[cfg(unix)]

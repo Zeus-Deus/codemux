@@ -501,7 +501,7 @@ pub async fn run_login(
     // though, is only hydrated by `check_auth` at startup — so say so
     // rather than let the window look signed-out. There is no control
     // command to push an auth refresh into a running instance today.
-    if crate::control::control_server_is_running() {
+    if crate::control::control_server_reachable() {
         println!(
             "Note: a Codemux instance is already running on this machine. It will \
              use this session for account/relay features immediately; restart it \

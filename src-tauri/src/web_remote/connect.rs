@@ -940,7 +940,7 @@ pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
         .identity()
         .to_string();
 
-    let instance_running = crate::control::control_server_is_running();
+    let instance_running = crate::control::control_server_reachable();
 
     // Step 2 — configuration. Exactly one of the two write paths, per the
     // module note: the running instance owns its in-memory config, so with one
@@ -1093,7 +1093,7 @@ pub async fn run_connect_status() -> Result<(), String> {
 
     // A running instance owns the config in memory and knows what is actually
     // bound, so ask it. A failed query degrades to the persisted view.
-    let instance_running = crate::control::control_server_is_running();
+    let instance_running = crate::control::control_server_reachable();
     let live = if instance_running {
         match send_control_request(ControlRequest {
             command: "web_remote_status".into(),
@@ -1142,7 +1142,7 @@ pub async fn run_connect_status() -> Result<(), String> {
 /// `codemux connect off`.
 pub async fn run_connect_off() -> Result<(), String> {
     let db = crate::database::init_database()?;
-    let instance_running = crate::control::control_server_is_running();
+    let instance_running = crate::control::control_server_reachable();
 
     // Config BEFORE the service, mirroring `connect`'s order — and load-bearing
     // rather than cosmetic. The instance we ask is usually the one
