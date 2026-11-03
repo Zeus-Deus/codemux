@@ -2873,7 +2873,9 @@ pub fn git_create_worktree(
         // no-remote repos fall through to the stale/local refs below.
         // Callers run this whole function on a blocking pool
         // (`spawn_blocking`), so the fetch never stalls the UI thread.
-        if let Some(b) = base {
+        // An exact commit is the base already: there is no origin branch to
+        // freshen, so no fetch (and no wait on an unreachable origin) runs.
+        if let Some(b) = base.filter(|b| !is_object_id(b)) {
             fetch_origin_branch(repo_path, b);
         }
         let resolved_base = base.map(|b| find_remote_ref(repo_path, b).unwrap_or_else(|| b.to_string()));
@@ -3867,6 +3869,37 @@ mod tests {
         assert_ne!(head, remote_tip, "remote tip is unreachable offline");
 
         git_remove_worktree(Path::new(&wt_path), Some("offline-base-test"), true).expect("cleanup");
+    }
+
+    #[test]
+    fn create_worktree_from_commit_id_skips_origin_fetch() {
+        let (sha1, sha256) = ("0123456789abcdef".repeat(4), "ABCDEF0123456789".repeat(4));
+        assert!(is_object_id(&sha1[..40]) && is_object_id(&sha256));
+        let (short, long, not_hex) = ("a".repeat(39), "a".repeat(41), "g".repeat(40));
+        for name in ["main", "", short.as_str(), long.as_str(), not_hex.as_str()] {
+            assert!(!is_object_id(name), "{name}");
+        }
+
+        let (_dir, repo) = setup_test_repo();
+        let base = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        run_git(&repo, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "after the base"]).unwrap();
+        run_git(&repo, &["remote", "add", "origin", "file:///nonexistent/codemux-origin.git"]).unwrap();
+        // Any `git fetch`, even one git answers locally, writes FETCH_HEAD.
+        let fetch_head = repo.join(".git").join("FETCH_HEAD");
+        assert!(!fetch_head.exists());
+
+        let started = std::time::Instant::now();
+        let wt_path = git_create_worktree(&repo, "from-commit", true, Some(&base), None)
+            .expect("create worktree from a commit");
+        let elapsed = started.elapsed();
+        let head = run_git(Path::new(&wt_path), &["rev-parse", "HEAD"]).unwrap();
+        git_remove_worktree(Path::new(&wt_path), Some("from-commit"), true).expect("cleanup");
+        assert_eq!(head, base, "the worktree starts at exactly that commit");
+        assert!(!fetch_head.exists(), "a commit base never fetches");
+        assert!(
+            elapsed < std::time::Duration::from_secs(BASE_FETCH_TIMEOUT_SECS / 2),
+            "a commit base must not wait on origin: {elapsed:?}"
+        );
     }
 
     #[test]
