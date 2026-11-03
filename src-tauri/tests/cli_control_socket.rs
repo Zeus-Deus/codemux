@@ -526,19 +526,20 @@ fn workspace_create_list_info_close_round_trip() {
 fn thread_start_wait_completes_with_a_fixture_provider() {
     let serve = Serve::start();
     let (workspace, _) = serve.workspace("project");
-    // Providers register in the background after boot.
+    // Providers register in the background after boot. Listing reads cached
+    // catalogs only, so a configured Cursor is enough: the launch discovers
+    // its catalog and checks the permission mode.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let probe = serve.cli(&["call", "agent_capabilities", &json!({"workspace_id": workspace, "provider": "cursor"}).to_string()]);
         let caps = stdout_json(&probe);
-        let modes = &caps["result"]["providers"][0]["allowed_permission_modes"];
-        if modes.as_array().is_some_and(|modes| modes.iter().any(|mode| mode == "agent")) {
+        if caps["result"]["providers"][0]["configured"] == true {
             break;
         }
         // Only a provider still starting is worth waiting for.
         let code = caps["error"]["code"].as_str().unwrap_or("provider_not_ready");
-        assert!(matches!(code, "provider_not_configured" | "provider_not_ready" | "catalog_not_discovered"), "{caps}");
-        assert!(Instant::now() < deadline, "Cursor never became launchable: {caps}\n{}", serve.log());
+        assert!(matches!(code, "provider_not_configured" | "provider_not_ready"), "{caps}");
+        assert!(Instant::now() < deadline, "Cursor never registered: {caps}\n{}", serve.log());
         std::thread::sleep(Duration::from_millis(500));
     }
 
