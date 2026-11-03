@@ -1,5 +1,5 @@
 //! Launch sequencing belongs here, above the existing native session owner.
-use super::{Access, ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlGuard, NativeControlState};
+use super::{Access, CallerKind, ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlGuard, NativeControlState};
 use crate::agent_provider::{ProviderChatCapabilities, ProviderKind, StartSessionInput, ThreadId};
 use crate::commands::agent_chat::{self, ProviderRegistry, SendTurnCommandInput};
 use crate::database::{AgentChatSessionConfig, DatabaseStore};
@@ -1252,6 +1252,11 @@ pub(super) struct RespondArgs { workspace_id: String, thread_id: String, client_
 pub(super) async fn thread_respond<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     if caller.thread_id().is_some() { return Err(ControlError::new(ErrorCode::PermissionDenied,"Agents cannot grant permission approvals")); }
     let input: RespondArgs = parse(args.clone())?;
+    // "Always" outlives the run a connector client is watching, so only the
+    // person on this computer grants it.
+    if caller.kind() == CallerKind::Client && matches!(input.decision, Decision::AllowAlways) {
+        return Err(ControlError::new(ErrorCode::PermissionDenied, "Connector clients can allow a request once or deny it; allow_always is only available on this computer"));
+    }
     identifier(&input.client_request_id,"client_request_id",128)?;
     identifier(&input.request_id,"request_id",256)?;
     if let Some(receipt) = retry_receipt(app, caller, "thread_respond", &args)? { return Ok(receipt); }

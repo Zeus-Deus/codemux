@@ -1,5 +1,6 @@
-//! Tests for the workspace and worktree tools and `thread_launch` into a new
-//! worktree, through the registry as every outside door calls it.
+//! Tests for the workspace and worktree tools, `thread_launch` into a new
+//! worktree, and outside answers to approvals, through the
+//! registry as every outside door calls it.
 //!
 //! A test that creates or closes a workspace or a worktree runs in an
 //! isolated child process (`test_isolation::isolated`): worktrees, the layout
@@ -7,6 +8,7 @@
 //! own Codemux state.
 use super::tests::{fixture, mock_agent_provider, native_caller_fixture, settle_operation};
 use super::{execute, registry, ClientName, ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlState};
+use crate::agent_provider::{ProviderRuntimeEvent as Event, RequestId, ThreadId, TurnId};
 use crate::database::DatabaseStore;
 use crate::state::{AppStateStore, WorkspaceSnapshot};
 use crate::test_isolation::isolated;
@@ -585,4 +587,64 @@ async fn thread_launch_worktree_keeps_checkout_when_start_fails() {
     assert!(message.contains(reserved) && message.contains("kept for inspection"), "{message}");
     assert!(app.state::<AppStateStore>().find_workspace(reserved).is_some(), "setup scripts may have written to it");
     assert!(crate::git::conventional_worktree_path(&repo, "kept").unwrap().exists());
+}
+
+// ── outside answers to approvals ───────────────────────────────────────────
+
+async fn launched(app: &App, key: &str, workspace: &str, mode: &str) -> String {
+    let receipt = call(app, &ControlCaller::trusted(), "thread_launch", json!({
+        "workspace_id": workspace, "client_request_id": key, "provider": "claude", "permission_mode": mode,
+    })).await.unwrap();
+    let launched = settle_operation(app, &receipt).await;
+    assert_eq!(launched["state"], "succeeded", "{launched}");
+    launched["thread_id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connector_respond_cannot_allow_always() {
+    let (app, provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "respond-launch", &workspace, "default").await;
+    app.state::<NativeControlState>().observe_event(&Event::RequestOpened {
+        thread_id: ThreadId(thread.clone()), turn_id: TurnId("approval-turn".into()),
+        request_id: RequestId("approval-request".into()), request_kind: "tool".into(),
+        payload: json!({}), tool_use_id: None, subagent_id: None,
+    });
+    let status = call(&app, &ControlCaller::trusted(), "thread_status", json!({"workspace_id": workspace, "thread_id": thread})).await.unwrap();
+    let request = status["pending_approvals"][0]["request_id"].clone();
+    let respond = |key: &str, decision: &str| json!({"workspace_id": workspace, "thread_id": thread, "client_request_id": key, "request_id": request, "decision": decision});
+    let full = connector(ControlAccess::FullAccess);
+    let error = refused(call(&app, &full, "thread_respond", respond("always", "allow_always")).await, ErrorCode::PermissionDenied);
+    assert!(error.message.contains("allow_always"), "{error}");
+    no_receipt(&app, &full, "always", "thread_respond");
+    assert!(!provider.calls.snapshot().iter().any(|call| matches!(call, MockCall::RespondToRequest(_, _))));
+    // A local client at full access still may; it is on this computer.
+    let local = call(&app, &named(ControlAccess::FullAccess), "thread_respond", respond("local-always", "allow_always")).await.unwrap();
+    assert_eq!(local["state"], "accepted", "{local}");
+    let _ = settle_once(&app, &named(ControlAccess::FullAccess), &local).await;
+    // The connector client can still allow once.
+    app.state::<NativeControlState>().observe_event(&Event::RequestOpened {
+        thread_id: ThreadId(thread.clone()), turn_id: TurnId("approval-turn".into()),
+        request_id: RequestId("second-request".into()), request_kind: "tool".into(),
+        payload: json!({}), tool_use_id: None, subagent_id: None,
+    });
+    let status = call(&app, &ControlCaller::trusted(), "thread_status", json!({"workspace_id": workspace, "thread_id": thread})).await.unwrap();
+    let second = status["pending_approvals"].as_array().unwrap().iter().find(|a| a["request_id"] != request).unwrap()["request_id"].clone();
+    let once = call(&app, &full, "thread_respond", json!({"workspace_id": workspace, "thread_id": thread, "client_request_id": "once", "request_id": second, "decision": "allow_once"})).await.unwrap();
+    assert_eq!(settle_once(&app, &full, &once).await["state"], "succeeded");
+}
+
+/// `settle_operation` reads receipts as the owner; these belong to other principals.
+async fn settle_once(app: &App, caller: &ControlCaller, receipt: &Value) -> Value {
+    let id = receipt["operation_id"].clone();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status = call(app, caller, "operation_status", json!({"operation_id": id})).await.unwrap();
+            if status["state"] != "accepted" && status["state"] != "running" {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
 }
