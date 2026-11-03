@@ -1,7 +1,52 @@
 //! Web clients get an explicit development surface, not the desktop IPC registry.
 //! New commands are denied until reviewed here. This is not a sandbox: paired
 //! clients can run agents and terminals, but cannot accidentally invoke desktop
-//! administration, dev fixtures, destructive Git/worktree operations or account changes.
+//! administration, dev fixtures or account changes, or lose work through Git:
+//! force delete, branch deletion and archived-worktree deletion stay on the
+//! desktop. A clean worktree may be removed; the backend refuses one with
+//! uncommitted or unpushed work.
+
+use serde_json::{Map, Value};
+
+/// Argument flags that make an allowed command destroy work. A paired client
+/// may not set them unless the (command, flag) pair is reviewed below.
+/// Unknown commands fail closed, so a newly allowlisted command that takes
+/// one of these flags is refused until someone reviews it here.
+const DESTRUCTIVE_FLAGS: [&str; 4] = ["removeWorktree", "deleteWorktree", "deleteBranch", "forceDelete"];
+
+/// Why a paired client may not send `args` to `cmd`, or `None` when it may.
+/// Checked per command because one flag means different things: `deleteBranch`
+/// on a merged pull request is the normal end of a merge, while on a worktree
+/// close it runs `git branch -D` on commits that may exist nowhere else.
+pub(super) fn refused_flag(cmd: &str, args: &Map<String, Value>) -> Option<&'static str> {
+    DESTRUCTIVE_FLAGS
+        .into_iter()
+        .filter(|flag| args.get(*flag).and_then(Value::as_bool) == Some(true))
+        .find(|flag| !reviewed_flag(cmd, flag))
+        .map(refusal)
+}
+
+fn reviewed_flag(cmd: &str, flag: &str) -> bool {
+    matches!(
+        (cmd, flag),
+        // The merge sheet offers this by default; the pull request is merged.
+        ("merge_pull_request", "deleteBranch")
+        // The backend refuses a worktree with uncommitted or unpushed work
+        // before removing anything, and the branch stays.
+        | ("close_workspace_with_worktree", "removeWorktree")
+    )
+}
+
+/// Refusals never say "use force" (the UI would offer to escalate), never
+/// read like the backend's dirty-worktree refusal (the Devices sweep keys on
+/// it) and never name an argument key.
+fn refusal(flag: &str) -> &'static str {
+    match flag {
+        "deleteBranch" => "web-remote: deleting a branch is only available in the Codemux desktop app",
+        "forceDelete" => "web-remote: force delete is only available in the Codemux desktop app",
+        _ => "web-remote: deleting worktree files is only available in the Codemux desktop app",
+    }
+}
 
 pub(super) fn allowed(cmd: &str) -> bool {
     matches!(
@@ -438,6 +483,49 @@ mod tests {
             "generate_workspace_title",
         ] {
             assert!(allowed(cmd), "{cmd}");
+        }
+    }
+
+    fn flags(args: serde_json::Value) -> Map<String, Value> {
+        args.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn destructive_flags_are_refused_per_command() {
+        const BRANCH: Option<&str> = Some("web-remote: deleting a branch is only available in the Codemux desktop app");
+        const FORCE: Option<&str> = Some("web-remote: force delete is only available in the Codemux desktop app");
+        const FILES: Option<&str> = Some("web-remote: deleting worktree files is only available in the Codemux desktop app");
+        let cases = [
+            ("close_workspace_with_worktree", serde_json::json!({"removeWorktree": true}), None),
+            ("close_workspace_with_worktree", serde_json::json!({"removeWorktree": true, "deleteBranch": true}), BRANCH),
+            ("close_workspace_with_worktree", serde_json::json!({"removeWorktree": true, "forceDelete": true}), FORCE),
+            ("close_workspace_with_worktree", serde_json::json!({"removeWorktree": false, "forceDelete": true}), FORCE),
+            ("close_workspace", serde_json::json!({"forceDelete": true}), FORCE),
+            ("close_workspace", serde_json::json!({"forceDelete": false}), None),
+            ("merge_pull_request", serde_json::json!({"deleteBranch": true}), None),
+            ("merge_pull_request", serde_json::json!({}), None),
+            ("future_command", serde_json::json!({"removeWorktree": true}), FILES),
+            ("future_command", serde_json::json!({"deleteWorktree": true}), FILES),
+            // Not a bool: Tauri rejects the argument type before the command runs.
+            ("close_workspace_with_worktree", serde_json::json!({"deleteBranch": "true"}), None),
+        ];
+        for (cmd, args, expected) in cases {
+            assert_eq!(refused_flag(cmd, &flags(args.clone())), expected, "{cmd} {args}");
+        }
+    }
+
+    #[test]
+    fn flag_refusals_never_invite_a_force_retry() {
+        for flag in DESTRUCTIVE_FLAGS {
+            let message = refusal(flag);
+            let lower = message.to_lowercase();
+            for phrase in ["use force", "uncommitted change", "unpushed commit"] {
+                assert!(!lower.contains(phrase), "{message:?} contains {phrase:?}");
+            }
+            assert!(message.contains("desktop app"), "{message:?}");
+            for key in DESTRUCTIVE_FLAGS {
+                assert!(!message.contains(key), "{message:?} names {key}");
+            }
         }
     }
 
