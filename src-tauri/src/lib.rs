@@ -2878,6 +2878,8 @@ fn build_core_app<R: tauri::Runtime>(
             mcp_connector::agent_connector_approve,
             mcp_connector::agent_connector_deny,
             mcp_connector::agent_connector_revoke,
+            mcp_connector::agent_connector_issue,
+            mcp_connector::agent_connector_revoke_all,
             commands::agent_chat_send_turn,
             commands::agent_chat_stage_image,
             commands::agent_chat_discard_staged_image,

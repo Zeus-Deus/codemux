@@ -1,12 +1,13 @@
 //! HTTP MCP and OAuth on the connector's own loopback listener (listener.rs).
 //! No paired-browser credentials.
 use super::{
-    callback_origin, changed, live, now_ms, parse_access, scope, validate_caller, McpConnectorState,
+    authority_changed, callback_origin, changed, live, now_ms, parse_access, scope,
+    validate_caller, McpConnectorState,
 };
 use super::{oauth, protocol};
 use crate::agent_control::{self, ControlCaller};
 use crate::database::{
-    mcp_connector::{NewMcpClient, NewMcpGrant},
+    mcp_connector::{NewMcpClient, NewMcpGrant, NewMcpRefresh, RefreshOutcome, RefreshRotation},
     DatabaseStore,
 };
 use axum::{
@@ -24,6 +25,28 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager, Runtime};
 
 const TOKEN_TTL_MS: i64 = 3_600_000;
+/// Each refresh issues a new 30-day token, so the window slides with use.
+pub(crate) const REFRESH_TTL_MS: i64 = 30 * 86_400_000;
+/// A spent refresh token presented again within this window fails without
+/// revoking: two processes sharing one stored token may refresh together.
+pub(crate) const REFRESH_REUSE_GRACE_MS: i64 = 30_000;
+const GRANT_TYPES: [&str; 2] = ["authorization_code", "refresh_token"];
+
+/// Access-token lifetime. Debug builds alone honour
+/// `CODEMUX_E2E_CONNECTOR_ACCESS_TTL_SECS` (5..=3600), so live tests can
+/// prove that real clients refresh.
+pub(crate) fn access_ttl_ms() -> i64 {
+    #[cfg(debug_assertions)]
+    if let Some(secs) = std::env::var("CODEMUX_E2E_CONNECTOR_ACCESS_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|secs| (5..=3600).contains(secs))
+    {
+        return secs * 1000;
+    }
+    TOKEN_TTL_MS
+}
+
 pub fn router<R: Runtime>() -> Router<AppHandle<R>> {
     Router::new()
         .route("/mcp", any(entry::<R>))
@@ -105,7 +128,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     let (scheme, token) = value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("Bearer")
         || !token
-            .strip_prefix("cmcp_")
+            .strip_prefix(oauth::ACCESS_PREFIX)
             .is_some_and(oauth::challenge_valid)
     {
         return None;
@@ -142,11 +165,10 @@ fn preflight<R: Runtime>(
             .mcp_grant_by_hash(&oauth::credential_hash(token), &resource, now_ms())
             .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "connector_unavailable"))?
             .ok_or_else(|| unauthorized(&issuer))?;
-        Some(ControlCaller::outside(
-            grant.client_id,
-            grant.id,
-            parse_access(&grant.access).map_err(|_| unauthorized(&issuer))?,
-        ))
+        let access = parse_access(&grant.access).map_err(|_| unauthorized(&issuer))?;
+        // A token's label, else the client's self-asserted name: attribution only.
+        let label = grant.label.unwrap_or(grant.client_name);
+        Some(ControlCaller::outside(grant.client_id, grant.id, access).labelled(Some(label)))
     } else {
         None
     };
@@ -235,7 +257,7 @@ async fn entry<R: Runtime>(
             } else {
                 json_response(
                     StatusCode::OK,
-                    json!({"issuer":ingress.issuer,"authorization_endpoint":format!("{}/oauth/mcp/authorize",ingress.issuer),"token_endpoint":format!("{}/oauth/mcp/token",ingress.issuer),"registration_endpoint":format!("{}/oauth/mcp/register",ingress.issuer),"response_types_supported":["code"],"grant_types_supported":["authorization_code"],"code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none"],"scopes_supported":oauth::SCOPES,"authorization_response_iss_parameter_supported":true}),
+                    json!({"issuer":ingress.issuer,"authorization_endpoint":format!("{}/oauth/mcp/authorize",ingress.issuer),"token_endpoint":format!("{}/oauth/mcp/token",ingress.issuer),"registration_endpoint":format!("{}/oauth/mcp/register",ingress.issuer),"response_types_supported":["code"],"grant_types_supported":GRANT_TYPES,"code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none"],"scopes_supported":oauth::SCOPES,"authorization_response_iss_parameter_supported":true}),
                 )
             }
         }
@@ -403,12 +425,12 @@ fn register<R: Runtime>(app: &AppHandle<R>, ingress: &Ingress, bytes: &[u8]) -> 
     }
     json_response(
         StatusCode::CREATED,
-        json!({"client_id":id,"client_id_issued_at":now/1000,"client_name":name,"redirect_uris":redirects,"token_endpoint_auth_method":"none","grant_types":["authorization_code"],"response_types":["code"],"scope":oauth::SCOPES.join(" ")}),
+        json!({"client_id":id,"client_id_issued_at":now/1000,"client_name":name,"redirect_uris":redirects,"token_endpoint_auth_method":"none","grant_types":GRANT_TYPES,"response_types":["code"],"scope":oauth::SCOPES.join(" ")}),
     )
 }
 
 fn waiting_html(name: &str, callback: &str, id: &str, nonce: &str) -> String {
-    format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"same-origin\"><title>Connect an agent to CodeMux</title></head><body><main><h1>Connect an outside agent</h1><p>The client calls itself <strong>{}</strong>. This name is untrusted and is not proof of identity.</p><p>Access will be delivered to <strong>{}</strong>. Check this callback host before approving.</p><p>Open CodeMux Settings → MCP → Outside agents and approve or deny this request. Access covers <strong>all workspaces</strong> on this instance, not just the focused workspace.</p><p>Read-only is the default. Supervised clients can start and control workers but cannot approve their own worker permission requests. <strong>Full access can authorize worker commands and filesystem changes.</strong></p><p>After the owner decides in CodeMux, press Continue. This browser cannot grant or increase access.</p><form action=\"/oauth/mcp/complete\" method=\"post\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><input type=\"hidden\" name=\"nonce\" value=\"{}\"><button type=\"submit\">Continue</button></form></main></body></html>",protocol::escaped(name),protocol::escaped(callback),protocol::escaped(id),protocol::escaped(nonce))
+    format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"same-origin\"><title>Connect an agent to CodeMux</title></head><body><main><h1>Connect an outside agent</h1><p>The client calls itself <strong>{}</strong>. This name is untrusted and is not proof of identity.</p><p>Access will be delivered to <strong>{}</strong>. Check this callback host before approving.</p><p>Approve or deny this request in CodeMux: open Settings → Connections → Outside assistants, or run <code>codemux connector pending</code> on that machine. Access covers <strong>all workspaces</strong> on this instance, not just the focused workspace.</p><p>Read-only is the default. Supervised clients can start and control workers but cannot approve their own worker permission requests. <strong>Full access can authorize worker commands and filesystem changes.</strong></p><p>After the owner decides in CodeMux, press Continue. This browser cannot grant or increase access.</p><form action=\"/oauth/mcp/complete\" method=\"post\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><input type=\"hidden\" name=\"nonce\" value=\"{}\"><button type=\"submit\">Continue</button></form></main></body></html>",protocol::escaped(name),protocol::escaped(callback),protocol::escaped(id),protocol::escaped(nonce))
 }
 fn wait_cookie(id: &str, nonce: &str, issuer: &str, clear: bool) -> Result<HeaderValue, String> {
     HeaderValue::from_str(&format!(
@@ -545,13 +567,20 @@ fn token<R: Runtime>(
     if headers.contains_key(header::AUTHORIZATION) {
         return failure(StatusCode::BAD_REQUEST, "invalid_client");
     }
-    let input: oauth::TokenInput = match parse_form(bytes) {
-        Ok(v) => v,
-        Err(_) => return failure(StatusCode::BAD_REQUEST, "invalid_request"),
+    let Ok(fields) = protocol::form_json(bytes) else {
+        return failure(StatusCode::BAD_REQUEST, "invalid_request");
     };
-    if input.grant_type != "authorization_code" {
-        return failure(StatusCode::BAD_REQUEST, "unsupported_grant_type");
+    match fields.get("grant_type").and_then(Value::as_str) {
+        Some("authorization_code") => exchange_code(app, ingress, fields),
+        Some("refresh_token") => refresh(app, ingress, fields),
+        Some(_) => failure(StatusCode::BAD_REQUEST, "unsupported_grant_type"),
+        None => failure(StatusCode::BAD_REQUEST, "invalid_request"),
     }
+}
+fn exchange_code<R: Runtime>(app: &AppHandle<R>, ingress: &Ingress, fields: Value) -> Response {
+    let Ok(input) = serde_json::from_value::<oauth::TokenInput>(fields) else {
+        return failure(StatusCode::BAD_REQUEST, "invalid_request");
+    };
     let result: Result<Value, String> = (|| {
         let state = app.state::<McpConnectorState>();
         let mut auth = state.auth.lock().map_err(|_| "Connector unavailable")?;
@@ -561,18 +590,93 @@ fn token<R: Runtime>(
             return Err("Unknown client".into());
         }
         let now = now_ms();
-        auth.exchange(&input,&ingress.resource,now,|code| {
-            let token = format!("cmcp_{}",oauth::opaque());
-            db.mcp_mint_grant(NewMcpGrant { id:oauth::opaque(), client_id:code.authorization.client_id.clone(), token_hash:oauth::credential_hash(&token), redirect_uri:code.authorization.redirect_uri.clone(), resource:code.authorization.resource.clone(), access:code.access.clone(), created_at:now, expires_at:now+TOKEN_TTL_MS })?;
-            Ok(json!({"access_token":token,"token_type":"Bearer","expires_in":TOKEN_TTL_MS/1000,"scope":scope(&code.access)}))
+        let ttl = access_ttl_ms();
+        auth.exchange(&input, &ingress.resource, now, |code| {
+            let token = oauth::access_token();
+            let refresh = oauth::refresh_token();
+            db.mcp_mint_grant_with_refresh(
+                NewMcpGrant {
+                    id: oauth::opaque(),
+                    client_id: code.authorization.client_id.clone(),
+                    token_hash: oauth::credential_hash(&token),
+                    redirect_uri: code.authorization.redirect_uri.clone(),
+                    resource: code.authorization.resource.clone(),
+                    access: code.access.clone(),
+                    created_at: now,
+                    expires_at: now + ttl,
+                },
+                Some(NewMcpRefresh {
+                    token_hash: oauth::credential_hash(&refresh),
+                    expires_at: now + REFRESH_TTL_MS,
+                }),
+            )?;
+            Ok(json!({"access_token":token,"token_type":"Bearer","expires_in":ttl/1000,"refresh_token":refresh,"scope":scope(&code.access)}))
         })
     })();
     match result {
         Ok(value) => {
-            changed(app);
+            // The mint revoked this client's previous grant.
+            authority_changed(app);
             json_response(StatusCode::OK, value)
         }
         Err(_) => failure(StatusCode::BAD_REQUEST, "invalid_grant"),
+    }
+}
+/// `grant_type=refresh_token`: rotate the presented token. The grant id and
+/// principal stay, so receipts, queued turns and in-flight work survive it.
+fn refresh<R: Runtime>(app: &AppHandle<R>, ingress: &Ingress, fields: Value) -> Response {
+    let Ok(input) = serde_json::from_value::<oauth::RefreshInput>(fields) else {
+        return failure(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let presented = match input.validate(&ingress.resource) {
+        Ok(hash) => hash,
+        Err(code) => return failure(StatusCode::BAD_REQUEST, code),
+    };
+    let token = oauth::access_token();
+    let refresh = oauth::refresh_token();
+    let ttl = access_ttl_ms();
+    let outcome = {
+        let state = app.state::<McpConnectorState>();
+        let Ok(mut auth) = state.auth.lock() else {
+            return failure(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
+        };
+        // A grant is bound to the address it was issued for.
+        if recheck(app, ingress, &mut auth).is_err() {
+            return failure(StatusCode::BAD_REQUEST, "invalid_grant");
+        }
+        let now = now_ms();
+        app.state::<DatabaseStore>().mcp_rotate_refresh(RefreshRotation {
+            client_id: &input.client_id,
+            presented_hash: &presented,
+            resource: &ingress.resource,
+            now,
+            access_hash: oauth::credential_hash(&token),
+            access_expires_at: now + ttl,
+            refresh: NewMcpRefresh {
+                token_hash: oauth::credential_hash(&refresh),
+                expires_at: now + REFRESH_TTL_MS,
+            },
+            reuse_grace_ms: REFRESH_REUSE_GRACE_MS,
+        })
+    };
+    match outcome {
+        Ok(RefreshOutcome::Rotated(grant)) => {
+            changed(app);
+            json_response(
+                StatusCode::OK,
+                json!({"access_token":token,"token_type":"Bearer","expires_in":ttl/1000,"refresh_token":refresh,"scope":scope(&grant.access)}),
+            )
+        }
+        Ok(RefreshOutcome::FamilyRevoked { client_name, .. }) => {
+            log::warn!(
+                "[codemux::mcp_connector] a spent refresh token for {client_name:?} came back; its sign-in was revoked"
+            );
+            authority_changed(app);
+            failure(StatusCode::BAD_REQUEST, "invalid_grant")
+        }
+        Ok(RefreshOutcome::Invalid) => failure(StatusCode::BAD_REQUEST, "invalid_grant"),
+        // Nothing rotated, so the client may retry with the same token.
+        Err(_) => failure(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
     }
 }
 
@@ -901,6 +1005,13 @@ mod tests {
     }
 
     async fn consent_and_exchange(f: &Fixture, client_id: &str, access: ControlAccess) -> String {
+        consent_tokens(f, client_id, access).await["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+    /// The whole token response of a fresh owner-approved sign-in.
+    async fn consent_tokens(f: &Fixture, client_id: &str, access: ControlAccess) -> Value {
         let origin = format!("http://127.0.0.1:{}", f.port);
         let resource = format!("{origin}/mcp");
         let callback = "https://client.example/cb";
@@ -999,10 +1110,7 @@ mod tests {
         )
         .await;
         assert_eq!(exchanged.status(), StatusCode::OK);
-        value(exchanged).await["access_token"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        value(exchanged).await
     }
 
     #[tokio::test]
@@ -1658,7 +1766,7 @@ mod tests {
         assert_eq!(metadata["issuer"], origin);
         assert_eq!(
             metadata["grant_types_supported"],
-            json!(["authorization_code"])
+            json!(["authorization_code", "refresh_token"])
         );
         assert_eq!(
             metadata["token_endpoint_auth_methods_supported"],
@@ -1825,7 +1933,9 @@ mod tests {
         assert!(connected.pending.is_empty());
         assert_eq!(connected.clients.len(), 1);
         assert_eq!(connected.clients[0].access, ControlAccess::ReadOnly);
-        assert!(token.get("refresh_token").is_none());
+        assert!(token["refresh_token"]
+            .as_str()
+            .is_some_and(|t| t.starts_with(oauth::REFRESH_PREFIX)));
         assert_eq!(
             invoke(&f, make(verifier)).await.status(),
             StatusCode::BAD_REQUEST
@@ -2169,7 +2279,245 @@ mod tests {
         }
     }
 
-    // ── The own listener ──
+    // ── Refresh tokens, personal tokens, the own listener ────────────────
+
+    fn refresh_request(f: &Fixture, client_id: &str, refresh: &str) -> axum::http::Request<Body> {
+        form_request(
+            f,
+            "/oauth/mcp/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", client_id),
+                ("refresh_token", refresh),
+            ],
+            None,
+        )
+    }
+    async fn refreshed(f: &Fixture, client_id: &str, refresh: &str) -> (StatusCode, Value) {
+        let response = invoke(f, refresh_request(f, client_id, refresh)).await;
+        (response.status(), value(response).await)
+    }
+    async fn ping(f: &Fixture, token: &str) -> StatusCode {
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        invoke(f, request(f, "/mcp", "POST", body, Some(token)))
+            .await
+            .status()
+    }
+    /// The connector plus a chat (`thread`) that thread tools can target. Wait
+    /// signals are process-wide and tagged by thread id, so each test names its
+    /// own worker and never wakes another test's waits.
+    async fn worker_fixture(thread: &str) -> (
+        Fixture,
+        std::sync::Arc<receipt_mock::MockAgentProvider>,
+        tempfile::TempDir,
+        String,
+    ) {
+        let provider = std::sync::Arc::new(receipt_mock::MockAgentProvider::new(
+            crate::agent_provider::ProviderKind::Claude,
+        ));
+        let (app, root, workspace, _pane) =
+            crate::agent_control::guard_tests::fixture(provider.clone(), thread).await;
+        app.manage(crate::web_remote::WebRemoteState::default());
+        app.manage(McpConnectorState::default());
+        let port = listen(app.handle());
+        (Fixture { app, port }, provider, root, workspace)
+    }
+    fn worker_runs(f: &Fixture, thread: &str) {
+        f.app.state::<agent_control::NativeControlState>().observe_event(
+            &crate::agent_provider::ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: crate::agent_provider::ThreadId(thread.into()),
+                status: crate::agent_provider::SessionStatus::Running {
+                    active_turn: crate::agent_provider::TurnId("busy-run".into()),
+                },
+            },
+        );
+    }
+    fn issue(f: &Fixture, label: &str, access: ControlAccess) -> super::super::IssuedToken {
+        super::super::agent_connector_issue(f.app.handle().clone(), label.into(), access, None)
+            .unwrap()
+    }
+    fn error_code(result: &Value) -> &str {
+        result["structuredContent"]["error"]["code"].as_str().unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_grant_rotates_and_keeps_receipts_and_in_flight_authority() {
+        let worker = "refresh-worker";
+        let (f, provider, _root, workspace) = worker_fixture(worker).await;
+        let _seed = grant(&f);
+        let first = consent_tokens(&f, "fixture-client", ControlAccess::FullAccess).await;
+        let (a1, r1) = (first["access_token"].as_str().unwrap(), first["refresh_token"].as_str().unwrap());
+        assert!(r1.starts_with(oauth::REFRESH_PREFIX));
+        let caller = authenticated_caller(&f, a1);
+        assert_eq!(caller.label.as_deref(), Some("synthetic"), "the client's name attributes its work");
+        worker_runs(&f, worker);
+        let args = json!({"workspace_id":workspace,"thread_id":worker,"client_request_id":"before-refresh"});
+        let receipt = call_tool(&f, a1, "thread_interrupt", args.clone()).await;
+        assert_ne!(receipt["isError"], true, "{receipt}");
+        let id = receipt["structuredContent"]["operation_id"].as_str().unwrap().to_string();
+        let frozen = settled_receipt(&f, a1, &id).await;
+        let (status, second) = refreshed(&f, "fixture-client", r1).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        let (a2, r2) = (second["access_token"].as_str().unwrap(), second["refresh_token"].as_str().unwrap());
+        assert_ne!(a2, a1);
+        assert_ne!(r2, r1);
+        assert_eq!(second["token_type"], "Bearer");
+        assert_eq!(second["expires_in"], 3600);
+        assert_eq!(second["scope"], "codemux:read codemux:full");
+        assert_eq!(ping(&f, a1).await, StatusCode::UNAUTHORIZED, "the old access token stops working");
+        assert_eq!(ping(&f, a2).await, StatusCode::OK);
+        let refreshed_caller = authenticated_caller(&f, a2);
+        assert_eq!(refreshed_caller.grant_id, caller.grant_id, "a refresh keeps the grant");
+        assert_eq!(refreshed_caller.principal, caller.principal);
+        assert!(validate_caller(f.app.handle(), &caller).is_ok(), "work admitted before the refresh keeps its authority");
+        let visible = call_tool(&f, a2, "operation_status", json!({"operation_id":id})).await;
+        assert_eq!(visible["structuredContent"], frozen);
+        // A retry after the refresh replays the receipt instead of acting twice.
+        let retry = call_tool(&f, a2, "thread_interrupt", args).await;
+        assert_eq!(retry["structuredContent"]["operation_id"], id.as_str(), "{retry}");
+        let interrupts = provider
+            .calls
+            .snapshot()
+            .iter()
+            .filter(|c| matches!(c, receipt_mock::MockCall::InterruptTurn(..)))
+            .count();
+        assert_eq!(interrupts, 1);
+        let status = super::super::agent_connector_status(f.app.handle().clone()).unwrap();
+        let client = &status.clients[0];
+        assert!(client.renews && client.kind == super::super::ClientKind::Oauth);
+        let lapses = chrono::DateTime::parse_from_rfc3339(&client.expires_at).unwrap().timestamp_millis();
+        assert!(lapses > now_ms() + REFRESH_TTL_MS - 60_000, "a renewing sign-in lapses with its refresh token");
+    }
+
+    #[tokio::test]
+    async fn refresh_reuse_is_answered_with_invalid_grant_and_a_revoked_family_needs_new_consent() {
+        let f = fixture().await;
+        let _seed = grant(&f);
+        let first = consent_tokens(&f, "fixture-client", ControlAccess::ReadOnly).await;
+        let r1 = first["refresh_token"].as_str().unwrap();
+        let (status, second) = refreshed(&f, "fixture-client", r1).await;
+        assert_eq!(status, StatusCode::OK);
+        let r2 = second["refresh_token"].as_str().unwrap();
+        // Inside the grace window a spent token fails without harm.
+        let (status, reuse) = refreshed(&f, "fixture-client", r1).await;
+        assert_eq!((status, reuse), (StatusCode::BAD_REQUEST, json!({"error":"invalid_grant"})));
+        let (status, third) = refreshed(&f, "fixture-client", r2).await;
+        assert_eq!(status, StatusCode::OK, "the latest token still rotates");
+        let (a3, r3) = (third["access_token"].as_str().unwrap(), third["refresh_token"].as_str().unwrap());
+        assert_eq!(ping(&f, a3).await, StatusCode::OK);
+        // After the grace window, a spent token revokes the whole family.
+        let resource = format!("http://127.0.0.1:{}/mcp", f.port);
+        let now = now_ms();
+        let outcome = f
+            .app
+            .state::<DatabaseStore>()
+            .mcp_rotate_refresh(RefreshRotation {
+                client_id: "fixture-client",
+                presented_hash: &oauth::credential_hash(r2),
+                resource: &resource,
+                now: now + REFRESH_REUSE_GRACE_MS + 1,
+                access_hash: oauth::credential_hash(&oauth::access_token()),
+                access_expires_at: now + TOKEN_TTL_MS,
+                refresh: NewMcpRefresh {
+                    token_hash: oauth::credential_hash(&oauth::refresh_token()),
+                    expires_at: now + REFRESH_TTL_MS,
+                },
+                reuse_grace_ms: REFRESH_REUSE_GRACE_MS,
+            })
+            .unwrap();
+        assert!(matches!(outcome, RefreshOutcome::FamilyRevoked { .. }));
+        assert_eq!(ping(&f, a3).await, StatusCode::UNAUTHORIZED);
+        let (status, _) = refreshed(&f, "fixture-client", r3).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a revoked family needs a new owner approval");
+        assert!(super::super::agent_connector_status(f.app.handle().clone()).unwrap().clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_rejects_mixed_unknown_and_header_authenticated_refresh_requests() {
+        let f = fixture().await;
+        let _seed = grant(&f);
+        let tokens = consent_tokens(&f, "fixture-client", ControlAccess::ReadOnly).await;
+        let (access, refresh) = (tokens["access_token"].as_str().unwrap(), tokens["refresh_token"].as_str().unwrap());
+        let resource = format!("http://127.0.0.1:{}/mcp", f.port);
+        let base = [("grant_type", "refresh_token"), ("client_id", "fixture-client"), ("refresh_token", refresh)];
+        let with = |extra: &[(&'static str, &'static str)]| -> Vec<(&str, &str)> {
+            base.iter().copied().chain(extra.iter().copied()).collect()
+        };
+        let cases: Vec<(Vec<(&str, &str)>, &str)> = vec![
+            (with(&[("code", "x"), ("code_verifier", "y")]), "invalid_request"),
+            (with(&[("redirect_uri", "https://client.example/cb")]), "invalid_request"),
+            (vec![("grant_type", "password"), ("client_id", "fixture-client")], "unsupported_grant_type"),
+            (vec![("client_id", "fixture-client"), ("refresh_token", refresh)], "invalid_request"),
+            (vec![("grant_type", "refresh_token"), ("client_id", "fixture-client"), ("refresh_token", access)], "invalid_grant"),
+            (with(&[("resource", "https://other.example/mcp")]), "invalid_grant"),
+            (with(&[("scope", "codemux:admin")]), "invalid_scope"),
+            (vec![("grant_type", "refresh_token"), ("client_id", "other-client"), ("refresh_token", refresh)], "invalid_grant"),
+        ];
+        for (pairs, error) in cases {
+            let response = invoke(&f, form_request(&f, "/oauth/mcp/token", &pairs, None)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{pairs:?}");
+            assert_eq!(value(response).await, json!({"error":error}), "{pairs:?}");
+        }
+        let mut header = refresh_request(&f, "fixture-client", refresh);
+        header
+            .headers_mut()
+            .insert(header::AUTHORIZATION, "Basic Zm9vOmJhcg==".parse().unwrap());
+        let response = invoke(&f, header).await;
+        assert_eq!(value(response).await, json!({"error":"invalid_client"}));
+        // A refresh token is never a bearer.
+        assert_eq!(ping(&f, refresh).await, StatusCode::UNAUTHORIZED);
+        // None of the refused requests spent the token.
+        let (status, ok) = refreshed(&f, "fixture-client", refresh).await;
+        assert_eq!(status, StatusCode::OK, "{ok}");
+        let explicit = [
+            ("grant_type", "refresh_token"),
+            ("client_id", "fixture-client"),
+            ("refresh_token", ok["refresh_token"].as_str().unwrap()),
+            ("resource", resource.as_str()),
+            ("scope", "codemux:read"),
+        ];
+        let response = invoke(&f, form_request(&f, "/oauth/mcp/token", &explicit, None)).await;
+        assert_eq!(response.status(), StatusCode::OK, "the canonical resource and a known scope are accepted");
+    }
+
+    #[tokio::test]
+    async fn metadata_and_registration_advertise_the_refresh_grant() {
+        let f = fixture().await;
+        let metadata = value(invoke(&f, request(&f, "/.well-known/oauth-authorization-server", "GET", "", None)).await).await;
+        assert_eq!(metadata["grant_types_supported"], json!(["authorization_code", "refresh_token"]));
+        let registered = invoke(
+            &f,
+            request(&f, "/oauth/mcp/register", "POST", r#"{"client_name":"Refreshing client","redirect_uris":["https://client.example/cb"]}"#, None),
+        )
+        .await;
+        assert_eq!(registered.status(), StatusCode::CREATED);
+        assert_eq!(value(registered).await["grant_types"], json!(["authorization_code", "refresh_token"]));
+    }
+
+    #[tokio::test]
+    async fn personal_token_authenticates_mcp_under_its_label_principal() {
+        let f = fixture().await;
+        let issued = issue(&f, "hermes-bot", ControlAccess::Supervised);
+        assert_eq!(issued.mcp_url, format!("http://127.0.0.1:{}/mcp", f.port));
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"hermes","version":"1"}}}"#;
+        let response = invoke(&f, request(&f, "/mcp", "POST", init, Some(&issued.token))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let list = value(invoke(&f, request(&f, "/mcp", "POST", r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, Some(&issued.token))).await).await;
+        let names: Vec<_> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"thread_launch"), "{names:?}");
+        let workspaces = call_tool(&f, &issued.token, "workspace_list", json!({})).await;
+        assert_ne!(workspaces["isError"], true, "{workspaces}");
+        let caller = authenticated_caller(&f, &issued.token);
+        assert_eq!(caller.principal, format!("mcp-client:{}", issued.client_id));
+        assert_eq!(caller.label.as_deref(), Some("hermes-bot"));
+        assert_eq!(caller.access, ControlAccess::Supervised);
+        let reader = issue(&f, "reader", ControlAccess::ReadOnly);
+        let stop = call_tool(&f, &reader.token, "thread_stop", json!({"workspace_id":"missing","thread_id":"missing","client_request_id":"r"})).await;
+        assert_eq!(error_code(&stop), "access_denied");
+        super::super::agent_connector_revoke(f.app.handle().clone(), issued.client_id.clone()).unwrap();
+        assert_eq!(ping(&f, &issued.token).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(ping(&f, &reader.token).await, StatusCode::OK, "revoking one label leaves the others");
+    }
 
     #[tokio::test]
     async fn connector_routes_are_not_served_by_the_web_remote_router() {
@@ -2193,5 +2541,28 @@ mod tests {
                 assert!(!text.contains(leaked), "web remote served {path}: {leaked}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn waiting_page_names_desktop_and_cli_approval() {
+        let f = fixture().await;
+        let _seed = grant(&f);
+        let origin = format!("http://127.0.0.1:{}", f.port);
+        let mut authorize = url::Url::parse(&format!("{origin}/oauth/mcp/authorize")).unwrap();
+        authorize.query_pairs_mut().extend_pairs([
+            ("client_id", "fixture-client"),
+            ("redirect_uri", "https://client.example/cb"),
+            ("response_type", "code"),
+            ("resource", format!("{origin}/mcp").as_str()),
+            ("code_challenge_method", "S256"),
+            ("code_challenge", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
+        ]);
+        let path = format!("/oauth/mcp/authorize?{}", authorize.query().unwrap());
+        let waiting = invoke(&f, request(&f, &path, "GET", "", None)).await;
+        assert_eq!(waiting.status(), StatusCode::OK);
+        let html = String::from_utf8(axum::body::to_bytes(waiting.into_body(), MAX_OAUTH_BODY).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("Settings → Connections → Outside assistants"), "{html}");
+        assert!(html.contains("<code>codemux connector pending</code>"), "{html}");
+        assert!(!html.contains("Outside agents") && !html.contains("Settings → MCP"), "stale path: {html}");
     }
 }

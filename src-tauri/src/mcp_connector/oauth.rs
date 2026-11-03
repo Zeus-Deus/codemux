@@ -512,6 +512,13 @@ impl AuthState {
         self.pending.retain(|_, p| p.authorization.client_id != id);
         self.codes.retain(|_, c| c.authorization.client_id != id);
     }
+    /// Revoke all: owner approvals not yet exchanged for a token (approved
+    /// requests and unredeemed codes) end too. Undecided requests stay.
+    pub fn withdraw_approvals(&mut self) {
+        self.pending
+            .retain(|_, p| !matches!(p.decision, Some(Some(_))));
+        self.codes.clear();
+    }
 }
 
 fn redirect_response(authorization: &Authorization, code: Option<&str>) -> String {

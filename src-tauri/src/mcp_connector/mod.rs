@@ -10,7 +10,10 @@ pub use http::router;
 use oauth::protocol;
 
 use crate::agent_control::{ControlAccess, ControlCaller, ControlError, ErrorCode};
-use crate::database::DatabaseStore;
+use crate::database::{
+    mcp_connector::{NewPersonalToken, PERSONAL_TOKEN_DEFAULT_TTL_MS},
+    DatabaseStore,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
@@ -68,16 +71,33 @@ pub struct ConnectorPending {
     pub expires_at: String,
     pub phase: oauth::AuthorizationPhase,
     pub access: Option<ControlAccess>,
+    /// The owner approved this client before: its sign-in lapsed or was revoked.
+    pub reconnecting: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientKind {
+    /// An assistant that signed in through OAuth.
+    Oauth,
+    /// A labelled personal token.
+    Token,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectorClient {
     pub id: String,
     pub client_name: String,
-    pub callback_origin: String,
+    /// `None` for tokens, which have no callback.
+    pub callback_origin: Option<String>,
     pub access: ControlAccess,
     pub created_at: String,
+    /// When access lapses if unused: a renewing sign-in's refresh expiry,
+    /// otherwise the token's own expiry.
     pub expires_at: String,
+    pub kind: ClientKind,
+    pub label: Option<String>,
+    /// The sign-in renews itself with a refresh token.
+    pub renews: bool,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,6 +117,22 @@ pub struct ConnectorStatus {
     pub revoked_grants: Option<usize>,
     pub pending: Vec<ConnectorPending>,
     pub clients: Vec<ConnectorClient>,
+}
+
+/// A personal token, shown once.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuedToken {
+    pub token: String,
+    pub client_id: String,
+    pub label: String,
+    pub access: ControlAccess,
+    pub expires_at: String,
+    /// `{issuer}/mcp`: the public origin's when one is saved.
+    pub mcp_url: String,
+    pub local_url: String,
+    /// A live token for this label stopped working.
+    pub replaced: bool,
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -340,6 +376,9 @@ pub fn agent_connector_status<R: Runtime>(app: AppHandle<R>) -> Result<Connector
                 expires_at: timestamp(p.expires_at),
                 phase,
                 access: access.map(parse_access).transpose()?,
+                reconnecting: db
+                    .mcp_client_approved_at(&p.authorization.client_id)?
+                    .is_some(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -348,13 +387,22 @@ pub fn agent_connector_status<R: Runtime>(app: AppHandle<R>) -> Result<Connector
         .mcp_list_grants(now)?
         .into_iter()
         .map(|g| {
+            let kind = if g.label.is_some() {
+                ClientKind::Token
+            } else {
+                ClientKind::Oauth
+            };
             Ok(ConnectorClient {
                 id: g.client_id,
                 client_name: g.client_name,
-                callback_origin: callback_origin(&g.redirect_uri),
+                callback_origin: (kind == ClientKind::Oauth)
+                    .then(|| callback_origin(&g.redirect_uri)),
                 access: parse_access(&g.access)?,
                 created_at: timestamp(g.created_at),
-                expires_at: timestamp(g.expires_at),
+                expires_at: timestamp(g.expires_at.max(g.refresh_expires_at.unwrap_or(0))),
+                kind,
+                renews: g.refresh_expires_at.is_some(),
+                label: g.label,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -389,6 +437,60 @@ pub fn agent_connector_set_config<R: Runtime>(
             port,
         },
     )
+}
+
+/// Issue a personal token for a headless bot, or rotate the label's token.
+/// Needs the switch on, not a bound listener: the issuer comes from config.
+#[tauri::command]
+pub fn agent_connector_issue<R: Runtime>(
+    app: AppHandle<R>,
+    label: String,
+    access: ControlAccess,
+    expires_in_hours: Option<u32>,
+) -> Result<IssuedToken, String> {
+    let lifetime = expires_in_hours
+        .map(|hours| i64::from(hours) * 3_600_000)
+        .unwrap_or(PERSONAL_TOKEN_DEFAULT_TTL_MS);
+    let issued = {
+        let state = app.state::<McpConnectorState>();
+        let mut auth = state.auth.lock().map_err(|_| "Connector unavailable")?;
+        let db = app.state::<DatabaseStore>();
+        let cfg = config(&db)?;
+        if !cfg.enabled {
+            return Err("Turn the connector on first: codemux connector enable".into());
+        }
+        let port = issuer_port(&app, &cfg);
+        let mcp_url = format!("{}/mcp", issuer(&cfg, port));
+        let token = oauth::access_token();
+        let now = now_ms();
+        let minted = db.mcp_issue_personal_token(NewPersonalToken {
+            label,
+            access: access_name(access).into(),
+            resource: mcp_url.clone(),
+            token_hash: oauth::credential_hash(&token),
+            now,
+            expires_at: now + lifetime,
+            protected_clients: auth.protected_clients(now),
+        })?;
+        // The store keeps a label's first spelling; show that one.
+        let grant = db
+            .mcp_list_grants(now)?
+            .into_iter()
+            .find(|g| g.id == minted.grant_id)
+            .ok_or("Token persistence failed")?;
+        IssuedToken {
+            token,
+            client_id: minted.client_id,
+            label: grant.label.unwrap_or(grant.client_name),
+            access,
+            expires_at: timestamp(grant.expires_at),
+            mcp_url,
+            local_url: local_url(port),
+            replaced: minted.replaced,
+        }
+    };
+    authority_changed(&app);
+    Ok(issued)
 }
 
 #[tauri::command]
@@ -435,11 +537,24 @@ pub fn agent_connector_revoke<R: Runtime>(
     authority_changed(&app);
     Ok(())
 }
+/// The incident switch: every OAuth sign-in and personal token stops working,
+/// and approvals not yet exchanged for a token are withdrawn.
+#[tauri::command]
+pub fn agent_connector_revoke_all<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    {
+        let state = app.state::<McpConnectorState>();
+        let mut auth = state.auth.lock().map_err(|_| "Connector unavailable")?;
+        app.state::<DatabaseStore>().mcp_revoke_all()?;
+        auth.withdraw_approvals();
+    }
+    authority_changed(&app);
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::mcp_connector::{NewMcpClient, NewMcpGrant};
+    use crate::database::mcp_connector::{NewMcpClient, NewMcpGrant, PERSONAL_CLIENT_PREFIX};
     use std::time::{Duration, Instant};
     use tauri::{Listener, Manager};
 
@@ -644,6 +759,135 @@ mod tests {
     }
 
     #[test]
+    fn revoke_all_revokes_oauth_grants_and_personal_tokens() {
+        let app = app();
+        let handle = app.handle();
+        let port = free_port();
+        set(handle, true, None, Some(port)).unwrap();
+        let issuer = format!("http://127.0.0.1:{port}");
+        let resource = format!("{issuer}/mcp");
+        let oauth_caller = approved_client(handle, "oauth-client", &resource);
+        let token = agent_connector_issue(handle.clone(), "bot".into(), ControlAccess::Supervised, None)
+            .unwrap();
+        let db = handle.state::<DatabaseStore>();
+        let token_grant = db
+            .mcp_grant_by_hash(&oauth::credential_hash(&token.token), &resource, now_ms())
+            .unwrap()
+            .unwrap();
+        let token_caller = ControlCaller::outside(
+            token.client_id.clone(),
+            token_grant.id,
+            ControlAccess::Supervised,
+        );
+        assert!(validate_caller(handle, &token_caller).is_ok());
+        let approved = begin(handle, "oauth-client", &issuer);
+        agent_connector_approve(handle.clone(), approved.clone(), ControlAccess::FullAccess).unwrap();
+        let awaiting = begin(handle, "oauth-client", &issuer);
+        agent_connector_revoke_all(handle.clone()).unwrap();
+        let status = agent_connector_status(handle.clone()).unwrap();
+        assert!(status.clients.is_empty());
+        for caller in [&oauth_caller, &token_caller] {
+            assert_eq!(validate_caller(handle, caller).unwrap_err().code, ErrorCode::GrantRevoked);
+        }
+        assert!(db
+            .mcp_grant_by_hash(&oauth::credential_hash(&token.token), &resource, now_ms())
+            .unwrap()
+            .is_none());
+        let pending: Vec<_> = status.pending.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(pending, [awaiting.as_str()], "an approval not yet exchanged is withdrawn");
+        assert!(status.enabled, "revoke all does not turn the connector off");
+        set(handle, false, None, None).unwrap();
+    }
+
+    #[test]
+    fn pending_requests_from_previously_approved_clients_are_marked_reconnecting() {
+        let app = app();
+        let handle = app.handle();
+        let port = free_port();
+        set(handle, true, None, Some(port)).unwrap();
+        let issuer = format!("http://127.0.0.1:{port}");
+        approved_client(handle, "returning-client", &format!("{issuer}/mcp"));
+        agent_connector_revoke(handle.clone(), "returning-client".into()).unwrap();
+        let now = now_ms();
+        handle
+            .state::<DatabaseStore>()
+            .mcp_register_client(
+                NewMcpClient {
+                    id: "new-client".into(),
+                    name: "Synthetic outside agent".into(),
+                    redirects: vec!["https://client.example/callback".into()],
+                    created_at: now,
+                },
+                now,
+            )
+            .unwrap();
+        let returning = begin(handle, "returning-client", &issuer);
+        let fresh = begin(handle, "new-client", &issuer);
+        let status = agent_connector_status(handle.clone()).unwrap();
+        let reconnecting = |id: &str| status.pending.iter().find(|p| p.id == id).unwrap().reconnecting;
+        assert!(reconnecting(&returning));
+        assert!(!reconnecting(&fresh));
+        set(handle, false, None, None).unwrap();
+    }
+
+    #[test]
+    fn issue_requires_an_enabled_connector_but_not_a_bound_listener() {
+        let app = app();
+        let handle = app.handle();
+        let off = agent_connector_issue(handle.clone(), "ci-bot".into(), ControlAccess::Supervised, None);
+        assert_eq!(off.err().as_deref(), Some("Turn the connector on first: codemux connector enable"));
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        assert!(!set(handle, true, None, Some(port)).unwrap().listener_running);
+        let issued =
+            agent_connector_issue(handle.clone(), "ci-bot".into(), ControlAccess::Supervised, Some(1)).unwrap();
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        assert!(issued.token.starts_with(oauth::ACCESS_PREFIX));
+        assert!(issued.client_id.starts_with(PERSONAL_CLIENT_PREFIX));
+        assert_eq!((issued.label.as_str(), issued.access), ("ci-bot", ControlAccess::Supervised));
+        assert_eq!((issued.mcp_url.as_str(), issued.local_url.as_str()), (url.as_str(), url.as_str()));
+        assert!(!issued.replaced);
+        let expires = chrono::DateTime::parse_from_rfc3339(&issued.expires_at).unwrap().timestamp_millis();
+        assert!((expires - now_ms() - 3_600_000).abs() < 60_000, "{}", issued.expires_at);
+        let db = handle.state::<DatabaseStore>();
+        assert!(db
+            .mcp_grant_by_hash(&oauth::credential_hash(&issued.token), &url, now_ms())
+            .unwrap()
+            .is_some());
+        // Reissuing a label rotates only its token and keeps its first spelling.
+        let again =
+            agent_connector_issue(handle.clone(), " CI-bot ".into(), ControlAccess::ReadOnly, None).unwrap();
+        assert!(again.replaced);
+        assert_eq!((again.client_id.as_str(), again.label.as_str()), (issued.client_id.as_str(), "ci-bot"));
+        assert!(db
+            .mcp_grant_by_hash(&oauth::credential_hash(&issued.token), &url, now_ms())
+            .unwrap()
+            .is_none());
+        let status = serde_json::to_value(agent_connector_status(handle.clone()).unwrap()).unwrap();
+        assert_eq!(
+            status["clients"][0],
+            serde_json::json!({
+                "id": issued.client_id, "clientName": "ci-bot", "callbackOrigin": null,
+                "access": "read_only", "createdAt": status["clients"][0]["createdAt"],
+                "expiresAt": status["clients"][0]["expiresAt"], "kind": "token",
+                "label": "ci-bot", "renews": false,
+            })
+        );
+        let text = status.to_string();
+        assert!(!text.contains(&issued.token) && !text.contains(&again.token), "a token is shown only once");
+        let issued = serde_json::to_value(&again).unwrap();
+        let keys: std::collections::BTreeSet<_> = issued.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["access", "clientId", "expiresAt", "label", "localUrl", "mcpUrl", "replaced", "token"].into()
+        );
+        assert!(agent_connector_issue(handle.clone(), "-bad".into(), ControlAccess::ReadOnly, None).is_err());
+        assert!(agent_connector_issue(handle.clone(), "bot".into(), ControlAccess::ReadOnly, Some(0)).is_err());
+        assert!(agent_connector_issue(handle.clone(), "bot".into(), ControlAccess::ReadOnly, Some(365 * 24 + 1)).is_err());
+        set(handle, false, None, None).unwrap();
+    }
+
+    #[test]
     fn events_are_null_and_disabled_approvals_cannot_resurrect_requests() {
         let app = app();
         let handle = app.handle();
@@ -705,7 +949,7 @@ mod tests {
                     "id": id, "clientName": "Synthetic outside agent",
                     "callbackOrigin": "https://client.example", "requestedAt": timestamp(now),
                     "expiresAt": timestamp(now + oauth::PENDING_TTL_MS),
-                    "phase": phase, "access": access,
+                    "phase": phase, "access": access, "reconnecting": false,
                 })
             };
             let status =

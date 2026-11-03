@@ -376,6 +376,26 @@ pub(super) fn allowed(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every native connector command. Paired clients must never manage who
+    /// can reach this machine, so a new one is added here, not to `allowed`.
+    const CONNECTOR_ADMIN_COMMANDS: [&str; 7] = [
+        "agent_connector_status",
+        "agent_connector_set_config",
+        "agent_connector_approve",
+        "agent_connector_deny",
+        "agent_connector_revoke",
+        "agent_connector_issue",
+        "agent_connector_revoke_all",
+    ];
+
+    #[test]
+    fn connector_administration_is_never_on_the_remote_allowlist() {
+        for cmd in CONNECTOR_ADMIN_COMMANDS {
+            assert!(!allowed(cmd), "{cmd} administers the outside-assistant connector");
+        }
+    }
+
     #[test]
     fn chatgpt_private_metadata_and_mutations_are_denied_to_web_remote() {
         for cmd in [
