@@ -105,8 +105,9 @@ pub enum Incoming {
 }
 
 /// Read one decoded JSON-RPC message, tolerating the quirks of existing local
-/// clients: `jsonrpc` may be missing and `params` may be null. An error is
-/// answered with `id: null`, as JSON-RPC requires when the request is invalid.
+/// clients: `jsonrpc` may be missing and `params` may be null. Answer an error
+/// with the message's `id` when that is a valid id, and with `id: null` when
+/// it cannot be read, as JSON-RPC requires.
 pub fn parse(message: Value) -> Result<Incoming, RpcError> {
     let mut message = match message {
         Value::Object(message) => message,

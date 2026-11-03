@@ -99,14 +99,21 @@ fn handle_line<H: Handler>(
     if line.is_empty() {
         return;
     }
-    let request = match serde_json::from_slice(line).map_err(RpcError::parse_error).and_then(parse) {
+    let message: Value = match serde_json::from_slice(line) {
+        Ok(message) => message,
+        Err(error) => return send(out, Response::error(None, RpcError::parse_error(error))),
+    };
+    // An invalid message whose id is still readable is answered with that id,
+    // so a client matching replies by id is not left waiting; otherwise null.
+    let error_id = message.get("id").and_then(RequestId::from_value);
+    let request = match parse(message) {
         Ok(Incoming::Request(request)) => request,
         Ok(Incoming::Notification(Notification::Cancelled { request_id, .. })) => {
             in_flight.cancel(&request_id);
             return;
         }
         Ok(Incoming::Notification(_) | Incoming::Response) => return,
-        Err(error) => return send(out, Response::error(None, error)),
+        Err(error) => return send(out, Response::error(error_id, error)),
     };
     let id = request.id.clone();
     // JSON-RPC ids must be unique among a client's open requests.
@@ -479,6 +486,22 @@ mod tests {
         session.send_raw("   ").await;
         session.send(request(json!(3), "echo", "still reading")).await;
         assert_eq!(session.next().await["result"]["label"], "still reading");
+    }
+
+    #[tokio::test]
+    async fn stdio_answers_envelope_errors_with_a_readable_id() {
+        let mut session = Session::start(Arc::new(Fake::default()));
+        for (message, id) in [
+            (json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": [1] }), json!(5)),
+            (json!({ "jsonrpc": "2.0", "id": "s" }), json!("s")),
+            (json!({ "jsonrpc": "2.0", "id": 6, "method": 7 }), json!(6)),
+            // An id MCP does not allow cannot be echoed.
+            (json!({ "jsonrpc": "2.0", "id": 1.5, "method": "echo" }), Value::Null),
+        ] {
+            session.send(message.clone()).await;
+            let reply = session.next().await;
+            assert_eq!((reply["id"].clone(), reply["error"]["code"].clone()), (id, json!(-32600)), "{message}");
+        }
     }
 
     #[tokio::test]

@@ -2387,7 +2387,7 @@ fn remove_mcp_config_locked(workspace_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::protocol::{Incoming, Response};
+    use crate::mcp::protocol::{Incoming, RequestId, Response};
     use std::time::Duration;
 
     /// A server with the real tool runner. Calls that reach the control
@@ -2399,10 +2399,11 @@ mod tests {
     /// Feed one JSON-RPC message to `server` and wait for its reply, as the
     /// stdio loop would. `None` for a notification.
     async fn rpc(server: &StdioServer, message: Value) -> Option<Value> {
+        let error_id = message.get("id").and_then(RequestId::from_value);
         let request = match protocol::parse(message) {
             Ok(Incoming::Request(request)) => request,
             Ok(_) => return None,
-            Err(error) => return Some(Response::error(None, error).to_value()),
+            Err(error) => return Some(Response::error(error_id, error).to_value()),
         };
         let id = request.id.clone();
         let outcome = match server.request(request) {
