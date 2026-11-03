@@ -3,7 +3,7 @@ use super::{ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControl
 use crate::agent_provider::{ProviderChatCapabilities, ProviderKind, StartSessionInput, ThreadId};
 use crate::commands::agent_chat::{self, ProviderRegistry, SendTurnCommandInput};
 use crate::database::{AgentChatSessionConfig, DatabaseStore};
-use crate::state::{AppStateStore, WorkspaceSnapshot};
+use crate::state::{AppStateStore, WorkspaceId, WorkspaceSnapshot};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -512,24 +512,6 @@ async fn materialize<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, inp
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct WorkspaceListArgs {}
-
-/// Every workspace on this instance, as outside callers need to target one.
-pub(super) fn workspace_list<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
-    let WorkspaceListArgs {} = parse(args)?;
-    let workspaces: Vec<_> = app.state::<AppStateStore>().snapshot().workspaces.iter().map(|workspace| json!({
-        "workspace_id": workspace.workspace_id.0,
-        "title": workspace.title,
-        "cwd": workspace.cwd,
-        "project_root": workspace.project_root,
-        "branch": workspace.git_branch,
-        "native_control_available": !workspace.is_local_import_snapshot_only() && workspace.host_id.is_none(),
-    })).collect();
-    Ok(json!({"workspaces": workspaces}))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct OperationStatusArgs { operation_id: String }
 
 pub(super) fn operation_status<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
@@ -812,6 +794,125 @@ fn retry_receipt<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, tool: &
     app.state::<DatabaseStore>().control_operation_by_key(&caller.principal, key, tool, &hash, &app.state::<NativeControlState>().epoch)
         .map_err(|e| ControlError::from_text(e, ErrorCode::OperationLookupFailed))?
         .map(serde_json::to_value).transpose().map_err(|e| ControlError::new(ErrorCode::SerializationFailed, e.to_string()))
+}
+
+fn fingerprint(args: &Value) -> Result<String, ControlError> {
+    let bytes = serde_json::to_vec(args).map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn keyed(args: &Value) -> bool {
+    args.get("client_request_id").is_some_and(|key| !key.is_null())
+}
+
+/// What a retry of a keyed call that was already admitted returns instead of
+/// running again; `None` for an unkeyed or new call. Handlers whose checks
+/// read state the first call changed (a closed workspace, an answered
+/// question) ask this before checking.
+pub(crate) fn recorded<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, tool: &str, args: &Value) -> Result<Option<Value>, ControlError> {
+    if !keyed(args) {
+        return Ok(None);
+    }
+    retry_receipt(app, caller, tool, args)?.map(replay).transpose()
+}
+
+/// A mutation that finishes within the call, optionally under a durable
+/// receipt. Without client_request_id the work runs directly. With one, a
+/// retry returns the recorded outcome instead of repeating side effects, and
+/// the receipt names its workspace from admission on: `target_workspace`, or
+/// with `reserve_workspace` a new id, reserved before the workspace exists and
+/// handed to `work`. A successful result's `workspace_id` replaces that name
+/// (an open folder reused, a checkout adopted).
+pub(crate) async fn run_receipted<R, F, Fut>(
+    app: &AppHandle<R>,
+    caller: &ControlCaller,
+    tool: &'static str,
+    args: &Value,
+    reserve_workspace: bool,
+    target_workspace: Option<&str>,
+    work: F,
+) -> Result<Value, ControlError>
+where
+    R: Runtime,
+    F: FnOnce(Option<WorkspaceId>) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, ControlError>>,
+{
+    if !keyed(args) {
+        return work(None).await;
+    }
+    if let Some(receipt) = retry_receipt(app, caller, tool, args)? {
+        return replay(receipt);
+    }
+    let key = args["client_request_id"].as_str().unwrap_or_default();
+    let reserved = reserve_workspace.then(AppStateStore::reserve_workspace_id);
+    let hash = fingerprint(args)?;
+    let epoch = app.state::<NativeControlState>().epoch.clone();
+    let db = app.state::<DatabaseStore>();
+    let admitted = caller
+        .admit(|| db.admit_control_operation_for_thread(
+            &caller.principal, key, tool, &hash, &epoch,
+            reserved.as_ref().map(|id| id.0.as_str()).or(target_workspace),
+            args["thread_id"].as_str(), caller.thread_id().zip(caller.admission_generation()),
+        ))
+        .map_err(|e| ControlError::from_text(e, ErrorCode::OperationAdmissionFailed))?;
+    let operation = admitted.receipt.operation_id.clone();
+    if !admitted.newly_admitted {
+        // A concurrent duplicate won the admission.
+        return replay(serde_json::to_value(&admitted.receipt).map_err(|e| ControlError::new(ErrorCode::SerializationFailed, e.to_string()))?);
+    }
+    db.update_control_operation(&caller.principal, &operation, &epoch, "running", None, None, None, None)
+        .map_err(|e| ControlError::new(ErrorCode::OperationAdmissionFailed, e))?;
+    #[cfg(test)]
+    let barrier = app.state::<NativeControlState>().fixture_operation_barrier.lock().unwrap().take();
+    #[cfg(test)]
+    if let Some(barrier) = barrier {
+        barrier.acquire().await.unwrap().forget();
+    }
+    let outcome = work(reserved).await;
+    let saved = match &outcome {
+        Ok(value) => db.update_control_operation(
+            &caller.principal, &operation, &epoch, "succeeded",
+            value["workspace_id"].as_str(), value["thread_id"].as_str(), Some(value), None,
+        ),
+        Err(error) => db.update_control_operation(
+            &caller.principal, &operation, &epoch, "failed", None, None, None, serde_json::to_value(error).ok().as_ref(),
+        ),
+    };
+    if let Err(error) = saved {
+        eprintln!("[codemux::agent_control] could not save operation outcome: {error}");
+    }
+    let mut value = outcome?;
+    if !value.is_object() {
+        value = json!({"result": value});
+    }
+    value["operation_id"] = json!(operation);
+    value["state"] = json!("succeeded");
+    Ok(value)
+}
+
+/// A receipt as a retry of its synchronous call returns it: the recorded
+/// result or failure once it ended, else where it stands, so the client polls
+/// operation_status.
+fn replay(receipt: Value) -> Result<Value, ControlError> {
+    let operation = receipt["operation_id"].clone();
+    match receipt["state"].as_str() {
+        Some("succeeded") => {
+            let mut value = match receipt["result"].clone() {
+                value @ Value::Object(_) => value,
+                value => json!({"result": value}),
+            };
+            value["operation_id"] = operation;
+            value["state"] = json!("succeeded");
+            value["replayed"] = json!(true);
+            Ok(value)
+        }
+        Some("failed") => {
+            let code = receipt["error"]["code"].as_str().unwrap_or("operation_failed");
+            let message = receipt["error"]["message"].as_str().unwrap_or("The operation failed");
+            Err(ControlError::new(ErrorCode::OperationFailed, format!("{code}: {message}")))
+        }
+        state => Ok(json!({"operation_id": operation, "state": state, "workspace_id": receipt["workspace_id"]})),
+    }
 }
 
 fn admit_mutation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, tool: &str, args: &Value, target: &Target) -> Result<crate::database::agent_control::Admission, ControlError> {

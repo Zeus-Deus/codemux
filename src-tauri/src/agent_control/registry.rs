@@ -7,8 +7,8 @@
 //! declaration in `ToolId::spec` (`catalog.rs`) and its handler arm in [`run`].
 //! Neither compiles without the other.
 use super::{
-    native, service, wait, Access, Audience, CallerKind, CallerView, ControlAccess, ControlCaller,
-    ControlError, ErrorCode,
+    native, service, wait, workspace_tools, Access, Audience, CallerKind, CallerView, ControlAccess,
+    ControlCaller, ControlError, ErrorCode,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -29,8 +29,9 @@ macro_rules! tool_ids {
 }
 
 tool_ids! {
-    WorkspaceList, AgentCapabilities, ThreadList, ThreadLaunch, ThreadSend, ThreadRead,
-    ThreadStatus, ThreadWait, ThreadInterrupt, ThreadStop, ThreadRespond, OperationStatus,
+    WorkspaceList, WorkspaceInfo, WorkspaceCreate, WorktreeCreate, WorkspaceClose,
+    AgentCapabilities, ThreadList, ThreadLaunch, ThreadSend, ThreadRead, ThreadStatus, ThreadWait,
+    ThreadInterrupt, ThreadStop, ThreadRespond, OperationStatus,
     OrchestratorCapabilities, CreateThreads, ThreadSearch, PluginList, PluginInvoke,
 }
 
@@ -361,7 +362,11 @@ async fn run<R: Runtime>(id: ToolId, call: Call<'_, R>) -> Result<Value, Control
         _ => Err(ControlError::new(ErrorCode::StaleCaller, "This tool needs the calling chat")),
     };
     match (id, route) {
-        (WorkspaceList, _) => service::workspace_list(app, args),
+        (WorkspaceList, _) => workspace_tools::list(app, args),
+        (WorkspaceInfo, _) => workspace_tools::info(app, caller, args),
+        (WorkspaceCreate, _) => workspace_tools::create(app, caller, args).await,
+        (WorktreeCreate, _) => workspace_tools::create_worktree(app, caller, args).await,
+        (WorkspaceClose, _) => workspace_tools::close(app, caller, args).await,
         (AgentCapabilities, _) => service::agent_capabilities(app, caller, args).await,
         (ThreadList, Route::Outside) => service::thread_list(app, args),
         (ThreadList, Route::InApp { .. }) => native::in_app_inventory(app, actor()?, "thread_list", args),
@@ -469,7 +474,8 @@ mod tests {
         for name in ["thread_launch", "thread_status", "create_threads"] {
             assert!(relay_refuses(name), "{name}");
         }
-        for name in ["workspace_list", "browser_click", "nope"] {
+        // The legacy twins keep their legacy arms on provider-origin stdio.
+        for name in ["workspace_list", "workspace_info", "workspace_create", "worktree_create", "workspace_close", "browser_click", "nope"] {
             assert!(!relay_refuses(name), "{name}");
         }
     }
@@ -490,7 +496,8 @@ mod tests {
         for name in SOCKET_ALIASES {
             assert!(served(name, Audience::Outside).is_some(), "{name}");
         }
-        for name in ["workspace_list", "create_threads", "tool_call", "automation_list"] {
+        // New tools are reachable only through tool_call.
+        for name in ["workspace_list", "workspace_create", "create_threads", "tool_call", "automation_list"] {
             assert!(!is_socket_alias(name), "{name}");
         }
     }
@@ -508,10 +515,15 @@ mod tests {
             }
         }
         assert_eq!(names(&CallerView::outside(ReadOnly)), [
-            "workspace_list", "agent_capabilities", "thread_list", "thread_read", "thread_status", "thread_wait",
-            "operation_status", "plugin_list",
+            "workspace_list", "workspace_info", "agent_capabilities", "thread_list", "thread_read", "thread_status",
+            "thread_wait", "operation_status", "plugin_list",
         ], "a read-only connection is not offered tools that change anything");
-        assert_eq!(names(&CallerView::outside(Supervised)).len(), 14);
+        let supervised = names(&CallerView::outside(Supervised));
+        assert_eq!(supervised.len(), 15);
+        for machine in ["workspace_create", "worktree_create", "workspace_close"] {
+            assert!(!supervised.contains(&machine), "{machine} changes this machine; supervised connections are not offered it");
+            assert!(names(&CallerView::outside(FullAccess)).contains(&machine), "{machine}");
+        }
         assert_eq!(names(&CallerView::in_app(ProviderKind::Claude, Some("default"), false)), ["plugin_list", "plugin_invoke"],
             "with Agent collaboration off, chats keep only plugin tools");
     }
@@ -522,7 +534,8 @@ mod tests {
         assert_eq!(index.len(), list(&CallerView::outside(FullAccess)).len(), "every outside tool has static text");
         let entry = |name: &str| index.iter().find(|(tool, _, _)| *tool == name).copied();
         assert_eq!(entry("thread_launch").map(|(_, access, _)| access), Some(Supervised));
-        assert_eq!(entry("workspace_list"), Some(("workspace_list", ReadOnly, "List workspaces on this CodeMux instance.")));
+        assert_eq!(entry("workspace_list"), Some(("workspace_list", ReadOnly, "List the workspaces open in CodeMux.")));
+        assert_eq!(entry("workspace_create").map(|(_, access, _)| access), Some(FullAccess));
         assert!(entry("create_threads").is_none(), "in-app tools are not outside tools");
     }
 
@@ -539,7 +552,7 @@ mod tests {
         }
         let destructive: Vec<&str> = list(&CallerView::outside(FullAccess)).into_iter()
             .filter(|tool| tool.definition.annotations["destructiveHint"] == true).map(|tool| tool.spec.name).collect();
-        assert_eq!(destructive, ["thread_interrupt", "thread_stop", "thread_respond", "plugin_invoke"]);
+        assert_eq!(destructive, ["workspace_close", "thread_interrupt", "thread_stop", "thread_respond", "plugin_invoke"]);
         assert!(list(&CallerView::outside(FullAccess)).iter().all(|tool| tool.definition.annotations["idempotentHint"] != false),
             "every outside mutation is keyed, so a retry is safe");
     }
@@ -595,29 +608,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn outside_schema_examples_parse_into_typed_args() {
+    /// Each outside tool's typed arguments, as its handler parses them.
+    fn typed_parser(name: &str) -> Option<fn(Value) -> Result<(), ControlError>> {
         use serde::de::DeserializeOwned;
         fn typed<T: DeserializeOwned>(args: Value) -> Result<(), ControlError> {
             service::parse::<T>(args).map(drop)
         }
-        let parser = |name: &str| -> Option<fn(Value) -> Result<(), ControlError>> {
-            Some(match name {
-                "workspace_list" => typed::<service::WorkspaceListArgs>,
-                "agent_capabilities" => typed::<service::CapabilitiesArgs>,
-                "thread_list" => typed::<service::ThreadListArgs>,
-                "thread_launch" => typed::<service::Launch>,
-                "thread_send" => typed::<service::ThreadSendArgs>,
-                "thread_read" => typed::<service::ThreadReadArgs>,
-                "thread_status" => typed::<service::Target>,
-                "thread_wait" => typed::<super::super::wait::Args>,
-                "thread_interrupt" => typed::<service::InterruptArgs>,
-                "thread_stop" => typed::<service::StopArgs>,
-                "thread_respond" => typed::<service::RespondArgs>,
-                "operation_status" => typed::<service::OperationStatusArgs>,
-                _ => return None,
-            })
-        };
+        Some(match name {
+            "workspace_list" => typed::<workspace_tools::ListArgs>,
+            "workspace_info" => typed::<workspace_tools::InfoArgs>,
+            "workspace_create" => typed::<workspace_tools::CreateArgs>,
+            "worktree_create" => typed::<crate::workspace_service::WorktreeArgs>,
+            "workspace_close" => typed::<workspace_tools::CloseArgs>,
+            "agent_capabilities" => typed::<service::CapabilitiesArgs>,
+            "thread_list" => typed::<service::ThreadListArgs>,
+            "thread_launch" => typed::<service::Launch>,
+            "thread_send" => typed::<service::ThreadSendArgs>,
+            "thread_read" => typed::<service::ThreadReadArgs>,
+            "thread_status" => typed::<service::Target>,
+            "thread_wait" => typed::<super::super::wait::Args>,
+            "thread_interrupt" => typed::<service::InterruptArgs>,
+            "thread_stop" => typed::<service::StopArgs>,
+            "thread_respond" => typed::<service::RespondArgs>,
+            "operation_status" => typed::<service::OperationStatusArgs>,
+            _ => return None,
+        })
+    }
+
+    #[test]
+    fn outside_schema_examples_parse_into_typed_args() {
         // The plugin layer checks its own fields by hand.
         const UNTYPED: &[&str] = &["plugin_list", "plugin_invoke"];
         for tool in list(&CallerView::outside(FullAccess)) {
@@ -625,7 +644,7 @@ mod tests {
             if UNTYPED.contains(&name) {
                 continue;
             }
-            let parse = parser(name).unwrap_or_else(|| panic!("{name} needs an entry here: its typed arguments"));
+            let parse = typed_parser(name).unwrap_or_else(|| panic!("{name} needs an entry in typed_parser: its typed arguments"));
             for required_only in [false, true] {
                 let mut args = example(&tool.definition.input_schema, required_only);
                 if args.get("provider").is_some() {
@@ -633,6 +652,31 @@ mod tests {
                 }
                 super::super::schema::check(&tool.definition.input_schema, &args).unwrap_or_else(|v| panic!("{name}: {v}: {args}"));
                 parse(args.clone()).unwrap_or_else(|error| panic!("{name} rejects its own schema's example {args}: {error}"));
+            }
+        }
+    }
+
+    /// The workspace tools' schemas and typed arguments agree on what is
+    /// accepted: an unknown property is refused by both, and every required
+    /// property is one the typed arguments cannot do without.
+    #[test]
+    fn workspace_tool_schemas_match_typed_args() {
+        for name in ["workspace_list", "workspace_info", "workspace_create", "worktree_create", "workspace_close"] {
+            let definition = list(&CallerView::outside(FullAccess)).into_iter().find(|tool| tool.spec.name == name)
+                .unwrap_or_else(|| panic!("{name} is an outside tool")).definition;
+            let (schema, parse) = (&definition.input_schema, typed_parser(name).unwrap());
+            let mut extra = example(schema, false);
+            extra["bogus"] = json!(1);
+            assert!(super::super::schema::check(schema, &extra).is_err(), "{name}: the schema refuses unknown properties");
+            assert!(parse(extra).is_err(), "{name}: the typed arguments refuse unknown properties");
+            let required: Vec<&str> = schema["required"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+            let minimal = example(schema, true);
+            parse(minimal.clone()).unwrap_or_else(|error| panic!("{name}: {error}"));
+            for field in required {
+                let mut missing = minimal.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(super::super::schema::check(schema, &missing).is_err(), "{name}: {field} is required by the schema");
+                assert!(parse(missing).is_err(), "{name}: {field} is required by the typed arguments");
             }
         }
     }

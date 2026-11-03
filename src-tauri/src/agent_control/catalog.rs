@@ -10,7 +10,7 @@ use super::registry::{self, Effect, Presentation, Scope, ToolId, ToolSpec};
 use super::{Audience, CallerView, ControlAccess};
 use serde_json::Value;
 
-pub const INSTRUCTIONS: &str = "Control CodeMux-owned native threads, not the outside client's conversation. Discover workspaces, then providers/models. Use explicit workspace and thread IDs. Select a provider-advertised permission mode; omission is an error. Mutations require a stable client_request_id: retry the same request unchanged. An operation accepted or a message queued is NOT completed work. Read operation_status, then thread_wait: it returns state, final_text and pending input in one call; call it again with since set to the previous wait_cursor to wait for the next change. Never blindly resend an operation marked needs_attention. Supervised clients leave worker approvals to the human in CodeMux. Questions and secret cards are answered by the person in CodeMux.";
+pub const INSTRUCTIONS: &str = "Control CodeMux-owned native threads, not the outside client's conversation. Discover workspaces, then providers/models. Use explicit workspace and thread IDs. Select a provider-advertised permission mode; omission is an error. Mutations require a stable client_request_id: retry the same request unchanged. Workspace and worktree tools accept an optional client_request_id; pass one so retries return the recorded outcome. Workspace lifecycle tools need full access and never take focus unless select is true. An operation accepted or a message queued is NOT completed work. Read operation_status, then thread_wait: it returns state, final_text and pending input in one call; call it again with since set to the previous wait_cursor to wait for the next change. Never blindly resend an operation marked needs_attention. Supervised clients leave worker approvals to the human in CodeMux. Questions and secret cards are answered by the person in CodeMux.";
 
 /// A keyed mutation: a retry with the same client_request_id returns its receipt.
 const KEYED: Effect = Effect { destructive: false, idempotent: true };
@@ -28,6 +28,10 @@ impl ToolId {
         use Scope::{Instance, Operation, Plugin, Thread, Workspace};
         match self {
             ToolId::WorkspaceList => ToolSpec::read("workspace_list", Outside, Instance, defs::workspace_list),
+            ToolId::WorkspaceInfo => ToolSpec::read("workspace_info", Outside, Workspace, defs::workspace_info),
+            ToolId::WorkspaceCreate => ToolSpec::machine("workspace_create", Outside, Instance, KEYED, defs::workspace_create),
+            ToolId::WorktreeCreate => ToolSpec::machine("worktree_create", Outside, Instance, KEYED, defs::worktree_create),
+            ToolId::WorkspaceClose => ToolSpec::machine("workspace_close", Outside, Workspace, ENDS_WORK, defs::workspace_close),
             ToolId::AgentCapabilities => ToolSpec::read("agent_capabilities", Outside, Workspace, defs::agent_capabilities),
             ToolId::ThreadList => ToolSpec::read("thread_list", Both, Workspace, defs::thread_list),
             ToolId::ThreadLaunch => ToolSpec::starts_threads("thread_launch", Both, Workspace, KEYED, defs::thread_launch),
@@ -109,8 +113,54 @@ mod defs {
         properties
     }
 
+    fn request_key() -> Value {
+        json!({"type": "string", "minLength": 1, "maxLength": 128})
+    }
+
     pub(super) fn workspace_list(view: &CallerView) -> Option<Definition> {
-        only_outside(view, outside("List workspaces on this CodeMux instance. Use the returned workspace IDs explicitly; outside clients have no current pane or calling thread.", json!({}), &[]))
+        only_outside(view, outside("List the workspaces open in CodeMux. Rows are summaries; detail \"full\" returns complete snapshots. Use the returned workspace IDs explicitly; outside clients have no current pane or calling thread.", json!({
+            "detail": {"type": "string", "enum": ["summary", "full"], "default": "summary"},
+        }), &[]))
+    }
+
+    pub(super) fn workspace_info(view: &CallerView) -> Option<Definition> {
+        only_outside(view, outside("Read one workspace's full snapshot (tabs, panes, git and PR fields). Local callers may omit workspace_id for the workspace focused in CodeMux; connector clients must name one.", json!({
+            "workspace_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        }), &[]))
+    }
+
+    pub(super) fn workspace_create(view: &CallerView) -> Option<Definition> {
+        only_outside(view, outside("Open a folder as a workspace, or return the workspace already open there (created false). Creating one runs the project's setup scripts and needs full access. Connector clients may only open folders of projects already opened in CodeMux. Never takes focus unless select is true. Pass client_request_id to make retries safe.", json!({
+            "path": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "select": {"type": "boolean", "default": false},
+            "client_request_id": request_key(),
+        }), &[]))
+    }
+
+    pub(super) fn worktree_create(view: &CallerView) -> Option<Definition> {
+        only_outside(view, outside("Create a git worktree and its workspace under ~/.codemux/worktrees. new_branch (default true) creates branch from base (default: the repository's default branch, freshened from origin when possible); start_from_origin true requires a fresh origin base, false uses the local ref exactly. An existing checkout of the branch that is already open is returned with adopted true. Runs setup scripts and needs full access. agent_preset_id starts a terminal CLI preset with initial_prompt; for native chats use thread_launch. Presets and prompts are available only on this computer. Never takes focus unless select is true. Pass client_request_id to make retries safe.", json!({
+            "repo_path": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "branch": {"type": "string", "minLength": 1, "maxLength": 256},
+            "new_branch": {"type": "boolean", "default": true},
+            "base": {"type": "string", "minLength": 1, "maxLength": 256},
+            "start_from_origin": {"type": "boolean"},
+            "layout": {"type": "string", "enum": ["single", "pair", "quad", "six", "eight", "shell_browser", "empty"], "default": "single"},
+            "agent_preset_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "initial_prompt": {"type": "string", "minLength": 1, "maxLength": 65536},
+            "pr_number": {"type": "integer", "minimum": 1},
+            "select": {"type": "boolean", "default": false},
+            "client_request_id": request_key(),
+        }), &["repo_path", "branch"]))
+    }
+
+    pub(super) fn workspace_close(view: &CallerView) -> Option<Definition> {
+        only_outside(view, outside("Close a workspace: stop its agents and terminals and run teardown. delete_worktree also removes a disposable worktree (never a project root; refuses uncommitted or unpushed work unless force_delete), and delete_branch its branch. Connector clients cannot force_delete. Needs full access. Pass client_request_id to make retries safe.", json!({
+            "workspace_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "delete_worktree": {"type": "boolean", "default": false},
+            "delete_branch": {"type": "boolean", "default": false},
+            "force_delete": {"type": "boolean", "default": false},
+            "client_request_id": request_key(),
+        }), &["workspace_id"]))
     }
 
     fn capabilities() -> Definition {
@@ -334,6 +384,32 @@ mod review_tests {
         assert!(launch.input_schema["properties"].get("worktree").is_none(),
             "a schema field promises support; worktree launch is deliberately unavailable");
         assert!(!launch.description.contains("new worktree"));
+    }
+
+    /// The workspace tools are registry tools for outside callers only: chats
+    /// keep their legacy `mcp__codemux__workspace_*` tools, and no new tool
+    /// becomes a bare socket command.
+    #[test]
+    fn workspace_tools_are_outside_tools_not_controller_tools() {
+        use super::super::Audience;
+        let names = ["workspace_list", "workspace_info", "workspace_create", "worktree_create", "workspace_close"];
+        for name in names {
+            assert!(!is_native_tool(name), "{name} is reachable only through tool_call");
+            assert!(registry::served(name, Audience::Outside).is_some(), "{name}");
+            assert!(registry::served(name, Audience::InApp).is_none(), "{name} would shadow the chat's legacy tool");
+            assert!(crate::mcp_server::is_legacy_tool(name), "{name} keeps its legacy name");
+            let definition = outside_definition(name);
+            for (property, schema) in definition.input_schema["properties"].as_object().unwrap() {
+                assert!(schema.get("type").is_some(), "{name}.{property} declares a type");
+            }
+        }
+        let listed = registry::tools_for(&super::super::ControlCaller::trusted());
+        let mut seen = std::collections::HashSet::new();
+        assert!(listed.iter().all(|tool| seen.insert(tool.name)), "one definition per name");
+        assert!(names.iter().all(|name| seen.contains(name)));
+        for name in ["workspace_create", "worktree_create", "workspace_close"] {
+            assert_eq!(registry::lookup(name).unwrap().1.access(), super::super::Access::Machine, "{name}");
+        }
     }
 
     #[test]

@@ -191,8 +191,10 @@ impl WorkspaceSummary {
             branch: workspace.git_branch.clone(),
             worktree_path: workspace.worktree_path.clone(),
             parent_workspace_id: workspace.parent_workspace_id.clone(),
+            // What outside thread tools accept as a target: local and live.
             native_control_available: !workspace.is_local_import_snapshot_only()
-                && workspace.host_id.is_none(),
+                && workspace.host_id.is_none()
+                && workspace.remote_cwd.is_none(),
         }
     }
 }
