@@ -3378,6 +3378,30 @@ async fn dispatch_accepts_null_optionals_everywhere() {
     assert!(in_app["messages"].is_array(), "{in_app}");
 }
 
+/// orchestrator_capabilities advertises instances as provider_instance_id, so
+/// a chat's launch takes that key inside target too. Outside callers keep the
+/// documented strict target.
+#[tokio::test]
+async fn in_app_launch_accepts_the_target_instance_alias() {
+    let (app, _provider, _root, workspace, _thread, _authority, actor) = native_caller_fixture("plan").await;
+    let receipt = native::call(app.handle().clone(), actor.clone(), "thread_launch".into(), json!({
+        "target":{"provider_instance_id":"claude"},"title":"Alias child","message":"Synthetic fixture task",
+    })).await.unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let status = native::call(app.handle().clone(), actor.clone(), "operation_status".into(), json!({"operation_id":receipt["operation_id"]})).await.unwrap();
+            if !matches!(status["state"].as_str(), Some("accepted" | "running")) { break status; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(outcome["state"], "succeeded", "{outcome}");
+    let error = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
+        "workspace_id":workspace,"client_request_id":"outside-alias","provider":"claude","permission_mode":"default",
+        "target":{"provider_instance_id":"claude"},
+    })).await.unwrap_err();
+    assert_eq!(error.to_string(), "invalid_arguments: unknown field `provider_instance_id` at /target");
+}
+
 /// Plugin tools are not Agent collaboration tools: with collaboration off, a
 /// chat's plugin call passes dispatch and reaches the plugin layer (which
 /// applies its own authorization), while its thread tools stay refused.

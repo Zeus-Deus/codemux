@@ -160,7 +160,15 @@ mod defs {
                 required.retain(|name| !matches!(name.as_str(), Some("permission_mode" | "provider" | "client_request_id")));
             }
             schema["properties"]["provider_instance_id"] = json!({"type": "string"});
-            schema["properties"]["target"] = super::super::selection::schema();
+            // orchestrator_capabilities advertises instances as
+            // provider_instance_id, and chats copy that key into target, so a
+            // chat's target takes it as an alias of instance_id. Neither is
+            // required here: ProviderSelection's serde alias then requires
+            // exactly one of the two.
+            let mut target = super::super::selection::schema();
+            target["properties"]["provider_instance_id"] = json!({"type": "string"});
+            target["required"] = json!([]);
+            schema["properties"]["target"] = target;
             schema["properties"]["worktree"] = json!({"description": "Unsupported in this version"});
             definition
         }))

@@ -100,11 +100,12 @@
               },
               "options": {
                 "type": "object"
+              },
+              "provider_instance_id": {
+                "type": "string"
               }
             },
-            "required": [
-              "instance_id"
-            ],
+            "required": [],
             "type": "object"
           },
           "title": {
@@ -624,11 +625,12 @@
               },
               "options": {
                 "type": "object"
+              },
+              "provider_instance_id": {
+                "type": "string"
               }
             },
-            "required": [
-              "instance_id"
-            ],
+            "required": [],
             "type": "object"
           },
           "title": {
