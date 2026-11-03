@@ -157,11 +157,14 @@ fn wait_cursor_changes_only_with_state_turn_or_pending() {
     );
 }
 
+/// Transports decide what parks from `ToolSpec::may_wait`; the test helper
+/// must name the same tools, or wait tests stop covering what doors budget.
 #[test]
 fn only_thread_wait_parks() {
     assert!(wait::is_long_wait("thread_wait"));
-    for tool in ["thread_status", "thread_read", "operation_status", "thread_send"] {
-        assert!(!wait::is_long_wait(tool), "{tool}");
+    for id in super::registry::ToolId::ALL {
+        let spec = id.spec();
+        assert_eq!(wait::is_long_wait(spec.name()), spec.may_wait(), "{}", spec.name());
     }
 }
 
