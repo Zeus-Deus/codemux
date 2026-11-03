@@ -1,6 +1,7 @@
 //! The control socket end to end through the built `codemux` binary: it tells
-//! the owner from processes Codemux started for agents, and the legacy
-//! workspace commands keep their shapes.
+//! the owner from processes Codemux started for agents, `codemux mcp` carries
+//! a client's name and access, and the legacy workspace commands keep their
+//! shapes.
 //!
 //! Each test runs its own `codemux serve` child in a throwaway home with its
 //! own `XDG_RUNTIME_DIR`, and drives it with the `codemux` CLI. Every child
@@ -11,8 +12,10 @@
 #![cfg(unix)]
 
 use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const CODEMUX: &str = env!("CARGO_BIN_EXE_codemux");
@@ -118,6 +121,79 @@ impl Drop for Serve {
     }
 }
 
+/// A `codemux mcp` child speaking to a [`Serve`], stopped when dropped.
+struct Mcp {
+    child: Child,
+    stdin: ChildStdin,
+    lines: mpsc::Receiver<String>,
+    next_id: u64,
+    log: std::path::PathBuf,
+}
+
+impl Mcp {
+    fn start(serve: &Serve, args: &[&str]) -> Self {
+        let log = serve.root.path().join(format!("mcp-{}.log", args.join("_")));
+        let mut cmd = Command::new(CODEMUX);
+        isolate(&mut cmd, serve.root.path());
+        let mut child = cmd
+            .arg("mcp")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let stdin = child.stdin.take().unwrap();
+        let mut mcp = Self { child, stdin, lines, next_id: 0, log };
+        let init = mcp.request(
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "ignored", "version": "1"}}),
+        );
+        assert!(init["result"]["protocolVersion"].is_string(), "{init}");
+        mcp
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let message = json!({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params});
+        // A child that already exited (an unknown flag) fails the write or
+        // the read; its stderr says why.
+        let sent = writeln!(self.stdin, "{message}").and_then(|()| self.stdin.flush());
+        let line = sent.ok().and_then(|()| self.lines.recv_timeout(Duration::from_secs(30)).ok()).unwrap_or_else(|| {
+            panic!("codemux mcp gave no reply to {method}:\n{}", std::fs::read_to_string(&self.log).unwrap_or_default())
+        });
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["id"], self.next_id, "{reply}");
+        reply
+    }
+
+    fn tool_names(&mut self) -> Vec<String> {
+        let listed = self.request("tools/list", json!({}));
+        listed["result"]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].as_str().unwrap().to_owned()).collect()
+    }
+
+    fn call(&mut self, name: &str, arguments: Value) -> Value {
+        self.request("tools/call", json!({"name": name, "arguments": arguments}))["result"].clone()
+    }
+}
+
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        // This test started it; stop it by its own handle.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn error_code(reply: &Value) -> &str {
     reply["error"].as_str().and_then(|error| error.split(':').next()).unwrap_or("")
 }
@@ -192,6 +268,42 @@ fn pty_shell_is_the_owner() {
         assert!(!env.lines().any(|line| line.starts_with(&format!("{key}="))), "{key} reached the terminal");
     }
     assert!(env.contains("CODEMUX_SESSION_ID="), "the dump is the terminal's env");
+}
+
+#[test]
+fn mcp_supervised_client_sees_no_admin_tools_and_is_refused_them() {
+    let serve = Serve::start(&[]);
+    let mut supervised = Mcp::start(&serve, &["--client", "integration-bot", "--access", "supervised"]);
+    let names = supervised.tool_names();
+    for hidden in ["automation_create", "terminal_write", "preset_apply", "workspace_create", "worktree_create", "workspace_unarchive"] {
+        assert!(!names.iter().any(|name| name == hidden), "supervised lists {hidden}: {names:?}");
+    }
+    for shown in ["thread_launch", "thread_wait", "notify", "git_commit", "workspace_list"] {
+        assert!(names.iter().any(|name| name == shown), "supervised lacks {shown}: {names:?}");
+    }
+    let refused = supervised.call("automation_create", json!({"name": "n", "prompt": "p", "schedule": "0 * * * *"}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(refused["content"][0]["text"].as_str().unwrap().starts_with("access_denied: "), "{refused}");
+    // Registry tools reach the app through the socket as this client.
+    let listed = supervised.call("thread_list", json!({"workspace_id": "none"}));
+    assert_eq!(listed["isError"], true, "{listed}");
+    assert_eq!(listed["structuredContent"]["error"]["code"], "workspace_not_found", "{listed}");
+    let automations = serve.json("automation_list", "{}", &[]);
+    assert_eq!(automations["data"], json!([]), "nothing was created: {automations}");
+
+    let mut read_only = Mcp::start(&serve, &["--client", "integration-bot", "--access", "read-only"]);
+    let listed = read_only.request("tools/list", json!({}));
+    for tool in listed["result"]["tools"].as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        let reads = match tool.get("annotations") {
+            Some(annotations) => annotations["readOnlyHint"] == true,
+            None => codemux_lib::control_identity::mcp_tool_access(name, &json!({}))
+                == Some(codemux_lib::agent_control::Access::Read),
+        };
+        assert!(reads, "read-only lists {name}");
+    }
+    let refused = read_only.call("notify", json!({"message": "x"}));
+    assert!(refused["content"][0]["text"].as_str().unwrap().starts_with("access_denied: "), "{refused}");
 }
 
 /// `get_app_state`'s focused workspace id.

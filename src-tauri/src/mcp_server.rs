@@ -1,17 +1,19 @@
-use crate::agent_control::ControlAccess;
+use crate::agent_control::{registry, Audience, CallerView, ControlAccess, ControlError, ErrorCode};
 use crate::control::{send_control_request, ControlRequest, ControlResponse};
+use crate::control_identity::{self, AGENT_PROCESS_ENV};
 use crate::mcp::protocol::stdio::{Handler, Reply};
 use crate::mcp::protocol::{
-    self, CallToolParams, ClientInfo, InitializeRequest, InitializeResult, Request, RpcError, ServerInfo,
+    self, CallToolParams, InitializeRequest, InitializeResult, Request, RpcError, ServerInfo,
 };
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 // Serialize checkout-level config reconciliation. Deferred startup repair
@@ -22,7 +24,6 @@ static MCP_CONFIG_IO_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(())
 
 /// Set by app-owned provider MCP descriptors, never per-call metadata.
 pub(crate) const PROVIDER_ORIGIN_ENV: &str = "CODEMUX_MCP_PROVIDER_ORIGIN";
-fn provider_stdio_origin() -> bool { std::env::var_os(PROVIDER_ORIGIN_ENV).is_some() }
 
 /// Check if auto-MCP config is enabled in settings (default: true).
 pub fn is_auto_mcp_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
@@ -44,25 +45,43 @@ struct McpTool {
     input_schema: Value,
 }
 
-/// A tool as `tools/list` serves it: the server's own tools plus the native
-/// control tools, whose text need not be static.
+/// A tool as `tools/list` serves it: one of the server's own tools, or a
+/// control-plane registry tool, whose text need not be static.
 struct StdioTool {
     name: Cow<'static, str>,
     description: Cow<'static, str>,
     input_schema: Value,
+    /// MCP behaviour hints. Registry tools carry them; legacy tools never did.
+    annotations: Option<Value>,
 }
 
 impl From<McpTool> for StdioTool {
     fn from(tool: McpTool) -> Self {
-        Self { name: tool.name.into(), description: tool.description.into(), input_schema: tool.input_schema }
+        Self {
+            name: tool.name.into(),
+            description: tool.description.into(),
+            input_schema: tool.input_schema,
+            annotations: None,
+        }
+    }
+}
+
+impl From<registry::ToolDefinition> for StdioTool {
+    fn from(tool: registry::ToolDefinition) -> Self {
+        Self {
+            name: tool.name.into(),
+            description: tool.description,
+            input_schema: tool.input_schema,
+            annotations: Some(tool.annotations),
+        }
     }
 }
 
 pub(crate) const REMOTE_DELEGATE_TOOL: &str = "delegate_remote_task";
 
-/// The stdio server's own tools, before any native control tool is added.
-/// Provider-origin processes see exactly these; a control-plane tool that
-/// shares one of these names keeps this implementation for them.
+/// The stdio server's own tools. Processes that serve an agent see exactly
+/// these; elsewhere a registry tool that shares one of these names replaces
+/// it (see [`stdio_tools`]).
 pub(crate) const LEGACY_TOOL_NAMES: [&str; 62] = [
     "delegation_targets", REMOTE_DELEGATE_TOOL, "task_status", "task_cancel",
     "browser_navigate", "browser_snapshot", "browser_accessibility_snapshot", "browser_click", "browser_fill",
@@ -86,11 +105,11 @@ pub(crate) fn is_legacy_tool(name: &str) -> bool {
 #[cfg(test)]
 pub(crate) fn remote_delegation_tools_for_test() -> Vec<crate::mcp::runtime::McpTool> {
     let config = crate::mcp::codemux_self::codemux_self_config();
-    register_tools()
+    legacy_tools()
         .into_iter()
         .filter(|tool| {
             matches!(
-                tool.name.as_ref(),
+                tool.name,
                 "delegation_targets" | REMOTE_DELEGATE_TOOL | "task_status" | "task_cancel"
             )
         })
@@ -104,8 +123,32 @@ pub(crate) fn remote_delegation_tools_for_test() -> Vec<crate::mcp::runtime::Mcp
         .collect()
 }
 
-fn register_tools() -> Vec<StdioTool> {
-    let legacy = vec![
+/// What `tools/list` serves. A process that serves an agent (provider origin
+/// or the agent marker) gets exactly the legacy tools. Any other caller gets
+/// the legacy tools the registry does not serve and its access can run, then
+/// the registry's outside catalog for that access. The count stays the same
+/// as registry tools take over legacy names.
+///
+/// Pure: only [`run_mcp_server_with`] reads the env and options.
+fn stdio_tools(provider_origin: bool, agent: bool, access: ControlAccess) -> Vec<StdioTool> {
+    let legacy = legacy_tools().into_iter().map(StdioTool::from);
+    if provider_origin || agent {
+        return legacy.collect();
+    }
+    let view = CallerView::outside(access);
+    let mut tools: Vec<StdioTool> = legacy
+        .filter(|tool| registry::served(&tool.name, Audience::Outside).is_none())
+        .filter(|tool| {
+            control_identity::mcp_tool_access(&tool.name, &json!({})).is_some_and(|needs| needs.listed(&view))
+        })
+        .collect();
+    tools.extend(registry::list(&view).into_iter().map(|tool| StdioTool::from(tool.definition)));
+    tools
+}
+
+/// The stdio server's own tools ([`LEGACY_TOOL_NAMES`], in that order).
+fn legacy_tools() -> Vec<McpTool> {
+    vec![
         McpTool {name:"delegation_targets",description:"List SSH remote hosts the user granted for delegate_remote_task (host/existing-checkout/provider/mode targets). For remote delegation only: an empty list says nothing about local delegation. To delegate to local child chats, use delegate_task. Grants are immutable to agents. Available only in an actual Codex/Claude adapter; generic MCP metadata is not authority.",input_schema:json!({"type":"object","properties":{},"additionalProperties":false})},
         McpTool {name:REMOTE_DELEGATE_TOOL,description:"Delegate a SELF-CONTAINED coding task to a user-granted SSH remote host checkout from delegation_targets. Remote hosts only; use delegate_task for local child chats. Supply only the needed goal/context, never credentials or full conversation history. Returns a durable task receipt promptly; the backend follows asynchronously and delivers its specific final result when this parent is idle. Continue local work or end the turn; do not busy-poll. Exact client_request_id retries dedupe; changed reuse is rejected. Only receiver-native Codex/Claude execution is currently supported.",input_schema:json!({"type":"object","properties":{"target_id":{"type":"string"},"prompt":{"type":"string","maxLength":32000},"title":{"type":"string"},"model":{"type":["string","null"]},"effort":{"type":["string","null"]},"client_request_id":{"type":"string","description":"Stable per-parent request identity. Reuse only for the identical task request."}},"required":["target_id","prompt","client_request_id"],"additionalProperties":false})},
         McpTool {name:"task_status",description:"Read this native parent's cached remote task and actual native events after an optional cursor. No launch and no remote busy-poll: the coordinator follows in the background. Use on demand, not in a tight waiting loop.",input_schema:json!({"type":"object","properties":{"task_id":{"type":"string"},"cursor":{"type":"integer","minimum":0}},"required":["task_id"],"additionalProperties":false})},
@@ -692,8 +735,7 @@ fn register_tools() -> Vec<StdioTool> {
                     },
                     "base": {
                         "type": "string",
-                        "description": "Base branch to fork from when `new_branch` is true. Defaults to \"main\".",
-                        "default": "main"
+                        "description": "Base branch to fork from when `new_branch` is true. Defaults to the repository's default branch."
                     },
                     "layout": {
                         "type": "string",
@@ -914,16 +956,7 @@ fn register_tools() -> Vec<StdioTool> {
                 "required": ["title", "html"]
             }),
         },
-    ];
-    let mut tools: Vec<StdioTool> = legacy.into_iter().map(StdioTool::from).collect();
-    if !provider_stdio_origin() {
-        tools.extend(crate::agent_control::native_tools().into_iter().map(|tool| StdioTool {
-            name: tool.name.into(),
-            description: tool.description.into(),
-            input_schema: tool.input_schema,
-        }));
-    }
-    tools
+    ]
 }
 
 /// Largest page `html_render` accepts. The page lives in the chat
@@ -1036,9 +1069,13 @@ fn html_render_result(arguments: &Value) -> Result<Value, String> {
 // MCP protocol handling
 // ---------------------------------------------------------------------------
 
-/// What provider-injected stdio tells the model: those processes list no
-/// native control tools.
+/// What stdio that serves an agent tells the model: those processes list no
+/// registry tools.
 const PROVIDER_INSTRUCTIONS: &str = "Use the advertised workspace and browser tools. Native thread control is unavailable on provider-injected MCP; it requires a separate authorized controller connection.";
+
+/// The refusal a process that serves an agent gets for a registry tool.
+const PROVIDER_CONTROL_DENIED: &str =
+    "provider_control_denied: provider MCP cannot use trusted native-controller tools";
 
 /// Command-line options for `codemux mcp`.
 #[derive(Debug, Clone, Default)]
@@ -1049,44 +1086,78 @@ pub struct McpServerOptions {
     pub access: Option<ControlAccess>,
 }
 
-/// Runs one tool call to its tool result. Tool failures are `isError` results
-/// the model sees, never JSON-RPC errors.
-type RunTool = Arc<dyn Fn(CallToolParams) -> BoxFuture<'static, Value> + Send + Sync>;
+/// Who this `codemux mcp` serves, fixed when it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StdioCaller {
+    /// Started from an app-installed config (`.mcp.json`, codemux-self).
+    provider_origin: bool,
+    /// Runs under an agent Codemux started (`CODEMUX_AGENT_PROCESS`).
+    agent: bool,
+    /// The most this process may do (`--access`, default full access).
+    access: ControlAccess,
+}
+
+impl StdioCaller {
+    /// `var` stands in for the process env, so tests never read it.
+    fn from_env(var: impl Fn(&str) -> Option<OsString>, access: ControlAccess) -> Self {
+        Self { provider_origin: var(PROVIDER_ORIGIN_ENV).is_some(), agent: var(AGENT_PROCESS_ENV).is_some(), access }
+    }
+
+    /// Such a process lists legacy tools only and is refused registry tools:
+    /// an agent controls threads through its own chat's tools.
+    fn serves_an_agent(self) -> bool {
+        self.provider_origin || self.agent
+    }
+}
+
+/// Which side of `codemux mcp` runs a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolKind {
+    /// A control-plane registry tool, run in the app through socket `tool_call`.
+    Registry,
+    /// One of the server's own tools, run on the legacy lane.
+    Legacy,
+}
+
+/// Runs one tool call to its result. Tool failures are `isError` results the
+/// model sees; a JSON-RPC error only for a tool the app does not know.
+type RunTool = Arc<dyn Fn(ToolKind, CallToolParams) -> BoxFuture<'static, Result<Value, RpcError>> + Send + Sync>;
+
+/// Records `clientInfo.name` as this process's client name; the first usable
+/// name wins, so `--client` beats it.
+type NameClient = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// The request handler behind `codemux mcp`.
 struct StdioServer {
-    /// The `clientInfo` from the first `initialize` that sent one.
-    client: OnceLock<ClientInfo>,
-    /// Kept for the caller identity the socket will carry; nothing reads them
-    /// yet.
-    #[allow(dead_code)]
-    options: McpServerOptions,
+    caller: StdioCaller,
+    name_client: NameClient,
     run: RunTool,
     legacy: LegacyLane,
 }
 
 impl StdioServer {
-    fn new(options: McpServerOptions) -> Self {
-        Self::with_runner(options, Arc::new(|call| -> BoxFuture<'static, Value> { Box::pin(handle_tool_call(call)) }))
+    /// Needs a Tokio runtime: the legacy lane runs on its own task.
+    fn new(caller: StdioCaller) -> Self {
+        Self::with_runner(caller, Arc::new(control_identity::set_client_name), Arc::new(run_tool))
     }
 
     /// Needs a Tokio runtime: the legacy lane runs on its own task.
-    fn with_runner(options: McpServerOptions, run: RunTool) -> Self {
+    fn with_runner(caller: StdioCaller, name_client: NameClient, run: RunTool) -> Self {
         let legacy = LegacyLane::spawn(Arc::clone(&run));
-        Self { client: OnceLock::new(), options, run, legacy }
+        Self { caller, name_client, run, legacy }
     }
 
     fn initialize(&self, params: &Value) -> Value {
         let offer = InitializeRequest::parse(params);
         let protocol_version = offer.negotiated_version();
-        if let Some(client) = offer.client_info {
-            let _ = self.client.set(client);
+        if let Some(client) = &offer.client_info {
+            (self.name_client)(&client.name);
         }
         InitializeResult {
             protocol_version,
             tools_list_changed: None,
             server_info: ServerInfo { name: "codemux", version: env!("CARGO_PKG_VERSION") },
-            instructions: Some(if provider_stdio_origin() {
+            instructions: Some(if self.caller.serves_an_agent() {
                 PROVIDER_INSTRUCTIONS
             } else {
                 crate::agent_control::INSTRUCTIONS
@@ -1095,24 +1166,47 @@ impl StdioServer {
         .to_value()
     }
 
+    fn tools_list(&self) -> Value {
+        let StdioCaller { provider_origin, agent, access } = self.caller;
+        let tools: Vec<Value> = stdio_tools(provider_origin, agent, access)
+            .into_iter()
+            .map(|tool| {
+                let mut listed = json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": tool.input_schema
+                });
+                if let Some(annotations) = tool.annotations {
+                    listed["annotations"] = annotations;
+                }
+                listed
+            })
+            .collect();
+        json!({ "tools": tools })
+    }
+
     fn tools_call(&self, params: &Value) -> Reply {
         let call = match CallToolParams::parse(params) {
             Ok(call) => call,
             Err(error) => return Reply::Now(Err(error)),
         };
-        if !crate::agent_control::is_native_tool(&call.name) {
-            return Reply::Queued(self.legacy.submit(call));
+        if self.caller.serves_an_agent() {
+            // Legacy twins keep their legacy implementation here.
+            if registry::relay_refuses(&call.name) {
+                return Reply::Now(Err(RpcError::invalid_request(PROVIDER_CONTROL_DENIED)));
+            }
+        } else if let Some((_, spec)) = registry::served(&call.name, Audience::Outside) {
+            // Registry tools are built for concurrent callers, so a long
+            // `thread_wait` never holds up `thread_status` or `thread_interrupt`.
+            return Reply::Later { future: (self.run)(ToolKind::Registry, call), parks: spec.may_wait() };
         }
-        if provider_stdio_origin() {
-            return Reply::Now(Err(RpcError::invalid_request(
-                "provider_control_denied: provider MCP cannot use trusted native-controller tools",
-            )));
+        // The app checks every command that reaches it; this covers the
+        // tools that run here (local git, `html_render`) and answers the
+        // rest without a round trip.
+        if let Err(error) = control_identity::stdio_permits(&call.name, &call.arguments, self.caller.access) {
+            return Reply::Now(Ok(protocol::error_result(error.to_string())));
         }
-        // Native control tools are built for concurrent callers, so a long
-        // `thread_wait` never holds up `thread_status` or `thread_interrupt`.
-        let parks = call.name == "thread_wait";
-        let result = (self.run)(call);
-        Reply::Later { future: Box::pin(async move { Ok(result.await) }), parks }
+        Reply::Queued(self.legacy.submit(call))
     }
 }
 
@@ -1121,7 +1215,7 @@ impl Handler for StdioServer {
         match request.method.as_str() {
             "initialize" => Reply::Now(Ok(self.initialize(&request.params))),
             "ping" => Reply::Now(Ok(json!({}))),
-            "tools/list" => Reply::Now(Ok(tools_list())),
+            "tools/list" => Reply::Now(Ok(self.tools_list())),
             "tools/call" => self.tools_call(&request.params),
             // Includes `server/discover`: method-not-found with the probe's id
             // tells a stateless-era client to fall back to `initialize`.
@@ -1130,18 +1224,12 @@ impl Handler for StdioServer {
     }
 }
 
-fn tools_list() -> Value {
-    let tools: Vec<Value> = register_tools()
-        .into_iter()
-        .map(|tool| {
-            json!({
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool.input_schema
-            })
-        })
-        .collect();
-    json!({ "tools": tools })
+/// The runner `codemux mcp` uses.
+fn run_tool(kind: ToolKind, call: CallToolParams) -> BoxFuture<'static, Result<Value, RpcError>> {
+    match kind {
+        ToolKind::Registry => Box::pin(relay_registry_call(call)),
+        ToolKind::Legacy => Box::pin(async move { Ok(handle_tool_call(call).await) }),
+    }
 }
 
 /// Runs the server's own tools one at a time, in arrival order, as the
@@ -1155,7 +1243,7 @@ struct LegacyLane {
 
 struct LegacyJob {
     call: CallToolParams,
-    reply: oneshot::Sender<Value>,
+    reply: oneshot::Sender<Result<Value, RpcError>>,
 }
 
 impl LegacyLane {
@@ -1173,10 +1261,10 @@ impl LegacyLane {
                 let name = call.name.clone();
                 // A panicking tool must not end the lane: every later legacy
                 // call would fail while the process still looks healthy.
-                let result = AssertUnwindSafe(async { run(call).await })
+                let result = AssertUnwindSafe(async { run(ToolKind::Legacy, call).await })
                     .catch_unwind()
                     .await
-                    .unwrap_or_else(|_| protocol::error_result(format!("{name} failed unexpectedly")));
+                    .unwrap_or_else(|_| Ok(protocol::error_result(format!("{name} failed unexpectedly"))));
                 let _ = reply.send(result);
             }
         });
@@ -1190,7 +1278,7 @@ impl LegacyLane {
         let (reply, result) = oneshot::channel();
         // A failed send drops `reply`, so the receiver reports it below.
         let _ = self.jobs.send(LegacyJob { call, reply });
-        Box::pin(async move { result.await.map_err(|_| RpcError::internal("The tool worker stopped")) })
+        Box::pin(async move { result.await.unwrap_or_else(|_| Err(RpcError::internal("The tool worker stopped"))) })
     }
 }
 
@@ -1240,8 +1328,8 @@ fn resolve_workspace_id(meta: Option<&Value>, env_fallback: Option<String>) -> S
         .unwrap_or_default()
 }
 
-/// Run one tool call. Provider-origin processes never get here with a native
-/// control tool: `StdioServer::tools_call` refuses it first.
+/// Run one of the server's own tools. Registry tools never get here:
+/// `StdioServer::tools_call` relays or refuses them first.
 async fn handle_tool_call(call: CallToolParams) -> Value {
     let CallToolParams { name: tool_name, arguments, meta } = call;
 
@@ -1265,7 +1353,6 @@ async fn handle_tool_call(call: CallToolParams) -> Value {
 
     let result = match tool_name.as_str() {
         "delegation_targets" | REMOTE_DELEGATE_TOOL | "task_status" | "task_cancel" => Err("Native-only delegation tool: use the actual Codex/Claude adapter context. Generic stdio MCP and caller-supplied metadata cannot authorize a parent.".into()),
-        name if crate::agent_control::is_native_tool(name) => call_socket(name,arguments.clone()).await,
         // -- Browser tools --
         "browser_navigate" => {
             let url = arguments.get("url").and_then(Value::as_str).unwrap_or_default();
@@ -1886,6 +1973,42 @@ async fn call_socket(command: &str, params: Value) -> Result<Value, String> {
     }
 }
 
+/// Runs a registry tool in the app through socket `tool_call`, so every door
+/// shares one dispatcher, and returns its CallToolResult as the app built it.
+async fn relay_registry_call(call: CallToolParams) -> Result<Value, RpcError> {
+    let CallToolParams { name, arguments, meta } = call;
+    let request = ControlRequest {
+        command: "tool_call".into(),
+        params: json!({ "name": name, "arguments": arguments }),
+    };
+    let response = match send_control_request(request).await {
+        Ok(response) => response,
+        Err(detail) => return Ok(registry::mcp_error(&ControlError::new(ErrorCode::AppUnavailable, detail))),
+    };
+    if response.ok {
+        return Ok(response.data.unwrap_or(Value::Null));
+    }
+    let text = response.error.unwrap_or_else(|| "Unknown error".to_string());
+    // A running app older than this binary (the package was upgraded and the
+    // app not restarted yet) has no `tool_call`. Answer the way that app
+    // would have: bare socket aliases as before, legacy twins with their
+    // legacy result (vexis-agent's `workspace_info {}` keeps working).
+    if text == "Unknown control command: tool_call" {
+        if registry::is_socket_alias(&name) {
+            let result = call_socket(&name, arguments).await.map_err(ControlError::from);
+            return Ok(registry::mcp_result(&name, result));
+        }
+        if is_legacy_tool(&name) {
+            return Ok(handle_tool_call(CallToolParams { name, arguments, meta }).await);
+        }
+    }
+    let error = ControlError::from(text);
+    if error.code == ErrorCode::UnknownTool {
+        return Err(RpcError::invalid_params(error.to_string()));
+    }
+    Ok(registry::mcp_error(&error))
+}
+
 // ---------------------------------------------------------------------------
 // Git helper (shell out in workspace cwd)
 // ---------------------------------------------------------------------------
@@ -1950,7 +2073,17 @@ pub async fn run_mcp_server() -> Result<(), String> {
 pub async fn run_mcp_server_with(options: McpServerOptions) -> Result<(), String> {
     // Log to stderr so it doesn't interfere with the JSON-RPC protocol on stdout.
     eprintln!("[codemux::mcp] MCP server starting (stdio transport)");
-    let server = Arc::new(StdioServer::new(options));
+    // Before any line is read: `--client` beats the client's own
+    // `clientInfo.name`, and every socket call carries both.
+    if let Some(name) = &options.client {
+        control_identity::set_client_name(name);
+    }
+    if let Some(access) = options.access {
+        control_identity::set_client_access(access);
+    }
+    let access = control_identity::client_access().unwrap_or(ControlAccess::FullAccess);
+    let caller = StdioCaller::from_env(|key| std::env::var_os(key), access);
+    let server = Arc::new(StdioServer::new(caller));
     let served = protocol::stdio::serve(tokio::io::stdin(), tokio::io::stdout(), server).await;
     eprintln!("[codemux::mcp] MCP server shutting down (stdin closed)");
     served
@@ -2392,10 +2525,28 @@ mod tests {
     use crate::mcp::protocol::{Incoming, RequestId, Response};
     use std::time::Duration;
 
-    /// A server with the real tool runner. Calls that reach the control
-    /// socket are not made here.
+    /// An outside caller at full access: no provider origin, no agent marker.
+    fn outside() -> StdioCaller {
+        StdioCaller { provider_origin: false, agent: false, access: ControlAccess::FullAccess }
+    }
+
+    /// Tests never name the test process's own client.
+    fn unnamed() -> NameClient {
+        Arc::new(|_: &str| false)
+    }
+
+    /// A server with the real tool runner for `caller`. Calls that reach the
+    /// control socket are not made here.
+    fn server_for(caller: StdioCaller) -> StdioServer {
+        StdioServer::with_runner(caller, unnamed(), Arc::new(run_tool))
+    }
+
     fn server() -> StdioServer {
-        StdioServer::new(McpServerOptions::default())
+        server_for(outside())
+    }
+
+    fn names(tools: &[StdioTool]) -> Vec<&str> {
+        tools.iter().map(|tool| tool.name.as_ref()).collect()
     }
 
     /// Feed one JSON-RPC message to `server` and wait for its reply, as the
@@ -2448,9 +2599,11 @@ mod tests {
             assert_eq!(codemux_mcp_entry()["env"][MARKER], "1", "app-installed provider configs must bind the restricted invocation");
             return;
         }
-        assert!(!register_tools().iter().any(|tool| crate::agent_control::is_native_tool(&tool.name)),
+        let caller = StdioCaller::from_env(|key| std::env::var_os(key), ControlAccess::FullAccess);
+        assert!(caller.provider_origin, "the marker is read from the process env");
+        assert!(!stdio_tools(caller.provider_origin, caller.agent, caller.access).iter().any(|tool| registry::relay_refuses(&tool.name)),
             "provider-origin stdio must omit trusted native tools");
-        let server = server();
+        let server = server_for(caller);
         let result = rpc(&server, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"thread_launch","arguments":{},
             "_meta":{"control_access":"full_access"}}})).await.unwrap();
         assert!(result.to_string().contains("provider_control_denied"),
@@ -2508,9 +2661,7 @@ mod tests {
 
     #[test]
     fn legacy_tool_names_are_pinned() {
-        let tools = register_tools();
-        let legacy: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref())
-            .filter(|name| !crate::agent_control::is_native_tool(name)).collect();
+        let legacy: Vec<&str> = legacy_tools().iter().map(|tool| tool.name).collect();
         assert_eq!(legacy, LEGACY_TOOL_NAMES, "a legacy tool was added, removed or renamed");
         assert!(LEGACY_TOOL_NAMES.iter().all(|name| is_legacy_tool(name)));
         assert!(!is_legacy_tool("thread_launch") && !is_legacy_tool("nope"));
@@ -2518,15 +2669,17 @@ mod tests {
 
     #[test]
     fn tool_registry_has_all_tools() {
-        let tools = register_tools();
+        // Registry tools take over legacy names on outside stdio, so the count
+        // stays 75 however many of the legacy tools they replace.
+        let tools = stdio_tools(false, false, ControlAccess::FullAccess);
         // Tool count bumped from 39 → 44 with the Phase 1.6 lifecycle +
         // issue tools, then 44 → 52 with the eight automation tools,
         // then 52 → 55 with the workspace-archive tools, then 55 → 57
         // with provider-neutral attached-conversation history
         // (workspace_archive / workspace_unarchive /
         // workspace_archive_list), then 57 → 58 with html_render. Keep
-        // this number in sync with register_tools() when adding new entries.
-        // Native control adds eleven, plus two isolated plugin tools.
+        // this number in sync with legacy_tools() when adding new entries.
+        // The registry adds its outside tools that have no legacy twin.
         assert_eq!(tools.len(), 75);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(names.contains(&"browser_navigate"));
@@ -2583,9 +2736,17 @@ mod tests {
         assert!(names.contains(&"issue_link_workspace"));
     }
 
+    /// Every tool any stdio caller is offered: the outside listing plus the
+    /// legacy definitions it replaces.
+    fn every_tool() -> Vec<StdioTool> {
+        let mut tools = stdio_tools(false, false, ControlAccess::FullAccess);
+        tools.extend(legacy_tools().into_iter().map(StdioTool::from));
+        tools
+    }
+
     #[test]
     fn tool_schemas_are_valid_json_objects() {
-        for tool in register_tools() {
+        for tool in every_tool() {
             assert!(tool.input_schema.is_object(), "Tool {} schema is not an object", tool.name);
             assert_eq!(
                 tool.input_schema.get("type").and_then(Value::as_str),
@@ -2598,7 +2759,7 @@ mod tests {
 
     #[test]
     fn tool_schemas_required_fields_are_arrays() {
-        for tool in register_tools() {
+        for tool in every_tool() {
             if let Some(required) = tool.input_schema.get("required") {
                 assert!(required.is_array(), "Tool {} required field is not an array", tool.name);
                 for item in required.as_array().unwrap() {
@@ -2610,7 +2771,7 @@ mod tests {
 
     #[test]
     fn tool_names_unique() {
-        let tools = register_tools();
+        let tools = stdio_tools(false, false, ControlAccess::FullAccess);
         let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         let original_len = names.len();
         names.sort();
@@ -2695,9 +2856,17 @@ mod tests {
         assert_eq!(result["capabilities"], json!({ "tools": {} }));
     }
 
+    /// A server whose client name goes to `slot` instead of the process.
+    fn named_server(slot: &Arc<std::sync::OnceLock<String>>) -> StdioServer {
+        let slot = Arc::clone(slot);
+        let name: NameClient = Arc::new(move |raw: &str| control_identity::adopt_name(&slot, raw));
+        StdioServer::with_runner(outside(), name, Arc::new(run_tool))
+    }
+
     #[tokio::test]
     async fn initialize_echoes_2025_11_25_and_records_client_info() {
-        let server = server();
+        let slot = Arc::new(std::sync::OnceLock::new());
+        let server = named_server(&slot);
         let resp = rpc(&server, json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
@@ -2706,17 +2875,14 @@ mod tests {
             }
         })).await.unwrap();
         assert_eq!(resp["result"]["protocolVersion"], "2025-11-25");
-        assert_eq!(
-            server.client.get(),
-            Some(&ClientInfo { name: "Hermes Agent".into(), version: "2.0.0".into(), title: Some("Hermes".into()) })
-        );
+        assert_eq!(slot.get().map(String::as_str), Some("Hermes Agent"), "clientInfo names the client");
         // The first name sticks; an offer the server does not speak gets the latest.
         let resp = rpc(&server, json!({
             "jsonrpc": "2.0", "id": 2, "method": "initialize",
             "params": {"protocolVersion": "2026-07-28", "clientInfo": {"name": "other", "version": "1"}}
         })).await.unwrap();
         assert_eq!(resp["result"]["protocolVersion"], "2025-11-25");
-        assert_eq!(server.client.get().unwrap().name, "Hermes Agent");
+        assert_eq!(slot.get().map(String::as_str), Some("Hermes Agent"), "the first name sticks");
         let bare = rpc(&server, json!({"jsonrpc": "2.0", "id": 3, "method": "initialize"})).await.unwrap();
         assert_eq!(bare["result"]["protocolVersion"], "2025-11-25");
     }
@@ -2804,9 +2970,18 @@ mod tests {
         let gate = Arc::new(tokio::sync::Notify::new());
         let started = Arc::new(Mutex::new(Vec::new()));
         let finished = Arc::new(Mutex::new(Vec::new()));
+        gated_server_for(outside(), gate, started, finished)
+    }
+
+    fn gated_server_for(
+        caller: StdioCaller,
+        gate: Arc<tokio::sync::Notify>,
+        started: Arc<Mutex<Vec<String>>>,
+        finished: Arc<Mutex<Vec<String>>>,
+    ) -> Gated {
         let (gate_for_run, started_for_run, finished_for_run) =
             (Arc::clone(&gate), Arc::clone(&started), Arc::clone(&finished));
-        let server = StdioServer::with_runner(McpServerOptions::default(), Arc::new(move |call: CallToolParams| -> BoxFuture<'static, Value> {
+        let run: RunTool = Arc::new(move |kind: ToolKind, call: CallToolParams| -> BoxFuture<'static, Result<Value, RpcError>> {
             let (gate, started, finished) =
                 (Arc::clone(&gate_for_run), Arc::clone(&started_for_run), Arc::clone(&finished_for_run));
             Box::pin(async move {
@@ -2817,10 +2992,10 @@ mod tests {
                     _ => {}
                 }
                 finished.lock().unwrap().push(call.name.clone());
-                protocol::text_result(call.name)
+                Ok(protocol::text_result(format!("{}{}", call.name, if kind == ToolKind::Registry { " (registry)" } else { "" })))
             })
-        }));
-        Gated { server, gate, started, finished }
+        });
+        Gated { server: StdioServer::with_runner(caller, unnamed(), run), gate, started, finished }
     }
 
     /// Lets other tasks run until `done` holds, for at most 2 s.
@@ -2838,7 +3013,7 @@ mod tests {
         let active = Arc::new(Mutex::new((0usize, 0usize)));
         let finished = Arc::new(Mutex::new(Vec::new()));
         let (active_for_run, finished_for_run) = (Arc::clone(&active), Arc::clone(&finished));
-        let server = StdioServer::with_runner(McpServerOptions::default(), Arc::new(move |call: CallToolParams| -> BoxFuture<'static, Value> {
+        let server = StdioServer::with_runner(outside(), unnamed(), Arc::new(move |_: ToolKind, call: CallToolParams| -> BoxFuture<'static, Result<Value, RpcError>> {
             let (active, finished) = (Arc::clone(&active_for_run), Arc::clone(&finished_for_run));
             Box::pin(async move {
                 {
@@ -2850,7 +3025,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 active.lock().unwrap().0 -= 1;
                 finished.lock().unwrap().push(call.name.clone());
-                protocol::text_result(call.name)
+                Ok(protocol::text_result(call.name))
             })
         }));
         // Each later call is quicker, so any overlap would reorder them.
@@ -2881,12 +3056,267 @@ mod tests {
         let (status, status_parks) = later(server.request(request(2, "thread_status", json!({}))));
         let (_, wait_parks) = later(server.request(request(3, "thread_wait", json!({}))));
         assert_eq!((legacy_parks, status_parks, wait_parks), (false, false, true), "only waits park");
-        // The native call finishes while the legacy job is still blocked.
+        // The registry call finishes while the legacy job is still blocked.
         let status = tokio::time::timeout(Duration::from_secs(2), status).await.expect("not held by the legacy lane");
-        assert_eq!(status.unwrap()["content"][0]["text"], "thread_status");
+        assert_eq!(status.unwrap()["content"][0]["text"], "thread_status (registry)");
         assert_eq!(*started.lock().unwrap(), ["git_status", "thread_status"]);
         gate.notify_one();
         assert_eq!(legacy.await.unwrap()["content"][0]["text"], "git_status");
+    }
+
+    fn caller(provider_origin: bool, agent: bool, access: ControlAccess) -> StdioCaller {
+        StdioCaller { provider_origin, agent, access }
+    }
+
+    /// A tool's access class: the registry's for registry tools, otherwise
+    /// the legacy classification.
+    fn class_of(tool: &StdioTool) -> crate::agent_control::Access {
+        match &tool.annotations {
+            Some(_) => registry::lookup(&tool.name).map(|(_, spec)| spec.access()),
+            None => control_identity::mcp_tool_access(&tool.name, &json!({})),
+        }
+        .unwrap_or_else(|| panic!("{} has no access class", tool.name))
+    }
+
+    #[test]
+    fn stdio_keeps_one_workspace_list() {
+        let outside = stdio_tools(false, false, ControlAccess::FullAccess);
+        let twins: Vec<&str> = LEGACY_TOOL_NAMES.iter().copied().filter(|name| registry::served(name, Audience::Outside).is_some()).collect();
+        assert!(twins.contains(&"workspace_list"), "{twins:?}");
+        for twin in &twins {
+            let served: Vec<&StdioTool> = outside.iter().filter(|tool| tool.name == *twin).collect();
+            assert_eq!(served.len(), 1, "{twin} is listed once");
+            assert!(served[0].annotations.is_some(), "{twin}: outside stdio serves the registry definition");
+            assert_eq!(served[0].input_schema["additionalProperties"], false, "{twin}");
+        }
+        let list = outside.iter().find(|tool| tool.name == "workspace_list").unwrap();
+        assert_eq!(list.annotations.as_ref().unwrap()["readOnlyHint"], true);
+        let provider = stdio_tools(true, false, ControlAccess::FullAccess);
+        let legacy = provider.iter().find(|tool| tool.name == "workspace_list").unwrap();
+        assert!(legacy.input_schema.get("additionalProperties").is_none(), "provider-origin stdio keeps the legacy schema");
+        assert!(legacy.annotations.is_none());
+    }
+
+    #[tokio::test]
+    async fn tools_list_serializes_annotations_only_for_registry_tools() {
+        let listed = rpc(&server(), json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await.unwrap();
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        let tool = |name: &str| tools.iter().find(|tool| tool["name"] == name).unwrap_or_else(|| panic!("{name} is listed"));
+        assert_eq!(tool("thread_wait")["annotations"]["readOnlyHint"], true);
+        assert_eq!(tool("thread_stop")["annotations"]["destructiveHint"], true);
+        assert!(tool("git_status").get("annotations").is_none(), "legacy tools keep their shape");
+    }
+
+    #[test]
+    fn legacy_stdio_schemas_use_only_the_validated_vocabulary() {
+        for tool in legacy_tools() {
+            let errors = crate::agent_control::schema::vocabulary_errors(&tool.input_schema);
+            assert!(errors.is_empty(), "{}: {errors:?}", tool.name);
+        }
+    }
+
+    #[test]
+    fn legacy_worktree_base_defaults_to_the_repository_default_branch() {
+        let tools = legacy_tools();
+        let worktree = tools.iter().find(|tool| tool.name == "worktree_create").unwrap();
+        let base = &worktree.input_schema["properties"]["base"];
+        assert!(base.get("default").is_none(), "{base}");
+        assert!(base["description"].as_str().unwrap().contains("Defaults to the repository's default branch"), "{base}");
+    }
+
+    #[tokio::test]
+    async fn client_name_comes_from_flag_then_client_info() {
+        let initialize = |name: &str| json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "clientInfo": {"name": name, "version": "1"}}});
+        // `--client` is applied before the server reads its first line.
+        let flagged = Arc::new(std::sync::OnceLock::new());
+        assert!(control_identity::adopt_name(&flagged, "hermes"));
+        let server = named_server(&flagged);
+        rpc(&server, initialize("Claude Code")).await.unwrap();
+        assert_eq!(flagged.get().map(String::as_str), Some("hermes"), "the flag beats clientInfo");
+        // Without the flag, the first usable clientInfo name wins.
+        let unflagged = Arc::new(std::sync::OnceLock::new());
+        let server = named_server(&unflagged);
+        rpc(&server, initialize("  ")).await.unwrap();
+        assert_eq!(unflagged.get(), None, "a blank name names nobody");
+        rpc(&server, initialize("Claude Code")).await.unwrap();
+        rpc(&server, initialize("other")).await.unwrap();
+        assert_eq!(unflagged.get().map(String::as_str), Some("Claude Code"));
+    }
+
+    #[test]
+    fn read_only_stdio_lists_only_read_tools() {
+        let tools = stdio_tools(false, false, ControlAccess::ReadOnly);
+        for tool in &tools {
+            assert_eq!(class_of(tool), crate::agent_control::Access::Read, "{} is listed read-only", tool.name);
+        }
+        let names = names(&tools);
+        for shown in ["git_status", "workspace_list", "workspace_info", "pane_list", "html_render", "thread_list", "thread_status", "thread_wait"] {
+            assert!(names.contains(&shown), "{shown}: {names:?}");
+        }
+        for hidden in ["git_commit", "notify", "browser_click", "thread_launch", "thread_send", "workspace_create", "terminal_write"] {
+            assert!(!names.contains(&hidden), "{hidden}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn supervised_stdio_hides_machine_and_admin_tools() {
+        use crate::agent_control::Access;
+        let tools = stdio_tools(false, false, ControlAccess::Supervised);
+        for tool in &tools {
+            assert!(matches!(class_of(tool), Access::Read | Access::Write | Access::StartsThreads), "{} is listed supervised", tool.name);
+        }
+        let names = names(&tools);
+        for shown in ["notify", "git_commit", "browser_click", "workspace_open", "thread_launch", "thread_send", "thread_respond"] {
+            assert!(names.contains(&shown), "{shown}: {names:?}");
+        }
+        for hidden in ["automation_create", "automation_pause", "terminal_write", "preset_apply", "workspace_create", "worktree_create", "workspace_unarchive"] {
+            assert!(!names.contains(&hidden), "{hidden}: {names:?}");
+        }
+        assert!(names.len() < stdio_tools(false, false, ControlAccess::FullAccess).len());
+    }
+
+    #[tokio::test]
+    async fn provider_origin_stdio_keeps_every_legacy_name() {
+        for access in [ControlAccess::ReadOnly, ControlAccess::Supervised, ControlAccess::FullAccess] {
+            let tools = stdio_tools(true, false, access);
+            assert_eq!(names(&tools), LEGACY_TOOL_NAMES, "{access:?}");
+            assert!(tools.iter().all(|tool| tool.annotations.is_none()));
+        }
+        let listed = rpc(&server_for(caller(true, false, ControlAccess::FullAccess)), json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await.unwrap();
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), LEGACY_TOOL_NAMES.len());
+    }
+
+    #[tokio::test]
+    async fn agent_marked_stdio_lists_legacy_only() {
+        fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
+            move |key| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| OsString::from(v))
+        }
+        let marked = StdioCaller::from_env(env(&[(AGENT_PROCESS_ENV, "")]), ControlAccess::FullAccess);
+        assert_eq!(marked, caller(false, true, ControlAccess::FullAccess), "presence alone marks an agent");
+        assert_eq!(StdioCaller::from_env(env(&[(PROVIDER_ORIGIN_ENV, "1")]), ControlAccess::ReadOnly), caller(true, false, ControlAccess::ReadOnly));
+        assert_eq!(StdioCaller::from_env(env(&[]), ControlAccess::Supervised), caller(false, false, ControlAccess::Supervised));
+
+        assert_eq!(names(&stdio_tools(false, true, ControlAccess::FullAccess)), LEGACY_TOOL_NAMES);
+        let Gated { server, started, .. } = gated_server_for(marked, Default::default(), Default::default(), Default::default());
+        for name in ["thread_list", "thread_wait", "create_threads"] {
+            let refused = rpc(&server, tools_call(1, name, json!({}))).await.unwrap();
+            assert_eq!(refused["error"]["code"], -32600, "{name}: {refused}");
+            assert!(refused["error"]["message"].as_str().unwrap().starts_with("provider_control_denied: "), "{refused}");
+        }
+        // A legacy twin keeps its legacy implementation.
+        let listed = rpc(&server, tools_call(2, "workspace_list", json!({}))).await.unwrap();
+        assert_eq!(listed["result"]["content"][0]["text"], "workspace_list", "{listed}");
+        assert_eq!(*started.lock().unwrap(), ["workspace_list"], "refused calls never ran");
+        let initialized = rpc(&server, json!({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {}})).await.unwrap();
+        assert!(initialized["result"]["instructions"].as_str().unwrap().contains("Native thread control is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn read_only_stdio_refuses_local_git_writes() {
+        let Gated { server, started, .. } =
+            gated_server_for(caller(false, false, ControlAccess::ReadOnly), Default::default(), Default::default(), Default::default());
+        for (name, arguments) in [("git_commit", json!({"message": "x"})), ("git_push", json!({})), ("notify", json!({"message": "x"}))] {
+            let refused = rpc(&server, tools_call(1, name, arguments)).await.unwrap();
+            assert_eq!(refused["result"]["isError"], true, "{name}: {refused}");
+            let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.starts_with("access_denied: This connection is read-only"), "{text}");
+        }
+        assert!(started.lock().unwrap().is_empty(), "a refused tool never runs");
+        let diff = rpc(&server, tools_call(2, "git_diff", json!({}))).await.unwrap();
+        assert_eq!(diff["result"]["content"][0]["text"], "git_diff");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_registry_calls_report_app_unavailable_without_codemux() {
+        if crate::test_isolation::isolated("mcp_server::tests::stdio_registry_calls_report_app_unavailable_without_codemux") {
+            return;
+        }
+        // Nothing listens in this child's private runtime dir.
+        let reply = rpc(&server(), tools_call(1, "operation_status", json!({"operation_id": "x"}))).await.unwrap();
+        let result = &reply["result"];
+        assert_eq!(result["isError"], true, "{reply}");
+        assert_eq!(result["structuredContent"]["error"]["code"], "app_unavailable", "{reply}");
+        assert_eq!(result["structuredContent"]["error"]["retryable"], true);
+    }
+
+    /// A control socket like an app from before `tool_call`: it answers
+    /// `get_app_state` and the bare aliases, and records each command.
+    #[cfg(unix)]
+    fn old_app_socket() -> Arc<Mutex<Vec<String>>> {
+        let path = crate::control::control_socket_path().unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut line = String::new();
+                if std::io::BufReader::new(&stream).read_line(&mut line).is_err() {
+                    continue;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let command = request["command"].as_str().unwrap().to_owned();
+                recorded.lock().unwrap().push(command.clone());
+                let (ok, data, error) = match command.as_str() {
+                    "get_app_state" => (true, json!({"active_workspace_id": "ws-1", "workspaces": [
+                        {"workspace_id": "ws-1", "cwd": "/w1", "surfaces": [{"surface_id": "s1"}]},
+                        {"workspace_id": "ws-2", "cwd": "/w2", "surfaces": []},
+                    ]}), Value::Null),
+                    "thread_list" => (true, json!({"threads": []}), Value::Null),
+                    "operation_status" => (false, Value::Null, json!("operation_not_found: No operation belongs to this client and ID")),
+                    other => (false, Value::Null, json!(format!("Unknown control command: {other}"))),
+                };
+                let reply = json!({"ok": ok, "protocol_version": 1, "data": data, "error": error});
+                let _ = writeln!(stream, "{reply}");
+            }
+        });
+        seen
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_twins_fall_back_to_legacy_arms_on_an_old_app() {
+        if crate::test_isolation::isolated("mcp_server::tests::stdio_twins_fall_back_to_legacy_arms_on_an_old_app") {
+            return;
+        }
+        let seen = old_app_socket();
+        let server = server();
+        let text = |reply: &Value| reply["result"]["content"][0]["text"].as_str().unwrap().to_owned();
+
+        // vexis-agent's call: the focused workspace's legacy snapshot.
+        let info = rpc(&server, tools_call(1, "workspace_info", json!({}))).await.unwrap();
+        let snapshot: Value = serde_json::from_str(&text(&info)).unwrap();
+        assert_eq!(snapshot["workspace_id"], "ws-1", "{info}");
+        assert_eq!(snapshot["surfaces"], json!([{"surface_id": "s1"}]));
+        assert!(info["result"].get("structuredContent").is_none(), "the legacy shape: {info}");
+
+        // Every legacy twin the registry serves falls back the same way.
+        let list = rpc(&server, tools_call(2, "workspace_list", json!({}))).await.unwrap();
+        let listed: Value = serde_json::from_str(&text(&list)).unwrap();
+        assert_eq!(listed["workspaces"].as_array().unwrap().len(), 2, "{list}");
+        assert!(text(&list).contains("\n"), "pretty legacy text: {list}");
+
+        // Bare aliases answer as the old app's own commands.
+        let threads = rpc(&server, tools_call(3, "thread_list", json!({"workspace_id": "ws-1"}))).await.unwrap();
+        assert_eq!(threads["result"]["isError"], false, "{threads}");
+        assert_eq!(threads["result"]["structuredContent"], json!({"threads": []}));
+        let missing = rpc(&server, tools_call(4, "operation_status", json!({"operation_id": "x"}))).await.unwrap();
+        assert_eq!(missing["result"]["structuredContent"]["error"]["code"], "operation_not_found", "{missing}");
+
+        let seen = seen.lock().unwrap().clone();
+        let relayed = |tool: &str| registry::served(tool, Audience::Outside).is_some();
+        let mut expected = Vec::new();
+        for tool in ["workspace_info", "workspace_list"] {
+            if relayed(tool) {
+                expected.push("tool_call");
+            }
+            expected.push("get_app_state");
+        }
+        expected.extend(["tool_call", "thread_list", "tool_call", "operation_status"]);
+        assert_eq!(seen, expected, "registry tools try tool_call first");
     }
 
     #[tokio::test]
@@ -3650,7 +4080,7 @@ mod tests {
 
     #[test]
     fn native_thread_control_tools_are_discoverable() {
-        let tools = register_tools();
+        let tools = stdio_tools(false, false, ControlAccess::FullAccess);
         let names: std::collections::HashSet<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         for name in [
             "agent_capabilities",
@@ -3699,7 +4129,7 @@ mod tests {
     }
     #[test]
     fn cross_host_delegation_tools_are_discoverable() {
-        let tools = register_tools();
+        let tools = legacy_tools();
         for name in ["delegation_targets", REMOTE_DELEGATE_TOOL, "task_status", "task_cancel"] {
             assert!(
                 tools.iter().any(|tool| tool.name == name),

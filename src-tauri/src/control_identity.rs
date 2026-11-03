@@ -73,7 +73,8 @@ pub fn set_client_name(raw: &str) -> bool {
     adopt_name(&CLIENT_NAME, raw)
 }
 
-fn adopt_name(slot: &OnceLock<String>, raw: &str) -> bool {
+/// [`set_client_name`]'s rule for any slot, so tests keep a private one.
+pub(crate) fn adopt_name(slot: &OnceLock<String>, raw: &str) -> bool {
     let raw = raw.trim();
     // A name with nothing left of its slug ("---", "") would resolve to the
     // owner on the server, so it does not claim the slot either.
@@ -83,6 +84,11 @@ fn adopt_name(slot: &OnceLock<String>, raw: &str) -> bool {
 /// Narrows this process's access. The first call wins.
 pub fn set_client_access(access: ControlAccess) {
     let _ = CLIENT_ACCESS.set(access);
+}
+
+/// The access this process asked for, if it narrowed itself.
+pub(crate) fn client_access() -> Option<ControlAccess> {
+    CLIENT_ACCESS.get().copied()
 }
 
 impl ControlClient {
