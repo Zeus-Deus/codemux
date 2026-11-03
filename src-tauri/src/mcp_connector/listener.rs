@@ -1,7 +1,8 @@
 //! The connector's own listener: OAuth + /mcp only, never the paired-browser
 //! surface, and never beyond 127.0.0.1. Off-machine clients reach it through
 //! an HTTPS reverse proxy on this host (the saved public origin).
-use super::{Config, McpConnectorState};
+use super::McpConnectorState;
+use crate::database::DatabaseStore;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, TcpListener as StdListener};
 use std::sync::atomic::Ordering;
@@ -29,13 +30,22 @@ struct Running {
     shutdown: tokio::sync::watch::Sender<bool>,
 }
 
-/// Bring the listener to what `cfg` asks for. Binding is synchronous, so the
+/// Bring the listener to the saved config. The config is read under the
+/// listener lock, so concurrent saves converge on the last one saved rather
+/// than on whichever caller reconciles last. Binding is synchronous, so the
 /// caller's status read-back reports the real outcome. Never falls back to
 /// another port: the issuer (and every grant's resource) depends on it.
-pub(crate) fn reconcile<R: Runtime>(app: &AppHandle<R>, cfg: &Config) {
+pub(crate) fn reconcile<R: Runtime>(app: &AppHandle<R>) {
     let state = app.state::<McpConnectorState>();
     let Ok(mut listener) = state.listener.lock() else {
         return;
+    };
+    let cfg = match super::config(&app.state::<DatabaseStore>()) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            log::warn!("[codemux::mcp_connector] listener left as it is: {e}");
+            return;
+        }
     };
     let want = cfg.enabled.then(|| cfg.configured_port());
     if let (Some(running), Some(port)) = (&listener.running, want) {

@@ -324,7 +324,7 @@ pub fn validate_caller<R: Runtime>(
 pub fn restore_on_boot<R: Runtime>(app: &AppHandle<R>) {
     match config(&app.state::<DatabaseStore>()) {
         Ok(cfg) => {
-            listener::reconcile(app, &cfg);
+            listener::reconcile(app);
             if cfg.enabled {
                 changed(app);
             }
@@ -355,7 +355,7 @@ pub(crate) fn apply_config<R: Runtime>(
     if cfg!(not(test)) && update.port == Some(0) {
         return Err("Choose a port between 1 and 65535".into());
     }
-    let (cfg, revoked) = {
+    let revoked = {
         let state = app.state::<McpConnectorState>();
         let mut auth = state.auth.lock().map_err(|_| "Connector unavailable")?;
         let db = app.state::<DatabaseStore>();
@@ -373,17 +373,17 @@ pub(crate) fn apply_config<R: Runtime>(
         if !cfg.enabled || moved {
             auth.clear();
         }
-        let revoked = if moved {
+        if moved {
             let now = now_ms();
             // Count only grants that still had authority.
             db.mcp_prune_clients(now, &auth.protected_clients(now))?;
             db.mcp_revoke_grants_not_bound_to(&format!("{new_issuer}/mcp"))?
         } else {
             0
-        };
-        (cfg, revoked)
+        }
     };
-    listener::reconcile(app, &cfg);
+    // Reads the saved config itself: a concurrent save may have landed since.
+    listener::reconcile(app);
     authority_changed(app);
     let mut status = agent_connector_status(app.clone())?;
     status.revoked_grants = Some(revoked);
@@ -805,6 +805,26 @@ mod tests {
         );
         set(handle, true, None, None).unwrap();
         assert!(validate_caller(handle, &caller).is_ok());
+        set(handle, false, None, None).unwrap();
+    }
+
+    #[test]
+    fn the_listener_follows_the_last_saved_config() {
+        let app = app();
+        let handle = app.handle();
+        let (first, second) = (free_port(), free_port());
+        set(handle, true, None, Some(first)).unwrap();
+        // A second save lands before the first caller reconciles: the
+        // listener follows the saved config, not the first caller's copy.
+        handle
+            .state::<DatabaseStore>()
+            .mcp_connector_set_config(&serde_json::json!({"enabled": true, "port": second}).to_string())
+            .unwrap();
+        listener::reconcile(handle);
+        let status = agent_connector_status(handle.clone()).unwrap();
+        assert!(status.listener_running, "{:?}", status.bind_error);
+        assert_eq!(status.port, second);
+        assert!(reachable(second));
         set(handle, false, None, None).unwrap();
     }
 
