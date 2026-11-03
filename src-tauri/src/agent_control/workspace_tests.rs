@@ -1,16 +1,16 @@
-//! Tests for the workspace and worktree tools, through the registry as every
-//! outside door calls them.
+//! Tests for the workspace and worktree tools and `thread_launch` into a new
+//! worktree, through the registry as every outside door calls it.
 //!
 //! A test that creates or closes a workspace or a worktree runs in an
 //! isolated child process (`test_isolation::isolated`): worktrees, the layout
 //! file and terminals then live in a private root, never in the developer's
 //! own Codemux state.
-use super::tests::{fixture, mock_agent_provider, native_caller_fixture};
+use super::tests::{fixture, mock_agent_provider, native_caller_fixture, settle_operation};
 use super::{execute, registry, ClientName, ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlState};
 use crate::database::DatabaseStore;
 use crate::state::{AppStateStore, WorkspaceSnapshot};
 use crate::test_isolation::isolated;
-use mock_agent_provider::MockAgentProvider;
+use mock_agent_provider::{MockAgentProvider, MockCall};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -465,4 +465,124 @@ async fn connector_worktree_create_refuses_presets_and_prompts() {
     refused(call(&app, &connector(ControlAccess::FullAccess), "worktree_create", json!({"repo_path": root.path(), "branch": "-not-a-branch"})).await, ErrorCode::InvalidArguments);
     let description = registry::tools_for(&connector(ControlAccess::FullAccess)).into_iter().find(|tool| tool.name == "worktree_create").unwrap().description;
     assert!(description.contains("Presets and prompts are available only on this computer"), "{description}");
+}
+
+// ── thread_launch into a new worktree ─────────────────────────────────────
+
+fn launch_args(workspace: &str, key: &str, worktree: Value) -> Value {
+    json!({
+        "workspace_id": workspace, "client_request_id": key, "provider": "claude", "permission_mode": "default",
+        "title": "Fix the parser", "message": "Synthetic fixture task", "worktree": worktree,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_launch_worktree_is_one_idempotent_background_call() {
+    if isolated(&format!("{MODULE}thread_launch_worktree_is_one_idempotent_background_call")) {
+        return;
+    }
+    let (app, provider, _root, workspace, repo) = git_fixture().await;
+    let main = git(&repo, &["rev-parse", "HEAD"]);
+    // The root checkout sits on another branch with its own commit, so a
+    // worktree forked from HEAD instead of the default branch would show.
+    git(&repo, &["checkout", "-b", "side"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "side only"]);
+    let side = git(&repo, &["rev-parse", "HEAD"]);
+    let state = app.state::<AppStateStore>();
+    state.set_workspace_project_identity(&workspace, Some("project-uid".into()), None);
+    let focused = active(&app);
+    let owner = ControlCaller::trusted();
+    let args = launch_args(&workspace, "wt-launch", json!({"branch": "feat-x"}));
+
+    let launched = call(&app, &owner, "thread_launch", args.clone()).await.unwrap();
+    let reserved = launched["workspace_id"].as_str().unwrap().to_string();
+    assert_ne!(reserved, workspace, "the receipt names the new workspace at once");
+    assert!(launched["thread_id"].is_string());
+    let settled = settle_operation(&app, &launched).await;
+    assert_eq!(settled["state"], "succeeded", "{settled}");
+    let path = crate::git::conventional_worktree_path(&repo, "feat-x").unwrap();
+    let created = state.find_workspace(&reserved).expect("created under the reserved id");
+    assert_eq!(created.worktree_path.as_deref(), Some(path.display().to_string().as_str()));
+    assert_eq!(created.project_uid.as_deref(), Some("project-uid"), "nests under the source workspace's project");
+    assert_eq!(created.title, "Fix the parser");
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), main, "forked from the default branch");
+    assert_eq!((git(&repo, &["rev-parse", "HEAD"]), git(&repo, &["branch", "--show-current"])), (side, "side".into()), "the root is untouched");
+    assert_eq!(active(&app), focused);
+    let result = &settled["result"];
+    assert_eq!(result["workspace_id"], reserved);
+    assert_eq!(result["worktree"], json!({"branch": "feat-x", "base": "main", "base_commit": main, "path": path.display().to_string()}));
+    let thread = settled["thread_id"].as_str().unwrap();
+    let start = provider.start_inputs().into_iter().find(|input| input.thread_id.0 == thread).unwrap();
+    assert_eq!(start.cwd, path, "the thread runs in the new checkout");
+
+    let retry = call(&app, &owner, "thread_launch", args.clone()).await.unwrap();
+    assert_eq!(retry["operation_id"], launched["operation_id"]);
+    let starts = provider.calls.snapshot().iter().filter(|call| matches!(call, MockCall::StartSession(_))).count();
+    assert_eq!(starts, 1);
+    let mut changed = args;
+    changed["worktree"]["base"] = json!("side");
+    refused(call(&app, &owner, "thread_launch", changed).await, ErrorCode::RequestKeyConflict);
+
+    // Without a branch, the title names one that is free.
+    let named_branch = settle_operation(&app, &call(&app, &owner, "thread_launch", launch_args(&workspace, "wt-titled", json!({}))).await.unwrap()).await;
+    assert_eq!(named_branch["result"]["worktree"]["branch"], "fix-the-parser", "{named_branch}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_launch_worktree_refusals_are_synchronous() {
+    if isolated(&format!("{MODULE}thread_launch_worktree_refusals_are_synchronous")) {
+        return;
+    }
+    let (app, _provider, _root, workspace, repo) = git_fixture().await;
+    git(&repo, &["branch", "taken"]);
+    let owner = ControlCaller::trusted();
+    refused(call(&app, &owner, "thread_launch", launch_args(&workspace, "taken", json!({"branch": "taken"}))).await, ErrorCode::WorktreeConflict);
+    no_receipt(&app, &owner, "taken", "thread_launch");
+    let supervised = named(ControlAccess::Supervised);
+    refused(call(&app, &supervised, "thread_launch", launch_args(&workspace, "supervised", json!({"branch": "fresh"}))).await, ErrorCode::AccessDenied);
+    no_receipt(&app, &supervised, "supervised", "thread_launch");
+    refused(call(&app, &owner, "thread_launch", launch_args(&workspace, "bogus", json!({"bogus": 1}))).await, ErrorCode::InvalidArguments);
+    refused(call(&app, &owner, "thread_launch", launch_args(&workspace, "dash", json!({"branch": "-x"}))).await, ErrorCode::InvalidArguments);
+    refused(call(&app, &owner, "thread_launch", launch_args(&workspace, "no-base", json!({"base": "missing-base", "start_from_origin": false}))).await, ErrorCode::WorktreeBaseUnavailable);
+    no_receipt(&app, &owner, "no-base", "thread_launch");
+    let elsewhere = tempfile::tempdir().unwrap();
+    let not_git = app.state::<AppStateStore>().create_empty_workspace_at_path(elsewhere.path().to_path_buf()).0;
+    refused(call(&app, &owner, "thread_launch", launch_args(&not_git, "not-git", json!({}))).await, ErrorCode::NotAGitRepository);
+    assert!(crate::git::conventional_worktree_path(&repo, "fresh").is_none_or(|path| !path.exists()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_launch_worktree_required_origin_failure_fails_receipt_without_checkout() {
+    if isolated(&format!("{MODULE}thread_launch_worktree_required_origin_failure_fails_receipt_without_checkout")) {
+        return;
+    }
+    let (app, provider, _root, workspace, repo) = git_fixture().await;
+    git(&repo, &["remote", "add", "origin", repo.join("gone.git").to_str().unwrap()]);
+    let owner = ControlCaller::trusted();
+    let launched = call(&app, &owner, "thread_launch", launch_args(&workspace, "origin-gone", json!({"branch": "needs-origin", "start_from_origin": true}))).await.unwrap();
+    let settled = settle_operation(&app, &launched).await;
+    assert_eq!(settled["state"], "failed", "{settled}");
+    assert_eq!(settled["error"]["code"], "worktree_base_unavailable", "{settled}");
+    let path = crate::git::conventional_worktree_path(&repo, "needs-origin").unwrap();
+    assert!(!path.exists(), "no checkout without a fresh base");
+    assert!(app.state::<AppStateStore>().find_workspace(launched["workspace_id"].as_str().unwrap()).is_none());
+    assert!(provider.start_inputs().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_launch_worktree_keeps_checkout_when_start_fails() {
+    if isolated(&format!("{MODULE}thread_launch_worktree_keeps_checkout_when_start_fails")) {
+        return;
+    }
+    let (app, provider, _root, workspace, repo) = git_fixture().await;
+    provider.fail_next_start(crate::agent_provider::ProviderError::ValidationError { message: "synthetic start failure".into() });
+    let owner = ControlCaller::trusted();
+    let launched = call(&app, &owner, "thread_launch", launch_args(&workspace, "start-fails", json!({"branch": "kept"}))).await.unwrap();
+    let settled = settle_operation(&app, &launched).await;
+    assert_eq!(settled["state"], "failed", "{settled}");
+    let reserved = launched["workspace_id"].as_str().unwrap();
+    let message = settled["error"]["message"].as_str().unwrap();
+    assert!(message.contains(reserved) && message.contains("kept for inspection"), "{message}");
+    assert!(app.state::<AppStateStore>().find_workspace(reserved).is_some(), "setup scripts may have written to it");
+    assert!(crate::git::conventional_worktree_path(&repo, "kept").unwrap().exists());
 }

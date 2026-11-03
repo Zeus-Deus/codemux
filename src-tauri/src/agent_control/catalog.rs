@@ -187,7 +187,7 @@ mod defs {
     }
 
     pub(super) fn thread_launch(view: &CallerView) -> Option<Definition> {
-        for_audience(view, outside("Launch a CodeMux-owned native thread in an existing workspace. Creating worktrees is unavailable. Select configured accounts, Hermes profiles and ACP instances through target. Returns an operation receipt; use operation_status. Explicit permission_mode is mandatory (null only for providers without a mode). No raw environment or filesystem attachment inputs.", json!({
+        for_audience(view, outside("Launch a CodeMux-owned native thread in an existing workspace or in a new git worktree of its repository. Select configured accounts, Hermes profiles and ACP instances through target. Returns an operation receipt; use operation_status. Explicit permission_mode is mandatory (null only for providers without a mode). With worktree, the thread starts in a NEW git worktree and workspace branched from workspace_id's repository: branch defaults to a name from title, base to the repository's default branch, freshened from origin when possible (start_from_origin true requires a fresh origin base, false uses the local ref exactly). Worktree launch needs full access because the new worktree runs the project's setup scripts. It never adopts an existing branch or checkout. The receipt names the new workspace id at once. No raw environment or filesystem attachment inputs.", json!({
             "workspace_id": {"type": "string", "minLength": 1},
             "client_request_id": {"type": "string", "minLength": 1, "maxLength": 128},
             "provider": {"type": "string"},
@@ -201,6 +201,11 @@ mod defs {
             "title": {"type": "string", "minLength": 1, "maxLength": 100},
             "message": {"type": "string", "minLength": 1, "maxLength": 65536},
             "select": {"type": "boolean", "default": false},
+            "worktree": {"type": "object", "properties": {
+                "branch": {"type": "string", "minLength": 1, "maxLength": 256},
+                "base": {"type": "string", "minLength": 1, "maxLength": 256},
+                "start_from_origin": {"type": "boolean"},
+            }, "additionalProperties": false},
         }), &["workspace_id", "client_request_id", "provider", "permission_mode"]), Some(|definition| {
             // A chat's launch inherits its provider, mode and selection, and
             // gets a key of its own when it names none.
@@ -378,12 +383,24 @@ fn outside_definition(name: &str) -> registry::ToolDefinition {
 #[cfg(test)]
 mod review_tests {
     use super::*;
+    /// Outside callers launch into a new worktree in one call; chats start
+    /// worktrees with workspace_launch, so their launch keeps refusing it.
     #[test]
-    fn review_n1_launch_catalog_does_not_promise_unsupported_worktrees() {
+    fn review_n1_launch_catalog_offers_worktree_to_outside_callers_only() {
         let launch = outside_definition("thread_launch");
-        assert!(launch.input_schema["properties"].get("worktree").is_none(),
-            "a schema field promises support; worktree launch is deliberately unavailable");
-        assert!(!launch.description.contains("new worktree"));
+        let worktree = &launch.input_schema["properties"]["worktree"];
+        assert_eq!(worktree["type"], "object");
+        assert_eq!(worktree["additionalProperties"], false);
+        let mut fields: Vec<&str> = worktree["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort();
+        assert_eq!(fields, ["base", "branch", "start_from_origin"]);
+        assert!(launch.description.contains("NEW git worktree"), "{}", launch.description);
+        assert!(!launch.description.contains("Creating worktrees is unavailable"));
+
+        let view = CallerView::in_app(crate::agent_provider::ProviderKind::Claude, Some("bypassPermissions"), true);
+        let in_app = registry::list(&view).into_iter().find(|tool| tool.spec.name() == "thread_launch").unwrap().definition;
+        assert_eq!(in_app.input_schema["properties"]["worktree"], serde_json::json!({"description": "Unsupported in this version"}));
+        assert!(in_app.description.contains("Worktree strategies are unsupported"), "{}", in_app.description);
     }
 
     /// The workspace tools are registry tools for outside callers only: chats

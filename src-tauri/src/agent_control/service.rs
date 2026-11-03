@@ -1,12 +1,14 @@
 //! Launch sequencing belongs here, above the existing native session owner.
-use super::{ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlGuard, NativeControlState};
+use super::{Access, ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlGuard, NativeControlState};
 use crate::agent_provider::{ProviderChatCapabilities, ProviderKind, StartSessionInput, ThreadId};
 use crate::commands::agent_chat::{self, ProviderRegistry, SendTurnCommandInput};
 use crate::database::{AgentChatSessionConfig, DatabaseStore};
 use crate::state::{AppStateStore, WorkspaceId, WorkspaceSnapshot};
+use crate::workspace_service::{self as workspaces, OriginPolicy, WorkspaceService, WorktreeBase, WorktreeRequest};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, Runtime};
 
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ControlError> {
@@ -231,7 +233,10 @@ pub(crate) async fn launch_placed<R: Runtime>(app: &AppHandle<R>, caller: &Contr
         if message.trim().is_empty() || message.len() > 65536 { return Err(ControlError::new(ErrorCode::InvalidArguments, "message must contain text and fit in 65536 bytes")); }
     }
     if let Some(title) = input.title.as_deref() { identifier(title, "title", 100)?; }
-    if input.worktree.is_some() { return Err(ControlError::new(ErrorCode::UnsupportedOperation, "Worktree launch is not available yet")); }
+    let worktree = match input.worktree.take() {
+        Some(raw) => Some(plan_worktree(caller, child_workspace, &input, &workspace, raw).await?),
+        None => None,
+    };
     prepare_selection(app, &mut input, &workspace.cwd).await?;
     validate_worker(app, caller, &input).await?;
     authorize(app, caller)?;
@@ -239,7 +244,7 @@ pub(crate) async fn launch_placed<R: Runtime>(app: &AppHandle<R>, caller: &Contr
     let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&args).map_err(|e|ControlError::new(ErrorCode::InvalidArguments,e.to_string()))?));
     let thread = uuid::Uuid::new_v4().to_string();
     // Named before admission so the receipt and any retry point at it.
-    let target = if child_workspace { AppStateStore::reserve_workspace_id().0 } else { workspace.workspace_id.0.clone() };
+    let target = if child_workspace || worktree.is_some() { AppStateStore::reserve_workspace_id().0 } else { workspace.workspace_id.0.clone() };
     let admitted = caller.admit(||app.state::<DatabaseStore>().admit_control_operation_for_thread(
         &caller.principal, &input.client_request_id, "thread_launch", &fingerprint, &epoch,
         Some(&target), Some(&thread), caller.thread_id().zip(caller.admission_generation()),
@@ -259,7 +264,7 @@ pub(crate) async fn launch_placed<R: Runtime>(app: &AppHandle<R>, caller: &Contr
             return Err(error);
         }
         input.title = Some(title);
-        input.workspace_id = target;
+        input.workspace_id = target.clone();
         crate::state::emit_app_state(app);
     }
     let app = app.clone();
@@ -283,7 +288,10 @@ pub(crate) async fn launch_placed<R: Runtime>(app: &AppHandle<R>, caller: &Contr
             ); }
         let idle_launch = input.message.is_none();
         let workspace_id = input.workspace_id.clone();
-        let outcome = materialize(&app, &caller, input, &thread).await;
+        let outcome = match &worktree {
+            None => materialize(&app, &caller, input, &thread).await,
+            Some(plan) => launch_in_worktree(&app, &caller, input, &thread, plan, &target).await,
+        };
         if idle_launch || outcome.is_err() { let _ = db.orchestration_launch_finished(&thread); }
         if child_workspace && outcome.is_err() { close_empty_child_workspace(&app, &workspace_id); }
         let (state, result, error) = match outcome {
@@ -304,6 +312,140 @@ fn chat_title(provider: ProviderKind, message: Option<&str>) -> String {
         Some(line) if line.chars().count() > 60 => format!("{}…", line.chars().take(59).collect::<String>().trim_end()),
         Some(line) => line.to_string(),
         None => format!("{} chat", crate::commands::delegation::provider_label(provider)),
+    }
+}
+
+/// `thread_launch.worktree`: where the new checkout goes, all of it checked
+/// before admission with local git only. The origin fetch, if any, runs after.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorktreeLaunch {
+    branch: Option<String>,
+    base: Option<String>,
+    start_from_origin: Option<bool>,
+}
+
+struct WorktreePlan {
+    repo: PathBuf,
+    branch: String,
+    base: String,
+    origin: OriginPolicy,
+    /// The source workspace's project, so the new worktree nests under it
+    /// even when the identity recomputed from today's origin would differ.
+    project_uid: Option<String>,
+}
+
+async fn plan_worktree(
+    caller: &ControlCaller,
+    child_workspace: bool,
+    input: &Launch,
+    workspace: &WorkspaceSnapshot,
+    raw: Value,
+) -> Result<WorktreePlan, ControlError> {
+    if child_workspace || caller.thread_id().is_some() {
+        return Err(ControlError::new(ErrorCode::UnsupportedOperation, "In-app chats start worktrees with workspace_launch"));
+    }
+    // The new worktree runs the project's setup scripts.
+    super::registry::require(caller, Access::Machine)?;
+    let launch: WorktreeLaunch = parse(raw).map_err(|error| ControlError::new(error.code, format!("worktree: {}", error.message)))?;
+    for (field, value) in [("worktree.branch", &launch.branch), ("worktree.base", &launch.base)] {
+        if let Some(value) = value {
+            workspaces::check_ref_text(field, value).map_err(|error| super::workspace_tools::git_error(error, ErrorCode::InvalidArguments))?;
+        }
+    }
+    let folder = PathBuf::from(workspace.project_root.as_deref().unwrap_or(&workspace.cwd));
+    let title = input.title.clone().unwrap_or_else(|| chat_title(input.provider, input.message.as_deref()));
+    let (repo, branch, base) = super::workspace_tools::blocking(move || {
+        let repo = crate::config::workspace_config::find_git_root(&folder).ok_or_else(|| {
+            ControlError::new(ErrorCode::NotAGitRepository, "The workspace's folder is not in a git repository")
+        })?;
+        let branch = launch.branch.unwrap_or_else(|| branch_for_title(&title, &repo));
+        let base = launch.base.unwrap_or_else(|| workspaces::default_base_name(&repo));
+        Ok((repo, branch, base))
+    }).await?;
+    let git_error = |error| super::workspace_tools::git_error(error, ErrorCode::WorktreeCreateFailed);
+    workspaces::check_new_worktree(&repo, &branch).await.map_err(git_error)?;
+    let origin = match launch.start_from_origin {
+        Some(true) => OriginPolicy::Required,
+        Some(false) => OriginPolicy::Local,
+        None => OriginPolicy::PreferFresh,
+    };
+    // A local base fails now rather than after the receipt is admitted.
+    if origin == OriginPolicy::Local {
+        workspaces::resolve_base(&repo, &base, origin).await.map_err(base_error)?;
+    }
+    Ok(WorktreePlan { repo, branch, base, origin, project_uid: workspace.project_uid.clone() })
+}
+
+/// A new branch named after the chat, unused in the repository; a random
+/// name when the title leaves nothing usable. Runs git synchronously.
+fn branch_for_title(title: &str, repo: &Path) -> String {
+    let slug = crate::branch_name::sanitize_branch_name(&title.to_lowercase());
+    if slug.is_empty() {
+        crate::branch_name::generate_random_name(repo)
+    } else {
+        crate::branch_name::deconflict_branch_name(&slug, repo)
+    }
+}
+
+/// Resolving a base fails only for the base: a bad name, or an origin or ref
+/// that cannot be read.
+fn base_error(error: String) -> ControlError {
+    super::workspace_tools::git_error(error, ErrorCode::WorktreeBaseUnavailable)
+}
+
+/// The admitted half of a worktree launch: create the checkout under the
+/// reserved id `target`, then start the thread in it. A checkout that exists
+/// when the start fails is kept, since setup scripts may already have written
+/// to it.
+async fn launch_in_worktree<R: Runtime>(
+    app: &AppHandle<R>,
+    caller: &ControlCaller,
+    mut input: Launch,
+    thread: &str,
+    plan: &WorktreePlan,
+    target: &str,
+) -> Result<Value, ControlError> {
+    let base = workspaces::resolve_base(&plan.repo, &plan.base, plan.origin).await.map_err(base_error)?;
+    // Another creator may have taken the branch while the base was fetched.
+    workspaces::check_new_worktree(&plan.repo, &plan.branch)
+        .await
+        .map_err(|error| super::workspace_tools::git_error(error, ErrorCode::WorktreeCreateFailed))?;
+    let created = WorkspaceService::new(app)
+        .create_worktree(WorktreeRequest {
+            repo_path: plan.repo.display().to_string(),
+            branch: plan.branch.clone(),
+            new_branch: true,
+            // A detached default records the commit, not "HEAD".
+            base: WorktreeBase::Commit { sha: base.commit.clone(), label: (base.label != "HEAD").then(|| base.label.clone()) },
+            layout: crate::state::WorkspacePresetLayout::Empty,
+            preset: None,
+            pr_number: None,
+            select: false,
+            initial_chat: None,
+            reserved_id: Some(WorkspaceId(target.to_string())),
+        })
+        .await
+        .map_err(|error| super::workspace_tools::git_error(error, ErrorCode::WorktreeCreateFailed))?;
+    if created.adopted {
+        return Err(ControlError::new(ErrorCode::WorktreeConflict, "The checkout was claimed concurrently; no prompt was sent"));
+    }
+    let state = app.state::<AppStateStore>();
+    if plan.project_uid.is_some() {
+        state.set_workspace_project_identity(target, plan.project_uid.clone(), None);
+    }
+    if let Some(title) = &input.title {
+        state.rename_workspace(target, title.clone());
+    }
+    crate::state::emit_app_state(app);
+    input.workspace_id = target.to_string();
+    let worktree = json!({"branch": plan.branch, "base": base.label, "base_commit": base.commit, "path": created.cwd});
+    match materialize(app, caller, input, thread).await {
+        Ok(mut result) => {
+            result["worktree"] = worktree;
+            Ok(result)
+        }
+        Err(error) => Err(ControlError::new(error.code, format!("{}. The created workspace {target} was kept for inspection.", error.message.trim_end_matches('.')))),
     }
 }
 
