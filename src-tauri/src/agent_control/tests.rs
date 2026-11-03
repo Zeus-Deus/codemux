@@ -3203,12 +3203,19 @@ async fn recorded_catalogs() -> serde_json::Value {
 
 const CATALOG_SNAPSHOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/agent_control/testdata/catalog.json");
 
-/// The first JSON path where two values differ, for a readable failure.
+/// The first JSON path where two values differ, for a readable failure. A key
+/// present on one side only is a difference even when its value is `null`, so a
+/// new field serialized as `null` cannot slip past the snapshot.
 fn first_difference(path: String, expected: &serde_json::Value, actual: &serde_json::Value) -> Option<String> {
     use serde_json::Value;
     match (expected, actual) {
         (Value::Object(e), Value::Object(a)) => e.keys().chain(a.keys().filter(|k| !e.contains_key(*k)))
-            .find_map(|k| first_difference(format!("{path}/{k}"), e.get(k).unwrap_or(&Value::Null), a.get(k).unwrap_or(&Value::Null))),
+            .find_map(|k| match (e.get(k), a.get(k)) {
+                (Some(e), Some(a)) => first_difference(format!("{path}/{k}"), e, a),
+                (Some(_), None) => Some(format!("{path}/{k}: missing")),
+                (None, Some(a)) => Some(format!("{path}/{k}: unexpected {a}")),
+                (None, None) => None,
+            }),
         (Value::Array(e), Value::Array(a)) if e.len() == a.len() => e.iter().zip(a).enumerate()
             .find_map(|(i, (e, a))| first_difference(format!("{path}/{i}"), e, a)),
         _ if expected == actual => None,
@@ -3226,6 +3233,20 @@ async fn catalogs_match_the_recorded_snapshot() {
     if let Some(difference) = first_difference(String::new(), &recorded, &actual) {
         panic!("catalog changed at {difference}; if intended, re-record with `cargo test --lib agent_control::tests::write_catalog_snapshot -- --ignored`");
     }
+}
+
+#[test]
+fn snapshot_comparator_reports_keys_on_one_side_only() {
+    let recorded = json!({"tools": [{"name": "a"}]});
+    assert_eq!(first_difference(String::new(), &recorded, &recorded), None);
+    assert_eq!(
+        first_difference(String::new(), &recorded, &json!({"tools": [{"name": "a", "outputSchema": null}]})),
+        Some("/tools/0/outputSchema: unexpected null".to_owned()),
+    );
+    assert_eq!(
+        first_difference(String::new(), &json!({"tools": [{"name": "a", "title": null}]}), &recorded),
+        Some("/tools/0/title: missing".to_owned()),
+    );
 }
 
 #[tokio::test]
