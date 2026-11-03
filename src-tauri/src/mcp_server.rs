@@ -1757,9 +1757,9 @@ async fn handle_tool_call(call: CallToolParams) -> Value {
             } else if branch.is_empty() {
                 Err("worktree_create: missing required argument 'branch'".to_string())
             } else {
-                // Build params lazily so the socket arm's defaults
-                // (new_branch=true, base="main", layout="single") fire
-                // when the brain omits them. Passing them explicitly
+                // Build params lazily so the socket arm's defaults (a new
+                // branch, the repository's default branch, one terminal)
+                // fire when the brain omits them. Passing them explicitly
                 // here would freeze the defaults on the MCP side and
                 // make future changes harder to coordinate.
                 let mut params = json!({
