@@ -999,43 +999,6 @@ pub(super) async fn thread_stop<R: Runtime>(app: &AppHandle<R>, caller: &Control
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct WaitArgs { workspace_id: String, thread_id: String, turn_id: Option<String>, timeout_ms: Option<u64> }
-
-pub(super) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
-    let mut args: WaitArgs = parse(args)?;
-    if args.turn_id.is_none() {
-        let initial=thread_status(app,json!({"workspace_id":args.workspace_id,"thread_id":args.thread_id})).await?;
-        if initial["settled"]==true {return Ok(json!({"timed_out":false,"settled":true,"status":initial}));}
-        args.turn_id=initial["turn_id"].as_str().map(str::to_string);
-    }
-    let timeout = args.timeout_ms.unwrap_or(1000);
-    if !(1..=20000).contains(&timeout) { return Err(ControlError::new(ErrorCode::InvalidArguments,"timeout_ms must be between 1 and 20000")); }
-    if let Some(turn) = &args.turn_id { identifier(turn,"turn_id",256)?; }
-    let target = json!({"workspace_id":args.workspace_id,"thread_id":args.thread_id});
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout);
-    loop {
-        authorize(app,caller)?;
-        let status = thread_status(app,target.clone()).await?;
-        let selected = if let Some(turn) = &args.turn_id {
-            app.state::<DatabaseStore>().control_turn_outcome(&args.thread_id,turn)?
-        } else { None };
-        let settled = match &args.turn_id {
-            None => status["settled"] == true,
-            Some(turn) => selected.is_some() && (
-                status["settled"] == true
-                || status["turn_id"].as_str().is_some_and(|current|current != turn)
-            ),
-        };
-        if settled || tokio::time::Instant::now() >= deadline {
-            let selected_turn = selected.map(|event|json!({"turn_id":event["turn_id"],"outcome":super::state::turn_outcome(event["status"]["kind"].as_str(), event["status"]["subtype"].as_str()).1}));
-            return Ok(json!({"timed_out":!settled,"settled":settled,"status":status,"selected_turn":selected_turn}));
-        }
-        tokio::time::sleep_until((tokio::time::Instant::now()+std::time::Duration::from_millis(100)).min(deadline)).await;
-    }
-}
-
-#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Decision { AllowOnce, AllowAlways, Deny }
 

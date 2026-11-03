@@ -386,7 +386,7 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Args {
+pub(super) struct Args {
     workspace_id: String,
     thread_id: String,
     turn_id: Option<String>,

@@ -610,6 +610,7 @@ mod tests {
                 "thread_send" => typed::<service::ThreadSendArgs>,
                 "thread_read" => typed::<service::ThreadReadArgs>,
                 "thread_status" => typed::<service::Target>,
+                "thread_wait" => typed::<super::super::wait::Args>,
                 "thread_interrupt" => typed::<service::InterruptArgs>,
                 "thread_stop" => typed::<service::StopArgs>,
                 "thread_respond" => typed::<service::RespondArgs>,
@@ -617,9 +618,8 @@ mod tests {
                 _ => return None,
             })
         };
-        // The plugin layer checks its own fields by hand. thread_wait's
-        // arguments (`since`) belong to its event-driven handler in wait.rs.
-        const UNTYPED: &[&str] = &["plugin_list", "plugin_invoke", "thread_wait"];
+        // The plugin layer checks its own fields by hand.
+        const UNTYPED: &[&str] = &["plugin_list", "plugin_invoke"];
         for tool in list(&CallerView::outside(FullAccess)) {
             let name = tool.spec.name;
             if UNTYPED.contains(&name) {
