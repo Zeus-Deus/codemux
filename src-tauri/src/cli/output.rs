@@ -114,6 +114,47 @@ impl fmt::Display for CliError {
     }
 }
 
+/// What `call` and every non-waiting verb print: `{ok, tool, result}` or
+/// `{ok, tool, error: {code, message}}`. A verb that settles a receipt keeps
+/// the receipt in `result` and sets `ok` from its state, so a failed receipt
+/// is `ok: false` with a `result`; hence the public fields.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct CallEnvelope {
+    pub(crate) ok: bool,
+    pub(crate) tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<ErrorBody>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl CallEnvelope {
+    /// A tool's outcome exactly as it came back, the way `call` reports it.
+    pub(crate) fn of(tool: impl Into<String>, outcome: Result<Value, ErrorBody>) -> Self {
+        let (result, error) = match outcome {
+            Ok(value) => (Some(value), None),
+            Err(error) => (None, Some(error)),
+        };
+        Self {
+            ok: error.is_none(),
+            tool: tool.into(),
+            result,
+            error,
+        }
+    }
+
+    /// 0 or 1. Only a run report exits 2 (needs input) or 3 (timed out).
+    pub(crate) fn exit(&self) -> Exit {
+        if self.ok {
+            Exit::Done
+        } else {
+            Exit::Failed
+        }
+    }
+}
+
 /// Print one line of the command's result on stdout.
 pub(crate) fn out(text: &str) -> Result<(), String> {
     write_line(&mut io::stdout().lock(), text)
@@ -213,5 +254,38 @@ mod tests {
         assert_eq!(timed_out.exit.code(), 3);
         assert_eq!(timed_out.last, Some(json!({"operation_id": "op-1", "state": "running"})));
         assert_eq!(CliError::failed("tool_error", "boom").exit, Exit::Failed);
+    }
+
+    #[test]
+    fn call_envelopes_carry_the_result_or_the_error() {
+        let listed = CallEnvelope::of("workspace_list", Ok(json!({"workspaces": []})));
+        assert_eq!(listed.exit(), Exit::Done);
+        // Printed in field order, so `ok` is always the first key a reader sees.
+        let mut printed = Vec::new();
+        write_json(&mut printed, &listed).unwrap();
+        assert_eq!(
+            String::from_utf8(printed).unwrap(),
+            "{\n  \"ok\": true,\n  \"tool\": \"workspace_list\",\n  \"result\": {\n    \"workspaces\": []\n  }\n}\n"
+        );
+
+        let refused = CallEnvelope::of(
+            "thread_read",
+            Err(ErrorBody::new("workspace_not_found", "Select an existing workspace explicitly")),
+        );
+        assert_eq!(refused.exit(), Exit::Failed);
+        assert_eq!(
+            serde_json::to_value(&refused).unwrap(),
+            json!({
+                "ok": false,
+                "tool": "thread_read",
+                "error": {"code": "workspace_not_found", "message": "Select an existing workspace explicitly"},
+            })
+        );
+
+        // A tool that returns null still reports a result, not a missing one.
+        assert_eq!(
+            serde_json::to_value(CallEnvelope::of("thread_stop", Ok(Value::Null))).unwrap(),
+            json!({"ok": true, "tool": "thread_stop", "result": null})
+        );
     }
 }
