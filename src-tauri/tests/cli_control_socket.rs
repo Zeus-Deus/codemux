@@ -218,6 +218,22 @@ fn waited(state: &str, cursor: &str, extra: Value) -> Value {
     value
 }
 
+/// A `thread_status` value: the legacy status object plus the run's state.
+fn thread_status(state: &str, extra: Value) -> Value {
+    let mut value = json!({"workspace_id": "ws", "thread_id": "th", "phase": "running", "settled": false, "turn_id": "t1",
+        "queued_ids": [], "uncertain_queued_ids": [], "state": state, "failure": null,
+        "pending": {"approvals": [], "questions": [], "secrets": []}, "paused_until_ms": null, "wait_cursor": "s1"});
+    for (key, field) in extra.as_object().cloned().unwrap_or_default() {
+        value[key] = field;
+    }
+    value
+}
+
+/// The registry tool a scripted request called, if it is a `tool_call`.
+fn tool_name(request: &Value) -> Option<&str> {
+    (request["command"] == "tool_call").then(|| request["params"]["name"].as_str()).flatten()
+}
+
 // ── Without an app ────────────────────────────────────────────────────────
 
 #[test]
@@ -294,8 +310,17 @@ fn an_older_app_is_reported_as_codemux_outdated() {
 
 #[test]
 fn waits_carry_the_client_and_map_run_states_to_exit_codes() {
-    let app = FakeApp::start(|request| match request["command"].as_str() {
+    let approval = json!({"approvals": [{"request_id": "r1", "turn_id": "t1", "request_kind": "command"}], "questions": [], "secrets": []});
+    let blocked = approval.clone();
+    let app = FakeApp::start(move |request| match request["command"].as_str() {
         Some("status") => ok_reply(json!({})),
+        Some("tool_call") if request["params"]["name"] == "thread_status" => {
+            tool_result(match request["params"]["arguments"]["thread_id"].as_str() {
+                Some("blocked") => thread_status("needs_input", json!({"phase": "waiting_approval", "pending": blocked.clone()})),
+                Some("settled") => thread_status("done", json!({"phase": "completed", "settled": true})),
+                _ => thread_status("running", json!({})),
+            })
+        }
         Some("tool_call") if request["params"]["name"] == "thread_wait" => {
             let arguments = &request["params"]["arguments"];
             let approval = json!({"approvals": [{"request_id": "r1", "turn_id": "t1", "request_kind": "command"}], "questions": [], "secrets": []});
@@ -323,16 +348,56 @@ fn waits_carry_the_client_and_map_run_states_to_exit_codes() {
     assert_eq!(exit_code(&fails), 1);
     assert_eq!(stdout_json(&fails)["failure"], "interrupted");
 
+    // A run already waiting on input is reported at once, without parking a wait.
+    let blocked = app.cli(&["thread", "wait", "blocked", "--workspace", "ws", "--json"]);
+    assert_eq!(exit_code(&blocked), 2);
+    assert_eq!(stdout_json(&blocked)["pending"], approval);
+
+    // A run's state is not a receipt's: status exits 0 whatever it is.
+    let status = app.cli(&["thread", "status", "settled", "--workspace", "ws", "--json"]);
+    assert_eq!(exit_code(&status), 0, "{}", String::from_utf8_lossy(&status.stdout));
+    let printed = stdout_json(&status);
+    assert_eq!((printed["ok"].clone(), printed["result"]["state"].clone()), (json!(true), json!("done")));
+    let text = app.cli(&["thread", "status", "settled", "--workspace", "ws"]);
+    assert_eq!(exit_code(&text), 0);
+    assert!(String::from_utf8_lossy(&text.stdout).starts_with("done  phase=completed"), "{}", String::from_utf8_lossy(&text.stdout));
+
     let requests = app.requests();
     // A narrowed client asks the app whether it enforces access first.
     assert_eq!(requests[0]["command"], "status");
-    let waits: Vec<&Value> = requests.iter().filter(|request| request["command"] == "tool_call").collect();
+    assert!(!requests.iter().any(|request| tool_name(request) == Some("thread_wait") && request["params"]["arguments"]["thread_id"] == "blocked"));
+    let waits: Vec<&Value> = requests.iter().filter(|request| tool_name(request) == Some("thread_wait")).collect();
     assert_eq!(waits[0]["client"], json!({"name": "itest", "access": "supervised"}));
     assert_eq!(waits[0]["params"]["arguments"], json!({"workspace_id": "ws", "thread_id": "done", "timeout_ms": 60_000}));
     assert_eq!(waits[1]["params"]["arguments"]["since"], "c1");
     // Unnamed calls run as the owner: no client at all.
     let owner = requests.iter().find(|request| request["params"]["arguments"]["thread_id"] == "asks").unwrap();
     assert!(owner.get("client").is_none(), "{owner}");
+}
+
+#[test]
+fn a_queued_send_waits_for_the_run_its_message_starts() {
+    // The server's shapes: the receipt names only the queue entry; a wait
+    // without a turn adopts the busy run t1, which settles once the entry has
+    // started t2 and left the queue.
+    let app = FakeApp::start(|request| match (request["command"].as_str(), tool_name(request)) {
+        (Some("status"), _) => ok_reply(json!({})),
+        (_, Some("thread_send")) => tool_result(json!({"operation_id": "op", "tool": "thread_send", "state": "succeeded",
+            "workspace_id": "ws", "thread_id": "th", "error": null,
+            "result": {"workspace_id": "ws", "thread_id": "th", "accepted_as": "queued", "turn": {"queued_id": "q1"}}})),
+        (_, Some("thread_status")) => tool_result(thread_status("running", json!({"queued_ids": ["q1"]}))),
+        (_, Some("thread_wait")) => tool_result(match request["params"]["arguments"]["turn_id"].as_str() {
+            None => waited("done", "c1", json!({"final_text": "ANSWER OF THE EARLIER RUN",
+                "status": {"turn_id": "t2", "queued_ids": [], "uncertain_queued_ids": []}})),
+            Some(turn) => waited("done", "c2", json!({"turn_id": turn, "final_text": format!("answer of {turn}"),
+                "status": {"turn_id": turn, "queued_ids": [], "uncertain_queued_ids": []}})),
+        }),
+        _ => json!({"ok": false, "protocol_version": 2, "data": null, "error": "unknown_tool: Unknown tool"}),
+    });
+    let sent = app.cli(&["thread", "send", "th", "--workspace", "ws", "-m", "follow-up", "--delivery", "queue", "--wait", "--json"]);
+    assert_eq!(exit_code(&sent), 0, "{}", String::from_utf8_lossy(&sent.stderr));
+    let report = stdout_json(&sent);
+    assert_eq!((report["turn_id"].clone(), report["final_text"].clone()), (json!("t2"), json!("answer of t2")), "{report}");
 }
 
 // ── Against a real app ────────────────────────────────────────────────────
