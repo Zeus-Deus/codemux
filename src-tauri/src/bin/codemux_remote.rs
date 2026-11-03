@@ -1,9 +1,9 @@
 //! `codemux-remote` — server-side binary.
 //!
 //! Runs on the remote host the laptop pushes workspaces to, **and**
-//! (new in this revision) hosts a headless Codemux daemon so an
-//! agent running on the host can drive Codemux through MCP — create
-//! workspaces, list them, write to terminals — without any UI.
+//! hosts a headless daemon so an agent running on the host can manage
+//! the host's folders, git worktrees and shells through MCP, without any
+//! UI. It does not run Codemux chats or control the Codemux app.
 //!
 //! Subcommands:
 //!
@@ -17,7 +17,8 @@
 //! - `serve stop` — find the daemon via the manifest and SIGTERM it.
 //!   New.
 //! - `mcp` — stdio MCP server that talks to the local `serve`
-//!   daemon over HTTP. Configure your CLI agent to launch this. New.
+//!   daemon over HTTP. Configure your CLI agent to launch this. It
+//!   starts without a daemon and follows it across restarts.
 //! - `version` — JSON version string. The laptop's bootstrap probe
 //!   parses it. Unchanged.
 //! - `project ensure` / `worktree create` — one-shot calls the desktop
@@ -89,7 +90,9 @@ enum Command {
     /// and Vexis when no Codemux app uses this machine.
     Serve(ServeArgs),
     /// Run the stdio MCP server that bridges an agent CLI to the
-    /// local `serve` daemon over HTTP.
+    /// local `serve` daemon over HTTP. It starts even when `serve` isn't
+    /// running (tool calls then say so) and finds a restarted `serve`
+    /// on its own.
     Mcp {
         /// State directory the daemon used. Defaults to the same
         /// path `serve` defaults to (~/.local/share/codemux-remote).
@@ -1101,10 +1104,10 @@ fn run_project_ensure(
 #[cfg(unix)]
 const DAEMON_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Cap on one `worktree_create` call through the daemon: a base fetch
-/// (itself capped at 10s), the checkout, and the include-file copy.
+/// Cap on one `worktree_create` call through the daemon, the same cap
+/// `codemux-remote mcp` applies to every tool call.
 #[cfg(unix)]
-const DAEMON_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const DAEMON_TOOL_TIMEOUT: std::time::Duration = codemux_lib::remote::tools::CALL_TIMEOUT;
 
 /// Implementation for `codemux-remote worktree create`. Prefers the
 /// `serve` daemon, which outlives this call and so can own the setup
