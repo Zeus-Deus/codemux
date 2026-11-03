@@ -2171,6 +2171,11 @@ pub(crate) fn is_object_id(name: &str) -> bool {
     matches!(name.len(), 40 | 64) && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Whether `name` is a full commit id that `repo_path` already holds.
+fn is_local_commit(repo_path: &Path, name: &str) -> bool {
+    is_object_id(name) && run_git(repo_path, &["cat-file", "-e", &format!("{name}^{{commit}}")]).is_ok()
+}
+
 /// Wall-clock cap for the best-effort base fetch in
 /// [`fetch_origin_branch`]. Matches the 10s per-fetch timeout used by the
 /// background sidebar-divergence fetcher: long enough for a healthy remote,
@@ -2873,9 +2878,11 @@ pub fn git_create_worktree(
         // no-remote repos fall through to the stale/local refs below.
         // Callers run this whole function on a blocking pool
         // (`spawn_blocking`), so the fetch never stalls the UI thread.
-        // An exact commit is the base already: there is no origin branch to
-        // freshen, so no fetch (and no wait on an unreachable origin) runs.
-        if let Some(b) = base.filter(|b| !is_object_id(b)) {
+        // A commit the repository already has is the base as it is: there is
+        // no origin branch to freshen, so no fetch (and no wait on an
+        // unreachable origin) runs. A commit only origin has, such as a SHA
+        // copied from a pull request page, is still fetched by id.
+        if let Some(b) = base.filter(|b| !is_local_commit(repo_path, b)) {
             fetch_origin_branch(repo_path, b);
         }
         let resolved_base = base.map(|b| find_remote_ref(repo_path, b).unwrap_or_else(|| b.to_string()));
@@ -3873,6 +3880,11 @@ mod tests {
 
     #[test]
     fn create_worktree_from_commit_id_skips_origin_fetch() {
+        // Isolated, so the worktree lands in a private home rather than the
+        // developer's ~/.codemux/worktrees.
+        if crate::test_isolation::isolated("git::tests::create_worktree_from_commit_id_skips_origin_fetch") {
+            return;
+        }
         let (sha1, sha256) = ("0123456789abcdef".repeat(4), "ABCDEF0123456789".repeat(4));
         assert!(is_object_id(&sha1[..40]) && is_object_id(&sha256));
         let (short, long, not_hex) = ("a".repeat(39), "a".repeat(41), "g".repeat(40));
@@ -3900,6 +3912,24 @@ mod tests {
             elapsed < std::time::Duration::from_secs(BASE_FETCH_TIMEOUT_SECS / 2),
             "a commit base must not wait on origin: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn create_worktree_from_an_origin_only_commit_fetches_it() {
+        if crate::test_isolation::isolated("git::tests::create_worktree_from_an_origin_only_commit_fetches_it") {
+            return;
+        }
+        let (_dir, local, remote_tip) = setup_stale_clone_with_remote("origin-commit");
+        assert!(
+            run_git(&local, &["cat-file", "-e", &format!("{remote_tip}^{{commit}}")]).is_err(),
+            "precondition: only origin has the commit"
+        );
+
+        let wt_path = git_create_worktree(&local, "from-origin-commit", true, Some(&remote_tip), None)
+            .expect("a commit only origin has is fetched by id");
+        let head = run_git(Path::new(&wt_path), &["rev-parse", "HEAD"]).unwrap();
+        git_remove_worktree(Path::new(&wt_path), Some("from-origin-commit"), true).expect("cleanup");
+        assert_eq!(head, remote_tip);
     }
 
     #[test]
