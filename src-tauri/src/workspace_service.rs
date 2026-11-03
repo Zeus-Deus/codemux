@@ -26,8 +26,9 @@ pub(crate) enum WorktreeBase {
     /// A caller-named ref: best-effort `origin/<ref>` fetch and preference,
     /// exactly as `git::git_create_worktree` does.
     Ref(String),
-    /// An exact commit, never fetched. `label` is recorded as the base branch;
-    /// without one the commit itself is.
+    /// An exact commit, fetched by id only when the repository lacks it.
+    /// `label` is recorded as the base branch; without one the commit itself
+    /// is.
     Commit { sha: String, label: Option<String> },
 }
 
@@ -326,10 +327,19 @@ pub(crate) fn default_base_name(repo: &Path) -> String {
 const RECENT_PROJECT_LIMIT: u32 = 200;
 
 /// Project roots this computer already works in: live and archived local
-/// workspaces' project roots, plus Recent projects. Canonical and git-rooted.
-/// Home workspaces and `$HOME` itself are never known, so a dotfiles repo at
-/// `$HOME` cannot make every folder known.
+/// workspaces' project roots and folders, plus Recent projects. Canonical and
+/// git-rooted. Home workspaces, `$HOME` and every folder that contains it are
+/// never known, so a dotfiles repository at `$HOME` (or a checkout at `/`)
+/// cannot make every folder known. Reads the filesystem; call it off the
+/// async runtime.
 pub(crate) fn known_project_roots<R: Runtime>(app: &AppHandle<R>) -> Vec<PathBuf> {
+    known_roots(known_folders(app), dirs::home_dir().as_deref())
+}
+
+/// The folders behind [`known_project_roots`], before git-rooting. A
+/// workspace contributes its folder as well as its project root: under a
+/// dotfiles `$HOME` the project root is `$HOME`, which is never known.
+fn known_folders<R: Runtime>(app: &AppHandle<R>) -> Vec<PathBuf> {
     let snapshot = app.state::<AppStateStore>().snapshot();
     let live = snapshot
         .workspaces
@@ -340,50 +350,89 @@ pub(crate) fn known_project_roots<R: Runtime>(app: &AppHandle<R>) -> Vec<PathBuf
                 && !w.is_local_import_snapshot_only()
                 && w.workspace_type != WorkspaceType::Home
         })
-        .map(|w| PathBuf::from(w.project_root.as_deref().unwrap_or(&w.cwd)));
+        .flat_map(|w| w.project_root.iter().chain([&w.cwd]));
     // Remote workspaces cannot be archived, so every entry is a local path.
     let archived = snapshot
         .archived_workspaces
         .iter()
-        .map(|entry| PathBuf::from(entry.project_root.as_deref().unwrap_or(&entry.cwd)));
+        .flat_map(|entry| entry.project_root.iter().chain([&entry.cwd]));
     let recent = app
         .try_state::<crate::database::DatabaseStore>()
         .map(|db| db.get_recent_projects(RECENT_PROJECT_LIMIT))
         .unwrap_or_default()
         .into_iter()
         .map(|project| PathBuf::from(project.path));
-    known_roots(live.chain(archived).chain(recent), dirs::home_dir().as_deref())
+    live.chain(archived).map(PathBuf::from).chain(recent).collect()
 }
 
 /// The pure part of [`known_project_roots`]: canonical git roots of the
-/// folders that exist, without `home`, deduplicated. A folder whose git root
-/// is `home` stands for itself.
+/// folders that exist, deduplicated, leaving out `home` and every folder that
+/// contains it. A folder whose git root contains `home` stands for itself.
 fn known_roots(folders: impl IntoIterator<Item = PathBuf>, home: Option<&Path>) -> Vec<PathBuf> {
     let home = home.and_then(|home| home.canonicalize().ok());
+    let holds_home = |root: &PathBuf| home.as_ref().is_some_and(|home| home.starts_with(root));
     let mut roots = Vec::new();
     for folder in folders {
         let Ok(folder) = folder.canonicalize() else {
             continue;
         };
-        let root = git_root(&folder)
-            .filter(|root| Some(root) != home.as_ref())
-            .unwrap_or(folder);
-        if Some(&root) != home.as_ref() && !roots.contains(&root) {
+        let root = git_root(&folder).filter(|root| !holds_home(root)).unwrap_or(folder);
+        if !holds_home(&root) && !roots.contains(&root) {
             roots.push(root);
         }
     }
     roots
 }
 
+/// The main checkout the canonical `folder` belongs to: the repository root
+/// for a folder in a repository, the main checkout for a linked worktree and
+/// the superproject for a submodule. `None` outside git.
+///
+/// This reads `.git` files itself: `find_git_root` takes a `gitdir:` as
+/// written, so a relative one (submodules, worktrees added with
+/// `--relative-paths`) would resolve against the app's own working folder.
 fn git_root(folder: &Path) -> Option<PathBuf> {
-    crate::config::workspace_config::find_git_root(folder).and_then(|root| root.canonicalize().ok())
+    let checkout = folder.ancestors().find(|dir| dir.join(".git").exists())?;
+    let dot_git = checkout.join(".git");
+    if dot_git.is_dir() {
+        return Some(checkout.to_path_buf());
+    }
+    Some(repository_of_git_file(checkout, &dot_git).unwrap_or_else(|| checkout.to_path_buf()))
+}
+
+/// For a checkout whose `.git` is a file, the repository that holds its git
+/// dir, canonical: linked worktrees and submodules keep theirs inside the
+/// main checkout's `.git` folder (`worktrees/<name>`, `modules/<name>`), and
+/// a bare repository's worktree names the repository as its `commondir`.
+/// `None` for a repository whose git dir lives elsewhere on its own.
+fn repository_of_git_file(checkout: &Path, dot_git: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(dot_git).ok()?;
+    let gitdir = checkout.join(text.strip_prefix("gitdir:")?.trim()).canonicalize().ok()?;
+    if let Some(repo_git) = gitdir
+        .ancestors()
+        .skip(1)
+        .find(|dir| dir.file_name() == Some(std::ffi::OsStr::new(".git")))
+    {
+        return repo_git.parent().map(Path::to_path_buf);
+    }
+    let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    gitdir.join(common.trim()).canonicalize().ok()
 }
 
 /// Checks that `path` is an existing folder whose git root (or, outside git,
 /// the folder itself) is one of `known`. A subfolder of a known repository
-/// and that repository's linked worktrees pass; a symlink is judged by where
-/// it points. Returns the canonical folder.
+/// and that repository's linked worktrees and submodules pass; a symlink is
+/// judged by where it points. `~` is the user's home, as in the legacy open;
+/// any other relative path is refused, since it would resolve against the
+/// app's own working folder. Returns the canonical folder.
 pub(crate) fn resolve_under_known_root(known: &[PathBuf], path: &Path) -> Result<PathBuf, String> {
+    let path = match path.to_str() {
+        Some(text) => PathBuf::from(crate::project::expand_tilde(text)),
+        None => path.to_path_buf(),
+    };
+    if !path.is_absolute() {
+        return Err(format!("invalid_arguments: path must be absolute: {}", path.display()));
+    }
     let folder = path
         .canonicalize()
         .map_err(|error| format!("invalid_arguments: {} does not exist: {error}", path.display()))?;
@@ -473,8 +522,12 @@ pub(crate) async fn resolve_base(
             let fetchable = branch != "HEAD"
                 && !crate::git::is_object_id(branch)
                 && is_literal_branch(repo, branch).await;
+            if fetchable {
+                // Best effort: a failed fetch still leaves the last fetched
+                // origin ref, which is preferred over the local branch.
+                let _ = fetch_origin(repo, branch).await;
+            }
             if fetchable
-                && fetch_origin(repo, branch).await.is_ok()
                 && git_text(repo, &["rev-parse", "--verify", "--quiet", &remote]).await.is_ok()
             {
                 (remote, branch.to_string())
@@ -762,6 +815,56 @@ mod tests {
         std::fs::write(repo.join("file.txt"), "x").unwrap();
         let file = resolve_under_known_root(&known, &repo.join("file.txt")).unwrap_err();
         assert!(file.starts_with("invalid_arguments: "), "{file}");
+
+        // A relative path would resolve against the app's own folder.
+        for relative in [".", "project", "../outside"] {
+            let error = resolve_under_known_root(&known, Path::new(relative)).unwrap_err();
+            assert!(
+                error.starts_with("invalid_arguments: path must be absolute"),
+                "{relative}: {error}"
+            );
+        }
+        // `~` is the user's home, as in the legacy open.
+        if let Some(home) = std::env::var_os("HOME").and_then(|home| PathBuf::from(home).canonicalize().ok()) {
+            for tilde in ["~", "~/."] {
+                assert_eq!(resolve_under_known_root(&[home.clone()], Path::new(tilde)).unwrap(), home);
+            }
+        }
+    }
+
+    #[test]
+    fn known_root_reads_relative_gitdirs_against_the_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = repo(dir.path(), "project", "main");
+        let canonical = project.canonicalize().unwrap();
+        let source = repo(dir.path(), "lib-source", "main");
+        git(
+            &project,
+            &["-c", "protocol.file.allow=always", "submodule", "add", source.to_str().unwrap(), "vendor/lib"],
+        );
+        let submodule = project.join("vendor").join("lib");
+        let gitdir = |checkout: &Path| std::fs::read_to_string(checkout.join(".git")).unwrap();
+        assert!(gitdir(&submodule).starts_with("gitdir: ../"), "{}", gitdir(&submodule));
+        // What `git worktree add --relative-paths` writes, without needing a
+        // git new enough to have the flag.
+        let linked = dir.path().join("linked-relative");
+        git(&project, &["worktree", "add", "-b", "linked-relative", linked.to_str().unwrap()]);
+        let admin = PathBuf::from(gitdir(&linked).trim().strip_prefix("gitdir: ").unwrap());
+        let name = admin.file_name().unwrap().to_str().unwrap();
+        std::fs::write(linked.join(".git"), format!("gitdir: ../project/.git/worktrees/{name}\n"))
+            .unwrap();
+        assert_eq!(git(&linked, &["rev-parse", "--abbrev-ref", "HEAD"]), "linked-relative");
+
+        assert_eq!(known_roots([submodule.clone(), linked.clone()], None), vec![canonical.clone()]);
+        let known = known_roots([project.clone()], None);
+        for inside in [&submodule, &submodule.join("."), &linked] {
+            assert_eq!(
+                resolve_under_known_root(&known, inside).unwrap(),
+                inside.canonicalize().unwrap(),
+                "{}",
+                inside.display()
+            );
+        }
     }
 
     #[test]
@@ -788,6 +891,26 @@ mod tests {
             .unwrap_err()
             .starts_with("unknown_project_root: "));
         assert!(resolve_under_known_root(&known, &project).is_ok());
+
+        // A checkout above $HOME (say at `/`) is excluded like $HOME itself,
+        // so it makes nothing below it known.
+        let top = dir.path().join("top");
+        let users = top.join("users");
+        let below_home = users.join("me");
+        let below_project = below_home.join("project");
+        let elsewhere = top.join("opt");
+        std::fs::create_dir_all(&below_project).unwrap();
+        std::fs::create_dir(&elsewhere).unwrap();
+        git(&top, &["init", "-b", "main"]);
+        let known = known_roots(
+            [top.clone(), users, below_home.clone(), below_project.clone()],
+            Some(&below_home),
+        );
+        assert_eq!(known, vec![below_project.canonicalize().unwrap()]);
+        for refused in [&top, &below_home, &elsewhere] {
+            let error = resolve_under_known_root(&known, refused).unwrap_err();
+            assert!(error.starts_with("unknown_project_root: "), "{}: {error}", refused.display());
+        }
     }
 
     #[test]
@@ -801,10 +924,24 @@ mod tests {
         state.set_workspace_project_root(&open.0, project.display().to_string());
         let home_like = state.create_workspace_at_path(other.clone());
         state.set_workspace_type(&home_like.0, WorkspaceType::Home);
+        // Under a dotfiles $HOME, opening a folder records $HOME as its
+        // project root; the folder itself must still count.
+        let home = dir.path().join("home");
+        let under_home = home.join("project");
+        std::fs::create_dir_all(&under_home).unwrap();
+        git(&home, &["init", "-b", "main"]);
+        let dotfiles = state.create_workspace_at_path(under_home.clone());
+        let recorded = crate::config::workspace_config::find_git_root(&under_home).unwrap();
+        assert_eq!(recorded, home, "the project root open_workspace_impl records");
+        state.set_workspace_project_root(&dotfiles.0, recorded.display().to_string());
         let app = mock_app(state);
 
         let known = known_project_roots(app.handle());
         assert!(known.contains(&project.canonicalize().unwrap()));
+        assert!(!known.contains(&other.canonicalize().unwrap()), "{known:?}");
+        let known = known_roots(known_folders(app.handle()), Some(&home));
+        assert!(known.contains(&under_home.canonicalize().unwrap()), "{known:?}");
+        assert!(!known.contains(&home.canonicalize().unwrap()), "{known:?}");
         assert!(!known.contains(&other.canonicalize().unwrap()), "{known:?}");
     }
 
@@ -859,16 +996,22 @@ mod tests {
             "a local base never fetches"
         );
 
+        // Each fetching policy starts from the stale origin ref, so reaching
+        // the origin tip proves that it fetched.
+        let make_stale = || git(&local, &["update-ref", "refs/remotes/origin/main", &local_tip]);
+        let origin_base = ResolvedBase { commit: origin_tip.clone(), label: "main".into() };
         for base in ["main", "origin/main"] {
-            let required = resolve_base(&local, base, OriginPolicy::Required).await.unwrap();
-            assert_eq!(required, ResolvedBase { commit: origin_tip.clone(), label: "main".into() });
+            make_stale();
+            assert_eq!(resolve_base(&local, base, OriginPolicy::PreferFresh).await.unwrap(), origin_base);
+            make_stale();
+            assert_eq!(resolve_base(&local, base, OriginPolicy::Required).await.unwrap(), origin_base);
         }
-        let fresh = resolve_base(&local, "main", OriginPolicy::PreferFresh).await.unwrap();
-        assert_eq!(fresh.commit, origin_tip);
 
         git(&local, &["remote", "set-url", "origin", dir.path().join("gone.git").to_str().unwrap()]);
         let error = resolve_base(&local, "main", OriginPolicy::Required).await.unwrap_err();
         assert!(error.starts_with("operation_failed: "), "{error}");
+        // A failed best-effort fetch keeps the last fetched origin ref.
+        assert_eq!(resolve_base(&local, "main", OriginPolicy::PreferFresh).await.unwrap(), origin_base);
         let error = resolve_base(&local, "@{-1}", OriginPolicy::Required).await.unwrap_err();
         assert!(error.starts_with("invalid_input: "), "{error}");
         assert!(resolve_base(&local, "-main", OriginPolicy::Local)
@@ -937,10 +1080,14 @@ mod tests {
         );
     }
 
+    // Only the paths that create nothing. A created workspace starts a
+    // terminal (`open` always uses the single layout), which would spawn a
+    // shell or the terminal daemon from the test binary, so creation through
+    // `open` is not exercised here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn open_reuses_an_open_folder_and_creates_new_ones_in_the_background() {
+    async fn open_reuses_an_open_folder_or_reservation_without_taking_focus() {
         if isolated(
-            "workspace_service::tests::open_reuses_an_open_folder_and_creates_new_ones_in_the_background",
+            "workspace_service::tests::open_reuses_an_open_folder_or_reservation_without_taking_focus",
         ) {
             return;
         }
