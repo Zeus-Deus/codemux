@@ -3,7 +3,7 @@ use super::{
     callback_origin, changed, live, now_ms, parse_access, scope, validate_caller, McpConnectorState,
 };
 use super::{oauth, protocol};
-use crate::agent_control::{self, ControlAccess, ControlCaller};
+use crate::agent_control::{self, ControlCaller};
 use crate::database::{
     mcp_connector::{NewMcpClient, NewMcpGrant},
     DatabaseStore,
@@ -297,9 +297,6 @@ fn rpc_error(id: Value, code: i64, message: &str, status: StatusCode) -> Respons
         json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}),
     )
 }
-fn tool_error(code: &str, message: &str) -> Value {
-    json!({"isError":true,"content":[{"type":"text","text":message}],"structuredContent":{"error":{"code":code,"message":message}}})
-}
 async fn mcp<R: Runtime>(
     app: &AppHandle<R>,
     ingress: &Ingress,
@@ -346,36 +343,17 @@ async fn mcp<R: Runtime>(
             json!({"protocolVersion":PROTOCOL,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"CodeMux","version":env!("CARGO_PKG_VERSION")},"instructions":agent_control::INSTRUCTIONS})
         }
         "ping" => json!({}),
-        "tools/list" => json!({"tools":agent_control::remote_tools()}),
+        "tools/list" => json!({"tools":agent_control::registry::tools_for(caller)}),
         "tools/call" => {
-            let name = rpc.params["name"].as_str().unwrap();
+            // validate_method guarantees a name.
+            let name = rpc.params["name"].as_str().unwrap_or_default();
             let arguments = rpc.params.get("arguments").cloned().unwrap_or(json!({}));
-            let tools = agent_control::remote_tools();
-            let Some(tool) = tools.iter().find(|t| t.name == name) else {
-                return rpc_error(id, -32602, "Unknown tool", StatusCode::OK);
-            };
-            if agent_control::schema::check(&tool.input_schema, &arguments).is_err() {
-                return rpc_error(id, -32602, "Invalid tool arguments", StatusCode::OK);
-            }
-            if caller.access == ControlAccess::ReadOnly && tool.annotations["readOnlyHint"] != true
-            {
-                tool_error(
-                    "access_denied",
-                    "Read-only connections cannot modify native threads",
-                )
-            } else {
-                // The native owner repeats grant/access checks immediately
-                // before each mutation and after any admission await.
-                match agent_control::execute(app, caller, name, arguments).await {
-                    Ok(value) => {
-                        if name=="plugin_invoke" {
-                            crate::plugins::platform_transport::mcp_result(value)
-                        }else{
-                            json!({"isError":false,"content":[{"type":"text","text":value.to_string()}],"structuredContent":if value.is_object() { value } else { json!({"result":value}) }})
-                        }
-                    }
-                    Err(error) => tool_error(error.code.as_str(), &error.message),
-                }
+            // The registry gates access, validates the arguments (a bad one is
+            // a tool error naming the field) and presents the result. Handlers
+            // repeat grant checks before each mutation and after any await.
+            match agent_control::registry::call(app, caller, name, arguments).await {
+                Ok(result) => result,
+                Err(_) => return rpc_error(id, -32602, "Unknown tool", StatusCode::OK),
             }
         }
         _ => return rpc_error(id, -32601, "Method not found", StatusCode::OK),
@@ -606,6 +584,7 @@ mod receipt_mock;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_control::ControlAccess;
     use tauri::Manager;
     use tower::ServiceExt;
 
@@ -667,6 +646,10 @@ mod tests {
         r.body(Body::from(body.to_string())).unwrap()
     }
     fn grant(f: &Fixture) -> String {
+        grant_with(f, "read_only")
+    }
+    /// A token for the fixture client at `access`, minted without consent.
+    fn grant_with(f: &Fixture, access: &str) -> String {
         let now = now_ms();
         let token = format!("cmcp_{}", oauth::opaque());
         let db = f.app.state::<DatabaseStore>();
@@ -686,7 +669,7 @@ mod tests {
             token_hash: oauth::credential_hash(&token),
             redirect_uri: "https://client.example/cb".into(),
             resource: format!("http://127.0.0.1:{}/mcp", f.port),
-            access: "read_only".into(),
+            access: access.into(),
             created_at: now,
             expires_at: now + 60_000,
         })
@@ -2091,9 +2074,19 @@ mod tests {
             .await,
         )
         .await;
+        let listed: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
         assert_eq!(
-            list["result"]["tools"].as_array().unwrap().len(),
-            crate::agent_control::remote_tools().len()
+            listed.len(),
+            crate::agent_control::registry::tools_for(&authenticated_caller(&f, &token)).len()
+        );
+        assert!(
+            !listed.contains(&"thread_stop") && listed.contains(&"thread_read"),
+            "a read-only grant is offered only what it can run: {listed:?}"
         );
         assert!(list["result"]["tools"]
             .as_array()
@@ -2132,6 +2125,62 @@ mod tests {
             .await
             .status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    #[tokio::test]
+    async fn invalid_tool_arguments_are_tool_errors_with_detail() {
+        let f = fixture().await;
+        let token = grant(&f);
+        let result = call_tool(&f, &token, "thread_list", json!({"bogus": 1})).await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["content"][0]["text"], "invalid_arguments: unknown field `bogus`");
+        assert_eq!(
+            result["structuredContent"]["error"],
+            json!({"code": "invalid_arguments", "message": "unknown field `bogus`", "retryable": false})
+        );
+    }
+    #[tokio::test]
+    async fn unknown_tools_stay_json_rpc_errors() {
+        let f = fixture().await;
+        let token = grant(&f);
+        // A legacy stdio tool and an in-app tool are both unknown here.
+        for name in ["terminal_write", "create_threads", "nope"] {
+            let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":{}}});
+            let response = invoke(&f, request(&f, "/mcp", "POST", &body.to_string(), Some(&token))).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = value(response).await;
+            assert_eq!(response["error"]["code"], -32602, "{name}: {response}");
+            assert!(response.get("result").is_none());
+        }
+    }
+    #[tokio::test]
+    async fn plugin_invoke_input_reaches_the_plugin_layer() {
+        let f = fixture().await;
+        let token = grant_with(&f, "full_access");
+        let result = call_tool(&f, &token, "plugin_invoke", json!({
+            "installationId": "missing", "generation": "g", "actionId": "a", "operationId": "op", "input": {"a": 1},
+        }))
+        .await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(
+            result["structuredContent"]["error"]["code"], "plugin_operation_failed",
+            "an untyped input passes the schema and reaches the plugin layer: {result}"
+        );
+    }
+    #[tokio::test]
+    async fn tool_errors_carry_retryable() {
+        let f = fixture().await;
+        f.app.manage(agent_control::NativeControlState::default());
+        let token = grant(&f);
+        let result = call_tool(&f, &token, "operation_status", json!({"operation_id": "missing"})).await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(
+            result["content"][0]["text"],
+            "operation_not_found: No operation belongs to this client and ID"
+        );
+        assert_eq!(
+            result["structuredContent"]["error"],
+            json!({"code": "operation_not_found", "message": "No operation belongs to this client and ID", "retryable": false})
         );
     }
     #[tokio::test]

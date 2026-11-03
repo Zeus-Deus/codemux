@@ -23,7 +23,7 @@ pub(crate) use types::AdmittedAuthority;
 pub use access::{Access, Audience, CallerKind, CallerView};
 pub use error::{ControlError, ErrorCode};
 pub use types::{CallerPrincipal, ClientName, ControlAccess, ControlCaller};
-pub use catalog::{is_native_tool, native_tools, remote_tools, INSTRUCTIONS};
+pub use catalog::{is_native_tool, native_tools, INSTRUCTIONS};
 
 /// Runs a registry tool on the explicit-argument route: the socket aliases,
 /// HTTP and in-process callers such as the plugin platform.

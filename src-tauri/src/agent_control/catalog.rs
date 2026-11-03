@@ -285,11 +285,6 @@ pub fn native_tools() -> Vec<NativeTool> {
         .collect()
 }
 
-/// The connector's catalog until it lists for its caller.
-pub fn remote_tools() -> Vec<registry::ToolDefinition> {
-    registry::list(&CallerView::outside(ControlAccess::FullAccess)).into_iter().map(|tool| tool.definition).collect()
-}
-
 /// Shim until the socket names its registry route itself: the bare socket
 /// commands that reach the registry.
 pub fn is_native_tool(name: &str) -> bool {
