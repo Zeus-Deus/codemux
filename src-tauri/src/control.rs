@@ -1,3 +1,4 @@
+use crate::control_identity::{ControlClient, SocketCaller};
 use crate::indexing;
 use crate::memory;
 use crate::state::AppStateStore;
@@ -176,13 +177,27 @@ use unix_transport as transport;
 #[cfg(windows)]
 use windows_transport as transport;
 
-const CONTROL_PROTOCOL_VERSION: u32 = 1;
+/// 2: requests may carry `client` (who is calling), and the server enforces
+/// the access a client asks for. Do not reuse 2 for another change.
+const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ControlRequest {
     pub command: String,
     #[serde(default)]
     pub params: Value,
+}
+
+/// One line on the control socket: the command plus who is asking.
+///
+/// With `client: None` the bytes are exactly a bare `ControlRequest`, and an
+/// older server (no `deny_unknown_fields`) reads a newer line as one.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ControlEnvelope {
+    #[serde(flatten)]
+    pub request: ControlRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<ControlClient>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -484,9 +499,10 @@ where
             continue;
         }
 
-        let request: ControlRequest = serde_json::from_str(&line)
+        let envelope: ControlEnvelope = serde_json::from_str(&line)
             .map_err(|error| format!("Invalid control request JSON: {error}"))?;
-        let response = dispatch_request(&app, request).await;
+        let caller = crate::control_identity::resolve_socket_caller(envelope.client);
+        let response = dispatch_request_as(&app, &caller, envelope.request).await;
         let payload = serde_json::to_string(&response)
             .map_err(|error| format!("Failed to encode control response: {error}"))?;
         writer
@@ -501,15 +517,75 @@ where
 /// Send a request to the running Codemux control endpoint and return the response.
 /// Used by both the CLI and the MCP server to communicate with the Codemux app.
 /// Transparently uses a Unix socket on Linux/macOS and a named pipe on Windows.
+///
+/// The request carries this process's identity (`ControlClient::current`).
 pub async fn send_control_request(request: ControlRequest) -> Result<ControlResponse, String> {
+    send_control_request_as(request, ControlClient::current().as_ref()).await
+}
+
+/// [`send_control_request`] with an explicit identity. `client = None` speaks
+/// as the owner: tests that drive a real socket pass `None` so a developer's
+/// own agent identity never leaks into them.
+pub async fn send_control_request_as(
+    request: ControlRequest,
+    client: Option<&ControlClient>,
+) -> Result<ControlResponse, String> {
     let socket_path = control_socket_path()
         .ok_or_else(|| "Control socket path unavailable".to_string())?;
-    let stream = transport::connect(&socket_path)
+    send_control_request_to(&socket_path, request, client, &SERVER_ENFORCES_ACCESS).await
+}
+
+/// Set once this process has seen a server that enforces `client.access`.
+static SERVER_ENFORCES_ACCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+async fn send_control_request_to(
+    socket_path: &std::path::Path,
+    request: ControlRequest,
+    client: Option<&ControlClient>,
+    enforcing: &std::sync::atomic::AtomicBool,
+) -> Result<ControlResponse, String> {
+    if client.is_some_and(ControlClient::narrows) {
+        ensure_server_enforces_access(socket_path, enforcing).await?;
+    }
+    exchange(socket_path, &ControlEnvelope { request, client: client.cloned() }).await
+}
+
+/// An older app ignores `client`, so a narrowed client would silently run
+/// with full access. Ask the server's protocol version first and refuse.
+/// Only a new-enough answer is remembered: the app may be restarted into a
+/// newer version while a long-lived `codemux mcp` keeps running.
+async fn ensure_server_enforces_access(
+    socket_path: &std::path::Path,
+    enforcing: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    if enforcing.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let probe = ControlEnvelope {
+        request: ControlRequest { command: "status".into(), params: serde_json::json!({}) },
+        client: None,
+    };
+    let status = exchange(socket_path, &probe).await?;
+    if status.protocol_version < CONTROL_PROTOCOL_VERSION {
+        return Err(crate::agent_control::ControlError::new(
+            crate::agent_control::ErrorCode::ServerTooOld,
+            "the running Codemux does not enforce --access; restart Codemux",
+        )
+        .to_string());
+    }
+    enforcing.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// One request line, one response line.
+async fn exchange(socket_path: &std::path::Path, envelope: &ControlEnvelope) -> Result<ControlResponse, String> {
+    let stream = transport::connect(socket_path)
         .await
         .map_err(|error| format!("Failed to connect to Codemux control endpoint: {error}"))?;
     let (reader, mut writer) = tokio::io::split(stream);
 
-    let payload = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    let payload = serde_json::to_string(envelope).map_err(|error| error.to_string())?;
     writer
         .write_all(format!("{payload}\n").as_bytes())
         .await
@@ -525,17 +601,50 @@ pub async fn send_control_request(request: ControlRequest) -> Result<ControlResp
     serde_json::from_str(&response).map_err(|error| format!("Invalid response JSON: {error}"))
 }
 
+/// Runs a request as the owner. In-process callers and tests use this.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlRequest) -> ControlResponse {
+    dispatch_request_as(app, &SocketCaller::owner(), request).await
+}
+
+fn control_response(result: Result<Value, String>) -> ControlResponse {
+    match result {
+        Ok(data) => ControlResponse {
+            ok: true,
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            data: Some(data),
+            error: None,
+        },
+        Err(error) => ControlResponse {
+            ok: false,
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            data: None,
+            error: Some(error),
+        },
+    }
+}
+
+/// Runs a request for `caller`: the access gate (`command_access` then
+/// `SocketCaller::permits`), then the command's handler.
+pub(crate) async fn dispatch_request_as<R: Runtime>(
+    app: &AppHandle<R>,
+    caller: &SocketCaller,
+    request: ControlRequest,
+) -> ControlResponse {
+    let required = crate::control_identity::command_access(&request.command, &request.params);
+    if let Err(error) = caller.permits(&request.command, required) {
+        return control_response(Err(error.to_string()));
+    }
     let result = match request.command.as_str() {
         "delegation_local_context" => match request.params.get("threadId").or_else(||request.params.get("thread_id")).and_then(Value::as_str) {
             Some(thread)=>crate::commands::delegation::delegation_local_context(app.clone(),thread.into()).await,
             None=>Err("threadId is required".into()),
         },
         "delegation_host_info" | "delegation_grants" | "delegation_authorize" | "delegation_revoke" | "delegate_task" | "delegation_list" | "delegation_read" | "delegation_cancel" | "delegation_respond" | "delegation_deliver" => crate::delegation::app::invoke(app, &request.command, request.params).await,
-        name if crate::agent_control::is_native_tool(name) => {
-            crate::agent_control::execute(app,&crate::agent_control::ControlCaller::trusted(),name,request.params.clone())
-                .await.map_err(|error|error.to_string())
-        }
+        name if crate::agent_control::is_native_tool(name) => match caller {
+            SocketCaller::Local(caller) => crate::agent_control::execute(app, caller, name, request.params.clone())
+                .await.map_err(|error| error.to_string()),
+        },
         "agent_connector_status" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct Args {}
             serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
@@ -1791,20 +1900,7 @@ pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: Co
         _ => Err(format!("Unknown control command: {}", request.command)),
     };
 
-    match result {
-        Ok(data) => ControlResponse {
-            ok: true,
-            protocol_version: CONTROL_PROTOCOL_VERSION,
-            data: Some(data),
-            error: None,
-        },
-        Err(error) => ControlResponse {
-            ok: false,
-            protocol_version: CONTROL_PROTOCOL_VERSION,
-            data: None,
-            error: Some(error),
-        },
-    }
+    control_response(result)
 }
 
 /// Filter `ports` to entries whose `workspace_id` matches `workspace_filter`.
@@ -2026,11 +2122,107 @@ mod tests {
         }).await;
         assert!(response.ok,"{:?}",response.error);
         let status = response.data.unwrap();
-        let mut fields: Vec<_> = status.as_object().unwrap().keys().map(String::as_str).collect();
-        fields.sort_unstable();
-        assert_eq!(fields,vec!["clients","enabled","listenerRunning","localCommand","mcpUrl","pending","publicOrigin"]);
+        let fields: std::collections::BTreeSet<_> = status.as_object().unwrap().keys().map(String::as_str).collect();
+        // The connector's own listener work adds fields; this pins only what
+        // must be there and what may be.
+        let allowed = ["clients","enabled","bindError","listenerRunning","localCommand","localExecutable","localUrl","mcpUrl","pending","port","publicOrigin","revokedGrants"];
+        let required = ["clients","enabled","listenerRunning","localCommand","mcpUrl","pending","publicOrigin"];
+        assert!(fields.iter().all(|field| allowed.contains(field)),"unexpected status fields: {fields:?}");
+        assert!(required.iter().all(|field| fields.contains(field)),"missing status fields: {fields:?}");
         assert_eq!(status["enabled"],false);
         assert_eq!(status["listenerRunning"],false);
+    }
+
+    fn request(command: &str, params: Value) -> ControlRequest {
+        ControlRequest { command: command.into(), params }
+    }
+
+    fn local(name: Option<&str>, access: crate::agent_control::ControlAccess) -> SocketCaller {
+        let name = name.and_then(crate::agent_control::ClientName::parse);
+        SocketCaller::Local(crate::agent_control::ControlCaller::local(name.as_ref(), access))
+    }
+
+    #[test]
+    fn envelope_is_backward_compatible() {
+        let line = r#"{"command":"notify","params":{"message":"hi"},"client":{"name":"hermes","access":"supervised"}}"#;
+        let old_server: ControlRequest = serde_json::from_str(line).unwrap();
+        assert_eq!((old_server.command.as_str(), &old_server.params), ("notify", &serde_json::json!({"message":"hi"})));
+        let envelope: ControlEnvelope = serde_json::from_str(line).unwrap();
+        assert_eq!(envelope.client, Some(ControlClient { name: Some("hermes".into()), access: Some(crate::agent_control::ControlAccess::Supervised) }));
+        let old_client: ControlEnvelope = serde_json::from_str(r#"{"command":"status"}"#).unwrap();
+        assert_eq!((old_client.request.command.as_str(), old_client.client), ("status", None));
+        assert_eq!(old_client.request.params, Value::Null, "params keep their default");
+        let today = request("notify", serde_json::json!({"message":"hi","n":1}));
+        let bare = serde_json::to_string(&today).unwrap();
+        let wrapped = serde_json::to_string(&ControlEnvelope { request: today, client: None }).unwrap();
+        assert_eq!(wrapped, bare, "an owner's line is byte-identical to a bare request");
+    }
+
+    #[tokio::test]
+    async fn read_only_local_clients_cannot_write() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        let read_only = local(Some("reader"), crate::agent_control::ControlAccess::ReadOnly);
+        let refused = dispatch_request_as(app.handle(), &read_only, request("notify", serde_json::json!({"message":"x"}))).await;
+        assert!(!refused.ok);
+        assert!(refused.error.as_deref().unwrap().starts_with("access_denied: "), "{:?}", refused.error);
+        assert_eq!(refused.protocol_version, CONTROL_PROTOCOL_VERSION);
+        assert!(app.state::<AppStateStore>().snapshot().notifications.is_empty(), "the handler never ran");
+        let status = dispatch_request_as(app.handle(), &read_only, request("status", serde_json::json!({}))).await;
+        assert!(status.ok, "{:?}", status.error);
+        let unnamed = local(None, crate::agent_control::ControlAccess::ReadOnly);
+        let refused = dispatch_request_as(app.handle(), &unnamed, request("web_remote_disable", serde_json::json!({}))).await;
+        assert!(refused.error.as_deref().unwrap().starts_with("access_denied: "), "narrowing applies to the owner too");
+    }
+
+    #[tokio::test]
+    async fn supervised_local_clients_cannot_run_setup_scripts() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        let supervised = local(Some("hermes"), crate::agent_control::ControlAccess::Supervised);
+        for command in ["create_workspace", "rerun_setup", "unarchive_workspace", "create_worktree_workspace"] {
+            let refused = dispatch_request_as(app.handle(), &supervised, request(command, serde_json::json!({"path":"/nonexistent"}))).await;
+            assert!(refused.error.as_deref().unwrap().starts_with("access_denied: "), "{command}: {:?}", refused.error);
+        }
+        let notify = dispatch_request_as(app.handle(), &supervised, request("notify", serde_json::json!({"message":"x"}))).await;
+        assert!(notify.ok, "supervised clients keep ordinary writes: {:?}", notify.error);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn narrowed_access_refuses_an_old_server() {
+        use std::sync::atomic::AtomicBool;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sock");
+        let listener = transport::bind(&path).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = seen.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok(stream) = listener.accept().await else { return };
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let command = serde_json::from_str::<Value>(&line).unwrap()["command"].as_str().unwrap().to_owned();
+                    recorded.lock().unwrap().push(command);
+                    let reply = serde_json::json!({"ok":true,"protocol_version":1,"data":{},"error":null});
+                    writer.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let read_only = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly) };
+        let enforcing = AtomicBool::new(false);
+        let error = send_control_request_to(&path, request("notify", serde_json::json!({"message":"x"})), Some(&read_only), &enforcing)
+            .await.unwrap_err();
+        assert!(error.starts_with("server_too_old: "), "{error}");
+        assert_eq!(*seen.lock().unwrap(), vec!["status"], "the real request never reached the old server");
+        // A full-access or unnamed client keeps today's behaviour with an old app.
+        let named = ControlClient { name: Some("bot".into()), access: None };
+        let reply = send_control_request_to(&path, request("notify", serde_json::json!({})), Some(&named), &enforcing).await.unwrap();
+        assert!(reply.ok);
+        assert_eq!(*seen.lock().unwrap(), vec!["status", "notify"]);
+        server.abort();
     }
 
     fn port(port: u16, ws: Option<&str>, label: Option<&str>) -> PortInfoSnapshot {
