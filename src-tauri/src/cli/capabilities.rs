@@ -74,8 +74,8 @@ const ENVIRONMENT: &[(&str, &str)] = &[
     ("CODEMUX_BROWSER_CMD", "Command prefix for browser control"),
     ("CODEMUX_PASSWORD", "Password for a non-interactive `codemux login` (warns; for automated runs only)"),
     ("CODEMUX_API_URL", "Override the Codemux API base URL (default https://api.codemux.org)"),
-    ("CODEMUX_CLIENT", "Default --client: the name the control socket records your calls under"),
-    ("CODEMUX_ACCESS", "Default --access: read-only, supervised or full-access"),
+    ("CODEMUX_CLIENT", "Default --client of the commands that call the running app: the name it records your calls under (blank is unset)"),
+    ("CODEMUX_ACCESS", "Default --access of the commands that call the running app: read-only, supervised or full-access (blank is unset)"),
     ("CODEMUX_AGENT_PROCESS", "Set by Codemux on processes it starts for agents; the control socket refuses them admin commands"),
     ("CODEMUX_MCP_GATEWAY_URL", "Set by Codemux in agent processes, with CODEMUX_MCP_GATEWAY_TOKEN; `codemux mcp-call` uses them to call the chat's own tools"),
     ("BROWSER", "Set to 'codemux browser open' for URL handling"),
@@ -101,9 +101,18 @@ pub(crate) fn capabilities() -> Capabilities {
             description,
         })
         .collect();
+    // The caller flags' env defaults are read by the commands that call the
+    // socket, not by clap, so the tree does not carry them.
+    let global_args = arguments(&root)
+        .into_iter()
+        .map(|mut arg| {
+            arg.env = super::args::caller_env(&arg.name).map(str::to_owned);
+            arg
+        })
+        .collect();
     Capabilities {
         version: env!("CARGO_PKG_VERSION"),
-        global_args: arguments(&root),
+        global_args,
         commands: subcommands(&root),
         tools,
         exit_codes: EXIT_CODES.iter().map(|&(code, meaning)| ExitCodeInfo { code, meaning }).collect(),
@@ -159,7 +168,8 @@ fn arg_info(arg: &Arg) -> ArgInfo {
         },
         default: (!flag).then(|| arg.get_default_values().iter().map(|value| value.to_string_lossy().into_owned()).collect::<Vec<_>>().join(","))
             .filter(|default| !default.is_empty()),
-        env: arg.get_env().map(|env| env.to_string_lossy().into_owned()),
+        // `capabilities` sets it for the root caller flags, the only ones with an env default.
+        env: None,
         help: arg.get_help().map(|help| help.to_string()),
     }
 }
@@ -217,6 +227,7 @@ mod tests {
         assert_eq!(client.env.as_deref(), Some("CODEMUX_CLIENT"));
         let access = caps.global_args.iter().find(|arg| arg.long.as_deref() == Some("access")).unwrap();
         assert_eq!(access.possible_values, ["read-only", "supervised", "full-access"]);
+        assert_eq!(access.env.as_deref(), Some("CODEMUX_ACCESS"));
     }
 
     #[test]

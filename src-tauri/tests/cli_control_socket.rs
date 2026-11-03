@@ -43,9 +43,14 @@ fn isolate(cmd: &mut Command, root: &Path) {
 
 /// Runs the CLI in `root`'s isolated env.
 fn cli_in(root: &Path, args: &[&str]) -> Output {
+    cli_with_env(root, &[], args)
+}
+
+/// Runs the CLI in `root`'s isolated env plus `env`.
+fn cli_with_env(root: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
     let mut cmd = Command::new(CODEMUX);
     isolate(&mut cmd, root);
-    cmd.args(args).stdin(Stdio::null()).output().unwrap()
+    cmd.envs(env.iter().copied()).args(args).stdin(Stdio::null()).output().unwrap()
 }
 
 fn stdout_json(output: &Output) -> Value {
@@ -279,6 +284,26 @@ fn with_no_app_running_verbs_report_codemux_unavailable() {
     assert_eq!(text.lines().nth(1), Some(format!("  \"version\": \"{}\",", env!("CARGO_PKG_VERSION")).as_str()));
     let parsed: Value = serde_json::from_str(&text).unwrap();
     assert!(parsed["commands"]["thread"]["subcommands"]["start"].is_object());
+}
+
+#[test]
+fn caller_env_is_read_only_by_commands_that_call_the_app() {
+    let root = tempfile::tempdir().unwrap();
+    // A blank or misspelled variable never stops a command that does not call the app.
+    for env in [&[("CODEMUX_CLIENT", "")][..], &[("CODEMUX_CLIENT", "---")], &[("CODEMUX_ACCESS", "readonly")]] {
+        let output = cli_with_env(root.path(), env, &["capabilities"]);
+        assert_eq!(exit_code(&output), 0, "{env:?}: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    // A blank one is unset: the call goes ahead and finds no app.
+    let blank = cli_with_env(root.path(), &[("CODEMUX_CLIENT", ""), ("CODEMUX_ACCESS", " ")], &["tools", "--json"]);
+    assert_eq!(stdout_json(&blank)["error"]["code"], "codemux_unavailable");
+    // A misspelled one is a usage error for a command that calls the app, before any call.
+    let misspelled = cli_with_env(root.path(), &[("CODEMUX_ACCESS", "readonly")], &["tools", "--json"]);
+    assert_eq!(exit_code(&misspelled), 64);
+    assert!(String::from_utf8_lossy(&misspelled.stderr).contains("CODEMUX_ACCESS=\"readonly\""), "{}", String::from_utf8_lossy(&misspelled.stderr));
+    // A flag overrides the variable.
+    let flagged = cli_with_env(root.path(), &[("CODEMUX_ACCESS", "readonly")], &["--access", "read-only", "tools", "--json"]);
+    assert_eq!(exit_code(&flagged), 1);
 }
 
 // ── Against a scripted socket ─────────────────────────────────────────────

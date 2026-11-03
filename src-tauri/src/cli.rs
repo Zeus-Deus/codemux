@@ -520,28 +520,94 @@ fn write_response(writer: &mut impl Write, response: &ControlResponse) -> Result
     Ok(if response.ok { Exit::Done } else { Exit::Failed })
 }
 
-/// Names this process's control identity before any socket call: every
-/// request then carries it (`ControlClient::current`). `codemux mcp` takes
-/// its own flags first, then the root's; unnamed calls run as the owner.
-fn adopt_caller(cli: &Cli) -> (Option<String>, Option<args::AccessArg>) {
-    let (client, access) = match &cli.command {
-        Some(CommandSet::Mcp { client, access }) => (client.clone().or(cli.caller.client.clone()), access.or(cli.caller.access)),
-        _ => (cli.caller.client.clone(), cli.caller.access),
+impl CommandSet {
+    /// Whether this command calls the control socket, so the caller env
+    /// defaults (`CODEMUX_CLIENT`, `CODEMUX_ACCESS`) apply to it. No wildcard:
+    /// a new command has to choose.
+    fn calls_control_socket(&self) -> bool {
+        match self {
+            CommandSet::Status
+            | CommandSet::Tools { .. }
+            | CommandSet::Call { .. }
+            | CommandSet::Workspace { .. }
+            | CommandSet::Worktree { .. }
+            | CommandSet::Thread { .. }
+            | CommandSet::Connector { .. }
+            | CommandSet::Mcp { .. }
+            | CommandSet::Notify { .. }
+            | CommandSet::Handoff
+            | CommandSet::Memory { .. }
+            | CommandSet::Index { .. }
+            | CommandSet::Browser { .. }
+            | CommandSet::Issue { .. }
+            | CommandSet::Remote { .. }
+            | CommandSet::Monitor { .. }
+            | CommandSet::Connect { .. }
+            | CommandSet::ReloadUi
+            | CommandSet::Json { .. } => true,
+            // The app, `serve` and the internal children must start whatever
+            // the env says; the rest never reach the socket as a client.
+            CommandSet::App
+            | CommandSet::Serve { .. }
+            | CommandSet::Ports { .. }
+            | CommandSet::Login { .. }
+            | CommandSet::Logout
+            | CommandSet::Whoami
+            | CommandSet::Logs { .. }
+            | CommandSet::Doctor
+            | CommandSet::Capabilities
+            | CommandSet::McpCall { .. }
+            | CommandSet::McpBridge
+            | CommandSet::PtyDaemon { .. } => false,
+        }
+    }
+}
+
+/// Who this invocation's control calls run as. `codemux mcp` takes its own
+/// flags first, then the root's. Commands that call the control socket fill
+/// the rest from the env (`var`); no other command reads it, so a blank or
+/// misspelled variable cannot stop the app, `serve` or a child from
+/// starting. Unnamed calls run as the owner.
+fn caller_of(cli: &Cli, var: impl Fn(&str) -> Option<String>) -> Result<args::CallerArgs, String> {
+    let flags = match &cli.command {
+        Some(CommandSet::Mcp { client, access }) => args::CallerArgs {
+            client: client.clone().or_else(|| cli.caller.client.clone()),
+            access: access.or(cli.caller.access),
+        },
+        _ => cli.caller.clone(),
     };
-    if let Some(name) = &client {
+    match &cli.command {
+        Some(command) if command.calls_control_socket() => flags.or_env(var),
+        _ => Ok(flags),
+    }
+}
+
+/// Names this process's control identity before any socket call: every
+/// request then carries it (`ControlClient::current`).
+fn adopt_caller(caller: &args::CallerArgs) {
+    if let Some(name) = &caller.client {
         crate::control_identity::set_client_name(name);
     }
-    if let Some(access) = access {
+    if let Some(access) = caller.access {
         crate::control_identity::set_client_access(access.into());
     }
-    (client, access)
 }
 
 /// Drive every control-socket / local CLI subcommand and return the exit
 /// status. No subcommand, `app` and `serve` are handled by [`maybe_run_cli`]
 /// before this runs.
 async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
-    let (client, access) = adopt_caller(&cli);
+    let env = |key: &str| std::env::var_os(key).map(|value| value.to_string_lossy().into_owned());
+    let caller = match caller_of(&cli, env) {
+        Ok(caller) => caller,
+        Err(message) => {
+            // A usage error, like the same value given as a flag.
+            output::note(&format!("error: {message}"));
+            return Ok(Exit::Usage);
+        }
+    };
+    adopt_caller(&caller);
+    let args::CallerArgs { client, access } = caller;
     match cli.command {
         None | Some(CommandSet::App) | Some(CommandSet::Serve { .. }) => {
             unreachable!("maybe_run_cli handles the GUI launch and serve before run_control_cli")
@@ -1523,6 +1589,48 @@ mod tests {
         assert!(Cli::try_parse_from(["codemux", "--client", "!!!", "status"]).is_err());
         assert!(Cli::try_parse_from(["codemux", "--client", "x", "tools", "--client", "y"]).is_err());
         assert_eq!(crate::agent_control::ControlAccess::from(args::AccessArg::Supervised), crate::agent_control::ControlAccess::Supervised);
+    }
+
+    #[test]
+    fn only_socket_commands_read_the_caller_env() {
+        use args::{AccessArg, CallerArgs};
+        let bad = |key: &str| match key {
+            "CODEMUX_CLIENT" => Some("---".to_owned()),
+            "CODEMUX_ACCESS" => Some("readonly".to_owned()),
+            _ => None,
+        };
+        let caller = |argv: &[&str], var: &dyn Fn(&str) -> Option<String>| caller_of(&Cli::try_parse_from(argv).unwrap(), var);
+        // A bad variable never stops the app, serve or the internal children.
+        for argv in [
+            &["codemux"][..],
+            &["codemux", "app"],
+            &["codemux", "serve"],
+            &["codemux", "pty-daemon", "--socket", "/tmp/x.sock"],
+            &["codemux", "mcp-bridge"],
+            &["codemux", "mcp-call", "--list"],
+            &["codemux", "capabilities"],
+        ] {
+            assert_eq!(caller(argv, &bad), Ok(CallerArgs::default()), "{argv:?}");
+        }
+        // Commands that call the socket refuse it rather than run as the owner.
+        for argv in [&["codemux", "tools"][..], &["codemux", "mcp"], &["codemux", "json", "status"]] {
+            assert!(caller(argv, &bad).unwrap_err().starts_with("CODEMUX_"), "{argv:?}");
+        }
+        // `codemux mcp` flags, then the root's, then the env.
+        let env = |key: &str| match key {
+            "CODEMUX_CLIENT" => Some("env-bot".to_owned()),
+            "CODEMUX_ACCESS" => Some("supervised".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            caller(&["codemux", "mcp"], &env),
+            Ok(CallerArgs { client: Some("env-bot".into()), access: Some(AccessArg::Supervised) })
+        );
+        assert_eq!(
+            caller(&["codemux", "--client", "root", "mcp", "--access", "read-only"], &env),
+            Ok(CallerArgs { client: Some("root".into()), access: Some(AccessArg::ReadOnly) })
+        );
+        assert_eq!(caller(&["codemux", "--client", "root", "mcp", "--client", "own"], &env).unwrap().client.as_deref(), Some("own"));
     }
 
     #[test]

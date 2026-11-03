@@ -6,19 +6,64 @@ use crate::agent_control::{ClientName, ControlAccess};
 use std::io::Read;
 use std::time::Duration;
 
+/// The env defaults of `--client` and `--access`.
+pub(crate) const CLIENT_ENV: &str = "CODEMUX_CLIENT";
+pub(crate) const ACCESS_ENV: &str = "CODEMUX_ACCESS";
+
 /// Who the control socket records this call as. A name attributes; an access
 /// level narrows. Neither is a credential: every process of this OS user is
 /// trusted alike.
-#[derive(clap::Args, Clone, Debug, Default)]
+///
+/// The env defaults are not clap `env` attributes: clap would parse them for
+/// every command line, so one blank or misspelled variable would stop the
+/// app, `serve` and the internal children from starting. Only the commands
+/// that call the control socket read them, through [`CallerArgs::or_env`].
+#[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
 #[command(next_help_heading = "Caller")]
 pub struct CallerArgs {
-    /// Name to record this client's calls under (`local:<NAME>`). Without it
-    /// calls run as you.
-    #[arg(long, env = "CODEMUX_CLIENT", value_name = "NAME", value_parser = client_name)]
+    /// Name to record this client's calls under (`local:<NAME>`; default
+    /// $CODEMUX_CLIENT). Without one, calls run as you.
+    #[arg(long, value_name = "NAME", value_parser = client_name)]
     pub client: Option<String>,
-    /// The most this client's calls may do (default: full-access).
-    #[arg(long, env = "CODEMUX_ACCESS", value_enum, value_name = "LEVEL")]
+    /// The most this client's calls may do (default $CODEMUX_ACCESS, else
+    /// full-access).
+    #[arg(long, value_enum, value_name = "LEVEL")]
     pub access: Option<AccessArg>,
+}
+
+impl CallerArgs {
+    /// Fills what the flags left out from `CODEMUX_CLIENT` and
+    /// `CODEMUX_ACCESS`. `var` stands in for the process env, so tests never
+    /// read it. A blank variable counts as unset; one that is set but unusable
+    /// is an error, never a silent owner or full access.
+    pub(crate) fn or_env(self, var: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let set = |key: &str| var(key).filter(|value| !value.trim().is_empty());
+        let client = match self.client {
+            Some(client) => Some(client),
+            None => set(CLIENT_ENV)
+                .map(|raw| client_name(&raw).map_err(|why| format!("{CLIENT_ENV}={raw:?} is not a usable client name: {why}")))
+                .transpose()?,
+        };
+        let access = match self.access {
+            Some(access) => Some(access),
+            None => set(ACCESS_ENV)
+                .map(|raw| {
+                    <AccessArg as clap::ValueEnum>::from_str(raw.trim(), false)
+                        .map_err(|_| format!("{ACCESS_ENV}={raw:?} is not an access level: use read-only, supervised or full-access"))
+                })
+                .transpose()?,
+        };
+        Ok(Self { client, access })
+    }
+}
+
+/// The env default of a root caller flag, by its id, for `capabilities`.
+pub(crate) fn caller_env(id: &str) -> Option<&'static str> {
+    match id {
+        "client" => Some(CLIENT_ENV),
+        "access" => Some(ACCESS_ENV),
+        _ => None,
+    }
 }
 
 /// `--access` values. The snake_case spellings the wire uses are accepted too.
@@ -215,6 +260,33 @@ mod tests {
         assert_eq!(message("hi\n\n").unwrap(), "hi");
         assert_eq!(message("  keep leading").unwrap(), "  keep leading");
         assert_eq!(message(" \n\t").unwrap_err().error.code, "invalid_arguments");
+    }
+
+    #[test]
+    fn caller_env_fills_only_what_the_flags_left_out() {
+        let env = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect();
+            move |key: &str| pairs.iter().find(|(name, _)| name == key).map(|(_, value)| value.clone())
+        };
+        let none = CallerArgs::default();
+        assert_eq!(none.clone().or_env(env(&[])), Ok(CallerArgs::default()));
+        assert_eq!(
+            none.clone().or_env(env(&[(CLIENT_ENV, "Hermes Bot"), (ACCESS_ENV, "supervised")])),
+            Ok(CallerArgs { client: Some("Hermes Bot".into()), access: Some(AccessArg::Supervised) })
+        );
+        for (spelling, access) in [("read_only", AccessArg::ReadOnly), (" full ", AccessArg::FullAccess), ("full-access", AccessArg::FullAccess)] {
+            assert_eq!(none.clone().or_env(env(&[(ACCESS_ENV, spelling)])).unwrap().access, Some(access), "{spelling}");
+        }
+        // A blank variable (an env file's `CODEMUX_CLIENT=`) is unset.
+        assert_eq!(none.clone().or_env(env(&[(CLIENT_ENV, ""), (ACCESS_ENV, "  ")])), Ok(CallerArgs::default()));
+        // Given flags win, so a bad variable they override does not matter.
+        let flags = CallerArgs { client: Some("cli".into()), access: Some(AccessArg::ReadOnly) };
+        assert_eq!(flags.clone().or_env(env(&[(CLIENT_ENV, "---"), (ACCESS_ENV, "readonly")])), Ok(flags));
+        // An unusable value fails closed instead of running as the owner at full access.
+        for (key, value) in [(CLIENT_ENV, "---"), (ACCESS_ENV, "readonly"), (ACCESS_ENV, "root")] {
+            let error = none.clone().or_env(env(&[(key, value)])).unwrap_err();
+            assert!(error.starts_with(&format!("{key}=\"{value}\"")), "{error}");
+        }
     }
 
     #[test]
