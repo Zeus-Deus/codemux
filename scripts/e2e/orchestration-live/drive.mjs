@@ -45,9 +45,9 @@ export function loadEnv(rootArg = process.env.ORCH_LIVE_ROOT) {
 /** `codemux json <cmd> <args>` against the isolated instance (see lib.sh cmx).
  *  An aborted `signal` kills the call. */
 export async function codemux(env, cmd, args = {}, { signal } = {}) {
-  let stdout;
+  let reply;
   try {
-    ({ stdout } = await run(env.BIN, ["json", cmd, JSON.stringify(args)], {
+    const { stdout } = await run(env.BIN, ["json", cmd, JSON.stringify(args)], {
       signal,
       env: {
         HOME: process.env.HOME,
@@ -59,17 +59,27 @@ export async function codemux(env, cmd, args = {}, { signal } = {}) {
         XDG_RUNTIME_DIR: `${env.ROOT}/runtime`,
       },
       maxBuffer: 64 << 20,
-    }));
+    });
+    reply = JSON.parse(stdout);
   } catch (error) {
-    // `codemux json` exits 1 on an ok:false reply but still prints it, so the
-    // reply's own error stays the message scenarios match on. An aborted call
-    // or one that printed nothing (no socket, crash) keeps its own error.
-    if (signal?.aborted || !error.stdout) throw error;
-    stdout = error.stdout;
+    reply = printedReply(error);
   }
-  const reply = JSON.parse(stdout);
   if (reply && reply.ok === false) throw new Error(`${cmd}: ${reply.error}`);
   return reply && "data" in reply ? reply.data : reply;
+}
+
+/** The reply a failed `codemux json` still printed: it exits 1 on an ok:false
+ *  reply, and that reply's error is the message scenarios match on. Any other
+ *  failure throws its own error: an aborted, killed or unstartable call or an
+ *  overflowed buffer (`code` is not an exit status), and an exit whose stdout
+ *  is empty or cut short mid-print (not valid JSON). */
+function printedReply(error) {
+  if (typeof error.code !== "number" || !error.stdout) throw error;
+  try {
+    return JSON.parse(error.stdout);
+  } catch {
+    throw error;
+  }
 }
 
 export class Driver {
