@@ -52,6 +52,7 @@ impl SendContext {
         let mut context = Self::new(TurnOrigin::Controller);
         context.provenance.created_by = caller.created_by;
         context.provenance.creation_source = CreationSource::Mcp;
+        context.provenance.sender_title = caller.label.clone();
         if let Some(thread) = caller.thread_id() {
             context.provenance.created_by = CreatedBy::Agent;
             context.provenance.creation_source = CreationSource::Provider;

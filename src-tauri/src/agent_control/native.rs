@@ -160,6 +160,7 @@ async fn qualify_for<R: Runtime>(app: &AppHandle<R>, actor: &crate::delegation::
         principal: format!("thread:{}", actor.thread_id),
         access: ControlAccess::Supervised,
         grant_id: None,
+        label: None,
     };
     service::authorize_native(app, &caller, orchestration)?;
     Ok(caller)

@@ -1330,7 +1330,7 @@ async fn workspace_chat_launch_shares_native_start_without_selecting_workspace()
     std::fs::create_dir(root.path().join("worktree")).unwrap();
     let target = app.state::<crate::state::AppStateStore>().create_empty_workspace_at_path(root.path().join("worktree"));
     app.state::<crate::state::AppStateStore>().activate_workspace(&parent);
-    let caller = ControlCaller { admitted: None, identity: super::CallerPrincipal::LocalController, created_by: crate::agent_provider::message::CreatedBy::Agent, principal: "thread:parent".into(), access: ControlAccess::FullAccess, grant_id: None };
+    let caller = ControlCaller { admitted: None, identity: super::CallerPrincipal::LocalController, created_by: crate::agent_provider::message::CreatedBy::Agent, principal: "thread:parent".into(), access: ControlAccess::FullAccess, grant_id: None, label: None };
     let prepared = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
         crate::agent_provider::ProviderKind::Claude, "Fix sidebar tests".into(), "Self-contained fixture brief".into(), None, None,
     ).await.unwrap();
@@ -3250,4 +3250,39 @@ async fn in_app_create_threads_retry_keys_are_unchanged() {
     let nested = call(json!({"threads":threads})).await.unwrap();
     assert!(nested["error"].is_null(), "{nested}");
     assert_eq!(nested["client_request_id"], expected(&json!({"workspace_id":workspace,"threads":threads}), true));
+}
+
+/// A named local client's message is an assistant's, attributed to its name;
+/// the owner's stays the person's (`orchestration_message_controller_retries_and_persists_caller_provenance`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_client_messages_are_attributed_to_the_client() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let launched = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
+        "workspace_id":workspace,"client_request_id":"named-launch","provider":"claude","permission_mode":"default",
+    })).await.unwrap();
+    let launched = settle_operation(&app, &launched).await;
+    assert_eq!(launched["state"], "succeeded", "{launched}");
+    let thread = launched["thread_id"].as_str().unwrap();
+    let hermes = ControlCaller::local(Some(&ClientName::parse("Hermes").unwrap()), ControlAccess::FullAccess);
+    let receipt = execute(app.handle(), &hermes, "thread_send", json!({
+        "workspace_id":workspace,"thread_id":thread,"client_request_id":"named-send","message":"From an outside assistant","delivery":"queue",
+    })).await.unwrap();
+    let operation = json!({"operation_id":receipt["operation_id"]});
+    assert_eq!(execute(app.handle(), &ControlCaller::trusted(), "operation_status", operation.clone()).await.unwrap_err().code, "operation_not_found",
+        "the named client's receipt is its own");
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let status = execute(app.handle(), &hermes, "operation_status", operation.clone()).await.unwrap();
+            if status["state"] != "accepted" && status["state"] != "running" { break status; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(delivered["state"], "succeeded", "{delivered}");
+    let messages: Vec<serde_json::Value> = app.state::<crate::database::DatabaseStore>().list_agent_chat_messages(thread).iter()
+        .map(|row| serde_json::from_str(row).unwrap()).filter(|row: &serde_json::Value| row["type"] == "user_message").collect();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0]["created_by"], "agent");
+    assert_eq!(messages[0]["creation_source"], "mcp");
+    assert_eq!(messages[0]["sender_title"], "Hermes");
+    assert!(messages[0]["sender_thread_id"].is_null(), "{}", messages[0]);
 }

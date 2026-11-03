@@ -18,7 +18,7 @@ pub(crate) use state::ThreadGate;
 pub(crate) use types::AdmittedAuthority;
 pub use access::{Access, Audience, CallerKind, CallerView};
 pub use error::{ControlError, ErrorCode};
-pub use types::{CallerPrincipal,ControlAccess, ControlCaller};
+pub use types::{CallerPrincipal, ClientName, ControlAccess, ControlCaller};
 pub use catalog::{is_native_tool, is_read_only, native_tools, remote_tools, INSTRUCTIONS};
 
 pub async fn execute<R: tauri::Runtime>(

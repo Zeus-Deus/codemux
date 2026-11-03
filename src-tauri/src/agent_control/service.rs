@@ -684,7 +684,10 @@ pub(crate) async fn thread_send<R: Runtime>(
     permission_ceiling(caller, provider, record.permission_mode.as_deref())?;
     let id = uuid::Uuid::new_v4().to_string();
     let mut context = super::delivery::SendContext::controller(caller);
-    context.provenance.sender_title=caller.thread_id().and_then(|thread|app.state::<DatabaseStore>().get_agent_chat_title(thread));
+    // A sending chat is titled after itself; outside clients keep their label.
+    if let Some(title) = caller.thread_id().and_then(|thread| app.state::<DatabaseStore>().get_agent_chat_title(thread)) {
+        context.provenance.sender_title = Some(title);
+    }
     context.provenance.message_id = Some(id.clone());
     let control = NativeControlGuard { caller:caller.clone(),workspace_id:input.workspace_id.clone(),thread_id:input.thread_id.clone(),provider,admission:None }.retain_admission(app);
     let command: SendTurnCommandInput = serde_json::from_value(json!({

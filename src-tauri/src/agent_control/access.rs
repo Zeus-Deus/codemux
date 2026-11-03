@@ -186,6 +186,8 @@ mod tests {
         let client = CallerView::of(&ControlCaller::outside("c".into(), "g".into(), ReadOnly), Audience::Outside);
         assert_eq!((client.kind, client.access), (CLIENT, ReadOnly));
         assert_eq!(CallerView::of(&ControlCaller::remote("s".into()), Audience::Outside).kind, OWNER);
+        let named = crate::agent_control::ClientName::parse("Hermes").unwrap();
+        assert_eq!(CallerView::of(&ControlCaller::local(Some(&named), Supervised), Audience::Outside).kind, OWNER);
         let full = CallerView::in_app(ProviderKind::Claude, Some("bypassPermissions"), true);
         assert_eq!((full.kind, full.access, full.audience), (FULL_AGENT, Supervised, Audience::InApp));
         assert_eq!(CallerView::in_app(ProviderKind::Codex, Some("plan"), false).kind, AGENT);

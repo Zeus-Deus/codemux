@@ -74,6 +74,7 @@ fn native_callers_nested_cancel_parent_stop_completes_without_deadlock() {
             principal: format!("thread:{parent}"),
             access: ControlAccess::Supervised,
             grant_id: None,
+            label: None,
         }),
         thread_id: parent.clone(),
         provider: ProviderKind::Claude,
