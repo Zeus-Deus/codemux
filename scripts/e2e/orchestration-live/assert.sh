@@ -28,7 +28,9 @@ case "$cmd" in
   sql) sql "$1" ;;
   conversation) conversation "$1" "${2:-50}" ;;
   reply)
-    page="$(conversation "$1" 50)"
+    # `codemux json` exits 1 on an ok:false reply; keep the page so the
+    # check below can print it as evidence.
+    page="$(conversation "$1" 50 || true)"
     echo "$page" | jq -e '(.ok // true) == true and ((.data // .) | has("messages"))' >/dev/null \
       || { echo "$page"; fail "conversation_read failed"; }
     match="$(echo "$page" | jq -c --arg re "$2" '

@@ -99,10 +99,12 @@ done
 [ -n "$SOCK" ] || { err "control socket never appeared"; cat "$WORK/serve.log"; exit 1; }
 ok "control socket at $SOCK"
 
-# `codemux json <command> <params>` is the generic socket round-trip.
+# `codemux json <command> <params>` is the generic socket round-trip. It exits
+# 1 on an ok:false reply but still prints it; `assert_json` checks `ok` and
+# reports the reply's error instead of `set -e` ending the run silently.
 call() {
   local command="$1" params="${2:-{\}}"
-  "$BIN" json "$command" "$params" 2>/dev/null
+  "$BIN" json "$command" "$params" 2>/dev/null || true
 }
 
 # assert_json <label> <json> <python-expr over `d` (the parsed response)>

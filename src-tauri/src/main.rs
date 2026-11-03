@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
+use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
@@ -167,13 +168,21 @@ fn main() {
     }
 
     match tauri::async_runtime::block_on(codemux_lib::cli::maybe_run_cli()) {
-        Ok(codemux_lib::cli::CliOutcome::Handled) => {
+        Ok(codemux_lib::cli::CliOutcome::Handled(exit)) => {
             #[cfg(debug_assertions)]
             codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
-                "[{}] startup_id={} outcome=cli_handled",
+                "[{}] startup_id={} outcome=cli_handled exit={}",
                 chrono_timestamp(),
-                startup_id
+                startup_id,
+                exit.code()
             ));
+            // `process::exit` skips buffered writers, so flush what the
+            // command printed before handing scripts a non-zero status.
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            if exit.code() != 0 {
+                std::process::exit(exit.code());
+            }
             return;
         }
         Ok(codemux_lib::cli::CliOutcome::RunServe(opts)) => {

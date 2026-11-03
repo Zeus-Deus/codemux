@@ -45,19 +45,28 @@ export function loadEnv(rootArg = process.env.ORCH_LIVE_ROOT) {
 /** `codemux json <cmd> <args>` against the isolated instance (see lib.sh cmx).
  *  An aborted `signal` kills the call. */
 export async function codemux(env, cmd, args = {}, { signal } = {}) {
-  const { stdout } = await run(env.BIN, ["json", cmd, JSON.stringify(args)], {
-    signal,
-    env: {
-      HOME: process.env.HOME,
-      PATH: "/usr/bin:/bin",
-      XDG_CONFIG_HOME: `${env.ROOT}/config`,
-      XDG_DATA_HOME: `${env.ROOT}/data`,
-      XDG_CACHE_HOME: `${env.ROOT}/cache`,
-      XDG_STATE_HOME: `${env.ROOT}/state`,
-      XDG_RUNTIME_DIR: `${env.ROOT}/runtime`,
-    },
-    maxBuffer: 64 << 20,
-  });
+  let stdout;
+  try {
+    ({ stdout } = await run(env.BIN, ["json", cmd, JSON.stringify(args)], {
+      signal,
+      env: {
+        HOME: process.env.HOME,
+        PATH: "/usr/bin:/bin",
+        XDG_CONFIG_HOME: `${env.ROOT}/config`,
+        XDG_DATA_HOME: `${env.ROOT}/data`,
+        XDG_CACHE_HOME: `${env.ROOT}/cache`,
+        XDG_STATE_HOME: `${env.ROOT}/state`,
+        XDG_RUNTIME_DIR: `${env.ROOT}/runtime`,
+      },
+      maxBuffer: 64 << 20,
+    }));
+  } catch (error) {
+    // `codemux json` exits 1 on an ok:false reply but still prints it, so the
+    // reply's own error stays the message scenarios match on. An aborted call
+    // or one that printed nothing (no socket, crash) keeps its own error.
+    if (signal?.aborted || !error.stdout) throw error;
+    stdout = error.stdout;
+  }
   const reply = JSON.parse(stdout);
   if (reply && reply.ok === false) throw new Error(`${cmd}: ${reply.error}`);
   return reply && "data" in reply ? reply.data : reply;

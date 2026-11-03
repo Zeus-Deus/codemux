@@ -1,7 +1,11 @@
-use crate::control::{send_control_request, ControlRequest};
+use crate::control::{send_control_request, ControlRequest, ControlResponse};
 use clap::{Parser, Subcommand};
+use output::Exit;
 use serde_json::{json, Value};
+use std::ffi::OsString;
+use std::io::Write;
 
+mod output;
 pub mod ports;
 
 #[derive(Parser)]
@@ -19,6 +23,8 @@ pub struct Cli {
 pub enum CommandSet {
     App,
     Status,
+    /// Debug: send one raw control-socket command and print the reply.
+    /// Exits 1 when the reply is not ok.
     Json { command: String, params: Option<String> },
     Notify { message: String },
     Handoff,
@@ -375,8 +381,8 @@ pub enum IndexCommand {
 /// control-socket round-trip, so it is signalled back to `main` instead of
 /// being driven inside `maybe_run_cli`'s async body.
 pub enum CliOutcome {
-    /// The CLI fully handled the command; the process should exit cleanly.
-    Handled,
+    /// The CLI fully handled the command; the process exits with this status.
+    Handled(Exit),
     /// No subcommand (or `app`): fall through to launching the desktop GUI.
     LaunchGui,
     /// `codemux serve [...]`: run the headless web-remote server on the main
@@ -385,7 +391,14 @@ pub enum CliOutcome {
 }
 
 pub async fn maybe_run_cli() -> Result<CliOutcome, String> {
-    let cli = Cli::parse();
+    let cli = match parse_outcome(std::env::args_os()) {
+        Ok(cli) => cli,
+        Err((exit, error)) => {
+            // clap picks the stream: help on stdout, rejections on stderr.
+            let _ = error.print();
+            return Ok(CliOutcome::Handled(exit));
+        }
+    };
     if cli.disable_plugins {
         std::env::set_var("CODEMUX_DISABLE_PLUGINS", "1");
     }
@@ -398,22 +411,45 @@ pub async fn maybe_run_cli() -> Result<CliOutcome, String> {
             relay: *relay,
         }));
     }
-    match run_control_cli(cli).await? {
-        true => Ok(CliOutcome::Handled),
-        false => Ok(CliOutcome::LaunchGui),
+    if matches!(cli.command, None | Some(CommandSet::App)) {
+        return Ok(CliOutcome::LaunchGui);
     }
+    run_control_cli(cli).await.map(CliOutcome::Handled)
 }
 
-/// Drive every control-socket / local CLI subcommand. Returns `Ok(true)` when
-/// the command was handled (process should exit) and `Ok(false)` when there is
-/// no subcommand and the GUI should launch. `serve` is intercepted by
-/// [`maybe_run_cli`] before this runs.
-async fn run_control_cli(cli: Cli) -> Result<bool, String> {
+/// Parse argv without letting clap exit the process from inside `block_on`.
+/// Help is exit 0 and every rejection is 64 (EX_USAGE), so a 2 only ever
+/// means "needs input". The caller prints the returned clap message.
+fn parse_outcome<I, T>(argv: I) -> Result<Cli, (Exit, clap::Error)>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    Cli::try_parse_from(argv).map_err(|error| {
+        let exit = if error.use_stderr() { Exit::Usage } else { Exit::Done };
+        (exit, error)
+    })
+}
+
+/// Print a control reply as the legacy verbs always have, failing the
+/// process when it is not ok. The reply still goes to stdout either way, so
+/// scripts keep reading the error from it.
+fn print_response(response: &ControlResponse) -> Result<Exit, String> {
+    write_response(&mut std::io::stdout().lock(), response)
+}
+
+fn write_response(writer: &mut impl Write, response: &ControlResponse) -> Result<Exit, String> {
+    output::write_json(writer, response)?;
+    Ok(if response.ok { Exit::Done } else { Exit::Failed })
+}
+
+/// Drive every control-socket / local CLI subcommand and return the exit
+/// status. No subcommand, `app` and `serve` are handled by [`maybe_run_cli`]
+/// before this runs.
+async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
     match cli.command {
-        None | Some(CommandSet::App) => Ok(false),
-        // Intercepted in `maybe_run_cli`; never reached here.
-        Some(CommandSet::Serve { .. }) => {
-            unreachable!("serve is handled by maybe_run_cli before run_control_cli")
+        None | Some(CommandSet::App) | Some(CommandSet::Serve { .. }) => {
+            unreachable!("maybe_run_cli handles the GUI launch and serve before run_control_cli")
         }
         Some(CommandSet::Status) => {
             let response = send_control_request(ControlRequest {
@@ -421,8 +457,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 params: json!({}),
             })
             .await?;
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Json { command, params }) => {
             let params = params
@@ -430,8 +465,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 .transpose()?
                 .unwrap_or_else(|| json!({}));
             let response = send_control_request(ControlRequest { command, params }).await?;
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Notify { message }) => {
             let response = send_control_request(ControlRequest {
@@ -439,8 +473,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 params: json!({ "message": message }),
             })
             .await?;
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Handoff) => {
             let response = send_control_request(ControlRequest {
@@ -448,8 +481,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 params: json!({}),
             })
             .await?;
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Memory { command }) => {
             let response = match command {
@@ -501,8 +533,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 }
             };
 
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Index { command }) => {
             let response = match command {
@@ -529,8 +560,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 }
             };
 
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Issue { command }) => {
             let response = match command {
@@ -558,7 +588,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                                     println!("#{:<6} {:8} {}", num, state_str, title);
                                 }
                             }
-                            return Ok(true);
+                            return Ok(Exit::Done);
                         }
                     }
                     response
@@ -588,7 +618,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                         }
                         println!();
                         println!("{}", body);
-                        return Ok(true);
+                        return Ok(Exit::Done);
                     }
                     response
                 }
@@ -601,8 +631,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 }
             };
 
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Browser { command }) => {
             let ws_id = std::env::var("CODEMUX_WORKSPACE_ID").unwrap_or_default();
@@ -813,8 +842,8 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     }))
                 }
             }?;
-            println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?);
-            Ok(true)
+            output::emit_json(&result)?;
+            Ok(Exit::Done)
         }
         Some(CommandSet::Workspace { command }) => {
             let response = match command {
@@ -832,8 +861,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     .await?
                 }
             };
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Monitor { command }) => {
             // The pane/workspace ids come from the agent's own injected
@@ -870,14 +898,13 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 params,
             })
             .await?;
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         // Purely local: the allocation table is a file on disk, so this works
         // from a bare shell with no Codemux instance running.
         Some(CommandSet::Ports { command }) => {
             ports::run(command)?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::Remote { command }) => {
             match command {
@@ -938,7 +965,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     println!("Web remote access disabled. Every live connection was severed.");
                 }
             }
-            Ok(true)
+            Ok(Exit::Done)
         }
         // Account commands are deliberately local: they open the same
         // SQLite store the app uses and talk to the auth API directly,
@@ -951,7 +978,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
             status,
         }) => {
             crate::auth::cli_login::run_login(email, token, status).await?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         // `connect` is local for the same reason `login` is — it exists to set
         // up a machine that has nothing running yet. It reaches for the control
@@ -972,15 +999,15 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     .await?
                 }
             }
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::Logout) => {
             crate::auth::cli_login::run_logout()?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::Whoami) => {
             crate::auth::cli_login::run_whoami()?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::ReloadUi) => {
             let response = send_control_request(ControlRequest {
@@ -994,18 +1021,18 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     .unwrap_or_else(|| "Codemux could not reload its interface".to_string()));
             }
             println!("Reloading the Codemux interface. Terminals and agents keep running.");
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::Logs { tail }) => {
             // Purely local — reads the file tauri-plugin-log writes, so
             // it works even when (especially when) the app won't start.
             match crate::app_logs::app_log_file() {
                 Some(path) if path.exists() => {
-                    eprintln!("# {}", path.display());
+                    output::note(&format!("# {}", path.display()));
                     for line in
                         crate::app_logs::tail_lines(&path, tail).map_err(|e| e.to_string())?
                     {
-                        println!("{line}");
+                        output::out(&line)?;
                     }
                 }
                 Some(path) => {
@@ -1016,19 +1043,19 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 }
                 None => println!("Could not resolve the platform log directory."),
             }
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::Doctor) => {
             crate::doctor::run().await;
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::Mcp) => {
             crate::mcp_server::run_mcp_server().await?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::McpBridge) => {
             crate::mcp::bridge::run().await?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::McpCall {
             tool,
@@ -1036,7 +1063,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
             list,
         }) => {
             crate::mcp::bridge::call(tool, arguments, list).await?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::PtyDaemon { socket }) => {
             // The daemon's `run` only returns on a fatal listener error;
@@ -1049,7 +1076,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
             #[cfg(unix)]
             {
                 crate::pty_daemon::server::run(socket).await?;
-                Ok(true)
+                Ok(Exit::Done)
             }
             #[cfg(not(unix))]
             {
@@ -1168,8 +1195,8 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     "BROWSER": "Set to 'codemux browser open' for URL handling"
                 }
             });
-            println!("{}", serde_json::to_string_pretty(&caps).map_err(|e| e.to_string())?);
-            Ok(true)
+            output::emit_json(&caps)?;
+            Ok(Exit::Done)
         }
     }
 }
@@ -1376,6 +1403,88 @@ mod tests {
         // that otherwise only surface when a user runs the command.
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn usage_errors_are_64_and_help_is_0() {
+        let exit_of = |argv: &[&str]| match parse_outcome(argv) {
+            Ok(_) => None,
+            Err((exit, _)) => Some(exit.code()),
+        };
+
+        // Help at any level prints on stdout and succeeds.
+        for argv in [
+            &["codemux", "--help"][..],
+            &["codemux", "-h"],
+            &["codemux", "help"],
+            &["codemux", "help", "memory"],
+            &["codemux", "status", "--help"],
+            &["codemux", "remote", "enable", "--help"],
+        ] {
+            assert_eq!(exit_of(argv), Some(0), "{argv:?}");
+        }
+
+        // Every rejection is EX_USAGE, never clap's 2, which means "needs input".
+        for argv in [
+            &["codemux", "no-such-command"][..],
+            &["codemux", "status", "--bogus"],
+            &["codemux", "notify"],
+            &["codemux", "memory"],
+            &["codemux", "serve", "--scope", "wan"],
+            &["codemux", "logs", "--tail", "many"],
+        ] {
+            assert_eq!(exit_of(argv), Some(64), "{argv:?}");
+        }
+
+        // Valid argv still parses, including the bare GUI launch.
+        for argv in [
+            &["codemux"][..],
+            &["codemux", "--disable-plugins"],
+            &["codemux", "json", "status"],
+            &["codemux", "json", "conversation_read", "{\"limit\":5}"],
+        ] {
+            assert_eq!(exit_of(argv), None, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn ok_false_replies_exit_1_and_still_print() {
+        let print = |response: &ControlResponse| {
+            let mut printed = Vec::new();
+            let exit = write_response(&mut printed, response).expect("writes to memory");
+            (exit, String::from_utf8(printed).expect("utf-8"))
+        };
+        // The exact pretty JSON the legacy verbs always printed.
+        let as_before = |response: &ControlResponse| {
+            format!("{}\n", serde_json::to_string_pretty(response).unwrap())
+        };
+
+        let ok = ControlResponse {
+            ok: true,
+            protocol_version: 1,
+            data: Some(json!({ "workspace_id": "ws-1" })),
+            error: None,
+        };
+        let (exit, printed) = print(&ok);
+        assert_eq!((exit, exit.code()), (Exit::Done, 0));
+        assert_eq!(printed, as_before(&ok));
+
+        let refused = ControlResponse {
+            ok: false,
+            protocol_version: 1,
+            data: None,
+            error: Some("workspace_not_found: Select an existing workspace explicitly".into()),
+        };
+        let (exit, printed) = print(&refused);
+        assert_eq!((exit, exit.code()), (Exit::Failed, 1));
+        // stdout is unchanged, so scripts still read the error from the reply.
+        assert_eq!(printed, as_before(&refused));
+        let reply: Value = serde_json::from_str(&printed).unwrap();
+        assert_eq!(reply["ok"], json!(false));
+        assert_eq!(
+            reply["error"],
+            json!("workspace_not_found: Select an existing workspace explicitly")
+        );
     }
 
     /// The `ports` module is only reachable if it is registered on
