@@ -16,8 +16,15 @@ vi.mock("@/lib/toast", () => ({
   toast: mockToast,
 }));
 
+const remote = vi.hoisted(() => ({ value: false }));
+vi.mock("@/components/remote/is-remote-client", () => ({
+  isRemoteClient: () => remote.value,
+}));
+
 import {
+  DESKTOP_ONLY_FORCE,
   USE_FORCE_PATTERN,
+  remoteForceMessage,
   runDeleteWithForceToast,
   useForceDelete,
 } from "./use-force-delete";
@@ -29,6 +36,7 @@ const DIRTY_MESSAGE =
 
 beforeEach(() => {
   vi.clearAllMocks();
+  remote.value = false;
 });
 
 describe("USE_FORCE_PATTERN", () => {
@@ -181,5 +189,52 @@ describe("runDeleteWithForceToast", () => {
     opts.action.onClick();
     await vi.waitFor(() => expect(mockToast.error).toHaveBeenCalledTimes(2));
     expect(mockToast.error.mock.calls[1][1].description).toBe("disk on fire");
+  });
+});
+
+describe("on a paired browser or phone", () => {
+  beforeEach(() => {
+    remote.value = true;
+  });
+
+  it("on a remote client a /use force/i rejection goes to onError with the desktop-only note and never escalates", async () => {
+    const run = vi
+      .fn()
+      .mockRejectedValueOnce("Worktree has 2 uncommitted change(s). Use force to override.");
+    const onDone = vi.fn();
+    const onError = vi.fn();
+    const { result } = renderHook(() =>
+      useForceDelete({ run, onDone, onError }),
+    );
+
+    await act(() => result.current.confirm());
+
+    expect(result.current.forceMessage).toBeNull();
+    expect(onError).toHaveBeenCalledWith(
+      "Worktree has 2 uncommitted change(s). Force delete is only available in the Codemux desktop app.",
+    );
+    expect(onDone).not.toHaveBeenCalled();
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledWith(false);
+  });
+
+  it("runDeleteWithForceToast on a remote client shows no Force delete action", async () => {
+    const run = vi.fn().mockRejectedValueOnce(DIRTY_MESSAGE);
+    await runDeleteWithForceToast({ run });
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(mockToast.error).toHaveBeenCalledTimes(1);
+    const [title, opts] = mockToast.error.mock.calls[0];
+    expect(title).toBe("Delete failed");
+    expect(opts.description).toBe(remoteForceMessage(DIRTY_MESSAGE));
+    expect(opts.description).toContain(DESKTOP_ONLY_FORCE);
+    expect(opts.action).toBeUndefined();
+  });
+
+  it("remoteForceMessage strips the teardown hint too", () => {
+    expect(remoteForceMessage("Teardown failed: x\nUse force delete to skip teardown.")).toBe(
+      "Teardown failed: x Force delete is only available in the Codemux desktop app.",
+    );
+    expect(USE_FORCE_PATTERN.test(remoteForceMessage(DIRTY_MESSAGE))).toBe(false);
   });
 });

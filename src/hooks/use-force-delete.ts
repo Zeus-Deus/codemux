@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { toast } from "@/lib/toast";
 
 /**
@@ -16,6 +17,10 @@ import { toast } from "@/lib/toast";
  *      offer an explicit "Force delete" that reissues with
  *      `forceDelete: true`. Any other rejection is a plain error.
  *
+ * The escalation exists only in the desktop app. A paired browser or
+ * phone may not force (web_remote/policy.rs), so there step 2 is a plain
+ * error whose "use force" hint is swapped for {@link DESKTOP_ONLY_FORCE}.
+ *
  * `useForceDelete` is the dialog-shaped variant (delete dialogs render
  * `forceMessage` in place and relabel their confirm button);
  * `runDeleteWithForceToast` is the toast-shaped variant for surfaces
@@ -26,6 +31,13 @@ import { toast } from "@/lib/toast";
  *  with force" rejections. The wording is pinned by a backend test; the
  *  UI only relies on this fragment. */
 export const USE_FORCE_PATTERN = /use force/i;
+
+/** The backend's "Use force …" sentence replaced by the desktop-only note.
+ *  Paired browsers and phones cannot force (web_remote/policy.rs). */
+export const DESKTOP_ONLY_FORCE = "Force delete is only available in the Codemux desktop app.";
+export function remoteForceMessage(message: string): string {
+  return `${message.replace(/\s*use force[^.]*\.?\s*$/i, "")} ${DESKTOP_ONLY_FORCE}`.trim();
+}
 
 export interface UseForceDeleteOptions {
   /** Perform the delete. Called with `force: false` first; called again
@@ -65,6 +77,10 @@ export function useForceDelete({
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (!force && USE_FORCE_PATTERN.test(message)) {
+        if (isRemoteClient()) {
+          onError?.(remoteForceMessage(message));
+          return;
+        }
         // Dirty worktree — escalate in place instead of failing.
         setForceMessage(message);
         return;
@@ -106,6 +122,10 @@ export async function runDeleteWithForceToast({
     await run(false);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    if (USE_FORCE_PATTERN.test(message) && isRemoteClient()) {
+      toast.error(errorTitle, { description: remoteForceMessage(message) });
+      return;
+    }
     if (USE_FORCE_PATTERN.test(message)) {
       toast.error(errorTitle, {
         description: message,
