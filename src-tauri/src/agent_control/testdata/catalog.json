@@ -1557,7 +1557,7 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
-      "description": "Answer a worker's open question (pending.questions from thread_wait or thread_status) with one answer per prompt, in order. The answer reaches the worker as the person's would, and never changes the thread's permission mode. Secret cards are not answered here. Reuse client_request_id unchanged on retry.",
+      "description": "Answer a worker's open question (pending.questions from thread_wait or thread_status) with one answer per prompt, in order. The answer reaches the worker as the person's would, and never changes the thread's permission mode. A question whose answer is still being delivered or awaits confirmation stays listed, but answering it again fails with question_answer_failed; the person settles it in CodeMux. Secret cards are not answered here. Reuse client_request_id unchanged on retry.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {

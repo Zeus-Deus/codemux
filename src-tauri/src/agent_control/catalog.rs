@@ -296,7 +296,7 @@ mod defs {
         let mut properties = mutation();
         properties["question_id"] = json!({"type": "string", "minLength": 1, "maxLength": 256});
         properties["answers"] = json!({"type": "array", "minItems": 1, "maxItems": 20, "items": {"type": "string", "minLength": 1, "maxLength": 32000}});
-        only_outside(view, outside("Answer a worker's open question (pending.questions from thread_wait or thread_status) with one answer per prompt, in order. The answer reaches the worker as the person's would, and never changes the thread's permission mode. Secret cards are not answered here. Reuse client_request_id unchanged on retry.", properties, &["workspace_id", "thread_id", "client_request_id", "question_id", "answers"]))
+        only_outside(view, outside("Answer a worker's open question (pending.questions from thread_wait or thread_status) with one answer per prompt, in order. The answer reaches the worker as the person's would, and never changes the thread's permission mode. A question whose answer is still being delivered or awaits confirmation stays listed, but answering it again fails with question_answer_failed; the person settles it in CodeMux. Secret cards are not answered here. Reuse client_request_id unchanged on retry.", properties, &["workspace_id", "thread_id", "client_request_id", "question_id", "answers"]))
     }
 
     pub(super) fn operation_status(view: &CallerView) -> Option<Definition> {
@@ -449,6 +449,7 @@ mod review_tests {
         let answer = outside_definition("thread_answer");
         assert!(answer.input_schema["properties"].get("permission_mode_override").is_none(),
             "an outside answer never changes the thread's mode");
+        assert!(answer.description.contains("answering it again fails with question_answer_failed"), "{}", answer.description);
     }
 
     #[test]

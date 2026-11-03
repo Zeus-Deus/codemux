@@ -9,8 +9,8 @@
 use super::tests::{fixture, mock_agent_provider, native_caller_fixture, settle_operation};
 use super::{execute, registry, ClientName, ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlState};
 use crate::agent_provider::{
-    CompletedItem, ProviderKind, ProviderRuntimeEvent as Event, RequestId, SessionStatus, ThreadId, TurnId, TurnStatus,
-    UserQuestion, UserQuestionSet,
+    CompletedItem, ProviderKind, ProviderRuntimeEvent as Event, QuestionResolution, RequestId, SessionStatus, ThreadId,
+    TurnId, TurnStatus, UserQuestion, UserQuestionSet,
 };
 use crate::commands::agent_chat::forward_event;
 use crate::database::DatabaseStore;
@@ -778,6 +778,36 @@ async fn outside_answer_resolves_a_question_and_the_wait_returns_done() {
     refused(call(&app, &bot, "thread_answer", wrong).await, ErrorCode::InvalidArguments);
     refused(call(&app, &named(ControlAccess::ReadOnly), "thread_answer", answer(&workspace, &thread, "answer-5", "second")).await, ErrorCode::AccessDenied);
     no_receipt(&app, &bot, "answer-4", "thread_answer");
+}
+
+/// An answer being delivered, or one the provider never confirmed, keeps the
+/// question in pending.questions. Another answer is refused for that reason,
+/// not as "already answered", so a client does not loop between the two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsettled_answer_keeps_the_question_open_and_refuses_another() {
+    let (app, _, _root, workspace) = fixture().await;
+    let mut asking = MockAgentProvider::new(ProviderKind::Claude);
+    asking.async_questions = true;
+    let provider = Arc::new(asking);
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_claude(provider.clone()).await;
+    let thread = launched(&app, "unsettled-launch", &workspace, "default").await;
+    ask(&app, &thread, "t1", "storage");
+    let bot = named(ControlAccess::FullAccess);
+    let db = app.state::<DatabaseStore>();
+    let answers = vec!["SQLite".to_string()];
+    for (key, next) in [
+        ("while-submitting", QuestionResolution::Submitting { submission_id: "card".into(), answers: answers.clone() }),
+        ("while-unknown", QuestionResolution::Unknown { submission_id: "card".into(), answers: answers.clone(), message: "No reply".into() }),
+    ] {
+        let (_, current) = db.async_question(&thread, "storage").unwrap();
+        assert!(db.change_async_question(&thread, "storage", &current, &next).unwrap().is_some());
+        let status = call(&app, &bot, "thread_status", json!({"workspace_id": workspace, "thread_id": thread})).await.unwrap();
+        assert_eq!(status["pending"]["questions"][0]["question_id"], "storage", "{status}");
+        let error = refused(call(&app, &bot, "thread_answer", answer(&workspace, &thread, key, "storage")).await, ErrorCode::QuestionAnswerFailed);
+        assert!(error.message.contains("being delivered or awaits confirmation"), "{error}");
+        no_receipt(&app, &bot, key, "thread_answer");
+    }
+    assert!(!provider.calls.snapshot().iter().any(|call| matches!(call, MockCall::AnswerQuestion(..))), "nothing reached the worker");
 }
 
 /// Records what each answer asked of the thread's mode.

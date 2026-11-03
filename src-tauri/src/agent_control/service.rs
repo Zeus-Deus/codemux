@@ -1332,8 +1332,13 @@ pub(super) async fn thread_answer<R: Runtime>(app: &AppHandle<R>, caller: &Contr
     permission_ceiling(caller, provider, record.permission_mode.as_deref())?;
     let (question, resolution) = app.state::<DatabaseStore>().async_question(&target.thread_id, &input.question_id)
         .map_err(|_| ControlError::new(ErrorCode::QuestionNotFound, "No question has this ID in the thread"))?;
-    if !matches!(resolution, QuestionResolution::Pending | QuestionResolution::Failed { .. }) {
-        return Err(ControlError::new(ErrorCode::QuestionClosed, "This question was already answered or dismissed"));
+    match resolution {
+        QuestionResolution::Pending | QuestionResolution::Failed { .. } => {}
+        // Still listed in pending.questions, so not "closed".
+        QuestionResolution::Submitting { .. } | QuestionResolution::Unknown { .. } => return Err(answer_unsettled()),
+        QuestionResolution::Answered { .. } | QuestionResolution::Dismissed => {
+            return Err(ControlError::new(ErrorCode::QuestionClosed, "This question was already answered or dismissed"));
+        }
     }
     question.answer_text(&input.answers).map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e))?;
     // The provider dedupes on the submission id, so a key keeps one.
@@ -1361,7 +1366,16 @@ pub(super) async fn thread_answer<R: Runtime>(app: &AppHandle<R>, caller: &Contr
             QuestionResolution::Unknown { submission_id, .. } | QuestionResolution::Submitting { submission_id, .. } if *submission_id == submission => {
                 Err(ControlError::new(ErrorCode::QuestionAnswerFailed, "The answer may have reached the worker, but its delivery was not confirmed. Do not answer again; the person can check the question in CodeMux"))
             }
+            // Someone else's answer claimed it first and has not settled.
+            QuestionResolution::Submitting { .. } | QuestionResolution::Unknown { .. } => Err(answer_unsettled()),
             _ => Err(ControlError::new(ErrorCode::QuestionClosed, "The question was answered or dismissed meanwhile")),
         }
     }).await
+}
+
+/// A question whose answer is being delivered, or was sent without the
+/// provider confirming it, stays open, but a second answer could reach the
+/// worker twice.
+fn answer_unsettled() -> ControlError {
+    ControlError::new(ErrorCode::QuestionAnswerFailed, "An answer to this question is being delivered or awaits confirmation; the person settles it in CodeMux")
 }
