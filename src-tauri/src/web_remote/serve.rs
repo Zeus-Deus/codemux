@@ -38,6 +38,10 @@ pub struct ServeOptions {
 /// returns. Returns an error — before booting — if another Codemux instance
 /// already holds this machine's control endpoint.
 pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
+    // 0. A serve started from an agent's shell must not pass that agent's
+    //    identity to the terminals and tools it starts.
+    crate::control_identity::scrub_inherited_agent_identity();
+
     // 1. Mutual exclusion: never boot a second backend alongside a running GUI
     //    or serve instance (they would fight over the control socket, the DB,
     //    the PTY daemon, and the web-remote port).

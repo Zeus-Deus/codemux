@@ -809,6 +809,8 @@ async fn spawn_pty(
     for key in crate::webview_tuning::RENDERER_ENV_VARS {
         cmd.env_remove(key);
     }
+    // Likewise an agent identity: a user's terminal is always the owner.
+    crate::terminal::strip_agent_identity_env(&mut cmd);
 
     let mut child = pair
         .slave

@@ -47,8 +47,16 @@ mod unix_transport {
     }
 
     impl Listener {
-        pub async fn accept(&self) -> std::io::Result<ServerStream> {
-            self.0.accept().await.map(|(stream, _)| stream)
+        /// The stream and the peer's pid (`SO_PEERCRED`), when the kernel
+        /// reports one. A peer in another pid namespace reads as 0.
+        pub async fn accept(&self) -> std::io::Result<(ServerStream, Option<u32>)> {
+            let (stream, _) = self.0.accept().await?;
+            let peer_pid = stream
+                .peer_cred()
+                .ok()
+                .and_then(|cred| cred.pid())
+                .and_then(|pid| u32::try_from(pid).ok());
+            Ok((stream, peer_pid))
         }
     }
 
@@ -99,7 +107,9 @@ mod windows_transport {
     }
 
     impl Listener {
-        pub async fn accept(&self) -> std::io::Result<ServerStream> {
+        /// The stream and the peer's pid. Named pipes report none here, so
+        /// only the env marker identifies agent processes on Windows.
+        pub async fn accept(&self) -> std::io::Result<(ServerStream, Option<u32>)> {
             let mut guard = self.pending.lock().await;
             let server = guard.take().ok_or_else(|| {
                 std::io::Error::new(
@@ -113,7 +123,7 @@ mod windows_transport {
             // to its handler task.
             let next = ServerOptions::new().create(&self.pipe_name)?;
             *guard = Some(next);
-            Ok(server)
+            Ok((server, None))
         }
     }
 
@@ -462,10 +472,10 @@ pub fn spawn_control_server<R: Runtime>(app: AppHandle<R>) {
 
         loop {
             match listener.accept().await {
-                Ok(stream) => {
+                Ok((stream, peer_pid)) => {
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        if let Err(error) = handle_client(app, stream).await {
+                        if let Err(error) = handle_client(app, stream, peer_pid).await {
                             crate::diagnostics::stderr_line(&format!(
                                 "[codemux::control] Client error: {error}"
                             ));
@@ -483,7 +493,7 @@ pub fn spawn_control_server<R: Runtime>(app: AppHandle<R>) {
     });
 }
 
-async fn handle_client<R: Runtime, S>(app: AppHandle<R>, stream: S) -> Result<(), String>
+async fn handle_client<R: Runtime, S>(app: AppHandle<R>, stream: S, peer_pid: Option<u32>) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -501,7 +511,7 @@ where
 
         let envelope: ControlEnvelope = serde_json::from_str(&line)
             .map_err(|error| format!("Invalid control request JSON: {error}"))?;
-        let caller = crate::control_identity::resolve_socket_caller(envelope.client);
+        let caller = crate::control_identity::resolve_socket_caller(envelope.client, peer_pid);
         let response = dispatch_request_as(&app, &caller, envelope.request).await;
         let payload = serde_json::to_string(&response)
             .map_err(|error| format!("Failed to encode control response: {error}"))?;
@@ -633,6 +643,12 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
 ) -> ControlResponse {
     let required = crate::control_identity::command_access(&request.command, &request.params);
     if let Err(error) = caller.permits(&request.command, required) {
+        if let SocketCaller::Agent { kind, .. } = caller {
+            crate::diagnostics::stderr_line(&format!(
+                "[codemux::control] refused `{}` to an agent process ({kind}): {}",
+                request.command, error.code
+            ));
+        }
         return control_response(Err(error.to_string()));
     }
     let result = match request.command.as_str() {
@@ -644,6 +660,13 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
         name if crate::agent_control::is_native_tool(name) => match caller {
             SocketCaller::Local(caller) => crate::agent_control::execute(app, caller, name, request.params.clone())
                 .await.map_err(|error| error.to_string()),
+            // The socket cannot tell which chat an agent process belongs to,
+            // so it never runs registry tools as one (and never as the owner).
+            SocketCaller::Agent { .. } => Err(crate::agent_control::ControlError::new(
+                crate::agent_control::ErrorCode::AgentIdentityRequired,
+                "This process runs under a Codemux agent; use your chat's own Codemux tools for thread control",
+            )
+            .to_string()),
         },
         "agent_connector_status" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct Args {}
@@ -2142,13 +2165,154 @@ mod tests {
         SocketCaller::Local(crate::agent_control::ControlCaller::local(name.as_ref(), access))
     }
 
+    fn agent(access: crate::agent_control::ControlAccess) -> SocketCaller {
+        SocketCaller::Agent { kind: "test".into(), access }
+    }
+
+    fn refused_with(response: &ControlResponse, code: &str) -> bool {
+        !response.ok && response.error.as_deref().is_some_and(|error| error.starts_with(&format!("{code}: ")))
+    }
+
+    #[tokio::test]
+    async fn agent_processes_are_refused_connector_administration() {
+        let app = tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(crate::web_remote::WebRemoteState::default());
+        app.manage(crate::mcp_connector::McpConnectorState::default());
+        let full = agent(crate::agent_control::ControlAccess::FullAccess);
+        let before = dispatch_request(app.handle(), request("agent_connector_status", serde_json::json!({}))).await;
+        assert!(before.ok, "{:?}", before.error);
+        for (command, params) in [
+            ("agent_connector_approve", serde_json::json!({"request_id":"x","access":"full_access"})),
+            ("agent_connector_status", serde_json::json!({})),
+            ("agent_connector_set_config", serde_json::json!({"enabled":true})),
+            ("agent_connector_deny", serde_json::json!({"request_id":"x"})),
+            ("agent_connector_revoke", serde_json::json!({"client_id":"x"})),
+        ] {
+            let response = dispatch_request_as(app.handle(), &full, request(command, params)).await;
+            assert!(refused_with(&response, "admin_refused"), "{command}: {:?}", response.error);
+        }
+        let after = dispatch_request(app.handle(), request("agent_connector_status", serde_json::json!({}))).await;
+        assert_eq!(after.data, before.data, "the refused calls changed nothing");
+        assert_eq!(after.data.unwrap()["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn agent_processes_are_refused_remote_access_and_automation_writes() {
+        let app = tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        let full = agent(crate::agent_control::ControlAccess::FullAccess);
+        let input = serde_json::json!({"name":"n","prompt":"p","agent":"claude","schedule":"0 * * * *"});
+        for (command, params) in [
+            ("web_remote_enable", serde_json::json!({"scope":"all"})),
+            ("web_remote_pair", serde_json::json!({"name":"phone"})),
+            ("web_remote_set_relay", serde_json::json!({"enabled":true})),
+            ("web_remote_disable", serde_json::json!({})),
+            ("automation_create", serde_json::json!({"input": input})),
+            ("automation_update", serde_json::json!({"id":1,"input": input})),
+            ("automation_set_enabled", serde_json::json!({"id":1,"enabled":true})),
+            ("automation_delete", serde_json::json!({"id":1})),
+            ("write_terminal", serde_json::json!({"data":"codemux json agent_connector_approve
+"})),
+            ("apply_preset", serde_json::json!({"workspace_id":"w","preset_id":"p"})),
+            ("create_worktree_workspace", serde_json::json!({"repo_path":"/r","branch":"b","initial_prompt":"go"})),
+            ("delegation_respond", serde_json::json!({})),
+            ("no_such_command", serde_json::json!({})),
+        ] {
+            let response = dispatch_request_as(app.handle(), &full, request(command, params)).await;
+            assert!(refused_with(&response, "admin_refused"), "{command}: {:?}", response.error);
+        }
+        let listed = dispatch_request_as(app.handle(), &full, request("automation_list", serde_json::json!({}))).await;
+        assert!(listed.ok, "agents keep reading automations: {:?}", listed.error);
+        assert_eq!(listed.data.unwrap(), serde_json::json!([]), "no automation was created");
+    }
+
+    #[tokio::test]
+    async fn agent_processes_keep_workspace_and_browser_commands() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        let full = agent(crate::agent_control::ControlAccess::FullAccess);
+        for command in ["status", "get_app_state"] {
+            let response = dispatch_request_as(app.handle(), &full, request(command, serde_json::json!({}))).await;
+            assert!(response.ok, "{command}: {:?}", response.error);
+        }
+        let notify = dispatch_request_as(app.handle(), &full, request("notify", serde_json::json!({"message":"hi"}))).await;
+        assert!(notify.ok, "{:?}", notify.error);
+        assert_eq!(app.state::<AppStateStore>().snapshot().notifications.len(), 1);
+        // `codemux browser` from an agent's shell: every action passes the
+        // gate (the handler itself needs a live browser).
+        for action in [serde_json::json!({"kind":"open","url":"about:blank"}), serde_json::json!({"kind":"snapshot"}),
+            serde_json::json!({"kind":"click_os"}), serde_json::json!({"kind":"eval","script":"1"})] {
+            let required = crate::control_identity::command_access("browser_automation", &serde_json::json!({"action": action}));
+            assert!(full.permits("browser_automation", required).is_ok(), "{action}");
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_socket_callers_keep_machine_class_legacy_commands() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        let full = agent(crate::agent_control::ControlAccess::FullAccess);
+        // The gate lets it through; the handler then fails on the unknown
+        // workspace without side effects.
+        let rerun = dispatch_request_as(app.handle(), &full, request("rerun_setup", serde_json::json!({"workspace_id":"missing"}))).await;
+        assert_eq!(rerun.error.as_deref(), Some("No workspace found for missing"));
+        for (command, params) in [
+            ("create_workspace", serde_json::json!({"path":"/tmp/project"})),
+            ("create_worktree_workspace", serde_json::json!({"repo_path":"/r","branch":"b"})),
+            ("close_workspace", serde_json::json!({"workspace_id":"w","delete_worktree":true})),
+            ("unarchive_workspace", serde_json::json!({})),
+        ] {
+            let required = crate::control_identity::command_access(command, &params);
+            assert_eq!(required, crate::agent_control::Access::Machine, "{command}");
+            assert!(full.permits(command, required).is_ok(), "{command}");
+        }
+        let automation = dispatch_request_as(app.handle(), &full, request("automation_create", serde_json::json!({}))).await;
+        assert!(refused_with(&automation, "admin_refused"), "{:?}", automation.error);
+        let supervised = agent(crate::agent_control::ControlAccess::Supervised);
+        let create = dispatch_request_as(app.handle(), &supervised, request("create_workspace", serde_json::json!({"path":"relative/dir"}))).await;
+        assert!(refused_with(&create, "access_denied"), "{:?}", create.error);
+    }
+
+    #[tokio::test]
+    async fn agent_without_chat_cannot_use_native_tools() {
+        let app = tauri::test::mock_app();
+        let state = AppStateStore::default();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = state.create_empty_workspace_at_path(root.path().to_path_buf()).0;
+        app.manage(state);
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        let full = agent(crate::agent_control::ControlAccess::FullAccess);
+        for (tool, params) in [
+            ("thread_list", serde_json::json!({"workspace_id": workspace})),
+            ("thread_launch", serde_json::json!({"workspace_id": workspace, "client_request_id":"k", "provider":"claude", "message":"hi"})),
+        ] {
+            let response = dispatch_request_as(app.handle(), &full, request(tool, params)).await;
+            assert!(refused_with(&response, "agent_identity_required"), "{tool}: {:?}", response.error);
+        }
+        let owner = dispatch_request(app.handle(), request("thread_list", serde_json::json!({"workspace_id": workspace}))).await;
+        assert!(owner.ok, "{:?}", owner.error);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unix_accept_reports_the_peer_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer.sock");
+        let listener = transport::bind(&path).unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await.map(|(_, pid)| pid) });
+        let _client = transport::connect(&path).await.unwrap();
+        assert_eq!(accepted.await.unwrap().unwrap(), Some(std::process::id()));
+    }
+
     #[test]
     fn envelope_is_backward_compatible() {
         let line = r#"{"command":"notify","params":{"message":"hi"},"client":{"name":"hermes","access":"supervised"}}"#;
         let old_server: ControlRequest = serde_json::from_str(line).unwrap();
         assert_eq!((old_server.command.as_str(), &old_server.params), ("notify", &serde_json::json!({"message":"hi"})));
         let envelope: ControlEnvelope = serde_json::from_str(line).unwrap();
-        assert_eq!(envelope.client, Some(ControlClient { name: Some("hermes".into()), access: Some(crate::agent_control::ControlAccess::Supervised) }));
+        assert_eq!(envelope.client, Some(ControlClient { name: Some("hermes".into()), access: Some(crate::agent_control::ControlAccess::Supervised), agent: None }));
         let old_client: ControlEnvelope = serde_json::from_str(r#"{"command":"status"}"#).unwrap();
         assert_eq!((old_client.request.command.as_str(), old_client.client), ("status", None));
         assert_eq!(old_client.request.params, Value::Null, "params keep their default");
@@ -2200,7 +2364,7 @@ mod tests {
         let recorded = seen.clone();
         let server = tokio::spawn(async move {
             loop {
-                let Ok(stream) = listener.accept().await else { return };
+                let Ok((stream, _)) = listener.accept().await else { return };
                 let (reader, mut writer) = tokio::io::split(stream);
                 let mut lines = BufReader::new(reader).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -2211,14 +2375,14 @@ mod tests {
                 }
             }
         });
-        let read_only = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly) };
+        let read_only = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly), agent: None };
         let enforcing = AtomicBool::new(false);
         let error = send_control_request_to(&path, request("notify", serde_json::json!({"message":"x"})), Some(&read_only), &enforcing)
             .await.unwrap_err();
         assert!(error.starts_with("server_too_old: "), "{error}");
         assert_eq!(*seen.lock().unwrap(), vec!["status"], "the real request never reached the old server");
         // A full-access or unnamed client keeps today's behaviour with an old app.
-        let named = ControlClient { name: Some("bot".into()), access: None };
+        let named = ControlClient { name: Some("bot".into()), access: None, agent: None };
         let reply = send_control_request_to(&path, request("notify", serde_json::json!({})), Some(&named), &enforcing).await.unwrap();
         assert!(reply.ok);
         assert_eq!(*seen.lock().unwrap(), vec!["status", "notify"]);
@@ -2734,7 +2898,7 @@ mod tests {
 
         let listener = transport::bind(&path).expect("bind unix socket");
         let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept");
+            let (stream, _) = listener.accept().await.expect("accept");
             echo_loop(stream).await.expect("echo_loop");
         });
 
@@ -2825,7 +2989,7 @@ mod tests {
 
         let listener = transport::bind(&path).expect("bind named pipe");
         let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept");
+            let (stream, _) = listener.accept().await.expect("accept");
             echo_loop(stream).await.expect("echo_loop");
         });
 

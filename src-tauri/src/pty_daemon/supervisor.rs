@@ -337,6 +337,11 @@ async fn spawn_daemon_detached() -> Result<PathBuf, PtyDaemonError> {
     for key in crate::webview_tuning::RENDERER_ENV_VARS {
         cmd.env_remove(key);
     }
+    // User terminals are the owner: an agent identity the app inherited never
+    // reaches the daemon's shells.
+    for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
+        cmd.env_remove(key);
+    }
 
     #[cfg(unix)]
     {

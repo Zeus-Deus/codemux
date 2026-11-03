@@ -426,17 +426,24 @@ async fn run_inner(
     let (program, args) = agent_command(&automation.agent, &automation.prompt)
         .map_err(|error| (Some(workdir.clone()), error))?;
 
-    let status = crate::execution::host_command_tokio(&program)
+    let launch_failed = |error: std::io::Error| {
+        (
+            Some(workdir.clone()),
+            format!("Failed to launch '{program}': {error}"),
+        )
+    };
+    // An unattended run is an agent process: it and its tools are refused
+    // admin commands on the control socket.
+    let mut child = crate::execution::host_command_tokio(&program)
         .args(&args)
         .current_dir(&worktree_dir)
-        .status()
-        .await
-        .map_err(|error| {
-            (
-                Some(workdir.clone()),
-                format!("Failed to launch '{program}': {error}"),
-            )
-        })?;
+        .env(crate::control_identity::AGENT_PROCESS_ENV, "automation")
+        .spawn()
+        .map_err(launch_failed)?;
+    if let Some(pid) = child.id() {
+        crate::control_identity::register_agent_process(pid);
+    }
+    let status = child.wait().await.map_err(launch_failed)?;
 
     if status.success() {
         // Best-effort: if the agent pushed a branch and opened a PR,

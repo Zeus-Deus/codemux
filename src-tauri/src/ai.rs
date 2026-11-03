@@ -145,15 +145,21 @@ pub(crate) async fn run_resolver_cli(
     repo_path: &Path,
     timeout: Duration,
 ) -> Result<Output, ResolverRunError> {
+    // The resolver runs an agent CLI with permissions skipped, so it and its
+    // tools are agent processes to the control socket.
     let child = crate::execution::host_command_tokio(program)
         .args(args)
         .current_dir(repo_path)
+        .env(crate::control_identity::AGENT_PROCESS_ENV, "resolver")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| ResolverRunError::Spawn(e.to_string()))?;
+    if let Some(pid) = child.id() {
+        crate::control_identity::register_agent_process(pid);
+    }
 
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(out)) => Ok(out),
@@ -1035,6 +1041,33 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "sleep 60 ran to completion — kill_on_drop regressed"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn resolver_runs_carry_the_agent_marker() {
+        let dir = TempDir::new().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!(
+            "printenv CODEMUX_AGENT_PROCESS; echo $$ > '{}'; sleep 1",
+            pid_file.display()
+        );
+        let args = ["-c".to_string(), script];
+        let run = run_resolver_cli("/bin/sh", &args, dir.path(), Duration::from_secs(10));
+        // While the run is live, the control socket sees it as an agent.
+        let probe = async {
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|t| t.trim().parse::<u32>().ok()) {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            crate::control_identity::is_agent_descendant(pid)
+        };
+        let (out, registered) = tokio::join!(run, probe);
+        let out = out.expect("printenv must run");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "resolver");
+        assert_eq!(registered, cfg!(target_os = "linux"), "registered for ancestry on Linux");
     }
 
     #[tokio::test]

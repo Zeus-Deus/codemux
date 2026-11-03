@@ -538,6 +538,11 @@ impl JsonRpcChild {
                 }
             }
         }
+        // Every child here runs for an agent (provider CLIs, sidecars, probes,
+        // MCP servers Codemux launches), so it and everything it starts carry
+        // the marker. Set after the isolated clear and before the overlay, so
+        // a provider's own value wins.
+        cmd.env(crate::control_identity::AGENT_PROCESS_ENV, "1");
         for (k, v) in &config.env {
             cmd.env(k, v);
         }
@@ -546,6 +551,9 @@ impl JsonRpcChild {
         }
 
         let child = cmd.spawn().map_err(RpcChildError::SpawnFailed)?;
+        if let Some(pid) = child.id() {
+            crate::control_identity::register_agent_process(pid);
+        }
         let managed_group = if managed || (immediate && cfg!(target_os = "macos")) { child.id() } else { None };
         let mut child = OwnedRpcProcess { inner: child, managed_group };
         let stdin = child.inner.stdin.take().ok_or_else(|| {
@@ -1777,6 +1785,29 @@ async fn route_incoming_line(
 #[cfg(all(test, unix))]
 mod safety_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn agent_runtimes_are_marked_as_agent_processes() {
+        let script = "import json,os,sys\nfor line in sys.stdin:\n    request=json.loads(line)\n    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'marker':os.environ.get('CODEMUX_AGENT_PROCESS'),'pid':os.getpid()}}),flush=True)\n";
+        let config = |env: HashMap<String, String>| SpawnConfig {
+            program: which::which("python3").unwrap(),
+            args: vec!["-u".into(), "-c".into(), script.into()],
+            env, cwd: None, default_timeout: Duration::from_secs(5),
+        };
+        let plain = JsonRpcChild::spawn(config(HashMap::new())).await.unwrap();
+        let reply = plain.request("env", serde_json::json!({})).await.unwrap();
+        assert_eq!(reply["marker"], "1");
+        #[cfg(target_os = "linux")]
+        assert!(crate::control_identity::is_agent_descendant(reply["pid"].as_u64().unwrap() as u32), "registered at spawn");
+        plain.shutdown().await.unwrap();
+        let overlay = HashMap::from([(crate::control_identity::AGENT_PROCESS_ENV.to_string(), "claude".to_string())]);
+        let overridden = JsonRpcChild::spawn(config(overlay)).await.unwrap();
+        assert_eq!(overridden.request("env", serde_json::json!({})).await.unwrap()["marker"], "claude", "a provider's value wins");
+        overridden.shutdown().await.unwrap();
+        let isolated = JsonRpcChild::spawn_isolated(config(HashMap::new())).await.unwrap();
+        assert_eq!(isolated.request("env", serde_json::json!({})).await.unwrap()["marker"], "1", "the isolated clear keeps the marker");
+        isolated.shutdown().await.unwrap();
+    }
     #[tokio::test]
     async fn queued_ordinary_writer_cannot_append_after_partial_frame_cancellation() {
         #[derive(Debug)]

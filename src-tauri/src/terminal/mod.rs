@@ -1377,6 +1377,15 @@ pub(crate) fn strip_renderer_env(cmd: &mut CommandBuilder) {
     }
 }
 
+/// Remove every agent identity var from a user terminal's environment, so
+/// `codemux ...` typed there is always the owner. The app scrubs them at
+/// startup too; this also covers a daemon adopted from an older instance.
+pub(crate) fn strip_agent_identity_env(cmd: &mut CommandBuilder) {
+    for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
+        cmd.env_remove(key);
+    }
+}
+
 /// Build worktree environment variables and dynamic agent context for a PTY session.
 /// Used by terminal sessions and agent-chat sidecars so workspace-level
 /// environment variables stay consistent.
@@ -1899,6 +1908,7 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
 
     // Renderer transport flags are an app-process concern only.
     strip_renderer_env(&mut cmd);
+    strip_agent_identity_env(&mut cmd);
 
     let child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,
@@ -3440,6 +3450,31 @@ fn daemon_path_viable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_terminals_never_carry_an_agent_identity() {
+        let mut cmd = CommandBuilder::new("sh");
+        for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
+            cmd.env(key, "inherited");
+        }
+        cmd.env("CODEMUX_WORKSPACE_ID", "ws");
+        strip_agent_identity_env(&mut cmd);
+        for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
+            assert_eq!(cmd.get_env(key), None, "{key} reached a user terminal");
+        }
+        assert!(cmd.get_env("CODEMUX_WORKSPACE_ID").is_some(), "routing vars stay");
+        // Every PTY spawn strips them, and the daemon-backed env list never
+        // adds them back.
+        let daemon_backed = include_str!("daemon_backed.rs");
+        for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
+            assert!(!daemon_backed.contains(key), "daemon_backed.rs names {key}");
+        }
+        let in_process = include_str!("mod.rs");
+        let spawn = &in_process[in_process.find("strip_renderer_env(&mut cmd);").unwrap()..];
+        assert!(spawn.starts_with("strip_renderer_env(&mut cmd);\n    strip_agent_identity_env(&mut cmd);"));
+        assert!(include_str!("../pty_daemon/server.rs").contains("crate::terminal::strip_agent_identity_env(&mut cmd);"));
+        assert!(include_str!("../pty_daemon/supervisor.rs").contains("in crate::control_identity::AGENT_IDENTITY_ENV_VARS"));
+    }
 
     #[test]
     fn restored_session_pty_starts_at_saved_size() {

@@ -8,7 +8,21 @@
 use crate::agent_control::{Access, CallerView, ClientName, ControlAccess, ControlCaller, ControlError, ErrorCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::ffi::OsString;
 use std::sync::OnceLock;
+
+/// Present (any value, even empty) on every process Codemux starts for an
+/// agent, and inherited by everything that process starts.
+pub const AGENT_PROCESS_ENV: &str = "CODEMUX_AGENT_PROCESS";
+
+/// Env that carries an agent's identity. An app or `codemux serve` instance
+/// drops it at startup and no user terminal ever inherits it.
+pub const AGENT_IDENTITY_ENV_VARS: [&str; 4] = [
+    AGENT_PROCESS_ENV,
+    crate::mcp::gateway::BRIDGE_URL_ENV,
+    crate::mcp::gateway::BRIDGE_TOKEN_ENV,
+    crate::mcp_server::PROVIDER_ORIGIN_ENV,
+];
 
 /// What a requesting process says about itself on the control socket.
 ///
@@ -21,6 +35,30 @@ pub struct ControlClient {
     /// Requested ceiling. It can only narrow what the socket would otherwise grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<ControlAccess>,
+    /// Present when the process runs under an agent that Codemux started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentProcess>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentProcess {
+    /// What started it (`1` for provider runtimes, `opencode`, `automation`,
+    /// `resolver`, `mcp`, ...). Diagnostic only, never used to authorize; at
+    /// most 32 bytes.
+    pub kind: String,
+}
+
+impl AgentProcess {
+    const MAX_KIND: usize = 32;
+
+    fn from_marker(value: &str) -> Self {
+        let mut end = value.len().min(Self::MAX_KIND);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        let kind = if value.is_empty() { "agent" } else { &value[..end] };
+        Self { kind: kind.to_owned() }
+    }
 }
 
 // One process has one control identity: the CLI and `codemux mcp` set it once
@@ -50,19 +88,142 @@ pub fn set_client_access(access: ControlAccess) {
 impl ControlClient {
     /// This process's identity, or `None` when it has nothing to say (the owner).
     pub fn current() -> Option<Self> {
-        Self::from_parts(CLIENT_NAME.get().map(String::as_str), CLIENT_ACCESS.get().copied())
+        Self::from_parts(|key| std::env::var_os(key), CLIENT_NAME.get().map(String::as_str), CLIENT_ACCESS.get().copied())
     }
 
-    /// Pure core of [`current`](Self::current), for tests.
-    pub(crate) fn from_parts(name: Option<&str>, access: Option<ControlAccess>) -> Option<Self> {
-        let client = Self { name: name.map(str::to_owned), access };
+    /// Pure core of [`current`](Self::current): `var` stands in for the
+    /// process env, so tests never read it.
+    pub(crate) fn from_parts(
+        var: impl Fn(&str) -> Option<OsString>,
+        name: Option<&str>,
+        access: Option<ControlAccess>,
+    ) -> Option<Self> {
+        // Presence fails closed: an empty marker still marks an agent. A
+        // provider-origin `codemux mcp` (the in-app `codemux` server and
+        // per-workspace `.mcp.json` entries) serves an agent too.
+        let agent = match var(AGENT_PROCESS_ENV) {
+            Some(value) => Some(AgentProcess::from_marker(&value.to_string_lossy())),
+            None => var(crate::mcp_server::PROVIDER_ORIGIN_ENV).map(|_| AgentProcess { kind: "mcp".into() }),
+        };
+        let client = Self { name: name.map(str::to_owned), access, agent };
         (client != Self::default()).then_some(client)
     }
 
     /// Whether this client asks for less than full access. Such a client must
     /// not talk to a server that would ignore the request (`server_too_old`).
+    /// An agent marker sent to an older app keeps that app's behaviour; an
+    /// old server cannot be fixed from the client.
     pub(crate) fn narrows(&self) -> bool {
-        matches!(self.access, Some(ControlAccess::ReadOnly | ControlAccess::Supervised))
+        self.agent.is_none() && matches!(self.access, Some(ControlAccess::ReadOnly | ControlAccess::Supervised))
+    }
+}
+
+/// Drops an agent identity this process inherited. An app or `codemux serve`
+/// started from an agent's shell would otherwise hand it to every terminal it
+/// opens. Never call it on CLI paths: they must send the identity.
+pub fn scrub_inherited_agent_identity() {
+    for key in AGENT_IDENTITY_ENV_VARS {
+        if std::env::var_os(key).is_some() {
+            // Same pattern and placement as the renderer env scrub: it runs
+            // first thing at startup, before other threads read the env.
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent process ancestry
+// ---------------------------------------------------------------------------
+
+/// Records a process Codemux just started for an agent (a provider runtime,
+/// OpenCode's server, an automation run, the conflict resolver). The socket
+/// then treats it and every descendant as an agent process, even when an MCP
+/// client cleared the env marker on the way. Linux only; elsewhere the env
+/// marker is the only signal.
+///
+/// Any new code that starts a model with tools outside `JsonRpcChild` must
+/// call this and set [`AGENT_PROCESS_ENV`].
+pub(crate) fn register_agent_process(pid: u32) {
+    #[cfg(target_os = "linux")]
+    ancestry::register(pid);
+    #[cfg(not(target_os = "linux"))]
+    let _ = pid;
+}
+
+/// Whether `pid` is a registered agent process or descends from one.
+pub(crate) fn is_agent_descendant(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        ancestry::is_descendant(pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod ancestry {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+
+    /// A soft bound. Past it, a registration first prunes dead entries; it
+    /// never drops or refuses a live one, because that would fail open.
+    pub(super) const PRUNE_AT: usize = 4096;
+    /// Deeper process trees than this are not walked.
+    const MAX_HOPS: usize = 64;
+
+    /// Registered agent processes: pid to start time. The start time keeps a
+    /// reused pid from inheriting the mark.
+    static ROOTS: Mutex<BTreeMap<u32, u64>> = Mutex::new(BTreeMap::new());
+
+    /// `(parent pid, start time in clock ticks)` from `/proc/<pid>/stat`.
+    pub(super) fn stat(pid: u32) -> Option<(u32, u64)> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command name (field 2) may contain spaces and parentheses, so
+        // fields are counted after its closing ')': state (3), ppid (4), ...,
+        // starttime (22).
+        let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
+        Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+    }
+
+    pub(super) fn register(pid: u32) {
+        // A process that is already gone has no descendants left to mark.
+        if let Some((_, start)) = stat(pid) {
+            insert(pid, start);
+        }
+    }
+
+    pub(super) fn insert(pid: u32, start: u64) {
+        let mut roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
+        if roots.len() >= PRUNE_AT {
+            roots.retain(|pid, start| stat(*pid).is_some_and(|(_, live)| live == *start));
+        }
+        roots.insert(pid, start);
+    }
+
+    pub(super) fn is_descendant(pid: u32) -> bool {
+        if ROOTS.lock().unwrap_or_else(PoisonError::into_inner).is_empty() {
+            return false;
+        }
+        // Walk up to init or to this app (whose own children are not agents
+        // unless registered), reading /proc outside the lock.
+        let own = std::process::id();
+        let mut chain = Vec::new();
+        let mut pid = pid;
+        while chain.len() < MAX_HOPS && pid > 1 && pid != own {
+            let Some((parent, start)) = stat(pid) else { break };
+            chain.push((pid, start));
+            pid = parent;
+        }
+        let roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
+        chain.iter().any(|(pid, start)| roots.get(pid) == Some(start))
+    }
+
+    #[cfg(test)]
+    pub(super) fn len() -> usize {
+        ROOTS.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 }
 
@@ -221,6 +382,10 @@ fn narrowed(command: &str, required: Access, access: ControlAccess) -> Result<()
 pub(crate) enum SocketCaller {
     /// The owner (principal `local`) or a named same-user client (`local:<slug>`).
     Local(ControlCaller),
+    /// A process started by a Codemux agent (env marker or, on Linux, process
+    /// ancestry). Never `CallerKind::Agent`: the socket cannot know the chat's
+    /// ceiling, so it rank-compares the process's own `access`.
+    Agent { kind: String, access: ControlAccess },
 }
 
 impl SocketCaller {
@@ -235,15 +400,35 @@ impl SocketCaller {
             // unnamed or named local caller is limited only by the access it
             // asked for.
             Self::Local(caller) => narrowed(command, required, caller.access),
+            Self::Agent { .. } if required == Access::Admin => Err(ControlError::new(
+                ErrorCode::AdminRefused,
+                format!(
+                    "`{command}` changes who can reach or control Codemux, or what runs without you. \
+                     Agent processes cannot run it; ask the person to run it in their own terminal or in Settings."
+                ),
+            )),
+            // Machine-class legacy commands stay open to agents at their own
+            // access: full-access chats reach them through codemux-self.
+            Self::Agent { access, .. } => narrowed(command, required, *access),
         }
     }
 }
 
 /// Resolves who sent a socket request. No client is the owner; a named client
-/// is `local:<slug>`, attributed as an outside assistant.
-pub(crate) fn resolve_socket_caller(client: Option<ControlClient>) -> SocketCaller {
+/// is `local:<slug>`, attributed as an outside assistant. An agent marker, or
+/// a peer that descends from a registered agent process, wins over any name:
+/// a name or access level can then only narrow.
+pub(crate) fn resolve_socket_caller(client: Option<ControlClient>, peer_pid: Option<u32>) -> SocketCaller {
     let client = client.unwrap_or_default();
     let access = client.access.unwrap_or(ControlAccess::FullAccess);
+    // The kind is only logged; bound what an arbitrary client may send.
+    let agent = client
+        .agent
+        .map(|agent| AgentProcess::from_marker(&agent.kind).kind)
+        .or_else(|| peer_pid.filter(|pid| is_agent_descendant(*pid)).map(|_| "process-tree".to_owned()));
+    if let Some(kind) = agent {
+        return SocketCaller::Agent { kind, access };
+    }
     let name = client.name.as_deref().and_then(ClientName::parse);
     SocketCaller::Local(ControlCaller::local(name.as_ref(), access))
 }
@@ -254,16 +439,56 @@ mod tests {
     use serde_json::json;
     use ControlAccess::{FullAccess, ReadOnly, Supervised};
 
+    fn no_env(_: &str) -> Option<OsString> {
+        None
+    }
+
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
+        move |key| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| OsString::from(v))
+    }
+
     #[test]
     fn control_client_from_parts_names_and_narrows() {
-        assert_eq!(ControlClient::from_parts(None, None), None, "the owner sends nothing");
-        let named = ControlClient::from_parts(Some("Hermes Agent"), None).unwrap();
-        assert_eq!((named.name.as_deref(), named.access), (Some("Hermes Agent"), None));
+        assert_eq!(ControlClient::from_parts(no_env, None, None), None, "the owner sends nothing");
+        let named = ControlClient::from_parts(no_env, Some("Hermes Agent"), None).unwrap();
+        assert_eq!((named.name.as_deref(), named.access, named.agent.as_ref()), (Some("Hermes Agent"), None, None));
         assert!(!named.narrows());
-        let narrowed = ControlClient::from_parts(None, Some(Supervised)).unwrap();
+        let narrowed = ControlClient::from_parts(no_env, None, Some(Supervised)).unwrap();
         assert!(narrowed.narrows());
-        assert!(ControlClient::from_parts(None, Some(ReadOnly)).unwrap().narrows());
-        assert!(!ControlClient::from_parts(None, Some(FullAccess)).unwrap().narrows());
+        assert!(ControlClient::from_parts(no_env, None, Some(ReadOnly)).unwrap().narrows());
+        assert!(!ControlClient::from_parts(no_env, None, Some(FullAccess)).unwrap().narrows());
+    }
+
+    #[test]
+    fn control_client_from_parts_marks_agents() {
+        let marked = ControlClient::from_parts(env(&[(AGENT_PROCESS_ENV, "")]), None, None).unwrap();
+        assert_eq!(marked.agent, Some(AgentProcess { kind: "agent".into() }), "presence alone marks an agent");
+        let origin = ControlClient::from_parts(env(&[(crate::mcp_server::PROVIDER_ORIGIN_ENV, "1")]), None, None).unwrap();
+        assert_eq!(origin.agent, Some(AgentProcess { kind: "mcp".into() }));
+        let both = ControlClient::from_parts(
+            env(&[(AGENT_PROCESS_ENV, "opencode"), (crate::mcp_server::PROVIDER_ORIGIN_ENV, "1")]),
+            Some("hermes"),
+            Some(Supervised),
+        )
+        .unwrap();
+        assert_eq!(both.agent, Some(AgentProcess { kind: "opencode".into() }));
+        assert!(!both.narrows(), "an agent never trips the old-server probe");
+        let long = ControlClient::from_parts(env(&[(AGENT_PROCESS_ENV, "é123456789012345678901234567890123")]), None, None);
+        assert_eq!(long.unwrap().agent.unwrap().kind.len(), 32, "the kind is bounded on a char boundary");
+        let gateway = ControlClient::from_parts(env(&[(crate::mcp::gateway::BRIDGE_TOKEN_ENV, "t")]), None, None);
+        assert_eq!(gateway, None, "the gateway credential is not a marker; it is scrubbed from terminals");
+        assert_eq!(
+            serde_json::to_value(&both).unwrap(),
+            json!({"name": "hermes", "access": "supervised", "agent": {"kind": "opencode"}})
+        );
+    }
+
+    #[test]
+    fn agent_identity_env_vars_cover_every_marker() {
+        assert_eq!(
+            AGENT_IDENTITY_ENV_VARS,
+            ["CODEMUX_AGENT_PROCESS", "CODEMUX_MCP_GATEWAY_URL", "CODEMUX_MCP_GATEWAY_TOKEN", "CODEMUX_MCP_PROVIDER_ORIGIN"]
+        );
     }
 
     #[test]
@@ -374,16 +599,22 @@ mod tests {
     }
 
     #[test]
-    fn local_caller_permission_matrix() {
+    fn socket_caller_permission_matrix() {
         let named = ClientName::parse("hermes").unwrap();
         let owner = SocketCaller::owner();
         let supervised = SocketCaller::Local(ControlCaller::local(Some(&named), Supervised));
         let read_only = SocketCaller::Local(ControlCaller::local(Some(&named), ReadOnly));
-        // (caller, the classes it may run)
-        let table: [(&SocketCaller, [bool; 5]); 3] = [
+        let agent = SocketCaller::Agent { kind: "1".into(), access: FullAccess };
+        let supervised_agent = SocketCaller::Agent { kind: "1".into(), access: Supervised };
+        let read_only_agent = SocketCaller::Agent { kind: "1".into(), access: ReadOnly };
+        // (caller, the classes it may run: Read, Write, StartsThreads, Machine, Admin)
+        let table: [(&SocketCaller, [bool; 5]); 6] = [
             (&owner, [true, true, true, true, true]),
             (&supervised, [true, true, true, false, false]),
             (&read_only, [true, false, false, false, false]),
+            (&agent, [true, true, true, true, false]),
+            (&supervised_agent, [true, true, true, false, false]),
+            (&read_only_agent, [true, false, false, false, false]),
         ];
         let classes = [Access::Read, Access::Write, Access::StartsThreads, Access::Machine, Access::Admin];
         for (caller, allowed) in table {
@@ -391,7 +622,12 @@ mod tests {
                 let result = caller.permits("cmd", *class);
                 assert_eq!(result.is_ok(), allowed, "{caller:?} {class:?}");
                 if let Err(error) = result {
-                    assert_eq!(error.code, ErrorCode::AccessDenied);
+                    let expected = if matches!(caller, SocketCaller::Agent { .. }) && *class == Access::Admin {
+                        ErrorCode::AdminRefused
+                    } else {
+                        ErrorCode::AccessDenied
+                    };
+                    assert_eq!(error.code, expected, "{caller:?} {class:?}");
                 }
             }
         }
@@ -399,22 +635,44 @@ mod tests {
         assert_eq!(refused.to_string(), "access_denied: This connection is read-only; `notify` needs write access");
         let refused = supervised.permits("create_workspace", Access::Machine).unwrap_err();
         assert_eq!(refused.to_string(), "access_denied: This connection is supervised; `create_workspace` needs full access");
+        let refused = agent.permits("agent_connector_approve", Access::Admin).unwrap_err();
+        assert!(refused.to_string().starts_with("admin_refused: `agent_connector_approve` changes who can reach"), "{refused}");
+    }
+
+    fn local_caller(caller: SocketCaller) -> ControlCaller {
+        match caller {
+            SocketCaller::Local(caller) => caller,
+            other => panic!("expected a local caller, got {other:?}"),
+        }
+    }
+
+    fn client(name: Option<&str>, access: Option<ControlAccess>, agent: Option<&str>) -> Option<ControlClient> {
+        Some(ControlClient { name: name.map(Into::into), access, agent: agent.map(|kind| AgentProcess { kind: kind.into() }) })
     }
 
     #[test]
     fn socket_clients_resolve_to_local_principals() {
-        let SocketCaller::Local(owner) = resolve_socket_caller(None);
+        let owner = local_caller(resolve_socket_caller(None, None));
         assert_eq!(owner.principal, "local");
         assert_eq!(owner.access, FullAccess);
-        let SocketCaller::Local(narrowed) = resolve_socket_caller(Some(ControlClient { name: None, access: Some(ReadOnly) }));
+        let narrowed = local_caller(resolve_socket_caller(client(None, Some(ReadOnly), None), None));
         assert_eq!((narrowed.principal.as_str(), narrowed.access), ("local", ReadOnly));
-        let SocketCaller::Local(named) =
-            resolve_socket_caller(Some(ControlClient { name: Some("Hermes Agent".into()), access: Some(Supervised) }));
+        let named = local_caller(resolve_socket_caller(client(Some("Hermes Agent"), Some(Supervised), None), None));
         assert_eq!(named.principal, "local:hermes-agent");
         assert_eq!(named.label.as_deref(), Some("Hermes Agent"));
         assert_eq!(named.access, Supervised);
-        let SocketCaller::Local(junk) = resolve_socket_caller(Some(ControlClient { name: Some("---".into()), access: None }));
+        let junk = local_caller(resolve_socket_caller(client(Some("---"), None, None), None));
         assert_eq!(junk.principal, "local", "an unusable name is the owner");
+        let own_pid = local_caller(resolve_socket_caller(None, Some(std::process::id())));
+        assert_eq!(own_pid.principal, "local", "the app itself is not an agent");
+    }
+
+    #[test]
+    fn agent_markers_win_over_names() {
+        let marked = resolve_socket_caller(client(Some("hermes"), Some(Supervised), Some("opencode")), None);
+        assert!(matches!(&marked, SocketCaller::Agent { kind, access: Supervised } if kind == "opencode"), "{marked:?}");
+        let default_access = resolve_socket_caller(client(None, None, Some("1")), None);
+        assert!(matches!(default_access, SocketCaller::Agent { access: FullAccess, .. }));
     }
 
     #[test]
@@ -425,5 +683,94 @@ mod tests {
         assert!(stdio_permits("git_commit", &json!({}), Supervised).is_ok());
         assert_eq!(stdio_permits("terminal_write", &json!({}), Supervised).unwrap_err().code, ErrorCode::AccessDenied);
         assert!(stdio_permits("thread_launch", &json!({}), ReadOnly).is_ok(), "the socket gates registry tools");
+    }
+
+    #[cfg(target_os = "linux")]
+    mod ancestry_tests {
+        use super::super::*;
+        use std::io::BufRead;
+        use std::process::{Child, Command, Stdio};
+
+        /// Stops a test-started process by its pid.
+        struct Started(Child);
+        impl Drop for Started {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn sleeper() -> Started {
+            Started(Command::new("sleep").arg("30").spawn().unwrap())
+        }
+
+        #[test]
+        fn agent_descendant_is_detected_through_proc_ancestry() {
+            let mut shell = Started(
+                Command::new("sh")
+                    .args(["-c", "sleep 30 & echo $!; wait"])
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut line = String::new();
+            std::io::BufReader::new(shell.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+            let sleep_pid: u32 = line.trim().parse().unwrap();
+            assert!(!is_agent_descendant(sleep_pid), "nothing is registered for this tree yet");
+            register_agent_process(shell.0.id());
+            assert!(is_agent_descendant(shell.0.id()), "the registered process itself");
+            assert!(is_agent_descendant(sleep_pid), "its child");
+            assert!(!is_agent_descendant(std::process::id()), "the app is never its own agent");
+            assert!(!is_agent_descendant(1));
+            // The grandchild was started by this test; stop it by pid.
+            unsafe { libc::kill(sleep_pid as i32, libc::SIGTERM) };
+        }
+
+        #[test]
+        fn peer_pid_reuse_is_not_an_agent() {
+            let unregistered = sleeper();
+            assert!(!is_agent_descendant(unregistered.0.id()));
+            let reused = sleeper();
+            let (_, start) = ancestry::stat(reused.0.id()).unwrap();
+            // An earlier process with this pid, which started at another time.
+            ancestry::insert(reused.0.id(), start + 1);
+            assert!(!is_agent_descendant(reused.0.id()), "a reused pid does not inherit the mark");
+            register_agent_process(reused.0.id());
+            assert!(is_agent_descendant(reused.0.id()), "registering the live process replaces the stale entry");
+        }
+
+        #[test]
+        fn registrations_past_the_bound_keep_live_processes() {
+            let live = sleeper();
+            register_agent_process(live.0.id());
+            // Dead entries: pids above the kernel's pid_max never exist.
+            for pid in 0..ancestry::PRUNE_AT as u32 {
+                ancestry::insert(u32::MAX - pid, 1);
+            }
+            let fresh = sleeper();
+            register_agent_process(fresh.0.id());
+            assert!(ancestry::len() < ancestry::PRUNE_AT, "the dead entries were pruned");
+            assert!(is_agent_descendant(live.0.id()), "a live registration is never dropped");
+            assert!(is_agent_descendant(fresh.0.id()));
+        }
+
+        #[test]
+        fn proc_stat_parses_names_with_parentheses() {
+            let (parent, start) = ancestry::stat(std::process::id()).unwrap();
+            assert!(parent > 0 && start > 0);
+            // The kernel names a process after the path it was started from.
+            let dir = tempfile::tempdir().unwrap();
+            let odd = dir.path().join("odd ) name (");
+            std::os::unix::fs::symlink(which::which("sleep").unwrap(), &odd).unwrap();
+            let tricky = Started(Command::new(&odd).arg("30").spawn().unwrap());
+            let comm = format!("/proc/{}/comm", tricky.0.id());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::fs::read_to_string(&comm).unwrap_or_default().trim_end() != "odd ) name (" {
+                assert!(std::time::Instant::now() < deadline, "the process never took its odd name");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let (parent, _) = ancestry::stat(tricky.0.id()).unwrap();
+            assert_eq!(parent, std::process::id());
+        }
     }
 }

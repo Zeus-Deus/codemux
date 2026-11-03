@@ -454,6 +454,9 @@ mod pr_publication_wiring_tests {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     diagnostics::record_startup_milestone("startup.run-enter");
+    // An app started from an agent's shell must not pass that agent's
+    // identity to the terminals and tools it starts.
+    control_identity::scrub_inherited_agent_identity();
     // Set WebKitGTK env vars before any GTK/Tauri initialization.
     //
     // Renderer transport: `webview_tuning::configure_renderer_env` sets
