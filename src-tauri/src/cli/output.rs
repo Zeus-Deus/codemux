@@ -162,10 +162,17 @@ impl CallEnvelope {
     }
 }
 
-/// Whether a settled value means the action happened. A value without a
-/// receipt `state` is a plain result.
+/// Whether `value` is an operation receipt: it names its operation and the
+/// operation's state. Other values with a `state`, such as `thread_status`
+/// (the run's state), are plain results.
+pub(crate) fn is_receipt(value: &Value) -> bool {
+    value["operation_id"].is_string() && value["state"].is_string()
+}
+
+/// Whether a settled value means the action happened: a receipt that
+/// succeeded, or any plain result.
 pub(crate) fn succeeded(value: &Value) -> bool {
-    value["state"].as_str().is_none_or(|state| state == "succeeded")
+    !is_receipt(value) || value["state"] == "succeeded"
 }
 
 /// Why a settled receipt did not succeed: its own error, else its state.
@@ -369,12 +376,12 @@ mod tests {
 
     #[test]
     fn settled_receipts_report_why_they_did_not_succeed() {
-        assert!(succeeded(&json!({"state": "succeeded"})));
+        assert!(succeeded(&json!({"operation_id": "op", "state": "succeeded"})));
         assert!(succeeded(&json!({"workspaces": []})));
-        assert!(!succeeded(&json!({"state": "failed"})));
-        let failed = json!({"state": "failed", "error": {"code": "provider_not_ready", "message": "Starting", "retryable": true}});
+        assert!(!succeeded(&json!({"operation_id": "op", "state": "failed"})));
+        let failed = json!({"operation_id": "op", "state": "failed", "error": {"code": "provider_not_ready", "message": "Starting", "retryable": true}});
         assert_eq!(receipt_error(&failed), ErrorBody::new("provider_not_ready", "Starting"));
-        assert!(receipt_error(&json!({"state": "needs_attention"})).message.contains("needs_attention"));
+        assert!(receipt_error(&json!({"operation_id": "op", "state": "needs_attention"})).message.contains("needs_attention"));
 
         let (envelope, exit) = CallEnvelope::settled("thread_stop", Ok(failed.clone()));
         assert_eq!(exit, Exit::Failed);
@@ -382,8 +389,17 @@ mod tests {
             serde_json::to_value(&envelope).unwrap(),
             json!({"ok": false, "tool": "thread_stop", "result": failed, "error": {"code": "provider_not_ready", "message": "Starting"}})
         );
-        let (envelope, exit) = CallEnvelope::settled("thread_stop", Ok(json!({"state": "succeeded"})));
+        let (envelope, exit) = CallEnvelope::settled("thread_stop", Ok(json!({"operation_id": "op", "state": "succeeded"})));
         assert_eq!((envelope.ok, exit), (true, Exit::Done));
+
+        // A run's state is not a receipt's: thread_status succeeds whatever
+        // state the run is in.
+        for state in ["running", "needs_input", "done", "failed"] {
+            let status = json!({"thread_id": "th", "phase": "completed", "state": state, "failure": null});
+            assert!(!is_receipt(&status) && succeeded(&status), "{state}");
+            let (envelope, exit) = CallEnvelope::settled("thread_status", Ok(status));
+            assert_eq!((envelope.ok, exit, envelope.error), (true, Exit::Done, None), "{state}");
+        }
 
         // A settle deadline keeps the receipt it stopped at and exits 3.
         let receipt = json!({"operation_id": "op", "state": "running"});
