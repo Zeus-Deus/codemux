@@ -1,5 +1,5 @@
 //! Resolve opaque composer instance IDs through host-owned configuration.
-use super::{service, ControlError};
+use super::{service, ControlError, ErrorCode};
 use crate::{
     agent_provider::{
         custom_acp::{AcpConfigOption, GenericAcpProvider},
@@ -105,7 +105,7 @@ pub(crate) async fn resolve<R: Runtime>(
             let config = db.acp_launch_config(id)?;
             if !config.agent.enabled {
                 return Err(ControlError::new(
-                    "provider_not_configured",
+                    ErrorCode::ProviderNotConfigured,
                     "ACP instance is disabled",
                 ));
             }
@@ -113,7 +113,7 @@ pub(crate) async fn resolve<R: Runtime>(
                 .try_state::<std::sync::Arc<GenericAcpProvider>>()
                 .ok_or_else(|| {
                     ControlError::new(
-                        "provider_not_configured",
+                        ErrorCode::ProviderNotConfigured,
                         "Custom ACP runtime is unavailable",
                     )
                 })?;
@@ -128,7 +128,7 @@ pub(crate) async fn resolve<R: Runtime>(
             let current = db.acp_launch_config(id)?;
             if current.agent.revision != config.agent.revision {
                 return Err(ControlError::new(
-                    "stale_provider_selection",
+                    ErrorCode::StaleProviderSelection,
                     "ACP definition changed during discovery",
                 ));
             }
@@ -145,7 +145,7 @@ pub(crate) async fn resolve<R: Runtime>(
                 .find(|p| p.id == id)
                 .ok_or_else(|| {
                     ControlError::new(
-                        "provider_not_configured",
+                        ErrorCode::ProviderNotConfigured,
                         "Select an existing configured Hermes profile",
                     )
                 })?;
@@ -153,7 +153,7 @@ pub(crate) async fn resolve<R: Runtime>(
             let runtime = app
                 .try_state::<std::sync::Arc<HermesProvider>>()
                 .ok_or_else(|| {
-                    ControlError::new("provider_not_configured", "Hermes runtime is unavailable")
+                    ControlError::new(ErrorCode::ProviderNotConfigured, "Hermes runtime is unavailable")
                 })?;
             let response = runtime
                 .orchestration_catalog(profile.clone(), discover)
@@ -203,7 +203,7 @@ pub(crate) async fn resolve<R: Runtime>(
                 .filter(|p| !matches!(p, ProviderKind::Acp | ProviderKind::Hermes))
                 .ok_or_else(|| {
                     ControlError::new(
-                        "provider_not_configured",
+                        ErrorCode::ProviderNotConfigured,
                         "Select an exact configured instance from orchestrator_capabilities",
                     )
                 })?;
@@ -215,14 +215,14 @@ pub(crate) async fn resolve<R: Runtime>(
                         .is_some_and(|a| a.provider == slug)
                 {
                     return Err(ControlError::new(
-                        "provider_not_configured",
+                        ErrorCode::ProviderNotConfigured,
                         "Provider account is unavailable",
                     ));
                 }
                 json!({"provider_account_id":account})
             } else if account.is_some() {
                 return Err(ControlError::new(
-                    "provider_not_configured",
+                    ErrorCode::ProviderNotConfigured,
                     "This provider has no configured account selector",
                 ));
             } else {
@@ -254,7 +254,7 @@ pub(crate) async fn resolve<R: Runtime>(
         .is_none()
     {
         return Err(ControlError::new(
-            "provider_not_configured",
+            ErrorCode::ProviderNotConfigured,
             "Selected runtime is unavailable",
         ));
     }
@@ -286,7 +286,7 @@ pub(crate) fn validate_options(
         .map(|id| {
             caps.models.iter().find(|m| &m.id == id).ok_or_else(|| {
                 ControlError::new(
-                    "unsupported_model",
+                    ErrorCode::UnsupportedModel,
                     "Select an exact model from this instance's catalog",
                 )
             })
@@ -299,7 +299,7 @@ pub(crate) fn validate_options(
                 || matches!(id.as_str(), "mode" | "permission_mode")
             {
                 return Err(ControlError::new(
-                    "unsupported_permission_ceiling",
+                    ErrorCode::UnsupportedPermissionCeiling,
                     "Opaque ACP mode options cannot change orchestration permissions",
                 ));
             }
@@ -322,7 +322,7 @@ pub(crate) fn validate_options(
             };
             if !supported {
                 return Err(ControlError::new(
-                    "unsupported_model_option",
+                    ErrorCode::UnsupportedModelOption,
                     format!("Option {id} is not advertised for this instance and model"),
                 ));
             }
@@ -339,10 +339,10 @@ pub(crate) fn verify<R: Runtime>(
     if selection.provider == ProviderKind::Acp {
         let id = selection.extra["acp_agent_id"]
             .as_str()
-            .ok_or_else(|| ControlError::new("stale_provider_selection", "ACP instance missing"))?;
+            .ok_or_else(|| ControlError::new(ErrorCode::StaleProviderSelection, "ACP instance missing"))?;
         if Some(db.acp_launch_config(id)?.agent.revision) != selection.revision {
             return Err(ControlError::new(
-                "stale_provider_selection",
+                ErrorCode::StaleProviderSelection,
                 "ACP launch definition changed after admission",
             ));
         }
@@ -361,7 +361,7 @@ pub(crate) fn verify<R: Runtime>(
             account.provider == crate::commands::delegation::provider_id(selection.provider)
         }) {
             return Err(ControlError::new(
-                "stale_provider_selection",
+                ErrorCode::StaleProviderSelection,
                 "Provider account was removed",
             ));
         }
@@ -413,7 +413,7 @@ mod all_provider_selection_tests {
 
 fn not_discovered() -> ControlError {
     ControlError::new(
-        "catalog_not_discovered",
+        ErrorCode::CatalogNotDiscovered,
         "This instance's catalog has not been discovered yet; target it directly to discover it",
     )
 }
@@ -468,7 +468,7 @@ pub(crate) async fn readiness<R: Runtime>(
         Ok(())
     } else {
         Err(ControlError::new(
-            "provider_not_ready",
+            ErrorCode::ProviderNotReady,
             health
                 .message
                 .unwrap_or_else(|| "Provider readiness is unconfirmed".into()),

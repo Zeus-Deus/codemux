@@ -1,5 +1,5 @@
 //! Launch sequencing belongs here, above the existing native session owner.
-use super::{ControlAccess, ControlCaller, ControlError, NativeControlGuard, NativeControlState};
+use super::{ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlGuard, NativeControlState};
 use crate::agent_provider::{ProviderChatCapabilities, ProviderKind, StartSessionInput, ThreadId};
 use crate::commands::agent_chat::{self, ProviderRegistry, SendTurnCommandInput};
 use crate::database::{AgentChatSessionConfig, DatabaseStore};
@@ -10,13 +10,13 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, Runtime};
 
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ControlError> {
-    if !value.is_object() { return Err(ControlError::new("invalid_arguments", "Arguments must be an object")); }
-    serde_json::from_value(value).map_err(|e| ControlError::new("invalid_arguments", e.to_string()))
+    if !value.is_object() { return Err(ControlError::new(ErrorCode::InvalidArguments, "Arguments must be an object")); }
+    serde_json::from_value(value).map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))
 }
 
 pub(crate) fn identifier(value: &str, name: &str, maximum: usize) -> Result<(), ControlError> {
     if value.is_empty() || value.len() > maximum || value.trim() != value || value.chars().any(char::is_control) {
-        return Err(ControlError::new("invalid_arguments", format!("{name} must be a nonempty unchanged identifier (max {maximum} bytes)")));
+        return Err(ControlError::new(ErrorCode::InvalidArguments, format!("{name} must be a nonempty unchanged identifier (max {maximum} bytes)")));
     }
     Ok(())
 }
@@ -24,12 +24,12 @@ pub(crate) fn identifier(value: &str, name: &str, maximum: usize) -> Result<(), 
 pub(crate) fn workspace<R: Runtime>(app: &AppHandle<R>, id: &str, mutation: bool) -> Result<WorkspaceSnapshot, ControlError> {
     identifier(id, "workspace_id", 256)?;
     let workspace = app.state::<AppStateStore>().snapshot().workspaces.into_iter().find(|w| w.workspace_id.0 == id)
-        .ok_or_else(|| ControlError::new("workspace_not_found", "Select an existing workspace explicitly"))?;
+        .ok_or_else(|| ControlError::new(ErrorCode::WorkspaceNotFound, "Select an existing workspace explicitly"))?;
     if mutation && workspace.is_local_import_snapshot_only() {
-        return Err(ControlError::new("imported_snapshot_read_only", "Imported workspaces are read-only snapshots"));
+        return Err(ControlError::new(ErrorCode::ImportedSnapshotReadOnly, "Imported workspaces are read-only snapshots"));
     }
     if mutation && (workspace.host_id.is_some() || workspace.remote_cwd.is_some()) {
-        return Err(ControlError::new("unsupported_remote_workspace", "Native outside control currently targets local workspaces"));
+        return Err(ControlError::new(ErrorCode::UnsupportedRemoteWorkspace, "Native outside control currently targets local workspaces"));
     }
     Ok(workspace)
 }
@@ -40,10 +40,10 @@ pub(crate) fn permission_ceiling(caller: &ControlCaller, provider: ProviderKind,
     if let Some(ceiling) = caller.ceiling() {
         return if super::permissions::Ceiling::for_mode(provider, mode).is_some_and(|target| ceiling.permits(target)) {
             Ok(())
-        } else { Err(ControlError::new("permission_ceiling", "Target mode exceeds this chat's effective native policy")) };
+        } else { Err(ControlError::new(ErrorCode::PermissionCeiling, "Target mode exceeds this chat's effective native policy")) };
     }
     if caller.access == ControlAccess::ReadOnly {
-        return Err(ControlError::new("permission_denied", "This connection has read-only access"));
+        return Err(ControlError::new(ErrorCode::PermissionDenied, "This connection has read-only access"));
     }
     if caller.access == ControlAccess::FullAccess { return Ok(()); }
     let supervised = match provider {
@@ -53,7 +53,7 @@ pub(crate) fn permission_ceiling(caller: &ControlCaller, provider: ProviderKind,
         ProviderKind::Hermes | ProviderKind::Acp | ProviderKind::OpenCode => false,
     };
     if supervised { Ok(()) } else {
-        Err(ControlError::new("permission_ceiling", "This worker mode needs full-access consent; supervised clients cannot target full-access or unknown modes"))
+        Err(ControlError::new(ErrorCode::PermissionCeiling, "This worker mode needs full-access consent; supervised clients cannot target full-access or unknown modes"))
     }
 }
 
@@ -76,7 +76,7 @@ fn authorize_with_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &Contro
         let connected = app.try_state::<crate::web_remote::WebRemoteState>()
             .is_some_and(|state| state.shared().connections.session_live(session_id));
         if !approved || !connected {
-            return Err(ControlError::new("stale_caller", "The remote client disconnected or its session was revoked"));
+            return Err(ControlError::new(ErrorCode::StaleCaller, "The remote client disconnected or its session was revoked"));
         }
     }
     if let super::CallerPrincipal::Thread { thread_id, provider,
@@ -85,22 +85,22 @@ fn authorize_with_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &Contro
         let mut orchestration = orchestration;
         match &caller.admitted {
             None => {
-                authority.verify(thread_id).map_err(|e| ControlError::new("stale_caller", e))?;
-                db.verify_delivery_generation(thread_id, authority.stop_generation).map_err(|e| ControlError::new("stale_caller", e))?;
+                authority.verify(thread_id).map_err(|e| ControlError::new(ErrorCode::StaleCaller, e))?;
+                db.verify_delivery_generation(thread_id, authority.stop_generation).map_err(|e| ControlError::new(ErrorCode::StaleCaller, e))?;
             }
             Some(super::AdmittedAuthority::Operation {operation_id}) => {
-                let receipt=db.control_operation(&caller.principal,operation_id,&app.state::<NativeControlState>().epoch)?.ok_or_else(||ControlError::new("stale_operation","Accepted operation missing"))?;
+                let receipt=db.control_operation(&caller.principal,operation_id,&app.state::<NativeControlState>().epoch)?.ok_or_else(||ControlError::new(ErrorCode::StaleOperation,"Accepted operation missing"))?;
                 if receipt.tool == "workspace_launch" { orchestration = false; }
-                if !matches!(receipt.tool.as_str(),"thread_launch"|"workspace_launch") || !matches!(receipt.state.as_str(),"accepted"|"running") {return Err(ControlError::new("stale_operation","Accepted launch ended or was revoked"));}
+                if !matches!(receipt.tool.as_str(),"thread_launch"|"workspace_launch") || !matches!(receipt.state.as_str(),"accepted"|"running") {return Err(ControlError::new(ErrorCode::StaleOperation,"Accepted launch ended or was revoked"));}
             }
             Some(super::AdmittedAuthority::Task {task_id}) => {
-                let task=db.delegation_task(task_id)?.ok_or_else(||ControlError::new("stale_task","Accepted task missing"))?;
-                if task.parent_thread_id!=*thread_id || task.cancellation_generation>0 || task.status.terminal() {return Err(ControlError::new("stale_task","Accepted task was stopped or ended"));}
+                let task=db.delegation_task(task_id)?.ok_or_else(||ControlError::new(ErrorCode::StaleTask,"Accepted task missing"))?;
+                if task.parent_thread_id!=*thread_id || task.cancellation_generation>0 || task.status.terminal() {return Err(ControlError::new(ErrorCode::StaleTask,"Accepted task was stopped or ended"));}
             }
             Some(super::AdmittedAuthority::Delivery {delivery_id}) => {
-                let row=db.message_delivery(delivery_id)?.ok_or_else(||ControlError::new("stale_delivery","Accepted message missing"))?;
+                let row=db.message_delivery(delivery_id)?.ok_or_else(||ControlError::new(ErrorCode::StaleDelivery,"Accepted message missing"))?;
                 let retryable = retry_held && !row.attempted && matches!(row.state.as_str(), "held" | "rejected");
-                if row.payload["caller"]["principal"]!=caller.principal || (!retryable && matches!(row.state.as_str(),"cancelled"|"disposed"|"held"|"held_unknown"|"rejected")) {return Err(ControlError::new("stale_delivery","Accepted message authority was revoked"));}
+                if row.payload["caller"]["principal"]!=caller.principal || (!retryable && matches!(row.state.as_str(),"cancelled"|"disposed"|"held"|"held_unknown"|"rejected")) {return Err(ControlError::new(ErrorCode::StaleDelivery,"Accepted message authority was revoked"));}
                 // Workspace startup remains authorized if collaboration is
                 // switched off after admission, including its queued prompt.
                 if let Ok(super::AdmittedAuthority::Operation { operation_id }) =
@@ -113,27 +113,27 @@ fn authorize_with_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &Contro
                 }
             }
         }
-        if orchestration && !crate::commands::delegation::setting_on(&db) { return Err(ControlError::new("orchestration_disabled", "Agent collaboration is off in Settings")); }
-        let record = db.get_agent_chat_session(thread_id).ok_or_else(|| ControlError::new("stale_caller", "Calling chat no longer exists"))?;
+        if orchestration && !crate::commands::delegation::setting_on(&db) { return Err(ControlError::new(ErrorCode::OrchestrationDisabled, "Agent collaboration is off in Settings")); }
+        let record = db.get_agent_chat_session(thread_id).ok_or_else(|| ControlError::new(ErrorCode::StaleCaller, "Calling chat no longer exists"))?;
         let bound = app.state::<AppStateStore>().agent_chat_pane_id_for_thread(thread_id)
             .and_then(|pane| app.state::<AppStateStore>().agent_chat_pane_thread(&pane));
         if (caller.admitted.is_none() && bound != Some((*provider, thread_id.clone()))) || record.provider != crate::commands::delegation::provider_id(*provider) || record.imported_from.is_some() {
-            return Err(ControlError::new("stale_caller", "Calling chat binding changed"));
+            return Err(ControlError::new(ErrorCode::StaleCaller, "Calling chat binding changed"));
         }
         if super::selection::current_instance(&db, thread_id, *provider)? != *provider_instance_id {
             return Err(ControlError::new(
-                "stale_caller",
+                ErrorCode::StaleCaller,
                 "Calling provider instance changed",
             ));
         }
         let canonical = super::permissions::Ceiling::for_record(&db, &record, *provider)
             .ok_or_else(|| {
-                ControlError::new("unsupported_permission_ceiling", "Canonical chat mode is unknown")
+                ControlError::new(ErrorCode::UnsupportedPermissionCeiling, "Canonical chat mode is unknown")
             })?;
-        if let Some(effective)=crate::delegation::authority::NativeAuthority::effective_ceiling(thread_id).map_err(|e|ControlError::new("unsupported_permission_ceiling",e))? {
-            if !effective.permits(*ceiling){return Err(ControlError::new("permission_ceiling","Effective native mode narrowed after admission"));}
+        if let Some(effective)=crate::delegation::authority::NativeAuthority::effective_ceiling(thread_id).map_err(|e|ControlError::new(ErrorCode::UnsupportedPermissionCeiling,e))? {
+            if !effective.permits(*ceiling){return Err(ControlError::new(ErrorCode::PermissionCeiling,"Effective native mode narrowed after admission"));}
         }
-        if !canonical.permits(*ceiling) { return Err(ControlError::new("permission_ceiling", "Calling chat policy was narrowed after admission")); }
+        if !canonical.permits(*ceiling) { return Err(ControlError::new(ErrorCode::PermissionCeiling, "Calling chat policy was narrowed after admission")); }
         workspace(app, &record.workspace_id, true)?;
         return Ok(());
     }
@@ -208,7 +208,7 @@ pub(crate) async fn launch<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
 /// folder, titled after the chat.
 pub(crate) async fn launch_placed<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value, child_workspace: bool) -> Result<Value, ControlError> {
     if !args.as_object().is_some_and(|args| args.contains_key("permission_mode")) {
-        return Err(ControlError::new("permission_mode_required", "Select an advertised worker permission mode explicitly; null is allowed only when the provider has no modes"));
+        return Err(ControlError::new(ErrorCode::PermissionModeRequired, "Select an advertised worker permission mode explicitly; null is allowed only when the provider has no modes"));
     }
     let mut input: Launch = parse(args.clone())?;
     identifier(&input.client_request_id, "client_request_id", 128)?;
@@ -222,23 +222,23 @@ pub(crate) async fn launch_placed<R: Runtime>(app: &AppHandle<R>, caller: &Contr
     let workspace = workspace(app, &input.workspace_id, true)?;
     permission_ceiling(caller, input.provider, input.permission_mode.as_deref())?;
     if let Some(message) = input.message.as_deref() {
-        if message.trim().is_empty() || message.len() > 65536 { return Err(ControlError::new("invalid_arguments", "message must contain text and fit in 65536 bytes")); }
+        if message.trim().is_empty() || message.len() > 65536 { return Err(ControlError::new(ErrorCode::InvalidArguments, "message must contain text and fit in 65536 bytes")); }
     }
     if let Some(title) = input.title.as_deref() { identifier(title, "title", 100)?; }
-    if input.worktree.is_some() { return Err(ControlError::new("unsupported_operation", "Worktree launch is not available yet")); }
+    if input.worktree.is_some() { return Err(ControlError::new(ErrorCode::UnsupportedOperation, "Worktree launch is not available yet")); }
     prepare_selection(app, &mut input, &workspace.cwd).await?;
     validate_worker(app, caller, &input).await?;
     authorize(app, caller)?;
     let epoch = app.state::<NativeControlState>().epoch.clone();
-    let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&args).map_err(|e|ControlError::new("invalid_arguments",e.to_string()))?));
+    let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&args).map_err(|e|ControlError::new(ErrorCode::InvalidArguments,e.to_string()))?));
     let thread = uuid::Uuid::new_v4().to_string();
     // Named before admission so the receipt and any retry point at it.
     let target = if child_workspace { AppStateStore::reserve_workspace_id().0 } else { workspace.workspace_id.0.clone() };
     let admitted = caller.admit(||app.state::<DatabaseStore>().admit_control_operation_for_thread(
         &caller.principal, &input.client_request_id, "thread_launch", &fingerprint, &epoch,
         Some(&target), Some(&thread), caller.thread_id().zip(caller.admission_generation()),
-    )).map_err(|e| ControlError::new(if e.starts_with("request_key_conflict") { "request_key_conflict" } else if e.starts_with("resource_limit") { "resource_limit" } else { "operation_admission_failed" }, e))?;
-    let receipt = serde_json::to_value(&admitted.receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
+    )).map_err(|e| ControlError::from_text(e, ErrorCode::OperationAdmissionFailed))?;
+    let receipt = serde_json::to_value(&admitted.receipt).map_err(|e|ControlError::new(ErrorCode::SerializationFailed,e.to_string()))?;
     if !admitted.newly_admitted { return Ok(receipt); }
     if child_workspace {
         let title = input.title.clone().unwrap_or_else(|| chat_title(input.provider, input.message.as_deref()));
@@ -246,7 +246,7 @@ pub(crate) async fn launch_placed<R: Runtime>(app: &AppHandle<R>, caller: &Contr
             &crate::state::WorkspaceId(target.clone()), &workspace.workspace_id.0, &workspace.cwd, &title,
         );
         if let Err(error) = created {
-            let error = ControlError::new("workspace_not_found", error);
+            let error = ControlError::new(ErrorCode::WorkspaceNotFound, error);
             let db = app.state::<DatabaseStore>();
             let _ = db.orchestration_launch_finished(&thread);
             let _ = db.update_control_operation(&caller.principal, &admitted.receipt.operation_id, &epoch, "failed", None, None, None, serde_json::to_value(&error).ok().as_ref());
@@ -321,13 +321,13 @@ async fn prepare_selection<R: Runtime>(
     input.selected_capabilities = Some(caps);
     if resolved.provider != input.provider {
         return Err(ControlError::new(
-            "invalid_arguments",
+            ErrorCode::InvalidArguments,
             "Target instance and provider disagree",
         ));
     }
     if input.model.is_some() && input.model != resolved.model {
         return Err(ControlError::new(
-            "invalid_arguments",
+            ErrorCode::InvalidArguments,
             "Conflicting model selections",
         ));
     }
@@ -358,7 +358,7 @@ pub(crate) fn validate_permission_mode(provider: ProviderKind, mode: Option<&str
     if plan || (caps.permission_modes.is_empty() && mode.is_none()) || caps.permission_modes.iter().any(|option| Some(option.value.as_str()) == mode) {
         Ok(())
     } else {
-        Err(ControlError::new("unsupported_permission_mode", "Select an exact mode from orchestrator_capabilities"))
+        Err(ControlError::new(ErrorCode::UnsupportedPermissionMode, "Select an exact mode from orchestrator_capabilities"))
     }
 }
 
@@ -366,7 +366,7 @@ async fn validate_worker<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller,
     permission_ceiling(caller, input.provider, input.permission_mode.as_deref())?;
     agent_chat::feature_flag_on(&app.state::<crate::observability::ObservabilityStore>())?;
     if app.state::<ProviderRegistry>().get(input.provider).await.is_none() {
-        return Err(ControlError::new("provider_not_configured", "The selected provider is not configured in CodeMux"));
+        return Err(ControlError::new(ErrorCode::ProviderNotConfigured, "The selected provider is not configured in CodeMux"));
     }
     let caps = if let Some(caps) = &input.selected_capabilities {
         caps.clone()
@@ -376,29 +376,29 @@ async fn validate_worker<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller,
     validate_permission_mode(input.provider, input.permission_mode.as_deref(), &caps)?;
     let model = match &input.model {
         Some(id) => Some(caps.models.iter().find(|model| &model.id == id)
-            .ok_or_else(|| ControlError::new("unsupported_model", "Select an exact model from agent_capabilities"))?),
+            .ok_or_else(|| ControlError::new(ErrorCode::UnsupportedModel, "Select an exact model from agent_capabilities"))?),
         None => None,
     };
     if let Some(effort) = &input.effort {
         if !model.is_some_and(|model| model.effort_levels.contains(effort)) {
-            return Err(ControlError::new("unsupported_effort", "Explicit effort requires a selected model advertising that exact value"));
+            return Err(ControlError::new(ErrorCode::UnsupportedEffort, "Explicit effort requires a selected model advertising that exact value"));
         }
     }
     if let Some(context) = &input.context_window {
         if !model.is_some_and(|model| model.context_window_options.iter().any(|option| &option.value == context)) {
-            return Err(ControlError::new("unsupported_context_window", "The selected model does not advertise that context window"));
+            return Err(ControlError::new(ErrorCode::UnsupportedContextWindow, "The selected model does not advertise that context window"));
         }
     }
     if input.service_tier.as_ref().is_some_and(|tier| {
         !model.is_some_and(|m| m.service_tiers.iter().any(|option| &option.value == tier))
     }) {
         return Err(ControlError::new(
-            "unsupported_service_tier",
+            ErrorCode::UnsupportedServiceTier,
             "The selected model does not advertise that service tier",
         ));
     }
     if input.fast_mode && !model.is_some_and(|model| model.supports_fast_mode) {
-        return Err(ControlError::new("unsupported_fast_mode", "The selected model does not advertise fast mode"));
+        return Err(ControlError::new(ErrorCode::UnsupportedFastMode, "The selected model does not advertise fast mode"));
     }
     Ok(())
 }
@@ -428,7 +428,7 @@ impl PreparedWorkspaceChat {
             resolved: None,
             selected_capabilities: None,
             workspace_id: String::new(), client_request_id: uuid::Uuid::new_v4().to_string(),
-            provider, permission_mode: if let Some(ceiling)=caller.ceiling() {ceiling.inherited_workspace(provider)?} else if caller.access==ControlAccess::FullAccess {crate::commands::agent_chat::fallback_permission_mode(provider).map(str::to_string)} else {return Err(ControlError::new("unsupported_permission_ceiling","Explicit reviewed worker policy required"));},
+            provider, permission_mode: if let Some(ceiling)=caller.ceiling() {ceiling.inherited_workspace(provider)?} else if caller.access==ControlAccess::FullAccess {crate::commands::agent_chat::fallback_permission_mode(provider).map(str::to_string)} else {return Err(ControlError::new(ErrorCode::UnsupportedPermissionCeiling,"Explicit reviewed worker policy required"));},
             title: Some(title), message: Some(message), model, effort,
             context_window: None,
             service_tier: None, fast_mode: false, select: false, worktree: None,
@@ -454,7 +454,7 @@ async fn materialize<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, inp
     if let Some(selection) = &input.resolved {
         super::selection::verify(app, selection)?;
     }
-    let provider_name = serde_json::to_value(input.provider).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
+    let provider_name = serde_json::to_value(input.provider).map_err(|e|ControlError::new(ErrorCode::SerializationFailed,e.to_string()))?;
     let db = app.state::<DatabaseStore>();
     // Save configuration before publishing a bound pane. A mounting renderer
     // cannot see an unbound draft and start a competing provider session.
@@ -489,14 +489,14 @@ async fn materialize<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, inp
     };
     let control = NativeControlGuard { caller:caller.clone(),workspace_id:input.workspace_id.clone(),thread_id:thread.into(),provider:input.provider,admission:None }.retain_admission(app);
     let actual = agent_chat::agent_chat_start_session_guarded(app.clone(), pane.clone(), input.provider, start, Some(thread.into()), Some(control.clone())).await?;
-    if actual.0 != thread { return Err(ControlError::new("unexpected_thread_binding", "Provider changed the native thread ID; inspect the pane before retrying")); }
+    if actual.0 != thread { return Err(ControlError::new(ErrorCode::UnexpectedThreadBinding, "Provider changed the native thread ID; inspect the pane before retrying")); }
     authorize(app, caller)?;
     let turn = if let Some(message) = input.message {
         let command: SendTurnCommandInput = serde_json::from_value(json!({
             "thread_id": thread, "text": message, "delivery":"queue", "model_override":null,
             "permission_mode_override": if plan_mode {Some("plan")} else {None},
             "client_nonce": input.client_request_id,
-        })).map_err(|e| ControlError::new("invalid_arguments", e.to_string()))?;
+        })).map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))?;
         let mut context = super::delivery::SendContext::controller(caller);
         context.control = Some(control);
         Some(agent_chat::send_turn_with_context(app.clone(), input.provider, command, context).await?)
@@ -511,8 +511,8 @@ pub(crate) fn operation_status<R: Runtime>(app: &AppHandle<R>, caller: &ControlC
     identifier(&args.operation_id, "operation_id", 256)?;
     let epoch = app.state::<NativeControlState>().epoch.clone();
     let receipt = app.state::<DatabaseStore>().control_operation(&caller.principal, &args.operation_id, &epoch)?
-        .ok_or_else(|| ControlError::new("operation_not_found", "No operation belongs to this client and ID"))?;
-    serde_json::to_value(receipt).map_err(|e| ControlError::new("serialization_failed",e.to_string()))
+        .ok_or_else(|| ControlError::new(ErrorCode::OperationNotFound, "No operation belongs to this client and ID"))?;
+    serde_json::to_value(receipt).map_err(|e| ControlError::new(ErrorCode::SerializationFailed,e.to_string()))
 }
 
 pub(crate) fn thread_list<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
@@ -521,7 +521,7 @@ pub(crate) fn thread_list<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result
     let args: Args = parse(args)?;
     workspace(app, &args.workspace_id, false)?;
     let limit = args.limit.unwrap_or(20);
-    if !(1..=100).contains(&limit) { return Err(ControlError::new("invalid_arguments", "limit must be between 1 and 100")); }
+    if !(1..=100).contains(&limit) { return Err(ControlError::new(ErrorCode::InvalidArguments, "limit must be between 1 and 100")); }
     if let Some(cursor) = &args.cursor { identifier(cursor, "cursor", 256)?; }
     let db = app.state::<DatabaseStore>();
     let mut ids = db.control_thread_ids(&args.workspace_id, args.cursor.as_deref(), limit + 1)?;
@@ -550,16 +550,16 @@ pub(crate) fn thread_read<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller
     identifier(&args.thread_id, "thread_id", 256)?;
     let limit = args.limit.unwrap_or(20);
     if !(1..=100).contains(&limit) || args.cursor.is_some_and(|cursor| cursor < 0) {
-        return Err(ControlError::new("invalid_arguments", "limit must be 1–100 and cursor must be nonnegative"));
+        return Err(ControlError::new(ErrorCode::InvalidArguments, "limit must be 1–100 and cursor must be nonnegative"));
     }
     let db = app.state::<DatabaseStore>();
     let record = db.get_agent_chat_session(&args.thread_id)
-        .ok_or_else(|| ControlError::new("thread_not_found", "No native thread has this ID"))?;
+        .ok_or_else(|| ControlError::new(ErrorCode::ThreadNotFound, "No native thread has this ID"))?;
     if record.workspace_id != args.workspace_id {
-        return Err(ControlError::new("thread_outside_workspace", "This thread does not belong to the selected workspace"));
+        return Err(ControlError::new(ErrorCode::ThreadOutsideWorkspace, "This thread does not belong to the selected workspace"));
     }
     let page = db.read_agent_chat_history_page(&args.workspace_id, &args.thread_id, args.cursor, limit)?;
-    serde_json::to_value(page).map_err(|e| ControlError::new("serialization_failed", e.to_string()))
+    serde_json::to_value(page).map_err(|e| ControlError::new(ErrorCode::SerializationFailed, e.to_string()))
 }
 
 #[derive(Clone, Deserialize)]
@@ -570,18 +570,18 @@ pub(crate) fn resolve_thread<R: Runtime>(app: &AppHandle<R>, target: &Target, mu
     workspace(app, &target.workspace_id, mutation)?;
     identifier(&target.thread_id, "thread_id", 256)?;
     let record = app.state::<DatabaseStore>().get_agent_chat_session(&target.thread_id)
-        .ok_or_else(|| ControlError::new("thread_not_found", "No native thread has this ID"))?;
-    if record.workspace_id != target.workspace_id { return Err(ControlError::new("thread_outside_workspace", "This thread does not belong to the selected workspace")); }
+        .ok_or_else(|| ControlError::new(ErrorCode::ThreadNotFound, "No native thread has this ID"))?;
+    if record.workspace_id != target.workspace_id { return Err(ControlError::new(ErrorCode::ThreadOutsideWorkspace, "This thread does not belong to the selected workspace")); }
     let provider: ProviderKind = serde_json::from_value(json!(record.provider))
-        .map_err(|_| ControlError::new("unsupported_provider", "This persisted thread has an unsupported provider"))?;
+        .map_err(|_| ControlError::new(ErrorCode::UnsupportedProvider, "This persisted thread has an unsupported provider"))?;
     if mutation {
-        if record.imported_from.is_some() { return Err(ControlError::new("imported_snapshot_read_only", "Imported threads are read-only snapshots")); }
+        if record.imported_from.is_some() { return Err(ControlError::new(ErrorCode::ImportedSnapshotReadOnly, "Imported threads are read-only snapshots")); }
         let state = app.state::<AppStateStore>();
         let pane = state.agent_chat_pane_id_for_thread(&record.thread_id)
-            .ok_or_else(|| ControlError::new("thread_not_bound", "Reopen this thread in CodeMux before controlling it"))?;
+            .ok_or_else(|| ControlError::new(ErrorCode::ThreadNotBound, "Reopen this thread in CodeMux before controlling it"))?;
         if state.workspace_id_for_pane(&pane).as_deref() != Some(target.workspace_id.as_str())
             || state.agent_chat_pane_thread(&pane) != Some((provider,target.thread_id.clone())) {
-            return Err(ControlError::new("stale_thread_binding", "The pane no longer belongs to this workspace/provider/thread"));
+            return Err(ControlError::new(ErrorCode::StaleThreadBinding, "The pane no longer belongs to this workspace/provider/thread"));
         }
     }
     Ok((record, provider))
@@ -658,11 +658,11 @@ pub(crate) async fn thread_send<R: Runtime>(
     }
     let input: Args = parse(args)?;
     let args = serde_json::to_value(&input)
-        .map_err(|e| ControlError::new("invalid_arguments", e.to_string()))?;
+        .map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))?;
     identifier(&input.client_request_id, "client_request_id", 128)?;
     if input.message.trim().is_empty() || input.message.len() > 65536 {
         return Err(ControlError::new(
-            "invalid_arguments",
+            ErrorCode::InvalidArguments,
             "message must contain text and fit in 65536 bytes",
         ));
     }
@@ -677,7 +677,7 @@ pub(crate) async fn thread_send<R: Runtime>(
     let (record, provider) = resolve_thread(app, &target, true)?;
     if record.imported_from.is_some() {
         return Err(ControlError::new(
-            "imported_snapshot_read_only",
+            ErrorCode::ImportedSnapshotReadOnly,
             "Imported threads are read-only snapshots",
         ));
     }
@@ -691,7 +691,7 @@ pub(crate) async fn thread_send<R: Runtime>(
         "thread_id":input.thread_id,"text":input.message,"delivery":input.delivery,
         "model_override":null,"client_nonce":input.client_request_id,
     }))
-    .map_err(|e| ControlError::new("invalid_arguments", e.to_string()))?;
+    .map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))?;
     let payload = serde_json::to_value(super::delivery::DeliveryPayload {
         provider,
         input: command,
@@ -700,12 +700,12 @@ pub(crate) async fn thread_send<R: Runtime>(
         caller: Some(caller.clone()),
         pr_watch: None,
     })
-    .map_err(|e| ControlError::new("invalid_arguments", e.to_string()))?;
+    .map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))?;
     let hash = format!(
         "{:x}",
         Sha256::digest(
             serde_json::to_vec(&args)
-                .map_err(|e| ControlError::new("invalid_arguments", e.to_string()))?
+                .map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))?
         )
     );
     let epoch = app.state::<NativeControlState>().epoch.clone();
@@ -726,26 +726,15 @@ pub(crate) async fn thread_send<R: Runtime>(
             }),
             true,
         ))
-        .map_err(|e| {
-            ControlError::new(
-                if e.starts_with("request_key_conflict") {
-                    "request_key_conflict"
-                } else if e.starts_with("resource_limit") {
-                    "resource_limit"
-                } else {
-                    "operation_admission_failed"
-                },
-                e,
-            )
-        })?;
+        .map_err(|e| ControlError::from_text(e, ErrorCode::OperationAdmissionFailed))?;
     let receipt = db
         .control_operation(&caller.principal, &id, &epoch)?
-        .ok_or_else(|| ControlError::new("operation_not_found", "Missing admitted receipt"))?;
+        .ok_or_else(|| ControlError::new(ErrorCode::OperationNotFound, "Missing admitted receipt"))?;
     if new {
         let owned = app.clone();
         let row = db
             .message_delivery(&id)?
-            .ok_or_else(|| ControlError::new("delivery_not_found", "Missing admitted delivery"))?;
+            .ok_or_else(|| ControlError::new(ErrorCode::DeliveryNotFound, "Missing admitted delivery"))?;
         #[cfg(test)]
         let barrier = app
             .state::<NativeControlState>()
@@ -762,7 +751,7 @@ pub(crate) async fn thread_send<R: Runtime>(
         });
         super::delivery::notify();
     }
-    let mut result=serde_json::to_value(receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
+    let mut result=serde_json::to_value(receipt).map_err(|e|ControlError::new(ErrorCode::SerializationFailed,e.to_string()))?;
     if let Some(task)=db.delegation_task(&format!("local:followup:{id}"))? {result["task_id"]=json!(task.task_id);}
     Ok(result)
 }
@@ -771,25 +760,25 @@ fn retry_receipt<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, tool: &
     authorize(app, caller)?;
     for field in ["workspace_id", "thread_id"] {
         if let Some(value) = args.get(field) {
-            identifier(value.as_str().ok_or_else(|| ControlError::new("invalid_arguments", field))?, field, 256)?;
+            identifier(value.as_str().ok_or_else(|| ControlError::new(ErrorCode::InvalidArguments, field))?, field, 256)?;
         }
     }
-    let key = args["client_request_id"].as_str().ok_or_else(|| ControlError::new("invalid_arguments", "client_request_id is required"))?;
+    let key = args["client_request_id"].as_str().ok_or_else(|| ControlError::new(ErrorCode::InvalidArguments, "client_request_id is required"))?;
     identifier(key, "client_request_id", 128)?;
-    let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(args).map_err(|e| ControlError::new("invalid_arguments", e.to_string()))?));
+    let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(args).map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))?));
     app.state::<DatabaseStore>().control_operation_by_key(&caller.principal, key, tool, &hash, &app.state::<NativeControlState>().epoch)
-        .map_err(|e| ControlError::new(if e.starts_with("request_key_conflict") { "request_key_conflict" } else { "operation_lookup_failed" }, e))?
-        .map(serde_json::to_value).transpose().map_err(|e| ControlError::new("serialization_failed", e.to_string()))
+        .map_err(|e| ControlError::from_text(e, ErrorCode::OperationLookupFailed))?
+        .map(serde_json::to_value).transpose().map_err(|e| ControlError::new(ErrorCode::SerializationFailed, e.to_string()))
 }
 
 fn admit_mutation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, tool: &str, args: &Value, target: &Target) -> Result<crate::database::agent_control::Admission, ControlError> {
     authorize(app,caller)?;
-    let key = args["client_request_id"].as_str().ok_or_else(||ControlError::new("invalid_arguments","client_request_id is required"))?;
+    let key = args["client_request_id"].as_str().ok_or_else(||ControlError::new(ErrorCode::InvalidArguments,"client_request_id is required"))?;
     identifier(key,"client_request_id",128)?;
-    let hash = format!("{:x}",Sha256::digest(serde_json::to_vec(args).map_err(|e|ControlError::new("invalid_arguments",e.to_string()))?));
+    let hash = format!("{:x}",Sha256::digest(serde_json::to_vec(args).map_err(|e|ControlError::new(ErrorCode::InvalidArguments,e.to_string()))?));
     let epoch = app.state::<NativeControlState>().epoch.clone();
     caller.admit(||app.state::<DatabaseStore>().admit_control_operation_for_thread(&caller.principal,key,tool,&hash,&epoch,Some(&target.workspace_id),Some(&target.thread_id),caller.thread_id().zip(caller.admission_generation())))
-        .map_err(|e|ControlError::new(if e.starts_with("request_key_conflict") {"request_key_conflict"} else {"operation_admission_failed"},e))
+        .map_err(|e|ControlError::from_text(e, ErrorCode::OperationAdmissionFailed))
 }
 
 fn spawn_operation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, receipt: crate::database::agent_control::OperationReceipt, work: impl std::future::Future<Output=Result<Value,ControlError>> + Send + 'static) {
@@ -829,7 +818,7 @@ pub(crate) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &
     workspace(app,&args.workspace_id,false)?;
     let registry = app.state::<ProviderRegistry>();
     let registered = match args.provider {
-        Some(kind) => vec![(kind,registry.get(kind).await.ok_or_else(||ControlError::new("provider_not_configured","The selected provider is not configured in CodeMux"))?)],
+        Some(kind) => vec![(kind,registry.get(kind).await.ok_or_else(||ControlError::new(ErrorCode::ProviderNotConfigured,"The selected provider is not configured in CodeMux"))?)],
         None => registry.all().await,
     };
     let mut providers = Vec::new();
@@ -904,8 +893,8 @@ pub(crate) async fn thread_interrupt<R: Runtime>(app: &AppHandle<R>, caller: &Co
     let (record, provider) = resolve_thread(app,&target,true)?;
     permission_ceiling(caller,provider,record.permission_mode.as_deref())?;
     let implementation = app.state::<ProviderRegistry>().get(provider).await
-        .ok_or_else(||ControlError::new("provider_not_configured","The selected provider is not configured in CodeMux"))?;
-    if !implementation.capabilities().supports_interrupt { return Err(ControlError::new("unsupported_operation","This provider does not support interruption")); }
+        .ok_or_else(||ControlError::new(ErrorCode::ProviderNotConfigured,"The selected provider is not configured in CodeMux"))?;
+    if !implementation.capabilities().supports_interrupt { return Err(ControlError::new(ErrorCode::UnsupportedOperation,"This provider does not support interruption")); }
     // Capture the selected run at admission. A delayed operation must not
     // interrupt a newer run that started while its receipt was pending.
     let mut selected = input.turn_id.clone().or_else(|| app.state::<NativeControlState>().thread_runtime(&target.thread_id).and_then(|view| view.turn_id));
@@ -915,14 +904,14 @@ pub(crate) async fn thread_interrupt<R: Runtime>(app: &AppHandle<R>, caller: &Co
             .and_then(|session| match session.status {crate::agent_provider::SessionStatus::Running {active_turn} => Some(active_turn.0), _ => None});
     }
     let admission = admit_mutation(app,caller,"thread_interrupt",&args,&target)?;
-    let receipt = serde_json::to_value(&admission.receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
+    let receipt = serde_json::to_value(&admission.receipt).map_err(|e|ControlError::new(ErrorCode::SerializationFailed,e.to_string()))?;
     if !admission.newly_admitted { return Ok(receipt); }
     let owned_app = app.clone();
     let owned_caller = caller.clone();
     spawn_operation(app,caller,admission.receipt,async move {
         authorize(&owned_app,&owned_caller)?;
         let (record,current_provider) = resolve_thread(&owned_app,&target,true)?;
-        if provider != current_provider { return Err(ControlError::new("stale_thread_binding","The thread changed provider after admission")); }
+        if provider != current_provider { return Err(ControlError::new(ErrorCode::StaleThreadBinding,"The thread changed provider after admission")); }
         permission_ceiling(&owned_caller,provider,record.permission_mode.as_deref())?;
         let control = NativeControlGuard { caller:owned_caller.clone(),workspace_id:target.workspace_id.clone(),thread_id:target.thread_id.clone(),provider,admission:None };
         let reached = if let Some(selected) = selected { agent_chat::agent_chat_interrupt_turn_guarded(owned_app.clone(),provider,ThreadId(target.thread_id.clone()),Some(crate::agent_provider::TurnId(selected)),Some(control)).await? } else { false };
@@ -941,14 +930,14 @@ pub(crate) async fn thread_stop<R: Runtime>(app: &AppHandle<R>, caller: &Control
     let (record, provider) = resolve_thread(app,&target,true)?;
     permission_ceiling(caller,provider,record.permission_mode.as_deref())?;
     let admission = admit_mutation(app,caller,"thread_stop",&args,&target)?;
-    let receipt = serde_json::to_value(&admission.receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
+    let receipt = serde_json::to_value(&admission.receipt).map_err(|e|ControlError::new(ErrorCode::SerializationFailed,e.to_string()))?;
     if !admission.newly_admitted { return Ok(receipt); }
     let owned_app = app.clone();
     let owned_caller = caller.clone();
     spawn_operation(app,caller,admission.receipt,async move {
         authorize(&owned_app,&owned_caller)?;
         let (record,current_provider) = resolve_thread(&owned_app,&target,true)?;
-        if provider != current_provider { return Err(ControlError::new("stale_thread_binding","The thread changed provider after admission")); }
+        if provider != current_provider { return Err(ControlError::new(ErrorCode::StaleThreadBinding,"The thread changed provider after admission")); }
         permission_ceiling(&owned_caller,provider,record.permission_mode.as_deref())?;
         let control = NativeControlGuard { caller:owned_caller.clone(),workspace_id:target.workspace_id.clone(),thread_id:target.thread_id.clone(),provider,admission:None };
         // The controller's explicit Stop is durable. Session restart and
@@ -970,7 +959,7 @@ pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &Control
         args.turn_id=initial["turn_id"].as_str().map(str::to_string);
     }
     let timeout = args.timeout_ms.unwrap_or(1000);
-    if !(1..=20000).contains(&timeout) { return Err(ControlError::new("invalid_arguments","timeout_ms must be between 1 and 20000")); }
+    if !(1..=20000).contains(&timeout) { return Err(ControlError::new(ErrorCode::InvalidArguments,"timeout_ms must be between 1 and 20000")); }
     if let Some(turn) = &args.turn_id { identifier(turn,"turn_id",256)?; }
     let target = json!({"workspace_id":args.workspace_id,"thread_id":args.thread_id});
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout);
@@ -1000,7 +989,7 @@ pub(crate) async fn thread_respond<R: Runtime>(app: &AppHandle<R>, caller: &Cont
     enum Decision { AllowOnce, AllowAlways, Deny }
     #[derive(Deserialize)] #[serde(deny_unknown_fields)]
     struct Args { workspace_id: String, thread_id: String, client_request_id: String, request_id: String, decision: Decision }
-    if caller.thread_id().is_some() { return Err(ControlError::new("permission_denied","Agents cannot grant permission approvals")); }
+    if caller.thread_id().is_some() { return Err(ControlError::new(ErrorCode::PermissionDenied,"Agents cannot grant permission approvals")); }
     let input: Args = parse(args.clone())?;
     identifier(&input.client_request_id,"client_request_id",128)?;
     identifier(&input.request_id,"request_id",256)?;
@@ -1009,7 +998,7 @@ pub(crate) async fn thread_respond<R: Runtime>(app: &AppHandle<R>, caller: &Cont
     let (record,provider) = resolve_thread(app,&target,true)?;
     permission_ceiling(caller,provider,record.permission_mode.as_deref())?;
     if caller.access != ControlAccess::FullAccess && !matches!(input.decision,Decision::Deny) {
-        return Err(ControlError::new("permission_ceiling","Supervised clients cannot approve worker requests"));
+        return Err(ControlError::new(ErrorCode::PermissionCeiling,"Supervised clients cannot approve worker requests"));
     }
     let decision = match input.decision {
         Decision::AllowOnce => crate::agent_provider::ApprovalDecision::Allow { updated_input:None,updated_permissions:None },
@@ -1017,14 +1006,14 @@ pub(crate) async fn thread_respond<R: Runtime>(app: &AppHandle<R>, caller: &Cont
         Decision::Deny => crate::agent_provider::ApprovalDecision::Deny { message:"Denied by the outside assistant".into() },
     };
     let admission = admit_mutation(app,caller,"thread_respond",&args,&target)?;
-    let receipt = serde_json::to_value(&admission.receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
+    let receipt = serde_json::to_value(&admission.receipt).map_err(|e|ControlError::new(ErrorCode::SerializationFailed,e.to_string()))?;
     if !admission.newly_admitted { return Ok(receipt); }
     let owned_app = app.clone();
     let control = NativeControlGuard { caller:caller.clone(),workspace_id:target.workspace_id.clone(),thread_id:target.thread_id.clone(),provider,admission:None };
     spawn_operation(app,caller,admission.receipt,async move {
         let provider_request = owned_app.state::<NativeControlState>()
             .provider_request_for_handle(&target.thread_id, &input.request_id)
-            .ok_or_else(|| ControlError::new("stale_provider_callback", "No current-process callback matches this outside handle"))?;
+            .ok_or_else(|| ControlError::new(ErrorCode::StaleProviderCallback, "No current-process callback matches this outside handle"))?;
         agent_chat::agent_chat_respond_to_request_guarded(owned_app,provider,ThreadId(target.thread_id.clone()),
             crate::agent_provider::RequestId(provider_request),decision,Some(control)).await?;
         Ok(json!({"workspace_id":target.workspace_id,"thread_id":target.thread_id,"request_id":input.request_id,"delivered":true}))

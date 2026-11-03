@@ -374,7 +374,7 @@ async fn mcp<R: Runtime>(
                             json!({"isError":false,"content":[{"type":"text","text":value.to_string()}],"structuredContent":if value.is_object() { value } else { json!({"result":value}) }})
                         }
                     }
-                    Err(error) => tool_error(error.code, &error.message),
+                    Err(error) => tool_error(error.code.as_str(), &error.message),
                 }
             }
         }

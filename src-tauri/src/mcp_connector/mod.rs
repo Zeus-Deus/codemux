@@ -7,7 +7,7 @@ pub mod oauth;
 pub use http::router;
 use oauth::protocol;
 
-use crate::agent_control::{ControlAccess, ControlCaller, ControlError};
+use crate::agent_control::{ControlAccess, ControlCaller, ControlError, ErrorCode};
 use crate::database::DatabaseStore;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -156,29 +156,29 @@ pub fn validate_caller<R: Runtime>(
     let _gate = state
         .auth
         .lock()
-        .map_err(|_| ControlError::new("connector_unavailable", "Connector unavailable"))?;
+        .map_err(|_| ControlError::new(ErrorCode::ConnectorUnavailable, "Connector unavailable"))?;
     let (_, issuer, _) = live(app).map_err(|_| {
         ControlError::new(
-            "connector_disabled",
+            ErrorCode::ConnectorDisabled,
             "Connector disabled or listener stopped",
         )
     })?;
     let grant = app
         .state::<DatabaseStore>()
         .mcp_grant(id, &format!("{issuer}/mcp"), now_ms())
-        .map_err(|_| ControlError::new("connector_unavailable", "Grant lookup failed"))?
+        .map_err(|_| ControlError::new(ErrorCode::ConnectorUnavailable, "Grant lookup failed"))?
         .ok_or_else(|| {
             ControlError::new(
-                "grant_revoked",
+                ErrorCode::GrantRevoked,
                 "Grant is expired, revoked or bound to another resource",
             )
         })?;
     if caller.principal != format!("mcp-client:{}", grant.client_id)
-        || parse_access(&grant.access).map_err(|e| ControlError::new("invalid_grant", e))?
+        || parse_access(&grant.access).map_err(|e| ControlError::new(ErrorCode::InvalidGrant, e))?
             != caller.access
     {
         return Err(ControlError::new(
-            "grant_changed",
+            ErrorCode::GrantChanged,
             "Grant identity or access changed",
         ));
     }

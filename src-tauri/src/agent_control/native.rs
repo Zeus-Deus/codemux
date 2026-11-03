@@ -1,6 +1,6 @@
 //! Authenticated in-process transport. Identity never comes from tool arguments.
 use super::{
-    permissions::Ceiling, service, CallerPrincipal, ControlAccess, ControlCaller, ControlError,
+    permissions::Ceiling, service, CallerPrincipal, ControlAccess, ControlCaller, ControlError, ErrorCode,
 };
 use crate::{
     agent_provider::ProviderKind,
@@ -101,12 +101,12 @@ async fn qualify_for<R: Runtime>(app: &AppHandle<R>, actor: &crate::delegation::
         .permit
         .wait_ready()
         .await
-        .map_err(|e| ControlError::new("stale_caller", e))?;
+        .map_err(|e| ControlError::new(ErrorCode::StaleCaller, e))?;
     let provider = app
         .state::<crate::commands::agent_chat::ProviderRegistry>()
         .get(actor.provider)
         .await
-        .ok_or_else(|| ControlError::new("stale_caller", "Calling provider is unavailable"))?;
+        .ok_or_else(|| ControlError::new(ErrorCode::StaleCaller, "Calling provider is unavailable"))?;
     if !provider
         .list_sessions()
         .await
@@ -115,18 +115,18 @@ async fn qualify_for<R: Runtime>(app: &AppHandle<R>, actor: &crate::delegation::
         .any(|s| s.thread_id.0 == actor.thread_id && s.session_id.0 == actor.session_id)
     {
         return Err(ControlError::new(
-            "stale_caller",
+            ErrorCode::StaleCaller,
             "Calling session was replaced",
         ));
     }
     let authority = actor
         .permit
         .identity()
-        .map_err(|e| ControlError::new("stale_caller", e))?;
+        .map_err(|e| ControlError::new(ErrorCode::StaleCaller, e))?;
     let record = app
         .state::<DatabaseStore>()
         .get_agent_chat_session(&actor.thread_id)
-        .ok_or_else(|| ControlError::new("stale_caller", "Calling chat no longer exists"))?;
+        .ok_or_else(|| ControlError::new(ErrorCode::StaleCaller, "Calling chat no longer exists"))?;
     let native = if actor.provider == ProviderKind::Acp {
         crate::delegation::authority::NativeAuthority::effective_ceiling(&actor.thread_id)
             .map_err(ControlError::from)?
@@ -135,13 +135,13 @@ async fn qualify_for<R: Runtime>(app: &AppHandle<R>, actor: &crate::delegation::
     }
     .ok_or_else(|| {
             ControlError::new(
-                "unsupported_permission_ceiling",
+                ErrorCode::UnsupportedPermissionCeiling,
                 "Effective native mode is unknown",
             )
         })?;
     let canonical = Ceiling::for_record(&app.state::<DatabaseStore>(), &record, actor.provider)
         .ok_or_else(|| {
-            ControlError::new("unsupported_permission_ceiling", "Stored mode is unknown")
+            ControlError::new(ErrorCode::UnsupportedPermissionCeiling, "Stored mode is unknown")
         })?;
     let caller = ControlCaller {
         admitted: None,
@@ -543,14 +543,14 @@ fn project_inventory<R: Runtime>(
     let db = app.state::<DatabaseStore>();
     let limit = input.limit.unwrap_or(20);
     if limit == 0 || limit > if tool == "thread_search" { 50 } else { 100 } {
-        return Err(ControlError::new("invalid_arguments", "Invalid limit"));
+        return Err(ControlError::new(ErrorCode::InvalidArguments, "Invalid limit"));
     }
     if tool == "thread_search" {
         let query = input
             .query
             .filter(|q| !q.trim().is_empty() && q.len() <= 1000)
             .ok_or_else(|| {
-                ControlError::new("invalid_arguments", "query required, max 1000 bytes")
+                ControlError::new(ErrorCode::InvalidArguments, "query required, max 1000 bytes")
             })?;
         let ids: Vec<_> = workspaces
             .iter()
@@ -610,7 +610,7 @@ fn read_bounded<R: Runtime>(
         .and_then(|o| o.remove("text_offset"))
         .map(|v| {
             v.as_u64().ok_or_else(|| {
-                ControlError::new("invalid_arguments", "text_offset must be nonnegative")
+                ControlError::new(ErrorCode::InvalidArguments, "text_offset must be nonnegative")
             })
         })
         .transpose()?
@@ -620,13 +620,13 @@ fn read_bounded<R: Runtime>(
         .and_then(|o| o.remove("max_chars"))
         .map(|v| {
             v.as_u64()
-                .ok_or_else(|| ControlError::new("invalid_arguments", "max_chars must be positive"))
+                .ok_or_else(|| ControlError::new(ErrorCode::InvalidArguments, "max_chars must be positive"))
         })
         .transpose()?
         .unwrap_or(16000) as usize;
     if maximum == 0 || maximum > 16000 {
         return Err(ControlError::new(
-            "invalid_arguments",
+            ErrorCode::InvalidArguments,
             "max_chars must be 1–16000",
         ));
     }
@@ -649,7 +649,7 @@ fn read_bounded<R: Runtime>(
         let start = if index == 0 { offset } else { 0 };
         if start > length {
             return Err(ControlError::new(
-                "invalid_cursor",
+                ErrorCode::InvalidCursor,
                 "text_offset is beyond the message",
             ));
         }

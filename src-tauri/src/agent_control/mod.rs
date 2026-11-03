@@ -1,6 +1,7 @@
 //! Typed control of application-owned native threads.
 pub mod catalog;
 mod types;
+pub(crate) mod error;
 pub(crate) mod permissions;
 pub(crate) mod native;
 mod state;
@@ -13,7 +14,8 @@ pub(crate) use guard::NativeStartCancellation;
 pub use state::{NativeControlState, PendingApproval, ThreadRuntimeView};
 pub(crate) use state::ThreadGate;
 pub(crate) use types::AdmittedAuthority;
-pub use types::{CallerPrincipal,ControlAccess, ControlCaller, ControlError};
+pub use error::{ControlError, ErrorCode};
+pub use types::{CallerPrincipal,ControlAccess, ControlCaller};
 pub use catalog::{is_native_tool, is_read_only, native_tools, remote_tools, INSTRUCTIONS};
 
 pub async fn execute<R: tauri::Runtime>(
@@ -26,7 +28,7 @@ pub async fn execute<R: tauri::Runtime>(
     service::authorize(app, caller)?;
     if matches!(tool,"plugin_list"|"plugin_invoke") {
         return crate::plugins::platform_transport::agent_request(app,caller.clone(),tool,args).await
-            .map_err(|error|ControlError::new("plugin_operation_failed",error));
+            .map_err(|error|ControlError::new(ErrorCode::PluginOperationFailed,error));
     }
     match tool {
         "thread_launch" => return service::launch(app, caller, args).await,
@@ -44,7 +46,7 @@ pub async fn execute<R: tauri::Runtime>(
     }
     if tool == "workspace_list" {
         if !args.as_object().is_some_and(|args| args.is_empty()) {
-            return Err(ControlError::new("invalid_arguments", "workspace_list accepts an empty object"));
+            return Err(ControlError::new(ErrorCode::InvalidArguments, "workspace_list accepts an empty object"));
         }
         let state = app.state::<crate::state::AppStateStore>().snapshot();
         let workspaces: Vec<_> = state.workspaces.iter().map(|workspace| serde_json::json!({
@@ -57,7 +59,7 @@ pub async fn execute<R: tauri::Runtime>(
         })).collect();
         return Ok(serde_json::json!({"workspaces": workspaces}));
     }
-    Err(ControlError::new("unknown_tool", "Native control is not available"))
+    Err(ControlError::new(ErrorCode::UnknownTool, "Native control is not available"))
 }
 
 #[cfg(test)]
