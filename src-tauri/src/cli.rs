@@ -7,6 +7,8 @@ use std::ffi::OsString;
 use std::io::Write;
 
 pub mod args;
+mod capabilities;
+pub mod connector;
 #[cfg(test)]
 mod docs_tests;
 mod door;
@@ -76,6 +78,11 @@ pub enum CommandSet {
     Thread {
         #[command(subcommand)]
         command: thread::ThreadCommand,
+    },
+    /// Run the network door that assistants on other devices sign in to
+    Connector {
+        #[command(subcommand)]
+        command: connector::ConnectorCommand,
     },
     /// Serve Codemux tools to an MCP client over stdio
     Mcp {
@@ -228,7 +235,8 @@ pub enum CommandSet {
     /// Check the local environment for common problems (file dialogs,
     /// logs). Works without a running Codemux instance.
     Doctor,
-    /// List all available codemux commands and capabilities
+    /// Describe every command, control tool, exit code and environment
+    /// variable as JSON (no running app needed)
     Capabilities,
     /// Debug: send one raw control-socket command and print the reply.
     /// Exits 1 when the reply is not ok. Scripts should prefer `codemux call`.
@@ -543,6 +551,7 @@ async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
         Some(CommandSet::Workspace { command }) => workspace::run(&Door::Socket, command).await,
         Some(CommandSet::Worktree { command }) => workspace::run_worktree(&Door::Socket, command).await,
         Some(CommandSet::Thread { command }) => thread::run(&Door::Socket, command).await,
+        Some(CommandSet::Connector { command }) => connector::run(&Door::Socket, command).await,
         Some(CommandSet::Status) => {
             let response = send_control_request(ControlRequest {
                 command: "status".into(),
@@ -1160,117 +1169,7 @@ async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
             }
         }
         Some(CommandSet::Capabilities) => {
-            let caps = json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "commands": {
-                    "browser": {
-                        "description": "Control the browser pane",
-                        "subcommands": {
-                            "open": { "args": "<url>", "description": "Navigate to a URL" },
-                            "snapshot": { "args": "[--dom]", "description": "Get page element tree" },
-                            "click": { "args": "<selector>", "description": "Click an element" },
-                            "fill": { "args": "<selector> <value>", "description": "Type into an input" },
-                            "screenshot": { "description": "Capture screenshot (base64 PNG)" },
-                            "console-logs": { "description": "Get browser console output" },
-                            "create": { "description": "Create a new browser pane" },
-                            "viewport": {
-                                "args": "<preset|WxH|reset> [--dpr N]",
-                                "description": "Set viewport for mobile/tablet/desktop testing"
-                            },
-                            "viewport-presets": { "description": "List available viewport presets" }
-                        }
-                    },
-                    "memory": {
-                        "description": "Project memory management",
-                        "subcommands": {
-                            "show": { "description": "Show project memory" },
-                            "set": { "args": "--brief/--goal/--focus", "description": "Update memory fields" },
-                            "add": { "args": "<kind> <content>", "description": "Add memory entry" }
-                        }
-                    },
-                    "index": {
-                        "description": "Code index for search",
-                        "subcommands": {
-                            "build": { "description": "Build/rebuild search index" },
-                            "status": { "description": "Show index status" },
-                            "search": { "args": "<query>", "description": "Search indexed code" }
-                        }
-                    },
-                    "issue": {
-                        "description": "GitHub issue operations",
-                        "subcommands": {
-                            "list": { "args": "[--search <query>]", "description": "List open issues for the current workspace's repo" },
-                            "view": { "args": "<number>", "description": "View a specific GitHub issue" },
-                            "link": { "args": "<number>", "description": "Link a GitHub issue to the active workspace" }
-                        }
-                    },
-                    "workspace": {
-                        "description": "Workspace operations",
-                        "subcommands": {
-                            "rerun-setup": { "args": "[workspace-id]", "description": "Re-run setup (.codemuxinclude + scripts) for a workspace" }
-                        }
-                    },
-                    "remote": {
-                        "description": "Web remote-access operations",
-                        "subcommands": {
-                            "enable": { "args": "[--scope all|tailscale|loopback] [--port N]", "description": "Turn web remote access on and print the reachable endpoint (requires the desktop app running)" },
-                            "disable": { "description": "Turn web remote access off, severing every live connection" },
-                            "pair": { "args": "[--name <label>]", "description": "Mint a one-time web-remote pairing code + QR (requires remote access enabled)" }
-                        }
-                    },
-                    "monitor": {
-                        "description": "Declare that this pane is watching something in the background (calm 'Monitoring' status). Provider-agnostic; targets CODEMUX_PANE_ID / CODEMUX_WORKSPACE_ID",
-                        "subcommands": {
-                            "start": { "args": "[--reason <text>] [--pane-id <id>]", "description": "Mark this pane as monitoring in the background" },
-                            "stop": { "args": "[--pane-id <id>]", "description": "Clear this pane's monitoring status" },
-                            "status": { "args": "[--pane-id <id>]", "description": "Report whether this pane currently reads as monitoring" }
-                        }
-                    },
-                    "ports": {
-                        "description": "Reserve host ports no other worktree will be handed, so parallel worktrees of one project can each run their own stack",
-                        "subcommands": {
-                            "allocate": { "args": "<name>", "description": "Print a free port reserved for this worktree under <name>; the same name always returns the same port" },
-                            "list": { "description": "List the ports this worktree owns" },
-                            "release": { "args": "<name>", "description": "Give a previously allocated port back" }
-                        }
-                    },
-                    "serve": {
-                        "args": "[--scope all|tailscale|loopback] [--port N] [--relay]",
-                        "description": "Run headless as a web-remote server (no GUI); prints a pairing QR + link and runs until Ctrl-C"
-                    },
-                    "connect": {
-                        "args": "[--email <address>] [--scope all|tailscale|loopback] [--port N]",
-                        "description": "One-command remote-access setup: sign in, turn relay mode on, and install a background service so this machine stays reachable",
-                        "subcommands": {
-                            "status": { "description": "Show the account, remote-access config, background service, and running-instance state" },
-                            "off": { "description": "Turn from-anywhere access off and remove the background service (stays signed in)" }
-                        }
-                    },
-                    "login": {
-                        "args": "[--email <address>] [--token <token>] [--status]",
-                        "description": "Sign this machine into a Codemux account (headless-friendly; no GUI or running instance needed)"
-                    },
-                    "logout": { "description": "Clear the cached account session on this machine" },
-                    "whoami": { "description": "Print the signed-in account; exits 1 when signed out" },
-                    "status": { "description": "Show Codemux app status" },
-                    "notify": { "args": "<message>", "description": "Send a notification to the user" },
-                    "handoff": { "description": "Generate project handoff summary" },
-                    "logs": { "args": "[--tail <n>]", "description": "Print recent lines from the desktop app's log file" },
-                    "doctor": { "description": "Diagnose the local environment (file dialogs, logs)" },
-                    "capabilities": { "description": "List all available commands (this output)" }
-                },
-                "environment": {
-                    "CODEMUX": "Set to '1' when running inside Codemux",
-                    "CODEMUX_VERSION": "Codemux version",
-                    "CODEMUX_WORKSPACE_ID": "Current workspace ID",
-                    "CODEMUX_PANE_ID": "Current pane ID (the default target for `codemux monitor`)",
-                    "CODEMUX_BROWSER_CMD": "Command prefix for browser control",
-                    "CODEMUX_PASSWORD": "Password for a non-interactive `codemux login` (warns; for automated runs only)",
-                    "CODEMUX_API_URL": "Override the Codemux API base URL (default https://api.codemux.org)",
-                    "BROWSER": "Set to 'codemux browser open' for URL handling"
-                }
-            });
-            output::emit_json(&caps)?;
+            capabilities::print()?;
             Ok(Exit::Done)
         }
     }
@@ -1590,6 +1489,11 @@ mod tests {
             &["codemux", "thread", "status", "t", "--json"],
             &["codemux", "thread", "interrupt", "t", "--turn", "t1"],
             &["codemux", "thread", "stop", "t"],
+            &["codemux", "connector", "status"],
+            &["codemux", "connector", "enable", "--port", "4378", "--origin", "https://desk.example"],
+            &["codemux", "connector", "issue", "--label", "bot", "--access", "supervised", "--expires", "30d"],
+            &["codemux", "connector", "revoke", "--all"],
+            &["codemux", "connector", "approve", "req", "--access", "read-only"],
         ] {
             parse(argv);
         }

@@ -80,6 +80,16 @@ impl Door {
         Ok(ToolList { caller: data["caller"].clone(), tools })
     }
 
+    /// A bare socket command, for the admin commands that are not registry
+    /// tools (the connector verbs).
+    pub(crate) async fn command(&self, command: &str, params: Value) -> Result<Value, CliError> {
+        match self {
+            Door::Socket => bounded(CALL_BOUND, socket(command, params)).await,
+            #[cfg(test)]
+            Door::Fake(fake) => fake.answer(command, params),
+        }
+    }
+
     /// A call inside a settle or follow loop. What an app restart or a lost
     /// reply causes is retried with the identical arguments, so a mutation's
     /// `client_request_id` keeps it idempotent. A verb's first call never

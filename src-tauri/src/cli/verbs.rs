@@ -18,6 +18,15 @@ pub(crate) const THREAD_INTERRUPT: &str = "thread_interrupt";
 pub(crate) const THREAD_STOP: &str = "thread_stop";
 pub(crate) const OPERATION_STATUS: &str = "operation_status";
 
+// Admin socket commands (not registry tools) behind `codemux connector`.
+pub(crate) const CONNECTOR_STATUS: &str = "agent_connector_status";
+pub(crate) const CONNECTOR_SET_CONFIG: &str = "agent_connector_set_config";
+pub(crate) const CONNECTOR_ISSUE: &str = "agent_connector_issue";
+pub(crate) const CONNECTOR_REVOKE: &str = "agent_connector_revoke";
+pub(crate) const CONNECTOR_REVOKE_ALL: &str = "agent_connector_revoke_all";
+pub(crate) const CONNECTOR_APPROVE: &str = "agent_connector_approve";
+pub(crate) const CONNECTOR_DENY: &str = "agent_connector_deny";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -30,6 +39,17 @@ mod tests {
             THREAD_RESPOND, THREAD_INTERRUPT, THREAD_STOP, OPERATION_STATUS,
         ] {
             assert!(registry::served(name, Audience::Outside).is_some(), "{name} is not an outside registry tool");
+        }
+    }
+
+    #[test]
+    fn connector_verbs_use_socket_commands_the_identity_layer_classifies() {
+        for name in [
+            CONNECTOR_STATUS, CONNECTOR_SET_CONFIG, CONNECTOR_ISSUE, CONNECTOR_REVOKE, CONNECTOR_REVOKE_ALL,
+            CONNECTOR_APPROVE, CONNECTOR_DENY,
+        ] {
+            assert!(crate::control_identity::CLASSIFIED.contains(&name), "{name} is not a classified socket command");
+            assert!(registry::lookup(name).is_none(), "{name} must stay a socket command, not a registry tool");
         }
     }
 }

@@ -105,6 +105,26 @@ pub(crate) fn parse_duration(raw: &str) -> Result<Duration, String> {
     Ok(duration)
 }
 
+/// A personal token's lifetime, `<N>d` or `<N>h`, in whole hours within the
+/// connector's limits (1 hour to 365 days).
+pub(crate) fn parse_expiry(raw: &str) -> Result<u32, String> {
+    use crate::database::mcp_connector::{PERSONAL_TOKEN_MAX_TTL_MS, PERSONAL_TOKEN_MIN_TTL_MS};
+    const HOUR_MS: i64 = 3_600_000;
+    let raw = raw.trim();
+    let invalid = || format!("`{raw}` is not a lifetime like 30d or 12h");
+    let (number, hours_per_unit) = match raw.strip_suffix('d') {
+        Some(days) => (days, 24),
+        None => (raw.strip_suffix('h').ok_or_else(invalid)?, 1),
+    };
+    let number: u32 = number.parse().map_err(|_| invalid())?;
+    let hours = number.checked_mul(hours_per_unit).ok_or_else(invalid)?;
+    let (min, max) = (PERSONAL_TOKEN_MIN_TTL_MS / HOUR_MS, PERSONAL_TOKEN_MAX_TTL_MS / HOUR_MS);
+    if !(min..=max).contains(&i64::from(hours)) {
+        return Err(format!("`{raw}` must be between 1h and 365d"));
+    }
+    Ok(hours)
+}
+
 /// A value given inline, or `-` to read it from stdin.
 pub(crate) fn inline_or_stdin(value: &str) -> Result<String, CliError> {
     if value != "-" {
@@ -159,6 +179,16 @@ mod tests {
         assert_eq!(parse_duration("24h"), Ok(MAX_DURATION));
         for bad in ["", "0s", "25h", "1d", "s", "-5s", "1.5s", "ten"] {
             assert!(parse_duration(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn token_lifetimes_stay_within_the_connector_limits() {
+        assert_eq!(parse_expiry("30d"), Ok(720));
+        assert_eq!(parse_expiry("1h"), Ok(1));
+        assert_eq!(parse_expiry("365d"), Ok(8760));
+        for bad in ["0h", "366d", "30", "1w", "d", "-1d", "99999999999d"] {
+            assert!(parse_expiry(bad).is_err(), "{bad}");
         }
     }
 

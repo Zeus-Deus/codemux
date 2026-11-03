@@ -255,6 +255,14 @@ fn with_no_app_running_verbs_report_codemux_unavailable() {
     assert_eq!(exit_code(&waited), 1);
     let report = stdout_json(&waited);
     assert_eq!((report["state"].clone(), report["thread_id"].clone()), (json!("failed"), json!("th")));
+
+    // capabilities needs no app, and leads with the version install.sh reads.
+    let capabilities = cli_in(root.path(), &["capabilities"]);
+    assert_eq!(exit_code(&capabilities), 0);
+    let text = String::from_utf8_lossy(&capabilities.stdout);
+    assert_eq!(text.lines().nth(1), Some(format!("  \"version\": \"{}\",", env!("CARGO_PKG_VERSION")).as_str()));
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert!(parsed["commands"]["thread"]["subcommands"]["start"].is_object());
 }
 
 // ── Against a scripted socket ─────────────────────────────────────────────
@@ -469,4 +477,42 @@ fn thread_start_wait_completes_with_a_fixture_provider() {
     assert_eq!(again["state"], "done", "{again}");
     let stopped = serve.ok(&["--client", "itest", "thread", "stop", &thread, "--workspace", &workspace, "--json"]);
     assert_eq!(stopped["ok"], true, "{stopped}");
+}
+
+#[test]
+fn connector_status_enable_and_disable_round_trip() {
+    let serve = Serve::start();
+    let status = serve.ok(&["connector", "status", "--json"]);
+    assert_eq!((status["tool"].clone(), status["result"]["enabled"].clone()), (json!("agent_connector_status"), json!(false)));
+    let enabled = serve.ok(&["connector", "enable", "--json"]);
+    assert_eq!(enabled["result"]["enabled"], true, "{enabled}");
+    let listed = serve.ok(&["connector", "list", "--json"]);
+    assert!(listed["result"]["clients"].is_array(), "{listed}");
+    let pending = serve.ok(&["connector", "pending", "--json"]);
+    assert!(pending["result"]["pending"].is_array(), "{pending}");
+    let disabled = serve.ok(&["connector", "disable", "--json"]);
+    assert_eq!(disabled["result"]["enabled"], false, "{disabled}");
+
+    // Revoking a name that matches nothing is refused, not a silent success.
+    let unknown = serve.cli(&["connector", "revoke", "nobody", "--json"]);
+    assert_eq!(exit_code(&unknown), 1);
+    assert_eq!(stdout_json(&unknown)["error"]["code"], "invalid_arguments");
+}
+
+#[test]
+fn connector_tokens_issue_list_and_revoke() {
+    let serve = Serve::start();
+    // Its own port, so the door never touches the default 4378.
+    serve.ok(&["connector", "enable", "--port", &free_loopback_port().to_string(), "--json"]);
+    let issued = serve.ok(&["connector", "issue", "--label", "itest-bot", "--expires", "1d", "--json"]);
+    let token = issued["result"]["token"].as_str().expect("a token");
+    assert!(token.starts_with("cmcp_"), "{issued}");
+    assert_eq!(issued["result"]["access"], "supervised", "tokens default to supervised");
+
+    let text = serve.cli(&["connector", "list"]);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("itest-bot"), "{}", String::from_utf8_lossy(&text.stdout));
+    serve.ok(&["connector", "revoke", "ITEST-BOT", "--json"]);
+    let listed = serve.ok(&["connector", "list", "--json"]);
+    assert!(!listed.to_string().contains("itest-bot"), "{listed}");
+    serve.ok(&["connector", "revoke", "--all", "--json"]);
 }
