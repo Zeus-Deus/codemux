@@ -89,6 +89,29 @@ struct McpTool {
 
 pub(crate) const REMOTE_DELEGATE_TOOL: &str = "delegate_remote_task";
 
+/// The stdio server's own tools, before any native control tool is added.
+/// Provider-origin processes see exactly these; a control-plane tool that
+/// shares one of these names keeps this implementation for them.
+pub(crate) const LEGACY_TOOL_NAMES: [&str; 62] = [
+    "delegation_targets", REMOTE_DELEGATE_TOOL, "task_status", "task_cancel",
+    "browser_navigate", "browser_snapshot", "browser_accessibility_snapshot", "browser_click", "browser_fill",
+    "browser_screenshot", "browser_console_logs", "browser_click_at", "browser_type_at", "browser_scroll_at",
+    "browser_key_press", "browser_drag", "browser_click_os", "browser_type_os", "browser_get_styles", "browser_wait",
+    "browser_evaluate", "browser_viewport", "browser_viewport_presets",
+    "workspace_list", "workspace_info", "workspace_create",
+    "automation_list", "automation_get", "automation_create", "automation_update", "automation_delete",
+    "automation_pause", "automation_resume", "automation_runs",
+    "pane_list", "pane_split_right", "pane_split_down", "conversation_read", "conversation_search", "notify",
+    "git_status", "git_diff", "git_stage", "git_commit", "git_push", "terminal_write", "terminal_read",
+    "workspace_open", "app_status", "port_list", "worktree_create", "preset_apply", "preset_list",
+    "workspace_close", "workspace_archive", "workspace_unarchive", "workspace_archive_list", "pane_close",
+    "issue_list", "issue_get", "issue_link_workspace", "html_render",
+];
+
+pub(crate) fn is_legacy_tool(name: &str) -> bool {
+    LEGACY_TOOL_NAMES.contains(&name)
+}
+
 #[cfg(test)]
 pub(crate) fn remote_delegation_tools_for_test() -> Vec<crate::mcp::runtime::McpTool> {
     let config = crate::mcp::codemux_self::codemux_self_config();
@@ -2389,6 +2412,15 @@ mod tests {
     // -----------------------------------------------------------------------
     // Tool registry tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn legacy_tool_names_are_pinned() {
+        let legacy: Vec<&str> = register_tools().iter().map(|tool| tool.name)
+            .filter(|name| !crate::agent_control::is_native_tool(name)).collect();
+        assert_eq!(legacy, LEGACY_TOOL_NAMES, "a legacy tool was added, removed or renamed");
+        assert!(LEGACY_TOOL_NAMES.iter().all(|name| is_legacy_tool(name)));
+        assert!(!is_legacy_tool("thread_launch") && !is_legacy_tool("nope"));
+    }
 
     #[test]
     fn tool_registry_has_all_tools() {

@@ -3,6 +3,7 @@
 //! merge router() into the existing listener and call the separate DB schema.
 //! NEVER put these commands on the paired-browser invoke allowlist.
 mod http;
+mod listener;
 pub mod oauth;
 pub use http::router;
 use oauth::protocol;

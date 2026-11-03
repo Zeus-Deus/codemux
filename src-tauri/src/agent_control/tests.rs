@@ -5,9 +5,9 @@ use tauri::Manager;
 
 #[allow(dead_code)]
 #[path = "../../tests/helpers/mock_agent_provider.rs"]
-mod mock_agent_provider;
+pub(super) mod mock_agent_provider;
 
-async fn fixture() -> (tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String) {
+pub(super) async fn fixture() -> (tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String) {
     let app = tauri::test::mock_app();
     let state = crate::state::AppStateStore::default();
     let root = tempfile::tempdir().unwrap();
@@ -1065,7 +1065,7 @@ async fn review_s4_outside_approval_handle_survives_no_provider_id_recycling() {
     assert_eq!(settle_operation(&app, &receipt).await["state"], "succeeded");
 }
 
-async fn settle_operation(app: &tauri::App<tauri::test::MockRuntime>, receipt: &serde_json::Value) -> serde_json::Value {
+pub(super) async fn settle_operation(app: &tauri::App<tauri::test::MockRuntime>, receipt: &serde_json::Value) -> serde_json::Value {
     let id = receipt["operation_id"].as_str().unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
@@ -1818,6 +1818,27 @@ async fn orchestration_message_controller_queue_release_refreshes_only_stop_fenc
     assert!(checkpoint.authorize_dispatch().is_err());
 }
 
+/// A connector client holding a live grant, as `validate_caller` sees it. The
+/// connector is served by the web-remote listener, so this enables web remote
+/// on a free loopback port; call `crate::web_remote::web_remote_disable` when done.
+pub(super) async fn connector_caller(app: &tauri::App<tauri::test::MockRuntime>, client_id: &str, grant_id: &str, access: ControlAccess) -> ControlCaller {
+    app.manage(crate::mcp_connector::McpConnectorState::default());
+    app.manage(crate::web_remote::WebRemoteState::default());
+    let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port=listener.local_addr().unwrap().port();drop(listener);
+    crate::web_remote::web_remote_set_config(app.handle().clone(),Some(port),None,Some("loopback".into()),Some(false),Some(false),Some(false),Some(true)).await.unwrap();
+    crate::web_remote::web_remote_enable(app.handle().clone()).await.unwrap();
+    crate::mcp_connector::agent_connector_set_config(app.handle().clone(),true,None).unwrap();
+    let db=app.state::<crate::database::DatabaseStore>();
+    let now=chrono::Utc::now().timestamp_millis();
+    db.mcp_register_client(crate::database::mcp_connector::NewMcpClient {id:client_id.into(),name:"Synthetic connector client".into(),redirects:vec!["https://client.example/cb".into()],created_at:now},now).unwrap();
+    let access_name=serde_json::to_value(access).unwrap().as_str().unwrap().to_string();
+    db.mcp_mint_grant(crate::database::mcp_connector::NewMcpGrant {id:grant_id.into(),client_id:client_id.into(),token_hash:format!("synthetic-hash-{grant_id}"),redirect_uri:"https://client.example/cb".into(),resource:format!("http://127.0.0.1:{port}/mcp"),access:access_name,created_at:now,expires_at:now+60_000}).unwrap();
+    let caller=ControlCaller::outside(client_id.into(),grant_id.into(),access);
+    crate::mcp_connector::validate_caller(app.handle(),&caller).unwrap();
+    caller
+}
+
 #[tokio::test]
 async fn orchestration_message_saved_replay_rechecks_revoked_caller_before_rearm() {
     use crate::agent_provider::{message::*,types::MessageDelivery,ProviderKind,ThreadId};
@@ -1828,16 +1849,7 @@ async fn orchestration_message_saved_replay_rechecks_revoked_caller_before_rearm
         let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"saved-revoked-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
         let launched=settle_operation(&app,&receipt).await;let thread=launched["thread_id"].as_str().unwrap();
         let db=app.state::<crate::database::DatabaseStore>();
-        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port=listener.local_addr().unwrap().port();drop(listener);
-        crate::web_remote::web_remote_set_config(app.handle().clone(),Some(port),None,Some("loopback".into()),Some(false),Some(false),Some(false),Some(true)).await.unwrap();
-        crate::web_remote::web_remote_enable(app.handle().clone()).await.unwrap();
-        crate::mcp_connector::agent_connector_set_config(app.handle().clone(),true,None).unwrap();
-        let now=chrono::Utc::now().timestamp_millis();
-        db.mcp_register_client(crate::database::mcp_connector::NewMcpClient {id:"revoked-client".into(),name:"Synthetic replay client".into(),redirects:vec!["https://client.example/cb".into()],created_at:now},now).unwrap();
-        db.mcp_mint_grant(crate::database::mcp_connector::NewMcpGrant {id:"revoked-grant".into(),client_id:"revoked-client".into(),token_hash:"synthetic-hash".into(),redirect_uri:"https://client.example/cb".into(),resource:format!("http://127.0.0.1:{port}/mcp"),access:"full_access".into(),created_at:now,expires_at:now+60_000}).unwrap();
-        let caller=ControlCaller::outside("revoked-client".into(),"revoked-grant".into(),ControlAccess::FullAccess);
-        crate::mcp_connector::validate_caller(app.handle(),&caller).unwrap();
+        let caller=connector_caller(&app,"revoked-client","revoked-grant",ControlAccess::FullAccess).await;
         let provenance=MessageProvenance {message_id:Some("B".into()),delivery_id:Some("B".into()),origin:Some(crate::commands::agent_chat::TurnOrigin::Controller),created_by:CreatedBy::User,creation_source:CreationSource::Mcp,..Default::default()};
         db.admit_message_delivery("B",thread,"B",&json!({"provider":"claude","origin":"controller","input":{"thread_id":thread,"text":"must not send"},"provenance":provenance,"caller":caller}),"old",0,None,true).unwrap();
         db.finish_message_delivery("B","queued",Some(&json!({"queued_id":"saved-B"})),None).unwrap();
@@ -1976,11 +1988,11 @@ async fn orchestration_message_queue_promotion_checks_authority_before_recording
     assert!(db.message_delivery("B").unwrap().unwrap().attempted);
 }
 
-async fn native_caller_fixture(mode:&str)->(tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String, String, Arc<crate::delegation::authority::NativeAuthority>, crate::delegation::app::NativeActor) {
+pub(super) async fn native_caller_fixture(mode:&str)->(tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String, String, Arc<crate::delegation::authority::NativeAuthority>, crate::delegation::app::NativeActor) {
     native_caller_provider_fixture(crate::agent_provider::ProviderKind::Claude, mode).await
 }
 
-async fn native_caller_provider_fixture(kind:crate::agent_provider::ProviderKind, mode:&str)->(tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String, String, Arc<crate::delegation::authority::NativeAuthority>, crate::delegation::app::NativeActor) {
+pub(super) async fn native_caller_provider_fixture(kind:crate::agent_provider::ProviderKind, mode:&str)->(tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String, String, Arc<crate::delegation::authority::NativeAuthority>, crate::delegation::app::NativeActor) {
     let (app, mut provider, root, workspace)=fixture().await;
     app.manage(crate::commands::delegation::DelegationState::default());
     if kind == crate::agent_provider::ProviderKind::Codex {

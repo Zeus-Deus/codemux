@@ -39,6 +39,7 @@ pub mod github;
 pub mod github_budget;
 pub mod github_cache;
 pub mod control;
+pub mod control_identity;
 pub mod diagnostics;
 pub mod dialog_fallback;
 pub mod dialog_preflight;
@@ -88,6 +89,7 @@ pub mod fs_size;
 pub mod hosts_upgrade;
 pub mod hosts_inventory;
 pub mod workspace_paths;
+pub mod workspace_service;
 pub mod project_identity;
 pub mod workspaces_sync;
 pub mod worktree_cleanup;
@@ -96,6 +98,8 @@ pub mod state;
 pub mod hooks;
 pub mod stream_input;
 pub mod terminal;
+#[cfg(test)]
+pub(crate) mod test_isolation;
 pub mod utility_ai;
 // Opt-in cloud-push diagnostic tracing. Defines the crate-wide
 // `trace_cloud_push!` macro (gated on `CODEMUX_TRACE_CLOUD_PUSH`).

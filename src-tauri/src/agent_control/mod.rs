@@ -10,6 +10,10 @@ mod state;
 pub(crate) mod service;
 mod guard;
 pub mod delivery;
+pub(crate) mod registry;
+pub(crate) mod wait;
+pub(crate) mod outcome;
+pub(crate) mod workspace_tools;
 pub use guard::NativeControlGuard;
 pub(crate) use guard::GuardedTurnCheckpoint;
 pub(crate) use guard::NativeStartCancellation;
@@ -38,12 +42,12 @@ pub async fn execute<R: tauri::Runtime>(
         "operation_status" => return service::operation_status(app, caller, args),
         "thread_list" => return service::thread_list(app, args),
         "thread_read" => return service::thread_read(app, caller, args),
-        "thread_status" => return service::thread_status(app, args).await,
+        "thread_status" => return wait::thread_status(app, args).await,
         "thread_send" => return service::thread_send(app, caller, args).await,
         "agent_capabilities" => return service::agent_capabilities(app, caller, args).await,
         "thread_interrupt" => return service::thread_interrupt(app, caller, args).await,
         "thread_stop" => return service::thread_stop(app, caller, args).await,
-        "thread_wait" => return service::thread_wait(app, caller, args).await,
+        "thread_wait" => return wait::thread_wait(app, caller, args).await,
         "thread_respond" => return service::thread_respond(app, caller, args).await,
         _ => {}
     }
@@ -67,6 +71,12 @@ pub async fn execute<R: tauri::Runtime>(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wait_tests;
+#[cfg(test)]
+mod workspace_tests;
+#[cfg(test)]
+mod docs_tests;
 #[cfg(test)]
 pub(crate) mod guard_tests;
 

@@ -12,6 +12,7 @@ pub mod gateway;
 pub mod http_client;
 pub mod parser;
 pub mod paths;
+pub mod protocol;
 pub mod registry;
 pub mod runtime;
 pub(crate) mod thread_gateway;
