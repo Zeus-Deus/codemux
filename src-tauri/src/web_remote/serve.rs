@@ -145,6 +145,9 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     // Mirror the GUI's `RunEvent::Exit` cleanup, then let `app` drop normally
     // so managed provider/server state gets its destructors. A success-path
     // `process::exit` would skip those destructors and leak child processes.
+    // Stop taking outside-assistant connections first, so no network client
+    // starts work against managers that are shutting down.
+    crate::mcp_connector::listener::stop(app.handle());
     if let Some(platform) =
         tauri::Manager::try_state::<crate::plugins::platform_transport::PluginPlatformState>(&app)
     {
@@ -169,7 +172,6 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
         eprintln!("[codemux::selection] headless shutdown flush failed: {error}");
     }
     crate::agent_browser::kill_stream_daemons();
-    crate::mcp_connector::listener::stop(app.handle());
     drop(app);
     result
 }
