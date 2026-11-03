@@ -1884,6 +1884,27 @@ mod tests {
     }
 
     #[test]
+    fn personal_token_issue_keeps_clients_with_consent_in_flight() {
+        let db = db();
+        db.mcp_register_client(client("pending"), 0).unwrap();
+        // Past the unapproved TTL, a first issue's registration prunes, but not
+        // a client whose consent is pending.
+        let now = UNAPPROVED_CLIENT_TTL_MS + 1;
+        db.mcp_issue_personal_token(NewPersonalToken {
+            protected_clients: vec!["pending".into()],
+            ..personal("hermes", "token-hermes", now)
+        })
+        .unwrap();
+        assert!(db.mcp_client("pending").unwrap().is_some());
+        db.mcp_issue_personal_token(personal("ci-bot", "token-ci", now))
+            .unwrap();
+        assert!(
+            db.mcp_client("pending").unwrap().is_none(),
+            "without protection the stale unapproved client is pruned"
+        );
+    }
+
+    #[test]
     fn personal_token_expiry_is_enforced_and_pruned() {
         let db = db();
         let short = |label: &str, token: &str, now: i64, lifetime: i64| NewPersonalToken {
