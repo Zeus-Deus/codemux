@@ -52,7 +52,8 @@ tokio = { version = "1.0", features = ["full"] }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4", "v5"] }
 notify-rust = "4"
-clap = { version = "4", features = ["derive"] }
+# `env` lets scripts name the client once (`CODEMUX_CLIENT`, `CODEMUX_ACCESS`).
+clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", features = ["blocking", "json", "stream"] }
 base64 = "0.22"
 tempfile = "3"

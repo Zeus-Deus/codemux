@@ -40,15 +40,12 @@ impl Exit {
 /// A failure as the JSON envelopes carry it: `{"code": …, "message": …}`.
 /// Server codes pass through unchanged; the CLI adds a few of its own
 /// (`codemux_unavailable`, `invalid_arguments`, `timed_out`, …).
-// The control verbs build on this; the legacy verbs still report plain strings.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ErrorBody {
     pub(crate) code: String,
     pub(crate) message: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ErrorBody {
     pub(crate) fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -68,7 +65,6 @@ impl fmt::Display for ErrorBody {
 
 /// A command that could not finish: what to report and the exit status it
 /// maps to.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CliError {
     pub(crate) error: ErrorBody,
@@ -78,7 +74,6 @@ pub(crate) struct CliError {
     pub(crate) last: Option<Value>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl CliError {
     pub(crate) fn new(exit: Exit, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -118,7 +113,6 @@ impl fmt::Display for CliError {
 /// `{ok, tool, error: {code, message}}`. A verb that settles a receipt keeps
 /// the receipt in `result` and sets `ok` from its state, so a failed receipt
 /// is `ok: false` with a `result`; hence the public fields.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct CallEnvelope {
     pub(crate) ok: bool,
@@ -129,7 +123,6 @@ pub(crate) struct CallEnvelope {
     pub(crate) error: Option<ErrorBody>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl CallEnvelope {
     /// A tool's outcome exactly as it came back, the way `call` reports it.
     pub(crate) fn of(tool: impl Into<String>, outcome: Result<Value, ErrorBody>) -> Self {
@@ -153,6 +146,91 @@ impl CallEnvelope {
             Exit::Failed
         }
     }
+
+    /// A verb's settled outcome. A receipt that did not succeed is `ok: false`
+    /// with the receipt in `result` and its reason in `error`. A failure that
+    /// stopped at a receipt (a settle deadline) keeps that receipt too.
+    pub(crate) fn settled(tool: &str, outcome: Result<Value, CliError>) -> (Self, Exit) {
+        match outcome {
+            Ok(value) if succeeded(&value) => (Self::of(tool, Ok(value)), Exit::Done),
+            Ok(receipt) => {
+                let error = receipt_error(&receipt);
+                (Self { ok: false, tool: tool.into(), result: Some(receipt), error: Some(error) }, Exit::Failed)
+            }
+            Err(failure) => (Self { ok: false, tool: tool.into(), result: failure.last, error: Some(failure.error) }, failure.exit),
+        }
+    }
+}
+
+/// Whether a settled value means the action happened. A value without a
+/// receipt `state` is a plain result.
+pub(crate) fn succeeded(value: &Value) -> bool {
+    value["state"].as_str().is_none_or(|state| state == "succeeded")
+}
+
+/// Why a settled receipt did not succeed: its own error, else its state.
+pub(crate) fn receipt_error(receipt: &Value) -> ErrorBody {
+    let error = &receipt["error"];
+    match (error["code"].as_str(), error["message"].as_str()) {
+        (Some(code), Some(message)) => ErrorBody::new(code, message),
+        _ if receipt["state"] == "needs_attention" => ErrorBody::new(
+            "operation_failed",
+            "Codemux could not confirm whether this request ran (needs_attention). Inspect the thread before sending it again.",
+        ),
+        _ => ErrorBody::new("operation_failed", format!("The operation ended {}", receipt["state"].as_str().unwrap_or("without a state"))),
+    }
+}
+
+/// Print a non-waiting verb's outcome: the call envelope with `--json`;
+/// otherwise `text` for a success, or `code: message` on stderr. A mutation
+/// whose reply was lost also gets the retry hint for its key.
+pub(crate) fn report(
+    tool: &str,
+    outcome: Result<Value, CliError>,
+    json: bool,
+    request_id: Option<&str>,
+    text: impl FnOnce(&Value) -> Result<(), String>,
+) -> Result<Exit, String> {
+    if let (Err(failure), Some(key)) = (&outcome, request_id) {
+        retry_hint(failure, key);
+    }
+    let (envelope, exit) = CallEnvelope::settled(tool, outcome);
+    if json {
+        emit_json(&envelope)?;
+    } else if envelope.ok {
+        text(envelope.result.as_ref().unwrap_or(&Value::Null))?;
+    } else if let Some(error) = &envelope.error {
+        note(&error.to_string());
+    }
+    Ok(exit)
+}
+
+/// When nothing confirmed whether a mutation ran, the same key makes trying
+/// again safe.
+pub(crate) fn retry_hint(failure: &CliError, request_id: &str) {
+    if matches!(failure.error.code.as_str(), "no_reply" | "codemux_unavailable") {
+        note(&format!("Retry safely with --request-id {request_id}"));
+    }
+}
+
+/// Rows as columns two spaces apart, the last column unpadded.
+pub(crate) fn table(rows: &[Vec<String>]) -> Result<(), String> {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..columns)
+        .map(|column| rows.iter().filter_map(|row| row.get(column)).map(|cell| cell.chars().count()).max().unwrap_or(0))
+        .collect();
+    for row in rows {
+        let mut line = String::new();
+        for (column, cell) in row.iter().enumerate() {
+            if column + 1 == row.len() {
+                line.push_str(cell);
+            } else {
+                line.push_str(&format!("{cell:<width$}  ", width = widths[column]));
+            }
+        }
+        out(line.trim_end())?;
+    }
+    Ok(())
 }
 
 /// Print one line of the command's result on stdout.
@@ -287,5 +365,30 @@ mod tests {
             serde_json::to_value(CallEnvelope::of("thread_stop", Ok(Value::Null))).unwrap(),
             json!({"ok": true, "tool": "thread_stop", "result": null})
         );
+    }
+
+    #[test]
+    fn settled_receipts_report_why_they_did_not_succeed() {
+        assert!(succeeded(&json!({"state": "succeeded"})));
+        assert!(succeeded(&json!({"workspaces": []})));
+        assert!(!succeeded(&json!({"state": "failed"})));
+        let failed = json!({"state": "failed", "error": {"code": "provider_not_ready", "message": "Starting", "retryable": true}});
+        assert_eq!(receipt_error(&failed), ErrorBody::new("provider_not_ready", "Starting"));
+        assert!(receipt_error(&json!({"state": "needs_attention"})).message.contains("needs_attention"));
+
+        let (envelope, exit) = CallEnvelope::settled("thread_stop", Ok(failed.clone()));
+        assert_eq!(exit, Exit::Failed);
+        assert_eq!(
+            serde_json::to_value(&envelope).unwrap(),
+            json!({"ok": false, "tool": "thread_stop", "result": failed, "error": {"code": "provider_not_ready", "message": "Starting"}})
+        );
+        let (envelope, exit) = CallEnvelope::settled("thread_stop", Ok(json!({"state": "succeeded"})));
+        assert_eq!((envelope.ok, exit), (true, Exit::Done));
+
+        // A settle deadline keeps the receipt it stopped at and exits 3.
+        let receipt = json!({"operation_id": "op", "state": "running"});
+        let late = CliError::new(Exit::TimedOut, "timed_out", "still running").with_last(receipt.clone());
+        let (envelope, exit) = CallEnvelope::settled("thread_launch", Err(late));
+        assert_eq!((envelope.ok, exit, envelope.result), (false, Exit::TimedOut, Some(receipt)));
     }
 }

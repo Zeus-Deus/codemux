@@ -1,41 +1,107 @@
 use crate::control::{send_control_request, ControlRequest, ControlResponse};
 use clap::{Parser, Subcommand};
+use door::Door;
 use output::Exit;
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::io::Write;
 
+pub mod args;
+#[cfg(test)]
+mod docs_tests;
+mod door;
 mod output;
 pub mod ports;
+pub mod thread;
+mod tools;
+mod verbs;
+pub mod workspace;
+
+/// Help footer of the root and of `thread`: the statuses scripts branch on.
+pub(crate) const EXIT_CODES_HELP: &str =
+    "Exit codes: 0 done · 1 failed · 2 needs input · 3 timed out · 64 usage error. Guide: docs/outside-agents.md";
 
 #[derive(Parser)]
-#[command(name = "codemux", about = "Codemux desktop and control CLI")]
+#[command(name = "codemux", about = "Codemux desktop and control CLI", after_help = EXIT_CODES_HELP)]
 pub struct Cli {
     /// Launch the desktop with every plugin off (same as
     /// `CODEMUX_DISABLE_PLUGINS=1`).
     #[arg(long, global = true, alias = "disable-addons")]
     pub disable_plugins: bool,
+    /// Who the control socket records this invocation's calls as. Given
+    /// before the command: `codemux --client hermes thread start …`.
+    #[command(flatten)]
+    pub caller: args::CallerArgs,
     #[command(subcommand)]
     pub command: Option<CommandSet>,
 }
 
+// Declaration order is help order: the app, then the control verbs, then
+// the other commands, with debug and internal ones last.
 #[derive(Subcommand)]
 pub enum CommandSet {
+    /// Open the desktop app (same as no command)
     App,
+    /// Show the running app's workspaces and focused pane
     Status,
-    /// Debug: send one raw control-socket command and print the reply.
-    /// Exits 1 when the reply is not ok.
-    Json { command: String, params: Option<String> },
+    /// List the control tools this caller can use, from the running app
+    Tools {
+        /// Print the MCP tool definitions as JSON.
+        #[arg(long, conflicts_with = "markdown")]
+        json: bool,
+        /// Print a Markdown reference.
+        #[arg(long)]
+        markdown: bool,
+    },
+    /// Call one control tool with JSON arguments and print the result as JSON
+    Call {
+        /// Tool name, as `codemux tools` lists it.
+        tool: String,
+        /// Arguments as a JSON object, or - to read them from stdin (default {}).
+        arguments: Option<String>,
+    },
+    /// Open, list, inspect and close workspaces
+    Workspace {
+        #[command(subcommand)]
+        command: workspace::WorkspaceCommand,
+    },
+    /// Create git worktrees as workspaces
+    Worktree {
+        #[command(subcommand)]
+        command: workspace::WorktreeCommand,
+    },
+    /// Launch agent threads, send them messages, and wait for and read
+    /// their replies
+    #[command(after_help = EXIT_CODES_HELP)]
+    Thread {
+        #[command(subcommand)]
+        command: thread::ThreadCommand,
+    },
+    /// Serve Codemux tools to an MCP client over stdio
+    Mcp {
+        /// Name this client's calls are recorded under (default: the MCP
+        /// client's own name).
+        #[arg(long, value_name = "NAME", value_parser = args::client_name)]
+        client: Option<String>,
+        /// The most this client's calls may do (default: full-access).
+        #[arg(long, value_enum, value_name = "LEVEL")]
+        access: Option<args::AccessArg>,
+    },
+    /// Send a notification to the user
     Notify { message: String },
+    /// Generate a project handoff summary
     Handoff,
+    /// Project memory management
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
     },
+    /// Code index for search
     Index {
         #[command(subcommand)]
         command: IndexCommand,
     },
+    /// Control the browser pane
     Browser {
         #[command(subcommand)]
         command: BrowserCommand,
@@ -44,11 +110,6 @@ pub enum CommandSet {
     Issue {
         #[command(subcommand)]
         command: IssueCommand,
-    },
-    /// Workspace operations
-    Workspace {
-        #[command(subcommand)]
-        command: WorkspaceCommand,
     },
     /// Web remote-access operations
     Remote {
@@ -169,12 +230,9 @@ pub enum CommandSet {
     Doctor,
     /// List all available codemux commands and capabilities
     Capabilities,
-    /// Start MCP server (JSON-RPC over stdio)
-    Mcp,
-    /// Relay a stdio MCP client to the desktop app's MCP gateway. Codemux
-    /// starts this for agents that only take stdio MCP servers.
-    #[command(hide = true)]
-    McpBridge,
+    /// Debug: send one raw control-socket command and print the reply.
+    /// Exits 1 when the reply is not ok. Scripts should prefer `codemux call`.
+    Json { command: String, params: Option<String> },
     /// Call an injected chat MCP tool with the chat's own authority. Reads
     /// the credential the agent process was started with.
     McpCall {
@@ -183,23 +241,19 @@ pub enum CommandSet {
         #[arg(long)]
         list: bool,
     },
+    /// Relay a stdio MCP client to the desktop app's MCP gateway. Codemux
+    /// starts this for agents that only take stdio MCP servers.
+    #[command(hide = true)]
+    McpBridge,
     /// Run as the persistent PTY daemon (internal subcommand spawned by the
     /// Tauri app; long-lived process that owns agent PTYs so they survive
     /// the app being closed).
+    #[command(hide = true)]
     PtyDaemon {
         /// Absolute path of the Unix socket to bind. The Tauri app passes
         /// this when spawning the daemon.
         #[arg(long)]
         socket: std::path::PathBuf,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum WorkspaceCommand {
-    /// Re-run setup scripts (.codemuxinclude + setup commands) for a workspace
-    RerunSetup {
-        /// Workspace ID (defaults to active workspace)
-        workspace_id: Option<String>,
     },
 }
 
@@ -274,32 +328,40 @@ pub enum MonitorCommand {
 
 #[derive(Subcommand)]
 pub enum BrowserCommand {
+    /// Create a new browser pane
     Create,
+    /// Navigate to a URL
     Open { url: String },
+    /// Get the page element tree
     Snapshot {
+        #[arg(hide = true)]
         browser_id: Option<String>,
         /// Use DOM-based query instead of ARIA tree
         #[arg(long)]
         dom: bool,
     },
-    Click { selector: String, browser_id: Option<String> },
-    Fill { selector: String, value: String, browser_id: Option<String> },
-    Screenshot { browser_id: Option<String> },
-    ConsoleLogs { browser_id: Option<String> },
+    /// Click an element
+    Click { selector: String, #[arg(hide = true)] browser_id: Option<String> },
+    /// Type into an input
+    Fill { selector: String, value: String, #[arg(hide = true)] browser_id: Option<String> },
+    /// Capture a screenshot (base64 PNG)
+    Screenshot { #[arg(hide = true)] browser_id: Option<String> },
+    /// Get the browser console output
+    ConsoleLogs { #[arg(hide = true)] browser_id: Option<String> },
     /// Click at pixel coordinates via CDP
-    ClickAt { x: f64, y: f64, #[arg(long, default_value = "left")] click_type: String, browser_id: Option<String> },
+    ClickAt { x: f64, y: f64, #[arg(long, default_value = "left")] click_type: String, #[arg(hide = true)] browser_id: Option<String> },
     /// Type text at coordinates or cursor position via CDP
-    TypeAt { text: String, #[arg(long)] x: Option<f64>, #[arg(long)] y: Option<f64>, browser_id: Option<String> },
+    TypeAt { text: String, #[arg(long)] x: Option<f64>, #[arg(long)] y: Option<f64>, #[arg(hide = true)] browser_id: Option<String> },
     /// Scroll at coordinates via CDP
-    ScrollAt { x: f64, y: f64, #[arg(long, default_value = "down")] direction: String, #[arg(long, default_value = "3")] amount: i32, browser_id: Option<String> },
+    ScrollAt { x: f64, y: f64, #[arg(long, default_value = "down")] direction: String, #[arg(long, default_value = "3")] amount: i32, #[arg(hide = true)] browser_id: Option<String> },
     /// Press a key or combo via CDP
-    KeyPress { key: String, browser_id: Option<String> },
+    KeyPress { key: String, #[arg(hide = true)] browser_id: Option<String> },
     /// Drag between coordinates via CDP
-    Drag { start_x: f64, start_y: f64, end_x: f64, end_y: f64, browser_id: Option<String> },
+    Drag { start_x: f64, start_y: f64, end_x: f64, end_y: f64, #[arg(hide = true)] browser_id: Option<String> },
     /// Click at coordinates using OS-level input (ydotool)
-    ClickOs { x: f64, y: f64, browser_id: Option<String> },
+    ClickOs { x: f64, y: f64, #[arg(hide = true)] browser_id: Option<String> },
     /// Type text using OS-level input (ydotool)
-    TypeOs { text: String, #[arg(long)] x: Option<f64>, #[arg(long)] y: Option<f64>, browser_id: Option<String> },
+    TypeOs { text: String, #[arg(long)] x: Option<f64>, #[arg(long)] y: Option<f64>, #[arg(hide = true)] browser_id: Option<String> },
     /// Set the browser viewport to a preset (mobile / tablet / desktop / ...),
     /// a custom WxH like `390x844`, or `reset` to return to the default.
     /// Use `codemux browser viewport-presets` to list every preset.
@@ -311,6 +373,7 @@ pub enum BrowserCommand {
         /// 1.0 for desktop / custom dimensions).
         #[arg(long)]
         dpr: Option<f64>,
+        #[arg(hide = true)]
         browser_id: Option<String>,
     },
     /// List the available viewport presets and their CSS dimensions.
@@ -319,7 +382,9 @@ pub enum BrowserCommand {
 
 #[derive(Subcommand)]
 pub enum MemoryCommand {
+    /// Show project memory
     Show,
+    /// Update memory fields
     Set {
         #[arg(long)]
         brief: Option<String>,
@@ -330,6 +395,7 @@ pub enum MemoryCommand {
         #[arg(long = "constraint")]
         constraints: Vec<String>,
     },
+    /// Add a memory entry
     Add {
         kind: String,
         content: String,
@@ -367,8 +433,11 @@ pub enum IssueCommand {
 
 #[derive(Subcommand)]
 pub enum IndexCommand {
+    /// Build or rebuild the search index
     Build,
+    /// Show index status
     Status,
+    /// Search indexed code
     Search {
         query: String,
         #[arg(long)]
@@ -443,14 +512,37 @@ fn write_response(writer: &mut impl Write, response: &ControlResponse) -> Result
     Ok(if response.ok { Exit::Done } else { Exit::Failed })
 }
 
+/// Names this process's control identity before any socket call: every
+/// request then carries it (`ControlClient::current`). `codemux mcp` takes
+/// its own flags first, then the root's; unnamed calls run as the owner.
+fn adopt_caller(cli: &Cli) -> (Option<String>, Option<args::AccessArg>) {
+    let (client, access) = match &cli.command {
+        Some(CommandSet::Mcp { client, access }) => (client.clone().or(cli.caller.client.clone()), access.or(cli.caller.access)),
+        _ => (cli.caller.client.clone(), cli.caller.access),
+    };
+    if let Some(name) = &client {
+        crate::control_identity::set_client_name(name);
+    }
+    if let Some(access) = access {
+        crate::control_identity::set_client_access(access.into());
+    }
+    (client, access)
+}
+
 /// Drive every control-socket / local CLI subcommand and return the exit
 /// status. No subcommand, `app` and `serve` are handled by [`maybe_run_cli`]
 /// before this runs.
 async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
+    let (client, access) = adopt_caller(&cli);
     match cli.command {
         None | Some(CommandSet::App) | Some(CommandSet::Serve { .. }) => {
             unreachable!("maybe_run_cli handles the GUI launch and serve before run_control_cli")
         }
+        Some(CommandSet::Tools { json, markdown }) => tools::run_tools(&Door::Socket, json, markdown).await,
+        Some(CommandSet::Call { tool, arguments }) => tools::run_call(&Door::Socket, &tool, arguments.as_deref()).await,
+        Some(CommandSet::Workspace { command }) => workspace::run(&Door::Socket, command).await,
+        Some(CommandSet::Worktree { command }) => workspace::run_worktree(&Door::Socket, command).await,
+        Some(CommandSet::Thread { command }) => thread::run(&Door::Socket, command).await,
         Some(CommandSet::Status) => {
             let response = send_control_request(ControlRequest {
                 command: "status".into(),
@@ -845,24 +937,6 @@ async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
             output::emit_json(&result)?;
             Ok(Exit::Done)
         }
-        Some(CommandSet::Workspace { command }) => {
-            let response = match command {
-                WorkspaceCommand::RerunSetup { workspace_id } => {
-                    let mut params = json!({});
-                    if let Some(id) = workspace_id {
-                        params["workspace_id"] = json!(id);
-                    } else if let Ok(id) = std::env::var("CODEMUX_WORKSPACE_ID") {
-                        params["workspace_id"] = json!(id);
-                    }
-                    send_control_request(ControlRequest {
-                        command: "rerun_setup".into(),
-                        params,
-                    })
-                    .await?
-                }
-            };
-            print_response(&response)
-        }
         Some(CommandSet::Monitor { command }) => {
             // The pane/workspace ids come from the agent's own injected
             // environment, so the common call is a bare `codemux monitor
@@ -1049,8 +1123,9 @@ async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
             crate::doctor::run().await;
             Ok(Exit::Done)
         }
-        Some(CommandSet::Mcp) => {
-            crate::mcp_server::run_mcp_server().await?;
+        Some(CommandSet::Mcp { .. }) => {
+            let options = crate::mcp_server::McpServerOptions { client, access: access.map(Into::into) };
+            crate::mcp_server::run_mcp_server_with(options).await?;
             Ok(Exit::Done)
         }
         Some(CommandSet::McpBridge) => {
@@ -1445,6 +1520,146 @@ mod tests {
         ] {
             assert_eq!(exit_of(argv), None, "{argv:?}");
         }
+
+        // The control verbs follow the same rule.
+        assert_eq!(exit_of(&["codemux", "thread", "--help"]), Some(0));
+        for argv in [
+            &["codemux", "thread", "start", "--provider", "codex", "-m", "hi"][..],
+            &["codemux", "thread", "wait", "t", "--timeout", "forever"],
+            &["codemux", "call"],
+            &["codemux", "--access", "root", "tools"],
+        ] {
+            assert_eq!(exit_of(argv), Some(64), "{argv:?}");
+        }
+    }
+
+    fn parse(argv: &[&str]) -> CommandSet {
+        Cli::try_parse_from(argv).unwrap_or_else(|error| panic!("{argv:?}: {error}")).command.expect("a command")
+    }
+
+    #[test]
+    fn control_verbs_parse() {
+        use thread::{Decision, ThreadCommand};
+        let start = ["codemux", "thread", "start", "--workspace", "ws", "--provider", "codex"];
+        let message = ["-m", "hi"];
+        let full = [&start[..], &["--permission-mode", "read-only"], &message, &["--wait", "--timeout", "10m", "--json"]].concat();
+        match parse(&full) {
+            CommandSet::Thread { command: ThreadCommand::Start(args) } => {
+                assert_eq!((args.provider.as_str(), args.permission_mode.as_deref(), args.message.as_str()), ("codex", Some("read-only"), "hi"));
+                assert!(args.run.wait && args.out.json);
+                assert_eq!(args.run.timeout, Some(std::time::Duration::from_secs(600)));
+            }
+            _ => panic!("expected thread start"),
+        }
+        // Exactly one of the permission flags, and never neither.
+        let both = [&start[..], &["--permission-mode", "x", "--no-permission-mode"], &message].concat();
+        assert!(Cli::try_parse_from(both).is_err());
+        assert!(Cli::try_parse_from([&start[..], &message].concat()).is_err());
+        assert!(Cli::try_parse_from([&start[..], &["--no-permission-mode"], &message].concat()).is_ok());
+        // A worktree base needs the worktree branch.
+        let base_only = [&start[..], &["--no-permission-mode", "--worktree-base", "trunk"], &message].concat();
+        assert!(Cli::try_parse_from(base_only).is_err());
+
+        // Branch deletion and force only come with worktree removal.
+        assert!(Cli::try_parse_from(["codemux", "workspace", "close", "ws", "--delete-branch"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "workspace", "close", "ws", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "workspace", "close", "ws", "--remove-worktree", "--delete-branch", "--force"]).is_ok());
+
+        for (word, decision) in [("allow-once", Decision::AllowOnce), ("allow-always", Decision::AllowAlways), ("deny", Decision::Deny)] {
+            match parse(&["codemux", "thread", "respond", "t", "r", word]) {
+                CommandSet::Thread { command: ThreadCommand::Respond(args) } => assert_eq!(args.decision, decision),
+                _ => panic!("expected thread respond"),
+            }
+        }
+        assert!(Cli::try_parse_from(["codemux", "thread", "respond", "t", "r", "allow_once"]).is_err());
+
+        for argv in [
+            &["codemux", "tools", "--json"][..],
+            &["codemux", "tools", "--markdown"],
+            &["codemux", "call", "thread_list", "{}"],
+            &["codemux", "call", "thread_list", "-"],
+            &["codemux", "workspace", "create", ".", "--select", "--request-id", "k", "--json"],
+            &["codemux", "workspace", "list"],
+            &["codemux", "workspace", "info"],
+            &["codemux", "workspace", "rerun-setup", "ws"],
+            &["codemux", "worktree", "create", "--repo", ".", "--branch", "b", "--base", "trunk"],
+            &["codemux", "thread", "send", "t", "--workspace", "ws", "-m", "-", "--delivery", "queue", "--wait"],
+            &["codemux", "thread", "wait", "t", "--turn", "t1", "--timeout", "90s"],
+            &["codemux", "thread", "read", "t", "--all"],
+            &["codemux", "thread", "list", "--limit", "5"],
+            &["codemux", "thread", "status", "t", "--json"],
+            &["codemux", "thread", "interrupt", "t", "--turn", "t1"],
+            &["codemux", "thread", "stop", "t"],
+        ] {
+            parse(argv);
+        }
+        assert!(Cli::try_parse_from(["codemux", "tools", "--json", "--markdown"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "worktree", "create", "--repo", ".", "--branch", "b", "--base", "x", "--existing"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "thread", "read", "t", "--all", "--cursor", "3"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "thread", "read", "t", "--limit", "101"]).is_err());
+    }
+
+    #[test]
+    fn caller_flags_name_and_narrow_the_client() {
+        // Root flags, before the command, for every verb.
+        let cli = Cli::try_parse_from(["codemux", "--client", "Hermes Bot", "--access", "supervised", "tools"]).unwrap();
+        assert_eq!(cli.caller.client.as_deref(), Some("Hermes Bot"));
+        assert_eq!(cli.caller.access, Some(args::AccessArg::Supervised));
+        for (spelling, access) in [
+            ("read-only", args::AccessArg::ReadOnly),
+            ("read_only", args::AccessArg::ReadOnly),
+            ("full-access", args::AccessArg::FullAccess),
+            ("full_access", args::AccessArg::FullAccess),
+            ("full", args::AccessArg::FullAccess),
+        ] {
+            let cli = Cli::try_parse_from(["codemux", "--access", spelling, "status"]).unwrap();
+            assert_eq!(cli.caller.access, Some(access), "{spelling}");
+        }
+        // A name with nothing usable would silently run as the owner.
+        assert!(Cli::try_parse_from(["codemux", "--client", "!!!", "status"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "--client", "x", "tools", "--client", "y"]).is_err());
+        assert_eq!(crate::agent_control::ControlAccess::from(args::AccessArg::Supervised), crate::agent_control::ControlAccess::Supervised);
+    }
+
+    #[test]
+    fn bare_mcp_still_serves_stdio() {
+        // `.mcp.json` entries, the Vexis config and Settings run exactly this.
+        assert!(matches!(parse(&["codemux", "mcp"]), CommandSet::Mcp { client: None, access: None }));
+        match parse(&["codemux", "mcp", "--client", "hermes", "--access", "supervised"]) {
+            CommandSet::Mcp { client, access } => {
+                assert_eq!(client.as_deref(), Some("hermes"));
+                assert_eq!(access, Some(args::AccessArg::Supervised));
+            }
+            _ => panic!("expected mcp"),
+        }
+        assert!(Cli::try_parse_from(["codemux", "mcp", "--client", "---"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "mcp", "install"]).is_err());
+    }
+
+    #[test]
+    fn mcp_call_still_parses() {
+        // ACP prompts tell agents to run exactly these.
+        assert!(matches!(parse(&["codemux", "mcp-call", "--list"]), CommandSet::McpCall { tool: None, list: true, .. }));
+        match parse(&["codemux", "mcp-call", "thread_list", "{}"]) {
+            CommandSet::McpCall { tool, arguments, list } => {
+                assert_eq!((tool.as_deref(), arguments.as_deref(), list), (Some("thread_list"), Some("{}"), false));
+            }
+            _ => panic!("expected mcp-call"),
+        }
+    }
+
+    #[test]
+    fn internal_commands_are_hidden_but_still_run() {
+        use clap::CommandFactory;
+        let root = Cli::command();
+        for name in ["mcp-bridge", "pty-daemon"] {
+            assert!(root.find_subcommand(name).is_some_and(|command| command.is_hide_set()), "{name}");
+        }
+        assert!(matches!(parse(&["codemux", "pty-daemon", "--socket", "/tmp/x.sock"]), CommandSet::PtyDaemon { .. }));
+        // The ignored browser ids are hidden from help but still accepted.
+        assert!(matches!(parse(&["codemux", "browser", "screenshot", "default"]), CommandSet::Browser { .. }));
+        let help = root.find_subcommand("browser").unwrap().find_subcommand("screenshot").unwrap().clone().render_help().to_string();
+        assert!(!help.contains("BROWSER_ID"), "{help}");
     }
 
     #[test]
