@@ -34,6 +34,12 @@ pub enum Reply {
         future: BoxFuture<'static, Result<Value, RpcError>>,
         parks: bool,
     },
+    /// Like `Later`, for work that waits its turn in a queue the handler
+    /// keeps, such as tools that must run one at a time in arrival order. It
+    /// does not count toward [`MAX_IN_FLIGHT`]: a burst of such calls is
+    /// queued, not refused, as a sequential server would have done. It never
+    /// parks.
+    Queued(BoxFuture<'static, Result<Value, RpcError>>),
 }
 
 pub trait Handler: Send + Sync + 'static {
@@ -44,6 +50,7 @@ pub trait Handler: Send + Sync + 'static {
 
 /// Most `Later` requests running at once. Past it a request is refused
 /// rather than queued, so the reader stays free to read cancellations.
+/// `Queued` requests are not counted.
 pub const MAX_IN_FLIGHT: usize = 64;
 
 /// Serve MCP over `input` and `output` until `input` ends.
@@ -120,31 +127,31 @@ fn handle_line<H: Handler>(
     if in_flight.contains(&id) {
         return send(out, Response::error(Some(id), RpcError::invalid_request("Request id is already in flight")));
     }
-    match handler.request(request) {
-        Reply::Now(outcome) => send(out, Response::from_outcome(id, outcome)),
-        Reply::Later { future, parks } => {
-            // Dropping `future` here abandons the work before it starts.
-            let Some(mut call) = in_flight.begin(id.clone(), parks) else {
-                return send(out, Response::error(Some(id), RpcError::internal("Too many concurrent requests")));
-            };
-            let out = out.clone();
-            tasks.spawn(async move {
-                let outcome = tokio::select! {
-                    biased;
-                    () = call.cancelled() => None,
-                    outcome = AssertUnwindSafe(future).catch_unwind() => Some(outcome.unwrap_or_else(|_| {
-                        Err(RpcError::internal("The request failed unexpectedly"))
-                    })),
-                };
-                // Free the id before replying: the client may reuse it as soon
-                // as it reads the reply.
-                drop(call);
-                if let Some(outcome) = outcome {
-                    send(&out, Response::from_outcome(id, outcome));
-                }
-            });
+    let (future, parks, counted) = match handler.request(request) {
+        Reply::Now(outcome) => return send(out, Response::from_outcome(id, outcome)),
+        Reply::Later { future, parks } => (future, parks, true),
+        Reply::Queued(future) => (future, false, false),
+    };
+    // Dropping `future` here abandons the work before it starts.
+    let Some(mut call) = in_flight.begin(id.clone(), parks, counted) else {
+        return send(out, Response::error(Some(id), RpcError::internal("Too many concurrent requests")));
+    };
+    let out = out.clone();
+    tasks.spawn(async move {
+        let outcome = tokio::select! {
+            biased;
+            () = call.cancelled() => None,
+            outcome = AssertUnwindSafe(future).catch_unwind() => Some(outcome.unwrap_or_else(|_| {
+                Err(RpcError::internal("The request failed unexpectedly"))
+            })),
+        };
+        // Free the id before replying: the client may reuse it as soon as it
+        // reads the reply.
+        drop(call);
+        if let Some(outcome) = outcome {
+            send(&out, Response::from_outcome(id, outcome));
         }
-    }
+    });
 }
 
 fn send(out: &mpsc::UnboundedSender<String>, response: Response) {
@@ -177,6 +184,8 @@ struct InFlight {
 struct Entry {
     cancel: watch::Sender<bool>,
     parks: bool,
+    /// Counts toward [`MAX_IN_FLIGHT`] (`Reply::Later`, not `Reply::Queued`).
+    counted: bool,
 }
 
 impl InFlight {
@@ -188,15 +197,16 @@ impl InFlight {
         self.lock().contains_key(id)
     }
 
-    /// `None` when [`MAX_IN_FLIGHT`] requests are already running. The caller
-    /// has checked that `id` is not one of them.
-    fn begin(&self, id: RequestId, parks: bool) -> Option<Call> {
+    /// `None` for a `counted` request when [`MAX_IN_FLIGHT`] counted requests
+    /// are already running. The caller has checked that `id` is not one of
+    /// them.
+    fn begin(&self, id: RequestId, parks: bool, counted: bool) -> Option<Call> {
         let mut calls = self.lock();
-        if calls.len() >= MAX_IN_FLIGHT {
+        if counted && calls.values().filter(|entry| entry.counted).count() >= MAX_IN_FLIGHT {
             return None;
         }
         let (cancel, cancelled) = watch::channel(false);
-        calls.insert(id.clone(), Entry { cancel, parks });
+        calls.insert(id.clone(), Entry { cancel, parks, counted });
         Some(Call { id, cancelled, calls: Arc::clone(&self.calls) })
     }
 
@@ -255,6 +265,7 @@ mod tests {
     /// - `slow`: `Later`, finishes when the test releases `gate`;
     /// - `park`: `Later` with `parks`, never finishes on its own;
     /// - `quick`: `Later`, finishes at once;
+    /// - `queue`: `Queued`, finishes when the test releases `gate`;
     /// - `boom`: `Later`, panics.
     #[derive(Default)]
     struct Fake {
@@ -284,18 +295,20 @@ mod tests {
             let mut unfinished =
                 Unfinished { label: label.clone(), finished: false, dropped: Arc::clone(&self.dropped) };
             match request.method.as_str() {
-                "slow" => {
+                method @ ("slow" | "queue") => {
                     let gate = Arc::clone(&self.gate);
-                    Reply::Later {
-                        future: Box::pin(async move {
-                            // Bind the whole guard: naming only its field would
-                            // capture a copy of the flag and drop the guard now.
-                            let mut unfinished = unfinished;
-                            gate.notified().await;
-                            unfinished.finished = true;
-                            Ok(json!({ "done": label }))
-                        }),
-                        parks: false,
+                    let future: BoxFuture<'static, Result<Value, RpcError>> = Box::pin(async move {
+                        // Bind the whole guard: naming only its field would
+                        // capture a copy of the flag and drop the guard now.
+                        let mut unfinished = unfinished;
+                        gate.notified().await;
+                        unfinished.finished = true;
+                        Ok(json!({ "done": label }))
+                    });
+                    if method == "queue" {
+                        Reply::Queued(future)
+                    } else {
+                        Reply::Later { future, parks: false }
                     }
                 }
                 "park" => Reply::Later {
@@ -534,6 +547,29 @@ mod tests {
         session.send(request(json!("fits"), "quick", "fits")).await;
         assert_eq!(session.next().await["id"], "fits");
         assert!(handler.dropped.lock().unwrap().contains(&"refused".to_owned()), "refused work is dropped unstarted");
+    }
+
+    #[tokio::test]
+    async fn stdio_queues_calls_past_max_in_flight_without_refusing_them() {
+        let handler = Arc::new(Fake::default());
+        let mut session = Session::start(Arc::clone(&handler));
+        for id in 0..MAX_IN_FLIGHT {
+            session.send(request(json!(id), "park", "held")).await;
+        }
+        // Queued work waits its turn instead of failing, however much is
+        // already running or queued.
+        for id in 0..2 * MAX_IN_FLIGHT {
+            session.send(request(json!(format!("q{id}")), "queue", "queued")).await;
+        }
+        session.send(request(json!("ping"), "echo", "ping")).await;
+        assert_eq!(session.next().await["id"], "ping", "no queued call was refused");
+        // Running calls are still capped.
+        session.send(request(json!("over"), "park", "refused")).await;
+        assert_eq!(session.next().await["error"]["code"], -32603);
+        handler.gate.notify_one();
+        let reply = session.next().await;
+        assert!(reply["id"].as_str().is_some_and(|id| id.starts_with('q')), "{reply}");
+        assert_eq!(reply["result"]["done"], "queued");
     }
 
     #[tokio::test]

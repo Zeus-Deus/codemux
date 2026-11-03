@@ -1101,7 +1101,7 @@ impl StdioServer {
             Err(error) => return Reply::Now(Err(error)),
         };
         if !crate::agent_control::is_native_tool(&call.name) {
-            return Reply::Later { future: self.legacy.submit(call), parks: false };
+            return Reply::Queued(self.legacy.submit(call));
         }
         if provider_stdio_origin() {
             return Reply::Now(Err(RpcError::invalid_request(
@@ -1146,7 +1146,9 @@ fn tools_list() -> Value {
 
 /// Runs the server's own tools one at a time, in arrival order, as the
 /// sequential server always did: the browser, pane and git tools act on shared
-/// app state, and every in-app chat shares one `codemux mcp` child.
+/// app state, and every in-app chat shares one `codemux mcp` child. The queue
+/// has no bound, as the sequential server's input had none: a burst of calls
+/// waits its turn instead of failing.
 struct LegacyLane {
     jobs: mpsc::UnboundedSender<LegacyJob>,
 }
@@ -2408,7 +2410,7 @@ mod tests {
         let id = request.id.clone();
         let outcome = match server.request(request) {
             Reply::Now(outcome) => outcome,
-            Reply::Later { future, .. } => future.await,
+            Reply::Later { future, .. } | Reply::Queued(future) => future.await,
         };
         Some(Response::from_outcome(id, outcome).to_value())
     }
@@ -2417,10 +2419,12 @@ mod tests {
         json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } })
     }
 
+    /// The work behind a deferred reply, and whether it parks.
     fn later(reply: Reply) -> (BoxFuture<'static, Result<Value, RpcError>>, bool) {
         match reply {
             Reply::Later { future, parks } => (future, parks),
-            Reply::Now(outcome) => panic!("expected a concurrent reply, got {outcome:?}"),
+            Reply::Queued(future) => (future, false),
+            Reply::Now(outcome) => panic!("expected a deferred reply, got {outcome:?}"),
         }
     }
 
