@@ -15,12 +15,21 @@ use crate::database::{
     DatabaseStore,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const CHANGED_EVENT: &str = "agent-connector-changed";
+
+/// HTTP requests in progress at once, waits excluded.
+const MAX_REQUESTS: usize = 16;
+/// Calls parked in a wait. They hold one of these instead of a request
+/// permit, so long waits cannot starve token refresh and every other call.
+const MAX_WAITS: usize = 32;
+/// One client cannot take every wait slot.
+const MAX_WAITS_PER_CLIENT: usize = 8;
 
 #[derive(Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -44,6 +53,8 @@ pub struct McpConnectorState {
     pub(crate) auth: Mutex<oauth::AuthState>,
     pub(crate) rate: Mutex<protocol::Rates>,
     pub(crate) concurrency: Arc<Semaphore>,
+    pub(crate) waiters: Arc<Semaphore>,
+    waits_by_client: Arc<Mutex<HashMap<String, usize>>>,
     pub(crate) listener: Mutex<listener::Listener>,
     /// Bound port of the own listener, 0 while stopped. Read without locks so
     /// `live()` can run under `auth` without lock nesting.
@@ -54,10 +65,49 @@ impl Default for McpConnectorState {
         Self {
             auth: Mutex::new(oauth::AuthState::default()),
             rate: Mutex::new(protocol::Rates::default()),
-            concurrency: Arc::new(Semaphore::new(16)),
+            concurrency: Arc::new(Semaphore::new(MAX_REQUESTS)),
+            waiters: Arc::new(Semaphore::new(MAX_WAITS)),
+            waits_by_client: Arc::default(),
             listener: Mutex::default(),
             bound_port: AtomicU16::new(0),
         }
+    }
+}
+
+/// A wait slot for one parked call; dropping it frees the slot.
+pub(crate) struct WaitSlot {
+    _permit: OwnedSemaphorePermit,
+    principal: String,
+    counts: Arc<Mutex<HashMap<String, usize>>>,
+}
+impl Drop for WaitSlot {
+    fn drop(&mut self) {
+        let Ok(mut counts) = self.counts.lock() else {
+            return;
+        };
+        if let Some(held) = counts.get_mut(&self.principal) {
+            *held -= 1;
+            if *held == 0 {
+                counts.remove(&self.principal);
+            }
+        }
+    }
+}
+impl McpConnectorState {
+    /// A slot for a call that may park, or `None` when the connector or this
+    /// client already holds as many waits as it may.
+    pub(crate) fn admit_wait(&self, principal: &str) -> Option<WaitSlot> {
+        let mut counts = self.waits_by_client.lock().ok()?;
+        if counts.get(principal).copied().unwrap_or(0) >= MAX_WAITS_PER_CLIENT {
+            return None;
+        }
+        let permit = self.waiters.clone().try_acquire_owned().ok()?;
+        *counts.entry(principal.to_owned()).or_default() += 1;
+        Some(WaitSlot {
+            _permit: permit,
+            principal: principal.to_owned(),
+            counts: self.waits_by_client.clone(),
+        })
     }
 }
 
@@ -885,6 +935,23 @@ mod tests {
         assert!(agent_connector_issue(handle.clone(), "bot".into(), ControlAccess::ReadOnly, Some(0)).is_err());
         assert!(agent_connector_issue(handle.clone(), "bot".into(), ControlAccess::ReadOnly, Some(365 * 24 + 1)).is_err());
         set(handle, false, None, None).unwrap();
+    }
+
+    #[test]
+    fn wait_slots_are_capped_per_client_and_freed_on_drop() {
+        let state = McpConnectorState::default();
+        let mut first: Vec<_> = (0..MAX_WAITS_PER_CLIENT)
+            .map(|_| state.admit_wait("mcp-client:a").unwrap())
+            .collect();
+        assert!(state.admit_wait("mcp-client:a").is_none(), "one client holds at most its share");
+        let others: Vec<_> = (0..MAX_WAITS - MAX_WAITS_PER_CLIENT)
+            .map(|i| state.admit_wait(&format!("mcp-client:{}", i % 3)).unwrap())
+            .collect();
+        assert!(state.admit_wait("mcp-client:fresh").is_none(), "the total stays bounded");
+        drop(others);
+        first.pop();
+        assert!(state.admit_wait("mcp-client:a").is_some(), "a dropped slot is free again");
+        assert!(state.admit_wait("mcp-client:fresh").is_some());
     }
 
     #[test]

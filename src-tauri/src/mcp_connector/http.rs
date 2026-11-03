@@ -5,7 +5,7 @@ use super::{
     validate_caller, McpConnectorState,
 };
 use super::{oauth, protocol};
-use crate::agent_control::{self, ControlCaller};
+use crate::agent_control::{self, ControlCaller, ControlError, ErrorCode};
 use crate::database::{
     mcp_connector::{NewMcpClient, NewMcpGrant, NewMcpRefresh, RefreshOutcome, RefreshRotation},
     DatabaseStore,
@@ -23,6 +23,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, Runtime};
+use tokio::sync::OwnedSemaphorePermit;
 
 const TOKEN_TTL_MS: i64 = 3_600_000;
 /// Each refresh issues a new 30-day token, so the window slides with use.
@@ -276,7 +277,7 @@ async fn entry<R: Runtime>(
                 failure(status, "invalid_mcp_headers")
             } else {
                 match read_body(request, MAX_MCP_BODY).await {
-                    Ok(bytes) => mcp(&app, &ingress, &headers, &bytes).await,
+                    Ok(bytes) => mcp(&app, &ingress, &headers, &bytes, permit).await,
                     Err(response) => response,
                 }
             }
@@ -309,7 +310,7 @@ async fn entry<R: Runtime>(
         }
         _ => failure(StatusCode::NOT_FOUND, "not_found"),
     };
-    drop(permit);
+    // The request permit (unless a wait gave it up) is released here.
     response
 }
 
@@ -324,6 +325,7 @@ async fn mcp<R: Runtime>(
     ingress: &Ingress,
     headers: &HeaderMap,
     bytes: &[u8],
+    permit: OwnedSemaphorePermit,
 ) -> Response {
     let value = match protocol::strict_json(bytes) {
         Ok(v) => v,
@@ -372,6 +374,25 @@ async fn mcp<R: Runtime>(
             // validate_method guarantees a name.
             let name = rpc.params["name"].as_str().unwrap_or_default();
             let arguments = rpc.params.get("arguments").cloned().unwrap_or(json!({}));
+            // A call that may park trades its request permit for a wait slot,
+            // so parked waits never starve token refresh or other calls.
+            let parks = agent_control::registry::lookup(name).is_some_and(|(_, spec)| spec.may_wait());
+            let _slot = if parks {
+                let Some(slot) = app.state::<McpConnectorState>().admit_wait(&caller.principal) else {
+                    let busy = ControlError::new(
+                        ErrorCode::WaitBudgetExhausted,
+                        "Too many waits in progress; retry shortly",
+                    );
+                    return json_response(
+                        StatusCode::OK,
+                        json!({"jsonrpc":"2.0","id":id,"result":agent_control::registry::mcp_error(&busy)}),
+                    );
+                };
+                drop(permit);
+                Some(slot)
+            } else {
+                None
+            };
             // The registry gates access, validates the arguments (a bad one is
             // a tool error naming the field) and presents the result. Handlers
             // repeat grant checks before each mutation and after any await.
@@ -2343,6 +2364,34 @@ mod tests {
         super::super::agent_connector_issue(f.app.handle().clone(), label.into(), access, None)
             .unwrap()
     }
+    /// A `thread_wait` on the busy worker, sent from its own task.
+    fn spawn_wait(f: &Fixture, token: &str, workspace: &str, thread: &str) -> tokio::task::JoinHandle<Value> {
+        let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"thread_wait","arguments":{
+            "workspace_id":workspace,"thread_id":thread,"timeout_ms":30_000
+        }}});
+        let r = request(f, "/mcp", "POST", &body.to_string(), Some(token));
+        let app = f.app.handle().clone();
+        tokio::spawn(async move {
+            let response = router().with_state(app).oneshot(r).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            value(response).await["result"].clone()
+        })
+    }
+    fn free_wait_slots(f: &Fixture) -> usize {
+        f.app.state::<McpConnectorState>().waiters.available_permits()
+    }
+    /// Waits until `parked` waits hold slots, and checks they stay parked.
+    async fn parked(f: &Fixture, parked: usize, waits: &[tokio::task::JoinHandle<Value>]) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while free_wait_slots(f) != super::super::MAX_WAITS - parked {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected {parked} parked waits, {} slots free", free_wait_slots(f)));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(waits.iter().all(|w| !w.is_finished()), "a wait returned instead of parking");
+    }
     fn error_code(result: &Value) -> &str {
         result["structuredContent"]["error"]["code"].as_str().unwrap_or_default()
     }
@@ -2571,6 +2620,85 @@ mod tests {
         assert!(html.contains("Settings → Connections → Outside assistants"), "{html}");
         assert!(html.contains("<code>codemux connector pending</code>"), "{html}");
         assert!(!html.contains("Outside agents") && !html.contains("Settings → MCP"), "stale path: {html}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parked_waits_use_the_waiter_budget_not_the_general_permits() {
+        let worker = "budget-worker";
+        let (f, _provider, _root, workspace) = worker_fixture(worker).await;
+        let _seed = grant(&f);
+        let oauth_tokens = consent_tokens(&f, "fixture-client", ControlAccess::ReadOnly).await;
+        // With every wait slot taken a wait is refused at once, as a
+        // retryable tool error, and other calls are unaffected.
+        let held = f.app.state::<McpConnectorState>().waiters.clone().try_acquire_many_owned(super::super::MAX_WAITS as u32).unwrap();
+        let bot = issue(&f, "wait-bot-a", ControlAccess::ReadOnly);
+        let refused = spawn_wait(&f, &bot.token, &workspace, worker).await.unwrap();
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert_eq!(refused["structuredContent"]["error"], json!({"code":"wait_budget_exhausted","message":"Too many waits in progress; retry shortly","retryable":true}));
+        assert_eq!(ping(&f, &bot.token).await, StatusCode::OK);
+        drop(held);
+        // As many parked waits as there are request permits leave room for
+        // everything else, token refresh included.
+        worker_runs(&f, worker);
+        let other = issue(&f, "wait-bot-b", ControlAccess::ReadOnly);
+        let waits: Vec<_> = (0..super::super::MAX_WAITS_PER_CLIENT * 2)
+            .map(|i| spawn_wait(&f, if i % 2 == 0 { &bot.token } else { &other.token }, &workspace, worker))
+            .collect();
+        parked(&f, waits.len(), &waits).await;
+        assert_eq!(f.app.state::<McpConnectorState>().concurrency.available_permits(), 16, "parked waits hold no request permit");
+        let status = call_tool(&f, &bot.token, "thread_status", json!({"workspace_id":workspace,"thread_id":worker})).await;
+        assert_ne!(status["isError"], true, "{status}");
+        let (refresh_status, _) = refreshed(&f, "fixture-client", oauth_tokens["refresh_token"].as_str().unwrap()).await;
+        assert_eq!(refresh_status, StatusCode::OK, "token refresh still gets a permit");
+        super::super::agent_connector_revoke_all(f.app.handle().clone()).unwrap();
+        for wait in waits {
+            assert_eq!(error_code(&wait.await.unwrap()), "grant_revoked");
+        }
+        assert_eq!(free_wait_slots(&f), super::super::MAX_WAITS, "every slot is returned");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waits_are_capped_per_client() {
+        let worker = "capped-worker";
+        let (f, _provider, _root, workspace) = worker_fixture(worker).await;
+        worker_runs(&f, worker);
+        let greedy = issue(&f, "greedy-bot", ControlAccess::ReadOnly);
+        let waits: Vec<_> = (0..super::super::MAX_WAITS_PER_CLIENT)
+            .map(|_| spawn_wait(&f, &greedy.token, &workspace, worker))
+            .collect();
+        parked(&f, waits.len(), &waits).await;
+        let ninth = spawn_wait(&f, &greedy.token, &workspace, worker).await.unwrap();
+        assert_eq!(error_code(&ninth), "wait_budget_exhausted", "{ninth}");
+        let polite = issue(&f, "polite-bot", ControlAccess::ReadOnly);
+        let theirs = spawn_wait(&f, &polite.token, &workspace, worker);
+        parked(&f, waits.len() + 1, std::slice::from_ref(&theirs)).await;
+        super::super::agent_connector_revoke_all(f.app.handle().clone()).unwrap();
+        for wait in waits.into_iter().chain([theirs]) {
+            assert_eq!(error_code(&wait.await.unwrap()), "grant_revoked");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revocation_ends_a_parked_wait() {
+        let worker = "revoked-worker";
+        let (f, _provider, _root, workspace) = worker_fixture(worker).await;
+        worker_runs(&f, worker);
+        let bot = issue(&f, "revoked-bot", ControlAccess::ReadOnly);
+        let wait = spawn_wait(&f, &bot.token, &workspace, worker);
+        parked(&f, 1, std::slice::from_ref(&wait)).await;
+        let started = std::time::Instant::now();
+        super::super::agent_connector_revoke(f.app.handle().clone(), bot.client_id.clone()).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(2), wait).await.expect("the wait outlived its grant").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert_eq!(error_code(&ended), "grant_revoked", "{ended}");
+        assert_eq!(free_wait_slots(&f), super::super::MAX_WAITS);
+        // Disabling the connector ends waits too.
+        let bot = issue(&f, "paused-bot", ControlAccess::ReadOnly);
+        let wait = spawn_wait(&f, &bot.token, &workspace, worker);
+        parked(&f, 1, std::slice::from_ref(&wait)).await;
+        configure(f.app.handle(), false, None, None).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(2), wait).await.expect("the wait outlived the switch").unwrap();
+        assert_eq!(error_code(&ended), "connector_disabled", "{ended}");
     }
 
     // ── Protocol versions and envelopes ──────────────────────────────────
