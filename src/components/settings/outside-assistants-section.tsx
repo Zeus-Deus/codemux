@@ -1,29 +1,37 @@
-import { NativeSelect } from "@/components/ui/native-select";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { ExternalLink } from "lucide-react";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
-import { Button } from "@/components/ui/button";
+import { Button, InlineButton } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
-import { useUIStore } from "@/stores/ui-store";
-import { onWebRemoteStateChanged } from "@/remote/web-remote-events";
-import { CopyButton } from "./remote-access-section";
 import {
-  agentConnectorApprove, agentConnectorDeny, agentConnectorRevoke,
-  agentConnectorSetConfig, agentConnectorStatus,
+  agentConnectorApprove, agentConnectorDeny, agentConnectorIssue, agentConnectorRevoke,
+  agentConnectorRevokeAll, agentConnectorSetConfig, agentConnectorStatus,
 } from "@/tauri/commands";
 import { onAgentConnectorChanged, type UnlistenFn } from "@/tauri/events";
-import type { AgentConnectorAccess, AgentConnectorClient, AgentConnectorPending, AgentConnectorStatus } from "@/tauri/types";
+import type { AgentConnectorAccess, AgentConnectorIssuedToken, AgentConnectorStatus } from "@/tauri/types";
+import {
+  CopySetup, GrantedConnection, IssuedTokenCard, LocalSetupList, PendingConnection, RevokeAll, TokenForm,
+} from "./outside-assistant-rows";
+import { expiryTimerDelay, localSetupCommands, tailscaleServeCommand } from "./outside-assistants-setup";
+import { validatePort } from "./remote-access-utils";
+import { SectionHeader, SettingsCard, SubsectionHeader } from "./settings-primitives";
 
-/** Inbound connections are independent of the agent's outbound MCP servers. */
+/** The outside-agent guide, on GitHub until the docs site has the page. */
+export const OUTSIDE_AGENTS_GUIDE_URL = "https://github.com/Zeus-Deus/codemux/blob/main/docs/outside-agents.md";
+
+/** The same rule the backend applies to a personal token's label. */
+const TOKEN_LABEL = /^[A-Za-z0-9][A-Za-z0-9 ._@-]{0,63}$/;
+
+const DESCRIPTION = "Let Claude Code, Codex, Hermes or any MCP client work with Codemux: open workspaces, start threads, wait for their results and read them.";
+
+/** Settings → Connections → Outside assistants: inbound control of Codemux,
+ *  separate from the outbound MCP servers in-app agents use. */
 export function OutsideAssistantsSection() {
   if (isRemoteClient()) {
-    return (
-      <section className="mt-6 border-t border-border/50 pt-6">
-        <h3 className="text-body font-semibold">Outside assistants</h3>
-        <p className="mt-1 text-body-sm text-muted-foreground">Manage connections from the desktop</p>
-      </section>
-    );
+    return <SectionHeader title="Outside assistants" description="Manage connections from the desktop" />;
   }
   return <NativeOutsideAssistantsSection />;
 }
@@ -31,10 +39,17 @@ export function OutsideAssistantsSection() {
 function NativeOutsideAssistantsSection() {
   const [status, setStatus] = useState<AgentConnectorStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [subscriptionError, setSubscriptionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [verified, setVerified] = useState(false);
   const [origin, setOrigin] = useState("");
+  const [portDraft, setPortDraft] = useState("");
+  const [tokenLabel, setTokenLabel] = useState("");
+  const [tokenAccess, setTokenAccess] = useState<AgentConnectorAccess>("supervised");
+  // The one-time token stays in this component's state only: never a store,
+  // event, toast or label. Done and unmount drop it.
+  const [issued, setIssued] = useState<AgentConnectorIssuedToken | null>(null);
   const mounted = useRef(false);
   const generation = useRef(0);
   const mutating = useRef(false);
@@ -73,25 +88,25 @@ function NativeOutsideAssistantsSection() {
 
   useEffect(() => {
     if (!status) return;
-    const expiry = Math.min(...[...status.pending, ...status.clients].map((row) => Date.parse(row.expiresAt)).filter(Number.isFinite));
-    if (!Number.isFinite(expiry)) return;
-    const timer = window.setTimeout(invalidate, Math.max(0, expiry - Date.now()));
+    const delay = expiryTimerDelay([...status.pending, ...status.clients].map((row) => row.expiresAt), Date.now());
+    if (delay === null) return;
+    const timer = window.setTimeout(invalidate, delay);
     return () => window.clearTimeout(timer);
   }, [status, invalidate]);
 
   useEffect(() => {
     mounted.current = true;
     let disposed = false;
-    const unlisten: UnlistenFn[] = [];
+    let unlisten: UnlistenFn | null = null;
     const onChange = () => { if (!disposed) invalidate(); };
-    // Both event streams are invalidation only; never consume their payloads.
-    const subscriptions = [onAgentConnectorChanged(onChange), onWebRemoteStateChanged(onChange)];
-    void Promise.all(subscriptions.map((subscription) => subscription.then((dispose) => {
+    // The event is invalidation only; its payload is never read. The
+    // connector owns its listener, so Remote Access changes don't matter here.
+    void onAgentConnectorChanged(onChange).then((dispose) => {
       if (disposed) { dispose(); return; }
-      unlisten.push(dispose);
+      unlisten = dispose;
     }).catch(() => {
       if (!disposed) setSubscriptionError("Live connection updates are unavailable. Reopen Settings to retry.");
-    }))).then(() => {
+    }).then(() => {
       // Subscribe before reading, so a change cannot fall into a blind gap.
       if (!disposed) void reload();
     });
@@ -102,11 +117,12 @@ function NativeOutsideAssistantsSection() {
       disposed = true; mounted.current = false; fresh.current = false; ++generation.current;
       window.removeEventListener("focus", onChange);
       document.removeEventListener("visibilitychange", onVisible);
-      for (const dispose of unlisten) dispose();
+      unlisten?.();
     };
   }, [reload, invalidate]);
 
-  const mutate = async (action: () => Promise<unknown>, failure: string, afterWrite?: () => void) => {
+  /** Write, then trust only an authoritative read-back. */
+  const mutate = async <T,>(action: () => Promise<T>, failure: string, afterWrite?: (result: T) => void) => {
     if (!status || !fresh.current || mutating.current) return;
     if ([...status.pending, ...status.clients].some((row) => Date.parse(row.expiresAt) <= Date.now())) {
       invalidate();
@@ -118,9 +134,10 @@ function NativeOutsideAssistantsSection() {
     fresh.current = false;
     setVerified(false);
     setError(null);
+    setNotice(null);
     try {
-      await action();
-      if (mounted.current) afterWrite?.();
+      const result = await action();
+      if (mounted.current) afterWrite?.(result);
     } catch {
       if (mounted.current) setError(failure);
     } finally {
@@ -135,10 +152,17 @@ function NativeOutsideAssistantsSection() {
     }
   };
 
-  const updateConfig = (enabled: boolean, publicOrigin: string | null, savedOrigin = false) => mutate(
-    () => agentConnectorSetConfig({ enabled, publicOrigin }),
-    "Unable to update HTTP connections. Check your desktop configuration and retry.",
-    () => { if (savedOrigin) originEdited.current = false; },
+  const updateConfig = (config: { enabled: boolean; publicOrigin: string | null; port?: number }, savedOrigin = false) => mutate(
+    () => agentConnectorSetConfig(config),
+    "Unable to update network connections. Check your desktop configuration and retry.",
+    (written) => {
+      if (savedOrigin) originEdited.current = false;
+      if (config.port !== undefined) setPortDraft("");
+      const revoked = written.revokedGrants ?? 0;
+      if (revoked > 0) {
+        setNotice(`The address changed, so ${revoked === 1 ? "1 assistant was" : `${revoked} assistants were`} signed out. ${revoked === 1 ? "It needs" : "They need"} to connect again.`);
+      }
+    },
   );
 
   const saveOrigin = () => {
@@ -147,147 +171,159 @@ function NativeOutsideAssistantsSection() {
       setError("Use an HTTPS origin only — no credentials, path, query or fragment.");
       return;
     }
-    void updateConfig(status.enabled, origin || null, true);
+    void updateConfig({ enabled: status.enabled, publicOrigin: origin || null }, true);
   };
+
+  const savePort = () => {
+    if (!status) return;
+    const port = validatePort(portDraft);
+    if (port.value === null) {
+      setError(port.error ?? "Use a port between 1024 and 65535.");
+      return;
+    }
+    void updateConfig({ enabled: status.enabled, publicOrigin: status.publicOrigin, port: port.value });
+  };
+
+  const createToken = () => {
+    const label = tokenLabel.trim();
+    if (!TOKEN_LABEL.test(label)) {
+      setError("Use a token label of up to 64 letters, digits, spaces or . _ @ -, starting with a letter or digit.");
+      return;
+    }
+    void mutate(
+      () => agentConnectorIssue({ label, access: tokenAccess }),
+      "Unable to create a token. Refresh and retry.",
+      (token) => { setIssued(token); setTokenLabel(""); },
+    );
+  };
+
   const locked = busy || !verified;
+  const localRows = status ? localSetupCommands(status.localExecutable || "codemux") : [];
+  const showAccess = !!status && (status.enabled || status.pending.length > 0 || status.clients.length > 0);
   return (
-    <section aria-labelledby="outside-assistants-heading" className="mt-6 border-t border-border/50 pt-6">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h3 id="outside-assistants-heading" className="text-body font-semibold">Outside assistants</h3>
-          <p className="mt-1 text-body-sm text-muted-foreground">Let another assistant use CodeMux tools. Separate from the MCP servers used by in-app agents.</p>
-        </div>
-        <Button variant="ghost" size="sm" disabled={busy} aria-label="Refresh outside assistants" onClick={() => { setError(null); void reload(); }}>Refresh</Button>
-      </div>
-      {error && <p role="alert" className="mt-3 text-label text-destructive">{error}</p>}
-      {subscriptionError && <p role="alert" className="mt-3 text-label text-destructive">{subscriptionError}</p>}
+    <div>
+      <SectionHeader
+        title="Outside assistants"
+        description={<>{DESCRIPTION}{" "}<InlineButton tone="muted" onClick={() => void openUrl(OUTSIDE_AGENTS_GUIDE_URL).catch(console.error)}>Setup guide<ExternalLink className="size-3" aria-hidden /></InlineButton></>}
+        action={<Button variant="ghost" size="sm" disabled={busy} aria-label="Refresh outside assistants" onClick={() => { setError(null); void reload(); }}>Refresh</Button>}
+      />
+      {error && <p role="alert" className="mb-3 text-label text-destructive">{error}</p>}
+      {subscriptionError && <p role="alert" className="mb-3 text-label text-destructive">{subscriptionError}</p>}
       {!status ? (
-        !error && <p className="mt-3 flex items-center gap-2 text-body-sm text-muted-foreground"><Spinner className="size-3.5" aria-hidden />Loading connections…</p>
+        !error && <p className="flex items-center gap-2 text-body-sm text-muted-foreground"><Spinner className="size-3.5" aria-hidden />Loading connections…</p>
       ) : (
-        <div className="mt-3 divide-y divide-border/40 rounded-md border border-border/50">
-          <div className="space-y-1.5 p-3">
-            <p className="text-body-sm font-medium">Local assistant · STDIO</p>
-            <CopySetup key={status.localCommand} value={status.localCommand} label="Copy local command" />
-            <p className="text-label text-muted-foreground">Use this command in a local MCP client. No HTTP listener needed.</p>
+        <div className="space-y-8">
+          <div>
+            <SubsectionHeader title="On this computer" description="Works while Codemux is open. Paste one command into a terminal." />
+            <LocalSetupList rows={localRows} />
+            <p className="mt-2 text-label leading-relaxed text-muted-foreground">
+              These run with your own access; <code className="font-mono">--client</code> only names the assistant on the messages it sends.
+              Hermes starts as Supervised because it relays chat messages: it can start and message threads, but approvals stay with you.
+            </p>
           </div>
-          <div className="space-y-3 p-3">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <p className="text-body-sm font-medium">HTTP MCP connections</p>
-                <p className="mt-0.5 text-label text-muted-foreground">{status.enabled ? "Enabled" : "Off"} · Uses the existing Remote Access listener; never starts or exposes it automatically.</p>
-              </div>
-              <Switch aria-label="Enable HTTP MCP connections" checked={status.enabled} disabled={locked} onCheckedChange={(enabled) => void updateConfig(enabled, status.publicOrigin)} />
-            </div>
-            {!verified && <p role="status" className="text-label text-muted-foreground">{busy ? "Verifying changes…" : "Checking current state…"} Showing last verified settings.</p>}
-            {!status.listenerRunning && (
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-label text-muted-foreground">Remote Access listener is offline. Enable its HTTP listener to accept connections.</p>
-                <Button variant="outline" size="sm" onClick={() => useUIStore.getState().setShowSettings(true, "remote_access")}>Open Remote Access</Button>
-              </div>
+
+          <div>
+            <SubsectionHeader
+              title="Over the network"
+              description="For an assistant on another device, or one that signs in over HTTP."
+              action={<Switch aria-label="Allow network connections" checked={status.enabled} disabled={locked}
+                onCheckedChange={(enabled) => void updateConfig({ enabled, publicOrigin: status.publicOrigin })} />}
+            />
+            {!verified && <p role="status" className="mb-2 text-label text-muted-foreground">{busy ? "Verifying changes…" : "Checking current state…"} Showing last verified settings.</p>}
+            {notice && <p role="status" className="mb-2 text-label text-foreground">{notice}</p>}
+            {!status.enabled ? (
+              <p className="text-label text-muted-foreground">Off. Nothing listens for network connections, and assistants with access can’t connect.</p>
+            ) : status.bindError ? (
+              <SettingsCard className="space-y-3">
+                <div>
+                  <p className="text-body-sm font-medium text-destructive">Couldn’t listen on port {status.port}</p>
+                  <p className="break-all text-label text-muted-foreground">{status.bindError}</p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Input aria-label="Port" inputMode="numeric" className="w-28 font-mono" placeholder={String(status.port)} value={portDraft} disabled={locked}
+                    onChange={(event) => setPortDraft(event.target.value)}
+                    onKeyDown={(event) => { if (event.key === "Enter") savePort(); }} />
+                  <Button variant="outline" disabled={locked || portDraft.trim() === ""} onClick={savePort}>Use port</Button>
+                  <Button variant="ghost" disabled={locked} onClick={() => void updateConfig({ enabled: true, publicOrigin: status.publicOrigin })}>Retry</Button>
+                </div>
+                <p className="text-label text-muted-foreground">Free the port and retry, or pick another one. A new port signs out every assistant that has access.</p>
+              </SettingsCard>
+            ) : !status.listenerRunning ? (
+              <p className="flex items-center gap-2 text-label text-muted-foreground"><Spinner className="size-3.5" aria-hidden />Starting…</p>
+            ) : (
+              <SettingsCard className="space-y-3">
+                <p className="flex items-center gap-2 text-body-sm text-foreground">
+                  <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-status-open" />
+                  Listening on this computer, port {status.port}
+                </p>
+                {status.publicOrigin && status.mcpUrl ? (
+                  <div className="space-y-1.5">
+                    {verified && <CopySetup key={status.mcpUrl} value={status.mcpUrl} label="Copy MCP URL" />}
+                    <p className="text-label leading-relaxed text-muted-foreground">
+                      Other devices use this address. Point your HTTPS proxy at{" "}
+                      <code className="break-all font-mono text-foreground/90">{status.localUrl}</code>; Codemux doesn’t check the proxy.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-1.5">
+                    {verified && status.localUrl && <CopySetup key={status.localUrl} value={status.localUrl} label="Copy local MCP URL" />}
+                    <p className="text-label text-muted-foreground">Only this computer can reach this address. To connect from another device, serve it over HTTPS, for example with Tailscale:</p>
+                    <CopySetup key={status.port} value={tailscaleServeCommand(status.port)} label="Copy Tailscale command" />
+                    <p className="text-label text-muted-foreground">then save the HTTPS address here.</p>
+                  </div>
+                )}
+                <div className="space-y-1.5">
+                  <label htmlFor="connector-public-origin" className="text-label font-medium">Public HTTPS origin</label>
+                  <div className="flex items-center gap-2">
+                    <Input id="connector-public-origin" value={origin} placeholder="https://codemux.example.com" disabled={locked} onChange={(e) => { originEdited.current = true; setOrigin(e.target.value); }} aria-describedby="connector-origin-help" />
+                    <Button variant="outline" disabled={locked} onClick={saveOrigin}>Save origin</Button>
+                  </div>
+                  <p id="connector-origin-help" className="text-label leading-relaxed text-muted-foreground">Leave it blank to use this computer only. Changing it signs out every assistant that has access.</p>
+                </div>
+                <p className="text-label text-muted-foreground">Assistants that support OAuth sign in with this URL; approve them below. Bots that can’t sign in can use a token.</p>
+              </SettingsCard>
             )}
-            {verified && status.enabled && status.listenerRunning && status.mcpUrl && <CopySetup key={status.mcpUrl} value={status.mcpUrl} label="Copy MCP URL" />}
-            <p className="text-label text-muted-foreground">Add the MCP URL in your assistant, start its OAuth connection, approve the request here on this desktop, then press Continue in the authorization browser.</p>
-            <div className="space-y-1.5">
-              <label htmlFor="connector-public-origin" className="text-label font-medium">Public HTTPS origin</label>
-              <div className="flex items-center gap-2">
-                <Input id="connector-public-origin" value={origin} placeholder="https://codemux.example.com" disabled={locked} onChange={(e) => { originEdited.current = true; setOrigin(e.target.value); }} aria-describedby="connector-origin-help" />
-                <Button variant="outline" size="sm" disabled={locked} onClick={saveOrigin}>Save origin</Button>
-              </div>
-              <p id="connector-origin-help" className="text-label leading-relaxed text-muted-foreground">Hosted assistants need a reachable HTTPS reverse proxy to this listener. Saving an origin does not set up or verify the proxy. The iroh relay does not support hosted HTTP MCP. Leave blank for local HTTP only.</p>
-            </div>
           </div>
-          {status.pending.length > 0 && (
-            <div className="space-y-3 p-3">
-              <h4 className="text-body-sm font-medium">Authorization requests</h4>
-              {status.pending.map((request) => (
-                <PendingConnection key={request.id} request={request} locked={locked} canApprove={status.enabled && status.listenerRunning}
-                  onApprove={(access) => void mutate(() => agentConnectorApprove(request.id, access), "Unable to approve this request. Refresh and retry.")}
-                  onDeny={() => void mutate(() => agentConnectorDeny(request.id), "Unable to deny this request. Refresh and retry.")} />
-              ))}
+
+          {showAccess && (
+            <div>
+              <SubsectionHeader title="Assistants with access"
+                action={status.clients.length > 0 ? <RevokeAll locked={locked}
+                  onRevokeAll={() => void mutate(() => agentConnectorRevokeAll(), "Unable to revoke access. Refresh and retry.")} /> : undefined} />
+              {!status.enabled && status.clients.length > 0 && (
+                <p className="mb-2 text-label text-muted-foreground">Network connections are off, so these can’t connect until you turn them back on.</p>
+              )}
+              <SettingsCard className="p-0">
+                {status.pending.length === 0 && status.clients.length === 0 ? (
+                  <p className="px-4 py-3 text-body-sm text-muted-foreground/80">No assistants have network access yet.</p>
+                ) : (
+                  <ul className="divide-y divide-border/40">
+                    {status.pending.map((request) => (
+                      <PendingConnection key={request.id} request={request} locked={locked} canApprove={status.enabled && status.listenerRunning}
+                        onApprove={(access) => void mutate(() => agentConnectorApprove(request.id, access), "Unable to approve this request. Refresh and retry.")}
+                        onDeny={() => void mutate(() => agentConnectorDeny(request.id), "Unable to deny this request. Refresh and retry.")} />
+                    ))}
+                    {status.clients.map((client) => (
+                      <GrantedConnection key={client.id} client={client} locked={locked}
+                        onRevoke={() => void mutate(() => agentConnectorRevoke(client.id), "Unable to revoke access. Refresh and retry.")} />
+                    ))}
+                  </ul>
+                )}
+              </SettingsCard>
+              {/* A token issued while the listener is down would be signed out by the port change that fixes it. */}
+              {status.enabled && status.listenerRunning && (
+                <div className="mt-3">
+                  <TokenForm label={tokenLabel} access={tokenAccess} locked={locked}
+                    onLabelChange={setTokenLabel} onAccessChange={setTokenAccess} onCreate={createToken} />
+                </div>
+              )}
+              {issued && <div className="mt-3"><IssuedTokenCard issued={issued} onDone={() => setIssued(null)} /></div>}
             </div>
           )}
-          <div className="space-y-3 p-3">
-            <h4 className="text-body-sm font-medium">Approved assistants</h4>
-            {status.clients.length === 0 ? <p className="text-label text-muted-foreground">No approved assistants.</p> : status.clients.map((client) => (
-              <GrantedConnection key={client.id} client={client} locked={locked}
-                onRevoke={() => void mutate(() => agentConnectorRevoke(client.id), "Unable to revoke access. Refresh and retry.")} />
-            ))}
-          </div>
         </div>
       )}
-    </section>
-  );
-}
-
-const ACCESS_LABELS: Record<AgentConnectorAccess, string> = {
-  read_only: "Read-only", supervised: "Supervised", full_access: "Full access",
-};
-
-function PendingConnection({ request, locked, canApprove, onApprove, onDeny }: {
-  request: AgentConnectorPending; locked: boolean; canApprove: boolean;
-  onApprove: (access: AgentConnectorAccess) => void; onDeny: () => void;
-}) {
-  const [selectedAccess, setAccess] = useState<AgentConnectorAccess>("read_only");
-  const undecided = request.phase === "awaiting_approval";
-  const access = request.phase === "approved_awaiting_client" ? request.access : selectedAccess;
-  return (
-    <div className="space-y-2" role="group" aria-label={`Connection request from ${request.clientName}`}>
-      <div>
-        <p className="break-all text-body-sm font-medium">{request.clientName}</p>
-        <p className="break-all text-label text-muted-foreground">Registered callback origin: {request.callbackOrigin}</p>
-        <p className="text-label text-muted-foreground">Client name and callback origin are self-asserted, not proof of identity.</p>
-        <p className="text-caption text-muted-foreground">Requested {displayDate(request.requestedAt)}</p>
-      </div>
-      <p className="text-label text-muted-foreground">Applies to all CodeMux workspaces and visible conversations, not just this project.</p>
-      <p className="text-label text-muted-foreground">Conversation reads include visible user and top-level assistant messages, not reasoning or tool payloads.</p>
-      {request.phase !== "denied" && <p className={access === "full_access" ? "text-label text-destructive" : "text-label text-muted-foreground"}>
-        {access === "read_only" ? "Can read workspace state and visible conversations; cannot launch workers, send messages or change state." : access === "supervised"
-          ? "Can start workers and send messages in supervised modes; some modes allow file edits. You handle approval requests in CodeMux; the assistant cannot approve its own requests."
-          : "Warning: Full access can run commands and change files with your account’s permissions, not a project-confined sandbox. Approve only an assistant you trust."}
-      </p>}
-      {request.phase === "approved_awaiting_client" && <div className="space-y-1">
-        <p className="text-label font-medium">Approved · {ACCESS_LABELS[request.access]} · waiting for the assistant</p>
-        <p className="text-label text-muted-foreground">Press Continue in the authorization browser, then let the assistant finish connecting. Access is not granted until its token exchange completes.</p>
-      </div>}
-      {request.phase === "denied" && <p className="text-label text-muted-foreground">Denied · no access was granted. The request will clear when the browser continues or it expires.</p>}
-      {undecided && <div className="flex flex-wrap items-center gap-2">
-        <NativeSelect size="sm" className="w-auto" aria-label={`Access for ${request.clientName}`} value={access} disabled={locked}
-          onChange={(event) => setAccess(event.target.value as AgentConnectorAccess)}>
-          {Object.entries(ACCESS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-        </NativeSelect>
-        <Button variant="outline" size="sm" disabled={locked || !canApprove} onClick={() => onApprove(access)}>Approve</Button>
-        <Button variant="ghost" size="sm" disabled={locked} onClick={onDeny}>Deny</Button>
-      </div>}
     </div>
   );
-}
-
-function GrantedConnection({ client, locked, onRevoke }: {
-  client: AgentConnectorClient; locked: boolean; onRevoke: () => void;
-}) {
-  const [confirm, setConfirm] = useState(false);
-  return (
-    <div role="group" aria-label={`Approved assistant ${client.clientName}`} className="space-y-2">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <p className="break-all text-body-sm font-medium">{client.clientName}</p>
-          <p className="break-all text-label text-muted-foreground">{client.callbackOrigin} · {ACCESS_LABELS[client.access]}</p>
-          <p className="text-caption text-muted-foreground">Approved {displayDate(client.createdAt)} · Expires {displayDate(client.expiresAt)}</p>
-        </div>
-        {!confirm && <Button variant="ghost" size="sm" disabled={locked} onClick={() => setConfirm(true)}>Revoke</Button>}
-      </div>
-      {confirm && <div className="flex flex-wrap items-center gap-2">
-        <p className="flex-1 text-label">Revoke this assistant’s access? It will need approval to reconnect.</p>
-        <Button variant="ghost" size="sm" disabled={locked} onClick={() => setConfirm(false)}>Cancel</Button>
-        <Button variant="destructive" size="sm" disabled={locked} onClick={onRevoke}>Revoke access</Button>
-      </div>}
-    </div>
-  );
-}
-
-function displayDate(value: string): string {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "Unknown" : date.toLocaleString();
 }
 
 function isHttpsOrigin(value: string): boolean {
@@ -297,13 +333,4 @@ function isHttpsOrigin(value: string): boolean {
     const url = new URL(value);
     return url.protocol === "https:" && !!url.hostname && !url.username && !url.password && url.pathname === "/" && !url.search && !url.hash;
   } catch { return false; }
-}
-
-function CopySetup({ value, label }: { value: string; label: string }) {
-  return (
-    <div className="flex items-center gap-2">
-      <code className="min-w-0 flex-1 select-text break-all rounded-md bg-muted/40 px-2 py-1.5 font-mono text-label">{value}</code>
-      <CopyButton text={value} label={label} />
-    </div>
-  );
 }

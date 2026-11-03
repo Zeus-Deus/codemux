@@ -214,6 +214,7 @@ import { SettingsNavSearch, revealSettingsAnchor } from "./settings-search";
 import type { SettingsSearchResult } from "@/lib/settings-search";
 import { RemoteAccessSection } from "./remote-access-section";
 import { McpSection } from "./mcp-section";
+import { OutsideAssistantsSection } from "./outside-assistants-section";
 import { PermissionsSection } from "./permissions-section";
 import { UsageSection } from "./usage-section";
 import { SkillsSection } from "./skills-section";
@@ -2766,6 +2767,9 @@ export function SettingsView() {
 
       case "remote_access":
         return <RemoteAccessSection />;
+
+      case "outside_assistants":
+        return <OutsideAssistantsSection />;
 
       case "updates":
         return <UpdatesSection />;

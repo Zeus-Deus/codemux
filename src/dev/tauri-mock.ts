@@ -4409,7 +4409,6 @@ function buildWebRemoteStatus(): WebRemoteStatus {
 
 function emitWebRemoteState(): void {
   emitEvent("web-remote-state-changed", buildWebRemoteStatus());
-  emitEvent("agent-connector-changed", null);
 }
 
 // Console/automation hooks: inject devices so the live "device wants to
@@ -4799,13 +4798,29 @@ function markMockHostInstalled(id: number): void {
 
 const customAcpMock = createCustomAcpMock(emitEvent);
 
-const agentConnectorMock = createAgentConnectorMock(
-  () => ({ running: webRemoteLanRunning(), port: webRemotePort }),
-  () => emitEvent("agent-connector-changed", null),
-);
+const agentConnectorMock = createAgentConnectorMock(() => emitEvent("agent-connector-changed", null));
 
 // Dev-only console hook for the outside-assistant approval screenshots.
 (window as unknown as { __codemuxAgentConnectorMock: typeof agentConnectorMock }).__codemuxAgentConnectorMock = agentConnectorMock;
+
+// `?fixture=outside-assistants`: network connections on behind a saved HTTPS
+// origin, with one signed-in assistant, one bot token and one request
+// waiting for approval. `?fixture=outside-assistants-failed`: the listener
+// could not bind its port. Synthetic names and hosts only.
+const outsideAssistantsFixture = new URLSearchParams(window.location.search).get("fixture");
+if (outsideAssistantsFixture === "outside-assistants") {
+  const { handlers } = agentConnectorMock;
+  handlers.agent_connector_set_config({ enabled: true, publicOrigin: "https://studio.example.ts.net" });
+  const signIn = agentConnectorMock.addPendingClient("Claude Code", "https://claude-code.example.test");
+  handlers.agent_connector_approve({ requestId: signIn, access: "read_only" });
+  agentConnectorMock.continuePendingClient(signIn);
+  agentConnectorMock.exchangePendingClient(signIn);
+  handlers.agent_connector_issue({ label: "hermes-bot", access: "supervised" });
+  agentConnectorMock.addPendingClient("Example assistant");
+} else if (outsideAssistantsFixture === "outside-assistants-failed") {
+  agentConnectorMock.handlers.agent_connector_set_config({ enabled: true, publicOrigin: null });
+  agentConnectorMock.failListener("bind 127.0.0.1:4378: Address already in use");
+}
 
 /** Live mock side chats and their pending stream timers. */
 const mockSideChats = new Map<string, { timers: number[] }>();

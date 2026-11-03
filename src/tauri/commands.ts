@@ -103,11 +103,29 @@ async function invokeAgentConnector<T>(command: string, args?: Record<string, un
 export const agentConnectorStatus = () =>
   invokeAgentConnector<import("./types").AgentConnectorStatus>("agent_connector_status");
 
-export const agentConnectorSetConfig = (config: { enabled: boolean; publicOrigin: string | null }) =>
+/** `port` is sent only when given, so the backend keeps the configured one. */
+export const agentConnectorSetConfig = (config: { enabled: boolean; publicOrigin: string | null; port?: number }) =>
   invokeAgentConnector<import("./types").AgentConnectorStatus>("agent_connector_set_config", {
     enabled: config.enabled,
     publicOrigin: config.publicOrigin,
+    ...(config.port === undefined ? {} : { port: config.port }),
   });
+
+/** Issue (or, for a label already in use, rotate) a personal token. */
+export const agentConnectorIssue = (request: {
+  label: string;
+  access: import("./types").AgentConnectorAccess;
+  expiresInHours?: number;
+}) =>
+  invokeAgentConnector<import("./types").AgentConnectorIssuedToken>("agent_connector_issue", {
+    label: request.label,
+    access: request.access,
+    ...(request.expiresInHours === undefined ? {} : { expiresInHours: request.expiresInHours }),
+  });
+
+/** Revoke every network grant: OAuth sign-ins and personal tokens. */
+export const agentConnectorRevokeAll = () =>
+  invokeAgentConnector<void>("agent_connector_revoke_all");
 
 export const agentConnectorApprove = (requestId: string, access: import("./types").AgentConnectorAccess) =>
   invokeAgentConnector<void>("agent_connector_approve", { requestId, access });
