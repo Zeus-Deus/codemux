@@ -304,6 +304,16 @@ fn mcp_supervised_client_sees_no_admin_tools_and_is_refused_them() {
     }
     let refused = read_only.call("notify", json!({"message": "x"}));
     assert!(refused["content"][0]["text"].as_str().unwrap().starts_with("access_denied: "), "{refused}");
+    // Outside stdio relays registry tools without a local access check, so
+    // the app's gate on the access this client carries is what refuses a
+    // write. It runs before the target checks: a client the app took for full
+    // access would get `workspace_not_found` here, as the supervised one does.
+    let send = json!({"workspace_id": "none", "thread_id": "t", "client_request_id": "k", "message": "x"});
+    let denied = read_only.call("thread_send", send.clone());
+    assert_eq!(denied["isError"], true, "{denied}");
+    assert_eq!(denied["structuredContent"]["error"]["code"], "access_denied", "{denied}");
+    let reached = supervised.call("thread_send", send);
+    assert_eq!(reached["structuredContent"]["error"]["code"], "workspace_not_found", "{reached}");
 }
 
 /// `get_app_state`'s focused workspace id.
