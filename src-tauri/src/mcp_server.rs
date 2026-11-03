@@ -5,9 +5,11 @@ use crate::mcp::protocol::{
     self, CallToolParams, ClientInfo, InitializeRequest, InitializeResult, Request, RpcError, ServerInfo,
 };
 use futures_util::future::BoxFuture;
+use futures_util::FutureExt;
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
@@ -1158,13 +1160,21 @@ impl LegacyLane {
     fn spawn(run: RunTool) -> Self {
         let (jobs, mut queue) = mpsc::unbounded_channel::<LegacyJob>();
         tokio::spawn(async move {
-            while let Some(LegacyJob { call, mut reply }) = queue.recv().await {
-                // A cancelled request is skipped, or abandoned mid-run.
-                let result = tokio::select! {
-                    biased;
-                    () = reply.closed() => continue,
-                    result = run(call) => result,
-                };
+            while let Some(LegacyJob { call, reply }) = queue.recv().await {
+                // A request cancelled while queued is skipped. One cancelled
+                // while running still runs to the end: dropping it would not
+                // stop its `git` child or the app-side handler, so the next
+                // job would overlap it.
+                if reply.is_closed() {
+                    continue;
+                }
+                let name = call.name.clone();
+                // A panicking tool must not end the lane: every later legacy
+                // call would fail while the process still looks healthy.
+                let result = AssertUnwindSafe(async { run(call).await })
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| protocol::error_result(format!("{name} failed unexpectedly")));
                 let _ = reply.send(result);
             }
         });
@@ -1172,7 +1182,8 @@ impl LegacyLane {
     }
 
     /// Queues `call` at once, so jobs run in the order `submit` is called.
-    /// Dropping the returned future cancels the job.
+    /// Dropping the returned future before the job starts skips it; once it
+    /// has started, it finishes and its result is discarded.
     fn submit(&self, call: CallToolParams) -> BoxFuture<'static, Result<Value, RpcError>> {
         let (reply, result) = oneshot::channel();
         // A failed send drops `reply`, so the receiver reports it below.
@@ -2772,23 +2783,49 @@ mod tests {
         }
     }
 
-    /// A runner for routing tests: `git_status` waits for `gate`, everything
-    /// else finishes at once; each call's name is logged when it starts.
-    fn gated_server() -> (StdioServer, Arc<tokio::sync::Notify>, Arc<Mutex<Vec<String>>>) {
+    /// A server for routing tests whose runner logs each call's name when it
+    /// starts and when it finishes.
+    struct Gated {
+        server: StdioServer,
+        /// `git_status` waits for this.
+        gate: Arc<tokio::sync::Notify>,
+        started: Arc<Mutex<Vec<String>>>,
+        finished: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// `git_status` waits for the gate, `boom` panics, everything else
+    /// finishes at once.
+    fn gated_server() -> Gated {
         let gate = Arc::new(tokio::sync::Notify::new());
         let started = Arc::new(Mutex::new(Vec::new()));
-        let (gate_for_run, started_for_run) = (Arc::clone(&gate), Arc::clone(&started));
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let (gate_for_run, started_for_run, finished_for_run) =
+            (Arc::clone(&gate), Arc::clone(&started), Arc::clone(&finished));
         let server = StdioServer::with_runner(McpServerOptions::default(), Arc::new(move |call: CallToolParams| -> BoxFuture<'static, Value> {
-            let (gate, started) = (Arc::clone(&gate_for_run), Arc::clone(&started_for_run));
+            let (gate, started, finished) =
+                (Arc::clone(&gate_for_run), Arc::clone(&started_for_run), Arc::clone(&finished_for_run));
             Box::pin(async move {
                 started.lock().unwrap().push(call.name.clone());
-                if call.name == "git_status" {
-                    gate.notified().await;
+                match call.name.as_str() {
+                    "git_status" => gate.notified().await,
+                    "boom" => panic!("tool bug"),
+                    _ => {}
                 }
+                finished.lock().unwrap().push(call.name.clone());
                 protocol::text_result(call.name)
             })
         }));
-        (server, gate, started)
+        Gated { server, gate, started, finished }
+    }
+
+    /// Lets other tasks run until `done` holds, for at most 2 s.
+    async fn until(done: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -2831,15 +2868,10 @@ mod tests {
 
     #[tokio::test]
     async fn registry_tools_bypass_the_legacy_lane() {
-        let (server, gate, started) = gated_server();
+        let Gated { server, gate, started, .. } = gated_server();
         let (legacy, legacy_parks) = later(server.request(request(1, "git_status", json!({}))));
         // Let the lane pick the legacy job up; it then blocks on the gate.
-        for _ in 0..200 {
-            if !started.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        until(|| !started.lock().unwrap().is_empty()).await;
         assert_eq!(*started.lock().unwrap(), ["git_status"]);
         let (status, status_parks) = later(server.request(request(2, "thread_status", json!({}))));
         let (_, wait_parks) = later(server.request(request(3, "thread_wait", json!({}))));
@@ -2854,7 +2886,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_legacy_job_is_skipped() {
-        let (server, gate, started) = gated_server();
+        let Gated { server, gate, started, .. } = gated_server();
         let (first, _) = later(server.request(request(1, "git_status", json!({}))));
         let (second, _) = later(server.request(request(2, "pane_list", json!({}))));
         drop(second);
@@ -2863,6 +2895,32 @@ mod tests {
         let (third, _) = later(server.request(request(3, "notify", json!({}))));
         assert_eq!(third.await.unwrap()["content"][0]["text"], "notify");
         assert_eq!(*started.lock().unwrap(), ["git_status", "notify"], "the cancelled job never ran");
+    }
+
+    #[tokio::test]
+    async fn cancelled_running_legacy_job_finishes_before_the_next_starts() {
+        let Gated { server, gate, started, finished } = gated_server();
+        let (first, _) = later(server.request(request(1, "git_status", json!({}))));
+        until(|| !started.lock().unwrap().is_empty()).await;
+        // Cancel it mid-run, then queue the next job.
+        drop(first);
+        let (second, _) = later(server.request(request(2, "pane_list", json!({}))));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*started.lock().unwrap(), ["git_status"], "the next job waits for the cancelled one");
+        gate.notify_one();
+        assert_eq!(second.await.unwrap()["content"][0]["text"], "pane_list");
+        assert_eq!(*finished.lock().unwrap(), ["git_status", "pane_list"], "the cancelled job ran to the end first");
+    }
+
+    #[tokio::test]
+    async fn legacy_lane_survives_a_panicking_tool() {
+        let Gated { server, .. } = gated_server();
+        let (boom, _) = later(server.request(request(1, "boom", json!({}))));
+        let result = boom.await.expect("a panic is a tool error, not a JSON-RPC error");
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"][0]["text"], "boom failed unexpectedly");
+        let (next, _) = later(server.request(request(2, "pane_list", json!({}))));
+        assert_eq!(next.await.unwrap()["content"][0]["text"], "pane_list");
     }
 
     async fn call_html_render(arguments: Value) -> Value {
