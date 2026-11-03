@@ -252,6 +252,21 @@ pub fn credential_hash(value: &str) -> String {
     ))
 }
 
+/// Bearer access tokens: OAuth access tokens and personal tokens share this
+/// format, so one bearer check covers both.
+pub const ACCESS_PREFIX: &str = "cmcp_";
+/// Refresh tokens get their own prefix so neither kind can stand in for the other.
+pub const REFRESH_PREFIX: &str = "cmcr_";
+
+/// A fresh plaintext access token. Store only its `credential_hash`.
+pub fn access_token() -> String {
+    format!("{ACCESS_PREFIX}{}", opaque())
+}
+/// A fresh plaintext refresh token. Store only its `credential_hash`.
+pub fn refresh_token() -> String {
+    format!("{REFRESH_PREFIX}{}", opaque())
+}
+
 use std::collections::HashMap;
 
 pub const PENDING_TTL_MS: i64 = 300_000;
@@ -303,6 +318,59 @@ pub struct TokenInput {
     pub redirect_uri: String,
     pub resource: String,
     pub code_verifier: String,
+}
+
+/// A `grant_type=refresh_token` request. Strict like `TokenInput`: code-grant
+/// fields such as `code` or `code_verifier` are rejected, never ignored.
+/// No `Debug`, so the presented token cannot reach a log line.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshInput {
+    pub grant_type: String,
+    pub client_id: String,
+    pub refresh_token: String,
+    pub resource: Option<String>,
+    pub scope: Option<String>,
+}
+
+impl RefreshInput {
+    /// Checks the request shape against the canonical `resource` and returns the
+    /// presented token's hash for the store lookup. Never echoes the token.
+    /// Errors are OAuth error codes for a 400 response. Client and grant binding
+    /// are checked by the store, inside the rotation transaction.
+    pub fn validate(&self, resource: &str) -> Result<String, &'static str> {
+        if self.grant_type != "refresh_token" {
+            return Err("unsupported_grant_type");
+        }
+        if self.client_id.is_empty()
+            || self.client_id.len() > 128
+            || self.client_id.chars().any(char::is_control)
+        {
+            return Err("invalid_request");
+        }
+        if !self
+            .refresh_token
+            .strip_prefix(REFRESH_PREFIX)
+            .is_some_and(challenge_valid)
+        {
+            return Err("invalid_grant");
+        }
+        // RFC 8707 makes `resource` optional on refresh; when sent it must
+        // name this server. The grant keeps its own binding either way.
+        if self.resource.as_deref().is_some_and(|r| r != resource) {
+            return Err("invalid_grant");
+        }
+        // Narrowing is not supported: the response always carries the grant's
+        // own scope, so a requested scope only has to be one we know.
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(|s| s.len() > 256 || s.split_whitespace().any(|v| !SCOPES.contains(&v)))
+        {
+            return Err("invalid_scope");
+        }
+        Ok(credential_hash(&self.refresh_token))
+    }
 }
 
 #[derive(Default)]
@@ -1083,6 +1151,105 @@ mod tests {
             .exchange::<()>(&t, &t.resource, 3, |_| Err("store failed".into()))
             .is_err());
         assert!(s.exchange(&t, &t.resource, 3, |_| Ok(())).is_ok());
+    }
+    #[test]
+    fn token_generators_use_distinct_prefixes_and_opaque_bodies() {
+        let (access, refresh) = (access_token(), refresh_token());
+        assert!(access
+            .strip_prefix(ACCESS_PREFIX)
+            .is_some_and(challenge_valid));
+        assert!(refresh
+            .strip_prefix(REFRESH_PREFIX)
+            .is_some_and(challenge_valid));
+        assert!(!access.starts_with(REFRESH_PREFIX) && !refresh.starts_with(ACCESS_PREFIX));
+        assert_ne!(access_token(), access);
+        assert_ne!(refresh_token(), refresh);
+    }
+    #[test]
+    fn refresh_input_is_strict_and_never_accepts_code_fields() {
+        let resource = "https://mcp.example/mcp";
+        let token = refresh_token();
+        let form = |extra: &str| {
+            let body = format!(
+                "grant_type=refresh_token&client_id=registered&refresh_token={token}{extra}"
+            );
+            serde_json::from_value::<RefreshInput>(protocol::form_json(body.as_bytes()).unwrap())
+        };
+        let hash = form("").unwrap().validate(resource).unwrap();
+        assert_eq!(hash, credential_hash(&token));
+        assert!(!hash.contains(token.strip_prefix(REFRESH_PREFIX).unwrap()));
+        // Code-grant fields and any other extra are refused when parsed.
+        for extra in [
+            "&code=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            "&redirect_uri=https%3A%2F%2Fclient.example%2Fcb",
+            "&client_secret=secret",
+            "&access=full_access",
+        ] {
+            assert!(form(extra).is_err(), "accepted {extra}");
+        }
+        assert!(serde_json::from_value::<RefreshInput>(
+            protocol::form_json(b"grant_type=refresh_token&client_id=registered").unwrap()
+        )
+        .is_err());
+        // Resource and scope are optional; when sent they must match.
+        assert!(form(
+            "&resource=https%3A%2F%2Fmcp.example%2Fmcp&scope=codemux%3Aread+codemux%3Asupervised"
+        )
+        .unwrap()
+        .validate(resource)
+        .is_ok());
+        for (extra, error) in [
+            (
+                "&resource=https%3A%2F%2Fevil.example%2Fmcp",
+                "invalid_grant",
+            ),
+            (
+                "&resource=https%3A%2F%2Fmcp.example%2Fmcp%2F",
+                "invalid_grant",
+            ),
+            ("&scope=codemux%3Aadmin", "invalid_scope"),
+            ("&scope=codemux%3Aread+admin", "invalid_scope"),
+        ] {
+            assert_eq!(
+                form(extra).unwrap().validate(resource),
+                Err(error),
+                "{extra}"
+            );
+        }
+        let input = |grant_type: &str, client_id: String, refresh_token: String| RefreshInput {
+            grant_type: grant_type.into(),
+            client_id,
+            refresh_token,
+            resource: None,
+            scope: None,
+        };
+        let body = token.strip_prefix(REFRESH_PREFIX).unwrap();
+        // Only `cmcr_` plus 43 base64url characters; an access token never refreshes.
+        for bad in [
+            String::new(),
+            body.to_string(),
+            format!("{ACCESS_PREFIX}{body}"),
+            format!("{REFRESH_PREFIX}{}", &body[..42]),
+            format!("{token}A"),
+            format!("{REFRESH_PREFIX}{}!", &body[..42]),
+        ] {
+            assert_eq!(
+                input("refresh_token", "registered".into(), bad.clone()).validate(resource),
+                Err("invalid_grant"),
+                "accepted {bad}"
+            );
+        }
+        assert_eq!(
+            input("authorization_code", "registered".into(), token.clone()).validate(resource),
+            Err("unsupported_grant_type")
+        );
+        for client in [String::new(), "c".repeat(129), "bad\nclient".into()] {
+            assert_eq!(
+                input("refresh_token", client, token.clone()).validate(resource),
+                Err("invalid_request")
+            );
+        }
     }
     #[test]
     fn expiry_bounds_revocation_and_disable_prevent_late_resurrection() {
