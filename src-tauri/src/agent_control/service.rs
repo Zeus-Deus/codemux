@@ -1286,3 +1286,58 @@ pub(super) async fn thread_respond<R: Runtime>(app: &AppHandle<R>, caller: &Cont
     });
     Ok(receipt)
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AnswerArgs { workspace_id: String, thread_id: String, client_request_id: String, question_id: String, answers: Vec<String> }
+
+/// Answers a worker's open question for the person, through the same path as
+/// the question card. The answer never carries a permission-mode change: on
+/// the card the person can approve a plan and leave plan mode in one go, but
+/// an outside answer leaves the thread's mode as it is.
+pub(super) async fn thread_answer<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    use crate::agent_provider::QuestionResolution;
+    use crate::commands::async_questions::{agent_chat_answer_question, QuestionAction};
+    if caller.thread_id().is_some() { return Err(ControlError::new(ErrorCode::PermissionDenied, "Agents cannot answer questions meant for the person")); }
+    let input: AnswerArgs = parse(args.clone())?;
+    identifier(&input.client_request_id, "client_request_id", 128)?;
+    identifier(&input.question_id, "question_id", 256)?;
+    if let Some(done) = recorded(app, caller, "thread_answer", &args)? { return Ok(done); }
+    authorize(app, caller)?;
+    let target = Target { workspace_id: input.workspace_id.clone(), thread_id: input.thread_id.clone() };
+    let (record, provider) = resolve_thread(app, &target, true)?;
+    permission_ceiling(caller, provider, record.permission_mode.as_deref())?;
+    let (question, resolution) = app.state::<DatabaseStore>().async_question(&target.thread_id, &input.question_id)
+        .map_err(|_| ControlError::new(ErrorCode::QuestionNotFound, "No question has this ID in the thread"))?;
+    if !matches!(resolution, QuestionResolution::Pending | QuestionResolution::Failed { .. }) {
+        return Err(ControlError::new(ErrorCode::QuestionClosed, "This question was already answered or dismissed"));
+    }
+    question.answer_text(&input.answers).map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e))?;
+    // The provider dedupes on the submission id, so a key keeps one.
+    let submission = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, json!(["codemux:thread_answer", caller.principal, input.client_request_id]).to_string().as_bytes()).to_string();
+    let AnswerArgs { workspace_id, thread_id, question_id, answers, .. } = input;
+    let receipt_workspace = workspace_id.clone();
+    run_receipted(app, caller, "thread_answer", &args, false, Some(&receipt_workspace), move |_| async move {
+        let action = QuestionAction::Answer { answers, submission_id: submission.clone(), retry_unknown: false, permission_mode_override: None };
+        let resolution = agent_chat_answer_question(app.clone(), ThreadId(thread_id.clone()), question_id.clone(), action)
+            .await
+            .map_err(|e| ControlError::new(ErrorCode::QuestionAnswerFailed, e))?;
+        match &resolution {
+            QuestionResolution::Answered { submission_id, delivery, .. } if *submission_id == submission => {
+                let turn = match delivery {
+                    crate::agent_provider::QuestionDelivery::Inflight { turn_id } | crate::agent_provider::QuestionDelivery::NewTurn { turn_id } => turn_id.0.clone(),
+                };
+                Ok(json!({"workspace_id": workspace_id, "thread_id": thread_id, "question_id": question_id, "turn_id": turn, "resolution": resolution}))
+            }
+            QuestionResolution::Failed { submission_id, message, .. } if *submission_id == submission => {
+                Err(ControlError::new(ErrorCode::QuestionAnswerFailed, format!("The worker did not take the answer: {message}")))
+            }
+            // Sent, but the provider never confirmed it: answering again
+            // could deliver it twice, so the person settles it on the card.
+            QuestionResolution::Unknown { submission_id, .. } | QuestionResolution::Submitting { submission_id, .. } if *submission_id == submission => {
+                Err(ControlError::new(ErrorCode::QuestionAnswerFailed, "The answer may have reached the worker, but its delivery was not confirmed. Do not answer again; the person can check the question in CodeMux"))
+            }
+            _ => Err(ControlError::new(ErrorCode::QuestionClosed, "The question was answered or dismissed meanwhile")),
+        }
+    }).await
+}

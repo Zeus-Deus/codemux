@@ -1,5 +1,5 @@
 //! Tests for the workspace and worktree tools, `thread_launch` into a new
-//! worktree, and outside answers to approvals, through the
+//! worktree, and outside answers to approvals and questions, through the
 //! registry as every outside door calls it.
 //!
 //! A test that creates or closes a workspace or a worktree runs in an
@@ -8,14 +8,18 @@
 //! own Codemux state.
 use super::tests::{fixture, mock_agent_provider, native_caller_fixture, settle_operation};
 use super::{execute, registry, ClientName, ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlState};
-use crate::agent_provider::{ProviderRuntimeEvent as Event, RequestId, ThreadId, TurnId};
+use crate::agent_provider::{
+    CompletedItem, ProviderKind, ProviderRuntimeEvent as Event, RequestId, SessionStatus, ThreadId, TurnId, TurnStatus,
+    UserQuestion, UserQuestionSet,
+};
+use crate::commands::agent_chat::forward_event;
 use crate::database::DatabaseStore;
 use crate::state::{AppStateStore, WorkspaceSnapshot};
 use crate::test_isolation::isolated;
 use mock_agent_provider::{MockAgentProvider, MockCall};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::Manager;
 
@@ -589,7 +593,7 @@ async fn thread_launch_worktree_keeps_checkout_when_start_fails() {
     assert!(crate::git::conventional_worktree_path(&repo, "kept").unwrap().exists());
 }
 
-// ── outside answers to approvals ───────────────────────────────────────────
+// ── outside answers: approvals and questions ──────────────────────────────
 
 async fn launched(app: &App, key: &str, workspace: &str, mode: &str) -> String {
     let receipt = call(app, &ControlCaller::trusted(), "thread_launch", json!({
@@ -647,4 +651,147 @@ async fn settle_once(app: &App, caller: &ControlCaller, receipt: &Value) -> Valu
     })
     .await
     .unwrap()
+}
+
+/// Run `turn` on `thread`, reply, ask one question, then end the turn: the
+/// shape of a worker stopping to ask.
+fn ask(app: &App, thread: &str, turn: &str, question: &str) {
+    let id = |text: &str| (ThreadId(thread.into()), TurnId(text.into()));
+    forward_event(app.handle(), Event::SessionStateChanged { thread_id: id(turn).0, status: SessionStatus::Running { active_turn: id(turn).1 } });
+    forward_event(app.handle(), Event::ItemCompleted {
+        thread_id: id(turn).0, turn_id: id(turn).1, item: CompletedItem::AssistantText { text: "I need one decision before I continue.".into() }, subagent_id: None,
+    });
+    forward_event(app.handle(), Event::QuestionsAsked {
+        thread_id: id(turn).0,
+        question: UserQuestionSet {
+            id: question.into(), target: "provider-route".into(), source_item_id: "item-q".into(), source_turn_id: turn.into(),
+            text: "Pick the storage".into(),
+            questions: vec![UserQuestion { title: "Which database?".into(), options: vec!["SQLite".into(), "PostgreSQL".into()] }],
+            subagent_id: None,
+        },
+    });
+    forward_event(app.handle(), Event::TurnCompleted { thread_id: id(turn).0, turn_id: id(turn).1, status: TurnStatus::Success, usage: None });
+}
+
+fn answer(workspace: &str, thread: &str, key: &str, question: &str) -> Value {
+    json!({"workspace_id": workspace, "thread_id": thread, "client_request_id": key, "question_id": question, "answers": ["SQLite"]})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outside_answer_resolves_a_question_and_the_wait_returns_done() {
+    let (app, _, _root, workspace) = fixture().await;
+    let mut asking = MockAgentProvider::new(ProviderKind::Claude);
+    asking.async_questions = true;
+    let provider = Arc::new(asking);
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_claude(provider.clone()).await;
+    let thread = launched(&app, "answer-launch", &workspace, "default").await;
+    ask(&app, &thread, "t1", "storage");
+    let bot = named(ControlAccess::FullAccess);
+    let target = json!({"workspace_id": workspace, "thread_id": thread});
+
+    let mut wait = target.clone();
+    wait["timeout_ms"] = json!(1000);
+    let asked = call(&app, &bot, "thread_wait", wait).await.unwrap();
+    assert_eq!(asked["state"], "needs_input", "{asked}");
+    assert_eq!(asked["pending"]["questions"][0]["question_id"], "storage");
+    let waiter = {
+        let (handle, caller) = (app.handle().clone(), bot.clone());
+        let mut args = target.clone();
+        args["since"] = asked["wait_cursor"].clone();
+        args["timeout_ms"] = json!(5000);
+        tokio::spawn(async move { execute(&handle, &caller, "thread_wait", args).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let answered = call(&app, &bot, "thread_answer", answer(&workspace, &thread, "answer-1", "storage")).await.unwrap();
+    assert_eq!(answered["state"], "succeeded", "{answered}");
+    assert_eq!(answered["resolution"]["status"], "answered");
+    assert_eq!(answered["resolution"]["answers"], json!(["SQLite"]));
+    assert_eq!(answered["turn_id"], "native-turn");
+    let done = waiter.await.unwrap().unwrap();
+    assert_eq!(done["state"], "done", "{done}");
+    assert_eq!(done["final_text"], "I need one decision before I continue.");
+    assert_eq!(done["pending"]["questions"], json!([]));
+
+    // One submission per key: a retry replays, a new key finds it closed.
+    let retry = call(&app, &bot, "thread_answer", answer(&workspace, &thread, "answer-1", "storage")).await.unwrap();
+    assert_eq!((retry["operation_id"].clone(), retry["replayed"].clone()), (answered["operation_id"].clone(), json!(true)));
+    refused(call(&app, &bot, "thread_answer", answer(&workspace, &thread, "answer-2", "storage")).await, ErrorCode::QuestionClosed);
+    let submissions: Vec<String> = provider.calls.snapshot().into_iter().filter_map(|call| match call {
+        MockCall::AnswerQuestion(_, submission) => Some(submission),
+        _ => None,
+    }).collect();
+    assert_eq!(submissions.len(), 1, "{submissions:?}");
+    assert_eq!(answered["resolution"]["submission_id"], submissions[0]);
+    assert!(uuid::Uuid::parse_str(&submissions[0]).is_ok());
+
+    refused(call(&app, &bot, "thread_answer", answer(&workspace, &thread, "answer-3", "no-such-question")).await, ErrorCode::QuestionNotFound);
+    let mut wrong = answer(&workspace, &thread, "answer-4", "storage");
+    wrong["answers"] = json!(["SQLite", "Two answers for one prompt"]);
+    ask(&app, &thread, "t2", "second");
+    wrong["question_id"] = json!("second");
+    refused(call(&app, &bot, "thread_answer", wrong).await, ErrorCode::InvalidArguments);
+    refused(call(&app, &named(ControlAccess::ReadOnly), "thread_answer", answer(&workspace, &thread, "answer-5", "second")).await, ErrorCode::AccessDenied);
+    no_receipt(&app, &bot, "answer-4", "thread_answer");
+}
+
+/// Records what each answer asked of the thread's mode.
+struct ModeRecorder {
+    inner: Arc<MockAgentProvider>,
+    overrides: Mutex<Vec<Option<String>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::agent_provider::AgentProvider for ModeRecorder {
+    fn kind(&self) -> ProviderKind { self.inner.kind() }
+    fn capabilities(&self) -> crate::agent_provider::ProviderCapabilities { self.inner.capabilities() }
+    fn supports_async_questions(&self) -> bool { true }
+    async fn answer_question(&self, input: crate::agent_provider::AnswerQuestionInput) -> Result<crate::agent_provider::QuestionDelivery, crate::agent_provider::QuestionDeliveryError> {
+        self.overrides.lock().unwrap().push(input.permission_mode_override.clone());
+        self.inner.answer_question(input).await
+    }
+    async fn start_session(&self, input: crate::agent_provider::StartSessionInput) -> Result<crate::agent_provider::ProviderSession, crate::agent_provider::ProviderError> { self.inner.start_session(input).await }
+    async fn send_turn(&self, input: crate::agent_provider::SendTurnInput) -> Result<crate::agent_provider::TurnStartResult, crate::agent_provider::ProviderError> { self.inner.send_turn(input).await }
+    async fn interrupt_turn(&self, t: ThreadId, id: Option<TurnId>) -> Result<(), crate::agent_provider::ProviderError> { self.inner.interrupt_turn(t, id).await }
+    async fn respond_to_request(&self, t: ThreadId, r: RequestId, d: crate::agent_provider::ApprovalDecision) -> Result<(), crate::agent_provider::ProviderError> { self.inner.respond_to_request(t, r, d).await }
+    async fn set_model(&self, t: ThreadId, m: String) -> Result<(), crate::agent_provider::ProviderError> { self.inner.set_model(t, m).await }
+    async fn set_permission_mode(&self, t: ThreadId, m: String) -> Result<(), crate::agent_provider::ProviderError> { self.inner.set_permission_mode(t, m).await }
+    async fn stop_session(&self, t: ThreadId) -> Result<(), crate::agent_provider::ProviderError> { self.inner.stop_session(t).await }
+    async fn list_sessions(&self) -> Result<Vec<crate::agent_provider::ProviderSession>, crate::agent_provider::ProviderError> { self.inner.list_sessions().await }
+    async fn has_session(&self, t: &ThreadId) -> bool { self.inner.has_session(t).await }
+    async fn turn_active(&self, t: &ThreadId) -> bool { self.inner.turn_active(t).await }
+    fn event_stream(&self) -> crate::agent_provider::ProviderEventStream { self.inner.event_stream() }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_answer_cannot_change_permission_mode() {
+    let (app, _, _root, workspace) = fixture().await;
+    let recorder = Arc::new(ModeRecorder { inner: Arc::new(MockAgentProvider::new(ProviderKind::Claude)), overrides: Mutex::new(Vec::new()) });
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_claude(recorder.clone()).await;
+    let planning = launched(&app, "plan-launch", &workspace, "plan").await;
+    ask(&app, &planning, "t1", "approach");
+    let bot = named(ControlAccess::Supervised);
+
+    // The tool has no way to ask for a mode change.
+    let mut leave_plan = answer(&workspace, &planning, "leave-plan", "approach");
+    leave_plan["permission_mode_override"] = json!("acceptEdits");
+    let error = refused(call(&app, &bot, "thread_answer", leave_plan).await, ErrorCode::InvalidArguments);
+    assert!(error.message.contains("permission_mode_override"), "{error}");
+    assert!(recorder.overrides.lock().unwrap().is_empty(), "refused before reaching the worker");
+
+    let answered = call(&app, &bot, "thread_answer", answer(&workspace, &planning, "plan-answer", "approach")).await.unwrap();
+    assert_eq!(answered["resolution"]["status"], "answered", "{answered}");
+    assert_eq!(*recorder.overrides.lock().unwrap(), [None], "the answer carries no mode change");
+    let record = app.state::<DatabaseStore>().get_agent_chat_session(&planning).unwrap();
+    assert_eq!(record.permission_mode.as_deref(), Some("plan"), "the thread is still planning");
+
+    // A supervised client cannot drive a full-access worker by answering it either.
+    let unbounded = launched(&app, "full-launch", &workspace, "bypassPermissions").await;
+    ask(&app, &unbounded, "t1", "scope");
+    refused(call(&app, &bot, "thread_answer", answer(&workspace, &unbounded, "full-answer", "scope")).await, ErrorCode::PermissionCeiling);
+    assert_eq!(recorder.overrides.lock().unwrap().len(), 1);
+    // Chats do not answer for the person.
+    let (app, _, _root, workspace, thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
+    let chat = super::native::qualify(app.handle(), &actor).await.unwrap();
+    refused(super::service::thread_answer(app.handle(), &chat, answer(&workspace, &thread, "chat-answer", "q")).await, ErrorCode::PermissionDenied);
 }

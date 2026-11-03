@@ -31,7 +31,7 @@ macro_rules! tool_ids {
 tool_ids! {
     WorkspaceList, WorkspaceInfo, WorkspaceCreate, WorktreeCreate, WorkspaceClose,
     AgentCapabilities, ThreadList, ThreadLaunch, ThreadSend, ThreadRead, ThreadStatus, ThreadWait,
-    ThreadInterrupt, ThreadStop, ThreadRespond, OperationStatus,
+    ThreadInterrupt, ThreadStop, ThreadRespond, ThreadAnswer, OperationStatus,
     OrchestratorCapabilities, CreateThreads, ThreadSearch, PluginList, PluginInvoke,
 }
 
@@ -383,6 +383,7 @@ async fn run<R: Runtime>(id: ToolId, call: Call<'_, R>) -> Result<Value, Control
         (ThreadInterrupt, route) => service::thread_interrupt(app, caller, native::target_workspace(app, route, args)?).await,
         (ThreadStop, _) => service::thread_stop(app, caller, args).await,
         (ThreadRespond, _) => service::thread_respond(app, caller, args).await,
+        (ThreadAnswer, _) => service::thread_answer(app, caller, args).await,
         (OperationStatus, _) => service::operation_status(app, caller, args),
         (PluginList | PluginInvoke, _) => crate::plugins::platform_transport::agent_request(app, caller.clone(), id.spec().name, args)
             .await
@@ -471,7 +472,7 @@ mod tests {
 
     #[test]
     fn relay_refuses_registry_tools_without_legacy_twins() {
-        for name in ["thread_launch", "thread_status", "create_threads"] {
+        for name in ["thread_launch", "thread_status", "thread_answer", "create_threads"] {
             assert!(relay_refuses(name), "{name}");
         }
         // The legacy twins keep their legacy arms on provider-origin stdio.
@@ -497,7 +498,7 @@ mod tests {
             assert!(served(name, Audience::Outside).is_some(), "{name}");
         }
         // New tools are reachable only through tool_call.
-        for name in ["workspace_list", "workspace_create", "create_threads", "tool_call", "automation_list"] {
+        for name in ["workspace_list", "workspace_create", "thread_answer", "create_threads", "tool_call", "automation_list"] {
             assert!(!is_socket_alias(name), "{name}");
         }
     }
@@ -519,11 +520,12 @@ mod tests {
             "thread_wait", "operation_status", "plugin_list",
         ], "a read-only connection is not offered tools that change anything");
         let supervised = names(&CallerView::outside(Supervised));
-        assert_eq!(supervised.len(), 15);
+        assert_eq!(supervised.len(), 16);
         for machine in ["workspace_create", "worktree_create", "workspace_close"] {
             assert!(!supervised.contains(&machine), "{machine} changes this machine; supervised connections are not offered it");
             assert!(names(&CallerView::outside(FullAccess)).contains(&machine), "{machine}");
         }
+        assert!(supervised.contains(&"thread_answer"), "answering a worker's question is a thread write");
         assert_eq!(names(&CallerView::in_app(ProviderKind::Claude, Some("default"), false)), ["plugin_list", "plugin_invoke"],
             "with Agent collaboration off, chats keep only plugin tools");
     }
@@ -536,6 +538,7 @@ mod tests {
         assert_eq!(entry("thread_launch").map(|(_, access, _)| access), Some(Supervised));
         assert_eq!(entry("workspace_list"), Some(("workspace_list", ReadOnly, "List the workspaces open in CodeMux.")));
         assert_eq!(entry("workspace_create").map(|(_, access, _)| access), Some(FullAccess));
+        assert_eq!(entry("thread_answer").map(|(_, access, _)| access), Some(Supervised));
         assert!(entry("create_threads").is_none(), "in-app tools are not outside tools");
     }
 
@@ -630,6 +633,7 @@ mod tests {
             "thread_interrupt" => typed::<service::InterruptArgs>,
             "thread_stop" => typed::<service::StopArgs>,
             "thread_respond" => typed::<service::RespondArgs>,
+            "thread_answer" => typed::<service::AnswerArgs>,
             "operation_status" => typed::<service::OperationStatusArgs>,
             _ => return None,
         })
@@ -661,7 +665,7 @@ mod tests {
     /// property is one the typed arguments cannot do without.
     #[test]
     fn workspace_tool_schemas_match_typed_args() {
-        for name in ["workspace_list", "workspace_info", "workspace_create", "worktree_create", "workspace_close"] {
+        for name in ["workspace_list", "workspace_info", "workspace_create", "worktree_create", "workspace_close", "thread_answer"] {
             let definition = list(&CallerView::outside(FullAccess)).into_iter().find(|tool| tool.spec.name == name)
                 .unwrap_or_else(|| panic!("{name} is an outside tool")).definition;
             let (schema, parse) = (&definition.input_schema, typed_parser(name).unwrap());
