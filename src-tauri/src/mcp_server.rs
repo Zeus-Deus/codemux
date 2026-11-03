@@ -1,10 +1,16 @@
+use crate::agent_control::ControlAccess;
 use crate::control::{send_control_request, ControlRequest, ControlResponse};
-use serde::{Deserialize, Serialize};
+use crate::mcp::protocol::stdio::{Handler, Reply};
+use crate::mcp::protocol::{
+    self, CallToolParams, ClientInfo, InitializeRequest, InitializeResult, Request, RpcError, ServerInfo,
+};
+use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use tokio::sync::{mpsc, oneshot};
 
 // Serialize checkout-level config reconciliation. Deferred startup repair
 // rechecks live workspace ownership while holding this lock, so a concurrent
@@ -26,65 +32,28 @@ pub fn is_auto_mcp_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool
 }
 
 // ---------------------------------------------------------------------------
-// JSON-RPC 2.0 types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: String,
-    method: String,
-    #[serde(default)]
-    params: Value,
-    id: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-    id: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
-}
-
-impl JsonRpcResponse {
-    fn success(id: Value, result: Value) -> Self {
-        Self { jsonrpc: "2.0", result: Some(result), error: None, id }
-    }
-
-    fn error(id: Value, code: i32, message: impl Into<String>) -> Self {
-        Self {
-            jsonrpc: "2.0",
-            result: None,
-            error: Some(JsonRpcError { code, message: message.into(), data: None }),
-            id,
-        }
-    }
-}
-
-// JSON-RPC error codes
-const INVALID_REQUEST: i32 = -32600;
-const METHOD_NOT_FOUND: i32 = -32601;
-const PARSE_ERROR: i32 = -32700;
-
-// ---------------------------------------------------------------------------
 // MCP tool definition
 // ---------------------------------------------------------------------------
 
+/// One of the stdio server's own tools.
 struct McpTool {
     name: &'static str,
     description: &'static str,
     input_schema: Value,
+}
+
+/// A tool as `tools/list` serves it: the server's own tools plus the native
+/// control tools, whose text need not be static.
+struct StdioTool {
+    name: Cow<'static, str>,
+    description: Cow<'static, str>,
+    input_schema: Value,
+}
+
+impl From<McpTool> for StdioTool {
+    fn from(tool: McpTool) -> Self {
+        Self { name: tool.name.into(), description: tool.description.into(), input_schema: tool.input_schema }
+    }
 }
 
 pub(crate) const REMOTE_DELEGATE_TOOL: &str = "delegate_remote_task";
@@ -119,12 +88,12 @@ pub(crate) fn remote_delegation_tools_for_test() -> Vec<crate::mcp::runtime::Mcp
         .into_iter()
         .filter(|tool| {
             matches!(
-                tool.name,
+                tool.name.as_ref(),
                 "delegation_targets" | REMOTE_DELEGATE_TOOL | "task_status" | "task_cancel"
             )
         })
         .map(|tool| crate::mcp::runtime::McpTool {
-            prefixed_name: crate::mcp::runtime::prefix_tool_name(&config.name, tool.name),
+            prefixed_name: crate::mcp::runtime::prefix_tool_name(&config.name, &tool.name),
             name: tool.name.into(),
             description: Some(tool.description.into()),
             input_schema: tool.input_schema,
@@ -133,8 +102,8 @@ pub(crate) fn remote_delegation_tools_for_test() -> Vec<crate::mcp::runtime::Mcp
         .collect()
 }
 
-fn register_tools() -> Vec<McpTool> {
-    let mut tools = vec![
+fn register_tools() -> Vec<StdioTool> {
+    let legacy = vec![
         McpTool {name:"delegation_targets",description:"List SSH remote hosts the user granted for delegate_remote_task (host/existing-checkout/provider/mode targets). For remote delegation only: an empty list says nothing about local delegation. To delegate to local child chats, use delegate_task. Grants are immutable to agents. Available only in an actual Codex/Claude adapter; generic MCP metadata is not authority.",input_schema:json!({"type":"object","properties":{},"additionalProperties":false})},
         McpTool {name:REMOTE_DELEGATE_TOOL,description:"Delegate a SELF-CONTAINED coding task to a user-granted SSH remote host checkout from delegation_targets. Remote hosts only; use delegate_task for local child chats. Supply only the needed goal/context, never credentials or full conversation history. Returns a durable task receipt promptly; the backend follows asynchronously and delivers its specific final result when this parent is idle. Continue local work or end the turn; do not busy-poll. Exact client_request_id retries dedupe; changed reuse is rejected. Only receiver-native Codex/Claude execution is currently supported.",input_schema:json!({"type":"object","properties":{"target_id":{"type":"string"},"prompt":{"type":"string","maxLength":32000},"title":{"type":"string"},"model":{"type":["string","null"]},"effort":{"type":["string","null"]},"client_request_id":{"type":"string","description":"Stable per-parent request identity. Reuse only for the identical task request."}},"required":["target_id","prompt","client_request_id"],"additionalProperties":false})},
         McpTool {name:"task_status",description:"Read this native parent's cached remote task and actual native events after an optional cursor. No launch and no remote busy-poll: the coordinator follows in the background. Use on demand, not in a tight waiting loop.",input_schema:json!({"type":"object","properties":{"task_id":{"type":"string"},"cursor":{"type":"integer","minimum":0}},"required":["task_id"],"additionalProperties":false})},
@@ -944,10 +913,11 @@ fn register_tools() -> Vec<McpTool> {
             }),
         },
     ];
+    let mut tools: Vec<StdioTool> = legacy.into_iter().map(StdioTool::from).collect();
     if !provider_stdio_origin() {
-        tools.extend(crate::agent_control::native_tools().into_iter().map(|tool| McpTool {
-            name: tool.name,
-            description: tool.description,
+        tools.extend(crate::agent_control::native_tools().into_iter().map(|tool| StdioTool {
+            name: tool.name.into(),
+            description: tool.description.into(),
             input_schema: tool.input_schema,
         }));
     }
@@ -1061,51 +1031,154 @@ fn html_render_result(arguments: &Value) -> Result<Value, String> {
 }
 
 // ---------------------------------------------------------------------------
-// MCP protocol dispatch
+// MCP protocol handling
 // ---------------------------------------------------------------------------
 
-async fn dispatch(request: JsonRpcRequest) -> Option<JsonRpcResponse> {
-    let id = match &request.id {
-        Some(id) => id.clone(),
-        None => {
-            // Notifications (no id) get no response.
-            return None;
-        }
-    };
+/// What provider-injected stdio tells the model: those processes list no
+/// native control tools.
+const PROVIDER_INSTRUCTIONS: &str = "Use the advertised workspace and browser tools. Native thread control is unavailable on provider-injected MCP; it requires a separate authorized controller connection.";
 
-    let response = match request.method.as_str() {
-        "initialize" => JsonRpcResponse::success(
-            id,
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": { "tools": {} },
-                "instructions": if provider_stdio_origin() {
-                    "Use the advertised workspace and browser tools. Native thread control is unavailable on provider-injected MCP; it requires a separate authorized controller connection."
-                } else { crate::agent_control::INSTRUCTIONS },
-                "serverInfo": {
-                    "name": "codemux",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-        ),
-        "tools/list" => {
-            let tools: Vec<Value> = register_tools()
-                .iter()
-                .map(|t| {
-                    json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "inputSchema": t.input_schema
-                    })
-                })
-                .collect();
-            JsonRpcResponse::success(id, json!({ "tools": tools }))
+/// Command-line options for `codemux mcp`.
+#[derive(Debug, Clone, Default)]
+pub struct McpServerOptions {
+    /// `--client`: the name the caller goes by.
+    pub client: Option<String>,
+    /// `--access`: the most the caller may do.
+    pub access: Option<ControlAccess>,
+}
+
+/// Runs one tool call to its tool result. Tool failures are `isError` results
+/// the model sees, never JSON-RPC errors.
+type RunTool = Arc<dyn Fn(CallToolParams) -> BoxFuture<'static, Value> + Send + Sync>;
+
+/// The request handler behind `codemux mcp`.
+struct StdioServer {
+    /// The `clientInfo` from the first `initialize` that sent one.
+    client: OnceLock<ClientInfo>,
+    /// Kept for the caller identity the socket will carry; nothing reads them
+    /// yet.
+    #[allow(dead_code)]
+    options: McpServerOptions,
+    run: RunTool,
+    legacy: LegacyLane,
+}
+
+impl StdioServer {
+    fn new(options: McpServerOptions) -> Self {
+        Self::with_runner(options, Arc::new(|call| -> BoxFuture<'static, Value> { Box::pin(handle_tool_call(call)) }))
+    }
+
+    /// Needs a Tokio runtime: the legacy lane runs on its own task.
+    fn with_runner(options: McpServerOptions, run: RunTool) -> Self {
+        let legacy = LegacyLane::spawn(Arc::clone(&run));
+        Self { client: OnceLock::new(), options, run, legacy }
+    }
+
+    fn initialize(&self, params: &Value) -> Value {
+        let offer = InitializeRequest::parse(params);
+        let protocol_version = offer.negotiated_version();
+        if let Some(client) = offer.client_info {
+            let _ = self.client.set(client);
         }
-        "tools/call" => handle_tool_call(id, request.params).await,
-        "ping" => JsonRpcResponse::success(id, json!({})),
-        _ => JsonRpcResponse::error(id, METHOD_NOT_FOUND, format!("Unknown method: {}", request.method)),
-    };
-    Some(response)
+        InitializeResult {
+            protocol_version,
+            tools_list_changed: None,
+            server_info: ServerInfo { name: "codemux", version: env!("CARGO_PKG_VERSION") },
+            instructions: Some(if provider_stdio_origin() {
+                PROVIDER_INSTRUCTIONS
+            } else {
+                crate::agent_control::INSTRUCTIONS
+            }),
+        }
+        .to_value()
+    }
+
+    fn tools_call(&self, params: &Value) -> Reply {
+        let call = match CallToolParams::parse(params) {
+            Ok(call) => call,
+            Err(error) => return Reply::Now(Err(error)),
+        };
+        if !crate::agent_control::is_native_tool(&call.name) {
+            return Reply::Later { future: self.legacy.submit(call), parks: false };
+        }
+        if provider_stdio_origin() {
+            return Reply::Now(Err(RpcError::invalid_request(
+                "provider_control_denied: provider MCP cannot use trusted native-controller tools",
+            )));
+        }
+        // Native control tools are built for concurrent callers, so a long
+        // `thread_wait` never holds up `thread_status` or `thread_interrupt`.
+        let parks = call.name == "thread_wait";
+        let result = (self.run)(call);
+        Reply::Later { future: Box::pin(async move { Ok(result.await) }), parks }
+    }
+}
+
+impl Handler for StdioServer {
+    fn request(&self, request: Request) -> Reply {
+        match request.method.as_str() {
+            "initialize" => Reply::Now(Ok(self.initialize(&request.params))),
+            "ping" => Reply::Now(Ok(json!({}))),
+            "tools/list" => Reply::Now(Ok(tools_list())),
+            "tools/call" => self.tools_call(&request.params),
+            // Includes `server/discover`: method-not-found with the probe's id
+            // tells a stateless-era client to fall back to `initialize`.
+            method => Reply::Now(Err(RpcError::method_not_found(method))),
+        }
+    }
+}
+
+fn tools_list() -> Value {
+    let tools: Vec<Value> = register_tools()
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.input_schema
+            })
+        })
+        .collect();
+    json!({ "tools": tools })
+}
+
+/// Runs the server's own tools one at a time, in arrival order, as the
+/// sequential server always did: the browser, pane and git tools act on shared
+/// app state, and every in-app chat shares one `codemux mcp` child.
+struct LegacyLane {
+    jobs: mpsc::UnboundedSender<LegacyJob>,
+}
+
+struct LegacyJob {
+    call: CallToolParams,
+    reply: oneshot::Sender<Value>,
+}
+
+impl LegacyLane {
+    fn spawn(run: RunTool) -> Self {
+        let (jobs, mut queue) = mpsc::unbounded_channel::<LegacyJob>();
+        tokio::spawn(async move {
+            while let Some(LegacyJob { call, mut reply }) = queue.recv().await {
+                // A cancelled request is skipped, or abandoned mid-run.
+                let result = tokio::select! {
+                    biased;
+                    () = reply.closed() => continue,
+                    result = run(call) => result,
+                };
+                let _ = reply.send(result);
+            }
+        });
+        Self { jobs }
+    }
+
+    /// Queues `call` at once, so jobs run in the order `submit` is called.
+    /// Dropping the returned future cancels the job.
+    fn submit(&self, call: CallToolParams) -> BoxFuture<'static, Result<Value, RpcError>> {
+        let (reply, result) = oneshot::channel();
+        // A failed send drops `reply`, so the receiver reports it below.
+        let _ = self.jobs.send(LegacyJob { call, reply });
+        Box::pin(async move { result.await.map_err(|_| RpcError::internal("The tool worker stopped")) })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,9 +1217,8 @@ fn pane_split_direction(tool: &str) -> &'static str {
 /// stay hermetic.
 /// The id is forwarded as-is; the control layer drops one that names no
 /// live workspace (`resolve_browser_workspace_id`).
-fn resolve_workspace_id(params: &Value, env_fallback: Option<String>) -> String {
-    params
-        .get("_meta")
+fn resolve_workspace_id(meta: Option<&Value>, env_fallback: Option<String>) -> String {
+    meta
         .and_then(|meta| meta.get(crate::mcp::WORKSPACE_META_KEY))
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
@@ -1155,21 +1227,15 @@ fn resolve_workspace_id(params: &Value, env_fallback: Option<String>) -> String 
         .unwrap_or_default()
 }
 
-async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
-    let tool_name = match params.get("name").and_then(Value::as_str) {
-        Some(name) => name.to_string(),
-        None => return JsonRpcResponse::error(id, INVALID_REQUEST, "Missing tool name"),
-    };
-    if provider_stdio_origin() && crate::agent_control::is_native_tool(&tool_name) {
-        return JsonRpcResponse::error(id, INVALID_REQUEST,
-            "provider_control_denied: provider MCP cannot use trusted native-controller tools");
-    }
-    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+/// Run one tool call. Provider-origin processes never get here with a native
+/// control tool: `StdioServer::tools_call` refuses it first.
+async fn handle_tool_call(call: CallToolParams) -> Value {
+    let CallToolParams { name: tool_name, arguments, meta } = call;
 
     // Workspace ID for workspace-scoped routing (browser session binding,
     // git cwd). Caller-tagged `_meta` first, env second.
     let workspace_id =
-        resolve_workspace_id(&params, std::env::var("CODEMUX_WORKSPACE_ID").ok());
+        resolve_workspace_id(meta.as_ref(), std::env::var("CODEMUX_WORKSPACE_ID").ok());
     // Best-effort cwd so the control layer can resolve the owning workspace
     // by path when this MCP server's `CODEMUX_WORKSPACE_ID` env is missing
     // (covers MCP callers whose env wasn't injected). Empty string on error;
@@ -1752,24 +1818,16 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
     };
 
     match result {
-        Ok(data) => {
-            let text = if data.is_string() {
-                data.as_str().unwrap_or_default().to_string()
-            } else {
-                serde_json::to_string_pretty(&data).unwrap_or_default()
-            };
-            JsonRpcResponse::success(
-                id,
-                json!({ "content": [{ "type": "text", "text": text }] }),
-            )
-        }
-        Err(error) => JsonRpcResponse::success(
-            id,
-            json!({
-                "content": [{ "type": "text", "text": error }],
-                "isError": true
-            }),
-        ),
+        Ok(data) => protocol::text_result(legacy_text(data)),
+        Err(error) => protocol::error_result(error),
+    }
+}
+
+/// A string result as it is; anything else as pretty JSON.
+fn legacy_text(data: Value) -> String {
+    match data {
+        Value::String(text) => text,
+        data => serde_json::to_string_pretty(&data).unwrap_or_default(),
     }
 }
 
@@ -1872,41 +1930,17 @@ async fn run_git(args: &[&str], workspace_id: &str) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 pub async fn run_mcp_server() -> Result<(), String> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
+    run_mcp_server_with(McpServerOptions::default()).await
+}
 
+/// Serve `codemux mcp` on stdin and stdout until stdin closes.
+pub async fn run_mcp_server_with(options: McpServerOptions) -> Result<(), String> {
     // Log to stderr so it doesn't interfere with the JSON-RPC protocol on stdout.
     eprintln!("[codemux::mcp] MCP server starting (stdio transport)");
-
-    let reader = std::io::BufReader::new(stdin.lock());
-    let mut stdout = stdout.lock();
-
-    for line in std::io::BufRead::lines(reader) {
-        let line = line.map_err(|e| format!("stdin read error: {e}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(req) => req,
-            Err(e) => {
-                let error_resp = JsonRpcResponse::error(Value::Null, PARSE_ERROR, format!("Parse error: {e}"));
-                let json = serde_json::to_string(&error_resp).unwrap_or_default();
-                let _ = writeln!(stdout, "{json}");
-                let _ = stdout.flush();
-                continue;
-            }
-        };
-
-        if let Some(response) = dispatch(request).await {
-            let json = serde_json::to_string(&response).unwrap_or_default();
-            let _ = writeln!(stdout, "{json}");
-            let _ = stdout.flush();
-        }
-    }
-
+    let server = Arc::new(StdioServer::new(options));
+    let served = protocol::stdio::serve(tokio::io::stdin(), tokio::io::stdout(), server).await;
     eprintln!("[codemux::mcp] MCP server shutting down (stdin closed)");
-    Ok(())
+    served
 }
 
 // ---------------------------------------------------------------------------
@@ -2342,6 +2376,48 @@ fn remove_mcp_config_locked(workspace_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::protocol::{Incoming, Response};
+    use std::time::Duration;
+
+    /// A server with the real tool runner. Calls that reach the control
+    /// socket are not made here.
+    fn server() -> StdioServer {
+        StdioServer::new(McpServerOptions::default())
+    }
+
+    /// Feed one JSON-RPC message to `server` and wait for its reply, as the
+    /// stdio loop would. `None` for a notification.
+    async fn rpc(server: &StdioServer, message: Value) -> Option<Value> {
+        let request = match protocol::parse(message) {
+            Ok(Incoming::Request(request)) => request,
+            Ok(_) => return None,
+            Err(error) => return Some(Response::error(None, error).to_value()),
+        };
+        let id = request.id.clone();
+        let outcome = match server.request(request) {
+            Reply::Now(outcome) => outcome,
+            Reply::Later { future, .. } => future.await,
+        };
+        Some(Response::from_outcome(id, outcome).to_value())
+    }
+
+    fn tools_call(id: u64, name: &str, arguments: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } })
+    }
+
+    fn later(reply: Reply) -> (BoxFuture<'static, Result<Value, RpcError>>, bool) {
+        match reply {
+            Reply::Later { future, parks } => (future, parks),
+            Reply::Now(outcome) => panic!("expected a concurrent reply, got {outcome:?}"),
+        }
+    }
+
+    fn request(id: u64, name: &str, arguments: Value) -> Request {
+        match protocol::parse(tools_call(id, name, arguments)) {
+            Ok(Incoming::Request(request)) => request,
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn review_s1_provider_stdio_has_no_trusted_native_controller_route() {
@@ -2356,14 +2432,15 @@ mod tests {
             assert_eq!(codemux_mcp_entry()["env"][MARKER], "1", "app-installed provider configs must bind the restricted invocation");
             return;
         }
-        assert!(!register_tools().iter().any(|tool| crate::agent_control::is_native_tool(tool.name)),
+        assert!(!register_tools().iter().any(|tool| crate::agent_control::is_native_tool(&tool.name)),
             "provider-origin stdio must omit trusted native tools");
-        let result = handle_tool_call(json!(1), json!({"name":"thread_launch","arguments":{},
-            "_meta":{"control_access":"full_access"}})).await;
-        assert!(serde_json::to_string(&result).unwrap().contains("provider_control_denied"),
+        let server = server();
+        let result = rpc(&server, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"thread_launch","arguments":{},
+            "_meta":{"control_access":"full_access"}}})).await.unwrap();
+        assert!(result.to_string().contains("provider_control_denied"),
             "provider stdio must reject guessed native calls before opening a trusted socket");
-        let initialized = dispatch(JsonRpcRequest {jsonrpc:"2.0".into(),method:"initialize".into(),params:json!({}),id:Some(json!(2))}).await.unwrap();
-        assert!(initialized.result.unwrap()["instructions"].as_str().unwrap().contains("Native thread control is unavailable"),
+        let initialized = rpc(&server, json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{}})).await.unwrap();
+        assert!(initialized["result"]["instructions"].as_str().unwrap().contains("Native thread control is unavailable"),
             "provider instructions must not promise the native tools removed from its catalog");
     }
 
@@ -2415,7 +2492,8 @@ mod tests {
 
     #[test]
     fn legacy_tool_names_are_pinned() {
-        let legacy: Vec<&str> = register_tools().iter().map(|tool| tool.name)
+        let tools = register_tools();
+        let legacy: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref())
             .filter(|name| !crate::agent_control::is_native_tool(name)).collect();
         assert_eq!(legacy, LEGACY_TOOL_NAMES, "a legacy tool was added, removed or renamed");
         assert!(LEGACY_TOOL_NAMES.iter().all(|name| is_legacy_tool(name)));
@@ -2434,7 +2512,7 @@ mod tests {
         // this number in sync with register_tools() when adding new entries.
         // Native control adds eleven, plus two isolated plugin tools.
         assert_eq!(tools.len(), 75);
-        let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
         assert!(names.contains(&"workspace_archive"));
@@ -2517,43 +2595,11 @@ mod tests {
     #[test]
     fn tool_names_unique() {
         let tools = register_tools();
-        let mut names: Vec<&str> = tools.iter().map(|t| t.name).collect();
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         let original_len = names.len();
         names.sort();
         names.dedup();
         assert_eq!(names.len(), original_len, "Duplicate tool names found");
-    }
-
-    // -----------------------------------------------------------------------
-    // JSON-RPC response tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn jsonrpc_response_success_format() {
-        let resp = JsonRpcResponse::success(json!(1), json!({"hello": "world"}));
-        let serialized = serde_json::to_value(&resp).unwrap();
-        assert_eq!(serialized["jsonrpc"], "2.0");
-        assert_eq!(serialized["id"], 1);
-        assert!(serialized.get("result").is_some());
-        assert!(serialized.get("error").is_none());
-    }
-
-    #[test]
-    fn jsonrpc_response_error_format() {
-        let resp = JsonRpcResponse::error(json!(2), -32600, "Bad request");
-        let serialized = serde_json::to_value(&resp).unwrap();
-        assert_eq!(serialized["jsonrpc"], "2.0");
-        assert_eq!(serialized["id"], 2);
-        assert!(serialized.get("result").is_none());
-        assert_eq!(serialized["error"]["code"], -32600);
-        assert_eq!(serialized["error"]["message"], "Bad request");
-    }
-
-    #[test]
-    fn jsonrpc_error_omits_null_data() {
-        let resp = JsonRpcResponse::error(json!(3), -32601, "Not found");
-        let serialized = serde_json::to_string(&resp).unwrap();
-        assert!(!serialized.contains("\"data\""), "data field should be omitted when None");
     }
 
     // -----------------------------------------------------------------------
@@ -2568,7 +2614,7 @@ mod tests {
             "_meta": { crate::mcp::WORKSPACE_META_KEY: "ws-from-meta" }
         });
         assert_eq!(
-            resolve_workspace_id(&params, Some("ws-from-env".into())),
+            resolve_workspace_id(params.get("_meta"), Some("ws-from-env".into())),
             "ws-from-meta"
         );
     }
@@ -2577,22 +2623,22 @@ mod tests {
     fn workspace_id_falls_back_to_env_without_meta() {
         let params = json!({ "name": "browser_navigate", "arguments": {} });
         assert_eq!(
-            resolve_workspace_id(&params, Some("ws-from-env".into())),
+            resolve_workspace_id(params.get("_meta"), Some("ws-from-env".into())),
             "ws-from-env"
         );
-        assert_eq!(resolve_workspace_id(&params, None), "");
+        assert_eq!(resolve_workspace_id(params.get("_meta"), None), "");
     }
 
     #[test]
     fn workspace_id_ignores_empty_or_non_string_meta() {
         let empty = json!({ "name": "t", "_meta": { crate::mcp::WORKSPACE_META_KEY: "" } });
         assert_eq!(
-            resolve_workspace_id(&empty, Some("ws-from-env".into())),
+            resolve_workspace_id(empty.get("_meta"), Some("ws-from-env".into())),
             "ws-from-env"
         );
         let wrong_type = json!({ "name": "t", "_meta": { crate::mcp::WORKSPACE_META_KEY: 7 } });
         assert_eq!(
-            resolve_workspace_id(&wrong_type, Some("ws-from-env".into())),
+            resolve_workspace_id(wrong_type.get("_meta"), Some("ws-from-env".into())),
             "ws-from-env"
         );
     }
@@ -2608,44 +2654,72 @@ mod tests {
 
         let params = json!({ "name": "browser_navigate", "arguments": {} });
         assert_eq!(
-            resolve_workspace_id(&params, Some("workspace-a".into())),
+            resolve_workspace_id(params.get("_meta"), Some("workspace-a".into())),
             "workspace-a"
         );
         assert_eq!(
-            resolve_workspace_id(&params, Some("workspace-b".into())),
+            resolve_workspace_id(params.get("_meta"), Some("workspace-b".into())),
             "workspace-b"
         );
     }
 
     // -----------------------------------------------------------------------
-    // Dispatch tests (async)
+    // Protocol handling (async)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn dispatch_initialize() {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            method: "initialize".into(),
-            params: json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}),
-            id: Some(json!(1)),
-        };
-        let resp = dispatch(req).await.unwrap();
-        let result = resp.result.unwrap();
+        let resp = rpc(&server(), json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}
+        })).await.unwrap();
+        let result = &resp["result"];
         assert_eq!(result["protocolVersion"], "2024-11-05");
-        assert!(result["serverInfo"]["name"].as_str() == Some("codemux"));
+        assert_eq!(result["serverInfo"]["name"], "codemux");
+        assert_eq!(result["capabilities"], json!({ "tools": {} }));
+    }
+
+    #[tokio::test]
+    async fn initialize_echoes_2025_11_25_and_records_client_info() {
+        let server = server();
+        let resp = rpc(&server, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "Hermes Agent", "version": "2.0.0", "title": "Hermes", "websiteUrl": "https://example.com"}
+            }
+        })).await.unwrap();
+        assert_eq!(resp["result"]["protocolVersion"], "2025-11-25");
+        assert_eq!(
+            server.client.get(),
+            Some(&ClientInfo { name: "Hermes Agent".into(), version: "2.0.0".into(), title: Some("Hermes".into()) })
+        );
+        // The first name sticks; an offer the server does not speak gets the latest.
+        let resp = rpc(&server, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "initialize",
+            "params": {"protocolVersion": "2026-07-28", "clientInfo": {"name": "other", "version": "1"}}
+        })).await.unwrap();
+        assert_eq!(resp["result"]["protocolVersion"], "2025-11-25");
+        assert_eq!(server.client.get().unwrap().name, "Hermes Agent");
+        let bare = rpc(&server, json!({"jsonrpc": "2.0", "id": 3, "method": "initialize"})).await.unwrap();
+        assert_eq!(bare["result"]["protocolVersion"], "2025-11-25");
+    }
+
+    #[tokio::test]
+    async fn server_discover_probe_gets_method_not_found_with_the_same_id() {
+        let server = server();
+        for id in [json!("discover-1"), json!(7)] {
+            let resp = rpc(&server, json!({"jsonrpc": "2.0", "id": id, "method": "server/discover", "params": {}})).await.unwrap();
+            assert_eq!(resp["id"], id);
+            assert_eq!(resp["error"]["code"], -32601);
+            assert!(resp.get("result").is_none());
+        }
     }
 
     #[tokio::test]
     async fn dispatch_tools_list() {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            method: "tools/list".into(),
-            params: json!({}),
-            id: Some(json!(2)),
-        };
-        let resp = dispatch(req).await.unwrap();
-        let result = resp.result.unwrap();
-        let tools = result["tools"].as_array().unwrap();
+        let resp = rpc(&server(), json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})).await.unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
         // Bumped 39 → 44 with the Phase 1.6 lifecycle + issue tools,
         // then 44 → 52 with the eight automation tools, then 52 → 55
         // with the workspace-archive tools, then 55 → 57 with attached
@@ -2662,65 +2736,138 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_unknown_method() {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            method: "nonexistent/method".into(),
-            params: json!({}),
-            id: Some(json!(3)),
-        };
-        let resp = dispatch(req).await.unwrap();
-        assert!(resp.error.is_some());
-        assert_eq!(resp.error.unwrap().code, METHOD_NOT_FOUND);
+        let resp = rpc(&server(), json!({"jsonrpc": "2.0", "id": 3, "method": "nonexistent/method", "params": {}})).await.unwrap();
+        assert_eq!(resp["error"]["code"], -32601);
     }
 
     #[tokio::test]
     async fn dispatch_notification_no_response() {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            method: "notifications/initialized".into(),
-            params: json!({}),
-            id: None,
-        };
-        let resp = dispatch(req).await;
+        let resp = rpc(&server(), json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})).await;
         assert!(resp.is_none(), "Notifications should return None");
     }
 
     #[tokio::test]
     async fn dispatch_ping() {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            method: "ping".into(),
-            params: json!({}),
-            id: Some(json!(4)),
-        };
-        let resp = dispatch(req).await.unwrap();
-        assert!(resp.result.is_some());
-        assert!(resp.error.is_none());
+        let resp = rpc(&server(), json!({"jsonrpc": "2.0", "id": 4, "method": "ping", "params": {}})).await.unwrap();
+        assert_eq!(resp["result"], json!({}));
+        assert!(resp.get("error").is_none());
     }
 
     #[tokio::test]
     async fn dispatch_tools_call_unknown_tool() {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            method: "tools/call".into(),
-            params: json!({"name": "nonexistent_tool", "arguments": {}}),
-            id: Some(json!(5)),
-        };
-        let resp = dispatch(req).await.unwrap();
-        let result = resp.result.unwrap();
+        let resp = rpc(&server(), tools_call(5, "nonexistent_tool", json!({}))).await.unwrap();
+        let result = &resp["result"];
         assert_eq!(result["isError"], true);
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Unknown tool"));
     }
 
+    #[tokio::test]
+    async fn tools_call_without_a_name_is_invalid_params() {
+        let server = server();
+        for params in [json!({}), json!({"name": ""}), json!({"name": "notify", "arguments": "x"})] {
+            let resp = rpc(&server, json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": params})).await.unwrap();
+            assert_eq!(resp["id"], 8);
+            assert_eq!(resp["error"]["code"], -32602, "{params}");
+        }
+    }
+
+    /// A runner for routing tests: `git_status` waits for `gate`, everything
+    /// else finishes at once; each call's name is logged when it starts.
+    fn gated_server() -> (StdioServer, Arc<tokio::sync::Notify>, Arc<Mutex<Vec<String>>>) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let (gate_for_run, started_for_run) = (Arc::clone(&gate), Arc::clone(&started));
+        let server = StdioServer::with_runner(McpServerOptions::default(), Arc::new(move |call: CallToolParams| -> BoxFuture<'static, Value> {
+            let (gate, started) = (Arc::clone(&gate_for_run), Arc::clone(&started_for_run));
+            Box::pin(async move {
+                started.lock().unwrap().push(call.name.clone());
+                if call.name == "git_status" {
+                    gate.notified().await;
+                }
+                protocol::text_result(call.name)
+            })
+        }));
+        (server, gate, started)
+    }
+
+    #[tokio::test]
+    async fn legacy_tools_run_in_arrival_order() {
+        let active = Arc::new(Mutex::new((0usize, 0usize)));
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let (active_for_run, finished_for_run) = (Arc::clone(&active), Arc::clone(&finished));
+        let server = StdioServer::with_runner(McpServerOptions::default(), Arc::new(move |call: CallToolParams| -> BoxFuture<'static, Value> {
+            let (active, finished) = (Arc::clone(&active_for_run), Arc::clone(&finished_for_run));
+            Box::pin(async move {
+                {
+                    let mut active = active.lock().unwrap();
+                    active.0 += 1;
+                    active.1 = active.1.max(active.0);
+                }
+                let delay = call.arguments["delay_ms"].as_u64().unwrap();
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                active.lock().unwrap().0 -= 1;
+                finished.lock().unwrap().push(call.name.clone());
+                protocol::text_result(call.name)
+            })
+        }));
+        // Each later call is quicker, so any overlap would reorder them.
+        let calls: Vec<_> = [("git_status", 60), ("pane_list", 30), ("notify", 0)]
+            .into_iter()
+            .enumerate()
+            .map(|(id, (name, delay))| {
+                let (future, parks) = later(server.request(request(id as u64, name, json!({ "delay_ms": delay }))));
+                assert!(!parks);
+                future
+            })
+            .collect();
+        let results = futures_util::future::join_all(calls).await;
+        assert_eq!(*finished.lock().unwrap(), ["git_status", "pane_list", "notify"]);
+        assert_eq!(active.lock().unwrap().1, 1, "legacy tools never overlap");
+        for (result, name) in results.into_iter().zip(["git_status", "pane_list", "notify"]) {
+            assert_eq!(result.unwrap()["content"][0]["text"], name);
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_tools_bypass_the_legacy_lane() {
+        let (server, gate, started) = gated_server();
+        let (legacy, legacy_parks) = later(server.request(request(1, "git_status", json!({}))));
+        // Let the lane pick the legacy job up; it then blocks on the gate.
+        for _ in 0..200 {
+            if !started.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*started.lock().unwrap(), ["git_status"]);
+        let (status, status_parks) = later(server.request(request(2, "thread_status", json!({}))));
+        let (_, wait_parks) = later(server.request(request(3, "thread_wait", json!({}))));
+        assert_eq!((legacy_parks, status_parks, wait_parks), (false, false, true), "only waits park");
+        // The native call finishes while the legacy job is still blocked.
+        let status = tokio::time::timeout(Duration::from_secs(2), status).await.expect("not held by the legacy lane");
+        assert_eq!(status.unwrap()["content"][0]["text"], "thread_status");
+        assert_eq!(*started.lock().unwrap(), ["git_status", "thread_status"]);
+        gate.notify_one();
+        assert_eq!(legacy.await.unwrap()["content"][0]["text"], "git_status");
+    }
+
+    #[tokio::test]
+    async fn cancelled_legacy_job_is_skipped() {
+        let (server, gate, started) = gated_server();
+        let (first, _) = later(server.request(request(1, "git_status", json!({}))));
+        let (second, _) = later(server.request(request(2, "pane_list", json!({}))));
+        drop(second);
+        gate.notify_one();
+        assert_eq!(first.await.unwrap()["content"][0]["text"], "git_status");
+        let (third, _) = later(server.request(request(3, "notify", json!({}))));
+        assert_eq!(third.await.unwrap()["content"][0]["text"], "notify");
+        assert_eq!(*started.lock().unwrap(), ["git_status", "notify"], "the cancelled job never ran");
+    }
+
     async fn call_html_render(arguments: Value) -> Value {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            method: "tools/call".into(),
-            params: json!({ "name": "html_render", "arguments": arguments }),
-            id: Some(json!(6)),
-        };
-        dispatch(req).await.unwrap().result.unwrap()
+        let resp = rpc(&server(), tools_call(6, "html_render", arguments)).await.unwrap();
+        resp["result"].clone()
     }
 
     #[tokio::test]
@@ -3441,7 +3588,7 @@ mod tests {
     #[test]
     fn native_thread_control_tools_are_discoverable() {
         let tools = register_tools();
-        let names: std::collections::HashSet<_> = tools.iter().map(|tool| tool.name).collect();
+        let names: std::collections::HashSet<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         for name in [
             "agent_capabilities",
             "thread_list",
@@ -3483,8 +3630,8 @@ mod tests {
     #[tokio::test]
     async fn cross_host_delegation_rejects_forged_generic_mcp_actor_metadata() {
         for name in ["delegation_targets",REMOTE_DELEGATE_TOOL,"task_status","task_cancel"] {
-            let response=handle_tool_call(json!(91),json!({"name":name,"arguments":{"parent_thread_id":"forged","permission_mode":"danger-full-access"},"_meta":{"thread_id":"forged","provider":"codex","native":true}})).await;
-            let result=response.result.unwrap();assert_eq!(result["isError"],true);assert!(result.to_string().contains("Native-only"));
+            let call=CallToolParams::parse(&json!({"name":name,"arguments":{"parent_thread_id":"forged","permission_mode":"danger-full-access"},"_meta":{"thread_id":"forged","provider":"codex","native":true}})).unwrap();
+            let result=handle_tool_call(call).await;assert_eq!(result["isError"],true);assert!(result.to_string().contains("Native-only"));
         }
     }
     #[test]
@@ -3498,7 +3645,7 @@ mod tests {
         }
         // An empty grant list must not read as "local delegation is off".
         for name in ["delegation_targets", REMOTE_DELEGATE_TOOL] {
-            let description = tools.iter().find(|tool| tool.name == name).unwrap().description;
+            let description = &tools.iter().find(|tool| tool.name == name).unwrap().description;
             assert!(description.contains("SSH remote host"), "{description}");
             assert!(description.contains("use delegate_task"), "{description}");
         }
