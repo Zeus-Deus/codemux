@@ -966,22 +966,15 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                 .and_then(|hits| serde_json::to_value(hits).map_err(|error| error.to_string()))
         })(),
         "create_workspace" => {
-            let state: State<'_, AppStateStore> = app.state();
-            let db: State<'_, crate::database::DatabaseStore> = app.state();
-            // Phase 1.5 fix: the MCP `workspace_create` tool advertises an
-            // optional `path` argument in its schema and the MCP dispatcher
-            // (mcp_server.rs::workspace_create) packs it into params, but
-            // this arm previously hardcoded `None` — so every call landed
-            // at `current_project_root()` regardless of what the brain
-            // asked for. Reading the param closes the silent-drop.
-            let path = request
-                .params
-                .get("path")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            crate::commands::workspace::create_workspace_impl(app.clone(), &state, &db, path)
+            // Backs the legacy `workspace_create` stdio tool. It always
+            // creates, and takes focus unless `select: false` asks it not to
+            // (registry `workspace_create` is the no-focus door).
+            let path = request.params.get("path").and_then(Value::as_str).map(str::to_string);
+            let select = request.params.get("select").and_then(Value::as_bool).unwrap_or(true);
+            crate::workspace_service::WorkspaceService::new(app)
+                .open(crate::workspace_service::OpenWorkspace { path, select, reuse_open: false, reserved_id: None })
                 .await
-                .map(|workspace_id| serde_json::json!({ "workspace_id": workspace_id }))
+                .and_then(|opened| serde_json::to_value(opened).map_err(|error| error.to_string()))
         }
         "split_pane" => {
             let state: State<'_, AppStateStore> = app.state();
@@ -1031,104 +1024,48 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
             .map(|()| serde_json::json!({ "ok": true }))
         }
         "create_worktree_workspace" => {
-            // Phase 1.5: backs the `worktree_create` MCP tool. The
-            // underlying impl already handles git worktree + workspace
-            // hydration + PTY spawn + setup scripts + .mcp.json autoconfig
-            // + preset launch with prompt injection in one atomic call —
-            // we only parse params and pass through.
-            let state: State<'_, AppStateStore> = app.state();
-            let db: State<'_, crate::database::DatabaseStore> = app.state();
-            let pty_state: State<'_, PtyState> = app.state();
-            let presets: State<'_, crate::presets::PresetStoreState> = app.state();
-            let repo_path = request
-                .params
-                .get("repo_path")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| "Missing required parameter: repo_path".to_string());
-            let branch = request
-                .params
-                .get("branch")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| "Missing required parameter: branch".to_string());
-            // Defaults match Phase 1.5 plan §5: new_branch=true so the
-            // brain's natural "spin up a new feature branch" flow doesn't
-            // need an extra arg, base="main" since that's where almost
-            // every project forks from, layout="single" because the brain
-            // typically wants one terminal pane to attach a CLI agent to.
-            let new_branch = request
-                .params
-                .get("new_branch")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            let base = request
-                .params
-                .get("base")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| Some("main".to_string()));
-            let layout = request
-                .params
-                .get("layout")
-                .and_then(Value::as_str)
-                .unwrap_or("single")
-                .to_string();
-            let initial_prompt = request
-                .params
-                .get("initial_prompt")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let agent_preset_id = request
-                .params
-                .get("agent_preset_id")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let pr_number = request
-                .params
-                .get("pr_number")
-                .and_then(Value::as_u64)
-                .map(|n| n as u32);
-            match (repo_path, branch) {
-                (Ok(rp), Ok(br)) => crate::commands::workspace::create_worktree_workspace_impl(
-                    app.clone(),
-                    &state,
-                    &db,
-                    &pty_state,
-                    &presets,
-                    rp,
-                    br,
-                    new_branch,
-                    base,
-                    layout,
-                    initial_prompt,
-                    agent_preset_id,
-                    request
-                        .params
-                        .get("model_selection")
-                        .cloned()
-                        .and_then(|v| {
-                            serde_json::from_value(v)
-                                .map_err(|e| {
-                                    eprintln!(
-                                        "[control] create_worktree_workspace: ignoring malformed model_selection: {e}"
-                                    )
-                                })
-                                .ok()
-                        }),
-                    pr_number,
-                )
-                .await
-                // `adopted` is additive: true when a live workspace already
-                // claimed the worktree path and was focused instead of a new
-                // one being created (any initial_prompt was dropped).
-                .map(|created| {
-                    serde_json::json!({
-                        "workspace_id": created.workspace_id,
-                        "adopted": created.adopted,
+            // Backs the legacy `worktree_create` stdio tool: git worktree,
+            // workspace and layout, PTYs, setup scripts, `.mcp.json` and an
+            // optional preset launch with its prompt, in one call. Params are
+            // read as leniently as they always were; the defaults are a new
+            // branch from the repository's default branch, one terminal, and
+            // focus on the new workspace unless `select: false`.
+            let text = |key: &str| request.params.get(key).and_then(Value::as_str).map(str::to_string);
+            let required = |key: &str| text(key).ok_or_else(|| format!("Missing required parameter: {key}"));
+            let model_selection = request.params.get("model_selection").cloned().and_then(|value| {
+                serde_json::from_value(value)
+                    .map_err(|error| {
+                        eprintln!("[control] create_worktree_workspace: ignoring malformed model_selection: {error}")
                     })
-                }),
-                (Err(e), _) | (_, Err(e)) => Err(e),
+                    .ok()
+            });
+            match (required("repo_path"), required("branch")) {
+                (Ok(repo_path), Ok(branch)) => {
+                    let args = crate::workspace_service::WorktreeArgs {
+                        repo_path,
+                        branch,
+                        new_branch: request.params.get("new_branch").and_then(Value::as_bool),
+                        base: text("base"),
+                        start_from_origin: None,
+                        layout: text("layout"),
+                        agent_preset_id: text("agent_preset_id"),
+                        initial_prompt: text("initial_prompt"),
+                        pr_number: request.params.get("pr_number").and_then(Value::as_u64).map(|n| n as u32),
+                        select: request.params.get("select").and_then(Value::as_bool).unwrap_or(true),
+                        client_request_id: None,
+                    };
+                    match args.into_request(model_selection, None).await {
+                        Ok(worktree) => crate::workspace_service::WorkspaceService::new(app)
+                            .create_worktree(worktree)
+                            .await
+                            // `adopted` is true when a live workspace already
+                            // held the checkout and was returned instead (any
+                            // initial_prompt was dropped).
+                            .and_then(|created| serde_json::to_value(created).map_err(|error| error.to_string())),
+                        Err(error) => Err(error),
+                    }
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error),
             }
         }
         "get_presets" => {
@@ -1236,47 +1173,21 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
             })
         }
         "close_workspace" => {
-            // Phase 1.6: backs the `workspace_close` MCP tool. Wraps the
-            // existing `close_workspace_with_worktree_impl` so both the
-            // Tauri command and the socket arm share teardown, PTY
-            // termination, agent-chat shutdown, MCP cleanup, and (when
-            // requested) `git worktree remove`. Safe default:
-            // `delete_worktree=false` — closing never destroys a worktree
-            // unless the brain asks for it.
-            let state: State<'_, AppStateStore> = app.state();
-            let db: State<'_, crate::database::DatabaseStore> = app.state();
-            let workspace_id = request
-                .params
-                .get("workspace_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| "Missing required parameter: workspace_id".to_string());
-            let delete_worktree = request
-                .params
-                .get("delete_worktree")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let delete_branch = request.params.get("delete_branch").and_then(Value::as_bool);
-            let force = request.params.get("force_delete").and_then(Value::as_bool);
-            match workspace_id {
-                Ok(ws_id) => crate::commands::workspace::close_workspace_with_worktree_impl(
-                    app.clone(),
-                    &state,
-                    &db,
-                    ws_id.clone(),
-                    delete_worktree,
-                    delete_branch,
-                    force,
-                )
-                .await
-                .map(|_| {
-                    serde_json::json!({
-                        "workspace_id": ws_id,
-                        "closed": true,
-                        "worktree_removed": delete_worktree,
+            // Backs the legacy `workspace_close` stdio tool, through the
+            // desktop close dialog's teardown and deletion guards. Closing
+            // never removes a worktree unless asked to.
+            let flag = |key: &str| request.params.get(key).and_then(Value::as_bool).unwrap_or(false);
+            match request.params.get("workspace_id").and_then(Value::as_str) {
+                Some(workspace_id) => crate::workspace_service::WorkspaceService::new(app)
+                    .close(crate::workspace_service::CloseWorkspace {
+                        workspace_id: workspace_id.to_string(),
+                        remove_worktree: flag("delete_worktree"),
+                        delete_branch: flag("delete_branch"),
+                        force: flag("force_delete"),
                     })
-                }),
-                Err(e) => Err(e),
+                    .await
+                    .and_then(|closed| serde_json::to_value(closed).map_err(|error| error.to_string())),
+                None => Err("Missing required parameter: workspace_id".to_string()),
             }
         }
         "archive_workspace" => {

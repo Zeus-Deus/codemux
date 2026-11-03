@@ -1,5 +1,6 @@
-//! The control socket tells the owner from processes Codemux started for
-//! agents, end to end through the built `codemux` binary.
+//! The control socket end to end through the built `codemux` binary: it tells
+//! the owner from processes Codemux started for agents, and the legacy
+//! workspace commands keep their shapes.
 //!
 //! Each test runs its own `codemux serve` child in a throwaway home with its
 //! own `XDG_RUNTIME_DIR`, and drives it with the `codemux` CLI. Every child
@@ -191,4 +192,88 @@ fn pty_shell_is_the_owner() {
         assert!(!env.lines().any(|line| line.starts_with(&format!("{key}="))), "{key} reached the terminal");
     }
     assert!(env.contains("CODEMUX_SESSION_ID="), "the dump is the terminal's env");
+}
+
+/// `get_app_state`'s focused workspace id.
+fn active_workspace(serve: &Serve) -> String {
+    let state = serve.json("get_app_state", "{}", &[]);
+    let active = &state["data"]["active_workspace_id"];
+    active.as_str().or_else(|| active["0"].as_str()).unwrap_or_else(|| panic!("no active workspace: {state}")).to_owned()
+}
+
+#[test]
+fn socket_legacy_create_arms_keep_shapes_and_focus() {
+    let serve = Serve::start(&[]);
+    let root = serve.root.path();
+    let (first, second) = (root.join("first"), root.join("second"));
+    for dir in [&first, &second] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+
+    let created = serve.json("create_workspace", &json!({ "path": first }).to_string(), &[]);
+    assert_eq!(created["ok"], true, "{created}");
+    let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
+    assert_eq!(created["data"]["cwd"], first.display().to_string());
+    assert_eq!(created["data"]["created"], true);
+    assert_eq!(active_workspace(&serve), id, "the legacy command still takes focus");
+
+    let background = serve.json("create_workspace", &json!({ "path": second, "select": false }).to_string(), &[]);
+    assert_eq!(background["ok"], true, "{background}");
+    let other = background["data"]["workspace_id"].as_str().unwrap().to_owned();
+    assert_ne!(other, id);
+    assert_eq!(active_workspace(&serve), id, "select:false keeps focus where it was");
+
+    let closed = serve.json("close_workspace", &json!({ "workspace_id": other }).to_string(), &[]);
+    assert_eq!(closed["data"], json!({"workspace_id": other, "closed": true, "worktree_removed": false}), "{closed}");
+    let missing = serve.json("close_workspace", "{}", &[]);
+    assert_eq!(missing["error"], "Missing required parameter: workspace_id", "{missing}");
+}
+
+/// `git` in `dir` with a fixed identity; its trimmed stdout.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Codemux test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Codemux test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", dir.join(".no-global-gitconfig"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn socket_worktree_default_base_is_repo_default_branch() {
+    let serve = Serve::start(&[]);
+    // A repository whose only branch is `trunk`: the old default base `main`
+    // does not exist there.
+    let repo = serve.root.path().join("trunk-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "trunk"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+    let trunk = git(&repo, &["rev-parse", "HEAD"]);
+
+    let params = json!({ "repo_path": repo, "branch": "feat", "layout": "empty" });
+    let created = serve.json("create_worktree_workspace", &params.to_string(), &[]);
+    assert_eq!(created["ok"], true, "{created}");
+    let data = &created["data"];
+    assert_eq!(data["base_branch"], "trunk", "{created}");
+    assert_eq!(data["adopted"], false);
+    let checkout = Path::new(data["cwd"].as_str().unwrap());
+    assert_eq!(git(checkout, &["rev-parse", "HEAD"]), trunk);
+    assert_eq!(git(checkout, &["branch", "--show-current"]), "feat");
+    let id = data["workspace_id"].as_str().unwrap().to_owned();
+    assert_eq!(active_workspace(&serve), id, "the legacy command still takes focus");
+
+    let params = json!({ "repo_path": repo, "branch": "feat-2", "layout": "empty", "select": false });
+    let background = serve.json("create_worktree_workspace", &params.to_string(), &[]);
+    assert_eq!(background["data"]["base_branch"], "trunk", "{background}");
+    assert_eq!(active_workspace(&serve), id, "select:false keeps focus where it was");
+
+    let missing = serve.json("create_worktree_workspace", &json!({ "branch": "x" }).to_string(), &[]);
+    assert_eq!(missing["error"], "Missing required parameter: repo_path", "{missing}");
 }
