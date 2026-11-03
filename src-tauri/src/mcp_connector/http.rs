@@ -2411,6 +2411,16 @@ mod tests {
     fn error_code(result: &Value) -> &str {
         result["structuredContent"]["error"]["code"].as_str().unwrap_or_default()
     }
+    /// Every wait slot comes back within a second.
+    async fn slots_return(f: &Fixture, after: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while free_wait_slots(f) != super::super::MAX_WAITS {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{after}: {} slots free", free_wait_slots(f)));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refresh_grant_rotates_and_keeps_receipts_and_in_flight_authority() {
@@ -2715,6 +2725,46 @@ mod tests {
         configure(f.app.handle(), false, None, None).unwrap();
         let ended = tokio::time::timeout(Duration::from_secs(2), wait).await.expect("the wait outlived the switch").unwrap();
         assert_eq!(error_code(&ended), "connector_disabled", "{ended}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_wait_frees_its_slot() {
+        let worker = "abandoned-worker";
+        let (f, _provider, _root, workspace) = worker_fixture(worker).await;
+        worker_runs(&f, worker);
+        let bot = issue(&f, "impatient-bot", ControlAccess::ReadOnly);
+        // The request future is dropped part-way.
+        let wait = spawn_wait(&f, &bot.token, &workspace, worker);
+        parked(&f, 1, std::slice::from_ref(&wait)).await;
+        wait.abort();
+        slots_return(&f, "an aborted request").await;
+        // A client whose HTTP timeout fires hangs up on the real listener.
+        let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"thread_wait","arguments":{
+            "workspace_id":workspace,"thread_id":worker,"timeout_ms":30_000
+        }}})
+        .to_string();
+        let raw = format!(
+            "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\ncontent-type: application/json\r\n\
+             accept: application/json, text/event-stream\r\nmcp-protocol-version: {LATEST_PROTOCOL_VERSION}\r\n\
+             authorization: Bearer {token}\r\ncontent-length: {length}\r\n\r\n{body}",
+            port = f.port,
+            token = bot.token,
+            length = body.len(),
+        );
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", f.port)).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, raw.as_bytes()).await.unwrap();
+        parked(&f, 1, &[]).await;
+        drop(client);
+        slots_return(&f, "a client that hung up").await;
+        // The same client is not locked out: it gets its whole share again.
+        let waits: Vec<_> = (0..super::super::MAX_WAITS_PER_CLIENT)
+            .map(|_| spawn_wait(&f, &bot.token, &workspace, worker))
+            .collect();
+        parked(&f, waits.len(), &waits).await;
+        super::super::agent_connector_revoke_all(f.app.handle().clone()).unwrap();
+        for wait in waits {
+            assert_eq!(error_code(&wait.await.unwrap()), "grant_revoked");
+        }
     }
 
     // ── Protocol versions and envelopes ──────────────────────────────────
