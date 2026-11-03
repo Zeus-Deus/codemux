@@ -994,6 +994,26 @@ mod tests {
         assert_eq!(read_to_string(&path), content);
     }
 
+    #[test]
+    fn yaml_treats_a_bare_servers_key_as_an_empty_list() {
+        let dir = TempDir::new().unwrap();
+        let content = "servers:\n";
+
+        let path = yaml_file(&dir, content);
+        assert_eq!(
+            ensure_in_yaml_config(&path, "/bin/codemux-remote", OURS).unwrap(),
+            EntryOutcome::Written
+        );
+        assert_eq!(yaml_names(&path), ["codemux"]);
+
+        let path = yaml_file(&dir, content);
+        assert_eq!(
+            ensure_in_yaml_config(&path, "/bin/codemux-remote", APP).unwrap(),
+            EntryOutcome::Absent
+        );
+        assert_eq!(read_to_string(&path), content, "bytes unchanged");
+    }
+
     // ─── Ownership ─────────────────────────────────────────────
 
     #[test]
