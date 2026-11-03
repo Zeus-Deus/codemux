@@ -3154,3 +3154,100 @@ async fn all_provider_premium_codex_tiers_start_delegated_children() {
         }).await.unwrap_or_else(|_| panic!("the {tier} child started"));
     }
 }
+
+/// Every catalog the native tools are served from, as JSON: the HTTP connector's
+/// `tools/list` for a full-access client, and the in-app host tools
+/// (orchestration plus plugins) for a full-access Claude chat, a Codex Plan chat
+/// and a chat with Agent collaboration off.
+async fn recorded_catalogs() -> serde_json::Value {
+    use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, _provider, _root, workspace) = fixture().await;
+    let in_app = |provider: ProviderKind, mode: &str| {
+        let caller = HostCaller {
+            control: None,
+            thread_id: "catalog-snapshot".into(),
+            provider,
+            workspace_id: Some(workspace.clone()),
+            permission_mode: Some(mode.into()),
+        };
+        let mut tools = native::OrchestrationHost(app.handle().clone()).tools_for(&caller);
+        tools.extend(crate::plugins::platform_transport::PluginToolsHost(app.handle().clone()).tools_for(&caller));
+        serde_json::to_value(tools).unwrap()
+    };
+    let in_app_full = in_app(ProviderKind::Claude, "bypassPermissions");
+    let in_app_plan_codex = in_app(ProviderKind::Codex, "plan");
+    app.state::<crate::database::DatabaseStore>()
+        .set_setting("agents.cross_provider_delegation", "false")
+        .unwrap();
+    let in_app_off = in_app(ProviderKind::Claude, "bypassPermissions");
+    json!({
+        "outside": serde_json::to_value(remote_tools()).unwrap(),
+        "in_app_full": in_app_full,
+        "in_app_plan_codex": in_app_plan_codex,
+        "in_app_off": in_app_off,
+    })
+}
+
+const CATALOG_SNAPSHOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/agent_control/testdata/catalog.json");
+
+/// The first JSON path where two values differ, for a readable failure.
+fn first_difference(path: String, expected: &serde_json::Value, actual: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    match (expected, actual) {
+        (Value::Object(e), Value::Object(a)) => e.keys().chain(a.keys().filter(|k| !e.contains_key(*k)))
+            .find_map(|k| first_difference(format!("{path}/{k}"), e.get(k).unwrap_or(&Value::Null), a.get(k).unwrap_or(&Value::Null))),
+        (Value::Array(e), Value::Array(a)) if e.len() == a.len() => e.iter().zip(a).enumerate()
+            .find_map(|(i, (e, a))| first_difference(format!("{path}/{i}"), e, a)),
+        _ if expected == actual => None,
+        _ => Some(format!("{path}: expected {expected}, got {actual}")),
+    }
+}
+
+/// The catalogs are a contract with in-app providers (prefixed tool names and
+/// schemas) and outside clients. A change must be deliberate: review the diff,
+/// then re-record with `write_catalog_snapshot`.
+#[tokio::test]
+async fn catalogs_match_the_recorded_snapshot() {
+    let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(CATALOG_SNAPSHOT).unwrap()).unwrap();
+    let actual = recorded_catalogs().await;
+    if let Some(difference) = first_difference(String::new(), &recorded, &actual) {
+        panic!("catalog changed at {difference}; if intended, re-record with `cargo test --lib agent_control::tests::write_catalog_snapshot -- --ignored`");
+    }
+}
+
+#[tokio::test]
+#[ignore = "rewrites testdata/catalog.json"]
+async fn write_catalog_snapshot() {
+    let mut text = serde_json::to_string_pretty(&recorded_catalogs().await).unwrap();
+    text.push('\n');
+    std::fs::write(CATALOG_SNAPSHOT, text).unwrap();
+}
+
+/// A `create_threads` retry without client_request_id must find the receipts of
+/// the first attempt, so the implicit batch key is a contract: a hash of the
+/// calling session and run, the arguments after the caller's workspace is
+/// filled in, and whether each chat gets its own child workspace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_app_create_threads_retry_keys_are_unchanged() {
+    use sha2::{Digest, Sha256};
+    let (app, _provider, _root, workspace, _thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
+    let run = actor.permit.identity().unwrap().run_id;
+    let expected = |args: &serde_json::Value, child_workspace: bool| format!("batch:{:x}", Sha256::digest(
+        serde_json::to_vec(&json!({"session":actor.session_id,"run":run,"args":args,"child_workspace":child_workspace})).unwrap(),
+    ));
+    let threads = json!([{"title":"Implicit key child","message":"Synthetic fixture task"}]);
+    let call = |args: serde_json::Value| native::call(app.handle().clone(), actor.clone(), "create_threads".into(), args);
+
+    let tab = json!({"workspace_id":workspace,"threads":threads});
+    let first = call(tab.clone()).await.unwrap();
+    assert!(first["error"].is_null(), "{first}");
+    assert_eq!(first["client_request_id"], expected(&tab, false));
+    let retry = call(tab.clone()).await.unwrap();
+    assert_eq!(retry["client_request_id"], first["client_request_id"]);
+    assert_eq!(retry["threads"][0]["operation_id"], first["threads"][0]["operation_id"], "{retry}");
+
+    let nested = call(json!({"threads":threads})).await.unwrap();
+    assert!(nested["error"].is_null(), "{nested}");
+    assert_eq!(nested["client_request_id"], expected(&json!({"workspace_id":workspace,"threads":threads}), true));
+}

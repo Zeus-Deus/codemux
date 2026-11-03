@@ -1,0 +1,1495 @@
+{
+  "in_app_full": [
+    {
+      "description": "List native threads in the explicitly selected workspace, including threads whose provider has not assigned a resume ID. Does not start or resume providers.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "thread_list",
+      "prefixedName": "mcp__codemux__thread_list",
+      "serverId": "codemux"
+    },
+    {
+      "description": "If the user asks to delegate work or wants results back, use delegate_task instead. Start an independent chat only when the user requests a separate conversation. Without workspace_id the chat gets its own workspace, nested under yours in the same folder and titled with title; with workspace_id it opens as a tab in that workspace. Omitted or null permission_mode inherits the caller's effective ceiling; explicit modes cannot exceed it. Worktree strategies are unsupported. Returns an operation receipt; use operation_status.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "context_window": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fast_mode": {
+            "default": false,
+            "type": "boolean"
+          },
+          "message": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "type": "string"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permission_mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "provider_instance_id": {
+            "type": "string"
+          },
+          "select": {
+            "default": false,
+            "type": "boolean"
+          },
+          "service_tier": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target": {
+            "additionalProperties": false,
+            "properties": {
+              "instance_id": {
+                "description": "Exact provider_instance_id from orchestrator_capabilities",
+                "type": "string"
+              },
+              "model": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "options": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "instance_id"
+            ],
+            "type": "object"
+          },
+          "title": {
+            "maxLength": 100,
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "worktree": {
+            "description": "Unsupported in this version"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "thread_launch",
+      "prefixedName": "mcp__codemux__thread_launch",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Send a message to another local chat as this authenticated agent. Auto starts an idle receiver, steers a ready busy receiver, or queues. Queue and steer may be selected explicitly. Use thread_interrupt for selected-run interruption. A queued receipt is not completion. Reuse client_request_id unchanged on retry.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "delivery": {
+            "default": "auto",
+            "enum": [
+              "auto",
+              "queue",
+              "steer"
+            ],
+            "type": "string"
+          },
+          "message": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "type": "string"
+          },
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "client_request_id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "thread_send",
+      "prefixedName": "mcp__codemux__thread_send",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Read cursor-addressable safe-visible user and top-level assistant prose. Hidden reasoning, raw tool payloads and subagent internals are excluded. Does not resume a provider.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_chars": {
+            "maximum": 16000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "text_offset": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id"
+        ],
+        "type": "object"
+      },
+      "name": "thread_read",
+      "prefixedName": "mcp__codemux__thread_read",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Wait at most 20 seconds for the selected native run to settle. A timeout does not cancel work; read status or wait again. Specify turn_id to avoid following a newer run.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "timeout_ms": {
+            "default": 1000,
+            "maximum": 20000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "turn_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id"
+        ],
+        "type": "object"
+      },
+      "name": "thread_wait",
+      "prefixedName": "mcp__codemux__thread_wait",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Interrupt the selected native turn without deleting its thread, pane, history or worktree. Use turn_id when available to avoid interrupting a newer run.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "turn_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "client_request_id"
+        ],
+        "type": "object"
+      },
+      "name": "thread_interrupt",
+      "prefixedName": "mcp__codemux__thread_interrupt",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Read an admitted mutation's durable receipt, scoped to its calling client. Accepted/running is not completion. needs_attention is an uncertain prior dispatch: inspect its thread instead of resending.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "operation_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id"
+        ],
+        "type": "object"
+      },
+      "name": "operation_status",
+      "prefixedName": "mcp__codemux__operation_status",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Discover live configured provider instances, model IDs, model options and inherited permission ceilings. Values are opaque. Chat links use codemux-chat://v1/<thread_id>.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "orchestrator_capabilities",
+      "prefixedName": "mcp__codemux__orchestrator_capabilities",
+      "serverId": "codemux"
+    },
+    {
+      "description": "If the user asks to delegate work or wants results back, use delegate_task instead. Start independent chats ONLY when the user requests separate conversations. Without workspace_id each chat gets its own workspace, nested under yours in the same folder; with workspace_id they open as tabs in that workspace. Results do not automatically return.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "type": "string"
+          },
+          "threads": {
+            "items": {
+              "type": "object"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "threads"
+        ],
+        "type": "object"
+      },
+      "name": "create_threads",
+      "prefixedName": "mcp__codemux__create_threads",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Search bounded safe-visible chat titles and prose. Defaults to the caller's project. Explicit workspace selects that project. Chat links use codemux-chat://v1/<thread_id>.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "query": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "thread_search",
+      "prefixedName": "mcp__codemux__thread_search",
+      "serverId": "codemux"
+    },
+    {
+      "description": "List enabled compatible plugin actions explicitly exposed to agents. This never installs, enables or starts plugin code. Retain installationId and generation; changed or disabled installations revoke that generation.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "plugin_list",
+      "prefixedName": "mcp__codemux__plugin_list",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Invoke an agent-callable plugin action. Use a stable operationId per intended action and reuse it for retries. Caller identity comes from the host, independently of requested context. Client intents are returned as data; they never navigate another person's interface. Plugin thread effects retain the caller's permission ceiling and project grants.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "actionId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "context": {
+            "additionalProperties": false,
+            "properties": {
+              "messageId": {
+                "type": "string"
+              },
+              "projectId": {
+                "type": "string"
+              },
+              "selection": {
+                "maxLength": 64000,
+                "type": "string"
+              },
+              "threadId": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "generation": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "input": {},
+          "installationId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operationId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "installationId",
+          "generation",
+          "actionId",
+          "operationId"
+        ],
+        "type": "object"
+      },
+      "name": "plugin_invoke",
+      "prefixedName": "mcp__codemux__plugin_invoke",
+      "serverId": "codemux"
+    }
+  ],
+  "in_app_off": [
+    {
+      "description": "List enabled compatible plugin actions explicitly exposed to agents. This never installs, enables or starts plugin code. Retain installationId and generation; changed or disabled installations revoke that generation.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "plugin_list",
+      "prefixedName": "mcp__codemux__plugin_list",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Invoke an agent-callable plugin action. Use a stable operationId per intended action and reuse it for retries. Caller identity comes from the host, independently of requested context. Client intents are returned as data; they never navigate another person's interface. Plugin thread effects retain the caller's permission ceiling and project grants.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "actionId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "context": {
+            "additionalProperties": false,
+            "properties": {
+              "messageId": {
+                "type": "string"
+              },
+              "projectId": {
+                "type": "string"
+              },
+              "selection": {
+                "maxLength": 64000,
+                "type": "string"
+              },
+              "threadId": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "generation": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "input": {},
+          "installationId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operationId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "installationId",
+          "generation",
+          "actionId",
+          "operationId"
+        ],
+        "type": "object"
+      },
+      "name": "plugin_invoke",
+      "prefixedName": "mcp__codemux__plugin_invoke",
+      "serverId": "codemux"
+    }
+  ],
+  "in_app_plan_codex": [
+    {
+      "description": "List native threads in the explicitly selected workspace, including threads whose provider has not assigned a resume ID. Does not start or resume providers.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "thread_list",
+      "prefixedName": "mcp__codemux__thread_list",
+      "serverId": "codemux"
+    },
+    {
+      "description": "If the user asks to delegate work or wants results back, use delegate_task instead. Start an independent chat only when the user requests a separate conversation. Without workspace_id the chat gets its own workspace, nested under yours in the same folder and titled with title; with workspace_id it opens as a tab in that workspace. Omitted or null permission_mode inherits the caller's effective ceiling; explicit modes cannot exceed it. Worktree strategies are unsupported. Returns an operation receipt; use operation_status.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "context_window": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fast_mode": {
+            "default": false,
+            "type": "boolean"
+          },
+          "message": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "type": "string"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permission_mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "provider_instance_id": {
+            "type": "string"
+          },
+          "select": {
+            "default": false,
+            "type": "boolean"
+          },
+          "service_tier": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target": {
+            "additionalProperties": false,
+            "properties": {
+              "instance_id": {
+                "description": "Exact provider_instance_id from orchestrator_capabilities",
+                "type": "string"
+              },
+              "model": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "options": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "instance_id"
+            ],
+            "type": "object"
+          },
+          "title": {
+            "maxLength": 100,
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "worktree": {
+            "description": "Unsupported in this version"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "thread_launch",
+      "prefixedName": "mcp__codemux__thread_launch",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Send a message to another local chat as this authenticated agent. Auto starts an idle receiver, steers a ready busy receiver, or queues. Queue and steer may be selected explicitly. Use thread_interrupt for selected-run interruption. A queued receipt is not completion. Reuse client_request_id unchanged on retry.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "delivery": {
+            "default": "auto",
+            "enum": [
+              "auto",
+              "queue",
+              "steer"
+            ],
+            "type": "string"
+          },
+          "message": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "type": "string"
+          },
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "client_request_id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "thread_send",
+      "prefixedName": "mcp__codemux__thread_send",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Read cursor-addressable safe-visible user and top-level assistant prose. Hidden reasoning, raw tool payloads and subagent internals are excluded. Does not resume a provider.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_chars": {
+            "maximum": 16000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "text_offset": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id"
+        ],
+        "type": "object"
+      },
+      "name": "thread_read",
+      "prefixedName": "mcp__codemux__thread_read",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Wait at most 20 seconds for the selected native run to settle. A timeout does not cancel work; read status or wait again. Specify turn_id to avoid following a newer run.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "timeout_ms": {
+            "default": 1000,
+            "maximum": 20000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "turn_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id"
+        ],
+        "type": "object"
+      },
+      "name": "thread_wait",
+      "prefixedName": "mcp__codemux__thread_wait",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Interrupt the selected native turn without deleting its thread, pane, history or worktree. Use turn_id when available to avoid interrupting a newer run.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "turn_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "client_request_id"
+        ],
+        "type": "object"
+      },
+      "name": "thread_interrupt",
+      "prefixedName": "mcp__codemux__thread_interrupt",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Read an admitted mutation's durable receipt, scoped to its calling client. Accepted/running is not completion. needs_attention is an uncertain prior dispatch: inspect its thread instead of resending.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "operation_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id"
+        ],
+        "type": "object"
+      },
+      "name": "operation_status",
+      "prefixedName": "mcp__codemux__operation_status",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Discover live configured provider instances, model IDs, model options and inherited permission ceilings. Values are opaque. Chat links use codemux-chat://v1/<thread_id>.\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "orchestrator_capabilities",
+      "prefixedName": "mcp__codemux__orchestrator_capabilities",
+      "serverId": "codemux"
+    },
+    {
+      "description": "If the user asks to delegate work or wants results back, use delegate_task instead. Start independent chats ONLY when the user requests separate conversations. Without workspace_id each chat gets its own workspace, nested under yours in the same folder; with workspace_id they open as tabs in that workspace. Results do not automatically return.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "type": "string"
+          },
+          "threads": {
+            "items": {
+              "type": "object"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "threads"
+        ],
+        "type": "object"
+      },
+      "name": "create_threads",
+      "prefixedName": "mcp__codemux__create_threads",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Search bounded safe-visible chat titles and prose. Defaults to the caller's project. Explicit workspace selects that project. Chat links use codemux-chat://v1/<thread_id>.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "query": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "thread_search",
+      "prefixedName": "mcp__codemux__thread_search",
+      "serverId": "codemux"
+    },
+    {
+      "description": "List enabled compatible plugin actions explicitly exposed to agents. This never installs, enables or starts plugin code. Retain installationId and generation; changed or disabled installations revoke that generation.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "plugin_list",
+      "prefixedName": "mcp__codemux__plugin_list",
+      "serverId": "codemux"
+    },
+    {
+      "description": "Invoke an agent-callable plugin action. Use a stable operationId per intended action and reuse it for retries. Caller identity comes from the host, independently of requested context. Client intents are returned as data; they never navigate another person's interface. Plugin thread effects retain the caller's permission ceiling and project grants.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "actionId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "context": {
+            "additionalProperties": false,
+            "properties": {
+              "messageId": {
+                "type": "string"
+              },
+              "projectId": {
+                "type": "string"
+              },
+              "selection": {
+                "maxLength": 64000,
+                "type": "string"
+              },
+              "threadId": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "generation": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "input": {},
+          "installationId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operationId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "installationId",
+          "generation",
+          "actionId",
+          "operationId"
+        ],
+        "type": "object"
+      },
+      "name": "plugin_invoke",
+      "prefixedName": "mcp__codemux__plugin_invoke",
+      "serverId": "codemux"
+    }
+  ],
+  "outside": [
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "List workspaces on this CodeMux instance. Use the returned workspace IDs explicitly; outside clients have no current pane or calling thread.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "workspace_list"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Discover provider-owned model, effort, permission and operation capabilities for a workspace. Registered/configured is not launch readiness: inspect discovery_error. Configured account, Hermes profile and custom ACP IDs are advertised as provider_instance_id values; use target to select one. Values are opaque; do not invent model IDs or permission defaults.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "name": "agent_capabilities"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "List native threads in the explicitly selected workspace, including threads whose provider has not assigned a resume ID. Does not start or resume providers.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "name": "thread_list"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Launch a CodeMux-owned native thread in an existing workspace. Creating worktrees is unavailable. Select configured accounts, Hermes profiles and ACP instances through target. Returns an operation receipt; use operation_status. Explicit permission_mode is mandatory (null only for providers without a mode). No raw environment or filesystem attachment inputs.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "context_window": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fast_mode": {
+            "default": false,
+            "type": "boolean"
+          },
+          "message": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "type": "string"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permission_mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "select": {
+            "default": false,
+            "type": "boolean"
+          },
+          "service_tier": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target": {
+            "additionalProperties": false,
+            "properties": {
+              "instance_id": {
+                "description": "Exact provider_instance_id from orchestrator_capabilities",
+                "type": "string"
+              },
+              "model": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "options": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "instance_id"
+            ],
+            "type": "object"
+          },
+          "title": {
+            "maxLength": 100,
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "client_request_id",
+          "provider",
+          "permission_mode"
+        ],
+        "type": "object"
+      },
+      "name": "thread_launch"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Send a follow-up to a native thread through CodeMux's normal intake. Auto delivery starts idle threads, safely steers ready active threads, and otherwise queues without interrupting. Explicit queue, steer, and interrupt remain available. A queued receipt is not completion. Reuse client_request_id unchanged on retry.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "delivery": {
+            "default": "auto",
+            "enum": [
+              "auto",
+              "queue",
+              "steer",
+              "interrupt"
+            ],
+            "type": "string"
+          },
+          "message": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "type": "string"
+          },
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "thread_id",
+          "client_request_id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "thread_send"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Read cursor-addressable safe-visible user and top-level assistant prose. Hidden reasoning, raw tool payloads and subagent internals are excluded. Does not resume a provider.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "thread_id"
+        ],
+        "type": "object"
+      },
+      "name": "thread_read"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Read live/terminal/unknown status and current pending approval IDs. A missing runtime after restart is not proof of completion. Does not resume providers.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "thread_id"
+        ],
+        "type": "object"
+      },
+      "name": "thread_status"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Wait at most 20 seconds for the selected native run to settle. A timeout does not cancel work; read status or wait again. Specify turn_id to avoid following a newer run.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "timeout_ms": {
+            "default": 1000,
+            "maximum": 20000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "turn_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "thread_id"
+        ],
+        "type": "object"
+      },
+      "name": "thread_wait"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Interrupt the selected native turn without deleting its thread, pane, history or worktree. Use turn_id when available to avoid interrupting a newer run.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "turn_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "thread_id",
+          "client_request_id"
+        ],
+        "type": "object"
+      },
+      "name": "thread_interrupt"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Stop the native provider session and queued work, preserving the pane, history and files. Stopping is not closing or deleting a workspace.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "thread_id",
+          "client_request_id"
+        ],
+        "type": "object"
+      },
+      "name": "thread_stop"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Deliver an exact decision to a currently live provider approval. Stale callbacks are errors, not successful approvals. Supervised outside clients may not approve their own worker requests.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_request_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "decision": {
+            "enum": [
+              "allow_once",
+              "allow_always",
+              "deny"
+            ],
+            "type": "string"
+          },
+          "request_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "thread_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "thread_id",
+          "client_request_id",
+          "request_id",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "name": "thread_respond"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Read an admitted mutation's durable receipt, scoped to its calling client. Accepted/running is not completion. needs_attention is an uncertain prior dispatch: inspect its thread instead of resending.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "operation_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id"
+        ],
+        "type": "object"
+      },
+      "name": "operation_status"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "List enabled compatible plugin actions explicitly exposed to agents. This never installs, enables or starts plugin code. Retain installationId and generation; changed or disabled installations revoke that generation.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "plugin_list"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Invoke an agent-callable plugin action. Use a stable operationId per intended action and reuse it for retries. Caller identity comes from the host, independently of requested context. Client intents are returned as data; they never navigate another person's interface. Plugin thread effects retain the caller's permission ceiling and project grants.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "actionId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "context": {
+            "additionalProperties": false,
+            "properties": {
+              "messageId": {
+                "type": "string"
+              },
+              "projectId": {
+                "type": "string"
+              },
+              "selection": {
+                "maxLength": 64000,
+                "type": "string"
+              },
+              "threadId": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "generation": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "input": {},
+          "installationId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operationId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "installationId",
+          "generation",
+          "actionId",
+          "operationId"
+        ],
+        "type": "object"
+      },
+      "name": "plugin_invoke"
+    }
+  ]
+}
