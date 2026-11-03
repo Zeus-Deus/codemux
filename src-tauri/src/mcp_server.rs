@@ -1981,9 +1981,12 @@ async fn relay_registry_call(call: CallToolParams) -> Result<Value, RpcError> {
         command: "tool_call".into(),
         params: json!({ "name": name, "arguments": arguments }),
     };
+    // A refusal this client raised itself keeps its code (`server_too_old`
+    // when a narrowed client meets an app that ignores `--access`, which a
+    // retry cannot fix); connect and read failures are `app_unavailable`.
     let response = match send_control_request(request).await {
         Ok(response) => response,
-        Err(detail) => return Ok(registry::mcp_error(&ControlError::new(ErrorCode::AppUnavailable, detail))),
+        Err(detail) => return Ok(registry::mcp_error(&ControlError::from_text(detail, ErrorCode::AppUnavailable))),
     };
     if response.ok {
         return Ok(response.data.unwrap_or(Value::Null));
@@ -3239,6 +3242,26 @@ mod tests {
         assert_eq!(result["isError"], true, "{reply}");
         assert_eq!(result["structuredContent"]["error"]["code"], "app_unavailable", "{reply}");
         assert_eq!(result["structuredContent"]["error"]["retryable"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn narrowed_stdio_reports_an_old_app_as_server_too_old() {
+        if crate::test_isolation::isolated("mcp_server::tests::narrowed_stdio_reports_an_old_app_as_server_too_old") {
+            return;
+        }
+        // `codemux mcp --access supervised` against an app that predates
+        // `client.access`: the client refuses rather than run at full access,
+        // and says so in a way a retry loop stops on.
+        control_identity::set_client_access(ControlAccess::Supervised);
+        let seen = old_app_socket();
+        let server = server_for(StdioCaller { access: ControlAccess::Supervised, ..outside() });
+        let reply = rpc(&server, tools_call(1, "thread_list", json!({}))).await.unwrap();
+        let error = &reply["result"]["structuredContent"]["error"];
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(error["code"], "server_too_old", "{reply}");
+        assert_eq!(error["retryable"], false, "{reply}");
+        assert_eq!(*seen.lock().unwrap(), ["status"], "only the version probe reaches the old app");
     }
 
     /// A control socket like an app from before `tool_call`: it answers
