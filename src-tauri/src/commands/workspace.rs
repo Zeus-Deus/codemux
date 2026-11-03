@@ -799,6 +799,10 @@ pub(crate) async fn create_worktree_from_request<R: tauri::Runtime>(
             // records as its base (a commit records its label, else itself).
             let (start, label) = match base {
                 WorktreeBase::RepoHead => (None, None),
+                WorktreeBase::DefaultBranch => {
+                    let name = crate::git::resolve_default_branch(repo);
+                    (name.clone(), name)
+                }
                 WorktreeBase::Ref(name) => (Some(name.clone()), Some(name)),
                 WorktreeBase::Commit { sha, label } => {
                     let label = label.unwrap_or_else(|| sha.clone());

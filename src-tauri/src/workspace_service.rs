@@ -9,7 +9,7 @@ use crate::state::{
     AppStateStore, InitialChatPane, WorkspaceId, WorkspacePresetLayout, WorkspaceSnapshot,
     WorkspaceType,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, Runtime};
 
@@ -19,6 +19,10 @@ pub(crate) enum WorktreeBase {
     /// The repository checkout's HEAD (`git worktree add -b` with no base).
     /// The desktop's "no base selected".
     RepoHead,
+    /// The repository's default branch (origin/HEAD, then main/master, then
+    /// the checked-out branch), freshened from origin like `Ref`; `RepoHead`
+    /// when none resolves. What agent-facing callers get by default.
+    DefaultBranch,
     /// A caller-named ref: best-effort `origin/<ref>` fetch and preference,
     /// exactly as `git::git_create_worktree` does.
     Ref(String),
@@ -48,6 +52,86 @@ pub(crate) struct WorktreeRequest {
     pub initial_chat: Option<InitialChatPane>,
     /// Inserted under this id when it is created (never when adopted).
     pub reserved_id: Option<WorkspaceId>,
+}
+
+/// Arguments of agent-facing worktree creation, which own its defaults: a
+/// new branch from the repository's default branch, one terminal, and no
+/// focus change unless `select` asks for it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorktreeArgs {
+    pub repo_path: String,
+    pub branch: String,
+    /// Default true.
+    pub new_branch: Option<bool>,
+    /// Default: the repository's default branch.
+    pub base: Option<String>,
+    /// For a new branch, `true` requires a freshly fetched origin base and
+    /// `false` uses the local ref exactly. Omitted: best-effort freshening.
+    pub start_from_origin: Option<bool>,
+    /// Default "single".
+    pub layout: Option<String>,
+    pub agent_preset_id: Option<String>,
+    pub initial_prompt: Option<String>,
+    pub pr_number: Option<u32>,
+    #[serde(default)]
+    pub select: bool,
+    /// Accepted so strict parsing admits it; the receipt layer reads the
+    /// raw arguments, so nothing here does.
+    #[allow(dead_code)]
+    pub client_request_id: Option<String>,
+}
+
+impl WorktreeArgs {
+    /// Resolves the defaults. With `start_from_origin` set, a new branch's
+    /// base is resolved to an exact commit first, so worktree creation's own
+    /// best-effort fetch can never apply a different origin policy.
+    pub(crate) async fn into_request(
+        self,
+        model_selection: Option<crate::agent_capability::ModelSelection>,
+        reserved_id: Option<WorkspaceId>,
+    ) -> Result<WorktreeRequest, String> {
+        let new_branch = self.new_branch.unwrap_or(true);
+        let layout = parse_layout(self.layout.as_deref().unwrap_or("single"))?;
+        let base = match self.start_from_origin.filter(|_| new_branch) {
+            Some(from_origin) => {
+                let repo = PathBuf::from(&self.repo_path);
+                let name = match self.base {
+                    Some(base) => base,
+                    None => {
+                        let repo = repo.clone();
+                        tokio::task::spawn_blocking(move || default_base_name(&repo))
+                            .await
+                            .map_err(|error| format!("default branch lookup failed: {error}"))?
+                    }
+                };
+                let origin = if from_origin { OriginPolicy::Required } else { OriginPolicy::Local };
+                let resolved = resolve_base(&repo, &name, origin).await?;
+                WorktreeBase::Commit {
+                    // A detached default records the commit, not "HEAD".
+                    label: (resolved.label != "HEAD").then_some(resolved.label),
+                    sha: resolved.commit,
+                }
+            }
+            None => self.base.map(WorktreeBase::Ref).unwrap_or(WorktreeBase::DefaultBranch),
+        };
+        Ok(WorktreeRequest {
+            repo_path: self.repo_path,
+            branch: self.branch,
+            new_branch,
+            base,
+            layout,
+            preset: self.agent_preset_id.map(|preset_id| PresetLaunch {
+                preset_id,
+                initial_prompt: self.initial_prompt,
+                model_selection,
+            }),
+            pr_number: self.pr_number,
+            select: self.select,
+            initial_chat: None,
+            reserved_id,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +314,12 @@ pub(crate) fn parse_layout(layout: &str) -> Result<WorkspacePresetLayout, String
         "empty" => WorkspacePresetLayout::Empty,
         _ => return Err(format!("Unsupported layout: {layout}")),
     })
+}
+
+/// The base agent-facing callers fork from when they name none: the
+/// repository's default branch, else `HEAD`. Runs git synchronously.
+pub(crate) fn default_base_name(repo: &Path) -> String {
+    crate::git::resolve_default_branch(repo).unwrap_or_else(|| "HEAD".into())
 }
 
 /// How many of the most recent Recent projects count as known.
@@ -468,6 +558,163 @@ mod tests {
         app.manage(crate::database::DatabaseStore::new_in_memory());
         app.manage(crate::terminal::PtyState::default());
         app
+    }
+
+    #[test]
+    fn default_base_name_prefers_default_branch_then_current_then_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let trunk = repo(dir.path(), "trunk-only", "trunk");
+        assert_eq!(default_base_name(&trunk), "trunk");
+
+        let master = repo(dir.path(), "with-master", "master");
+        git(&master, &["checkout", "-b", "feature"]);
+        assert_eq!(default_base_name(&master), "master", "master beats the checked-out branch");
+
+        let develop = repo(dir.path(), "origin-head", "main");
+        git(&develop, &["update-ref", "refs/remotes/origin/develop", "HEAD"]);
+        git(&develop, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"]);
+        assert_eq!(default_base_name(&develop), "develop", "origin/HEAD beats main");
+
+        let detached = repo(dir.path(), "detached", "trunk");
+        git(&detached, &["checkout", "--detach"]);
+        assert_eq!(default_base_name(&detached), "HEAD");
+    }
+
+    #[tokio::test]
+    async fn worktree_args_default_to_a_new_branch_from_the_default_branch() {
+        let parse = |args: serde_json::Value| serde_json::from_value::<WorktreeArgs>(args);
+        let request = parse(serde_json::json!({"repo_path": "/repo", "branch": "feat"}))
+            .unwrap()
+            .into_request(None, None)
+            .await
+            .unwrap();
+        assert!(request.new_branch);
+        assert_eq!(request.base, WorktreeBase::DefaultBranch);
+        assert!(matches!(request.layout, WorkspacePresetLayout::Single));
+        assert!(!request.select, "agent callers never take focus by default");
+        assert!(request.preset.is_none() && request.pr_number.is_none());
+        assert!(request.initial_chat.is_none() && request.reserved_id.is_none());
+
+        let reserved = AppStateStore::reserve_workspace_id();
+        let model = crate::agent_capability::ModelSelection::default();
+        let request = parse(serde_json::json!({
+            "repo_path": "/repo", "branch": "feat", "new_branch": false, "base": "release",
+            "start_from_origin": true, "layout": "empty", "agent_preset_id": "claude",
+            "initial_prompt": "Fix it", "pr_number": 7, "select": true,
+            "client_request_id": "key-1"
+        }))
+        .unwrap()
+        .into_request(Some(model.clone()), Some(reserved.clone()))
+        .await
+        .unwrap();
+        assert!(!request.new_branch);
+        // An existing branch has no base to resolve, so origin policy is moot.
+        assert_eq!(request.base, WorktreeBase::Ref("release".into()));
+        assert!(matches!(request.layout, WorkspacePresetLayout::Empty));
+        let preset = request.preset.unwrap();
+        assert_eq!(
+            (preset.preset_id.as_str(), preset.initial_prompt.as_deref()),
+            ("claude", Some("Fix it"))
+        );
+        assert_eq!(preset.model_selection, Some(model));
+        assert_eq!((request.pr_number, request.select), (Some(7), true));
+        assert_eq!(request.reserved_id, Some(reserved));
+
+        let error = parse(serde_json::json!({"repo_path": "/repo", "branch": "b", "bogus": 1}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field `bogus`"), "{error}");
+        let error = parse(serde_json::json!({"repo_path": "/repo", "branch": "b", "layout": "grid"}))
+            .unwrap()
+            .into_request(None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Unsupported layout: grid");
+
+        // start_from_origin pins a new branch's base to an exact commit.
+        let dir = tempfile::tempdir().unwrap();
+        let trunk = repo(dir.path(), "project", "trunk");
+        let tip = git(&trunk, &["rev-parse", "HEAD"]);
+        async fn pinned(args: serde_json::Value) -> Result<WorktreeRequest, String> {
+            let args: WorktreeArgs = serde_json::from_value(args).unwrap();
+            args.into_request(None, None).await
+        }
+        let local = pinned(serde_json::json!({
+            "repo_path": trunk, "branch": "feat", "start_from_origin": false
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            local.base,
+            WorktreeBase::Commit { sha: tip.clone(), label: Some("trunk".into()) }
+        );
+        let error = pinned(serde_json::json!({
+            "repo_path": trunk, "branch": "feat", "start_from_origin": true
+        }))
+        .await
+        .unwrap_err();
+        assert!(error.starts_with("operation_failed: "), "no origin to fetch: {error}");
+        git(&trunk, &["checkout", "--detach"]);
+        let detached = pinned(serde_json::json!({
+            "repo_path": trunk, "branch": "feat", "start_from_origin": false
+        }))
+        .await
+        .unwrap();
+        assert_eq!(detached.base, WorktreeBase::Commit { sha: tip, label: None });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_worktree_takes_the_reserved_id_and_forks_the_default_branch() {
+        if isolated(
+            "workspace_service::tests::create_worktree_takes_the_reserved_id_and_forks_the_default_branch",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let project = repo(dir.path(), "project", "main");
+        let main = git(&project, &["rev-parse", "HEAD"]);
+        // The root checkout sits on another branch with its own commit, so
+        // forking HEAD instead of the default branch would show.
+        git(&project, &["checkout", "-b", "side"]);
+        git(&project, &["commit", "--allow-empty", "-m", "side only"]);
+        let state = AppStateStore::default();
+        state.create_empty_workspace_at_path(project.clone());
+        let focused = state.snapshot().active_workspace_id;
+        let app = mock_app(state);
+        let service = WorkspaceService::new(app.handle());
+        let args = |new_branch: bool| {
+            serde_json::from_value::<WorktreeArgs>(serde_json::json!({
+                "repo_path": project, "branch": "feat", "new_branch": new_branch,
+                "layout": "empty"
+            }))
+            .unwrap()
+        };
+
+        let reserved = AppStateStore::reserve_workspace_id();
+        let request = args(true).into_request(None, Some(reserved.clone())).await.unwrap();
+        let created = service.create_worktree(request).await.unwrap();
+        let path = crate::git::conventional_worktree_path(&project, "feat").unwrap();
+        assert_eq!(created.workspace_id, reserved.0);
+        assert_eq!(created.cwd, path.display().to_string());
+        assert!(!created.adopted);
+        assert_eq!(created.base_branch.as_deref(), Some("main"));
+        assert_eq!(git(&path, &["rev-parse", "HEAD"]), main);
+        let state = app.state::<AppStateStore>();
+        let workspace = state.find_workspace(&reserved.0).unwrap();
+        assert_eq!(workspace.worktree_path.as_deref(), Some(created.cwd.as_str()));
+        assert_eq!(workspace.base_branch.as_deref(), Some("main"));
+        assert_eq!(state.snapshot().active_workspace_id, focused, "created in the background");
+
+        let count = state.snapshot().workspaces.len();
+        let unused = AppStateStore::reserve_workspace_id();
+        let request = args(false).into_request(None, Some(unused.clone())).await.unwrap();
+        let adopted = service.create_worktree(request).await.unwrap();
+        assert!(adopted.adopted);
+        assert_eq!(adopted.workspace_id, reserved.0, "the live checkout is adopted");
+        assert_eq!((adopted.cwd.as_str(), adopted.base_branch), (created.cwd.as_str(), None));
+        assert_eq!(state.snapshot().workspaces.len(), count);
+        assert!(state.find_workspace(&unused.0).is_none());
+        assert_eq!(state.snapshot().active_workspace_id, focused);
     }
 
     #[test]
