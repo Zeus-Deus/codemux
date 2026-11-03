@@ -404,16 +404,19 @@ fn waits_carry_the_client_and_map_run_states_to_exit_codes() {
 fn a_queued_send_waits_for_the_run_its_message_starts() {
     // The server's shapes: the receipt names only the queue entry; a wait
     // without a turn adopts the busy run t1, which settles once the entry has
-    // started t2 and left the queue.
-    let app = FakeApp::start(|request| match (request["command"].as_str(), tool_name(request)) {
+    // started t2 and left the queue. By then the receipt names t2, even if
+    // yet another run (t3) is current.
+    let receipt = |accepted_as: &str, turn: Value| json!({"operation_id": "op", "tool": "thread_send", "state": "succeeded",
+        "workspace_id": "ws", "thread_id": "th", "error": null,
+        "result": {"workspace_id": "ws", "thread_id": "th", "accepted_as": accepted_as, "turn": turn}});
+    let app = FakeApp::start(move |request| match (request["command"].as_str(), tool_name(request)) {
         (Some("status"), _) => ok_reply(json!({})),
-        (_, Some("thread_send")) => tool_result(json!({"operation_id": "op", "tool": "thread_send", "state": "succeeded",
-            "workspace_id": "ws", "thread_id": "th", "error": null,
-            "result": {"workspace_id": "ws", "thread_id": "th", "accepted_as": "queued", "turn": {"queued_id": "q1"}}})),
+        (_, Some("thread_send")) => tool_result(receipt("queued", json!({"queued_id": "q1"}))),
+        (_, Some("operation_status")) => tool_result(receipt("dispatched", json!({"turn_id": "t2", "queued_id": null, "steered": false}))),
         (_, Some("thread_status")) => tool_result(thread_status("running", json!({"queued_ids": ["q1"]}))),
         (_, Some("thread_wait")) => tool_result(match request["params"]["arguments"]["turn_id"].as_str() {
             None => waited("done", "c1", json!({"final_text": "ANSWER OF THE EARLIER RUN",
-                "status": {"turn_id": "t2", "queued_ids": [], "uncertain_queued_ids": []}})),
+                "status": {"turn_id": "t3", "queued_ids": [], "uncertain_queued_ids": []}})),
             Some(turn) => waited("done", "c2", json!({"turn_id": turn, "final_text": format!("answer of {turn}"),
                 "status": {"turn_id": turn, "queued_ids": [], "uncertain_queued_ids": []}})),
         }),
