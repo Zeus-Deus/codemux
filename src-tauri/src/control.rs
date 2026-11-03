@@ -557,18 +557,32 @@ pub fn spawn_control_server<R: Runtime>(app: AppHandle<R>) {
     });
 }
 
+/// Answers each request line with one response line, in order.
+///
+/// A client must keep the connection open until it has read its reply. A
+/// request that parks (`thread_wait`) ends when the client hangs up, since
+/// nobody is left to read its result; a line the client pipelines meanwhile
+/// is kept and answered after it. Other requests always run to the end.
 async fn handle_client<R: Runtime, S>(app: AppHandle<R>, stream: S, peer_pid: Option<u32>) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
+    let mut pipelined: Option<String> = None;
 
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|error| format!("Failed to read control request: {error}"))?
-    {
+    loop {
+        let line = match pipelined.take() {
+            Some(line) => line,
+            None => match lines
+                .next_line()
+                .await
+                .map_err(|error| format!("Failed to read control request: {error}"))?
+            {
+                Some(line) => line,
+                None => break,
+            },
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -576,7 +590,24 @@ where
         let envelope: ControlEnvelope = serde_json::from_str(&line)
             .map_err(|error| format!("Invalid control request JSON: {error}"))?;
         let caller = crate::control_identity::resolve_socket_caller(envelope.client, peer_pid);
-        let response = dispatch_request_as(&app, &caller, envelope.request).await;
+        let request = envelope.request;
+        let response = if !may_park(&request) {
+            dispatch_request_as(&app, &caller, request).await
+        } else {
+            let work = dispatch_request_as(&app, &caller, request);
+            tokio::pin!(work);
+            tokio::select! {
+                response = &mut work => response,
+                // `next_line` is cancel safe: no line is lost here.
+                next = lines.next_line() => match next {
+                    Ok(Some(line)) => {
+                        pipelined = Some(line);
+                        work.await
+                    }
+                    Ok(None) | Err(_) => return Ok(()),
+                },
+            }
+        };
         let payload = serde_json::to_string(&response)
             .map_err(|error| format!("Failed to encode control response: {error}"))?;
         writer
@@ -586,6 +617,17 @@ where
     }
 
     Ok(())
+}
+
+/// Whether `request` runs a registry tool that may park for a time the client
+/// chooses: the same predicate the stdio and HTTP doors use.
+fn may_park(request: &ControlRequest) -> bool {
+    let tool = match request.command.as_str() {
+        "tool_call" => request.params.get("name").and_then(Value::as_str),
+        alias if crate::agent_control::registry::is_socket_alias(alias) => Some(alias),
+        _ => None,
+    };
+    tool.and_then(crate::agent_control::registry::lookup).is_some_and(|(_, spec)| spec.may_wait())
 }
 
 /// Send a request to the running Codemux control endpoint and return the response.
@@ -2432,6 +2474,87 @@ mod tests {
 
         let extra = dispatch_request(app.handle(), request("tools_list", serde_json::json!({"cursor": "x"}))).await;
         assert!(refused_with(&extra, "invalid_arguments"), "{:?}", extra.error);
+    }
+
+    /// A persisted chat with no live session. A wait with `since` set to its
+    /// current cursor parks until something changes or it times out.
+    async fn waitable() -> (tauri::App<tauri::test::MockRuntime>, tempfile::TempDir, Value) {
+        let app = operation_app();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = app.state::<AppStateStore>().create_empty_workspace_at_path(root.path().to_path_buf()).0;
+        app.manage(crate::commands::agent_chat::ProviderRegistry::new());
+        app.state::<crate::database::DatabaseStore>()
+            .upsert_agent_chat_session("socket-wait", &workspace, None, "claude")
+            .unwrap();
+        let target = serde_json::json!({"workspace_id": workspace, "thread_id": "socket-wait"});
+        let status = dispatch_request(app.handle(), request("thread_status", target.clone())).await;
+        assert!(status.ok, "{:?}", status.error);
+        let mut wait = target;
+        wait["since"] = status.data.unwrap()["wait_cursor"].clone();
+        (app, root, wait)
+    }
+
+    /// A client connection served by `handle_client`, as the socket server
+    /// runs it.
+    fn connect(
+        app: &tauri::App<tauri::test::MockRuntime>,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), String>>,
+        tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let served = tokio::spawn(handle_client(app.handle().clone(), server, None));
+        let (reader, writer) = tokio::io::split(client);
+        (served, BufReader::new(reader).lines(), writer)
+    }
+
+    async fn reply(replies: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>) -> ControlResponse {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), replies.next_line())
+            .await
+            .expect("a reply within 5 s")
+            .unwrap()
+            .expect("the connection is open");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn socket_wait_ends_when_the_client_hangs_up() {
+        let (app, _root, wait) = waitable().await;
+        let mut long = wait;
+        long["timeout_ms"] = serde_json::json!(600_000);
+        for line in [
+            serde_json::json!({"command": "thread_wait", "params": long}),
+            serde_json::json!({"command": "tool_call", "params": {"name": "thread_wait", "arguments": long}}),
+        ] {
+            let (served, mut replies, mut writer) = connect(&app);
+            writer.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+            let early = tokio::time::timeout(std::time::Duration::from_millis(300), replies.next_line()).await;
+            assert!(early.is_err(), "the wait parks: {early:?}");
+            drop((replies, writer));
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(5), served)
+                .await
+                .expect("a ten-minute wait ends as soon as its client hangs up");
+            assert_eq!(ended.unwrap(), Ok(()), "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_keeps_a_pipelined_line_during_a_wait() {
+        let (app, _root, wait) = waitable().await;
+        let mut short = wait;
+        short["timeout_ms"] = serde_json::json!(400);
+        let (served, mut replies, mut writer) = connect(&app);
+        // The second line arrives while the wait is parked.
+        let lines = format!("{}\n{}\n", serde_json::json!({"command": "thread_wait", "params": short}), serde_json::json!({"command": "status"}));
+        writer.write_all(lines.as_bytes()).await.unwrap();
+        let first = reply(&mut replies).await;
+        assert!(first.ok, "{:?}", first.error);
+        assert_eq!(first.data.unwrap()["timed_out"], true, "replies keep request order");
+        let second = reply(&mut replies).await;
+        assert!(second.ok, "the pipelined line was kept: {:?}", second.error);
+        drop((replies, writer));
+        assert_eq!(served.await.unwrap(), Ok(()));
     }
 
     #[cfg(target_os = "linux")]
