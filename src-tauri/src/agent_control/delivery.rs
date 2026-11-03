@@ -111,6 +111,7 @@ pub(crate) fn notify() {
     wake().notify_one();
 }
 pub(crate) fn changed<R: Runtime>(app: &AppHandle<R>, thread: &str) {
+    super::wait::signal(Some(thread));
     let _ = app.emit("agent_chat_delivery_changed", thread);
 }
 fn wake() -> &'static tokio::sync::Notify {

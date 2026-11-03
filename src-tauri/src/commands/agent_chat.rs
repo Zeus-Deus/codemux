@@ -8753,6 +8753,11 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     // After the subagent tracker saw the event, so a turn end that only
     // yields to delegated work reads as such.
     super::restart_resume::on_event(app, &event);
+    // Waiters read persisted state (transcript, questions, queue journal,
+    // delivery and task rows), so they hear of a change only now.
+    if crate::agent_control::wait::wakes_waiters(&event) {
+        crate::agent_control::wait::signal(thread_id_for_event(&event).as_ref().map(|thread| thread.0.as_str()));
+    }
 
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are

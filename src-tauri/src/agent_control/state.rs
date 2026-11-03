@@ -458,6 +458,10 @@ impl NativeControlState {
             }
             _ => {}
         }
+        // This view lives in memory, so waiters can read the change as soon as
+        // the lock is released. Events the early returns skipped wake nobody.
+        drop(runtime);
+        super::wait::signal(Some(thread));
     }
     pub fn thread_runtime(&self, thread: &str) -> Option<ThreadRuntimeView> {
         self.runtime

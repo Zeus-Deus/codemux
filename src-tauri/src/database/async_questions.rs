@@ -119,6 +119,25 @@ impl DatabaseStore {
         ))
     }
 
+    /// Questions the user has not answered or dismissed, oldest first: the
+    /// same "open" rule as `has_open_async_question`, which delegation uses.
+    /// A claimed (submitting) answer is still open until it is delivered.
+    pub fn open_async_questions(&self, thread_id: &str, limit: usize) -> Result<Vec<UserQuestionSet>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut statement = conn.prepare(
+            "SELECT question_json FROM agent_chat_questions WHERE thread_id=?1
+             AND json_extract(resolution_json,'$.status') NOT IN ('answered','dismissed')
+             ORDER BY source_event_id ASC LIMIT ?2",
+        ).map_err(|e| e.to_string())?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement
+            .query_map(params![thread_id, limit], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
+        rows.iter().map(|json| serde_json::from_str(json).map_err(|e| e.to_string())).collect()
+    }
+
     /// Compare-and-set prevents double submissions from concurrent windows.
     /// A changed record is persisted with its transcript event before fan-out.
     pub fn change_async_question(
@@ -232,6 +251,42 @@ mod tests {
         drop(conn);
         assert!(db.async_question("thread", &q.id).is_err());
     }
+    #[test]
+    fn open_async_questions_lists_only_unresolved_in_order() {
+        let db = init_test_database();
+        for thread in ["thread", "other"] {
+            db.upsert_agent_chat_session(thread, "workspace", None, "codex").unwrap();
+        }
+        let ask = |thread: &str, id: &str| {
+            let mut q = question();
+            q.id = id.into();
+            db.record_async_question(thread, &q).unwrap().unwrap();
+        };
+        for id in ["claimed", "answered", "dismissed", "failed", "pending"] {
+            ask("thread", id);
+        }
+        ask("other", "elsewhere");
+        let claimed = QuestionResolution::Submitting { submission_id: "s1".into(), answers: vec!["SQLite".into()] };
+        db.change_async_question("thread", "claimed", &QuestionResolution::Pending, &claimed).unwrap().unwrap();
+        let answered = QuestionResolution::Answered {
+            submission_id: "s2".into(),
+            answers: vec!["SQLite".into()],
+            delivery: QuestionDelivery::Inflight { turn_id: TurnId("t2".into()) },
+        };
+        db.change_async_question("thread", "answered", &QuestionResolution::Pending, &answered).unwrap().unwrap();
+        db.change_async_question("thread", "dismissed", &QuestionResolution::Pending, &QuestionResolution::Dismissed).unwrap().unwrap();
+        let failed = QuestionResolution::Failed { submission_id: "s3".into(), answers: vec!["SQLite".into()], message: "rejected".into() };
+        db.change_async_question("thread", "failed", &QuestionResolution::Pending, &failed).unwrap().unwrap();
+        let ids = |limit| db.open_async_questions("thread", limit).unwrap().into_iter().map(|q| q.id).collect::<Vec<_>>();
+        assert_eq!(ids(20), ["claimed", "failed", "pending"], "a claimed answer is still open until delivered");
+        assert_eq!(ids(1), ["claimed"]);
+        let open = db.open_async_questions("thread", 20).unwrap();
+        assert_eq!(open[2].text, "Choose storage");
+        assert_eq!(open[2].questions[0].title, "Which database?");
+        assert_eq!(db.open_async_questions("other", 20).unwrap()[0].id, "elsewhere");
+        assert!(db.open_async_questions("missing", 20).unwrap().is_empty());
+    }
+
     #[test]
     fn async_question_follows_session_promotion_and_deletion() {
         let db = init_test_database();

@@ -152,6 +152,21 @@ impl DatabaseStore {
         event.map(|event|serde_json::from_str(&event).map_err(|e|e.to_string())).transpose()
     }
 
+    /// The run's last top-level assistant message: the prose `thread_read`
+    /// shows. The filter is the search index's, so the id is always a
+    /// `thread_read` row. Subagent text, reasoning and blank text never count.
+    pub fn control_turn_final_text(&self, thread: &str, turn: &str) -> Result<Option<(i64, String)>, String> {
+        self.conn.lock().unwrap().query_row(
+            "SELECT id, json_extract(payload,'$.item.text') FROM agent_chat_messages WHERE thread_id=?1
+             AND json_valid(payload) AND json_extract(payload,'$.type')='item_completed'
+             AND json_extract(payload,'$.turn_id')=?2 AND json_extract(payload,'$.item.kind')='assistant_text'
+             AND json_extract(payload,'$.subagent_id') IS NULL
+             AND length(trim(COALESCE(json_extract(payload,'$.item.text'),'')))>0
+             ORDER BY id DESC LIMIT 1",
+            params![thread, turn], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|e| e.to_string())
+    }
+
     /// Append the unchanged visible envelope and its ID-only run correlation
     /// atomically. A crash must not leave a late envelope without its identity.
     /// Neither this journal nor historical IDs restore runtime authority.
@@ -1354,5 +1369,32 @@ mod tests {
         assert!(!retry.newly_admitted);
         assert_eq!(first.receipt.operation_id, retry.receipt.operation_id);
         assert_eq!(retry.receipt.state, "needs_attention", "a restart must not turn uncertain dispatch into a duplicate run");
+    }
+
+    #[test]
+    fn control_turn_final_text_ignores_subagents_blank_text_and_other_turns() {
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("t", "w", None, "claude").unwrap();
+        let item = |turn: &str, kind: &str, text: &str, subagent: Option<&str>| {
+            serde_json::json!({"type":"item_completed","thread_id":"t","turn_id":turn,
+                "item":{"kind":kind,"text":text},"subagent_id":subagent}).to_string()
+        };
+        let append = |payload: String| db.append_agent_chat_message("t", &payload).unwrap().unwrap();
+        assert_eq!(db.control_turn_final_text("t", "a").unwrap(), None);
+        append(item("a", "assistant_text", "First draft", None));
+        let last = append(item("a", "assistant_text", "Final answer PONG", None));
+        append(item("a", "assistant_text", "   ", None));
+        append(item("a", "assistant_thinking", "Private reasoning", None));
+        append(item("a", "assistant_text", "Subagent report", Some("sub-1")));
+        append(item("b", "assistant_text", "A later run", None));
+        append(serde_json::json!({"type":"turn_completed","thread_id":"t","turn_id":"a","status":{"kind":"success"}}).to_string());
+        assert_eq!(db.control_turn_final_text("t", "a").unwrap(), Some((last, "Final answer PONG".into())));
+        assert_eq!(db.control_turn_final_text("t", "b").unwrap().unwrap().1, "A later run");
+        assert_eq!(db.control_turn_final_text("other", "a").unwrap(), None);
+        // The id is the search row thread_read pages through.
+        let indexed: i64 = db.conn.lock().unwrap().query_row(
+            "SELECT rowid FROM agent_chat_search WHERE agent_chat_search MATCH 'PONG'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(indexed, last);
     }
 }

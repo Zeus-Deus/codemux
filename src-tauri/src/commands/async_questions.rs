@@ -62,6 +62,9 @@ fn publish<R: Runtime>(
     // delegation directly: a delegated child waiting on this question is
     // working again (or done) once it is answered or dismissed.
     super::delegation::observe(app, &event, Some(row_id));
+    // Every answer, dismissal and reopen is committed before it is published,
+    // so a thread wait woken here reads the question's new state.
+    crate::agent_control::wait::signal(Some(&thread_id.0));
     fan_out_to_thread_channels(
         app,
         thread_id,

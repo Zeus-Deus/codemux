@@ -311,10 +311,35 @@ pub fn spawn_sweeper() {
 
 fn emit<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
     let requests = registry().open_for(thread_id);
+    // Every open, answer, decline, expiry and cancel ends here, after the
+    // registry changed, so a thread wait woken now sees the new cards.
+    crate::agent_control::wait::signal(Some(thread_id));
     let _ = app.emit(
         SECRET_REQUESTS_CHANGED_EVENT,
         SecretRequestsChanged { thread_id: thread_id.to_string(), requests },
     );
+}
+
+/// The chat's cards a person can still answer, for thread waits. Views never
+/// carry a value; a card past its lifetime is left out even before the next
+/// sweep settles it.
+pub(crate) fn open_for_thread(thread_id: &str) -> Vec<SecretRequestView> {
+    let now = now_ms();
+    let mut open = registry().open_for(thread_id);
+    open.retain(|view| view.expires_at_ms > now);
+    open
+}
+
+/// Open a card as `request_secret` would, without an agent call waiting on
+/// it, and wake thread waits. Returns the request id.
+#[cfg(test)]
+pub(crate) fn open_for_test(thread_id: &str, turn_id: Option<&str>, label: &str) -> String {
+    let args = ToolArgs { label: Some(label.into()), reason: Some(format!("Needed for {label}")), placeholder: None, request_id: None };
+    let id = match registry().open(thread_id, turn_id, &args, now_ms()).expect("a valid test card") {
+        Opened::Created(id, _) | Opened::Existing(id, _) => id,
+    };
+    crate::agent_control::wait::signal(Some(thread_id));
+    id
 }
 
 /// A chat's turn ended: nobody is left to receive its answers.
