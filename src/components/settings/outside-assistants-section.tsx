@@ -69,6 +69,9 @@ function NativeOutsideAssistantsSection() {
       fresh.current = true;
       setVerified(true);
       if (!originEdited.current) setOrigin(next.publicOrigin ?? "");
+      // A revoked token's reveal would offer a dead credential. Only a
+      // verified read may drop it, so a failed read-back never loses a fresh one.
+      setIssued((current) => current && !next.clients.some((client) => client.id === current.clientId) ? null : current);
     } catch {
       if (mounted.current && request === generation.current) {
         setError("Unable to verify connections. Refresh before making changes.");
@@ -246,7 +249,11 @@ function NativeOutsideAssistantsSection() {
                   <Button variant="outline" disabled={locked || portDraft.trim() === ""} onClick={savePort}>Use port</Button>
                   <Button variant="ghost" disabled={locked} onClick={() => void updateConfig({ enabled: true, publicOrigin: status.publicOrigin })}>Retry</Button>
                 </div>
-                <p className="text-label text-muted-foreground">Free the port and retry, or pick another one. A new port signs out every assistant that has access.</p>
+                <p className="text-label text-muted-foreground">
+                  Free the port and retry, or pick another one.{" "}
+                  {/* The saved origin is the issuer, so only a loopback address carries the port. */}
+                  {status.publicOrigin ? "After a port change, point your HTTPS proxy at the new port." : "A new port signs out every assistant that has access."}
+                </p>
               </SettingsCard>
             ) : !status.listenerRunning ? (
               <p className="flex items-center gap-2 text-label text-muted-foreground"><Spinner className="size-3.5" aria-hidden />Starting…</p>
@@ -299,7 +306,7 @@ function NativeOutsideAssistantsSection() {
                 ) : (
                   <ul className="divide-y divide-border/40">
                     {status.pending.map((request) => (
-                      <PendingConnection key={request.id} request={request} locked={locked} canApprove={status.enabled && status.listenerRunning}
+                      <PendingConnection key={request.id} request={request} publicOrigin={status.publicOrigin} locked={locked} canApprove={status.enabled && status.listenerRunning}
                         onApprove={(access) => void mutate(() => agentConnectorApprove(request.id, access), "Unable to approve this request. Refresh and retry.")}
                         onDeny={() => void mutate(() => agentConnectorDeny(request.id), "Unable to deny this request. Refresh and retry.")} />
                     ))}

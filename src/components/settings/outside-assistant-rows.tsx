@@ -54,8 +54,11 @@ export function LocalSetupList({ rows }: { rows: LocalSetupRow[] }) {
   );
 }
 
-export function PendingConnection({ request, locked, canApprove, onApprove, onDeny }: {
-  request: AgentConnectorPending; locked: boolean; canApprove: boolean;
+export function PendingConnection({ request, publicOrigin, locked, canApprove, onApprove, onDeny }: {
+  request: AgentConnectorPending;
+  /** The saved HTTPS origin: any device that can reach it can start a sign-in. */
+  publicOrigin: string | null;
+  locked: boolean; canApprove: boolean;
   onApprove: (access: AgentConnectorAccess) => void; onDeny: () => void;
 }) {
   const [selectedAccess, setAccess] = useState<AgentConnectorAccess>("read_only");
@@ -72,7 +75,9 @@ export function PendingConnection({ request, locked, canApprove, onApprove, onDe
         <p className="text-label text-muted-foreground">Client name and callback origin are self-asserted, not proof of identity.</p>
         <p className="text-caption text-muted-foreground">Requested {displayDate(request.requestedAt)}</p>
       </div>
-      {undecided && <p className="text-label font-medium text-foreground">Approve only a sign-in you just started. Any program on this computer can ask.</p>}
+      {undecided && <p className="break-words text-label font-medium text-foreground">
+        Approve only a sign-in you just started. {publicOrigin ? `Anyone who can reach ${publicOrigin} can ask.` : "Any program on this computer can ask."}
+      </p>}
       <p className="text-label text-muted-foreground">Applies to all Codemux workspaces and visible conversations, not just this project.</p>
       <p className="text-label text-muted-foreground">Conversation reads include visible user and top-level assistant messages, not reasoning or tool payloads.</p>
       {request.phase !== "denied" && <p className={access === "full_access" ? "text-label text-destructive" : "text-label text-muted-foreground"}>
@@ -164,6 +169,9 @@ export function TokenForm({ label, access, locked, onLabelChange, onAccessChange
 /** Shown once, right after a token is created. The token lives only in the
  *  section's state; this card never puts it in a label, title or toast. */
 export function IssuedTokenCard({ issued, onDone }: { issued: AgentConnectorIssuedToken; onDone: () => void }) {
+  // The token is bound to its issuer: the saved origin when there is one,
+  // else the loopback address, which is the only one that carries the port.
+  const publicAddress = issued.mcpUrl !== issued.localUrl;
   return (
     <SettingsCard role="status" className="space-y-2 p-3">
       <p className="text-body-sm font-medium text-foreground">Copy the token for “{issued.label}” now</p>
@@ -171,7 +179,7 @@ export function IssuedTokenCard({ issued, onDone }: { issued: AgentConnectorIssu
       <p className="text-label leading-relaxed text-muted-foreground">
         Codemux won’t show it again. Send it as <code className="font-mono">Authorization: Bearer &lt;token&gt;</code> to{" "}
         <span className="break-all">{issued.mcpUrl}</span>. It expires {displayDate(issued.expiresAt)}, and stops working
-        sooner if you change the port or public origin.
+        sooner if you change {publicAddress ? "the public origin" : "the port or public origin"}.
         {issued.replaced && ` The earlier token for “${issued.label}” no longer works.`}
       </p>
       <Button variant="outline" size="sm" onClick={onDone}>Done</Button>

@@ -186,6 +186,7 @@ it("reports a listener failure and changes the port by read-back", async () => {
   render(<OutsideAssistantsSection />);
   expect(await screen.findByText("Couldn’t listen on port 4378")).toBeInTheDocument();
   expect(screen.getByText("bind 127.0.0.1:4378: Address already in use")).toBeInTheDocument();
+  expect(screen.getByText(/A new port signs out every assistant that has access/)).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Open Remote Access" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Create token" })).not.toBeInTheDocument();
   const write = deferred<AgentConnectorStatus>();
@@ -215,7 +216,10 @@ it.each(["80", "70000", "abc", "4378.5"])("rejects port %s with an alert and no 
 it("retries a failed bind with the current settings", async () => {
   api.status.mockResolvedValue(snapshot({ enabled: true, publicOrigin: "https://box.example.test", bindError: "bind 127.0.0.1:4378: Address already in use" }));
   render(<OutsideAssistantsSection />);
-  fireEvent.click(await screen.findByRole("button", { name: "Retry" }));
+  // The saved origin is the issuer, so a new port signs nobody out; only the proxy needs it.
+  expect(await screen.findByText(/After a port change, point your HTTPS proxy at the new port/)).toBeInTheDocument();
+  expect(screen.queryByText(/signs out every assistant/)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
   await waitFor(() => expect(api.config).toHaveBeenCalledWith({ enabled: true, publicOrigin: "https://box.example.test" }));
   await waitFor(() => expect(api.status).toHaveBeenCalledTimes(2));
 });
@@ -384,12 +388,21 @@ it("warns to approve only a sign-in you just started, and marks a returning assi
   render(<OutsideAssistantsSection />);
   const group = within(await screen.findByRole("group", { name: "Connection request from " + request.clientName }));
   const warning = group.getByText(/Approve only a sign-in you just started/);
+  expect(warning).toHaveTextContent("Approve only a sign-in you just started. Any program on this computer can ask.");
   expect(warning.compareDocumentPosition(group.getByRole("button", { name: "Approve" })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   expect(group.getByText("Reconnecting · approved before")).toBeInTheDocument();
   api.status.mockResolvedValue(snapshot({ ...LISTENING, pending: [{ ...request, phase: "approved_awaiting_client", access: "read_only" }] }));
   await act(async () => api.changed?.());
   expect(screen.queryByText(/Approve only a sign-in you just started/)).not.toBeInTheDocument();
   expect(screen.queryByText("Reconnecting · approved before")).not.toBeInTheDocument();
+});
+
+it("warns that anyone who can reach a saved public origin can ask", async () => {
+  api.status.mockResolvedValue(snapshot({ ...LISTENING, publicOrigin: "https://box.example.test", mcpUrl: "https://box.example.test/mcp", pending: [request] }));
+  render(<OutsideAssistantsSection />);
+  const group = within(await screen.findByRole("group", { name: "Connection request from " + request.clientName }));
+  expect(group.getByText(/Approve only a sign-in you just started/)).toHaveTextContent("Approve only a sign-in you just started. Anyone who can reach https://box.example.test can ask.");
+  expect(group.queryByText(/Any program on this computer/)).not.toBeInTheDocument();
 });
 
 it("reloads on change events and ignores an older completion", async () => {
@@ -568,6 +581,14 @@ const tokenClient = { id: "mock-token-1", kind: "token" as const, clientName: "<
 const issuedToken = { token: "mock-token-not-a-credential-7", clientId: "mock-token-1", label: "hermes-bot", access: "supervised" as const,
   expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(), mcpUrl: "http://127.0.0.1:4378/mcp", localUrl: "http://127.0.0.1:4378/mcp", replaced: false };
 
+/** Issue answers with `token` and, like the backend, makes later reads list its client. */
+function issueListing(token: typeof issuedToken, state: Partial<AgentConnectorStatus> = LISTENING) {
+  api.issue.mockImplementation(async () => {
+    api.status.mockResolvedValue(snapshot({ ...state, clients: [{ ...tokenClient, id: token.clientId, clientName: token.label, label: token.label }] }));
+    return token;
+  });
+}
+
 it("hides the token form while network connections are off or the listener is down", async () => {
   for (const state of [snapshot({ clients: [granted] }), snapshot({ enabled: true }), snapshot({ enabled: true, bindError: "bind 127.0.0.1:4378: Address already in use" })]) {
     api.status.mockResolvedValue(state);
@@ -601,6 +622,7 @@ it("creates a token by read-back, shows it once and forgets it on Done", async (
   expect(reveal.getByText("Copy the token for “hermes-bot” now")).toBeInTheDocument();
   expect(reveal.getByText(issuedToken.token)).toBeInTheDocument();
   expect(reveal.getByText(/won’t show it again/)).toHaveTextContent(issuedToken.mcpUrl);
+  expect(reveal.getByText(/won’t show it again/)).toHaveTextContent("stops working sooner if you change the port or public origin.");
   fireEvent.click(reveal.getByRole("button", { name: "Copy token" }));
   await waitFor(() => expect(api.copy).toHaveBeenCalledWith(issuedToken.token));
   await waitFor(() => expect(api.toastSuccess).toHaveBeenCalledWith("Copied to clipboard"));
@@ -620,7 +642,7 @@ it("creates a token by read-back, shows it once and forgets it on Done", async (
 
 it("drops an unconfirmed token reveal on unmount", async () => {
   api.status.mockResolvedValue(snapshot({ ...LISTENING }));
-  api.issue.mockResolvedValue({ ...issuedToken, replaced: true });
+  issueListing({ ...issuedToken, replaced: true });
   const view = render(<OutsideAssistantsSection />);
   fireEvent.change(await screen.findByRole("textbox", { name: "Token label" }), { target: { value: "hermes-bot" } });
   fireEvent.click(screen.getByRole("button", { name: "Create token" }));
@@ -628,6 +650,64 @@ it("drops an unconfirmed token reveal on unmount", async () => {
   view.unmount();
   render(<OutsideAssistantsSection />);
   await screen.findByRole("textbox", { name: "Token label" });
+  expect(document.body.textContent).not.toContain(issuedToken.token);
+});
+
+it("names only the public origin in a token reveal bound to it", async () => {
+  const origin = { ...LISTENING, publicOrigin: "https://box.example.test", mcpUrl: "https://box.example.test/mcp" };
+  api.status.mockResolvedValue(snapshot(origin));
+  issueListing({ ...issuedToken, mcpUrl: "https://box.example.test/mcp" }, origin);
+  render(<OutsideAssistantsSection />);
+  fireEvent.change(await screen.findByRole("textbox", { name: "Token label" }), { target: { value: "hermes-bot" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create token" }));
+  const sentence = await screen.findByText(/won’t show it again/);
+  expect(sentence).toHaveTextContent("https://box.example.test/mcp");
+  expect(sentence).toHaveTextContent("stops working sooner if you change the public origin.");
+  expect(sentence).not.toHaveTextContent(/port/);
+});
+
+it("keeps a token reveal through a failed read and drops it once its row is revoked", async () => {
+  api.status.mockResolvedValue(snapshot({ ...LISTENING }));
+  issueListing(issuedToken);
+  render(<OutsideAssistantsSection />);
+  fireEvent.change(await screen.findByRole("textbox", { name: "Token label" }), { target: { value: "hermes-bot" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create token" }));
+  expect(await screen.findByText(issuedToken.token)).toBeInTheDocument();
+  api.status.mockRejectedValueOnce(new Error("synthetic read failure"));
+  await act(async () => api.changed?.());
+  expect(screen.getByRole("alert")).toHaveTextContent("Unable to verify connections");
+  expect(screen.getByText(issuedToken.token)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Refresh outside assistants" }));
+  await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+  expect(screen.getByText(issuedToken.token)).toBeInTheDocument();
+  const row = within(screen.getByRole("group", { name: "Token hermes-bot" }));
+  fireEvent.click(row.getByRole("button", { name: "Revoke" }));
+  api.status.mockResolvedValue(snapshot({ ...LISTENING }));
+  fireEvent.click(row.getByRole("button", { name: "Revoke access" }));
+  await waitFor(() => expect(api.revoke).toHaveBeenCalledWith(issuedToken.clientId));
+  await waitFor(() => expect(screen.queryByText(/Copy the token/)).not.toBeInTheDocument());
+  expect(document.body.textContent).not.toContain(issuedToken.token);
+});
+
+it("does not bring back a revoked token's reveal when network connections return", async () => {
+  api.status.mockResolvedValue(snapshot({ ...LISTENING }));
+  issueListing(issuedToken);
+  render(<OutsideAssistantsSection />);
+  fireEvent.change(await screen.findByRole("textbox", { name: "Token label" }), { target: { value: "hermes-bot" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create token" }));
+  expect(await screen.findByText(issuedToken.token)).toBeInTheDocument();
+  const listed = { ...tokenClient, clientName: "hermes-bot", label: "hermes-bot" };
+  api.status.mockResolvedValue(snapshot({ clients: [listed] }));
+  fireEvent.click(screen.getByRole("switch", { name: "Allow network connections" }));
+  expect(await screen.findByText(/Network connections are off/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Revoke all" }));
+  api.status.mockResolvedValue(snapshot());
+  fireEvent.click(screen.getByRole("button", { name: "Revoke every assistant" }));
+  await waitFor(() => expect(screen.queryByRole("heading", { name: "Assistants with access" })).not.toBeInTheDocument());
+  api.status.mockResolvedValue(snapshot({ ...LISTENING }));
+  fireEvent.click(screen.getByRole("switch", { name: "Allow network connections" }));
+  expect(await screen.findByText("No assistants have network access yet.")).toBeInTheDocument();
+  expect(screen.queryByText(/Copy the token/)).not.toBeInTheDocument();
   expect(document.body.textContent).not.toContain(issuedToken.token);
 });
 
