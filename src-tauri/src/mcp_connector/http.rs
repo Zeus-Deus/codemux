@@ -1591,7 +1591,23 @@ mod tests {
                     .1
                     .into_owned();
             }
-            let port = listen(f.app.handle());
+            // Move the address without apply_config, which would clear the
+            // pending sign-ins and codes itself: each boundary must refuse
+            // the obsolete resource on its own.
+            let port = free_port();
+            f.app
+                .state::<DatabaseStore>()
+                .mcp_connector_set_config(&json!({"enabled": true, "port": port}).to_string())
+                .unwrap();
+            super::super::listener::reconcile(f.app.handle());
+            // Not through status: it would prune the obsolete requests first.
+            assert_eq!(
+                f.app
+                    .state::<McpConnectorState>()
+                    .bound_port
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                port
+            );
             let new_issuer = format!("http://127.0.0.1:{port}");
             let ingress = Ingress {
                 resource: format!("{new_issuer}/mcp"),
