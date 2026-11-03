@@ -263,6 +263,8 @@ pub(crate) struct WaitView {
     status: Value,
     /// The legacy settle rule for the selected run.
     settled: bool,
+    /// Codemux has seen the run end, live or persisted.
+    end_known: bool,
     /// Legacy `{turn_id, outcome}` of the selected run, when it has ended.
     selected_turn: Option<Value>,
     /// The selected run, else the thread's current or latest.
@@ -367,8 +369,9 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
         (state, failure.map(|failure| failure.code()))
     };
     let cursor = cursor(state, current, settled, &pending.ids());
+    let end_known = end.is_some();
     let turn_id = turn_id.map(str::to_owned);
-    Ok(WaitView { status, settled, selected_turn, turn_id, state, failure, pending, paused_until_ms, final_message, cursor })
+    Ok(WaitView { status, settled, end_known, selected_turn, turn_id, state, failure, pending, paused_until_ms, final_message, cursor })
 }
 
 // ── Tools ─────────────────────────────────────────────────────────────────
@@ -412,7 +415,13 @@ pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &Control
         return Err(ControlError::new(ErrorCode::InvalidTarget, "A chat cannot wait for its own run"));
     }
     // Follow only the run in progress, never a newer one (legacy adoption).
-    let selected = args.turn_id.clone().or_else(|| (!first.settled).then(|| first.turn_id.clone()).flatten());
+    // A run whose end is already known is not in progress: right after
+    // thread_send the thread is busy with a delivery while its current run is
+    // still the finished one, and adopting that would return its old answer
+    // as soon as the new run starts. Follow the thread instead; the new run
+    // appearing changes the view, and the next wait adopts it.
+    let adopt = !first.settled && !first.end_known;
+    let selected = args.turn_id.clone().or_else(|| adopt.then(|| first.turn_id.clone()).flatten());
     let baseline = args.since.clone().unwrap_or_else(|| first.cursor.clone());
     let mut view = first;
     let mut evaluated = Instant::now();

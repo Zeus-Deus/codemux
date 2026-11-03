@@ -398,6 +398,59 @@ async fn wait_since_blocks_on_a_settled_thread_until_new_work() {
     assert_ne!(next["wait_cursor"], cursor);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_after_send_never_returns_the_previous_run() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let trusted = ControlCaller::trusted();
+    for follow in ["plain", "since"] {
+        let thread = format!("wait-after-send-{follow}");
+        persisted(&app, &workspace, &thread);
+        running(&app, &thread, "t0");
+        reply(&app, &thread, "t0", "OLD ANSWER");
+        completed(&app, &thread, "t0", TurnStatus::Success);
+        let done = wait_for(&app, &trusted, target(&workspace, &thread, json!({"timeout_ms": 1000}))).await.unwrap();
+        assert_eq!(done["final_text"], "OLD ANSWER", "{done}");
+        // thread_send returns once its delivery is admitted: the thread is
+        // busy, but its current run is still the finished t0.
+        let db = app.state::<DatabaseStore>();
+        let delivery = format!("send-{follow}");
+        db.admit_message_delivery(&delivery, &thread, &delivery, &json!({"origin": "controller"}), "epoch", 0, None, true).unwrap();
+        let mut args = json!({"timeout_ms": 5000});
+        if follow == "since" {
+            // The send is the first change a since-loop sees.
+            let busy = wait_for(&app, &trusted, target(&workspace, &thread, json!({"since": done["wait_cursor"], "timeout_ms": 1000}))).await.unwrap();
+            assert_eq!(busy["state"], "running", "{busy}");
+            assert_eq!(busy["timed_out"], false);
+            assert_eq!(busy["final_text"], Value::Null);
+            args["since"] = busy["wait_cursor"].clone();
+        }
+        let waiter = spawn_wait(&app, &trusted, target(&workspace, &thread, args));
+        parked().await;
+        db.finish_message_delivery(&delivery, "accepted", Some(&json!({"turn_id": "t1"})), None).unwrap();
+        running(&app, &thread, "t1");
+        let started = waiter.await.unwrap().unwrap();
+        assert_eq!(started["state"], "running", "{follow}: the new run, never t0's answer: {started}");
+        assert_eq!(started["turn_id"], "t1");
+        assert_eq!(started["timed_out"], false);
+        assert_eq!(started["final_text"], Value::Null);
+        // The next wait follows t1 and reports t1's own result.
+        let mut args = json!({"timeout_ms": 5000});
+        if follow == "since" {
+            args["since"] = started["wait_cursor"].clone();
+        }
+        let waiter = spawn_wait(&app, &trusted, target(&workspace, &thread, args));
+        parked().await;
+        reply(&app, &thread, "t1", "NEW ANSWER");
+        completed(&app, &thread, "t1", TurnStatus::Success);
+        let finished = waiter.await.unwrap().unwrap();
+        assert_eq!(finished["state"], "done", "{follow}: {finished}");
+        assert_eq!(finished["turn_id"], "t1");
+        assert_eq!(finished["selected_turn"]["turn_id"], "t1");
+        assert_eq!(finished["final_text"], "NEW ANSWER");
+        assert_eq!(finished["timed_out"], false);
+    }
+}
+
 #[tokio::test]
 async fn wait_limits_depend_on_the_caller() {
     let (app, _provider, _root, workspace, _own, _authority, actor) = native_caller_fixture("bypassPermissions").await;
