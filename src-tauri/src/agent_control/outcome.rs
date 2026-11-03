@@ -97,7 +97,8 @@ pub(crate) fn awaits_user(run_failed: bool, open_requests: bool) -> bool {
 }
 
 pub(crate) struct RunFacts<'a> {
-    /// The run stopped (thread_wait's legacy settle rule).
+    /// The run stopped: thread_wait's legacy settle rule, or its session went
+    /// idle without recording an end.
     pub ended: bool,
     pub end: Option<TurnEnd<'a>>,
     pub last_text: Option<&'a str>,

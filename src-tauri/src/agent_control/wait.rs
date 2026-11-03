@@ -263,6 +263,9 @@ pub(crate) struct WaitView {
     status: Value,
     /// The legacy settle rule for the selected run.
     settled: bool,
+    /// The selected run is over: it settled, or its session went idle
+    /// without a recorded end (a stop mid-turn), so it will never settle.
+    ended: bool,
     /// Codemux has seen the run end, live or persisted.
     end_known: bool,
     /// Legacy `{turn_id, outcome}` of the selected run, when it has ended.
@@ -348,8 +351,13 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
         .filter(|last| turn_id.is_some_and(|turn| last.get("turn_id").and_then(Value::as_str) == Some(turn)))
         .and_then(|last| last.get("status"));
     let end = end_event.as_ref().map(|event| TurnEnd::of_json(&event["status"])).or(live_end.map(TurnEnd::of_json));
+    // A stopped session records no end for the run it cut off. Once the thread
+    // is idle on that run, it is over, though the legacy rule never settles it.
+    // The live end above covers a run whose end row has not landed yet.
+    let vanished = is_current && status["settled"] == true && end.is_none();
+    let ended = settled || vanished;
     let final_message = match turn_id {
-        Some(turn) if settled => db.control_turn_final_text(thread, turn)?.map(FinalMessage::bounded),
+        Some(turn) if ended => db.control_turn_final_text(thread, turn)?.map(FinalMessage::bounded),
         _ => None,
     };
     let (state, failure) = if is_current && status["phase"] == "needs_attention" && pending.is_empty() {
@@ -360,7 +368,7 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
         (RunState::Done, None)
     } else {
         let (state, failure) = run_state(&RunFacts {
-            ended: settled,
+            ended,
             end,
             last_text: final_message.as_ref().map(|message| message.text.as_str()),
             open_requests: is_current && !pending.is_empty(),
@@ -371,7 +379,7 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
     let cursor = cursor(state, current, settled, &pending.ids());
     let end_known = end.is_some();
     let turn_id = turn_id.map(str::to_owned);
-    Ok(WaitView { status, settled, end_known, selected_turn, turn_id, state, failure, pending, paused_until_ms, final_message, cursor })
+    Ok(WaitView { status, settled, ended, end_known, selected_turn, turn_id, state, failure, pending, paused_until_ms, final_message, cursor })
 }
 
 // ── Tools ─────────────────────────────────────────────────────────────────
@@ -386,11 +394,12 @@ struct Args {
     since: Option<String>,
 }
 
-/// Without `since`, returns when the selected run settles, when its view
-/// changes from the start of the call (an approval opens, a question appears,
-/// the state flips) or at the deadline; something pending at the start does
-/// not return early, so `while !settled` loops never spin. With `since` (a
-/// previous `wait_cursor`), returns once the view differs from it.
+/// Without `since`, returns when the selected run settles or is otherwise
+/// over, when its view changes from the start of the call (an approval opens,
+/// a question appears, the state flips) or at the deadline; something pending
+/// at the start does not return early, so `while !settled` loops never spin.
+/// With `since` (a previous `wait_cursor`), returns once the view differs
+/// from it.
 pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     let args: Args = service::parse(args)?;
     let maximum = max_wait_ms(caller);
@@ -427,7 +436,7 @@ pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &Control
     let mut evaluated = Instant::now();
     loop {
         let changed = view.cursor != baseline;
-        let returns = if args.since.is_some() { changed } else { view.settled || changed };
+        let returns = if args.since.is_some() { changed } else { view.ended || changed };
         if returns { return Ok(view.into_result(false)); }
         if Instant::now() >= deadline { return Ok(view.into_result(true)); }
         tokio::select! {

@@ -451,6 +451,45 @@ async fn wait_after_send_never_returns_the_previous_run() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_wait_on_a_closed_session_reads_went_idle() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let thread = "wait-closed-mid-turn";
+    persisted(&app, &workspace, thread);
+    running(&app, thread, "t1");
+    reply(&app, thread, "t1", "Halfway there");
+    let trusted = ControlCaller::trusted();
+    let args = || target(&workspace, thread, json!({"turn_id": "t1", "timeout_ms": 5000}));
+    let waiter = spawn_wait(&app, &trusted, args());
+    parked().await;
+    let started = Instant::now();
+    // Stopping a session mid-turn closes it; no TurnCompleted is ever sent
+    // for the run it cut off.
+    forward_event(app.handle(), Event::SessionStateChanged { thread_id: ThreadId(thread.into()), status: SessionStatus::Closed });
+    let stopped = waiter.await.unwrap().unwrap();
+    assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
+    assert_eq!(stopped["state"], "failed", "{stopped}");
+    assert_eq!(stopped["failure"], "went_idle");
+    assert_eq!(stopped["turn_id"], "t1");
+    assert_eq!(stopped["timed_out"], false);
+    assert_eq!(stopped["final_text"], "Halfway there");
+    // The legacy flag still needs a recorded end.
+    assert_eq!(stopped["settled"], false);
+    assert_eq!(stopped["selected_turn"], Value::Null);
+    // A wait that starts after the stop returns at once, and every view agrees.
+    let started = Instant::now();
+    let again = wait_for(&app, &trusted, args()).await.unwrap();
+    assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
+    let plain = wait_for(&app, &trusted, target(&workspace, thread, json!({"timeout_ms": 5000}))).await.unwrap();
+    let status = wait::thread_status(app.handle(), target(&workspace, thread, json!({}))).await.unwrap();
+    for view in [&again, &plain, &status] {
+        assert_eq!(view["state"], "failed", "{view}");
+        assert_eq!(view["failure"], "went_idle");
+    }
+    assert_eq!(again["timed_out"], false);
+    assert_eq!(again["wait_cursor"], stopped["wait_cursor"]);
+}
+
 #[tokio::test]
 async fn wait_limits_depend_on_the_caller() {
     let (app, _provider, _root, workspace, _own, _authority, actor) = native_caller_fixture("bypassPermissions").await;
