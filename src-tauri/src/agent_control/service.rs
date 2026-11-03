@@ -178,7 +178,7 @@ pub(crate) async fn cached_capabilities<R: Runtime>(
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Launch {
+pub(super) struct Launch {
     target: Option<super::selection::ProviderSelection>,
     #[serde(skip)]
     resolved: Option<super::selection::ResolvedSelection>,
@@ -199,7 +199,7 @@ struct Launch {
     worktree: Option<Value>,
 }
 
-pub(crate) async fn launch<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+pub(super) async fn launch<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     launch_placed(app, caller, args, false).await
 }
 
@@ -504,10 +504,30 @@ async fn materialize<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, inp
     Ok(json!({"workspace_id":input.workspace_id,"thread_id":thread,"pane_id":pane,"turn":turn,"selection":input.resolved}))
 }
 
-pub(crate) fn operation_status<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
-    #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-    struct Args { operation_id: String }
-    let args: Args = parse(args)?;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WorkspaceListArgs {}
+
+/// Every workspace on this instance, as outside callers need to target one.
+pub(super) fn workspace_list<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
+    let WorkspaceListArgs {} = parse(args)?;
+    let workspaces: Vec<_> = app.state::<AppStateStore>().snapshot().workspaces.iter().map(|workspace| json!({
+        "workspace_id": workspace.workspace_id.0,
+        "title": workspace.title,
+        "cwd": workspace.cwd,
+        "project_root": workspace.project_root,
+        "branch": workspace.git_branch,
+        "native_control_available": !workspace.is_local_import_snapshot_only() && workspace.host_id.is_none(),
+    })).collect();
+    Ok(json!({"workspaces": workspaces}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OperationStatusArgs { operation_id: String }
+
+pub(super) fn operation_status<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let args: OperationStatusArgs = parse(args)?;
     identifier(&args.operation_id, "operation_id", 256)?;
     let epoch = app.state::<NativeControlState>().epoch.clone();
     let receipt = app.state::<DatabaseStore>().control_operation(&caller.principal, &args.operation_id, &epoch)?
@@ -515,10 +535,12 @@ pub(crate) fn operation_status<R: Runtime>(app: &AppHandle<R>, caller: &ControlC
     serde_json::to_value(receipt).map_err(|e| ControlError::new(ErrorCode::SerializationFailed,e.to_string()))
 }
 
-pub(crate) fn thread_list<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
-    #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-    struct Args { workspace_id: String, cursor: Option<String>, limit: Option<u32> }
-    let args: Args = parse(args)?;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ThreadListArgs { workspace_id: String, cursor: Option<String>, limit: Option<u32> }
+
+pub(super) fn thread_list<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
+    let args: ThreadListArgs = parse(args)?;
     workspace(app, &args.workspace_id, false)?;
     let limit = args.limit.unwrap_or(20);
     if !(1..=100).contains(&limit) { return Err(ControlError::new(ErrorCode::InvalidArguments, "limit must be between 1 and 100")); }
@@ -542,10 +564,12 @@ pub(crate) fn thread_list<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result
     Ok(json!({"threads":threads,"has_more":has_more,"next_cursor":next_cursor}))
 }
 
-pub(crate) fn thread_read<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
-    #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-    struct Args { workspace_id: String, thread_id: String, cursor: Option<i64>, limit: Option<u32> }
-    let args: Args = parse(args)?;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ThreadReadArgs { workspace_id: String, thread_id: String, cursor: Option<i64>, limit: Option<u32> }
+
+pub(super) fn thread_read<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let args: ThreadReadArgs = parse(args)?;
     if caller.thread_id().is_none() { workspace(app, &args.workspace_id, false)?; }
     identifier(&args.thread_id, "thread_id", 256)?;
     let limit = args.limit.unwrap_or(20);
@@ -587,7 +611,7 @@ pub(crate) fn resolve_thread<R: Runtime>(app: &AppHandle<R>, target: &Target, mu
     Ok((record, provider))
 }
 
-pub(crate) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
+pub(super) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
     let target: Target = parse(args)?;
     let (record, provider) = resolve_thread(app, &target, false)?;
     let implementation = app.state::<ProviderRegistry>().get(provider).await;
@@ -638,25 +662,27 @@ pub(crate) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -
     }))
 }
 
-pub(crate) async fn thread_send<R: Runtime>(
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ThreadSendArgs {
+    workspace_id: String,
+    thread_id: String,
+    client_request_id: String,
+    message: String,
+    #[serde(default = "auto_delivery")]
+    delivery: crate::agent_provider::types::MessageDelivery,
+}
+
+fn auto_delivery() -> crate::agent_provider::types::MessageDelivery {
+    crate::agent_provider::types::MessageDelivery::Auto
+}
+
+pub(super) async fn thread_send<R: Runtime>(
     app: &AppHandle<R>,
     caller: &ControlCaller,
     args: Value,
 ) -> Result<Value, ControlError> {
-    #[derive(Deserialize, serde::Serialize)]
-    #[serde(deny_unknown_fields)]
-    struct Args {
-        workspace_id: String,
-        thread_id: String,
-        client_request_id: String,
-        message: String,
-        #[serde(default = "auto_delivery")]
-        delivery: crate::agent_provider::types::MessageDelivery,
-    }
-    fn auto_delivery() -> crate::agent_provider::types::MessageDelivery {
-        crate::agent_provider::types::MessageDelivery::Auto
-    }
-    let input: Args = parse(args)?;
+    let input: ThreadSendArgs = parse(args)?;
     let args = serde_json::to_value(&input)
         .map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))?;
     identifier(&input.client_request_id, "client_request_id", 128)?;
@@ -814,10 +840,12 @@ fn collaboration_unavailable<R: Runtime>(app: &AppHandle<R>, kind: ProviderKind)
         .then_some(crate::agent_provider::opencode::session::LEGACY_COLLABORATION)
 }
 
-pub(crate) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
-    #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-    struct Args { workspace_id: String, provider: Option<ProviderKind> }
-    let args: Args = parse(args)?;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CapabilitiesArgs { workspace_id: String, provider: Option<ProviderKind> }
+
+pub(super) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let args: CapabilitiesArgs = parse(args)?;
     workspace(app,&args.workspace_id,false)?;
     let registry = app.state::<ProviderRegistry>();
     let registered = match args.provider {
@@ -885,10 +913,12 @@ pub(crate) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &
     Ok(json!({"workspace_id":args.workspace_id,"access":caller.access,"providers":providers}))
 }
 
-pub(crate) async fn thread_interrupt<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
-    #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-    struct Args { workspace_id: String, thread_id: String, client_request_id: String, turn_id: Option<String> }
-    let input: Args = parse(args.clone())?;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct InterruptArgs { workspace_id: String, thread_id: String, client_request_id: String, turn_id: Option<String> }
+
+pub(super) async fn thread_interrupt<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let input: InterruptArgs = parse(args.clone())?;
     identifier(&input.client_request_id,"client_request_id",128)?;
     if let Some(turn) = &input.turn_id { identifier(turn,"turn_id",256)?; }
     if let Some(receipt) = retry_receipt(app, caller, "thread_interrupt", &args)? { return Ok(receipt); }
@@ -923,10 +953,12 @@ pub(crate) async fn thread_interrupt<R: Runtime>(app: &AppHandle<R>, caller: &Co
     Ok(receipt)
 }
 
-pub(crate) async fn thread_stop<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
-    #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-    struct Args { workspace_id: String, thread_id: String, client_request_id: String }
-    let input: Args = parse(args.clone())?;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StopArgs { workspace_id: String, thread_id: String, client_request_id: String }
+
+pub(super) async fn thread_stop<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let input: StopArgs = parse(args.clone())?;
     identifier(&input.client_request_id,"client_request_id",128)?;
     if let Some(receipt) = retry_receipt(app, caller, "thread_stop", &args)? { return Ok(receipt); }
     let target = Target { workspace_id:input.workspace_id,thread_id:input.thread_id };
@@ -952,10 +984,12 @@ pub(crate) async fn thread_stop<R: Runtime>(app: &AppHandle<R>, caller: &Control
     Ok(receipt)
 }
 
-pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
-    #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-    struct Args { workspace_id: String, thread_id: String, turn_id: Option<String>, timeout_ms: Option<u64> }
-    let mut args: Args = parse(args)?;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WaitArgs { workspace_id: String, thread_id: String, turn_id: Option<String>, timeout_ms: Option<u64> }
+
+pub(super) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let mut args: WaitArgs = parse(args)?;
     if args.turn_id.is_none() {
         let initial=thread_status(app,json!({"workspace_id":args.workspace_id,"thread_id":args.thread_id})).await?;
         if initial["settled"]==true {return Ok(json!({"timed_out":false,"settled":true,"status":initial}));}
@@ -987,13 +1021,17 @@ pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &Control
     }
 }
 
-pub(crate) async fn thread_respond<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
-    #[derive(Deserialize)] #[serde(rename_all="snake_case")]
-    enum Decision { AllowOnce, AllowAlways, Deny }
-    #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-    struct Args { workspace_id: String, thread_id: String, client_request_id: String, request_id: String, decision: Decision }
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Decision { AllowOnce, AllowAlways, Deny }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RespondArgs { workspace_id: String, thread_id: String, client_request_id: String, request_id: String, decision: Decision }
+
+pub(super) async fn thread_respond<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     if caller.thread_id().is_some() { return Err(ControlError::new(ErrorCode::PermissionDenied,"Agents cannot grant permission approvals")); }
-    let input: Args = parse(args.clone())?;
+    let input: RespondArgs = parse(args.clone())?;
     identifier(&input.client_request_id,"client_request_id",128)?;
     identifier(&input.request_id,"request_id",256)?;
     if let Some(receipt) = retry_receipt(app, caller, "thread_respond", &args)? { return Ok(receipt); }

@@ -3193,8 +3193,9 @@ async fn recorded_catalogs() -> serde_json::Value {
         .set_setting("agents.cross_provider_delegation", "false")
         .unwrap();
     let in_app_off = in_app(ProviderKind::Claude, "bypassPermissions");
+    let outside_client = ControlCaller::outside("catalog-snapshot".into(), "catalog-snapshot".into(), ControlAccess::FullAccess);
     json!({
-        "outside": serde_json::to_value(remote_tools()).unwrap(),
+        "outside": serde_json::to_value(registry::tools_for(&outside_client)).unwrap(),
         "in_app_full": in_app_full,
         "in_app_plan_codex": in_app_plan_codex,
         "in_app_off": in_app_off,
@@ -3318,4 +3319,74 @@ async fn named_client_messages_are_attributed_to_the_client() {
     assert_eq!(messages[0]["creation_source"], "mcp");
     assert_eq!(messages[0]["sender_title"], "Hermes");
     assert!(messages[0]["sender_thread_id"].is_null(), "{}", messages[0]);
+}
+
+/// Each route serves only its audience's tools. Anything else is unknown, or,
+/// for an in-app chat, a legacy self tool behind the relay's own policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_refuses_tools_off_their_route() {
+    let (app, _provider, _root, workspace, thread, _authority, actor) = native_caller_fixture("default").await;
+    for name in ["create_threads", "orchestrator_capabilities", "thread_search", "nope"] {
+        let error = execute(app.handle(), &ControlCaller::trusted(), name, json!({"workspace_id":workspace})).await.unwrap_err();
+        assert_eq!(error.code, "unknown_tool", "{name}: {error}");
+        assert_eq!(error.message, format!("Unknown tool: {name}"));
+    }
+    // Chats have no thread_status: the name falls through to the legacy relay,
+    // which refuses it below full access.
+    let error = native::call(app.handle().clone(), actor, "thread_status".into(), json!({"thread_id":thread})).await.unwrap_err();
+    assert!(error.starts_with("provider_control_denied:"), "{error}");
+}
+
+/// A caller learns nothing about the arguments of a tool it may not run.
+#[tokio::test]
+async fn dispatch_checks_access_before_arguments() {
+    let (app, _provider, _root, _workspace) = fixture().await;
+    let reader = ControlCaller::local(None, ControlAccess::ReadOnly);
+    let error = execute(app.handle(), &reader, "thread_stop", json!({"x":1})).await.unwrap_err();
+    assert_eq!(error.code, "access_denied", "{error}");
+    let error = execute(app.handle(), &reader, "thread_list", json!({"x":1})).await.unwrap_err();
+    assert_eq!(error.code, "invalid_arguments", "a tool the caller may run still checks its arguments: {error}");
+}
+
+/// The socket aliases and in-process callers get the schema check every other
+/// route gets, with the field named.
+#[tokio::test]
+async fn dispatch_validates_arguments_on_socket_routes() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let owner = ControlCaller::trusted();
+    let error = execute(app.handle(), &owner, "thread_list", json!({"workspace_id":workspace,"bogus":1})).await.unwrap_err();
+    assert_eq!((error.code, error.message.as_str()), (ErrorCode::InvalidArguments, "unknown field `bogus`"));
+    let error = execute(app.handle(), &owner, "thread_list", json!({"workspace_id":workspace,"limit":0})).await.unwrap_err();
+    assert_eq!(error.to_string(), "invalid_arguments: /limit is below the minimum 1");
+    let error = execute(app.handle(), &owner, "workspace_list", json!([])).await.unwrap_err();
+    assert_eq!(error.to_string(), "invalid_arguments: Arguments must be an object");
+    let listed = execute(app.handle(), &owner, "workspace_list", json!({})).await.unwrap();
+    assert!(listed["workspaces"].as_array().unwrap().iter().any(|w| w["workspace_id"] == workspace), "{listed}");
+}
+
+/// A null optional argument means "absent" on every route, as serde's `Option` does.
+#[tokio::test]
+async fn dispatch_accepts_null_optionals_everywhere() {
+    let (app, _provider, _root, workspace, thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
+    let outside = execute(app.handle(), &ControlCaller::trusted(), "thread_read", json!({
+        "workspace_id":workspace,"thread_id":thread,"cursor":null,"limit":null,
+    })).await.unwrap();
+    assert!(outside["messages"].is_array(), "{outside}");
+    let in_app = native::call(app.handle().clone(), actor, "thread_read".into(), json!({
+        "workspace_id":null,"thread_id":thread,"cursor":null,"text_offset":null,"max_chars":null,
+    })).await.unwrap();
+    assert!(in_app["messages"].is_array(), "{in_app}");
+}
+
+/// Plugin tools are not Agent collaboration tools: with collaboration off, a
+/// chat's plugin call passes dispatch and reaches the plugin layer (which
+/// applies its own authorization), while its thread tools stay refused.
+#[tokio::test]
+async fn in_app_plugin_tools_skip_the_collaboration_gate() {
+    let (app, _provider, _root, _workspace, _thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
+    app.state::<crate::database::DatabaseStore>().set_setting("agents.cross_provider_delegation", "false").unwrap();
+    let error = native::call(app.handle().clone(), actor.clone(), "plugin_list".into(), json!({})).await.unwrap_err();
+    assert!(error.starts_with("plugin_operation_failed:"), "the plugin layer answered: {error}");
+    let error = native::call(app.handle().clone(), actor, "thread_list".into(), json!({})).await.unwrap_err();
+    assert!(error.starts_with("orchestration_disabled:"), "{error}");
 }

@@ -1942,20 +1942,13 @@ pub fn mcp_result(mut value: Value) -> Value {
 
 pub struct PluginToolsHost<R: Runtime>(pub AppHandle<R>);
 impl<R: Runtime> crate::mcp::registry::HostTools for PluginToolsHost<R> {
+    /// The registry's tools that ignore Agent collaboration: plugin tools.
     fn tools_for(
         &self,
-        _caller: &crate::mcp::registry::HostCaller,
+        caller: &crate::mcp::registry::HostCaller,
     ) -> Vec<crate::mcp::runtime::McpTool> {
-        crate::agent_control::catalog::plugin_tools()
-            .into_iter()
-            .map(|tool| crate::mcp::runtime::McpTool {
-                name: tool.name.into(),
-                prefixed_name: crate::mcp::runtime::prefix_tool_name("codemux", tool.name),
-                description: Some(tool.description.into()),
-                input_schema: tool.input_schema,
-                server_id: "codemux".into(),
-            })
-            .collect()
+        let view = crate::agent_control::native::in_app_view(&self.0, caller);
+        crate::agent_control::native::host_tools(&view, false)
     }
     fn call(
         &self,
@@ -1973,20 +1966,20 @@ impl<R: Runtime> crate::mcp::registry::HostTools for PluginToolsHost<R> {
         _call_id: Option<&'a str>,
         _run_id: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send + 'a>> {
+        use crate::agent_control::{registry, Audience};
         Box::pin(async move {
             let raw = name.strip_prefix("mcp__codemux__")?;
-            if !matches!(raw, "plugin_list" | "plugin_invoke") {
-                return None;
-            }
+            registry::served(raw, Audience::InApp).filter(|(_, spec)| !spec.collaboration())?;
             let Some(control) = caller.control.clone() else {
                 return Some(
                     json!({"isError":true,"content":[{"type":"text","text":"A host-verified plugin caller is required"}]}),
                 );
             };
+            let route = registry::Route::InApp { actor: None };
             Some(
-                match agent_request(&self.0, control, raw, args.clone()).await {
+                match registry::dispatch(&self.0, &control, route, raw, args.clone()).await {
                     Ok(value) => mcp_result(value),
-                    Err(error) => json!({"isError":true,"content":[{"type":"text","text":error}]}),
+                    Err(error) => json!({"isError":true,"content":[{"type":"text","text":error.to_string()}]}),
                 },
             )
         })

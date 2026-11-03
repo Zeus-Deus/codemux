@@ -241,15 +241,20 @@ impl Default for McpRegistry {
     }
 }
 
+/// The legacy self tools a chat below full access may still call: they read,
+/// or (remote delegation) are granted per host.
+pub(crate) const RELAY_READ_TOOLS: [&str; 26] = [
+    "browser_snapshot", "browser_accessibility_snapshot", "browser_screenshot", "browser_console_logs", "browser_get_styles", "browser_viewport_presets", "browser_wait",
+    "app_status", "pane_list", "port_list",
+    "conversation_read", "conversation_search", "workspace_list", "workspace_info", "workspace_archive_list",
+    "automation_list", "automation_get", "automation_runs", "git_status", "git_diff", "terminal_read",
+    "issue_list", "issue_get", "preset_list", "delegation_targets", "delegate_remote_task",
+];
+
 /// Full-access native callers retain the base self-server catalog.
 /// Provider adapters apply the same predicate to discovery and dispatch.
 pub(crate) fn native_relay_allowed(raw:&str, full_access:bool)->bool {
-    full_access || matches!(raw,
-        "browser_snapshot" | "browser_accessibility_snapshot" | "browser_screenshot" | "browser_console_logs" | "browser_get_styles" | "browser_viewport_presets" | "browser_wait" |
-        "app_status" | "pane_list" | "port_list" |
-        "conversation_read" | "conversation_search" | "workspace_list" | "workspace_info" | "workspace_archive_list" |
-        "automation_list" | "automation_get" | "automation_runs" | "git_status" | "git_diff" | "terminal_read" |
-        "issue_list" | "issue_get" | "preset_list" | "delegation_targets" | "delegate_remote_task")
+    full_access || RELAY_READ_TOOLS.contains(&raw)
 }
 pub(crate) fn native_tool_visible(tool:&McpTool, caller:&HostCaller)->bool {
     if matches!(
@@ -1024,7 +1029,7 @@ impl McpRegistry {
                         .tools
                         .iter()
                         .filter(|tool| {
-                            !is_self || !crate::agent_control::is_native_tool(&tool.name)
+                            !is_self || !crate::agent_control::registry::relay_refuses(&tool.name)
                         })
                         .cloned(),
                 );
@@ -1224,7 +1229,7 @@ impl McpRegistry {
         // This relay has provider identity only, never a local controller or
         // connector grant. In particular a persisted Codex dynamic tool can
         // outlive its catalog. Omission alone is not an authority boundary.
-        if is_codemux_self && crate::agent_control::is_native_tool(&raw_name) {
+        if is_codemux_self && crate::agent_control::registry::relay_refuses(&raw_name) {
             return Err("provider_control_denied: native controller tools are not available through provider MCP relays".into());
         }
         let params = tool_call_params(&raw_name, arguments, is_codemux_self, workspace_id);
@@ -1826,9 +1831,7 @@ mod tests {
             .iter()
             .any(|t| t.name == "thread_launch"));
         // Controller discovery itself and Settings retain the native catalog.
-        assert!(crate::agent_control::native_tools()
-            .iter()
-            .any(|t| t.name == "thread_launch"));
+        assert!(crate::agent_control::registry::lookup("thread_launch").is_some());
         assert!(registry
             .list_tools_for_server("codemux-remote")
             .await
