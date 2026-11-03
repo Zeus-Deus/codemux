@@ -155,9 +155,16 @@ export const UserMessage = memo(function UserMessage({
           {attribution === "agent" ? (item.sender_thread_id && senderExists === true
             ? <InlineButton tone="muted" aria-label="Open sending chat" title={item.sender_title} onClick={() => { if (item.sender_thread_id) void openDelegatedChat(item.sender_thread_id); }}>Sent by another agent</InlineButton>
             : <span title={item.sender_title}>Sent by another agent{item.sender_title ? ` · ${item.sender_title}` : ""}</span>)
-            // A client names itself, so a long name truncates instead of
-            // pushing the bubble column wider.
-            : attribution === "outside" ? <span className="inline-block max-w-full truncate align-bottom" title={item.sender_title}>{outsideAttribution(item.sender_title)}</span>
+            // A client names itself, so only the name truncates: the
+            // "outside assistant" qualifier must stay visible however long
+            // the name is, or a self-chosen name could pass for the user.
+            : attribution === "outside" ? (item.sender_title
+              ? <span className="inline-flex max-w-full align-bottom" title={item.sender_title}>
+                  <span className="shrink-0 whitespace-pre">Sent by </span>
+                  <span className="min-w-0 truncate">{item.sender_title}</span>
+                  <span className="shrink-0 whitespace-pre"> · outside assistant</span>
+                </span>
+              : outsideAttribution(undefined))
             : attribution === "automation" ? "Sent by automation" : "Sent by Codemux"}
         </p>}
         {!queued && (steer || item.input_intent === "queued_turn") && <span className="me-1 flex items-center justify-end gap-1 text-label leading-none text-muted-foreground"
