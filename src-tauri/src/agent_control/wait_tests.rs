@@ -572,8 +572,9 @@ async fn wait_ends_promptly_when_an_outside_grant_is_revoked() {
     parked().await;
     let started = Instant::now();
     crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "wait-client".into()).unwrap();
-    // The connector raises signal_all on every authority change; raised
-    // here directly, so this checks the wait's side of that contract.
+    // The connector does not raise signal_all on authority changes yet, so
+    // this checks only the wait's side. Delete this line once it does: the
+    // test then covers the connector's hook too.
     wait::signal_all();
     let ended = waiter.await.unwrap().unwrap_err();
     assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
