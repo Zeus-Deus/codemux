@@ -360,7 +360,10 @@ impl Task {
     /// approval, unless its turn already failed (a question left open by a
     /// failed or dead child will never be answered into this task).
     fn awaits_user(&self) -> bool {
-        !self.turn_failed() && (self.asking || !self.open_requests.is_empty())
+        crate::agent_control::outcome::awaits_user(
+            self.turn_failed(),
+            self.asking || !self.open_requests.is_empty(),
+        )
     }
 
     fn turn_failed(&self) -> bool {
@@ -684,31 +687,29 @@ fn usage_limit_reason(resets_at_ms: Option<i64>) -> String {
 
 /// How a child's finished run maps onto the task. `None` means Codemux
 /// never saw the turn end (only the sweep calls it that way), which fails
-/// closed: a report Codemux cannot vouch for is not a success.
+/// closed: a report Codemux cannot vouch for is not a success. The rules are
+/// `agent_control::outcome`'s, shared with thread waits; this only words them.
 fn finalize_outcome(
     status: Option<&TurnStatus>,
     last_text: Option<&str>,
     usage_reset_ms: Option<i64>,
 ) -> Phase {
-    let text = last_text.map(str::trim).filter(|text| !text.is_empty());
-    match status {
-        Some(TurnStatus::Success) => match text {
-            Some(text) => Phase::Completed(text.to_string()),
-            None => Phase::Failed("It finished without a final message.".into()),
-        },
-        Some(TurnStatus::Error { subtype, .. })
-            if subtype == crate::agent_provider::events::RATE_LIMIT_SUBTYPE =>
-        {
-            Phase::Failed(one_line(&usage_limit_reason(usage_reset_ms)))
-        }
-        Some(TurnStatus::Error { message, .. }) => Phase::Failed(one_line(message)),
-        Some(TurnStatus::MaxTurns) => Phase::Failed("It hit its max-turns limit.".into()),
-        Some(TurnStatus::MaxBudget) => Phase::Failed("It hit its budget limit.".into()),
-        None => Phase::Failed(one_line(&match text {
+    use crate::agent_control::outcome::{finished, Failure, RunEnd, TurnEnd};
+    let failure = match finished(status.map(TurnEnd::of), last_text) {
+        RunEnd::Done(text) => return Phase::Completed(text.to_string()),
+        RunEnd::Failed(failure) => failure,
+    };
+    Phase::Failed(match failure {
+        Failure::NoFinalMessage => "It finished without a final message.".into(),
+        Failure::UsageLimit => one_line(&usage_limit_reason(usage_reset_ms)),
+        Failure::Turn { outcome: "max_turns", .. } => "It hit its max-turns limit.".into(),
+        Failure::Turn { outcome: "max_budget", .. } => "It hit its budget limit.".into(),
+        Failure::Turn { message, .. } => one_line(message.unwrap_or_default()),
+        Failure::WentIdle { last_text } => one_line(&match last_text {
             Some(text) => format!("It went idle without a final result; its last message: {text}"),
             None => "It went idle without a final result.".to_string(),
-        })),
-    }
+        }),
+    })
 }
 
 fn activity_line(task: &Task) -> String {
