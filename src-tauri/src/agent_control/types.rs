@@ -8,6 +8,18 @@ pub enum ControlAccess {
     FullAccess,
 }
 
+impl ControlAccess {
+    /// ReadOnly < Supervised < FullAccess. An explicit rank rather than a
+    /// derived `Ord`, so reordering the variants can never change who may do what.
+    pub fn rank(self) -> u8 {
+        match self {
+            ControlAccess::ReadOnly => 0,
+            ControlAccess::Supervised => 1,
+            ControlAccess::FullAccess => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CallerPrincipal {
@@ -84,6 +96,16 @@ impl ControlCaller {
         match &self.identity {
             CallerPrincipal::Thread { authority, .. } => Some(authority.stop_generation),
             _ => None,
+        }
+    }
+    /// What the access gate and tool listing treat this caller as. Named
+    /// local clients stay owners: their name is attribution, `access`
+    /// governs what they may do.
+    pub fn kind(&self) -> super::CallerKind {
+        match &self.identity {
+            CallerPrincipal::LocalController | CallerPrincipal::RemoteClient { .. } => super::CallerKind::Owner,
+            CallerPrincipal::OutsideClient => super::CallerKind::Client,
+            CallerPrincipal::Thread { ceiling, .. } => super::CallerKind::Agent { full_access: ceiling.full_access() },
         }
     }
     pub fn ceiling(&self) -> Option<super::permissions::Ceiling> {

@@ -1,6 +1,7 @@
 //! Typed control of application-owned native threads.
 pub mod catalog;
 mod types;
+pub(crate) mod access;
 pub(crate) mod error;
 pub(crate) mod schema;
 pub(crate) mod permissions;
@@ -15,6 +16,7 @@ pub(crate) use guard::NativeStartCancellation;
 pub use state::{NativeControlState, PendingApproval, ThreadRuntimeView};
 pub(crate) use state::ThreadGate;
 pub(crate) use types::AdmittedAuthority;
+pub use access::{Access, Audience, CallerKind, CallerView};
 pub use error::{ControlError, ErrorCode};
 pub use types::{CallerPrincipal,ControlAccess, ControlCaller};
 pub use catalog::{is_native_tool, is_read_only, native_tools, remote_tools, INSTRUCTIONS};
