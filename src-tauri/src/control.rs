@@ -712,10 +712,68 @@ impl Connection {
     }
 }
 
-/// Runs a request as the owner. In-process callers and tests use this.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Runs a request as the owner. Only tests call it: every socket request
+/// goes through [`dispatch_request_as`] with the caller it resolved.
+#[cfg(test)]
 pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlRequest) -> ControlResponse {
     dispatch_request_as(app, &SocketCaller::owner(), request).await
+}
+
+/// The caller registry tools run as. The socket cannot tell which chat an
+/// agent process belongs to, so it never runs registry tools as one (and
+/// never as the owner).
+fn registry_caller(caller: &SocketCaller) -> Result<&crate::agent_control::ControlCaller, String> {
+    match caller {
+        SocketCaller::Local(caller) => Ok(caller),
+        SocketCaller::Agent { .. } => Err(crate::agent_control::ControlError::new(
+            crate::agent_control::ErrorCode::AgentIdentityRequired,
+            "This process runs under a Codemux agent; use your chat's own Codemux tools for thread control",
+        )
+        .to_string()),
+    }
+}
+
+/// Absent or null params read as `{}`.
+fn params_object(params: &Value) -> Value {
+    if params.is_null() { serde_json::json!({}) } else { params.clone() }
+}
+
+/// `tool_call {name, arguments}`: any outside registry tool, by name. `data`
+/// is the MCP CallToolResult, tool errors included; `ok:false` only for
+/// malformed params, agent callers and unknown tools (`unknown_tool: …`).
+async fn tool_call<R: Runtime>(
+    app: &AppHandle<R>,
+    caller: &crate::agent_control::ControlCaller,
+    params: &Value,
+) -> Result<Value, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Args {
+        name: String,
+        #[serde(default)]
+        arguments: Value,
+    }
+    let args: Args = serde_json::from_value(params_object(params)).map_err(|error| {
+        crate::agent_control::ControlError::new(crate::agent_control::ErrorCode::InvalidArguments, error.to_string()).to_string()
+    })?;
+    crate::agent_control::registry::call(app, caller, &args.name, params_object(&args.arguments))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// `tools_list {}`: the outside catalog this caller may run, and who the
+/// socket took it for.
+fn tools_list(caller: &crate::agent_control::ControlCaller, params: &Value) -> Result<Value, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Args {}
+    serde_json::from_value::<Args>(params_object(params)).map_err(|error| {
+        crate::agent_control::ControlError::new(crate::agent_control::ErrorCode::InvalidArguments, error.to_string()).to_string()
+    })?;
+    Ok(serde_json::json!({
+        "tools": crate::agent_control::registry::tools_for(caller),
+        "caller": { "principal": caller.principal, "access": caller.access },
+    }))
 }
 
 fn control_response(result: Result<Value, String>) -> ControlResponse {
@@ -758,17 +816,17 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
             None=>Err("threadId is required".into()),
         },
         "delegation_host_info" | "delegation_grants" | "delegation_authorize" | "delegation_revoke" | "delegate_task" | "delegation_list" | "delegation_read" | "delegation_cancel" | "delegation_respond" | "delegation_deliver" => crate::delegation::app::invoke(app, &request.command, request.params).await,
-        name if crate::agent_control::is_native_tool(name) => match caller {
-            SocketCaller::Local(caller) => crate::agent_control::execute(app, caller, name, request.params.clone())
+        // The bare aliases keep returning raw data or `code: message`.
+        name if crate::agent_control::registry::is_socket_alias(name) => match registry_caller(caller) {
+            Ok(caller) => crate::agent_control::execute(app, caller, name, request.params.clone())
                 .await.map_err(|error| error.to_string()),
-            // The socket cannot tell which chat an agent process belongs to,
-            // so it never runs registry tools as one (and never as the owner).
-            SocketCaller::Agent { .. } => Err(crate::agent_control::ControlError::new(
-                crate::agent_control::ErrorCode::AgentIdentityRequired,
-                "This process runs under a Codemux agent; use your chat's own Codemux tools for thread control",
-            )
-            .to_string()),
+            Err(refused) => Err(refused),
         },
+        "tool_call" => match registry_caller(caller) {
+            Ok(caller) => tool_call(app, caller, &request.params).await,
+            Err(refused) => Err(refused),
+        },
+        "tools_list" => registry_caller(caller).and_then(|caller| tools_list(caller, &request.params)),
         "agent_connector_status" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct Args {}
             serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
@@ -2377,7 +2435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_without_chat_cannot_use_native_tools() {
+    async fn agent_without_chat_cannot_use_registry_tools() {
         let app = tauri::test::mock_app();
         let state = AppStateStore::default();
         let root = tempfile::tempdir().unwrap();
@@ -2388,12 +2446,81 @@ mod tests {
         for (tool, params) in [
             ("thread_list", serde_json::json!({"workspace_id": workspace})),
             ("thread_launch", serde_json::json!({"workspace_id": workspace, "client_request_id":"k", "provider":"claude", "message":"hi"})),
+            ("tool_call", serde_json::json!({"name":"thread_list", "arguments":{"workspace_id": workspace}})),
+            ("tools_list", serde_json::json!({})),
         ] {
             let response = dispatch_request_as(app.handle(), &full, request(tool, params)).await;
             assert!(refused_with(&response, "agent_identity_required"), "{tool}: {:?}", response.error);
         }
         let owner = dispatch_request(app.handle(), request("thread_list", serde_json::json!({"workspace_id": workspace}))).await;
         assert!(owner.ok, "{:?}", owner.error);
+    }
+
+    fn operation_app() -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(crate::agent_control::NativeControlState::default());
+        app
+    }
+
+    #[tokio::test]
+    async fn socket_tool_call_matches_the_alias() {
+        let app = operation_app();
+        let arguments = serde_json::json!({"operation_id": "missing"});
+        let called = dispatch_request(app.handle(), request("tool_call", serde_json::json!({"name": "operation_status", "arguments": arguments}))).await;
+        assert!(called.ok, "a tool error is a result, not a failed request: {:?}", called.error);
+        let result = called.data.unwrap();
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["structuredContent"]["error"]["code"], "operation_not_found");
+        assert_eq!(result["structuredContent"]["error"]["retryable"], false);
+        let alias = dispatch_request(app.handle(), request("operation_status", arguments)).await;
+        assert!(!alias.ok);
+        assert_eq!(alias.error.as_deref(), result["content"][0]["text"].as_str(), "the alias keeps its `code: message` text");
+
+        // Bad arguments are tool errors with detail; null arguments are `{}`.
+        let bogus = dispatch_request(app.handle(), request("tool_call", serde_json::json!({"name": "operation_status", "arguments": {"bogus": 1}}))).await;
+        let bogus = bogus.data.unwrap();
+        assert_eq!(bogus["structuredContent"]["error"]["code"], "invalid_arguments", "{bogus}");
+        assert!(bogus["structuredContent"]["error"]["message"].as_str().unwrap().contains("bogus"), "{bogus}");
+        let null = dispatch_request(app.handle(), request("tool_call", serde_json::json!({"name": "operation_status", "arguments": null}))).await;
+        let null = null.data.unwrap();
+        assert!(null["content"][0]["text"].as_str().unwrap().contains("operation_id"), "null reads as no arguments: {null}");
+
+        // Unknown tools and malformed requests are failed requests.
+        let unknown = dispatch_request(app.handle(), request("tool_call", serde_json::json!({"name": "nope"}))).await;
+        assert_eq!(unknown.error.as_deref(), Some("unknown_tool: Unknown tool: nope"));
+        let in_app_only = dispatch_request(app.handle(), request("tool_call", serde_json::json!({"name": "create_threads", "arguments": {}}))).await;
+        assert!(refused_with(&in_app_only, "unknown_tool"), "{:?}", in_app_only.error);
+        for params in [serde_json::json!({}), serde_json::json!({"name": 1}), serde_json::json!({"name": "thread_list", "extra": true}), Value::Null] {
+            let malformed = dispatch_request(app.handle(), request("tool_call", params.clone())).await;
+            assert!(refused_with(&malformed, "invalid_arguments"), "{params}: {:?}", malformed.error);
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_tools_list_serves_the_outside_catalog() {
+        use crate::agent_control::{ClientName, ControlAccess, ControlCaller};
+        let app = tauri::test::mock_app();
+        let owner = dispatch_request(app.handle(), request("tools_list", serde_json::json!({}))).await;
+        assert!(owner.ok, "{:?}", owner.error);
+        let owner = owner.data.unwrap();
+        let catalog = |caller: &ControlCaller| serde_json::to_value(crate::agent_control::registry::tools_for(caller)).unwrap();
+        assert_eq!(owner["tools"], catalog(&ControlCaller::trusted()));
+        assert_eq!(owner["caller"], serde_json::json!({"principal": "local", "access": "full_access"}));
+
+        let hermes = local(Some("Hermes Agent"), ControlAccess::ReadOnly);
+        let narrowed = dispatch_request_as(app.handle(), &hermes, request("tools_list", Value::Null)).await;
+        let narrowed = narrowed.data.unwrap();
+        let name = ClientName::parse("Hermes Agent").unwrap();
+        assert_eq!(narrowed["tools"], catalog(&ControlCaller::local(Some(&name), ControlAccess::ReadOnly)));
+        assert_eq!(narrowed["caller"], serde_json::json!({"principal": "local:hermes-agent", "access": "read_only"}));
+        let listed = narrowed["tools"].as_array().unwrap();
+        assert!(listed.len() < owner["tools"].as_array().unwrap().len());
+        assert!(listed.iter().all(|tool| tool["annotations"]["readOnlyHint"] == true), "read-only callers see read tools only");
+
+        let extra = dispatch_request(app.handle(), request("tools_list", serde_json::json!({"cursor": "x"}))).await;
+        assert!(refused_with(&extra, "invalid_arguments"), "{:?}", extra.error);
     }
 
     #[cfg(target_os = "linux")]

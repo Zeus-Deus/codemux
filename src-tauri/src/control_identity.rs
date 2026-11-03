@@ -286,9 +286,9 @@ socket_commands! {
 /// fail closed for everyone but the owner (who then gets "Unknown control
 /// command").
 pub fn command_access(command: &str, params: &Value) -> Access {
-    // The native tool aliases are registry tools; the registry gates them
-    // with each tool's own class and the caller's access.
-    if crate::agent_control::is_native_tool(command) {
+    // The bare tool aliases are registry tools; the registry gates them with
+    // each tool's own class and the caller's access, as it does `tool_call`.
+    if crate::agent_control::registry::is_socket_alias(command) {
         return Access::Read;
     }
     match command {
@@ -389,6 +389,9 @@ pub(crate) enum SocketCaller {
 }
 
 impl SocketCaller {
+    /// What a request with no client resolves to. Socket requests always
+    /// resolve their caller; tests run commands as the owner with this.
+    #[cfg(test)]
     pub(crate) fn owner() -> Self {
         Self::Local(ControlCaller::trusted())
     }
