@@ -58,7 +58,9 @@ pub struct CallerView {
     pub audience: Audience,
     pub access: ControlAccess,
     pub kind: CallerKind,
-    /// Agent collaboration (Settings). It only hides collaboration tools from agents.
+    /// Agent collaboration (Settings). While it is off, agents are offered no
+    /// tools; dispatch still lets plugin calls reach the plugin layer, which
+    /// refuses them.
     pub collaboration: bool,
 }
 
