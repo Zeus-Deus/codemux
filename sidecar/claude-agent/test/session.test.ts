@@ -196,14 +196,26 @@ test("managed workflows expose only virtual tools and ignore native settings", a
   expect(options?.env?.ENABLE_TOOL_SEARCH).toBe("false");
   expect(options?.env?.MCP_CONNECTION_NONBLOCKING).toBe("0");
   expect(options?.env?.ENABLE_CLAUDEAI_MCP_SERVERS).toBe("false");
-  expect(options?.settingSources).toEqual([]);
+  // User settings load only for provider routing (proxy env, apiKeyHelper);
+  // their CLAUDE.md stays out and the managed env outranks their `env`.
+  expect(options?.settingSources).toEqual(["user"]);
+  expect(options?.env?.CLAUDE_CODE_DISABLE_CLAUDE_MDS).toBe("1");
   expect(options?.strictMcpConfig).toBe(true);
   expect(options?.plugins).toEqual([]);
   expect(options?.extraArgs).toEqual({});
   expect(options?.additionalDirectories).toEqual([]);
   expect(options?.resume).toBeUndefined();
   expect(options?.permissionMode).toBe("default");
-  expect(options?.settings).toEqual({ disableAllHooks: true, ultracode: false });
+  expect(options?.settings).toEqual({
+    disableAllHooks: true,
+    ultracode: false,
+    env: {
+      ENABLE_TOOL_SEARCH: "false",
+      MCP_CONNECTION_NONBLOCKING: "0",
+      ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+      CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
+    },
+  });
   expect(options?.allowedTools).toEqual(["mcp__codemux__workflow_submit_result"]);
   expect(options?.systemPrompt).toBeUndefined();
   expect((await options!.canUseTool!("Bash", { command: "unsafe" }, { signal: new AbortController().signal, toolUseID: "native" })).behavior).toBe("deny");
@@ -257,7 +269,7 @@ test("start-session RPC forwards the host managed flag to SDK isolation", async 
       extraArgs: { tools: "Bash" },
     });
     expect(fake.capturedOptions?.tools).toEqual([]);
-    expect(fake.capturedOptions?.settingSources).toEqual([]);
+    expect(fake.capturedOptions?.settingSources).toEqual(["user"]);
     expect(fake.capturedOptions?.extraArgs).toEqual({});
     expect(fake.capturedOptions?.maxBudgetUsd).toBe(0.2);
     expect(fake.capturedOptions?.maxTurns).toBe(6);

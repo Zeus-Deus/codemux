@@ -37,7 +37,7 @@ pub struct ProbeInstalledResult {
 #[derive(Debug, Clone)]
 pub enum AuthStatus {
     /// CLI is installed AND the user is logged in.
-    Authenticated,
+    Authenticated { auth_label: Option<String> },
     /// CLI is installed but not logged in. `message` describes the
     /// remediation path.
     Unauthenticated { message: String },
@@ -98,8 +98,14 @@ pub async fn probe_authenticated(
         serde_json::from_value(value).map_err(|e| ProviderError::RpcError {
             message: format!("malformed probe-authenticated response: {e}"),
         })?;
-    Ok(match parsed.status.as_str() {
-        "authenticated" => AuthStatus::Authenticated,
+    Ok(auth_status_from_response(parsed))
+}
+
+fn auth_status_from_response(parsed: ProbeAuthenticatedResponse) -> AuthStatus {
+    match parsed.status.as_str() {
+        "authenticated" => AuthStatus::Authenticated {
+            auth_label: parsed.auth_label,
+        },
         "unauthenticated" => AuthStatus::Unauthenticated {
             message: parsed.message.unwrap_or_else(|| {
                 "Claude CLI is not authenticated. Run `claude login` and retry.".into()
@@ -108,7 +114,19 @@ pub async fn probe_authenticated(
         _ => AuthStatus::Unknown {
             raw: parsed.message.unwrap_or_default(),
         },
-    })
+    }
+}
+
+/// User settings may route the CLI through a proxy without OAuth files.
+pub(crate) fn read_settings(home: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(home.join("settings.json")).ok()?).ok()
+}
+
+pub(crate) fn config_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
 }
 
 fn claude_binary_param(claude_binary: Option<&Path>) -> serde_json::Value {
@@ -162,4 +180,26 @@ async fn run_probe(
         });
     let _ = child.shutdown().await;
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_readiness_claude_label_is_optional_and_passes_through() {
+        for label in [None, Some("Custom endpoint · localhost:8080")] {
+            let mut response = json!({"status": "authenticated"});
+            if let Some(label) = label {
+                response["authLabel"] = json!(label);
+            }
+            let status = auth_status_from_response(serde_json::from_value(response).unwrap());
+            match status {
+                AuthStatus::Authenticated { auth_label } => {
+                    assert_eq!(auth_label.as_deref(), label)
+                }
+                other => panic!("expected authenticated, got {other:?}"),
+            }
+        }
+    }
 }

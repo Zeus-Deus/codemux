@@ -24,6 +24,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 
 import { AsyncPromptQueue } from "./async-queue.ts";
+import { userRoutingOptions } from "./user-routing.ts";
 import type { EventEmitter, QueryFactory } from "./session.ts";
 
 export interface SideChatStartInput {
@@ -88,15 +89,15 @@ export function buildSideChatOptions(input: SideChatStartInput): Options {
     disallowedTools: [...SIDE_CHAT_DISALLOWED_TOOLS],
     permissionMode: "default",
     canUseTool: sideChatCanUseTool,
-    // No user/project settings: their hooks, permission rules and plugins
-    // could act. The fork still carries the main thread's context.
-    settingSources: [],
+    // Only the user's settings, for their provider routing; hooks and MCP
+    // stay off and project settings unread. The fork still carries the
+    // main thread's context. User permission rules cannot widen the tool
+    // list above.
+    ...userRoutingOptions(),
     settings: {
       disableAllHooks: true,
       ...(input.effort === "ultracode" ? { ultracode: true } : {}),
     } as unknown as NonNullable<Options["settings"]>,
-    mcpServers: {},
-    strictMcpConfig: true,
     plugins: [],
     systemPrompt: {
       type: "preset",

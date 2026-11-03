@@ -66,13 +66,14 @@ describe("side chat options", () => {
     expect(options.cwd).toBe("/tmp/repo");
   });
 
-  test("offer only read tools and disable hooks, settings and MCP", () => {
+  test("offer only read tools and disable hooks, project settings and MCP", () => {
     const options = buildSideChatOptions(START);
     expect(options.tools).toEqual(["Read", "Grep", "Glob"]);
     for (const tool of ["Bash", "Edit", "Write", "NotebookEdit", "Agent", "Task"]) {
       expect(options.disallowedTools).toContain(tool);
     }
-    expect(options.settingSources).toEqual([]);
+    // User settings carry proxy routing (env, apiKeyHelper); nothing else.
+    expect(options.settingSources).toEqual(["user"]);
     expect((options.settings as Record<string, unknown>).disableAllHooks).toBe(true);
     expect(options.mcpServers).toEqual({});
     expect(options.strictMcpConfig).toBe(true);

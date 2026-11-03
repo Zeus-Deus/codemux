@@ -44,6 +44,7 @@ const CLAUDE_NESTED_SESSION_ENV_VARS: &[&str] = &[
 fn build_invocation(
     selection: &UtilityModelSelection,
     temp_dir: &Path,
+    codex_config: Option<&toml::Value>,
 ) -> Result<UtilityInvocation, String> {
     if selection.model.trim().is_empty() {
         return Err("utility_model_required".into());
@@ -64,6 +65,9 @@ fn build_invocation(
                 "--model".into(),
                 selection.model.clone(),
             ];
+            // Keep provider routing, but not hooks, MCP servers, tools or
+            // instructions from the user's full agent configuration.
+            args.extend(codex_provider_overrides(codex_config));
             if let Some(effort) = selection.effort.as_deref().filter(|v| !v.is_empty()) {
                 args.extend([
                     "--config".into(),
@@ -87,10 +91,13 @@ fn build_invocation(
             let mut args = vec![
                 "--print".into(),
                 "--no-session-persistence".into(),
-                // Load no user/project settings: CLAUDE.md, auto-memory,
-                // skills, and plugins would otherwise bleed into the output.
+                // User settings carry proxy env and apiKeyHelper. Disable
+                // execution customizations while preserving that routing.
                 "--setting-sources".into(),
-                "".into(),
+                "user".into(),
+                "--settings".into(),
+                r#"{"disableAllHooks":true,"autoMemoryEnabled":false}"#.into(),
+                "--disable-slash-commands".into(),
                 "--output-format".into(),
                 "text".into(),
                 "--strict-mcp-config".into(),
@@ -150,6 +157,22 @@ fn build_invocation(
     }
 }
 
+fn codex_provider_overrides(config: Option<&toml::Value>) -> Vec<String> {
+    [
+        "model_provider",
+        "model_providers",
+        "cli_auth_credentials_store",
+        "forced_chatgpt_workspace_id",
+        "forced_login_method",
+        "openai_base_url",
+        "chatgpt_base_url",
+    ]
+    .into_iter()
+    .filter_map(|key| config?.get(key).map(|value| (key, value)))
+    .flat_map(|(key, value)| ["--config".into(), format!("{key}={value}")])
+    .collect()
+}
+
 fn strip_ansi(value: &str) -> String {
     let mut clean = String::with_capacity(value.len());
     let mut chars = value.chars().peekable();
@@ -173,7 +196,15 @@ pub async fn generate_utility_text(
     prompt: &str,
 ) -> Result<String, String> {
     let temp = tempfile::tempdir().map_err(|e| format!("utility_temp_dir_failed: {e}"))?;
-    let invocation = build_invocation(selection, temp.path())?;
+    let codex_config = if selection.provider == "codex" {
+        crate::agent_provider::codex::auth::config_home()
+            .map(|home| crate::agent_provider::codex::auth::read_user_config(&home))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let invocation = build_invocation(selection, temp.path(), codex_config.as_ref())?;
     let mut command = crate::execution::host_command_tokio(&invocation.program);
     command
         .args(&invocation.args)
@@ -249,6 +280,7 @@ mod tests {
         let inv = build_invocation(
             &selection("codex", "gpt-5.6-luna", Some("low")),
             Path::new("/tmp/codemux-utility-test"),
+            None,
         )
         .unwrap();
         assert!(inv.args.iter().any(|a| a == "--ephemeral"));
@@ -261,13 +293,66 @@ mod tests {
         let inv = build_invocation(
             &selection("claude", "claude-haiku-4-5", None),
             Path::new("/tmp/codemux-utility-test"),
+            None,
         )
         .unwrap();
         assert!(inv.args.iter().any(|a| a == "--no-session-persistence"));
         assert!(inv.args.windows(2).any(|a| a == ["--tools", ""]));
-        assert!(inv.args.windows(2).any(|a| a == ["--setting-sources", ""]));
+        assert!(inv
+            .args
+            .windows(2)
+            .any(|a| a == ["--setting-sources", "user"]));
+        assert!(inv.args.iter().any(|a| a == "--disable-slash-commands"));
+        assert!(inv.args.iter().any(|a| a == "--strict-mcp-config"));
+        let settings = inv.args.windows(2).find(|a| a[0] == "--settings").unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&settings[1]).unwrap();
+        assert_eq!(settings["disableAllHooks"], true);
+        assert_eq!(settings["autoMemoryEnabled"], false);
         assert!(inv.env_remove.contains(&"CLAUDECODE"));
         assert!(!inv.args.iter().any(|a| a.contains("dangerously")));
+    }
+
+    #[test]
+    fn proxy_readiness_codex_utility_preserves_only_provider_config() {
+        let config: toml::Value = toml::from_str(
+            r#"
+model_provider = "gateway"
+cli_auth_credentials_store = "file"
+notify = ["unsafe-command"]
+developer_instructions = "unwanted instructions"
+[model_providers.gateway]
+name = "My gateway"
+base_url = "http://localhost:8080/v1"
+env_key = "PROXY_KEY"
+[model_providers.gateway.auth]
+command = ["key-helper"]
+[mcp_servers.unwanted]
+command = "unsafe-command"
+[hooks]
+SessionStart = []
+"#,
+        )
+        .unwrap();
+        let inv = build_invocation(
+            &selection("codex", "test-model", None),
+            Path::new("/tmp/codemux-utility-test"),
+            Some(&config),
+        )
+        .unwrap();
+        let args = inv.args;
+        assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
+        assert!(args.iter().any(|arg| arg == "--ignore-rules"));
+        assert!(args.contains(&"model_provider=\"gateway\"".into()));
+        let providers = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("model_providers="))
+            .unwrap();
+        let providers: toml::Value = providers.parse().unwrap();
+        assert_eq!(providers["gateway"], config["model_providers"]["gateway"]);
+        assert!(!args
+            .iter()
+            .any(|arg| arg.contains("unsafe-command") || arg.contains("unwanted instructions")));
+        assert!(codex_provider_overrides(None).is_empty());
     }
 
     #[test]
@@ -275,6 +360,7 @@ mod tests {
         let inv = build_invocation(
             &selection("opencode", "openai/gpt-5", Some("low")),
             Path::new("/tmp/codemux-utility-test"),
+            None,
         )
         .unwrap();
         assert!(inv.args.iter().any(|a| a == "--pure"));

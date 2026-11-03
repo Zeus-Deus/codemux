@@ -335,15 +335,25 @@ function buildQueryOptions(
     opts.tools = [];
     // All MCP tools are deferred by current CLIs. This small captured set
     // must load upfront because managed sessions expose no ToolSearch.
-    opts.env = { ...opts.env, ENABLE_TOOL_SEARCH: "false", MCP_CONNECTION_NONBLOCKING: "0", ENABLE_CLAUDEAI_MCP_SERVERS: "false" };
+    // User settings are loaded only for provider routing (settings.json
+    // `env` / `apiKeyHelper` is how proxies are set up). Their CLAUDE.md
+    // stays out, and these flag-level env values outrank anything the
+    // user's `env` block sets for the same keys.
+    const managedEnv = {
+      ENABLE_TOOL_SEARCH: "false",
+      MCP_CONNECTION_NONBLOCKING: "0",
+      ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+      CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
+    };
+    opts.env = { ...opts.env, ...managedEnv };
     opts.disallowedTools = ["Bash", "Agent", "Task", "Workflow"];
-    opts.settingSources = [];
+    opts.settingSources = ["user"];
     // Attempts keep the bare prompt they were built against; Claude Code's
     // guidance describes tools they cannot use.
     delete opts.systemPrompt;
     opts.strictMcpConfig = true;
     opts.plugins = [];
-    const managedSettings = { disableAllHooks: true, ultracode: false };
+    const managedSettings = { disableAllHooks: true, ultracode: false, env: managedEnv };
     opts.settings = managedSettings;
     opts.allowedTools = mcpTools.map((tool) => `mcp__codemux__${tool.prefixedName}`);
     const managedNames = new Set(mcpTools.flatMap((tool) => [tool.prefixedName, `mcp__codemux__${tool.prefixedName}`]));

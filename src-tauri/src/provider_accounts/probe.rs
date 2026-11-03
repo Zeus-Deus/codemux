@@ -56,7 +56,39 @@ pub fn claude_identity(home: &Path, is_default: bool) -> AccountIdentity {
     let state = claude_state_file(home, is_default)
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
-    claude_identity_from(state.as_ref(), home.join(".credentials.json").is_file())
+    let mut identity = claude_identity_from(state.as_ref(), home.join(".credentials.json").is_file());
+    if claude_proxy_configured(home) { identity.signed_in = Some(true); }
+    identity
+}
+
+fn claude_proxy_configured(home: &Path) -> bool {
+    let Some(settings) = crate::agent_provider::claude::auth::read_settings(home) else {
+        return false;
+    };
+    fn nonempty(value: Option<&Value>) -> Option<&str> {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+    if nonempty(settings.get("apiKeyHelper")).is_some() {
+        return true;
+    }
+    let env = settings.get("env");
+    if ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+        .iter()
+        .any(|key| nonempty(env.and_then(|env| env.get(key))).is_some())
+    {
+        return true;
+    }
+    nonempty(env.and_then(|env| env.get("ANTHROPIC_BASE_URL")))
+        .and_then(|base| url::Url::parse(base).ok())
+        .is_some_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url
+                    .host_str()
+                    .is_some_and(|host| host != "api.anthropic.com")
+        })
 }
 
 fn claude_identity_from(state: Option<&Value>, credentials_file: bool) -> AccountIdentity {
@@ -183,6 +215,30 @@ pub fn identity_now(provider: ProviderKind, home: &Path, is_default: bool) -> Ac
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_readiness_claude_extra_home_accepts_proxy_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        for settings in [
+            json!({"env":{"ANTHROPIC_BASE_URL":"http://localhost:8080"}}),
+            json!({"env":{"ANTHROPIC_AUTH_TOKEN":"test-token"}}),
+            json!({"env":{"ANTHROPIC_API_KEY":"test-key"}}),
+            json!({"apiKeyHelper":"key-helper"}),
+        ] {
+            std::fs::write(tmp.path().join("settings.json"), settings.to_string()).unwrap();
+            assert_eq!(claude_identity(tmp.path(), false).signed_in, Some(true));
+        }
+        for settings in [
+            json!({}),
+            json!({"apiKeyHelper":" "}),
+            json!({"env":{"ANTHROPIC_API_KEY":"", "ANTHROPIC_AUTH_TOKEN":" "}}),
+            json!({"env":{"ANTHROPIC_BASE_URL":"https://api.anthropic.com"}}),
+            json!({"env":{"ANTHROPIC_BASE_URL":"not a URL"}}),
+        ] {
+            std::fs::write(tmp.path().join("settings.json"), settings.to_string()).unwrap();
+            assert_eq!(claude_identity(tmp.path(), false).signed_in, Some(false));
+        }
+    }
 
     #[test]
     fn claude_reads_the_signed_in_account() {
