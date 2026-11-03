@@ -491,6 +491,32 @@ mod tests {
         );
     }
 
+    /// The GUI and `codemux serve` drop an inherited identity before anything
+    /// else runs. `pty_shell_is_the_owner` stays green while either this scrub
+    /// or the PTY strip holds, so each one is pinned on its own.
+    #[test]
+    fn app_and_serve_scrub_an_inherited_identity_first() {
+        for (file, source, signature) in [
+            ("lib.rs", include_str!("lib.rs"), "\npub fn run() {"),
+            (
+                "web_remote/serve.rs",
+                include_str!("web_remote/serve.rs"),
+                "\npub fn run_serve(opts: ServeOptions) -> Result<(), String> {",
+            ),
+        ] {
+            let start = source.find(signature).unwrap_or_else(|| panic!("{file}: `{}` not found", signature.trim()));
+            let first = source[start + signature.len()..]
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with("//"))
+                .unwrap();
+            assert!(
+                first.ends_with("control_identity::scrub_inherited_agent_identity();"),
+                "{file}: the first statement must be the scrub, found `{first}`"
+            );
+        }
+    }
+
     #[test]
     fn first_usable_client_name_wins() {
         let slot = OnceLock::new();
