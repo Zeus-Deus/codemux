@@ -397,11 +397,18 @@ fn spawn_on_device(
     let cwd = cwd.to_str().ok_or_else(|| ProviderError::ValidationError {
         message: format!("{} isn't a valid folder on the device", cwd.display()),
     })?;
+    // `JsonRpcChild` marks only the local `ssh` client, and ssh forwards no
+    // environment, so the device's own `codemux` would take this agent for
+    // its owner. Mark the program on the device too; a provider's own value
+    // wins, as it does locally.
+    let mut env = env.clone();
+    env.entry(crate::control_identity::AGENT_PROCESS_ENV.to_string())
+        .or_insert_with(|| "1".to_string());
     stdio_spawn_config(
         &remote.ssh_target,
         program,
         args,
-        env,
+        &env,
         Some(cwd),
         default_timeout,
     )
@@ -790,6 +797,80 @@ mod tests {
             &["/nonexistent/bin/codex", "app-server"],
         );
         assert_eq!(out.status.code(), Some(127));
+    }
+
+    /// The device-side command line, as the device's login shell gets it
+    /// from ssh.
+    fn device_script(cfg: &SpawnConfig) -> &str {
+        assert_eq!(cfg.program, std::path::PathBuf::from("ssh"));
+        assert!(cfg.env.is_empty(), "nothing rides on the local ssh client");
+        cfg.args.last().unwrap()
+    }
+
+    /// Run a device script here, with only a minimal environment, so the
+    /// marker can come from nowhere but the script itself.
+    fn run_device_script(script: &str, home: &Path) -> std::process::Output {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn device_spawns_mark_the_agent_process_on_the_device() {
+        let marker = crate::control_identity::AGENT_PROCESS_ENV;
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = home.path().to_path_buf();
+        let printenv = format!("printf %s \"${marker}\"");
+        for program in ["sh", "/bin/sh"] {
+            let cfg = device_spawn_config(
+                &device(),
+                &DeviceProgram(program.into()),
+                &["-c".into(), printenv.clone()],
+                &HashMap::from([("CODEMUX_WORKSPACE_ID".to_string(), "ws".to_string())]),
+                &cwd,
+                Duration::from_secs(20),
+            )
+            .unwrap();
+            let out = run_device_script(device_script(&cfg), home.path());
+            assert!(
+                out.status.success(),
+                "{program}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "1", "{program}");
+        }
+
+        // A provider that set its own marker keeps it.
+        let cfg = device_spawn_config(
+            &device(),
+            &DeviceProgram("sh".into()),
+            &["-c".into(), printenv],
+            &HashMap::from([(marker.to_string(), "acp".to_string())]),
+            &cwd,
+            Duration::from_secs(20),
+        )
+        .unwrap();
+        let out = run_device_script(device_script(&cfg), home.path());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "acp");
+
+        let cfg = claude_spawn_config(
+            &device(),
+            &DeviceProgram("claude".into()),
+            &HashMap::new(),
+            &cwd,
+            Duration::from_secs(20),
+        )
+        .unwrap();
+        assert!(
+            device_script(&cfg).contains(&format!("{marker}=1")),
+            "{}",
+            device_script(&cfg)
+        );
     }
 
     #[tokio::test]
