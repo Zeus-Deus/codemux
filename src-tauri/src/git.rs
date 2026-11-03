@@ -2165,6 +2165,12 @@ pub fn find_remote_ref(repo_path: &Path, branch: &str) -> Option<String> {
     }
 }
 
+/// Whether `name` spells a full commit id (SHA-1 or SHA-256 hex), which no
+/// remote branch fetch can freshen.
+pub(crate) fn is_object_id(name: &str) -> bool {
+    matches!(name.len(), 40 | 64) && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Wall-clock cap for the best-effort base fetch in
 /// [`fetch_origin_branch`]. Matches the 10s per-fetch timeout used by the
 /// background sidebar-divergence fetcher: long enough for a healthy remote,
@@ -2817,7 +2823,7 @@ pub fn git_create_worktree(
     // `workspace_create`, the workspace gets a generic "Workspace N"
     // title, and any `initial_prompt` gets dropped because the fallback
     // doesn't run the preset-launch / prompt-injection block in
-    // `create_worktree_workspace_impl`. Detect-and-reuse keeps the
+    // `create_worktree_from_request`. Detect-and-reuse keeps the
     // happy path intact for the Telegram "spin up an agent in this
     // branch" flow even when the worktree is already on disk.
     //
@@ -3599,7 +3605,7 @@ mod tests {
     // `workspace_create` with the same path) produced a workspace with
     // generic "Workspace N" title and silently dropped `initial_prompt`
     // because the fallback skips the preset-launch + prompt-injection
-    // block in `create_worktree_workspace_impl`.
+    // block in `create_worktree_from_request`.
     //
     // Fix: `git_create_worktree` now detects when the requested worktree
     // path is already registered against the requested branch and

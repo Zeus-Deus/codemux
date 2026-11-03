@@ -90,65 +90,7 @@ process.stdout.write(JSON.stringify(choices(JSON.parse(process.argv[2]), JSON.pa
 /// Worktree placement and layout emits use test-only path overrides, including on
 /// Windows where Known Folders ignore HOME. Set paths only on a new process.
 fn isolated(name: &str) -> bool {
-    if let Some(root) = std::env::var_os("CODEMUX_PLATFORM_ACCEPTANCE_ROOT") {
-        assert_eq!(
-            Path::new(&std::env::var_os("CODEMUX_TEST_WORKTREE_HOME").unwrap()),
-            Path::new(&root)
-        );
-        assert!(
-            Path::new(&std::env::var_os("CODEMUX_TEST_LAYOUT_PATH").unwrap()).starts_with(&root)
-        );
-        return false;
-    }
-    let root = tempfile::tempdir().unwrap();
-    let profile = root.path().join("profile");
-    std::fs::create_dir(&profile).unwrap();
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command
-        .current_dir(root.path())
-        .args([
-            "--exact",
-            &format!("plugins::platform_acceptance_tests::{name}"),
-            "--nocapture",
-        ])
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        // Keep HOME different so Unix runs exercise the explicit override too.
-        .env("HOME", &profile)
-        .env("USERPROFILE", &profile)
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("XDG_DATA_HOME", root.path().join("data"))
-        .env("XDG_CACHE_HOME", root.path().join("cache"))
-        .env("TMPDIR", root.path())
-        .env("TEMP", root.path())
-        .env("TMP", root.path())
-        .env("CODEMUX_PLATFORM_ACCEPTANCE_ROOT", root.path())
-        .env("CODEMUX_TEST_WORKTREE_HOME", root.path())
-        .env("CODEMUX_TEST_LAYOUT_PATH", root.path().join("layout.json"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", root.path().join("gitconfig"))
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_AUTHOR_NAME", "Native acceptance")
-        .env("GIT_AUTHOR_EMAIL", "acceptance@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Native acceptance")
-        .env("GIT_COMMITTER_EMAIL", "acceptance@example.invalid");
-    if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") {
-        command.env("LD_LIBRARY_PATH", path);
-    }
-    #[cfg(windows)]
-    for key in ["SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
-    let output = command.output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success() && stdout.contains("1 passed"),
-        "isolated {name}: {stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    true
+    crate::test_isolation::isolated(&format!("plugins::platform_acceptance_tests::{name}"))
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -387,8 +329,7 @@ impl Fixture {
 
     fn worktree_path(&self, branch: &str) -> std::path::PathBuf {
         let path = crate::git::conventional_worktree_path(self.root.path(), branch).unwrap();
-        let root =
-            std::path::PathBuf::from(std::env::var_os("CODEMUX_PLATFORM_ACCEPTANCE_ROOT").unwrap());
+        let root = crate::test_isolation::isolated_root().unwrap();
         assert!(path.starts_with(root.join(".codemux").join("worktrees")));
         path
     }

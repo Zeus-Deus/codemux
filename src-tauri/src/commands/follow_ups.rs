@@ -948,26 +948,28 @@ pub async fn follow_up_start<R: Runtime>(
         return Err(error);
     }
 
-    let created = super::workspace::create_worktree_workspace_impl_with_selection(
+    let created = super::workspace::create_worktree_from_request(
         app.clone(),
-        &app_state,
-        &db,
-        &app.state::<crate::terminal::PtyState>(),
-        &app.state::<crate::presets::PresetStoreState>(),
-        repo_path.display().to_string(),
-        branch.clone(),
-        true,
-        Some(base_sha.clone()),
-        "empty".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        Some(InitialChatPane {
-            provider,
-            thread_id: child.clone(),
-        }),
+        crate::workspace_service::WorktreeRequest {
+            repo_path: repo_path.display().to_string(),
+            branch: branch.clone(),
+            new_branch: true,
+            // The commit stands in as the base until the parent's branch,
+            // when known, is recorded below.
+            base: crate::workspace_service::WorktreeBase::Commit {
+                sha: base_sha.clone(),
+                label: None,
+            },
+            layout: crate::state::WorkspacePresetLayout::Empty,
+            preset: None,
+            pr_number: None,
+            select: false,
+            initial_chat: Some(InitialChatPane {
+                provider,
+                thread_id: child.clone(),
+            }),
+            reserved_id: None,
+        },
     )
     .await;
     let created = match created {

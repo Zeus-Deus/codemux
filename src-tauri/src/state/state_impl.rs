@@ -2184,7 +2184,20 @@ impl AppStateStore {
         snapshot: &mut AppStateSnapshot,
         cwd_path: PathBuf,
     ) -> WorkspaceId {
-        let workspace_id = WorkspaceId(next_id("workspace"));
+        Self::create_empty_workspace_at_path_locked_with_id(
+            snapshot,
+            cwd_path,
+            Self::reserve_workspace_id(),
+        )
+    }
+
+    /// [`Self::create_empty_workspace_at_path_locked`] under a caller-chosen
+    /// id, so an admission record can name the workspace before it exists.
+    fn create_empty_workspace_at_path_locked_with_id(
+        snapshot: &mut AppStateSnapshot,
+        cwd_path: PathBuf,
+        workspace_id: WorkspaceId,
+    ) -> WorkspaceId {
         let workspace_index = snapshot.workspaces.len() + 1;
         let cwd = cwd_path.display().to_string();
 
@@ -2645,19 +2658,47 @@ impl AppStateStore {
         layout: WorkspacePresetLayout,
         select: bool,
     ) -> WorkspaceId {
+        self.create_workspace_with_layout_reserved(cwd_path, layout, select, None)
+    }
+
+    /// Create a workspace under `reserved` (from [`Self::reserve_workspace_id`])
+    /// when given, so a receipt admitted earlier names it. Idempotent on the
+    /// id: when a workspace already holds it, nothing is created and that id
+    /// is returned.
+    pub fn create_workspace_with_layout_reserved(
+        &self,
+        cwd_path: PathBuf,
+        layout: WorkspacePresetLayout,
+        select: bool,
+        reserved: Option<WorkspaceId>,
+    ) -> WorkspaceId {
         let mut snapshot = self.inner.lock().unwrap();
+        if let Some(existing) = reserved
+            .as_ref()
+            .filter(|id| snapshot.workspaces.iter().any(|w| &w.workspace_id == *id))
+        {
+            return existing.clone();
+        }
+        let workspace_id = reserved.unwrap_or_else(Self::reserve_workspace_id);
         Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
-            Self::create_workspace_with_layout_locked(snapshot, cwd_path, layout)
+            Self::create_workspace_with_layout_locked_with_id(
+                snapshot,
+                cwd_path,
+                layout,
+                workspace_id,
+            )
         })
     }
 
     /// Body of [`Self::create_workspace_with_layout`], factored out so
     /// callers that already hold the state lock (the atomic
-    /// adopt-or-create path) can insert without re-locking.
-    fn create_workspace_with_layout_locked(
+    /// adopt-or-create path) can insert without re-locking. The caller picks
+    /// the id: a fresh one, or one reserved before the workspace existed.
+    fn create_workspace_with_layout_locked_with_id(
         snapshot: &mut AppStateSnapshot,
         cwd_path: PathBuf,
         layout: WorkspacePresetLayout,
+        workspace_id: WorkspaceId,
     ) -> WorkspaceId {
         // Empty layout short-circuits to the same shape
         // `create_empty_workspace_at_path` produces: no tabs, no
@@ -2665,10 +2706,13 @@ impl AppStateStore {
         // chat-worktree flow) fill the workspace with their own pane
         // afterward via `agent_chat_create_pane`.
         if matches!(layout, WorkspacePresetLayout::Empty) {
-            return Self::create_empty_workspace_at_path_locked(snapshot, cwd_path);
+            return Self::create_empty_workspace_at_path_locked_with_id(
+                snapshot,
+                cwd_path,
+                workspace_id,
+            );
         }
 
-        let workspace_id = WorkspaceId(next_id("workspace"));
         let surface_id = SurfaceId(next_id("surface"));
         let cwd = cwd_path.display().to_string();
         let shell = env::var("SHELL").ok();
@@ -2816,9 +2860,16 @@ impl AppStateStore {
             probe,
             true,
             None,
+            None,
         )
     }
 
+    /// [`Self::adopt_or_create_worktree_workspace`] with explicit focus, an
+    /// optional first chat pane, and an optional `reserved` id for the new
+    /// workspace. A checkout `probe` finds is adopted and the reservation
+    /// goes unused. A reservation that already names a live workspace is
+    /// returned as adopted, so retrying under the same id never duplicates.
+    #[allow(clippy::too_many_arguments)]
     pub fn adopt_or_create_worktree_workspace_with_selection<F>(
         &self,
         cwd_path: PathBuf,
@@ -2828,6 +2879,7 @@ impl AppStateStore {
         probe: F,
         select: bool,
         initial_chat: Option<InitialChatPane>,
+        reserved: Option<WorkspaceId>,
     ) -> WorktreeWorkspaceClaim
     where
         F: FnOnce(&AppStateSnapshot) -> Option<String>,
@@ -2837,8 +2889,18 @@ impl AppStateStore {
             if let Some(existing_id) = probe(&snapshot) {
                 return WorktreeWorkspaceClaim::Adopted(existing_id);
             }
-            let workspace_id =
-                Self::create_workspace_with_layout_locked(snapshot, cwd_path, layout);
+            if let Some(existing) = reserved
+                .as_ref()
+                .filter(|id| snapshot.workspaces.iter().any(|w| &w.workspace_id == *id))
+            {
+                return WorktreeWorkspaceClaim::Adopted(existing.0.clone());
+            }
+            let workspace_id = Self::create_workspace_with_layout_locked_with_id(
+                snapshot,
+                cwd_path,
+                layout,
+                reserved.unwrap_or_else(Self::reserve_workspace_id),
+            );
             if let Some(workspace) = snapshot
                 .workspaces
                 .iter_mut()
@@ -13600,5 +13662,97 @@ mod metadata_change_tests {
             store.link_workspace_issue(&id, issue("Crash on launch", crate::github::IssueState::Closed)),
             "a retitle is a change"
         );
+    }
+}
+
+#[cfg(test)]
+mod reserved_workspace_id_tests {
+    //! A receipt names a workspace before it exists, so creation must accept
+    //! that reserved id and stay idempotent on it.
+    use super::*;
+
+    #[test]
+    fn reserved_ids_name_the_new_workspace_and_never_duplicate() {
+        let store = AppStateStore::default();
+        let focused = store.create_workspace();
+        let before = store.snapshot().workspaces.len();
+
+        for layout in [WorkspacePresetLayout::Single, WorkspacePresetLayout::Empty] {
+            let reserved = AppStateStore::reserve_workspace_id();
+            let created = store.create_workspace_with_layout_reserved(
+                PathBuf::from("/tmp/codemux-reserved-id-test"),
+                layout.clone(),
+                false,
+                Some(reserved.clone()),
+            );
+            assert_eq!(created, reserved, "{layout:?}: the reservation names the workspace");
+            let again = store.create_workspace_with_layout_reserved(
+                PathBuf::from("/tmp/codemux-reserved-id-test"),
+                layout.clone(),
+                false,
+                Some(reserved.clone()),
+            );
+            assert_eq!(again, reserved, "{layout:?}: a retry returns the same workspace");
+            let snapshot = store.snapshot();
+            assert_eq!(
+                snapshot.workspaces.iter().filter(|w| w.workspace_id == reserved).count(),
+                1,
+                "{layout:?}: one workspace per reserved id"
+            );
+            assert_eq!(snapshot.active_workspace_id, focused, "{layout:?}: background create");
+        }
+        assert_eq!(store.snapshot().workspaces.len(), before + 2);
+
+        let unreserved = store.create_workspace_with_layout_reserved(
+            PathBuf::from("/tmp/codemux-reserved-id-test"),
+            WorkspacePresetLayout::Single,
+            true,
+            None,
+        );
+        assert_ne!(unreserved, focused);
+        assert_eq!(store.snapshot().active_workspace_id, unreserved, "select takes focus");
+    }
+
+    #[test]
+    fn worktree_claims_use_the_reservation_unless_a_checkout_is_adopted() {
+        let store = AppStateStore::default();
+        let focused = store.create_workspace();
+        let claim = |reserved: Option<WorkspaceId>, adopt: Option<String>| {
+            store.adopt_or_create_worktree_workspace_with_selection(
+                PathBuf::from("/tmp/codemux-reserved-worktree"),
+                WorkspacePresetLayout::Empty,
+                "/tmp/codemux-reserved-worktree".into(),
+                "feat".into(),
+                |_| adopt,
+                false,
+                None,
+                reserved,
+            )
+        };
+
+        let reserved = AppStateStore::reserve_workspace_id();
+        assert_eq!(
+            claim(Some(reserved.clone()), None),
+            WorktreeWorkspaceClaim::Created(reserved.clone())
+        );
+        let workspace = store.find_workspace(&reserved.0).unwrap();
+        assert_eq!(workspace.worktree_path.as_deref(), Some("/tmp/codemux-reserved-worktree"));
+        assert_eq!(workspace.title, "feat");
+        assert_eq!(store.snapshot().active_workspace_id, focused);
+
+        let count = store.snapshot().workspaces.len();
+        assert_eq!(
+            claim(Some(reserved.clone()), None),
+            WorktreeWorkspaceClaim::Adopted(reserved.0.clone()),
+            "a retry under the same reservation adopts it"
+        );
+        let unused = AppStateStore::reserve_workspace_id();
+        assert_eq!(
+            claim(Some(unused.clone()), Some(reserved.0.clone())),
+            WorktreeWorkspaceClaim::Adopted(reserved.0.clone()),
+            "a live checkout wins over the reservation"
+        );
+        assert_eq!(store.snapshot().workspaces.len(), count);
+        assert!(store.find_workspace(&unused.0).is_none());
     }
 }

@@ -411,23 +411,25 @@ async fn start<R: Runtime>(
                 "A worktree path already exists for '{branch}'. Choose a new branch."
             ));
         }
-        let created = super::workspace::create_worktree_workspace_impl_with_selection(
+        // `base` is the commit resolved before admission; the workspace
+        // records the base the caller named, when it named one.
+        let created = super::workspace::create_worktree_from_request(
             app.clone(),
-            &app.state::<AppStateStore>(),
-            &app.state::<crate::database::DatabaseStore>(),
-            &app.state::<crate::terminal::PtyState>(),
-            &app.state::<crate::presets::PresetStoreState>(),
-            repo.to_string_lossy().into_owned(),
-            branch,
-            true,
-            Some(base),
-            "empty".into(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            None,
+            crate::workspace_service::WorktreeRequest {
+                repo_path: repo.to_string_lossy().into_owned(),
+                branch,
+                new_branch: true,
+                base: crate::workspace_service::WorktreeBase::Commit {
+                    sha: base,
+                    label: input.base,
+                },
+                layout: crate::state::WorkspacePresetLayout::Empty,
+                preset: None,
+                pr_number: None,
+                select: false,
+                initial_chat: None,
+                reserved_id: None,
+            },
         )
         .await?;
         if created.adopted {
