@@ -2670,20 +2670,23 @@ mod tests {
         assert!(!is_legacy_tool("thread_launch") && !is_legacy_tool("nope"));
     }
 
+    /// Outside stdio at full access: every legacy tool the registry does not
+    /// take over, then the registry's whole outside catalog. Computed rather
+    /// than pinned, because it moves with the registry: a twin replaces its
+    /// legacy tool one for one, and a tool with no legacy twin, such as
+    /// `thread_answer`, adds one. The pins live in
+    /// `legacy_tool_names_are_pinned` (62) and the catalog snapshot.
+    fn full_access_outside_tool_count() -> usize {
+        let kept = LEGACY_TOOL_NAMES.iter().filter(|name| registry::served(name, Audience::Outside).is_none()).count();
+        kept + registry::list(&CallerView::outside(ControlAccess::FullAccess)).len()
+    }
+
     #[test]
     fn tool_registry_has_all_tools() {
-        // Registry tools take over legacy names on outside stdio, so the count
-        // stays 75 however many of the legacy tools they replace.
+        // Registry tools take over the legacy tools they share a name with,
+        // and a full-access caller is offered every other legacy tool.
         let tools = stdio_tools(false, false, ControlAccess::FullAccess);
-        // Tool count bumped from 39 → 44 with the Phase 1.6 lifecycle +
-        // issue tools, then 44 → 52 with the eight automation tools,
-        // then 52 → 55 with the workspace-archive tools, then 55 → 57
-        // with provider-neutral attached-conversation history
-        // (workspace_archive / workspace_unarchive /
-        // workspace_archive_list), then 57 → 58 with html_render. Keep
-        // this number in sync with legacy_tools() when adding new entries.
-        // The registry adds its outside tools that have no legacy twin.
-        assert_eq!(tools.len(), 75);
+        assert_eq!(tools.len(), full_access_outside_tool_count());
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
@@ -2905,13 +2908,8 @@ mod tests {
     async fn dispatch_tools_list() {
         let resp = rpc(&server(), json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        // Bumped 39 → 44 with the Phase 1.6 lifecycle + issue tools,
-        // then 44 → 52 with the eight automation tools, then 52 → 55
-        // with the workspace-archive tools, then 55 → 57 with attached
-        // conversation history, then 57 → 58 with html_render. See
-        // tool_registry_has_all_tools for the canonical count (native control
-        // adds eleven, plus two isolated plugin tools).
-        assert_eq!(tools.len(), 75);
+        // `tools/list` serves what `stdio_tools` builds for this caller.
+        assert_eq!(tools.len(), full_access_outside_tool_count());
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());
