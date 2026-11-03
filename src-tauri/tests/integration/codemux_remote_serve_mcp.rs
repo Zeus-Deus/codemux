@@ -55,6 +55,14 @@ struct ServeFixture {
 
 impl ServeFixture {
     fn start() -> Self {
+        Self::start_with_home(TempDir::new().expect("home tempdir"))
+    }
+
+    /// Start the daemon with a `HOME` the caller seeded first (agent
+    /// configs, an app layout). Its config dir is `<home>/.config`, so the
+    /// developer's own Codemux app never decides who owns the `codemux`
+    /// MCP name here.
+    fn start_with_home(home: TempDir) -> Self {
         let bin = binary_path();
         assert!(
             bin.exists(),
@@ -63,7 +71,6 @@ impl ServeFixture {
             bin
         );
         let state_dir = TempDir::new().expect("tempdir");
-        let home = TempDir::new().expect("home tempdir");
         // Spawn the daemon. Inherit stderr so test failures surface
         // the daemon's own diagnostics. Redirect stdout to /dev/null
         // because we don't care about it (the daemon logs to stderr).
@@ -72,6 +79,7 @@ impl ServeFixture {
             .arg("--state-dir")
             .arg(state_dir.path())
             .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         let child = cmd.spawn().expect("spawn codemux-remote serve");
@@ -376,6 +384,100 @@ fn http_worktree_create_provisions_like_desktop() {
         "CODEMUX_WORKSPACE_PATH"
     );
 
+    fx.stop();
+}
+
+/// Where the `codemux` MCP name belongs to another program (here the
+/// Codemux app's `codemux mcp`), the daemon leaves both agent configs
+/// byte-identical.
+#[test]
+fn serve_keeps_a_foreign_codemux_mcp_entry() {
+    let home = TempDir::new().unwrap();
+    let claude = home.path().join(".claude.json");
+    let claude_before = r#"{"mcpServers":{"codemux":{"command":"/usr/bin/codemux","args":["mcp"]}}}"#;
+    std::fs::write(&claude, claude_before).unwrap();
+    let vexis = home.path().join(".vexis").join("mcp-servers.yaml");
+    let vexis_before = "servers:\n  - name: codemux\n    command: /usr/bin/codemux\n    args: [\"mcp\"]\n";
+    std::fs::create_dir_all(vexis.parent().unwrap()).unwrap();
+    std::fs::write(&vexis, vexis_before).unwrap();
+
+    // Healthy means serve is past registration: it runs before the router.
+    let fx = ServeFixture::start_with_home(home);
+
+    assert_eq!(std::fs::read_to_string(&claude).unwrap(), claude_before);
+    assert_eq!(std::fs::read_to_string(&vexis).unwrap(), vexis_before);
+    fx.stop();
+}
+
+/// The daemon refreshes an entry that runs another copy of codemux-remote
+/// and adds a missing one, in both agent configs.
+#[test]
+fn serve_updates_its_own_entry() {
+    let home = TempDir::new().unwrap();
+    let claude = home.path().join(".claude.json");
+    std::fs::write(
+        &claude,
+        r#"{"mcpServers":{"codemux":{"command":"/opt/old/codemux-remote","args":["mcp"]},"github":{"command":"gh-mcp"}}}"#,
+    )
+    .unwrap();
+    let vexis = home.path().join(".vexis").join("mcp-servers.yaml");
+    std::fs::create_dir_all(vexis.parent().unwrap()).unwrap();
+    std::fs::write(
+        &vexis,
+        "servers:\n  - name: codemux\n    command: /opt/old/codemux-remote\n    args: [\"mcp\"]\n",
+    )
+    .unwrap();
+
+    let fx = ServeFixture::start_with_home(home);
+    let exe = std::fs::canonicalize(binary_path()).unwrap();
+    let exe = exe.to_string_lossy();
+
+    let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
+    assert_eq!(parsed["mcpServers"]["codemux"]["command"], json!(exe), "{parsed}");
+    assert_eq!(parsed["mcpServers"]["codemux"]["args"], json!(["mcp"]));
+    assert_eq!(parsed["mcpServers"]["github"]["command"], json!("gh-mcp"));
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&vexis).unwrap()).unwrap();
+    assert_eq!(yaml["servers"][0]["command"].as_str(), Some(exe.as_ref()), "{yaml:?}");
+    fx.stop();
+
+    // A home with no entry yet gets one added.
+    let home = TempDir::new().unwrap();
+    let claude = home.path().join(".claude.json");
+    std::fs::write(&claude, r#"{"theme":"dark"}"#).unwrap();
+    let fx = ServeFixture::start_with_home(home);
+    let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
+    assert_eq!(parsed["mcpServers"]["codemux"]["command"], json!(exe), "{parsed}");
+    assert_eq!(parsed["theme"], json!("dark"));
+    fx.stop();
+}
+
+/// Once the Codemux app has saved its layout under this user's config dir,
+/// `codemux` is the app's name: the daemon withdraws the entry it wrote and
+/// keeps the user's other servers.
+#[test]
+fn serve_withdraws_its_entry_where_the_app_has_run() {
+    let home = TempDir::new().unwrap();
+    let layout = home.path().join(".config").join("codemux").join("layout.json");
+    std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
+    std::fs::write(&layout, "{}").unwrap();
+    let exe = std::fs::canonicalize(binary_path()).unwrap();
+    let claude = home.path().join(".claude.json");
+    std::fs::write(
+        &claude,
+        json!({ "mcpServers": {
+            "codemux": { "command": exe, "args": ["mcp"] },
+            "github": { "command": "gh-mcp" },
+        }})
+        .to_string(),
+    )
+    .unwrap();
+
+    let fx = ServeFixture::start_with_home(home);
+
+    let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
+    assert!(parsed["mcpServers"].get("codemux").is_none(), "{parsed}");
+    assert_eq!(parsed["mcpServers"]["github"]["command"], json!("gh-mcp"));
     fx.stop();
 }
 
