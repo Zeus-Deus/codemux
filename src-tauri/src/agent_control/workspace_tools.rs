@@ -115,8 +115,9 @@ pub(super) async fn create<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
         // The legacy default: the folder Codemux itself was started in.
         None => None,
     };
+    let owned = app.clone();
     service::run_receipted(app, caller, "workspace_create", &args, true, None, move |reserved| async move {
-        let opened = WorkspaceService::new(app)
+        let opened = WorkspaceService::new(&owned)
             .open(OpenWorkspace { path, select, reuse_open: true, reserved_id: reserved })
             .await
             .map_err(|error| ControlError::from_text(error, ErrorCode::WorkspaceCreateFailed))?;
@@ -164,9 +165,10 @@ pub(super) async fn create_worktree<R: Runtime>(app: &AppHandle<R>, caller: &Con
     } else {
         local_folder(&input.repo_path)?
     };
+    let owned = app.clone();
     service::run_receipted(app, caller, "worktree_create", &args, true, None, move |reserved| async move {
         let request = input.into_request(None, reserved).await.map_err(request_error)?;
-        let created = WorkspaceService::new(app)
+        let created = WorkspaceService::new(&owned)
             .create_worktree(request)
             .await
             .map_err(|error| git_error(error, ErrorCode::WorktreeCreateFailed))?;
@@ -199,8 +201,9 @@ pub(super) async fn close<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller
     }
     service::workspace(app, &workspace_id, false)?;
     let receipt_workspace = workspace_id.clone();
+    let owned = app.clone();
     service::run_receipted(app, caller, "workspace_close", &args, false, Some(&receipt_workspace), move |_| async move {
-        let closed = WorkspaceService::new(app)
+        let closed = WorkspaceService::new(&owned)
             .close(CloseWorkspace { workspace_id, remove_worktree: delete_worktree, delete_branch, force: force_delete })
             .await
             // Verbatim: the text says why (uncommitted work, a shared checkout).

@@ -92,6 +92,25 @@ fn receipt(app: &App, caller: &ControlCaller, operation_id: &Value) -> crate::da
     app.state::<DatabaseStore>().control_operation(&caller.principal, operation_id.as_str().unwrap(), &epoch).unwrap().unwrap()
 }
 
+/// Holds the next receipted call's work until a permit is added.
+fn hold_next_work(app: &App) -> Arc<tokio::sync::Semaphore> {
+    let barrier = Arc::new(tokio::sync::Semaphore::new(0));
+    *app.state::<NativeControlState>().fixture_operation_barrier.lock().unwrap() = Some(barrier.clone());
+    barrier
+}
+
+/// Returns once a call took the barrier from `hold_next_work`: it was admitted
+/// and its work is waiting for the permit.
+async fn work_is_held(app: &App) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while app.state::<NativeControlState>().fixture_operation_barrier.lock().unwrap().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the call reaches its work");
+}
+
 /// No receipt was admitted under `key`: the refusal came before admission.
 fn no_receipt(app: &App, caller: &ControlCaller, key: &str, tool: &str) {
     let epoch = app.state::<NativeControlState>().epoch.clone();
@@ -166,20 +185,13 @@ async fn workspace_create_receipt_names_reserved_id_and_replays() {
 
     // A duplicate while the first call is still working sees its receipt,
     // which already names the workspace it will create.
-    let barrier = Arc::new(tokio::sync::Semaphore::new(0));
-    *app.state::<NativeControlState>().fixture_operation_barrier.lock().unwrap() = Some(barrier.clone());
+    let barrier = hold_next_work(&app);
     let held_args = json!({"path": other.path(), "client_request_id": "create-2"});
     let held = {
         let (handle, caller, args) = (app.handle().clone(), owner.clone(), held_args.clone());
         tokio::spawn(async move { execute(&handle, &caller, "workspace_create", args).await })
     };
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while app.state::<NativeControlState>().fixture_operation_barrier.lock().unwrap().is_some() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the first call reaches its work");
+    work_is_held(&app).await;
     let duplicate = call(&app, &owner, "workspace_create", held_args).await.unwrap();
     assert_eq!(duplicate["state"], "running", "{duplicate}");
     let reserved = duplicate["workspace_id"].as_str().unwrap().to_string();
@@ -452,6 +464,39 @@ async fn registry_worktree_create_receipt_reserves_id_adopts_and_honours_origin_
     let not_git = tempfile::tempdir().unwrap();
     refused(call(&app, &owner, "worktree_create", json!({"repo_path": not_git.path(), "branch": "x", "layout": "empty"})).await, ErrorCode::NotAGitRepository);
     refused(call(&app, &owner, "worktree_create", json!({"repo_path": repo, "branch": "-x"})).await, ErrorCode::InvalidArguments);
+}
+
+/// A call whose caller goes away (an HTTP client disconnecting, a proxy
+/// timing out) only stops waiting. The checkout is still made, claimed and
+/// recorded: no orphan checkout, no receipt left running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worktree_create_finishes_when_the_caller_goes_away() {
+    if isolated(&format!("{MODULE}worktree_create_finishes_when_the_caller_goes_away")) {
+        return;
+    }
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    let owner = named(ControlAccess::FullAccess);
+    let args = json!({"repo_path": repo, "branch": "dropped", "layout": "empty", "client_request_id": "wt-dropped"});
+    let barrier = hold_next_work(&app);
+    let held = {
+        let (handle, caller, args) = (app.handle().clone(), owner.clone(), args.clone());
+        tokio::spawn(async move { execute(&handle, &caller, "worktree_create", args).await })
+    };
+    work_is_held(&app).await;
+    let running = call(&app, &owner, "worktree_create", args.clone()).await.unwrap();
+    assert_eq!(running["state"], "running", "{running}");
+    let reserved = running["workspace_id"].as_str().unwrap().to_string();
+
+    held.abort();
+    assert!(held.await.unwrap_err().is_cancelled(), "the caller went away while its work was held");
+    barrier.add_permits(1);
+    let settled = settle_once(&app, &owner, &running).await;
+    assert_eq!((settled["state"].clone(), settled["workspace_id"].clone()), (json!("succeeded"), json!(reserved)), "{settled}");
+    let workspace = app.state::<AppStateStore>().find_workspace(&reserved).expect("the workspace exists under the reserved id");
+    let path = crate::git::conventional_worktree_path(&repo, "dropped").unwrap();
+    assert_eq!(workspace.worktree_path.as_deref(), Some(path.display().to_string().as_str()));
+    let retry = call(&app, &owner, "worktree_create", args).await.unwrap();
+    assert_eq!((retry["workspace_id"].clone(), retry["replayed"].clone()), (json!(reserved), json!(true)), "{retry}");
 }
 
 #[tokio::test]

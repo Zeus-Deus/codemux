@@ -959,12 +959,17 @@ pub(crate) fn recorded<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, t
 }
 
 /// A mutation that finishes within the call, optionally under a durable
-/// receipt. Without client_request_id the work runs directly. With one, a
+/// receipt. Without client_request_id the work runs with no receipt. With one, a
 /// retry returns the recorded outcome instead of repeating side effects, and
 /// the receipt names its workspace from admission on: `target_workspace`, or
 /// with `reserve_workspace` a new id, reserved before the workspace exists and
 /// handed to `work`. A successful result's `workspace_id` replaces that name
 /// (an open folder reused, a checkout adopted).
+///
+/// The work runs in its own task, which also records a keyed call's outcome.
+/// A caller that goes away (an HTTP client disconnecting, a proxy timing out)
+/// only stops waiting: the work is never cut off halfway, and its receipt
+/// still settles.
 pub(crate) async fn run_receipted<R, F, Fut>(
     app: &AppHandle<R>,
     caller: &ControlCaller,
@@ -976,11 +981,11 @@ pub(crate) async fn run_receipted<R, F, Fut>(
 ) -> Result<Value, ControlError>
 where
     R: Runtime,
-    F: FnOnce(Option<WorkspaceId>) -> Fut,
-    Fut: std::future::Future<Output = Result<Value, ControlError>>,
+    F: FnOnce(Option<WorkspaceId>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<Value, ControlError>> + Send + 'static,
 {
     if !keyed(args) {
-        return work(None).await;
+        return detached(work(None)).await;
     }
     if let Some(receipt) = retry_receipt(app, caller, tool, args)? {
         return replay(receipt);
@@ -1004,32 +1009,48 @@ where
     }
     db.update_control_operation(&caller.principal, &operation, &epoch, "running", None, None, None, None)
         .map_err(|e| ControlError::new(ErrorCode::OperationAdmissionFailed, e))?;
+    let (owned, principal, id) = (app.clone(), caller.principal.clone(), operation.clone());
     #[cfg(test)]
     let barrier = app.state::<NativeControlState>().fixture_operation_barrier.lock().unwrap().take();
-    #[cfg(test)]
-    if let Some(barrier) = barrier {
-        barrier.acquire().await.unwrap().forget();
-    }
-    let outcome = work(reserved).await;
-    let saved = match &outcome {
-        Ok(value) => db.update_control_operation(
-            &caller.principal, &operation, &epoch, "succeeded",
-            value["workspace_id"].as_str(), value["thread_id"].as_str(), Some(value), None,
-        ),
-        Err(error) => db.update_control_operation(
-            &caller.principal, &operation, &epoch, "failed", None, None, None, serde_json::to_value(error).ok().as_ref(),
-        ),
-    };
-    if let Err(error) = saved {
-        eprintln!("[codemux::agent_control] could not save operation outcome: {error}");
-    }
-    let mut value = outcome?;
+    let mut value = detached(async move {
+        #[cfg(test)]
+        if let Some(barrier) = barrier {
+            barrier.acquire().await.unwrap().forget();
+        }
+        let outcome = work(reserved).await;
+        let db = owned.state::<DatabaseStore>();
+        let saved = match &outcome {
+            Ok(value) => db.update_control_operation(
+                &principal, &id, &epoch, "succeeded",
+                value["workspace_id"].as_str(), value["thread_id"].as_str(), Some(value), None,
+            ),
+            Err(error) => db.update_control_operation(
+                &principal, &id, &epoch, "failed", None, None, None, serde_json::to_value(error).ok().as_ref(),
+            ),
+        };
+        if let Err(error) = saved {
+            eprintln!("[codemux::agent_control] could not save operation outcome: {error}");
+        }
+        outcome
+    })
+    .await?;
     if !value.is_object() {
         value = json!({"result": value});
     }
     value["operation_id"] = json!(operation);
     value["state"] = json!("succeeded");
     Ok(value)
+}
+
+/// Runs `work` in a task of its own: dropping the caller's future leaves it
+/// running to the end.
+async fn detached<Fut>(work: Fut) -> Result<Value, ControlError>
+where
+    Fut: std::future::Future<Output = Result<Value, ControlError>> + Send + 'static,
+{
+    tauri::async_runtime::spawn(work)
+        .await
+        .map_err(|error| ControlError::new(ErrorCode::NativeControlFailed, format!("Worker failed: {error}")))?
 }
 
 /// A receipt as a retry of its synchronous call returns it: the recorded
@@ -1317,9 +1338,10 @@ pub(super) async fn thread_answer<R: Runtime>(app: &AppHandle<R>, caller: &Contr
     let submission = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, json!(["codemux:thread_answer", caller.principal, input.client_request_id]).to_string().as_bytes()).to_string();
     let AnswerArgs { workspace_id, thread_id, question_id, answers, .. } = input;
     let receipt_workspace = workspace_id.clone();
+    let owned = app.clone();
     run_receipted(app, caller, "thread_answer", &args, false, Some(&receipt_workspace), move |_| async move {
         let action = QuestionAction::Answer { answers, submission_id: submission.clone(), retry_unknown: false, permission_mode_override: None };
-        let resolution = agent_chat_answer_question(app.clone(), ThreadId(thread_id.clone()), question_id.clone(), action)
+        let resolution = agent_chat_answer_question(owned, ThreadId(thread_id.clone()), question_id.clone(), action)
             .await
             .map_err(|e| ControlError::new(ErrorCode::QuestionAnswerFailed, e))?;
         match &resolution {
