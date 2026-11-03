@@ -2004,6 +2004,16 @@ function mockThreadPayloads(threadId: string): string[] {
     ].map((message)=>JSON.stringify(message));
   }
 
+  // `?mockScenario=outside-launch`: a chat an outside assistant started with
+  // `codemux mcp --client hermes`, then the worker's reply.
+  if (new URLSearchParams(window.location.search).get("mockScenario") === "outside-launch" && threadId === MOCK_CHAT_THREAD_ID) {
+    return [
+      {type:"user_message",thread_id:threadId,message_id:"outside-launch",created_by:"agent",creation_source:"mcp",sender_title:"hermes",input_intent:"turn_start",text:"Run the parser tests and tell me which ones fail."},
+      {type:"item_completed",thread_id:threadId,turn_id:"outside-launch-turn",item_id:"outside-launch-answer",item:{kind:"assistant_text",text:"All 42 parser tests pass. The two that failed yesterday were fixed by the Unicode boundary change."},subagent_id:null},
+      {type:"turn_completed",thread_id:threadId,turn_id:"outside-launch-turn",status:{kind:"success"},usage:null},
+    ].map((message)=>JSON.stringify(message));
+  }
+
   if (new URLSearchParams(window.location.search).get("mockScenario") === "message-provenance" && threadId === MOCK_CHAT_THREAD_ID) {
     return [
       {message_id:"provenance-agent",created_by:"agent",creation_source:"provider",sender_thread_id:MOCK_SECOND_CHAT_THREAD_ID,sender_title:"Parser review",input_intent:"turn_start",text:"Review the parser changes and run the focused checks."},

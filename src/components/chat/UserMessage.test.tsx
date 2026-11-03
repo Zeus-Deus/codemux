@@ -164,6 +164,26 @@ describe("UserMessage provenance", () => {
     expect(getByText("Sent by another agent · Previous reviewer")).toBeTruthy();
     expect(queryByRole("button",{name:"Open sending chat"})).toBeNull();
   });
+  it("labels a message from an outside assistant with the name it gave", () => {
+    getSessionMock.mockClear();
+    const {getByText,queryByRole,container}=render(<UserMessage item={{...makeItem([]),created_by:"agent",creation_source:"mcp",sender_title:"hermes"}} />);
+    expect(getByText("Sent by hermes · outside assistant")).toBeTruthy();
+    expect(container.querySelector('[data-user-message-attribution="outside"]')).not.toBeNull();
+    expect(queryByRole("button",{name:"Open sending chat"})).toBeNull();
+    expect(getSessionMock).not.toHaveBeenCalled();
+  });
+  it("labels an unnamed outside assistant and keeps a hostile name as text", () => {
+    const unnamed=render(<UserMessage item={{...makeItem([]),created_by:"agent",creation_source:"mcp"}} />);
+    expect(unnamed.getByText("Sent by an outside assistant")).toBeTruthy();
+    unnamed.unmount();
+    const {container,getByText}=render(<UserMessage item={{...makeItem([]),created_by:"agent",creation_source:"mcp",sender_title:"<img src=x onerror=alert(1)>"}} />);
+    expect(getByText("Sent by <img src=x onerror=alert(1)> · outside assistant").getAttribute("title")).toBe("<img src=x onerror=alert(1)>");
+    expect(container.querySelector("img")).toBeNull();
+  });
+  it("leaves the owner's own MCP message unlabelled", () => {
+    const {container}=render(<UserMessage item={{...makeItem([]),created_by:"user",creation_source:"mcp"}} />);
+    expect(container.querySelector("[data-user-message-attribution]")).toBeNull();
+  });
   it("attributes app-authored input to Codemux", () => {
     const {getByText}=render(<UserMessage item={{...makeItem([]),created_by:"system",creation_source:"codemux"}} />);
     expect(getByText("Sent by Codemux")).toBeTruthy();

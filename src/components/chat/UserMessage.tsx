@@ -1,5 +1,5 @@
 import { InlineButton } from "@/components/ui/button";
-import { messageAttribution } from "@/lib/agent-chat/message-provenance";
+import { messageAttribution, outsideAttribution } from "@/lib/agent-chat/message-provenance";
 import { openDelegatedChat } from "./delegation-actions";
 import { memo, useCallback, useEffect, useState } from "react";
 import { CornerDownLeft, ImageOff, Redo2, Undo2, X } from "lucide-react";
@@ -151,10 +151,13 @@ export const UserMessage = memo(function UserMessage({
     // its own.
     <div className={cn(MESSAGE_GROUP_CLASS, "group flex justify-end")}>
       <div className="flex max-w-[82%] flex-col items-end gap-1">
-        {attribution && <p className="me-1 text-caption text-muted-foreground/70" data-user-message-attribution={attribution}>
+        {attribution && <p className="me-1 max-w-full text-caption text-muted-foreground/70" data-user-message-attribution={attribution}>
           {attribution === "agent" ? (item.sender_thread_id && senderExists === true
             ? <InlineButton tone="muted" aria-label="Open sending chat" title={item.sender_title} onClick={() => { if (item.sender_thread_id) void openDelegatedChat(item.sender_thread_id); }}>Sent by another agent</InlineButton>
             : <span title={item.sender_title}>Sent by another agent{item.sender_title ? ` · ${item.sender_title}` : ""}</span>)
+            // A client names itself, so a long name truncates instead of
+            // pushing the bubble column wider.
+            : attribution === "outside" ? <span className="inline-block max-w-full truncate align-bottom" title={item.sender_title}>{outsideAttribution(item.sender_title)}</span>
             : attribution === "automation" ? "Sent by automation" : "Sent by Codemux"}
         </p>}
         {!queued && (steer || item.input_intent === "queued_turn") && <span className="me-1 flex items-center justify-end gap-1 text-label leading-none text-muted-foreground"

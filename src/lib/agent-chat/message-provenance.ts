@@ -22,11 +22,31 @@ export function messageProvenance(value: MessageProvenance): MessageProvenance {
   };
 }
 
-export function messageAttribution(item: MessageProvenance): "agent" | "codemux" | "automation" | null {
+export type MessageAttribution = "agent" | "outside" | "codemux" | "automation";
+
+export function messageAttribution(item: MessageProvenance): MessageAttribution | null {
   if (item.automation_id) return "automation";
   if (item.created_by === "system" || (item.created_by === "agent" && item.creation_source === "codemux")) return "codemux";
+  // An outside assistant (a named local MCP client or a network grant)
+  // drives Codemux over MCP and has no chat here to link back to.
+  if (item.created_by === "agent" && item.creation_source === "mcp" && !item.sender_thread_id) return "outside";
   if (item.created_by === "agent") return "agent";
   return null;
+}
+
+/** "Sent by hermes · outside assistant". The name is the client's own label,
+ *  so it is shown as given, never as a verified identity. */
+export function outsideAttribution(senderTitle: string | undefined): string {
+  return senderTitle ? `Sent by ${senderTitle} · outside assistant` : "Sent by an outside assistant";
+}
+
+/** The attribution line as plain text, for compact places like the queue. */
+export function attributionText(item: MessageProvenance): string | null {
+  const attribution = messageAttribution(item);
+  if (attribution === null) return null;
+  if (attribution === "outside") return outsideAttribution(item.sender_title);
+  const sender = attribution === "agent" ? "another agent" : attribution === "automation" ? "automation" : "Codemux";
+  return `Sent by ${sender}${item.sender_title ? ` · ${item.sender_title}` : ""}`;
 }
 
 /** Legacy text changes presentation only; attribution still requires metadata. */
