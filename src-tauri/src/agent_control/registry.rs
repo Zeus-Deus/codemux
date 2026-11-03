@@ -126,7 +126,9 @@ impl ToolSpec {
         self
     }
 
-    /// Agents may call it while Agent collaboration is off (plugin tools).
+    /// Not an Agent collaboration tool (plugin tools): the plugin host serves
+    /// it, and dispatch leaves the collaboration setting to the plugin layer,
+    /// which authorizes every call itself.
     pub const fn without_collaboration(mut self) -> Self {
         self.collaboration = false;
         self
@@ -161,7 +163,8 @@ impl ToolSpec {
         self.waits
     }
 
-    /// An Agent collaboration tool: agents reach it only while collaboration is on.
+    /// An Agent collaboration tool: the orchestration host serves it, and
+    /// dispatch refuses it to agents while collaboration is off.
     pub fn collaboration(&self) -> bool {
         self.collaboration
     }
@@ -239,12 +242,15 @@ fn reaches(declared: Audience, route: Audience) -> bool {
 /// The tools `view` may run, in [`ToolId::ALL`] order. Callers are offered only
 /// what they can run; a hidden tool's call still fails with the gate's code.
 pub fn list(view: &CallerView) -> Vec<Listed> {
-    let agent = matches!(view.kind, CallerKind::Agent { .. });
+    // With Agent collaboration off a chat can run none of these: dispatch
+    // refuses collaboration tools, and the plugin layer refuses plugin calls
+    // from chats on its own.
+    let offered = view.collaboration || !matches!(view.kind, CallerKind::Agent { .. });
     ToolId::ALL
         .iter()
         .map(|id| id.spec())
         .filter(|spec| reaches(spec.audience, view.audience))
-        .filter(|spec| view.collaboration || !spec.collaboration || !agent)
+        .filter(|_| offered)
         .filter(|spec| spec.access.listed(view))
         .filter_map(|spec| {
             let Definition { description, input_schema } = (spec.def)(view)?;
@@ -510,7 +516,7 @@ mod tests {
             for id in ToolId::ALL {
                 let spec = id.spec();
                 let runnable = reaches(spec.audience, view.audience)
-                    && (view.collaboration || !spec.collaboration || !matches!(view.kind, CallerKind::Agent { .. }))
+                    && (view.collaboration || !matches!(view.kind, CallerKind::Agent { .. }))
                     && spec.access.check(&view).is_ok();
                 assert_eq!(listed.contains(&spec.name), runnable, "{} for {view:?}", spec.name);
             }
@@ -526,8 +532,8 @@ mod tests {
             assert!(names(&CallerView::outside(FullAccess)).contains(&machine), "{machine}");
         }
         assert!(supervised.contains(&"thread_answer"), "answering a worker's question is a thread write");
-        assert_eq!(names(&CallerView::in_app(ProviderKind::Claude, Some("default"), false)), ["plugin_list", "plugin_invoke"],
-            "with Agent collaboration off, chats keep only plugin tools");
+        assert!(names(&CallerView::in_app(ProviderKind::Claude, Some("default"), false)).is_empty(),
+            "with Agent collaboration off, chats are offered nothing: the plugin layer refuses their plugin calls too");
     }
 
     #[test]
