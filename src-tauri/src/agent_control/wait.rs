@@ -13,6 +13,7 @@ use crate::database::DatabaseStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, Runtime};
@@ -311,7 +312,7 @@ impl WaitView {
     }
 
     /// `thread_status` is the legacy object plus the current run's state.
-    fn into_status(self) -> Value {
+    pub(super) fn into_status(self) -> Value {
         let mut status = self.status;
         status["state"] = json!(self.state);
         status["failure"] = json!(self.failure);
@@ -324,9 +325,28 @@ impl WaitView {
 
 /// Read `target` as a waiter on `selected` (or on its current run) sees it.
 pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Target, selected: Option<&str>) -> Result<WaitView, ControlError> {
-    let status = service::thread_status(app, json!({"workspace_id": target.workspace_id, "thread_id": target.thread_id})).await?;
-    let db = app.state::<DatabaseStore>();
+    let status = service::thread_status(app, json!({"workspace_id": target.workspace_id, "thread_id": target.thread_id}));
+    observe_with(app, target, selected, status).await
+}
+
+/// [`observe`] over a status read it has yet to await, so a test can move a
+/// launch on while that read is under way.
+pub(super) async fn observe_with<R: Runtime>(
+    app: &AppHandle<R>,
+    target: &service::Target,
+    selected: Option<&str>,
+    status: impl Future<Output = Result<Value, ControlError>>,
+) -> Result<WaitView, ControlError> {
     let thread = target.thread_id.as_str();
+    // A launch saves its new thread and shows its pane, then starts the
+    // provider session, which can take seconds while MCP servers start, and
+    // admits its message only after that. Until its receipt settles, the
+    // thread reads unknown or idle with no run, yet its first run is coming.
+    // The receipt is read before the status: a launch that admits its message
+    // and settles while the status is read leaves that read idle with no run.
+    let launch_open = app.state::<DatabaseStore>().control_thread_launch_open(thread, &app.state::<NativeControlState>().epoch)?;
+    let status = status.await?;
+    let db = app.state::<DatabaseStore>();
     let current = status["turn_id"].as_str();
     let selected_event = match selected {
         Some(turn) => db.control_turn_outcome(thread, turn)?,
@@ -343,13 +363,18 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
         "outcome": super::state::turn_outcome(event["status"]["kind"].as_str(), event["status"]["subtype"].as_str()).1,
     }));
     let turn_id = selected.or(current);
-    // A launch saves its new thread and shows its pane, then starts the
-    // provider session, which can take seconds while MCP servers start, and
-    // admits its message only after that. Until its receipt settles, the
-    // thread reads unknown or idle with no run, yet its first run is coming.
-    let launching = turn_id.is_none()
-        && db.control_thread_launch_open(thread, &app.state::<NativeControlState>().epoch)?;
-    let settled = settled && !launching;
+    // With no run in view, one may still be starting: a launch was starting
+    // the thread when this read began, or a run with an ID or a message in
+    // delivery landed after the status was read (the status named no run,
+    // and an idle one had nothing in delivery). A launch that settled during
+    // the read still counts; the next read sees its run.
+    let (on_record, delivering) = match turn_id {
+        None => (db.control_last_thread_run_event(thread)?, db.has_inflight_message_deliveries(thread)?),
+        Some(_) => (None, false),
+    };
+    let run_named = on_record.as_ref().is_some_and(|event| event["turn_id"].as_str().is_some_and(|turn| !turn.is_empty()));
+    let starting = turn_id.is_none() && (launch_open || run_named || delivering);
+    let settled = settled && !starting;
     // A newer run's approvals and questions do not make an older selected run wait on input.
     let is_current = selected.is_none_or(|turn| current == Some(turn));
     let pending = Pending::read(&db, thread, &status)?;
@@ -394,15 +419,15 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
     // the legacy rule never settles it. The live end above covers a run whose
     // end row has not landed yet.
     let vanished = turn_id.is_some() && is_current && status["settled"] == true && end.is_none();
-    // With no turn to follow and no launch still starting the thread, there
-    // is nothing to wait for once the thread is idle, or once it is at rest
+    // With no turn to follow and nothing starting the thread, there is
+    // nothing to wait for once the thread is idle, or once it is at rest
     // with no run on record at all (a thread Codemux has not reopened since a
     // restart never settles). A run a restart cut off stays open on a thread
     // at rest: restart resume may continue the chat through the normal send
     // path, which queues and delivers nothing.
     let never_ran = turn_id.is_none()
-        && !launching
-        && (settled || (at_rest(&db, thread, &status)? && db.control_last_thread_run_event(thread)?.is_none()));
+        && !starting
+        && (settled || (at_rest(&db, thread, &status)? && on_record.is_none()));
     let ended = settled || vanished || superseded || never_ran;
     let final_message = match turn_id {
         Some(turn) if ended => db.control_turn_final_text(thread, turn)?.map(FinalMessage::bounded),
@@ -433,7 +458,7 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
 /// is `unknown` (no live session and no run in view, as for a thread Codemux
 /// has not reopened since a restart, which never settles) with no message
 /// queued or being delivered. A launch still starting the thread is not
-/// seen here: `observe` asks its receipt (`launching`).
+/// seen here: `observe` asks its receipt (`starting`).
 fn at_rest(db: &DatabaseStore, thread: &str, status: &Value) -> Result<bool, ControlError> {
     if status["settled"] == true {
         return Ok(true);

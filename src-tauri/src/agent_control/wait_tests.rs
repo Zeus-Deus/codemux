@@ -4,7 +4,7 @@
 use super::outcome::RunState;
 use super::tests::{connector_caller, connector_off, fixture, mock_agent_provider, native_caller_fixture, settle_operation};
 use super::wait::{self, Change};
-use super::{execute, ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlState};
+use super::{execute, service, ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlState};
 use crate::agent_provider::{
     CompletedItem, ProviderKind, ProviderRuntimeEvent as Event, RequestId, SessionStatus, ThreadId, TurnId, TurnStatus,
     UserQuestion, UserQuestionSet,
@@ -701,6 +701,76 @@ async fn thread_wait_reads_running_while_a_launch_starts_its_session() {
         .unwrap();
     let status = wait::thread_status(app.handle(), target(&workspace, restarted, json!({}))).await.unwrap();
     assert_eq!((status["phase"].as_str(), status["state"].as_str()), (Some("unknown"), Some("done")), "{status}");
+}
+
+/// Read `thread` as `thread_status` does, running `during` once the status
+/// read has taken its view and before the read decides on it.
+async fn observe_while(app: &App, workspace: &str, thread: &str, during: impl std::future::Future<Output = ()>) -> Value {
+    let read = async {
+        let status = service::thread_status(app.handle(), target(workspace, thread, json!({}))).await?;
+        during.await;
+        Ok::<_, ControlError>(status)
+    };
+    let target = service::Target { workspace_id: workspace.into(), thread_id: thread.into() };
+    wait::observe_with(app.handle(), &target, None, read).await.unwrap().into_status()
+}
+
+/// A launch can admit its message, start its run and settle its receipt
+/// while a status read is under way, after that read saw the session idle
+/// with no run. The receipt was open when the read began, so the thread
+/// reads running, never done, and the next read follows the run. A launch
+/// with no message that settles so reads running once, then done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_that_settles_during_the_status_read_never_reads_done() {
+    let (app, provider, _root, workspace) = fixture().await;
+    let trusted = ControlCaller::trusted();
+    for (key, message) in [("settling-launch", Some("Say PONG")), ("settling-idle-launch", None)] {
+        let (entered, release) = provider.hold_next_start();
+        let mut args = json!({"workspace_id": workspace, "client_request_id": key, "provider": "claude", "permission_mode": "default"});
+        if let Some(message) = message {
+            args["message"] = json!(message);
+        }
+        let receipt = execute(app.handle(), &trusted, "thread_launch", args).await.unwrap();
+        entered.notified().await;
+        let thread = receipt["thread_id"].as_str().unwrap().to_string();
+        // The session reports itself up and idle before the launch sends anything.
+        session(&app, &thread, SessionStatus::Ready);
+        let view = observe_while(&app, &workspace, &thread, async {
+            release.notify_one();
+            let settled = settle_operation(&app, &receipt).await;
+            assert_eq!(settled["state"], "succeeded", "{settled}");
+            assert_eq!(settled["result"]["turn"]["turn_id"].as_str(), message.map(|_| "mock-turn"), "{settled}");
+        }).await;
+        // The legacy fields are the status read's own view: idle, no run.
+        assert_eq!(
+            (view["settled"].as_bool(), &view["turn_id"], view["state"].as_str()),
+            (Some(true), &Value::Null, Some("running")),
+            "{key}: {view}"
+        );
+        let next = wait::thread_status(app.handle(), target(&workspace, &thread, json!({}))).await.unwrap();
+        let expected = match message {
+            Some(_) => (Some("running"), Some("mock-turn")),
+            None => (Some("done"), None),
+        };
+        assert_eq!((next["state"].as_str(), next["turn_id"].as_str()), expected, "{key}: {next}");
+    }
+}
+
+/// A message admitted after the status read saw an idle thread with no run
+/// keeps that read from calling the thread done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivery_admitted_during_the_status_read_never_reads_done() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, &workspace, "delivery-during-read").await;
+    let idle = wait::thread_status(app.handle(), target(&workspace, &thread, json!({}))).await.unwrap();
+    assert_eq!((idle["settled"].as_bool(), &idle["turn_id"], idle["state"].as_str()), (Some(true), &Value::Null, Some("done")), "{idle}");
+    let view = observe_while(&app, &workspace, &thread, async {
+        let db = app.state::<DatabaseStore>();
+        let (epoch, generation) = (app.state::<NativeControlState>().epoch.clone(), db.delivery_generation(&thread).unwrap().0);
+        let payload = json!({"provider": "claude", "origin": "controller", "input": {"thread_id": thread, "text": "Next task"}});
+        db.admit_message_delivery("delivery-during-read", &thread, "delivery-during-read", &payload, &epoch, generation, None, true).unwrap();
+    }).await;
+    assert_eq!((view["settled"].as_bool(), view["state"].as_str()), (Some(true), Some("running")), "{view}");
 }
 
 /// A message queued behind the running t1, as `thread_send` takes it: its
