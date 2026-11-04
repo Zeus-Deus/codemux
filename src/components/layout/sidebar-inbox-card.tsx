@@ -1347,10 +1347,11 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   {workspace.notification_count > 0 && (
                     <span
                       className={cn(
-                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-surface-3 px-1 text-caption font-bold text-muted-foreground",
-                        "transition-opacity duration-150",
-                        visuallyReceded &&
-                          "opacity-70 group-hover/card:opacity-100 group-focus-within/card:opacity-100",
+                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-surface-3 px-1 text-caption font-bold",
+                        "transition-colors duration-150",
+                        visuallyReceded
+                          ? "text-subtle-foreground group-hover/card:text-muted-foreground group-focus-within/card:text-muted-foreground"
+                          : "text-muted-foreground",
                       )}
                     >
                       {workspace.notification_count}

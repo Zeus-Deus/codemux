@@ -347,7 +347,7 @@ export function ProjectScopePopover({
                   // it, so these are still perfectly valid places to run.
                   <span>
                     Settled{" "}
-                    <span className="font-normal opacity-60">· still open</span>
+                    <span className="font-normal text-subtle-foreground">· still open</span>
                   </span>
                 }
               >

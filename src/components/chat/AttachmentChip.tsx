@@ -339,7 +339,7 @@ export function AttachmentChip({
           </Eyebrow>
         )}
       {lineCountLabel && (
-        <span className="text-caption opacity-70" aria-hidden>
+        <span className="text-caption text-subtle-foreground" aria-hidden>
           {lineCountLabel}
         </span>
       )}

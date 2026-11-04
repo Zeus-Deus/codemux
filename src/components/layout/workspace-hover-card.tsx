@@ -395,7 +395,7 @@ export function WorkspaceHoverCardBody({
           >
             {status ? STATUS_LABEL[status] : "Idle"}
             {elapsed && (
-              <span className="ml-1 font-normal tabular-nums opacity-70">
+              <span className="ml-1 font-normal tabular-nums">
                 {elapsed}
               </span>
             )}

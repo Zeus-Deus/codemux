@@ -3533,12 +3533,12 @@ export function Composer({
                           command is still bare, so a filled-in command
                           doesn't keep nagging with a hint it satisfied. */}
                       {!pendingCommand.args && pendingCommand.argumentHint && (
-                        <span className="shrink-0 opacity-60">
+                        <span className="shrink-0 text-subtle-foreground">
                           {pendingCommand.argumentHint}
                         </span>
                       )}
                       {pendingCommand.description && (
-                        <span className="truncate opacity-70">
+                        <span className="truncate text-subtle-foreground">
                           · {pendingCommand.description}
                         </span>
                       )}

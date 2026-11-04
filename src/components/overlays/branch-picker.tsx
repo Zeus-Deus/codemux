@@ -258,7 +258,7 @@ export function BranchPicker({
               onClick={() => setFilterMode("all")}
             >
               All{" "}
-              <span className="text-caption opacity-60 tabular-nums">{allCount}</span>
+              <span className="text-caption text-subtle-foreground tabular-nums">{allCount}</span>
             </button>
             <button
               type="button"
@@ -271,7 +271,7 @@ export function BranchPicker({
               onClick={() => setFilterMode("worktrees")}
             >
               Worktrees{" "}
-              <span className="text-caption opacity-60 tabular-nums">{worktreeCount}</span>
+              <span className="text-caption text-subtle-foreground tabular-nums">{worktreeCount}</span>
             </button>
             {syncing && !loading && (
               <span

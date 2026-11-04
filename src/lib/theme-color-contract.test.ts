@@ -10,6 +10,12 @@ import { BUILT_IN_THEMES, contrastRatio, normalizeColor, subtleForeground } from
 // strength, so they take no alpha either.
 const FADED_TEXT_INK = /(?<![\w-])text-(?:(?:muted-foreground|success|danger|warning|destructive|status-[a-z]+)\/\d+|foreground\/(?:[1-4]\d|[0-9]))\b/g;
 
+// Fading a text span with opacity bypasses the ink floor the same way an
+// alpha does. A lone separator glyph (·, ←, →) is decoration and may fade;
+// words, numbers and interpolated values may not. Class strings assembled
+// with cn() are out of reach of this check.
+const FADED_TEXT_SPAN = /<span className="[^"]*(?<![\w:/-])opacity-[1-9]\d\b[^"]*">\s*(?:\{|[\p{L}\p{N}])/gu;
+
 const RAW_PALETTE_UTILITY = /\b(?:bg|text|border|ring|from|to|via)-(?:slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-\d+/g;
 
 function sourceFiles(directory: string): string[] {
@@ -37,6 +43,17 @@ describe("theme color contract", () => {
     const hits = sourceFiles(resolve(root, "src")).flatMap((file) => {
       const contents = readFileSync(file, "utf8");
       return [...contents.matchAll(FADED_TEXT_INK)].map((match) =>
+        `${relative(root, file)}:${match[0]}`,
+      );
+    });
+    expect(hits).toEqual([]);
+  });
+
+  it("never fades a text span with opacity", () => {
+    const root = resolve(process.cwd());
+    const hits = sourceFiles(resolve(root, "src")).flatMap((file) => {
+      const contents = readFileSync(file, "utf8");
+      return [...contents.matchAll(FADED_TEXT_SPAN)].map((match) =>
         `${relative(root, file)}:${match[0]}`,
       );
     });

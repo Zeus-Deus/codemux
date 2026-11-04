@@ -244,7 +244,7 @@ function StepTitle({ step }: { step: ActivityStep }) {
       {argument ? (
         <>
           {" "}
-          <span className="font-mono text-label opacity-60">{argument}</span>
+          <span className="font-mono text-label text-subtle-foreground">{argument}</span>
         </>
       ) : null}
     </TraceTitle>

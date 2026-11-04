@@ -198,7 +198,7 @@ export function SubagentsPane({
       {model.attention.length > 0 && (
         <section aria-label="Needs attention" className="flex flex-col gap-1.5">
           <SectionHeader
-            label={`NEEDS ATTENTION · ${model.attention.length}`}
+            label={`Needs attention · ${model.attention.length}`}
           />
           {model.attention.map((view) => (
             <AttentionCard

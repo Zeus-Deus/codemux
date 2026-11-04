@@ -104,7 +104,7 @@ export function ProviderStatusNotice({
           >
             <span className="font-medium">{label}</span>
             <span className="mx-1.5 opacity-60">·</span>
-            <span className="opacity-90">
+            <span>
               {report.message ?? `${label} is unavailable.`}
             </span>
           </div>

@@ -640,8 +640,8 @@ function PreviewCodeLine({
         tone === "muted" && "text-muted-foreground",
       )}
     >
-      <span className="w-7 shrink-0 select-none text-right opacity-45">{number}</span>
-      <span className="w-6 shrink-0 select-none text-center opacity-70">{prefix}</span>
+      <span className="w-7 shrink-0 select-none text-right text-subtle-foreground">{number}</span>
+      <span className="w-6 shrink-0 select-none text-center">{prefix}</span>
       <span className="pr-4 whitespace-pre">{text}</span>
     </div>
   );

@@ -264,8 +264,8 @@ export const BUILT_IN_THEMES: readonly ThemeDefinition[] = [
       secondaryForeground: "oklch(0.216 0.006 56.043)",
       muted: "oklch(0.97 0.001 106.424)",
       // Darker than the preset's 0.553 so muted text still clears 4.5:1 on
-      // the off-white rail, not only on the white canvas.
-      mutedForeground: "oklch(0.52 0.013 58.071)",
+      // the off-white rail and on chip fills, not only on the white canvas.
+      mutedForeground: "oklch(0.49 0.013 58.071)",
       accent: "oklch(0.97 0.001 106.424)",
       accentForeground: "oklch(0.216 0.006 56.043)",
       border: "oklch(0.923 0.003 48.717)",
