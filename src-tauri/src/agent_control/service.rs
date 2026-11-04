@@ -77,13 +77,48 @@ pub(crate) fn authorize_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &
     authorize_with_delivery_retry(app, caller, true, true)
 }
 
+/// [`authorize`] for work a call leaves running once it returned: a new
+/// workspace's setup copies its includes and runs its commands after the
+/// create did. What is scoped to the call has normally ended by then (a
+/// paired device's connection, a chat's turn, a launch receipt), so this asks
+/// only what a person withdraws: a connector grant, a paired device's
+/// session, or a chat's own authority (stopped, narrowed or deleted).
+pub(crate) fn authorize_background<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller) -> Result<(), ControlError> {
+    match &caller.identity {
+        super::CallerPrincipal::RemoteClient { session_id } if !remote_session_approved(app, session_id) => {
+            return Err(ControlError::new(ErrorCode::StaleCaller, "The paired device's session was revoked"));
+        }
+        super::CallerPrincipal::Thread { thread_id, provider, authority, ceiling, .. } => {
+            let db = app.state::<DatabaseStore>();
+            // Only a Stop moves the thread's delivery generation on; the end
+            // of a turn leaves it as it was.
+            db.verify_delivery_generation(thread_id, authority.stop_generation)
+                .map_err(|_| ControlError::new(ErrorCode::StaleCaller, "The calling chat was stopped"))?;
+            let record = db.get_agent_chat_session(thread_id)
+                .ok_or_else(|| ControlError::new(ErrorCode::StaleCaller, "Calling chat no longer exists"))?;
+            let saved = super::permissions::Ceiling::for_record(&db, &record, *provider)
+                .ok_or_else(|| ControlError::new(ErrorCode::UnsupportedPermissionCeiling, "Canonical chat mode is unknown"))?;
+            if !saved.permits(*ceiling) {
+                return Err(ControlError::new(ErrorCode::PermissionCeiling, "Calling chat policy was narrowed after admission"));
+            }
+        }
+        _ => {}
+    }
+    crate::mcp_connector::validate_caller(app, caller)
+}
+
+/// A paired device's session stands until the person revokes or removes it,
+/// however often the device disconnects.
+fn remote_session_approved<R: Runtime>(app: &AppHandle<R>, session_id: &str) -> bool {
+    app.state::<DatabaseStore>().web_remote_get_session(session_id)
+        .is_some_and(|session| session.approved && !session.revoked)
+}
+
 fn authorize_with_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, orchestration: bool, retry_held: bool) -> Result<(), ControlError> {
     if let super::CallerPrincipal::RemoteClient { session_id } = &caller.identity {
-        let approved = app.state::<DatabaseStore>().web_remote_get_session(session_id)
-            .is_some_and(|session| session.approved && !session.revoked);
         let connected = app.try_state::<crate::web_remote::WebRemoteState>()
             .is_some_and(|state| state.shared().connections.session_live(session_id));
-        if !approved || !connected {
+        if !remote_session_approved(app, session_id) || !connected {
             return Err(ControlError::new(ErrorCode::StaleCaller, "The remote client disconnected or its session was revoked"));
         }
     }

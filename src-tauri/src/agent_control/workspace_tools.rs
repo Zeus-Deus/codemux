@@ -223,14 +223,14 @@ pub(super) async fn close<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller
 /// records why.
 ///
 /// A new workspace's setup runs on after the call returned, past an in-app
-/// chat's turn and a web-remote session's connection, so it asks only
-/// whether a connector grant still stands.
+/// chat's turn and a web-remote session's connection, so it asks only what a
+/// person withdraws ([`service::authorize_background`]).
 pub(super) fn checkpoint<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller) -> Checkpoint {
     let (app, caller) = (app.clone(), caller.clone());
     let (setup_app, setup_caller) = (app.clone(), caller.clone());
     Checkpoint::new(move || service::authorize(&app, &caller).map_err(|error| error.to_string()))
         .with_background(move || {
-            crate::mcp_connector::validate_caller(&setup_app, &setup_caller).map_err(|error| error.to_string())
+            service::authorize_background(&setup_app, &setup_caller).map_err(|error| error.to_string())
         })
 }
 

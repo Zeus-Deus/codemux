@@ -986,6 +986,41 @@ async fn workspace_close_revoked_during_teardown_leaves_the_workspace_open() {
     connector_off(&app);
 }
 
+/// A new workspace's setup outlives the call: a paired device's connection
+/// and a chat's turn end normally before it does, and its background check
+/// lets it run on. Revoking the device, or the person stopping the chat,
+/// stops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_checkpoint_outlives_a_connection_and_a_turn_but_not_revocation_or_stop() {
+    let (app, _provider, _root, _workspace, thread, authority, actor) = native_caller_fixture("default").await;
+    app.manage(crate::web_remote::WebRemoteState::default());
+    let shared = app.state::<crate::web_remote::WebRemoteState>().shared();
+    let connections = &shared.connections;
+    app.state::<DatabaseStore>().web_remote_insert_session("paired", None, None, "paired-hash", true).unwrap();
+    let connection = connections.connect_for_test("paired");
+    let device = super::workspace_tools::checkpoint(app.handle(), &ControlCaller::remote("paired".into()));
+    device.check().unwrap();
+    device.background().check().unwrap();
+    connections.disconnect_for_test(connection);
+    assert!(device.check().unwrap_err().starts_with("stale_caller: "));
+    device.background().check().unwrap();
+    crate::web_remote::web_remote_revoke_session(app.handle().clone(), "paired".into()).unwrap();
+    let refusal = device.background().check().unwrap_err();
+    assert!(refusal.starts_with("stale_caller: "), "{refusal}");
+
+    let caller = super::native::qualify(app.handle(), &actor).await.unwrap();
+    let chat = super::workspace_tools::checkpoint(app.handle(), &caller);
+    chat.check().unwrap();
+    chat.background().check().unwrap();
+    authority.finish("native-run");
+    assert!(chat.check().unwrap_err().starts_with("stale_caller: "));
+    chat.background().check().unwrap();
+    app.state::<DatabaseStore>().stop_message_deliveries(&thread).unwrap();
+    let refusal = chat.background().check().unwrap_err();
+    assert!(refusal.starts_with("stale_caller: "), "{refusal}");
+    authority.revoke();
+}
+
 // ── outside answers: approvals and questions ──────────────────────────────
 
 async fn launched(app: &App, key: &str, workspace: &str, mode: &str) -> String {

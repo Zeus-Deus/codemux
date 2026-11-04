@@ -288,8 +288,10 @@ impl PlatformService {
     /// one queued meanwhile.
     ///
     /// A new workspace's setup runs on after the invocation ended, which
-    /// cancels `caller`, and past an in-app chat's turn. It asks whether the
-    /// connector grant behind the call and the plugin's own grant still stand.
+    /// cancels `caller`, and past an in-app chat's turn and a paired device's
+    /// connection. It asks only what a person withdraws: the authority behind
+    /// the call ([`crate::agent_control::service::authorize_background`]) and
+    /// the plugin's own grant.
     pub(crate) fn checkpoint<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -312,7 +314,7 @@ impl PlatformService {
         Checkpoint::new(move || authorize(&store, &app, &caller, name, Some(&project)).map(drop))
             .with_background(move || {
                 let (store, app, caller, project) = &setup;
-                crate::mcp_connector::validate_caller(app, &caller.control)
+                crate::agent_control::service::authorize_background(app, &caller.control)
                     .map_err(|error| error.to_string())?;
                 platform_authority::capability(
                     &store.read(&caller.installation_id)?,

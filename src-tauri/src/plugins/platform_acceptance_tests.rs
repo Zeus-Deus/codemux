@@ -922,6 +922,136 @@ async fn platform_worktree_setup_outlives_the_invocation_but_not_the_grants() {
     crate::agent_control::tests::connector_off(&f.app);
 }
 
+/// How each setup ends, as the desktop is told: (event, payload).
+fn setup_outcomes(f: &Fixture) -> mpsc::UnboundedReceiver<(&'static str, Value)> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    for name in ["workspace-setup-failed", "workspace-setup-complete"] {
+        let sender = sender.clone();
+        f.app.listen_any(name, move |event| {
+            let _ = sender.send((name, serde_json::from_str(event.payload()).unwrap_or_default()));
+        });
+    }
+    receiver
+}
+
+/// A paired device invokes a plugin action that creates a worktree, then
+/// goes away while the new worktree's setup waits to start. A device that
+/// only disconnected leaves its setup running, as the setup outlives the
+/// call; one revoked in Settings starts no setup command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn platform_worktree_setup_stops_once_its_paired_device_is_revoked() {
+    if isolated("platform_worktree_setup_stops_once_its_paired_device_is_revoked") {
+        return;
+    }
+    for revoked in [true, false] {
+        let f = Fixture::new().await;
+        f.app.manage(crate::web_remote::WebRemoteState::default());
+        let shared = f.app.state::<crate::web_remote::WebRemoteState>().shared();
+        f.app
+            .state::<DatabaseStore>()
+            .web_remote_insert_session("paired", None, None, "paired-hash", true)
+            .unwrap();
+        let connection = shared.connections.connect_for_test("paired");
+        let mut device = caller(&f.record);
+        device.control = ControlCaller::remote("paired".into());
+        std::fs::create_dir_all(f.root.path().join(".codemux")).unwrap();
+        std::fs::write(
+            f.root.path().join(".codemux/config.json"),
+            json!({"setup": ["touch setup-first"]}).to_string(),
+        )
+        .unwrap();
+        let mut outcomes = setup_outcomes(&f);
+        let branch = if revoked { "device-revoked" } else { "device-disconnected" };
+        let mut request = f.request(branch);
+        request["workspaceStrategy"] = json!({
+            "type":"worktree","branch":branch,"baseRef":"main","startFromOrigin":false
+        });
+        let path = f.worktree_path(branch);
+        // The workspace appears after the create's last check of the caller
+        // and just before its setup starts waiting.
+        let gone = {
+            let (app, path) = (f.app.handle().clone(), path.clone());
+            tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    while !app.state::<AppStateStore>().snapshot().workspaces.iter().any(|workspace| {
+                        workspace.worktree_path.as_deref().map(Path::new) == Some(path.as_path())
+                    }) {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .expect("the create makes its workspace");
+                if revoked {
+                    crate::web_remote::web_remote_revoke_session(app, "paired".into()).unwrap();
+                } else {
+                    shared.connections.disconnect_for_test(connection);
+                }
+            })
+        };
+        // The call itself may then be refused: the device is gone.
+        let _ = f.create(&device, request).await;
+        gone.await.unwrap();
+
+        let (event, payload) = tokio::time::timeout(Duration::from_secs(15), outcomes.recv())
+            .await
+            .expect("the setup ends")
+            .unwrap();
+        if revoked {
+            assert_eq!(event, "workspace-setup-failed", "{payload}");
+            assert_eq!(payload["command"], "touch setup-first", "{payload}");
+            let stderr = payload["stderr"].as_str().unwrap();
+            assert!(stderr.starts_with("stale_caller: "), "{payload}");
+            assert!(!path.join("setup-first").exists(), "no setup command starts once the device is revoked");
+        } else {
+            assert_eq!(event, "workspace-setup-complete", "{payload}");
+            assert!(path.join("setup-first").exists(), "a disconnect alone leaves setup running");
+        }
+    }
+}
+
+/// A chat's plugin call creates a worktree too. Its setup runs past the
+/// chat's turn, but stops once the person narrows the chat's mode or stops
+/// the chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn platform_worktree_setup_outlives_the_turn_but_not_a_stop() {
+    if isolated("platform_worktree_setup_outlives_the_turn_but_not_a_stop") {
+        return;
+    }
+    let f = Fixture::new().await;
+    let (chat, authority) = f.policy_caller("acceptEdits");
+    let checkpoint = f
+        .platform
+        .checkpoint(f.app.handle(), &chat, "worktrees.create", &f.project);
+    checkpoint.check().unwrap();
+    checkpoint.background().check().unwrap();
+
+    authority.finish("fixture-turn");
+    let refusal = checkpoint.check().unwrap_err();
+    assert!(refusal.starts_with("stale_caller: "), "{refusal}");
+    checkpoint.background().check().unwrap();
+
+    let db = f.app.state::<DatabaseStore>();
+    let mode = |mode: &str| {
+        db.update_agent_chat_session_config(
+            SOURCE,
+            &AgentChatSessionConfig {
+                permission_mode: Some(Some(mode.into())),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    mode("plan");
+    let refusal = checkpoint.background().check().unwrap_err();
+    assert!(refusal.starts_with("permission_ceiling: "), "{refusal}");
+    mode("acceptEdits");
+    checkpoint.background().check().unwrap();
+
+    db.stop_message_deliveries(SOURCE).unwrap();
+    let refusal = checkpoint.background().check().unwrap_err();
+    assert!(refusal.starts_with("stale_caller: "), "{refusal}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn platform_native_partial_worktree_preparation_retains_unknown_receipt_and_frozen_ref() {
     if isolated(
