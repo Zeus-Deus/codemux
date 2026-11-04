@@ -3,7 +3,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { routedOptions, settingsPath, userRouting } from "../src/user-routing.ts";
@@ -71,11 +71,10 @@ describe("userRouting", () => {
   });
 
   test("reads the bound account home, else ~/.claude", () => {
-    expect(settingsPath({ CLAUDE_CONFIG_DIR: "/accounts/work" })).toBe(
-      "/accounts/work/settings.json",
-    );
-    expect(settingsPath({ CLAUDE_CONFIG_DIR: "" })).toMatch(/\.claude\/settings\.json$/);
-    expect(settingsPath({})).toMatch(/\.claude\/settings\.json$/);
+    const work = join(tmpdir(), "accounts", "work");
+    expect(settingsPath({ CLAUDE_CONFIG_DIR: work })).toBe(join(work, "settings.json"));
+    expect(settingsPath({ CLAUDE_CONFIG_DIR: "" })).toBe(join(homedir(), ".claude", "settings.json"));
+    expect(settingsPath({})).toBe(join(homedir(), ".claude", "settings.json"));
   });
 
   test("a missing, malformed or odd settings file adds nothing", () => {
