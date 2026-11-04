@@ -133,7 +133,9 @@ it("hides every inbound privileged control from remote clients without IPC", asy
   api.remote = true;
   render(<OutsideAssistantsSection />);
   expect(screen.getByRole("heading", { name: "Outside assistants" })).toBeInTheDocument();
-  expect(screen.getByText("Manage connections from the desktop")).toBeInTheDocument();
+  expect(screen.getByText(/^Manage connections on the computer running Codemux/)).toHaveTextContent(
+    "Manage connections on the computer running Codemux: in its desktop app, or over SSH with codemux connector.",
+  );
   expect(screen.queryByRole("switch")).not.toBeInTheDocument();
   expect(screen.queryByText(CODEX_COMMAND)).not.toBeInTheDocument();
   await act(async () => {});

@@ -28,10 +28,17 @@ const TOKEN_LABEL = /^[A-Za-z0-9][A-Za-z0-9 ._@-]{0,63}$/;
 const DESCRIPTION = "Let Claude Code, Codex, Hermes or any MCP client work with Codemux: open workspaces, start threads, wait for their results and read them.";
 
 /** Settings → Connections → Outside assistants: inbound control of Codemux,
- *  separate from the outbound MCP servers in-app agents use. */
+ *  separate from the outbound MCP servers in-app agents use. A paired browser
+ *  gets no connector controls; `codemux serve` has no desktop, so the shell is
+ *  the way in there. */
 export function OutsideAssistantsSection() {
   if (isRemoteClient()) {
-    return <SectionHeader title="Outside assistants" description="Manage connections from the desktop" />;
+    return (
+      <SectionHeader
+        title="Outside assistants"
+        description={<>Manage connections on the computer running Codemux: in its desktop app, or over SSH with <code className="font-mono">codemux connector</code>.</>}
+      />
+    );
   }
   return <NativeOutsideAssistantsSection />;
 }
