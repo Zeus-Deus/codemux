@@ -1124,6 +1124,18 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     () => rowBudgets(remPx, !inTitlebar, compactTabs),
     [compactTabs, inTitlebar, remPx],
   );
+  // The fold decision budgets the row one fixed way, reserving the drag
+  // gap's floor as a labelled row does, whatever the tabs are doing right
+  // now. The reserve folds actions a little early, which is what keeps the
+  // active tab's label at the default panel width. Letting it follow
+  // `compactTabs` would hand the tabs' fit back to the actions: labels back →
+  // a 16px gap floor → actions fold → room for labels → compact → no floor →
+  // actions unfold, forever. The tabs' fit still reads the real row, so the
+  // dependency runs one way only.
+  const foldBudgets = useMemo(
+    () => rowBudgets(remPx, !inTitlebar, false),
+    [inTitlebar, remPx],
+  );
   const {
     collapsed: actionsCollapsed,
     tabsOverflow,
@@ -1136,7 +1148,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     actionsKey: activeTab ?? "",
     actionsShape: actionsShape(actions),
     hasActions: actions != null,
-    budgets,
+    budgets: foldBudgets,
   });
   // An inline row grows an "All tabs" button once the tabs overflow beside
   // it; a folded row lists them in its "…" whenever any are out of view.

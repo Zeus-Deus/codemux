@@ -355,10 +355,10 @@ describe("PaneTabStrip — overflow", () => {
         const id = (this as HTMLElement).dataset?.testid;
         if (id === "right-panel-pane-actions") return 110;
         if (id === "right-panel-tabs-scroll" || id === "right-panel-tabs-content") {
-          // Labelled, the run is 260px. Compact, it depends on how the
-          // active tab is fitted too: 172px with its count, 132px without.
-          if (!document.querySelector("[data-compact]")) return 260;
-          return document.querySelector('[data-state="active"][data-fit]') ? 132 : 172;
+          // Labelled, the run is 220px. Compact, it depends on how the
+          // active tab is fitted too: 132px with its count, 92px without.
+          if (!document.querySelector("[data-compact]")) return 220;
+          return document.querySelector('[data-state="active"][data-fit]') ? 92 : 132;
         }
         return 0;
       },
@@ -388,7 +388,9 @@ describe("PaneTabStrip — overflow", () => {
     });
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      for (header = 400; header <= 800; header += 5) {
+      // Every width across the band where either fit flips, 1px apart: the
+      // cycles live on narrow boundaries.
+      for (header = 400; header <= 800; header += 1) {
         for (const activeTab of ["files", "changes"] as const) {
           const { unmount } = renderStrip({
             activeTab,
