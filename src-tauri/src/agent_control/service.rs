@@ -159,7 +159,10 @@ pub(crate) async fn capabilities_for_account<R: Runtime>(
 ) -> Result<ProviderChatCapabilities, ControlError> {
     #[cfg(test)]
     if let Some(state) = app.try_state::<NativeControlState>() {
-        if let Some(caps) = state.fixture_capabilities.lock().unwrap().get(&provider).cloned() { return Ok(caps); }
+        if let Some(caps) = state.fixture_capabilities.lock().unwrap().get(&provider).cloned() {
+            state.fixture_harvests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(caps);
+        }
     }
     agent_chat::list_chat_provider_capabilities(
         app.clone(), provider, None, account_id,
@@ -1161,9 +1164,13 @@ pub(super) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &
     // Listing every provider reads cached composer catalogs only, so it
     // never spawns an agent or opens a provider session, and instances
     // resolve concurrently. Naming one provider also reads a catalog nothing
-    // has cached yet (`Discovery::Catalog`): an outside agent has no other way
-    // to learn an exact model id before its first launch.
-    let discovery = if args.provider.is_some() { super::selection::Discovery::Catalog } else { super::selection::Discovery::Cached };
+    // has cached yet (`Discovery::Catalog`), which can start the provider's
+    // CLI or a promptless ACP or Hermes session: an outside agent has no
+    // other way to learn an exact model id before its first launch. Only a
+    // caller that may start threads gets that; a read-only one cannot
+    // launch, so it never makes Codemux start provider processes.
+    let discovers = args.provider.is_some() && super::registry::require(caller, Access::StartsThreads).is_ok();
+    let discovery = if discovers { super::selection::Discovery::Catalog } else { super::selection::Discovery::Cached };
     let resolved = futures_util::future::join_all(pending.iter().map(|(_, _, instance)| {
         let selection = super::selection::ProviderSelection { instance_id: instance.clone(), ..Default::default() };
         super::selection::resolve(app, selection, &selected_workspace.cwd, discovery)
@@ -1177,7 +1184,14 @@ pub(super) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &
                     .map(|m|m.value.clone()).collect();
                 providers.push(json!({"provider":kind,"provider_instance_id":instance,"selection":resolved,"configured":true,"capabilities":capabilities,"options":options,"operations":operations,"allowed_permission_modes":allowed_modes,"discovery_error":null,"collaboration_unavailable":collaboration_unavailable(app,kind)}));
             }
-            Err(error) => providers.push(json!({"provider":kind,"provider_instance_id":instance,"configured":true,"capabilities":null,"operations":operations,"allowed_permission_modes":[],"discovery_error":error})),
+            Err(mut error) => {
+                // The cache-miss message says to name the provider, which a
+                // read-only caller already did.
+                if args.provider.is_some() && !discovers && error.code == ErrorCode::CatalogNotDiscovered {
+                    error.message = "This instance's catalog has not been discovered yet, and a read-only connection lists only catalogs Codemux has already read".into();
+                }
+                providers.push(json!({"provider":kind,"provider_instance_id":instance,"configured":true,"capabilities":null,"operations":operations,"allowed_permission_modes":[],"discovery_error":error}))
+            }
         }
     }
     authorize(app,caller)?;

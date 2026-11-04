@@ -1144,6 +1144,33 @@ async fn naming_a_provider_discovers_its_uncached_catalog() {
     assert!(provider.calls.snapshot().is_empty(), "discovery must not launch a coding session");
 }
 
+/// Discovery can start a provider's CLI or an ACP session, so only a caller
+/// that may start threads gets it. A read-only one naming a provider with a
+/// cold cache reads caches only, and Codemux starts nothing for it.
+#[tokio::test]
+async fn read_only_callers_naming_a_provider_start_no_discovery() {
+    use crate::agent_provider::ProviderKind::Claude;
+    use std::sync::atomic::Ordering::SeqCst;
+    let (app, provider, _root, workspace) = fixture().await;
+    let state = app.state::<NativeControlState>();
+    state.fixture_uncached.lock().unwrap().insert(Claude);
+    let args = json!({"workspace_id":workspace,"provider":"claude"});
+    let harvests = || state.fixture_harvests.load(SeqCst);
+    let before = harvests();
+
+    let reader = ControlCaller::local(None, ControlAccess::ReadOnly);
+    let read_only = execute(app.handle(), &reader, "agent_capabilities", args.clone()).await.unwrap();
+    assert_eq!(read_only["providers"][0]["discovery_error"]["code"], "catalog_not_discovered", "{read_only}");
+    assert!(read_only["providers"][0]["discovery_error"]["message"].as_str().unwrap().contains("read-only"), "{read_only}");
+    assert_eq!(harvests(), before, "a read-only caller started catalog discovery");
+
+    let writer = ControlCaller::local(None, ControlAccess::Supervised);
+    let supervised = execute(app.handle(), &writer, "agent_capabilities", args).await.unwrap();
+    assert_eq!(supervised["providers"][0]["discovery_error"], serde_json::Value::Null, "{supervised}");
+    assert_eq!(harvests(), before + 1, "a caller that may start threads discovers");
+    assert!(provider.calls.snapshot().is_empty(), "discovery must not launch a coding session");
+}
+
 /// Listing reads caches only. With every catalog cold it reports each
 /// built-in instance undiscovered and starts nothing: no OpenCode server, no
 /// CLI health check, no catalog harvest. A cached catalog is listed as is.

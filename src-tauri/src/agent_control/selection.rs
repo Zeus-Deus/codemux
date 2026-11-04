@@ -87,10 +87,11 @@ pub(crate) enum Discovery {
     /// Listing: cached catalogs only. Never runs a health check, spawns an
     /// agent or server, or opens a provider session.
     Cached,
-    /// A listing that names its provider: reads the catalog, starting the
-    /// provider's CLI when nothing has cached it yet, so an outside agent can
-    /// pick an exact model before its first launch. No health check; a broken
-    /// CLI fails the read itself.
+    /// A listing that names its provider, by a caller that may start
+    /// threads: reads the catalog, starting the provider's CLI (or a
+    /// promptless ACP or Hermes session) when nothing has cached it yet, so an
+    /// outside agent can pick an exact model before its first launch. No
+    /// health check; a broken CLI fails the read itself.
     Catalog,
     /// A targeted launch: health-check the instance, then refresh its catalog.
     Launch,
@@ -254,8 +255,8 @@ pub(crate) async fn resolve<R: Runtime>(
             } else {
                 // Listing: a recent health verdict and the composer's cached
                 // catalog. Health checks and harvests run CLIs, so only a
-                // listing that names the provider harvests, and only a
-                // catalog nothing has cached.
+                // `Catalog` listing harvests, and only a catalog nothing has
+                // cached.
                 if let Some(verdict) = recent_readiness(kind) {
                     verdict?;
                 }

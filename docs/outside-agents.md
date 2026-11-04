@@ -307,7 +307,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
 
    It returns each provider's `provider_instance_id`, its models, efforts and permission modes, and `allowed_permission_modes`: the modes your access level may use. Use only values it returns.
 
-   - Name the `provider` you want. Codemux then reads its catalog if it hasn't yet, which runs the provider's CLI but starts no chat.
+   - Name the `provider` you want. If Codemux hasn't read its catalog yet, it reads it now for a Supervised or Full access caller. That runs the provider's CLI, or for an ACP agent or Hermes opens a session and closes it without sending a prompt. No chat starts. A Read-only caller never starts this: it gets only catalogs Codemux has already read, and `catalog_not_discovered` for the others.
    - Without `provider`, it lists every provider, but only the catalogs Codemux has already read. The others have the `discovery_error` `catalog_not_discovered`: ask for that provider alone.
    - Any other `discovery_error`, such as `provider_not_ready`, means that provider can't start yet.
 

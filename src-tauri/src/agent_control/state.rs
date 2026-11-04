@@ -157,6 +157,10 @@ pub struct NativeControlState {
     /// cold composer cache: a cache read finds nothing for them.
     #[cfg(test)]
     pub(crate) fixture_uncached: Mutex<std::collections::HashSet<crate::agent_provider::ProviderKind>>,
+    /// Catalog harvests the fixture answered: each one would run a provider
+    /// CLI in the app.
+    #[cfg(test)]
+    pub(crate) fixture_harvests: std::sync::atomic::AtomicUsize,
 }
 impl Default for NativeControlState {
     fn default() -> Self {
@@ -171,6 +175,8 @@ impl Default for NativeControlState {
             fixture_capabilities: Default::default(),
             #[cfg(test)]
             fixture_uncached: Default::default(),
+            #[cfg(test)]
+            fixture_harvests: Default::default(),
         }
     }
 }
