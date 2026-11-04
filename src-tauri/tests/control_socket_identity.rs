@@ -279,6 +279,55 @@ fn pty_shell_is_the_owner() {
     assert!(env.contains("CODEMUX_SESSION_ID="), "the dump is the terminal's env");
 }
 
+/// Setup scripts come from the folder's `.codemux/config.json`, which an
+/// agent can write, and an agent may run them (`create_workspace` and
+/// `rerun_setup` are Machine class). A `codemux` they start is an agent
+/// process whoever triggered the setup, so it cannot answer for the person
+/// or mint a connector token.
+#[test]
+fn setup_scripts_are_agent_processes() {
+    let serve = Serve::start(&[]);
+    let root = serve.root.path();
+    // Who opens the folder: the owner, then an agent's shell.
+    for (name, env) in [("owner", &[][..]), ("agent", &[(AGENT_PROCESS, "1")][..])] {
+        let project = root.join(name);
+        std::fs::create_dir_all(project.join(".codemux")).unwrap();
+        let file = |suffix: &str| root.join(format!("{name}.{suffix}"));
+        let (env_dump, marked, unmarked, done) = (file("env"), file("marked.json"), file("unmarked.json"), file("done"));
+        // An admin command, the way an agent's script would ask; the second
+        // call clears the marker, which only the process ancestry still catches.
+        let script = format!(
+            "env > '{env}'; '{CODEMUX}' json agent_connector_status '{{}}' > '{marked}'; \
+             env -u {AGENT_PROCESS} '{CODEMUX}' json agent_connector_status '{{}}' > '{unmarked}'; touch '{done}'",
+            env = env_dump.display(),
+            marked = marked.display(),
+            unmarked = unmarked.display(),
+            done = done.display(),
+        );
+        std::fs::write(project.join(".codemux/config.json"), json!({ "setup": [script] }).to_string()).unwrap();
+
+        // The setup runs in the background once the folder is open.
+        let created = serve.json("create_workspace", &json!({ "path": project }).to_string(), env);
+        assert_eq!(created["ok"], true, "{name}: {created}");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !done.exists() {
+            assert!(Instant::now() < deadline, "{name}: the setup script never finished:\n{}", serve.log());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let reply = |file: &Path| -> Value { serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap() };
+        let marked = reply(&marked);
+        assert_eq!(error_code(&marked), "admin_refused", "{name}: a setup script is an agent: {marked}");
+        if cfg!(target_os = "linux") {
+            let unmarked = reply(&unmarked);
+            assert_eq!(error_code(&unmarked), "admin_refused", "{name}: ancestry marks it too: {unmarked}");
+        }
+        let env = std::fs::read_to_string(&env_dump).unwrap();
+        assert!(env.lines().any(|line| line == format!("{AGENT_PROCESS}=setup-script")), "{name}: {env}");
+    }
+    let owner = serve.json("agent_connector_status", "{}", &[]);
+    assert_eq!(owner["ok"], true, "the owner keeps admin commands: {owner}");
+}
+
 #[test]
 fn mcp_supervised_client_sees_no_admin_tools_and_is_refused_them() {
     let serve = Serve::start(&[]);

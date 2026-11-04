@@ -5,6 +5,7 @@ use crate::database::DatabaseStore;
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Output, Stdio};
 use tauri::{AppHandle, Emitter, Runtime};
 
 /// Default worktree include patterns when no `.codemuxinclude` file or project
@@ -360,8 +361,9 @@ pub enum SetupEvent<'a> {
 /// identical commands with identical env (`CODEMUX_ROOT_PATH` /
 /// `CODEMUX_WORKSPACE_PATH` / `CODEMUX_BRANCH` / `CODEMUX_PORT` plus
 /// `CODEMUX_WORKSPACE_NAME` / `CODEMUX_WORKSPACE_ID`). Commands run
-/// sequentially via `sh -c` in `workspace_path`; the first failure stops
-/// the pipeline and is returned as `Err`.
+/// sequentially via `sh -c` in `workspace_path`, as agent processes (see
+/// [`run_script_command`]); the first failure stops the pipeline and is
+/// returned as `Err`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_setup_commands(
     workspace_path: &Path,
@@ -383,7 +385,9 @@ pub fn run_setup_commands(
         root_path.display()
     );
 
-    let env_vars = script_env(workspace_path, root_path, branch, port);
+    let mut env_vars = script_env(workspace_path, root_path, branch, port);
+    env_vars.push(("CODEMUX_WORKSPACE_NAME", workspace_name.to_string()));
+    env_vars.push(("CODEMUX_WORKSPACE_ID", workspace_id.to_string()));
     let total = config.setup.len();
 
     for (index, command) in config.setup.iter().enumerate() {
@@ -393,18 +397,7 @@ pub fn run_setup_commands(
             total,
         });
 
-        let mut cmd = crate::execution::host_command("sh");
-        cmd.arg("-c")
-            .arg(command)
-            .current_dir(workspace_path)
-            .env("CODEMUX_WORKSPACE_NAME", workspace_name)
-            .env("CODEMUX_WORKSPACE_ID", workspace_id);
-        for (k, v) in &env_vars {
-            cmd.env(k, v);
-        }
-
-        let output = cmd
-            .output()
+        let output = run_script_command(command, workspace_path, &env_vars, SETUP_SCRIPT)
             .map_err(|e| format!("Failed to run setup command `{command}`: {e}"))?;
 
         if !output.status.success() {
@@ -523,21 +516,12 @@ pub fn run_teardown_scripts(
     };
 
     let root_path = resolve_root_path(workspace_path);
-    let env_vars = script_env(workspace_path, &root_path, None, None);
+    let mut env_vars = script_env(workspace_path, &root_path, None, None);
+    env_vars.push(("CODEMUX_WORKSPACE_NAME", workspace_name.to_string()));
+    env_vars.push(("CODEMUX_WORKSPACE_ID", workspace_id.to_string()));
 
     for command in &config.teardown {
-        let mut cmd = crate::execution::host_command("sh");
-        cmd.arg("-c")
-            .arg(command)
-            .current_dir(workspace_path)
-            .env("CODEMUX_WORKSPACE_NAME", workspace_name)
-            .env("CODEMUX_WORKSPACE_ID", workspace_id);
-        for (k, v) in &env_vars {
-            cmd.env(k, v);
-        }
-
-        let output = cmd
-            .output()
+        let output = run_script_command(command, workspace_path, &env_vars, TEARDOWN_SCRIPT)
             .map_err(|e| format!("Failed to run teardown command `{command}`: {e}"))?;
 
         if !output.status.success() {
@@ -556,6 +540,42 @@ pub fn run_teardown_scripts(
     }
 
     Ok(())
+}
+
+/// The agent-process kinds of setup and teardown commands. Diagnostic only,
+/// like every `CODEMUX_AGENT_PROCESS` value.
+const SETUP_SCRIPT: &str = "setup-script";
+const TEARDOWN_SCRIPT: &str = "teardown-script";
+
+/// Runs one setup or teardown command with `sh -c` in `folder`, its output
+/// captured, and waits for it.
+///
+/// These commands are repository content: `.codemux/config.json`, which any
+/// agent working in the folder can write, overrides the project's saved
+/// scripts, and agents can make them run (`rerun_setup`, workspace and
+/// worktree creation, closing a worktree's workspace). So each one runs as an
+/// agent process, whoever triggered it: the env marker and the ancestry
+/// registration make a `codemux` it starts an agent on the control socket,
+/// refused admin commands, never the owner.
+///
+/// The `run` command is not marked. It runs only in the person's own
+/// "Workspace Run" terminal when they press Run (`run_project_dev_command`),
+/// and a person's terminal is the owner, as for anything they type there.
+/// Agents cannot start it: no socket command or tool does, and typing into a
+/// terminal is admin.
+fn run_script_command(command: &str, folder: &Path, env: &[(&str, String)], kind: &str) -> std::io::Result<Output> {
+    let mut cmd = crate::execution::host_command("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(folder)
+        .envs(env.iter().map(|(key, value)| (*key, value)))
+        .env(crate::control_identity::AGENT_PROCESS_ENV, kind)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn()?;
+    crate::control_identity::register_agent_process(child.id());
+    child.wait_with_output()
 }
 
 #[cfg(test)]
@@ -602,6 +622,56 @@ mod tests {
             workspace_dir.path().to_string_lossy(),
             "CODEMUX_WORKSPACE_PATH should match workspace directory"
         );
+    }
+
+    /// Setup and teardown commands come from the repository, which agents can
+    /// write, so a `codemux` they start must reach the control socket as an
+    /// agent process: the env marker on every platform, and on Linux the
+    /// registration that still holds once the marker is cleared.
+    #[cfg(unix)]
+    #[test]
+    fn setup_and_teardown_commands_run_as_agent_processes() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        // Each probe reports its pid and env, then holds until `<name>.go`
+        // so the test can check the live process (bounded at 30 s).
+        let probe = |name: &str| {
+            format!(
+                "{{ echo $$; env; }} > {name}.part && mv {name}.part {name}.out; \
+                 i=0; while [ ! -e {name}.go ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done"
+            )
+        };
+        let config = WorkspaceConfig { setup: vec![probe("setup")], teardown: vec![probe("teardown")], ..Default::default() };
+        fs::create_dir(dir.path().join(".codemux")).unwrap();
+        fs::write(dir.path().join(".codemux/config.json"), serde_json::to_string(&config).unwrap()).unwrap();
+
+        for (name, kind) in [("setup", "setup-script"), ("teardown", "teardown-script")] {
+            let (folder, config) = (dir.path().to_path_buf(), config.clone());
+            let run = std::thread::spawn(move || match name {
+                "setup" => run_setup_commands(&folder, "ws", "ws-1", &config, &folder, None, None, &mut |_| {}),
+                _ => run_teardown_scripts(&folder, "ws", "ws-1", None),
+            });
+            let out = dir.path().join(format!("{name}.out"));
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !out.exists() {
+                assert!(Instant::now() < deadline && !run.is_finished(), "the {name} command never reported");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let report = fs::read_to_string(&out).unwrap();
+            let pid: u32 = report.lines().next().unwrap().trim().parse().unwrap();
+            // Exact: a test run from an agent's shell inherits another value.
+            let marker = format!("{}={kind}", crate::control_identity::AGENT_PROCESS_ENV);
+            assert!(report.lines().any(|line| line == marker), "the {name} command is not marked `{marker}`:\n{report}");
+            assert!(report.lines().any(|line| line == "CODEMUX_WORKSPACE_ID=ws-1"), "its own env stays:\n{report}");
+            #[cfg(target_os = "linux")]
+            while !crate::control_identity::is_agent_descendant(pid) {
+                assert!(Instant::now() < deadline, "the {name} command ({pid}) was never registered as an agent process");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = pid;
+            fs::write(dir.path().join(format!("{name}.go")), "").unwrap();
+            run.join().unwrap().unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
     }
 
     #[test]
