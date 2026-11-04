@@ -730,7 +730,7 @@ describe("Settings footer navigation", () => {
     useFeatureFlags.setState({ enableAgentChat: false });
     vi.clearAllMocks();
     const status = { enabled: true, publicOrigin: null, listenerRunning: false, port: 4378, bindError: null, localUrl: null, mcpUrl: null,
-      localExecutable: "codemux", localCommand: "codemux mcp", pending: [], clients: [{ id: "synthetic-granted", kind: "oauth" as const,
+      localExecutable: "codemux", localCommand: "codemux mcp", pending: [], clients: [{ id: "synthetic-granted", grantId: "synthetic-grant", kind: "oauth" as const,
         clientName: "Synthetic read-only assistant", callbackOrigin: "https://client.example", access: "read_only" as const,
         createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString(), label: null, renews: true }] };
     vi.mocked(commands.agentConnectorStatus).mockResolvedValue(status);

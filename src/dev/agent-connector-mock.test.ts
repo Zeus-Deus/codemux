@@ -279,13 +279,16 @@ it("issues a synthetic token once and lists it as a token client", () => {
   expect(issued.token).toContain("not-a-credential");
   expect(Date.parse(issued.expiresAt) - Date.now()).toBe(30 * 86_400_000);
   const status = read(mock);
-  expect(status.clients).toEqual([expect.objectContaining({ id: issued.clientId, kind: "token", clientName: "hermes-bot",
+  expect(issued.grantId).toEqual(expect.any(String));
+  expect(status.clients).toEqual([expect.objectContaining({ id: issued.clientId, grantId: issued.grantId, kind: "token", clientName: "hermes-bot",
     label: "hermes-bot", callbackOrigin: null, access: "supervised", renews: false, expiresAt: issued.expiresAt })]);
   expect(JSON.stringify(status)).not.toContain(issued.token);
   // The same label (in any case) rotates that bot's token and keeps its client id and first spelling.
   const again = mock.handlers.agent_connector_issue({ label: "Hermes-Bot", access: "read_only", expiresInHours: 48 }) as AgentConnectorIssuedToken;
   expect(again).toMatchObject({ clientId: issued.clientId, label: "hermes-bot", replaced: true, access: "read_only" });
-  expect(read(mock).clients).toEqual([expect.objectContaining({ clientName: "hermes-bot", label: "hermes-bot" })]);
+  // A new grant, so a reveal of the earlier token can tell it no longer works.
+  expect(again.grantId).not.toBe(issued.grantId);
+  expect(read(mock).clients).toEqual([expect.objectContaining({ id: issued.clientId, grantId: again.grantId, clientName: "hermes-bot", label: "hermes-bot" })]);
   expect(again.token).not.toBe(issued.token);
   expect(Date.parse(again.expiresAt) - Date.now()).toBe(48 * 3_600_000);
   expect(read(mock).clients).toHaveLength(1);

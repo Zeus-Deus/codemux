@@ -581,15 +581,15 @@ it("clears its expiry timer on unmount", async () => {
 });
 
 const request = { id: "request-1", clientName: "<img src=x onerror=evil()> assistant", callbackOrigin: "https://assistant.example.test", requestedAt: "2026-10-08T00:00:00Z", expiresAt: new Date(Date.now() + 300_000).toISOString(), phase: "awaiting_approval" as const, access: null, reconnecting: false };
-const granted = { id: "client-1", kind: "oauth" as const, clientName: "Example assistant", callbackOrigin: "https://assistant.example.test", access: "read_only" as const, createdAt: "2026-10-08T00:00:00Z", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), label: null, renews: false };
-const tokenClient = { id: "mock-token-1", kind: "token" as const, clientName: "<b>hermes-bot</b>", callbackOrigin: null, access: "supervised" as const, createdAt: "2026-10-08T00:00:00Z", expiresAt: new Date(Date.now() + 86_400_000).toISOString(), label: "<b>hermes-bot</b>", renews: false };
-const issuedToken = { token: "mock-token-not-a-credential-7", clientId: "mock-token-1", label: "hermes-bot", access: "supervised" as const,
+const granted = { id: "client-1", grantId: "grant-1", kind: "oauth" as const, clientName: "Example assistant", callbackOrigin: "https://assistant.example.test", access: "read_only" as const, createdAt: "2026-10-08T00:00:00Z", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), label: null, renews: false };
+const tokenClient = { id: "mock-token-1", grantId: "mock-grant-1", kind: "token" as const, clientName: "<b>hermes-bot</b>", callbackOrigin: null, access: "supervised" as const, createdAt: "2026-10-08T00:00:00Z", expiresAt: new Date(Date.now() + 86_400_000).toISOString(), label: "<b>hermes-bot</b>", renews: false };
+const issuedToken = { token: "mock-token-not-a-credential-7", clientId: "mock-token-1", grantId: "mock-grant-1", label: "hermes-bot", access: "supervised" as const,
   expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(), mcpUrl: "http://127.0.0.1:4378/mcp", localUrl: "http://127.0.0.1:4378/mcp", replaced: false };
 
 /** Issue answers with `token` and, like the backend, makes later reads list its client. */
 function issueListing(token: typeof issuedToken, state: Partial<AgentConnectorStatus> = LISTENING) {
   api.issue.mockImplementation(async () => {
-    api.status.mockResolvedValue(snapshot({ ...state, clients: [{ ...tokenClient, id: token.clientId, clientName: token.label, label: token.label }] }));
+    api.status.mockResolvedValue(snapshot({ ...state, clients: [{ ...tokenClient, id: token.clientId, grantId: token.grantId, clientName: token.label, label: token.label }] }));
     return token;
   });
 }
@@ -692,6 +692,22 @@ it("keeps a token reveal through a failed read and drops it once its row is revo
   await waitFor(() => expect(api.revoke).toHaveBeenCalledWith(issuedToken.clientId));
   await waitFor(() => expect(screen.queryByText(/Copy the token/)).not.toBeInTheDocument());
   expect(document.body.textContent).not.toContain(issuedToken.token);
+});
+
+it("drops a token reveal once its label is reissued elsewhere, though the client row stays", async () => {
+  api.status.mockResolvedValue(snapshot({ ...LISTENING }));
+  issueListing(issuedToken);
+  render(<OutsideAssistantsSection />);
+  fireEvent.change(await screen.findByRole("textbox", { name: "Token label" }), { target: { value: "hermes-bot" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create token" }));
+  expect(await screen.findByText(issuedToken.token)).toBeInTheDocument();
+  // `codemux connector issue --label hermes-bot` rotates it: the same client id, a new grant.
+  const rotated = { ...tokenClient, id: issuedToken.clientId, grantId: "mock-grant-2", clientName: "hermes-bot", label: "hermes-bot" };
+  api.status.mockResolvedValue(snapshot({ ...LISTENING, clients: [rotated] }));
+  await act(async () => api.changed?.());
+  await waitFor(() => expect(screen.queryByText(/Copy the token/)).not.toBeInTheDocument());
+  expect(document.body.textContent).not.toContain(issuedToken.token);
+  expect(screen.getByRole("group", { name: "Token hermes-bot" })).toBeInTheDocument();
 });
 
 it("does not bring back a revoked token's reveal when network connections return", async () => {

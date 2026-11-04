@@ -76,9 +76,10 @@ function NativeOutsideAssistantsSection() {
       fresh.current = true;
       setVerified(true);
       if (!originEdited.current) setOrigin(next.publicOrigin ?? "");
-      // A revoked token's reveal would offer a dead credential. Only a
-      // verified read may drop it, so a failed read-back never loses a fresh one.
-      setIssued((current) => current && !next.clients.some((client) => client.id === current.clientId) ? null : current);
+      // A revoked or reissued token's reveal would offer a dead credential.
+      // Reissuing keeps the client row, so match the grant. Only a verified
+      // read may drop it, so a failed read-back never loses a fresh one.
+      setIssued((current) => current && !next.clients.some((client) => client.grantId === current.grantId) ? null : current);
     } catch {
       if (mounted.current && request === generation.current) {
         setError("Unable to verify connections. Refresh before making changes.");

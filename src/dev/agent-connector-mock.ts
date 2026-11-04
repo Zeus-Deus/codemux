@@ -149,13 +149,15 @@ export function createAgentConnectorMock(changed: () => void) {
       const replaced = clients.some((client) => client.id === clientId);
       const now = Date.now();
       const expiresAt = new Date(now + hours * 3_600_000).toISOString();
+      // Reissuing keeps the client id but mints a new grant, as the store does.
+      const grantId = `mock-grant-${++sequence}`;
       grant({
-        id: clientId, kind: "token", clientName: firstLabel, callbackOrigin: null, access,
+        id: clientId, grantId, kind: "token", clientName: firstLabel, callbackOrigin: null, access,
         createdAt: new Date(now).toISOString(), expiresAt, label: firstLabel, renews: false,
       });
       changed();
       return {
-        token: `mock-token-not-a-credential-${++sequence}`, clientId, label: firstLabel, access, expiresAt,
+        token: `mock-token-not-a-credential-${++sequence}`, clientId, grantId, label: firstLabel, access, expiresAt,
         mcpUrl: resource(), localUrl: localUrl(), replaced,
       };
     },
@@ -184,7 +186,7 @@ export function createAgentConnectorMock(changed: () => void) {
       const { request } = completion;
       const now = Date.now();
       grant({
-        id: `mock-client-${++sequence}`, kind: "oauth", clientName: request.clientName,
+        id: `mock-client-${++sequence}`, grantId: `mock-grant-${++sequence}`, kind: "oauth", clientName: request.clientName,
         callbackOrigin: request.callbackOrigin, access: request.access, createdAt: new Date(now).toISOString(),
         expiresAt: new Date(now + MOCK_SIGN_IN_LIFETIME_MS).toISOString(), label: null, renews: true,
       });

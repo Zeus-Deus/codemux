@@ -21,6 +21,9 @@ export type AgentConnectorClientKind = "oauth" | "token";
 
 export interface AgentConnectorClient {
   id: string;
+  /** The live grant behind this row; not a credential. Reissuing a token
+   *  keeps the client id and changes this. */
+  grantId: string;
   kind: AgentConnectorClientKind;
   /** OAuth client name or token label: untrusted plain text. */
   clientName: string;
@@ -64,6 +67,8 @@ export interface AgentConnectorIssuedToken {
   /** Shown once; never stored by the UI. */
   token: string;
   clientId: string;
+  /** The grant this token belongs to: the client row's `grantId` while it still works. */
+  grantId: string;
   label: string;
   access: AgentConnectorAccess;
   expiresAt: string;

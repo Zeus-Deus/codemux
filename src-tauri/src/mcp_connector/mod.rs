@@ -137,6 +137,9 @@ pub enum ClientKind {
 #[serde(rename_all = "camelCase")]
 pub struct ConnectorClient {
     pub id: String,
+    /// The live grant behind this row; not a credential. Reissuing a token
+    /// keeps the client id and changes this.
+    pub grant_id: String,
     pub client_name: String,
     /// `None` for tokens, which have no callback.
     pub callback_origin: Option<String>,
@@ -179,6 +182,8 @@ pub struct ConnectorStatus {
 pub struct IssuedToken {
     pub token: String,
     pub client_id: String,
+    /// The token's grant: its client row's `grant_id` while the token works.
+    pub grant_id: String,
     pub label: String,
     pub access: ControlAccess,
     pub expires_at: String,
@@ -494,6 +499,7 @@ pub fn agent_connector_status<R: Runtime>(app: AppHandle<R>) -> Result<Connector
             };
             Ok(ConnectorClient {
                 id: g.client_id,
+                grant_id: g.id,
                 client_name: g.client_name,
                 callback_origin: (kind == ClientKind::Oauth)
                     .then(|| callback_origin(&g.redirect_uri)),
@@ -582,6 +588,7 @@ pub fn agent_connector_issue<R: Runtime>(
         IssuedToken {
             token,
             client_id: minted.client_id,
+            grant_id: grant.id,
             label: grant.label.unwrap_or(grant.client_name),
             access,
             expires_at: timestamp(grant.expires_at),
@@ -1067,6 +1074,7 @@ mod tests {
             agent_connector_issue(handle.clone(), " CI-bot ".into(), ControlAccess::ReadOnly, None).unwrap();
         assert!(again.replaced);
         assert_eq!((again.client_id.as_str(), again.label.as_str()), (issued.client_id.as_str(), "ci-bot"));
+        assert_ne!(again.grant_id, issued.grant_id, "a reissue is a new grant under the same client");
         assert!(db
             .mcp_grant_by_hash(&oauth::credential_hash(&issued.token), &url, now_ms())
             .unwrap()
@@ -1075,7 +1083,7 @@ mod tests {
         assert_eq!(
             status["clients"][0],
             serde_json::json!({
-                "id": issued.client_id, "clientName": "ci-bot", "callbackOrigin": null,
+                "id": issued.client_id, "grantId": again.grant_id, "clientName": "ci-bot", "callbackOrigin": null,
                 "access": "read_only", "createdAt": status["clients"][0]["createdAt"],
                 "expiresAt": status["clients"][0]["expiresAt"], "kind": "token",
                 "label": "ci-bot", "renews": false,
@@ -1087,7 +1095,7 @@ mod tests {
         let keys: std::collections::BTreeSet<_> = issued.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            ["access", "clientId", "expiresAt", "label", "localUrl", "mcpUrl", "replaced", "token"].into()
+            ["access", "clientId", "expiresAt", "grantId", "label", "localUrl", "mcpUrl", "replaced", "token"].into()
         );
         assert!(agent_connector_issue(handle.clone(), "-bad".into(), ControlAccess::ReadOnly, None).is_err());
         assert!(agent_connector_issue(handle.clone(), "bot".into(), ControlAccess::ReadOnly, Some(0)).is_err());
