@@ -48,8 +48,9 @@ impl Config {
 }
 
 pub struct McpConnectorState {
-    // Also serializes synchronous config changes, native decisions, code mint,
-    // token persistence and revocation. Never held over an await.
+    // Also serializes synchronous config changes (with the listener reconcile
+    // they trigger), native decisions, code mint, token persistence and
+    // revocation. Never held over an await. Lock order: `auth`, then `listener`.
     pub(crate) auth: Mutex<oauth::AuthState>,
     pub(crate) rate: Mutex<protocol::Rates>,
     pub(crate) concurrency: Arc<Semaphore>,
@@ -387,6 +388,9 @@ pub(crate) struct ConfigUpdate {
 /// Save the switch, origin and port, then bring the listener to match.
 /// Disabling pauses: pending sign-ins end, grants stay. A new address (origin,
 /// or port without an origin) also revokes every grant bound to the old one.
+/// All under `auth`, so issuance and every HTTP check never see the new saved
+/// address while the old port is still bound (a token minted there would name
+/// a port that is about to stop).
 pub(crate) fn apply_config<R: Runtime>(
     app: &AppHandle<R>,
     update: ConfigUpdate,
@@ -417,17 +421,17 @@ pub(crate) fn apply_config<R: Runtime>(
         if !cfg.enabled || moved {
             auth.clear();
         }
-        if moved {
+        let revoked = if moved {
             let now = now_ms();
             // Count only grants that still had authority.
             db.mcp_prune_clients(now, &auth.protected_clients(now))?;
             db.mcp_revoke_grants_not_bound_to(&format!("{new_issuer}/mcp"))?
         } else {
             0
-        }
+        };
+        listener::reconcile(app);
+        revoked
     };
-    // Reads the saved config itself: a concurrent save may have landed since.
-    listener::reconcile(app);
     authority_changed(app);
     let mut status = agent_connector_status(app.clone())?;
     status.revoked_grants = Some(revoked);
@@ -907,6 +911,58 @@ mod tests {
         assert!(status.listener_running, "{:?}", status.bind_error);
         assert_eq!(status.port, second);
         assert!(reachable(second));
+        set(handle, false, None, None).unwrap();
+    }
+
+    #[test]
+    fn a_token_issued_while_the_port_moves_is_bound_to_the_new_port() {
+        let app = app();
+        let handle = app.handle();
+        let (old, new) = (free_port(), free_port());
+        set(handle, true, None, Some(old)).unwrap();
+        // Hold the listener: the port change saves and revokes, then cannot
+        // reconcile, so the old port stays bound under the new saved config.
+        let state = handle.state::<McpConnectorState>();
+        let held = state.listener.lock().unwrap();
+        let mover = {
+            let handle = handle.clone();
+            std::thread::spawn(move || set(&handle, true, None, Some(new)).map(|_| ()))
+        };
+        let db = handle.state::<DatabaseStore>();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while config(&db).unwrap().port != Some(new) {
+            assert!(Instant::now() < deadline, "the port change never saved");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (sender, issued) = std::sync::mpsc::channel();
+        let issuer = {
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                let token =
+                    agent_connector_issue(handle, "moving-bot".into(), ControlAccess::Supervised, None);
+                let _ = sender.send(token);
+            })
+        };
+        // Give issuance every chance to run inside the window before the listener moves.
+        let early = issued.recv_timeout(Duration::from_millis(300));
+        drop(held);
+        mover.join().unwrap().unwrap();
+        let token = early
+            .or_else(|_| issued.recv_timeout(Duration::from_secs(5)))
+            .unwrap()
+            .unwrap();
+        issuer.join().unwrap();
+        // The resource the live /mcp door checks a bearer against.
+        let (_, live_issuer, bound) = live(handle).unwrap();
+        assert_eq!(bound, new);
+        let resource = format!("{live_issuer}/mcp");
+        assert_eq!((token.mcp_url.as_str(), token.local_url.as_str()), (resource.as_str(), resource.as_str()));
+        assert!(
+            db.mcp_grant_by_hash(&oauth::credential_hash(&token.token), &resource, now_ms())
+                .unwrap()
+                .is_some(),
+            "a token returned during a port change must work at the new port"
+        );
         set(handle, false, None, None).unwrap();
     }
 
