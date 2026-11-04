@@ -384,9 +384,16 @@ async fn connector_workspace_close_refuses_force_delete() {
     no_receipt(&app, &full, "force", "workspace_close");
     assert!(app.state::<AppStateStore>().find_workspace(&workspace).is_some());
     // Removal itself is allowed, under the desktop's own guards.
-    let error = refused(call(&app, &full, "workspace_close", json!({"workspace_id": workspace, "delete_worktree": true, "client_request_id": "root-delete"})).await, ErrorCode::WorkspaceCloseRefused);
+    let root_delete = json!({"workspace_id": workspace, "delete_worktree": true, "client_request_id": "root-delete"});
+    let error = refused(call(&app, &full, "workspace_close", root_delete.clone()).await, ErrorCode::WorkspaceCloseRefused);
     assert!(error.message.contains("cannot be deleted"), "{error}");
     assert!(app.state::<AppStateStore>().find_workspace(&workspace).is_some(), "a refused close closes nothing");
+    // The refusal came after admission, so its key holds a failed receipt: a
+    // retry returns that receipt as data, as every keyed tool's retry does.
+    let retry = call(&app, &full, "workspace_close", root_delete).await.expect("a failed receipt is data");
+    assert_eq!(retry["state"], "failed", "{retry}");
+    assert_eq!(retry["error"]["code"], "workspace_close_refused", "{retry}");
+    assert!(app.state::<AppStateStore>().find_workspace(&workspace).is_some(), "the retry closes nothing");
 }
 
 // ── worktree_create ───────────────────────────────────────────────────────

@@ -112,8 +112,10 @@ impl ErrorCode {
         Self::ALL.iter().copied().find(|known| known.as_str() == code)
     }
 
-    /// Retrying the identical request later (the same client_request_id for
-    /// mutations) may succeed without any change by the caller or the person.
+    /// Retrying the identical request later may succeed without any change by
+    /// the caller or the person. A refusal before admission keeps its
+    /// client_request_id free; a failed receipt is final for its key, so that
+    /// retry needs a new one.
     pub const fn retryable(self) -> bool {
         matches!(
             self,
