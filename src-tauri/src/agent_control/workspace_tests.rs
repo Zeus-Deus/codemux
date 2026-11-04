@@ -839,10 +839,27 @@ async fn unsettled_answer_keeps_the_question_open_and_refuses_another() {
     assert!(!provider.calls.snapshot().iter().any(|call| matches!(call, MockCall::AnswerQuestion(..))), "nothing reached the worker");
 }
 
-/// Records what each answer asked of the thread's mode.
+/// Records what each answer that reached the worker asked of the thread's
+/// mode. Like Codex, it authorizes each answer at its dispatch boundary;
+/// `hold_next_answer` keeps one waiting just before that, as the outbound
+/// lock or `thread/read` can.
 struct ModeRecorder {
     inner: Arc<MockAgentProvider>,
     overrides: Mutex<Vec<Option<String>>>,
+    held: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+}
+
+impl ModeRecorder {
+    fn new(inner: Arc<MockAgentProvider>) -> Self {
+        Self { inner, overrides: Mutex::new(Vec::new()), held: Mutex::new(None) }
+    }
+
+    /// The first notify fires once the next answer waits; the second lets it go on.
+    fn hold_next_answer(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let (waiting, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        *self.held.lock().unwrap() = Some((waiting.clone(), release.clone()));
+        (waiting, release)
+    }
 }
 
 #[async_trait::async_trait]
@@ -851,6 +868,14 @@ impl crate::agent_provider::AgentProvider for ModeRecorder {
     fn capabilities(&self) -> crate::agent_provider::ProviderCapabilities { self.inner.capabilities() }
     fn supports_async_questions(&self) -> bool { true }
     async fn answer_question(&self, input: crate::agent_provider::AnswerQuestionInput) -> Result<crate::agent_provider::QuestionDelivery, crate::agent_provider::QuestionDeliveryError> {
+        let held = self.held.lock().unwrap().take();
+        if let Some((waiting, release)) = held {
+            waiting.notify_one();
+            release.notified().await;
+        }
+        if let Some(checkpoint) = &input.checkpoint {
+            checkpoint.authorize_dispatch().map_err(|error| crate::agent_provider::QuestionDeliveryError::Rejected(error.to_string()))?;
+        }
         self.overrides.lock().unwrap().push(input.permission_mode_override.clone());
         self.inner.answer_question(input).await
     }
@@ -870,7 +895,7 @@ impl crate::agent_provider::AgentProvider for ModeRecorder {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervised_answer_cannot_change_permission_mode() {
     let (app, _, _root, workspace) = fixture().await;
-    let recorder = Arc::new(ModeRecorder { inner: Arc::new(MockAgentProvider::new(ProviderKind::Claude)), overrides: Mutex::new(Vec::new()) });
+    let recorder = Arc::new(ModeRecorder::new(Arc::new(MockAgentProvider::new(ProviderKind::Claude))));
     app.state::<crate::commands::agent_chat::ProviderRegistry>().set_claude(recorder.clone()).await;
     let planning = launched(&app, "plan-launch", &workspace, "plan").await;
     ask(&app, &planning, "t1", "approach");
@@ -898,4 +923,104 @@ async fn supervised_answer_cannot_change_permission_mode() {
     let (app, _, _root, workspace, thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
     let chat = super::native::qualify(app.handle(), &actor).await.unwrap();
     refused(super::service::thread_answer(app.handle(), &chat, answer(&workspace, &thread, "chat-answer", "q")).await, ErrorCode::PermissionDenied);
+}
+
+fn answer_in_background(app: &App, caller: &ControlCaller, args: Value) -> tokio::task::JoinHandle<Result<Value, ControlError>> {
+    let (handle, caller) = (app.handle().clone(), caller.clone());
+    tokio::spawn(async move { execute(&handle, &caller, "thread_answer", args).await })
+}
+
+async fn reaches(gate: &tokio::sync::Notify, what: &str) {
+    tokio::time::timeout(Duration::from_secs(10), gate.notified()).await.unwrap_or_else(|_| panic!("the answer never reached {what}"));
+}
+
+/// An outside answer keeps its caller's authority until it reaches the
+/// worker. Revoking the connector grant while the answer waits in delivery
+/// stops it there, and the person can still answer the question.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_waiting_in_delivery_stops_when_the_grant_is_revoked() {
+    let (app, _, _root, workspace) = fixture().await;
+    let recorder = Arc::new(ModeRecorder::new(Arc::new(MockAgentProvider::new(ProviderKind::Claude))));
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_claude(recorder.clone()).await;
+    let thread = launched(&app, "revoked-launch", &workspace, "default").await;
+    ask(&app, &thread, "t1", "storage");
+    let bot = super::tests::connector_caller(&app, "answer-client", "answer-grant", ControlAccess::FullAccess).await;
+
+    let (waiting, release) = recorder.hold_next_answer();
+    let answering = answer_in_background(&app, &bot, answer(&workspace, &thread, "revoked-answer", "storage"));
+    reaches(&waiting, "delivery").await;
+    crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "answer-client".into()).unwrap();
+    release.notify_one();
+
+    let error = refused(answering.await.unwrap(), ErrorCode::QuestionAnswerFailed);
+    assert!(error.message.contains("grant_revoked"), "{error}");
+    assert!(recorder.overrides.lock().unwrap().is_empty(), "the answer never reached the worker");
+    let (_, resolution) = app.state::<DatabaseStore>().async_question(&thread, "storage").unwrap();
+    assert!(matches!(resolution, QuestionResolution::Failed { .. }), "the person can still answer it: {resolution:?}");
+    super::tests::connector_off(&app);
+}
+
+/// A supervised answer stops in delivery once its worker would run beyond
+/// the supervised ceiling: the person switched the thread to full access,
+/// or the live worker's mode no longer matches the saved one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_answer_waiting_in_delivery_stops_when_the_worker_mode_widens() {
+    let (app, _, _root, workspace) = fixture().await;
+    let recorder = Arc::new(ModeRecorder::new(Arc::new(MockAgentProvider::new(ProviderKind::Claude))));
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_claude(recorder.clone()).await;
+    let bot = named(ControlAccess::Supervised);
+    for (case, saved, code) in [("switched", true, "permission_ceiling"), ("live-only", false, "permission_state_unconfirmed")] {
+        let thread = launched(&app, &format!("{case}-launch"), &workspace, "default").await;
+        ask(&app, &thread, "t1", "scope");
+        let (waiting, release) = recorder.hold_next_answer();
+        let answering = answer_in_background(&app, &bot, answer(&workspace, &thread, case, "scope"));
+        reaches(&waiting, "delivery").await;
+        if saved {
+            let full = crate::database::AgentChatSessionConfig { permission_mode: Some(Some("bypassPermissions".into())), ..Default::default() };
+            app.state::<DatabaseStore>().update_agent_chat_session_config(&thread, &full).unwrap();
+        }
+        app.state::<NativeControlState>().record_worker_mode(&thread, ProviderKind::Claude, Some("bypassPermissions".into()));
+        release.notify_one();
+
+        let error = refused(answering.await.unwrap(), ErrorCode::QuestionAnswerFailed);
+        assert!(error.message.contains(code), "{case}: {error}");
+    }
+    assert!(recorder.overrides.lock().unwrap().is_empty(), "no answer reached the worker");
+}
+
+/// An answer to a thread whose worker exited resumes the worker first.
+/// Revoking the grant while the worker starts stops the answer before it is
+/// handed to the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_waiting_on_worker_startup_stops_when_the_grant_is_revoked() {
+    use crate::agent_provider::AgentProvider;
+    let (app, _, _root, workspace) = fixture().await;
+    let mut asking = MockAgentProvider::new(ProviderKind::Codex);
+    asking.async_questions = true;
+    let codex = Arc::new(asking);
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_codex(codex.clone()).await;
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap()
+        .insert(ProviderKind::Codex, crate::agent_provider::codex::capabilities::build_capabilities(vec![]));
+    let launch = call(&app, &ControlCaller::trusted(), "thread_launch", json!({
+        "workspace_id": workspace, "client_request_id": "startup-launch", "provider": "codex", "permission_mode": "workspace-write",
+    })).await.unwrap();
+    let launched = settle_operation(&app, &launch).await;
+    assert_eq!(launched["state"], "succeeded", "{launched}");
+    let thread = launched["thread_id"].as_str().unwrap().to_string();
+    ask(&app, &thread, "t1", "storage");
+    // The worker exited; its conversation can still be resumed.
+    codex.stop_session(ThreadId(thread.clone())).await.unwrap();
+    app.state::<DatabaseStore>().set_agent_chat_sdk_session_id(&thread, "codex-conversation").unwrap();
+    let bot = super::tests::connector_caller(&app, "startup-client", "startup-grant", ControlAccess::FullAccess).await;
+
+    let (starting, release) = codex.hold_next_start();
+    let answering = answer_in_background(&app, &bot, answer(&workspace, &thread, "startup-answer", "storage"));
+    reaches(&starting, "worker startup").await;
+    crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "startup-client".into()).unwrap();
+    release.notify_one();
+
+    let error = refused(answering.await.unwrap(), ErrorCode::QuestionAnswerFailed);
+    assert!(error.message.contains("grant_revoked"), "{error}");
+    assert!(!codex.calls.snapshot().iter().any(|call| matches!(call, MockCall::AnswerQuestion(..))), "the answer never reached the worker");
+    super::tests::connector_off(&app);
 }

@@ -1304,10 +1304,12 @@ pub(super) struct AnswerArgs { workspace_id: String, thread_id: String, client_r
 /// Answers a worker's open question for the person, through the same path as
 /// the question card. The answer never carries a permission-mode change: on
 /// the card the person can approve a plan and leave plan mode in one go, but
-/// an outside answer leaves the thread's mode as it is.
+/// an outside answer leaves the thread's mode as it is. The caller's
+/// authority travels with the answer and is rechecked until it reaches the
+/// worker, as a sent message's is.
 pub(super) async fn thread_answer<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     use crate::agent_provider::QuestionResolution;
-    use crate::commands::async_questions::{agent_chat_answer_question, QuestionAction};
+    use crate::commands::async_questions::{answer_question_guarded, QuestionAction};
     if caller.thread_id().is_some() { return Err(ControlError::new(ErrorCode::PermissionDenied, "Agents cannot answer questions meant for the person")); }
     let input: AnswerArgs = parse(args.clone())?;
     identifier(&input.client_request_id, "client_request_id", 128)?;
@@ -1333,9 +1335,10 @@ pub(super) async fn thread_answer<R: Runtime>(app: &AppHandle<R>, caller: &Contr
     let AnswerArgs { workspace_id, thread_id, question_id, answers, .. } = input;
     let receipt_workspace = workspace_id.clone();
     let owned = app.clone();
+    let control = NativeControlGuard { caller: caller.clone(), workspace_id: workspace_id.clone(), thread_id: thread_id.clone(), provider, admission: None }.retain_admission(app);
     run_receipted(app, caller, "thread_answer", &args, false, Some(&receipt_workspace), move |_| async move {
         let action = QuestionAction::Answer { answers, submission_id: submission.clone(), retry_unknown: false, permission_mode_override: None };
-        let resolution = agent_chat_answer_question(owned, ThreadId(thread_id.clone()), question_id.clone(), action)
+        let resolution = answer_question_guarded(owned, ThreadId(thread_id.clone()), question_id.clone(), action, Some(control))
             .await
             .map_err(|e| ControlError::new(ErrorCode::QuestionAnswerFailed, e))?;
         match &resolution {

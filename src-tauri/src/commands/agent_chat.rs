@@ -3002,6 +3002,18 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
     thread_id: &ThreadId,
     require_original: bool,
 ) -> Result<(), String> {
+    ensure_live_session_guarded(app, provider_kind, thread_id, require_original, None).await
+}
+
+/// [`ensure_live_session_mode`] for a controller's action: `control` is
+/// rechecked at each step of the rebuild, as a guarded send's is.
+pub(super) async fn ensure_live_session_guarded<R: Runtime>(
+    app: &AppHandle<R>,
+    provider_kind: ProviderKind,
+    thread_id: &ThreadId,
+    require_original: bool,
+    control: Option<&NativeControlGuard>,
+) -> Result<(), String> {
     let gate = native_thread_gate(app, &thread_id.0);
     let generation = gate.generation();
     let _native_guard = gate.dispatch.clone().lock_owned().await;
@@ -3010,7 +3022,7 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         provider_kind,
         thread_id,
         require_original,
-        None,
+        control,
         &gate,
         generation,
     )

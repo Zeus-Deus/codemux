@@ -1892,6 +1892,12 @@ impl CodexSession {
                         text_elements: vec![],
                     }],
                 };
+                // Authorized at the wire, as a steered message is: the
+                // answerer's authority may have been withdrawn while it
+                // waited for the outbound lock or `thread/read`.
+                if let Some(checkpoint) = &input.checkpoint {
+                    checkpoint.authorize_dispatch().map_err(|error| Error::Rejected(error.to_string()))?;
+                }
                 match self.child().await
                     .request("turn/steer", serde_json::to_value(params).unwrap())
                     .await
