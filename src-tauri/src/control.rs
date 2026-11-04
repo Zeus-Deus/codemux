@@ -573,22 +573,27 @@ pub fn spawn_control_server<R: Runtime>(app: AppHandle<R>) {
     });
 }
 
+/// Lines a client may send ahead while a request parks. Past this many the
+/// server stops reading until the request returns.
+const MAX_PIPELINED_LINES: usize = 64;
+
 /// Answers each request line with one response line, in order.
 ///
 /// A client must keep the connection open until it has read its reply. A
 /// request that parks (`thread_wait`) ends when the client hangs up, since
-/// nobody is left to read its result; a line the client pipelines meanwhile
-/// is kept and answered after it. Other requests always run to the end.
+/// nobody is left to read its result; lines the client pipelines meanwhile
+/// are kept and answered after it, and the hang-up is still watched for.
+/// Other requests always run to the end.
 async fn handle_client<R: Runtime, S>(app: AppHandle<R>, stream: S, peer_pid: Option<u32>) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
-    let mut pipelined: Option<String> = None;
+    let mut pipelined: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
     loop {
-        let line = match pipelined.take() {
+        let line = match pipelined.pop_front() {
             Some(line) => line,
             None => match lines
                 .next_line()
@@ -619,16 +624,18 @@ where
                 } else {
                     let work = dispatch_request_as(&app, &caller, request);
                     tokio::pin!(work);
-                    tokio::select! {
-                        response = &mut work => response,
-                        // `next_line` is cancel safe: no line is lost here.
-                        next = lines.next_line() => match next {
-                            Ok(Some(line)) => {
-                                pipelined = Some(line);
-                                work.await
-                            }
-                            Ok(None) | Err(_) => return Ok(()),
-                        },
+                    loop {
+                        if pipelined.len() >= MAX_PIPELINED_LINES {
+                            break work.await;
+                        }
+                        tokio::select! {
+                            response = &mut work => break response,
+                            // `next_line` is cancel safe: no line is lost here.
+                            next = lines.next_line() => match next {
+                                Ok(Some(line)) => pipelined.push_back(line),
+                                Ok(None) | Err(_) => return Ok(()),
+                            },
+                        }
                     }
                 }
             }
@@ -2633,16 +2640,36 @@ mod tests {
         let mut short = wait;
         short["timeout_ms"] = serde_json::json!(400);
         let (served, mut replies, mut writer) = connect(&app);
-        // The second line arrives while the wait is parked.
-        let lines = format!("{}\n{}\n", serde_json::json!({"command": "thread_wait", "params": short}), serde_json::json!({"command": "status"}));
+        // The later lines arrive while the wait is parked.
+        let status = serde_json::json!({"command": "status"});
+        let lines = format!("{}\n{status}\n{status}\n", serde_json::json!({"command": "thread_wait", "params": short}));
         writer.write_all(lines.as_bytes()).await.unwrap();
         let first = reply(&mut replies).await;
         assert!(first.ok, "{:?}", first.error);
         assert_eq!(first.data.unwrap()["timed_out"], true, "replies keep request order");
-        let second = reply(&mut replies).await;
-        assert!(second.ok, "the pipelined line was kept: {:?}", second.error);
+        for _ in 0..2 {
+            let kept = reply(&mut replies).await;
+            assert!(kept.ok, "every pipelined line was kept: {:?}", kept.error);
+        }
         drop((replies, writer));
         assert_eq!(served.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn socket_wait_ends_when_a_client_pipelines_and_hangs_up() {
+        let (app, _root, wait) = waitable().await;
+        let mut long = wait;
+        long["timeout_ms"] = serde_json::json!(600_000);
+        let (served, mut replies, mut writer) = connect(&app);
+        let lines = format!("{}\n{}\n", serde_json::json!({"command": "thread_wait", "params": long}), serde_json::json!({"command": "status"}));
+        writer.write_all(lines.as_bytes()).await.unwrap();
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), replies.next_line()).await;
+        assert!(early.is_err(), "the wait parks with the second line held: {early:?}");
+        drop((replies, writer));
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), served)
+            .await
+            .expect("a held line does not keep a ten-minute wait alive after its client hung up");
+        assert_eq!(ended.unwrap(), Ok(()));
     }
 
     #[tokio::test]
