@@ -2,7 +2,7 @@
 //! reference, the example tool calls in its flow, its wait states and its
 //! error codes.
 use super::outcome::RunState;
-use super::{registry, schema, CallerView, ControlAccess, ErrorCode};
+use super::{registry, schema, Audience, CallerView, ControlAccess, ErrorCode};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -65,6 +65,21 @@ fn outside_agents_guide_lists_only_registered_tools() {
     }
     let missing: Vec<&str> = registered.iter().map(|(tool, _, _)| *tool).filter(|tool| !documented.contains(tool)).collect();
     assert!(missing.is_empty(), "document every outside tool in the guide's tool reference: {missing:?}");
+}
+
+#[test]
+fn outside_agents_guide_counts_the_stdio_tools() {
+    // What outside `codemux mcp` lists at full access: the legacy tools no
+    // registry tool replaces, then the registry's outside catalog.
+    // `mcp_server`'s `tool_registry_has_all_tools` checks that `tools/list`
+    // serves exactly this many.
+    let kept = crate::mcp_server::LEGACY_TOOL_NAMES
+        .iter()
+        .filter(|name| registry::served(name, Audience::Outside).is_none())
+        .count();
+    let count = kept + registry::list(&CallerView::outside(ControlAccess::FullAccess)).len();
+    let claim = format!("`codemux mcp` lists {count} tools at full access");
+    assert!(GUIDE.contains(&claim), "the guide's release notes say {claim:?}");
 }
 
 /// One example call from a `text` fence: `tool {json arguments}`, the JSON on
@@ -135,8 +150,9 @@ fn outside_agents_guide_tool_calls_match_the_schemas() {
 
 #[test]
 fn outside_agents_guide_names_real_wait_states_and_error_codes() {
-    // A new state does not compile until it is listed here, and then the
-    // guide's table must explain it.
+    // The test compares the guide with `states`, not with the enum itself. A
+    // new state stops the match below compiling, which points here: add it to
+    // `states` too, and the guide's table must then explain it.
     let states = [RunState::Running, RunState::NeedsInput, RunState::Done, RunState::Failed];
     for state in states {
         match state {
