@@ -1276,6 +1276,9 @@ async fn wait_is_bounded_and_never_mistakes_missing_runtime_for_completion() {
     let (app, provider, _root, workspace) = fixture().await;
     let db = app.state::<crate::database::DatabaseStore>();
     db.upsert_agent_chat_session("wait-thread", &workspace, None, "claude").unwrap();
+    // A run on record with no runtime behind it. A thread with no run at all
+    // has nothing to wait for and reads done (wait_tests).
+    db.append_agent_chat_message("wait-thread", &json!({"type":"user_message","thread_id":"wait-thread","text":"Wait fixture task"}).to_string()).unwrap();
     let response = execute(app.handle(), &ControlCaller::trusted(), "thread_wait", json!({
         "workspace_id":workspace,"thread_id":"wait-thread","timeout_ms":20,
     })).await.unwrap();

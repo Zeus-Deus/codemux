@@ -370,8 +370,8 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
      - If the message never runs, `state` is `failed`, at once. `failure` is `operation_failed` when the launch or send failed or the message was removed from the queue, and `delivery_needs_attention` when Codemux can't tell whether it was delivered.
      - The result also holds `operation`: the receipt's `operation_id`, `state` and `error`.
      - An id that isn't yours is `operation_not_found`. A receipt for another thread, or for a launch without a message, is `invalid_target`.
-   - **`turn_id`** follows that run only. A run that was stopped without a recorded end reads `failed` with `went_idle` once the thread is idle or a newer run has started. A `turn_id` the thread never ran is `invalid_target` once the thread is idle.
-   - **Neither** follows the thread's current run.
+   - **`turn_id`** follows that run only. A run that was stopped without a recorded end reads `failed` with `went_idle` once the thread is idle or a newer run has started. A run a restart cut off reads `running` until Codemux resumes the chat or someone reopens it. A `turn_id` the thread never ran is `invalid_target` once the thread is idle, or at rest after a restart with nothing queued or being delivered.
+   - **Neither** follows the thread's current run. A thread that has never run reads `done` at once, also at rest after a restart.
 
    **Receipts.** `operation_status` reads a receipt without waiting:
 

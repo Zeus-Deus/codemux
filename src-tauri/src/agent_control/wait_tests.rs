@@ -617,6 +617,48 @@ async fn turn_wait_on_an_unknown_turn_of_a_thread_at_rest_is_an_invalid_target()
     assert_eq!((delivering["state"].as_str(), delivering["timed_out"].as_bool()), (Some("running"), Some(true)), "{delivering}");
 }
 
+/// A wait on the thread itself, at rest after a restart: one with no run on
+/// record has nothing to wait for and reads `done` at once, as it would once
+/// reopened. A run the restart cut off stays `running`, since restart resume
+/// may continue the chat without queueing or delivering anything, and so
+/// does a thread with a message being delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_wait_at_rest_reads_done_only_when_the_thread_never_ran() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let (empty, cut_off, unkeyed) = ("wait-at-rest-empty", "wait-at-rest-cut-off", "wait-at-rest-unkeyed");
+    for thread in [empty, cut_off, unkeyed] {
+        persisted(&app, &workspace, thread);
+    }
+    person_started(&app, cut_off, "t1");
+    // A cut-off run whose rows name no turn: the thread's turn_id stays null.
+    app.state::<DatabaseStore>()
+        .append_agent_chat_message(unkeyed, &json!({"type": "user_message", "thread_id": unkeyed, "text": "Next task"}).to_string())
+        .unwrap();
+    let trusted = ControlCaller::trusted();
+    let shape = |view: &Value| (view["status"]["phase"].as_str().map(str::to_owned), view["settled"].as_bool(), view["state"].as_str().map(str::to_owned), view["timed_out"].as_bool());
+    let status = wait::thread_status(app.handle(), target(&workspace, empty, json!({}))).await.unwrap();
+    assert_eq!((status["phase"].as_str(), status["settled"].as_bool(), status["state"].as_str()), (Some("unknown"), Some(false), Some("done")), "{status}");
+    let started = Instant::now();
+    let done = wait_for(&app, &trusted, target(&workspace, empty, json!({"timeout_ms": 2000}))).await.unwrap();
+    assert_eq!(shape(&done), (Some("unknown".into()), Some(false), Some("done".into()), Some(false)), "{done}");
+    assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
+    for (thread, turn) in [(cut_off, None), (cut_off, Some("t1")), (unkeyed, None)] {
+        let mut args = target(&workspace, thread, json!({"timeout_ms": 300}));
+        if let Some(turn) = turn {
+            args["turn_id"] = json!(turn);
+        }
+        let open = wait_for(&app, &trusted, args).await.unwrap();
+        assert_eq!(shape(&open), (Some("unknown".into()), Some(false), Some("running".into()), Some(true)), "{thread} {turn:?}: {open}");
+    }
+    let epoch = app.state::<NativeControlState>().epoch.clone();
+    let payload = json!({"provider": "claude", "origin": "controller", "input": {"thread_id": empty, "text": "First task"}});
+    app.state::<DatabaseStore>()
+        .admit_message_delivery("wait-at-rest-delivery", empty, "wait-at-rest-delivery", &payload, &epoch, 0, None, true)
+        .unwrap();
+    let delivering = wait_for(&app, &trusted, target(&workspace, empty, json!({"timeout_ms": 300}))).await.unwrap();
+    assert_eq!((delivering["state"].as_str(), delivering["timed_out"].as_bool()), (Some("running"), Some(true)), "{delivering}");
+}
+
 /// A message queued behind the running t1, as `thread_send` takes it: its
 /// receipt names the queue entry and no run yet.
 async fn queued_send(app: &App, provider: &mock_agent_provider::MockAgentProvider, workspace: &str, thread: &str, key: &str) -> Value {

@@ -387,7 +387,15 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
     // the legacy rule never settles it. The live end above covers a run whose
     // end row has not landed yet.
     let vanished = is_current && status["settled"] == true && end.is_none();
-    let ended = settled || vanished || superseded;
+    // With no turn to follow there is nothing to wait for once the thread is
+    // idle, or once it is at rest with no run on record at all (a thread
+    // Codemux has not reopened since a restart never settles). A run a
+    // restart cut off stays open on a thread at rest: restart resume may
+    // continue the chat through the normal send path, which queues and
+    // delivers nothing.
+    let never_ran = turn_id.is_none()
+        && (settled || (at_rest(&db, thread, &status)? && db.control_last_thread_run_event(thread)?.is_none()));
+    let ended = settled || vanished || superseded || never_ran;
     let final_message = match turn_id {
         Some(turn) if ended => db.control_turn_final_text(thread, turn)?.map(FinalMessage::bounded),
         _ => None,
@@ -395,8 +403,7 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
     let (state, failure) = if is_current && status["phase"] == "needs_attention" && pending.is_empty() {
         // A message delivery needs the person: the run it asked for never started.
         (RunState::Failed, Some("delivery_needs_attention"))
-    } else if settled && turn_id.is_none() {
-        // An idle thread that never ran has nothing to wait for.
+    } else if never_ran {
         (RunState::Done, None)
     } else {
         let (state, failure) = run_state(&RunFacts {
@@ -423,6 +430,8 @@ fn at_rest(db: &DatabaseStore, thread: &str, status: &Value) -> Result<bool, Con
         return Ok(true);
     }
     let empty = |key: &str| status[key].as_array().is_none_or(Vec::is_empty);
+    // Redundant today: with an empty queue, uncertain entries already make
+    // the phase `needs_attention`. Kept so this rule does not lean on that.
     Ok(status["phase"] == "unknown" && empty("queued_ids") && empty("uncertain_queued_ids") && !db.has_inflight_message_deliveries(thread)?)
 }
 
