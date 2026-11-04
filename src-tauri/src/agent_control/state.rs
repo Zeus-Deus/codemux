@@ -153,6 +153,10 @@ pub struct NativeControlState {
             crate::agent_provider::ProviderChatCapabilities,
         >,
     >,
+    /// Providers whose fixture catalog only a discovery returns, as with a
+    /// cold composer cache: a cache read finds nothing for them.
+    #[cfg(test)]
+    pub(crate) fixture_uncached: Mutex<std::collections::HashSet<crate::agent_provider::ProviderKind>>,
 }
 impl Default for NativeControlState {
     fn default() -> Self {
@@ -165,6 +169,8 @@ impl Default for NativeControlState {
             worker_modes: Default::default(),
             #[cfg(test)]
             fixture_capabilities: Default::default(),
+            #[cfg(test)]
+            fixture_uncached: Default::default(),
         }
     }
 }

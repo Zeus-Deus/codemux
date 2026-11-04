@@ -556,9 +556,8 @@ fn workspace_create_list_info_close_round_trip() {
 fn thread_start_wait_completes_with_a_fixture_provider() {
     let serve = Serve::start();
     let (workspace, _) = serve.workspace("project");
-    // Providers register in the background after boot. Listing reads cached
-    // catalogs only, so a configured Cursor is enough: the launch discovers
-    // its catalog and checks the permission mode.
+    // Providers register in the background after boot. A configured Cursor
+    // is enough: the launch checks the permission mode against its catalog.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let probe = serve.cli(&["call", "agent_capabilities", &json!({"workspace_id": workspace, "provider": "cursor"}).to_string()]);

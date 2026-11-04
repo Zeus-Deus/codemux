@@ -414,7 +414,7 @@ mod all_provider_selection_tests {
 fn not_discovered() -> ControlError {
     ControlError::new(
         ErrorCode::CatalogNotDiscovered,
-        "This instance's catalog has not been discovered yet; target it directly to discover it",
+        "This instance's catalog has not been discovered yet; name its provider (`provider`) to discover it",
     )
 }
 

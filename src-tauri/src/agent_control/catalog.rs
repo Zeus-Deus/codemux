@@ -166,7 +166,7 @@ mod defs {
     fn capabilities() -> Definition {
         outside("Discover provider-owned model, effort, permission and operation capabilities for a workspace. Registered/configured is not launch readiness: inspect discovery_error. Configured account, Hermes profile and custom ACP IDs are advertised as provider_instance_id values; use target to select one. Values are opaque; do not invent model IDs or permission defaults.", json!({
             "workspace_id": {"type": "string", "minLength": 1},
-            "provider": {"type": "string"},
+            "provider": {"type": "string", "description": "Only this provider; its catalog is discovered if it has not been yet. Without it, only catalogs already discovered are listed."},
         }), &["workspace_id"])
     }
 

@@ -1121,6 +1121,29 @@ async fn capabilities_discover_provider_owned_models_and_operations() {
     assert!(provider.calls.snapshot().is_empty(), "metadata must not launch a coding session");
 }
 
+/// Naming a provider targets it, as a launch does: a catalog the composer
+/// has not cached yet is discovered, so an outside agent can pick an exact
+/// model id before its first launch. Discovery starts no coding session, and
+/// listing every provider still reads caches only.
+#[tokio::test]
+async fn naming_a_provider_discovers_its_uncached_catalog() {
+    use crate::agent_provider::ProviderKind::Claude;
+    let (app, provider, _root, workspace) = fixture().await;
+    let state = app.state::<NativeControlState>();
+    state.fixture_uncached.lock().unwrap().insert(Claude);
+    let expected = state.fixture_capabilities.lock().unwrap().get(&Claude).cloned().unwrap();
+    let trusted = ControlCaller::trusted();
+
+    let all = execute(app.handle(), &trusted, "agent_capabilities", json!({"workspace_id":workspace})).await.unwrap();
+    let listed = all["providers"].as_array().unwrap().iter().find(|p| p["provider"] == "claude").unwrap();
+    assert_eq!(listed["discovery_error"]["code"], "catalog_not_discovered", "{listed}");
+
+    let named = execute(app.handle(), &trusted, "agent_capabilities", json!({"workspace_id":workspace,"provider":"claude"})).await.unwrap();
+    assert_eq!(named["providers"][0]["discovery_error"], serde_json::Value::Null, "{named}");
+    assert_eq!(named["providers"][0]["capabilities"], serde_json::to_value(expected).unwrap());
+    assert!(provider.calls.snapshot().is_empty(), "discovery must not launch a coding session");
+}
+
 /// Listing reads caches only. With every catalog cold it reports each
 /// built-in instance undiscovered and starts nothing: no OpenCode server, no
 /// CLI health check, no catalog harvest. A cached catalog is listed as is.

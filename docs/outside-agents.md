@@ -302,10 +302,14 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
 2. **See what can run there.**
 
    ```text
-   agent_capabilities {"workspace_id": "workspace-7"}
+   agent_capabilities {"workspace_id": "workspace-7", "provider": "claude"}
    ```
 
-   It returns each provider's `provider_instance_id`, its models, efforts and permission modes, and `allowed_permission_modes`: the modes your access level may use. Use only values it returns. A provider with a `discovery_error` can't start yet.
+   It returns each provider's `provider_instance_id`, its models, efforts and permission modes, and `allowed_permission_modes`: the modes your access level may use. Use only values it returns.
+
+   - Name the `provider` you want. Codemux then reads its catalog if it hasn't yet, which runs the provider's CLI but starts no chat.
+   - Without `provider`, it lists every provider, but only the catalogs Codemux has already read. The others have the `discovery_error` `catalog_not_discovered`: ask for that provider alone.
+   - Any other `discovery_error`, such as `provider_not_ready`, means that provider can't start yet.
 
 3. **Start a thread, in a new worktree if you like.**
 
@@ -508,6 +512,7 @@ A paired phone or browser can remove a clean worktree, for example with **Device
   - Control tools return compact JSON with `structuredContent`, and errors as `isError` results with a code.
 - **`--access` narrows `codemux mcp`.** A supervised or read-only client is offered fewer tools.
 - **`thread_launch` needs `permission_mode`.** Without it, it fails with `invalid_arguments` (missing field `permission_mode`).
+- **`agent_capabilities` with `provider` reads that provider's catalog** if Codemux hasn't yet. It used to list only catalogs Codemux had already read, so a provider no chat had used yet offered no models.
 - **`thread_wait` returns `state`, `final_text`, `pending` and `wait_cursor`.** It waits up to 50 seconds by default and 10 minutes at most.
 - **Outside assistants can answer worker questions** with `thread_answer`.
 - **New worktrees branch from the repository's default branch**, not always `main`.

@@ -1898,7 +1898,7 @@ fn outside_answer_resolves_a_codex_question_and_the_wait_returns_done() {
     let mut cleanup = Cleanup::default();
     let mut door = StdioDoor::named(&w.env, &format!("answer-{t}"), None);
     let workspace = w.repo_workspace.clone();
-    // Listing reads cached catalogs only; the launch discovers the fake's.
+    // A configured Codex is enough: the launch checks the model against the fake's catalog.
     eventually("Codex is configured", Duration::from_secs(60), || {
         door.call("agent_capabilities", json!({"workspace_id": workspace, "provider": "codex"}))
             .is_ok_and(|caps| caps["providers"][0]["configured"] == true)

@@ -310,6 +310,7 @@
         "additionalProperties": false,
         "properties": {
           "provider": {
+            "description": "Only this provider; its catalog is discovered if it has not been yet. Without it, only catalogs already discovered are listed.",
             "type": "string"
           },
           "workspace_id": {
@@ -764,6 +765,7 @@
         "additionalProperties": false,
         "properties": {
           "provider": {
+            "description": "Only this provider; its catalog is discovered if it has not been yet. Without it, only catalogs already discovered are listed.",
             "type": "string"
           },
           "workspace_id": {
@@ -1110,6 +1112,7 @@
         "additionalProperties": false,
         "properties": {
           "provider": {
+            "description": "Only this provider; its catalog is discovered if it has not been yet. Without it, only catalogs already discovered are listed.",
             "type": "string"
           },
           "workspace_id": {

@@ -179,6 +179,7 @@ pub(crate) async fn cached_capabilities<R: Runtime>(
 ) -> Result<Option<ProviderChatCapabilities>, ControlError> {
     #[cfg(test)]
     if let Some(state) = app.try_state::<NativeControlState>() {
+        if state.fixture_uncached.lock().unwrap().contains(&provider) { return Ok(None); }
         if let Some(caps) = state.fixture_capabilities.lock().unwrap().get(&provider).cloned() { return Ok(Some(caps)); }
     }
     agent_chat::cached_chat_provider_capabilities(app, provider, account_id).await.map_err(ControlError::from)
@@ -1153,11 +1154,15 @@ pub(super) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &
         };
         pending.extend(instances.into_iter().map(|instance| (kind, operations.clone(), instance)));
     }
-    // Cached composer catalogs only: listing never spawns an agent or opens
-    // a provider session, so instances resolve concurrently.
+    // Listing every provider reads cached composer catalogs only: it never
+    // spawns an agent or opens a provider session, so instances resolve
+    // concurrently. Naming one provider targets it, as a launch does, and
+    // discovers a catalog nothing has cached yet: an outside agent has no
+    // other way to learn an exact model id before its first launch.
+    let discover = args.provider.is_some();
     let resolved = futures_util::future::join_all(pending.iter().map(|(_, _, instance)| {
         let selection = super::selection::ProviderSelection { instance_id: instance.clone(), ..Default::default() };
-        super::selection::resolve(app, selection, &selected_workspace.cwd, false)
+        super::selection::resolve(app, selection, &selected_workspace.cwd, discover)
     }))
     .await;
     for ((kind, operations, instance), outcome) in pending.into_iter().zip(resolved) {
