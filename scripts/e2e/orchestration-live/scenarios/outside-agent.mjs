@@ -526,7 +526,14 @@ async function cli(ctx) {
     ctx.check("cli: thread send --wait exits 0 with the next reply",
       sent.code === 0 && (printed(sent)?.final_text ?? "").includes(second.expected), { code: sent.code, final_text: printed(sent)?.final_text });
 
-    const asking = await run(["thread", "start", "--workspace", workspaceId, "--provider", "claude", "--model", CLAUDE_MODEL,
+    // An outside launch takes only a model id that agent_capabilities lists
+    // (`unsupported_model` otherwise). Claude's catalog lists aliases such as
+    // `haiku`, so pick the cheap one from it, as the guide tells agents to.
+    const caps = printed(await run(["call", "agent_capabilities", JSON.stringify({ workspace_id: workspaceId, provider: "claude" })]));
+    const claudeModels = caps?.result?.providers?.[0]?.capabilities?.models?.map((model) => model.id) ?? [];
+    const claudeModel = claudeModels.find((id) => id === CLAUDE_MODEL) ?? claudeModels.find((id) => /haiku/i.test(id));
+    ctx.check("cli: agent_capabilities lists a cheap Claude model", !!claudeModel, { models: claudeModels });
+    const asking = await run(["thread", "start", "--workspace", workspaceId, "--provider", "claude", "--model", claudeModel,
       "--permission-mode", "default", "-m", "Create a file named x.txt containing hi in the current directory.", "--wait", "--json"]);
     const pending = printed(asking);
     const approval = pending?.pending?.approvals?.[0];
