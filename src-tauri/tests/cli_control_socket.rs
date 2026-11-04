@@ -432,30 +432,33 @@ fn the_needs_input_hint_answers_a_question_as_printed() {
 
 #[test]
 fn a_queued_send_waits_for_the_run_its_message_starts() {
-    // The server's shapes: the receipt names only the queue entry; a wait
-    // without a turn adopts the busy run t1, which settles once the entry has
-    // started t2 and left the queue. By then the receipt names t2, even if
-    // yet another run (t3) is current.
+    // The server's shapes: the receipt names only the queue entry, so the
+    // CLI waits on the operation. That reads running until the message's own
+    // run (t2) starts, then follows it; another run's answer never counts.
     let receipt = |accepted_as: &str, turn: Value| json!({"operation_id": "op", "tool": "thread_send", "state": "succeeded",
         "workspace_id": "ws", "thread_id": "th", "error": null,
         "result": {"workspace_id": "ws", "thread_id": "th", "accepted_as": accepted_as, "turn": turn}});
     let app = FakeApp::start(move |request| match (request["command"].as_str(), tool_name(request)) {
         (Some("status"), _) => ok_reply(json!({})),
         (_, Some("thread_send")) => tool_result(receipt("queued", json!({"queued_id": "q1"}))),
-        (_, Some("operation_status")) => tool_result(receipt("dispatched", json!({"turn_id": "t2", "queued_id": null, "steered": false}))),
         (_, Some("thread_status")) => tool_result(thread_status("running", json!({"queued_ids": ["q1"]}))),
-        (_, Some("thread_wait")) => tool_result(match request["params"]["arguments"]["turn_id"].as_str() {
-            None => waited("done", "c1", json!({"final_text": "ANSWER OF THE EARLIER RUN",
-                "status": {"turn_id": "t3", "queued_ids": [], "uncertain_queued_ids": []}})),
-            Some(turn) => waited("done", "c2", json!({"turn_id": turn, "final_text": format!("answer of {turn}"),
-                "status": {"turn_id": turn, "queued_ids": [], "uncertain_queued_ids": []}})),
-        }),
+        (_, Some("thread_wait")) => {
+            let arguments = &request["params"]["arguments"];
+            let operation = json!({"operation_id": "op", "state": "succeeded", "error": null});
+            tool_result(match (arguments["operation_id"].as_str(), arguments["since"].as_str()) {
+                (Some("op"), None) => waited("running", "c1", json!({"turn_id": null, "operation": operation})),
+                (Some("op"), Some("c1")) => waited("done", "c2", json!({"turn_id": "t2", "final_text": "answer of t2", "operation": operation})),
+                _ => waited("done", "c9", json!({"final_text": "ANSWER OF ANOTHER RUN"})),
+            })
+        }
         _ => json!({"ok": false, "protocol_version": 2, "data": null, "error": "unknown_tool: Unknown tool"}),
     });
     let sent = app.cli(&["thread", "send", "th", "--workspace", "ws", "-m", "follow-up", "--delivery", "queue", "--wait", "--json"]);
     assert_eq!(exit_code(&sent), 0, "{}", String::from_utf8_lossy(&sent.stderr));
     let report = stdout_json(&sent);
     assert_eq!((report["turn_id"].clone(), report["final_text"].clone()), (json!("t2"), json!("answer of t2")), "{report}");
+    let requests = app.requests();
+    assert!(!requests.iter().any(|request| tool_name(request) == Some("operation_status")), "the server resolves the operation");
 }
 
 // ── Against a real app ────────────────────────────────────────────────────

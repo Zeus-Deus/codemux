@@ -666,12 +666,12 @@ mod tests {
         }
     }
 
-    /// The workspace tools' schemas and typed arguments agree on what is
-    /// accepted: an unknown property is refused by both, and every required
-    /// property is one the typed arguments cannot do without.
+    /// These tools' schemas and typed arguments agree on what is accepted:
+    /// an unknown property is refused by both, and every required property
+    /// is one the typed arguments cannot do without.
     #[test]
     fn workspace_tool_schemas_match_typed_args() {
-        for name in ["workspace_list", "workspace_info", "workspace_create", "worktree_create", "workspace_close", "thread_answer"] {
+        for name in ["workspace_list", "workspace_info", "workspace_create", "worktree_create", "workspace_close", "thread_answer", "thread_wait"] {
             let definition = list(&CallerView::outside(FullAccess)).into_iter().find(|tool| tool.spec.name == name)
                 .unwrap_or_else(|| panic!("{name} is an outside tool")).definition;
             let (schema, parse) = (&definition.input_schema, typed_parser(name).unwrap());

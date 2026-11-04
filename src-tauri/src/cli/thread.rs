@@ -370,21 +370,18 @@ async fn mutate(door: &Door, tool: &str, arguments: Value, deadline: Option<Inst
 /// What `--wait` follows after a launch or send: the receipt's thread (else
 /// `thread`) in the receipt's workspace (a worktree launch names its new
 /// one), and the turn its message started or joined. A queued message has no
-/// turn yet, only its queue entry.
+/// turn yet: its operation names the run once it starts.
 fn followed(settled: Result<Value, CliError>, workspace: &str, thread: Option<&str>, request_id: &str) -> Result<Followed, Box<RunReport>> {
     let receipt = settled.map_err(|failure| Box::new(RunReport::ended(failure, Some(request_id))))?;
     let text = |value: &Value| value.as_str().filter(|text| !text.is_empty()).map(str::to_owned);
     let result = &receipt["result"];
-    let turn_id = text(&result["turn"]["turn_id"]);
-    let queued_id = if turn_id.is_none() && result["accepted_as"] == "queued" { text(&result["turn"]["queued_id"]) } else { None };
     let run = Followed {
         workspace_id: text(&receipt["workspace_id"]).or_else(|| text(&result["workspace_id"])).unwrap_or_else(|| workspace.to_owned()),
         thread_id: text(&receipt["thread_id"])
             .or_else(|| text(&result["thread_id"]))
             .or_else(|| thread.map(str::to_owned))
             .unwrap_or_default(),
-        turn_id,
-        queued_id,
+        turn_id: text(&result["turn"]["turn_id"]),
         operation_id: text(&receipt["operation_id"]),
         client_request_id: Some(request_id.to_owned()),
     };
@@ -443,7 +440,7 @@ async fn wait(door: &Door, wait: WaitArgs) -> Result<Exit, String> {
         Ok(workspace) => workspace,
         Err(failure) => return print_report(RunReport::ended(failure, None), json),
     };
-    let run = Followed { workspace_id: workspace, thread_id: wait.thread, turn_id: wait.turn, queued_id: None, operation_id: None, client_request_id: None };
+    let run = Followed { workspace_id: workspace, thread_id: wait.thread, turn_id: wait.turn, operation_id: None, client_request_id: None };
     let deadline = wait.timeout.map(|timeout| Instant::now() + timeout);
     print_report(follow_run(door, run, deadline, false).await, json)
 }
@@ -618,11 +615,9 @@ async fn stop(door: &Door, stop: StopArgs) -> Result<Exit, String> {
 pub(crate) struct Followed {
     pub(crate) workspace_id: String,
     pub(crate) thread_id: String,
-    /// Follow this turn; `None` follows the thread's current run.
+    /// Follow this turn. Without one, follow the run `operation_id`'s
+    /// message starts (a queued message's), else the thread's current run.
     pub(crate) turn_id: Option<String>,
-    /// Without a turn: the queue entry of a queued message, whose run is
-    /// followed once it starts.
-    pub(crate) queued_id: Option<String>,
     pub(crate) operation_id: Option<String>,
     pub(crate) client_request_id: Option<String>,
 }
@@ -754,36 +749,32 @@ fn wait_state(waited: &Value) -> Result<Waited, ErrorBody> {
     }
 }
 
-/// Whether a thread status object still lists queue entries; `entry`
-/// narrows it to one. Uncertain entries count: their delivery is unsettled.
-fn queued(status: &Value, entry: Option<&str>) -> bool {
-    ["queued_ids", "uncertain_queued_ids"].iter().any(|key| {
-        status[*key].as_array().is_some_and(|ids| entry.map_or(!ids.is_empty(), |entry| ids.iter().any(|id| id == entry)))
-    })
+/// Whether a thread status object still lists queue entries. Uncertain
+/// entries count: their delivery is unsettled.
+fn queued(status: &Value) -> bool {
+    ["queued_ids", "uncertain_queued_ids"].iter().any(|key| status[*key].as_array().is_some_and(|ids| !ids.is_empty()))
 }
 
 /// What a follow waits for.
 #[derive(Debug, Clone, PartialEq)]
 enum Target {
-    /// One run, named by a receipt, by `--turn` or by a queued message that
-    /// started it. The follow ends when this run does, whatever else is
-    /// queued behind it: those are other messages' runs.
+    /// One run, named by a receipt or by `--turn`. The follow ends when this
+    /// run does, whatever else is queued behind it: those are other
+    /// messages' runs.
     Run(String),
-    /// A queued message whose run has not started. A wait without a turn
-    /// follows the busy run ahead of it, and that run settles only after the
-    /// next entry has started and left the queue. So the entry, not the
-    /// ended run, tells when the message's own run begins
-    /// ([`queued_run`]).
-    Queued(String),
+    /// The run a queued message starts. `thread_wait` resolves the
+    /// operation to that run once it starts, and reports input that holds
+    /// the queue meanwhile.
+    Operation(String),
     /// The thread's current run, then whatever is queued behind it.
     Thread,
 }
 
 impl Target {
     fn of(run: &Followed) -> Self {
-        match (&run.turn_id, &run.queued_id) {
+        match (&run.turn_id, &run.operation_id) {
             (Some(turn), _) => Target::Run(turn.clone()),
-            (None, Some(entry)) => Target::Queued(entry.clone()),
+            (None, Some(operation)) => Target::Operation(operation.clone()),
             (None, None) => Target::Thread,
         }
     }
@@ -791,52 +782,25 @@ impl Target {
     fn turn(&self) -> Option<&str> {
         match self {
             Target::Run(turn) => Some(turn),
-            Target::Queued(_) | Target::Thread => None,
+            Target::Operation(_) | Target::Thread => None,
         }
     }
 
-    /// Whether `status` (a thread status object) shows a queued message's
-    /// entry has left the queue.
-    fn left_queue(&self, status: &Value) -> bool {
-        matches!(self, Target::Queued(entry) if !queued(status, Some(entry)))
-    }
-
-    /// Whether an ended run leaves this follow waiting: a message still in
-    /// the queue, or a thread with queued work. A delivery that needs the
-    /// person never drains on its own, so it ends the wait.
-    fn outlives(&self, waited: &Value) -> bool {
-        if waited["failure"] == "delivery_needs_attention" {
-            return false;
-        }
+    /// Selects this target in `thread_wait` arguments.
+    fn select(&self, arguments: &mut Value) {
         match self {
-            Target::Run(_) => false,
-            // A message that left the queue was already moved onto its run.
-            Target::Queued(_) => true,
-            Target::Thread => queued(&waited["status"], None),
+            Target::Run(turn) => arguments["turn_id"] = json!(turn),
+            Target::Operation(operation) => arguments["operation_id"] = json!(operation),
+            Target::Thread => {}
         }
     }
-}
 
-/// What follows a queued message once its entry has left the queue. The
-/// dispatch that drains an entry first settles its receipt again, naming
-/// the run it started (or the turn it was steered into), and a cancelled
-/// entry fails it. Without a receipt naming a run, the thread's current run
-/// in `status` is the message's: the dispatch made it current. With no run
-/// at all, what the thread does is all there is to report.
-async fn queued_run(door: &Door, operation: Option<&str>, status: &Value) -> Result<Target, CliError> {
-    if let Some(operation) = operation {
-        let receipt = door.call_in_loop(verbs::OPERATION_STATUS, json!({"operation_id": operation})).await?;
-        if !output::succeeded(&receipt) {
-            return Err(CliError::from(output::receipt_error(&receipt)).with_last(receipt));
-        }
-        if let Some(turn) = receipt["result"]["turn"]["turn_id"].as_str().filter(|turn| !turn.is_empty()) {
-            return Ok(Target::Run(turn.to_owned()));
-        }
+    /// Whether an ended run leaves this follow waiting: a thread with queued
+    /// work. A delivery that needs the person never drains on its own, so it
+    /// ends the wait.
+    fn outlives(&self, waited: &Value) -> bool {
+        *self == Target::Thread && waited["failure"] != "delivery_needs_attention" && queued(&waited["status"])
     }
-    Ok(match status["turn_id"].as_str().filter(|turn| !turn.is_empty()) {
-        Some(current) => Target::Run(current.to_owned()),
-        None => Target::Thread,
-    })
 }
 
 /// One call of the follow loop. Retried, except as the verb's first call, so
@@ -856,11 +820,11 @@ async fn follow_call(door: &Door, retry: bool, tool: &str, arguments: Value) -> 
 /// is the verb's first, so a stopped app fails fast.
 pub(crate) async fn follow_run(door: &Door, run: Followed, deadline: Option<Instant>, retry_first: bool) -> RunReport {
     let mut report = RunReport::of(&run);
-    let mut target = Target::of(&run);
+    let target = Target::of(&run);
     let thread = json!({"workspace_id": run.workspace_id, "thread_id": run.thread_id});
     let mut since: Option<String> = None;
     let mut retry = retry_first;
-    // Each target starts with a thread_status read, which does not park.
+    // The follow starts with a thread_status read, which does not park.
     let mut checked = false;
     loop {
         let slice = match deadline {
@@ -884,12 +848,6 @@ pub(crate) async fn follow_run(door: &Door, run: Followed, deadline: Option<Inst
             };
             retry = true;
             checked = true;
-            if target.left_queue(&status) {
-                target = match queued_run(door, run.operation_id.as_deref(), &status).await {
-                    Ok(target) => target,
-                    Err(failure) => return RunReport::of(&run).stopped(failure),
-                };
-            }
             // A wait does not return for input already pending when it
             // starts, so a run that is already blocked would cost a slice.
             if status["state"] == "needs_input" && target.turn().is_none_or(|turn| status["turn_id"] == turn) {
@@ -899,9 +857,7 @@ pub(crate) async fn follow_run(door: &Door, run: Followed, deadline: Option<Inst
         }
         let mut arguments = thread.clone();
         arguments["timeout_ms"] = json!(slice.as_millis() as u64);
-        if let Some(turn) = target.turn() {
-            arguments["turn_id"] = json!(turn);
-        }
+        target.select(&mut arguments);
         if let Some(since) = &since {
             arguments["since"] = json!(since);
         }
@@ -909,26 +865,16 @@ pub(crate) async fn follow_run(door: &Door, run: Followed, deadline: Option<Inst
             Ok(waited) => waited,
             Err(failure) => return report.stopped(failure),
         };
+        // A message that never ran fails with its receipt's own error.
+        if matches!(waited["operation"]["state"].as_str(), Some("failed" | "needs_attention")) {
+            return RunReport::of(&run).stopped(CliError::from(output::receipt_error(&waited["operation"])));
+        }
         report.absorb(&waited);
         let state = match wait_state(&waited) {
             Ok(state) => state,
             Err(error) => return report.stopped(error.into()),
         };
         since = waited["wait_cursor"].as_str().map(str::to_owned);
-        if target.left_queue(&waited["status"]) {
-            // The report is about the message's own run, never the one ahead.
-            target = match queued_run(door, run.operation_id.as_deref(), &waited["status"]).await {
-                Ok(target) => target,
-                Err(failure) => return RunReport::of(&run).stopped(failure),
-            };
-            if target.turn().is_some_and(|turn| waited["turn_id"] != turn) {
-                // That view was of another run. Follow the message's own
-                // afresh: it may already have ended or be waiting on input,
-                // which a `since` from that view can hide.
-                (report, since, checked) = (RunReport::of(&run), None, false);
-                continue;
-            }
-        }
         match state {
             Waited::Running => {}
             Waited::NeedsInput => return report.finish(RunState::NeedsInput),
@@ -1066,13 +1012,12 @@ mod tests {
         follow_run(door, following(None, None), deadline, false).await
     }
 
-    fn following(turn: Option<&str>, queued: Option<&str>) -> Followed {
+    fn following(turn: Option<&str>, operation: Option<&str>) -> Followed {
         Followed {
             workspace_id: "ws".into(),
             thread_id: "th".into(),
             turn_id: turn.map(str::to_owned),
-            queued_id: queued.map(str::to_owned),
-            operation_id: None,
+            operation_id: operation.map(str::to_owned),
             client_request_id: None,
         }
     }
@@ -1253,94 +1198,55 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_queued_send_reports_the_run_its_message_started() {
-        // What the server sends: the queued receipt names only the queue
-        // entry, and the wait adopts the busy run ahead of it, which settles
-        // when the entry starts t2 and has left the queue in the same update.
-        // By then the receipt names t2.
+    async fn a_queued_send_follows_its_operation_to_its_own_run() {
+        // The queued receipt names only the queue entry, so the follow waits
+        // on the operation: the server reads `running` until the message's
+        // run starts, then follows that run.
         let receipt = |result: Value| json!({"operation_id": "op", "tool": "thread_send", "state": "succeeded", "workspace_id": "ws",
             "thread_id": "th", "result": result, "error": null});
         let queued = receipt(json!({"workspace_id": "ws", "thread_id": "th", "accepted_as": "queued", "turn": {"queued_id": "q1"}}));
-        let started = |turn: &str| receipt(json!({"workspace_id": "ws", "thread_id": "th", "accepted_as": "dispatched",
-            "turn": {"turn_id": turn, "queued_id": null, "steered": false}}));
         let run = followed(Ok(queued), "ws", Some("th"), "k").unwrap();
-        assert_eq!((run.turn_id.as_deref(), run.queued_id.as_deref(), run.operation_id.as_deref()), (None, Some("q1"), Some("op")));
-        let ahead = |current: &str| json!({"turn_id": "t1", "final_text": "ANSWER OF THE EARLIER RUN",
-            "status": {"turn_id": current, "phase": "running", "queued_ids": [], "uncertain_queued_ids": []}});
+        assert_eq!((run.turn_id.as_deref(), run.operation_id.as_deref()), (None, Some("op")));
+        let operation = |state: &str, error: Value| json!({"operation_id": "op", "state": state, "error": error});
+        let not_started = json!({"turn_id": null, "operation": operation("succeeded", Value::Null)});
         let door = Door::fake(vec![
             ("thread_status", Ok(status_reply("running", json!({"queued_ids": ["q1"]})))),
-            ("thread_wait", Ok(waited("done", ahead("t2")))),
-            ("operation_status", Ok(started("t2"))),
-            ("thread_status", Ok(status_reply("running", json!({"turn_id": "t2"})))),
-            ("thread_wait", Ok(waited("done", json!({"turn_id": "t2", "final_text": "queued run", "status": {"turn_id": "t2", "queued_ids": [], "uncertain_queued_ids": []}})))),
+            ("thread_wait", Ok(waited("running", not_started.clone()))),
+            ("thread_wait", Ok(waited("running", json!({"turn_id": "t2", "operation": operation("succeeded", Value::Null)})))),
+            ("thread_wait", Ok(waited("done", json!({"turn_id": "t2", "final_text": "queued run", "operation": operation("succeeded", Value::Null)})))),
         ]);
         let report = follow_run(&door, run.clone(), None, true).await;
         assert_eq!((report.state, report.turn_id.as_deref(), report.final_text.as_deref()), (RunState::Done, Some("t2"), Some("queued run")));
         let calls = door.script().calls();
-        assert!(calls[1].1.get("turn_id").is_none(), "{}", calls[1].1);
-        assert_eq!(calls[2].1, json!({"operation_id": "op"}));
-        // The message's own run is followed afresh: no `since` from the
-        // earlier run's view, which could hide that t2 already ended.
-        assert_eq!(calls[4].1, json!({"workspace_id": "ws", "thread_id": "th", "turn_id": "t2", "timeout_ms": 60_000}));
-
-        // The receipt names the run even when another one has started since.
-        let door = Door::fake(vec![
-            ("thread_status", Ok(status_reply("running", json!({"queued_ids": ["q1"]})))),
-            ("thread_wait", Ok(waited("done", ahead("t3")))),
-            ("operation_status", Ok(started("t2"))),
-            busy(),
-            ("thread_wait", Ok(waited("done", json!({"turn_id": "t2", "final_text": "queued run"})))),
-        ]);
-        let report = follow_run(&door, run.clone(), None, true).await;
-        assert_eq!((report.turn_id.as_deref(), report.final_text.as_deref()), (Some("t2"), Some("queued run")));
-        assert_eq!(door.script().calls()[4].1["turn_id"], "t2");
-
-        // A cancelled entry never ran: the follow fails with the receipt's
-        // reason and none of the earlier run's answer.
-        let mut cancelled = receipt(Value::Null);
-        cancelled["state"] = json!("failed");
-        cancelled["error"] = json!({"code": "cancelled", "message": "Queued message cancelled"});
-        let door = Door::fake(vec![
-            ("thread_status", Ok(status_reply("running", json!({"queued_ids": ["q1"]})))),
-            ("thread_wait", Ok(waited("done", ahead("t1")))),
-            ("operation_status", Ok(cancelled)),
-        ]);
-        let report = follow_run(&door, run, None, true).await;
-        assert_eq!((report.state, report.error.map(|error| error.code)), (RunState::Failed, Some("cancelled".to_owned())));
-        assert_eq!((report.turn_id, report.final_text), (None, None));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_message_queued_behind_others_waits_for_its_own_run() {
-        let view = |turn: &str, queued: Value| json!({"turn_id": turn, "queued_ids": queued, "uncertain_queued_ids": []});
-        let door = Door::fake(vec![
-            ("thread_status", Ok(status_reply("running", json!({"queued_ids": ["q0", "q1"]})))),
-            // t1 ends when q0 starts t2; q1 is still queued.
-            ("thread_wait", Ok(waited("done", json!({"final_text": "t1 text", "status": view("t2", json!(["q1"]))})))),
-            ("thread_wait", Ok(waited("running", json!({"turn_id": "t2", "status": view("t2", json!(["q1"]))})))),
-            // t2 ends when q1 starts t3: that run is the message's.
-            ("thread_wait", Ok(waited("done", json!({"turn_id": "t2", "final_text": "t2 text", "status": view("t3", json!([]))})))),
-            ("thread_status", Ok(status_reply("running", json!({"turn_id": "t3"})))),
-            // Someone else's message queued behind it does not extend the wait.
-            ("thread_wait", Ok(waited("done", json!({"turn_id": "t3", "final_text": "mine", "status": view("t3", json!(["q2"]))})))),
-        ]);
-        let report = follow_run(&door, following(None, Some("q1")), None, true).await;
-        assert_eq!((report.state, report.turn_id.as_deref(), report.final_text.as_deref()), (RunState::Done, Some("t3"), Some("mine")));
-        let calls = door.script().calls();
-        assert!(calls[2].1.get("turn_id").is_none() && calls[2].1["since"] == "cur-done", "{}", calls[2].1);
-        assert_eq!(calls[5].1["turn_id"], "t3");
+        assert_eq!(calls[1].1, json!({"workspace_id": "ws", "thread_id": "th", "operation_id": "op", "timeout_ms": 60_000}));
+        assert_eq!((calls[2].1["operation_id"].as_str(), calls[2].1["since"].as_str()), (Some("op"), Some("cur-running")));
+        assert!(calls.iter().all(|(_, arguments)| arguments.get("turn_id").is_none()), "the server picks the run");
         assert!(door.script().finished());
 
-        // An entry steered into the running turn leaves the queue while that
-        // turn stays current: the message's answer is that turn's.
+        // A message that never runs fails with its receipt's own error and
+        // none of another run's answer: cancelled from the queue, or held by
+        // a stop.
+        for (state, code) in [("failed", "cancelled"), ("needs_attention", "delivery_held")] {
+            let ended = json!({"turn_id": null, "failure": "operation_failed", "final_text": null,
+                "operation": operation(state, json!({"code": code, "message": "It never ran"}))});
+            let door = Door::fake(vec![
+                ("thread_status", Ok(status_reply("running", json!({"queued_ids": ["q1"]})))),
+                ("thread_wait", Ok(waited("running", not_started.clone()))),
+                ("thread_wait", Ok(waited("failed", ended))),
+            ]);
+            let report = follow_run(&door, run.clone(), None, true).await;
+            assert_eq!((report.state, report.error.map(|error| error.code)), (RunState::Failed, Some(code.to_owned())), "{state}");
+            assert_eq!((report.turn_id, report.final_text, report.failure), (None, None, None), "{state}");
+        }
+
+        // Input that holds the queue is reported, as for any follow.
+        let approval = json!({"approvals": [{"request_id": "r1", "turn_id": "t1", "request_kind": "command"}], "questions": [], "secrets": []});
         let door = Door::fake(vec![
             ("thread_status", Ok(status_reply("running", json!({"queued_ids": ["q1"]})))),
-            ("thread_wait", Ok(waited("running", json!({"status": view("t1", json!([]))})))),
-            ("thread_wait", Ok(waited("done", json!({"final_text": "steered answer"})))),
+            ("thread_wait", Ok(waited("needs_input", json!({"turn_id": null, "pending": approval, "operation": operation("succeeded", Value::Null)})))),
         ]);
-        let report = follow_run(&door, following(None, Some("q1")), None, true).await;
-        assert_eq!((report.state, report.final_text.as_deref()), (RunState::Done, Some("steered answer")));
-        assert_eq!(door.script().calls()[2].1["turn_id"], "t1");
+        let report = follow_run(&door, run, None, true).await;
+        assert_eq!((report.state, report.turn_id, report.pending), (RunState::NeedsInput, None, Some(approval)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1356,23 +1262,23 @@ mod tests {
         let calls = door.script().calls();
         assert!(calls[2].1.get("turn_id").is_none() && calls[2].1["since"] == "cur-done", "{}", calls[2].1);
 
-        // A named run ends the follow when it ends; the queue holds other messages.
-        let door = Door::fake(vec![
-            busy(),
-            ("thread_wait", Ok(waited("done", json!({"final_text": "t1 text", "status": {"queued_ids": ["q5"], "uncertain_queued_ids": []}})))),
-        ]);
-        let report = follow_run(&door, following(Some("t1"), None), None, true).await;
-        assert_eq!((report.state, report.final_text.as_deref()), (RunState::Done, Some("t1 text")));
-
-        // A delivery that needs the person ends the wait instead, also for
-        // the message whose delivery it is.
-        let stuck = json!({"failure": "delivery_needs_attention", "status": {"queued_ids": [], "uncertain_queued_ids": ["q9"]}});
-        for queued in [None, Some("q9")] {
-            let held = status_reply("running", json!({"phase": "needs_attention", "uncertain_queued_ids": ["q9"]}));
-            let door = Door::fake(vec![("thread_status", Ok(held)), ("thread_wait", Ok(waited("failed", stuck.clone())))]);
-            let report = follow_run(&door, following(None, queued), None, false).await;
-            assert_eq!((report.state, report.failure.as_deref()), (RunState::Failed, Some("delivery_needs_attention")), "{queued:?}");
+        // A named run, or an operation's, ends the follow when it ends; the
+        // queue holds other messages.
+        for run in [following(Some("t1"), None), following(None, Some("op"))] {
+            let door = Door::fake(vec![
+                busy(),
+                ("thread_wait", Ok(waited("done", json!({"final_text": "t1 text", "status": {"queued_ids": ["q5"], "uncertain_queued_ids": []}})))),
+            ]);
+            let report = follow_run(&door, run, None, true).await;
+            assert_eq!((report.state, report.final_text.as_deref()), (RunState::Done, Some("t1 text")));
         }
+
+        // A delivery that needs the person ends the wait instead.
+        let stuck = json!({"failure": "delivery_needs_attention", "status": {"queued_ids": [], "uncertain_queued_ids": ["q9"]}});
+        let held = status_reply("running", json!({"phase": "needs_attention", "uncertain_queued_ids": ["q9"]}));
+        let door = Door::fake(vec![("thread_status", Ok(held)), ("thread_wait", Ok(waited("failed", stuck)))]);
+        let report = follow_run(&door, following(None, None), None, false).await;
+        assert_eq!((report.state, report.failure.as_deref()), (RunState::Failed, Some("delivery_needs_attention")));
     }
 
     #[tokio::test(start_paused = true)]

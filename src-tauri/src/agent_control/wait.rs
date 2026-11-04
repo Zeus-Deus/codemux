@@ -6,7 +6,8 @@
 //! before they read, so a change between the read and the wait is never lost,
 //! and a fallback tick bounds the cost of a transition nobody signalled.
 use super::outcome::{run_state, RunFacts, RunState, TurnEnd};
-use super::{service, ControlCaller, ControlError, ErrorCode};
+use super::{service, ControlCaller, ControlError, ErrorCode, NativeControlState};
+use crate::database::agent_control::OperationReceipt;
 use crate::database::DatabaseStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -280,12 +281,14 @@ pub(crate) struct WaitView {
     paused_until_ms: Option<i64>,
     final_message: Option<FinalMessage>,
     cursor: String,
+    /// `{operation_id, state, error}` of the receipt a wait on an operation follows.
+    operation: Option<Value>,
 }
 
 impl WaitView {
     fn into_result(self, timed_out: bool) -> Value {
         let final_message = self.final_message.as_ref();
-        json!({
+        let mut result = json!({
             "timed_out": timed_out,
             "settled": self.settled,
             "status": self.status,
@@ -299,7 +302,11 @@ impl WaitView {
             "pending": self.pending,
             "paused_until_ms": self.paused_until_ms,
             "wait_cursor": self.cursor,
-        })
+        });
+        if let Some(operation) = self.operation {
+            result["operation"] = operation;
+        }
+        result
     }
 
     /// `thread_status` is the legacy object plus the current run's state.
@@ -403,7 +410,94 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
     let cursor = cursor(state, current, settled, &pending.ids());
     let end_known = end.is_some();
     let turn_id = turn_id.map(str::to_owned);
-    Ok(WaitView { status, settled, ended, end_known, selected_turn, turn_id, state, failure, pending, paused_until_ms, final_message, cursor })
+    Ok(WaitView { status, settled, ended, end_known, selected_turn, turn_id, state, failure, pending, paused_until_ms, final_message, cursor, operation: None })
+}
+
+/// Where the message of a launch or send stands, by its receipt.
+enum Placement {
+    /// Codemux is still delivering it, or it waits in the thread's queue.
+    NotStarted,
+    /// It started this run, or was steered into it.
+    Run(String),
+    /// It will never run: its receipt failed, or needs the person.
+    Ended(&'static str),
+}
+
+impl Placement {
+    fn of(receipt: &OperationReceipt) -> Result<Self, ControlError> {
+        let result = receipt.result.as_ref().unwrap_or(&Value::Null);
+        let text = |value: &Value| value.as_str().filter(|text| !text.is_empty()).map(str::to_owned);
+        match receipt.state.as_str() {
+            "failed" => Ok(Self::Ended("operation_failed")),
+            "needs_attention" => Ok(Self::Ended("delivery_needs_attention")),
+            "succeeded" => match text(&result["turn"]["turn_id"]) {
+                Some(turn) => Ok(Self::Run(turn)),
+                None if result["accepted_as"] == "queued" || text(&result["turn"]["queued_id"]).is_some() => Ok(Self::NotStarted),
+                None => Err(ControlError::new(ErrorCode::InvalidTarget, "This operation started no run (a launch without a message); wait on the thread instead")),
+            },
+            // Accepted or running: Codemux is still carrying it out.
+            _ => Ok(Self::NotStarted),
+        }
+    }
+}
+
+/// Read the run `operation` started, as a waiter on it sees it. The operation
+/// is the caller's own `thread_launch` or `thread_send` for `target`; the
+/// receipt names the run once the message starts it.
+async fn observe_operation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, target: &service::Target, operation: &str) -> Result<WaitView, ControlError> {
+    let epoch = app.state::<NativeControlState>().epoch.clone();
+    let receipt = app.state::<DatabaseStore>().control_operation(&caller.principal, operation, &epoch)?
+        .ok_or_else(|| ControlError::new(ErrorCode::OperationNotFound, "No operation belongs to this client and ID"))?;
+    if !matches!(receipt.tool.as_str(), "thread_launch" | "thread_send") {
+        return Err(ControlError::new(ErrorCode::InvalidTarget, "operation_id must name a thread_launch or thread_send"));
+    }
+    if receipt.workspace_id.as_deref() != Some(target.workspace_id.as_str()) || receipt.thread_id.as_deref() != Some(target.thread_id.as_str()) {
+        return Err(ControlError::new(ErrorCode::InvalidTarget, "This operation is for another workspace or thread"));
+    }
+    let mut view = match Placement::of(&receipt)? {
+        Placement::Run(turn) => observe(app, target, Some(&turn)).await?,
+        Placement::NotStarted => before_run(app, target, None).await?,
+        Placement::Ended(failure) => before_run(app, target, Some(failure)).await?,
+    };
+    view.operation = Some(json!({"operation_id": receipt.operation_id, "state": receipt.state, "error": receipt.error}));
+    Ok(view)
+}
+
+/// A message whose run has not started: Codemux is still delivering it, it
+/// waits in the queue, or (`failure`) it never will. Input the thread waits
+/// on holds the queue, so it reads as this message's too.
+async fn before_run<R: Runtime>(app: &AppHandle<R>, target: &service::Target, failure: Option<&'static str>) -> Result<WaitView, ControlError> {
+    let thread = match observe(app, target, None).await {
+        Ok(view) => Some(view),
+        // A launch names its thread, and a worktree launch its workspace, before it creates them.
+        Err(error) if matches!(error.code, ErrorCode::ThreadNotFound | ErrorCode::WorkspaceNotFound) => None,
+        Err(error) => return Err(error),
+    };
+    let blocked = thread.as_ref().is_some_and(|view| view.state == RunState::NeedsInput);
+    let state = match failure {
+        Some(_) => RunState::Failed,
+        None if blocked => RunState::NeedsInput,
+        None => RunState::Running,
+    };
+    let (status, pending, paused_until_ms) = match thread {
+        Some(view) => (view.status, view.pending, view.paused_until_ms),
+        None => (Value::Null, Pending::default(), None),
+    };
+    // No run of its own yet, so the cursor moves when that run starts.
+    let cursor = cursor(state, None, false, &pending.ids());
+    Ok(WaitView {
+        status, settled: false, ended: failure.is_some(), end_known: false, selected_turn: None, turn_id: None,
+        state, failure, pending, paused_until_ms, final_message: None, cursor, operation: None,
+    })
+}
+
+/// One read of what a wait follows: an operation's run, else `selected`, else
+/// the thread's current run.
+async fn read<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, target: &service::Target, operation: Option<&str>, selected: Option<&str>) -> Result<WaitView, ControlError> {
+    match operation {
+        Some(operation) => observe_operation(app, caller, target, operation).await,
+        None => observe(app, target, selected).await,
+    }
 }
 
 // ── Tools ─────────────────────────────────────────────────────────────────
@@ -414,6 +508,9 @@ pub(super) struct Args {
     workspace_id: String,
     thread_id: String,
     turn_id: Option<String>,
+    /// A `thread_launch` or `thread_send` receipt of this caller: follow the
+    /// run its message starts.
+    operation_id: Option<String>,
     timeout_ms: Option<u64>,
     since: Option<String>,
 }
@@ -423,7 +520,8 @@ pub(super) struct Args {
 /// a question appears, the state flips) or at the deadline; something pending
 /// at the start does not return early, so `while !settled` loops never spin.
 /// With `since` (a previous `wait_cursor`), returns once the view differs
-/// from it.
+/// from it. `operation_id` selects the run a launch's or send's message
+/// starts, once it starts; until then the wait reads `running`.
 pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     let args: Args = service::parse(args)?;
     let maximum = max_wait_ms(caller);
@@ -432,14 +530,19 @@ pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &Control
         return Err(ControlError::new(ErrorCode::InvalidArguments, format!("timeout_ms must be between 1 and {maximum}")));
     }
     if let Some(turn) = &args.turn_id { service::identifier(turn, "turn_id", 256)?; }
+    if let Some(operation) = &args.operation_id { service::identifier(operation, "operation_id", 256)?; }
+    if args.turn_id.is_some() && args.operation_id.is_some() {
+        return Err(ControlError::new(ErrorCode::InvalidArguments, "Pass turn_id or operation_id, not both"));
+    }
     if let Some(since) = &args.since { service::identifier(since, "since", 64)?; }
     let deadline = Instant::now() + Duration::from_millis(timeout);
     let target = service::Target { workspace_id: args.workspace_id, thread_id: args.thread_id };
+    let operation = args.operation_id.as_deref();
     let mut changes = subscribe(&target.thread_id);
     service::authorize(app, caller)?;
-    let first = observe(app, &target, args.turn_id.as_deref()).await?;
+    let first = read(app, caller, &target, operation, args.turn_id.as_deref()).await?;
     // Legacy: a thread already settled at call start returns at once.
-    if args.turn_id.is_none() && args.since.is_none() && first.settled {
+    if args.turn_id.is_none() && operation.is_none() && args.since.is_none() && first.settled {
         return Ok(first.into_result(false));
     }
     // A chat's own run cannot end while it waits on it, so this would only
@@ -453,7 +556,8 @@ pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &Control
     // still the finished one, and adopting that would return its old answer
     // as soon as the new run starts. Follow the thread instead; the new run
     // appearing changes the view, and the next wait adopts it.
-    let adopt = !first.settled && !first.end_known;
+    // An operation's receipt selects its run on every read.
+    let adopt = operation.is_none() && !first.settled && !first.end_known;
     let selected = args.turn_id.clone().or_else(|| adopt.then(|| first.turn_id.clone()).flatten());
     let baseline = args.since.clone().unwrap_or_else(|| first.cursor.clone());
     let mut view = first;
@@ -478,7 +582,7 @@ pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &Control
         }
         // A revoked grant reads grant_revoked; a disabled connector, connector_disabled.
         service::authorize(app, caller)?;
-        view = observe(app, &target, selected.as_deref()).await?;
+        view = read(app, caller, &target, operation, selected.as_deref()).await?;
         evaluated = Instant::now();
     }
 }

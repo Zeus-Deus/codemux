@@ -302,6 +302,8 @@ pub(crate) async fn launch_placed<R: Runtime>(app: &AppHandle<R>, caller: &Contr
         if let Err(error) = db.update_control_operation(&caller.principal, &operation, &epoch, state, None, None, result.as_ref(), error.as_ref()) {
             eprintln!("[codemux::agent_control] could not save operation outcome: {error}");
         }
+        // A wait on this operation reads its run from the receipt.
+        super::wait::signal(Some(&thread));
     });
     Ok(receipt)
 }
