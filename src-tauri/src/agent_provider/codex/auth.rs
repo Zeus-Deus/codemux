@@ -211,8 +211,9 @@ pub(crate) async fn probe_authenticated_in_home(
     let result = async {
         let account = result?;
         let name = if account.account.is_none() {
-            // A rejected config must not be mistaken for missing login.
-            let response = tokio::time::timeout(
+            // A rejected config must not be mistaken for missing login. A
+            // Codex build without `config/read` simply names nothing.
+            let response = match tokio::time::timeout(
                 Duration::from_secs(1),
                 child.request("config/read", json!({"includeLayers": false})),
             )
@@ -220,9 +221,17 @@ pub(crate) async fn probe_authenticated_in_home(
             .map_err(|_| ProviderError::Timeout {
                 operation: "codex app-server config/read".into(),
                 elapsed_ms: 1000,
-            })?
-            .map_err(rpc_error)?;
-            custom_provider_name(&response["config"])
+            })? {
+                Ok(response) => Some(response),
+                Err(crate::json_rpc_child::RpcChildError::RpcError(error))
+                    if error.code == METHOD_NOT_FOUND =>
+                {
+                    None
+                }
+                Err(error) => return Err(rpc_error(error)),
+            };
+            response
+                .and_then(|response| custom_provider_name(&response["config"]))
                 .or_else(|| custom_provider_name(&serde_json::to_value(config.as_ref()?).ok()?))
         } else {
             None
@@ -233,6 +242,9 @@ pub(crate) async fn probe_authenticated_in_home(
     let _ = child.shutdown().await;
     result
 }
+
+/// JSON-RPC "method not found".
+const METHOD_NOT_FOUND: i64 = -32601;
 
 fn rpc_error(error: crate::json_rpc_child::RpcChildError) -> ProviderError {
     ProviderError::RpcError {
