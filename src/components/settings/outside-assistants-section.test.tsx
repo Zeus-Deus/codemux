@@ -175,8 +175,11 @@ it.each([
   expect(screen.queryByText("Copied")).not.toBeInTheDocument();
 });
 
-it("falls back to codemux on PATH when the backend names no executable", async () => {
-  api.status.mockResolvedValue(snapshot({ localExecutable: "" }));
+it.each([
+  ["omits it", () => { const { localExecutable: _omitted, ...status } = baseline; return status; }],
+  ["sends an empty one", () => snapshot({ localExecutable: "" })],
+])("falls back to codemux on PATH when the backend %s", async (_case, status) => {
+  api.status.mockResolvedValue(status());
   render(<OutsideAssistantsSection />);
   expect(await screen.findByText("codex mcp add codemux -- codemux mcp --client codex")).toBeInTheDocument();
 });

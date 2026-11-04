@@ -49,8 +49,9 @@ export interface AgentConnectorStatus {
   localUrl: string | null;
   /** The address assistants use: the public origin's, else `localUrl`. */
   mcpUrl: string | null;
-  /** The durable `codemux` executable (raw, unquoted) for local setup. */
-  localExecutable: string;
+  /** The durable `codemux` executable (raw, unquoted) for local setup. A
+   *  backend that does not report it yet omits it; the UI then uses `codemux`. */
+  localExecutable?: string;
   /** `<quoted executable> mcp`, kept for JSON consumers. */
   localCommand: string;
   /** Only in `agent_connector_set_config` replies: grants an address change revoked. */
