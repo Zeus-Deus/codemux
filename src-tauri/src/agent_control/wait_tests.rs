@@ -597,6 +597,11 @@ async fn queued_send(app: &App, provider: &mock_agent_provider::MockAgentProvide
     sent
 }
 
+/// The queue entry a settled launch or send receipt names.
+fn queued_id(receipt: &Value) -> String {
+    receipt["result"]["turn"]["queued_id"].as_str().expect("the receipt names a queue entry").to_string()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn operation_wait_follows_a_queued_message_to_its_own_run() {
     let (app, provider, _root, workspace) = fixture().await;
@@ -604,7 +609,7 @@ async fn operation_wait_follows_a_queued_message_to_its_own_run() {
     person_started(&app, &thread, "t1");
     running(&app, &thread, "t1");
     let sent = queued_send(&app, &provider, &workspace, &thread, "operation-wait-queued").await;
-    let operation = sent["operation_id"].as_str().unwrap().to_string();
+    let (operation, entry) = (sent["operation_id"].as_str().unwrap().to_string(), queued_id(&sent));
     let trusted = ControlCaller::trusted();
     let args = |extra: Value| {
         let mut args = target(&workspace, &thread, json!({"operation_id": operation}));
@@ -629,7 +634,7 @@ async fn operation_wait_follows_a_queued_message_to_its_own_run() {
     db.finish_message_delivery(&operation, "accepted", Some(&json!({"turn_id": "t2", "queued_id": null, "steered": false})), None).unwrap();
     person_started(&app, &thread, "t2");
     app.state::<NativeControlState>().observe_event(&Event::QueuedTurnDispatched {
-        thread_id: ThreadId(thread.clone()), queued_id: "deferred-native-queue".into(), turn_id: TurnId("t2".into()),
+        thread_id: ThreadId(thread.clone()), queued_id: entry, turn_id: TurnId("t2".into()),
         text: "Then do this".into(), steered: false,
     });
     let started = waiter.await.unwrap().unwrap();
@@ -656,7 +661,7 @@ async fn operation_wait_reports_a_cancelled_message_with_its_receipt_error() {
     person_started(&app, &thread, "t1");
     running(&app, &thread, "t1");
     let sent = queued_send(&app, &provider, &workspace, &thread, "operation-cancel-queued").await;
-    let operation = sent["operation_id"].as_str().unwrap().to_string();
+    let (operation, queued) = (sent["operation_id"].as_str().unwrap().to_string(), queued_id(&sent));
     let trusted = ControlCaller::trusted();
     let args = target(&workspace, &thread, json!({"operation_id": operation, "timeout_ms": 5000}));
     let waiter = spawn_wait(&app, &trusted, args.clone());
@@ -664,7 +669,7 @@ async fn operation_wait_reports_a_cancelled_message_with_its_receipt_error() {
     // The person removes the entry from the queue.
     app.state::<DatabaseStore>().finish_message_delivery(&operation, "cancelled", None, Some("Queued message cancelled")).unwrap();
     app.state::<NativeControlState>().observe_event(&Event::QueuedTurnCancelled {
-        thread_id: ThreadId(thread.clone()), queued_id: "deferred-native-queue".into(),
+        thread_id: ThreadId(thread.clone()), queued_id: queued,
     });
     let cancelled = waiter.await.unwrap().unwrap();
     assert_eq!(cancelled["state"], "failed", "{cancelled}");
@@ -708,6 +713,82 @@ async fn operation_wait_follows_a_launch_from_its_first_receipt() {
     completed(&app, &thread, "mock-turn", TurnStatus::Success);
     let done = wait_for(&app, &trusted, args(json!({"since": running["wait_cursor"], "timeout_ms": 5000}))).await.unwrap();
     assert_eq!((done["state"].as_str(), done["final_text"].as_str()), (Some("done"), Some("PONG")), "{done}");
+}
+
+/// A launch whose first message the provider queued, as Hermes always does
+/// and any provider does while its session is busy. Its receipt settles once,
+/// naming only the queue entry, and is never rewritten afterwards.
+async fn queued_launch(app: &App, provider: &mock_agent_provider::MockAgentProvider, workspace: &str, key: &str) -> (String, String, String) {
+    provider.queue_next_send();
+    let receipt = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
+        "workspace_id": workspace, "client_request_id": key, "provider": "claude", "permission_mode": "default",
+        "message": "Say PONG",
+    })).await.unwrap();
+    let launched = settle_operation(app, &receipt).await;
+    assert_eq!((launched["state"].as_str(), launched["result"]["turn"]["turn_id"].as_str()), (Some("succeeded"), Some("")), "{launched}");
+    let thread = launched["thread_id"].as_str().unwrap().to_string();
+    (thread, launched["operation_id"].as_str().unwrap().to_string(), queued_id(&launched))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operation_wait_follows_a_launchs_queued_message_to_its_run() {
+    let (app, provider, _root, workspace) = fixture().await;
+    let (thread, operation, queued) = queued_launch(&app, &provider, &workspace, "operation-queued-launch").await;
+    let trusted = ControlCaller::trusted();
+    let args = |extra: Value| {
+        let mut args = target(&workspace, &thread, json!({"operation_id": operation}));
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        args
+    };
+    let waiting = wait_for(&app, &trusted, args(json!({"timeout_ms": 200}))).await.unwrap();
+    assert_eq!((waiting["state"].as_str(), waiting["timed_out"].as_bool()), (Some("running"), Some(true)), "{waiting}");
+    assert_eq!(waiting["turn_id"], Value::Null);
+    let waiter = spawn_wait(&app, &trusted, args(json!({"timeout_ms": 5000})));
+    parked().await;
+    let started = Instant::now();
+    // The provider dispatches the entry. The event bridge records the run on
+    // the message's delivery; the launch receipt keeps naming only the entry.
+    forward_event(app.handle(), Event::QueuedTurnDispatched {
+        thread_id: ThreadId(thread.clone()), queued_id: queued.clone(), turn_id: TurnId("t1".into()),
+        text: "Say PONG".into(), steered: false,
+    });
+    let running = waiter.await.unwrap().unwrap();
+    assert!(started.elapsed() < PROMPT, "the dispatch wakes the wait: {:?}", started.elapsed());
+    assert_eq!((running["state"].as_str(), running["turn_id"].as_str(), running["timed_out"].as_bool()), (Some("running"), Some("t1"), Some(false)), "{running}");
+    let waiter = spawn_wait(&app, &trusted, args(json!({"since": running["wait_cursor"], "timeout_ms": 5000})));
+    parked().await;
+    reply(&app, &thread, "t1", "PONG");
+    completed(&app, &thread, "t1", TurnStatus::Success);
+    let done = waiter.await.unwrap().unwrap();
+    assert_eq!((done["state"].as_str(), done["turn_id"].as_str(), done["final_text"].as_str()), (Some("done"), Some("t1"), Some("PONG")), "{done}");
+    assert_eq!(done["operation"], json!({"operation_id": operation, "state": "succeeded", "error": null}));
+    let receipt = execute(app.handle(), &trusted, "operation_status", json!({"operation_id": operation})).await.unwrap();
+    assert_eq!(queued_id(&receipt), queued, "the launch receipt still names only the entry: {receipt}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operation_wait_ends_when_a_launchs_queued_message_never_runs() {
+    let (app, provider, _root, workspace) = fixture().await;
+    let trusted = ControlCaller::trusted();
+    // The person removes the entry from the queue.
+    let (thread, operation, queued) = queued_launch(&app, &provider, &workspace, "operation-queued-launch-cancel").await;
+    let waiter = spawn_wait(&app, &trusted, target(&workspace, &thread, json!({"operation_id": operation, "timeout_ms": 5000})));
+    parked().await;
+    let started = Instant::now();
+    forward_event(app.handle(), Event::QueuedTurnCancelled { thread_id: ThreadId(thread.clone()), queued_id: queued });
+    let cancelled = waiter.await.unwrap().unwrap();
+    assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
+    assert_eq!((cancelled["state"].as_str(), cancelled["failure"].as_str()), (Some("failed"), Some("operation_failed")), "{cancelled}");
+    assert_eq!((&cancelled["turn_id"], &cancelled["final_text"], &cancelled["timed_out"]), (&Value::Null, &Value::Null, &json!(false)));
+    // The launch itself succeeded; its message did not run.
+    assert_eq!(cancelled["operation"]["state"], "succeeded");
+    // A stop holds a queued message for the person instead.
+    let (thread, operation, _) = queued_launch(&app, &provider, &workspace, "operation-queued-launch-stop").await;
+    app.state::<DatabaseStore>().stop_message_deliveries(&thread).unwrap();
+    let started = Instant::now();
+    let held = wait_for(&app, &trusted, target(&workspace, &thread, json!({"operation_id": operation, "timeout_ms": 2000}))).await.unwrap();
+    assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
+    assert_eq!((held["state"].as_str(), held["failure"].as_str()), (Some("failed"), Some("delivery_needs_attention")), "{held}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

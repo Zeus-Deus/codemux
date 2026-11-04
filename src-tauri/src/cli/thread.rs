@@ -1093,6 +1093,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn start_wait_follows_a_queued_first_message_by_its_operation() {
+        // The provider queued the launch's message, so the settled receipt
+        // names only the queue entry and never changes. The follow waits on
+        // the operation, which the server resolves to the message's run.
+        let launched = receipt("succeeded", json!({"turn": {"turn_id": "", "queued_id": "q", "steered": false}}));
+        let operation = json!({"operation_id": "op-1", "state": "succeeded", "error": null});
+        let door = Door::fake(vec![
+            ("thread_launch", Ok(launched)),
+            busy(),
+            ("thread_wait", Ok(waited("running", json!({"turn_id": null, "operation": operation, "timed_out": true})))),
+            ("thread_wait", Ok(waited("running", json!({"turn_id": "t1", "operation": operation, "wait_cursor": "cur-started"})))),
+            ("thread_wait", Ok(waited("done", json!({"turn_id": "t1", "final_text": "PONG", "operation": operation})))),
+        ]);
+        let mut argv = base();
+        argv.extend(["--wait", "--json", "--request-id", "k"]);
+        assert_eq!(start(&door, start_args(&argv)).await.unwrap(), Exit::Done);
+        assert!(door.script().finished());
+        let calls = door.script().calls();
+        assert_eq!(calls[2].1, json!({"workspace_id": "ws-new", "thread_id": "th-1", "operation_id": "op-1", "timeout_ms": 60_000}));
+        assert_eq!((calls[3].1["operation_id"].as_str(), calls[3].1["since"].as_str()), (Some("op-1"), Some("cur-running")));
+        assert_eq!((calls[4].1["operation_id"].as_str(), calls[4].1["since"].as_str()), (Some("op-1"), Some("cur-started")));
+        assert!(calls.iter().all(|(_, arguments)| arguments.get("turn_id").is_none()), "the server picks the run");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn needs_input_exits_2_with_pending() {
         let approval = json!({"approvals": [{"request_id": "r1", "turn_id": "t1", "request_kind": "command"}], "questions": [], "secrets": []});
         let door = Door::fake(vec![busy(), ("thread_wait", Ok(waited("needs_input", json!({"pending": approval}))))]);

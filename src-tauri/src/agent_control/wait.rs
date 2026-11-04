@@ -8,6 +8,7 @@
 use super::outcome::{run_state, RunFacts, RunState, TurnEnd};
 use super::{service, ControlCaller, ControlError, ErrorCode, NativeControlState};
 use crate::database::agent_control::OperationReceipt;
+use crate::database::message_delivery::DeliveryRecord;
 use crate::database::DatabaseStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -424,26 +425,47 @@ enum Placement {
 }
 
 impl Placement {
-    fn of(receipt: &OperationReceipt) -> Result<Self, ControlError> {
+    fn of(db: &DatabaseStore, principal: &str, receipt: &OperationReceipt) -> Result<Self, ControlError> {
         let result = receipt.result.as_ref().unwrap_or(&Value::Null);
         let text = |value: &Value| value.as_str().filter(|text| !text.is_empty()).map(str::to_owned);
+        let queued = result["accepted_as"] == "queued" || text(&result["turn"]["queued_id"]).is_some();
         match receipt.state.as_str() {
             "failed" => Ok(Self::Ended("operation_failed")),
             "needs_attention" => Ok(Self::Ended("delivery_needs_attention")),
             "succeeded" => match text(&result["turn"]["turn_id"]) {
                 Some(turn) => Ok(Self::Run(turn)),
-                None if result["accepted_as"] == "queued" || text(&result["turn"]["queued_id"]).is_some() => Ok(Self::NotStarted),
+                // A send's receipt follows its message's delivery. A launch's
+                // settles once, while its message may still be queued, so
+                // that message's own delivery says where it stands.
+                None if queued && receipt.tool == "thread_launch" => Ok(db.control_launch_delivery(principal, &receipt.operation_id)?
+                    .map_or(Self::NotStarted, |delivery| Self::of_delivery(&delivery))),
+                None if queued => Ok(Self::NotStarted),
                 None => Err(ControlError::new(ErrorCode::InvalidTarget, "This operation started no run (a launch without a message); wait on the thread instead")),
             },
             // Accepted or running: Codemux is still carrying it out.
             _ => Ok(Self::NotStarted),
         }
     }
+
+    /// A message by its delivery, read as `finish_message_delivery` maps a
+    /// delivery onto a send's receipt: cancelled or rejected fails, held
+    /// needs the person, and a delivery that names its run started it.
+    fn of_delivery(delivery: &DeliveryRecord) -> Self {
+        match delivery.state.as_str() {
+            "cancelled" | "rejected" => Self::Ended("operation_failed"),
+            "held" | "held_unknown" => Self::Ended("delivery_needs_attention"),
+            _ => match delivery.turn_id.as_deref().filter(|turn| !turn.is_empty()) {
+                Some(turn) => Self::Run(turn.to_owned()),
+                None => Self::NotStarted,
+            },
+        }
+    }
 }
 
 /// Read the run `operation` started, as a waiter on it sees it. The operation
-/// is the caller's own `thread_launch` or `thread_send` for `target`; the
-/// receipt names the run once the message starts it.
+/// is the caller's own `thread_launch` or `thread_send` for `target`; its
+/// receipt, or a launch's message delivery, names the run once the message
+/// starts it.
 async fn observe_operation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, target: &service::Target, operation: &str) -> Result<WaitView, ControlError> {
     let epoch = app.state::<NativeControlState>().epoch.clone();
     let receipt = app.state::<DatabaseStore>().control_operation(&caller.principal, operation, &epoch)?
@@ -454,7 +476,8 @@ async fn observe_operation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
     if receipt.workspace_id.as_deref() != Some(target.workspace_id.as_str()) || receipt.thread_id.as_deref() != Some(target.thread_id.as_str()) {
         return Err(ControlError::new(ErrorCode::InvalidTarget, "This operation is for another workspace or thread"));
     }
-    let mut view = match Placement::of(&receipt)? {
+    let placement = Placement::of(&app.state::<DatabaseStore>(), &caller.principal, &receipt)?;
+    let mut view = match placement {
         Placement::Run(turn) => observe(app, target, Some(&turn)).await?,
         Placement::NotStarted => before_run(app, target, None).await?,
         Placement::Ended(failure) => before_run(app, target, Some(failure)).await?,

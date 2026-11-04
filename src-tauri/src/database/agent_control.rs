@@ -353,6 +353,23 @@ impl DatabaseStore {
             },
         ).optional().map_err(|e|e.to_string())
     }
+
+    /// The delivery of the message `operation`, a `thread_launch` of
+    /// `principal`, sent: the launch sends it under its request key as the
+    /// message ID. The receipt stays unlinked from it, because a delivery
+    /// rewrites a linked receipt's result, which would drop the launch's pane
+    /// and selection.
+    pub(crate) fn control_launch_delivery(&self, principal: &str, operation: &str) -> Result<Option<super::message_delivery::DeliveryRecord>, String> {
+        let message: Option<(String, String)> = self.conn.lock().unwrap().query_row(
+            "SELECT thread_id, request_key FROM agent_control_operations
+             WHERE principal=?1 AND id=?2 AND tool='thread_launch' AND thread_id IS NOT NULL",
+            params![principal, operation], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        match message {
+            Some((thread, key)) => self.message_delivery_for_message(&thread, &key),
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
