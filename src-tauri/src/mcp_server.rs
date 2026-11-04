@@ -3,7 +3,8 @@ use crate::control::{send_control_request, ControlRequest, ControlResponse};
 use crate::control_identity::{self, AGENT_PROCESS_ENV};
 use crate::mcp::protocol::stdio::{Handler, Reply};
 use crate::mcp::protocol::{
-    self, CallToolParams, InitializeRequest, InitializeResult, Request, RpcError, ServerInfo,
+    self, CacheScope, CallToolParams, DiscoverResult, Era, InitializeRequest, InitializeResult, ModernRequest, Request,
+    RpcError, ServerInfo,
 };
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
@@ -1073,6 +1074,8 @@ fn html_render_result(arguments: &Value) -> Result<Value, String> {
 /// registry tools.
 const PROVIDER_INSTRUCTIONS: &str = "Use the advertised workspace and browser tools. Native thread control is unavailable on provider-injected MCP; it requires a separate authorized controller connection.";
 
+const SERVER_INFO: ServerInfo = ServerInfo { name: "codemux", version: env!("CARGO_PKG_VERSION") };
+
 /// The refusal a process that serves an agent gets for a registry tool.
 const PROVIDER_CONTROL_DENIED: &str =
     "provider_control_denied: provider MCP cannot use trusted native-controller tools";
@@ -1147,6 +1150,14 @@ impl StdioServer {
         Self { caller, name_client, run, legacy }
     }
 
+    fn instructions(&self) -> &'static str {
+        if self.caller.serves_an_agent() {
+            PROVIDER_INSTRUCTIONS
+        } else {
+            crate::agent_control::INSTRUCTIONS
+        }
+    }
+
     fn initialize(&self, params: &Value) -> Value {
         let offer = InitializeRequest::parse(params);
         let protocol_version = offer.negotiated_version();
@@ -1156,14 +1167,17 @@ impl StdioServer {
         InitializeResult {
             protocol_version,
             tools_list_changed: None,
-            server_info: ServerInfo { name: "codemux", version: env!("CARGO_PKG_VERSION") },
-            instructions: Some(if self.caller.serves_an_agent() {
-                PROVIDER_INSTRUCTIONS
-            } else {
-                crate::agent_control::INSTRUCTIONS
-            }),
+            server_info: SERVER_INFO,
+            instructions: Some(self.instructions()),
         }
         .to_value()
+    }
+
+    /// The stateless era's description of this server: the revisions of both
+    /// eras, and the same capabilities and instructions as `initialize`.
+    fn discover(&self) -> Value {
+        DiscoverResult { tools_list_changed: None, server_info: SERVER_INFO, instructions: Some(self.instructions()) }
+            .to_value()
     }
 
     fn tools_list(&self) -> Value {
@@ -1210,16 +1224,48 @@ impl StdioServer {
     }
 }
 
-impl Handler for StdioServer {
-    fn request(&self, request: Request) -> Reply {
+impl StdioServer {
+    fn legacy_request(&self, request: Request) -> Reply {
         match request.method.as_str() {
             "initialize" => Reply::Now(Ok(self.initialize(&request.params))),
             "ping" => Reply::Now(Ok(json!({}))),
             "tools/list" => Reply::Now(Ok(self.tools_list())),
             "tools/call" => self.tools_call(&request.params),
-            // Includes `server/discover`: method-not-found with the probe's id
-            // tells a stateless-era client to fall back to `initialize`.
+            // Includes a `server/discover` that names no stateless revision:
+            // method-not-found with the probe's id tells the client to fall
+            // back to `initialize`.
             method => Reply::Now(Err(RpcError::method_not_found(method))),
+        }
+    }
+
+    /// A stateless-era request. With no handshake, each request names its own
+    /// client; the first name still wins. Tools run exactly as they do for
+    /// initialize-era clients, and every result is marked complete.
+    fn modern_request(&self, request: Request, modern: ModernRequest) -> Reply {
+        if let Some(client) = &modern.client_info {
+            (self.name_client)(&client.name);
+        }
+        let reply = match request.method.as_str() {
+            "server/discover" => Reply::Now(Ok(self.discover())),
+            "tools/list" => {
+                Reply::Now(Ok(protocol::cacheable(self.tools_list(), protocol::TOOLS_LIST_TTL_MS, CacheScope::Private)))
+            }
+            "tools/call" => self.tools_call(&request.params),
+            // `ping` is not part of the stateless era.
+            method => return Reply::Now(Err(RpcError::method_not_found(method))),
+        };
+        reply.map_result(|result| protocol::complete_result(result, SERVER_INFO))
+    }
+}
+
+impl Handler for StdioServer {
+    /// Each request picks its era: one process serves initialize-era and
+    /// stateless-era clients side by side.
+    fn request(&self, request: Request) -> Reply {
+        match Era::of(&request.method, &request.params) {
+            Ok(Era::Legacy) => self.legacy_request(request),
+            Ok(Era::Modern(modern)) => self.modern_request(request, modern),
+            Err(error) => Reply::Now(Err(error)),
         }
     }
 }
@@ -2902,6 +2948,127 @@ mod tests {
             assert_eq!(resp["error"]["code"], -32601);
             assert!(resp.get("result").is_none());
         }
+    }
+
+    /// A stateless-era (2026-07-28) request: `params` plus the `_meta`
+    /// envelope dual-era SDKs stamp on every request.
+    fn modern(id: u64, method: &str, mut params: Value) -> Value {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { "name": "Claude Code", "version": "2.1.317" },
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+    }
+
+    fn server_info() -> Value {
+        json!({ "name": "codemux", "version": env!("CARGO_PKG_VERSION") })
+    }
+
+    #[tokio::test]
+    async fn stateless_discover_describes_both_eras_and_the_same_instructions() {
+        for (caller, instructions) in [
+            (outside(), crate::agent_control::INSTRUCTIONS),
+            (StdioCaller { provider_origin: true, ..outside() }, PROVIDER_INSTRUCTIONS),
+        ] {
+            let resp = rpc(&server_for(caller), modern(1, "server/discover", json!({}))).await.unwrap();
+            assert_eq!(resp["id"], 1);
+            let result = &resp["result"];
+            assert_eq!(result["resultType"], "complete", "{resp}");
+            assert_eq!(
+                result["supportedVersions"],
+                json!(["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"])
+            );
+            assert_eq!(result["capabilities"], json!({ "tools": {} }));
+            assert_eq!(result["instructions"], instructions);
+            assert_eq!(result["_meta"]["io.modelcontextprotocol/serverInfo"], server_info());
+            assert_eq!((result["ttlMs"].as_u64(), result["cacheScope"].as_str()), (Some(3_600_000), Some("public")));
+        }
+    }
+
+    #[tokio::test]
+    async fn stateless_and_initialize_era_clients_share_one_server() {
+        let Gated { server, .. } = gated_server();
+        // An initialize-era client first, then a stateless one, interleaved.
+        let init = rpc(&server, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "vexis", "version": "1"}}
+        })).await.unwrap();
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+
+        let legacy_list = rpc(&server, json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).await.unwrap();
+        let modern_list = rpc(&server, modern(3, "tools/list", json!({}))).await.unwrap();
+        assert_eq!(modern_list["result"]["tools"], legacy_list["result"]["tools"], "one catalog for both eras");
+        assert!(legacy_list["result"].get("resultType").is_none(), "initialize-era results are unchanged");
+        let listed = &modern_list["result"];
+        assert_eq!(listed["resultType"], "complete");
+        assert_eq!((listed["ttlMs"].as_u64(), listed["cacheScope"].as_str()), (Some(300_000), Some("private")));
+        assert_eq!(listed["_meta"]["io.modelcontextprotocol/serverInfo"], server_info());
+
+        // Legacy-lane and registry tools both answer stateless calls, marked complete.
+        for (id, name, text) in [(4, "pane_list", "pane_list"), (5, "thread_status", "thread_status (registry)")] {
+            let resp = rpc(&server, modern(id, "tools/call", json!({ "name": name, "arguments": {} }))).await.unwrap();
+            assert_eq!(resp["result"]["content"][0]["text"], text, "{resp}");
+            assert_eq!(resp["result"]["resultType"], "complete", "{resp}");
+            assert_eq!(resp["result"]["_meta"]["io.modelcontextprotocol/serverInfo"], server_info());
+            let legacy = rpc(&server, tools_call(id + 10, name, json!({}))).await.unwrap();
+            assert_eq!(legacy["result"], json!({ "content": [{ "type": "text", "text": text }] }), "{legacy}");
+        }
+        // A wait still parks on the stateless path.
+        let (_, parks) = later(server.request(match protocol::parse(modern(6, "tools/call", json!({ "name": "thread_wait" }))) {
+            Ok(Incoming::Request(request)) => request,
+            other => panic!("{other:?}"),
+        }));
+        assert!(parks);
+        // Tool failures stay tool results.
+        let read_only = gated_server_for(
+            StdioCaller { access: ControlAccess::ReadOnly, ..outside() },
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+        );
+        let refused = rpc(&read_only.server, modern(7, "tools/call", json!({ "name": "git_commit", "arguments": { "message": "m" } })))
+            .await
+            .unwrap();
+        assert_eq!((refused["result"]["isError"].clone(), refused["result"]["resultType"].clone()), (json!(true), json!("complete")));
+    }
+
+    #[tokio::test]
+    async fn stateless_requests_name_the_client_and_the_first_name_sticks() {
+        let slot = Arc::new(std::sync::OnceLock::new());
+        let server = named_server(&slot);
+        rpc(&server, modern(1, "tools/list", json!({}))).await.unwrap();
+        assert_eq!(slot.get().map(String::as_str), Some("Claude Code"));
+        rpc(&server, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "clientInfo": {"name": "other", "version": "1"}}
+        })).await.unwrap();
+        assert_eq!(slot.get().map(String::as_str), Some("Claude Code"));
+    }
+
+    #[tokio::test]
+    async fn stateless_requests_refuse_unknown_revisions_and_methods_outside_the_revision() {
+        let server = server();
+        let mut future = modern(1, "server/discover", json!({}));
+        future["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2099-01-01");
+        let resp = rpc(&server, future).await.unwrap();
+        assert_eq!(resp["id"], 1);
+        assert_eq!(resp["error"]["code"], -32022);
+        assert_eq!(resp["error"]["data"]["supported"][0], "2026-07-28");
+        assert_eq!(resp["error"]["data"]["requested"], "2099-01-01");
+
+        let mut no_capabilities = modern(2, "tools/list", json!({}));
+        no_capabilities["params"]["_meta"].as_object_mut().unwrap().remove("io.modelcontextprotocol/clientCapabilities");
+        assert_eq!(rpc(&server, no_capabilities).await.unwrap()["error"]["code"], -32602);
+
+        for method in ["ping", "resources/list"] {
+            let resp = rpc(&server, modern(3, method, json!({}))).await.unwrap();
+            assert_eq!(resp["error"]["code"], -32601, "{method}");
+        }
+        // `initialize` always selects the initialize era, whatever `_meta` says.
+        let init = rpc(&server, modern(4, "initialize", json!({ "protocolVersion": "2025-11-25" }))).await.unwrap();
+        assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+        assert!(init["result"].get("resultType").is_none());
     }
 
     #[tokio::test]

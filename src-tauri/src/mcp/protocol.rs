@@ -6,9 +6,13 @@
 //! `codemux-remote mcp` can use it too. Transports own framing, authentication
 //! and HTTP status mapping.
 //!
-//! Codemux speaks the initialize era of MCP (newest 2025-11-25). Requests keep
-//! their `params._meta` untouched, so a later stateless-era path can read the
-//! per-request protocol version from it without a new envelope type.
+//! Codemux speaks both eras of MCP. The initialize era (2024-11-05 through
+//! 2025-11-25) negotiates once per connection with `initialize`. The stateless
+//! era (2026-07-28) has no handshake: each request names its revision in
+//! `params._meta`, and `server/discover` describes the server. [`Era::of`]
+//! tells them apart per request, so one process serves both kinds of client.
+//! Only `codemux mcp` and the connector serve the stateless era; the in-app
+//! gateway and `codemux-remote mcp` stay initialize-era servers.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -33,6 +37,38 @@ pub const HTTP_DEFAULT_PROTOCOL_VERSION: &str = "2025-03-26";
 pub const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 pub const SESSION_HEADER: &str = "mcp-session-id";
 
+/// Serve the stateless 2026-07-28 revision beside the initialize era. `false`
+/// makes every request an initialize-era one again: per-request versions are
+/// ignored and `server/discover` is method-not-found, which tells dual-era
+/// clients to fall back to `initialize`.
+pub const MODERN_ERA_ENABLED: bool = true;
+
+/// Revisions served per request, without `initialize`, newest first.
+pub const MODERN_PROTOCOL_VERSIONS: [&str; 1] = ["2026-07-28"];
+
+/// The methods of the stateless revision Codemux serves. `initialize`,
+/// `notifications/initialized` and `ping` do not exist in it.
+pub const MODERN_METHODS: [&str; 3] = ["server/discover", "tools/list", "tools/call"];
+
+/// Streamable HTTP headers that mirror a stateless-era request's body.
+pub const METHOD_HEADER: &str = "mcp-method";
+pub const NAME_HEADER: &str = "mcp-name";
+
+/// How long a client may reuse a `server/discover` result: it changes only
+/// when Codemux is upgraded.
+pub const DISCOVER_TTL_MS: u64 = 3_600_000;
+/// How long a client may reuse a `tools/list` result. A list depends only on
+/// the build and the caller's access level, both fixed for a connection.
+pub const TOOLS_LIST_TTL_MS: u64 = 300_000;
+
+/// `_meta` keys of the stateless revision.
+pub mod meta {
+    pub const PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+    pub const CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+    pub const CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+    pub const SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+}
+
 /// JSON-RPC error codes Codemux emits. Codemux-defined server errors stay in
 /// -32000..=-32019; -32020..=-32099 are reserved for the MCP specification.
 pub mod code {
@@ -44,6 +80,11 @@ pub mod code {
     /// A failure of something the server depends on, such as a daemon it
     /// forwards to.
     pub const SERVER_ERROR: i64 = -32000;
+    /// Stateless era, HTTP: a header disagrees with the body, or a required
+    /// header is missing or malformed.
+    pub const HEADER_MISMATCH: i64 = -32020;
+    /// Stateless era: the request names a revision Codemux does not speak.
+    pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +271,20 @@ impl RpcError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(code::INTERNAL_ERROR, message)
     }
+
+    /// -32022 with every revision Codemux speaks, so a stateless-era client
+    /// retries with one of them instead of falling back to `initialize`.
+    pub fn unsupported_version(requested: &str) -> Self {
+        Self {
+            code: code::UNSUPPORTED_PROTOCOL_VERSION,
+            message: format!("Unsupported protocol version: {requested}"),
+            data: Some(json!({ "supported": supported_versions(), "requested": requested })),
+        }
+    }
+
+    pub fn header_mismatch(detail: impl std::fmt::Display) -> Self {
+        Self::new(code::HEADER_MISMATCH, format!("Header mismatch: {detail}"))
+    }
 }
 
 impl std::fmt::Display for RpcError {
@@ -250,10 +305,11 @@ pub fn negotiate(requested: Option<&str>) -> &'static str {
         .unwrap_or(LATEST_PROTOCOL_VERSION)
 }
 
-/// Check a Streamable HTTP request's `MCP-Protocol-Version` header. Not for
-/// `initialize`, whose body carries the offer. A missing header means
-/// 2025-03-26, as the spec says; any value Codemux does not speak, including
-/// 2026-07-28, is an error the transport answers with HTTP 400.
+/// Check an initialize-era Streamable HTTP request's `MCP-Protocol-Version`
+/// header. Not for `initialize`, whose body carries the offer. A missing
+/// header means 2025-03-26, as the spec says; any value Codemux does not speak
+/// this way, including 2026-07-28, is an error the transport answers with HTTP
+/// 400. Stateless-era requests are told apart first ([`Era::of_http`]).
 pub fn http_version(header: Option<&str>) -> Result<&'static str, UnsupportedVersion> {
     let Some(header) = header else {
         return Ok(HTTP_DEFAULT_PROTOCOL_VERSION);
@@ -356,19 +412,253 @@ pub struct InitializeResult<'a> {
 
 impl InitializeResult<'_> {
     pub fn to_value(&self) -> Value {
-        let tools = match self.tools_list_changed {
-            None => json!({}),
-            Some(list_changed) => json!({ "listChanged": list_changed }),
-        };
         let mut result = json!({
             "protocolVersion": self.protocol_version,
-            "capabilities": { "tools": tools },
-            "serverInfo": { "name": self.server_info.name, "version": self.server_info.version },
+            "capabilities": capabilities(self.tools_list_changed),
+            "serverInfo": self.server_info.to_value(),
         });
         if let Some(instructions) = self.instructions {
             result["instructions"] = json!(instructions);
         }
         result
+    }
+}
+
+impl ServerInfo {
+    fn to_value(self) -> Value {
+        json!({ "name": self.name, "version": self.version })
+    }
+}
+
+/// `None` advertises `"tools": {}`; `Some(flag)` adds `listChanged`.
+fn capabilities(tools_list_changed: Option<bool>) -> Value {
+    let tools = match tools_list_changed {
+        None => json!({}),
+        Some(list_changed) => json!({ "listChanged": list_changed }),
+    };
+    json!({ "tools": tools })
+}
+
+// ---------------------------------------------------------------------------
+// Stateless era (2026-07-28)
+// ---------------------------------------------------------------------------
+
+/// Every revision Codemux speaks, newest first: what `server/discover` and an
+/// unsupported-version error advertise.
+pub fn supported_versions() -> Vec<&'static str> {
+    MODERN_PROTOCOL_VERSIONS.into_iter().chain(SUPPORTED_PROTOCOL_VERSIONS).collect()
+}
+
+/// Whether `version` names a stateless-era revision Codemux serves.
+pub fn is_modern_version(version: &str) -> bool {
+    MODERN_ERA_ENABLED && MODERN_PROTOCOL_VERSIONS.contains(&version)
+}
+
+/// Which era of MCP one request speaks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Era {
+    /// Served under initialize-era rules.
+    Legacy,
+    /// Served statelessly at the revision the request names.
+    Modern(ModernRequest),
+}
+
+/// What a stateless-era request says about itself in `_meta`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModernRequest {
+    pub version: &'static str,
+    /// Self-reported, so good for attribution only.
+    pub client_info: Option<ClientInfo>,
+}
+
+impl Era {
+    /// The era of one request, from its `params._meta`:
+    /// - `initialize` always selects the initialize era (the dual-era rule);
+    /// - no `_meta` revision, or an initialize-era one: [`Era::Legacy`];
+    /// - a stateless revision Codemux serves: [`Era::Modern`], which must
+    ///   also declare its client capabilities (-32602 otherwise);
+    /// - any other revision: -32022 listing the ones Codemux speaks.
+    pub fn of(method: &str, params: &Value) -> Result<Self, RpcError> {
+        era_of(MODERN_ERA_ENABLED, method, params)
+    }
+
+    /// [`Era::of`] for Streamable HTTP, where `MCP-Protocol-Version` (`header`)
+    /// mirrors the body. A stateless request needs a matching header
+    /// (-32020). A stateless header on a body without a revision is -32602,
+    /// never quietly served under initialize-era rules. A header naming a
+    /// revision Codemux does not speak is -32022.
+    pub fn of_http(header: Option<&str>, method: &str, params: &Value) -> Result<Self, RpcError> {
+        era_of_http(MODERN_ERA_ENABLED, header, method, params)
+    }
+}
+
+fn envelope_version(params: &Value) -> Option<&Value> {
+    params.get("_meta")?.get(meta::PROTOCOL_VERSION)
+}
+
+fn missing_meta(key: &str) -> RpcError {
+    RpcError::invalid_params(format!("Missing required _meta field {key}"))
+}
+
+fn era_of(enabled: bool, method: &str, params: &Value) -> Result<Era, RpcError> {
+    if !enabled || method == "initialize" {
+        return Ok(Era::Legacy);
+    }
+    let Some(version) = envelope_version(params) else {
+        return Ok(Era::Legacy);
+    };
+    let Some(version) = version.as_str() else {
+        return Err(RpcError::invalid_params(format!("_meta field {} must be a string", meta::PROTOCOL_VERSION)));
+    };
+    if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+        return Ok(Era::Legacy);
+    }
+    let Some(version) = MODERN_PROTOCOL_VERSIONS.into_iter().find(|modern| *modern == version) else {
+        return Err(RpcError::unsupported_version(version));
+    };
+    let fields = &params["_meta"];
+    if !fields.get(meta::CLIENT_CAPABILITIES).is_some_and(Value::is_object) {
+        return Err(missing_meta(meta::CLIENT_CAPABILITIES));
+    }
+    let client_info = fields.get(meta::CLIENT_INFO).and_then(ClientInfo::read);
+    Ok(Era::Modern(ModernRequest { version, client_info }))
+}
+
+fn era_of_http(enabled: bool, header: Option<&str>, method: &str, params: &Value) -> Result<Era, RpcError> {
+    if !enabled || method == "initialize" {
+        return Ok(Era::Legacy);
+    }
+    let differs = |header: &str, body: &str| {
+        RpcError::header_mismatch(format_args!(
+            "MCP-Protocol-Version header value '{header}' does not match body value '{body}'"
+        ))
+    };
+    match era_of(enabled, method, params)? {
+        Era::Modern(request) => match header {
+            Some(header) if header == request.version => Ok(Era::Modern(request)),
+            Some(header) => Err(differs(header, request.version)),
+            None => Err(RpcError::header_mismatch("missing required MCP-Protocol-Version header")),
+        },
+        Era::Legacy => match header {
+            Some(header) if MODERN_PROTOCOL_VERSIONS.contains(&header) => {
+                Err(match envelope_version(params).and_then(Value::as_str) {
+                    Some(body) => differs(header, body),
+                    None => missing_meta(meta::PROTOCOL_VERSION),
+                })
+            }
+            Some(header) if !SUPPORTED_PROTOCOL_VERSIONS.contains(&header) => Err(RpcError::unsupported_version(header)),
+            _ => Ok(Era::Legacy),
+        },
+    }
+}
+
+/// Check a stateless-era HTTP request's `Mcp-Method` and `Mcp-Name` headers
+/// against its body: a missing or different one is -32020. `Mcp-Name` may
+/// carry its value as `=?base64?…?=`. Requests without a name (`tools/list`,
+/// `server/discover`) need only `Mcp-Method`.
+pub fn check_standard_headers(
+    method_header: Option<&str>,
+    name_header: Option<&str>,
+    method: &str,
+    params: &Value,
+) -> Result<(), RpcError> {
+    match method_header {
+        Some(header) if header == method => {}
+        Some(header) => {
+            return Err(RpcError::header_mismatch(format_args!(
+                "Mcp-Method header value '{header}' does not match body value '{method}'"
+            )))
+        }
+        None => return Err(RpcError::header_mismatch("missing required Mcp-Method header")),
+    }
+    let source = match method {
+        "tools/call" | "prompts/get" => "name",
+        "resources/read" => "uri",
+        _ => return Ok(()),
+    };
+    let body = params.get(source).and_then(Value::as_str);
+    let header = name_header.map(decode_header_value).transpose()?;
+    match (header.as_deref(), body) {
+        (Some(header), Some(body)) if header == body => Ok(()),
+        (Some(header), Some(body)) => Err(RpcError::header_mismatch(format_args!(
+            "Mcp-Name header value '{header}' does not match body value '{body}'"
+        ))),
+        (None, Some(_)) => Err(RpcError::header_mismatch("missing required Mcp-Name header")),
+        (Some(_), None) => Err(RpcError::header_mismatch(format_args!("Mcp-Name header without a params.{source}"))),
+        // The method's own parameter check reports the missing name.
+        (None, None) => Ok(()),
+    }
+}
+
+/// A mirrored header value, decoding the `=?base64?…?=` form clients use for
+/// values that are not plain ASCII.
+fn decode_header_value(value: &str) -> Result<String, RpcError> {
+    use base64::Engine;
+    let Some(encoded) = value.strip_prefix("=?base64?").and_then(|rest| rest.strip_suffix("?=")) else {
+        return Ok(value.to_owned());
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(|| RpcError::header_mismatch("Mcp-Name header is not valid Base64"))
+}
+
+/// Mark a stateless-era result as final: `resultType: "complete"` and the
+/// server's identity in `_meta`. Fields the result already has are kept.
+pub fn complete_result(mut result: Value, server: ServerInfo) -> Value {
+    if let Value::Object(fields) = &mut result {
+        fields.entry("resultType").or_insert_with(|| json!("complete"));
+        if let Value::Object(stamp) = fields.entry("_meta").or_insert_with(|| json!({})) {
+            stamp.entry(meta::SERVER_INFO).or_insert_with(|| server.to_value());
+        }
+    }
+    result
+}
+
+/// Who may keep a cached result (`cacheScope`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheScope {
+    /// The same for every caller, so shared caches may keep it.
+    Public,
+    /// Only for the caller's own authorization.
+    Private,
+}
+
+/// Add the cache hints the stateless era requires on `tools/list` and
+/// `server/discover` results.
+pub fn cacheable(mut result: Value, ttl_ms: u64, scope: CacheScope) -> Value {
+    if let Value::Object(fields) = &mut result {
+        let scope = match scope {
+            CacheScope::Public => "public",
+            CacheScope::Private => "private",
+        };
+        fields.insert("ttlMs".into(), json!(ttl_ms));
+        fields.insert("cacheScope".into(), json!(scope));
+    }
+    result
+}
+
+/// A `server/discover` result: every revision Codemux speaks (both eras), its
+/// capabilities, identity and instructions, ready to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoverResult<'a> {
+    pub tools_list_changed: Option<bool>,
+    pub server_info: ServerInfo,
+    pub instructions: Option<&'a str>,
+}
+
+impl DiscoverResult<'_> {
+    pub fn to_value(&self) -> Value {
+        let mut result = json!({
+            "supportedVersions": supported_versions(),
+            "capabilities": capabilities(self.tools_list_changed),
+        });
+        if let Some(instructions) = self.instructions {
+            result["instructions"] = json!(instructions);
+        }
+        // Nothing in it depends on who asks.
+        cacheable(complete_result(result, self.server_info), DISCOVER_TTL_MS, CacheScope::Public)
     }
 }
 

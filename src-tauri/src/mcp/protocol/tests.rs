@@ -315,3 +315,208 @@ fn tool_result_shapes_match_existing_wire_formats() {
     // The stdio server's legacy success shape (no isError) and its failure shape.
     assert_eq!(text_result("done"), json!({ "content": [{ "type": "text", "text": "done" }] }));
 }
+
+// ---------------------------------------------------------------------------
+// Stateless era (2026-07-28)
+// ---------------------------------------------------------------------------
+
+const CODEMUX: ServerInfo = ServerInfo { name: "codemux", version: "9.9.9" };
+
+/// `params` of a stateless-era request at `version`, as dual-era SDKs stamp it.
+fn modern_params(version: &str) -> Value {
+    json!({
+        "_meta": {
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientInfo": { "name": "Hermes Agent", "version": "2.0.0" },
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }
+    })
+}
+
+fn modern(version: &'static str, client: Option<&str>) -> Era {
+    Era::Modern(ModernRequest {
+        version,
+        client_info: client.map(|name| ClientInfo { name: name.into(), version: "2.0.0".into(), title: None }),
+    })
+}
+
+#[test]
+fn the_kill_switch_is_on_and_both_eras_are_advertised() {
+    assert!(MODERN_ERA_ENABLED);
+    assert_eq!(MODERN_PROTOCOL_VERSIONS, ["2026-07-28"]);
+    assert_eq!(supported_versions(), ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]);
+    assert!(is_modern_version("2026-07-28"));
+    assert!(!is_modern_version("2025-11-25"));
+    // `initialize` still never selects the stateless revision.
+    assert_eq!(negotiate(Some("2026-07-28")), LATEST_PROTOCOL_VERSION);
+}
+
+#[test]
+fn requests_name_their_era_in_meta() {
+    for (params, era) in [
+        (json!({}), Era::Legacy),
+        (json!({ "_meta": {} }), Era::Legacy),
+        (json!({ "_meta": "odd" }), Era::Legacy),
+        (json!({ "name": "x", "_meta": { "progressToken": 1 } }), Era::Legacy),
+        // An initialize-era revision in `_meta` keeps initialize-era rules.
+        (modern_params("2025-11-25"), Era::Legacy),
+        (modern_params("2024-11-05"), Era::Legacy),
+        (modern_params("2026-07-28"), modern("2026-07-28", Some("Hermes Agent"))),
+    ] {
+        assert_eq!(Era::of("tools/list", &params), Ok(era), "{params}");
+    }
+    let unnamed = json!({ "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} },
+        "io.modelcontextprotocol/clientInfo": { "version": "1" }
+    } });
+    assert_eq!(Era::of("tools/call", &unnamed), Ok(modern("2026-07-28", None)), "clientInfo is optional");
+}
+
+#[test]
+fn initialize_always_selects_the_initialize_era() {
+    assert_eq!(Era::of("initialize", &modern_params("2026-07-28")), Ok(Era::Legacy));
+    assert_eq!(Era::of("initialize", &modern_params("2099-01-01")), Ok(Era::Legacy));
+    assert_eq!(Era::of_http(Some("2026-07-28"), "initialize", &json!({})), Ok(Era::Legacy));
+}
+
+#[test]
+fn an_unknown_revision_is_refused_with_every_supported_one() {
+    for requested in ["2099-01-01", "1900-01-01", "", "2026-07-28 "] {
+        let error = Era::of("server/discover", &modern_params(requested)).unwrap_err();
+        assert_eq!(error.code, -32022, "{requested:?}");
+        assert_eq!(error.message, format!("Unsupported protocol version: {requested}"));
+        assert_eq!(error.data, Some(json!({ "supported": supported_versions(), "requested": requested })));
+    }
+}
+
+#[test]
+fn a_stateless_request_must_carry_a_well_formed_envelope() {
+    let mut no_capabilities = modern_params("2026-07-28");
+    no_capabilities["_meta"].as_object_mut().unwrap().remove("io.modelcontextprotocol/clientCapabilities");
+    let mut capabilities_not_an_object = modern_params("2026-07-28");
+    capabilities_not_an_object["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!([]);
+    for params in [no_capabilities, capabilities_not_an_object] {
+        let error = Era::of("tools/list", &params).unwrap_err();
+        assert_eq!(error.code, -32602, "{params}");
+        assert!(error.message.contains("io.modelcontextprotocol/clientCapabilities"), "{}", error.message);
+    }
+    let error = Era::of("tools/list", &json!({ "_meta": { "io.modelcontextprotocol/protocolVersion": 20260728 } })).unwrap_err();
+    assert_eq!(error.code, -32602);
+}
+
+#[test]
+fn with_the_kill_switch_off_every_request_is_initialize_era() {
+    for params in [modern_params("2026-07-28"), modern_params("2099-01-01"), json!({ "_meta": { "io.modelcontextprotocol/protocolVersion": 1 } })] {
+        assert_eq!(super::era_of(false, "server/discover", &params), Ok(Era::Legacy), "{params}");
+        assert_eq!(super::era_of_http(false, Some("2026-07-28"), "tools/list", &params), Ok(Era::Legacy), "{params}");
+    }
+}
+
+#[test]
+fn http_requests_mirror_their_revision_in_the_version_header() {
+    let body = modern_params("2026-07-28");
+    assert_eq!(Era::of_http(Some("2026-07-28"), "tools/list", &body), Ok(modern("2026-07-28", Some("Hermes Agent"))));
+    // Initialize-era requests keep their own header rules.
+    for header in [None, Some("2025-11-25"), Some("2025-03-26")] {
+        assert_eq!(Era::of_http(header, "tools/list", &json!({})), Ok(Era::Legacy), "{header:?}");
+        assert_eq!(Era::of_http(header, "tools/list", &modern_params("2025-06-18")), Ok(Era::Legacy), "{header:?}");
+    }
+
+    let mismatch = |header: Option<&str>, params: &Value| {
+        let error = Era::of_http(header, "tools/call", params).unwrap_err();
+        assert_eq!(error.code, -32020, "{header:?} {params}");
+        error.message
+    };
+    assert_eq!(mismatch(None, &body), "Header mismatch: missing required MCP-Protocol-Version header");
+    assert_eq!(
+        mismatch(Some("2025-11-25"), &body),
+        "Header mismatch: MCP-Protocol-Version header value '2025-11-25' does not match body value '2026-07-28'"
+    );
+    assert!(mismatch(Some("2026-07-28"), &modern_params("2025-11-25")).contains("body value '2025-11-25'"));
+
+    // A stateless header on a body that lost its envelope is malformed, not legacy.
+    let error = Era::of_http(Some("2026-07-28"), "tools/list", &json!({})).unwrap_err();
+    assert_eq!((error.code, error.message.as_str()), (-32602, "Missing required _meta field io.modelcontextprotocol/protocolVersion"));
+
+    // A header naming a revision Codemux does not speak lists the ones it does.
+    for header in ["2099-01-01", "wrong", "2025-6-18"] {
+        let error = Era::of_http(Some(header), "tools/list", &json!({})).unwrap_err();
+        assert_eq!(error.code, -32022, "{header}");
+        assert_eq!(error.data.unwrap()["requested"], header);
+    }
+    // The body's revision is checked before the header.
+    assert_eq!(Era::of_http(Some("2026-07-28"), "tools/list", &modern_params("2099-01-01")).unwrap_err().code, -32022);
+}
+
+#[test]
+fn standard_headers_must_mirror_the_body() {
+    let call = json!({ "name": "thread_list", "arguments": {} });
+    assert_eq!(check_standard_headers(Some("tools/call"), Some("thread_list"), "tools/call", &call), Ok(()));
+    assert_eq!(check_standard_headers(Some("tools/list"), None, "tools/list", &json!({})), Ok(()));
+    assert_eq!(check_standard_headers(Some("server/discover"), Some("ignored"), "server/discover", &json!({})), Ok(()));
+    // A name outside plain ASCII travels Base64-encoded.
+    let unicode = json!({ "name": "überprüfen" });
+    let encoded = format!("=?base64?{}?=", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "überprüfen"));
+    assert_eq!(check_standard_headers(Some("tools/call"), Some(&encoded), "tools/call", &unicode), Ok(()));
+    let read = json!({ "uri": "file:///a" });
+    assert_eq!(check_standard_headers(Some("resources/read"), Some("file:///a"), "resources/read", &read), Ok(()));
+
+    for (method_header, name_header, message) in [
+        (None, Some("thread_list"), "Header mismatch: missing required Mcp-Method header"),
+        (Some("tools/list"), Some("thread_list"), "Header mismatch: Mcp-Method header value 'tools/list' does not match body value 'tools/call'"),
+        (Some("tools/call"), None, "Header mismatch: missing required Mcp-Name header"),
+        (Some("tools/call"), Some("thread_wait"), "Header mismatch: Mcp-Name header value 'thread_wait' does not match body value 'thread_list'"),
+        (Some("tools/call"), Some("=?base64?***?="), "Header mismatch: Mcp-Name header is not valid Base64"),
+    ] {
+        let error = check_standard_headers(method_header, name_header, "tools/call", &call).unwrap_err();
+        assert_eq!((error.code, error.message.as_str()), (-32020, message));
+    }
+    let error = check_standard_headers(Some("tools/call"), Some("x"), "tools/call", &json!({})).unwrap_err();
+    assert_eq!(error.code, -32020, "a name header with no body name to match");
+    // With neither, the method's own parameter check reports the missing name.
+    assert_eq!(check_standard_headers(Some("tools/call"), None, "tools/call", &json!({})), Ok(()));
+}
+
+#[test]
+fn stateless_results_are_marked_complete_and_name_the_server() {
+    let text = complete_result(text_result("done"), CODEMUX);
+    assert_eq!(
+        text,
+        json!({
+            "content": [{ "type": "text", "text": "done" }],
+            "resultType": "complete",
+            "_meta": { "io.modelcontextprotocol/serverInfo": { "name": "codemux", "version": "9.9.9" } }
+        })
+    );
+    // Existing fields win; other `_meta` keys survive.
+    let stamped = complete_result(json!({ "resultType": "complete", "_meta": { "x.y/z": 1 }, "isError": true }), CODEMUX);
+    assert_eq!(stamped["_meta"]["x.y/z"], 1);
+    assert_eq!(stamped["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "codemux");
+    assert_eq!(stamped["isError"], true);
+    // Only objects are results.
+    assert_eq!(complete_result(json!([1]), CODEMUX), json!([1]));
+
+    let listed = cacheable(json!({ "tools": [] }), TOOLS_LIST_TTL_MS, CacheScope::Private);
+    assert_eq!(listed, json!({ "tools": [], "ttlMs": 300_000, "cacheScope": "private" }));
+}
+
+#[test]
+fn discover_describes_both_eras_capabilities_and_identity() {
+    let result = DiscoverResult { tools_list_changed: None, server_info: CODEMUX, instructions: Some("Use the tools.") }.to_value();
+    assert_eq!(
+        result,
+        json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"],
+            "capabilities": { "tools": {} },
+            "instructions": "Use the tools.",
+            "ttlMs": 3_600_000,
+            "cacheScope": "public",
+            "_meta": { "io.modelcontextprotocol/serverInfo": { "name": "codemux", "version": "9.9.9" } }
+        })
+    );
+    let connector = DiscoverResult { tools_list_changed: Some(false), server_info: CODEMUX, instructions: None }.to_value();
+    assert_eq!(connector["capabilities"], json!({ "tools": { "listChanged": false } }));
+    assert!(connector.get("instructions").is_none());
+}

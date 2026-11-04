@@ -42,6 +42,18 @@ pub enum Reply {
     Queued(BoxFuture<'static, Result<Value, RpcError>>),
 }
 
+impl Reply {
+    /// Rewrite the successful result whenever it arrives; errors pass
+    /// through. Scheduling (`Now`, `Later`, `Queued`, `parks`) is unchanged.
+    pub fn map_result(self, rewrite: impl FnOnce(Value) -> Value + Send + 'static) -> Self {
+        match self {
+            Self::Now(outcome) => Self::Now(outcome.map(rewrite)),
+            Self::Later { future, parks } => Self::Later { future: future.map(|outcome| outcome.map(rewrite)).boxed(), parks },
+            Self::Queued(future) => Self::Queued(future.map(|outcome| outcome.map(rewrite)).boxed()),
+        }
+    }
+}
+
 pub trait Handler: Send + Sync + 'static {
     /// Called on the reader, one request at a time and in arrival order, so
     /// work a handler queues here keeps that order.
@@ -615,5 +627,19 @@ mod tests {
         input.write_all(format!("{}\n", request(json!(1), "echo", "lost")).as_bytes()).await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(5), served).await.expect("serve ends").unwrap();
         assert!(result.unwrap_err().contains("stdout"), "the write failure is reported");
+    }
+
+    #[tokio::test]
+    async fn map_result_rewrites_results_and_keeps_errors_and_scheduling() {
+        let mark = |value: Value| json!({ "marked": value });
+        let Reply::Now(Ok(now)) = Reply::Now(Ok(json!(1))).map_result(mark) else { panic!("still Now") };
+        assert_eq!(now, json!({ "marked": 1 }));
+        let Reply::Now(Err(error)) = Reply::Now(Err(RpcError::internal("no"))).map_result(mark) else { panic!("still Now") };
+        assert_eq!(error.code, -32603, "errors pass through");
+        let later = Reply::Later { future: async { Ok(json!(2)) }.boxed(), parks: true }.map_result(mark);
+        let Reply::Later { future, parks: true } = later else { panic!("still a parking Later") };
+        assert_eq!(future.await.unwrap(), json!({ "marked": 2 }));
+        let Reply::Queued(future) = Reply::Queued(async { Ok(json!(3)) }.boxed()).map_result(mark) else { panic!("still Queued") };
+        assert_eq!(future.await.unwrap(), json!({ "marked": 3 }));
     }
 }
