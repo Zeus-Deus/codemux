@@ -286,6 +286,10 @@ impl PlatformService {
     /// lifecycle asks for it again after each of its waits. Revoking the
     /// caller's grant does not end a plugin invocation, so this is what stops
     /// one queued meanwhile.
+    ///
+    /// A new workspace's setup runs on after the invocation ended, which
+    /// cancels `caller`, and past an in-app chat's turn. It asks whether the
+    /// connector grant behind the call and the plugin's own grant still stand.
     pub(crate) fn checkpoint<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -299,7 +303,24 @@ impl PlatformService {
             caller.clone(),
             project.to_owned(),
         );
+        let setup = (
+            store.clone(),
+            app.clone(),
+            PlatformCaller { cancellation: None, ..caller.clone() },
+            project.clone(),
+        );
         Checkpoint::new(move || authorize(&store, &app, &caller, name, Some(&project)).map(drop))
+            .with_background(move || {
+                let (store, app, caller, project) = &setup;
+                crate::mcp_connector::validate_caller(app, &caller.control)
+                    .map_err(|error| error.to_string())?;
+                platform_authority::capability(
+                    &store.read(&caller.installation_id)?,
+                    caller,
+                    name,
+                    Some(project),
+                )
+            })
     }
     pub async fn dispatch<R: Runtime>(
         &self,

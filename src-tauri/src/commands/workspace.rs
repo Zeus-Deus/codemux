@@ -231,7 +231,7 @@ pub(crate) async fn open_workspace_impl<R: tauri::Runtime>(
     terminal::spawn_missing_ptys_for_workspace(app.clone(), &workspace_id.0);
 
     // Run setup scripts in background thread
-    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path, checkpoint);
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
@@ -489,7 +489,7 @@ async fn create_empty_workspace_impl<R: tauri::Runtime>(
     // scripts, no .mcp.json injection. Git metadata still populates
     // (cheap, harmless for non-repo paths).
     if !skip_setup.unwrap_or(false) {
-        spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path);
+        spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path, &Checkpoint::default());
 
         if crate::mcp_server::is_auto_mcp_enabled(&app) {
             crate::mcp_server::upsert_mcp_config(&repo_path);
@@ -601,7 +601,7 @@ pub async fn create_workspace_with_preset<R: tauri::Runtime>(
     }
 
     // Run setup scripts in background thread
-    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path, &Checkpoint::default());
 
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
@@ -945,7 +945,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
     }
 
     // Run setup scripts in background thread
-    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf, checkpoint);
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
@@ -1134,7 +1134,7 @@ pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
         terminal::spawn_pty_for_session(app.clone(), session_id);
     }
 
-    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf, &Checkpoint::default());
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
@@ -1311,8 +1311,8 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
 }
 
 /// [`close_workspace_with_worktree_impl`], asking `checkpoint` again before
-/// it stops Hermes chats or runs teardown scripts, and before any file is
-/// deleted.
+/// it stops Hermes chats, before each teardown command, before the workspace
+/// leaves, and before any file is deleted.
 pub(crate) async fn close_workspace_checked<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     request: CloseWorkspace,
@@ -1778,19 +1778,25 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // workspace: its folder is its parent's, still in use. The scripts
     // block until they finish, and one may call `codemux` back, so they run
     // on the blocking pool: a blocked async worker can leave nobody polling
-    // the control socket to answer it.
+    // the control socket to answer it. Each asks the checkpoint first.
+    let mut torn_down = Ok(());
     if !force && !hermes_pending {
         if let Some(folder) = teardown {
             let commands = crate::scripts::teardown_commands(Path::new(&folder), Some(db));
-            let (title, id) = (ws_title.clone(), workspace_id.clone());
-            tokio::task::spawn_blocking(move || {
-                crate::scripts::run_teardown_scripts(Path::new(&folder), &title, &id, &commands)
+            let (title, id, checkpoint) = (ws_title.clone(), workspace_id.clone(), checkpoint.clone());
+            torn_down = tokio::task::spawn_blocking(move || {
+                crate::scripts::run_teardown_scripts(Path::new(&folder), &title, &id, &commands, &checkpoint)
             })
             .await
-            .unwrap_or_else(|error| Err(format!("teardown task failed: {error}")))
-            .map_err(|e| format!("Teardown failed: {e}\nUse force delete to skip teardown."))?;
+            .unwrap_or_else(|error| Err(format!("teardown task failed: {error}")));
         }
     }
+    // So may teardown: a requester whose authority was withdrawn meanwhile
+    // closes nothing, so the workspace stays open and its chats keep
+    // running. Asked before the teardown's own result, so a teardown it
+    // stopped fails with the refusal's code.
+    checkpoint.check()?;
+    torn_down.map_err(|e| format!("Teardown failed: {e}\nUse force delete to skip teardown."))?;
 
     let detached = detach_workspace(&app, state, db, &workspace_id)?;
     #[cfg(test)]
@@ -3290,13 +3296,16 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
 // ---- Setup/teardown scripts ----
 
 /// Spawn setup scripts in a background thread so workspace creation isn't blocked.
-/// Runs the full pipeline: .codemuxinclude file copy + setup commands.
+/// Runs the full pipeline: .codemuxinclude file copy + setup commands. The
+/// create has returned by then, so it asks `checkpoint`'s
+/// [`Checkpoint::background`] before the copy and before each command.
 fn spawn_setup_scripts<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     workspace_id: &str,
     workspace_path: &Path,
+    checkpoint: &Checkpoint,
 ) {
     // Pre-resolve root path on the calling thread to avoid race conditions.
     let root_path = crate::scripts::resolve_root_path(workspace_path);
@@ -3323,10 +3332,20 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
     let ws_path = workspace_path.to_path_buf();
     let ws_id = workspace_id.to_string();
     let app2 = app.clone();
+    let checkpoint = checkpoint.background();
 
     std::thread::spawn(move || {
         // Wait for frontend to mount the overlay and register event listeners
         std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // A requester whose grant was withdrawn since the create returned
+        // copies nothing and starts no command. The copy and each command can
+        // take long, so the runner asks again before every command.
+        if let Err(refusal) = checkpoint.check() {
+            let error = crate::scripts::report_setup_stopped(&app2, &ws_id, config.as_ref(), &refusal);
+            eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {error}");
+            return;
+        }
 
         // Step 1: Process worktree includes (file → setting → defaults)
         match crate::scripts::process_worktree_includes(&root_path, &ws_path, &setting_patterns) {
@@ -3350,7 +3369,7 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
             if !config.setup.is_empty() {
                 if let Err(e) = crate::scripts::run_setup_scripts_with_config(
                     &ws_path, &ws_title, &ws_id, &app2, &config, &root_path,
-                    ws_branch.as_deref(), Some(port),
+                    ws_branch.as_deref(), Some(port), &checkpoint,
                 ) {
                     eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {e}");
                 }

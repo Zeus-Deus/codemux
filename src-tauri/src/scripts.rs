@@ -2,6 +2,7 @@ use crate::config::workspace_config::{
     find_git_root, read_effective_config, read_workspace_config, WorkspaceConfig,
 };
 use crate::database::DatabaseStore;
+use crate::workspace_service::Checkpoint;
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -330,6 +331,7 @@ pub fn run_setup_scripts<R: Runtime>(
         &root_path,
         branch,
         port,
+        &Checkpoint::default(),
     )
 }
 
@@ -375,6 +377,35 @@ pub fn run_setup_commands(
     port: Option<u16>,
     notify: &mut dyn FnMut(SetupEvent<'_>),
 ) -> Result<(), String> {
+    run_checked_setup_commands(
+        workspace_path,
+        workspace_name,
+        workspace_id,
+        config,
+        root_path,
+        branch,
+        port,
+        &Checkpoint::default(),
+        notify,
+    )
+}
+
+/// [`run_setup_commands`], asking `checkpoint` before each command starts.
+/// Setup runs in the background after a create returned, and a command can
+/// take long: once whoever asked for it lost their authority, no further
+/// command starts, and setup fails as [`stop_setup`] reports.
+#[allow(clippy::too_many_arguments)]
+fn run_checked_setup_commands(
+    workspace_path: &Path,
+    workspace_name: &str,
+    workspace_id: &str,
+    config: &WorkspaceConfig,
+    root_path: &Path,
+    branch: Option<&str>,
+    port: Option<u16>,
+    checkpoint: &Checkpoint,
+    notify: &mut dyn FnMut(SetupEvent<'_>),
+) -> Result<(), String> {
     if config.setup.is_empty() {
         return Ok(());
     }
@@ -391,6 +422,9 @@ pub fn run_setup_commands(
     let total = config.setup.len();
 
     for (index, command) in config.setup.iter().enumerate() {
+        if let Err(refusal) = checkpoint.check() {
+            return Err(stop_setup(command, &refusal, notify));
+        }
         notify(SetupEvent::Progress {
             command,
             index,
@@ -427,15 +461,31 @@ pub fn run_setup_commands(
     Ok(())
 }
 
+/// Ends setup before `command`, the first one that did not start, because
+/// whoever asked for it lost their authority. It is reported as a failed
+/// setup is, as that command's failure, so the person sees which commands
+/// never ran. Returns the error.
+fn stop_setup(command: &str, refusal: &str, notify: &mut dyn FnMut(SetupEvent<'_>)) -> String {
+    let stderr = format!("{refusal}\nSetup stopped before this command started.");
+    notify(SetupEvent::Failed {
+        command,
+        stdout: "",
+        stderr: &stderr,
+        exit_code: None,
+    });
+    format!("Setup stopped before `{command}`: {refusal}")
+}
+
 /// Run setup scripts with a pre-resolved config and root path.
 /// The `root_path` should be resolved on the calling thread (not inside a spawned thread)
 /// to avoid race conditions with worktree `.git` file resolution.
 ///
 /// Thin Tauri wrapper over [`run_setup_commands`]: forwards each
 /// [`SetupEvent`] to the frontend as the events it has always listened
-/// for, with unchanged payload shapes.
+/// for, with unchanged payload shapes. `checkpoint` is asked before each
+/// command starts.
 #[allow(clippy::too_many_arguments)]
-pub fn run_setup_scripts_with_config<R: Runtime>(
+pub(crate) fn run_setup_scripts_with_config<R: Runtime>(
     workspace_path: &Path,
     workspace_name: &str,
     workspace_id: &str,
@@ -444,8 +494,9 @@ pub fn run_setup_scripts_with_config<R: Runtime>(
     root_path: &Path,
     branch: Option<&str>,
     port: Option<u16>,
+    checkpoint: &Checkpoint,
 ) -> Result<(), String> {
-    run_setup_commands(
+    run_checked_setup_commands(
         workspace_path,
         workspace_name,
         workspace_id,
@@ -453,49 +504,73 @@ pub fn run_setup_scripts_with_config<R: Runtime>(
         root_path,
         branch,
         port,
-        &mut |event| match event {
-            SetupEvent::Progress {
-                command,
-                index,
-                total,
-            } => {
-                let _ = app_handle.emit(
-                    "workspace-setup-progress",
-                    SetupProgress {
-                        workspace_id: workspace_id.to_string(),
-                        command: command.to_string(),
-                        index,
-                        total,
-                    },
-                );
-            }
-            SetupEvent::Failed {
-                command,
-                stdout,
-                stderr,
-                exit_code,
-            } => {
-                let _ = app_handle.emit(
-                    "workspace-setup-failed",
-                    SetupFailed {
-                        workspace_id: workspace_id.to_string(),
-                        command: command.to_string(),
-                        stdout: stdout.to_string(),
-                        stderr: stderr.to_string(),
-                        exit_code,
-                    },
-                );
-            }
-            SetupEvent::Complete => {
-                let _ = app_handle.emit(
-                    "workspace-setup-complete",
-                    SetupComplete {
-                        workspace_id: workspace_id.to_string(),
-                    },
-                );
-            }
-        },
+        checkpoint,
+        &mut frontend_events(app_handle, workspace_id),
     )
+}
+
+/// Setup that stopped before it began, as [`run_setup_scripts_with_config`]
+/// reports one that stopped before a command: whoever asked for it lost
+/// their authority while it waited to start. Returns the error.
+pub fn report_setup_stopped<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    workspace_id: &str,
+    config: Option<&WorkspaceConfig>,
+    refusal: &str,
+) -> String {
+    match config.and_then(|config| config.setup.first()) {
+        Some(command) => stop_setup(command, refusal, &mut frontend_events(app_handle, workspace_id)),
+        None => format!("Setup stopped before it started: {refusal}"),
+    }
+}
+
+/// Tells the frontend about a workspace's setup.
+fn frontend_events<'a, R: Runtime>(
+    app_handle: &'a AppHandle<R>,
+    workspace_id: &'a str,
+) -> impl FnMut(SetupEvent<'_>) + 'a {
+    move |event: SetupEvent<'_>| match event {
+        SetupEvent::Progress {
+            command,
+            index,
+            total,
+        } => {
+            let _ = app_handle.emit(
+                "workspace-setup-progress",
+                SetupProgress {
+                    workspace_id: workspace_id.to_string(),
+                    command: command.to_string(),
+                    index,
+                    total,
+                },
+            );
+        }
+        SetupEvent::Failed {
+            command,
+            stdout,
+            stderr,
+            exit_code,
+        } => {
+            let _ = app_handle.emit(
+                "workspace-setup-failed",
+                SetupFailed {
+                    workspace_id: workspace_id.to_string(),
+                    command: command.to_string(),
+                    stdout: stdout.to_string(),
+                    stderr: stderr.to_string(),
+                    exit_code,
+                },
+            );
+        }
+        SetupEvent::Complete => {
+            let _ = app_handle.emit(
+                "workspace-setup-complete",
+                SetupComplete {
+                    workspace_id: workspace_id.to_string(),
+                },
+            );
+        }
+    }
 }
 
 /// The folder's teardown commands: its `.codemux/config.json`, else the
@@ -511,12 +586,15 @@ pub fn teardown_commands(workspace_path: &Path, db: Option<&DatabaseStore>) -> V
 
 /// Runs `commands` (see [`teardown_commands`]) in order, stopping at the
 /// first failure. It blocks until they finish, so an async caller runs it on
-/// the blocking pool.
-pub fn run_teardown_scripts(
+/// the blocking pool. A command can take long while the close waits: once
+/// whoever asked for the close lost their authority (`checkpoint`), no
+/// further command starts.
+pub(crate) fn run_teardown_scripts(
     workspace_path: &Path,
     workspace_name: &str,
     workspace_id: &str,
     commands: &[String],
+    checkpoint: &Checkpoint,
 ) -> Result<(), String> {
     if commands.is_empty() {
         return Ok(());
@@ -528,6 +606,9 @@ pub fn run_teardown_scripts(
     env_vars.push(("CODEMUX_WORKSPACE_ID", workspace_id.to_string()));
 
     for command in commands {
+        checkpoint
+            .check()
+            .map_err(|refusal| format!("{refusal}; teardown stopped before `{command}`"))?;
         let output = run_script_command(command, workspace_path, &env_vars, TEARDOWN_SCRIPT)
             .map_err(|e| format!("Failed to run teardown command `{command}`: {e}"))?;
 
@@ -656,7 +737,7 @@ mod tests {
             let (folder, config) = (dir.path().to_path_buf(), config.clone());
             let run = std::thread::spawn(move || match name {
                 "setup" => run_setup_commands(&folder, "ws", "ws-1", &config, &folder, None, None, &mut |_| {}),
-                _ => run_teardown_scripts(&folder, "ws", "ws-1", &teardown_commands(&folder, None)),
+                _ => run_teardown_scripts(&folder, "ws", "ws-1", &teardown_commands(&folder, None), &Checkpoint::default()),
             });
             let out = dir.path().join(format!("{name}.out"));
             let deadline = Instant::now() + Duration::from_secs(20);
@@ -679,6 +760,42 @@ mod tests {
             fs::write(dir.path().join(format!("{name}.go")), "").unwrap();
             run.join().unwrap().unwrap_or_else(|error| panic!("{name}: {error}"));
         }
+    }
+
+    /// Once the checkpoint refuses, no further setup or teardown command
+    /// starts, and setup reports the first one it did not start as failed.
+    #[cfg(unix)]
+    #[test]
+    fn setup_and_teardown_commands_stop_where_their_checkpoint_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = vec!["touch one".to_string(), "touch two".to_string()];
+        // Passes once, then refuses as a revoked grant does.
+        let once = || {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            Checkpoint::new(move || match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Ok(()),
+                _ => Err("grant_revoked: withdrawn".into()),
+            })
+        };
+
+        let config = WorkspaceConfig { setup: commands.clone(), ..Default::default() };
+        let mut failed = Vec::new();
+        let error = run_checked_setup_commands(dir.path(), "ws", "ws-1", &config, dir.path(), None, None, &once(), &mut |event| {
+            if let SetupEvent::Failed { command, stderr, exit_code, .. } = event {
+                failed.push((command.to_string(), stderr.to_string(), exit_code));
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error, "Setup stopped before `touch two`: grant_revoked: withdrawn");
+        assert_eq!(failed, [("touch two".to_string(), "grant_revoked: withdrawn\nSetup stopped before this command started.".to_string(), None)]);
+        assert!(dir.path().join("one").exists());
+        assert!(!dir.path().join("two").exists());
+
+        fs::remove_file(dir.path().join("one")).unwrap();
+        let error = run_teardown_scripts(dir.path(), "ws", "ws-1", &commands, &once()).unwrap_err();
+        assert_eq!(error, "grant_revoked: withdrawn; teardown stopped before `touch two`");
+        assert!(dir.path().join("one").exists());
+        assert!(!dir.path().join("two").exists());
     }
 
     #[test]

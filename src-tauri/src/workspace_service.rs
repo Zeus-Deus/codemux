@@ -19,21 +19,46 @@ use tauri::{AppHandle, Manager, Runtime};
 /// the points it cannot take back after a wait: once the shared lifecycle
 /// lock is held (a checkout removal holds it for as long as its delete
 /// takes), before the checkout is made, and before a workspace is created,
-/// terminals, setup or teardown scripts start, a closing workspace's chats
-/// stop or files are deleted. Outside callers and plugins pass their grant
-/// check. The desktop and the control socket act for the person at this
-/// computer and pass the default, which always passes.
+/// terminals or each teardown command start, a closing workspace leaves or
+/// its chats stop, or files are deleted. A new workspace's setup outlives the
+/// call and asks [`Self::background`] instead. Outside callers and plugins
+/// pass their grant check. The desktop and the control socket act for the
+/// person at this computer and pass the default, which always passes.
 #[derive(Clone, Default)]
-pub(crate) struct Checkpoint(Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>);
+pub(crate) struct Checkpoint {
+    check: Option<Check>,
+    background: Option<Check>,
+}
+
+type Check = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 impl Checkpoint {
     pub(crate) fn new(check: impl Fn() -> Result<(), String> + Send + Sync + 'static) -> Self {
-        Self(Some(Arc::new(check)))
+        Self { check: Some(Arc::new(check)), background: None }
+    }
+
+    /// Adds the check for work the operation leaves running once it
+    /// returned: a new workspace's setup copies its worktree includes and
+    /// runs its setup commands in the background. The call has ended by then,
+    /// and so has authority scoped to it (an agent's turn, a plugin
+    /// invocation, a launch receipt), so this asks only what a person
+    /// withdraws, such as a connector grant or a plugin's grant. Without it,
+    /// that work is not asked again.
+    pub(crate) fn with_background(
+        self,
+        check: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self { background: Some(Arc::new(check)), ..self }
     }
 
     /// The refusal reads `code: message`, as the caller's own check words it.
     pub(crate) fn check(&self) -> Result<(), String> {
-        self.0.as_ref().map_or(Ok(()), |check| check())
+        self.check.as_ref().map_or(Ok(()), |check| check())
+    }
+
+    /// The checkpoint work left running asks (see [`Self::with_background`]).
+    pub(crate) fn background(&self) -> Checkpoint {
+        Checkpoint { check: self.background.clone(), background: None }
     }
 }
 
@@ -823,15 +848,19 @@ mod tests {
     }
 
     /// Passes `passes` times, then refuses as a revoked grant does.
-    fn withdrawn_after(passes: usize) -> Checkpoint {
+    fn refuses_after(passes: usize) -> impl Fn() -> Result<(), String> + Send + Sync + 'static {
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        Checkpoint::new(move || {
+        move || {
             if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < passes {
                 Ok(())
             } else {
                 Err("grant_revoked: withdrawn".into())
             }
-        })
+        }
+    }
+
+    fn withdrawn_after(passes: usize) -> Checkpoint {
+        Checkpoint::new(refuses_after(passes))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -965,9 +994,9 @@ mod tests {
         };
         let checked = |checkpoint| WorkspaceService::new(app.handle()).checked(checkpoint);
 
-        // Withdrawn while the pre-flight read git, or while Hermes chats
-        // stopped: the workspace stays as it was.
-        for passes in [0, 1] {
+        // Withdrawn while the pre-flight read git, while Hermes chats
+        // stopped, or while teardown ran: the workspace stays as it was.
+        for passes in [0, 1, 2] {
             let error = checked(withdrawn_after(passes)).close(close()).await.unwrap_err();
             assert_eq!(error, "grant_revoked: withdrawn");
             assert!(state.find_workspace(&closing).is_some());
@@ -975,11 +1004,75 @@ mod tests {
 
         // Withdrawn while its agents stopped and the lifecycle lock was taken:
         // the close stands, and the files and the branch stay.
-        let error = checked(withdrawn_after(2)).close(close()).await.unwrap_err();
+        let error = checked(withdrawn_after(3)).close(close()).await.unwrap_err();
         assert_eq!(error, "grant_revoked: withdrawn; the workspace was closed and its files were kept");
         assert!(state.find_workspace(&closing).is_none());
         assert!(checkout.join(".git").exists());
         git(&project, &["rev-parse", "--verify", "refs/heads/feat"]);
+    }
+
+    /// A new worktree's setup runs once the create returned, so it asks the
+    /// background check, never the call's own: that one ends with the call
+    /// (an agent's turn, a plugin invocation). Each case is (checkpoint, files
+    /// in the checkout afterwards, how setup ended, the command it stopped
+    /// before).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worktree_setup_asks_only_its_background_checkpoint() {
+        if isolated("workspace_service::tests::worktree_setup_asks_only_its_background_checkpoint") {
+            return;
+        }
+        use tauri::Listener;
+        let dir = tempfile::tempdir().unwrap();
+        let project = repo(dir.path(), "project", "main");
+        std::fs::create_dir(project.join(".codemux")).unwrap();
+        std::fs::write(project.join(".codemux/config.json"), r#"{"setup": ["touch first", "touch second"]}"#).unwrap();
+        std::fs::write(project.join(".env"), "SECRET=1").unwrap();
+        let state = AppStateStore::default();
+        state.create_empty_workspace_at_path(project.clone());
+        let app = mock_app(state);
+        let (sender, mut ended) = tokio::sync::mpsc::unbounded_channel();
+        for name in ["workspace-setup-failed", "workspace-setup-complete"] {
+            let sender = sender.clone();
+            app.listen_any(name, move |event| {
+                let payload: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+                let _ = sender.send((name, payload));
+            });
+        }
+
+        type Case = (Checkpoint, &'static [&'static str], &'static str, Option<&'static str>);
+        let cases: [(&str, Case); 4] = [
+            // The call's check would refuse now; setup does not ask it.
+            ("ended-call", (withdrawn_after(2), &[".env", "first", "second"], "workspace-setup-complete", None)),
+            // Withdrawn before setup began: nothing copied, nothing run.
+            ("before-copy", (Checkpoint::default().with_background(refuses_after(0)), &[], "workspace-setup-failed", Some("touch first"))),
+            // Withdrawn while the includes were copied.
+            ("after-copy", (Checkpoint::default().with_background(refuses_after(1)), &[".env"], "workspace-setup-failed", Some("touch first"))),
+            // Withdrawn while a command ran.
+            ("mid-setup", (Checkpoint::default().with_background(refuses_after(2)), &[".env", "first"], "workspace-setup-failed", Some("touch second"))),
+        ];
+        for (branch, (checkpoint, made, event, stopped_before)) in cases {
+            let request = WorktreeRequest {
+                repo_path: project.display().to_string(),
+                branch: branch.into(),
+                new_branch: true,
+                base: WorktreeBase::RepoHead,
+                layout: WorkspacePresetLayout::Empty,
+                preset: None,
+                pr_number: None,
+                select: false,
+                initial_chat: None,
+                reserved_id: None,
+            };
+            let created = WorkspaceService::new(app.handle()).checked(checkpoint).create_worktree(request).await.unwrap();
+            let (name, payload) = tokio::time::timeout(std::time::Duration::from_secs(15), ended.recv()).await.unwrap().unwrap();
+            assert_eq!((name, payload["workspace_id"].as_str()), (event, Some(created.workspace_id.as_str())), "{branch}: {payload}");
+            if let Some(command) = stopped_before {
+                assert_eq!(payload["command"], command, "{branch}");
+                assert_eq!(payload["stderr"], "grant_revoked: withdrawn\nSetup stopped before this command started.", "{branch}");
+            }
+            let present: Vec<_> = [".env", "first", "second"].into_iter().filter(|file| Path::new(&created.cwd).join(file).exists()).collect();
+            assert_eq!(present, made, "{branch}");
+        }
     }
 
     #[test]

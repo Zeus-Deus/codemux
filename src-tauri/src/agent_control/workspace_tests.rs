@@ -880,6 +880,112 @@ async fn workspace_close_withdrawn_during_its_preflight_stops_no_hermes_chat() {
     assert!(checkout.join(".git").exists());
 }
 
+// ── setup and teardown commands after a revocation ────────────────────────
+//
+// Setup runs in the background once a create returned; teardown runs while a
+// close waits. Each command is repository content and can take long, so none
+// may start once the requester's grant is gone.
+
+/// A command that marks `started` in its folder, then waits for `release`
+/// there (at most 10 s).
+fn held_command(started: &str) -> String {
+    format!("touch {started}; i=0; while [ ! -e release ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done")
+}
+
+fn write_scripts(folder: &Path, scripts: Value) {
+    std::fs::create_dir_all(folder.join(".codemux")).unwrap();
+    std::fs::write(folder.join(".codemux/config.json"), scripts.to_string()).unwrap();
+}
+
+async fn appears(path: &Path) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} appears", path.display()));
+}
+
+/// How each setup ends, as the desktop is told: (event, payload).
+fn setup_outcomes(app: &App) -> tokio::sync::mpsc::UnboundedReceiver<(&'static str, Value)> {
+    use tauri::Listener;
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    for name in ["workspace-setup-failed", "workspace-setup-complete"] {
+        let sender = sender.clone();
+        app.listen_any(name, move |event| {
+            let _ = sender.send((name, serde_json::from_str(event.payload()).unwrap_or_default()));
+        });
+    }
+    receiver
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worktree_setup_revoked_during_a_command_starts_no_further_command() {
+    if isolated(&format!("{MODULE}worktree_setup_revoked_during_a_command_starts_no_further_command")) {
+        return;
+    }
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    // The new checkout falls back to the repository's own scripts.
+    write_scripts(&repo, json!({"setup": [held_command("setup-started"), "touch setup-second"]}));
+    let mut outcomes = setup_outcomes(&app);
+    let caller = connector_caller(&app, "setup-client", "setup-grant", ControlAccess::FullAccess).await;
+    let args = json!({"repo_path": repo, "branch": "setup-revoked", "layout": "empty", "client_request_id": "setup-revoked"});
+
+    // The create returns while its setup still runs.
+    let created = call(&app, &caller, "worktree_create", args).await.unwrap();
+    assert_eq!(created["state"], "succeeded", "{created}");
+    let cwd = PathBuf::from(created["cwd"].as_str().unwrap());
+    appears(&cwd.join("setup-started")).await;
+    crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "setup-client".into()).unwrap();
+    std::fs::write(cwd.join("release"), "").unwrap();
+
+    let (event, payload) = tokio::time::timeout(Duration::from_secs(15), outcomes.recv()).await.expect("the setup ends").unwrap();
+    assert_eq!(event, "workspace-setup-failed", "{payload}");
+    assert_eq!(payload["workspace_id"], created["workspace_id"]);
+    assert_eq!(payload["command"], "touch setup-second", "the first command it did not start");
+    assert!(payload["stderr"].as_str().unwrap().starts_with("grant_revoked: "), "{payload}");
+    assert!(!cwd.join("setup-second").exists(), "no command starts once the grant is gone");
+    assert!(app.state::<AppStateStore>().find_workspace(created["workspace_id"].as_str().unwrap()).is_some());
+    connector_off(&app);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_close_revoked_during_teardown_leaves_the_workspace_open() {
+    if isolated(&format!("{MODULE}workspace_close_revoked_during_teardown_leaves_the_workspace_open")) {
+        return;
+    }
+    let (app, provider, _root, _workspace, repo) = git_fixture().await;
+    let parent = tempfile::tempdir().unwrap();
+    let checkout = parent.path().join("teardown-close");
+    git(&repo, &["worktree", "add", "-b", "teardown-close", checkout.to_str().unwrap()]);
+    write_scripts(&checkout, json!({"teardown": [held_command("teardown-started"), "touch teardown-second"]}));
+    let state = app.state::<AppStateStore>();
+    let closing = state.create_empty_workspace_at_path(checkout.clone()).0;
+    state.set_workspace_worktree(&closing, checkout.display().to_string(), "teardown-close".into());
+    // A chat in the workspace, which closing it would stop.
+    let chat = call(&app, &ControlCaller::trusted(), "thread_launch", json!({
+        "workspace_id": closing, "client_request_id": "teardown-chat", "provider": "claude", "permission_mode": "default",
+    })).await.unwrap();
+    assert_eq!(settle_operation(&app, &chat).await["state"], "succeeded");
+    let caller = connector_caller(&app, "teardown-client", "teardown-grant", ControlAccess::FullAccess).await;
+    let args = json!({"workspace_id": closing, "client_request_id": "teardown-close"});
+
+    let close = spawn_call(&app, &caller, "workspace_close", &args);
+    let running = admitted(&app, &caller, "workspace_close", &args).await;
+    appears(&checkout.join("teardown-started")).await;
+    crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "teardown-client".into()).unwrap();
+    std::fs::write(checkout.join("release"), "").unwrap();
+
+    refused(close.await.unwrap(), ErrorCode::GrantRevoked);
+    failed_as_revoked(&settled(&app, &caller, &running["operation_id"]).await);
+    assert!(state.find_workspace(&closing).is_some(), "the workspace stays open");
+    assert!(!checkout.join("teardown-second").exists(), "no teardown command starts once the grant is gone");
+    let stops: Vec<_> = provider.calls.snapshot().into_iter().filter(|call| matches!(call, MockCall::StopSession(_))).collect();
+    assert!(stops.is_empty(), "its chat keeps running: {stops:?}");
+    connector_off(&app);
+}
+
 // ── outside answers: approvals and questions ──────────────────────────────
 
 async fn launched(app: &App, key: &str, workspace: &str, mode: &str) -> String {

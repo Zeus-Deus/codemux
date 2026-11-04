@@ -870,6 +870,58 @@ async fn platform_native_worktree_revoked_while_queued_on_the_lifecycle_lock_che
     crate::agent_control::tests::connector_off(&f.app);
 }
 
+/// A plugin worktree's setup scripts run on after the invocation that made it
+/// ended, which cancels its caller. They still stop once the plugin, or the
+/// connector client that invoked it, loses its grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn platform_worktree_setup_outlives_the_invocation_but_not_the_grants() {
+    if isolated("platform_worktree_setup_outlives_the_invocation_but_not_the_grants") {
+        return;
+    }
+    let f = Fixture::new().await;
+    let invocation = super::platform_runtime::RuntimeCancellation::default();
+    let plugin = caller(&f.record).with_cancellation(invocation.clone());
+    let mut connector = plugin.clone();
+    connector.control = crate::agent_control::tests::connector_caller(
+        &f.app,
+        "setup-plugin-client",
+        "setup-plugin-grant",
+        ControlAccess::FullAccess,
+    )
+    .await;
+    let checkpoint = |actor: &PlatformCaller| {
+        f.platform
+            .checkpoint(f.app.handle(), actor, "worktrees.create", &f.project)
+    };
+    let (by_plugin, by_connector) = (checkpoint(&plugin), checkpoint(&connector));
+    for checkpoint in [&by_plugin, &by_connector] {
+        checkpoint.check().unwrap();
+        checkpoint.background().check().unwrap();
+    }
+
+    // The invocation returned.
+    invocation.cancel();
+    for checkpoint in [&by_plugin, &by_connector] {
+        assert!(checkpoint.check().unwrap_err().starts_with("cancelled:"));
+        checkpoint.background().check().unwrap();
+    }
+
+    crate::mcp_connector::agent_connector_revoke(
+        f.app.handle().clone(),
+        "setup-plugin-client".into(),
+    )
+    .unwrap();
+    let refusal = by_connector.background().check().unwrap_err();
+    assert!(refusal.starts_with("grant_revoked:"), "{refusal}");
+    by_plugin.background().check().unwrap();
+
+    // Disabling the plugin moves it to a new generation.
+    f.platform.set_enabled(INSTALLATION, false).unwrap();
+    let refusal = by_plugin.background().check().unwrap_err();
+    assert!(refusal.starts_with("stale_generation:"), "{refusal}");
+    crate::agent_control::tests::connector_off(&f.app);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn platform_native_partial_worktree_preparation_retains_unknown_receipt_and_frozen_ref() {
     if isolated(

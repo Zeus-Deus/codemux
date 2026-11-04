@@ -217,12 +217,21 @@ pub(super) async fn close<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller
 }
 
 /// The caller's authority, as the workspace lifecycle asks for it again after
-/// each wait: on the lifecycle lock, a fetch, a large checkout, stopping a
-/// closing workspace's agents. A grant revoked or a connector disabled
-/// meanwhile stops the operation there, and its receipt records why.
+/// each wait: on the lifecycle lock, a fetch, a large checkout, a teardown
+/// command, stopping a closing workspace's agents. A grant revoked or a
+/// connector disabled meanwhile stops the operation there, and its receipt
+/// records why.
+///
+/// A new workspace's setup runs on after the call returned, past an in-app
+/// chat's turn and a web-remote session's connection, so it asks only
+/// whether a connector grant still stands.
 pub(super) fn checkpoint<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller) -> Checkpoint {
     let (app, caller) = (app.clone(), caller.clone());
+    let (setup_app, setup_caller) = (app.clone(), caller.clone());
     Checkpoint::new(move || service::authorize(&app, &caller).map_err(|error| error.to_string()))
+        .with_background(move || {
+            crate::mcp_connector::validate_caller(&setup_app, &setup_caller).map_err(|error| error.to_string())
+        })
 }
 
 /// Maps the workspace and git layers' `prefix: message` errors to codes. Text
