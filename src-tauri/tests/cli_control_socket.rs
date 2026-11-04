@@ -340,16 +340,13 @@ fn waits_carry_the_client_and_map_run_states_to_exit_codes() {
     let app = FakeApp::start(move |request| match request["command"].as_str() {
         Some("status") => ok_reply(json!({})),
         Some("tool_call") if request["params"]["name"] == "thread_status" => {
-            tool_result(match request["params"]["arguments"]["thread_id"].as_str() {
-                Some("blocked") => thread_status("needs_input", json!({"phase": "waiting_approval", "pending": blocked.clone()})),
-                Some("settled") => thread_status("done", json!({"phase": "completed", "settled": true})),
-                _ => thread_status("running", json!({})),
-            })
+            tool_result(thread_status("done", json!({"phase": "completed", "settled": true})))
         }
         Some("tool_call") if request["params"]["name"] == "thread_wait" => {
             let arguments = &request["params"]["arguments"];
             let approval = json!({"approvals": [{"request_id": "r1", "turn_id": "t1", "request_kind": "command"}], "questions": [], "secrets": []});
             tool_result(match (arguments["thread_id"].as_str(), arguments["since"].as_str()) {
+                (Some("blocked"), None) => waited("needs_input", "c1", json!({"pending": blocked.clone()})),
                 (_, None) => waited("running", "c1", json!({})),
                 (Some("asks"), Some(_)) => waited("needs_input", "c2", json!({"pending": approval})),
                 (Some("fails"), Some(_)) => waited("failed", "c2", json!({"failure": "interrupted"})),
@@ -373,7 +370,7 @@ fn waits_carry_the_client_and_map_run_states_to_exit_codes() {
     assert_eq!(exit_code(&fails), 1);
     assert_eq!(stdout_json(&fails)["failure"], "interrupted");
 
-    // A run already waiting on input is reported at once, without parking a wait.
+    // A run already waiting on input is reported by the first read, which does not park.
     let blocked = app.cli(&["thread", "wait", "blocked", "--workspace", "ws", "--json"]);
     assert_eq!(exit_code(&blocked), 2);
     assert_eq!(stdout_json(&blocked)["pending"], approval);
@@ -390,11 +387,15 @@ fn waits_carry_the_client_and_map_run_states_to_exit_codes() {
     let requests = app.requests();
     // A narrowed client asks the app whether it enforces access first.
     assert_eq!(requests[0]["command"], "status");
-    assert!(!requests.iter().any(|request| tool_name(request) == Some("thread_wait") && request["params"]["arguments"]["thread_id"] == "blocked"));
+    let blocked: Vec<&Value> = requests.iter()
+        .filter(|request| tool_name(request) == Some("thread_wait") && request["params"]["arguments"]["thread_id"] == "blocked")
+        .collect();
+    assert_eq!(blocked.len(), 1, "{blocked:?}");
+    assert_eq!(blocked[0]["params"]["arguments"]["timeout_ms"], 1);
     let waits: Vec<&Value> = requests.iter().filter(|request| tool_name(request) == Some("thread_wait")).collect();
     assert_eq!(waits[0]["client"], json!({"name": "itest", "access": "supervised"}));
-    assert_eq!(waits[0]["params"]["arguments"], json!({"workspace_id": "ws", "thread_id": "done", "timeout_ms": 60_000}));
-    assert_eq!(waits[1]["params"]["arguments"]["since"], "c1");
+    assert_eq!(waits[0]["params"]["arguments"], json!({"workspace_id": "ws", "thread_id": "done", "timeout_ms": 1}));
+    assert_eq!(waits[1]["params"]["arguments"], json!({"workspace_id": "ws", "thread_id": "done", "timeout_ms": 60_000, "since": "c1"}));
     // Unnamed calls run as the owner: no client at all.
     let owner = requests.iter().find(|request| request["params"]["arguments"]["thread_id"] == "asks").unwrap();
     assert!(owner.get("client").is_none(), "{owner}");
@@ -406,7 +407,7 @@ fn the_needs_input_hint_answers_a_question_as_printed() {
         "questions": [{"question_id": "q1", "turn_id": "t1", "text": "Which database?", "questions": [{"title": "Database", "options": []}]}]});
     let app = FakeApp::start(move |request| match (request["command"].as_str(), tool_name(request)) {
         (Some("status"), _) => ok_reply(json!({})),
-        (_, Some("thread_status")) => tool_result(thread_status("needs_input", json!({"pending": pending.clone()}))),
+        (_, Some("thread_wait")) => tool_result(waited("needs_input", "c1", json!({"pending": pending.clone()}))),
         (_, Some("thread_answer")) => tool_result(json!({"workspace_id": "ws", "thread_id": "th", "question_id": "q1",
             "turn_id": "t2", "operation_id": "op", "state": "succeeded"})),
         _ => json!({"ok": false, "protocol_version": 2, "data": null, "error": "unknown_tool: Unknown tool"}),
@@ -441,7 +442,6 @@ fn a_queued_send_waits_for_the_run_its_message_starts() {
     let app = FakeApp::start(move |request| match (request["command"].as_str(), tool_name(request)) {
         (Some("status"), _) => ok_reply(json!({})),
         (_, Some("thread_send")) => tool_result(receipt("queued", json!({"queued_id": "q1"}))),
-        (_, Some("thread_status")) => tool_result(thread_status("running", json!({"queued_ids": ["q1"]}))),
         (_, Some("thread_wait")) => {
             let arguments = &request["params"]["arguments"];
             let operation = json!({"operation_id": "op", "state": "succeeded", "error": null});
@@ -483,6 +483,60 @@ fn timeout_bounds_calls_to_an_app_that_stops_answering() {
         assert_eq!(stdout_json(&output)["error"]["code"], "timed_out", "{args:?}");
         assert!(elapsed < Duration::from_secs(5), "{args:?} took {elapsed:?}");
     }
+}
+
+#[test]
+fn a_retried_launch_reports_its_own_run_not_a_newer_runs_approval() {
+    // A keyed retry returns the launch's settled receipt: its first message
+    // was queued, so it names only the queue entry. That message has run
+    // and finished as t1; a newer run, t2, is now the thread's current one
+    // and waits on an approval. The server resolves the operation to t1.
+    let app = FakeApp::start(|request| match (request["command"].as_str(), tool_name(request)) {
+        (Some("status"), _) => ok_reply(json!({})),
+        (_, Some("thread_launch")) => tool_result(json!({"operation_id": "op", "tool": "thread_launch", "state": "succeeded",
+            "workspace_id": "ws", "thread_id": "th", "error": null,
+            "result": {"workspace_id": "ws", "thread_id": "th", "accepted_as": "queued", "turn": {"turn_id": "", "queued_id": "q1", "steered": false}}})),
+        (_, Some("thread_status")) => tool_result(thread_status("needs_input", json!({"turn_id": "t2", "phase": "waiting_approval",
+            "pending": {"approvals": [{"request_id": "r2", "turn_id": "t2", "request_kind": "command"}], "questions": [], "secrets": []}}))),
+        (_, Some("thread_wait")) if request["params"]["arguments"]["operation_id"] == "op" => tool_result(waited("done", "c1",
+            json!({"turn_id": "t1", "final_text": "answer of t1", "operation": {"operation_id": "op", "state": "succeeded", "error": null}}))),
+        _ => json!({"ok": false, "protocol_version": 2, "data": null, "error": "unknown_tool: Unknown tool"}),
+    });
+    let retried = app.cli(&["thread", "start", "--workspace", "ws", "--provider", "cursor", "--permission-mode", "agent", "-m", "hi",
+        "--request-id", "launch-key", "--wait", "--json"]);
+    assert_eq!(exit_code(&retried), 0, "{}", String::from_utf8_lossy(&retried.stdout));
+    let report = stdout_json(&retried);
+    assert_eq!((report["turn_id"].clone(), report["final_text"].clone()), (json!("t1"), json!("answer of t1")), "{report}");
+    assert_eq!(report["pending"]["approvals"], json!([]), "{report}");
+}
+
+#[test]
+fn input_that_opens_after_the_first_read_is_reported_at_once() {
+    // An approval opens right after the follow's first read of the run. A
+    // wait that started without that read's cursor takes the approval as its
+    // baseline, as the server's waits do, and reports it only at its timeout.
+    let approval = json!({"approvals": [{"request_id": "r1", "turn_id": "t1", "request_kind": "command"}], "questions": [], "secrets": []});
+    let read = Arc::new(Mutex::new(false));
+    let app = FakeApp::start(move |request| {
+        let first = !std::mem::replace(&mut *read.lock().unwrap(), true);
+        let arguments = &request["params"]["arguments"];
+        match tool_name(request) {
+            Some("thread_status") if first => tool_result(thread_status("running", json!({"wait_cursor": "before"}))),
+            Some("thread_wait") if first => tool_result(waited("running", "before", json!({"timed_out": true}))),
+            Some("thread_wait") if arguments["since"] == "before" => tool_result(waited("needs_input", "after", json!({"pending": approval}))),
+            Some("thread_wait") => {
+                std::thread::sleep(Duration::from_millis(arguments["timeout_ms"].as_u64().unwrap_or(0)));
+                tool_result(waited("needs_input", "after", json!({"pending": approval, "timed_out": true})))
+            }
+            _ => json!({"ok": false, "protocol_version": 2, "data": null, "error": "unknown_tool: Unknown tool"}),
+        }
+    });
+    let started = Instant::now();
+    let asks = app.cli(&["thread", "wait", "th", "--workspace", "ws", "--timeout", "8s", "--json"]);
+    let elapsed = started.elapsed();
+    assert_eq!(exit_code(&asks), 2, "{}", String::from_utf8_lossy(&asks.stdout));
+    assert_eq!(stdout_json(&asks)["pending"]["approvals"][0]["request_id"], "r1");
+    assert!(elapsed < Duration::from_secs(4), "the approval waited for a timeout: {elapsed:?}");
 }
 
 // ── Against a real app ────────────────────────────────────────────────────

@@ -269,6 +269,14 @@ const SETTLE_BUDGET: Duration = Duration::from_secs(120);
 /// test checks); each slice is a fresh connection.
 pub(crate) const WAIT_SLICE: Duration = Duration::from_secs(60);
 
+/// A follow's first slice: long enough to read its target once, too short
+/// to park. A wait does not return for input already pending when it
+/// starts, so parking at once would cost a whole slice to report a run that
+/// is already blocked. This read reports that run, as the server sees the
+/// target, and its cursor carries into the next slice, which then returns
+/// for anything that changed after it.
+const FIRST_SLICE: Duration = Duration::from_millis(1);
+
 pub(crate) async fn run(door: &Door, command: ThreadCommand) -> Result<Exit, String> {
     match command {
         ThreadCommand::Start(args) => start(door, args).await,
@@ -779,13 +787,6 @@ impl Target {
         }
     }
 
-    fn turn(&self) -> Option<&str> {
-        match self {
-            Target::Run(turn) => Some(turn),
-            Target::Operation(_) | Target::Thread => None,
-        }
-    }
-
     /// Selects this target in `thread_wait` arguments.
     fn select(&self, arguments: &mut Value) {
         match self {
@@ -803,14 +804,14 @@ impl Target {
     }
 }
 
-/// One call of the follow loop, given up at `deadline`. Retried, except as
-/// the verb's first call, so a stopped app fails fast.
-async fn follow_call(door: &Door, retry: bool, tool: &str, arguments: Value, deadline: Option<Instant>) -> Result<Value, CliError> {
+/// One `thread_wait` of the follow loop, given up at `deadline`. Retried,
+/// except as the verb's first call, so a stopped app fails fast.
+async fn follow_call(door: &Door, retry: bool, arguments: Value, deadline: Option<Instant>) -> Result<Value, CliError> {
     door::by_deadline(deadline, async {
         if retry {
-            door.call_in_loop(tool, arguments).await
+            door.call_in_loop(verbs::THREAD_WAIT, arguments).await
         } else {
-            door.call(tool, arguments).await
+            door.call(verbs::THREAD_WAIT, arguments).await
         }
     })
     .await
@@ -818,8 +819,10 @@ async fn follow_call(door: &Door, retry: bool, tool: &str, arguments: Value, dea
 
 /// Follows a run with `thread_wait` slices until it is done, failed or needs
 /// input, or `deadline` passes, which also cuts off a call still under way.
-/// Each later slice passes the last `wait_cursor` as `since`, so it parks
-/// until something changes. Never interrupts or stops anything.
+/// The first slice only reads the target ([`FIRST_SLICE`]); each later one
+/// passes the last `wait_cursor` as `since`, so it parks until something
+/// changes. The server reads every slice for the target, so input another
+/// run waits on never ends this follow. Never interrupts or stops anything.
 /// `retry_first` is false when the first call is the verb's first, so a
 /// stopped app fails fast.
 pub(crate) async fn follow_run(door: &Door, run: Followed, deadline: Option<Instant>, retry_first: bool) -> RunReport {
@@ -828,26 +831,11 @@ pub(crate) async fn follow_run(door: &Door, run: Followed, deadline: Option<Inst
     let thread = json!({"workspace_id": run.workspace_id, "thread_id": run.thread_id});
     let mut since: Option<String> = None;
     let mut retry = retry_first;
-    // The follow starts with a thread_status read, which does not park.
-    let mut checked = false;
+    let mut longest = FIRST_SLICE;
     loop {
-        if !checked {
-            let status = match follow_call(door, retry, verbs::THREAD_STATUS, thread.clone(), deadline).await {
-                Ok(status) => status,
-                Err(failure) => return report.stopped(failure),
-            };
-            retry = true;
-            checked = true;
-            // A wait does not return for input already pending when it
-            // starts, so a run that is already blocked would cost a slice.
-            if status["state"] == "needs_input" && target.turn().is_none_or(|turn| status["turn_id"] == turn) {
-                report.absorb(&status);
-                return report.finish(RunState::NeedsInput);
-            }
-        }
-        // Sized from what is left now, after the status read took its time.
+        // Sized from what is left now, after the last call took its time.
         let slice = match deadline {
-            None => WAIT_SLICE,
+            None => longest,
             Some(deadline) => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left < Duration::from_millis(1) {
@@ -857,7 +845,7 @@ pub(crate) async fn follow_run(door: &Door, run: Followed, deadline: Option<Inst
                         "The run was still going at the deadline. Nothing was cancelled.",
                     ));
                 }
-                left.min(WAIT_SLICE)
+                left.min(longest)
             }
         };
         let mut arguments = thread.clone();
@@ -866,10 +854,12 @@ pub(crate) async fn follow_run(door: &Door, run: Followed, deadline: Option<Inst
         if let Some(since) = &since {
             arguments["since"] = json!(since);
         }
-        let waited = match follow_call(door, retry, verbs::THREAD_WAIT, arguments, deadline).await {
+        let waited = match follow_call(door, retry, arguments, deadline).await {
             Ok(waited) => waited,
             Err(failure) => return report.stopped(failure),
         };
+        retry = true;
+        longest = WAIT_SLICE;
         // A message that never ran fails with its receipt's own error.
         if matches!(waited["operation"]["state"].as_str(), Some("failed" | "needs_attention")) {
             return RunReport::of(&run).stopped(CliError::from(output::receipt_error(&waited["operation"])));
@@ -1015,12 +1005,12 @@ mod tests {
         value
     }
 
-    /// The tool every follow reads first.
-    const FIRST_READ: &str = "thread_status";
+    /// The tool every follow reads first: a wait that only reads.
+    const FIRST_READ: &str = "thread_wait";
 
-    /// The status read every follow starts with, for a run still going.
+    /// The read every follow starts with, for a run still going.
     fn busy() -> (&'static str, Result<Value, CliError>) {
-        (FIRST_READ, Ok(status_reply("running", json!({}))))
+        (FIRST_READ, Ok(waited("running", json!({"wait_cursor": "cur-first"}))))
     }
 
     /// A call to an app that took the request and never answers: the door
@@ -1104,9 +1094,10 @@ mod tests {
         assert_eq!(exit, Exit::Done);
         let calls = door.script().calls();
         // The receipt's workspace (a worktree launch names its new one), not the flag's.
-        assert_eq!(calls[1].1, json!({"workspace_id": "ws-new", "thread_id": "th-1"}));
-        assert_eq!(calls[2].1, json!({"workspace_id": "ws-new", "thread_id": "th-1", "turn_id": "t1", "timeout_ms": 60_000}));
-        // The next slice parks until the view moves on from the last one.
+        // The first slice only reads the run; the next ones park until the
+        // view moves on from the last one.
+        assert_eq!(calls[1].1, json!({"workspace_id": "ws-new", "thread_id": "th-1", "turn_id": "t1", "timeout_ms": 1}));
+        assert_eq!(calls[2].1, json!({"workspace_id": "ws-new", "thread_id": "th-1", "turn_id": "t1", "timeout_ms": 60_000, "since": "cur-first"}));
         assert_eq!(calls[3].1["since"], "cur-running");
         assert_eq!(calls[3].1["turn_id"], "t1");
 
@@ -1126,7 +1117,6 @@ mod tests {
         let operation = json!({"operation_id": "op-1", "state": "succeeded", "error": null});
         let door = Door::fake(vec![
             ("thread_launch", Ok(launched)),
-            busy(),
             ("thread_wait", Ok(waited("running", json!({"turn_id": null, "operation": operation, "timed_out": true})))),
             ("thread_wait", Ok(waited("running", json!({"turn_id": "t1", "operation": operation, "wait_cursor": "cur-started"})))),
             ("thread_wait", Ok(waited("done", json!({"turn_id": "t1", "final_text": "PONG", "operation": operation})))),
@@ -1136,9 +1126,9 @@ mod tests {
         assert_eq!(start(&door, start_args(&argv)).await.unwrap(), Exit::Done);
         assert!(door.script().finished());
         let calls = door.script().calls();
-        assert_eq!(calls[2].1, json!({"workspace_id": "ws-new", "thread_id": "th-1", "operation_id": "op-1", "timeout_ms": 60_000}));
-        assert_eq!((calls[3].1["operation_id"].as_str(), calls[3].1["since"].as_str()), (Some("op-1"), Some("cur-running")));
-        assert_eq!((calls[4].1["operation_id"].as_str(), calls[4].1["since"].as_str()), (Some("op-1"), Some("cur-started")));
+        assert_eq!(calls[1].1, json!({"workspace_id": "ws-new", "thread_id": "th-1", "operation_id": "op-1", "timeout_ms": 1}));
+        assert_eq!((calls[2].1["operation_id"].as_str(), calls[2].1["since"].as_str()), (Some("op-1"), Some("cur-running")));
+        assert_eq!((calls[3].1["operation_id"].as_str(), calls[3].1["since"].as_str()), (Some("op-1"), Some("cur-started")));
         assert!(calls.iter().all(|(_, arguments)| arguments.get("turn_id").is_none()), "the server picks the run");
     }
 
@@ -1155,21 +1145,58 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn input_already_pending_is_reported_without_parking() {
         // A wait does not return for input pending when it starts, so the
-        // status read reports it before any slice parks.
+        // first slice, which only reads, reports it before any slice parks.
         let approval = json!({"approvals": [{"request_id": "r1", "turn_id": "t1", "request_kind": "command"}], "questions": [], "secrets": []});
-        let blocked = || ("thread_status", Ok(status_reply("needs_input", json!({"phase": "waiting_approval", "pending": approval}))));
-        for turn in [None, Some("t1")] {
+        let blocked = || (FIRST_READ, Ok(waited("needs_input", json!({"pending": approval, "timed_out": true}))));
+        for run in [following(None, None), following(Some("t1"), None), following(None, Some("op"))] {
             let door = Door::fake(vec![blocked()]);
-            let report = follow_run(&door, following(turn, None), None, false).await;
-            assert_eq!((report.state, report.turn_id.as_deref(), report.pending.as_ref()), (RunState::NeedsInput, Some("t1"), Some(&approval)), "{turn:?}");
-            assert_eq!(door.script().names(), ["thread_status"], "{turn:?}");
+            let report = follow_run(&door, run.clone(), None, false).await;
+            assert_eq!((report.state, report.turn_id.as_deref(), report.pending.as_ref()), (RunState::NeedsInput, Some("t1"), Some(&approval)), "{run:?}");
+            let calls = door.script().calls();
+            assert_eq!((calls.len(), calls[0].1["timeout_ms"].as_u64(), calls[0].1.get("since")), (1, Some(1), None), "{run:?}");
         }
 
-        // Input a newer run waits on does not stop the follow of an older one.
-        let door = Door::fake(vec![blocked(), ("thread_wait", Ok(waited("done", json!({"turn_id": "t0", "final_text": "older"}))))]);
+        // The server reads that slice for the target, so input a newer run
+        // waits on does not stop the follow of an older one.
+        let door = Door::fake(vec![(FIRST_READ, Ok(waited("done", json!({"turn_id": "t0", "final_text": "older", "pending": approval}))))]);
         let report = follow_run(&door, following(Some("t0"), None), None, false).await;
         assert_eq!((report.state, report.final_text.as_deref()), (RunState::Done, Some("older")));
-        assert_eq!(door.script().calls()[1].1["turn_id"], "t0");
+        assert_eq!(door.script().calls()[0].1["turn_id"], "t0");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_launch_follows_its_own_run_not_a_newer_runs_input() {
+        // A keyed retry of a launch returns its settled receipt again. Its
+        // first message was queued, so the receipt names only the queue
+        // entry. That message has since run and finished as t1, and a newer
+        // run in the thread waits on an approval. The follow asks for the
+        // operation's run and never reads the thread's own input.
+        let retried = receipt("succeeded", json!({"accepted_as": "queued", "turn": {"turn_id": "", "queued_id": "q", "steered": false}}));
+        let operation = json!({"operation_id": "op-1", "state": "succeeded", "error": null});
+        let door = Door::fake(vec![
+            ("thread_launch", Ok(retried)),
+            (FIRST_READ, Ok(waited("done", json!({"turn_id": "t1", "final_text": "PONG", "operation": operation})))),
+        ]);
+        let mut argv = base();
+        argv.extend(["--wait", "--json", "--request-id", "k"]);
+        assert_eq!(start(&door, start_args(&argv)).await.unwrap(), Exit::Done);
+        assert_eq!(door.script().names(), ["thread_launch", "thread_wait"], "no read of the whole thread");
+        assert_eq!(door.script().calls()[1].1, json!({"workspace_id": "ws-new", "thread_id": "th-1", "operation_id": "op-1", "timeout_ms": 1}));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_parked_wait_starts_from_the_first_reads_cursor() {
+        // Input that opens after the first read but before the next slice
+        // starts would be that slice's baseline without `since`, and come
+        // out only at its timeout. With the first read's cursor it is a
+        // change, so the slice returns it at once.
+        let approval = json!({"approvals": [{"request_id": "r1", "turn_id": "t1", "request_kind": "command"}], "questions": [], "secrets": []});
+        for run in [following(None, None), following(Some("t1"), None), following(None, Some("op"))] {
+            let door = Door::fake(vec![busy(), ("thread_wait", Ok(waited("needs_input", json!({"pending": approval}))))]);
+            let report = follow_run(&door, run.clone(), None, false).await;
+            assert_eq!(report.state, RunState::NeedsInput, "{run:?}");
+            assert_eq!(door.script().calls()[1].1["since"], "cur-first", "{run:?}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1205,7 +1232,7 @@ mod tests {
         assert_eq!((report.state, report.state.exit().code()), (RunState::TimedOut, 3));
         assert_eq!(report.error.unwrap().code, code::TIMED_OUT);
         // Two slices fit the deadline exactly; nothing else was called.
-        assert_eq!(door.script().names(), ["thread_status", "thread_wait", "thread_wait"]);
+        assert_eq!(door.script().names(), [FIRST_READ, "thread_wait", "thread_wait"]);
         assert_eq!(door.script().calls()[2].1["timeout_ms"], 30_000);
     }
 
@@ -1313,7 +1340,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn first_call_is_not_retried() {
-        let door = Door::fake(vec![("thread_status", Err(CliError::failed(code::UNAVAILABLE, "Start the Codemux app")))]);
+        let door = Door::fake(vec![(FIRST_READ, Err(CliError::failed(code::UNAVAILABLE, "Start the Codemux app")))]);
         let report = follow(&door, None).await;
         assert_eq!((report.state.exit().code(), report.error.unwrap().code), (1, code::UNAVAILABLE.to_owned()));
         assert!(door.script().finished());
@@ -1336,7 +1363,6 @@ mod tests {
         let operation = |state: &str, error: Value| json!({"operation_id": "op", "state": state, "error": error});
         let not_started = json!({"turn_id": null, "operation": operation("succeeded", Value::Null)});
         let door = Door::fake(vec![
-            ("thread_status", Ok(status_reply("running", json!({"queued_ids": ["q1"]})))),
             ("thread_wait", Ok(waited("running", not_started.clone()))),
             ("thread_wait", Ok(waited("running", json!({"turn_id": "t2", "operation": operation("succeeded", Value::Null)})))),
             ("thread_wait", Ok(waited("done", json!({"turn_id": "t2", "final_text": "queued run", "operation": operation("succeeded", Value::Null)})))),
@@ -1344,8 +1370,8 @@ mod tests {
         let report = follow_run(&door, run.clone(), None, true).await;
         assert_eq!((report.state, report.turn_id.as_deref(), report.final_text.as_deref()), (RunState::Done, Some("t2"), Some("queued run")));
         let calls = door.script().calls();
-        assert_eq!(calls[1].1, json!({"workspace_id": "ws", "thread_id": "th", "operation_id": "op", "timeout_ms": 60_000}));
-        assert_eq!((calls[2].1["operation_id"].as_str(), calls[2].1["since"].as_str()), (Some("op"), Some("cur-running")));
+        assert_eq!(calls[0].1, json!({"workspace_id": "ws", "thread_id": "th", "operation_id": "op", "timeout_ms": 1}));
+        assert_eq!((calls[1].1["operation_id"].as_str(), calls[1].1["since"].as_str()), (Some("op"), Some("cur-running")));
         assert!(calls.iter().all(|(_, arguments)| arguments.get("turn_id").is_none()), "the server picks the run");
         assert!(door.script().finished());
 
@@ -1356,7 +1382,6 @@ mod tests {
             let ended = json!({"turn_id": null, "failure": "operation_failed", "final_text": null,
                 "operation": operation(state, json!({"code": code, "message": "It never ran"}))});
             let door = Door::fake(vec![
-                ("thread_status", Ok(status_reply("running", json!({"queued_ids": ["q1"]})))),
                 ("thread_wait", Ok(waited("running", not_started.clone()))),
                 ("thread_wait", Ok(waited("failed", ended))),
             ]);
@@ -1368,7 +1393,6 @@ mod tests {
         // Input that holds the queue is reported, as for any follow.
         let approval = json!({"approvals": [{"request_id": "r1", "turn_id": "t1", "request_kind": "command"}], "questions": [], "secrets": []});
         let door = Door::fake(vec![
-            ("thread_status", Ok(status_reply("running", json!({"queued_ids": ["q1"]})))),
             ("thread_wait", Ok(waited("needs_input", json!({"turn_id": null, "pending": approval, "operation": operation("succeeded", Value::Null)})))),
         ]);
         let report = follow_run(&door, run, None, true).await;
@@ -1401,8 +1425,7 @@ mod tests {
 
         // A delivery that needs the person ends the wait instead.
         let stuck = json!({"failure": "delivery_needs_attention", "status": {"queued_ids": [], "uncertain_queued_ids": ["q9"]}});
-        let held = status_reply("running", json!({"phase": "needs_attention", "uncertain_queued_ids": ["q9"]}));
-        let door = Door::fake(vec![("thread_status", Ok(held)), ("thread_wait", Ok(waited("failed", stuck)))]);
+        let door = Door::fake(vec![("thread_wait", Ok(waited("failed", stuck)))]);
         let report = follow_run(&door, following(None, None), None, false).await;
         assert_eq!((report.state, report.failure.as_deref()), (RunState::Failed, Some("delivery_needs_attention")));
     }
