@@ -11,8 +11,8 @@
 //! the caller's authority again wherever it waited ([`checkpoint`]).
 use super::{registry, service, Access, ControlCaller, ControlError, ErrorCode};
 use crate::workspace_service::{
-    self as workspaces, Checkpoint, CloseWorkspace, InfoError, OpenWorkspace, WorkspaceService,
-    WorkspaceTarget, WorktreeArgs,
+    self as workspaces, BranchDeletion, Checkpoint, CloseWorkspace, InfoError, OpenWorkspace,
+    WorkspaceService, WorkspaceTarget, WorktreeArgs,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -201,6 +201,10 @@ pub(super) async fn close<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller
     if force_delete && caller.is_network() {
         return Err(ControlError::new(ErrorCode::PermissionDenied, "force_delete is only available on this computer"));
     }
+    // Unforced, a branch holding the only copy of some commit stays: a
+    // worker's new branch has no upstream, so the unpushed-work check alone
+    // would let it go.
+    let delete_branch = delete_branch.then_some(if force_delete { BranchDeletion::Force } else { BranchDeletion::Retained });
     // A retry after the close replays it instead of finding no workspace.
     if let Some(done) = service::recorded(app, caller, "workspace_close", &args)? {
         return Ok(done);

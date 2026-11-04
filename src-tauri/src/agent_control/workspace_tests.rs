@@ -466,6 +466,61 @@ async fn connector_workspace_close_refuses_force_delete() {
     assert!(app.state::<AppStateStore>().find_workspace(&workspace).is_some(), "the retry closes nothing");
 }
 
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    !git(repo, &["branch", "--list", branch]).is_empty()
+}
+
+/// A new worktree on `branch` whose worker committed once and never pushed:
+/// no remote, no upstream. Returns its workspace, checkout and branch tip.
+async fn committed_worktree(app: &App, owner: &ControlCaller, repo: &Path, branch: &str) -> (String, PathBuf, String) {
+    let created = call(app, owner, "worktree_create", json!({"repo_path": repo, "branch": branch, "layout": "empty"})).await.unwrap();
+    let cwd = PathBuf::from(created["cwd"].as_str().unwrap());
+    git(&cwd, &["commit", "--allow-empty", "-m", "only copy"]);
+    let upstream = std::process::Command::new("git").current_dir(&cwd).args(["rev-parse", "--abbrev-ref", "@{upstream}"]).output().unwrap();
+    assert!(!upstream.status.success(), "the premise: {branch} has no upstream");
+    (created["workspace_id"].as_str().unwrap().to_string(), cwd, git(repo, &["rev-parse", branch]))
+}
+
+/// A worker's branch that holds commits nothing else keeps (never pushed,
+/// no upstream, not merged) is the only reference to that work. A close
+/// that is not forced refuses to delete it before any teardown, and a
+/// connector client can never force. Once another ref keeps the commits,
+/// the branch may go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_close_keeps_a_branch_holding_the_only_copy_of_its_commits() {
+    if isolated(&format!("{MODULE}workspace_close_keeps_a_branch_holding_the_only_copy_of_its_commits")) {
+        return;
+    }
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    let owner = named(ControlAccess::FullAccess);
+    let close = |id: &str, key: &str| json!({"workspace_id": id, "delete_worktree": true, "delete_branch": true, "client_request_id": key});
+    let full = connector(ControlAccess::FullAccess);
+    let (id, cwd, tip) = committed_worktree(&app, &owner, &repo, "worker").await;
+
+    for (caller, key) in [(&full, "connector-close"), (&owner, "local-close")] {
+        let error = refused(call(&app, caller, "workspace_close", close(&id, key)).await, ErrorCode::WorkspaceCloseRefused);
+        assert!(error.message.contains("'worker'") && error.message.contains("1 commit"), "{key}: {error}");
+        assert!(app.state::<AppStateStore>().find_workspace(&id).is_some(), "{key}: refused before any teardown");
+        assert!(cwd.join(".git").exists(), "{key}: the checkout stays");
+        assert_eq!(git(&repo, &["rev-parse", "worker"]), tip, "{key}: the branch keeps the commit");
+    }
+
+    // The default branch now holds the commit, so deleting the branch loses
+    // nothing.
+    git(&repo, &["merge", "--ff-only", "worker"]);
+    let closed = call(&app, &full, "workspace_close", close(&id, "connector-merged")).await.unwrap();
+    assert_eq!((closed["closed"].clone(), closed["worktree_removed"].clone()), (json!(true), json!(true)), "{closed}");
+    assert!(!cwd.exists());
+    assert!(!branch_exists(&repo, "worker"), "a branch whose commits main holds is deleted");
+
+    // Forcing stays the local escalation that discards the work.
+    let (forced, forced_cwd, _) = committed_worktree(&app, &owner, &repo, "forced").await;
+    let closed = call(&app, &owner, "workspace_close", json!({"workspace_id": forced, "delete_worktree": true, "delete_branch": true, "force_delete": true})).await.unwrap();
+    assert_eq!(closed["worktree_removed"], true, "{closed}");
+    assert!(!forced_cwd.exists());
+    assert!(!branch_exists(&repo, "forced"), "force_delete deletes it as before");
+}
+
 // ── worktree_create ───────────────────────────────────────────────────────
 
 /// A bare origin seeded from `seed`, cloned into the fixture repository,
@@ -937,7 +992,7 @@ async fn workspace_close_withdrawn_during_its_preflight_stops_no_hermes_chat() {
         .close(crate::workspace_service::CloseWorkspace {
             workspace_id: closing.clone(),
             remove_worktree: true,
-            delete_branch: true,
+            delete_branch: Some(crate::workspace_service::BranchDeletion::Force),
             force: false,
         })
         .await

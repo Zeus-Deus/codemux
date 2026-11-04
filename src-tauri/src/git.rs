@@ -3102,27 +3102,112 @@ pub fn git_branch_exists(repo_path: &Path, branch: &str) -> bool {
     })
 }
 
-pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>, force: bool) -> Result<(), String> {
-    // Find the main repo by reading .git file in worktree
+/// How a worktree removal deletes the branch the worktree had checked out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchDeletion {
+    /// `git branch -D`, even when the branch is the only reference to some
+    /// of its commits: the desktop close dialog and the legacy close tools.
+    Force,
+    /// Only while other refs keep all of its commits: a remote-tracking
+    /// branch (an upstream among them) or the repository's default branch.
+    /// A branch holding the only copy of a commit stays, so a close that may
+    /// not discard work checks [`ensure_branch_retained`] before teardown.
+    Retained,
+}
+
+/// The repository a worktree belongs to: the main checkout its `.git` file
+/// points into, or `worktree_path` itself when that is the main checkout.
+fn main_checkout_of(worktree_path: &Path) -> Result<PathBuf, String> {
     let git_file = worktree_path.join(".git");
-    let repo_path = if git_file.is_file() {
-        let content = std::fs::read_to_string(&git_file)
-            .map_err(|e| format!("Failed to read .git file: {e}"))?;
-        // Content is "gitdir: /path/to/main/.git/worktrees/<name>"
-        let gitdir = content
-            .strip_prefix("gitdir: ")
-            .unwrap_or(&content)
-            .trim();
-        // Go up from .git/worktrees/<name> to the repo root
-        PathBuf::from(gitdir)
-            .parent() // worktrees/
-            .and_then(|p| p.parent()) // .git/
-            .and_then(|p| p.parent()) // repo root
-            .unwrap_or(worktree_path)
-            .to_path_buf()
-    } else {
-        worktree_path.to_path_buf()
-    };
+    if !git_file.is_file() {
+        return Ok(worktree_path.to_path_buf());
+    }
+    let content = std::fs::read_to_string(&git_file)
+        .map_err(|e| format!("Failed to read .git file: {e}"))?;
+    // Content is "gitdir: /path/to/main/.git/worktrees/<name>"
+    let gitdir = content
+        .strip_prefix("gitdir: ")
+        .unwrap_or(&content)
+        .trim();
+    // Go up from .git/worktrees/<name> to the repo root
+    Ok(PathBuf::from(gitdir)
+        .parent() // worktrees/
+        .and_then(|p| p.parent()) // .git/
+        .and_then(|p| p.parent()) // repo root
+        .unwrap_or(worktree_path)
+        .to_path_buf())
+}
+
+/// Whether a worktree removal deletes `branch` at all: never main or
+/// master, nor the branch the main checkout has checked out, nor one that
+/// does not exist.
+fn deletable_branch(repo_path: &Path, branch: &str) -> bool {
+    !["main", "master"].contains(&branch)
+        && run_git_permissive(repo_path, &["branch", "--show-current"]) != branch
+        && run_git(repo_path, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+}
+
+/// How many of `branch`'s commits no other ref keeps: no remote-tracking
+/// branch and not the repository's default branch. 0 means deleting the
+/// branch loses no commit.
+fn commits_only_on(repo_path: &Path, branch: &str) -> Result<usize, String> {
+    let mut args = vec![
+        "rev-list".to_string(),
+        "--count".into(),
+        format!("refs/heads/{branch}"),
+        "--not".into(),
+        "--remotes".into(),
+    ];
+    // A local-only repository's default may exist only locally; one read
+    // from origin/HEAD is among the remote-tracking branches already.
+    if let Some(default) = resolve_default_branch(repo_path).filter(|default| default != branch) {
+        let default = format!("refs/heads/{default}");
+        if run_git(repo_path, &["rev-parse", "--verify", "--quiet", &default]).is_ok() {
+            args.push(default);
+        }
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let count = run_git(repo_path, &args)?;
+    count
+        .trim()
+        .parse()
+        .map_err(|e| format!("git rev-list gave {count:?}: {e}"))
+}
+
+/// Refuses to delete `branch` together with the worktree at `worktree_path`
+/// while the branch holds commits no other ref keeps: never pushed, or
+/// pushed and then amended, and not merged into the default branch. Without
+/// an upstream, [`ensure_worktree_removable`] cannot see such commits. Like
+/// it, this runs before any teardown, so a refusal leaves the workspace as
+/// it was. A branch the removal would not delete passes.
+pub(crate) fn ensure_branch_retained(worktree_path: &Path, branch: &str) -> Result<(), String> {
+    let repo_path = main_checkout_of(worktree_path)?;
+    if !deletable_branch(&repo_path, branch) {
+        return Ok(());
+    }
+    match commits_only_on(&repo_path, branch) {
+        Ok(0) => Ok(()),
+        Ok(count) => Err(format!(
+            "Branch '{branch}' has {count} commit(s) that no remote branch or the default branch holds. Push or merge them first, or keep the branch."
+        )),
+        Err(error) => Err(format!(
+            "Could not check that the commits of branch '{branch}' are kept elsewhere ({error}). Keep the branch."
+        )),
+    }
+}
+
+pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>, force: bool) -> Result<(), String> {
+    remove_worktree(worktree_path, branch.map(|branch| (branch, BranchDeletion::Force)), force)
+}
+
+/// [`git_remove_worktree`], deleting the branch as its [`BranchDeletion`]
+/// says.
+pub(crate) fn remove_worktree(
+    worktree_path: &Path,
+    branch: Option<(&str, BranchDeletion)>,
+    force: bool,
+) -> Result<(), String> {
+    let repo_path = main_checkout_of(worktree_path)?;
 
     if !force {
         ensure_worktree_removable(worktree_path)?;
@@ -3141,11 +3226,13 @@ pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>, force: bo
     }
 
     // Delete the branch if requested (skip main/master and the repo's current branch)
-    if let Some(branch_name) = branch {
-        let protected = ["main", "master"];
-        if !protected.contains(&branch_name) {
-            let current = run_git_permissive(&repo_path, &["branch", "--show-current"]);
-            if current != branch_name {
+    if let Some((branch_name, deletion)) = branch {
+        if deletable_branch(&repo_path, branch_name) {
+            // Checked again now nothing works in the checkout: its agents
+            // and teardown may have committed since the pre-flight.
+            if deletion == BranchDeletion::Retained && !matches!(commits_only_on(&repo_path, branch_name), Ok(0)) {
+                eprintln!("[codemux::git] kept branch {branch_name}: it holds commits no other ref keeps");
+            } else {
                 let _ = run_git(&repo_path, &["branch", "-D", branch_name]);
             }
         }
@@ -4943,6 +5030,62 @@ mod tests {
         // Clean working tree, no upstream — force=false should succeed (lenient policy)
         git_remove_worktree(Path::new(&wt_path), Some("local-only-wt"), false).expect("clean local-only worktree should be deletable without force");
         assert!(!PathBuf::from(&wt_path).exists(), "worktree dir should be gone");
+    }
+
+    /// Under `BranchDeletion::Retained` a branch holding the only copy of a
+    /// commit (no upstream, never pushed, not merged) is refused by the
+    /// pre-flight and kept by the removal. One whose commits a
+    /// remote-tracking branch or the default branch holds is deleted, and
+    /// `Force` deletes as before.
+    #[test]
+    fn retained_branch_deletion_keeps_the_only_copy_of_a_commit() {
+        let (dir, local, _remote) = setup_test_repo_with_remote();
+        let commit = |path: &Path| {
+            run_git(path, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "work"])
+                .expect("commit");
+        };
+        let add = |branch: &str| {
+            let path = dir.path().join(branch);
+            run_git(&local, &["worktree", "add", "-b", branch, path.to_str().unwrap()]).expect("worktree add");
+            path
+        };
+        let exists = |branch: &str| {
+            run_git(&local, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+        };
+
+        // No commits of its own: the default branch holds them all.
+        let fresh = add("fresh");
+        ensure_branch_retained(&fresh, "fresh").expect("nothing to lose");
+
+        let unpushed = add("unpushed");
+        commit(&unpushed);
+        ensure_worktree_removable(&unpushed).expect("the premise: no upstream, so the unpushed check passes");
+        let error = ensure_branch_retained(&unpushed, "unpushed").unwrap_err();
+        assert!(error.contains("'unpushed' has 1 commit(s)"), "{error}");
+        remove_worktree(&unpushed, Some(("unpushed", BranchDeletion::Retained)), true).expect("remove");
+        assert!(!unpushed.exists(), "the checkout goes");
+        assert!(exists("unpushed"), "the only copy of the commit stays");
+
+        // Pushed without setting an upstream: origin/pushed holds it.
+        let pushed = add("pushed");
+        commit(&pushed);
+        run_git(&pushed, &["push", "origin", "pushed"]).expect("push");
+        ensure_branch_retained(&pushed, "pushed").expect("a remote-tracking branch holds it");
+        remove_worktree(&pushed, Some(("pushed", BranchDeletion::Retained)), true).expect("remove");
+        assert!(!exists("pushed"));
+
+        // Merged into the default branch here, never pushed.
+        let merged = add("merged");
+        commit(&merged);
+        run_git(&local, &["merge", "--ff-only", "merged"]).expect("merge");
+        ensure_branch_retained(&merged, "merged").expect("the default branch holds it");
+        remove_worktree(&merged, Some(("merged", BranchDeletion::Retained)), true).expect("remove");
+        assert!(!exists("merged"));
+
+        let forced = add("forced");
+        commit(&forced);
+        remove_worktree(&forced, Some(("forced", BranchDeletion::Force)), true).expect("remove");
+        assert!(!exists("forced"), "forcing deletes the only copy, as before");
     }
 
     // ── merge_branch comprehensive integration tests ──
