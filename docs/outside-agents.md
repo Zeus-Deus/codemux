@@ -45,14 +45,7 @@ codex mcp add codemux -- codemux mcp --client codex
   codex mcp add codemux --env "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" -- codemux mcp --client codex
   ```
 
-- Codex gives up on a tool call after its own timeout. To allow long waits, set `tool_timeout_sec` in `~/.codex/config.toml`:
-
-  ```toml
-  [mcp_servers.codemux]
-  command = "codemux"
-  args = ["mcp", "--client", "codex"]
-  tool_timeout_sec = 660
-  ```
+- Codex gives up on a tool call after its own timeout. To allow long waits, open `~/.codex/config.toml` and add `tool_timeout_sec = 660` under `[mcp_servers.codemux]`, the table `codex mcp add` wrote. Leave the rest of that table as it is.
 
 ### Hermes
 
@@ -60,8 +53,8 @@ codex mcp add codemux -- codemux mcp --client codex
 hermes mcp add codemux --command codemux --args mcp --client hermes --access supervised
 ```
 
-1. Run it as the user Hermes runs as. Codemux must be running, because Hermes lists the tools before it saves the entry.
-2. At **Enable all tools?**, press Enter. To give the bot only the control tools, answer `select` and keep `workspace_list`, `workspace_info`, `workspace_create`, `worktree_create`, `workspace_close`, `agent_capabilities`, `operation_status` and the `thread_*` tools.
+1. Run it as the user Hermes runs as. Hermes can list the tools while Codemux is closed, but its tool calls need Codemux running.
+2. At **Enable all tools?**, press Enter. To give the bot only the control tools, answer `select` and keep the ones in the [Tool reference](#tool-reference). A supervised bot isn't offered `workspace_create`, `worktree_create` or `workspace_close`: they need full access.
 3. Run `/reload-mcp` in open chats, or start a new one.
 4. `hermes mcp test codemux` should list `thread_launch`.
 
@@ -108,7 +101,7 @@ For clients that read `mcpServers` JSON:
 
 ### Inside a Codemux workspace folder
 
-Codemux writes a `.mcp.json` file into each workspace folder for the agents you start in its terminals. That file has an entry that is also named `codemux`, and Claude Code prefers it over your user entry. That entry is for agents working inside the workspace: it has the older tools (browser, git, terminals), no thread or workspace control, and it is refused administration tools such as `terminal_write` and `automation_create`.
+Codemux writes a `.mcp.json` file into each workspace folder for the agents you start in its terminals. That file has an entry that is also named `codemux`, and Claude Code prefers it over your user entry. That entry is for agents working inside the workspace: it has the older tools (browser, git, terminals, and the older workspace tools), no thread control, and it is refused administration tools such as `terminal_write` and `automation_create`.
 
 To drive Codemux from Claude Code in such a folder, start Claude Code from another folder, or give it the entry explicitly. Save this as `~/.claude/codemux-mcp.json`:
 
@@ -132,15 +125,31 @@ If the other device can SSH to the computer running Codemux, run `codemux mcp` o
 { "mcpServers": { "codemux": { "command": "ssh", "args": ["-T", "desktop", "codemux", "mcp", "--client", "laptop-claude"] } } }
 ```
 
-Or, with the client's own command:
+Or, with Claude Code's own command:
 
 ```sh
 claude mcp add --scope user codemux -- ssh -T desktop codemux mcp --client laptop-claude
+```
+
+- `codemux` must be on the PATH of a non-interactive SSH session there. If it isn't, use its full path: `command -v codemux` on that computer prints it.
+- An SSH key that logs in to that computer can run any command there as you. Over SSH, `--access` limits nothing by itself, because whoever holds the key picks the command and its flags. Use an unrestricted key only from your own devices, and restrict every key a bot can use, as below.
+- Codex and Hermes start MCP servers without `SSH_AUTH_SOCK`, so ssh can't ask your SSH agent for a key. It then needs a key file it can use on its own (an `IdentityFile` in `~/.ssh/config`). Restrict that key as below: anything that can read the file can use it.
+
+#### A bot over SSH
+
+Give the bot its own key, and let that key run only `codemux mcp`. On the computer running Codemux, add the bot's public key to `~/.ssh/authorized_keys` with a forced command:
+
+```text
+restrict,command="codemux mcp --client vps-hermes --access supervised" ssh-ed25519 AAAA… vps-hermes
+```
+
+Whatever the bot asks ssh to run, that key starts only this command, at the access level written here. `restrict` also turns off terminals and forwarding for the key. Use the full path to `codemux` here if a non-interactive SSH session can't find it. Then, on the bot's machine:
+
+```sh
 hermes mcp add codemux --command ssh --args -T desktop codemux mcp --client vps-hermes --access supervised
 ```
 
-- `codemux` must be on the PATH of a non-interactive SSH session there. If it isn't, use its full path.
-- Codex and Hermes start MCP servers without `SSH_AUTH_SOCK`, so ssh can't ask your SSH agent for a key. Give that host a key ssh can read on its own, in `~/.ssh/config`.
+If you can't restrict the key, use [the network door](#over-the-network) with a Supervised token instead. There, Codemux checks the access level itself.
 
 ### Over the network
 
@@ -204,7 +213,7 @@ codemux connector pending
 codemux connector approve "$SIGN_IN_ID" --access supervised
 ```
 
-A sign-in renews itself while the assistant uses it. It lapses after 30 days without use.
+A sign-in renews itself while the assistant uses it. It lapses after 30 days without use. Each renewal replaces the saved refresh token. If a used one comes back more than 30 seconds later, Codemux ends the sign-in, because a copy of it is in use somewhere else. So sign in on each machine instead of copying a client's saved sign-in.
 
 #### Tokens for bots
 
@@ -370,7 +379,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
      → {"question_id": "…", "turn_id": "c41b…", "operation_id": "…", "state": "succeeded", …}
      ```
 
-     An answer never changes the thread's permission mode. `question_closed` means someone answered it already; `question_answer_failed` means an answer is still being delivered and the person settles it in Codemux.
+     An answer never changes the thread's permission mode. `question_closed` means someone answered or dismissed it already. `question_answer_failed` means the answer wasn't delivered, or its delivery isn't confirmed. If the message says the worker didn't take the answer, you can answer again with a new `client_request_id`. Otherwise don't: the person settles it in Codemux.
    - **Secrets** (`pending.secrets`): only the person can enter a secret, in Codemux. You see its label and reason, never a value. Tell the person, then wait again.
 
 7. **Read more, or follow up.**
@@ -416,7 +425,7 @@ codemux workspace close "$WS" --remove-worktree
 ```
 
 - `codemux tools` lists what this caller may run. `codemux call <tool> '<json>'` runs one (`-` reads the JSON from stdin), for example `agent_capabilities` to see the providers, models and permission modes. `codemux capabilities` describes every command and tool as JSON, without a running app.
-- `worktree create` and `workspace create ~/src/api` print the workspace id. `thread start` and `thread send` print the thread id, or with `--wait` the reply. `thread start --worktree-branch fix/flaky-login` creates the worktree and starts the thread in one step.
+- `worktree create` and `workspace create ~/src/api` print the workspace id. `thread start` prints the thread id, and `thread send` prints `Sent.`, `Steered.` or `Queued.` With `--wait`, both print the reply. `thread start --worktree-branch fix/flaky-login` creates the worktree and starts the thread in one step.
 - Name the caller before the command: `codemux --client nightly-script --access supervised thread start …`.
 - `--workspace` defaults to `$CODEMUX_WORKSPACE_ID`, which Codemux sets in its own terminals.
 - `--json` prints one JSON object, even on failure.
@@ -452,13 +461,14 @@ Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` 
 - **Chat bots relay other people's words.** A message to your Hermes bot can try to steer what it asks Codemux to do. That's prompt injection. Keep bots supervised, so approvals stay with you. Never approve worker requests automatically from a bot. Limit who can message the bot.
 - **What a thread says is data, not instructions.** `final_text` and `thread_read` can quote files, web pages or tool output that contain hostile text.
 - **Access covers every workspace.** Any level can read every workspace and every visible conversation, not just one project.
+- **An SSH key that reaches Codemux is a shell** on that computer, unless `authorized_keys` restricts it to `codemux mcp`. See [A bot over SSH](#a-bot-over-ssh).
 - **Tokens are passwords.** Give each bot its own token. Keep it in a secret store or `.env` file, never in a repository. Revoke it when you're done. Off this computer, use HTTPS only.
 - **Approve only a sign-in you just started.** The name a client shows is its own claim, not proof.
 
 ## Supported MCP versions
 
 - Through `initialize`: 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05. Codemux answers with the version the client asks for, or with 2025-11-25 when it asks for another one.
-- Through `server/discover`: 2026-07-28, on `codemux mcp` and on the network door. Claude Code and Codex try it first; other clients use `initialize`.
+- Through `server/discover`: 2026-07-28, on `codemux mcp` and on the network door. Clients that support it, such as Claude Code, try it first and fall back to `initialize`.
 - Over HTTP, a request without an `MCP-Protocol-Version` header counts as 2025-03-26.
 - Batched requests are refused.
 
@@ -481,7 +491,7 @@ A paired phone or browser can remove a clean worktree, for example with **Device
 ## If you used Codemux's MCP server before
 
 - **The network door moved to its own port, 4378.** It used to share Remote Access's port 4377, and it no longer needs Remote Access. Point your proxy at port 4378. Assistants that used `http://127.0.0.1:4377/mcp` directly need the new URL and a new sign-in.
-- **Network sign-ins renew themselves**, and bots can use labelled tokens. Hermes can now connect over HTTP.
+- **Network sign-ins renew themselves**, and bots can use labelled tokens. A used refresh token that comes back more than 30 seconds later ends its sign-in, so don't copy a client's saved sign-in between machines. Hermes can now connect over HTTP.
 - **`codemux mcp` lists 76 tools at full access.** `workspace_list`, `workspace_info`, `workspace_create`, `worktree_create` and `workspace_close` are now control tools there:
   - `workspace_list` returns summaries; `"detail": "full"` returns the old snapshots. Rows add `worktree_path` and `parent_workspace_id`, and workspaces on other machines read `native_control_available: false`.
   - `workspace_create` and `worktree_create` don't take focus unless you pass `"select": true`.
@@ -537,7 +547,7 @@ The codes an outside assistant meets most often. "Retry" means retrying the iden
 | `workspace_close_refused` | The worktree can't be removed safely; the message says why, such as uncommitted or unpushed work | No |
 | `question_not_found` | No open question has that id | No |
 | `question_closed` | The question was answered or dismissed already | No |
-| `question_answer_failed` | An answer is still being delivered; the person settles it in Codemux | No |
+| `question_answer_failed` | The answer wasn't delivered or confirmed. Answer again, with a new id, only if the worker refused it; otherwise the person settles it in Codemux | No |
 | `provider_not_ready` | The provider isn't ready: not installed, signed out or still starting | Yes |
 | `wait_budget_exhausted` | Too many waits at once on the network door | Yes |
 | `grant_revoked` | This network assistant's access was revoked | No |
