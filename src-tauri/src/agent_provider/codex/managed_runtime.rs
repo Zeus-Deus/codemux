@@ -83,12 +83,8 @@ fn switch_off_user_codemux_server(args: &mut Vec<String>, env: &HashMap<String, 
         .or_else(|| crate::provider_accounts::homes::default_home(crate::agent_provider::ProviderKind::Codex));
     let Some(config) = home.and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok()) else { return };
     let own = crate::mcp_server::codemux_mcp_command();
-    for name in user_codemux_servers(&config, std::path::Path::new(&own)) {
-        // Bare, never quoted: Codex splits a `-c` key on every `.` and keeps
-        // quote characters, so `mcp_servers."codemux"` names another server,
-        // `"codemux"` with no transport, and Codex then refuses to load its
-        // configuration at all ("invalid transport").
-        args.extend(["-c".into(), format!("mcp_servers.{name}.enabled=false")]);
+    if let Some(off) = mcp_servers_off_override(&user_codemux_servers(&config, std::path::Path::new(&own))) {
+        args.extend(["-c".into(), off]);
     }
 }
 
@@ -454,11 +450,23 @@ mod user_codemux_server_tests {
         assert_eq!(args, ["app-server"], "only a declared codemux entry is overridden");
         std::fs::write(home.path().join("config.toml"), "[mcp_servers.codemux]\ncommand = \"codemux\"\nargs = [\"mcp\"]\n").unwrap();
         switch_off_user_codemux_server(&mut args, &env);
-        assert_eq!(args, ["app-server", "-c", "mcp_servers.codemux.enabled=false"]);
-        // Codex reads the key as its `.`-separated segments, quotes included,
-        // so each one must be the plain name it overrides.
-        let key = args[2].split_once('=').unwrap().0;
-        assert_eq!(key.split('.').collect::<Vec<_>>(), ["mcp_servers", USER_CODEMUX_SERVER, "enabled"]);
+        assert_eq!(args[..2], ["app-server", "-c"]);
+        assert_eq!(switched_off(&args[2]), ["codemux"]);
+        assert_eq!(args.len(), 3);
+        // Codex splits a `-c` key on every `.` and keeps quote characters, so
+        // the key is the bare table name and every server name is in the value.
+        assert_eq!(args[2].split_once('=').unwrap().0, "mcp_servers");
+    }
+
+    /// The server names an `mcp_servers={…}` override switches off, checking
+    /// that it says only `enabled = false` for each.
+    fn switched_off(arg: &str) -> Vec<String> {
+        let parsed: toml::Table = toml::from_str(arg).unwrap_or_else(|error| panic!("{arg}: {error}"));
+        let servers = parsed["mcp_servers"].as_table().unwrap();
+        for (name, entry) in servers {
+            assert_eq!(entry.to_string(), "{ enabled = false }", "{name} in {arg}");
+        }
+        servers.keys().cloned().collect()
     }
 
     /// `codex mcp add cmux -- codemux mcp` must not load inside in-app chats
@@ -473,9 +481,60 @@ mod user_codemux_server_tests {
         std::fs::write(home.path().join("config.toml"), config).unwrap();
         let mut args = vec!["app-server".to_string()];
         switch_off_user_codemux_server(&mut args, &env);
-        assert_eq!(
-            args,
-            ["app-server", "-c", "mcp_servers.cmux.enabled=false", "-c", "mcp_servers.tools.enabled=false"]
-        );
+        assert_eq!(args[..2], ["app-server", "-c"]);
+        assert_eq!(switched_off(&args[2]), ["cmux", "tools"], "one flag for every entry");
+        assert_eq!(args.len(), 3);
+    }
+
+    /// The real Codex must take both switch-off overrides (the in-app one and
+    /// the workflow restart's) and turn off exactly the named entries: argv
+    /// comparisons alone once passed a form Codex refuses to start with.
+    /// Skipped when no `codex` on PATH can list its MCP servers as JSON.
+    #[test]
+    fn real_codex_accepts_the_mcp_switch_off_overrides() {
+        let Ok(codex) = which::which("codex") else {
+            eprintln!("skipped: codex is not on PATH");
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let config = "[mcp_servers.cmux]\ncommand = \"codemux\"\nargs = [\"mcp\"]\n\n\
+                      [mcp_servers.\"dotted.name\"]\ncommand = \"codemux\"\nargs = [\"--client\", \"codex\", \"mcp\"]\n\n\
+                      [mcp_servers.other]\ncommand = \"echo\"\nargs = [\"x\"]\n";
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        // A cleared env plus what a launcher needs, with this throwaway home.
+        let list = |args: &[String]| {
+            std::process::Command::new(&codex)
+                .args(args)
+                .args(["mcp", "list", "--json"])
+                .env_clear()
+                .envs(["PATH", "HOME"].into_iter().filter_map(|key| Some((key, std::env::var_os(key)?))))
+                .env("CODEX_HOME", home.path())
+                .current_dir(home.path())
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let enabled = |output: &std::process::Output, name: &str| -> Option<bool> {
+            let servers: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).ok()?;
+            servers.iter().find(|server| server["name"] == name)?["enabled"].as_bool()
+        };
+        let baseline = list(&[]);
+        if !baseline.status.success() || enabled(&baseline, "cmux") != Some(true) {
+            eprintln!("skipped: {} cannot list MCP servers as JSON", codex.display());
+            return;
+        }
+
+        let env = HashMap::from([("CODEX_HOME".to_string(), home.path().to_string_lossy().into_owned())]);
+        let mut in_app = Vec::new();
+        switch_off_user_codemux_server(&mut in_app, &env);
+        let mut workflow = managed_codex_args(&["cmux".into(), "dotted.name".into()]);
+        assert_eq!(workflow.pop().as_deref(), Some("app-server"));
+        for args in [in_app, workflow] {
+            let output = list(&args);
+            assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            for (name, on) in [("cmux", false), ("dotted.name", false), ("other", true)] {
+                assert_eq!(enabled(&output, name), Some(on), "{name} with {args:?}: {}", String::from_utf8_lossy(&output.stdout));
+            }
+        }
     }
 }

@@ -2344,19 +2344,31 @@ fn managed_codex_args(disabled_servers: &[String]) -> Vec<String> {
         "-c".into(),
         "web_search=\"disabled\"".into(),
     ]);
-    for name in disabled_servers {
-        // Quoted TOML keys preserve punctuation; these are argv entries,
-        // never shell interpolation or mutations of the user's config.
-        args.extend([
-            "-c".into(),
-            format!(
-                "mcp_servers.{}.enabled=false",
-                serde_json::to_string(name).unwrap_or_default()
-            ),
-        ]);
+    if let Some(off) = mcp_servers_off_override(disabled_servers) {
+        args.extend(["-c".into(), off]);
     }
     args.push("app-server".into());
     args
+}
+
+/// The one `-c` value that switches off the named `[mcp_servers.*]` entries,
+/// or `None` for no names. An argv entry, never shell interpolation or a
+/// change to the user's config.
+///
+/// Codex splits a `-c` key on every `.` and ignores TOML quotes, so
+/// `mcp_servers."x".enabled=false` declares a new server literally named
+/// `"x"`, with no transport, and Codex refuses to start. The value side is
+/// parsed as TOML, so a whole `mcp_servers` table carries any name, and Codex
+/// merges it into the entries it already has. Keep it one flag: a second
+/// `-c mcp_servers=…` replaces the first. Name only servers Codex has; an
+/// unknown name has no transport either.
+fn mcp_servers_off_override(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let off = || toml::Value::Table(toml::Table::from_iter([("enabled".to_string(), toml::Value::Boolean(false))]));
+    let servers: toml::Table = names.iter().map(|name| (name.clone(), off())).collect();
+    Some(format!("mcp_servers={}", toml::Value::Table(servers)))
 }
 
 fn disabled(value: Option<&Value>) -> bool {
@@ -3360,9 +3372,21 @@ mod tests {
             .unwrap();
         shell["enabled"] = json!(true);
         assert!(validate_managed_codex_config(&config, &report).is_err());
-        let args = managed_codex_args(&["name.with.dot\"quoted".into()]);
-        assert!(args.contains(&"mcp_servers.\"name.with.dot\\\"quoted\".enabled=false".to_string()));
+        let args = managed_codex_args(&["name.with.dot\"quoted".into(), "plain".into()]);
+        let overrides: Vec<&String> = args.iter().filter(|arg| arg.starts_with("mcp_servers")).collect();
+        assert_eq!(overrides.len(), 1, "one flag, or the second replaces the first: {args:?}");
+        // The flag is itself a TOML line: one table, keyed by the exact names.
+        let parsed: toml::Table = toml::from_str(overrides[0]).unwrap();
+        let off = toml::Table::from_iter([("enabled".to_string(), toml::Value::Boolean(false))]);
+        let expected = toml::Table::from_iter([(
+            "mcp_servers".to_string(),
+            toml::Value::Table(toml::Table::from_iter(
+                ["name.with.dot\"quoted", "plain"].map(|name| (name.to_string(), toml::Value::Table(off.clone()))),
+            )),
+        )]);
+        assert_eq!(parsed, expected);
         assert_eq!(args.last().unwrap(), "app-server");
+        assert!(!managed_codex_args(&[]).iter().any(|arg| arg.starts_with("mcp_servers")));
     }
 
     #[test]
