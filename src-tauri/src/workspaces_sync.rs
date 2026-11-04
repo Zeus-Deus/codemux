@@ -468,7 +468,7 @@ fn read_git_head_sha(path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
     }
-    let output = std::process::Command::new("git")
+    let output = crate::git::git_command()
         .args(["rev-parse", "HEAD"])
         .current_dir(path)
         .output()

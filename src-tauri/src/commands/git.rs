@@ -1,7 +1,7 @@
 use crate::git::{BaseBranchDiff, CommitFileEntry, ConflictCheckResult, GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, MergeIntoBaseResult, MergeState, ResolverBranchInfo, WorktreeInfo};
 use std::path::{Path, PathBuf};
 
-// Every command here shells out via `crate::git::*` → `Command::new("git")`.
+// Every command here shells out via `crate::git::*` → `git::git_command()`.
 // They MUST run on Tokio's blocking pool: a sync `#[tauri::command]` runs on
 // the GTK main thread, and any wedged `git` subprocess (slow disk, stuck FS,
 // network credential prompt) freezes the whole UI hard enough that even
@@ -256,7 +256,7 @@ pub async fn git_fetch_prune(path: String) -> Result<(), String> {
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        tokio::process::Command::new("git")
+        crate::git::git_command_tokio()
             .args(["fetch", "--prune"])
             .current_dir(&path)
             .output(),
@@ -738,7 +738,6 @@ pub async fn git_clone_repo<R: tauri::Runtime>(
     use std::time::Duration;
     use tauri::Emitter;
     use tokio::io::AsyncReadExt;
-    use tokio::process::Command;
 
     // Fail if git produces NO new output for this long. A healthy slow clone
     // keeps emitting `--progress` lines, so it can run for hours without ever
@@ -756,7 +755,7 @@ pub async fn git_clone_repo<R: tauri::Runtime>(
     // never a directory the user already had.
     let existed_before = Path::new(&target_dir).exists();
 
-    let mut child = Command::new("git")
+    let mut child = crate::git::git_command_tokio()
         .args(["clone", "--progress", &url, &target_dir])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())

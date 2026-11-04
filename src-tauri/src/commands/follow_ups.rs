@@ -270,7 +270,7 @@ pub(crate) fn branch_name_for(title: &str, existing: &HashSet<String>) -> String
 // ── Git ──────────────────────────────────────────────────────────────
 
 fn git_command(dir: &Path) -> Command {
-    let mut command = Command::new("git");
+    let mut command = crate::git::git_command();
     command
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")

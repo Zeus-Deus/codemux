@@ -205,7 +205,7 @@ fn validate_launch(
                 && Path::new(&w.path).canonicalize().ok().as_ref() == Some(&canonical)
         })
         .ok_or("checkout is not registered in this remote host's workspace registry")?;
-    let git = std::process::Command::new("git")
+    let git = crate::git::git_command()
         .args([
             "-C",
             &request.workspace_path,

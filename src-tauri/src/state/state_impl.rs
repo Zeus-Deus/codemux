@@ -7600,7 +7600,7 @@ fn derive_last_activity_ms(path: &Path) -> Option<i64> {
 /// because the only caller is a best-effort backfill that must never
 /// take the app down with it.
 fn last_commit_ms(path: &Path) -> Option<i64> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::git_command()
         .args(["log", "-1", "--format=%ct"])
         .current_dir(path)
         .output()

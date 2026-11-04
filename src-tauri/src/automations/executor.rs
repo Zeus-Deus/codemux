@@ -105,7 +105,7 @@ pub fn prepare_worktree(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create worktree parent directory: {error}"))?;
     }
-    let mut cmd = crate::execution::host_command("git");
+    let mut cmd = crate::git::git_command();
     cmd.arg("-C")
         .arg(project)
         .args(["worktree", "add"])
@@ -212,7 +212,7 @@ fn resolve_repo(automation: &AutomationRecord) -> Result<ResolvedRepo, String> {
 /// no token (matching Superset's clone behaviour).
 fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
     if clone_dir.join(".git").exists() {
-        let output = crate::execution::host_command("git")
+        let output = crate::git::git_command()
             .arg("-C")
             .arg(clone_dir)
             .args(["fetch", "--prune", "origin"])
@@ -230,7 +230,7 @@ fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create clone directory: {error}"))?;
     }
-    let output = crate::execution::host_command("git")
+    let output = crate::git::git_command()
         .args(["clone", remote])
         .arg(clone_dir)
         .output()
@@ -246,7 +246,7 @@ fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
 
 /// `origin/<default-branch>` for a clone, resolved via `origin/HEAD`.
 fn default_remote_branch(clone_dir: &Path) -> Option<String> {
-    let output = crate::execution::host_command("git")
+    let output = crate::git::git_command()
         .arg("-C")
         .arg(clone_dir)
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])

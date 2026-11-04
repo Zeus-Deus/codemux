@@ -122,7 +122,7 @@ pub fn git_canonical_remote(dir: &Path) -> Option<String> {
     if !dir.join(".git").exists() {
         return None;
     }
-    let out = std::process::Command::new("git")
+    let out = crate::git::git_command()
         .arg("-C")
         .arg(dir)
         .args(["config", "--get", "remote.origin.url"])

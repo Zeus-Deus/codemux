@@ -405,7 +405,7 @@ fn lock_path(store: &Path) -> PathBuf {
 /// canonical working directory stands in, so the command still works in a
 /// plain directory.
 fn worktree_key(cwd: &Path) -> String {
-    let toplevel = std::process::Command::new("git")
+    let toplevel = crate::git::git_command()
         .arg("-C")
         .arg(cwd)
         .args(["rev-parse", "--show-toplevel"])

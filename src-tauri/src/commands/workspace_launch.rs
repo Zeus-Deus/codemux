@@ -116,7 +116,7 @@ fn caller_workspace<R: Runtime>(
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let mut command = std::process::Command::new("git");
+    let mut command = crate::git::git_command();
     command
         .current_dir(repo)
         .args(args)

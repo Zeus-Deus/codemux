@@ -180,7 +180,7 @@ fn copy_matching_files(
     worktree_path: &Path,
     exclude_file: &Path,
 ) -> Result<Vec<String>, String> {
-    let output = crate::execution::host_command("git")
+    let output = crate::git::git_command()
         .args([
             "ls-files",
             "-z",

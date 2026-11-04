@@ -26,7 +26,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -380,7 +379,7 @@ fn prune_closed(snapshot: &AppStateSnapshot, closed: &[ClosedWorktree]) -> Vec<C
 /// Git without optional locks: a scan must not refresh the index (that
 /// would also be a write inside a worktree nobody is using).
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = crate::git::git_command()
         .arg("--no-optional-locks")
         .args(args)
         .current_dir(dir)

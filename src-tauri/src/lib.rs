@@ -2140,7 +2140,7 @@ fn build_core_app<R: tauri::Runtime>(
                         .for_each_concurrent(FETCH_CONCURRENCY, |cwd| async move {
                             let _ = tokio::time::timeout(
                                 std::time::Duration::from_secs(PER_FETCH_TIMEOUT_SECS),
-                                tokio::process::Command::new("git")
+                                crate::git::git_command_tokio()
                                     .args(["fetch", "--prune", "--quiet", "--no-tags"])
                                     .current_dir(&cwd)
                                     .env("GIT_TERMINAL_PROMPT", "0")

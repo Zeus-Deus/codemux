@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Ref namespace for per-turn diff snapshots:
 /// `<prefix>/<thread>/<token>/{before,after}`.
@@ -112,7 +112,7 @@ fn git_with(
     index: Option<&Path>,
     stdin: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
-    let mut command = Command::new("git");
+    let mut command = crate::git::git_command();
     command
         .args(args)
         .current_dir(repo)
@@ -603,7 +603,7 @@ fn stream_patches(
     let mut args = diff_args(&["--src-prefix=a/", "--dst-prefix=b/"], from, to);
     args.push("--");
     args.extend(specs.iter().map(String::as_str));
-    let mut child = Command::new("git")
+    let mut child = crate::git::git_command()
         .args(&args)
         .current_dir(repo)
         .stdin(Stdio::null())

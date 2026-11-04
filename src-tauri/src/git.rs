@@ -103,8 +103,43 @@ pub(crate) fn sanitize_branch_for_worktree_path(branch: &str) -> String {
         .collect()
 }
 
+/// The agent-process kind on every git Codemux starts. Diagnostic only, like
+/// every `CODEMUX_AGENT_PROCESS` value.
+pub(crate) const GIT_PROCESS_KIND: &str = "git-hook";
+
+/// Builds every git command Codemux runs, in the app, the CLI and
+/// codemux-remote. A source-scan test keeps other `git` spawns out of
+/// production code.
+///
+/// Git runs repository content: hooks (`.git/hooks`, `core.hooksPath`) and
+/// commands named in `.git/config` such as `core.fsmonitor`, which any agent
+/// working in the checkout can write. So git carries the agent-process marker,
+/// and everything it starts inherits it: a `codemux` that a hook runs reaches
+/// the control socket as an agent, refused admin commands, never as the owner.
+/// Unlike setup scripts, git is not registered for ancestry (most callers wait
+/// on `output()`, which gives no pid), so the inherited marker is the signal.
+///
+/// The marker is the only change to git's environment besides the AppImage
+/// loader fixups of [`crate::execution::host_command`], so `GIT_*`, SSH
+/// agents and credential helpers work as before. A caller that clears the
+/// environment must set the marker again.
+pub(crate) fn git_command() -> Command {
+    let mut cmd = crate::execution::host_command("git");
+    cmd.env(crate::control_identity::AGENT_PROCESS_ENV, GIT_PROCESS_KIND);
+    cmd
+}
+
+/// Tokio form of [`git_command`].
+pub(crate) fn git_command_tokio() -> tokio::process::Command {
+    git_command().into()
+}
+
+#[cfg(test)]
+#[path = "git_command_tests.rs"]
+mod command_tests;
+
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(repo_path)
         .output()
@@ -124,7 +159,7 @@ fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Run git and return stdout even on non-zero exit (for commands where failure is expected).
 fn run_git_permissive(repo_path: &Path, args: &[&str]) -> String {
-    Command::new("git")
+    git_command()
         .args(args)
         .current_dir(repo_path)
         .output()
@@ -189,7 +224,7 @@ pub fn git_clone(remote_url: &str, target_dir: &Path) -> Result<String, String> 
     // Use `--no-checkout` so the worktree-add we'll do next chooses
     // the right branch — clone's default checkout of the remote's
     // HEAD branch is wasted work for our flow.
-    let output = Command::new("git")
+    let output = git_command()
         .args(["clone", "--no-checkout", remote_url, &target_str])
         .current_dir(parent)
         .output()
@@ -256,7 +291,7 @@ mod git_clone_input_validation {
 
 /// Run git and return (stdout, stderr, success) regardless of exit code.
 fn run_git_full(repo_path: &Path, args: &[&str]) -> Result<(String, String, bool), String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(repo_path)
         .output()
@@ -554,7 +589,7 @@ fn run_git_with_index(
     index_file: &Path,
     args: &[&str],
 ) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .env("GIT_INDEX_FILE", index_file)
         .current_dir(repo_path)
@@ -2217,7 +2252,7 @@ pub fn fetch_origin_branch(repo_path: &Path, branch: &str) -> bool {
     if !remotes.lines().any(|r| r.trim() == "origin") {
         return false;
     }
-    let Ok(mut child) = Command::new("git")
+    let Ok(mut child) = git_command()
         .args(["fetch", "--quiet", "--no-tags", "origin", branch])
         .current_dir(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -3007,7 +3042,7 @@ pub(crate) fn ensure_worktree_removable(worktree_path: &Path) -> Result<(), Stri
 /// counts, matching the previous suffix behavior for non-origin remotes.
 pub fn git_branch_exists(repo_path: &Path, branch: &str) -> bool {
     // Local branch — exact ref path excludes tags.
-    let local = Command::new("git")
+    let local = git_command()
         .args([
             "show-ref",
             "--verify",

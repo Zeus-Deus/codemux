@@ -316,7 +316,7 @@ pub async fn generate_commit_message(
     model: Option<&str>,
 ) -> Result<String, String> {
     let diff = {
-        let output = crate::execution::host_command_tokio("git")
+        let output = crate::git::git_command_tokio()
             .args(["diff", "--cached"])
             .current_dir(repo_path)
             .stdin(Stdio::null())

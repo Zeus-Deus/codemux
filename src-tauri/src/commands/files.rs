@@ -149,7 +149,7 @@ fn git_ignored_set(
         })
         .collect();
 
-    let output = Command::new("git")
+    let output = crate::git::git_command()
         .args(["check-ignore", "--stdin", "-z"])
         .current_dir(dir)
         .stdin(std::process::Stdio::piped())
