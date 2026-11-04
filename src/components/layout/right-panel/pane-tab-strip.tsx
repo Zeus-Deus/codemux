@@ -27,8 +27,9 @@
  *
  * **Overflow.** The deck grows: every file opened from the tree is another
  * tab, and a busy thread adds tasks, orchestration and subagents on top of
- * the three defaults. Tabs never shrink. Each one keeps its icon and a label
- * that is capped and truncated, and the row scrolls sideways (a plain
+ * the three defaults. Once the labels no longer fit, the inactive tabs drop
+ * theirs and show only their icon (named, with its count, by a tooltip) while the
+ * active tab keeps its label; past that, the row scrolls sideways (a plain
  * vertical wheel pans it) with a soft fade on whichever edge is clipped.
  * Panning alone left the clipped tabs hard to find at the default width,
  * where the row shows about one and a half, so while any tab is out of
@@ -44,7 +45,9 @@
  * the whole header jump by a row mid-drag and left a near-empty band above.
  *
  * **Close affordance.** A tab's leading icon doubles as its close button and
- * turns into an `×` on hover, so closing never covers the label's tail.
+ * turns into an `×` on hover (and stays one on touch), so closing never
+ * covers the label's tail. An icon-only tab has no close button: its icon
+ * is its whole face, so it selects; middle-click and the menu still close.
  * Right-click offers the bulk closes the main tab bar has.
  */
 import {
@@ -100,6 +103,7 @@ import {
 import { useTabReorder, type PillReorderHandlers } from "@/lib/tab-reorder";
 import { topRightReserve } from "@/lib/titlebar-geometry";
 import { useTitlebarActionsWidth } from "@/contrib/react/titlebar-actions";
+import { MENU_SECTION_LABEL } from "@/components/ui/menu-chrome";
 import { cn } from "@/lib/utils";
 import { useHorizontalWheelScroll } from "@/lib/wheel";
 import type { RightPanelTab } from "@/stores/ui-store";
@@ -138,6 +142,7 @@ export interface DeckTab {
 function DeckTabChip({
   tab,
   active,
+  compact,
   dragging,
   reorderProps,
   onSelect,
@@ -145,28 +150,77 @@ function DeckTabChip({
 }: {
   tab: DeckTab;
   active: boolean;
+  /** The row is too narrow for every label: an inactive tab shows only its
+   *  icon, named (with its count) by its tooltip. The active tab keeps its
+   *  label. */
+  compact: boolean;
   dragging: boolean;
   reorderProps: PillReorderHandlers;
   onSelect: () => void;
   onClose: () => void;
 }) {
   const Icon = tab.icon;
+  const name = tab.attribution ? `${tab.label} — ${tab.attribution}` : tab.label;
+  const chipClass = cn(
+    // No border, no shadow, no ring — the fill is the whole signal.
+    "group/tab relative flex h-[26px] shrink-0 items-center rounded-md",
+    "transition-colors duration-100",
+    active
+      ? "bg-surface-3 font-semibold text-foreground"
+      : "font-medium text-muted-foreground hover:bg-surface-2 hover:text-foreground",
+    dragging && "opacity-40",
+  );
+  if (compact && !active) {
+    // Icon-only: the icon is the select button here, never a close button,
+    // since it is the tab's whole face. Closing stays on middle-click and
+    // the right-click menu, or on the tab's own × once it is active.
+    return (
+      <div
+        {...reorderProps}
+        data-testid={tab.testId}
+        data-state="inactive"
+        data-compact="true"
+        {...middleClickCloseProps(onClose)}
+        className={chipClass}
+      >
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={onSelect}
+              aria-pressed={false}
+              aria-label={name}
+              className="relative flex size-[26px] items-center justify-center"
+            >
+              <Icon className="size-[13px] shrink-0" />
+              {/* The count moves into the tooltip; only a count that asks
+                  for the user (a failed subagent) keeps a mark on the tab. */}
+              {tab.badge != null && tab.badgeTone === "attention" && (
+                <span
+                  aria-hidden
+                  className="absolute right-[4px] top-[4px] size-[5px] rounded-full bg-status-attention"
+                />
+              )}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="flex items-center gap-[7px]">
+            {name}
+            <TabBadge tab={tab} active={false} />
+          </TooltipContent>
+        </Tooltip>
+      </div>
+    );
+  }
   return (
     <div
       {...reorderProps}
       data-testid={tab.testId}
       data-state={active ? "active" : "inactive"}
       {...middleClickCloseProps(onClose)}
-      className={cn(
-        // No border, no shadow, no ring — the fill is the whole signal.
-        "group/tab relative flex h-[26px] shrink-0 items-center rounded-md pl-[5px]",
-        "transition-colors duration-100",
-        active
-          ? "bg-surface-3 font-semibold text-foreground"
-          : "font-medium text-foreground/42 hover:bg-surface-2 hover:text-foreground/70",
-        dragging && "opacity-40",
-      )}
+      className={cn(chipClass, "pl-[2px]")}
     >
+      {/* A 24px target around a 13px glyph; the 2px insets on either side
+          keep the icon and label exactly where the 18px button left them. */}
       <button
         type="button"
         data-no-drag
@@ -175,10 +229,10 @@ function DeckTabChip({
           event.stopPropagation();
           onClose();
         }}
-        className="group/close flex size-[18px] shrink-0 items-center justify-center rounded-sm hover:bg-surface-3"
+        className="group/close flex size-6 shrink-0 items-center justify-center rounded-sm hover:bg-surface-3"
       >
-        <Icon className="size-[13px] group-hover/tab:hidden group-focus-visible/close:hidden" />
-        <X className="hidden size-[12px] group-hover/tab:block group-focus-visible/close:block" />
+        <Icon className="size-[13px] group-hover/tab:hidden group-focus-visible/close:hidden pointer-coarse:hidden" />
+        <X className="hidden size-[12px] group-hover/tab:block group-focus-visible/close:block pointer-coarse:block" />
       </button>
       <button
         type="button"
@@ -189,7 +243,7 @@ function DeckTabChip({
         }
         // The full name on hover, for labels the cap below truncates.
         title={tab.attribution ? `${tab.label} — ${tab.attribution}` : tab.label}
-        className="flex h-full min-w-0 items-center gap-[7px] whitespace-nowrap pl-[5px] pr-[9px] text-body-sm"
+        className="flex h-full min-w-0 items-center gap-[7px] whitespace-nowrap pl-[2px] pr-[9px] text-body-sm"
       >
         <span className="max-w-[140px] truncate">{tab.label}</span>
         <TabBadge tab={tab} active={active} />
@@ -210,7 +264,7 @@ function TabBadge({ tab, active }: { tab: DeckTab; active: boolean }) {
           ? "text-status-attention"
           : active && tab.accentBadgeWhenActive
             ? "text-accent-ember"
-            : "text-foreground/38",
+            : "text-muted-foreground",
       )}
     >
       {tab.badge}
@@ -509,6 +563,95 @@ function useCollapsedActions({
   return { collapsed, tabsOverflow: layout.tabsOverflow, onPopoverOpenChange };
 }
 
+/** Slack a compact row needs before its labels come back, so a row sitting
+ *  right on the line doesn't flip between labelled and icon-only tabs. */
+const COMPACT_HYSTERESIS_PX = 16;
+
+/**
+ * Whether the inactive tabs have to drop their labels to fit. Labels that
+ * scroll out of view under the top-right cluster are as good as missing, so
+ * once the tabs' labelled width outgrows the room the row leaves them, the
+ * inactive tabs show their icon only and the active one keeps its label. Five default panes then fit in the default panel instead of
+ * two and a half.
+ *
+ * The labelled width is read while the labels are shown and kept while they
+ * are hidden, keyed by the tab set and the active tab, so a changed set
+ * shows the labels for one layout pass to be measured afresh (before paint).
+ * The room is the header's inner width less every sibling the scroller
+ * shares it with (the "+", "…", "All tabs" and legacy controls, measured,
+ * not budgeted) and the drag gap's floor.
+ */
+function useCompactTabs({
+  headerRef,
+  scrollerRef,
+  contentRef,
+  tabsKey,
+  dragGapPx,
+}: {
+  headerRef: React.RefObject<HTMLElement | null>;
+  scrollerRef: React.RefObject<HTMLDivElement | null>;
+  contentRef: React.RefObject<HTMLDivElement | null>;
+  tabsKey: string;
+  dragGapPx: number;
+}) {
+  const [compact, setCompact] = useState(false);
+  const compactRef = useRef(false);
+  compactRef.current = compact;
+  const labelled = useRef<{ key: string; width: number } | null>(null);
+
+  const measure = useCallback(() => {
+    const header = headerRef.current;
+    const scroller = scrollerRef.current;
+    const content = contentRef.current;
+    // No layout to measure (jsdom): keep every label.
+    if (!header || !scroller || !content || header.clientWidth === 0) {
+      setCompact(false);
+      return;
+    }
+    if (!compactRef.current) {
+      labelled.current = { key: tabsKey, width: content.scrollWidth };
+    }
+    const known = labelled.current;
+    if (known?.key !== tabsKey) {
+      setCompact(false);
+      return;
+    }
+    const style = getComputedStyle(header);
+    const gap = parseFloat(style.columnGap) || 0;
+    const kids = [...header.children] as HTMLElement[];
+    let room =
+      header.clientWidth -
+      (parseFloat(style.paddingLeft) || 0) -
+      (parseFloat(style.paddingRight) || 0) -
+      gap * Math.max(0, kids.length - 1) -
+      dragGapPx;
+    for (const kid of kids) {
+      if (kid === scroller || kid.dataset.testid === "right-panel-drag-gap") {
+        continue;
+      }
+      const kidStyle = getComputedStyle(kid);
+      room -=
+        kid.offsetWidth +
+        (parseFloat(kidStyle.marginLeft) || 0) +
+        (parseFloat(kidStyle.marginRight) || 0);
+    }
+    setCompact((prev) =>
+      prev ? known.width > room - COMPACT_HYSTERESIS_PX : known.width > room,
+    );
+  }, [contentRef, dragGapPx, headerRef, scrollerRef, tabsKey]);
+
+  useLayoutEffect(measure);
+  useLayoutEffect(() => {
+    const header = headerRef.current;
+    if (!header || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(header);
+    return () => observer.disconnect();
+  }, [headerRef, measure]);
+
+  return compact;
+}
+
 /**
  * What didn't fit in the row, behind one button. Folded (`folded` given),
  * it is the "…" holding the "+" and the pane actions — the very same nodes,
@@ -566,7 +709,7 @@ function RowOverflowMenu({
               className={cn(
                 "flex size-6 shrink-0 items-center justify-center rounded-md",
                 "transition-colors duration-100",
-                "text-foreground/42 hover:bg-surface-2 hover:text-foreground/80",
+                "text-subtle-foreground hover:bg-surface-2 hover:text-foreground/80",
                 "data-[state=open]:bg-surface-3 data-[state=open]:text-foreground",
               )}
             >
@@ -580,7 +723,6 @@ function RowOverflowMenu({
       </Tooltip>
       <PopoverContent
         align="end"
-        collisionPadding={8}
         aria-label={label}
         data-testid={
           folded
@@ -785,6 +927,13 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     hasActions: actions != null,
     budgets,
   });
+  const compactTabs = useCompactTabs({
+    headerRef,
+    scrollerRef: containerRef,
+    contentRef,
+    tabsKey: `${tabs.map((tab) => `${tab.id}:${tab.label}`).join("|")}#${activeTab ?? ""}`,
+    dragGapPx: remPx,
+  });
   // An inline row grows an "All tabs" button once the tabs overflow beside
   // it; a folded row lists them in its "…" whenever any are out of view.
   const inlineTabList = !actionsCollapsed && tabsOverflow;
@@ -836,7 +985,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           aria-label="Open pane"
           data-testid="right-panel-add-pane"
           className={cn(
-            "flex size-[24px] shrink-0 items-center justify-center rounded-md text-foreground/42 transition-colors duration-100 hover:bg-surface-2 hover:text-foreground data-[state=open]:bg-surface-3 data-[state=open]:text-foreground",
+            "flex size-[24px] shrink-0 items-center justify-center rounded-md text-subtle-foreground transition-colors duration-100 hover:bg-surface-2 hover:text-foreground data-[state=open]:bg-surface-3 data-[state=open]:text-foreground",
             !actionsCollapsed && "ml-[3px]",
           )}
         >
@@ -847,8 +996,8 @@ export const PaneTabStrip = memo(function PaneTabStrip({
         align="start"
         className="w-[206px] rounded-lg p-[5px] [&_[role=menuitem]]:whitespace-nowrap"
       >
-        <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
-          OPEN PANE
+        <DropdownMenuLabel className={cn(MENU_SECTION_LABEL, "px-[9px]")}>
+          Open pane
         </DropdownMenuLabel>
         {/* Same `surfaces` array the empty-panel picker renders as cards,
             including Terminal, which is a *workspace* pane and routes to
@@ -868,8 +1017,8 @@ export const PaneTabStrip = memo(function PaneTabStrip({
         {pluginSurfaces.length > 0 && (
           <>
             <DropdownMenuSeparator className="mx-1 my-[5px]" />
-            <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
-              PLUGINS
+            <DropdownMenuLabel className={cn(MENU_SECTION_LABEL, "px-[9px]")}>
+              Plugins
             </DropdownMenuLabel>
             {pluginSurfaces.map((surface) => (
               <DropdownMenuItem
@@ -936,6 +1085,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
                   <DeckTabChip
                     tab={tab}
                     active={tab.id === activeTab}
+                    compact={compactTabs}
                     dragging={dragTabId === tab.id}
                     reorderProps={getPillProps(tab.id)}
                     onSelect={() => onSelect(tab.id)}

@@ -923,7 +923,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     // Title recedes past the plain muted tone the active cards use, and comes
     // back on hover *and* keyboard focus.
     const title = within(row).getByText("Shipped");
-    expect(title.className).toContain("text-muted-foreground/60");
+    expect(title.className).toContain("text-subtle-foreground");
     expect(title.className).toContain("group-hover/settled:text-foreground");
     expect(title.className).toContain(
       "group-focus-within/settled:text-foreground",
@@ -942,7 +942,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     const badge = within(row).getByRole("button", {
       name: "Open PR #87 on GitHub — open",
     });
-    expect(badge.className).toContain("text-muted-foreground/55");
+    expect(badge.className).toContain("text-subtle-foreground");
     expect(badge.className).not.toMatch(/(^|\s)text-status-open\b/);
     expect(badge.className).toContain("group-hover/settled:text-status-open");
     expect(badge.className).toContain(
@@ -1004,7 +1004,7 @@ describe("SidebarInbox — settle / un-settle", () => {
       '[data-settled-row="ws-2"]',
     ) as HTMLElement;
     expect(within(other).getByText("Untouched").className).toContain(
-      "text-muted-foreground/60",
+      "text-subtle-foreground",
     );
   });
 
@@ -1038,7 +1038,7 @@ describe("SidebarInbox — settle / un-settle", () => {
       name: "Open PR #87 on GitHub — open",
     });
     expect(badge.className).toContain("text-status-open");
-    expect(badge.className).not.toContain("text-muted-foreground/55");
+    expect(badge.className).not.toContain("text-subtle-foreground");
   });
 
   it("never dims a settled row holding unread output", async () => {

@@ -89,7 +89,7 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
                   <span className="w-[72px] shrink-0" />
                   <span
                     className={cn(
-                      "text-muted-foreground/60 px-3",
+                      "text-subtle-foreground px-3",
                       gutterSize,
                       wrap && "min-w-0 break-words",
                     )}

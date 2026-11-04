@@ -2007,7 +2007,7 @@ function AutoResumedTurnDivider({ text, label }: { text: string; label: string }
         aria-expanded={open}
         title={text}
         onClick={() => setOpen((cur) => !cur)}
-        className="group flex w-full items-center gap-3 rounded-sm text-muted-foreground/70 outline-none transition-colors duration-150 hover:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
+        className="group flex w-full items-center gap-3 rounded-sm text-subtle-foreground outline-none transition-colors duration-150 hover:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
       >
         <span className="h-px flex-1 bg-border/60" />
         <span className="inline-flex items-center gap-1.5 text-label font-medium">
@@ -2039,7 +2039,7 @@ function SessionStartMarker({ startedAt }: { startedAt?: number }) {
   return (
     <Marker
       variant="separator"
-      className="text-label font-medium text-muted-foreground/70 before:bg-border/60 after:bg-border/60"
+      className="text-label font-medium text-subtle-foreground before:bg-border/60 after:bg-border/60"
     >
       <MarkerContent>{formatSessionStart(startedAt)}</MarkerContent>
     </Marker>
@@ -2502,7 +2502,7 @@ function TurnFoldRow({
     // the fold's place rather than a toggle.
     return (
       <div className="flex items-center justify-between gap-3 border-b border-border/60 pb-2 pt-1">
-        <span className="flex items-center gap-1 px-1 text-body tabular-nums text-muted-foreground">
+        <span className="-mx-1 flex items-center gap-1 px-1 text-body tabular-nums text-muted-foreground">
           {liveSince == null ? (
             label
           ) : (
@@ -2521,7 +2521,7 @@ function TurnFoldRow({
         type="button"
         aria-expanded={expanded}
         onClick={() => onToggleTurnFold(turnId, pinnedBy)}
-        className="flex items-center gap-1 rounded-md px-1 text-body tabular-nums text-muted-foreground transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+        className="-mx-1 flex items-center gap-1 rounded-md px-1 text-body tabular-nums text-muted-foreground transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
       >
         <span>{label}</span>
         {failedCount > 0 ? (

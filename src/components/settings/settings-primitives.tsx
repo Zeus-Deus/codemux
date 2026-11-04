@@ -130,7 +130,7 @@ function DeviceOnlyMark({ id }: { id: string }) {
     <TooltipProvider>
       <Tooltip>
         <TooltipTrigger asChild>
-          <span className="inline-flex text-muted-foreground/60">
+          <span className="inline-flex text-subtle-foreground">
             <Monitor className="size-3" aria-hidden />
             <span id={id} className="sr-only">
               Only on this device

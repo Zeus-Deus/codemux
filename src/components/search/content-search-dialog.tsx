@@ -278,7 +278,7 @@ export function ContentSearchDialog() {
                   onClick={() => openMatch(match)}
                   onMouseEnter={() => setSelectedIndex(idx)}
                 >
-                  <span className="shrink-0 w-8 text-right text-muted-foreground/60 tabular-nums">
+                  <span className="shrink-0 w-8 text-right text-subtle-foreground tabular-nums">
                     {match.line_number}
                   </span>
                   <span className="min-w-0 truncate">
@@ -299,7 +299,7 @@ export function ContentSearchDialog() {
                   <span className="text-label text-muted-foreground truncate">
                     {pathUnderRoot(cwd, group.filePath)}
                   </span>
-                  <span className="text-caption text-muted-foreground/50 shrink-0 tabular-nums">
+                  <span className="text-caption text-subtle-foreground shrink-0 tabular-nums">
                     ({group.matches.length})
                   </span>
                 </div>

@@ -140,7 +140,7 @@ export function WorkspaceResourceSection({
           aria-label={isProjectCollapsed ? "Expand project" : "Collapse project"}
         >
           <div className="flex items-center gap-1 min-w-0 mr-2">
-            <span className="flex items-center justify-center size-4 shrink-0 text-muted-foreground/70 group-hover:text-muted-foreground transition-colors duration-150">
+            <span className="flex items-center justify-center size-4 shrink-0 text-subtle-foreground group-hover:text-muted-foreground transition-colors duration-150">
               {isProjectCollapsed ? (
                 <ChevronRight className="size-3" />
               ) : (
@@ -171,7 +171,7 @@ export function WorkspaceResourceSection({
                     <button
                       type="button"
                       onClick={() => toggleWorkspace(workspace.workspace_id)}
-                      className="flex items-center justify-center h-7 w-5 ml-3.5 shrink-0 text-muted-foreground/60 hover:text-muted-foreground transition-colors duration-150"
+                      className="flex items-center justify-center h-7 w-5 ml-3.5 shrink-0 text-subtle-foreground hover:text-muted-foreground transition-colors duration-150"
                       aria-label={
                         isCollapsed ? "Expand workspace" : "Collapse workspace"
                       }

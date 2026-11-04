@@ -280,7 +280,7 @@ function FormField({
       </div>
       {children}
       {caption && (
-        <p className="text-label text-muted-foreground/70 leading-relaxed">
+        <p className="text-label text-subtle-foreground leading-relaxed">
           {caption}
         </p>
       )}
@@ -300,7 +300,7 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cn(
-        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-md text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-md text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
         active
           ? "bg-surface-3 text-foreground"
           : "text-muted-foreground/90 hover:bg-surface-2 hover:text-foreground",
@@ -311,7 +311,7 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
           "size-4 shrink-0 transition-colors duration-150",
           active
             ? "text-foreground/85"
-            : "text-muted-foreground/70 group-hover/nav:text-foreground/80",
+            : "text-subtle-foreground group-hover/nav:text-foreground/80",
         )}
       />
       <span className="truncate">{label}</span>
@@ -1973,7 +1973,7 @@ export function SettingsView() {
               {authUser ? (
                 <>
                   <SettingRow label="Email" description="Your sign-in email address.">
-                    <span className="select-text font-mono text-body text-muted-foreground">{authUser.email}</span>
+                    <span className="select-text text-body text-muted-foreground">{authUser.email}</span>
                   </SettingRow>
                   <Separator />
                   <SettingRow label="Name" description="Your display name.">
@@ -2001,7 +2001,7 @@ export function SettingsView() {
             {authUser && (
               <SectionGroup>
                 <SubsectionHeader title="Session" />
-                <SettingsCard className="flex items-center justify-between gap-4 border-destructive/25 bg-destructive/[0.07]">
+                <SettingsCard className="flex items-center justify-between gap-4">
                   <div className="min-w-0">
                     <p className="text-body-lg font-semibold text-foreground">Sign out of Codemux</p>
                     <p className="text-body-sm text-muted-foreground/80 mt-0.5">
@@ -2347,7 +2347,7 @@ export function SettingsView() {
               )}
             </SectionGroup>
 
-            <p className="text-body-sm text-muted-foreground/70 leading-relaxed mt-8">
+            <p className="text-body-sm text-subtle-foreground leading-relaxed mt-8">
               Agents in Codemux terminals automatically receive workspace context.{" "}
               <a href="https://docs.codemux.org/agent-awareness" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors duration-150">
                 Learn how to configure it for your tools
@@ -3289,7 +3289,7 @@ function SortablePresetRow({
     >
       <button
         type="button"
-        className="p-1 rounded-sm text-muted-foreground/30 hover:text-muted-foreground hover:bg-surface-2 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 group-focus-within/preset:opacity-100 transition-opacity duration-150"
+        className="p-1 rounded-sm text-subtle-foreground hover:text-muted-foreground hover:bg-surface-2 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 group-focus-within/preset:opacity-100 transition-opacity duration-150"
         title="Drag to reorder"
         {...attributes}
         {...listeners}
@@ -3304,7 +3304,7 @@ function SortablePresetRow({
         onClick={onSelect}
         aria-label={`Edit ${preset.name}`}
         // Inset ring: the list clips anything drawn outside a row.
-        className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-sm py-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-sm py-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring"
       >
       {/* Glyph tile — the agent icon seated in a rounded tile, per the
           design's preset rows. */}
@@ -3321,7 +3321,7 @@ function SortablePresetRow({
           )}
         </div>
         {preset.commands.length > 0 && (
-          <code className="text-label text-muted-foreground/70 font-mono truncate block mt-0.5">
+          <code className="text-label text-subtle-foreground font-mono truncate block mt-0.5">
             {preset.commands[0]}
           </code>
         )}

@@ -66,7 +66,7 @@ function SplitSideLine({
         className={cn("flex bg-surface-1 whitespace-pre mt-1 first:mt-0", rowHeight)}
       >
         <span className="w-10 shrink-0 select-none" />
-        <span className={cn("text-muted-foreground/60 px-2 truncate", gutterSize)}>
+        <span className={cn("text-subtle-foreground px-2 truncate", gutterSize)}>
           {line.content}
         </span>
       </div>

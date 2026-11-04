@@ -73,12 +73,18 @@ describe("SidebarSetupBanner", () => {
   it("shows banner when no scripts configured and has worktrees", async () => {
     render(<SidebarSetupBanner />);
     await flushPromises();
-    const title = screen.getByText("Setup scripts");
-    expect(title).toBeInTheDocument();
-    expect(screen.queryByText("Setup")).not.toBeInTheDocument();
+    // One quiet row: the whole label is the Configure button, with the
+    // dismiss × beside it in the same row.
+    const configure = screen.getByRole("button", {
+      name: "Add setup scripts for myapp",
+    });
+    expect(configure).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Dismiss setup tip" }).parentElement)
-      .toBe(title.parentElement);
-    expect(screen.getByText(/Automate workspace setup/)).toBeInTheDocument();
+      .toBe(configure.parentElement);
+    expect(configure).toHaveAttribute(
+      "title",
+      expect.stringMatching(/Automate workspace setup/),
+    );
   });
 
   it("shows banner for non-worktree workspaces with matching project", async () => {
@@ -94,7 +100,7 @@ describe("SidebarSetupBanner", () => {
     };
     render(<SidebarSetupBanner />);
     await flushPromises();
-    expect(screen.getByText("Setup scripts")).toBeInTheDocument();
+    expect(screen.getByText("Add setup scripts for myapp")).toBeInTheDocument();
   });
 
   it("hides when no project root", async () => {
@@ -110,7 +116,7 @@ describe("SidebarSetupBanner", () => {
     };
     render(<SidebarSetupBanner />);
     await flushPromises();
-    expect(screen.queryByText("Setup scripts")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Add setup scripts/)).not.toBeInTheDocument();
   });
 
   it("hides for home-rooted workspaces (project_root === $HOME)", async () => {
@@ -132,7 +138,7 @@ describe("SidebarSetupBanner", () => {
     };
     render(<SidebarSetupBanner />);
     await flushPromises();
-    expect(screen.queryByText("Setup scripts")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Add setup scripts/)).not.toBeInTheDocument();
   });
 
   it("calls correct APIs with project root", async () => {
@@ -148,8 +154,9 @@ describe("SidebarSetupBanner", () => {
   it("configure button opens settings to projects section", async () => {
     render(<SidebarSetupBanner />);
     await flushPromises();
-    const configureBtns = screen.getAllByText("Configure");
-    await userEvent.click(configureBtns[0]);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Add setup scripts for myapp" }),
+    );
     expect(mockSetShowSettings).toHaveBeenCalledWith(true, "projects");
   });
 

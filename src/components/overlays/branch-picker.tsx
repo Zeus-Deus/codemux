@@ -401,7 +401,7 @@ export function BranchPicker({
                               actions on hover and on the keyboard-selected
                               row, so arrowing shows what Enter will do. */}
                           {!alwaysShowActions && (
-                            <span className="text-label text-muted-foreground/60 tabular-nums shrink-0 group-hover/row:hidden group-data-[selected=true]/row:hidden">
+                            <span className="text-label text-subtle-foreground tabular-nums shrink-0 group-hover/row:hidden group-data-[selected=true]/row:hidden">
                               {formatRelativeTime(branch.last_commit_unix)}
                             </span>
                           )}

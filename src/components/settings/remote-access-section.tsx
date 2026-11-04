@@ -221,16 +221,16 @@ function EndpointGroupBlock({ group }: { group: EndpointGroupView }) {
     return (
       <details className="group rounded-md border border-border/50 bg-muted/20 px-3 py-2">
         <summary className="flex cursor-pointer list-none items-center gap-1.5 text-body font-semibold text-foreground marker:content-none">
-          <span className="text-muted-foreground/70 transition-transform duration-150 group-open:rotate-90">
+          <span className="text-subtle-foreground transition-transform duration-150 group-open:rotate-90">
             ›
           </span>
           {group.title}
-          <span className="font-normal text-muted-foreground/70">
+          <span className="font-normal text-subtle-foreground">
             ({group.endpoints.length})
           </span>
         </summary>
         <div className="mt-1.5 space-y-1">
-          <p className="text-body-sm leading-relaxed text-muted-foreground/70">
+          <p className="text-body-sm leading-relaxed text-subtle-foreground">
             {group.explanation}
           </p>
           <EndpointGroupRows endpoints={group.endpoints} />
@@ -243,7 +243,7 @@ function EndpointGroupBlock({ group }: { group: EndpointGroupView }) {
       <p className="text-body font-semibold text-foreground">
         {group.title}
       </p>
-      <p className="text-body-sm leading-relaxed text-muted-foreground/70">
+      <p className="text-body-sm leading-relaxed text-subtle-foreground">
         {group.explanation}
       </p>
       <EndpointGroupRows endpoints={group.endpoints} />
@@ -541,7 +541,7 @@ function DeviceRow({
               Connected
             </span>
           ) : (
-            <span className="flex items-center gap-1 text-label text-muted-foreground/70">
+            <span className="flex items-center gap-1 text-label text-subtle-foreground">
               <span className="inline-block size-1.5 rounded-full bg-muted-foreground/40" />
               Offline
             </span>
@@ -1493,7 +1493,7 @@ export function RemoteAccessSection() {
           </span>
         )}
         {relayRegistered && relayLastRegisteredAt && (
-          <span className="text-body-sm text-muted-foreground/70">
+          <span className="text-body-sm text-subtle-foreground">
             · confirmed {relativeTime(relayLastRegisteredAt)}
           </span>
         )}
@@ -1541,7 +1541,7 @@ export function RemoteAccessSection() {
             Connection details
           </summary>
           <div className="mt-1.5 flex items-center gap-2">
-            <span className="shrink-0 text-body-sm text-muted-foreground/70">Address</span>
+            <span className="shrink-0 text-body-sm text-subtle-foreground">Address</span>
             <code className="min-w-0 flex-1 truncate font-mono text-body-sm text-foreground">
               {relayNodeId}
             </code>
@@ -1939,7 +1939,7 @@ export function RemoteAccessSection() {
 
             {approved.length === 0 ? (
               pending.length === 0 && (
-                <div className="flex items-center gap-2.5 rounded-lg border border-dashed border-border/60 px-3.5 py-4 text-body text-muted-foreground/70">
+                <div className="flex items-center gap-2.5 rounded-lg border border-dashed border-border/60 px-3.5 py-4 text-body text-subtle-foreground">
                   <Server className="size-4" />
                   No browsers yet. Connect one from app.codemux.org or with a
                   pairing link.

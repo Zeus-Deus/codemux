@@ -252,7 +252,7 @@ export function UsageTrendChart({
       aria-describedby={hoveredPoint ? tooltipId : undefined}
       tabIndex={0}
       className={cn(
-        "relative w-full select-none rounded-md focus-visible:ring-2 focus-visible:ring-ring/60",
+        "relative w-full select-none rounded-md focus-visible:ring-2 focus-visible:ring-focus-ring",
         className,
       )}
       style={{ height }}
@@ -482,7 +482,7 @@ function Readout({
               <span
                 className={cn(
                   "inline-flex min-w-0 items-center gap-2",
-                  empty ? "text-muted-foreground/60" : "text-foreground/85",
+                  empty ? "text-subtle-foreground" : "text-foreground/85",
                 )}
               >
                 <span
@@ -498,7 +498,7 @@ function Readout({
               <span
                 className={cn(
                   "text-right font-mono tabular-nums",
-                  empty ? "text-muted-foreground/60" : "text-foreground",
+                  empty ? "text-subtle-foreground" : "text-foreground",
                 )}
               >
                 {empty ? "—" : formatValue(value)}

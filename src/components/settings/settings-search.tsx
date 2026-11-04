@@ -103,7 +103,7 @@ export function SettingsNavSearch({
     <>
       <div className="shrink-0 px-3 pb-4">
         <div className="relative">
-          <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground/70" />
+          <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-subtle-foreground" />
           <input
             ref={inputRef}
             type="text"
@@ -121,7 +121,7 @@ export function SettingsNavSearch({
             }}
             onKeyDown={onKeyDown}
             spellCheck={false}
-            className="h-8 w-full rounded-md border border-hairline-strong bg-surface-1 pr-8 pl-8 text-body-sm text-foreground transition-colors duration-100 outline-none placeholder:text-muted-foreground/70 hover:bg-surface-2 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60"
+            className="h-8 w-full rounded-md border border-hairline-strong bg-surface-1 pr-8 pl-8 text-body-sm text-foreground transition-colors duration-100 outline-none placeholder:text-subtle-foreground hover:bg-surface-2 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-focus-ring"
           />
           {searching ? (
             <button
@@ -179,13 +179,13 @@ export function SettingsNavSearch({
                         <span className="min-w-0 flex-1 leading-snug break-words">
                           <Highlighted text={result.label} query={query} />
                           {result.matchedKeyword && (
-                            <span className="block text-label text-muted-foreground/70">
+                            <span className="block text-label text-subtle-foreground">
                               Matches <Highlighted text={result.matchedKeyword} query={query} />
                             </span>
                           )}
                         </span>
                         {result.anchor === null && (
-                          <span className="shrink-0 self-start pt-px text-label text-muted-foreground/70">
+                          <span className="shrink-0 self-start pt-px text-label text-subtle-foreground">
                             Page
                           </span>
                         )}

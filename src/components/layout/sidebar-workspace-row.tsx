@@ -395,7 +395,7 @@ function WorkspaceMenuHeader({
           {workspace.title}
         </span>
         {project && (
-          <span className="truncate text-label text-muted-foreground/70">
+          <span className="truncate text-label text-subtle-foreground">
             {project.name}
           </span>
         )}
@@ -444,14 +444,14 @@ function MoveToDeviceSubmenu({
             "flex items-center text-foreground",
           )}
         >
-          <MonitorSmartphone className="size-3.5 shrink-0 text-muted-foreground/70" />
+          <MonitorSmartphone className="size-3.5 shrink-0 text-subtle-foreground" />
           <span className="flex min-w-0 flex-1 flex-col">
             <span className="truncate">This device</span>
           </span>
           <Check className="size-3 shrink-0 text-accent-ember" />
         </div>
         {hosts.length === 0 ? (
-          <p className="px-[9px] pt-2 pb-1.5 text-label leading-snug text-muted-foreground/70">
+          <p className="px-[9px] pt-2 pb-1.5 text-label leading-snug text-subtle-foreground">
             No other devices signed in.
           </p>
         ) : (
@@ -464,7 +464,7 @@ function MoveToDeviceSubmenu({
               <Server />
               <span className="flex min-w-0 flex-1 flex-col">
                 <span className="truncate">{host.name}</span>
-                <span className={cn("truncate text-caption text-muted-foreground/70", !host.dirty && "font-mono")}>
+                <span className={cn("truncate text-caption text-subtle-foreground", !host.dirty && "font-mono")}>
                   {host.dirty ? "not synced yet" : host.ssh_target}
                 </span>
               </span>
@@ -1421,7 +1421,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <BellOff
-                        className="size-3 shrink-0 text-muted-foreground/60"
+                        className="size-3 shrink-0 text-subtle-foreground"
                         aria-label="Notifications muted"
                       />
                     </TooltipTrigger>
@@ -1551,7 +1551,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                   rows (with its hover-slide affordance). */}
               {showGitLine && (
                 <div className={cn(
-                  "flex items-center gap-1.5 font-mono leading-tight text-muted-foreground/60",
+                  "flex items-center gap-1.5 font-mono leading-tight text-subtle-foreground",
                   isWorking ? "text-caption mt-1" : "text-label mt-0.5",
                 )}>
                   {workspace.git_branch && (
@@ -1638,7 +1638,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <BellOff
-                              className="size-3 text-muted-foreground/60"
+                              className="size-3 text-subtle-foreground"
                               aria-label="Notifications muted"
                             />
                           </TooltipTrigger>

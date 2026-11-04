@@ -350,7 +350,7 @@ export function DiffPane({
         <GitCompare className="size-8 opacity-30" />
         <p className="text-label">Select a file to view changes</p>
         {filteredFiles.length > 0 && (
-          <p className="text-caption text-muted-foreground/60">
+          <p className="text-caption text-subtle-foreground">
             {filteredFiles.length} file{filteredFiles.length !== 1 ? "s" : ""}{" "}
             with changes
           </p>
@@ -430,7 +430,7 @@ export function DiffPane({
               in a narrow panel. The inner ltr span keeps the trailing slash
               where it belongs inside the rtl truncation. */}
           <span className="flex min-w-0 flex-1 font-mono text-label" title={tab.filePath}>
-            <span dir="rtl" className="truncate text-muted-foreground/70">
+            <span dir="rtl" className="truncate text-subtle-foreground">
               <span dir="ltr">{dir}</span>
             </span>
             <span className="shrink-0 text-foreground">{name}</span>

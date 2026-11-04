@@ -211,7 +211,7 @@ export function SidebarNeedsYouStrip({
 
   return (
     <div
-      className="mx-1.5 mt-1.5 mb-1.5 rounded-lg border border-border bg-surface-2 px-2 py-[7px] animate-in fade-in slide-in-from-top-1 duration-250"
+      className="mx-1.5 mt-1.5 mb-1.5 rounded-lg border border-border bg-surface-2 px-2 py-[7px] animate-in fade-in slide-in-from-top-1 duration-150"
       role="region"
       aria-label="Workspaces needing you"
     >

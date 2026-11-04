@@ -32,6 +32,7 @@ function HoverCardContent({
   className,
   align = "center",
   sideOffset = 4,
+  collisionPadding = 8,
   entrance = "default",
   ...props
 }: React.ComponentProps<typeof HoverCardPrimitive.Content> & {
@@ -43,6 +44,7 @@ function HoverCardContent({
         data-slot="hover-card-content"
         align={align}
         sideOffset={sideOffset}
+        collisionPadding={collisionPadding}
         className={cn(
           "z-50 w-64 origin-(--radix-hover-card-content-transform-origin) rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-popup outline-hidden",
           ENTRANCE_CLASS[entrance],

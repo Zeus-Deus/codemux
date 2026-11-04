@@ -49,7 +49,7 @@ export function SubagentBreadcrumb({
         Orchestrator
       </button>
       <ChevronRight
-        className="size-3 shrink-0 text-muted-foreground/70"
+        className="size-3 shrink-0 text-subtle-foreground"
         aria-hidden
       />
       <span className="flex min-w-0 items-center gap-2 text-body font-semibold text-foreground">

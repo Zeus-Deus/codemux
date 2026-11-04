@@ -72,7 +72,7 @@ function WorktreeRow({
         </div>
         <p className="truncate text-label text-muted-foreground">
           {kept ? worktree.kept_because : staleReasonLabel(worktree)}
-          <span className="text-muted-foreground/60">
+          <span className="text-subtle-foreground">
             {" · "}
             {worktree.project ? `${worktree.project} · ` : ""}
             {worktree.source}

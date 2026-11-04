@@ -263,7 +263,9 @@ export const BUILT_IN_THEMES: readonly ThemeDefinition[] = [
       secondary: "oklch(0.97 0.001 106.424)",
       secondaryForeground: "oklch(0.216 0.006 56.043)",
       muted: "oklch(0.97 0.001 106.424)",
-      mutedForeground: "oklch(0.553 0.013 58.071)",
+      // Darker than the preset's 0.553 so muted text still clears 4.5:1 on
+      // the off-white rail, not only on the white canvas.
+      mutedForeground: "oklch(0.52 0.013 58.071)",
       accent: "oklch(0.97 0.001 106.424)",
       accentForeground: "oklch(0.216 0.006 56.043)",
       border: "oklch(0.923 0.003 48.717)",
@@ -549,6 +551,33 @@ function solveLightness(base: Oklch, against: string, minimum: number, direction
     else high = mid;
   }
   return rgbToHex(oklchToRgb({ ...base, L: best }));
+}
+
+/**
+ * The quietest readable text ink for a palette: muted ink pulled toward the
+ * canvas, but only as far as it still clears 4.5:1 on every surface text
+ * sits on (canvas, rail, card, popover). Imported and generated palettes put
+ * muted ink anywhere from 4.5:1 to 8:1, so a fixed mix would either fail the
+ * floor or barely move; solving it per palette keeps one meaning everywhere.
+ */
+export function subtleForeground(roles: Pick<ThemeRoleMap, "background" | "sidebar" | "card" | "popover" | "mutedForeground">): string {
+  const ink = parseHex(normalizeColor(roles.mutedForeground) ?? "#000000")!;
+  const canvas = parseHex(normalizeColor(roles.background) ?? "#000000")!;
+  const surfaces = [roles.background, roles.sidebar, roles.card, roles.popover]
+    .map((surface) => normalizeColor(surface, normalizeColor(roles.background) ?? "#000000") ?? "#000000");
+  const mix = (weight: number) => rgbToHex({
+    r: ink.r * weight + canvas.r * (1 - weight),
+    g: ink.g * weight + canvas.g * (1 - weight),
+    b: ink.b * weight + canvas.b * (1 - weight),
+  });
+  const readable = (color: string) => surfaces.every((surface) => contrastRatio(color, surface) >= 4.5);
+  // Never quieter than 80% of the way to muted: below that, subtle stops
+  // reading as text and starts reading as disabled.
+  for (let weight = 0.8; weight < 1; weight += 0.02) {
+    const candidate = mix(weight);
+    if (readable(candidate)) return candidate;
+  }
+  return rgbToHex(ink);
 }
 
 function readableOn(background: string, tintedHue?: number): string {
@@ -1154,6 +1183,7 @@ function writeThemeVariables(root: HTMLElement, theme: ThemeDefinition) {
   for (const slot of ANSI_SLOTS) root.style.setProperty(ANSI_VARIABLES[slot], theme.ansi[slot]);
   if (theme.radius) root.style.setProperty("--cm-theme-radius", theme.radius);
   else root.style.removeProperty("--cm-theme-radius");
+  root.style.setProperty("--cm-theme-subtle-foreground", subtleForeground(theme.roles));
   root.dataset.themeId = theme.id;
   // The palette owns the scheme. `.dark` still drives Tailwind's `dark:`
   // variant and the handful of scheme-specific rules in globals.css;

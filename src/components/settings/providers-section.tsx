@@ -295,7 +295,7 @@ function ProviderListRow({
         type="button"
         aria-current={selected ? "true" : undefined}
         onClick={onSelect}
-        className="flex min-w-0 flex-1 items-center gap-2.5 py-2 pl-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/60 rounded-md"
+        className="flex min-w-0 flex-1 items-center gap-2.5 py-2 pl-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-focus-ring rounded-md"
       >
         <span aria-hidden className={cn("flex size-5 shrink-0 items-center justify-center", !enabled && "opacity-50")}>{logo}</span>
         <span className="min-w-0 flex-1">

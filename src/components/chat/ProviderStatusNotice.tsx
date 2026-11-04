@@ -23,7 +23,7 @@ const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
 };
 
 const ACTION_CLASS =
-  "shrink-0 rounded-sm px-1.5 py-0.5 text-label font-medium transition-colors duration-100 hover:bg-surface-2 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
+  "shrink-0 rounded-sm px-1.5 py-0.5 text-label font-medium transition-colors duration-100 hover:bg-surface-2 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring";
 
 /**
  * Probe-backed provider status banner for chat surfaces.
@@ -141,7 +141,7 @@ export function ProviderStatusNotice({
             type="button"
             aria-label={`Dismiss ${label} provider status`}
             onClick={() => dismiss(provider)}
-            className="shrink-0 rounded-sm p-0.5 opacity-60 transition-opacity duration-150 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+            className="shrink-0 rounded-sm p-0.5 opacity-60 transition-opacity duration-150 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
           >
             <X className="size-3.5" aria-hidden />
           </button>

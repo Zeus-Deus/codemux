@@ -7,7 +7,7 @@ import { Kbd } from "@/components/ui/kbd";
  */
 export function KeyHint({ keys, label }: { keys: string; label: string }) {
   return (
-    <span className="flex items-center gap-1.5 text-label text-muted-foreground/70">
+    <span className="flex items-center gap-1.5 text-label text-subtle-foreground">
       <Kbd>{keys}</Kbd>
       {label}
     </span>

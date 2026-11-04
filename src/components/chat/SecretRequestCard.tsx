@@ -138,7 +138,7 @@ function SecretRequestCard({
                 {request.label}
               </label>
               {more > 0 && (
-                <span className="ml-auto shrink-0 text-caption text-muted-foreground/70">
+                <span className="ml-auto shrink-0 text-caption text-subtle-foreground">
                   {more} more after this
                 </span>
               )}

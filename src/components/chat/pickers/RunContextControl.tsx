@@ -342,12 +342,12 @@ export function RunContextControl({
                       placeholder="auto-name if empty"
                       aria-label="Worktree name"
                       spellCheck={false}
-                      className="ml-auto h-5 min-w-0 flex-1 rounded-sm border border-accent-ember/50 bg-background px-1.5 font-mono text-caption text-foreground outline-none placeholder:text-muted-foreground/50"
+                      className="ml-auto h-5 min-w-0 flex-1 rounded-sm border border-accent-ember/50 bg-background px-1.5 font-mono text-caption text-foreground outline-none placeholder:text-subtle-foreground"
                     />
                   ) : (
                     <span className="ml-auto flex min-w-0 items-center gap-1">
                       {typedName && (
-                        <span className="min-w-0 truncate font-mono text-caption text-muted-foreground/70">
+                        <span className="min-w-0 truncate font-mono text-caption text-subtle-foreground">
                           {typedName}
                         </span>
                       )}

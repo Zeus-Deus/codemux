@@ -100,7 +100,7 @@ export function DeviceOptions({
         <Monitor className="size-3.5 text-muted-foreground" />
         <span className="min-w-0 truncate">{localName ?? "This device"}</span>
         {hostId === null && <SelectedMark />}
-        <span className="ml-auto shrink-0 text-caption text-muted-foreground/70">
+        <span className="ml-auto shrink-0 text-caption text-subtle-foreground">
           this device
         </span>
       </CommandItem>
@@ -119,7 +119,7 @@ export function DeviceOptions({
             <Server
               className={cn(
                 "size-3.5",
-                tone === "online" ? "text-muted-foreground" : "text-muted-foreground/50",
+                tone === "online" ? "text-muted-foreground" : "text-subtle-foreground",
               )}
             />
             <span
@@ -131,7 +131,7 @@ export function DeviceOptions({
               {host.name}
             </span>
             {hostId === host.id && <SelectedMark />}
-            <span className="ml-auto flex shrink-0 items-center gap-1.5 text-caption text-muted-foreground/70">
+            <span className="ml-auto flex shrink-0 items-center gap-1.5 text-caption text-subtle-foreground">
               <span
                 aria-hidden
                 className={cn("size-1.5 rounded-full", TONE_DOT[tone])}

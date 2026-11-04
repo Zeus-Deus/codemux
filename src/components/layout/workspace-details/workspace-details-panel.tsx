@@ -337,7 +337,6 @@ export function WorkspaceDetailsHost({
         ref={contentRef}
         align="end"
         sideOffset={remPx / 4}
-        collisionPadding={8}
         data-testid="workspace-details-card"
         data-mode="popover"
         aria-label="Workspace details"

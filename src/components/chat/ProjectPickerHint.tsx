@@ -43,7 +43,7 @@ export function ProjectPickerHint({
       data-testid="project-picker-hint"
       className={cn(
         // Only where the pane has room beside the headline.
-        "pointer-events-none absolute left-full hidden text-muted-foreground/70 @[46rem]:flex",
+        "pointer-events-none absolute left-full hidden text-subtle-foreground @[46rem]:flex",
         "animate-in fade-in duration-250 delay-300 fill-mode-backwards motion-reduce:animate-none",
         placement === "below"
           ? "top-[85%] -ml-5 items-end"

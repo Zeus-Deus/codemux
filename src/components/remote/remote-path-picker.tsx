@@ -286,7 +286,7 @@ export function RemotePathPicker() {
                         <span
                           className={cn(
                             "truncate",
-                            entry.is_gitignored && "text-muted-foreground/70",
+                            entry.is_gitignored && "text-subtle-foreground",
                           )}
                         >
                           {entry.name}

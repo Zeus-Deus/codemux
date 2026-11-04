@@ -153,7 +153,7 @@ function PaceLabel({ pace }: { pace: LimitPace }) {
           tabIndex={0}
           aria-label={`${PACE[pace].word}: ${PACE[pace].label}`}
           className={cn(
-            "inline-flex items-center gap-1.5 rounded-sm text-label outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+            "inline-flex items-center gap-1.5 rounded-sm text-label outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
             pace === "ahead" ? "text-status-attention" : "text-muted-foreground",
           )}
         >

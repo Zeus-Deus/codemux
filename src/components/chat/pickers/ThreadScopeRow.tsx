@@ -465,7 +465,7 @@ function BranchControl({
                           Worktree
                         </Eyebrow>
                       )}
-                      <span className="shrink-0 text-label tabular-nums text-muted-foreground/70">
+                      <span className="shrink-0 text-label tabular-nums text-subtle-foreground">
                         {formatRelativeTime(branch.last_commit_unix)}
                       </span>
                     </CommandItem>

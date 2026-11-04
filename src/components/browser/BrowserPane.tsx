@@ -1083,7 +1083,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-card z-10 px-4 text-center">
             {status === "error" ? (
               <>
-                <Globe className="size-8 text-muted-foreground/30 mb-2" />
+                <Globe className="size-8 text-subtle-foreground mb-2" />
                 <p className="max-w-sm text-label text-destructive">{errorMsg || "Connection failed"}</p>
                 {retryAt !== null && (
                   <p className="mt-1 text-label text-muted-foreground">

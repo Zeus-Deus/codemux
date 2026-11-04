@@ -1268,7 +1268,7 @@ function ModelRow({
         <div className="text-label font-medium leading-snug">
           <span className="truncate">{model.label}</span>
         </div>
-        <div className="mt-0.5 flex items-center gap-1 text-label text-muted-foreground/70">
+        <div className="mt-0.5 flex items-center gap-1 text-label text-subtle-foreground">
           <ProviderLogo provider={provider} className="size-2.5 shrink-0" />
           <span className="truncate" title={subtitle}>
             {subtitle}
@@ -1319,7 +1319,7 @@ function ModelRow({
           "shrink-0 rounded-sm p-1 transition-colors duration-150 hover:bg-surface-3",
           isFavorite
             ? "text-status-working"
-            : "text-muted-foreground/40 hover:text-foreground focus-visible:text-foreground",
+            : "text-subtle-foreground hover:text-foreground focus-visible:text-foreground",
         )}
       >
         <Star

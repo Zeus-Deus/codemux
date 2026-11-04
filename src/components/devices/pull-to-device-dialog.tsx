@@ -437,7 +437,7 @@ function HostBackedAdoptionForm({
       <button
         type="button"
         onClick={onToggleDisclosure}
-        className="flex w-full items-center gap-1 text-body-sm text-muted-foreground/75 hover:text-foreground transition-colors duration-150"
+        className="flex w-full items-center gap-1 text-body-sm text-subtle-foreground hover:text-foreground transition-colors duration-150"
       >
         {disclosureOpen ? (
           <ChevronDown className="size-3" />
@@ -532,7 +532,7 @@ function CloneFallbackBlock({
         </SummaryRow>
         <SummaryRow
           label="Branch"
-          icon={<GitBranch className="size-3 text-muted-foreground/70" />}
+          icon={<GitBranch className="size-3 text-subtle-foreground" />}
         >
           <span className="font-mono text-body-sm">
             {syncRow.git_branch ?? "main"}
@@ -604,7 +604,7 @@ function SameBranchProjectBlock({
         You already have this branch open on this device, just at a
         different path.
       </p>
-      <p className="text-muted-foreground/65">
+      <p className="text-subtle-foreground">
         Pulling would create a parallel copy of work you're already
         doing. Open the existing workspace instead.
       </p>

@@ -5,7 +5,7 @@ import { useProviderHealth } from "@/stores/provider-health-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
 const ACTION_CLASS =
-  "shrink-0 rounded-sm px-1.5 py-0.5 text-label font-medium transition-colors duration-100 hover:bg-surface-2 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
+  "shrink-0 rounded-sm px-1.5 py-0.5 text-label font-medium transition-colors duration-100 hover:bg-surface-2 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring";
 
 /**
  * Transcript row for a run that failed because the provider's CLI is

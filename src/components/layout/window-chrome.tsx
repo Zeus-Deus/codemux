@@ -115,9 +115,14 @@ export function WindowChrome() {
         data-tauri-drag-region
         className="pointer-events-auto absolute inset-0"
       />
-      <div className="pointer-events-auto relative flex items-center">
+      {/* Same box as the main title bar's cluster (right-1 top-1, a 32px row,
+          rounded clip), so opening Settings or a utility page never moves the
+          window controls under the pointer. */}
+      <div className="pointer-events-auto absolute right-1 top-1 flex h-8 items-center">
         <TitlebarActions />
-        <WindowControls />
+        <div className="overflow-hidden rounded-md">
+          <WindowControls />
+        </div>
       </div>
     </div>
   );

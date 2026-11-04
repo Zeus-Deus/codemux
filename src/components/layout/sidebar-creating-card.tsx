@@ -106,7 +106,7 @@ export const SidebarCreatingCard = memo(function SidebarCreatingCard({
         <div className="mt-0.5 truncate text-body font-medium leading-[1.35] text-foreground">
           {title}
         </div>
-        <div className="mt-1 truncate font-mono text-label leading-tight text-muted-foreground/60">
+        <div className="mt-1 truncate font-mono text-label leading-tight text-subtle-foreground">
           {step}
         </div>
         <CardProgressSweep />

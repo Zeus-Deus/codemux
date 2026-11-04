@@ -272,6 +272,60 @@ describe("PaneTabStrip — overflow", () => {
     );
   });
 
+  // Labels that scroll away under the top-right cluster are as good as
+  // missing, so a row too narrow for every label drops the inactive ones
+  // and keeps the active tab's.
+  it("drops inactive labels once the labelled tabs outgrow the row", () => {
+    const restore = stubLayout({ header: 200, tabs: 300, scroller: 100 });
+    try {
+      const { onSelect } = renderStrip();
+      expect(screen.getByText("Files")).toBeInTheDocument();
+      expect(screen.queryByText("Changes")).toBeNull();
+      const changes = screen.getByRole("button", { name: "Changes", pressed: false });
+      expect(changes.closest("[data-compact]")).toHaveAttribute("data-state", "inactive");
+      // The icon selects; an icon-only tab has no close button to hit.
+      expect(screen.queryByLabelText("Close Changes")).toBeNull();
+      fireEvent.click(changes);
+      expect(onSelect).toHaveBeenCalledWith("changes");
+    } finally {
+      restore();
+    }
+  });
+
+  it("brings the labels back once the row has room for them", () => {
+    const widths = { header: 200, tabs: 300, scroller: 100 };
+    const restore = stubLayout(widths);
+    try {
+      const { rerender } = renderStrip();
+      expect(screen.queryByText("Changes")).toBeNull();
+      // Wide enough for the labels plus the hysteresis: the next layout
+      // pass shows them again.
+      widths.header = 600;
+      rerender(
+        <TooltipProvider>
+          <PaneTabStrip
+            tabs={TABS}
+            activeTab="files"
+            onSelect={() => {}}
+            onClose={() => {}}
+            onCloseMany={() => {}}
+            onReorder={() => {}}
+            surfaces={[]}
+            onOpenFile={() => {}}
+            openFileKeys=""
+            inTitlebar
+            onToggleExpand={() => {}}
+            expanded={false}
+            onCollapsePanel={() => {}}
+          />
+        </TooltipProvider>,
+      );
+      expect(screen.getByText("Changes")).toBeInTheDocument();
+    } finally {
+      restore();
+    }
+  });
+
   // A count the user has to deal with reads the same whether or not its
   // pane is in front — otherwise a failure dims itself the moment you look
   // at another pane.
@@ -508,8 +562,11 @@ describe("PaneTabStrip — overflow", () => {
       });
       try {
         const { onSelect } = renderStrip({ actions });
-        // Every tab keeps its full label in the strip itself.
-        expect(screen.getByText("README.md")).toBeInTheDocument();
+        // Too narrow for every label: the hidden tab is icon-only in the
+        // strip, still named for assistive tech.
+        expect(
+          screen.getByRole("button", { name: "README.md", pressed: false }),
+        ).toBeInTheDocument();
 
         fireEvent.click(screen.getByLabelText("Pane actions"));
         const popover = await screen.findByTestId(

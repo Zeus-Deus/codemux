@@ -108,7 +108,7 @@ export function ThemeMarketplacePanel({
           onChange={(event) => setQuery(event.target.value)}
           placeholder="tokyo night"
           aria-label="Search the VS Code Marketplace"
-          className="min-w-0 flex-1 bg-transparent text-body-sm text-foreground outline-none placeholder:text-muted-foreground/60"
+          className="min-w-0 flex-1 bg-transparent text-body-sm text-foreground outline-none placeholder:text-subtle-foreground"
         />
         {searching && <Spinner className="size-3 flex-none text-muted-foreground" />}
       </label>
@@ -120,7 +120,7 @@ export function ThemeMarketplacePanel({
       )}
 
       {results?.length === 0 && !searching && (
-        <p className="text-label text-muted-foreground/70">
+        <p className="text-label text-subtle-foreground">
           Nothing on the Marketplace matches{" "}
           <span className="font-mono text-foreground">{query.trim()}</span>.
         </p>
@@ -182,7 +182,7 @@ export function ThemeMarketplacePanel({
         </div>
       )}
 
-      <span className="text-label leading-relaxed text-muted-foreground/70">
+      <span className="text-label leading-relaxed text-subtle-foreground">
         Light and dark variants both import — the theme's own background decides
         which one Codemux ends up with.
       </span>

@@ -146,7 +146,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
         <ChecksIndicator status={pr.checks_status} />
         <span
           className={cn(
-            "text-muted-foreground/60 font-mono tabular-nums shrink-0",
+            "text-subtle-foreground font-mono tabular-nums shrink-0",
             tzBody,
           )}
         >
@@ -180,10 +180,10 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
           Swapping them inline made the wider hover state re-truncate the
           branch name beside it, so every row you passed over twitched. */}
       <div className="flex items-center gap-1.5 mt-1 min-w-0 h-[22px]">
-        <span className={cn("text-muted-foreground/60 shrink-0", tzMeta)}>{pr.author}</span>
+        <span className={cn("text-subtle-foreground shrink-0", tzMeta)}>{pr.author}</span>
         {pr.head_branch && (
           <span
-            className={cn("text-muted-foreground/40 font-mono truncate min-w-0", tzMeta)}
+            className={cn("text-subtle-foreground font-mono truncate min-w-0", tzMeta)}
           >
             {pr.head_branch}
           </span>
@@ -203,7 +203,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
               </span>
             )}
             {pr.updated_at && (
-              <span className={cn("text-muted-foreground/60", tzMeta)}>
+              <span className={cn("text-subtle-foreground", tzMeta)}>
                 {formatRelativeTime(pr.updated_at)}
               </span>
             )}
@@ -330,7 +330,7 @@ export function IncomingPrsView({
           {provider.nounTitleCase}s
         </span>
         {!loading && prs.length > 0 && (
-          <span className={cn("ml-1.5 tabular-nums text-muted-foreground/60", tzMeta)}>
+          <span className={cn("ml-1.5 tabular-nums text-subtle-foreground", tzMeta)}>
             {prs.length}
           </span>
         )}
@@ -382,7 +382,7 @@ export function IncomingPrsView({
             {prs.length >= 50 && (
               <button
                 className={cn(
-                  "text-muted-foreground/60 hover:text-foreground px-2.5 py-1.5 mt-1 transition-colors duration-150 text-left",
+                  "text-subtle-foreground hover:text-foreground px-2.5 py-1.5 mt-1 transition-colors duration-150 text-left",
                   tzMeta,
                 )}
                 onClick={() => {

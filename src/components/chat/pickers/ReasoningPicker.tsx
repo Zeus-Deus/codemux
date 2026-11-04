@@ -224,7 +224,7 @@ export function ReasoningPicker({
         <span className={cn(PICKER_ROW_TITLE, "truncate")}>
           {title}
           {isDefault ? (
-            <span className="ml-1.5 font-normal text-muted-foreground/60">
+            <span className="ml-1.5 font-normal text-subtle-foreground">
               (default)
             </span>
           ) : null}

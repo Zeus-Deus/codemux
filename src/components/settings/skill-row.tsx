@@ -111,7 +111,7 @@ export function SkillRow({
               <TooltipTrigger asChild>
                 <span
                   data-testid="skill-row-symlink-icon"
-                  className="inline-flex items-center text-muted-foreground/70 hover:text-muted-foreground"
+                  className="inline-flex items-center text-subtle-foreground hover:text-muted-foreground"
                   aria-label="Symlinked skill"
                 >
                   <Link2 className="size-3" aria-hidden />

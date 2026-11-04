@@ -1,4 +1,5 @@
 import type { LucideIcon } from "lucide-react";
+import { CountBadge } from "@/components/ui/count-badge";
 import { useState, useMemo, useCallback, useRef } from "react";
 import {
   Popover,
@@ -196,9 +197,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
               <Icon className="size-[18px]" />
               {labeled && "Ports"}
               {portCount > 0 && (
-                <span className="absolute -top-0.5 -right-0.5 min-w-[15px] h-[15px] px-1 rounded-full bg-primary text-micro leading-[15px] text-primary-foreground font-semibold tabular-nums">
-                  {portCount}
-                </span>
+                <CountBadge>{portCount}</CountBadge>
               )}
             </Button>
           </PopoverTrigger>
@@ -244,7 +243,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                         {port.port}
                       </span>
                       <PortName name={port.label ?? port.process_name} />
-                      <span className="text-caption text-muted-foreground/50 tabular-nums shrink-0 transition-opacity duration-150 group-hover/port:opacity-0">
+                      <span className="text-caption text-subtle-foreground tabular-nums shrink-0 transition-opacity duration-150 group-hover/port:opacity-0">
                         {port.source === "docker"
                           ? port.process_name
                           : `PID ${port.pid}`}

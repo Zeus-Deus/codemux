@@ -153,7 +153,7 @@ function AppMenuFooter({ version }: { version: string | null }) {
 
   return (
     <div className="-mx-1.5 mt-1.5 flex h-8 items-center gap-2 rounded-b-lg border-t border-border/70 bg-background/50 px-3.5">
-      <span className="min-w-0 truncate font-mono text-caption text-muted-foreground/70">
+      <span className="min-w-0 truncate font-mono text-caption text-subtle-foreground">
         Codemux {version ? `v${version}` : ""}
       </span>
       <span className="flex-1" />
@@ -266,7 +266,7 @@ function AppMenu({
         >
           <BookOpen />
           <span className="flex-1">Documentation</span>
-          <ExternalLink className="ml-auto size-[11px] shrink-0 text-muted-foreground/60" />
+          <ExternalLink className="ml-auto size-[11px] shrink-0 text-subtle-foreground" />
         </DropdownMenuItem>
         <DropdownMenuItem
           className={MENU_ROW}
@@ -276,7 +276,7 @@ function AppMenu({
         >
           <Bug />
           <span className="flex-1">Report issue</span>
-          <ExternalLink className="ml-auto size-[11px] shrink-0 text-muted-foreground/60" />
+          <ExternalLink className="ml-auto size-[11px] shrink-0 text-subtle-foreground" />
         </DropdownMenuItem>
         <DropdownMenuSeparator className={MENU_SEPARATOR} />
         <DropdownMenuItem

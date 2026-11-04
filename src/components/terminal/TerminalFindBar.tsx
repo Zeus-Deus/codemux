@@ -125,7 +125,7 @@ export function TerminalFindBar({ search, focusToken, onClose }: Props) {
       role="search"
       aria-label="Find in terminal"
       onKeyDown={onBarKeyDown}
-      className="absolute right-3 top-2 z-10 flex items-center gap-1 rounded-md border border-border bg-popover py-1 pl-2 pr-1 text-popover-foreground shadow-md has-[input:focus]:ring-2 has-[input:focus]:ring-ring/60 motion-safe:animate-in motion-safe:fade-in motion-safe:slide-in-from-top-1 motion-safe:duration-150"
+      className="absolute right-3 top-2 z-10 flex items-center gap-1 rounded-md border border-border bg-popover py-1 pl-2 pr-1 text-popover-foreground shadow-md has-[input:focus]:ring-2 has-[input:focus]:ring-focus-ring motion-safe:animate-in motion-safe:fade-in motion-safe:slide-in-from-top-1 motion-safe:duration-150"
     >
       <input
         ref={inputRef}

@@ -86,10 +86,11 @@ function tabIcon(tab: TabSnapshot, isChat: boolean): React.ReactNode {
 // The close button leads the pill and wears the tab's kind icon, which turns
 // into the × on hover or keyboard focus (and stays a × on touch, where there
 // is no hover). Same footprint either way, so the pill never changes size and
-// keeps no empty slot for a hidden ×. `pl-2` plus the button's 2px inset puts
-// the icon 10px in, matching `pr-2.5`.
+// keeps no empty slot for a hidden ×. The button is a 24px target around a
+// 12px glyph: `pl-1` plus its 6px inset puts the icon 10px in, matching
+// `pr-2.5`, and its `-mr-1` keeps the label where a 16px button left it.
 const PILL_BASE = cn(
-  "group/tab flex h-7 shrink-0 items-center gap-1 pl-2 pr-2.5 text-label transition-colors duration-150",
+  "group/tab flex h-7 shrink-0 items-center gap-1 pl-1 pr-2.5 text-label transition-colors duration-150",
   BAND_CONTROL_RADIUS,
 );
 const PILL_ACTIVE = cn(BAND_ACTIVE_FILL, "text-foreground font-semibold");
@@ -99,7 +100,7 @@ const PILL_INACTIVE =
 // label stays the tab's first stop for Tab and for the rename input's
 // refocus, which lands on the pill's first button.
 const CLOSE_BTN =
-  "group/close order-first flex size-4 shrink-0 items-center justify-center rounded-sm transition-colors duration-150 hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
+  "group/close order-first -mr-1 flex size-6 shrink-0 items-center justify-center rounded-sm transition-colors duration-150 hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring";
 const CLOSE_ICON =
   "shrink-0 opacity-90 group-hover/tab:hidden group-focus-visible/close:hidden pointer-coarse:hidden";
 const CLOSE_X =

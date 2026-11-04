@@ -429,7 +429,7 @@ export function AutomationsSection() {
       <div className="flex h-full min-h-[460px] items-center justify-center">
         <div className="max-w-sm space-y-4 text-center">
           <div className="mx-auto flex size-14 items-center justify-center rounded-lg border border-border/50 bg-muted/40">
-            <CalendarClock className="size-6 text-muted-foreground/70" />
+            <CalendarClock className="size-6 text-subtle-foreground" />
           </div>
           <div className="space-y-1.5">
             <h3 className="text-body-lg font-semibold tracking-tight text-foreground">
@@ -465,7 +465,7 @@ export function AutomationsSection() {
           <Eyebrow>
             Automations
           </Eyebrow>
-          <span className="text-label text-muted-foreground/60 tabular-nums">
+          <span className="text-label text-subtle-foreground tabular-nums">
             {automations.length}
           </span>
         </div>
@@ -529,7 +529,7 @@ export function AutomationsSection() {
                         />
                       )}
                     </span>
-                    <span className="mt-0.5 block truncate text-label text-muted-foreground/55">
+                    <span className="mt-0.5 block truncate text-label text-subtle-foreground">
                       {describeTrigger(automation)}
                     </span>
                   </span>
@@ -576,7 +576,7 @@ export function AutomationsSection() {
           <div className="flex h-full items-center justify-center text-center">
             <div className="space-y-3">
               <div className="mx-auto size-12 rounded-full bg-muted/40 border border-border/40 flex items-center justify-center">
-                <CalendarClock className="size-5 text-muted-foreground/60" />
+                <CalendarClock className="size-5 text-subtle-foreground" />
               </div>
               <p className="text-body text-muted-foreground/80">
                 Select an automation, or create a new one.
@@ -794,15 +794,15 @@ function RunHistory({ automationId }: { automationId: number }) {
           Run history
         </Eyebrow>
         {runs.length > 0 && (
-          <span className="text-label text-muted-foreground/50 tabular-nums">
+          <span className="text-label text-subtle-foreground tabular-nums">
             {runs.length}
           </span>
         )}
       </div>
       {loading ? (
-        <p className="py-2 text-body-sm text-muted-foreground/70">Loading…</p>
+        <p className="py-2 text-body-sm text-subtle-foreground">Loading…</p>
       ) : runs.length === 0 ? (
-        <p className="rounded-lg border border-dashed border-border/60 px-3 py-3 text-body-sm text-muted-foreground/70">
+        <p className="rounded-lg border border-dashed border-border/60 px-3 py-3 text-body-sm text-subtle-foreground">
           No runs yet. Each run will appear here.
         </p>
       ) : (
@@ -825,12 +825,12 @@ function RunHistory({ automationId }: { automationId: number }) {
                   Pull request ↗
                 </button>
               ) : run.branch ? (
-                <span className="min-w-0 truncate font-mono text-label text-muted-foreground/55">
+                <span className="min-w-0 truncate font-mono text-label text-subtle-foreground">
                   {run.branch}
                 </span>
               ) : null}
               {run.trigger_type === "webhook" && (
-                <span className="shrink-0 text-caption uppercase tracking-wide text-muted-foreground/60">
+                <span className="shrink-0 text-caption uppercase tracking-wide text-subtle-foreground">
                   webhook
                 </span>
               )}
@@ -1065,7 +1065,7 @@ function AutomationForm({
 
       <div className="flex items-center justify-end gap-3 pt-2 border-t border-border/40">
         {!canSave ? (
-          <span className="mr-auto text-label text-muted-foreground/60">
+          <span className="mr-auto text-label text-subtle-foreground">
             Name, prompt and project are required.
           </span>
         ) : agentWarning ? (
@@ -1180,7 +1180,7 @@ function ScheduleField({
             className="h-9 w-28 text-body tabular-nums"
           />
           {draft.builder.frequency === "HOURLY" && (
-            <span className="text-body-sm text-muted-foreground/70">
+            <span className="text-body-sm text-subtle-foreground">
               past each hour
             </span>
           )}
@@ -1188,12 +1188,12 @@ function ScheduleField({
       )}
 
       <div className="mt-1.5 flex items-center justify-between gap-3">
-        <span className="min-w-0 truncate text-label text-muted-foreground/60">
+        <span className="min-w-0 truncate text-label text-subtle-foreground">
           Runs {describeSchedule(composed).toLowerCase()}
         </span>
         <button
           type="button"
-          className="shrink-0 text-label text-muted-foreground/70 hover:text-foreground transition-colors duration-150"
+          className="shrink-0 text-label text-subtle-foreground hover:text-foreground transition-colors duration-150"
           onClick={() => {
             if (draft.rawMode) {
               patch({ rawMode: false });
@@ -1312,8 +1312,8 @@ function RepoAccessRow({
     <div className="flex items-start gap-2 text-body-sm leading-relaxed">
       {checking ? (
         <>
-          <Spinner className="mt-0.5 size-3 shrink-0 text-muted-foreground/60" />
-          <span className="text-muted-foreground/70">
+          <Spinner className="mt-0.5 size-3 shrink-0 text-subtle-foreground" />
+          <span className="text-subtle-foreground">
             Checking repository access…
           </span>
         </>
@@ -1329,7 +1329,7 @@ function RepoAccessRow({
           <span
             className={cn(
               "min-w-0",
-              result.ok ? "text-muted-foreground/75" : "text-warning",
+              result.ok ? "text-subtle-foreground" : "text-warning",
             )}
           >
             {result.message}
@@ -1337,7 +1337,7 @@ function RepoAccessRow({
           <button
             type="button"
             onClick={check}
-            className="ml-auto shrink-0 text-muted-foreground/60 hover:text-foreground transition-colors duration-150"
+            className="ml-auto shrink-0 text-subtle-foreground hover:text-foreground transition-colors duration-150"
           >
             Check again
           </button>
@@ -1361,7 +1361,7 @@ function Field({
       <Label className="text-body font-medium text-foreground">{label}</Label>
       {children}
       {hint && (
-        <p className="text-label text-muted-foreground/70 leading-relaxed">
+        <p className="text-label text-subtle-foreground leading-relaxed">
           {hint}
         </p>
       )}

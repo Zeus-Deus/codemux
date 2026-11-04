@@ -535,7 +535,7 @@ function PluginListRow({
         aria-current={selected ? "true" : undefined}
         aria-label={name}
         aria-describedby={`${id}-summary`}
-        className="flex min-w-0 flex-1 flex-col rounded-md py-2 pl-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+        className="flex min-w-0 flex-1 flex-col rounded-md py-2 pl-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
         onClick={() => onSelect(installation.installationId)}
       >
         <span className="flex min-w-0 items-baseline gap-1.5">
@@ -548,11 +548,11 @@ function PluginListRow({
             {manifest.name}
           </span>
           {version ? (
-            <span className="max-w-20 shrink-0 truncate font-mono text-label text-muted-foreground/70">v{version}</span>
+            <span className="max-w-20 shrink-0 truncate font-mono text-label text-subtle-foreground">v{version}</span>
           ) : null}
         </span>
         {hint ? (
-          <span className="truncate font-mono text-label text-muted-foreground/70" title={hint}>
+          <span className="truncate font-mono text-label text-subtle-foreground" title={hint}>
             {hint}
           </span>
         ) : null}

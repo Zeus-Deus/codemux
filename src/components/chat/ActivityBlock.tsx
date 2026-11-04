@@ -157,7 +157,7 @@ export const ActivityBlock = memo(function ActivityBlock({
           <Trace>
             {hiddenCount > 0 && (
               <button type="button" onClick={() => setShowAll(true)}>
-                <TraceLine className="text-muted-foreground/70">
+                <TraceLine className="text-subtle-foreground">
                   <TraceTitle>Show {hiddenCount} earlier</TraceTitle>
                 </TraceLine>
               </button>
@@ -340,7 +340,7 @@ function StepLine({
             <StepIcon step={step} />
             <StepTitle step={step} />
             {ticking ? (
-              <StepElapsed step={step} className={cn(META_CLASS, "text-muted-foreground/60")} />
+              <StepElapsed step={step} className={cn(META_CLASS, "text-subtle-foreground")} />
             ) : description && !runningLive ? (
               <TraceDescription className={META_CLASS}>{description}</TraceDescription>
             ) : null}
@@ -410,7 +410,7 @@ function SubagentRunLine({
         </TraceTitle>
         <TickingText
           active={status === "running"}
-          className={cn(META_CLASS, "shrink-0 whitespace-nowrap text-muted-foreground/60 tabular-nums")}
+          className={cn(META_CLASS, "shrink-0 whitespace-nowrap text-subtle-foreground tabular-nums")}
           compute={(now) => subagentRunMeta(run, now)}
         />
         <TraceIcon>

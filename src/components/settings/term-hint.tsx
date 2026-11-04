@@ -23,7 +23,7 @@ export function TermHint({
           type="button"
           className={cn(
             // Preflight already strips a button's font, colour and padding.
-            "cursor-help rounded-sm underline decoration-muted-foreground/60 decoration-dotted underline-offset-[3px] focus-visible:ring-2 focus-visible:ring-ring/60",
+            "cursor-help rounded-sm underline decoration-muted-foreground/60 decoration-dotted underline-offset-[3px] focus-visible:ring-2 focus-visible:ring-focus-ring",
             className,
           )}
         >

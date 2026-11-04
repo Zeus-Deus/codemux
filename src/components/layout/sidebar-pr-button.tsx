@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import { CountBadge } from "@/components/ui/count-badge";
 import { useMemo } from "react";
 import { GitPullRequest, type LucideIcon } from "lucide-react";
 
@@ -53,12 +54,9 @@ export function SidebarPullRequestsButton({
           <Icon className="size-[15px]" />
           {labeled && "Pull requests"}
           {count > 0 && (
-            <span
-              data-testid="sidebar-pull-requests-badge"
-              className="absolute -right-0.5 -top-0.5 min-w-[15px] h-[15px] px-1 rounded-full bg-primary text-center text-micro leading-[15px] text-primary-foreground font-semibold tabular-nums"
-            >
+            <CountBadge data-testid="sidebar-pull-requests-badge">
               {badgeLabel(count)}
-            </span>
+            </CountBadge>
           )}
         </Button>
       </TooltipTrigger>

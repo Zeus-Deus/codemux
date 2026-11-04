@@ -37,7 +37,7 @@ export const MESSAGE_ACTION_CLASS = [
   "group-hover/message:pointer-events-auto group-hover/message:opacity-100",
   "group-focus-within/message:pointer-events-auto group-focus-within/message:opacity-100",
   "focus-visible:pointer-events-auto focus-visible:opacity-100",
-  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
   "pointer-coarse:pointer-events-auto pointer-coarse:opacity-100",
 ].join(" ");
 

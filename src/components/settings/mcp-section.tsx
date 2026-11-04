@@ -262,7 +262,7 @@ function ServerGroup({
         <h3 className={cn(eyebrowVariants())}>
           {sourceHeading(source)}
         </h3>
-        <span className="text-caption text-muted-foreground/70">
+        <span className="text-caption text-subtle-foreground">
           {servers.length} server{servers.length === 1 ? "" : "s"}
         </span>
       </header>

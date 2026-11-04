@@ -179,7 +179,7 @@ export function ModelPicker({
                     <div className="truncate">{model.label}</div>
                     {model.description ? (
                       <div
-                        className="mt-0.5 truncate text-label text-muted-foreground/70"
+                        className="mt-0.5 truncate text-label text-subtle-foreground"
                         title={model.description}
                       >
                         {model.description}

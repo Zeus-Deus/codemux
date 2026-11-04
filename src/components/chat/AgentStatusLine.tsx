@@ -4,7 +4,7 @@ import { useUIStore } from "@/stores/ui-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { AGENT_NAME, type FirstRunAgents } from "./first-run-agents";
 
-const SEPARATOR = <span aria-hidden className="text-muted-foreground/50">·</span>;
+const SEPARATOR = <span aria-hidden className="text-subtle-foreground">·</span>;
 
 /**
  * One quiet line under the first-run landing: which agent new chats will

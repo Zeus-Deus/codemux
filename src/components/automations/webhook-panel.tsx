@@ -220,7 +220,7 @@ export function WebhookPanel({
 
       <div className="space-y-2 rounded-lg border border-border/60 bg-muted/30 p-3">
         <div className="flex items-center gap-2">
-          <Webhook className="size-3.5 shrink-0 text-muted-foreground/70" />
+          <Webhook className="size-3.5 shrink-0 text-subtle-foreground" />
           <span className="text-body-sm text-muted-foreground/85">
             POST to this URL to start a run
           </span>
@@ -312,7 +312,7 @@ export function WebhookPanel({
             <ShieldCheck
               className={cn(
                 "size-3.5 shrink-0",
-                signature ? "text-success" : "text-muted-foreground/50",
+                signature ? "text-success" : "text-subtle-foreground",
               )}
             />
             <div className="min-w-0 flex-1">
@@ -321,7 +321,7 @@ export function WebhookPanel({
               </p>
               <p
                 data-testid="webhook-signature-summary"
-                className="truncate text-label text-muted-foreground/70"
+                className="truncate text-label text-subtle-foreground"
               >
                 {signature
                   ? `HMAC-SHA256 in ${signature.header}, ${signature.encoding} digest · secret stored encrypted`
@@ -491,7 +491,7 @@ function SignatureEditor({
           </div>
         </div>
       )}
-      <p className="text-label leading-relaxed text-muted-foreground/70">
+      <p className="text-label leading-relaxed text-subtle-foreground">
         Stored encrypted on this machine and never shown again. It is not added to prompts or logs.
       </p>
       {error && <p className="text-body-sm text-destructive">{error}</p>}

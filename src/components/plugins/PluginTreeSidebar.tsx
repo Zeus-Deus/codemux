@@ -147,12 +147,12 @@ function SectionToggle({
       <ChevronRight
         aria-hidden
         className={cn(
-          "size-3.5 shrink-0 text-muted-foreground/70 transition-transform duration-150 ease-drawer",
+          "size-3.5 shrink-0 text-subtle-foreground transition-transform duration-150 ease-drawer",
           !folded && "rotate-90",
         )}
       />
       <span className="min-w-0 flex-1 truncate">{title}</span>
-      <span className="min-w-6 px-1 text-center text-label font-normal tabular-nums text-muted-foreground/70">
+      <span className="min-w-6 px-1 text-center text-label font-normal tabular-nums text-subtle-foreground">
         {count}
       </span>
     </button>

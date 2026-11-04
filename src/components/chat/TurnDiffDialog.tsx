@@ -68,7 +68,7 @@ function OmittedFile({ file, reason }: { file: TurnDiffFile; reason?: string }) 
       data-testid="turn-diff-omitted"
     >
       <span className="flex min-w-0 items-center gap-2 font-mono text-body-sm text-muted-foreground">
-        <FileText className="size-3 shrink-0 text-muted-foreground/70" aria-hidden />
+        <FileText className="size-3 shrink-0 text-subtle-foreground" aria-hidden />
         <span className="truncate" title={fileLabel(file)}>
           {fileLabel(file)}
         </span>

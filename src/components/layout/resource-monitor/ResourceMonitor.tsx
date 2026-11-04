@@ -181,7 +181,7 @@ export function ResourceMonitor({
         </TooltipContent>
       </Tooltip>
 
-      <PopoverContent align="start" className="w-[28rem] p-0 overflow-hidden">
+      <PopoverContent align="end" className="w-[28rem] p-0 overflow-hidden">
         <div className="px-3.5 pt-3 pb-3 border-b border-border/60">
           <div className="flex items-center justify-between">
             <h4 className="text-body font-medium tracking-tight text-foreground">

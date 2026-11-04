@@ -97,7 +97,7 @@ export function SubagentNotificationRow({
         </time>
       )}
       {open && (
-        <ChevronRight className="size-3.5 shrink-0 text-muted-foreground/60" />
+        <ChevronRight className="size-3.5 shrink-0 text-subtle-foreground" />
       )}
     </>
   );

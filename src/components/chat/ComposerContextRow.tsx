@@ -54,7 +54,7 @@ export function ComposerContextRow({ projectRoot, isHomeWorkspace, branch }: Pro
           </span>
           {branch && (
             <>
-              <span className="shrink-0 select-none text-muted-foreground/50">·</span>
+              <span className="shrink-0 select-none text-subtle-foreground">·</span>
               <span
                 className="inline-flex h-6 min-w-0 items-center gap-1.5 rounded-md px-2 font-mono"
                 title={`Branch: ${branch}`}

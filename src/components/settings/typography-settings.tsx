@@ -308,7 +308,7 @@ export function TypographySettings() {
       </div>
 
       <div className="mt-3 flex items-center justify-between gap-4 px-1">
-        <p className="max-w-xl text-label leading-relaxed text-muted-foreground/65">
+        <p className="max-w-xl text-label leading-relaxed text-subtle-foreground">
           Font names sync with your account. If a face is unavailable on another device, Codemux
           falls back safely without changing the saved choice.
         </p>
@@ -369,12 +369,12 @@ function TypographySurfaceCard({
             <div className="flex flex-wrap items-center gap-2">
               <p className="text-body font-semibold text-foreground">{title}</p>
               {linkedLabel ? (
-                <span className="rounded-full border border-hairline bg-surface-1 px-2 py-0.5 text-caption text-muted-foreground/75">
+                <span className="rounded-full border border-hairline bg-surface-1 px-2 py-0.5 text-caption text-subtle-foreground">
                   {linkedLabel}
                 </span>
               ) : null}
             </div>
-            <p className="mt-0.5 max-w-md text-label leading-relaxed text-muted-foreground/70">
+            <p className="mt-0.5 max-w-md text-label leading-relaxed text-subtle-foreground">
               {description}
             </p>
           </div>
@@ -462,7 +462,7 @@ function FontFamilyPicker({
         <button
           type="button"
           aria-label={`Font family: ${display}`}
-          className="flex h-8 min-w-0 flex-1 items-center justify-between gap-2 rounded-lg border border-input bg-background/75 px-2.5 text-left text-body-sm text-foreground transition-colors duration-150 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 sm:w-[190px] sm:flex-none"
+          className="flex h-8 min-w-0 flex-1 items-center justify-between gap-2 rounded-lg border border-input bg-background/75 px-2.5 text-left text-body-sm text-foreground transition-colors duration-150 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring sm:w-[190px] sm:flex-none"
         >
           <span className="min-w-0 truncate" style={{ fontFamily: fontStack(value, defaultStack) }}>
             {display}
@@ -506,7 +506,7 @@ function FontFamilyPicker({
                 >
                   {family}
                 </span>
-                <span className="font-mono text-caption text-muted-foreground/45">Ag 01</span>
+                <span className="font-mono text-caption text-subtle-foreground">Ag 01</span>
                 {value === family ? <Check className="size-3.5" aria-hidden /> : null}
               </CommandItem>
             ))}

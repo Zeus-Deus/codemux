@@ -209,7 +209,7 @@ export function LaunchModelPicker({
             {model.label}
           </span>
           {model.subProvider ? (
-            <span className="truncate text-caption text-muted-foreground/70">
+            <span className="truncate text-caption text-subtle-foreground">
               {model.subProvider}
             </span>
           ) : null}
@@ -233,7 +233,7 @@ export function LaunchModelPicker({
                 "size-3.5",
                 isFav
                   ? "fill-current text-status-working"
-                  : "text-muted-foreground/40",
+                  : "text-subtle-foreground",
               )}
             />
           </button>

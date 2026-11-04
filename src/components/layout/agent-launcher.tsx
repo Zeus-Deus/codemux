@@ -78,7 +78,7 @@ function TitlebarPinToggle({
       {!pinned && (
         <span
           data-testid={`launcher-destination-${presetId}`}
-          className="font-mono text-caption tracking-[0.02em] text-muted-foreground/70 transition-opacity duration-150 group-hover/command-item:opacity-0 group-data-selected/command-item:opacity-0"
+          className="font-mono text-caption tracking-[0.02em] text-subtle-foreground transition-opacity duration-150 group-hover/command-item:opacity-0 group-data-selected/command-item:opacity-0"
         >
           {destination}
         </span>
@@ -96,7 +96,7 @@ function TitlebarPinToggle({
           useTitlebarPinsStore.getState().toggleTitlebarPin(presetId);
         }}
         className={cn(
-          "flex size-5 shrink-0 items-center justify-center rounded-sm transition-[color,opacity] duration-150 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+          "flex size-5 shrink-0 items-center justify-center rounded-sm transition-[color,opacity] duration-150 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
           pinned
             ? "text-accent-ember hover:text-accent-ember/80"
             : "absolute right-0 top-1/2 -translate-y-1/2 text-muted-foreground opacity-0 group-hover/command-item:opacity-100 group-data-selected/command-item:opacity-100 hover:text-foreground",
@@ -131,9 +131,9 @@ function PresetPinnedBadge({ presetId }: { presetId: string }) {
   return (
     <span
       data-testid={`launcher-preset-pinned-${presetId}`}
-      className="shrink-0 font-mono text-micro font-semibold tracking-[0.09em] text-muted-foreground/70"
+      className="shrink-0 font-mono text-caption tracking-[0.02em] text-subtle-foreground"
     >
-      PINNED
+      pinned
     </span>
   );
 }
@@ -178,7 +178,7 @@ function LauncherDestination({
   return (
     <span
       data-testid={`launcher-destination-${presetId}`}
-      className="ml-auto shrink-0 font-mono text-caption tracking-[0.02em] text-muted-foreground/70"
+      className="ml-auto shrink-0 font-mono text-caption tracking-[0.02em] text-subtle-foreground"
     >
       {children}
     </span>
@@ -208,7 +208,10 @@ function LauncherCommandList({
         ref={listRef}
         data-testid={`${testId}-list`}
         // Keep keyboard selection clear of the fades and sticky footer.
-        className="thin-scrollbar max-h-80 scroll-pt-5 scroll-pb-[68px]"
+        // Tall enough for the usual presets without scrolling, capped by the
+        // room Radix measures below the trigger less the search row, so a
+        // short window still scrolls instead of running off-screen.
+        className="thin-scrollbar max-h-[min(28rem,calc(var(--radix-popover-content-available-height,20rem)-3rem))] scroll-pt-5 scroll-pb-[68px]"
       >
         {children}
         {/* The footer stays INSIDE the list: cmdk only treats items inside
@@ -248,7 +251,7 @@ function LauncherFooter({ onSelect }: { onSelect: () => void }) {
       >
         <Settings className="size-3.5 text-muted-foreground" />
         <span className="flex-1 text-muted-foreground">Manage presets…</span>
-        <ExternalLink className="size-3 text-muted-foreground/70" />
+        <ExternalLink className="size-3 text-subtle-foreground" />
       </CommandItem>
     </CommandGroup>
   );

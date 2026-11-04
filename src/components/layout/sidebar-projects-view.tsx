@@ -159,13 +159,13 @@ function StatusGlyph({
     return (
       <AlarmClock
         aria-hidden
-        className="size-3.5 shrink-0 text-muted-foreground/60"
+        className="size-3.5 shrink-0 text-subtle-foreground"
       />
     );
   }
   return (
     <span className="flex size-3.5 shrink-0 items-center justify-center">
-      <Circle aria-hidden className="size-2 text-muted-foreground/45" />
+      <Circle aria-hidden className="size-2 text-subtle-foreground" />
     </span>
   );
 }
@@ -299,7 +299,7 @@ const ProjectRow = memo(function ProjectRow({
             ) : meta ? (
               <span
                 aria-label={parked === "snoozed" ? `Wakes in ${meta}` : undefined}
-                className="shrink-0 font-mono text-label tabular-nums text-muted-foreground/70"
+                className="shrink-0 font-mono text-label tabular-nums text-subtle-foreground"
               >
                 {meta}
               </span>
@@ -363,13 +363,13 @@ function FooterToggle({
       <ChevronRight
         aria-hidden
         className={cn(
-          "size-3.5 shrink-0 text-muted-foreground/70 transition-transform duration-150 ease-drawer",
+          "size-3.5 shrink-0 text-subtle-foreground transition-transform duration-150 ease-drawer",
           open && "rotate-90",
         )}
       />
       <span className="min-w-0 flex-1 truncate">{label}</span>
       {count !== undefined && (
-        <span className="min-w-6 px-1 text-center text-label tabular-nums text-muted-foreground/70">
+        <span className="min-w-6 px-1 text-center text-label tabular-nums text-subtle-foreground">
           {count}
         </span>
       )}
@@ -977,7 +977,7 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
         <ChevronRight
           aria-hidden
           className={cn(
-            "size-3.5 shrink-0 text-muted-foreground/70 transition-transform duration-150 ease-drawer",
+            "size-3.5 shrink-0 text-subtle-foreground transition-transform duration-150 ease-drawer",
             !folded && "rotate-90",
           )}
         />
@@ -1000,7 +1000,7 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
       <span
         aria-hidden
         className={cn(
-          "pointer-events-none col-start-2 row-start-1 min-w-6 px-1 text-center text-label tabular-nums text-muted-foreground/70 transition-opacity duration-150 motion-reduce:transition-none group-hover/proj:opacity-0 group-focus-within/proj:opacity-0 pointer-coarse:opacity-0",
+          "pointer-events-none col-start-2 row-start-1 min-w-6 px-1 text-center text-label tabular-nums text-subtle-foreground transition-opacity duration-150 motion-reduce:transition-none group-hover/proj:opacity-0 group-focus-within/proj:opacity-0 pointer-coarse:opacity-0",
           count === 0 && "font-mono",
         )}
       >

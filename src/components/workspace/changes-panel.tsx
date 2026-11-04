@@ -247,11 +247,11 @@ function FileRow({
           <span className="truncate text-label text-foreground min-w-0 flex-1">
             {name}
             {dir && (
-              <span className="ml-1 text-caption text-muted-foreground/40">{dir}</span>
+              <span className="ml-1 text-caption text-subtle-foreground">{dir}</span>
             )}
           </span>
           {(file.additions > 0 || file.deletions > 0) && (
-            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 group-focus-within/file:opacity-0 transition-opacity duration-150">
+            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-subtle-foreground group-hover/file:opacity-0 group-focus-within/file:opacity-0 transition-opacity duration-150">
               {file.additions > 0 && <span className="text-success">+{file.additions}</span>}
               {file.deletions > 0 && <span className="text-danger">{file.deletions}</span>}
             </span>
@@ -336,7 +336,7 @@ function FileSection({
       <div className="flex h-5 items-center pr-1">
         <Eyebrow className="flex flex-1 items-center px-2.5">
           <span>{label}</span>
-          <span className="ml-1.5 tabular-nums text-muted-foreground/40">{files.length}</span>
+          <span className="ml-1.5 tabular-nums text-subtle-foreground">{files.length}</span>
         </Eyebrow>
         {bulk && (
           <Button
@@ -394,7 +394,7 @@ function BranchPill({ info }: { info: GitBranchInfo | null }) {
         </span>
       )}
       {!info.has_upstream && (
-        <span className="ml-auto text-caption italic text-muted-foreground/60">no remote</span>
+        <span className="ml-auto text-caption italic text-subtle-foreground">no remote</span>
       )}
     </PanelHeader>
   );
@@ -851,7 +851,7 @@ export function ChangesPanel({
             </div>
           ) : totalChanges === 0 ? (
             showNoGit ? (
-              <div className="flex flex-col items-center justify-center px-4 py-10 gap-2 text-center text-muted-foreground/70">
+              <div className="flex flex-col items-center justify-center px-4 py-10 gap-2 text-center text-subtle-foreground">
                 <GitBranch className="size-4 opacity-50" />
                 <p className="text-label">
                   Not a git repository — changes can&apos;t be tracked
@@ -870,7 +870,7 @@ export function ChangesPanel({
                 </Button>
               </div>
             ) : (
-              <div className="flex flex-col items-center justify-center py-10 gap-1.5 text-muted-foreground/70">
+              <div className="flex flex-col items-center justify-center py-10 gap-1.5 text-subtle-foreground">
                 <Check className="size-4 opacity-50" />
                 <p className="text-label">Working tree clean</p>
               </div>
@@ -1154,7 +1154,7 @@ export function SmartCommitButton({
 
   if (!primary || !display) {
     return (
-      <div className="text-caption text-muted-foreground/60 text-center py-1">
+      <div className="text-caption text-subtle-foreground text-center py-1">
         Resolve or abort the merge above.
       </div>
     );

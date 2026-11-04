@@ -1679,7 +1679,7 @@ export function Composer({
                 <span className="text-caption font-medium text-foreground/70">
                   {sessionProviderLabel(session.provider)}
                 </span>
-                <span className="mt-1 whitespace-nowrap font-mono text-micro text-muted-foreground/60">
+                <span className="mt-1 whitespace-nowrap font-mono text-micro text-subtle-foreground">
                   {when}
                 </span>
               </span>
@@ -3266,7 +3266,7 @@ export function Composer({
         {zone1Override !== null && zone1Override !== undefined ? (
           <div className="pb-1">{zone1Override}</div>
         ) : zone1Override === undefined && cwd ? (
-          <div className="px-3 pb-1 text-label text-muted-foreground/70 truncate font-mono">
+          <div className="px-3 pb-1 text-label text-subtle-foreground truncate font-mono">
             {cwd}
           </div>
         ) : null}
@@ -3859,7 +3859,7 @@ export function Composer({
                     // Transparent text — the colored mirror behind shows
                     // through. Caret stays visible via `caret-foreground`.
                     "text-transparent caret-foreground",
-                    "placeholder:text-muted-foreground/60",
+                    "placeholder:text-subtle-foreground",
                     "outline-none",
                   )}
                   // min-height (rather than a floor in the auto-grow effect)
@@ -3910,16 +3910,16 @@ export function Composer({
               !expanded ? (
                 <span
                   aria-hidden
-                  className="conversation-text truncate leading-5 text-muted-foreground/60"
+                  className="conversation-text truncate leading-5 text-subtle-foreground"
                 >
                   {placeholderText}
                 </span>
               ) : submitHint ? (
-                <span className="truncate text-label leading-none text-muted-foreground/70">
+                <span className="truncate text-label leading-none text-subtle-foreground">
                   {submitHint}
                 </span>
               ) : showQueueHint ? (
-                <span className="truncate text-label leading-none text-muted-foreground/70">
+                <span className="truncate text-label leading-none text-subtle-foreground">
                   {steeringUnavailable ? "Steer unavailable" : `Enter to ${delivery.delivery}`}
                 </span>
               ) : null
@@ -3998,7 +3998,7 @@ const COMPOSER_TEXT_LAYOUT = "px-5 py-2.5 conversation-text leading-relaxed";
 /** Muted colour of the textarea's native placeholder, reused for the
  *  argument ghost so both hints read the same. Keep in step with the
  *  textarea's `placeholder:` utility. */
-const COMPOSER_PLACEHOLDER_COLOR = "text-muted-foreground/60";
+const COMPOSER_PLACEHOLDER_COLOR = "text-subtle-foreground";
 
 function placeholderForMode(mode: ChatMode, isDraft: boolean): string {
   switch (mode) {

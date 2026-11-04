@@ -17,11 +17,11 @@ import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
  *  minimum so a row never grows), with a 14px muted icon in the leading
  *  slot. */
 export const MENU_ROW =
-  "h-7 gap-2 whitespace-nowrap rounded-sm px-2 text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
+  "h-7 gap-2 whitespace-nowrap rounded-sm px-2 text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-subtle-foreground";
 
 /** A 36px row carrying a title plus a mono state line (the device list). */
 export const MENU_ROW_TWO_LINE_COMPACT =
-  "h-9 gap-2 whitespace-nowrap rounded-sm px-2 text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
+  "h-9 gap-2 whitespace-nowrap rounded-sm px-2 text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-subtle-foreground";
 
 /**
  * The destructive tail row. Radix's highlight convention is a surface change,
@@ -51,7 +51,7 @@ export const MENU_SECTION_LABEL =
 
 /** Trailing metadata on a row (a username, a device state, a hint). */
 export const MENU_ROW_META =
-  "ml-auto shrink-0 text-label text-muted-foreground/70";
+  "ml-auto shrink-0 text-label text-subtle-foreground";
 
 const IS_MAC =
   typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
@@ -137,7 +137,7 @@ export function MenuKeycap({ actionId, keys, className }: KeycapProps) {
       // the item is called, so it stays out of the row's accessible name.
       aria-hidden
       className={cn(
-        "ml-auto shrink-0 font-mono text-caption font-normal tracking-normal text-muted-foreground/70",
+        "ml-auto shrink-0 font-mono text-caption font-normal tracking-normal text-subtle-foreground",
         className,
       )}
     >

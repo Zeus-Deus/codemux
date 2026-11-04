@@ -384,7 +384,7 @@ function RunCommandForm({
                 <span className="min-w-0 flex-1 truncate font-mono text-label">
                   {c.command}
                 </span>
-                <span className="shrink-0 font-mono text-caption text-muted-foreground/60">
+                <span className="shrink-0 font-mono text-caption text-subtle-foreground">
                   {c.source}
                 </span>
               </button>

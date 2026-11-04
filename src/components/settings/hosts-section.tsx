@@ -653,7 +653,7 @@ function AddDeviceForm({
         />
         {!running && matches.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-            <span className="text-label text-muted-foreground/70">From your SSH config</span>
+            <span className="text-label text-subtle-foreground">From your SSH config</span>
             {matches.map((suggestion) => (
               <button
                 key={suggestion}
@@ -673,7 +673,7 @@ function AddDeviceForm({
 
       <div className="grid gap-1.5">
         <Label htmlFor="add-device-name" className="text-body-sm">
-          Name <span className="font-normal text-muted-foreground/70">optional</span>
+          Name <span className="font-normal text-subtle-foreground">optional</span>
         </Label>
         <Input
           id="add-device-name"
@@ -696,12 +696,12 @@ function AddDeviceForm({
                 <p
                   className={cn(
                     "text-body-sm",
-                    steps[id] === "pending" ? "text-muted-foreground/70" : "text-foreground",
+                    steps[id] === "pending" ? "text-subtle-foreground" : "text-foreground",
                   )}
                 >
                   {label}
                   {steps[id] === "skipped" && (
-                    <span className="text-muted-foreground/70"> · already installed</span>
+                    <span className="text-subtle-foreground"> · already installed</span>
                   )}
                 </p>
                 {steps[id] === "failed" && failure && (
@@ -744,7 +744,7 @@ function StepIcon({ state }: { state: StepState }) {
     case "done":
       return <Check className="size-3.5 text-status-open" aria-hidden />;
     case "skipped":
-      return <Minus className="size-3.5 text-muted-foreground/60" aria-hidden />;
+      return <Minus className="size-3.5 text-subtle-foreground" aria-hidden />;
     case "failed":
       return <X className="size-3.5 text-destructive" aria-hidden />;
     default:

@@ -241,8 +241,14 @@ export function useQueuedTurnEditor({
 // ── The list ───────────────────────────────────────────────────────────
 
 const ACTION =
-  "inline-flex h-[22px] shrink-0 items-center justify-center gap-1 rounded-sm px-1.5 text-label font-semibold text-muted-foreground outline-none transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60 disabled:pointer-events-none disabled:opacity-40";
+  "inline-flex h-[22px] shrink-0 items-center justify-center gap-1 rounded-sm px-1.5 text-label font-semibold text-muted-foreground outline-none transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:ring-2 focus-visible:ring-focus-ring disabled:pointer-events-none disabled:opacity-40";
 const ICON_ACTION = cn(ACTION, "w-[22px] px-0");
+/** The grip, pencil and × wait for intent: at rest a queued row shows its
+ *  text and its one send verb. Keyboard focus anywhere in the row and coarse
+ *  pointers (no hover) keep them visible; editing and dragging keep the row
+ *  "in use" through `focus-within`. */
+const REVEAL_ON_INTENT =
+  "opacity-0 transition-[color,background-color,opacity] duration-100 group-hover/queued:opacity-100 group-focus-within/queued:opacity-100 pointer-coarse:opacity-100";
 
 /** Where a drop lands: before `index` in the dragged turn's group. */
 interface DragState {
@@ -386,7 +392,7 @@ export function QueuedTurnsList({
         aria-label={expanded ? "Collapse queued messages" : "Expand queued messages"}
         onClick={() => setExpanded((open) => !open)}
         className={cn(
-          "flex w-full items-center gap-2.5 rounded-t-lg px-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
+          "flex w-full items-center gap-2.5 rounded-t-lg px-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring",
           STRIP_ROW_HEIGHT,
         )}
       >
@@ -450,7 +456,7 @@ export function QueuedTurnsList({
                   completeDrag(drag);
                 }}
                 className={cn(
-                  "relative flex h-7 items-center gap-1.5 rounded-md pr-1 pl-0.5",
+                  "group/queued relative flex h-7 items-center gap-1.5 rounded-md pr-1 pl-0.5",
                   editing && "bg-surface-2",
                   drag?.queuedId === queuedId && "opacity-50",
                 )}
@@ -483,7 +489,7 @@ export function QueuedTurnsList({
                       move(queuedId, ids[index + 2] ?? null);
                     }
                   }}
-                  className={cn(ICON_ACTION, "cursor-grab active:cursor-grabbing")}
+                  className={cn(ICON_ACTION, REVEAL_ON_INTENT, "cursor-grab active:cursor-grabbing")}
                 >
                   <GripVertical className="size-3.5" aria-hidden />
                 </button>
@@ -505,7 +511,7 @@ export function QueuedTurnsList({
                 </Tooltip>
                 {saved && !editing ? (
                   <span
-                    className="shrink-0 rounded-sm bg-surface-2 px-1.5 text-label font-medium text-muted-foreground"
+                    className="shrink-0 px-1 text-label text-subtle-foreground"
                     title="Kept from before Codemux restarted. It waits until you send it."
                   >
                     Saved
@@ -534,7 +540,7 @@ export function QueuedTurnsList({
                         editor.begin(item);
                         focusComposerNear(rootRef.current);
                       }}
-                      className={ICON_ACTION}
+                      className={cn(ICON_ACTION, REVEAL_ON_INTENT)}
                     >
                       <Pencil className="size-3" aria-hidden />
                     </button>
@@ -581,7 +587,7 @@ export function QueuedTurnsList({
                       aria-label="Remove queued message"
                       title="Remove from the queue"
                       onClick={() => remove(item)}
-                      className={cn(ICON_ACTION, "hover:bg-destructive/10 hover:text-destructive/80")}
+                      className={cn(ICON_ACTION, REVEAL_ON_INTENT, "hover:bg-destructive/10 hover:text-destructive/80")}
                     >
                       <X className="size-3.5" aria-hidden />
                     </button>
