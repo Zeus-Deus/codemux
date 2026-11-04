@@ -6,7 +6,7 @@ use crate::config::{
     ShellAppearance,
     ThemeColors,
 };
-use crate::git::CommitLoss;
+use crate::git::{CommitLoss, Kept};
 use crate::state::{
     AppStateSnapshot,
     AppStateStore,
@@ -1359,12 +1359,13 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
 
 /// [`close_workspace_with_worktree_impl`], asking `checkpoint` again before
 /// it stops Hermes chats, before each teardown command, before the workspace
-/// leaves, and before any file is deleted.
+/// leaves, and before any file is deleted. Returns what it kept of what it
+/// was asked to delete.
 pub(crate) async fn close_workspace_checked<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     request: CloseWorkspace,
     checkpoint: &Checkpoint,
-) -> Result<(), String> {
+) -> Result<Option<Kept>, String> {
     let state = app.state::<AppStateStore>();
     let db = app.state::<crate::database::DatabaseStore>();
     close_workspace_tracked(
@@ -1380,7 +1381,7 @@ pub(crate) async fn close_workspace_checked<R: tauri::Runtime>(
         checkpoint,
     )
     .await
-    .map(drop)
+    .map(|closed| closed.kept)
 }
 
 /// Which route a close came in by. They differ only in where teardown
@@ -1705,8 +1706,16 @@ pub(crate) fn close_delegated_child_workspace<R: tauri::Runtime>(
     stops
 }
 
-/// The close itself, behind every close route. Resolves with the workspace
-/// the UI should show next.
+/// What a close did.
+struct Closed {
+    /// The workspace the UI should show next.
+    fallback: String,
+    /// What it kept of what it was asked to delete, with
+    /// [`CommitLoss::Refuse`] only.
+    kept: Option<Kept>,
+}
+
+/// The close itself, behind every close route.
 async fn close_workspace_tracked<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &AppStateStore,
@@ -1718,7 +1727,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     force_delete: Option<bool>,
     commits: CommitLoss,
     checkpoint: &Checkpoint,
-) -> Result<String, String> {
+) -> Result<Closed, String> {
     // Fast refusal while the workspace is still intact. Not under the
     // Hermes lifecycle lock: teardown must not serialize every close, so
     // the hold is re-checked under the lock right before the delete.
@@ -1803,8 +1812,9 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // Nor may a close that must not discard work lose a commit nothing
     // else keeps: one a detached HEAD made, or one only the branch it
     // deletes holds. The check above sees neither without an upstream.
-    // Refused here for the same reason, before any teardown. The branch
-    // deletion checks again; the checkout's HEAD, like its files, only here.
+    // Refused here for the same reason, before any teardown. Teardown and
+    // agents not yet stopped can still commit, so the removal checks both
+    // again and keeps what holds such a commit (`git::remove_worktree`).
     if remove_worktree && commits == CommitLoss::Refuse {
         if let Some(wt_path) = worktree_path.clone() {
             if Path::new(&wt_path).exists() {
@@ -1874,7 +1884,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     let Some(wt_path) = deleting else {
         detached.retire(&app);
         crate::state::emit_app_state(&app);
-        return Ok(fallback);
+        return Ok(Closed { fallback, kept: None });
     };
 
     // Agents run inside the worktree; deleting it while one is still
@@ -1958,14 +1968,25 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // with no live row left to escalate from. Forcing here closes
     // that hole; the pre-flight remains the only place uncommitted
     // work can block the close.
-    tokio::task::spawn_blocking(move || {
+    //
+    // Commits are another matter. With `CommitLoss::Refuse` the removal
+    // checks again what holds the only copy of one, now that nothing works
+    // in the checkout, and keeps it: the close stands and reports why.
+    let kept = tokio::task::spawn_blocking(move || {
         crate::git::remove_worktree(Path::new(&wt_path), branch_to_delete.as_deref(), commits, true)
     })
     .await
     .map_err(|e| format!("git_remove_worktree task join failed: {e}"))??;
+    // A checkout kept for its HEAD's commits: cleanup treats it as after a
+    // close that kept it, and keeps it while its HEAD is detached.
+    if matches!(kept, Some(Kept::Checkout(_))) {
+        if let (Some(ws), Some(claim)) = (closing.as_ref(), claim) {
+            crate::worktree_cleanup::retire_workspace(&app, claim, ws, Default::default(), Default::default(), true);
+        }
+    }
 
     crate::state::emit_app_state(&app);
-    Ok(fallback)
+    Ok(Closed { fallback, kept })
 }
 
 /// The ONE root-protection predicate shared by every file-deletion
@@ -2758,7 +2779,9 @@ pub async fn close_workspace<R: tauri::Runtime>(
     workspace_id: String,
     force_delete: Option<bool>,
 ) -> Result<String, String> {
-    close_workspace_tracked(app, &state, &db, workspace_id, CloseRoute::Plain, false, None, force_delete, CommitLoss::Allow, &Checkpoint::default()).await
+    close_workspace_tracked(app, &state, &db, workspace_id, CloseRoute::Plain, false, None, force_delete, CommitLoss::Allow, &Checkpoint::default())
+        .await
+        .map(|closed| closed.fallback)
 }
 
 #[tauri::command]

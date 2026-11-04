@@ -7,6 +7,7 @@
 //! [`Checkpoint`] the service asks again wherever it waited.
 use crate::commands::workspace::WorkspaceCreated;
 pub(crate) use crate::git::CommitLoss;
+use crate::git::Kept;
 use crate::state::{
     AppStateStore, InitialChatPane, WorkspaceId, WorkspacePresetLayout, WorkspaceSnapshot,
     WorkspaceType,
@@ -217,6 +218,10 @@ pub(crate) struct ClosedWorkspace {
     pub workspace_id: String,
     pub closed: bool,
     pub worktree_removed: bool,
+    /// Why a close that may not lose commits kept the worktree or branch it
+    /// was asked to delete: something committed in it while it closed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_because: Option<String>,
 }
 
 /// The slim row outside catalogs list: the connector's existing
@@ -340,18 +345,20 @@ impl<R: Runtime> WorkspaceService<R> {
     /// Close a workspace through the same teardown and deletion guards as the
     /// desktop's close dialog. Error text passes through verbatim.
     pub(crate) async fn close(&self, request: CloseWorkspace) -> Result<ClosedWorkspace, String> {
-        crate::commands::workspace::close_workspace_checked(
+        let kept = crate::commands::workspace::close_workspace_checked(
             self.app.clone(),
             request.clone(),
             &self.checkpoint,
         )
         .await?;
-        // A close that was asked to remove the worktree and succeeded did:
-        // a workspace without one is refused before any teardown.
+        // A close that was asked to remove the worktree and succeeded did (a
+        // workspace without one is refused before any teardown), unless its
+        // HEAD gained a commit nothing else keeps while it closed.
         Ok(ClosedWorkspace {
             workspace_id: request.workspace_id,
             closed: true,
-            worktree_removed: request.remove_worktree,
+            worktree_removed: request.remove_worktree && !matches!(kept, Some(Kept::Checkout(_))),
+            kept_because: kept.map(Kept::into_reason),
         })
     }
 

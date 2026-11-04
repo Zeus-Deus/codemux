@@ -569,6 +569,83 @@ async fn workspace_close_keeps_commits_only_a_detached_head_holds() {
     assert_eq!(git(&repo, &["rev-parse", "saved"]), only);
 }
 
+/// A new worktree detached at the default branch's tip: its HEAD holds no
+/// commit of its own, so a close's pre-flight passes. Returns its workspace
+/// and checkout.
+async fn detached_worktree(app: &App, owner: &ControlCaller, repo: &Path, branch: &str) -> (String, PathBuf) {
+    let created = call(app, owner, "worktree_create", json!({"repo_path": repo, "branch": branch, "layout": "empty"})).await.unwrap();
+    let cwd = PathBuf::from(created["cwd"].as_str().unwrap());
+    git(&cwd, &["checkout", "--detach"]);
+    (created["workspace_id"].as_str().unwrap().to_string(), cwd)
+}
+
+/// The close's teardown runs in the checkout after its pre-flight, and can
+/// commit, as a checkpoint script does. A commit it made on a detached HEAD
+/// keeps the checkout of a close that is not forced: the close stands and
+/// says why the worktree stayed. A branch asked to go that gained a commit
+/// only it holds stays the same way, and the close says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_close_keeps_commits_its_teardown_made() {
+    if isolated(&format!("{MODULE}workspace_close_keeps_commits_its_teardown_made")) {
+        return;
+    }
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    // Every checkout of the repository commits on teardown.
+    write_scripts(&repo, json!({"teardown": ["git -c commit.gpgsign=false commit --allow-empty -m checkpoint"]}));
+    git(&repo, &["add", ".codemux"]);
+    git(&repo, &["commit", "-m", "teardown checkpoint"]);
+    let owner = named(ControlAccess::FullAccess);
+    let full = connector(ControlAccess::FullAccess);
+
+    let (id, cwd) = detached_worktree(&app, &owner, &repo, "detached-teardown").await;
+    let close = json!({"workspace_id": id, "delete_worktree": true, "client_request_id": "detached-teardown"});
+    let closed = call(&app, &full, "workspace_close", close).await.unwrap();
+    assert_eq!((closed["closed"].clone(), closed["worktree_removed"].clone()), (json!(true), json!(false)), "{closed}");
+    assert!(closed["kept_because"].as_str().is_some_and(|why| why.contains("detached HEAD has 1 commit")), "{closed}");
+    assert!(app.state::<AppStateStore>().find_workspace(&id).is_none(), "the close stands");
+    assert_eq!(git(&cwd, &["log", "-1", "--format=%s"]), "checkpoint", "the checkout keeps the commit");
+    let only = git(&cwd, &["rev-parse", "HEAD"]);
+    assert_eq!(git(&repo, &["for-each-ref", "--contains", &only]), "", "the premise: no ref holds it");
+
+    // On its branch, asked to delete it: the checkout goes, the branch stays.
+    let created = call(&app, &owner, "worktree_create", json!({"repo_path": repo, "branch": "branch-teardown", "layout": "empty"})).await.unwrap();
+    let (id, cwd) = (created["workspace_id"].as_str().unwrap(), PathBuf::from(created["cwd"].as_str().unwrap()));
+    let close = json!({"workspace_id": id, "delete_worktree": true, "delete_branch": true, "client_request_id": "branch-teardown"});
+    let closed = call(&app, &full, "workspace_close", close).await.unwrap();
+    assert_eq!((closed["closed"].clone(), closed["worktree_removed"].clone()), (json!(true), json!(true)), "{closed}");
+    assert!(closed["kept_because"].as_str().is_some_and(|why| why.contains("'branch-teardown' has 1 commit")), "{closed}");
+    assert!(!cwd.exists());
+    assert_eq!(git(&repo, &["log", "-1", "--format=%s", "branch-teardown"]), "checkpoint", "the branch keeps the commit");
+}
+
+/// A worker still running in the checkout can commit after the close's
+/// pre-flight, until the close stops it. A commit it made on a detached HEAD
+/// keeps the checkout too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_close_keeps_a_detached_commit_made_while_it_closed() {
+    if isolated(&format!("{MODULE}workspace_close_keeps_a_detached_commit_made_while_it_closed")) {
+        return;
+    }
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    let owner = named(ControlAccess::FullAccess);
+    let full = connector(ControlAccess::FullAccess);
+    let (id, cwd) = detached_worktree(&app, &owner, &repo, "detached-worker").await;
+
+    // Paused once the workspace left app state, before its agents stop.
+    let (reached, release) = crate::commands::workspace::close_pause::pause(&id);
+    let args = json!({"workspace_id": id, "delete_worktree": true, "client_request_id": "detached-worker"});
+    let close = spawn_call(&app, &full, "workspace_close", &args);
+    tokio::time::timeout(Duration::from_secs(10), reached.notified()).await.expect("the close passes its pre-flight");
+    git(&cwd, &["commit", "--allow-empty", "-m", "late work"]);
+    release.notify_one();
+
+    let closed = close.await.unwrap().unwrap();
+    assert_eq!((closed["closed"].clone(), closed["worktree_removed"].clone()), (json!(true), json!(false)), "{closed}");
+    assert!(closed["kept_because"].as_str().is_some_and(|why| why.contains("detached HEAD has 1 commit")), "{closed}");
+    assert!(app.state::<AppStateStore>().find_workspace(&id).is_none(), "the close stands");
+    assert_eq!(git(&cwd, &["log", "-1", "--format=%s"]), "late work", "the checkout keeps the commit");
+}
+
 // ── worktree_create ───────────────────────────────────────────────────────
 
 /// A bare origin seeded from `seed`, cloned into the fixture repository,
