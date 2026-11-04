@@ -1310,7 +1310,9 @@ pub(super) struct AnswerArgs { workspace_id: String, thread_id: String, client_r
 /// the card the person can approve a plan and leave plan mode in one go, but
 /// an outside answer leaves the thread's mode as it is. The caller's
 /// authority travels with the answer and is rechecked until it reaches the
-/// worker, as a sent message's is.
+/// worker, as a sent message's is. When Codemux, not the worker, refuses the
+/// answer for that authority, the caller gets the authority's code, not
+/// `question_answer_failed`: answering again would be refused the same way.
 pub(super) async fn thread_answer<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     use crate::agent_provider::QuestionResolution;
     use crate::commands::async_questions::{answer_question_guarded, QuestionAction};
@@ -1339,12 +1341,15 @@ pub(super) async fn thread_answer<R: Runtime>(app: &AppHandle<R>, caller: &Contr
     let AnswerArgs { workspace_id, thread_id, question_id, answers, .. } = input;
     let receipt_workspace = workspace_id.clone();
     let owned = app.clone();
-    let control = NativeControlGuard { caller: caller.clone(), workspace_id: workspace_id.clone(), thread_id: thread_id.clone(), provider, admission: None }.retain_admission(app);
+    // Without this answer's Stop fence: the authority a new answer would meet.
+    let standing = NativeControlGuard { caller: caller.clone(), workspace_id: workspace_id.clone(), thread_id: thread_id.clone(), provider, admission: None };
+    let control = standing.clone().retain_admission(app);
     run_receipted(app, caller, "thread_answer", &args, false, Some(&receipt_workspace), move |_| async move {
         let action = QuestionAction::Answer { answers, submission_id: submission.clone(), retry_unknown: false, permission_mode_override: None };
-        let resolution = answer_question_guarded(owned, ThreadId(thread_id.clone()), question_id.clone(), action, Some(control))
+        let failed = |error: ControlError| authority_refusal(&owned, &standing).unwrap_or(error);
+        let resolution = answer_question_guarded(owned.clone(), ThreadId(thread_id.clone()), question_id.clone(), action, Some(control))
             .await
-            .map_err(|e| ControlError::new(ErrorCode::QuestionAnswerFailed, e))?;
+            .map_err(|e| failed(ControlError::new(ErrorCode::QuestionAnswerFailed, e)))?;
         match &resolution {
             QuestionResolution::Answered { submission_id, delivery, .. } if *submission_id == submission => {
                 let turn = match delivery {
@@ -1353,7 +1358,7 @@ pub(super) async fn thread_answer<R: Runtime>(app: &AppHandle<R>, caller: &Contr
                 Ok(json!({"workspace_id": workspace_id, "thread_id": thread_id, "question_id": question_id, "turn_id": turn, "resolution": resolution}))
             }
             QuestionResolution::Failed { submission_id, message, .. } if *submission_id == submission => {
-                Err(ControlError::new(ErrorCode::QuestionAnswerFailed, format!("The worker did not take the answer: {message}")))
+                Err(failed(ControlError::new(ErrorCode::QuestionAnswerFailed, format!("The worker did not take the answer: {message}"))))
             }
             // Sent, but the provider never confirmed it: answering again
             // could deliver it twice, so the person settles it on the card.
@@ -1365,6 +1370,18 @@ pub(super) async fn thread_answer<R: Runtime>(app: &AppHandle<R>, caller: &Contr
             _ => Err(ControlError::new(ErrorCode::QuestionClosed, "The question was answered or dismissed meanwhile")),
         }
     }).await
+}
+
+/// Codemux's refusal of `control`'s caller on its thread, when its authority
+/// no longer holds for a reason only the person can change: the grant was
+/// revoked, the thread's mode is above the caller's ceiling, or a supervised
+/// caller's worker runs in a mode Codemux cannot confirm. Checked once an
+/// answer has failed: either Codemux refused it for this, or a new answer
+/// would be.
+fn authority_refusal<R: Runtime>(app: &AppHandle<R>, control: &NativeControlGuard) -> Option<ControlError> {
+    let refusal = ControlError::from(control.verify(app).err()?);
+    matches!(refusal.code, ErrorCode::GrantRevoked | ErrorCode::PermissionCeiling | ErrorCode::PermissionStateUnconfirmed)
+        .then_some(refusal)
 }
 
 /// A question whose answer is being delivered, or was sent without the

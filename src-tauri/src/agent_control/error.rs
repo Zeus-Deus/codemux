@@ -36,6 +36,7 @@ codes! {
     AgentIdentityRequired => "agent_identity_required",
     PermissionDenied => "permission_denied",
     PermissionCeiling => "permission_ceiling",
+    PermissionStateUnconfirmed => "permission_state_unconfirmed",
     UnsupportedPermissionCeiling => "unsupported_permission_ceiling",
     ProviderControlDenied => "provider_control_denied",
     StaleCaller => "stale_caller",

@@ -384,7 +384,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
      → {"question_id": "…", "turn_id": "c41b…", "operation_id": "…", "state": "succeeded", …}
      ```
 
-     An answer never changes the thread's permission mode. `question_closed` means someone answered or dismissed it already. `question_answer_failed` means the answer wasn't delivered, or its delivery isn't confirmed. If the message says the worker didn't take the answer, you can answer again with a new `client_request_id`. Otherwise don't: the person settles it in Codemux.
+     An answer never changes the thread's permission mode. `question_closed` means someone answered or dismissed it already. `question_answer_failed` means the answer wasn't delivered, or its delivery isn't confirmed. If the message says the worker didn't take the answer, you can answer again with a new `client_request_id`. Otherwise don't: the person settles it in Codemux. If Codemux refused the answer because your access no longer covers the thread, you get that reason instead: `grant_revoked`, `permission_ceiling` or `permission_state_unconfirmed`. Answering again won't help until the person changes that.
    - **Secrets** (`pending.secrets`): only the person can enter a secret, in Codemux. You see its label and reason, never a value. Tell the person, then wait again.
 
 7. **Read more, or follow up.**
@@ -545,6 +545,7 @@ The codes an outside assistant meets most often. "Retry" means retrying the iden
 | `invalid_arguments` | An argument is missing, unknown or out of range; the message names it | No |
 | `access_denied` | Your access level is too low for this tool | No |
 | `permission_ceiling` | The permission mode or decision needs full access | No |
+| `permission_state_unconfirmed` | Supervised: the worker's live permission mode doesn't match its saved one. The person applies the mode in Codemux or restarts the worker | No |
 | `permission_denied` | Not allowed over the network (`allow_always`, `force_delete`), or read-only | No |
 | `admin_refused` | An agent that Codemux started asked for an administration command | No |
 | `agent_identity_required` | An agent that Codemux started called a control tool; it uses its chat's own tools | No |

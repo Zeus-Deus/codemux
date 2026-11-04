@@ -1187,8 +1187,8 @@ async fn answer_waiting_in_delivery_stops_when_the_grant_is_revoked() {
     crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "answer-client".into()).unwrap();
     release.notify_one();
 
-    let error = refused(answering.await.unwrap(), ErrorCode::QuestionAnswerFailed);
-    assert!(error.message.contains("grant_revoked"), "{error}");
+    // Codemux refused it, not the worker: answering again would not help.
+    refused(answering.await.unwrap(), ErrorCode::GrantRevoked);
     assert!(recorder.overrides.lock().unwrap().is_empty(), "the answer never reached the worker");
     let (_, resolution) = app.state::<DatabaseStore>().async_question(&thread, "storage").unwrap();
     assert!(matches!(resolution, QuestionResolution::Failed { .. }), "the person can still answer it: {resolution:?}");
@@ -1204,7 +1204,7 @@ async fn supervised_answer_waiting_in_delivery_stops_when_the_worker_mode_widens
     let recorder = Arc::new(ModeRecorder::new(Arc::new(MockAgentProvider::new(ProviderKind::Claude))));
     app.state::<crate::commands::agent_chat::ProviderRegistry>().set_claude(recorder.clone()).await;
     let bot = named(ControlAccess::Supervised);
-    for (case, saved, code) in [("switched", true, "permission_ceiling"), ("live-only", false, "permission_state_unconfirmed")] {
+    for (case, saved, code) in [("switched", true, ErrorCode::PermissionCeiling), ("live-only", false, ErrorCode::PermissionStateUnconfirmed)] {
         let thread = launched(&app, &format!("{case}-launch"), &workspace, "default").await;
         ask(&app, &thread, "t1", "scope");
         let (waiting, release) = recorder.hold_next_answer();
@@ -1217,8 +1217,8 @@ async fn supervised_answer_waiting_in_delivery_stops_when_the_worker_mode_widens
         app.state::<NativeControlState>().record_worker_mode(&thread, ProviderKind::Claude, Some("bypassPermissions".into()));
         release.notify_one();
 
-        let error = refused(answering.await.unwrap(), ErrorCode::QuestionAnswerFailed);
-        assert!(error.message.contains(code), "{case}: {error}");
+        let error = answering.await.unwrap().expect_err("the call must be refused");
+        assert_eq!(error.code, code, "{case}: {error}");
     }
     assert!(recorder.overrides.lock().unwrap().is_empty(), "no answer reached the worker");
 }
@@ -1254,8 +1254,61 @@ async fn answer_waiting_on_worker_startup_stops_when_the_grant_is_revoked() {
     crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "startup-client".into()).unwrap();
     release.notify_one();
 
-    let error = refused(answering.await.unwrap(), ErrorCode::QuestionAnswerFailed);
-    assert!(error.message.contains("grant_revoked"), "{error}");
+    refused(answering.await.unwrap(), ErrorCode::GrantRevoked);
     assert!(!codex.calls.snapshot().iter().any(|call| matches!(call, MockCall::AnswerQuestion(..))), "the answer never reached the worker");
+    super::tests::connector_off(&app);
+}
+
+/// An answer's authority is checked before it resumes an exited worker, not
+/// only once the worker is up: an answer held before the resume starts no
+/// worker once the grant is revoked. A worker that fails to start refused
+/// the answer itself, and the caller may answer again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_held_before_resume_starts_no_worker_once_the_grant_is_revoked() {
+    use crate::agent_provider::AgentProvider;
+    let (app, _, _root, workspace) = fixture().await;
+    let mut asking = MockAgentProvider::new(ProviderKind::Codex);
+    asking.async_questions = true;
+    let codex = Arc::new(asking);
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_codex(codex.clone()).await;
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap()
+        .insert(ProviderKind::Codex, crate::agent_provider::codex::capabilities::build_capabilities(vec![]));
+    let launch = call(&app, &ControlCaller::trusted(), "thread_launch", json!({
+        "workspace_id": workspace, "client_request_id": "held-resume-launch", "provider": "codex", "permission_mode": "workspace-write",
+    })).await.unwrap();
+    let launched = settle_operation(&app, &launch).await;
+    assert_eq!(launched["state"], "succeeded", "{launched}");
+    let thread = launched["thread_id"].as_str().unwrap().to_string();
+    ask(&app, &thread, "t1", "storage");
+    codex.stop_session(ThreadId(thread.clone())).await.unwrap();
+    app.state::<DatabaseStore>().set_agent_chat_sdk_session_id(&thread, "codex-conversation").unwrap();
+    let bot = super::tests::connector_caller(&app, "held-resume-client", "held-resume-grant", ControlAccess::FullAccess).await;
+    let starts = || codex.calls.snapshot().iter().filter(|call| matches!(call, MockCall::StartSession(_))).count();
+    let resolution = || app.state::<DatabaseStore>().async_question(&thread, "storage").unwrap().1;
+
+    codex.fail_next_start(crate::agent_provider::ProviderError::ValidationError { message: "synthetic start failure".into() });
+    let error = refused(call(&app, &bot, "thread_answer", answer(&workspace, &thread, "failed-start", "storage")).await, ErrorCode::QuestionAnswerFailed);
+    assert!(error.message.starts_with("The worker did not take the answer"), "{error}");
+    let started = starts();
+
+    // Holding the thread's dispatch lock keeps the answer just before the
+    // resume, once it has claimed the question. The gate lives only while
+    // someone holds it, so keep it until the answer has its own.
+    let gate = app.state::<NativeControlState>().thread_gate(&thread);
+    let held = gate.dispatch.clone().lock_owned().await;
+    let answering = answer_in_background(&app, &bot, answer(&workspace, &thread, "held-answer", "storage"));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(resolution(), QuestionResolution::Submitting { .. }) && !answering.is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the answer never claimed the question");
+    assert!(matches!(resolution(), QuestionResolution::Submitting { .. }), "the answer waits to resume: {:?}", resolution());
+    crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "held-resume-client".into()).unwrap();
+    drop((held, gate));
+
+    refused(answering.await.unwrap(), ErrorCode::GrantRevoked);
+    assert_eq!(starts(), started, "no worker started for the revoked caller's answer");
+    assert!(!codex.calls.snapshot().iter().any(|call| matches!(call, MockCall::AnswerQuestion(..))), "the answer never reached the worker");
+    assert!(matches!(resolution(), QuestionResolution::Failed { .. }), "the person can still answer it: {:?}", resolution());
     super::tests::connector_off(&app);
 }
