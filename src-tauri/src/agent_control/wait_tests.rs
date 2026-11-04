@@ -585,6 +585,38 @@ async fn turn_wait_on_a_turn_the_thread_never_ran_is_an_invalid_target() {
     assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
 }
 
+/// A persisted thread Codemux has not reopened, as after a restart, reads
+/// `unknown` and never settles. With no live session and nothing under way,
+/// no run can still bring a turn it has no record of, so the wait refuses
+/// that turn at once instead of reading `running` until every deadline. A
+/// message Codemux is still delivering may start the run, so the wait goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_wait_on_an_unknown_turn_of_a_thread_at_rest_is_an_invalid_target() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    // A thread that never ran, and one whose run was cut off by an exit.
+    let (empty, cut_off) = ("wait-unknown-turn-at-rest", "wait-unknown-turn-cut-off");
+    persisted(&app, &workspace, empty);
+    persisted(&app, &workspace, cut_off);
+    person_started(&app, cut_off, "t1");
+    let trusted = ControlCaller::trusted();
+    let typo = |thread: &str, timeout_ms: u64| target(&workspace, thread, json!({"turn_id": "no-such-turn", "timeout_ms": timeout_ms}));
+    for thread in [empty, cut_off] {
+        let status = wait::thread_status(app.handle(), target(&workspace, thread, json!({}))).await.unwrap();
+        assert_eq!((status["phase"].as_str(), status["settled"].as_bool()), (Some("unknown"), Some(false)), "{status}");
+        let started = Instant::now();
+        let refused = wait_for(&app, &trusted, typo(thread, 2000)).await.unwrap_err();
+        assert_eq!(refused.code, ErrorCode::InvalidTarget, "{thread}: {refused}");
+        assert!(started.elapsed() < PROMPT, "{thread}: {:?}", started.elapsed());
+    }
+    let epoch = app.state::<NativeControlState>().epoch.clone();
+    let payload = json!({"provider": "claude", "origin": "controller", "input": {"thread_id": empty, "text": "Next task"}});
+    app.state::<DatabaseStore>()
+        .admit_message_delivery("wait-unknown-turn-delivery", empty, "wait-unknown-turn-delivery", &payload, &epoch, 0, None, true)
+        .unwrap();
+    let delivering = wait_for(&app, &trusted, typo(empty, 300)).await.unwrap();
+    assert_eq!((delivering["state"].as_str(), delivering["timed_out"].as_bool()), (Some("running"), Some(true)), "{delivering}");
+}
+
 /// A message queued behind the running t1, as `thread_send` takes it: its
 /// receipt names the queue entry and no run yet.
 async fn queued_send(app: &App, provider: &mock_agent_provider::MockAgentProvider, workspace: &str, thread: &str, key: &str) -> Value {
@@ -1013,6 +1045,8 @@ async fn missed_signal_is_covered_by_the_fallback_tick() {
     let (app, _provider, _root, workspace) = fixture().await;
     let thread = "wait-missed-signal";
     persisted(&app, &workspace, thread);
+    // t1 has started, so the thread has a record of it.
+    person_started(&app, thread, "t1");
     tokio::time::pause();
     let started = Instant::now();
     let waiter = spawn_wait(&app, &ControlCaller::trusted(), target(&workspace, thread, json!({"turn_id": "t1", "timeout_ms": 30_000})));

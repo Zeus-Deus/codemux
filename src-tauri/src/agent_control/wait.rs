@@ -377,9 +377,9 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
         }
         _ => (false, false),
     };
-    // While the thread is busy, an unknown turn may be a run whose first row
-    // has yet to land; an idle thread will not run it.
-    if unknown && status["settled"] == true {
+    // While work is under way, an unknown turn may be a run whose first row
+    // has yet to land; a thread at rest will not run it.
+    if unknown && at_rest(&db, thread, &status)? {
         return Err(ControlError::new(ErrorCode::InvalidTarget, "This thread has no run with this turn_id"));
     }
     // A stopped session records no end for the run it cut off. Once the thread
@@ -412,6 +412,18 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
     let end_known = end.is_some();
     let turn_id = turn_id.map(str::to_owned);
     Ok(WaitView { status, settled, ended, end_known, selected_turn, turn_id, state, failure, pending, paused_until_ms, final_message, cursor, operation: None })
+}
+
+/// Whether nothing on the thread can start a run any more: it is idle, or it
+/// is `unknown` (no live session and no run in view, as for a thread Codemux
+/// has not reopened since a restart, which never settles) with no message
+/// queued or being delivered.
+fn at_rest(db: &DatabaseStore, thread: &str, status: &Value) -> Result<bool, ControlError> {
+    if status["settled"] == true {
+        return Ok(true);
+    }
+    let empty = |key: &str| status[key].as_array().is_none_or(Vec::is_empty);
+    Ok(status["phase"] == "unknown" && empty("queued_ids") && empty("uncertain_queued_ids") && !db.has_inflight_message_deliveries(thread)?)
 }
 
 /// Where the message of a launch or send stands, by its receipt.
