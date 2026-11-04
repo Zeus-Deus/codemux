@@ -11,6 +11,8 @@ down.sh             stop only the recorded sandbox (graceful, or --hard), then c
 drive.mjs           headless browser driver (library + CLI)
 assert.sh           read-only sqlite + `codemux json conversation_read` helpers
 run.mjs             run scenarios/*.mjs → <root>/report.md, report.json, shots/
+sandbox-run.sh      run one command in the root's sandbox, stdio passed through (outside agents, `codemux mcp`)
+mcp-client.mjs      MCP clients for scenarios: stdio (through sandbox-run.sh), HTTP connector, CLI runner
 lib.sh              shared env, sandbox, stop and credential-check helpers
 isolation-check.sh  runs inside the sandbox during up.sh; asserts what must be out of reach
 tests/              harness self-tests (no providers, no build): teardown-test.sh
@@ -94,7 +96,8 @@ export async function run(ctx) {
 | `observe(key, value)` | Record ids for the report. |
 | `shot(name, {phone})` | Screenshot at 1440×900 and 390×844. Below the phone breakpoint the app shows the phone shell; `phone(driver)` navigates it first. |
 
-Each scenario has a 10-minute budget (`ORCH_LIVE_SCENARIO_TIMEOUT_MS`). When
+Each scenario has a 10-minute budget, or its own `export const budgetMs`
+(`ORCH_LIVE_SCENARIO_TIMEOUT_MS` overrides both). When
 it runs out, `ctx.signal` aborts: browser, CLI and assert calls in flight are
 killed and every `waitFor` throws. A scenario that is still running 30 s
 later ends the whole run. A failure takes a `<name>-failure` screenshot.
@@ -104,6 +107,40 @@ Assert on what the model produced, never on text the prompt already contains
 name the exact tool and arguments, so runs are close to deterministic. Inside
 agent tasks, wait with `python3 -c 'import time; time.sleep(N)'`; Claude's
 harness blocks a standalone `sleep`.
+
+## Outside agents
+
+Three scenarios drive Codemux the way an outside agent does, through the
+doors `docs/outside-agents.md` describes:
+
+| Scenario | What it proves | Providers |
+|---|---|---|
+| `outside-agent` | The guide's end-to-end flow over `codemux mcp --client hermes` (worktree, Codex launch, wait, read, interrupt during a wait on one connection, `notifications/cancelled`, a `since` timeout, a 600 s socket wait, close); the connector with a personal token and a scripted OAuth sign-in (`codemux connector approve`, refresh rotation, a spent refresh token revoking the sign-in after 31 s); the CLI verbs (`--client live-cli`); an in-app Claude's own shell refused an admin command; `claude -p` as a real outside agent; a user-scope `codemux` entry not widening in-app Claude and Codex chats; optionally Hermes | Claude, Codex; Hermes opt-in |
+| `outside-guide-setup` | The four local setup commands Settings prints (`src/components/settings/outside-assistants-setup.ts`, imported with Node's type stripping, so Node ≥ 22.18) work as printed, with a throwaway HOME in the sandbox | none (credential-free) |
+| `remote-delete-guard` | Over the paired browser, a clean worktree can be removed, `deleteBranch`/`forceDelete` are refused with the guard's text, a dirty worktree is refused and kept, and the delete dialog offers neither | none |
+
+`outside-agent` has parts: `ORCH_LIVE_OUTSIDE_PARTS=flow,http,cli,agent-shell,claude,user-scope,hermes`
+(default: all but `hermes`; unknown or empty selections are errors). `hermes`
+needs `ORCH_LIVE_PROVIDERS` to include `hermes`, because up.sh mounts its
+runtime and login only then; it adds a `codemux` server to the run-local
+`<root>/private/hermes/config.yaml` in place and restores it afterwards. Its
+budget is 25 minutes (`budgetMs`). The `http` part runs the connector on a
+free port and puts the previous settings back; its access-token expiry check
+runs only when serve has `CODEMUX_E2E_CONNECTOR_ACCESS_TTL_SECS` (debug
+builds, 5–3600 s) in its environment, and is recorded as not exercised
+otherwise.
+
+`sandbox-run.sh [--root DIR] [--cwd DIR] [--timeout SEC] [--env KEY=VALUE]… -- CMD ARGS…`
+runs a command with serve's mounts, environment allow-list and isolation, in
+its own PID namespace beside serve's, so Codemux sees an outside process. Its
+stdio is the caller's, so it can host an MCP stdio server. The inner
+`timeout -s TERM` (default 600 s) is the only stop; there is no
+`--die-with-parent`, which would SIGKILL a provider. `mcp-client.mjs` spawns
+`codemux mcp` through it (`StdioMcpClient`), talks to the connector
+(`HttpMcpClient`), runs CLI verbs on the host against the root
+(`codemuxCli`), and shares `toolResult`, `settle`, `finishRun` and
+`untilInput`. A wait without `since` does not return for input that was
+already pending when it started; `untilInput` reads `thread_status` first.
 
 ## Cost
 
