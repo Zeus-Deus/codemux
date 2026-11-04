@@ -1144,10 +1144,12 @@ fn write_workspace_prs(workspace: &mut WorkspaceSnapshot, prs: Vec<WorkspacePr>)
     true
 }
 
-/// Outcome of [`AppStateStore::adopt_or_create_worktree_workspace`]:
-/// either an existing live workspace already claimed the worktree path
-/// (adopt it — do NOT run the create-side effects again), or a fresh
-/// workspace was inserted with its `worktree_path` claim already stamped.
+/// Outcome of an atomic lookup-and-insert
+/// ([`AppStateStore::adopt_or_create_worktree_workspace`],
+/// [`AppStateStore::open_or_create_workspace`]): either an existing live
+/// workspace already claimed the path (adopt it — do NOT run the
+/// create-side effects again), or a fresh workspace was inserted (for a
+/// worktree, with its `worktree_path` claim already stamped).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorktreeWorkspaceClaim {
     /// Id of the live workspace that already claims the path.
@@ -2672,22 +2674,52 @@ impl AppStateStore {
         select: bool,
         reserved: Option<WorkspaceId>,
     ) -> WorkspaceId {
+        match self.open_or_create_workspace(cwd_path, layout, select, reserved, |_| None) {
+            WorktreeWorkspaceClaim::Adopted(id) => WorkspaceId(id),
+            WorktreeWorkspaceClaim::Created(id) => id,
+        }
+    }
+
+    /// Atomically return a live workspace for an open, or create one at
+    /// `cwd_path` under `reserved` — one acquisition of the state lock. The
+    /// workspace `reserved` already names is returned first (a retry), then
+    /// the one `probe` finds (the folder already open). With the lookup and
+    /// the insert as separate acquisitions, two concurrent opens of one
+    /// folder could both find nothing and both insert, each then starting
+    /// terminals and setup scripts in it.
+    ///
+    /// `probe` runs under the state lock; it must only read the snapshot.
+    /// A returned workspace keeps the focus as it is; the caller selects it.
+    pub fn open_or_create_workspace<F>(
+        &self,
+        cwd_path: PathBuf,
+        layout: WorkspacePresetLayout,
+        select: bool,
+        reserved: Option<WorkspaceId>,
+        probe: F,
+    ) -> WorktreeWorkspaceClaim
+    where
+        F: FnOnce(&AppStateSnapshot) -> Option<String>,
+    {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(existing) = reserved
             .as_ref()
             .filter(|id| snapshot.workspaces.iter().any(|w| &w.workspace_id == *id))
         {
-            return existing.clone();
+            return WorktreeWorkspaceClaim::Adopted(existing.0.clone());
+        }
+        if let Some(existing) = probe(&snapshot) {
+            return WorktreeWorkspaceClaim::Adopted(existing);
         }
         let workspace_id = reserved.unwrap_or_else(Self::reserve_workspace_id);
-        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+        WorktreeWorkspaceClaim::Created(Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
             Self::create_workspace_with_layout_locked_with_id(
                 snapshot,
                 cwd_path,
                 layout,
                 workspace_id,
             )
-        })
+        }))
     }
 
     /// Body of [`Self::create_workspace_with_layout`], factored out so
@@ -13711,6 +13743,57 @@ mod reserved_workspace_id_tests {
         );
         assert_ne!(unreserved, focused);
         assert_eq!(store.snapshot().active_workspace_id, unreserved, "select takes focus");
+    }
+
+    /// Concurrent opens of one folder under their own reservations: one
+    /// creates the workspace and every other gets it back, because each
+    /// looks for it and inserts under one acquisition of the lock.
+    #[test]
+    fn concurrent_opens_of_one_folder_make_one_workspace() {
+        use std::sync::{Arc, Barrier};
+        let store = Arc::new(AppStateStore::default());
+        let focused = store.create_workspace();
+        let folder = PathBuf::from("/tmp/codemux-concurrent-open-test");
+        let racers = 8;
+        let barrier = Arc::new(Barrier::new(racers));
+        let claims: Vec<WorktreeWorkspaceClaim> = (0..racers)
+            .map(|_| {
+                let (store, barrier, folder) = (store.clone(), barrier.clone(), folder.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.open_or_create_workspace(
+                        folder.clone(),
+                        WorkspacePresetLayout::Single,
+                        false,
+                        Some(AppStateStore::reserve_workspace_id()),
+                        |snapshot| {
+                            snapshot
+                                .workspaces
+                                .iter()
+                                .find(|w| Path::new(&w.cwd) == folder)
+                                .map(|w| w.workspace_id.0.clone())
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|racer| racer.join().unwrap())
+            .collect();
+
+        let snapshot = store.snapshot();
+        let at_folder: Vec<&WorkspaceSnapshot> =
+            snapshot.workspaces.iter().filter(|w| Path::new(&w.cwd) == folder).collect();
+        assert_eq!(at_folder.len(), 1, "one workspace per folder");
+        let id = at_folder[0].workspace_id.clone();
+        let created: Vec<_> = claims.iter().filter(|claim| matches!(claim, WorktreeWorkspaceClaim::Created(_))).collect();
+        assert_eq!(created, [&WorktreeWorkspaceClaim::Created(id.clone())], "exactly one racer creates");
+        for claim in &claims {
+            if let WorktreeWorkspaceClaim::Adopted(adopted) = claim {
+                assert_eq!(adopted, &id.0, "the others get the created workspace back");
+            }
+        }
+        assert_eq!(snapshot.active_workspace_id, focused, "background opens keep the focus");
     }
 
     #[test]

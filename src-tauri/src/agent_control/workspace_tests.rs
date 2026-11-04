@@ -248,6 +248,43 @@ async fn workspace_create_retry_replays_after_the_folder_is_gone() {
     }
 }
 
+/// Two opens of one unopened folder under different keys make one
+/// workspace: the second gets the first's back, and only the first ran the
+/// create's terminal and setup scripts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_creates_of_one_folder_open_one_workspace() {
+    if isolated(&format!("{MODULE}concurrent_creates_of_one_folder_open_one_workspace")) {
+        return;
+    }
+    without_terminal_daemon();
+    let (app, _provider, _root, _workspace) = fixture().await;
+    app.manage(crate::terminal::PtyState::default());
+    let owner = named(ControlAccess::FullAccess);
+    let folder = tempfile::tempdir().unwrap();
+    let before = count(&app);
+
+    // Both opens have looked for a workspace at the folder and found none
+    // before either goes on to make one.
+    crate::commands::workspace::open_pause::line_up(folder.path(), 2);
+    let first = spawn_call(&app, &owner, "workspace_create", &json!({"path": folder.path(), "client_request_id": "race-a"}));
+    let second = spawn_call(&app, &owner, "workspace_create", &json!({"path": folder.path(), "client_request_id": "race-b"}));
+    let (first, second) = (first.await.unwrap().unwrap(), second.await.unwrap().unwrap());
+
+    let at_folder: Vec<String> = app.state::<AppStateStore>().snapshot().workspaces.iter()
+        .filter(|w| Path::new(&w.cwd) == folder.path())
+        .map(|w| w.workspace_id.0.clone())
+        .collect();
+    assert_eq!(at_folder.len(), 1, "one workspace per folder: {at_folder:?}");
+    assert_eq!(count(&app), before + 1);
+    assert_eq!(first["workspace_id"], second["workspace_id"], "{first} {second}");
+    let mut created = [first["created"].as_bool().unwrap(), second["created"].as_bool().unwrap()];
+    created.sort();
+    assert_eq!(created, [false, true], "one created it, the other reused it");
+    for result in [&first, &second] {
+        assert_eq!(receipt(&app, &owner, &result["operation_id"]).workspace_id.as_deref(), Some(at_folder[0].as_str()), "each receipt names the one workspace");
+    }
+}
+
 // ── access ────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -209,18 +209,23 @@ pub(crate) async fn open_workspace_impl<R: tauri::Runtime>(
             .unwrap_or_default()
     };
     checkpoint.check()?;
-    // Another open of this folder may have made it during the read. From
-    // here to the create nothing waits.
-    if let Some(opened) = reopen_workspace(&app, &state, &request, &repo_path)? {
-        return Ok(opened);
-    }
-
-    let workspace_id = state.create_workspace_with_layout_reserved(
+    #[cfg(test)]
+    open_pause::reached(&repo_path).await;
+    // Another open of this folder may have made it during the read, or be
+    // making it now: the last look and the insert are one step under the
+    // state lock, so one open creates the workspace (and alone runs its
+    // terminal and setup below) and the others get it back.
+    let claim = state.open_or_create_workspace(
         repo_path.clone(),
         WorkspacePresetLayout::Single,
         request.select,
-        request.reserved_id,
+        request.reserved_id.clone(),
+        |snapshot| open_at(snapshot, &request, &repo_path),
     );
+    let workspace_id = match claim {
+        WorktreeWorkspaceClaim::Adopted(existing) => return reopened(&app, &state, &request, existing),
+        WorktreeWorkspaceClaim::Created(id) => id,
+    };
 
     // Set project root (resolve through git root for worktree grouping)
     let project_root = crate::config::workspace_config::find_git_root(&repo_path)
@@ -246,6 +251,31 @@ pub(crate) async fn open_workspace_impl<R: tauri::Runtime>(
     })
 }
 
+/// Lines concurrent opens of one folder up just before the step that makes
+/// the workspace, so a test can run them through it together.
+#[cfg(test)]
+pub(crate) mod open_pause {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::Barrier;
+
+    static LINE_UP: Mutex<Option<(PathBuf, Arc<Barrier>)>> = Mutex::new(None);
+
+    /// The next `parties` opens of `path` wait there for each other.
+    pub(crate) fn line_up(path: &Path, parties: usize) {
+        *LINE_UP.lock().unwrap() = Some((path.to_path_buf(), Arc::new(Barrier::new(parties))));
+    }
+
+    pub(crate) async fn reached(path: &Path) {
+        let barrier = LINE_UP.lock().unwrap().as_ref().filter(|(at, _)| at == path).map(|(_, barrier)| barrier.clone());
+        if let Some(barrier) = barrier {
+            // Bounded, so a broken test fails on its assertions, not a hang.
+            let _ = tokio::time::timeout(Duration::from_secs(10), barrier.wait()).await;
+        }
+    }
+}
+
 /// A retry under the same reservation, or a folder that is already open, gets
 /// that workspace back (focused when asked) and runs none of the create-side
 /// effects again.
@@ -260,22 +290,34 @@ fn reopen_workspace<R: tauri::Runtime>(
         request
             .reserved_id
             .as_ref()
-            .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id == id))
-            .or_else(|| {
-                request
-                    .reuse_open
-                    .then(|| find_open_workspace_at_path(&snapshot, repo_path))
-                    .flatten()
-            })
-            .map(|w| (w.workspace_id.0.clone(), w.cwd.clone()))
+            .filter(|id| snapshot.workspaces.iter().any(|w| &w.workspace_id == *id))
+            .map(|id| id.0.clone())
+            .or_else(|| open_at(&snapshot, request, repo_path))
     };
-    let Some((workspace_id, cwd)) = existing else {
-        return Ok(None);
-    };
+    existing.map(|workspace_id| reopened(app, state, request, workspace_id)).transpose()
+}
+
+/// The live workspace an open that reuses one gets back for `path`.
+fn open_at(snapshot: &AppStateSnapshot, request: &OpenWorkspace, path: &Path) -> Option<String> {
+    request
+        .reuse_open
+        .then(|| find_open_workspace_at_path(snapshot, path))
+        .flatten()
+        .map(|w| w.workspace_id.0.clone())
+}
+
+/// An existing workspace returned for an open, focused when asked.
+fn reopened<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppStateStore,
+    request: &OpenWorkspace,
+    workspace_id: String,
+) -> Result<OpenedWorkspace, String> {
     if request.select {
         activate_workspace_impl(app.clone(), state, workspace_id.clone())?;
     }
-    Ok(Some(OpenedWorkspace { workspace_id, cwd, created: false }))
+    let cwd = state.workspace_cwd(&workspace_id).unwrap_or_default();
+    Ok(OpenedWorkspace { workspace_id, cwd, created: false })
 }
 
 /// The live top-level local workspace opened directly at `path`, if any.
