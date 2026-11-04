@@ -519,6 +519,9 @@ struct StdioDoor {
     principal: String,
     log: PathBuf,
     initialized: Value,
+    /// The stateless era's per-request `_meta` (MCP 2026-07-28); `None` for
+    /// an initialize-era client.
+    meta: Option<Value>,
 }
 
 impl StdioDoor {
@@ -533,6 +536,37 @@ impl StdioDoor {
 
     /// Runs `codemux <args>`, then `initialize` and `notifications/initialized`.
     fn spawn(env: &ChildEnv, args: &[&str], extra: &[(&str, &str)], principal: &str) -> Self {
+        let mut door = Self::start(env, args, extra, principal);
+        let id = door.send("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "outside-agent-control", "version": "1"}}));
+        door.initialized = door.response(id, Duration::from_secs(20));
+        door.notify("notifications/initialized", json!({}));
+        door
+    }
+
+    /// Plain `codemux mcp` driven by a stateless-era (2026-07-28) client: no
+    /// `initialize`; every request carries `_meta` with the revision, the
+    /// client's capabilities and `clientInfo`, which names the client.
+    fn stateless(env: &ChildEnv, client: &str) -> Self {
+        let mut door = Self::start(env, &["mcp"], &[], &format!("local:{client}"));
+        door.meta = Some(json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": client, "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        }));
+        door
+    }
+
+    /// `params` with this client's `_meta`, if it has one.
+    fn params(&self, mut params: Value) -> Value {
+        if let Some(meta) = &self.meta {
+            params["_meta"] = meta.clone();
+        }
+        params
+    }
+
+    /// Runs `codemux <args>` with no handshake.
+    fn start(env: &ChildEnv, args: &[&str], extra: &[(&str, &str)], principal: &str) -> Self {
         let log = env.logs.join(format!("stdio-{}-{}.log", principal.replace(':', "_"), tag()));
         let mut child = env
             .command(CODEMUX, extra)
@@ -555,12 +589,7 @@ impl StdioDoor {
             }
         });
         let stdin = child.stdin.take();
-        let mut door = Self { child, stdin, rx, early: HashMap::new(), next_id: 0, principal: principal.into(), log, initialized: Value::Null };
-        let id = door.send("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {},
-            "clientInfo": {"name": "outside-agent-control", "version": "1"}}));
-        door.initialized = door.response(id, Duration::from_secs(20));
-        door.notify("notifications/initialized", json!({}));
-        door
+        Self { child, stdin, rx, early: HashMap::new(), next_id: 0, principal: principal.into(), log, initialized: Value::Null, meta: None }
     }
 
     fn write(&mut self, message: &Value) {
@@ -650,12 +679,14 @@ impl Drop for StdioDoor {
 
 impl Door for StdioDoor {
     fn call_raw(&mut self, tool: &str, arguments: Value) -> Value {
-        let id = self.send("tools/call", json!({"name": tool, "arguments": arguments}));
+        let params = self.params(json!({"name": tool, "arguments": arguments}));
+        let id = self.send("tools/call", params);
         self.response(id, Duration::from_secs(90))
     }
 
     fn list(&mut self) -> Vec<Value> {
-        let id = self.send("tools/list", json!({}));
+        let params = self.params(json!({}));
+        let id = self.send("tools/list", params);
         let reply = self.response(id, Duration::from_secs(20));
         reply["result"]["tools"].as_array().cloned().unwrap_or_else(|| panic!("tools/list: {reply}"))
     }
@@ -1035,6 +1066,81 @@ fn doors_list_the_same_outside_tools_with_the_same_result_shape() {
         assert_eq!(parsed, result["structuredContent"], "{listed}");
         assert!(result["structuredContent"]["workspaces"].is_array(), "{listed}");
     }
+}
+
+/// MCP 2026-07-28 on `codemux mcp`: a client that probes `server/discover`
+/// (as Claude Code does) and then sends no `initialize` drives the same flow,
+/// through the same app, as an initialize-era client.
+#[test]
+fn stateless_era_stdio_client_drives_a_thread_without_initialize() {
+    if !codemux_lib::mcp::protocol::MODERN_ERA_ENABLED {
+        // Switched off, every request is initialize-era, which the other tests cover.
+        eprintln!("skipped: the stateless era is switched off (mcp::protocol::MODERN_ERA_ENABLED)");
+        return;
+    }
+    let w = world();
+    let t = tag();
+    let mut cleanup = Cleanup::default();
+    let client = format!("modern-{t}");
+    let mut door = StdioDoor::stateless(&w.env, &client);
+
+    let probe = door.params(json!({}));
+    let id = door.send("server/discover", probe);
+    let discover = door.response(id, Duration::from_secs(20));
+    let found = &discover["result"];
+    assert_eq!(found["resultType"], "complete", "{discover}");
+    let versions = found["supportedVersions"].as_array().unwrap_or_else(|| panic!("{discover}"));
+    for version in ["2026-07-28", "2025-11-25", "2024-11-05"] {
+        assert!(versions.contains(&json!(version)), "{version} in {discover}");
+    }
+    assert_eq!(found["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "codemux", "{discover}");
+    assert!(!text(&found["instructions"]).is_empty(), "{discover}");
+
+    // One catalog for both eras: the outside tools, as an initialize-era client sees them.
+    let listing = door.params(json!({}));
+    let id = door.send("tools/list", listing);
+    let listed = door.response(id, Duration::from_secs(20));
+    assert_eq!((listed["result"]["resultType"].clone(), listed["result"]["cacheScope"].clone()), (json!("complete"), json!("private")), "{listed}");
+    let modern_names = names(listed["result"]["tools"].as_array().unwrap());
+    let mut legacy = StdioDoor::named(&w.env, &format!("legacy-{t}"), None);
+    assert_eq!(modern_names, names(&legacy.list()));
+    for tool in ["workspace_create", "thread_launch", "thread_wait", "thread_answer"] {
+        assert!(modern_names.iter().any(|name| name == tool), "{tool} in {modern_names:?}");
+    }
+    assert!(legacy.close().success());
+
+    // Registry tools reach the app and come back in the outside result shape, marked complete.
+    let reply = door.call_raw("workspace_list", json!({}));
+    let result = &reply["result"];
+    assert_eq!((result["resultType"].clone(), result["isError"].clone()), (json!("complete"), json!(false)), "{reply}");
+    assert!(result["structuredContent"]["workspaces"].is_array(), "{reply}");
+    let reply = door.call_raw("thread_read", json!({"workspace_id": format!("missing-{t}"), "thread_id": "x"}));
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    assert_eq!(reply["result"]["structuredContent"]["error"]["code"], "workspace_not_found", "{reply}");
+
+    // The whole loop: launch, a wait that parks on the stateless path, read.
+    let workspace = w.fresh_workspace(&format!("modern{t}"), &mut cleanup);
+    let (thread, turn) = launch(&mut door, &workspace, "agent", &format!("echo-prompt modern-{t}"), &format!("launch-{t}"));
+    cleanup.threads.push((workspace.clone(), thread.clone()));
+    let waited = door.finish(&workspace, &thread, turn.as_deref());
+    assert_eq!(waited["state"], "done", "{waited}");
+    assert!(text(&waited["final_text"]).contains(&format!("modern-{t}")), "{waited}");
+    let page = door.ok("thread_read", json!({"workspace_id": workspace, "thread_id": thread}));
+    assert!(page["messages"].as_array().unwrap().iter().any(|m| m["role"] == "assistant"), "{page}");
+
+    // `clientInfo` in the requests named the client: it owns the receipts.
+    let receipts = receipts(w, &t);
+    assert!(!receipts.is_empty() && receipts.iter().all(|(principal, _)| *principal == format!("local:{client}")), "{receipts:?}");
+
+    // A revision Codemux does not speak lists the ones it does; the process keeps serving.
+    let mut future = door.params(json!({}));
+    future["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2099-01-01");
+    let id = door.send("tools/list", future);
+    let refused = door.response(id, Duration::from_secs(20));
+    assert_eq!(refused["error"]["code"], -32022, "{refused}");
+    assert!(refused["error"]["data"]["supported"].as_array().is_some_and(|list| list.contains(&json!("2026-07-28"))), "{refused}");
+    assert!(door.ok("workspace_list", json!({}))["workspaces"].is_array());
+    assert!(door.close().success());
 }
 
 #[test]
@@ -1487,6 +1593,14 @@ fn agent_processes_are_refused_admin_and_native_tools() {
     assert!(String::from_utf8_lossy(&marked.stdout).contains("admin_refused"), "{}", describe(&marked));
     let marked = w.cli(&["call", "thread_list", &list], &marker);
     assert_eq!(stdout_json(&marked)["error"]["code"], "agent_identity_required", "{}", describe(&marked));
+
+    // The refusals are about the caller: the owner runs the same administration command.
+    let owner_label = format!("owner-{t}");
+    let issued = w.cli(&["connector", "issue", "--label", &owner_label, "--access", "read-only", "--json"], &[]);
+    assert_eq!(exit_code(&issued), 0, "{}", describe(&issued));
+    assert!(text(&stdout_json(&issued)["result"]["token"]).starts_with("cmcp_"), "{}", describe(&issued));
+    let revoked = w.cli(&["connector", "revoke", &owner_label, "--json"], &[]);
+    assert_eq!(exit_code(&revoked), 0, "{}", describe(&revoked));
 
     #[cfg(target_os = "linux")]
     refused_by_ancestry(w, &mut owner, &workspace, &thread, &t);
