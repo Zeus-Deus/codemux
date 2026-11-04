@@ -258,7 +258,7 @@ function Row({
             tone === "available" && "text-foreground",
             tone === "error" && "text-destructive",
             tone === "done" && "text-success",
-            tone === "muted" && "text-muted-foreground/80",
+            tone === "muted" && "text-subtle-foreground",
           )}
         >
           {detail}
@@ -301,7 +301,7 @@ function ProviderRows({ machine, state }: { machine: MachineKey; state: MachineS
   }
   if (state.providers.length === 0) {
     return (
-      <li className="px-4 py-3 text-body-sm text-muted-foreground/80">
+      <li className="px-4 py-3 text-body-sm text-subtle-foreground">
         {state.error && machine === LOCAL ? state.error : "No coding agents installed."}
       </li>
     );

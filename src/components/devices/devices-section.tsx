@@ -172,7 +172,7 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
           <Trash2 className="size-3" aria-hidden />
           Sweep {count} settled
           {knownBytes !== null && knownBytes > 0 && (
-            <span className="font-medium text-status-working/80 tabular-nums">
+            <span className="font-medium text-status-working tabular-nums">
               · ~{formatBytes(knownBytes)}
             </span>
           )}
@@ -292,7 +292,7 @@ function DeviceCardView({
               className={cn(
                 "truncate font-mono text-caption",
                 card.tone === "attention"
-                  ? "text-status-working/80"
+                  ? "text-status-working"
                   : "text-subtle-foreground",
               )}
             >

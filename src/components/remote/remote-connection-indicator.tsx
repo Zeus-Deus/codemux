@@ -63,7 +63,7 @@ export function RemoteConnectionChip({ compact = false }: { compact?: boolean })
           />
           <span className="shrink-0">Remote</span>
           {host && (
-            <span className="hidden max-w-[180px] truncate text-status-remote/70 lg:inline">
+            <span className="hidden max-w-[180px] truncate text-status-remote lg:inline">
               · {host}
             </span>
           )}

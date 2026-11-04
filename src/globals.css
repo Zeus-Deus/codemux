@@ -619,6 +619,13 @@ body.pane-resizing iframe {
     outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
     }
+  /* A highlighted or selected row sits on a lighter fill than the surface the
+   * subtle ink was solved against, so its quietest text steps up to muted.
+   * Radix menus mark the row data-highlighted; cmdk lists mark it
+   * data-selected="true". */
+  :where([data-highlighted], [cmdk-item][data-selected="true"]) {
+    --subtle-foreground: var(--muted-foreground);
+    }
   /* A root-scoped highlight supplies the default through the CSS highlight
    * inheritance model while still allowing a deliberate descendant override.
    * Defining both colors prevents browser/WebView native-blue fallbacks. */

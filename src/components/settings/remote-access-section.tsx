@@ -189,7 +189,7 @@ function EndpointRow({ endpoint }: { endpoint: WebRemoteEndpoint }) {
             </Badge>
           )}
         </div>
-        <p className="text-body-sm leading-relaxed text-muted-foreground/80">
+        <p className="text-body-sm leading-relaxed text-subtle-foreground">
           {hint.detail}
         </p>
       </div>
@@ -377,7 +377,7 @@ function PairingPanel({
                 {expired ? "Expired" : `Expires in ${formatCountdown(remainingMs)}`}
               </span>
             </div>
-            <p className="mt-1 text-body-sm leading-relaxed text-muted-foreground/80">
+            <p className="mt-1 text-body-sm leading-relaxed text-subtle-foreground">
               One-time link — it pairs a single device, then can't be reused.
               Open it on your phone or laptop to connect.
             </p>
@@ -466,13 +466,13 @@ function PendingRow({
           {session.source === "account" && (
             <Badge
               variant="outline"
-              className="border-border/60 text-caption text-muted-foreground/80"
+              className="border-border/60 text-caption text-subtle-foreground"
             >
               Account
             </Badge>
           )}
         </div>
-        <p className="truncate text-body-sm text-muted-foreground/80">
+        <p className="truncate text-body-sm text-subtle-foreground">
           {d.platform || "Unknown platform"} ·{" "}
           {session.source === "account"
             ? "signed in and awaiting approval"
@@ -531,7 +531,7 @@ function DeviceRow({
           </p>
           <Badge
             variant="outline"
-            className="border-border/60 text-caption text-muted-foreground/80"
+            className="border-border/60 text-caption text-subtle-foreground"
           >
             {isAccount ? "Account" : "Paired"}
           </Badge>
@@ -547,7 +547,7 @@ function DeviceRow({
             </span>
           )}
         </div>
-        <p className="truncate text-body-sm text-muted-foreground/80">
+        <p className="truncate text-body-sm text-subtle-foreground">
           {d.platform || "Unknown platform"} ·{" "}
           {isAccount ? "signed in" : "paired"} {relativeTime(session.created_at)}{" "}
           · last seen {relativeTime(session.last_seen_at)}
@@ -616,7 +616,7 @@ function WayCard({
               <h3 className="text-body font-semibold text-foreground">{title}</h3>
               {badge}
             </div>
-            <p className="text-body-sm leading-relaxed text-muted-foreground/80">
+            <p className="text-body-sm leading-relaxed text-subtle-foreground">
               {description}
             </p>
           </div>
@@ -695,7 +695,7 @@ function FailureCallout({
           {reason}
         </p>
         {hint && (
-          <p className="text-body-sm leading-relaxed text-muted-foreground/85">
+          <p className="text-body-sm leading-relaxed text-muted-foreground">
             {hint}
           </p>
         )}
@@ -749,7 +749,7 @@ function SettingRow({
     <div className="flex items-center justify-between gap-8">
       <div className="min-w-0 space-y-1">
         <p className="text-body font-medium leading-tight text-foreground">{title}</p>
-        <p className="text-body-sm leading-relaxed text-muted-foreground/80">{detail}</p>
+        <p className="text-body-sm leading-relaxed text-subtle-foreground">{detail}</p>
       </div>
       <Switch
         checked={checked}
@@ -1486,7 +1486,7 @@ export function RemoteAccessSection() {
           <LiveState tone="pending">Registering…</LiveState>
         )}
         {relayDisplayName && (
-          <span className="flex min-w-0 items-center gap-1 text-body-sm text-muted-foreground/80">
+          <span className="flex min-w-0 items-center gap-1 text-body-sm text-subtle-foreground">
             as
             <code className="truncate font-mono text-foreground">{relayDisplayName}</code>
             <CopyButton text={relayDisplayName} label="Copy device name" />
@@ -1518,7 +1518,7 @@ export function RemoteAccessSection() {
           </Button>
         </div>
       ) : (
-        <p className="text-body-sm leading-relaxed text-muted-foreground/80">
+        <p className="text-body-sm leading-relaxed text-subtle-foreground">
           {relayRegistered
             ? "Listed with your account. Open app.codemux.org in any browser signed into it, then pick this device."
             : "Listing this device with your account. This takes a moment."}
@@ -1745,7 +1745,7 @@ export function RemoteAccessSection() {
                     );
                   })}
                 </div>
-                <p className="text-body-sm leading-relaxed text-muted-foreground/85">
+                <p className="text-body-sm leading-relaxed text-muted-foreground">
                   {BIND_SCOPE_OPTIONS.find((o) => o.value === bindScope)?.detail}
                 </p>
               </div>
@@ -1764,7 +1764,7 @@ export function RemoteAccessSection() {
                   />
                 ) : (
                   <div className="flex items-center justify-between gap-4">
-                    <p className="text-body-sm leading-relaxed text-muted-foreground/85">
+                    <p className="text-body-sm leading-relaxed text-muted-foreground">
                       Create a one-time link, then scan its QR code or open it
                       on the other device.
                     </p>
@@ -1804,7 +1804,7 @@ export function RemoteAccessSection() {
                   >
                     Port
                   </label>
-                  <p className="text-body-sm leading-relaxed text-muted-foreground/85">
+                  <p className="text-body-sm leading-relaxed text-muted-foreground">
                     Changing it restarts the server immediately and invalidates
                     any open pairing link.
                   </p>

@@ -92,7 +92,7 @@ export const SidebarCreatingCard = memo(function SidebarCreatingCard({
               className="shrink-0 font-bold"
             />
           )}
-          <span className="min-w-0 truncate text-label font-medium tracking-[0.01em] text-muted-foreground/80">
+          <span className="min-w-0 truncate text-label font-medium tracking-[0.01em] text-subtle-foreground">
             {projectName}
           </span>
           <span className="ml-auto flex shrink-0 items-center gap-1.5 text-label font-semibold text-muted-foreground">

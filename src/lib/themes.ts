@@ -556,14 +556,16 @@ function solveLightness(base: Oklch, against: string, minimum: number, direction
 /**
  * The quietest readable text ink for a palette: muted ink pulled toward the
  * canvas, but only as far as it still clears 4.5:1 on every surface text
- * sits on (canvas, rail, card, popover). Imported and generated palettes put
+ * sits on (canvas, rail, card, popover, selected rows). Imported and generated palettes put
  * muted ink anywhere from 4.5:1 to 8:1, so a fixed mix would either fail the
  * floor or barely move; solving it per palette keeps one meaning everywhere.
  */
-export function subtleForeground(roles: Pick<ThemeRoleMap, "background" | "sidebar" | "card" | "popover" | "mutedForeground">): string {
+export function subtleForeground(roles: Pick<ThemeRoleMap, "background" | "sidebar" | "card" | "popover" | "accent" | "sidebarAccent" | "mutedForeground">): string {
   const ink = parseHex(normalizeColor(roles.mutedForeground) ?? "#000000")!;
   const canvas = parseHex(normalizeColor(roles.background) ?? "#000000")!;
-  const surfaces = [roles.background, roles.sidebar, roles.card, roles.popover]
+  // Selected and highlighted rows (menu/palette `accent`, rail
+  // `sidebarAccent`) keep their metadata, so they count as surfaces too.
+  const surfaces = [roles.background, roles.sidebar, roles.card, roles.popover, roles.accent, roles.sidebarAccent]
     .map((surface) => normalizeColor(surface, normalizeColor(roles.background) ?? "#000000") ?? "#000000");
   const mix = (weight: number) => rgbToHex({
     r: ink.r * weight + canvas.r * (1 - weight),

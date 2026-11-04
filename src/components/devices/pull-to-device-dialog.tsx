@@ -315,7 +315,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
           <DialogTitle className="text-body-lg font-semibold">
             Pull workspace to this device
           </DialogTitle>
-          <DialogDescription className="text-body-sm text-muted-foreground/80">
+          <DialogDescription className="text-body-sm text-subtle-foreground">
             Bring{" "}
             <span className="font-medium text-foreground">
               {syncRow.title}
@@ -415,7 +415,7 @@ function HostBackedAdoptionForm({
       <dl className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body space-y-1.5">
         <SummaryRow
           label="From"
-          icon={<Cloud className="size-3 text-status-remote/80" />}
+          icon={<Cloud className="size-3 text-status-remote" />}
         >
           {preview.host_label ?? "—"}
         </SummaryRow>
@@ -428,7 +428,7 @@ function HostBackedAdoptionForm({
           </span>
         </SummaryRow>
         <SummaryRow label="Will land">
-          <span className="font-mono text-label text-muted-foreground/80 break-all">
+          <span className="font-mono text-label text-subtle-foreground break-all">
             {preview.suggested_path}
           </span>
         </SummaryRow>
@@ -448,7 +448,7 @@ function HostBackedAdoptionForm({
       </button>
 
       {disclosureOpen && (
-        <ul className="rounded-md bg-muted/20 border border-border/40 px-3 py-2 text-body-sm text-muted-foreground/85 leading-relaxed space-y-1">
+        <ul className="rounded-md bg-muted/20 border border-border/40 px-3 py-2 text-body-sm text-muted-foreground leading-relaxed space-y-1">
           <li>
             • Copies the workspace files from{" "}
             <span className="font-medium text-foreground/90">
@@ -519,7 +519,7 @@ function CloneFallbackBlock({
 }) {
   return (
     <>
-      <p className="text-body-sm text-muted-foreground/85 leading-relaxed">
+      <p className="text-body-sm text-muted-foreground leading-relaxed">
         This workspace lives only on another device (no shared host).
         We'll clone it from git.
       </p>
@@ -539,7 +539,7 @@ function CloneFallbackBlock({
           </span>
         </SummaryRow>
         <SummaryRow label="Will land">
-          <span className="font-mono text-label text-muted-foreground/80 break-all">
+          <span className="font-mono text-label text-subtle-foreground break-all">
             {preview.suggested_path}
           </span>
         </SummaryRow>
@@ -565,7 +565,7 @@ function CloneFallbackBlock({
 
 function NoOptionsBlock() {
   return (
-    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground/85 leading-relaxed">
+    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground leading-relaxed">
       We don't have a way to bring this workspace over yet — no shared
       host, no git remote URL. Open the device it lives on and push
       it to a shared device first, then pull from here.
@@ -599,7 +599,7 @@ function SameBranchProjectBlock({
   // is "you have a logically-equivalent workspace open — same
   // branch of the same project — just at a different path."
   return (
-    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground/85 leading-relaxed space-y-2">
+    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground leading-relaxed space-y-2">
       <p>
         You already have this branch open on this device, just at a
         different path.
@@ -621,7 +621,7 @@ function SameBranchProjectBlock({
 
 function AlreadyAdoptedBlock({ onOpen }: { onOpen: () => void }) {
   return (
-    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground/85 leading-relaxed space-y-2">
+    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground leading-relaxed space-y-2">
       <p>You've already pulled this workspace to this device.</p>
       <Button
         variant="secondary"

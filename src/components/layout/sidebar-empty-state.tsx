@@ -106,7 +106,7 @@ export function SidebarEmptyState({ filterName }: { filterName: string | null })
       ) : (
         <Plate src={plate.src} />
       )}
-      <span className="font-mono text-micro uppercase tracking-[0.14em] text-muted-foreground/80">
+      <span className="font-mono text-micro uppercase tracking-[0.14em] text-subtle-foreground">
         <b className="font-medium text-status-working">{plate.fig}</b> — {plate.caption}
       </span>
       <figure className="flex flex-col items-center gap-2">

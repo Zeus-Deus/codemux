@@ -290,7 +290,7 @@ function KeybindRow({
 
         {/* Recording timeout hint */}
         {isRecording && recordingTimedOut && !pendingConflict && (
-          <p className="text-body-sm text-muted-foreground/80 mt-1.5 leading-relaxed">
+          <p className="text-body-sm text-subtle-foreground mt-1.5 leading-relaxed">
             Some shortcuts (e.g. Ctrl+W, Ctrl+T) are captured by the system and
             can't be recorded. Press Escape to cancel.
           </p>

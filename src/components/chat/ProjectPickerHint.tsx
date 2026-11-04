@@ -72,7 +72,7 @@ export function ProjectPickerHint({
         // The sidebar's annotation voice (see sidebar-empty-state).
         style={{ fontFamily: "'Instrument Serif', Georgia, serif" }}
         className={cn(
-          "ml-1 whitespace-nowrap text-[1.125rem] italic leading-none text-muted-foreground/80 after:content-[attr(data-note)]",
+          "ml-1 whitespace-nowrap text-[1.125rem] italic leading-none text-subtle-foreground after:content-[attr(data-note)]",
           placement === "below" ? "translate-y-1.5" : "translate-y-2",
         )}
       />

@@ -47,7 +47,7 @@ export const MENU_SEPARATOR = "mx-2 my-1 h-px bg-border";
  * navigation skips it.
  */
 export const MENU_SECTION_LABEL =
-  "flex h-6 items-center px-2 text-label font-medium text-muted-foreground/80";
+  "flex h-6 items-center px-2 text-label font-medium text-subtle-foreground";
 
 /** Trailing metadata on a row (a username, a device state, a hint). */
 export const MENU_ROW_META =

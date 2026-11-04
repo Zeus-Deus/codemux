@@ -171,7 +171,7 @@ export function SettingsNavSearch({
                         onClick={() => go(result)}
                         className={cn(
                           "flex min-h-8 cursor-pointer items-center gap-2 rounded-lg px-2.5 py-1.5 text-body transition-colors duration-150",
-                          selected ? "bg-surface-3 text-foreground" : "text-muted-foreground/90",
+                          selected ? "bg-surface-3 text-foreground" : "text-muted-foreground",
                         )}
                       >
                         {/* Long labels wrap rather than truncate: the nav is

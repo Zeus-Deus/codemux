@@ -75,7 +75,7 @@ export function SectionHeader({
         {description && (
           <p
             className={cn(
-              "max-w-prose leading-relaxed text-muted-foreground/80",
+              "max-w-prose leading-relaxed text-subtle-foreground",
               stacked ? "mt-1 text-body" : "mt-1.5 text-body-lg",
             )}
           >
@@ -188,7 +188,7 @@ export function SettingRow({
           {scopeId && <DeviceOnlyMark id={scopeId} />}
         </div>
         {description && (
-          <p id={descriptionId} className="text-body-sm leading-relaxed text-muted-foreground/80">
+          <p id={descriptionId} className="text-body-sm leading-relaxed text-subtle-foreground">
             {description}
           </p>
         )}
@@ -222,7 +222,7 @@ export function SubsectionHeader({
           {title}
         </h3>
         {description && (
-          <p className="text-body-sm text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
+          <p className="text-body-sm text-subtle-foreground mt-1.5 leading-relaxed max-w-prose">
             {description}
           </p>
         )}

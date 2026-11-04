@@ -61,7 +61,7 @@ function ProviderRow({ provider, capability }: { provider: WorkflowProviderKind;
           {status.label}
         </span>
       </div>
-      {status.detail && <p className="mt-0.5 truncate text-body-sm text-muted-foreground/80" title={status.detail}>{status.detail}</p>}
+      {status.detail && <p className="mt-0.5 truncate text-body-sm text-subtle-foreground" title={status.detail}>{status.detail}</p>}
     </div>
     {unavailable ? <span /> : catalog.length > 0 && !capability?.requires_model ? (
       <Select value={preference.model || DEFAULT_MODEL} onValueChange={(value) => setWorkflowProviderPreference(provider, { model: value === DEFAULT_MODEL ? "" : value })}>
@@ -118,7 +118,7 @@ export function WorkflowsSection() {
             <input type="radio" name="workflow-agents" value={policy.value} checked={checked} onChange={() => set("workflows.agents", policy.value)} className="mt-1 size-4 shrink-0 accent-[var(--primary)]" />
             <span className="min-w-0">
               <span className="flex items-center gap-2 text-body-lg font-semibold text-foreground">{policy.title}{policy.value === "same_provider" && <span className="rounded-full border border-hairline-strong px-1.5 text-caption font-normal text-muted-foreground">Default</span>}</span>
-              <span className="mt-1 block text-body-sm leading-relaxed text-muted-foreground/80">{policy.description}</span>
+              <span className="mt-1 block text-body-sm leading-relaxed text-subtle-foreground">{policy.description}</span>
             </span>
           </label>;
         })}

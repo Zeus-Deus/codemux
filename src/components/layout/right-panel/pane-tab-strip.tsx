@@ -143,6 +143,7 @@ function DeckTabChip({
   tab,
   active,
   compact,
+  activeFit,
   dragging,
   reorderProps,
   onSelect,
@@ -152,8 +153,9 @@ function DeckTabChip({
   active: boolean;
   /** The row is too narrow for every label: an inactive tab shows only its
    *  icon, named (with its count) by its tooltip. The active tab keeps its
-   *  label. */
+   *  label, fitted to what the icons leave it (`activeFit`). */
   compact: boolean;
+  activeFit: ActiveFit;
   dragging: boolean;
   reorderProps: PillReorderHandlers;
   onSelect: () => void;
@@ -190,7 +192,7 @@ function DeckTabChip({
               onClick={onSelect}
               aria-pressed={false}
               aria-label={name}
-              className="relative flex size-[26px] items-center justify-center"
+              className="relative flex h-[26px] w-6 items-center justify-center"
             >
               <Icon className="size-[13px] shrink-0" />
               {/* The count moves into the tooltip; only a count that asks
@@ -211,13 +213,58 @@ function DeckTabChip({
       </div>
     );
   }
+  const fit = compact && active ? activeFit : ({ kind: "full" } as const);
+  if (fit.kind === "icon") {
+    // Active and icon-only: the fill still says "selected", the tooltip
+    // names it, and the icon is its close button as on a labelled tab.
+    return (
+      <div
+        {...reorderProps}
+        data-testid={tab.testId}
+        data-state="active"
+        data-fit="icon"
+        {...middleClickCloseProps(onClose)}
+        className={chipClass}
+      >
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              data-no-drag
+              aria-label={`Close ${tab.label}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                onClose();
+              }}
+              className="group/close flex size-6 shrink-0 items-center justify-center rounded-sm hover:bg-surface-3"
+            >
+              <Icon className="size-[13px] group-hover/tab:hidden group-focus-visible/close:hidden pointer-coarse:hidden" />
+              <X className="hidden size-[12px] group-hover/tab:block group-focus-visible/close:block pointer-coarse:block" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="flex items-center gap-[7px]">
+            {name}
+            <TabBadge tab={tab} active />
+          </TooltipContent>
+        </Tooltip>
+        {fit.badge && (
+          <span className="pl-[2px] pr-2">
+            <TabBadge tab={tab} active />
+          </span>
+        )}
+        <span className="sr-only">{`${name} (current tab)`}</span>
+      </div>
+    );
+  }
   return (
     <div
       {...reorderProps}
       data-testid={tab.testId}
       data-state={active ? "active" : "inactive"}
+      data-fit={fit.kind === "full" ? undefined : fit.kind}
       {...middleClickCloseProps(onClose)}
       className={cn(chipClass, "pl-[2px]")}
+      style={fit.kind === "truncate" ? { maxWidth: fit.maxWidth } : undefined}
     >
       {/* A 24px target around a 13px glyph; the 2px insets on either side
           keep the icon and label exactly where the 18px button left them. */}
@@ -243,10 +290,10 @@ function DeckTabChip({
         }
         // The full name on hover, for labels the cap below truncates.
         title={tab.attribution ? `${tab.label} — ${tab.attribution}` : tab.label}
-        className="flex h-full min-w-0 items-center gap-[7px] whitespace-nowrap pl-[2px] pr-[9px] text-body-sm"
+        className="flex h-full min-w-0 items-center gap-[7px] whitespace-nowrap pl-[2px] pr-2 text-body-sm"
       >
-        <span className="max-w-[140px] truncate">{tab.label}</span>
-        <TabBadge tab={tab} active={active} />
+        <span className="min-w-0 max-w-[140px] truncate">{tab.label}</span>
+        {fit.kind === "full" && <TabBadge tab={tab} active={active} />}
       </button>
     </div>
   );
@@ -256,6 +303,7 @@ function TabBadge({ tab, active }: { tab: DeckTab; active: boolean }) {
   if (tab.badge == null) return null;
   return (
     <span
+      data-tab-badge
       className={cn(
         // A row, not a run of inline text: a badge can be a count plus a
         // status icon (Review), which must sit beside the count, not under it.
@@ -371,8 +419,9 @@ const TAB_FLOOR_PX = 140;
  * drag gap's floor (`min-w-4`), the "…" and legacy chrome's expand/close
  * buttons (`size-6`) are rem, so they grow with the interface-size setting.
  */
-function rowBudgets(remPx: number, legacy: boolean) {
-  const dragGap = remPx;
+function rowBudgets(remPx: number, legacy: boolean, compact: boolean) {
+  // A compact row has given the drag gap's floor to its tabs.
+  const dragGap = compact ? 0 : remPx;
   // Divider with its margins, two buttons, three row gaps.
   const legacyControls = legacy ? 11 + 3 * remPx + 6 : 0;
   return {
@@ -566,13 +615,42 @@ function useCollapsedActions({
 /** Slack a compact row needs before its labels come back, so a row sitting
  *  right on the line doesn't flip between labelled and icon-only tabs. */
 const COMPACT_HYSTERESIS_PX = 16;
+/** An icon-only tab's width, and the gap between tabs. */
+const ICON_TAB_PX = 24;
+const TAB_GAP_PX = 2;
+/** An active label is truncated only while it keeps this share of its width
+ *  and this many px; any less leaves a stub ("Sub…"), so the active tab goes
+ *  icon-only instead. */
+const KEEP_LABEL_SHARE = 0.8;
+const ACTIVE_LABEL_FLOOR_PX = 44;
+/** Slack between the measured row and the action budget's model of it with
+ *  the "+" inline, so a row fitted to the pixel is never read back as
+ *  overflowing (which would bring the "All tabs" button back). */
+const FIT_SLACK_PX = 3;
+/** What a labelled chip spends besides its label: 2px inset, the 24px close
+ *  button, the label button's 2px and 8px insets. */
+const ACTIVE_CHIP_CHROME_PX = 36;
+
+/** How the active tab fits a compact row: as is, without its count (which
+ *  the pane itself shows), or with its label truncated as well. */
+export type ActiveFit =
+  | { kind: "full" }
+  | { kind: "no-badge" }
+  | { kind: "truncate"; maxWidth: number }
+  /** Icon-only, still filled, keeping its count when that fits. */
+  | { kind: "icon"; badge: boolean };
 
 /**
  * Whether the inactive tabs have to drop their labels to fit. Labels that
  * scroll out of view under the top-right cluster are as good as missing, so
  * once the tabs' labelled width outgrows the room the row leaves them, the
- * inactive tabs show their icon only and the active one keeps its label. Five default panes then fit in the default panel instead of
- * two and a half.
+ * inactive tabs show their icon only and the active one keeps its label.
+ * The active tab is then budgeted against what the icons leave it: it drops
+ * its count first, then truncates its label (full name in its title and
+ * accessible name) while most of it stays readable, and rather than leave a
+ * stub it goes icon-only too, keeping its fill and count. The five default panes stay in view at
+ * the default panel width whichever one is active, instead of two and a
+ * half.
  *
  * The labelled width is read while the labels are shown and kept while they
  * are hidden, keyed by the tab set and the active tab, so a changed set
@@ -594,10 +672,32 @@ function useCompactTabs({
   tabsKey: string;
   dragGapPx: number;
 }) {
-  const [compact, setCompact] = useState(false);
+  const [layout, setLayout] = useState<{ compact: boolean; active: ActiveFit }>({
+    compact: false,
+    active: { kind: "full" },
+  });
   const compactRef = useRef(false);
-  compactRef.current = compact;
-  const labelled = useRef<{ key: string; width: number } | null>(null);
+  compactRef.current = layout.compact;
+  const labelled = useRef<{
+    key: string;
+    width: number;
+    /** The active chip's labelled width, and what its count adds to it. */
+    active: number;
+    badge: number;
+  } | null>(null);
+  const commit = useCallback(
+    (compact: (prev: boolean) => boolean, active: ActiveFit = { kind: "full" }) =>
+      setLayout((prev) => {
+        const nextCompact = compact(prev.compact);
+        const nextActive = nextCompact ? active : ({ kind: "full" } as const);
+        const same =
+          prev.compact === nextCompact &&
+          prev.active.kind === nextActive.kind &&
+          JSON.stringify(prev.active) === JSON.stringify(nextActive);
+        return same ? prev : { compact: nextCompact, active: nextActive };
+      }),
+    [],
+  );
 
   const measure = useCallback(() => {
     const header = headerRef.current;
@@ -605,20 +705,32 @@ function useCompactTabs({
     const content = contentRef.current;
     // No layout to measure (jsdom): keep every label.
     if (!header || !scroller || !content || header.clientWidth === 0) {
-      setCompact(false);
+      commit(() => false);
       return;
     }
     if (!compactRef.current) {
-      labelled.current = { key: tabsKey, width: content.scrollWidth };
+      const chip = content.querySelector<HTMLElement>('[data-state="active"]');
+      const badge = chip?.querySelector<HTMLElement>("[data-tab-badge]");
+      labelled.current = {
+        key: tabsKey,
+        width: content.scrollWidth,
+        active: chip?.getBoundingClientRect().width ?? 0,
+        // The badge plus the label row's 7px gap before it.
+        badge: badge ? badge.getBoundingClientRect().width + 7 : 0,
+      };
     }
     const known = labelled.current;
     if (known?.key !== tabsKey) {
-      setCompact(false);
+      commit(() => false);
       return;
     }
     const style = getComputedStyle(header);
     const gap = parseFloat(style.columnGap) || 0;
-    const kids = [...header.children] as HTMLElement[];
+    // Not the "All tabs" button: it only shows while the tabs overflow, which
+    // is what fitting them removes, so counting it would let it keep itself.
+    const kids = ([...header.children] as HTMLElement[]).filter(
+      (kid) => kid.dataset.testid !== "right-panel-tabs-overflow",
+    );
     let room =
       header.clientWidth -
       (parseFloat(style.paddingLeft) || 0) -
@@ -635,10 +747,38 @@ function useCompactTabs({
         (parseFloat(kidStyle.marginLeft) || 0) +
         (parseFloat(kidStyle.marginRight) || 0);
     }
-    setCompact((prev) =>
-      prev ? known.width > room - COMPACT_HYSTERESIS_PX : known.width > room,
+    // A compact row gives the drag gap's floor to the tabs as well: the gap
+    // still takes whatever they leave, it just stops reserving room.
+    const others = content.children.length - 1;
+    // With the "+" inline, the action budget models the row (and so
+    // whether "All tabs" shows) a few px tighter than measured.
+    const plusInline = kids.some(
+      (kid) => kid.dataset.testid === "right-panel-add-pane",
     );
-  }, [contentRef, dragGapPx, headerRef, scrollerRef, tabsKey]);
+    const forActive =
+      room +
+      dragGapPx -
+      others * (ICON_TAB_PX + TAB_GAP_PX) -
+      (plusInline ? FIT_SLACK_PX : 0);
+    const active: ActiveFit =
+      known.active <= forActive
+        ? { kind: "full" }
+        : known.active - known.badge <= forActive
+          ? { kind: "no-badge" }
+          : forActive - ACTIVE_CHIP_CHROME_PX >=
+              Math.max(
+                ACTIVE_LABEL_FLOOR_PX,
+                KEEP_LABEL_SHARE *
+                  (known.active - known.badge - ACTIVE_CHIP_CHROME_PX),
+              )
+            ? { kind: "truncate", maxWidth: Math.floor(forActive) }
+            : { kind: "icon", badge: ICON_TAB_PX + known.badge <= forActive };
+    commit(
+      (prev) =>
+        prev ? known.width > room - COMPACT_HYSTERESIS_PX : known.width > room,
+      active,
+    );
+  }, [commit, contentRef, dragGapPx, headerRef, scrollerRef, tabsKey]);
 
   useLayoutEffect(measure);
   useLayoutEffect(() => {
@@ -649,7 +789,7 @@ function useCompactTabs({
     return () => observer.disconnect();
   }, [headerRef, measure]);
 
-  return compact;
+  return layout;
 }
 
 /**
@@ -910,9 +1050,18 @@ export const PaneTabStrip = memo(function PaneTabStrip({
 
   const headerRef = useRef<HTMLElement>(null);
   const actionsRef = useRef<HTMLDivElement>(null);
+  // Before the action budget, which needs to know whether the row is
+  // compact: a compact row reserves no drag-gap floor.
+  const { compact: compactTabs, active: activeFit } = useCompactTabs({
+    headerRef,
+    scrollerRef: containerRef,
+    contentRef,
+    tabsKey: `${tabs.map((tab) => `${tab.id}:${tab.label}`).join("|")}#${activeTab ?? ""}`,
+    dragGapPx: remPx,
+  });
   const budgets = useMemo(
-    () => rowBudgets(remPx, !inTitlebar),
-    [inTitlebar, remPx],
+    () => rowBudgets(remPx, !inTitlebar, compactTabs),
+    [compactTabs, inTitlebar, remPx],
   );
   const {
     collapsed: actionsCollapsed,
@@ -926,13 +1075,6 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     actionsShape: actionsShape(actions),
     hasActions: actions != null,
     budgets,
-  });
-  const compactTabs = useCompactTabs({
-    headerRef,
-    scrollerRef: containerRef,
-    contentRef,
-    tabsKey: `${tabs.map((tab) => `${tab.id}:${tab.label}`).join("|")}#${activeTab ?? ""}`,
-    dragGapPx: remPx,
   });
   // An inline row grows an "All tabs" button once the tabs overflow beside
   // it; a folded row lists them in its "…" whenever any are out of view.
@@ -1086,6 +1228,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
                     tab={tab}
                     active={tab.id === activeTab}
                     compact={compactTabs}
+                    activeFit={activeFit}
                     dragging={dragTabId === tab.id}
                     reorderProps={getPillProps(tab.id)}
                     onSelect={() => onSelect(tab.id)}
@@ -1141,7 +1284,11 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     <div
       data-testid="right-panel-drag-gap"
       data-tauri-drag-region={inTitlebar && !remoteClient ? true : undefined}
-      className="min-w-4 flex-1 self-stretch"
+      className={cn(
+        "flex-1 self-stretch",
+        // A compact row has budgeted the gap's floor to the tabs.
+        compactTabs ? "min-w-0" : "min-w-4",
+      )}
     />
   );
 

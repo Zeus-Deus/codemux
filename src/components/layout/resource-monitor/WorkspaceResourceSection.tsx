@@ -228,7 +228,7 @@ export function WorkspaceResourceSection({
                         <div
                           className={cn(
                             METRIC_COLS,
-                            "text-label text-muted-foreground/80",
+                            "text-label text-subtle-foreground",
                           )}
                         >
                           <span className={CPU_COL}>

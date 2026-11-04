@@ -692,7 +692,7 @@ export function MultiProviderModelPicker({
           className="flex-col items-start gap-0.5"
         >
           <span>{triggerLabel}</span>
-          {triggerDetails && <span className="opacity-70">{triggerDetails}</span>}
+          {triggerDetails && <span className="text-subtle-foreground">{triggerDetails}</span>}
         </TooltipContent>
       </Tooltip>
       <PopoverContent
@@ -1175,7 +1175,7 @@ function AccountRailEntry({
           <span>
             {label} <span className="text-muted-foreground">·</span> {accountSummary(account)}
           </span>
-          {waitsForTurn && <span className="opacity-70">Accounts can be switched once this turn finishes.</span>}
+          {waitsForTurn && <span className="text-subtle-foreground">Accounts can be switched once this turn finishes.</span>}
         </TooltipContent>
       </Tooltip>
     </div>

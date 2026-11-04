@@ -317,7 +317,7 @@ export function ReasoningPicker({
             }
           >
             {hasEffortSection && ultrathinkInBodyText ? (
-              <div className="px-2 pt-1.5 pb-1 text-label text-muted-foreground/80">
+              <div className="px-2 pt-1.5 pb-1 text-label text-subtle-foreground">
                 Your prompt contains &quot;ultrathink&quot; in the text. Remove
                 it to change effort.
               </div>

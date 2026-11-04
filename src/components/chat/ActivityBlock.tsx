@@ -272,7 +272,7 @@ function CollapsedLine({
         </TraceIcon>
         <TraceTitle>
           {status === "running" ? "Running subagents" : "Ran subagents"}{" "}
-          <span className="opacity-60">{subagentPreview(entry.subagents)}</span>
+          <span className="text-subtle-foreground">{subagentPreview(entry.subagents)}</span>
         </TraceTitle>
         {settledTotals}
       </TraceLine>
@@ -406,7 +406,7 @@ function SubagentRunLine({
         </TraceIcon>
         <TraceTitle>
           {status === "running" ? "Running" : "Ran"} {count} subagent{count === 1 ? "" : "s"}{" "}
-          <span className="opacity-60">{subagentPreview(run.subagents)}</span>
+          <span className="text-subtle-foreground">{subagentPreview(run.subagents)}</span>
         </TraceTitle>
         <TickingText
           active={status === "running"}

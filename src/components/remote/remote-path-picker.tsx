@@ -279,7 +279,7 @@ export function RemotePathPicker() {
                         )}
                       >
                         {entry.is_dir ? (
-                          <Folder className="size-3.5 shrink-0 text-status-remote/80" />
+                          <Folder className="size-3.5 shrink-0 text-status-remote" />
                         ) : (
                           <FileIcon className="size-3.5 shrink-0 text-muted-foreground" />
                         )}

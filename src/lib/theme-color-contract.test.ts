@@ -3,9 +3,10 @@ import { join, relative, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { BUILT_IN_THEMES, contrastRatio, normalizeColor, subtleForeground } from "./themes";
 
-// Text faded below the subtle ink floor composites under 4.5:1 and reads as
-// disabled. `text-subtle-foreground` is the quietest legal text ink.
-const FADED_TEXT_INK = /(?<![\w-])text-(?:muted-foreground\/(?:[1-7]\d|[0-9])|foreground\/(?:[1-4]\d|[0-9]))\b/g;
+// Faded muted ink composites under 4.5:1 (and below the subtle floor on
+// selected fills) and reads as disabled. `text-subtle-foreground` is the
+// quietest legal text ink; foreground keeps its alphas down to 50%.
+const FADED_TEXT_INK = /(?<![\w-])text-(?:muted-foreground\/\d+|foreground\/(?:[1-4]\d|[0-9]))\b/g;
 
 const RAW_PALETTE_UTILITY = /\b(?:bg|text|border|ring|from|to|via)-(?:slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-\d+/g;
 
@@ -41,11 +42,11 @@ describe("theme color contract", () => {
   });
 
   it.each(BUILT_IN_THEMES.map((theme) => [theme.id, theme] as const))(
-    "%s keeps muted and subtle ink readable and the focus ring visible on every surface",
+    "%s keeps muted and subtle ink readable and the focus ring visible on every surface, selected fills included",
     (_id, theme) => {
       const { roles } = theme;
       const backdrop = normalizeColor(roles.background) ?? "#000000";
-      const surfaces = [roles.background, roles.sidebar, roles.card, roles.popover]
+      const surfaces = [roles.background, roles.sidebar, roles.card, roles.popover, roles.accent, roles.sidebarAccent]
         .map((surface) => normalizeColor(surface, backdrop) ?? "#000000");
       const subtle = subtleForeground(roles);
       for (const surface of surfaces) {

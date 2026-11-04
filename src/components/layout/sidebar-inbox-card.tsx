@@ -1207,8 +1207,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       <span
                         className={cn(
                           visuallyReceded
-                            ? "text-subtle-foreground transition-colors duration-150 group-hover/card:text-status-open/80 group-focus-within/card:text-status-open/80"
-                            : "text-status-open/80",
+                            ? "text-subtle-foreground transition-colors duration-150 group-hover/card:text-status-open group-focus-within/card:text-status-open"
+                            : "text-status-open",
                         )}
                       >
                         +{workspace.git_additions}
@@ -1218,8 +1218,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       <span
                         className={cn(
                           visuallyReceded
-                            ? "text-subtle-foreground transition-colors duration-150 group-hover/card:text-status-attention/80 group-focus-within/card:text-status-attention/80"
-                            : "text-status-attention/80",
+                            ? "text-subtle-foreground transition-colors duration-150 group-hover/card:text-status-attention group-focus-within/card:text-status-attention"
+                            : "text-status-attention",
                         )}
                       >
                         −{workspace.git_deletions}
@@ -1285,7 +1285,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         specific PR the click opens — a bare count next to
                         `#372` would read as part of that reference. */}
                     {extraPrCount > 0 && (
-                      <span className="opacity-70">+{extraPrCount}</span>
+                      <span className="text-subtle-foreground">+{extraPrCount}</span>
                     )}
                   </button>
                 )}

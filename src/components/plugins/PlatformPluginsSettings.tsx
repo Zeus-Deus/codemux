@@ -142,7 +142,7 @@ export function PlatformPluginsSection() {
           </div>
         }
       />
-      <p className="mb-4 max-w-prose text-body-sm leading-relaxed text-muted-foreground/80">
+      <p className="mb-4 max-w-prose text-body-sm leading-relaxed text-subtle-foreground">
         Each runs in its own background process and reaches Codemux only through the permissions you grant. It is
         still trusted code running as your user, with your access to files and the network.
       </p>

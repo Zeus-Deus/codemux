@@ -295,7 +295,7 @@ export function ComposerCommandMenu({
                   "border-t border-hairline px-3 py-2 text-label",
                   footerNote.tone === "error"
                     ? "text-destructive"
-                    : "text-muted-foreground/80",
+                    : "text-subtle-foreground",
                 )}
               >
                 {footerNote.message}

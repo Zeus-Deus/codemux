@@ -887,7 +887,7 @@ export function SidebarProjectsView() {
                 <Collapse open={shelfOpen}>
                   {shelfGroups.map((g) => (
                     <div key={g.path} data-shelf-group={g.path}>
-                      <div className="truncate pb-0.5 pl-[30px] pr-2 pt-1.5 text-label font-semibold text-muted-foreground/80">
+                      <div className="truncate pb-0.5 pl-[30px] pr-2 pt-1.5 text-label font-semibold text-subtle-foreground">
                         {g.name}
                       </div>
                       <SidebarMenu>{renderParkedRows(g.workspaces)}</SidebarMenu>
@@ -897,7 +897,7 @@ export function SidebarProjectsView() {
                     <button
                       type="button"
                       onClick={() => setShelfLimit((n) => n + SHELF_PAGE_COUNT)}
-                      className="flex h-7 w-full items-center rounded-lg pl-[30px] text-left text-label text-muted-foreground/80 transition-colors duration-150 hover:text-foreground"
+                      className="flex h-7 w-full items-center rounded-lg pl-[30px] text-left text-label text-subtle-foreground transition-colors duration-150 hover:text-foreground"
                     >
                       Show {Math.min(shelfHidden, SHELF_PAGE_COUNT)} more
                     </button>

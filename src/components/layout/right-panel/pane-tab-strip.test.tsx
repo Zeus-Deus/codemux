@@ -276,7 +276,9 @@ describe("PaneTabStrip — overflow", () => {
   // missing, so a row too narrow for every label drops the inactive ones
   // and keeps the active tab's.
   it("drops inactive labels once the labelled tabs outgrow the row", () => {
-    const restore = stubLayout({ header: 200, tabs: 300, scroller: 100 });
+    // The header's right padding is the titlebar reserve, so 600px leaves
+    // the tabs about 350.
+    const restore = stubLayout({ header: 600, tabs: 700, scroller: 100 });
     try {
       const { onSelect } = renderStrip();
       expect(screen.getByText("Files")).toBeInTheDocument();
@@ -292,15 +294,36 @@ describe("PaneTabStrip — overflow", () => {
     }
   });
 
+  // Rather than truncate the active label to a stub, a row with no room for
+  // it shows the active tab icon-only too: still filled, still closable,
+  // still named.
+  it("goes icon-only on the active tab too when its label cannot fit", () => {
+    // Narrower than the titlebar reserve leaves the active tab no room.
+    const restore = stubLayout({ header: 200, tabs: 700, scroller: 100 });
+    try {
+      const { onClose } = renderStrip();
+      const active = screen.getByTestId("files-tab");
+      // No visible label, just the icon (the name is screen-reader text).
+      expect(active.querySelector(".truncate")).toBeNull();
+      expect(active).toHaveAttribute("data-state", "active");
+      expect(active).toHaveAttribute("data-fit", "icon");
+      expect(active).toHaveTextContent("Files (current tab)");
+      fireEvent.click(screen.getByLabelText("Close Files"));
+      expect(onClose).toHaveBeenCalledWith("files");
+    } finally {
+      restore();
+    }
+  });
+
   it("brings the labels back once the row has room for them", () => {
-    const widths = { header: 200, tabs: 300, scroller: 100 };
+    const widths = { header: 600, tabs: 700, scroller: 100 };
     const restore = stubLayout(widths);
     try {
       const { rerender } = renderStrip();
       expect(screen.queryByText("Changes")).toBeNull();
       // Wide enough for the labels plus the hysteresis: the next layout
       // pass shows them again.
-      widths.header = 600;
+      widths.header = 1200;
       rerender(
         <TooltipProvider>
           <PaneTabStrip
@@ -419,8 +442,9 @@ describe("PaneTabStrip — overflow", () => {
       try {
         const view = renderStrip({ actions });
         expect(screen.getByLabelText("Pane actions")).toBeInTheDocument();
+        // A compact row: the "…" and its gaps, no drag-gap floor.
         expect(screen.getByTestId("right-panel-tabs-scroll").style.minWidth).toBe(
-          "min(140px, calc(100% - 44px))",
+          "min(140px, calc(100% - 28px))",
         );
 
         widths.header = 2000;
@@ -534,9 +558,9 @@ describe("PaneTabStrip — overflow", () => {
       try {
         renderStrip({ actions });
         expect(screen.getByLabelText("Pane actions")).toBeInTheDocument();
-        // 20px drag gap + 30px "…" + two 2px gaps.
+        // 30px "…" + two 2px gaps; a compact row reserves no drag gap.
         expect(screen.getByTestId("right-panel-tabs-scroll").style.minWidth).toBe(
-          "min(140px, calc(100% - 54px))",
+          "min(140px, calc(100% - 34px))",
         );
       } finally {
         document.documentElement.style.fontSize = "";
@@ -625,9 +649,10 @@ describe("PaneTabStrip — overflow", () => {
           "Refresh",
         );
         expect(screen.queryByLabelText("Pane actions")).toBeNull();
-        // The "+", the drag gap, the row gaps and the 24px button + its gap.
+        // Too many tabs even icon-only: the "+", the row gaps and the 24px
+        // button + its gap (a compact row reserves no drag gap).
         expect(screen.getByTestId("right-panel-tabs-scroll").style.minWidth).toBe(
-          "min(140px, calc(100% - 75px))",
+          "min(140px, calc(100% - 59px))",
         );
 
         // A keyboard open lands on the active tab; arrows walk the list.

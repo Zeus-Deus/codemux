@@ -3480,7 +3480,7 @@ export function Composer({
                   className="px-5 pt-2 text-label text-destructive/90 leading-tight"
                 >
                   <span>Send failed: {errorMessage}. </span>
-                  <span className="text-muted-foreground/80">
+                  <span className="text-subtle-foreground">
                     Press Enter to retry.
                   </span>
                 </div>

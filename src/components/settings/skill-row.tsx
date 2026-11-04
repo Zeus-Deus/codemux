@@ -129,7 +129,7 @@ export function SkillRow({
             {skill.description}
           </p>
         )}
-        <p className="mt-0.5 truncate text-label text-muted-foreground/80">
+        <p className="mt-0.5 truncate text-label text-subtle-foreground">
           {status || "Unavailable"}
         </p>
       </div>

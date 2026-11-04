@@ -380,7 +380,7 @@ function ServerRow({
           <McpStatusBadge runtime={runtime} disabled={disabled} server={server} />
           {additionalSources.length > 0 && (
             <span
-              className="text-caption text-muted-foreground/80"
+              className="text-caption text-subtle-foreground"
               data-testid={`mcp-row-${server.id}-extra-sources`}
             >
               also: {additionalSources.map(sourceHeading).join(", ")}
@@ -439,7 +439,7 @@ function McpStatusBadge({
   if (disabled) {
     return (
       <span
-        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-muted-foreground/80"
+        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-subtle-foreground"
         data-testid={`mcp-row-${server.id}-status`}
         data-status="disabled"
       >
@@ -452,7 +452,7 @@ function McpStatusBadge({
   if (!runtime || runtime.status.kind === "discovered") {
     return (
       <span
-        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-muted-foreground/80"
+        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-subtle-foreground"
         data-testid={`mcp-row-${server.id}-status`}
         data-status="discovered"
       >
@@ -516,7 +516,7 @@ function McpStatusBadge({
   // stopped
   return (
     <span
-      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-muted-foreground/80"
+      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-subtle-foreground"
       data-testid={`mcp-row-${server.id}-status`}
       data-status="stopped"
     >

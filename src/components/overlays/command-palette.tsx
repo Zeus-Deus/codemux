@@ -1480,7 +1480,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <KeyHint keys="↑↓" label="preview" />
             <KeyHint keys="↵" label="keep it" />
             <KeyHint keys="esc" label={`back to ${appliedTheme.label}`} />
-            <span className="ml-auto text-caption text-subtle-foreground">
+            <span className="ml-auto text-caption text-muted-foreground">
               {previewTheme.id === OMARCHY_THEME_ID ? "follows this desktop" : "syncs to your account"}
             </span>
           </>
@@ -1490,7 +1490,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <KeyHint keys="↵" label="open" />
             <KeyHint keys={COMMAND_MODE_PREFIX} label="commands" />
             <KeyHint keys={PR_MODE_PREFIX.trim()} label="pull requests" />
-            <span className="ml-auto text-caption text-subtle-foreground tabular-nums">
+            <span className="ml-auto text-caption text-muted-foreground tabular-nums">
               {resultCountLabel(totalShown)}
             </span>
           </>
@@ -1549,7 +1549,7 @@ function PaletteItem({
       value={value}
       onSelect={onSelect}
       className={cn(
-        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-selected:bg-accent data-selected:[--foreground:var(--accent-foreground)] data-selected:[--muted-foreground:color-mix(in_oklch,var(--accent-foreground)_70%,var(--accent))]",
+        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-selected:bg-accent data-selected:[--foreground:var(--accent-foreground)] data-selected:[--muted-foreground:color-mix(in_oklch,var(--accent-foreground)_70%,var(--accent))] data-selected:[--subtle-foreground:var(--muted-foreground)]",
         className,
       )}
     >
@@ -1704,7 +1704,7 @@ function ConversationItem({
       onSelect={onSelect}
       className="h-[58px] py-1.5"
     >
-      <span className="flex size-6 flex-none items-center justify-center rounded-md border border-border/60 bg-surface-1 text-muted-foreground/80">
+      <span className="flex size-6 flex-none items-center justify-center rounded-md border border-border/60 bg-surface-1 text-subtle-foreground">
         <Icon className="size-3" />
       </span>
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">

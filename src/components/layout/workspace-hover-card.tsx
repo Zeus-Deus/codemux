@@ -377,7 +377,7 @@ export function WorkspaceHoverCardBody({
             shape="square"
             className="font-bold"
           />
-          <span className="min-w-0 flex-1 truncate text-label font-semibold tracking-[0.01em] text-muted-foreground/80">
+          <span className="min-w-0 flex-1 truncate text-label font-semibold tracking-[0.01em] text-subtle-foreground">
             {repo.name}
           </span>
           {providers.map((p) => (

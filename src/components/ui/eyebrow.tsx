@@ -30,7 +30,7 @@ const eyebrowVariants = cva(
     variants: {
       tone: {
         /** Default: a label, not content. Quiet enough to scan past. */
-        muted: "text-muted-foreground/80",
+        muted: "text-subtle-foreground",
         /** For a label that has to hold its own against a dense row. */
         strong: "text-foreground/80",
         /** Reserved for the one label on a surface that is an accent. */

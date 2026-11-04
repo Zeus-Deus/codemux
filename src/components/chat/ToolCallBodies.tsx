@@ -147,7 +147,7 @@ export function BashToolBody({
           <span className="text-subtle-foreground">$ </span>
           {command}
           {description && (
-            <div className="mt-1 font-sans text-label text-muted-foreground/80">
+            <div className="mt-1 font-sans text-label text-subtle-foreground">
               {description}
             </div>
           )}
@@ -268,7 +268,7 @@ export function GrepToolBody({ item, input }: BodyProps) {
       {matches.length > 0 ? (
         <div className="select-text rounded-md bg-muted/40">
           <div className={cn("space-y-1 px-3 py-2", showAll && FULL_OUTPUT_CLASS)}>
-            <p className="text-label text-muted-foreground/80">
+            <p className="text-label text-subtle-foreground">
               {matches.length} match{matches.length === 1 ? "" : "es"}
             </p>
             <ul className="space-y-0.5">

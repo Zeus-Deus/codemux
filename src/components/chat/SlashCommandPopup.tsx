@@ -197,7 +197,7 @@ export function SlashCommandPopup({
                 "px-3 py-2 text-label border-t border-hairline",
                 footerNote.tone === "error"
                   ? "text-destructive"
-                  : "text-muted-foreground/80",
+                  : "text-subtle-foreground",
               )}
             >
               {footerNote.message}

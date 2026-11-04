@@ -403,10 +403,10 @@ function WorkspaceMenuHeader({
       {hasStats && (
         <span className="flex shrink-0 gap-1.5 font-mono text-caption tabular-nums">
           {additions > 0 && (
-            <span className="text-status-open/80">+{additions}</span>
+            <span className="text-status-open">+{additions}</span>
           )}
           {deletions > 0 && (
-            <span className="text-status-attention/80">−{deletions}</span>
+            <span className="text-status-attention">−{deletions}</span>
           )}
         </span>
       )}
@@ -1503,7 +1503,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                     {sidebarElapsedSec !== null && (
                       <span
                         title="Push/pull in progress — large workspaces can take a while."
-                        className="rounded-full bg-muted/60 px-1.5 py-0 text-caption font-medium tabular-nums leading-[14px] text-muted-foreground/85"
+                        className="rounded-full bg-muted/60 px-1.5 py-0 text-caption font-medium tabular-nums leading-[14px] text-muted-foreground"
                       >
                         {sidebarElapsedSec}s
                       </span>

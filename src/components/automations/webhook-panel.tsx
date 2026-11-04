@@ -221,7 +221,7 @@ export function WebhookPanel({
       <div className="space-y-2 rounded-lg border border-border/60 bg-muted/30 p-3">
         <div className="flex items-center gap-2">
           <Webhook className="size-3.5 shrink-0 text-subtle-foreground" />
-          <span className="text-body-sm text-muted-foreground/85">
+          <span className="text-body-sm text-muted-foreground">
             POST to this URL to start a run
           </span>
           {endpoints.length > 1 && (

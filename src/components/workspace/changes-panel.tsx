@@ -374,7 +374,7 @@ function BranchPill({ info }: { info: GitBranchInfo | null }) {
   const ahead = info.ahead ?? 0;
   const behind = info.behind ?? 0;
   return (
-    <PanelHeader className="gap-1.5 text-label text-muted-foreground/80">
+    <PanelHeader className="gap-1.5 text-label text-subtle-foreground">
       <GitBranch className="size-3 shrink-0" />
       <span className="truncate font-mono text-foreground/90">{info.branch}</span>
       {(ahead > 0 || behind > 0) && (

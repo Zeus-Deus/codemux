@@ -500,11 +500,11 @@ describe("SidebarInboxCard — background recede", () => {
     const deletions = screen.getByText("−12");
     expect(additions.className).toContain("text-subtle-foreground");
     expect(additions.className).toContain(
-      "group-hover/card:text-status-open/80",
+      "group-hover/card:text-status-open",
     );
     expect(deletions.className).toContain("text-subtle-foreground");
     expect(deletions.className).toContain(
-      "group-focus-within/card:text-status-attention/80",
+      "group-focus-within/card:text-status-attention",
     );
 
     const pr = screen.getByRole("button", { name: "Pull request #87 — open" });
@@ -633,9 +633,9 @@ describe("SidebarInboxCard — background recede", () => {
 
     expect(screen.getByText("M").className).not.toContain("grayscale");
     expect(screen.getByText("Ship it").className).toContain("text-foreground");
-    expect(screen.getByText("+8").className).toContain("text-status-open/80");
+    expect(screen.getByText("+8").className).toContain("text-status-open");
     expect(screen.getByText("−3").className).toContain(
-      "text-status-attention/80",
+      "text-status-attention",
     );
     expect(
       screen.getByRole("button", { name: "Pull request #12 — open" }).className,

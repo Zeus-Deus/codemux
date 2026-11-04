@@ -419,7 +419,7 @@ function RowGlyph({ view }: { view: SubagentView }) {
           kind === "failed"
             ? "text-status-attention"
             : kind === "stopped"
-              ? "text-status-working/80"
+              ? "text-status-working"
               : "text-status-open",
         )}
         aria-hidden
@@ -535,7 +535,7 @@ function AttentionCard({
       </div>
       <p
         title={activity}
-        className="mt-0.5 truncate pl-7 font-mono text-caption leading-[1.45] text-status-attention/85"
+        className="mt-0.5 truncate pl-7 font-mono text-caption leading-[1.45] text-status-attention"
       >
         {activity}
       </p>
@@ -726,7 +726,7 @@ function PromptDivider({ text }: { text: string }) {
     <p
       data-testid="wave-prompt"
       title={text}
-      className="mt-2 truncate px-1 text-caption text-muted-foreground/80 first:mt-0"
+      className="mt-2 truncate px-1 text-caption text-subtle-foreground first:mt-0"
     >
       <span className="mr-1 text-subtle-foreground" aria-hidden>
         ›

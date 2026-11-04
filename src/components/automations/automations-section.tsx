@@ -435,7 +435,7 @@ export function AutomationsSection() {
             <h3 className="text-body-lg font-semibold tracking-tight text-foreground">
               No automations yet
             </h3>
-            <p className="text-body leading-relaxed text-muted-foreground/80">
+            <p className="text-body leading-relaxed text-subtle-foreground">
               Run an agent on a schedule — triage issues each morning,
               sweep stale branches nightly, post a weekly summary — or when
               a webhook arrives, like a new GitHub issue.
@@ -471,7 +471,7 @@ export function AutomationsSection() {
         </div>
 
         {automations.length === 0 && draft === null && (
-          <div className="rounded-lg border border-dashed border-border/60 p-3 text-body-sm text-muted-foreground/80 leading-relaxed">
+          <div className="rounded-lg border border-dashed border-border/60 p-3 text-body-sm text-subtle-foreground leading-relaxed">
             No automations yet. Create one to run an agent on a schedule.
           </div>
         )}
@@ -578,7 +578,7 @@ export function AutomationsSection() {
               <div className="mx-auto size-12 rounded-full bg-muted/40 border border-border/40 flex items-center justify-center">
                 <CalendarClock className="size-5 text-subtle-foreground" />
               </div>
-              <p className="text-body text-muted-foreground/80">
+              <p className="text-body text-subtle-foreground">
                 Select an automation, or create a new one.
               </p>
             </div>
@@ -655,7 +655,7 @@ function AutomationDetail({
             </Eyebrow>
           )}
         </div>
-        <p className="text-body-sm text-muted-foreground/85">
+        <p className="text-body-sm text-muted-foreground">
           {describeTrigger(automation)} · {agentLabel} · {hostLabel}
         </p>
       </div>
@@ -813,7 +813,7 @@ function RunHistory({ automationId }: { automationId: number }) {
               title={run.error ?? undefined}
               className="flex items-center gap-2.5 px-3 py-2"
             >
-              <span className="shrink-0 font-mono text-body-sm tabular-nums text-muted-foreground/80">
+              <span className="shrink-0 font-mono text-body-sm tabular-nums text-subtle-foreground">
                 {formatStamp(run.scheduled_for)}
               </span>
               {run.pr_url ? (

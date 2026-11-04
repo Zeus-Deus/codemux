@@ -396,7 +396,7 @@ export function PrList({
                     {watchingOpen ? (
                       watching.map((row) => renderRow(row, true))
                     ) : (
-                      <p className={cn("px-3 leading-relaxed text-muted-foreground/80", tzMetaNum)}>
+                      <p className={cn("px-3 leading-relaxed text-subtle-foreground", tzMetaNum)}>
                         Repositories you have open but aren't involved in.
                       </p>
                     )}

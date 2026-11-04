@@ -818,7 +818,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   open={teardownOpen}
                   onOpenChange={setTeardownOpen}
                 >
-                  <CollapsibleTrigger className="flex items-center gap-1.5 text-label text-muted-foreground/80 hover:text-muted-foreground transition-colors duration-150 py-1">
+                  <CollapsibleTrigger className="flex items-center gap-1.5 text-label text-subtle-foreground hover:text-muted-foreground transition-colors duration-150 py-1">
                     <ChevronDown
                       className={cn(
                         "size-3 transition-transform duration-150",
