@@ -1043,29 +1043,23 @@ where
         .map_err(|error| ControlError::new(ErrorCode::NativeControlFailed, format!("Worker failed: {error}")))?
 }
 
-/// A receipt as a retry of its synchronous call returns it: the recorded
-/// result or failure once it ended, else where it stands, so the client polls
+/// What a retry of a synchronous keyed call returns: the recorded result once
+/// it succeeded, else the receipt itself, as every keyed tool's retry does. A
+/// failed one carries the first call's `error {code, message, retryable}`;
+/// an unfinished one says where it stands, so the client polls
 /// operation_status.
 fn replay(receipt: Value) -> Result<Value, ControlError> {
-    let operation = receipt["operation_id"].clone();
-    match receipt["state"].as_str() {
-        Some("succeeded") => {
-            let mut value = match receipt["result"].clone() {
-                value @ Value::Object(_) => value,
-                value => json!({"result": value}),
-            };
-            value["operation_id"] = operation;
-            value["state"] = json!("succeeded");
-            value["replayed"] = json!(true);
-            Ok(value)
-        }
-        Some("failed") => {
-            let code = receipt["error"]["code"].as_str().unwrap_or("operation_failed");
-            let message = receipt["error"]["message"].as_str().unwrap_or("The operation failed");
-            Err(ControlError::new(ErrorCode::OperationFailed, format!("{code}: {message}")))
-        }
-        state => Ok(json!({"operation_id": operation, "state": state, "workspace_id": receipt["workspace_id"]})),
+    if receipt["state"] != "succeeded" {
+        return Ok(receipt);
     }
+    let mut value = match receipt["result"].clone() {
+        value @ Value::Object(_) => value,
+        value => json!({"result": value}),
+    };
+    value["operation_id"] = receipt["operation_id"].clone();
+    value["state"] = json!("succeeded");
+    value["replayed"] = json!(true);
+    Ok(value)
 }
 
 fn admit_mutation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, tool: &str, args: &Value, target: &Target) -> Result<crate::database::agent_control::Admission, ControlError> {
@@ -1366,4 +1360,32 @@ pub(super) async fn thread_answer<R: Runtime>(app: &AppHandle<R>, caller: &Contr
 /// worker twice.
 fn answer_unsettled() -> ControlError {
     ControlError::new(ErrorCode::QuestionAnswerFailed, "An answer to this question is being delivered or awaits confirmation; the person settles it in CodeMux")
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::replay;
+    use serde_json::json;
+
+    /// A retry of a failed workspace or worktree call reads like a retry of
+    /// any other keyed tool: the receipt, carrying the first call's own code.
+    #[test]
+    fn a_retry_returns_the_result_once_it_succeeded_and_the_receipt_otherwise() {
+        let failed = json!({
+            "operation_id": "op-1", "tool": "workspace_close", "state": "failed", "workspace_id": "ws-1",
+            "thread_id": null, "result": null,
+            "error": {"code": "workspace_close_refused", "message": "The worktree has uncommitted work", "retryable": false},
+            "delivery_id": null, "dispatch_disposition": null, "created_at": "t0", "updated_at": "t1",
+        });
+        assert_eq!(replay(failed.clone()).unwrap(), failed);
+        let running = json!({"operation_id": "op-2", "tool": "worktree_create", "state": "running", "workspace_id": "ws-2"});
+        assert_eq!(replay(running.clone()).unwrap(), running);
+        let closed = json!({"operation_id": "op-3", "state": "succeeded", "result": {"workspace_id": "ws-3", "closed": true}});
+        assert_eq!(
+            replay(closed).unwrap(),
+            json!({"workspace_id": "ws-3", "closed": true, "operation_id": "op-3", "state": "succeeded", "replayed": true})
+        );
+        let scalar = json!({"operation_id": "op-4", "state": "succeeded", "result": 5});
+        assert_eq!(replay(scalar).unwrap()["result"], 5);
+    }
 }
