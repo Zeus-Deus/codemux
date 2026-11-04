@@ -6,6 +6,7 @@ use super::{
 };
 use super::{oauth, protocol};
 use crate::agent_control::{self, ControlCaller, ControlError, ErrorCode};
+use crate::mcp::protocol::{self as mcp_protocol, Era, RpcError};
 use crate::database::{
     mcp_connector::{NewMcpClient, NewMcpGrant, NewMcpRefresh, RefreshOutcome, RefreshRotation},
     DatabaseStore,
@@ -320,6 +321,60 @@ fn rpc_error(id: Value, code: i64, message: &str, status: StatusCode) -> Respons
         json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}),
     )
 }
+
+/// The connector as a stateless-era (2026-07-28) server names itself the way
+/// its `initialize` does.
+const SERVER_INFO: mcp_protocol::ServerInfo =
+    mcp_protocol::ServerInfo { name: "CodeMux", version: env!("CARGO_PKG_VERSION") };
+
+/// A stateless-era rejection, `data` included (an unsupported revision lists
+/// the supported ones). A method the revision lacks is 404; header, revision
+/// and envelope errors are 400, which is how a dual-era client tells a
+/// stateless server from an initialize-era one.
+fn modern_failure(id: &Value, error: RpcError) -> Response {
+    let status = if error.code == mcp_protocol::code::METHOD_NOT_FOUND {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    json_response(status, json!({"jsonrpc":"2.0","id":id,"error":error}))
+}
+
+/// Which era serves this POST. Requests name it per request; notifications
+/// carry no `_meta` revision, so a stateless client's ones are known by
+/// their header alone. Both eras share one endpoint.
+fn request_era(rpc: &protocol::Rpc, headers: &HeaderMap, id: &Value) -> Result<Era, Response> {
+    let version = protocol::header_value(headers, mcp_protocol::PROTOCOL_VERSION_HEADER)
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "invalid_mcp_headers"))?;
+    let era = if rpc.id.is_some() {
+        Era::of_http(version, &rpc.method, &rpc.params).map_err(|error| modern_failure(id, error))?
+    } else {
+        Era::Legacy
+    };
+    match era {
+        Era::Modern(_) => {
+            // Duplicated or non-ASCII mirror headers are malformed.
+            let mirror = |name| {
+                protocol::header_value(headers, name).map_err(|_| {
+                    modern_failure(id, RpcError::header_mismatch(format_args!("malformed {name} header")))
+                })
+            };
+            let (method, name) = (mirror(mcp_protocol::METHOD_HEADER)?, mirror(mcp_protocol::NAME_HEADER)?);
+            mcp_protocol::check_standard_headers(method, name, &rpc.method, &rpc.params)
+                .map_err(|error| modern_failure(id, error))?;
+            if !mcp_protocol::MODERN_METHODS.contains(&rpc.method.as_str()) {
+                return Err(modern_failure(id, RpcError::method_not_found(&rpc.method)));
+            }
+        }
+        Era::Legacy => {
+            let unchecked = rpc.method == "initialize"
+                || (rpc.id.is_none() && version.is_some_and(mcp_protocol::is_modern_version));
+            protocol::mcp_headers(headers, unchecked).map_err(|status| failure(status, "invalid_mcp_headers"))?;
+        }
+    }
+    Ok(era)
+}
+
 async fn mcp<R: Runtime>(
     app: &AppHandle<R>,
     ingress: &Ingress,
@@ -338,9 +393,11 @@ async fn mcp<R: Runtime>(
         }
     };
     let id = rpc.id.clone().unwrap_or(Value::Null);
-    if let Err(status) = protocol::mcp_headers(headers, rpc.method == "initialize") {
-        return failure(status, "invalid_mcp_headers");
-    }
+    let era = match request_era(&rpc, headers, &id) {
+        Ok(era) => era,
+        Err(response) => return response,
+    };
+    let modern = matches!(era, Era::Modern(_));
     if let Err((code, message)) = rpc.validate_method() {
         return rpc_error(
             id,
@@ -363,13 +420,27 @@ async fn mcp<R: Runtime>(
         return secure(StatusCode::ACCEPTED.into_response());
     }
     let result = match rpc.method.as_str() {
+        "server/discover" if modern => mcp_protocol::DiscoverResult {
+            tools_list_changed: Some(false),
+            server_info: SERVER_INFO,
+            instructions: Some(agent_control::INSTRUCTIONS),
+        }
+        .to_value(),
         "initialize" => {
             // Echo the offer when Codemux speaks it, else the latest revision.
             let version = crate::mcp::protocol::negotiate(rpc.params["protocolVersion"].as_str());
             json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"CodeMux","version":env!("CARGO_PKG_VERSION")},"instructions":agent_control::INSTRUCTIONS})
         }
         "ping" => json!({}),
-        "tools/list" => json!({"tools":agent_control::registry::tools_for(caller)}),
+        "tools/list" => {
+            let tools = json!({"tools":agent_control::registry::tools_for(caller)});
+            if modern {
+                // The list depends on the grant's access level.
+                mcp_protocol::cacheable(tools, mcp_protocol::TOOLS_LIST_TTL_MS, mcp_protocol::CacheScope::Private)
+            } else {
+                tools
+            }
+        }
         "tools/call" => {
             // validate_method guarantees a name.
             let name = rpc.params["name"].as_str().unwrap_or_default();
@@ -377,32 +448,33 @@ async fn mcp<R: Runtime>(
             // A call that may park trades its request permit for a wait slot,
             // so parked waits never starve token refresh or other calls.
             let parks = agent_control::registry::lookup(name).is_some_and(|(_, spec)| spec.may_wait());
-            let _slot = if parks {
-                let Some(slot) = app.state::<McpConnectorState>().admit_wait(&caller.principal) else {
-                    let busy = ControlError::new(
-                        ErrorCode::WaitBudgetExhausted,
-                        "Too many waits in progress; retry shortly",
-                    );
-                    return json_response(
-                        StatusCode::OK,
-                        json!({"jsonrpc":"2.0","id":id,"result":agent_control::registry::mcp_error(&busy)}),
-                    );
-                };
-                drop(permit);
-                Some(slot)
+            let slot = if parks {
+                let slot = app.state::<McpConnectorState>().admit_wait(&caller.principal);
+                if slot.is_some() {
+                    drop(permit);
+                }
+                slot.map(Some)
             } else {
-                None
+                Some(None)
             };
-            // The registry gates access, validates the arguments (a bad one is
-            // a tool error naming the field) and presents the result. Handlers
-            // repeat grant checks before each mutation and after any await.
-            match agent_control::registry::call(app, caller, name, arguments).await {
-                Ok(result) => result,
-                Err(_) => return rpc_error(id, -32602, "Unknown tool", StatusCode::OK),
+            match slot {
+                None => agent_control::registry::mcp_error(&ControlError::new(
+                    ErrorCode::WaitBudgetExhausted,
+                    "Too many waits in progress; retry shortly",
+                )),
+                // The registry gates access, validates the arguments (a bad
+                // one is a tool error naming the field) and presents the
+                // result. Handlers repeat grant checks before each mutation
+                // and after any await. The wait slot is held until it returns.
+                Some(_slot) => match agent_control::registry::call(app, caller, name, arguments).await {
+                    Ok(result) => result,
+                    Err(_) => return rpc_error(id, -32602, "Unknown tool", StatusCode::OK),
+                },
             }
         }
         _ => return rpc_error(id, -32601, "Method not found", StatusCode::OK),
     };
+    let result = if modern { mcp_protocol::complete_result(result, SERVER_INFO) } else { result };
     json_response(
         StatusCode::OK,
         json!({"jsonrpc":"2.0","id":id,"result":result}),
@@ -2796,16 +2868,135 @@ mod tests {
         assert_eq!(response["result"]["serverInfo"]["name"], "CodeMux");
     }
 
+    /// A stateless-era (2026-07-28) POST the way dual-era SDKs send it: the
+    /// `_meta` envelope in the body, mirrored by the version, method and
+    /// name headers.
+    fn modern_request(f: &Fixture, id: u64, method: &str, mut params: Value, token: Option<&str>) -> axum::http::Request<Body> {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "hermes", "version": "2.0.0"},
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        let name = params["name"].as_str().map(str::to_owned);
+        let body = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+        let mut r = request(f, "/mcp", "POST", &body.to_string(), token);
+        let headers = r.headers_mut();
+        headers.insert("mcp-protocol-version", "2026-07-28".parse().unwrap());
+        headers.insert("mcp-method", method.parse().unwrap());
+        if let Some(name) = name {
+            headers.insert("mcp-name", name.parse().unwrap());
+        }
+        r
+    }
+
+    fn server_info() -> Value {
+        json!({"name": "CodeMux", "version": env!("CARGO_PKG_VERSION")})
+    }
+
     #[tokio::test]
-    async fn connector_rejects_modern_protocol_header_with_a_legacy_error_body() {
+    async fn stateless_clients_discover_list_and_call_beside_initialize_era_ones() {
         let f = fixture().await;
         let token = grant(&f);
-        let mut r = request(&f, "/mcp", "POST", r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, Some(&token));
-        r.headers_mut().insert("mcp-protocol-version", "2026-07-28".parse().unwrap());
-        let response = invoke(&f, r).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = value(response).await;
-        assert!(!body.to_string().contains("-32022"), "{body}");
+        let response = invoke(&f, modern_request(&f, 1, "server/discover", json!({}), Some(&token))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let discover = value(response).await;
+        assert_eq!(discover["id"], 1);
+        let result = &discover["result"];
+        assert_eq!(result["resultType"], "complete", "{discover}");
+        assert_eq!(result["supportedVersions"], json!(["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]));
+        assert_eq!(result["capabilities"], json!({"tools": {"listChanged": false}}));
+        assert_eq!(result["instructions"], agent_control::INSTRUCTIONS);
+        assert_eq!(result["_meta"]["io.modelcontextprotocol/serverInfo"], server_info());
+        assert_eq!((result["ttlMs"].as_u64(), result["cacheScope"].as_str()), (Some(3_600_000), Some("public")));
+
+        let modern_list = value(invoke(&f, modern_request(&f, 2, "tools/list", json!({}), Some(&token))).await).await;
+        let legacy_list = value(invoke(&f, request(&f, "/mcp", "POST", r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#, Some(&token))).await).await;
+        assert_eq!(modern_list["result"]["tools"], legacy_list["result"]["tools"], "one catalog per grant for both eras");
+        assert!(legacy_list["result"].get("resultType").is_none(), "initialize-era results are unchanged");
+        let listed = &modern_list["result"];
+        assert_eq!(listed["resultType"], "complete");
+        assert_eq!((listed["ttlMs"].as_u64(), listed["cacheScope"].as_str()), (Some(300_000), Some("private")));
+        assert_eq!(listed["_meta"]["io.modelcontextprotocol/serverInfo"], server_info());
+
+        let call = value(invoke(&f, modern_request(&f, 4, "tools/call", json!({"name": "workspace_list", "arguments": {}}), Some(&token))).await).await;
+        assert_eq!(call["result"]["isError"], false, "{call}");
+        assert_eq!(call["result"]["resultType"], "complete");
+        assert!(call["result"]["structuredContent"]["workspaces"].is_array(), "{call}");
+        // Tool failures stay tool results; a read grant is refused writes.
+        let refused = value(invoke(&f, modern_request(&f, 5, "tools/call", json!({"name": "thread_stop", "arguments": {
+            "workspace_id": "missing", "thread_id": "missing", "client_request_id": "request"
+        }}), Some(&token))).await).await;
+        assert_eq!(refused["result"]["structuredContent"]["error"]["code"], "access_denied", "{refused}");
+        assert_eq!(refused["result"]["resultType"], "complete");
+
+        // Credentials are still checked first-class on the stateless path.
+        assert_eq!(invoke(&f, modern_request(&f, 6, "tools/list", json!({}), None)).await.status(), StatusCode::UNAUTHORIZED);
+        // A stateless client's notification carries its revision only in the header.
+        let mut cancelled = request(&f, "/mcp", "POST", r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4}}"#, Some(&token));
+        cancelled.headers_mut().insert("mcp-protocol-version", "2026-07-28".parse().unwrap());
+        assert_eq!(invoke(&f, cancelled).await.status(), StatusCode::ACCEPTED);
+    }
+
+    /// The status and JSON-RPC error of one rejected POST.
+    async fn rejected(f: &Fixture, r: axum::http::Request<Body>) -> (StatusCode, Value) {
+        let response = invoke(f, r).await;
+        let status = response.status();
+        (status, value(response).await["error"].clone())
+    }
+
+    #[tokio::test]
+    async fn stateless_headers_must_mirror_the_body() {
+        let f = fixture().await;
+        let token = grant(&f);
+        let call = || modern_request(&f, 7, "tools/call", json!({"name": "thread_list", "arguments": {}}), Some(&token));
+        let cases: Vec<(&str, axum::http::Request<Body>)> = vec![
+            ("missing Mcp-Method", { let mut r = call(); r.headers_mut().remove("mcp-method"); r }),
+            ("other Mcp-Method", { let mut r = call(); r.headers_mut().insert("mcp-method", "tools/list".parse().unwrap()); r }),
+            ("missing Mcp-Name", { let mut r = call(); r.headers_mut().remove("mcp-name"); r }),
+            ("other Mcp-Name", { let mut r = call(); r.headers_mut().insert("mcp-name", "thread_stop".parse().unwrap()); r }),
+            ("two Mcp-Name", { let mut r = call(); r.headers_mut().append("mcp-name", "thread_list".parse().unwrap()); r }),
+            ("missing version", { let mut r = call(); r.headers_mut().remove("mcp-protocol-version"); r }),
+            ("other version", { let mut r = call(); r.headers_mut().insert("mcp-protocol-version", "2025-11-25".parse().unwrap()); r }),
+        ];
+        for (case, r) in cases {
+            let (status, error) = rejected(&f, r).await;
+            assert_eq!((status, error["code"].clone()), (StatusCode::BAD_REQUEST, json!(-32020)), "{case}: {error}");
+        }
+        // A Base64-encoded name is decoded before it is compared.
+        let mut encoded = call();
+        encoded.headers_mut().insert("mcp-name", "=?base64?dGhyZWFkX2xpc3Q=?=".parse().unwrap());
+        assert_eq!(invoke(&f, encoded).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn stateless_revision_errors_are_modern_json_rpc_errors() {
+        let f = fixture().await;
+        let token = grant(&f);
+        // A revision Codemux does not speak lists the ones it does, so a
+        // dual-era client retries instead of falling back.
+        let body = json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{
+            "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }}});
+        let mut future = request(&f, "/mcp", "POST", &body.to_string(), Some(&token));
+        future.headers_mut().insert("mcp-protocol-version", "2099-01-01".parse().unwrap());
+        future.headers_mut().insert("mcp-method", "server/discover".parse().unwrap());
+        let (status, error) = rejected(&f, future).await;
+        assert_eq!((status, error["code"].clone()), (StatusCode::BAD_REQUEST, json!(-32022)), "{error}");
+        assert_eq!(error["data"]["supported"][0], "2026-07-28");
+        assert_eq!(error["data"]["requested"], "2099-01-01");
+        // A stateless header on a body that lost its envelope is malformed.
+        let mut bare = request(&f, "/mcp", "POST", r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, Some(&token));
+        bare.headers_mut().insert("mcp-protocol-version", "2026-07-28".parse().unwrap());
+        let (status, error) = rejected(&f, bare).await;
+        assert_eq!((status, error["code"].clone()), (StatusCode::BAD_REQUEST, json!(-32602)), "{error}");
+        // `ping` is not part of the stateless revision.
+        let (status, error) = rejected(&f, modern_request(&f, 2, "ping", json!({}), Some(&token))).await;
+        assert_eq!((status, error["code"].clone()), (StatusCode::NOT_FOUND, json!(-32601)), "{error}");
+        // Without an envelope, discover is method-not-found: the fallback signal.
+        let legacy = r#"{"jsonrpc":"2.0","id":3,"method":"server/discover","params":{}}"#;
+        let response = value(invoke(&f, request(&f, "/mcp", "POST", legacy, Some(&token))).await).await;
+        assert_eq!((response["id"].clone(), response["error"]["code"].clone()), (json!(3), json!(-32601)));
     }
 
     #[tokio::test]

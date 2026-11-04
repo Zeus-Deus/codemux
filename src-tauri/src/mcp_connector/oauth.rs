@@ -644,7 +644,10 @@ pub mod protocol {
             && parts.all(|s| s.trim().eq_ignore_ascii_case("charset=utf-8"))
     }
 
-    pub fn mcp_headers(headers: &HeaderMap, initialize: bool) -> Result<(), StatusCode> {
+    /// The initialize-era header rules. `version_free` skips the version
+    /// check for requests that do not follow it: `initialize`, and a
+    /// stateless-era (2026-07-28) client's notifications.
+    pub fn mcp_headers(headers: &HeaderMap, version_free: bool) -> Result<(), StatusCode> {
         if !content_type(headers, "application/json") {
             return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         }
@@ -668,7 +671,7 @@ pub mod protocol {
         // name any revision Codemux speaks.
         let version = header_value(headers, crate::mcp::protocol::PROTOCOL_VERSION_HEADER)
             .map_err(|_| StatusCode::BAD_REQUEST)?;
-        if initialize {
+        if version_free {
             return Ok(());
         }
         crate::mcp::protocol::http_version(version)
@@ -874,6 +877,9 @@ pub mod protocol {
                         && self.params["clientInfo"].get("title").is_none_or(label)
                 }
                 "ping" => keys(&self.params, &["_meta"]),
+                // Stateless era (2026-07-28) only; mcp() answers an
+                // initialize-era one with method-not-found.
+                "server/discover" => keys(&self.params, &["_meta"]),
                 // Codemux never paginates, so no cursor is one it handed out.
                 "tools/list" if self.params.get("cursor").is_some() => {
                     return Err((-32602, "Invalid cursor"))
@@ -1054,6 +1060,9 @@ pub mod protocol {
             let list = |params| Rpc::parse(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":params})).unwrap();
             assert_eq!(list(json!({"cursor":"next"})).validate_method(), Err((-32602, "Invalid cursor")));
             assert!(list(json!({"_meta":{}})).validate_method().is_ok());
+            let discover = |params| Rpc::parse(json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":params})).unwrap();
+            assert!(discover(json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}})).validate_method().is_ok());
+            assert_eq!(discover(json!({"extra":1})).validate_method(), Err((-32602, "Invalid params")));
         }
         #[test]
         fn escaped_neutralizes_html_metacharacters() {
