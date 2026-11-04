@@ -393,6 +393,22 @@ impl<R: Runtime> WorkspaceLaunchHost<R> {
     }
 }
 
+/// The new workspace's setup runs on after this launch returned and after the
+/// chat's turn ended, so it asks only what the person withdraws: it stops
+/// once they stop or delete the chat or narrow its mode
+/// ([`service::authorize_background`]), as a plugin's worktree setup does.
+/// The create's own steps pass unchecked as before: `start` authorizes the
+/// chat before it and again before the new chat starts.
+fn setup_checkpoint<R: Runtime>(
+    app: &AppHandle<R>,
+    control: &crate::agent_control::ControlCaller,
+) -> crate::workspace_service::Checkpoint {
+    let (app, control) = (app.clone(), control.clone());
+    crate::workspace_service::Checkpoint::default().with_background(move || {
+        service::authorize_background(&app, &control).map_err(|error| error.to_string())
+    })
+}
+
 async fn start<R: Runtime>(
     app: &AppHandle<R>,
     caller: &HostCaller,
@@ -429,7 +445,7 @@ async fn start<R: Runtime>(
         }
         // `base` is the commit resolved before admission, labelled with the
         // branch the caller named, if any.
-        let created = super::workspace::create_worktree_from_request(
+        let created = super::workspace::create_worktree_checked(
             app.clone(),
             crate::workspace_service::WorktreeRequest {
                 repo_path: repo.to_string_lossy().into_owned(),
@@ -443,6 +459,7 @@ async fn start<R: Runtime>(
                 initial_chat: None,
                 reserved_id: None,
             },
+            &setup_checkpoint(app, &control),
         )
         .await?;
         if created.adopted {

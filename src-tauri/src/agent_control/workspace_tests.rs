@@ -1041,6 +1041,77 @@ async fn setup_checkpoint_stops_once_remote_access_is_turned_off() {
     assert!(db.web_remote_get_session("paired").is_some_and(|session| session.approved && !session.revoked));
 }
 
+/// An in-app chat's `workspace_launch` returns before the new workspace's
+/// setup runs. The end of the chat's turn leaves that setup running; the
+/// person stopping the chat while the setup waits to start means no setup
+/// command starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_launch_setup_outlives_the_turn_but_not_a_stop() {
+    if isolated(&format!("{MODULE}workspace_launch_setup_outlives_the_turn_but_not_a_stop")) {
+        return;
+    }
+    without_terminal_daemon();
+    for stopped in [true, false] {
+        let (app, _provider, root, workspace, thread, authority, actor) = native_caller_fixture("default").await;
+        app.manage(crate::terminal::PtyState::default());
+        app.manage(crate::presets::PresetStoreState::new(&app.state::<DatabaseStore>()));
+        let repo = root.path().to_path_buf();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+        // The new checkout falls back to the repository's own scripts.
+        write_scripts(&repo, json!({"setup": ["touch setup-first"]}));
+        let mut outcomes = setup_outcomes(&app);
+        let branch = if stopped { "launch-stopped" } else { "launch-turn-ended" };
+        let path = crate::git::conventional_worktree_path(&repo, branch).unwrap();
+        let caller = crate::mcp::registry::HostCaller {
+            control: Some(super::native::qualify(app.handle(), &actor).await.unwrap()),
+            thread_id: thread.clone(),
+            provider: ProviderKind::Claude,
+            workspace_id: Some(workspace),
+            permission_mode: Some("default".into()),
+        };
+        let host = crate::commands::workspace_launch::WorkspaceLaunchHost::with_install_check(app.handle().clone(), |_| true);
+        let args = json!({"title": "Setup after launch", "message": "Work on this self-contained fixture", "branch": branch});
+        let result = crate::mcp::registry::HostTools::call(&host, &caller, "mcp__codemux__workspace_launch", &args).unwrap();
+        assert_eq!(result["isError"], false, "{result}");
+
+        // The workspace appears once the create made it, just before its
+        // setup starts waiting.
+        let created = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let found = app.state::<AppStateStore>().snapshot().workspaces.into_iter()
+                    .find(|w| w.worktree_path.as_deref().map(Path::new) == Some(path.as_path()));
+                if let Some(found) = found {
+                    break found.workspace_id.0;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the launch creates its workspace");
+        if stopped {
+            // Stop, as the person presses it in the chat.
+            crate::commands::agent_chat::agent_chat_interrupt_turn(app.handle().clone(), ProviderKind::Claude, ThreadId(thread.clone()), None)
+                .await
+                .unwrap();
+        } else {
+            authority.finish("native-run");
+        }
+
+        let (event, payload) = tokio::time::timeout(Duration::from_secs(15), outcomes.recv()).await.expect("the setup ends").unwrap();
+        assert_eq!(payload["workspace_id"], created, "{payload}");
+        if stopped {
+            assert_eq!(event, "workspace-setup-failed", "{payload}");
+            assert_eq!(payload["command"], "touch setup-first", "{payload}");
+            assert!(payload["stderr"].as_str().unwrap().starts_with("stale_caller: "), "{payload}");
+            assert!(!path.join("setup-first").exists(), "no setup command starts once the chat is stopped");
+        } else {
+            assert_eq!(event, "workspace-setup-complete", "{payload}");
+            assert!(path.join("setup-first").exists(), "the end of a turn leaves setup running");
+        }
+    }
+}
+
 // ── outside answers: approvals and questions ──────────────────────────────
 
 async fn launched(app: &App, key: &str, workspace: &str, mode: &str) -> String {
