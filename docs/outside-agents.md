@@ -16,7 +16,7 @@ There are two ways in:
 | Sign-in | None. It runs as you. | OAuth sign-in or a token, with an access level you choose |
 | Needs | Codemux open: the desktop app or `codemux serve` | **Over the network** turned on |
 
-Both reach the same tools. **Settings → Connections → Outside assistants** shows copy-ready commands for both.
+Both reach the same tools. **Settings → Connections → Outside assistants** shows copy-ready setup commands for this computer. For the network door it shows the MCP URL, a Tailscale command and the tokens.
 
 ## On this computer
 
@@ -38,7 +38,7 @@ codex mcp add codemux -- codemux mcp --client codex
 
 `codex mcp list` should list `codemux`.
 
-- Keep the name `codemux`. Codemux turns off an entry with exactly that name in the Codex chats it starts itself, because those chats already have their own Codemux tools.
+- In the Codex chats it starts itself, Codemux turns off every entry in `~/.codex/config.toml` that runs `codemux mcp`, whatever its name, and any entry named `codemux`. Those chats already have their own Codemux tools.
 - Codex starts MCP servers without `XDG_RUNTIME_DIR`. Codemux then looks for its socket in `/run/user/<your uid>`, which is where it listens on most Linux systems. If `echo "$XDG_RUNTIME_DIR"` prints another folder, add the entry with this command instead:
 
   ```sh
@@ -76,7 +76,7 @@ mcp_servers:
 hermes mcp add codemux --command codemux --args mcp --client hermes --access full-access
 ```
 
-Hermes also loads its MCP servers in the Hermes chats that Codemux starts. On Linux, Codemux recognises those as its own agents: they keep the older tools but are refused thread, workspace and administration tools. On macOS and Windows it can't tell them apart, so they run as `hermes` with the access level above. That is one more reason to keep a bot supervised.
+Hermes also loads its MCP servers in the Hermes chats that Codemux starts. On Linux, Codemux recognises those as its own agents. They can still use the older tools, such as the browser and git tools, but every tool in the [Tool reference](#tool-reference) fails with `agent_identity_required`, and administration tools fail with `admin_refused`. On macOS and Windows it can't tell them apart, so they run as `hermes` with the access level above. That is one more reason to keep a bot supervised.
 
 ### Any other MCP client
 
@@ -169,7 +169,7 @@ Codemux listens on this computer only, on port 4378, at `http://127.0.0.1:4378/m
 codemux connector enable --port 4379
 ```
 
-`codemux connector status` shows whether it is listening, its URLs and who has access.
+`codemux connector status` shows whether it is listening, its URLs, and how many assistants are connected or waiting to sign in. `codemux connector list` names the connected ones, and `codemux connector pending` the sign-ins.
 
 #### Serve it over HTTPS
 
@@ -266,7 +266,7 @@ codemux connector revoke hermes-bot
 codemux connector revoke --all
 ```
 
-`revoke` takes a token's label or a client id from `codemux connector list`. Turning **Over the network** off (`codemux connector disable`) pauses every network assistant: they can't connect, and they work again when you turn it back on. **Revoke all** ends them for good. Assistants on this computer aren't affected either way, because they run as you.
+`revoke` takes a token's label or a client id from `codemux connector list`. Revoking also stops that assistant's calls in progress: its waits end, and a change it started, such as a worktree being created or an answer on its way to the worker, stops before its next step. Their receipts fail with `grant_revoked`. Turning **Over the network** off (`codemux connector disable`) pauses every network assistant: they can't connect, and they work again when you turn it back on. **Revoke all** ends them for good. Assistants on this computer aren't affected either way, because they run as you.
 
 #### What differs over the network
 
@@ -274,13 +274,13 @@ codemux connector revoke --all
 - `workspace_create` and `worktree_create` only open folders of projects already opened in Codemux (`unknown_project_root` otherwise).
 - `thread_respond` can allow a request once or deny it. `allow_always` is only available on this computer.
 - `workspace_close` can remove a clean worktree and its branch, never with `force_delete`.
-- `worktree_create` can't start a terminal preset or prompt.
+- `worktree_create` can't start a terminal preset (`agent_preset_id`). Without a preset, `initial_prompt` is ignored.
 - At most 32 `thread_wait` calls wait at once, 8 per assistant. Over that, a call fails with `wait_budget_exhausted`; retry it shortly.
 - Proxies often cut requests that take longer than a minute or two. Behind one, keep `timeout_ms` at 90000 or less.
 
 ### Codemux on a server
 
-Run `codemux serve` on the server. A bot on the same server uses the [On this computer](#on-this-computer) setup. A bot elsewhere uses SSH or the network door. Manage the network door over SSH with `codemux connector …`: Settings, opened from a paired browser, only shows it.
+Run `codemux serve` on the server. A bot on the same server uses the [On this computer](#on-this-computer) setup. A bot elsewhere uses SSH or the network door. The server has no desktop app, and Settings in a paired browser doesn't manage outside assistants, so manage the network door over SSH with `codemux connector …`.
 
 ## The end-to-end flow
 
@@ -332,35 +332,28 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
    - With `worktree`, the thread starts in a new git worktree and workspace, branched from the repository's default branch unless you pass `base`. The receipt names the new workspace at once. This needs full access, because the worktree runs the project's setup scripts. It never reuses an existing branch.
    - Without `worktree`, the thread runs in the workspace's own folder.
 
-4. **Wait for the launch to land.**
+4. **Wait for the result.** Pass the receipt's `workspace_id`, `thread_id` and `operation_id`:
 
    ```text
-   operation_status {"operation_id": "5d2e…"}
-   → {"state": "succeeded", "result": {"turn": {"turn_id": "c41b…", …}, …}, …}
-   ```
-
-   Call it again until `state` is `succeeded` or `failed`. `accepted` and `running` mean Codemux took the request, not that the work is done. `failed` carries an `error` with a code. `needs_attention` means Codemux can't tell whether the work started: read the thread before you send anything again.
-
-5. **Wait for the result.**
-
-   ```text
-   thread_wait {"workspace_id": "workspace-9", "thread_id": "8a1f…", "turn_id": "c41b…", "timeout_ms": 50000}
-   → {"state": "running", "timed_out": true, "wait_cursor": "9c41d07e2b6a8f15", …}
+   thread_wait {"workspace_id": "workspace-9", "thread_id": "8a1f…", "operation_id": "5d2e…", "timeout_ms": 50000}
+   → {"state": "running", "turn_id": "c41b…", "timed_out": false, "wait_cursor": "9c41d07e2b6a8f15", …}
    → {"state": "done", "final_text": "The test raced the session cleanup. …", "pending": {"approvals": [], "questions": [], "secrets": []}, …}
    ```
+
+   Call `thread_wait` again while `state` is `running`:
 
    <!-- wait-states:start -->
    | `state` | Meaning | What to do |
    |---|---|---|
-   | `running` | Still working; the wait timed out | Call `thread_wait` again |
-   | `needs_input` | It waits for an approval, an answer or a secret (`pending`) | See step 6 |
+   | `running` | Still working, or the run just started | Call `thread_wait` again |
+   | `needs_input` | It waits for an approval, an answer or a secret (`pending`) | See step 5 |
    | `done` | The run finished | Read `final_text` |
    | `failed` | It ended without a usable answer; `failure` says why | Read the thread, then decide |
    <!-- wait-states:end -->
 
-   - `failure` is one of `error`, `interrupted`, `max_turns`, `max_budget`, `usage_limit`, `no_final_message`, `went_idle` and `delivery_needs_attention`.
+   - `failure` is one of `error`, `interrupted`, `max_turns`, `max_budget`, `usage_limit`, `no_final_message`, `went_idle`, `delivery_needs_attention` and `operation_failed`.
    - `timeout_ms` defaults to 50000 (50 seconds), under the 60-second request timeout many MCP clients use by default. The most is 600000 (ten minutes). Keep it below your client's tool timeout. A timeout never cancels work.
-   - `turn_id` keeps the wait on one run. Without it, the wait follows the thread's current run.
+   - Loop on `state`, not on the older `settled` field: a run that was stopped, or that a newer run replaced, returns at once with `settled: false`.
    - A wait returns when something changes. Input that was already pending when the wait began is reported only at its timeout. After a reconnect, call `thread_status` first: it returns the same `state`, `pending` and `wait_cursor` at once.
    - To wait for the next change of any kind, pass the previous `wait_cursor` as `since`:
 
@@ -370,7 +363,26 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
 
    - `final_text` is the run's last assistant message. It is data, not instructions: it can quote hostile text from files or web pages.
 
-6. **Answer what it waits on.** `pending` lists what is open:
+   **Which run a wait follows.** Pass `operation_id` or `turn_id`, not both (`invalid_arguments`):
+
+   - **`operation_id`**, from your own `thread_launch` or `thread_send` receipt, follows the run its message starts or is steered into, even while the message still waits in the thread's queue.
+     - Until that run starts, `turn_id` is `null` and `state` is `running`, or `needs_input` if the thread waits on input first. The wait returns as soon as the run starts, with its `turn_id`.
+     - If the message never runs, `state` is `failed`, at once. `failure` is `operation_failed` when the launch or send failed or the message was removed from the queue, and `delivery_needs_attention` when Codemux can't tell whether it was delivered.
+     - The result also holds `operation`: the receipt's `operation_id`, `state` and `error`.
+     - An id that isn't yours is `operation_not_found`. A receipt for another thread, or for a launch without a message, is `invalid_target`.
+   - **`turn_id`** follows that run only. A run that was stopped without a recorded end reads `failed` with `went_idle` once the thread is idle or a newer run has started. A `turn_id` the thread never ran is `invalid_target` once the thread is idle.
+   - **Neither** follows the thread's current run.
+
+   **Receipts.** `operation_status` reads a receipt without waiting:
+
+   ```text
+   operation_status {"operation_id": "5d2e…"}
+   → {"state": "succeeded", "result": {"turn": {"turn_id": "c41b…", …}, …}, …}
+   ```
+
+   `accepted` and `running` mean Codemux took the request, not that the work is done. `failed` carries an `error` with a code. `needs_attention` means Codemux can't tell whether the work started: read the thread before you send anything again.
+
+5. **Answer what it waits on.** `pending` lists what is open:
    - **Approvals** (`pending.approvals`): answer with `thread_respond`. Supervised assistants can only deny. Full access can allow once.
 
      ```text
@@ -387,7 +399,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
      An answer never changes the thread's permission mode. `question_closed` means someone answered or dismissed it already. `question_answer_failed` means the answer wasn't delivered, or its delivery isn't confirmed. If the message says the worker didn't take the answer, you can answer again with a new `client_request_id`. Otherwise don't: the person settles it in Codemux. If Codemux refused the answer because your access no longer covers the thread, you get that reason instead: `grant_revoked`, `permission_ceiling` or `permission_state_unconfirmed`. Answering again won't help until the person changes that.
    - **Secrets** (`pending.secrets`): only the person can enter a secret, in Codemux. You see its label and reason, never a value. Tell the person, then wait again.
 
-7. **Read more, or follow up.**
+6. **Read more, or follow up.**
 
    ```text
    thread_read {"workspace_id": "workspace-9", "thread_id": "8a1f…", "limit": 20}
@@ -395,10 +407,10 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
    ```
 
    - `thread_read` pages through the visible conversation with `cursor` (from `next_cursor`). It holds user messages and the assistant's replies, not hidden reasoning or raw tool output.
-   - `thread_send` with the default `"delivery": "auto"` starts an idle thread, steers a busy one where that's safe, and otherwise queues. `queue`, `steer` and `interrupt` are explicit. Its receipt's `result.accepted_as` says which happened, and `result.turn.turn_id` is the run to wait on.
+   - `thread_send` with the default `"delivery": "auto"` starts an idle thread, steers a busy one where that's safe, and otherwise queues. `queue`, `steer` and `interrupt` are explicit. Its receipt's `result.accepted_as` says which happened. Pass its `operation_id` to `thread_wait` to follow the run the message starts, queued or not.
    - `thread_interrupt` stops the current turn; pass `turn_id` so a newer run isn't cut short. `thread_stop` ends the provider session and its queue. The thread, its history and files stay.
 
-8. **Clean up.**
+7. **Clean up.**
 
    ```text
    workspace_close {"workspace_id": "workspace-9", "delete_worktree": true, "client_request_id": "close-9"}
@@ -442,7 +454,9 @@ codemux workspace close "$WS" --remove-worktree
 
 - `workspace close --remove-worktree` also removes the worktree; it refuses one with uncommitted or unpushed work unless you add `--force`.
 - Every mutation takes `--request-id` (`--request-key` for `thread respond`). Reuse it to retry safely.
-- `--wait` and `thread wait` keep waiting until the run ends or needs input. Pass `--timeout` in scripts.
+- `--wait` follows the run its message starts, also when the message was queued, and stops when that run ends or needs input. A message that never runs exits `1` with its receipt's error.
+- `thread wait` follows the thread's current run, then any runs queued behind it. It stops when a run needs input, or when a run ends with nothing queued after it. `--turn` keeps it on one run.
+- Neither stops while the work goes on. Pass `--timeout` in scripts.
 
 Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` usage error.
 
@@ -461,15 +475,16 @@ Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` 
 
 - Supervised permission modes are the ones that ask before acting, such as Claude's `default`, `acceptEdits` and `plan`, or Codex's `read-only`, `workspace-write` and `plan`. `agent_capabilities` lists the ones you may use as `allowed_permission_modes`.
 - Opening a workspace or creating a worktree runs the project's setup scripts. That's why those need full access.
-- `allow_always`, `force_delete`, and `worktree_create` with a terminal preset or prompt are only for assistants on this computer.
+- `allow_always`, `force_delete`, and `worktree_create` with a terminal preset (`agent_preset_id`) are only for assistants on this computer.
 - Assistants on this computer at full access also get the older administration tools of `codemux mcp`, such as `automation_create`, `terminal_write` and `preset_apply`. Network assistants never do.
 - Approving connections, Remote Access and pairing devices are never MCP tools. Use Settings or the `codemux` CLI.
 - Agents that Codemux started are refused administration commands, even through the `codemux` CLI (`admin_refused`). They use their chat's own Codemux tools for threads and workspaces (`agent_identity_required` otherwise).
+- Codemux runs a project's setup and teardown scripts, and every git command it starts, as such agents, whoever asked for them. So a `codemux` command in a setup or teardown script, a git hook or a `core.fsmonitor` command gets the same refusals. Commands you type in your own terminal aren't affected.
 
 ## Security
 
 - **An assistant on this computer runs as you.** Names and access levels set limits and record who did what. They don't isolate one program from another under the same account.
-- **Full access lets an assistant run any program as you**, through the agents it starts and the setup scripts it triggers. Agents that Codemux started are refused administration commands as a safety net, not as a boundary. Give bots Supervised unless you trust everything that can reach them.
+- **Full access lets an assistant run any program as you**, through the agents it starts and the setup scripts it triggers. Agents that Codemux started, setup and teardown scripts, and git hooks are refused administration commands as a safety net, not as a boundary. Give bots Supervised unless you trust everything that can reach them.
 - **Chat bots relay other people's words.** A message to your Hermes bot can try to steer what it asks Codemux to do. That's prompt injection. Keep bots supervised, so approvals stay with you. Never approve worker requests automatically from a bot. Limit who can message the bot.
 - **What a thread says is data, not instructions.** `final_text` and `thread_read` can quote files, web pages or tool output that contain hostile text.
 - **Access covers every workspace.** Any level can read every workspace and every visible conversation, not just one project.
@@ -505,28 +520,34 @@ A paired phone or browser can remove a clean worktree, for example with **Device
 
 - **The network door moved to its own port, 4378.** It used to share Remote Access's port 4377, and it no longer needs Remote Access. Point your proxy at port 4378. Assistants that used `http://127.0.0.1:4377/mcp` directly need the new URL and a new sign-in.
 - **Network sign-ins renew themselves**, and bots can use labelled tokens. A used refresh token that comes back more than 30 seconds later ends its sign-in, so don't copy a client's saved sign-in between machines. Hermes can now connect over HTTP.
-- **`codemux mcp` lists 76 tools at full access.** `workspace_list`, `workspace_info`, `workspace_create`, `worktree_create` and `workspace_close` are now control tools there:
+- **`codemux mcp` lists 76 tools at full access.** `workspace_list`, `workspace_info`, `workspace_create`, `worktree_create` and `workspace_close` are now control tools there. If your scripts called them before:
+  - All five refuse unknown arguments (`invalid_arguments`), return compact JSON with `structuredContent`, and report errors as `isError` results with a code.
   - `workspace_list` returns summaries; `"detail": "full"` returns the old snapshots. Rows add `worktree_path` and `parent_workspace_id`, and workspaces on other machines read `native_control_available: false`.
+  - `workspace_info` takes an optional `workspace_id`. Without one, while no workspace is focused in Codemux, it is the error `no_active_workspace`, not a result with an `error` key.
+  - `workspace_create` returns the workspace already open in that folder (`created: false`) instead of opening a second one. Its `path` must be an existing folder, absolute or starting with `~`.
   - `workspace_create` and `worktree_create` don't take focus unless you pass `"select": true`.
-  - `workspace_info` without an id, while no workspace is focused in Codemux, is the error `no_active_workspace`.
-  - Control tools return compact JSON with `structuredContent`, and errors as `isError` results with a code.
-- **`--access` narrows `codemux mcp`.** A supervised or read-only client is offered fewer tools.
+  - `workspace_close` needs full access, also when it keeps the worktree.
+  - `workspace_create`, `worktree_create` and `workspace_close` take a `client_request_id`, so a retry returns the first call's result.
+  - A `codemux mcp` that serves a Codemux agent, or that a workspace's `.mcp.json` starts, keeps the older versions unchanged.
+- **`--access` narrows `codemux mcp`.** A supervised or read-only client is offered fewer tools, and it refuses to work with an older Codemux that can't enforce its access level (`server_too_old`).
 - **`thread_launch` needs `permission_mode`.** Without it, it fails with `invalid_arguments` (missing field `permission_mode`).
 - **`agent_capabilities` with `provider` reads that provider's catalog** if Codemux hasn't yet. It used to list only catalogs Codemux had already read, so a provider no chat had used yet offered no models.
-- **`thread_wait` returns `state`, `final_text`, `pending` and `wait_cursor`.** It waits up to 50 seconds by default and 10 minutes at most.
+- **`thread_wait` returns `state`, `final_text`, `pending` and `wait_cursor`.** It waits up to 50 seconds by default and 10 minutes at most. With `operation_id` it follows the run a launch or send starts, also from the queue.
 - **Outside assistants can answer worker questions** with `thread_answer`.
 - **New worktrees branch from the repository's default branch**, not always `main`.
-- **`codemux json` and the older `codemux` commands exit `1` when the reply is not ok.** Check scripts that use `set -e`.
+- **`codemux json` and the older `codemux` commands exit `1` when the reply is not ok.** That includes the refusals below. Check scripts that use `set -e`.
 - **Agents that Codemux started are refused administration commands**, through MCP and through the `codemux` CLI, also on devices that run `codemux serve`. That includes Claude Code started in a workspace folder (see [Inside a Codemux workspace folder](#inside-a-codemux-workspace-folder)).
+- **Setup and teardown scripts and git hooks run as Codemux agents.** This covers a project's setup and teardown commands, and the hooks and `core.fsmonitor` commands of every git command Codemux runs. A `codemux` command in them gets `admin_refused` for administration commands and `agent_identity_required` for control tools, and exits `1`. Such a setup command now stops the setup, and such a teardown command stops the close, unless it ends with `|| true`.
+- **Codex chats that Codemux starts turn off your own Codemux MCP entries**: every entry that runs `codemux mcp`, whatever its name, and any entry named `codemux`. Those chats have their own Codemux tools.
 - **Chats with "Let agents work with other chats" turned off** (Settings → Agents → Models & behavior) are offered no Codemux thread or plugin tools.
 - **`codemux-remote` no longer replaces a `codemux` entry it doesn't own.**
 
 ## Troubleshooting
 
-- **`codemux_unavailable`, or tools fail with a connection error.** Codemux isn't running: start the app or `codemux serve`. From Codex, see the `XDG_RUNTIME_DIR` note under [Codex](#codex).
-- **`codemux_outdated`.** The running Codemux is older than the `codemux` command. Restart Codemux after an update.
+- **`app_unavailable` from `codemux mcp`, `codemux_unavailable` from the `codemux` CLI, or a connection error.** Codemux isn't running, or the command can't find it: start the app or `codemux serve`, then retry the call. From Codex, see the `XDG_RUNTIME_DIR` note under [Codex](#codex).
+- **`server_too_old` from `codemux mcp` or the CLI, or `codemux_outdated` from the CLI.** The running Codemux is older than the `codemux` command: restart Codemux after an update. `server_too_old` means a read-only or supervised client refused to work with a Codemux that can't enforce its access level. From `codemux mcp`, a tool the older Codemux lacks fails with "Unknown control command".
 - **Only the older tools, no `thread_*`.** Claude Code is using a workspace folder's `.mcp.json`; see [Inside a Codemux workspace folder](#inside-a-codemux-workspace-folder). Or a Codemux agent started this program, so it counts as that agent.
-- **`admin_refused` or `agent_identity_required`.** A Codemux agent started this program. Run it from your own terminal.
+- **`admin_refused` or `agent_identity_required`.** A Codemux agent started this program, or it runs in a setup or teardown script or a git hook that Codemux ran. Run it from your own terminal.
 - **`access_denied`.** The access level is too low for that tool. Raise `--access`, or approve or issue the network assistant again with more access.
 - **`permission_ceiling`.** That permission mode needs full access. Pick one from `allowed_permission_modes`.
 - **A wait ends with a client timeout.** Lower `timeout_ms`, or raise the client's tool timeout (`timeout` for Hermes, `tool_timeout_sec` for Codex).
@@ -550,10 +571,12 @@ The codes an outside assistant meets most often. "Retry" means retrying the iden
 | `admin_refused` | An agent that Codemux started asked for an administration command | No |
 | `agent_identity_required` | An agent that Codemux started called a control tool; it uses its chat's own tools | No |
 | `request_key_conflict` | This `client_request_id` was used with other arguments | No |
-| `operation_failed` | `codemux` CLI only: the app's error carried no code, or a receipt ended without an error of its own | No |
+| `operation_failed` | `codemux` CLI only: the app's error carried no code, or a receipt ended without an error of its own. As a `thread_wait` `failure`, the message never ran | No |
+| `operation_not_found` | No operation with that id belongs to this assistant | No |
 | `workspace_not_found` | No open workspace has that id | No |
-| `no_active_workspace` | `workspace_info` without an id, and no workspace is open | No |
+| `no_active_workspace` | `workspace_info` without an id, and no workspace is focused in Codemux | No |
 | `thread_not_found` | No thread has that id in that workspace | No |
+| `invalid_target` | `thread_wait` can't follow that `turn_id` or `operation_id` in this thread | No |
 | `unsupported_remote_workspace` | The workspace is on another machine; thread tools can't target it | No |
 | `unknown_project_root` | Network assistants may only open folders of projects already open in Codemux | No |
 | `not_a_git_repository` | A worktree needs a git repository | No |
@@ -565,6 +588,8 @@ The codes an outside assistant meets most often. "Retry" means retrying the iden
 | `question_answer_failed` | The answer wasn't delivered or confirmed. Answer again, with a new id, only if the worker refused it; otherwise the person settles it in Codemux | No |
 | `provider_not_ready` | The provider isn't ready: not installed, signed out or still starting | Yes |
 | `wait_budget_exhausted` | Too many waits at once on the network door | Yes |
+| `app_unavailable` | `codemux mcp` can't reach Codemux: it isn't running, or its socket can't be found. The `codemux` CLI reports `codemux_unavailable` | Yes |
+| `server_too_old` | A read-only or supervised client met a Codemux too old to enforce its access level; restart Codemux. Other calls an older Codemux can't run are `codemux_outdated` from the CLI | No |
 | `grant_revoked` | This network assistant's access was revoked | No |
 | `connector_disabled` | **Over the network** is off | No |
 <!-- error-codes:end -->

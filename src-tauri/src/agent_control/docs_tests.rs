@@ -175,12 +175,20 @@ fn outside_agents_guide_names_real_wait_states_and_error_codes() {
 
     let codes = rows(&block("error-codes"));
     assert!(!codes.is_empty(), "the guide lists error codes");
+    let mut listed = BTreeSet::new();
     for row in codes {
         let [code, means, retry] = row.as_slice() else { panic!("an error code row has three cells: {row:?}") };
         let parsed = ErrorCode::parse(code_cell(code)).unwrap_or_else(|| panic!("the guide lists {code}, which is not an error code"));
         assert!(!means.is_empty(), "{code} says what it means");
         assert!(matches!(retry.as_str(), "Yes" | "No"), "{code}: Retry is Yes or No");
         assert_eq!(retry == "Yes", parsed.retryable(), "{code}: the Retry column says {retry:?}");
+        listed.insert(parsed.as_str());
+    }
+    // The doors raise these themselves, before any tool runs: `codemux mcp`
+    // when it can't reach the app or the app can't enforce `--access`, and
+    // the network door when its waits are full. A client meets them first.
+    for code in [ErrorCode::AppUnavailable, ErrorCode::ServerTooOld, ErrorCode::WaitBudgetExhausted] {
+        assert!(listed.contains(code.as_str()), "the guide's error table explains {code}");
     }
 }
 

@@ -203,6 +203,17 @@ fn check(doc: &str, shown: &str, argv: &[String]) {
     }
 }
 
+/// The CLI reports an unreachable or older app with codes of its own, where
+/// `codemux mcp` reports `app_unavailable` and `server_too_old`. The guide's
+/// troubleshooting names both, so a script author finds either.
+#[test]
+fn outside_agents_guide_names_the_clis_own_transport_codes() {
+    let (_, guide) = DOCS[0];
+    for code in [super::door::code::UNAVAILABLE, super::door::code::OUTDATED] {
+        assert!(guide.contains(&format!("`{code}`")), "the guide names `{code}`");
+    }
+}
+
 #[test]
 fn outside_agents_guide_cli_examples_parse() {
     let starts = command_starts();

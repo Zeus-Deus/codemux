@@ -71,7 +71,7 @@ On this computer, with Codemux running:
 claude mcp add --scope user codemux -- codemux mcp --client claude-code
 ```
 
-From another device, run the same `codemux mcp` over SSH, or turn on **Settings → Connections → Outside assistants → Over the network**, put HTTPS in front of it, and sign in with OAuth or a token. Scripts can use the same tools with `codemux call` and the `codemux thread` commands.
+From another device, run the same `codemux mcp` over SSH, or turn on **Settings → Connections → Outside assistants → Over the network** (or run `codemux connector enable`), put HTTPS in front of it, and sign in with OAuth or a token. Scripts can use the same tools with `codemux call` and the `codemux thread` commands.
 
 [docs/outside-agents.md](docs/outside-agents.md) covers per-client setup (including Hermes), the end-to-end flow, access levels and security. The [MCP Server docs](https://docs.codemux.org/mcp-server) list every tool.
 
