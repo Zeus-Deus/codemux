@@ -3,6 +3,11 @@
 //! loopback port, serves OAuth metadata and personal-token MCP with web remote
 //! off, and runs independently of the web-remote listener.
 //!
+//! A real dual-era MCP client also drives it when one is installed: the MCP
+//! Python SDK (2.x) that Hermes Agent ships. `CODEMUX_TEST_MCP_PYTHON` names
+//! its interpreter; otherwise Hermes's own virtualenv is used. Without either
+//! that leg is skipped.
+//!
 //! Isolation: every state dir is repointed at a throwaway tempdir before the
 //! app boots, and both listeners use free loopback ports.
 //!
@@ -11,6 +16,8 @@
 
 #![cfg(unix)]
 
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use codemux_lib::agent_control::ControlAccess;
@@ -79,8 +86,87 @@ impl Mcp {
     }
 }
 
+/// The SDK's interpreter, found before the test isolates `HOME`.
+fn dual_era_python() -> Option<PathBuf> {
+    let python = std::env::var_os("CODEMUX_TEST_MCP_PYTHON").map(PathBuf::from).or_else(|| {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hermes/hermes-agent/.venv/bin/python"))
+    })?;
+    let probe = Command::new(&python)
+        .args(["-I", "-c", "from mcp.client import Client; from mcp_types.version import MODERN_PROTOCOL_VERSIONS; import httpx2"])
+        .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    probe.is_ok_and(|status| status.success()).then_some(python)
+}
+
+/// Connects once per connect mode given after the URL and token and reports
+/// what each session negotiated, listed and got back.
+const DUAL_ERA_CLIENT: &str = r#"
+import asyncio, json, sys
+import httpx2
+import mcp_types
+from mcp.client import Client
+from mcp.client.streamable_http import streamable_http_client
+
+async def session(url, token, mode):
+    http = httpx2.AsyncClient(headers={"Authorization": "Bearer " + token}, timeout=30)
+    info = mcp_types.Implementation(name="sdk-" + mode, version="2.0.0")
+    async with http, Client(streamable_http_client(url, http_client=http), mode=mode, cache=None, client_info=info) as client:
+        listed = await client.list_tools()
+        listed_workspaces = await client.call_tool("workspace_list", {})
+        refused = await client.call_tool("thread_stop", {"workspace_id": "w", "thread_id": "t", "client_request_id": "r"})
+        return {
+            "version": client.protocol_version,
+            "server": client.server_info.name if client.server_info else None,
+            "tools": sorted(tool.name for tool in listed.tools),
+            "workspaces_error": bool(listed_workspaces.is_error),
+            "workspaces": listed_workspaces.structured_content,
+            "refused": refused.structured_content,
+        }
+
+async def main():
+    url, token = sys.argv[1], sys.argv[2]
+    print(json.dumps({mode: await session(url, token, mode) for mode in sys.argv[3:]}))
+
+asyncio.run(main())
+"#;
+
+/// The SDK connects over Streamable HTTP with a personal token, once probing
+/// (it goes stateless, 2026-07-28) and once with `initialize`. Both list the
+/// grant's catalog and call a tool. With the stateless era switched off, the
+/// probing client falls back to `initialize`.
+fn a_real_dual_era_sdk_uses_the_connector(python: &std::path::Path, home: &std::path::Path, url: &str, token: &str) {
+    let output = Command::new(python)
+        .args(["-I", "-c", DUAL_ERA_CLIENT, url, token, "auto", "legacy"])
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("run the SDK client");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the SDK client failed:\n{stderr}");
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}\n{stderr}", String::from_utf8_lossy(&output.stdout)));
+
+    let probing = if codemux_lib::mcp::protocol::MODERN_ERA_ENABLED { "2026-07-28" } else { "2025-11-25" };
+    assert_eq!(report["auto"]["version"], probing, "a dual-era client goes stateless when it can: {report}");
+    assert_eq!(report["legacy"]["version"], "2025-11-25", "{report}");
+    for mode in ["auto", "legacy"] {
+        let session = &report[mode];
+        assert_eq!(session["server"], "CodeMux", "{mode}: {session}");
+        assert_eq!(session["tools"], report["auto"]["tools"], "{mode}: one catalog per grant");
+        assert!(session["tools"].as_array().unwrap().contains(&json!("thread_launch")), "{mode}: {session}");
+        assert_eq!(session["workspaces_error"], false, "{mode}: {session}");
+        assert!(session["workspaces"]["workspaces"].is_array(), "{mode}: {session}");
+        // Tool failures arrive as tool results in both eras.
+        assert!(session["refused"]["error"]["code"].is_string(), "{mode}: {session}");
+    }
+}
+
 #[test]
 fn connector_runs_without_web_remote_and_serves_oauth_and_tokens() {
+    let python = dual_era_python();
     let tmp = tempfile::tempdir().expect("tempdir");
     isolate_env(tmp.path());
     let port = free_loopback_port();
@@ -143,6 +229,10 @@ fn connector_runs_without_web_remote_and_serves_oauth_and_tokens() {
     let listed = mcp.call("tools/call", json!({"name":"workspace_list","arguments":{}}));
     assert_eq!(listed["result"]["isError"], false, "{listed}");
     assert!(listed["result"]["structuredContent"]["workspaces"].is_array(), "{listed}");
+    match &python {
+        Some(python) => a_real_dual_era_sdk_uses_the_connector(python, tmp.path(), &mcp.url, &issued.token),
+        None => eprintln!("skipped the SDK leg: no MCP Python SDK with the stateless era (set CODEMUX_TEST_MCP_PYTHON)"),
+    }
 
     mcp_connector::agent_connector_revoke(handle.clone(), issued.client_id.clone()).expect("revoke");
     let refused = mcp.post(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
