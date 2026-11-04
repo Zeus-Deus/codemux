@@ -30,6 +30,8 @@ claude mcp add --scope user codemux -- codemux mcp --client claude-code
 
 `claude mcp get codemux` should show it connected.
 
+Keep the name `codemux`. Claude chats that Codemux starts swap only an entry with exactly that name for their own Codemux tools, so under any other name yours also loads in those chats, as a second Codemux server. Codex chats, and the MCP servers Codemux itself starts for its chats, skip it under any name.
+
 ### Codex
 
 ```sh
@@ -299,6 +301,8 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
 
    `workspace_create` returns the workspace already open in that folder (`created: false`), or opens one and runs the project's setup scripts. It needs full access. Workspace tools never take focus in Codemux unless you pass `"select": true`.
 
+   Setup runs in the background, so a receipt from `workspace_create`, `worktree_create` or a `thread_launch` with `worktree` can report success while setup is still running. If revoking your access stops setup, that shows as a failed setup (Codemux's `workspace-setup-failed` event, with the reason in its stderr), not in the receipt.
+
 2. **See what can run there.**
 
    ```text
@@ -389,7 +393,9 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
      thread_respond {"workspace_id": "workspace-9", "thread_id": "8a1f…", "client_request_id": "deny-1", "request_id": "<from pending.approvals>", "decision": "deny"}
      ```
 
-   - **Questions** (`pending.questions`): answer with `thread_answer`, one answer per prompt, in order. It returns the `turn_id` of the run that continues; wait on that one.
+     A question that holds the run until it's answered, such as Claude's AskUserQuestion or Codex's `request_user_input`, is an approval with `request_kind` `"user-input"`, not a question. `thread_respond` can only allow it, with no answer, or deny it; `thread_answer` can't answer it. Only the person can answer it, in Codemux.
+
+   - **Questions** (`pending.questions`): questions a Codex chat asks while it keeps working (`request_user_input_async`). Answer them with `thread_answer`, one answer per prompt, in order. It returns the `turn_id` of the run that continues; wait on that one.
 
      ```text
      thread_answer {"workspace_id": "workspace-9", "thread_id": "8a1f…", "client_request_id": "answer-1", "question_id": "<from pending.questions>", "answers": ["Use the staging database"]}
@@ -531,9 +537,9 @@ A paired phone or browser can remove a clean worktree, for example with **Device
   - A `codemux mcp` that serves a Codemux agent, or that a workspace's `.mcp.json` starts, keeps the older versions unchanged.
 - **`--access` narrows `codemux mcp`.** A supervised or read-only client is offered fewer tools, and it refuses to work with an older Codemux that can't enforce its access level (`server_too_old`).
 - **`thread_launch` needs `permission_mode`.** Without it, it fails with `invalid_arguments` (missing field `permission_mode`).
-- **`agent_capabilities` with `provider` reads that provider's catalog** if Codemux hasn't yet. It used to list only catalogs Codemux had already read, so a provider no chat had used yet offered no models.
+- **`agent_capabilities` with `provider` reads that provider's catalog** if Codemux hasn't yet, for a Supervised or Full access caller. It used to list only catalogs Codemux had already read, so a provider no chat had used yet offered no models. A Read-only caller still gets only those.
 - **`thread_wait` returns `state`, `final_text`, `pending` and `wait_cursor`.** It waits up to 50 seconds by default and 10 minutes at most. With `operation_id` it follows the run a launch or send starts, also from the queue.
-- **Outside assistants can answer worker questions** with `thread_answer`.
+- **Outside assistants can answer worker questions** in `pending.questions` with `thread_answer`. A question that arrives as a `"user-input"` approval, such as Claude's AskUserQuestion, can only be allowed or denied.
 - **New worktrees branch from the repository's default branch**, not always `main`.
 - **`codemux json` and the older `codemux` commands exit `1` when the reply is not ok.** That includes the refusals below. Check scripts that use `set -e`.
 - **Agents that Codemux started are refused administration commands**, through MCP and through the `codemux` CLI, also on devices that run `codemux serve`. That includes Claude Code started in a workspace folder (see [Inside a Codemux workspace folder](#inside-a-codemux-workspace-folder)).
