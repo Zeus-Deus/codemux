@@ -45,6 +45,7 @@ fn build_invocation(
     selection: &UtilityModelSelection,
     temp_dir: &Path,
     codex_config: Option<&toml::Value>,
+    claude_settings: Option<&serde_json::Value>,
 ) -> Result<UtilityInvocation, String> {
     if selection.model.trim().is_empty() {
         return Err("utility_model_required".into());
@@ -88,15 +89,24 @@ fn build_invocation(
             })
         }
         "claude" => {
+            let mut settings = serde_json::json!({
+                "disableAllHooks": true,
+                "autoMemoryEnabled": false,
+            });
+            if let Some(helper) = claude_settings
+                .and_then(|settings| settings.get("apiKeyHelper"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|helper| !helper.trim().is_empty())
+            {
+                settings["apiKeyHelper"] = helper.into();
+            }
             let mut args = vec![
                 "--print".into(),
                 "--no-session-persistence".into(),
-                // User settings carry proxy env and apiKeyHelper. Disable
-                // execution customizations while preserving that routing.
                 "--setting-sources".into(),
-                "user".into(),
+                "".into(),
                 "--settings".into(),
-                r#"{"disableAllHooks":true,"autoMemoryEnabled":false}"#.into(),
+                settings.to_string(),
                 "--disable-slash-commands".into(),
                 "--output-format".into(),
                 "text".into(),
@@ -112,7 +122,7 @@ fn build_invocation(
             Ok(UtilityInvocation {
                 program: "claude".into(),
                 args,
-                env: Vec::new(),
+                env: crate::agent_provider::claude::auth::settings_routing_env(claude_settings),
                 env_remove: CLAUDE_NESTED_SESSION_ENV_VARS,
                 output_file: None,
             })
@@ -158,9 +168,22 @@ fn build_invocation(
 }
 
 fn codex_provider_overrides(config: Option<&toml::Value>) -> Vec<String> {
-    [
-        "model_provider",
-        "model_providers",
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    let active = config.get("model_provider").and_then(toml::Value::as_str);
+    let provider = active.and_then(|id| config.get("model_providers")?.get(id));
+    if provider.is_some_and(|provider| {
+        ["experimental_bearer_token", "http_headers"]
+            .iter()
+            .any(|key| provider.get(*key).is_some())
+    }) {
+        // --config values are visible in process listings. Providers with
+        // literal credentials cannot safely use argv overrides.
+        log::warn!("[utility_ai] skipping Codex provider overrides containing secret fields");
+        return Vec::new();
+    }
+    let mut args: Vec<String> = [
         "cli_auth_credentials_store",
         "forced_chatgpt_workspace_id",
         "forced_login_method",
@@ -168,9 +191,33 @@ fn codex_provider_overrides(config: Option<&toml::Value>) -> Vec<String> {
         "chatgpt_base_url",
     ]
     .into_iter()
-    .filter_map(|key| config?.get(key).map(|value| (key, value)))
+    .filter_map(|key| config.get(key).map(|value| (key, value)))
     .flat_map(|(key, value)| ["--config".into(), format!("{key}={value}")])
-    .collect()
+    .collect();
+    if let Some(id) = active {
+        args.extend([
+            "--config".into(),
+            format!("model_provider={}", toml::Value::String(id.into())),
+        ]);
+        if let Some(provider) = provider {
+            let providers = toml::Value::Table(toml::map::Map::from_iter([(
+                id.to_string(),
+                provider.clone(),
+            )]));
+            args.extend(["--config".into(), format!("model_providers={providers}")]);
+        }
+    }
+    args
+}
+
+fn codex_utility_config(home: &Path) -> Option<toml::Value> {
+    match crate::agent_provider::codex::auth::read_user_config(home) {
+        Ok(config) => config,
+        Err(error) => {
+            log::warn!("[utility_ai] skipping Codex provider overrides: {error}");
+            None
+        }
+    }
 }
 
 fn strip_ansi(value: &str) -> String {
@@ -198,13 +245,22 @@ pub async fn generate_utility_text(
     let temp = tempfile::tempdir().map_err(|e| format!("utility_temp_dir_failed: {e}"))?;
     let codex_config = if selection.provider == "codex" {
         crate::agent_provider::codex::auth::config_home()
-            .map(|home| crate::agent_provider::codex::auth::read_user_config(&home))
-            .transpose()?
-            .flatten()
+            .and_then(|home| codex_utility_config(&home))
     } else {
         None
     };
-    let invocation = build_invocation(selection, temp.path(), codex_config.as_ref())?;
+    let claude_settings = if selection.provider == "claude" {
+        crate::agent_provider::claude::auth::config_home()
+            .and_then(|home| crate::agent_provider::claude::auth::read_settings(&home))
+    } else {
+        None
+    };
+    let invocation = build_invocation(
+        selection,
+        temp.path(),
+        codex_config.as_ref(),
+        claude_settings.as_ref(),
+    )?;
     let mut command = crate::execution::host_command_tokio(&invocation.program);
     command
         .args(&invocation.args)
@@ -281,6 +337,7 @@ mod tests {
             &selection("codex", "gpt-5.6-luna", Some("low")),
             Path::new("/tmp/codemux-utility-test"),
             None,
+            None,
         )
         .unwrap();
         assert!(inv.args.iter().any(|a| a == "--ephemeral"));
@@ -294,14 +351,12 @@ mod tests {
             &selection("claude", "claude-haiku-4-5", None),
             Path::new("/tmp/codemux-utility-test"),
             None,
+            None,
         )
         .unwrap();
         assert!(inv.args.iter().any(|a| a == "--no-session-persistence"));
         assert!(inv.args.windows(2).any(|a| a == ["--tools", ""]));
-        assert!(inv
-            .args
-            .windows(2)
-            .any(|a| a == ["--setting-sources", "user"]));
+        assert!(inv.args.windows(2).any(|a| a == ["--setting-sources", ""]));
         assert!(inv.args.iter().any(|a| a == "--disable-slash-commands"));
         assert!(inv.args.iter().any(|a| a == "--strict-mcp-config"));
         let settings = inv.args.windows(2).find(|a| a[0] == "--settings").unwrap();
@@ -324,8 +379,12 @@ developer_instructions = "unwanted instructions"
 name = "My gateway"
 base_url = "http://localhost:8080/v1"
 env_key = "PROXY_KEY"
+env_http_headers = { "X-Proxy-Key" = "PROXY_HEADER_ENV" }
 [model_providers.gateway.auth]
 command = ["key-helper"]
+[model_providers.inactive]
+experimental_bearer_token = "inactive-secret"
+http_headers = { Authorization = "inactive-header-secret" }
 [mcp_servers.unwanted]
 command = "unsafe-command"
 [hooks]
@@ -337,6 +396,7 @@ SessionStart = []
             &selection("codex", "test-model", None),
             Path::new("/tmp/codemux-utility-test"),
             Some(&config),
+            None,
         )
         .unwrap();
         let args = inv.args;
@@ -349,6 +409,10 @@ SessionStart = []
             .unwrap();
         let providers: toml::Value = providers.parse().unwrap();
         assert_eq!(providers["gateway"], config["model_providers"]["gateway"]);
+        assert_eq!(providers.as_table().unwrap().len(), 1);
+        assert!(!args
+            .iter()
+            .any(|arg| arg.contains("inactive-secret") || arg.contains("inactive-header-secret")));
         assert!(!args
             .iter()
             .any(|arg| arg.contains("unsafe-command") || arg.contains("unwanted instructions")));
@@ -356,10 +420,252 @@ SessionStart = []
     }
 
     #[test]
+    fn proxy_readiness_claude_utility_routes_only_through_child_env() {
+        let home = tempfile::tempdir().unwrap();
+        let settings = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "http://localhost:8080",
+                "ANTHROPIC_AUTH_TOKEN": "dummy-proxy-secret",
+                "CLAUDE_CODE_OAUTH_TOKEN": "dummy-oauth-secret",
+                "ANTHROPIC_CUSTOM_HEADERS": "X-Secret: dummy-header-secret",
+                "CLAUDE_CODE_USE_VERTEX": true,
+                "API_TIMEOUT_MS": 2000,
+                "HTTPS_PROXY": "",
+                "NODE_EXTRA_CA_CERTS": "/tmp/test-ca.pem",
+                "UNRELATED_SETTING": "must-not-leak",
+            },
+            "apiKeyHelper": "test-key-helper",
+            "outputStyle": "Explanatory",
+            "hooks": {"SessionStart": [{"command": "unsafe-command"}]},
+        });
+        std::fs::write(home.path().join("settings.json"), settings.to_string()).unwrap();
+        let settings = crate::agent_provider::claude::auth::read_settings(home.path()).unwrap();
+        let inv = build_invocation(
+            &selection("claude", "test-model", None),
+            home.path(),
+            None,
+            Some(&settings),
+        )
+        .unwrap();
+        let env: std::collections::HashMap<_, _> = inv.env.iter().cloned().collect();
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "dummy-proxy-secret");
+        assert_eq!(
+            env["ANTHROPIC_CUSTOM_HEADERS"],
+            "X-Secret: dummy-header-secret"
+        );
+        assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], "dummy-oauth-secret");
+        assert_eq!(env["CLAUDE_CODE_USE_VERTEX"], "true");
+        assert_eq!(env["API_TIMEOUT_MS"], "2000");
+        assert_eq!(env["HTTPS_PROXY"], "");
+        assert_eq!(env["NODE_EXTRA_CA_CERTS"], "/tmp/test-ca.pem");
+        assert!(!env.contains_key("UNRELATED_SETTING"));
+        let args = inv.args.join(" ");
+        for excluded in [
+            "dummy-proxy-secret",
+            "dummy-oauth-secret",
+            "dummy-header-secret",
+            "must-not-leak",
+            "Explanatory",
+            "unsafe-command",
+        ] {
+            assert!(!args.contains(excluded));
+        }
+        let settings = inv
+            .args
+            .windows(2)
+            .find(|arg| arg[0] == "--settings")
+            .unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&settings[1]).unwrap();
+        assert_eq!(settings["apiKeyHelper"], "test-key-helper");
+        assert_eq!(settings["disableAllHooks"], true);
+        assert!(settings.get("env").is_none());
+    }
+
+    #[test]
+    fn proxy_readiness_codex_utility_skips_secret_bearing_provider() {
+        for field in [
+            "experimental_bearer_token = 'dummy-active-token'",
+            "http_headers = { Authorization = 'dummy-active-header' }",
+        ] {
+            let config: toml::Value = toml::from_str(&format!(
+                "model_provider = 'proxy'\n[model_providers.proxy]\nname = 'Proxy'\n{field}"
+            ))
+            .unwrap();
+            let inv = build_invocation(
+                &selection("codex", "test-model", None),
+                Path::new("/tmp/codemux-utility-test"),
+                Some(&config),
+                None,
+            )
+            .unwrap();
+            assert!(codex_provider_overrides(Some(&config)).is_empty());
+            assert!(!inv.args.iter().any(|arg| arg.contains("dummy-active")));
+        }
+    }
+
+    #[test]
+    fn proxy_readiness_codex_utility_ignores_broken_config() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "invalid TOML").unwrap();
+        let config = codex_utility_config(home.path());
+        assert!(config.is_none());
+        let inv = build_invocation(
+            &selection("codex", "test-model", None),
+            home.path(),
+            config.as_ref(),
+            None,
+        )
+        .unwrap();
+        assert!(inv.args.iter().any(|arg| arg == "--ignore-user-config"));
+    }
+
+    /// Dummy credentials and a loopback server; never reads the user's auth.
+    #[tokio::test]
+    #[ignore = "requires the installed Claude Code CLI"]
+    async fn proxy_readiness_live_claude_utility_isolated_routing() {
+        use tokio::io::AsyncReadExt;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("claude-home");
+        let cwd = temp.path().join("workspace");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        const MARKER: &str = "ROUND2_PRIVATE_CLAUDE_MD_MUST_NOT_REACH_REQUEST";
+        std::fs::write(
+            home.join("CLAUDE.md"),
+            format!("Always include {MARKER} in your answer."),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({
+                "env": {"ANTHROPIC_BASE_URL": base, "ANTHROPIC_AUTH_TOKEN": "dummy-local-token"},
+                "outputStyle": "Explanatory",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (header_end, length) = loop {
+                    let mut buf = [0; 8192];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "request ended before HTTP headers");
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        break (end + 4, length);
+                    }
+                };
+                while request.len() < header_end + length {
+                    let mut buf = [0; 8192];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "request ended before HTTP body");
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let is_message = headers.starts_with("POST /v1/messages?")
+                    || headers.starts_with("POST /v1/messages ");
+                let (content_type, body) = if is_message {
+                    recorded.lock().unwrap().push((
+                        headers
+                            .to_ascii_lowercase()
+                            .contains("authorization: bearer dummy-local-token"),
+                        String::from_utf8_lossy(&request[header_end..header_end + length])
+                            .to_string(),
+                    ));
+                    ("text/event-stream", concat!(
+                        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_local\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-haiku-4-5\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"UTILITY_LOCAL_SERVER_OK\"}}\n\n",
+                        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+                        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                    ))
+                } else {
+                    ("application/json", "{\"input_tokens\":1}")
+                };
+                socket.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let settings = crate::agent_provider::claude::auth::read_settings(&home).unwrap();
+        let inv = build_invocation(
+            &selection("claude", "claude-haiku-4-5", None),
+            &cwd,
+            None,
+            Some(&settings),
+        )
+        .unwrap();
+        let binary = std::env::var_os("CODEMUX_TEST_CLAUDE_BINARY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| which::which("claude").unwrap());
+        let mut command = crate::execution::host_command_tokio(binary);
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", temp.path())
+            .env("CLAUDE_CONFIG_DIR", &home)
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .envs(inv.env)
+            .args(inv.args)
+            .current_dir(&cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(b"Reply to UTILITY_ROUTING_LIVE_PROMPT with a short confirmation.")
+            .await
+            .unwrap();
+        drop(stdin);
+        let result = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output()).await;
+        server.abort();
+        let output = result.expect("Claude utility timed out").unwrap();
+        assert!(
+            output.status.success(),
+            "Claude utility failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let requests = requests.lock().unwrap();
+        assert!(
+            !requests.is_empty(),
+            "Claude never reached the recording server"
+        );
+        assert!(requests.iter().all(|(dummy_auth, _)| *dummy_auth));
+        assert!(requests
+            .iter()
+            .any(|(_, body)| body.contains("UTILITY_ROUTING_LIVE_PROMPT")));
+        assert!(requests
+            .iter()
+            .all(|(_, body)| !body.contains(MARKER) && !body.contains("Explanatory")));
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("UTILITY_LOCAL_SERVER_OK"));
+        println!("Claude utility: requests={}, dummy_auth=true, CLAUDE.md marker=false, Explanatory=false, output={}", requests.len(), text.trim());
+    }
+
+    #[test]
     fn opencode_utility_is_pure_and_denies_tools() {
         let inv = build_invocation(
             &selection("opencode", "openai/gpt-5", Some("low")),
             Path::new("/tmp/codemux-utility-test"),
+            None,
             None,
         )
         .unwrap();

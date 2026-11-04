@@ -2,6 +2,9 @@
 // the notification stream, driven through the RPC handlers with FakeQuery.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import type { EventEmitter } from "../src/session.ts";
@@ -66,18 +69,42 @@ describe("side chat options", () => {
     expect(options.cwd).toBe("/tmp/repo");
   });
 
-  test("offer only read tools and disable hooks, project settings and MCP", () => {
+  test("offer only read tools and disable hooks, settings and MCP", () => {
     const options = buildSideChatOptions(START);
     expect(options.tools).toEqual(["Read", "Grep", "Glob"]);
     for (const tool of ["Bash", "Edit", "Write", "NotebookEdit", "Agent", "Task"]) {
       expect(options.disallowedTools).toContain(tool);
     }
-    // User settings carry proxy routing (env, apiKeyHelper); nothing else.
-    expect(options.settingSources).toEqual(["user"]);
+    expect(options.settingSources).toEqual([]);
     expect((options.settings as Record<string, unknown>).disableAllHooks).toBe(true);
     expect(options.mcpServers).toEqual({});
     expect(options.strictMcpConfig).toBe(true);
     expect(options.permissionMode).toBe("default");
+  });
+
+  test("carry provider routing from settings.json but no other user settings", () => {
+    const home = mkdtempSync(join(tmpdir(), "claude-home-"));
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", ANTHROPIC_AUTH_TOKEN: "dummy", DISABLE_TELEMETRY: "1" },
+      apiKeyHelper: "print-key",
+      outputStyle: "Pirate",
+      enabledPlugins: { "x@y": true },
+    }));
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = home;
+    try {
+      const options = buildSideChatOptions({ ...START, effort: "ultracode" });
+      expect(options.settingSources).toEqual([]);
+      expect(options.plugins).toEqual([]);
+      expect(options.env?.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8317");
+      expect(options.env?.ANTHROPIC_AUTH_TOKEN).toBe("dummy");
+      expect(options.env?.DISABLE_TELEMETRY).toBe(process.env.DISABLE_TELEMETRY);
+      expect(options.settings).toEqual({ disableAllHooks: true, apiKeyHelper: "print-key", ultracode: true });
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previous;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test("carry the main chat's model and effort", () => {

@@ -62,32 +62,48 @@ pub fn claude_identity(home: &Path, is_default: bool) -> AccountIdentity {
 }
 
 fn claude_proxy_configured(home: &Path) -> bool {
-    let Some(settings) = crate::agent_provider::claude::auth::read_settings(home) else {
-        return false;
-    };
+    let settings = crate::agent_provider::claude::auth::read_settings(home);
+    claude_proxy_configured_from(settings.as_ref(), |key| std::env::var(key).ok())
+}
+
+fn claude_proxy_configured_from(
+    settings: Option<&Value>,
+    inherited: impl Fn(&str) -> Option<String>,
+) -> bool {
     fn nonempty(value: Option<&Value>) -> Option<&str> {
         value
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
     }
-    if nonempty(settings.get("apiKeyHelper")).is_some() {
+    if nonempty(settings.and_then(|settings| settings.get("apiKeyHelper"))).is_some() {
         return true;
     }
-    let env = settings.get("env");
-    if ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+    let env = settings.and_then(|settings| settings.get("env"));
+    crate::agent_provider::claude::auth::CLAUDE_ROUTING_ENV_KEYS
         .iter()
-        .any(|key| nonempty(env.and_then(|env| env.get(key))).is_some())
-    {
-        return true;
-    }
-    nonempty(env.and_then(|env| env.get("ANTHROPIC_BASE_URL")))
-        .and_then(|base| url::Url::parse(base).ok())
-        .is_some_and(|url| {
-            matches!(url.scheme(), "http" | "https")
-                && url
-                    .host_str()
-                    .is_some_and(|host| host != "api.anthropic.com")
+        .any(|key| {
+            // An explicitly empty setting also overrides an inherited value.
+            let value = env
+                .and_then(|env| env.get(*key))
+                .and_then(crate::agent_provider::claude::auth::routing_env_value)
+                .or_else(|| inherited(key));
+            let value = value.as_deref().unwrap_or_default().trim();
+            match *key {
+                "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN" | "CLAUDE_CODE_OAUTH_TOKEN" => {
+                    !value.is_empty()
+                }
+                "CLAUDE_CODE_USE_BEDROCK"
+                | "CLAUDE_CODE_USE_VERTEX"
+                | "CLAUDE_CODE_USE_FOUNDRY"
+                | "CLAUDE_CODE_USE_MANTLE" => {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                }
+                _ => false,
+            }
         })
 }
 
@@ -220,24 +236,84 @@ mod tests {
     fn proxy_readiness_claude_extra_home_accepts_proxy_settings() {
         let tmp = tempfile::tempdir().unwrap();
         for settings in [
-            json!({"env":{"ANTHROPIC_BASE_URL":"http://localhost:8080"}}),
             json!({"env":{"ANTHROPIC_AUTH_TOKEN":"test-token"}}),
             json!({"env":{"ANTHROPIC_API_KEY":"test-key"}}),
             json!({"apiKeyHelper":"key-helper"}),
         ] {
             std::fs::write(tmp.path().join("settings.json"), settings.to_string()).unwrap();
-            assert_eq!(claude_identity(tmp.path(), false).signed_in, Some(true));
+            let settings = crate::agent_provider::claude::auth::read_settings(tmp.path()).unwrap();
+            assert!(claude_proxy_configured_from(Some(&settings), |_| None));
         }
         for settings in [
             json!({}),
+            json!({"env":{"ANTHROPIC_BASE_URL":"http://localhost:8080"}}),
             json!({"apiKeyHelper":" "}),
             json!({"env":{"ANTHROPIC_API_KEY":"", "ANTHROPIC_AUTH_TOKEN":" "}}),
             json!({"env":{"ANTHROPIC_BASE_URL":"https://api.anthropic.com"}}),
             json!({"env":{"ANTHROPIC_BASE_URL":"not a URL"}}),
         ] {
             std::fs::write(tmp.path().join("settings.json"), settings.to_string()).unwrap();
-            assert_eq!(claude_identity(tmp.path(), false).signed_in, Some(false));
+            let settings = crate::agent_provider::claude::auth::read_settings(tmp.path()).unwrap();
+            assert!(!claude_proxy_configured_from(Some(&settings), |_| None));
         }
+    }
+
+    #[test]
+    fn proxy_readiness_claude_inherited_tokens_and_cloud_flags() {
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ] {
+            assert!(
+                claude_proxy_configured_from(None, |name| (name == key).then(|| "dummy-token".into()))
+            );
+            let settings = json!({"env": {key: ""}});
+            assert!(!claude_proxy_configured_from(Some(&settings), |name| (name
+                == key)
+                .then(|| "dummy-token".into())));
+        }
+        for key in [
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_MANTLE",
+        ] {
+            for value in [json!(true), json!(1)] {
+                assert!(claude_proxy_configured_from(
+                    Some(&json!({"env": {key: value}})),
+                    |_| None
+                ));
+            }
+            assert!(!claude_proxy_configured_from(
+                Some(&json!({"env": {key: false}})),
+                |name| (name == key).then(|| "1".into())
+            ));
+            for value in ["1", "true", "YES", " on "] {
+                assert!(claude_proxy_configured_from(None, |name| (name == key).then(|| value.into())));
+                assert!(claude_proxy_configured_from(
+                    Some(&json!({"env": {key: value}})),
+                    |_| None
+                ));
+            }
+            for value in ["0", "false", "off", ""] {
+                assert!(!claude_proxy_configured_from(
+                    Some(&json!({"env": {key: value}})),
+                    |_| None
+                ));
+            }
+        }
+        assert!(!claude_proxy_configured_from(None, |name| (name
+            == "ANTHROPIC_BASE_URL")
+            .then(|| "http://localhost:8080".into())));
+        assert!(!claude_proxy_configured_from(
+            Some(&json!({"env":{"ANTHROPIC_AUTH_TOKEN":""}})),
+            |_| None
+        ));
+        assert!(claude_proxy_configured_from(
+            Some(&json!({"env":{"ANTHROPIC_AUTH_TOKEN":"dummy-settings-token"}})),
+            |_| None
+        ));
     }
 
     #[test]

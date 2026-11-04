@@ -238,11 +238,18 @@ fn claude_report_from_auth(
         // Inconclusive output / probe failure after a confirmed install:
         // advisory only — sessions may still work (e.g. API-key auth the
         // probe can't see), so don't block with a red banner.
-        Ok(claude::auth::AuthStatus::Unknown { .. }) => ProviderHealthReport::warning(
-            ProviderKind::Claude,
-            version,
-            "Could not verify Claude authentication status.".into(),
-        ),
+        Ok(claude::auth::AuthStatus::Unknown { raw, auth_label }) => ProviderHealthReport {
+            auth_label,
+            ..ProviderHealthReport::warning(
+                ProviderKind::Claude,
+                version,
+                if raw.trim().is_empty() {
+                    "Could not verify Claude authentication status.".into()
+                } else {
+                    raw
+                },
+            )
+        },
         Err(err) => ProviderHealthReport::warning(
             ProviderKind::Claude,
             version,
@@ -564,6 +571,85 @@ mod tests {
         assert!(report.login_command.is_none());
     }
 
+    #[tokio::test]
+    async fn proxy_readiness_broken_codex_config_is_warning() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "invalid TOML").unwrap();
+        let report = codex_report_from_auth(
+            codex::auth::probe_authenticated_in_home(
+                std::path::Path::new("unused-codex-binary"),
+                Some(home.path()),
+            )
+            .await,
+            None,
+        );
+        assert_eq!(report.status, ProviderHealthStatus::Warning);
+        assert!(report.login_command.is_none());
+        assert!(report
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("could not parse"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_readiness_codex_config_rpc_failure_is_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let binary = home.path().join("codex-fixture");
+        std::fs::write(
+            &binary,
+            r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    if 'id' not in req:
+        continue
+    if req['method'] == 'config/read':
+        response = {'error': {'code': -32600, 'message': 'invalid provider configuration'}}
+    elif req['method'] == 'account/read':
+        response = {'result': {'account': None, 'requiresOpenaiAuth': True}}
+    else:
+        response = {'result': {}}
+    print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], **response}), flush=True)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let report = codex_report_from_auth(
+            codex::auth::probe_authenticated_in_home(&binary, Some(home.path())).await,
+            None,
+        );
+        assert_eq!(report.status, ProviderHealthStatus::Warning);
+        assert!(report.login_command.is_none());
+        assert!(report
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("invalid provider configuration"));
+    }
+
+    #[test]
+    fn proxy_readiness_claude_unverified_endpoint_keeps_label_and_message() {
+        let message =
+            "Custom endpoint · localhost:8080 is set, but Claude Code reports no credentials for it.";
+        let report = claude_report_from_auth(
+            Ok(claude::auth::AuthStatus::Unknown {
+                raw: message.into(),
+                auth_label: Some("Custom endpoint · localhost:8080".into()),
+            }),
+            None,
+        );
+        assert_eq!(report.status, ProviderHealthStatus::Warning);
+        assert_eq!(
+            report.auth_label.as_deref(),
+            Some("Custom endpoint · localhost:8080")
+        );
+        assert_eq!(report.message.as_deref(), Some(message));
+        assert!(report.login_command.is_none());
+    }
+
     /// Read-only smoke probe; no model requests and no credential refresh.
     #[cfg(unix)]
     #[tokio::test]
@@ -582,6 +668,8 @@ mod tests {
         std::os::unix::fs::symlink(user_home.join("auth.json"), native.path().join("auth.json"))
             .unwrap();
         let custom = tempfile::tempdir().unwrap();
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join("config.toml"), "invalid TOML").unwrap();
         std::fs::write(
             custom.path().join("config.toml"),
             r#"
@@ -596,6 +684,7 @@ env_key = "CODEMUX_PROXY_READINESS_TEST_KEY"
         .unwrap();
         for (name, home, status, label) in [
             ("empty", empty.path(), ProviderHealthStatus::Error, None),
+            ("broken config", broken.path(), ProviderHealthStatus::Warning, None),
             (
                 "proxy-only ai-gateway",
                 proxy.path(),
@@ -630,6 +719,9 @@ env_key = "CODEMUX_PROXY_READINESS_TEST_KEY"
                 report.status, report.auth_label, report.login_command
             );
             assert_eq!(report.status, status, "{name}");
+            if status == ProviderHealthStatus::Warning {
+                assert!(report.login_command.is_none());
+            }
             if let Some(label) = label {
                 assert_eq!(report.auth_label.as_deref(), Some(label));
             }

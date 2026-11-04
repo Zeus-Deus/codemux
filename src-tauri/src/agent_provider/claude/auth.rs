@@ -24,6 +24,73 @@ use super::protocol::{
 /// Ceiling for the whole probe round trip (spawn + RPC + shutdown).
 const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Provider routing accepted by Claude Code. Helpers forward only these
+/// settings in the child environment so user instructions stay isolated.
+/// Keep in step with `ROUTING_ENV_KEYS` in sidecar/claude-agent/src/user-routing.ts.
+pub(crate) const CLAUDE_ROUTING_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    "CLOUD_ML_REGION",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "NODE_EXTRA_CA_CERTS",
+    "CLAUDE_CODE_CLIENT_CERT",
+    "CLAUDE_CODE_CLIENT_KEY",
+    "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+    "API_TIMEOUT_MS",
+];
+
+pub(crate) fn settings_routing_env(settings: Option<&serde_json::Value>) -> Vec<(String, String)> {
+    let env = settings.and_then(|settings| settings.get("env"));
+    CLAUDE_ROUTING_ENV_KEYS
+        .iter()
+        .filter_map(|key| {
+            let value = routing_env_value(env?.get(*key)?)?;
+            Some(((*key).to_string(), value))
+        })
+        .collect()
+}
+
+/// Claude Code stringifies scalar settings env values before spawning.
+pub(crate) fn routing_env_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
 /// Result of a `probe_installed` call.
 #[derive(Debug, Clone)]
 pub struct ProbeInstalledResult {
@@ -42,7 +109,10 @@ pub enum AuthStatus {
     /// remediation path.
     Unauthenticated { message: String },
     /// Output couldn't be classified — surface the raw text.
-    Unknown { raw: String },
+    Unknown {
+        raw: String,
+        auth_label: Option<String>,
+    },
 }
 
 /// Spawn the sidecar, call `probe-installed`, shut down.
@@ -113,6 +183,7 @@ fn auth_status_from_response(parsed: ProbeAuthenticatedResponse) -> AuthStatus {
         },
         _ => AuthStatus::Unknown {
             raw: parsed.message.unwrap_or_default(),
+            auth_label: parsed.auth_label,
         },
     }
 }
@@ -200,6 +271,21 @@ mod tests {
                 }
                 other => panic!("expected authenticated, got {other:?}"),
             }
+        }
+        let response = json!({
+            "status": "unknown",
+            "authLabel": "Custom endpoint · localhost:8080",
+            "message": "Custom endpoint has no credentials",
+        });
+        match auth_status_from_response(serde_json::from_value(response).unwrap()) {
+            AuthStatus::Unknown { raw, auth_label } => {
+                assert_eq!(raw, "Custom endpoint has no credentials");
+                assert_eq!(
+                    auth_label.as_deref(),
+                    Some("Custom endpoint · localhost:8080")
+                );
+            }
+            other => panic!("expected unverified endpoint, got {other:?}"),
         }
     }
 }

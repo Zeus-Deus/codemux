@@ -14,7 +14,7 @@
 
 import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
-import { userRoutingOptions } from "../user-routing.ts";
+import { routedOptions } from "../user-routing.ts";
 
 export interface GetUsageInput {
   cwd: string;
@@ -78,10 +78,9 @@ export async function getUsage(input: GetUsageInput): Promise<unknown> {
     options: {
       cwd: input.cwd,
       pathToClaudeCodeExecutable: input.pathToClaudeCodeExecutable,
-      env: process.env as Record<string, string | undefined>,
       // Ask the account the user's chats use, including one reached
       // through settings.json routing.
-      ...userRoutingOptions(),
+      ...routedOptions(),
       includePartialMessages: false,
     },
   });

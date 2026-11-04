@@ -130,15 +130,33 @@ describe("classifyAuthStatus", () => {
     });
   });
 
-  test("a base URL with no token is ready even though the CLI says logged out", () => {
+  test("a base URL with no token is unverified, not ready and not signed out", () => {
+    // Claude Code 2.1.317 refuses to send ("Not logged in") in this state
+    // without contacting the endpoint, so it is not ready; a token-less
+    // endpoint may still exist, so it does not block either.
     const result = classifyAuthStatus(
       statusJson({ loggedIn: false }),
       "Anthropic base URL: http://127.0.0.1:8317\nNot logged in. Run claude auth login to authenticate.\n",
     );
     expect(result).toEqual({
-      status: "authenticated",
+      status: "unknown",
+      message:
+        "Custom endpoint · 127.0.0.1:8317 is set, but Claude Code reports no credentials for it. " +
+        "Sessions may still work if the endpoint needs none.",
       authLabel: "Custom endpoint · 127.0.0.1:8317",
     });
+  });
+
+  test("a legacy CLI with a base URL is ready only when it says logged in", () => {
+    expect(
+      classifyAuthStatus("Anthropic base URL: http://proxy:4000\nLogged in\n", "").status,
+    ).toBe("authenticated");
+    const unverified = classifyAuthStatus(
+      "Anthropic base URL: http://proxy:4000\nNot logged in\n",
+      "",
+    );
+    expect(unverified.status).toBe("unknown");
+    expect(unverified.authLabel).toBe("Custom endpoint · proxy:4000");
   });
 
   test("an apiKeyHelper is labelled as such", () => {

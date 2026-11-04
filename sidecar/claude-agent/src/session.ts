@@ -42,6 +42,7 @@ import {
 } from "./permissions.ts";
 import { logger } from "./logger.ts";
 import { createPluginPermissions } from "./plugin-permissions.ts";
+import { userRouting } from "./user-routing.ts";
 
 /** User-facing event channel. The RPC dispatcher implements this by
  *  writing a JSON-RPC notification line to stdout. */
@@ -335,25 +336,18 @@ function buildQueryOptions(
     opts.tools = [];
     // All MCP tools are deferred by current CLIs. This small captured set
     // must load upfront because managed sessions expose no ToolSearch.
-    // User settings are loaded only for provider routing (settings.json
-    // `env` / `apiKeyHelper` is how proxies are set up). Their CLAUDE.md
-    // stays out, and these flag-level env values outrank anything the
-    // user's `env` block sets for the same keys.
-    const managedEnv = {
-      ENABLE_TOOL_SEARCH: "false",
-      MCP_CONNECTION_NONBLOCKING: "0",
-      ENABLE_CLAUDEAI_MCP_SERVERS: "false",
-      CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
-    };
-    opts.env = { ...opts.env, ...managedEnv };
+    // No setting sources load; only the user's provider routing
+    // (settings.json `env` / `apiKeyHelper`) is carried over.
+    const routing = userRouting(opts.env ?? {});
+    opts.env = { ...routing.env, ENABLE_TOOL_SEARCH: "false", MCP_CONNECTION_NONBLOCKING: "0", ENABLE_CLAUDEAI_MCP_SERVERS: "false" };
     opts.disallowedTools = ["Bash", "Agent", "Task", "Workflow"];
-    opts.settingSources = ["user"];
+    opts.settingSources = [];
     // Attempts keep the bare prompt they were built against; Claude Code's
     // guidance describes tools they cannot use.
     delete opts.systemPrompt;
     opts.strictMcpConfig = true;
     opts.plugins = [];
-    const managedSettings = { disableAllHooks: true, ultracode: false, env: managedEnv };
+    const managedSettings = { disableAllHooks: true, ultracode: false, ...routing.settings };
     opts.settings = managedSettings;
     opts.allowedTools = mcpTools.map((tool) => `mcp__codemux__${tool.prefixedName}`);
     const managedNames = new Set(mcpTools.flatMap((tool) => [tool.prefixedName, `mcp__codemux__${tool.prefixedName}`]));

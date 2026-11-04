@@ -333,19 +333,33 @@ function claudePlanLabel(
   return /^claude\b/i.test(method) ? method : `Claude ${method}`;
 }
 
+/** A custom base URL whose credentials could not be confirmed. Not a
+ *  sign-in failure: some endpoints need no token, so sending stays
+ *  allowed and the user sees what was found. */
+function unverifiedEndpoint(host: string): ProbeAuthenticatedResult {
+  return {
+    status: "unknown",
+    message:
+      `Custom endpoint · ${host} is set, but Claude Code reports no credentials for it. ` +
+      "Sessions may still work if the endpoint needs none.",
+    authLabel: `Custom endpoint · ${host}`,
+  };
+}
+
 /** Combine both `auth status` outputs into readiness plus a label.
  *
  *  A proxy (LiteLLM, a personal gateway, …) is set up through
- *  ANTHROPIC_BASE_URL, often with an ANTHROPIC_AUTH_TOKEN or an
- *  apiKeyHelper and sometimes with no credential at all. The CLI's JSON
- *  reports a proxy token as `authMethod: "oauth_token"`, exactly like a
- *  real login, and reports a token-less proxy as `loggedIn: false` even
- *  though chats work. Only the text form names the base URL, so a
- *  configured custom endpoint counts as ready on its own and wins the
- *  label. Cloud providers (Bedrock, Vertex, …) authenticate with their
- *  own credentials, so a non-first-party provider counts as ready too;
- *  the Cloud gateway is the exception because it needs a sign-in the
- *  JSON does report. Pure so every case is unit-testable. */
+ *  ANTHROPIC_BASE_URL, usually with an ANTHROPIC_AUTH_TOKEN or an
+ *  apiKeyHelper. The CLI's JSON reports a proxy token as
+ *  `authMethod: "oauth_token"`, exactly like a real login; only the
+ *  text form names the base URL, so a configured custom endpoint wins
+ *  the label. A base URL alone is not enough: with no credential the
+ *  CLI refuses to send ("Not logged in") without contacting the
+ *  endpoint, so that case is reported unverified rather than ready.
+ *  Cloud providers (Bedrock, Vertex, …) authenticate with their own
+ *  credentials, so a non-first-party provider counts as ready; the
+ *  Cloud gateway is the exception because it needs a sign-in the JSON
+ *  does report. Pure so every case is unit-testable. */
 export function classifyAuthStatus(
   jsonOutput: string,
   textOutput: string,
@@ -358,7 +372,12 @@ export function classifyAuthStatus(
   const endpoint =
     customEndpointHost(facts.baseUrl) ?? customEndpointHost(plainFacts.baseUrl);
   if (endpoint) {
-    return { status: "authenticated", authLabel: `Custom endpoint · ${endpoint}` };
+    const loggedIn = json
+      ? json.loggedIn
+      : classifyAuthOutput(jsonOutput).status === "authenticated";
+    return loggedIn
+      ? { status: "authenticated", authLabel: `Custom endpoint · ${endpoint}` }
+      : unverifiedEndpoint(endpoint);
   }
 
   if (!json) {
@@ -425,11 +444,10 @@ export async function probeAuthenticated(
   // carries no facts, which is the legacy behaviour.
   const textOutput = text.timedOut || text.error ? "" : `${text.stdout}\n${text.stderr}`;
   if (result.timedOut || result.error) {
-    // The text form alone still proves a custom endpoint.
+    // The text form alone names a custom endpoint but cannot say
+    // whether it has credentials.
     const endpoint = customEndpointHost(parseAuthStatusText(textOutput).baseUrl);
-    if (endpoint) {
-      return { status: "authenticated", authLabel: `Custom endpoint · ${endpoint}` };
-    }
+    if (endpoint) return unverifiedEndpoint(endpoint);
     return {
       status: "unknown",
       message: result.timedOut ? "probe timed out" : result.error!.message,

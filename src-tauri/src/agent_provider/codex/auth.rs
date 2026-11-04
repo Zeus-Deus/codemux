@@ -138,6 +138,15 @@ pub(crate) async fn probe_authenticated_in_home(
     codex_binary: &Path,
     home: Option<&Path>,
 ) -> Result<AuthStatus, ProviderError> {
+    // A malformed config can make account/read look like a fresh signed-out
+    // home. Preserve an advisory result instead of telling the user to log in.
+    let config = home
+        .map(Path::to_path_buf)
+        .or_else(config_home)
+        .map(|home| read_user_config(&home))
+        .transpose()
+        .map_err(|message| ProviderError::RpcError { message })?
+        .flatten();
     let mut env = HashMap::new();
     if let Some(home) = home {
         env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
@@ -199,32 +208,28 @@ pub(crate) async fn probe_authenticated_in_home(
         elapsed_ms: PROBE_TIMEOUT.as_millis() as u64,
     })
     .and_then(|result| result);
-    let result = match result {
-        Ok(account) => {
-            let name = if account.account.is_none() && !account.needs_login() {
-                // Naming is optional and has its own budget after the auth
-                // handshake, so a slow config/read cannot undo readiness.
-                let config = tokio::time::timeout(
-                    Duration::from_secs(1),
-                    child.request("config/read", json!({"includeLayers": false})),
-                )
-                .await;
-                match config {
-                    Ok(Ok(response)) => custom_provider_name(&response["config"]),
-                    _ => None,
-                }
-                .or_else(|| {
-                    let home = home.map(Path::to_path_buf).or_else(config_home)?;
-                    let config = read_user_config(&home).ok()??;
-                    custom_provider_name(&serde_json::to_value(config).ok()?)
-                })
-            } else {
-                None
-            };
-            Ok(classify_account_read(&account, name.as_deref()))
-        }
-        Err(error) => Err(error),
-    };
+    let result = async {
+        let account = result?;
+        let name = if account.account.is_none() {
+            // A rejected config must not be mistaken for missing login.
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                child.request("config/read", json!({"includeLayers": false})),
+            )
+            .await
+            .map_err(|_| ProviderError::Timeout {
+                operation: "codex app-server config/read".into(),
+                elapsed_ms: 1000,
+            })?
+            .map_err(rpc_error)?;
+            custom_provider_name(&response["config"])
+                .or_else(|| custom_provider_name(&serde_json::to_value(config.as_ref()?).ok()?))
+        } else {
+            None
+        };
+        Ok(classify_account_read(&account, name.as_deref()))
+    }
+    .await;
     let _ = child.shutdown().await;
     result
 }

@@ -561,7 +561,17 @@ async fn harvest_via_api() -> Result<ProviderChatCapabilities, HarvestError> {
     let parsed: ApiModelsResponse = resp.json().await.map_err(|e| HarvestError::HarvestFailed {
         message: format!("decode: {e}"),
     })?;
-    Ok(build_capabilities_from_live(parsed.data))
+    let caps = build_capabilities_from_live(parsed.data);
+    nonempty_catalog(caps)
+}
+
+fn nonempty_catalog(caps: ProviderChatCapabilities) -> Result<ProviderChatCapabilities, HarvestError> {
+    if caps.models.is_empty() {
+        return Err(HarvestError::HarvestFailed {
+            message: "API returned an empty model list".into(),
+        });
+    }
+    Ok(caps)
 }
 
 fn api_models_request(
@@ -1304,6 +1314,24 @@ fn merge_sdk_with_maintained(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_readiness_empty_api_catalog_falls_back() {
+        for response in [json!({"data": []}), json!({"data": [{"id":""}]})] {
+            let response: ApiModelsResponse = serde_json::from_value(response).unwrap();
+            assert!(matches!(
+                nonempty_catalog(build_capabilities_from_live(response.data)),
+                Err(HarvestError::HarvestFailed { .. })
+            ));
+        }
+        assert!(
+            nonempty_catalog(build_capabilities_from_live(vec![ApiModel {
+                id: "claude-haiku-4-5".into(),
+                display_name: "Haiku".into(),
+            }]))
+            .is_ok()
+        );
+    }
 
     #[test]
     fn proxy_readiness_api_harvest_uses_endpoint_and_auth_precedence() {
