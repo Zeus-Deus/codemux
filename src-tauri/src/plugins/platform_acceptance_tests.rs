@@ -807,6 +807,69 @@ async fn platform_native_launch_authority_is_checked_before_checkout_or_provider
     }
 }
 
+/// `plugin_invoke` carries an outside client's authority into the plugin's
+/// host calls. A checkout removal holds the lifecycle lock for as long as its
+/// delete takes; a worktree create queued behind it must ask for that
+/// authority again once it gets the lock, since revoking a grant does not end
+/// a plugin invocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn platform_native_worktree_revoked_while_queued_on_the_lifecycle_lock_checks_out_nothing() {
+    if isolated(
+        "platform_native_worktree_revoked_while_queued_on_the_lifecycle_lock_checks_out_nothing",
+    ) {
+        return;
+    }
+    let f = Fixture::new().await;
+    let mut actor = caller(&f.record);
+    actor.control = crate::agent_control::tests::connector_caller(
+        &f.app,
+        "queued-plugin-client",
+        "queued-plugin-grant",
+        ControlAccess::FullAccess,
+    )
+    .await;
+    let mut request = f.request("queued-plugin-worktree");
+    request["workspaceStrategy"] = json!({
+        "type":"worktree","branch":"queued-plugin","baseRef":"main","startFromOrigin":false
+    });
+    let path = f.worktree_path("queued-plugin");
+    let before = git(f.root.path(), &["worktree", "list", "--porcelain"]);
+    let workspaces = f.app.state::<AppStateStore>().snapshot().workspaces.len();
+
+    let removal = crate::worktree_cleanup::removal_guard().await;
+    let revoker = {
+        let (app, repo, path) = (f.app.handle().clone(), f.root.path().to_path_buf(), path.clone());
+        tokio::spawn(async move {
+            // The create freezes its base ref, then waits for the lock.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while git(&repo, &["for-each-ref", "refs/codemux/plugin-worktrees/"]).is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the create freezes its base");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!path.exists(), "no checkout while a removal holds the lock");
+            crate::mcp_connector::agent_connector_revoke(app, "queued-plugin-client".into())
+                .unwrap();
+            drop(removal);
+        })
+    };
+    let error = f.create(&actor, request).await.unwrap_err();
+    revoker.await.unwrap();
+
+    assert!(error.contains("grant_revoked"), "{error}");
+    assert!(!path.exists(), "no checkout, so no setup script");
+    assert_eq!(git(f.root.path(), &["worktree", "list", "--porcelain"]), before);
+    assert_eq!(git(f.root.path(), &["branch", "--list", "queued-plugin"]), "");
+    assert_eq!(
+        f.app.state::<AppStateStore>().snapshot().workspaces.len(),
+        workspaces
+    );
+    assert!(f.starts().is_empty());
+    crate::agent_control::tests::connector_off(&f.app);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn platform_native_partial_worktree_preparation_retains_unknown_receipt_and_frozen_ref() {
     if isolated(

@@ -37,7 +37,7 @@ pub async fn execute<R: tauri::Runtime>(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 #[cfg(test)]
 mod wait_tests;
 #[cfg(test)]

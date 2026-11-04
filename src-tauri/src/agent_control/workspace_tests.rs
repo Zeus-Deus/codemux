@@ -823,6 +823,60 @@ async fn workspace_close_revoked_while_queued_on_the_lifecycle_lock_deletes_noth
     connector_off(&app);
 }
 
+/// The close's dirty-checkout pre-flight reads git. A requester whose
+/// authority was withdrawn meanwhile does not get to stop the workspace's
+/// Hermes chats either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_close_withdrawn_during_its_preflight_stops_no_hermes_chat() {
+    if isolated(&format!("{MODULE}workspace_close_withdrawn_during_its_preflight_stops_no_hermes_chat")) {
+        return;
+    }
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    let hermes = Arc::new(MockAgentProvider::new(ProviderKind::Hermes));
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_hermes(hermes.clone()).await;
+    let parent = tempfile::tempdir().unwrap();
+    let checkout = parent.path().join("preflight-close");
+    git(&repo, &["worktree", "add", "-b", "preflight-close", checkout.to_str().unwrap()]);
+    let state = app.state::<AppStateStore>();
+    let closing = state.create_empty_workspace_at_path(checkout.clone()).0;
+    state.set_workspace_worktree(&closing, checkout.display().to_string(), "preflight-close".into());
+    let profile = crate::agent_provider::hermes::profile::Profile {
+        schema_version: 1,
+        host: "local".into(),
+        installation: parent.path().join("hermes"),
+        root: parent.path().join("hermes-home"),
+        id: "default".into(),
+        home: parent.path().join("hermes-home"),
+        identity: "fixture".into(),
+    };
+    app.state::<DatabaseStore>()
+        .save_hermes_binding(&crate::agent_provider::hermes::binding::Binding {
+            schema_version: 1, profile, thread_id: "preflight-hermes".into(), workspace_id: Some(closing.clone()),
+            cwd: checkout.clone(), acp_session_id: None, current_native_id: None, root_native_id: None,
+            model_override: None, resolved_model: None, permission_mode: None, compatibility: String::new(),
+            cleanup_pending: false,
+        })
+        .unwrap();
+
+    let withdrawn = crate::workspace_service::Checkpoint::new(|| Err("grant_revoked: withdrawn".into()));
+    let error = crate::workspace_service::WorkspaceService::new(app.handle())
+        .checked(withdrawn)
+        .close(crate::workspace_service::CloseWorkspace {
+            workspace_id: closing.clone(),
+            remove_worktree: true,
+            delete_branch: true,
+            force: false,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, "grant_revoked: withdrawn");
+    let stops: Vec<_> = hermes.calls.snapshot().into_iter().filter(|call| matches!(call, MockCall::StopSession(_))).collect();
+    assert!(stops.is_empty(), "{stops:?}");
+    assert!(state.find_workspace(&closing).is_some(), "the workspace stays as it was");
+    assert!(checkout.join(".git").exists());
+}
+
 // ── outside answers: approvals and questions ──────────────────────────────
 
 async fn launched(app: &App, key: &str, workspace: &str, mode: &str) -> String {

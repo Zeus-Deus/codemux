@@ -1258,8 +1258,12 @@ async fn prepare_worktree<R: Runtime>(
         false,
     )
     .await?;
-    platform.authorize(app, caller, "worktrees.create", Some(project))?;
-    let created = crate::commands::workspace::create_worktree_from_request(
+    // The create may queue behind a checkout removal on the lifecycle lock.
+    // It asks for the caller's and the plugin's authority again once it holds
+    // the lock and once the checkout exists, so a grant withdrawn meanwhile
+    // gets no checkout, terminals or setup scripts.
+    let checkpoint = platform.checkpoint(app, caller, "worktrees.create", project);
+    let created = crate::commands::workspace::create_worktree_checked(
         app.clone(),
         crate::workspace_service::WorktreeRequest {
             repo_path: repo,
@@ -1273,6 +1277,7 @@ async fn prepare_worktree<R: Runtime>(
             initial_chat: None,
             reserved_id: None,
         },
+        &checkpoint,
     )
     .await?;
     if created.adopted {

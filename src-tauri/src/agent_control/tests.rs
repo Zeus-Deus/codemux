@@ -1844,7 +1844,7 @@ async fn orchestration_message_controller_queue_release_refreshes_only_stop_fenc
 /// A connector client holding a live grant, as `validate_caller` sees it. This
 /// starts the connector's own listener on a free loopback port; call
 /// `connector_off` when done.
-pub(super) async fn connector_caller(app: &tauri::App<tauri::test::MockRuntime>, client_id: &str, grant_id: &str, access: ControlAccess) -> ControlCaller {
+pub(crate) async fn connector_caller(app: &tauri::App<tauri::test::MockRuntime>, client_id: &str, grant_id: &str, access: ControlAccess) -> ControlCaller {
     app.manage(crate::mcp_connector::McpConnectorState::default());
     let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port=listener.local_addr().unwrap().port();drop(listener);
@@ -1861,7 +1861,7 @@ pub(super) async fn connector_caller(app: &tauri::App<tauri::test::MockRuntime>,
 }
 
 /// Stops the listener `connector_caller` started.
-pub(super) fn connector_off(app: &tauri::App<tauri::test::MockRuntime>) {
+pub(crate) fn connector_off(app: &tauri::App<tauri::test::MockRuntime>) {
     crate::mcp_connector::agent_connector_set_config(app.handle().clone(),false,None,None).unwrap();
 }
 

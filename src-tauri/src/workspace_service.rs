@@ -18,10 +18,11 @@ use tauri::{AppHandle, Manager, Runtime};
 /// Asks again whether whoever requested a lifecycle operation still may, at
 /// the points it cannot take back after a wait: once the shared lifecycle
 /// lock is held (a checkout removal holds it for as long as its delete
-/// takes), before the checkout is made, and before terminals, setup or
-/// teardown scripts start or files are deleted. Outside callers pass their
-/// grant check. The desktop and the control socket act for the person at
-/// this computer and pass the default, which always passes.
+/// takes), before the checkout is made, and before a workspace is created,
+/// terminals, setup or teardown scripts start, a closing workspace's chats
+/// stop or files are deleted. Outside callers and plugins pass their grant
+/// check. The desktop and the control socket act for the person at this
+/// computer and pass the default, which always passes.
 #[derive(Clone, Default)]
 pub(crate) struct Checkpoint(Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>);
 
@@ -858,6 +859,8 @@ mod tests {
             reserved_id: Some(reserved.clone()),
         };
         let checked = |checkpoint| WorkspaceService::new(app.handle()).checked(checkpoint);
+        let db = app.state::<crate::database::DatabaseStore>();
+        let closed = || crate::worktree_cleanup::closed_paths(&db);
 
         // Withdrawn while it waited for the lifecycle lock: no checkout.
         let reserved = AppStateStore::reserve_workspace_id();
@@ -865,9 +868,11 @@ mod tests {
         assert_eq!(error, "grant_revoked: withdrawn");
         assert!(!crate::git::conventional_worktree_path(&project, "early").unwrap().exists());
         assert_eq!(git(&project, &["branch", "--list", "early"]), "");
+        assert!(closed().is_empty());
 
         // Withdrawn while git checked out: the checkout stays, and no
-        // workspace claims it or starts anything in it.
+        // workspace claims it or starts anything in it. Cleanup remembers it
+        // as a closed workspace's checkout, so it is offered once stale.
         let error = checked(withdrawn_after(1)).create_worktree(request("late", &reserved)).await.unwrap_err();
         let path = crate::git::conventional_worktree_path(&project, "late").unwrap();
         assert_eq!(
@@ -877,15 +882,28 @@ mod tests {
         assert!(path.join(".git").exists());
         assert!(state.find_workspace(&reserved.0).is_none());
         assert_eq!(state.snapshot().workspaces.len(), count);
+        assert_eq!(closed(), [path.display().to_string()]);
 
-        // A later create of that branch takes the kept checkout.
+        // A later worktree create of that branch takes the kept checkout.
         let created = WorkspaceService::new(app.handle()).create_worktree(request("late", &reserved)).await.unwrap();
         assert_eq!((created.workspace_id.as_str(), created.cwd.as_str()), (reserved.0.as_str(), path.to_str().unwrap()));
         assert!(!created.adopted);
+
+        // A checkout that was already there before the call is not its to
+        // hand to cleanup.
+        let holder = AppStateStore::reserve_workspace_id();
+        WorkspaceService::new(app.handle()).create_worktree(request("held", &holder)).await.unwrap();
+        let refused = AppStateStore::reserve_workspace_id();
+        let error = checked(withdrawn_after(1)).create_worktree(request("held", &refused)).await.unwrap_err();
+        assert!(error.starts_with("grant_revoked: withdrawn; the checkout at "), "{error}");
+        assert!(state.find_workspace(&refused.0).is_none());
+        assert!(state.find_workspace(&holder.0).is_some());
+        assert_eq!(closed(), [path.display().to_string()]);
     }
 
     // Creation through `open` starts a terminal; a checkpoint withdrawn
-    // after the git reads stops it before that, so this test starts none.
+    // after the git reads stops it before the workspace exists, so this test
+    // starts none.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_stops_where_its_checkpoint_is_withdrawn() {
         if isolated("workspace_service::tests::open_stops_where_its_checkpoint_is_withdrawn") {
@@ -915,8 +933,9 @@ mod tests {
         assert_eq!(error, "grant_revoked: withdrawn");
         assert_eq!(state.snapshot().active_workspace_id, other);
 
-        // Withdrawn while it read git: the new workspace goes again.
-        let error = checked(withdrawn_after(1)).open(open(&fresh, false)).await.unwrap_err();
+        // Withdrawn while it read git: no workspace was made, so focus stays
+        // where it was.
+        let error = checked(withdrawn_after(1)).open(open(&fresh, true)).await.unwrap_err();
         assert_eq!(error, "grant_revoked: withdrawn");
         let snapshot = state.snapshot();
         assert_eq!(snapshot.workspaces.len(), count);
@@ -946,14 +965,17 @@ mod tests {
         };
         let checked = |checkpoint| WorkspaceService::new(app.handle()).checked(checkpoint);
 
-        // Withdrawn before teardown: the workspace stays as it was.
-        let error = checked(withdrawn_after(0)).close(close()).await.unwrap_err();
-        assert_eq!(error, "grant_revoked: withdrawn");
-        assert!(state.find_workspace(&closing).is_some());
+        // Withdrawn while the pre-flight read git, or while Hermes chats
+        // stopped: the workspace stays as it was.
+        for passes in [0, 1] {
+            let error = checked(withdrawn_after(passes)).close(close()).await.unwrap_err();
+            assert_eq!(error, "grant_revoked: withdrawn");
+            assert!(state.find_workspace(&closing).is_some());
+        }
 
         // Withdrawn while its agents stopped and the lifecycle lock was taken:
         // the close stands, and the files and the branch stay.
-        let error = checked(withdrawn_after(1)).close(close()).await.unwrap_err();
+        let error = checked(withdrawn_after(2)).close(close()).await.unwrap_err();
         assert_eq!(error, "grant_revoked: withdrawn; the workspace was closed and its files were kept");
         assert!(state.find_workspace(&closing).is_none());
         assert!(checkout.join(".git").exists());

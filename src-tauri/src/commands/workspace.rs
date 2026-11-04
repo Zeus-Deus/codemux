@@ -193,30 +193,26 @@ pub(crate) async fn open_workspace_impl<R: tauri::Runtime>(
     // a hand-typed `~` path would otherwise be stored verbatim.
     let repo_path = request
         .path
-        .map(|path| PathBuf::from(crate::project::expand_tilde(&path)))
+        .as_deref()
+        .map(|path| PathBuf::from(crate::project::expand_tilde(path)))
         .unwrap_or_else(crate::project::current_project_root);
 
-    // A retry under the same reservation, or a folder that is already open,
-    // returns that workspace and runs none of the create-side effects again.
-    let existing = {
-        let snapshot = state.snapshot();
-        request
-            .reserved_id
-            .as_ref()
-            .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id == id))
-            .or_else(|| {
-                request
-                    .reuse_open
-                    .then(|| find_open_workspace_at_path(&snapshot, &repo_path))
-                    .flatten()
-            })
-            .map(|w| (w.workspace_id.0.clone(), w.cwd.clone()))
+    if let Some(opened) = reopen_workspace(&app, &state, &request, &repo_path)? {
+        return Ok(opened);
+    }
+    // Read before the workspace exists, so a requester whose authority was
+    // withdrawn during the read leaves nothing behind to undo.
+    let git_info = {
+        let path = repo_path.clone();
+        tokio::task::spawn_blocking(move || gather_workspace_git_info(&path))
+            .await
+            .unwrap_or_default()
     };
-    if let Some((workspace_id, cwd)) = existing {
-        if request.select {
-            activate_workspace_impl(app.clone(), &state, workspace_id.clone())?;
-        }
-        return Ok(OpenedWorkspace { workspace_id, cwd, created: false });
+    checkpoint.check()?;
+    // Another open of this folder may have made it during the read. From
+    // here to the create nothing waits.
+    if let Some(opened) = reopen_workspace(&app, &state, &request, &repo_path)? {
+        return Ok(opened);
     }
 
     let workspace_id = state.create_workspace_with_layout_reserved(
@@ -230,14 +226,7 @@ pub(crate) async fn open_workspace_impl<R: tauri::Runtime>(
     let project_root = crate::config::workspace_config::find_git_root(&repo_path)
         .unwrap_or_else(|| repo_path.clone());
     state.set_workspace_project_root(&workspace_id.0, project_root.display().to_string());
-    populate_git_info_async(&state, &workspace_id.0, repo_path.clone()).await;
-    // So may reading git. Then nothing starts in the new workspace, which
-    // goes again: no terminal has started in it yet.
-    if let Err(error) = checkpoint.check() {
-        let _ = state.close_workspace(&workspace_id.0);
-        crate::state::emit_app_state(&app);
-        return Err(error);
-    }
+    apply_workspace_git_info(&state, &workspace_id.0, git_info);
 
     terminal::spawn_missing_ptys_for_workspace(app.clone(), &workspace_id.0);
 
@@ -255,6 +244,38 @@ pub(crate) async fn open_workspace_impl<R: tauri::Runtime>(
         cwd: repo_path.display().to_string(),
         created: true,
     })
+}
+
+/// A retry under the same reservation, or a folder that is already open, gets
+/// that workspace back (focused when asked) and runs none of the create-side
+/// effects again.
+fn reopen_workspace<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppStateStore,
+    request: &OpenWorkspace,
+    repo_path: &Path,
+) -> Result<Option<OpenedWorkspace>, String> {
+    let existing = {
+        let snapshot = state.snapshot();
+        request
+            .reserved_id
+            .as_ref()
+            .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id == id))
+            .or_else(|| {
+                request
+                    .reuse_open
+                    .then(|| find_open_workspace_at_path(&snapshot, repo_path))
+                    .flatten()
+            })
+            .map(|w| (w.workspace_id.0.clone(), w.cwd.clone()))
+    };
+    let Some((workspace_id, cwd)) = existing else {
+        return Ok(None);
+    };
+    if request.select {
+        activate_workspace_impl(app.clone(), state, workspace_id.clone())?;
+    }
+    Ok(Some(OpenedWorkspace { workspace_id, cwd, created: false }))
 }
 
 /// The live top-level local workspace opened directly at `path`, if any.
@@ -762,7 +783,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
     // `git worktree add -b` forks the repo's checked-out branch, so that is
     // read BEFORE the add. A reused on-disk worktree keeps whatever it was
     // forked from originally, which we can't know, so it records nothing.
-    let (worktree_path, base_branch) = {
+    let (worktree_path, base_branch, made_here) = {
         let repo_path = repo_path.clone();
         let branch = branch.clone();
         tokio::task::spawn_blocking(move || {
@@ -781,16 +802,16 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
                     (Some(sha), Some(label))
                 }
             };
-            let base_branch = if new_branch
-                && !crate::git::conventional_worktree_path(repo, &branch)
-                    .is_some_and(|p| p.exists())
-            {
+            // Nothing at the path yet: the checkout below is this call's own.
+            let made_here = !crate::git::conventional_worktree_path(repo, &branch)
+                .is_some_and(|p| p.exists());
+            let base_branch = if new_branch && made_here {
                 label.or_else(|| crate::git::current_branch(repo))
             } else {
                 None
             };
             crate::git::git_create_worktree(repo, &branch, new_branch, start.as_deref(), pr_number)
-                .map(|path| (path, base_branch))
+                .map(|path| (path, base_branch, made_here))
         })
         .await
         .map_err(|e| format!("git_create_worktree task join failed: {e}"))??
@@ -806,12 +827,19 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
     };
     // The checkout can take long (a fetch, a large tree). A requester whose
     // authority was withdrawn meanwhile gets no workspace, terminals, setup
-    // scripts or preset. The checkout stays: nothing ran in it, a later
-    // create of the branch reuses it, and removing it here could race a
-    // concurrent create that adopts it.
-    checkpoint.check().map_err(|error| {
-        format!("{error}; the checkout at {worktree_path} was kept and nothing was started in it")
-    })?;
+    // scripts or preset. The checkout stays, since removing it here could
+    // race a concurrent create that adopts it. Nothing ran in it: a later
+    // worktree create of the branch takes it over, while a new-branch launch
+    // refuses the branch as taken. One this call made is remembered as a
+    // closed workspace's, so cleanup offers it once stale.
+    if let Err(error) = checkpoint.check() {
+        if made_here {
+            crate::worktree_cleanup::remember_unclaimed_checkout(&db, &worktree_path, &branch);
+        }
+        return Err(format!(
+            "{error}; the checkout at {worktree_path} was kept and nothing was started in it"
+        ));
+    }
 
     // ADOPT-EXISTING GUARD. `git_create_worktree` does not always create
     // something: when the conventional path is already on disk and
@@ -1283,7 +1311,8 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
 }
 
 /// [`close_workspace_with_worktree_impl`], asking `checkpoint` again before
-/// teardown scripts run and before any file is deleted.
+/// it stops Hermes chats or runs teardown scripts, and before any file is
+/// deleted.
 pub(crate) async fn close_workspace_checked<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     request: CloseWorkspace,
@@ -1722,6 +1751,9 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
             }
         }
     }
+    // The pre-flight read git: a requester whose authority was withdrawn
+    // meanwhile does not get to stop this workspace's Hermes chats either.
+    checkpoint.check()?;
 
     // Hermes owns background work with no drain acknowledgment. Await foreground
     // cancellation, retain files and defer teardown scripts while cleanup is pending.
@@ -1739,9 +1771,8 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
             }
         }
     }
-    // The pre-flight and stopping Hermes may have taken a while: a requester
-    // whose authority was withdrawn meanwhile runs no teardown script and
-    // closes nothing.
+    // So may stopping Hermes: a requester whose authority was withdrawn
+    // meanwhile runs no teardown script and closes nothing.
     checkpoint.check()?;
     // Run teardown scripts before closing. Never for a chat child
     // workspace: its folder is its parent's, still in use.
