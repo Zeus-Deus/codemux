@@ -60,7 +60,8 @@ pub const NAME_HEADER: &str = "mcp-name";
 /// when Codemux is upgraded.
 pub const DISCOVER_TTL_MS: u64 = 3_600_000;
 /// How long a client may reuse a `tools/list` result. A list depends only on
-/// the build and the caller's access level, both fixed for a connection.
+/// the build and the caller's access level, both fixed for a `codemux mcp`
+/// process and for a network grant.
 pub const TOOLS_LIST_TTL_MS: u64 = 300_000;
 
 /// `_meta` keys of the stateless revision.
