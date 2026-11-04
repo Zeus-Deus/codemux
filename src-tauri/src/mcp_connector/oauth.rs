@@ -878,8 +878,9 @@ pub mod protocol {
                 }
                 "ping" => keys(&self.params, &["_meta"]),
                 // Stateless era (2026-07-28) only; mcp() answers an
-                // initialize-era one with method-not-found.
-                "server/discover" => keys(&self.params, &["_meta"]),
+                // initialize-era one with method-not-found. With the era
+                // switched off it is unknown here, before authentication.
+                "server/discover" if crate::mcp::protocol::MODERN_ERA_ENABLED => keys(&self.params, &["_meta"]),
                 // Codemux never paginates, so no cursor is one it handed out.
                 "tools/list" if self.params.get("cursor").is_some() => {
                     return Err((-32602, "Invalid cursor"))
@@ -1068,8 +1069,15 @@ pub mod protocol {
             assert!(call(json!({"name":"thread_list","arguments":null})).validate_method().is_ok(), "null arguments mean none");
             assert_eq!(call(json!({"name":"thread_list","arguments":[]})).validate_method(), Err((-32602, "Invalid params")));
             let discover = |params| Rpc::parse(json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":params})).unwrap();
-            assert!(discover(json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}})).validate_method().is_ok());
-            assert_eq!(discover(json!({"extra":1})).validate_method(), Err((-32602, "Invalid params")));
+            let probe = discover(json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}})).validate_method();
+            let extra = discover(json!({"extra":1})).validate_method();
+            if crate::mcp::protocol::MODERN_ERA_ENABLED {
+                assert!(probe.is_ok());
+                assert_eq!(extra, Err((-32602, "Invalid params")));
+            } else {
+                // Switched off, discover is unknown, as it was before the stateless era.
+                assert_eq!((probe, extra), (Err((-32601, "Method not found")), Err((-32601, "Method not found"))));
+            }
         }
         #[test]
         fn escaped_neutralizes_html_metacharacters() {
