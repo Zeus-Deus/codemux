@@ -191,11 +191,30 @@ impl WorkspaceSummary {
             branch: workspace.git_branch.clone(),
             worktree_path: workspace.worktree_path.clone(),
             parent_workspace_id: workspace.parent_workspace_id.clone(),
-            // What outside thread tools accept as a target: local and live.
-            native_control_available: !workspace.is_local_import_snapshot_only()
-                && workspace.host_id.is_none()
-                && workspace.remote_cwd.is_none(),
+            native_control_available: native_control(workspace).is_ok(),
         }
+    }
+}
+
+/// Why outside thread tools cannot act in a workspace.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum NotControllable {
+    /// An imported, read-only snapshot.
+    ImportedSnapshot,
+    /// On an SSH device or in a remote folder.
+    Remote,
+}
+
+/// Whether outside thread tools may act in `workspace`: only a live local one.
+/// The one rule behind both `native_control_available` and the thread tools'
+/// refusal, so a listing never offers a target the tools then refuse.
+pub(crate) fn native_control(workspace: &WorkspaceSnapshot) -> Result<(), NotControllable> {
+    if workspace.is_local_import_snapshot_only() {
+        Err(NotControllable::ImportedSnapshot)
+    } else if workspace.host_id.is_some() || workspace.remote_cwd.is_some() {
+        Err(NotControllable::Remote)
+    } else {
+        Ok(())
     }
 }
 
@@ -1026,6 +1045,23 @@ mod tests {
         for base in ["main", "HEAD", head.as_str()] {
             let fresh = resolve_base(&no_origin, base, OriginPolicy::PreferFresh).await.unwrap();
             assert_eq!(fresh, ResolvedBase { commit: head.clone(), label: base.into() });
+        }
+    }
+
+    #[test]
+    fn native_control_is_one_rule_for_listing_and_thread_tools() {
+        let local = AppStateStore::default().snapshot().workspaces[0].clone();
+        let imported = WorkspaceSnapshot { imported_snapshot_only: Some(true), ..local.clone() };
+        let device = WorkspaceSnapshot { host_id: Some(7), ..local.clone() };
+        let remote_folder = WorkspaceSnapshot { remote_cwd: Some("/srv/app".into()), ..local.clone() };
+        for (workspace, expected) in [
+            (&local, Ok(())),
+            (&imported, Err(NotControllable::ImportedSnapshot)),
+            (&device, Err(NotControllable::Remote)),
+            (&remote_folder, Err(NotControllable::Remote)),
+        ] {
+            assert_eq!(native_control(workspace), expected, "{:?}", workspace.workspace_id);
+            assert_eq!(WorkspaceSummary::of(workspace).native_control_available, expected.is_ok());
         }
     }
 

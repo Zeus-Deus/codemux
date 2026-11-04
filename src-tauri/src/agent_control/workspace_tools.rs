@@ -92,10 +92,8 @@ pub(super) fn info<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args:
         InfoError::NotFound => ControlError::new(ErrorCode::WorkspaceNotFound, "Select an existing workspace explicitly"),
         InfoError::NoActive => ControlError::new(ErrorCode::NoActiveWorkspace, "No workspace is focused in CodeMux; pass workspace_id"),
     })?;
-    // Exactly what thread tools accept as a target.
-    let controllable = service::workspace(app, &workspace.workspace_id.0, true).is_ok();
     let mut value = serde_json::to_value(&workspace).map_err(serialization)?;
-    value["native_control_available"] = json!(controllable);
+    value["native_control_available"] = json!(workspaces::native_control(&workspace).is_ok());
     Ok(value)
 }
 

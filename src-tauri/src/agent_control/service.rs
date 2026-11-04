@@ -4,7 +4,7 @@ use crate::agent_provider::{ProviderChatCapabilities, ProviderKind, StartSession
 use crate::commands::agent_chat::{self, ProviderRegistry, SendTurnCommandInput};
 use crate::database::{AgentChatSessionConfig, DatabaseStore};
 use crate::state::{AppStateStore, WorkspaceId, WorkspaceSnapshot};
-use crate::workspace_service::{self as workspaces, OriginPolicy, WorkspaceService, WorktreeBase, WorktreeRequest};
+use crate::workspace_service::{self as workspaces, NotControllable, OriginPolicy, WorkspaceService, WorktreeBase, WorktreeRequest};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -33,11 +33,11 @@ pub(crate) fn workspace<R: Runtime>(app: &AppHandle<R>, id: &str, mutation: bool
     identifier(id, "workspace_id", 256)?;
     let workspace = app.state::<AppStateStore>().snapshot().workspaces.into_iter().find(|w| w.workspace_id.0 == id)
         .ok_or_else(|| ControlError::new(ErrorCode::WorkspaceNotFound, "Select an existing workspace explicitly"))?;
-    if mutation && workspace.is_local_import_snapshot_only() {
-        return Err(ControlError::new(ErrorCode::ImportedSnapshotReadOnly, "Imported workspaces are read-only snapshots"));
-    }
-    if mutation && (workspace.host_id.is_some() || workspace.remote_cwd.is_some()) {
-        return Err(ControlError::new(ErrorCode::UnsupportedRemoteWorkspace, "Native outside control currently targets local workspaces"));
+    if mutation {
+        workspaces::native_control(&workspace).map_err(|refusal| match refusal {
+            NotControllable::ImportedSnapshot => ControlError::new(ErrorCode::ImportedSnapshotReadOnly, "Imported workspaces are read-only snapshots"),
+            NotControllable::Remote => ControlError::new(ErrorCode::UnsupportedRemoteWorkspace, "Native outside control currently targets local workspaces"),
+        })?;
     }
     Ok(workspace)
 }
