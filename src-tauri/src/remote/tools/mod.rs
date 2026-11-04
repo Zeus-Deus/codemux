@@ -222,16 +222,16 @@ pub fn dispatch(
     match name {
         "workspace_create" => workspace_create(params, workspaces),
         "worktree_create" => worktree_create(params, workspaces),
-        "workspace_list" => workspace_list(workspaces),
+        "workspace_list" => workspace_list(params, workspaces),
         "workspace_info" => workspace_info(params, workspaces),
         "workspace_update" => workspace_update(params, workspaces),
         "workspace_close" => workspace_close(params, workspaces),
         "terminal_spawn" => terminal_spawn(params, ptys),
         "terminal_write" => terminal_write(params, ptys),
         "terminal_read" => terminal_read(params, ptys),
-        "terminal_list" => terminal_list(ptys),
+        "terminal_list" => terminal_list(params, ptys),
         "terminal_close" => terminal_close(params, ptys),
-        "app_status" => app_status(workspaces, ptys, started_at),
+        "app_status" => app_status(params, workspaces, ptys, started_at),
         other => Err(ToolError::not_found(format!("unknown tool: {other}"))),
     }
 }
@@ -240,6 +240,19 @@ pub fn dispatch(
 // `additionalProperties: false`, and a desktop-style call such as
 // `workspace_close{delete_worktree: true}` must fail instead of quietly
 // doing less than asked.
+
+/// The input of a tool that takes no arguments. It refuses every key too,
+/// so `terminal_list{workspace_id}` fails instead of listing every shell.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoInput {}
+
+/// Accepts `{}`, or null: the daemon reads a missing `arguments` as null.
+fn no_arguments(params: &Value) -> Result<(), ToolError> {
+    serde_json::from_value::<Option<NoInput>>(params.clone())
+        .map(|_| ())
+        .map_err(|e| ToolError::invalid(e.to_string()))
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -529,7 +542,8 @@ pub fn run_worktree_setup(
     )
 }
 
-fn workspace_list(store: &WorkspaceStore) -> ToolResult {
+fn workspace_list(params: &Value, store: &WorkspaceStore) -> ToolResult {
+    no_arguments(params)?;
     let list = store.list().map_err(workspace_err)?;
     Ok(json!({ "workspaces": list }))
 }
@@ -636,7 +650,8 @@ fn terminal_read(params: &Value, ptys: &PtyManager) -> ToolResult {
     }))
 }
 
-fn terminal_list(ptys: &PtyManager) -> ToolResult {
+fn terminal_list(params: &Value, ptys: &PtyManager) -> ToolResult {
+    no_arguments(params)?;
     Ok(json!({ "terminals": ptys.list() }))
 }
 
@@ -654,10 +669,12 @@ fn terminal_close(params: &Value, ptys: &PtyManager) -> ToolResult {
 }
 
 fn app_status(
+    params: &Value,
     workspaces: &WorkspaceStore,
     ptys: &PtyManager,
     started_at: &str,
 ) -> ToolResult {
+    no_arguments(params)?;
     let workspace_count = workspaces.list().map_err(workspace_err)?.len();
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -1303,6 +1320,13 @@ mod tests {
                     json!({ "terminal_id": "t", "force": true }),
                     "force",
                 ),
+                ("workspace_list", json!({ "detail": "full" }), "detail"),
+                (
+                    "terminal_list",
+                    json!({ "workspace_id": id }),
+                    "workspace_id",
+                ),
+                ("app_status", json!({ "verbose": true }), "verbose"),
             ];
             for (tool, args, field) in cases {
                 let err = call(tool, args, &store).unwrap_err();
@@ -1312,6 +1336,14 @@ mod tests {
                     "{tool}: {}",
                     err.message
                 );
+            }
+            // The tools with no arguments still take `{}`, and null, which
+            // is what the daemon reads when a call leaves `arguments` out.
+            for tool in ["workspace_list", "terminal_list", "app_status"] {
+                for args in [json!({}), Value::Null] {
+                    call(tool, args.clone(), &store)
+                        .unwrap_or_else(|e| panic!("{tool}({args}): {}", e.message));
+                }
             }
             assert_eq!(
                 store.list().unwrap().len(),

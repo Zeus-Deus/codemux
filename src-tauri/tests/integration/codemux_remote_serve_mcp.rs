@@ -255,6 +255,25 @@ fn http_workspace_create_then_list() {
     let workspaces = body["data"]["workspaces"].as_array().unwrap();
     assert!(workspaces.iter().any(|w| w["id"] == json!(id)));
 
+    // A body without `arguments` is a call with none. A tool that takes
+    // none still refuses a key it doesn't know.
+    let resp = client
+        .post(format!("{}/tools/call", fx.endpoint))
+        .bearer_auth(&fx.secret)
+        .json(&json!({ "name": "workspace_list" }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .post(format!("{}/tools/call", fx.endpoint))
+        .bearer_auth(&fx.secret)
+        .json(&json!({ "name": "workspace_list", "arguments": { "detail": "full" } }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().unwrap();
+    assert_eq!(body["error"]["kind"], json!("invalid_input"));
+
     fx.stop();
 }
 
