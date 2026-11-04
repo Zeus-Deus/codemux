@@ -357,6 +357,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
    - `failure` is one of `error`, `interrupted`, `max_turns`, `max_budget`, `usage_limit`, `no_final_message`, `went_idle` and `delivery_needs_attention`.
    - `timeout_ms` defaults to 60000 (one minute). The most is 600000 (ten minutes). Keep it below your client's tool timeout. A timeout never cancels work.
    - `turn_id` keeps the wait on one run. Without it, the wait follows the thread's current run.
+   - A wait returns when something changes. Input that was already pending when the wait began is reported only at its timeout. After a reconnect, call `thread_status` first: it returns the same `state`, `pending` and `wait_cursor` at once.
    - To wait for the next change of any kind, pass the previous `wait_cursor` as `since`:
 
      ```text
@@ -402,12 +403,11 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
 
    It stops the workspace's agents and terminals and runs its teardown. `delete_worktree` removes a worktree, never a project folder, and refuses one with uncommitted or unpushed work (`workspace_close_refused`). `delete_branch` also deletes its branch. `force_delete` removes it anyway; only assistants on this computer can use it.
 
-**Errors.** A failed call is an MCP tool error (`isError: true`) whose text reads `code: message` and whose `structuredContent.error` holds `code`, `message` and `retryable`. An unknown tool is a JSON-RPC error. Retrying a call that failed returns the failure again, in one of two shapes:
+**Errors.** A failed call is an MCP tool error (`isError: true`) whose text reads `code: message` and whose `structuredContent.error` holds `code`, `message` and `retryable`. An unknown tool is a JSON-RPC error.
 
-- `thread_launch`, `thread_send`, `thread_respond`, `thread_interrupt` and `thread_stop` return the failed receipt as a result: `{"state": "failed", "error": {"code": …, "message": …}}`.
-- `workspace_create`, `worktree_create`, `workspace_close` and `thread_answer` return a tool error: `operation_failed: <original code>: <message>`.
+A call Codemux accepted and that then failed is final for its `client_request_id`. Retrying it with the same id returns its receipt as a normal result, not an error: `{"operation_id": …, "state": "failed", "error": {"code": …, "message": …, "retryable": …}, …}`. A retry while the first call still runs returns the same receipt with `state` `accepted` or `running`; poll `operation_status`. When `error.retryable` is `true`, try again with a new `client_request_id`. A call refused before Codemux accepted it, such as one with a wrong argument or too little access, leaves its id unused.
 
-If a client drops one of those last four calls (it disconnects, or a proxy times out), Codemux still finishes it. A retry with the same `client_request_id` returns the result.
+If a client drops a `workspace_create`, `worktree_create`, `workspace_close` or `thread_answer` call (it disconnects, or a proxy times out), Codemux still finishes it. A retry with the same `client_request_id` returns the result, with `"replayed": true`.
 
 ## From the shell
 
@@ -468,7 +468,8 @@ Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` 
 ## Supported MCP versions
 
 - Through `initialize`: 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05. Codemux answers with the version the client asks for, or with 2025-11-25 when it asks for another one.
-- Through `server/discover`: 2026-07-28, on `codemux mcp` and on the network door. Clients that support it, such as Claude Code, try it first and fall back to `initialize`.
+- Through `server/discover`: 2026-07-28, on `codemux mcp` and on the network door. Clients that support it, such as Claude Code, try it first and fall back to `initialize`. Each such request names its version and `clientCapabilities` in `_meta`. A version Codemux doesn't speak gets error -32022, which lists the ones it does.
+- `codemux-remote mcp` speaks only the `initialize` versions.
 - Over HTTP, a request without an `MCP-Protocol-Version` header counts as 2025-03-26.
 - Batched requests are refused.
 
@@ -523,7 +524,7 @@ A paired phone or browser can remove a clean worktree, for example with **Device
 
 ## Error codes
 
-The codes an outside assistant meets most often. "Retry" means retrying the identical call later can succeed without anyone changing anything.
+The codes an outside assistant meets most often. "Retry" means retrying the identical call later can succeed without anyone changing anything. If Codemux had accepted the first call, the retry needs a new `client_request_id` (see [Errors](#the-end-to-end-flow) in the flow).
 
 <!-- error-codes:start -->
 | Code | Means | Retry |
@@ -535,7 +536,7 @@ The codes an outside assistant meets most often. "Retry" means retrying the iden
 | `admin_refused` | An agent that Codemux started asked for an administration command | No |
 | `agent_identity_required` | An agent that Codemux started called a control tool; it uses its chat's own tools | No |
 | `request_key_conflict` | This `client_request_id` was used with other arguments | No |
-| `operation_failed` | A retried call had failed; the message holds the original code | No |
+| `operation_failed` | `codemux` CLI only: the app's error carried no code, or a receipt ended without an error of its own | No |
 | `workspace_not_found` | No open workspace has that id | No |
 | `no_active_workspace` | `workspace_info` without an id, and no workspace is open | No |
 | `thread_not_found` | No thread has that id in that workspace | No |
