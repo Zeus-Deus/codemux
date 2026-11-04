@@ -522,6 +522,8 @@ To control Codemux from another machine, use SSH or **Over the network**, not `c
 
 A paired phone or browser can remove a clean worktree, for example with **Devices → Sweep**. Codemux refuses one with uncommitted or unpushed work. Force delete, deleting the branch together with the worktree, and deleting archived workspaces are only in the desktop app. Merging a pull request from the phone can delete its branch, as on the desktop.
 
+**Revoke** under **Settings → Connections → Remote Access → Paired browsers** ends that device's connection. It also stops what the device started through a plugin: a change in progress stops before its next step, and a new worktree's setup starts no further command. Turning **Remote Access** off does the same for every paired device. A workspace or worktree the device created in the Codemux app itself is created as you, as on the desktop, so its setup keeps running either way.
+
 ## If you used Codemux's MCP server before
 
 - **The network door moved to its own port, 4378.** It used to share Remote Access's port 4377, and it no longer needs Remote Access. Point your proxy at port 4378. Assistants that used `http://127.0.0.1:4377/mcp` directly need the new URL and a new sign-in.
