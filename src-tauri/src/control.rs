@@ -2483,6 +2483,8 @@ mod tests {
             // A prompt without a preset is dropped: nothing launches.
             ("create_worktree_workspace", serde_json::json!({"repo_path":"/r","branch":"b","initial_prompt":"go"})),
             ("close_workspace", serde_json::json!({"workspace_id":"w","delete_worktree":true})),
+            ("close_workspace", serde_json::json!({"workspace_id":"w"})),
+            ("archive_workspace", serde_json::json!({"workspace_id":"w"})),
             ("unarchive_workspace", serde_json::json!({})),
         ] {
             let required = crate::control_identity::command_access(command, &params);
@@ -2494,6 +2496,30 @@ mod tests {
         let supervised = agent(crate::agent_control::ControlAccess::Supervised);
         let create = dispatch_request_as(app.handle(), &supervised, request("create_workspace", serde_json::json!({"path":"relative/dir"}))).await;
         assert!(refused_with(&create, "access_denied"), "{:?}", create.error);
+    }
+
+    /// Closing and archiving run the worktree's teardown scripts even when
+    /// the worktree stays, so a supervised caller is refused both before
+    /// anything closes.
+    #[tokio::test]
+    async fn supervised_callers_cannot_close_or_archive() {
+        use crate::agent_control::ControlAccess::Supervised;
+        let app = tauri::test::mock_app();
+        let state = AppStateStore::default();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = state.create_empty_workspace_at_path(root.path().to_path_buf()).0;
+        app.manage(state);
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        for caller in [local(Some("hermes"), Supervised), agent(Supervised)] {
+            for command in ["close_workspace", "archive_workspace"] {
+                let params = serde_json::json!({"workspace_id": workspace});
+                let response = dispatch_request_as(app.handle(), &caller, request(command, params)).await;
+                assert!(refused_with(&response, "access_denied"), "{caller:?} {command}: {:?}", response.error);
+            }
+        }
+        let snapshot = app.state::<AppStateStore>().snapshot();
+        assert!(snapshot.workspaces.iter().any(|ws| ws.workspace_id.0 == workspace), "the workspace stays open");
+        assert!(snapshot.archived_workspaces.is_empty(), "nothing was archived");
     }
 
     #[tokio::test]

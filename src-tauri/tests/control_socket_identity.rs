@@ -497,6 +497,61 @@ fn mcp_git_tools_take_file_names_as_paths() {
     assert_eq!(git(&repo, &["log", "--format=%s"]), "--amend\nfirst", "a new commit, not an amended one");
 }
 
+/// Whether `id` is an open workspace.
+fn is_open(serve: &Serve, id: &str) -> bool {
+    let state = serve.json("get_app_state", "{}", &[]);
+    let workspaces = state["data"]["workspaces"].as_array().unwrap_or_else(|| panic!("no workspaces: {state}"));
+    workspaces.iter().any(|ws| ws["workspace_id"] == id || ws["workspace_id"]["0"] == id)
+}
+
+/// Archiving or closing a worktree workspace runs its teardown scripts, also
+/// when the worktree stays, and they run any command as the person. So a
+/// supervised client is refused both on the stdio and the socket route
+/// before any teardown starts.
+#[test]
+fn supervised_clients_cannot_run_teardown_through_archive_or_close() {
+    let serve = Serve::start(&[]);
+    let root = serve.root.path();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "trunk"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+    let params = json!({ "repo_path": repo, "branch": "feat", "layout": "empty" });
+    let created = serve.json("create_worktree_workspace", &params.to_string(), &[]);
+    assert_eq!(created["ok"], true, "{created}");
+    let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
+    let checkout = Path::new(created["data"]["cwd"].as_str().unwrap()).to_path_buf();
+    let ran = root.join("teardown-ran");
+    std::fs::create_dir_all(checkout.join(".codemux")).unwrap();
+    let config = json!({ "teardown": [format!("touch '{}'", ran.display())] });
+    std::fs::write(checkout.join(".codemux/config.json"), config.to_string()).unwrap();
+
+    let mut supervised = Mcp::start(&serve, &["--client", "integration-bot", "--access", "supervised"]);
+    let archived = supervised.call("workspace_archive", json!({ "workspace_id": id }));
+    assert!(!ran.exists(), "a supervised workspace_archive ran the teardown: {archived}");
+    assert_eq!(archived["isError"], true, "{archived}");
+    assert!(archived["content"][0]["text"].as_str().unwrap().starts_with("access_denied: "), "{archived}");
+    let closed = supervised.call("workspace_close", json!({ "workspace_id": id }));
+    assert_eq!(closed["structuredContent"]["error"]["code"], "access_denied", "{closed}");
+    // The socket commands behind the legacy tools, from a supervised CLI.
+    let as_bot = [("CODEMUX_CLIENT", "integration-bot"), ("CODEMUX_ACCESS", "supervised")];
+    for command in ["archive_workspace", "close_workspace"] {
+        let refused = serve.json(command, &json!({ "workspace_id": id }).to_string(), &as_bot);
+        assert!(!ran.exists(), "a supervised {command} ran the teardown: {refused}");
+        assert_eq!(error_code(&refused), "access_denied", "{command}: {refused}");
+    }
+    assert!(is_open(&serve, &id), "a refused call closed the workspace");
+    let names = supervised.tool_names();
+    for hidden in ["workspace_archive", "workspace_close"] {
+        assert!(!names.iter().any(|name| name == hidden), "supervised lists {hidden}: {names:?}");
+    }
+
+    // The owner's archive runs it, so the refusals above are what kept it from running.
+    let archived = serve.json_within("archive_workspace", &json!({ "workspace_id": id }).to_string(), Duration::from_secs(60));
+    assert_eq!(archived["ok"], true, "{archived}");
+    assert!(ran.exists(), "the owner's archive ran the teardown");
+}
+
 /// A control socket like a Codemux build from before `client.access`
 /// (protocol 1), bound where `path`'s app was: it answers every line the way
 /// that build would (no `tool_call`, the legacy commands succeed) and records

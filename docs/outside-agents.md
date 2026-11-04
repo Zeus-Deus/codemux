@@ -477,10 +477,10 @@ Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` 
 | Read workspaces, threads, providers and models; wait for results | Yes, but only the model catalogs Codemux has already read | Yes | Yes |
 | Start threads, send messages, interrupt, stop, answer questions, run plugin actions | No | Yes, for threads in supervised permission modes | Yes |
 | Answer approvals | No | Deny only | Allow once or deny |
-| Open workspaces, create worktrees (also `thread_launch` with `worktree`), close and remove them | No | No | Yes |
+| Open workspaces, create worktrees (also `thread_launch` with `worktree`), close, archive and remove them | No | No | Yes |
 
 - Supervised permission modes are the ones that ask before acting, such as Claude's `default`, `acceptEdits` and `plan`, or Codex's `read-only`, `workspace-write` and `plan`. `agent_capabilities` lists the ones you may use as `allowed_permission_modes`.
-- Opening a workspace or creating a worktree runs the project's setup scripts. That's why those need full access.
+- Opening a workspace or creating a worktree runs the project's setup scripts. Closing or archiving a worktree workspace runs its teardown scripts, even when the worktree stays. That's why those need full access.
 - `allow_always`, `force_delete`, and `worktree_create` with a terminal preset (`agent_preset_id`) are only for assistants on this computer.
 - Assistants on this computer at full access also get the older administration tools of `codemux mcp`, such as `automation_create`, `terminal_write` and `preset_apply`. Network assistants never do.
 - Approving connections, Remote Access and pairing devices are never MCP tools. Use Settings or the `codemux` CLI.
@@ -537,7 +537,7 @@ A paired phone or browser can remove a clean worktree, for example with **Device
   - `workspace_close` needs full access, also when it keeps the worktree.
   - `workspace_create`, `worktree_create` and `workspace_close` take a `client_request_id`, so a retry returns the first call's result.
   - A `codemux mcp` that serves a Codemux agent, or that a workspace's `.mcp.json` starts, keeps the older versions unchanged.
-- **`--access` narrows `codemux mcp`.** A supervised or read-only client is offered fewer tools, and it refuses to work with an older Codemux that can't enforce its access level (`server_too_old`).
+- **`--access` narrows `codemux mcp`.** A supervised or read-only client is offered fewer tools, and it refuses to work with an older Codemux that can't enforce its access level (`server_too_old`). `workspace_archive` needs full access, like `workspace_close`, because both run teardown scripts. So do the `archive_workspace` and `close_workspace` commands of `codemux json`.
 - **`thread_launch` needs `permission_mode`.** Without it, it fails with `invalid_arguments` (missing field `permission_mode`).
 - **`agent_capabilities` with `provider` reads that provider's catalog** if Codemux hasn't yet, for a Supervised or Full access caller. It used to list only catalogs Codemux had already read, so a provider no chat had used yet offered no models. A Read-only caller still gets only those.
 - **`thread_wait` returns `state`, `final_text`, `pending` and `wait_cursor`.** It waits up to 50 seconds by default and 10 minutes at most. With `operation_id` it follows the run a launch or send starts, also from the queue.

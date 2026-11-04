@@ -281,13 +281,16 @@ socket_commands! {
     ],
     Write => [
         "agent_chat_import_local_sessions", "split_pane", "create_browser_pane", "open_url", "notify",
-        "activate_workspace", "close_workspace", "archive_workspace", "close_pane", "monitor_start",
-        "monitor_stop", "browser_automation", "update_project_memory", "add_project_memory_entry",
-        "rebuild_index", "link_workspace_issue", "reload_ui", "delegate_task", "delegation_cancel",
-        "delegation_deliver",
+        "activate_workspace", "close_pane", "monitor_start", "monitor_stop", "browser_automation",
+        "update_project_memory", "add_project_memory_entry", "rebuild_index", "link_workspace_issue",
+        "reload_ui", "delegate_task", "delegation_cancel", "delegation_deliver",
     ],
-    // Runs repository setup scripts or removes files.
-    Machine => ["create_workspace", "create_worktree_workspace", "unarchive_workspace", "rerun_setup"],
+    // Runs repository setup or teardown scripts, or removes files. Closing
+    // and archiving run a worktree's teardown also when the worktree stays.
+    Machine => [
+        "create_workspace", "create_worktree_workspace", "unarchive_workspace", "rerun_setup", "close_workspace",
+        "archive_workspace",
+    ],
     // Changes who can reach or control Codemux, schedules unattended work,
     // answers on the person's behalf, or runs arbitrary input as the owner.
     Admin => [
@@ -312,7 +315,6 @@ pub fn command_access(command: &str, params: &Value) -> Access {
     match command {
         "browser_automation" => browser_action_access(params.get("action").unwrap_or(&Value::Null)),
         "create_worktree_workspace" if launches_an_agent(params) => Access::Admin,
-        "close_workspace" if removes_files(params) => Access::Machine,
         _ => declared_access(command).unwrap_or(Access::Admin),
     }
 }
@@ -328,14 +330,16 @@ pub fn mcp_tool_access(tool: &str, arguments: &Value) -> Option<Access> {
         | "automation_get" | "automation_runs" | "conversation_read" | "conversation_search" | "git_status"
         | "git_diff" | "terminal_read" | "port_list" | "preset_list" | "issue_list" | "issue_get"
         | "html_render" | "delegation_targets" | "task_status" => Access::Read,
-        "workspace_close" if removes_files(arguments) => Access::Machine,
         "browser_navigate" | "browser_click" | "browser_fill" | "browser_click_at" | "browser_type_at"
         | "browser_scroll_at" | "browser_key_press" | "browser_drag" | "browser_click_os" | "browser_type_os"
-        | "browser_evaluate" | "browser_viewport" | "workspace_open" | "workspace_close" | "workspace_archive"
-        | "pane_split_right" | "pane_split_down" | "pane_close" | "notify" | "git_stage" | "git_commit"
-        | "git_push" | "issue_link_workspace" | "delegate_remote_task" | "task_cancel" => Access::Write,
+        | "browser_evaluate" | "browser_viewport" | "workspace_open" | "pane_split_right" | "pane_split_down"
+        | "pane_close" | "notify" | "git_stage" | "git_commit" | "git_push" | "issue_link_workspace"
+        | "delegate_remote_task" | "task_cancel" => Access::Write,
         "worktree_create" if launches_an_agent(arguments) => Access::Admin,
-        "workspace_create" | "worktree_create" | "workspace_unarchive" => Access::Machine,
+        // These run repository setup or teardown scripts, as their socket commands do.
+        "workspace_create" | "worktree_create" | "workspace_unarchive" | "workspace_close" | "workspace_archive" => {
+            Access::Machine
+        }
         "automation_create" | "automation_update" | "automation_delete" | "automation_pause"
         | "automation_resume" | "terminal_write" | "preset_apply" => Access::Admin,
         _ => return None,
@@ -375,12 +379,6 @@ fn browser_action_access(action: &Value) -> Access {
 /// drops it and nothing launches.
 fn launches_an_agent(params: &Value) -> bool {
     params.get("agent_preset_id").is_some_and(|value| !value.is_null())
-}
-
-fn removes_files(params: &Value) -> bool {
-    ["delete_worktree", "delete_branch", "force_delete"]
-        .iter()
-        .any(|key| params.get(key).and_then(Value::as_bool) == Some(true))
 }
 
 /// The gate for a caller whose only limit is the access it asked for.
@@ -597,8 +595,9 @@ mod tests {
         ] {
             assert_eq!(mcp_tool_access(tool, &json!({})), Some(access), "{tool}");
         }
-        assert_eq!(mcp_tool_access("workspace_close", &json!({})), Some(Access::Write));
+        assert_eq!(mcp_tool_access("workspace_close", &json!({})), Some(Access::Machine));
         assert_eq!(mcp_tool_access("workspace_close", &json!({"delete_worktree": true})), Some(Access::Machine));
+        assert_eq!(mcp_tool_access("workspace_archive", &json!({})), Some(Access::Machine));
         assert_eq!(mcp_tool_access("worktree_create", &json!({"agent_preset_id": "claude"})), Some(Access::Admin));
         assert_eq!(mcp_tool_access("worktree_create", &json!({"initial_prompt": "go"})), Some(Access::Machine));
     }
@@ -619,12 +618,28 @@ mod tests {
             ("status", Access::Read), ("web_remote_status", Access::Read), ("tool_call", Access::Read),
             ("tools_list", Access::Read), ("thread_list", Access::Read), ("thread_launch", Access::Read),
             ("notify", Access::Write), ("create_workspace", Access::Machine), ("rerun_setup", Access::Machine),
-            ("unarchive_workspace", Access::Machine), ("close_workspace", Access::Write),
+            ("unarchive_workspace", Access::Machine), ("close_workspace", Access::Machine),
+            ("archive_workspace", Access::Machine),
         ] {
             assert_eq!(command_access(command, &json!({})), access, "{command}");
         }
         assert_eq!(command_access("close_workspace", &json!({"force_delete": true})), Access::Machine);
-        assert_eq!(command_access("close_workspace", &json!({"delete_worktree": false})), Access::Write);
+        assert_eq!(command_access("close_workspace", &json!({"delete_worktree": false})), Access::Machine);
+    }
+
+    /// Closing and archiving run the worktree's teardown scripts, which run
+    /// any command as the person, also when the worktree stays on disk.
+    #[test]
+    fn closing_or_archiving_needs_full_access_on_both_routes() {
+        let arguments = json!({ "workspace_id": "w" });
+        for (tool, command) in [("workspace_close", "close_workspace"), ("workspace_archive", "archive_workspace")] {
+            assert_eq!(mcp_tool_access(tool, &arguments), Some(Access::Machine), "{tool}");
+            assert_eq!(command_access(command, &arguments), Access::Machine, "{command}");
+            let refused = stdio_permits(tool, &arguments, Supervised).unwrap_err();
+            assert_eq!(refused.code, ErrorCode::AccessDenied, "{tool}");
+            assert!(refused.message.ends_with("needs full access"), "{tool}: {}", refused.message);
+            assert!(stdio_permits(tool, &arguments, FullAccess).is_ok(), "{tool}");
+        }
     }
 
     #[test]

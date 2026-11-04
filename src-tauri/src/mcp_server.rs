@@ -3404,7 +3404,10 @@ mod tests {
         for shown in ["notify", "git_commit", "browser_click", "workspace_open", "thread_launch", "thread_send", "thread_respond"] {
             assert!(names.contains(&shown), "{shown}: {names:?}");
         }
-        for hidden in ["automation_create", "automation_pause", "terminal_write", "preset_apply", "workspace_create", "worktree_create", "workspace_unarchive"] {
+        for hidden in [
+            "automation_create", "automation_pause", "terminal_write", "preset_apply", "workspace_create", "worktree_create",
+            "workspace_unarchive", "workspace_close", "workspace_archive",
+        ] {
             assert!(!names.contains(&hidden), "{hidden}: {names:?}");
         }
         assert!(names.len() < stdio_tools(false, false, ControlAccess::FullAccess).len());
