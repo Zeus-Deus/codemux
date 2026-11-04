@@ -951,7 +951,7 @@ fn pending_lines(pending: &Value) -> Vec<String> {
         lines.push(format!("approval {} ({})", text(&approval["request_id"]), text(&approval["request_kind"])));
     }
     for question in items("questions") {
-        lines.push(format!("question {}: {} (answer it in Codemux)", text(&question["question_id"]), text(&question["text"])));
+        lines.push(format!("question {}: {} (answer it in Codemux or with `codemux call thread_answer`)", text(&question["question_id"]), text(&question["text"])));
     }
     for secret in items("secrets") {
         lines.push(format!("secret {} \"{}\" (enter it in Codemux)", text(&secret["request_id"]), text(&secret["label"])));
