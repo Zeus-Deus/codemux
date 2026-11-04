@@ -81,15 +81,28 @@ pub(crate) fn current_instance(
     })
 }
 
-/// Resolve an instance through its composer catalog. `discover` lets a
-/// targeted launch probe an instance and refresh a stale catalog; listing
-/// passes `false` and reads caches only: it never runs a health check,
-/// spawns an agent or server, or opens a provider session.
+/// How far [`resolve`] may go to read an instance's catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Discovery {
+    /// Listing: cached catalogs only. Never runs a health check, spawns an
+    /// agent or server, or opens a provider session.
+    Cached,
+    /// A listing that names its provider: reads the catalog, starting the
+    /// provider's CLI when nothing has cached it yet, so an outside agent can
+    /// pick an exact model before its first launch. No health check; a broken
+    /// CLI fails the read itself.
+    Catalog,
+    /// A targeted launch: health-check the instance, then refresh its catalog.
+    Launch,
+}
+
+/// Resolve an instance through its composer catalog, as far as `discovery`
+/// allows.
 pub(crate) async fn resolve<R: Runtime>(
     app: &AppHandle<R>,
     requested: ProviderSelection,
     cwd: &str,
-    discover: bool,
+    discovery: Discovery,
 ) -> Result<
     (
         ResolvedSelection,
@@ -119,7 +132,7 @@ pub(crate) async fn resolve<R: Runtime>(
                 })?;
             let catalog = match runtime.probed_catalog(id, &config.agent.revision) {
                 Some(catalog) => catalog,
-                None if discover => runtime
+                None if discovery != Discovery::Cached => runtime
                     .probe(id, cwd.into())
                     .await
                     .map_err(|e| ControlError::from(e.to_string()))?,
@@ -156,7 +169,7 @@ pub(crate) async fn resolve<R: Runtime>(
                     ControlError::new(ErrorCode::ProviderNotConfigured, "Hermes runtime is unavailable")
                 })?;
             let response = runtime
-                .orchestration_catalog(profile.clone(), discover)
+                .orchestration_catalog(profile.clone(), discovery != Discovery::Cached)
                 .await
                 .map_err(|e| ControlError::from(e.to_string()))?
                 .ok_or_else(not_discovered)?;
@@ -228,22 +241,29 @@ pub(crate) async fn resolve<R: Runtime>(
             } else {
                 json!({})
             };
-            let caps = if discover {
-                readiness(app, kind).await?;
+            let harvest = || async {
                 if let Some(account) = account {
-                    service::capabilities_for_account(app, kind, Some(account.to_string())).await?
+                    service::capabilities_for_account(app, kind, Some(account.to_string())).await
                 } else {
-                    service::capabilities(app, kind).await?
+                    service::capabilities(app, kind).await
                 }
+            };
+            let caps = if discovery == Discovery::Launch {
+                readiness(app, kind).await?;
+                harvest().await?
             } else {
                 // Listing: a recent health verdict and the composer's cached
-                // catalog only. Health checks and harvests run CLIs.
+                // catalog. Health checks and harvests run CLIs, so only a
+                // listing that names the provider harvests, and only a
+                // catalog nothing has cached.
                 if let Some(verdict) = recent_readiness(kind) {
                     verdict?;
                 }
-                service::cached_capabilities(app, kind, account.map(str::to_string))
-                    .await?
-                    .ok_or_else(not_discovered)?
+                match service::cached_capabilities(app, kind, account.map(str::to_string)).await? {
+                    Some(caps) => caps,
+                    None if discovery == Discovery::Catalog => harvest().await?,
+                    None => return Err(not_discovered()),
+                }
             };
             (kind, extra, None, caps, vec![])
         };

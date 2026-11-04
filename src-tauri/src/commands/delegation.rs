@@ -945,7 +945,7 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                         .and_then(|r| r.cwd)
                         .ok_or("Calling cwd missing")?;
                     let (resolved, caps, _) =
-                        crate::agent_control::selection::resolve(&self.app, target, &cwd, true)
+                        crate::agent_control::selection::resolve(&self.app, target, &cwd, crate::agent_control::selection::Discovery::Launch)
                             .await
                             .map_err(|e| e.to_string())?;
                     if !input.provider.is_empty()

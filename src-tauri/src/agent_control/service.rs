@@ -468,7 +468,7 @@ async fn prepare_selection<R: Runtime>(
     let Some(target) = input.target.clone() else {
         return Ok(());
     };
-    let (resolved, caps, _) = super::selection::resolve(app, target, cwd, true).await?;
+    let (resolved, caps, _) = super::selection::resolve(app, target, cwd, super::selection::Discovery::Launch).await?;
     input.selected_capabilities = Some(caps);
     if resolved.provider != input.provider {
         return Err(ControlError::new(
@@ -1154,15 +1154,15 @@ pub(super) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &
         };
         pending.extend(instances.into_iter().map(|instance| (kind, operations.clone(), instance)));
     }
-    // Listing every provider reads cached composer catalogs only: it never
-    // spawns an agent or opens a provider session, so instances resolve
-    // concurrently. Naming one provider targets it, as a launch does, and
-    // discovers a catalog nothing has cached yet: an outside agent has no
-    // other way to learn an exact model id before its first launch.
-    let discover = args.provider.is_some();
+    // Listing every provider reads cached composer catalogs only, so it
+    // never spawns an agent or opens a provider session, and instances
+    // resolve concurrently. Naming one provider also reads a catalog nothing
+    // has cached yet (`Discovery::Catalog`): an outside agent has no other way
+    // to learn an exact model id before its first launch.
+    let discovery = if args.provider.is_some() { super::selection::Discovery::Catalog } else { super::selection::Discovery::Cached };
     let resolved = futures_util::future::join_all(pending.iter().map(|(_, _, instance)| {
         let selection = super::selection::ProviderSelection { instance_id: instance.clone(), ..Default::default() };
-        super::selection::resolve(app, selection, &selected_workspace.cwd, discover)
+        super::selection::resolve(app, selection, &selected_workspace.cwd, discovery)
     }))
     .await;
     for ((kind, operations, instance), outcome) in pending.into_iter().zip(resolved) {

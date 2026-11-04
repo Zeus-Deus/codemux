@@ -1043,7 +1043,7 @@ async fn mutate<R: Runtime>(
             options: selected.options,
         };
         let (resolved, caps, _) =
-            agent_control::selection::resolve(app, selection.clone(), &workspace.cwd, true)
+            agent_control::selection::resolve(app, selection.clone(), &workspace.cwd, agent_control::selection::Discovery::Launch)
                 .await
                 .map_err(|e| e.to_string())?;
         let mode = native_mode(
