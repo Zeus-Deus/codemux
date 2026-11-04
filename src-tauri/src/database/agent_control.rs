@@ -354,6 +354,18 @@ impl DatabaseStore {
         ).optional().map_err(|e|e.to_string())
     }
 
+    /// Whether a launch admitted in this run of Codemux (`epoch`) is still
+    /// starting `thread`: its receipt stays accepted or running until the
+    /// thread's session is up and its first message admitted. One from before
+    /// a restart never finishes and starts nothing.
+    pub(crate) fn control_thread_launch_open(&self, thread: &str, epoch: &str) -> Result<bool, String> {
+        self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_control_operations
+             WHERE thread_id=?1 AND epoch=?2 AND tool IN ('thread_launch','workspace_launch') AND state IN ('accepted','running'))",
+            params![thread, epoch], |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
     /// The delivery of the message `operation`, a `thread_launch` of
     /// `principal`, sent: the launch sends it under its request key as the
     /// message ID. The receipt stays unlinked from it, because a delivery

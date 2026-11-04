@@ -343,6 +343,13 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
         "outcome": super::state::turn_outcome(event["status"]["kind"].as_str(), event["status"]["subtype"].as_str()).1,
     }));
     let turn_id = selected.or(current);
+    // A launch saves its new thread and shows its pane, then starts the
+    // provider session, which can take seconds while MCP servers start, and
+    // admits its message only after that. Until its receipt settles, the
+    // thread reads unknown or idle with no run, yet its first run is coming.
+    let launching = turn_id.is_none()
+        && db.control_thread_launch_open(thread, &app.state::<NativeControlState>().epoch)?;
+    let settled = settled && !launching;
     // A newer run's approvals and questions do not make an older selected run wait on input.
     let is_current = selected.is_none_or(|turn| current == Some(turn));
     let pending = Pending::read(&db, thread, &status)?;
@@ -386,14 +393,15 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
     // is idle on that run, or has moved on to a newer one, it is over, though
     // the legacy rule never settles it. The live end above covers a run whose
     // end row has not landed yet.
-    let vanished = is_current && status["settled"] == true && end.is_none();
-    // With no turn to follow there is nothing to wait for once the thread is
-    // idle, or once it is at rest with no run on record at all (a thread
-    // Codemux has not reopened since a restart never settles). A run a
-    // restart cut off stays open on a thread at rest: restart resume may
-    // continue the chat through the normal send path, which queues and
-    // delivers nothing.
+    let vanished = turn_id.is_some() && is_current && status["settled"] == true && end.is_none();
+    // With no turn to follow and no launch still starting the thread, there
+    // is nothing to wait for once the thread is idle, or once it is at rest
+    // with no run on record at all (a thread Codemux has not reopened since a
+    // restart never settles). A run a restart cut off stays open on a thread
+    // at rest: restart resume may continue the chat through the normal send
+    // path, which queues and delivers nothing.
     let never_ran = turn_id.is_none()
+        && !launching
         && (settled || (at_rest(&db, thread, &status)? && db.control_last_thread_run_event(thread)?.is_none()));
     let ended = settled || vanished || superseded || never_ran;
     let final_message = match turn_id {
@@ -424,7 +432,8 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
 /// Whether nothing on the thread can start a run any more: it is idle, or it
 /// is `unknown` (no live session and no run in view, as for a thread Codemux
 /// has not reopened since a restart, which never settles) with no message
-/// queued or being delivered.
+/// queued or being delivered. A launch still starting the thread is not
+/// seen here: `observe` asks its receipt (`launching`).
 fn at_rest(db: &DatabaseStore, thread: &str, status: &Value) -> Result<bool, ControlError> {
     if status["settled"] == true {
         return Ok(true);

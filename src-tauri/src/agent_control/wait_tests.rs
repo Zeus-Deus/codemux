@@ -659,6 +659,50 @@ async fn thread_wait_at_rest_reads_done_only_when_the_thread_never_ran() {
     assert_eq!((delivering["state"].as_str(), delivering["timed_out"].as_bool()), (Some("running"), Some(true)), "{delivering}");
 }
 
+/// A launch saves its new thread and shows its pane, then starts the
+/// provider session, which can take seconds while MCP servers start, and
+/// only then sends its message. The empty thread is not done meanwhile, for
+/// a wait on the thread itself as for one on the receipt. A launch receipt
+/// left from before a restart starts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_wait_reads_running_while_a_launch_starts_its_session() {
+    let (app, provider, _root, workspace) = fixture().await;
+    let (entered, release) = provider.hold_next_start();
+    let trusted = ControlCaller::trusted();
+    let receipt = execute(app.handle(), &trusted, "thread_launch", json!({
+        "workspace_id": workspace, "client_request_id": "starting-launch", "provider": "claude", "permission_mode": "default",
+        "message": "Say PONG",
+    })).await.unwrap();
+    entered.notified().await;
+    let thread = receipt["thread_id"].as_str().unwrap().to_string();
+    let status = wait::thread_status(app.handle(), target(&workspace, &thread, json!({}))).await.unwrap();
+    assert_eq!((status["phase"].as_str(), status["state"].as_str()), (Some("unknown"), Some("running")), "{status}");
+    let starting = wait_for(&app, &trusted, target(&workspace, &thread, json!({"timeout_ms": 300}))).await.unwrap();
+    assert_eq!(
+        (starting["state"].as_str(), starting["settled"].as_bool(), starting["timed_out"].as_bool()),
+        (Some("running"), Some(false), Some(true)),
+        "{starting}"
+    );
+    assert_eq!(starting["turn_id"], Value::Null);
+    let waiter = spawn_wait(&app, &trusted, target(&workspace, &thread, json!({"timeout_ms": 5000})));
+    parked().await;
+    release.notify_one();
+    let running = waiter.await.unwrap().unwrap();
+    assert_eq!((running["state"].as_str(), running["turn_id"].as_str()), (Some("running"), Some("mock-turn")), "{running}");
+    reply(&app, &thread, "mock-turn", "PONG");
+    completed(&app, &thread, "mock-turn", TurnStatus::Success);
+    let done = wait_for(&app, &trusted, target(&workspace, &thread, json!({"since": running["wait_cursor"], "timeout_ms": 5000}))).await.unwrap();
+    assert_eq!((done["state"].as_str(), done["final_text"].as_str()), (Some("done"), Some("PONG")), "{done}");
+
+    let restarted = "wait-launch-before-restart";
+    persisted(&app, &workspace, restarted);
+    app.state::<DatabaseStore>()
+        .admit_control_operation_for_thread("local", "launch-before-restart", "thread_launch", "hash", "previous-epoch", Some(workspace.as_str()), Some(restarted), None)
+        .unwrap();
+    let status = wait::thread_status(app.handle(), target(&workspace, restarted, json!({}))).await.unwrap();
+    assert_eq!((status["phase"].as_str(), status["state"].as_str()), (Some("unknown"), Some("done")), "{status}");
+}
+
 /// A message queued behind the running t1, as `thread_send` takes it: its
 /// receipt names the queue entry and no run yet.
 async fn queued_send(app: &App, provider: &mock_agent_provider::MockAgentProvider, workspace: &str, thread: &str, key: &str) -> Value {
