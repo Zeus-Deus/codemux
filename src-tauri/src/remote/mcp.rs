@@ -8,9 +8,11 @@
 //! - `initialize` negotiates the version with the shared protocol helpers
 //!   and returns [`INSTRUCTIONS`].
 //! - `tools/list` comes from the compiled catalog, so it answers without a
-//!   daemon. The bridge and the daemon are the same binary, so an older
-//!   daemon that is still running only answers "unknown tool" for a tool it
-//!   predates, until `serve` restarts.
+//!   daemon. The bridge and the daemon are the same binary, but an older
+//!   daemon that is still running after an upgrade can refuse a tool or an
+//!   argument it predates until `serve` restarts. For example, a daemon
+//!   from before `workspace_id` refuses `workspace_info{workspace_id}`
+//!   with "missing field `id`".
 //! - `tools/call` forwards to the daemon's `/tools/call`. The result text is
 //!   pretty-printed JSON of the reply's `data`, or of its `{kind, message}`
 //!   error: vexis-agent matches `"kind": "not_found"` in it, space included.
