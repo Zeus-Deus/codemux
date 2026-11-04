@@ -606,14 +606,14 @@ fn local_gh_auth(host: &str) -> LocalGhAuth {
             return auth.clone();
         }
     }
-    let mut token = crate::execution::host_command("gh");
+    let mut token = crate::git::source_control_cli_command("gh");
     token.args(["auth", "token", "--hostname", host]);
     sanitize_gui_env_std_keep_dbus(&mut token);
     let auth = match crate::git_provider::exec::run_timed(token, GH_AUTH_STATUS_TIMEOUT) {
         Ok(output) if output.success && !output.stdout.trim().is_empty() => {
             let mut identity = std::collections::hash_map::DefaultHasher::new();
             output.stdout.trim().hash(&mut identity);
-            let mut user = crate::execution::host_command("gh");
+            let mut user = crate::git::source_control_cli_command("gh");
             user.args(["config", "get", "user", "--host", host]);
             sanitize_gui_env_std_keep_dbus(&mut user);
             let username = crate::git_provider::exec::run_timed(user, GH_AUTH_STATUS_TIMEOUT)

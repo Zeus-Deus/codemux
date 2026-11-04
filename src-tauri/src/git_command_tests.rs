@@ -2,7 +2,7 @@
 //! `core.fsmonitor`), so every git Codemux starts goes through
 //! [`git_command`] and carries the agent-process marker.
 
-use super::{git_command, git_command_tokio, run_git, GIT_PROCESS_KIND};
+use super::{git_command, git_command_tokio, run_git, source_control_cli_command, GIT_PROCESS_KIND};
 use crate::control_identity::AGENT_PROCESS_ENV;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -21,6 +21,16 @@ fn git_command_adds_only_the_agent_marker() {
     envs.sort();
     expected.sort();
     assert_eq!(envs, expected);
+}
+
+/// `gh` and `glab` run git themselves, so they carry exactly git's marker.
+#[test]
+fn source_control_clis_carry_the_git_marker() {
+    for program in ["gh", "glab"] {
+        let cli = source_control_cli_command(program);
+        assert_eq!(cli.get_program(), program);
+        assert!(cli.get_envs().eq(git_command().get_envs()), "{program}");
+    }
 }
 
 /// A hook and an fsmonitor command set in the repository's config, as an
@@ -80,12 +90,18 @@ async fn hooks_and_fsmonitor_run_with_the_agent_marker() {
     saw_marker(&hook, "git_command_tokio checkout");
 }
 
-/// What production code must not call: anything else that starts git.
-const RAW_GIT: [&str; 3] = ["Command::new(\"git\")", "host_command(\"git\")", "host_command_tokio(\"git\")"];
+/// What production code must not call: anything else that starts git, or
+/// `gh` and `glab`, which start git themselves.
+const RAW_GIT: [&str; 9] = [
+    "Command::new(\"git\")", "host_command(\"git\")", "host_command_tokio(\"git\")",
+    "Command::new(\"gh\")", "host_command(\"gh\")", "host_command_tokio(\"gh\")",
+    "Command::new(\"glab\")", "host_command(\"glab\")", "host_command_tokio(\"glab\")",
+];
 
-/// Every production file starts git only through [`git_command`]. Test code
-/// (gated by `cfg(test)` alone or inside `all(..)`, inline or as a module
-/// file) may run raw git.
+/// Every production file starts git only through [`git_command`], and `gh`
+/// and `glab` only through [`source_control_cli_command`]. Test code (gated
+/// by `cfg(test)` alone or inside `all(..)`, inline or as a module file) may
+/// run them raw.
 #[test]
 fn production_code_starts_git_only_through_git_command() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -128,7 +144,11 @@ fn production_code_starts_git_only_through_git_command() {
     }
     // Guards against a scan that takes everything for test code.
     assert!(production_files > 100, "only {production_files} production files scanned");
-    assert!(found.is_empty(), "start git with crate::git::git_command() or git_command_tokio():\n{}", found.join("\n"));
+    assert!(
+        found.is_empty(),
+        "start git with crate::git::git_command() or git_command_tokio(), and gh or glab with crate::git::source_control_cli_command():\n{}",
+        found.join("\n")
+    );
 }
 
 /// The scanner itself: comments, strings and test-gated items are skipped,
@@ -149,9 +169,10 @@ fn u() { host_command("git"); }
 #[cfg(any(test, windows))]
 fn w<'a>() { tokio::process::Command::new("git"); }
 fn git_command() -> Command { host_command("git") }
+fn pr() -> Command { host_command("gh") }
 "##;
-    assert_eq!(raw_git_lines(source, None), (vec![2, 13, 14], 0));
-    assert_eq!(raw_git_lines(source, Some("fn git_command() -> Command {")), (vec![2, 13], 1));
+    assert_eq!(raw_git_lines(source, None), (vec![2, 13, 14, 15], 0));
+    assert_eq!(raw_git_lines(source, Some("fn git_command() -> Command {")), (vec![2, 13, 15], 1));
 }
 
 fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {

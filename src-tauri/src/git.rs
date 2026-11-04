@@ -134,6 +134,18 @@ pub(crate) fn git_command_tokio() -> tokio::process::Command {
     git_command().into()
 }
 
+/// Builds every `gh` and `glab` command Codemux runs. Both start git
+/// themselves (`gh pr create` reads the checkout with it, `gh pr merge
+/// --delete-branch` switches and deletes local branches), so they carry
+/// git's marker, and the repository hooks that git fires run as agents too.
+/// The same source-scan test keeps other `gh` and `glab` spawns out of
+/// production code.
+pub(crate) fn source_control_cli_command(program: &str) -> Command {
+    let mut cmd = crate::execution::host_command(program);
+    cmd.env(crate::control_identity::AGENT_PROCESS_ENV, GIT_PROCESS_KIND);
+    cmd
+}
+
 #[cfg(test)]
 #[path = "git_command_tests.rs"]
 mod command_tests;

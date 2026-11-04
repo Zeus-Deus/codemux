@@ -183,7 +183,7 @@ fn glab_available() -> bool {
 /// a nulled `DBUS_SESSION_BUS_ADDRESS` makes a logged-in user read as
 /// logged out. See `auth_status`.
 fn glab_command(args: &[&str]) -> std::process::Command {
-    let mut cmd = crate::execution::host_command("glab");
+    let mut cmd = crate::git::source_control_cli_command("glab");
     cmd.args(args);
     sanitize_gui_env_std_keep_dbus(&mut cmd);
     cmd
