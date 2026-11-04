@@ -102,6 +102,10 @@ export async function run(ctx) {
       return { text: d.innerText, checkboxes: d.querySelectorAll('[role="checkbox"], input[type="checkbox"]').length }; })()`);
     ctx.check("the paired browser's delete dialog keeps the branch and has no branch checkbox",
       dialog.checkboxes === 0 && dialog.text.includes("The branch is kept."), dialog);
+    // Only the desktop halves of these shots are evidence. The phone shell
+    // has no "Delete worktree…" (its workspace actions are rename, pin, mute
+    // and archive), so at 390×844 the shot shows its workspace list.
+    ctx.observe("phone shots", "remote-delete-dialog-mobile and remote-delete-refused-mobile show the phone shell's list, not the dialog or toast");
     await ctx.shot("remote-delete-dialog");
     // The phone-width shot can unmount the dialog; reopen it at desktop width.
     if (!(await ctx.driver.eval(`!!document.querySelector('[role="dialog"]')`))) await openDeleteDialog(ctx, card);

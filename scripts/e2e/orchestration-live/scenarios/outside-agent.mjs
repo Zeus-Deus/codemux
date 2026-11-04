@@ -256,19 +256,26 @@ async function flow(ctx) {
       workspace_id: workspaceId, thread_id: threadId, client_request_id: `of-sleep2-${tag}`,
       message: `Run this exact shell command with your shell tool and wait for it to finish: python3 -c 'import time; ${SLEEP2}'. Then reply DONE.`,
     }), { signal });
+    // Park the wait only once the run is busy: its start, or an approval
+    // opening after the wait, would answer a wait that the cancel then misses.
+    await ctx.waitFor(async () => running(SLEEP2).length > 0
+      || (await client.call("thread_status", { workspace_id: workspaceId, thread_id: threadId })).state === "needs_input" || null,
+    { timeout: 240_000, interval: 2_000, label: "the agent runs its second command" });
     const cancelled = client.send("tools/call", { name: "thread_wait",
       arguments: { workspace_id: workspaceId, thread_id: threadId, turn_id: turnOf(held), timeout_ms: 60_000 } });
     await sleep(500, undefined, { signal });
     client.notify("notifications/cancelled", { requestId: cancelled, reason: "orch-live" });
     const ping = await client.response(client.send("ping", {}), 5_000);
     ctx.check("flow: ping answers after a cancelled wait", !!ping.result && !ping.error, ping);
-    // The assertion window: a cancelled request must stay unanswered.
-    await sleep(3_000, undefined, { signal });
-    ctx.check("flow: the cancelled wait got no answer", client.arrivedAt(cancelled) === undefined);
     await settle(client, await client.call("thread_interrupt", {
       workspace_id: workspaceId, thread_id: threadId, turn_id: turnOf(held), client_request_id: `of-int2-${tag}`,
     }), { signal });
     await finishRun(client, { workspaceId, threadId, turnId: turnOf(held), signal });
+    // A wait that was never cancelled answers when its run ends, so only
+    // after the interrupt can silence prove the cancel. The pause covers an
+    // answer written just after finishRun's own.
+    await sleep(1_000, undefined, { signal });
+    ctx.check("flow: the cancelled wait stayed unanswered after its run ended", client.arrivedAt(cancelled) === undefined);
 
     // `since` returns at its timeout when nothing changes, without spinning.
     const status = await client.call("thread_status", { workspace_id: workspaceId, thread_id: threadId });
@@ -315,10 +322,14 @@ async function provenanceShot(ctx, workspaceId, paneId) {
   await ctx.shot("outside-agent-provenance");
 }
 
-/** A live agent process's identity, replayed on a host CLI call, is refused
- *  an admin command (the env-marker path; agent-shell covers ancestry). */
+/** A live agent process's marker, replayed on a host CLI call, is refused
+ *  an admin command (the env-marker path; agent-shell covers ancestry).
+ *  Only the two variables the socket reads as a marker are replayed: the
+ *  per-chat gateway pair is not one, so a process that carries only that
+ *  would make the host CLI the owner. The probe changes nothing, so a miss
+ *  cannot pair a device or touch the connector. */
 async function agentEnvironment(ctx) {
-  const IDENTITY = /^(CODEMUX_AGENT_PROCESS|CODEMUX_MCP_GATEWAY_URL|CODEMUX_MCP_GATEWAY_TOKEN|CODEMUX_MCP_PROVIDER_ORIGIN)=/;
+  const MARKER = /^(CODEMUX_AGENT_PROCESS|CODEMUX_MCP_PROVIDER_ORIGIN)=/;
   let found = null;
   for (const pid of below(ctx.env.INIT_PID)) {
     let environ;
@@ -327,20 +338,20 @@ async function agentEnvironment(ctx) {
     } catch {
       continue; // not dumpable (Codex marks itself so)
     }
-    const vars = Object.fromEntries(environ.filter((entry) => IDENTITY.test(entry))
+    const vars = Object.fromEntries(environ.filter((entry) => MARKER.test(entry))
       .map((entry) => [entry.slice(0, entry.indexOf("=")), entry.slice(entry.indexOf("=") + 1)]));
     if (Object.keys(vars).length) {
       found = { pid, argv0: cmdline(pid)[0], vars };
-      if (vars.CODEMUX_MCP_GATEWAY_TOKEN) break;
+      break;
     }
   }
   if (!found) {
-    ctx.observe("flow: agent environment", "no agent process exposed its environment; the Rust contract test covers the mechanism");
+    ctx.observe("flow: agent environment", "no agent process exposed its marker; the Rust contract test covers the mechanism");
     return;
   }
-  const refused = await codemuxCli(ctx.env, ["json", "web_remote_pair", "{}"], { signal: ctx.signal, extraEnv: found.vars });
+  const refused = await codemuxCli(ctx.env, ["json", "agent_connector_status", "{}"], { signal: ctx.signal, extraEnv: found.vars });
   ctx.observe("flow: agent environment from", { pid: found.pid, argv0: found.argv0, vars: Object.keys(found.vars) });
-  ctx.check("flow: an agent process's identity is refused web_remote_pair",
+  ctx.check("flow: an agent process's marker is refused agent_connector_status",
     refused.code === 1 && refused.stdout.includes("admin_refused"), { code: refused.code, stdout: refused.stdout.slice(0, 300) });
 }
 
