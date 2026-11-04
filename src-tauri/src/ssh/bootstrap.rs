@@ -431,9 +431,11 @@ pub async fn provision_scheduler(
 ///
 /// Installs a systemd **user** unit that runs `codemux-remote serve`,
 /// enables lingering so it survives logout and reboot, and starts it.
-/// After this returns successfully an MCP-capable agent on the host
-/// (configured with `codemux-remote mcp`) can drive Codemux locally
-/// without any further setup — that's the auto-magic UX target.
+/// After this returns successfully, an MCP client on the host configured
+/// with `codemux-remote mcp` can manage the host's folders, git worktrees
+/// and shells with no further setup; the workspaces it registers show up
+/// under Devices in the Codemux app. It does not run Codemux chats or
+/// control the app.
 ///
 /// Best-effort by contract: callers treat a failure as non-fatal —
 /// a host's push-workspace capability does not depend on serve, and

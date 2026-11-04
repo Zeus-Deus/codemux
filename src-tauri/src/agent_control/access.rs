@@ -58,9 +58,11 @@ pub struct CallerView {
     pub audience: Audience,
     pub access: ControlAccess,
     pub kind: CallerKind,
-    /// Agent collaboration (Settings). While it is off, agents are offered no
-    /// tools; dispatch still lets plugin calls reach the plugin layer, which
-    /// refuses them.
+    /// Agent collaboration (Settings), for listing only: while it is off,
+    /// `registry::list` offers agents no tools. Only `in_app` views read the
+    /// setting; the others, including the views dispatch builds, carry
+    /// true. Dispatch checks the setting itself for collaboration tools,
+    /// and the plugin layer refuses plugin calls from chats.
     pub collaboration: bool,
 }
 

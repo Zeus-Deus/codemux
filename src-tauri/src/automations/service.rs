@@ -66,13 +66,15 @@ pub const SYSTEMD_UNIT_NAME: &str = "codemux-scheduler.service";
 /// Default launchd label for the scheduler service.
 pub const LAUNCHD_LABEL: &str = "org.codemux.scheduler";
 
-// ─── codemux-remote serve (headless Codemux daemon) ──────────────
+// ─── codemux-remote serve (headless host daemon) ──────────────
 //
-// The `serve` subcommand is the auto-provisioned headless equivalent
-// of the desktop Codemux app — an MCP-aware agent on this host can
-// drive workspaces, terminals, etc. through `codemux-remote mcp`
-// without any manual setup. Bootstrap installs this alongside the
-// scheduler so a freshly-pushed host is immediately MCP-capable.
+// The `serve` subcommand is the host-side daemon behind
+// `codemux-remote mcp`: through it an MCP client on this host manages
+// the host's folders, git worktrees and shells, and the workspaces it
+// registers show up under Devices in the Codemux app. It is not a
+// headless Codemux app: it runs no chats. Bootstrap installs it
+// alongside the scheduler so a freshly pushed host is MCP-capable at
+// once.
 
 /// A systemd **user** service unit for the `serve` daemon.
 ///
