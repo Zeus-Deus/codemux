@@ -429,12 +429,20 @@ codemux workspace close "$WS" --remove-worktree
 - Name the caller before the command: `codemux --client nightly-script --access supervised thread start …`.
 - `--workspace` defaults to `$CODEMUX_WORKSPACE_ID`, which Codemux sets in its own terminals.
 - `--json` prints one JSON object, even on failure.
-- `thread respond "$THREAD" "$REQUEST_ID" deny --workspace "$WS"` answers an approval. Questions have no verb yet: use `codemux call thread_answer '<json>'`.
+- `thread respond "$THREAD" "$REQUEST_ID" deny --workspace "$WS"` answers an approval. `thread answer` answers a question, with one `--answer` per prompt, in order. It prints the `turn_id` of the run that continues:
+
+  ```sh
+  TURN=$(codemux thread answer --workspace "$WS" --thread "$THREAD" --question "$QUESTION" --answer "Use the staging database")
+  codemux thread wait "$THREAD" --workspace "$WS" --turn "$TURN"
+  ```
+
 - `workspace close --remove-worktree` also removes the worktree; it refuses one with uncommitted or unpushed work unless you add `--force`.
 - Every mutation takes `--request-id` (`--request-key` for `thread respond`). Reuse it to retry safely.
 - `--wait` and `thread wait` keep waiting until the run ends or needs input. Pass `--timeout` in scripts.
 
 Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` usage error.
+
+`codemux call` prints the tool's result unchanged, under `result`, and exits `0` for any result that isn't a tool error. That includes a receipt whose `state` is `failed`, which a retry of a failed keyed call returns (see "Errors" above). After `codemux call`, check `state` yourself. The typed verbs, such as `thread answer` and `workspace close`, exit `1` for a failed receipt.
 
 `codemux json <command> '<json>'` sends one raw control-socket command. It exits `1` when the reply is not ok. Scripts should prefer `codemux call`.
 

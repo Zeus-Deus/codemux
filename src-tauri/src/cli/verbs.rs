@@ -14,6 +14,7 @@ pub(crate) const THREAD_READ: &str = "thread_read";
 pub(crate) const THREAD_LIST: &str = "thread_list";
 pub(crate) const THREAD_STATUS: &str = "thread_status";
 pub(crate) const THREAD_RESPOND: &str = "thread_respond";
+pub(crate) const THREAD_ANSWER: &str = "thread_answer";
 pub(crate) const THREAD_INTERRUPT: &str = "thread_interrupt";
 pub(crate) const THREAD_STOP: &str = "thread_stop";
 pub(crate) const OPERATION_STATUS: &str = "operation_status";
@@ -36,8 +37,8 @@ mod tests {
     fn workspace_and_thread_verbs_use_outside_registry_tools() {
         for name in [
             WORKSPACE_CREATE, WORKSPACE_LIST, WORKSPACE_INFO, WORKSPACE_CLOSE, WORKTREE_CREATE, THREAD_LAUNCH,
-            THREAD_SEND, THREAD_WAIT, THREAD_READ, THREAD_LIST, THREAD_STATUS, THREAD_RESPOND, THREAD_INTERRUPT,
-            THREAD_STOP, OPERATION_STATUS,
+            THREAD_SEND, THREAD_WAIT, THREAD_READ, THREAD_LIST, THREAD_STATUS, THREAD_RESPOND, THREAD_ANSWER,
+            THREAD_INTERRUPT, THREAD_STOP, OPERATION_STATUS,
         ] {
             assert!(registry::served(name, Audience::Outside).is_some(), "{name} is not an outside registry tool");
         }

@@ -1,5 +1,5 @@
 //! `codemux thread …`: launch agent threads, send them messages, wait for
-//! their runs, read them and answer their approvals.
+//! their runs, read them and answer their approvals and questions.
 //!
 //! Mutations settle their receipt before they return. `--wait` then follows
 //! the run with `thread_wait` slices until it is done, failed or needs
@@ -32,6 +32,8 @@ pub enum ThreadCommand {
     Status(StatusArgs),
     /// Answer a pending approval.
     Respond(RespondArgs),
+    /// Answer a worker's pending question and print the turn that continues.
+    Answer(AnswerArgs),
     /// Interrupt the running turn. The thread, its history and files stay.
     Interrupt(InterruptArgs),
     /// Stop the agent session and its queued work. Nothing is deleted.
@@ -194,6 +196,27 @@ pub struct RespondArgs {
     pub out: OutputArgs,
 }
 
+#[derive(Args)]
+pub struct AnswerArgs {
+    /// Workspace of the thread (default $CODEMUX_WORKSPACE_ID).
+    #[arg(long, value_name = "ID")]
+    pub workspace: Option<String>,
+    /// The thread whose worker asked.
+    #[arg(long, value_name = "ID")]
+    pub thread: String,
+    /// The question's id, from `thread status` or a wait's pending questions.
+    #[arg(long, value_name = "ID")]
+    pub question: String,
+    /// One answer per prompt of the question, in order: repeat the flag.
+    #[arg(long = "answer", value_name = "TEXT", required = true)]
+    pub answers: Vec<String>,
+    /// Idempotency key (default: a new one).
+    #[arg(long, value_name = "ID")]
+    pub request_id: Option<String>,
+    #[command(flatten)]
+    pub out: OutputArgs,
+}
+
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
     AllowOnce,
@@ -257,6 +280,7 @@ pub(crate) async fn run(door: &Door, command: ThreadCommand) -> Result<Exit, Str
         ThreadCommand::List(args) => list(door, args).await,
         ThreadCommand::Status(args) => status(door, args).await,
         ThreadCommand::Respond(args) => respond(door, args).await,
+        ThreadCommand::Answer(args) => answer(door, args).await,
         ThreadCommand::Interrupt(args) => interrupt(door, args).await,
         ThreadCommand::Stop(args) => stop(door, args).await,
     }
@@ -531,6 +555,31 @@ async fn respond(door: &Door, respond: RespondArgs) -> Result<Exit, String> {
     }
     .await;
     output::report(verbs::THREAD_RESPOND, outcome, respond.out.json, Some(&request_key), |_| output::out("Done."))
+}
+
+/// A failed answer exits 1, also when a retry of its key returns the failed
+/// receipt instead of an error.
+async fn answer(door: &Door, answer: AnswerArgs) -> Result<Exit, String> {
+    let request_id = args::request_id(answer.request_id.as_deref());
+    let outcome = async {
+        let arguments = json!({
+            "workspace_id": args::workspace(answer.workspace.as_deref())?,
+            "thread_id": answer.thread,
+            "client_request_id": request_id,
+            "question_id": answer.question,
+            "answers": answer.answers,
+        });
+        mutate(door, verbs::THREAD_ANSWER, arguments, None).await
+    }
+    .await;
+    output::report(verbs::THREAD_ANSWER, outcome, answer.out.json, Some(&request_id), |answered| {
+        // The tool's own result, or the receipt a settled retry read.
+        let field = |key: &str| answered[key].as_str().or_else(|| answered["result"][key].as_str()).unwrap_or_default();
+        let turn = field("turn_id");
+        output::out(turn)?;
+        output::note(&format!("Answered. Follow the run: codemux thread wait {} --turn {turn} --workspace {}", field("thread_id"), field("workspace_id")));
+        Ok(())
+    })
 }
 
 async fn interrupt(door: &Door, interrupt: InterruptArgs) -> Result<Exit, String> {
@@ -916,6 +965,11 @@ fn print_report(report: RunReport, json: bool) -> Result<Exit, String> {
                     "Answer: codemux thread respond {thread} {approval} allow-once|deny --workspace {workspace}"
                 ));
             }
+            if let Some(question) = report.pending.as_ref().and_then(|pending| pending["questions"][0]["question_id"].as_str()) {
+                output::note(&format!(
+                    "Answer: codemux thread answer --workspace {workspace} --thread {thread} --question {question} --answer <text>"
+                ));
+            }
         }
         RunState::TimedOut => output::note(&format!(
             "Still running at the deadline. Wait again: codemux thread wait {thread} --workspace {workspace}"
@@ -951,7 +1005,7 @@ fn pending_lines(pending: &Value) -> Vec<String> {
         lines.push(format!("approval {} ({})", text(&approval["request_id"]), text(&approval["request_kind"])));
     }
     for question in items("questions") {
-        lines.push(format!("question {}: {} (answer it in Codemux or with `codemux call thread_answer`)", text(&question["question_id"]), text(&question["text"])));
+        lines.push(format!("question {}: {} (answer it in Codemux or with `codemux thread answer`)", text(&question["question_id"]), text(&question["text"])));
     }
     for secret in items("secrets") {
         lines.push(format!("secret {} \"{}\" (enter it in Codemux)", text(&secret["request_id"]), text(&secret["label"])));
@@ -1408,5 +1462,48 @@ mod tests {
             door.script().calls()[0].1,
             json!({"workspace_id": "ws", "thread_id": "th", "request_id": "r1", "decision": "allow_once", "client_request_id": "k"})
         );
+    }
+
+    fn answer_args(extra: &[&str]) -> AnswerArgs {
+        let argv = [&["codemux", "thread", "answer", "--workspace", "ws", "--thread", "th", "--question", "q1"][..], extra].concat();
+        match Cli::try_parse_from(argv).unwrap().command {
+            Some(CommandSet::Thread { command: ThreadCommand::Answer(args) }) => args,
+            _ => panic!("expected thread answer"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answer_sends_every_answer_in_order_under_its_key() {
+        let answered = json!({"workspace_id": "ws", "thread_id": "th", "question_id": "q1", "turn_id": "t2", "operation_id": "op", "state": "succeeded"});
+        let door = Door::fake(vec![("thread_answer", Ok(answered))]);
+        assert_eq!(answer(&door, answer_args(&["--answer", "staging", "--answer", "yes", "--request-id", "k", "--json"])).await.unwrap(), Exit::Done);
+        assert_eq!(
+            door.script().calls()[0].1,
+            json!({"workspace_id": "ws", "thread_id": "th", "client_request_id": "k", "question_id": "q1", "answers": ["staging", "yes"]})
+        );
+
+        // A retry while the first call runs settles its receipt.
+        let door = Door::fake(vec![
+            ("thread_answer", Ok(json!({"operation_id": "op", "state": "running"}))),
+            ("operation_status", Ok(json!({"operation_id": "op", "state": "succeeded", "result": {"turn_id": "t2"}}))),
+        ]);
+        assert_eq!(answer(&door, answer_args(&["--answer", "staging", "--request-id", "k"])).await.unwrap(), Exit::Done);
+        assert!(door.script().finished());
+
+        // The tool needs an answer, so the CLI refuses none before calling.
+        let none = Cli::try_parse_from(["codemux", "thread", "answer", "--workspace", "ws", "--thread", "th", "--question", "q1"]);
+        assert!(none.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_answer_exits_1_also_when_its_retry_returns_the_receipt() {
+        let door = Door::fake(vec![("thread_answer", Err(CliError::failed("question_closed", "This question was already answered or dismissed")))]);
+        assert_eq!(answer(&door, answer_args(&["--answer", "staging"])).await.unwrap(), Exit::Failed);
+
+        // A keyed retry of an answer that failed gets its receipt as a result.
+        let failed = json!({"operation_id": "op", "tool": "thread_answer", "state": "failed", "result": null,
+            "error": {"code": "question_answer_failed", "message": "The worker did not take the answer", "retryable": false}});
+        let door = Door::fake(vec![("thread_answer", Ok(failed))]);
+        assert_eq!(answer(&door, answer_args(&["--answer", "staging", "--request-id", "k", "--json"])).await.unwrap(), Exit::Failed);
     }
 }
