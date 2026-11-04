@@ -1370,6 +1370,7 @@ fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConf
 
     let project_path: Option<PathBuf> = project_root.map(|p| p.to_path_buf());
     let scan = enumerate_mcp_paths(project_path.as_deref());
+    let own = PathBuf::from(crate::mcp_server::codemux_mcp_command());
 
     for (path, source) in scan.paths {
         let parsed = if is_claude_wrapped_path(&path) {
@@ -1388,8 +1389,9 @@ fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConf
             Ok(parsed) => {
                 for srv in parsed {
                     // Same filter as the list command: drop provider-written
-                    // `codemux` entries so we don't spawn the built-in twice.
-                    if srv.name == "codemux" {
+                    // Codemux entries, whatever their name, so we don't spawn
+                    // the built-in twice.
+                    if srv.is_codemux_entry(&own) {
                         continue;
                     }
                     out.push(srv);
@@ -2307,6 +2309,27 @@ mod tests {
         let rows = reg.list_runtime().await;
         let row = rows.iter().find(|r| r.id == "x").unwrap();
         assert!(matches!(row.status, McpServerStatus::Stopped));
+    }
+
+    /// A user's `codemux mcp` entry under another name (`codex mcp add cmux
+    /// -- codemux mcp`) is never started for chats: its tools would reach
+    /// every chat outside the permission ceiling Codemux's own row keeps.
+    #[test]
+    fn chats_never_start_a_codemux_mcp_entry_under_another_name() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers": {
+                "cmux": {"command": "codemux", "args": ["mcp", "--client", "codex"]},
+                "demo": {"command": "echo"}
+            }}"#,
+        )
+        .unwrap();
+        let configs = discover_configs(Some(project.path()));
+        let names: Vec<&str> = configs.iter().map(|config| config.name.as_str()).collect();
+        assert!(!names.contains(&"cmux"), "{names:?}");
+        assert!(names.contains(&"demo"), "{names:?}");
+        assert_eq!(configs.iter().filter(|config| config.sources.contains(&McpConfigSource::Codemux)).count(), 1, "{names:?}");
     }
 }
 

@@ -102,27 +102,15 @@ fn user_codemux_servers(config_toml: &str, own: &std::path::Path) -> Vec<String>
         .collect()
 }
 
-/// Whether an entry runs a Codemux executable whose command line parses to
-/// `codemux mcp`, so root flags before it count (`codemux --client codex mcp`).
+/// Whether a `[mcp_servers.*]` entry runs `codemux mcp`
+/// ([`crate::mcp_server::runs_codemux_mcp`]).
 fn runs_codemux_mcp(entry: &toml::Value, own: &std::path::Path) -> bool {
-    use clap::Parser;
     let Some(command) = entry.get("command").and_then(toml::Value::as_str) else { return false };
     let args: Option<Vec<&str>> = match entry.get("args") {
         None => Some(Vec::new()),
         Some(args) => args.as_array().and_then(|args| args.iter().map(toml::Value::as_str).collect()),
     };
-    let Some(args) = args else { return false };
-    is_codemux_executable(command, own)
-        && crate::cli::Cli::try_parse_from(std::iter::once("codemux").chain(args))
-            .is_ok_and(|cli| matches!(cli.command, Some(crate::cli::CommandSet::Mcp { .. })))
-}
-
-/// `codemux` by name on any platform (`codemux.exe`, an install path), or
-/// this app's own executable under another name (an AppImage).
-fn is_codemux_executable(command: &str, own: &std::path::Path) -> bool {
-    let path = std::path::Path::new(command);
-    let named = path.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| stem.eq_ignore_ascii_case("codemux"));
-    named || std::fs::canonicalize(path).is_ok_and(|path| std::fs::canonicalize(own).is_ok_and(|own| own == path))
+    args.is_some_and(|args| crate::mcp_server::runs_codemux_mcp(command, &args, own))
 }
 
 /// Preserve opaque IDs and ordering, including all pages. No bundled/default fallback here.

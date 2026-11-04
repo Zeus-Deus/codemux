@@ -34,6 +34,7 @@ async fn discover_mcp_servers(
     let scan = enumerate_mcp_paths(project_path.as_deref());
 
     let mut servers: Vec<McpServerConfig> = vec![codemux_self_config()];
+    let own = PathBuf::from(crate::mcp_server::codemux_mcp_command());
 
     for (path, source) in scan.paths {
         // `~/.claude.json` is a multi-section file; everything else is the
@@ -56,9 +57,10 @@ async fn discover_mcp_servers(
                 for srv in parsed {
                     // The Codemux self-row already represents Codemux's
                     // built-in MCP. Provider CLIs may auto-write the same
-                    // `codemux` entry into their own config; suppress every
+                    // `codemux` entry into their own config, and a user may
+                    // add `codemux mcp` under another name; suppress every
                     // discovered copy so users see the always-on row once.
-                    if srv.name == "codemux" {
+                    if srv.is_codemux_entry(&own) {
                         continue;
                     }
                     servers.push(srv);
@@ -330,6 +332,33 @@ mod tests {
             1
         );
         // `demo` from the same file still shows up.
+        assert!(result.iter().any(|s| s.name == "demo"));
+    }
+
+    /// What an entry runs decides, not what it is called: `codemux mcp`
+    /// under another name is Codemux too, and is listed (and started) once,
+    /// as the built-in row. Other `codemux` subcommands stay ordinary rows.
+    #[tokio::test]
+    async fn project_codemux_mcp_under_another_name_is_filtered_out() {
+        let project = TempDir::new().unwrap();
+        fs::write(
+            project.path().join(".mcp.json"),
+            r#"{
+              "mcpServers": {
+                "cmux":   { "command": "/usr/bin/codemux", "args": ["--client", "claude-code", "mcp"] },
+                "notify": { "command": "codemux", "args": ["notify", "mcp"] },
+                "demo":   { "command": "echo" }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let result = discover_mcp_servers(Some(project.path().display().to_string()))
+            .await
+            .unwrap();
+
+        assert!(!result.iter().any(|s| s.name == "cmux"), "codemux mcp leaked in as its own row: {result:?}");
+        assert!(result.iter().any(|s| s.name == "notify"));
         assert!(result.iter().any(|s| s.name == "demo"));
     }
 }

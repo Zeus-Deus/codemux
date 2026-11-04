@@ -2180,6 +2180,26 @@ pub(crate) fn codemux_mcp_command() -> String {
         .unwrap_or_else(|| "codemux".to_string())
 }
 
+/// Whether a provider config's MCP entry runs this Codemux's MCP server,
+/// whatever the entry is called: a Codemux executable whose command line
+/// parses to `codemux mcp`, so root flags before it count
+/// (`codemux --client codex mcp`). `own` is this app's executable, as
+/// Settings offers it ([`codemux_mcp_command`]).
+pub(crate) fn runs_codemux_mcp(command: &str, args: &[&str], own: &Path) -> bool {
+    use clap::Parser;
+    is_codemux_executable(command, own)
+        && crate::cli::Cli::try_parse_from(std::iter::once("codemux").chain(args.iter().copied()))
+            .is_ok_and(|cli| matches!(cli.command, Some(crate::cli::CommandSet::Mcp { .. })))
+}
+
+/// `codemux` by name on any platform (`codemux.exe`, an install path), or
+/// this app's own executable under another name (an AppImage).
+fn is_codemux_executable(command: &str, own: &Path) -> bool {
+    let path = Path::new(command);
+    let named = path.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| stem.eq_ignore_ascii_case("codemux"));
+    named || std::fs::canonicalize(path).is_ok_and(|path| std::fs::canonicalize(own).is_ok_and(|own| own == path))
+}
+
 /// Linux names a running binary that an upgrade replaced or removed
 /// `<path> (deleted)`. The install path is the one to launch: after an
 /// upgrade it holds the new binary.
