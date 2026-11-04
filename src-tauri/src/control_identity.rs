@@ -24,6 +24,12 @@ pub const AGENT_IDENTITY_ENV_VARS: [&str; 4] = [
     crate::mcp_server::PROVIDER_ORIGIN_ENV,
 ];
 
+/// A client's own defaults for `--client` and `--access`. They describe the
+/// process that reads them, so an app or `codemux serve` instance drops them
+/// at startup: what its launcher exported must not name or narrow the in-app
+/// chats' `codemux mcp` or the terminals it starts.
+pub const CLIENT_DEFAULT_ENV_VARS: [&str; 2] = [crate::cli::args::CLIENT_ENV, crate::cli::args::ACCESS_ENV];
+
 /// What a requesting process says about itself on the control socket.
 ///
 /// No `deny_unknown_fields`: a newer CLI may add fields an older app ignores.
@@ -124,17 +130,23 @@ impl ControlClient {
     }
 }
 
-/// Drops an agent identity this process inherited. An app or `codemux serve`
-/// started from an agent's shell would otherwise hand it to every terminal it
-/// opens. Never call it on CLI paths: they must send the identity.
+/// Drops an agent identity this process inherited, and a launcher's client
+/// defaults. An app or `codemux serve` started from an agent's or a bot's
+/// shell would otherwise hand them to every terminal and in-app MCP server it
+/// starts. Never call it on CLI paths: they must send the identity.
 pub fn scrub_inherited_agent_identity() {
-    for key in AGENT_IDENTITY_ENV_VARS {
+    for key in inherited_identity_vars() {
         if std::env::var_os(key).is_some() {
             // Same pattern and placement as the renderer env scrub: it runs
             // first thing at startup, before other threads read the env.
             unsafe { std::env::remove_var(key) };
         }
     }
+}
+
+/// What [`scrub_inherited_agent_identity`] drops.
+fn inherited_identity_vars() -> impl Iterator<Item = &'static str> {
+    AGENT_IDENTITY_ENV_VARS.into_iter().chain(CLIENT_DEFAULT_ENV_VARS)
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +510,14 @@ mod tests {
             AGENT_IDENTITY_ENV_VARS,
             ["CODEMUX_AGENT_PROCESS", "CODEMUX_MCP_GATEWAY_URL", "CODEMUX_MCP_GATEWAY_TOKEN", "CODEMUX_MCP_PROVIDER_ORIGIN"]
         );
+    }
+
+    #[test]
+    fn the_app_and_serve_drop_a_launchers_client_defaults() {
+        let dropped: Vec<&str> = inherited_identity_vars().collect();
+        for key in AGENT_IDENTITY_ENV_VARS.into_iter().chain(["CODEMUX_CLIENT", "CODEMUX_ACCESS"]) {
+            assert!(dropped.contains(&key), "{key} would reach the terminals and in-app MCP servers");
+        }
     }
 
     /// The GUI and `codemux serve` drop an inherited identity before anything
