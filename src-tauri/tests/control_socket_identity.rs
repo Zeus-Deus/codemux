@@ -13,9 +13,10 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CODEMUX: &str = env!("CARGO_BIN_EXE_codemux");
@@ -103,11 +104,13 @@ impl Serve {
         self.try_json(command, params, env)
             .unwrap_or_else(|| panic!("`codemux json {command}` printed no reply:\n{}", self.log()))
     }
-}
 
-impl Drop for Serve {
-    fn drop(&mut self) {
-        // This test started the serve; stop it by its pid.
+    /// Stops the serve and keeps its home. This test started it; stop it by
+    /// its pid, and never signal a pid already reaped, which may be reused.
+    fn stop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
         unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -118,6 +121,12 @@ impl Drop for Serve {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl Drop for Serve {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -314,6 +323,58 @@ fn mcp_supervised_client_sees_no_admin_tools_and_is_refused_them() {
     assert_eq!(denied["structuredContent"]["error"]["code"], "access_denied", "{denied}");
     let reached = supervised.call("thread_send", send);
     assert_eq!(reached["structuredContent"]["error"]["code"], "workspace_not_found", "{reached}");
+}
+
+/// A control socket like a Codemux build from before `client.access`
+/// (protocol 1), bound where `path`'s app was: it answers every line the way
+/// that build would (no `tool_call`, the legacy commands succeed) and records
+/// each command.
+fn old_app_at(path: &Path) -> Arc<Mutex<Vec<String>>> {
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            for line in BufReader::new(&stream).lines() {
+                let Ok(line) = line else { break };
+                let command = serde_json::from_str::<Value>(&line).unwrap()["command"].as_str().unwrap().to_owned();
+                recorded.lock().unwrap().push(command.clone());
+                let reply = match command.as_str() {
+                    "tool_call" => json!({"ok": false, "protocol_version": 1, "data": null, "error": "Unknown control command: tool_call"}),
+                    _ => json!({"ok": true, "protocol_version": 1, "data": {}, "error": null}),
+                };
+                if writeln!(&stream, "{reply}").is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    seen
+}
+
+/// `codemux mcp --access read-only` outlives the app it first reached, and an
+/// older build comes up on the same socket. That build ignores `client`, so
+/// the client must refuse before the call reaches it, including a registry
+/// twin it would answer from its legacy arm on an app without `tool_call`.
+#[test]
+fn narrowed_mcp_refuses_an_old_app_that_replaced_a_new_one() {
+    let mut serve = Serve::start(&[]);
+    let status = serve.json("status", "{}", &[]);
+    let socket = std::path::PathBuf::from(status["data"]["socket_path"].as_str().unwrap_or_else(|| panic!("{status}")));
+    let mut mcp = Mcp::start(&serve, &["--access", "read-only"]);
+    let listed = mcp.call("workspace_list", json!({}));
+    assert_eq!(listed["isError"], false, "the new app answers: {listed}");
+
+    serve.stop();
+    let seen = old_app_at(&socket);
+    let project = serve.root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let refused = mcp.call("workspace_create", json!({"path": project}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(refused["structuredContent"]["error"]["code"], "server_too_old", "{refused}");
+    assert_eq!(*seen.lock().unwrap(), ["status"], "only the version probe reached the older app");
 }
 
 /// `get_app_state`'s focused workspace id.

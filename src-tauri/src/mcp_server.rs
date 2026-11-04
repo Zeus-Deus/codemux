@@ -2048,6 +2048,12 @@ async fn relay_registry_call(call: CallToolParams) -> Result<Value, RpcError> {
             return Ok(registry::mcp_result(&name, result));
         }
         if is_legacy_tool(&name) {
+            // The legacy arm runs here, so it gets the local gate every
+            // legacy call meets before the legacy lane.
+            let access = control_identity::client_access().unwrap_or(ControlAccess::FullAccess);
+            if let Err(error) = control_identity::stdio_permits(&name, &arguments, access) {
+                return Ok(protocol::error_result(error.to_string()));
+            }
             return Ok(handle_tool_call(CallToolParams { name, arguments, meta }).await);
         }
     }
@@ -3455,7 +3461,7 @@ mod tests {
         // `client.access`: the client refuses rather than run at full access,
         // and says so in a way a retry loop stops on.
         control_identity::set_client_access(ControlAccess::Supervised);
-        let seen = old_app_socket();
+        let seen = old_app_socket(1);
         let server = server_for(StdioCaller { access: ControlAccess::Supervised, ..outside() });
         let reply = rpc(&server, tools_call(1, "thread_list", json!({}))).await.unwrap();
         let error = &reply["result"]["structuredContent"]["error"];
@@ -3465,10 +3471,12 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), ["status"], "only the version probe reaches the old app");
     }
 
-    /// A control socket like an app from before `tool_call`: it answers
-    /// `get_app_state` and the bare aliases, and records each command.
+    /// A control socket like an app from before `tool_call`, speaking
+    /// control protocol `version`: it answers every line of a connection in
+    /// order (`get_app_state` and the bare aliases succeed), and records each
+    /// command.
     #[cfg(unix)]
-    fn old_app_socket() -> Arc<Mutex<Vec<String>>> {
+    fn old_app_socket(version: u32) -> Arc<Mutex<Vec<String>>> {
         let path = crate::control::control_socket_path().unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -3476,28 +3484,54 @@ mod tests {
         std::thread::spawn(move || {
             use std::io::{BufRead, Write};
             for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                let mut line = String::new();
-                if std::io::BufReader::new(&stream).read_line(&mut line).is_err() {
-                    continue;
+                let Ok(stream) = stream else { return };
+                for line in std::io::BufReader::new(&stream).lines() {
+                    let Ok(line) = line else { break };
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let command = request["command"].as_str().unwrap().to_owned();
+                    recorded.lock().unwrap().push(command.clone());
+                    let (ok, data, error) = match command.as_str() {
+                        "get_app_state" => (true, json!({"active_workspace_id": "ws-1", "workspaces": [
+                            {"workspace_id": "ws-1", "cwd": "/w1", "surfaces": [{"surface_id": "s1"}]},
+                            {"workspace_id": "ws-2", "cwd": "/w2", "surfaces": []},
+                        ]}), Value::Null),
+                        "thread_list" => (true, json!({"threads": []}), Value::Null),
+                        "operation_status" => (false, Value::Null, json!("operation_not_found: No operation belongs to this client and ID")),
+                        other => (false, Value::Null, json!(format!("Unknown control command: {other}"))),
+                    };
+                    let reply = json!({"ok": ok, "protocol_version": version, "data": data, "error": error});
+                    if writeln!(&stream, "{reply}").is_err() {
+                        break;
+                    }
                 }
-                let request: Value = serde_json::from_str(&line).unwrap();
-                let command = request["command"].as_str().unwrap().to_owned();
-                recorded.lock().unwrap().push(command.clone());
-                let (ok, data, error) = match command.as_str() {
-                    "get_app_state" => (true, json!({"active_workspace_id": "ws-1", "workspaces": [
-                        {"workspace_id": "ws-1", "cwd": "/w1", "surfaces": [{"surface_id": "s1"}]},
-                        {"workspace_id": "ws-2", "cwd": "/w2", "surfaces": []},
-                    ]}), Value::Null),
-                    "thread_list" => (true, json!({"threads": []}), Value::Null),
-                    "operation_status" => (false, Value::Null, json!("operation_not_found: No operation belongs to this client and ID")),
-                    other => (false, Value::Null, json!(format!("Unknown control command: {other}"))),
-                };
-                let reply = json!({"ok": ok, "protocol_version": 1, "data": data, "error": error});
-                let _ = writeln!(stream, "{reply}");
             }
         });
         seen
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn narrowed_stdio_holds_a_legacy_fallback_to_its_access() {
+        if crate::test_isolation::isolated("mcp_server::tests::narrowed_stdio_holds_a_legacy_fallback_to_its_access") {
+            return;
+        }
+        // An app that enforces `--access` but has no `tool_call`: the legacy
+        // twin a registry call falls back to meets the same local gate as a
+        // legacy call, so a read-only client never asks for a workspace.
+        control_identity::set_client_access(ControlAccess::ReadOnly);
+        let seen = old_app_socket(2);
+        let server = server_for(StdioCaller { access: ControlAccess::ReadOnly, ..outside() });
+        assert!(registry::served("workspace_create", Audience::Outside).is_some(), "a registry twin");
+        let refused = rpc(&server, tools_call(1, "workspace_create", json!({"path": "/w3"}))).await.unwrap();
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("access_denied: This connection is read-only"), "{text}");
+        assert_eq!(*seen.lock().unwrap(), ["status", "tool_call"], "create_workspace never reached the app");
+
+        // A read the access allows still falls back.
+        let info = rpc(&server, tools_call(2, "workspace_info", json!({}))).await.unwrap();
+        assert!(info["result"]["content"][0]["text"].as_str().unwrap().contains("\"ws-1\""), "{info}");
+        assert_eq!(*seen.lock().unwrap(), ["status", "tool_call", "status", "tool_call", "status", "get_app_state"]);
     }
 
     #[cfg(unix)]
@@ -3506,7 +3540,7 @@ mod tests {
         if crate::test_isolation::isolated("mcp_server::tests::stdio_twins_fall_back_to_legacy_arms_on_an_old_app") {
             return;
         }
-        let seen = old_app_socket();
+        let seen = old_app_socket(1);
         let server = server();
         let text = |reply: &Value| reply["result"]["content"][0]["text"].as_str().unwrap().to_owned();
 

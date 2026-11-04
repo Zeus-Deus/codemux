@@ -671,37 +671,27 @@ pub async fn send_control_request_as(
     request: ControlRequest,
     client: Option<&ControlClient>,
 ) -> Result<ControlResponse, String> {
-    send_control_request_to(&control_socket_candidates(), request, client, &SERVER_ENFORCES_ACCESS).await
+    send_control_request_to(&control_socket_candidates(), request, client).await
 }
-
-/// Set once this process has seen a server that enforces `client.access`.
-static SERVER_ENFORCES_ACCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 async fn send_control_request_to(
     candidates: &[PathBuf],
     request: ControlRequest,
     client: Option<&ControlClient>,
-    enforcing: &std::sync::atomic::AtomicBool,
 ) -> Result<ControlResponse, String> {
     let mut connection = Connection::open(candidates).await?;
     if client.is_some_and(ControlClient::narrows) {
-        ensure_server_enforces_access(&mut connection, enforcing).await?;
+        ensure_server_enforces_access(&mut connection).await?;
     }
     connection.exchange(&ControlEnvelope { request, client: client.cloned() }).await
 }
 
 /// An older app ignores `client`, so a narrowed client would silently run
-/// with full access. Ask the server's protocol version first and refuse.
-/// Only a new-enough answer is remembered: the app may be restarted into a
-/// newer version while a long-lived `codemux mcp` keeps running.
-async fn ensure_server_enforces_access(
-    connection: &mut Connection,
-    enforcing: &std::sync::atomic::AtomicBool,
-) -> Result<(), String> {
-    use std::sync::atomic::Ordering;
-    if enforcing.load(Ordering::Relaxed) {
-        return Ok(());
-    }
+/// with full access. Ask the server's protocol version first, on the
+/// connection the request then uses, and refuse. Nothing is remembered: a
+/// long-lived `codemux mcp` may outlive its app, and the next connection may
+/// reach an older build on the same socket.
+async fn ensure_server_enforces_access(connection: &mut Connection) -> Result<(), String> {
     let probe = ControlEnvelope {
         request: ControlRequest { command: "status".into(), params: serde_json::json!({}) },
         client: None,
@@ -714,7 +704,6 @@ async fn ensure_server_enforces_access(
         )
         .to_string());
     }
-    enforcing.store(true, Ordering::Relaxed);
     Ok(())
 }
 
@@ -2811,7 +2800,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn clients_skip_missing_and_stale_sockets() {
-        use std::sync::atomic::AtomicBool;
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.sock");
         // A crashed app leaves its socket file behind: connecting is refused.
@@ -2819,26 +2807,25 @@ mod tests {
         drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
         let live = dir.path().join("live.sock");
         let (server, seen) = spawn_line_server(&live, CONTROL_PROTOCOL_VERSION);
-        let enforcing = AtomicBool::new(false);
 
         let candidates = [missing.clone(), stale.clone(), live];
-        let reply = send_control_request_to(&candidates, request("status", serde_json::json!({})), None, &enforcing).await.unwrap();
+        let reply = send_control_request_to(&candidates, request("status", serde_json::json!({})), None).await.unwrap();
         assert!(reply.ok);
         assert_eq!(*seen.lock().unwrap(), vec![(0, "status".to_owned())]);
 
         // A narrowed client's probe and request share one connection.
         let read_only = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly), agent: None };
-        let reply = send_control_request_to(&candidates, request("notify", serde_json::json!({})), Some(&read_only), &enforcing).await.unwrap();
+        let reply = send_control_request_to(&candidates, request("notify", serde_json::json!({})), Some(&read_only)).await.unwrap();
         assert!(reply.ok);
         assert_eq!(
             *seen.lock().unwrap(),
             vec![(0, "status".to_owned()), (1, "status".to_owned()), (1, "notify".to_owned())]
         );
 
-        let error = send_control_request_to(&[missing, stale], request("status", serde_json::json!({})), None, &enforcing)
+        let error = send_control_request_to(&[missing, stale], request("status", serde_json::json!({})), None)
             .await.unwrap_err();
         assert!(error.starts_with("Failed to connect to Codemux control endpoint: ") && error.contains("refused"), "the last error: {error}");
-        let error = send_control_request_to(&[], request("status", serde_json::json!({})), None, &enforcing).await.unwrap_err();
+        let error = send_control_request_to(&[], request("status", serde_json::json!({})), None).await.unwrap_err();
         assert_eq!(error, "Control socket path unavailable");
         server.abort();
     }
@@ -2846,23 +2833,48 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn narrowed_access_refuses_an_old_server() {
-        use std::sync::atomic::AtomicBool;
         let dir = tempfile::tempdir().unwrap();
         let path = [dir.path().join("old.sock")];
         let (server, seen) = spawn_line_server(&path[0], 1);
         let commands = || seen.lock().unwrap().iter().map(|(_, command)| command.clone()).collect::<Vec<_>>();
         let read_only = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly), agent: None };
-        let enforcing = AtomicBool::new(false);
-        let error = send_control_request_to(&path, request("notify", serde_json::json!({"message":"x"})), Some(&read_only), &enforcing)
+        let error = send_control_request_to(&path, request("notify", serde_json::json!({"message":"x"})), Some(&read_only))
             .await.unwrap_err();
         assert!(error.starts_with("server_too_old: "), "{error}");
         assert_eq!(commands(), vec!["status"], "the real request never reached the old server");
         // A full-access or unnamed client keeps today's behaviour with an old app.
         let named = ControlClient { name: Some("bot".into()), access: None, agent: None };
-        let reply = send_control_request_to(&path, request("notify", serde_json::json!({})), Some(&named), &enforcing).await.unwrap();
+        let reply = send_control_request_to(&path, request("notify", serde_json::json!({})), Some(&named)).await.unwrap();
         assert!(reply.ok);
         assert_eq!(commands(), vec!["status", "notify"]);
         server.abort();
+    }
+
+    /// A long-lived narrowed client (`codemux mcp --access read-only`) can
+    /// outlive the app it first reached: an older build may come up on the
+    /// same socket. The answer of one connection says nothing about the
+    /// server behind the next one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn narrowed_client_refuses_an_old_server_that_replaced_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = [dir.path().join("app.sock")];
+        let read_only = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly), agent: None };
+
+        let (new_app, seen) = spawn_line_server(&path[0], CONTROL_PROTOCOL_VERSION);
+        let reply = send_control_request_to(&path, request("notify", serde_json::json!({})), Some(&read_only))
+            .await.unwrap();
+        assert!(reply.ok);
+        assert_eq!(*seen.lock().unwrap(), vec![(0, "status".to_owned()), (0, "notify".to_owned())]);
+        new_app.abort();
+
+        // `bind` replaces the socket file, as a restarted app does.
+        let (old_app, seen) = spawn_line_server(&path[0], 1);
+        let error = send_control_request_to(&path, request("notify", serde_json::json!({})), Some(&read_only))
+            .await.unwrap_err();
+        assert!(error.starts_with("server_too_old: "), "{error}");
+        assert_eq!(*seen.lock().unwrap(), vec![(0, "status".to_owned())], "the request never reached the older app");
+        old_app.abort();
     }
 
     fn port(port: u16, ws: Option<&str>, label: Option<&str>) -> PortInfoSnapshot {
