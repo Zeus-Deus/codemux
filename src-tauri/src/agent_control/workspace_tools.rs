@@ -105,6 +105,10 @@ pub(super) async fn create<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
     if let Some(key) = &client_request_id {
         service::identifier(key, "client_request_id", 128)?;
     }
+    // A retry replays even if the folder has since moved or gone.
+    if let Some(done) = service::recorded(app, caller, "workspace_create", &args)? {
+        return Ok(done);
+    }
     let path = match path {
         Some(path) if caller.is_network() => Some(known_folder(app, path).await?),
         Some(path) => Some(local_folder(&path)?),

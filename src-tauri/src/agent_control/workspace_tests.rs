@@ -215,6 +215,39 @@ async fn workspace_create_reuse_overwrites_reserved_receipt_target() {
     assert_eq!((status["state"].clone(), status["workspace_id"].clone()), (json!("succeeded"), json!(workspace)));
 }
 
+/// A retry of a keyed create replays its receipt even once the folder it
+/// opened is gone: the folder is checked only on a new call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_create_retry_replays_after_the_folder_is_gone() {
+    if isolated(&format!("{MODULE}workspace_create_retry_replays_after_the_folder_is_gone")) {
+        return;
+    }
+    without_terminal_daemon();
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    let parent = tempfile::tempdir().unwrap();
+    let cases = [
+        (named(ControlAccess::FullAccess), parent.path().join("local"), "gone-local"),
+        // A connector client's folder must be under a known project root.
+        (connector(ControlAccess::FullAccess), repo.join("connector"), "gone-connector"),
+    ];
+    for (caller, folder, key) in cases {
+        std::fs::create_dir(&folder).unwrap();
+        let args = json!({"path": folder, "client_request_id": key});
+        let created = call(&app, &caller, "workspace_create", args.clone()).await.unwrap();
+        assert_eq!(created["created"], true, "{key}: {created}");
+        std::fs::rename(&folder, folder.with_extension("moved")).unwrap();
+        let after = count(&app);
+
+        let retry = call(&app, &caller, "workspace_create", args).await.expect("a retry replays, not a path error");
+        assert_eq!((retry["operation_id"].clone(), retry["workspace_id"].clone()), (created["operation_id"].clone(), created["workspace_id"].clone()), "{key}");
+        assert_eq!(retry["replayed"], true, "{key}: {retry}");
+        assert_eq!(count(&app), after, "{key}: a replay opens nothing");
+        // The key still binds its arguments.
+        let other = folder.with_extension("missing");
+        refused(call(&app, &caller, "workspace_create", json!({"path": other, "client_request_id": key})).await, ErrorCode::RequestKeyConflict);
+    }
+}
+
 // ── access ────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
