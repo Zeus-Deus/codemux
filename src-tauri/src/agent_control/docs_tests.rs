@@ -183,3 +183,16 @@ fn outside_agents_guide_names_real_wait_states_and_error_codes() {
         assert_eq!(retry == "Yes", parsed.retryable(), "{code}: the Retry column says {retry:?}");
     }
 }
+
+#[test]
+fn outside_agents_guide_states_the_wait_limits_the_handler_enforces() {
+    use super::wait::{DEFAULT_WAIT_MS, MAX_OUTSIDE_WAIT_MS};
+    let seconds = DEFAULT_WAIT_MS / 1000;
+    for stated in [
+        format!("`timeout_ms` defaults to {DEFAULT_WAIT_MS} ({seconds} seconds)"),
+        format!("The most is {MAX_OUTSIDE_WAIT_MS} (ten minutes)"),
+        format!("It waits up to {seconds} seconds by default"),
+    ] {
+        assert!(GUIDE.contains(&stated), "the guide says {stated:?}");
+    }
+}

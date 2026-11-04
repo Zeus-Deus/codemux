@@ -450,8 +450,8 @@ mod review_tests {
     fn wait_schema_advertises_since_and_a_ten_minute_cap() {
         use super::super::wait::{DEFAULT_WAIT_MS, MAX_OUTSIDE_WAIT_MS};
         assert_eq!(MAX_OUTSIDE_WAIT_MS, 600_000);
-        // Codex cuts a tool call at 60 s by default; a wait that names no
-        // timeout must return before that.
+        // MCP TypeScript SDK clients and older Codex releases cut a call at
+        // 60 s by default; a wait that names no timeout returns before that.
         assert!(DEFAULT_WAIT_MS < 60_000, "{DEFAULT_WAIT_MS}");
         let wait = outside_definition("thread_wait");
         let timeout = &wait.input_schema["properties"]["timeout_ms"];

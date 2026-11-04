@@ -45,7 +45,7 @@ codex mcp add codemux -- codemux mcp --client codex
   codex mcp add codemux --env "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" -- codemux mcp --client codex
   ```
 
-- Codex gives up on a tool call after 60 seconds unless you allow more. A `thread_wait` that names no `timeout_ms` returns within 50 seconds, so it fits. To allow longer waits, open `~/.codex/config.toml` and add `tool_timeout_sec = 660` under `[mcp_servers.codemux]`, the table `codex mcp add` wrote. Leave the rest of that table as it is.
+- Codex gives up on a tool call after its tool timeout: 300 seconds in current releases, as little as 60 in older ones. A `thread_wait` that names no `timeout_ms` returns within 50 seconds, so it fits either way. To allow longer waits, open `~/.codex/config.toml` and add `tool_timeout_sec = 660` under `[mcp_servers.codemux]`, the table `codex mcp add` wrote. Leave the rest of that table as it is.
 
 ### Hermes
 
@@ -355,7 +355,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
    <!-- wait-states:end -->
 
    - `failure` is one of `error`, `interrupted`, `max_turns`, `max_budget`, `usage_limit`, `no_final_message`, `went_idle` and `delivery_needs_attention`.
-   - `timeout_ms` defaults to 50000 (50 seconds), which stays under the 60-second tool timeout Codex uses unless told otherwise. The most is 600000 (ten minutes). Keep it below your client's tool timeout. A timeout never cancels work.
+   - `timeout_ms` defaults to 50000 (50 seconds), under the 60-second request timeout many MCP clients use by default. The most is 600000 (ten minutes). Keep it below your client's tool timeout. A timeout never cancels work.
    - `turn_id` keeps the wait on one run. Without it, the wait follows the thread's current run.
    - A wait returns when something changes. Input that was already pending when the wait began is reported only at its timeout. After a reconnect, call `thread_status` first: it returns the same `state`, `pending` and `wait_cursor` at once.
    - To wait for the next change of any kind, pass the previous `wait_cursor` as `since`:
