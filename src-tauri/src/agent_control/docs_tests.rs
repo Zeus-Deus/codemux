@@ -164,13 +164,8 @@ fn outside_agents_guide_tool_calls_match_the_schemas() {
 
 #[test]
 fn outside_agents_guide_names_real_wait_states_and_error_codes() {
-    // A new state stops this match compiling; add it to `RunState::ALL`, and
-    // the guide's table must then explain it.
-    for state in RunState::ALL {
-        match state {
-            RunState::Running | RunState::NeedsInput | RunState::Done | RunState::Failed => {}
-        }
-    }
+    // `RunState::ALL` holds every state by construction, so a new one fails
+    // this check until the guide's table explains it.
     let expected: BTreeSet<String> = RunState::ALL
         .iter()
         .map(|state| serde_json::to_value(state).unwrap().as_str().unwrap().to_owned())

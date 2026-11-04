@@ -5,21 +5,26 @@ use crate::agent_provider::TurnStatus;
 use serde::Serialize;
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RunState {
-    Running,
-    NeedsInput,
-    Done,
-    Failed,
+/// Declares [`RunState`] and, for tests, `RunState::ALL` from one list, so a
+/// new state cannot be left out of `ALL`: the guide's wait-states table is
+/// checked against it (`docs_tests`).
+macro_rules! run_states {
+    ($($state:ident),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+        #[serde(rename_all = "snake_case")]
+        pub(crate) enum RunState {
+            $($state),+
+        }
+
+        #[cfg(test)]
+        impl RunState {
+            /// Every state, in declaration order.
+            pub(crate) const ALL: &'static [Self] = &[$(Self::$state),+];
+        }
+    };
 }
 
-#[cfg(test)]
-impl RunState {
-    /// Every state. A new state belongs here too: the guide's wait-states
-    /// table is checked against this list (`docs_tests`).
-    pub(crate) const ALL: [Self; 4] = [Self::Running, Self::NeedsInput, Self::Done, Self::Failed];
-}
+run_states!(Running, NeedsInput, Done, Failed);
 
 /// A run's terminal status as Codemux recorded it, live or persisted.
 #[derive(Debug, Clone, Copy)]
