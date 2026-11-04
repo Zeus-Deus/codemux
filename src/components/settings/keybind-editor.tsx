@@ -344,7 +344,7 @@ function KeybindRow({
                 </div>
               </div>
               {affectsCritical && (
-                <p className="text-label text-warning/80">
+                <p className="text-label text-warning">
                   This will unbind a navigation shortcut. You can always reach settings from the menu.
                 </p>
               )}

@@ -3477,7 +3477,7 @@ export function Composer({
               {errorMessage && (
                 <div
                   role="alert"
-                  className="px-5 pt-2 text-label text-destructive/90 leading-tight"
+                  className="px-5 pt-2 text-label text-destructive leading-tight"
                 >
                   <span>Send failed: {errorMessage}. </span>
                   <span className="text-subtle-foreground">

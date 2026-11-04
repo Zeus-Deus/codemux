@@ -5,8 +5,10 @@ import { BUILT_IN_THEMES, contrastRatio, normalizeColor, subtleForeground } from
 
 // Faded muted ink composites under 4.5:1 (and below the subtle floor on
 // selected fills) and reads as disabled. `text-subtle-foreground` is the
-// quietest legal text ink; foreground keeps its alphas down to 50%.
-const FADED_TEXT_INK = /(?<![\w-])text-(?:muted-foreground\/\d+|foreground\/(?:[1-4]\d|[0-9]))\b/g;
+// quietest legal text ink; foreground keeps its alphas down to 50%. Status
+// and semantic tones are tuned per scheme to clear 4.5:1 only at full
+// strength, so they take no alpha either.
+const FADED_TEXT_INK = /(?<![\w-])text-(?:(?:muted-foreground|success|danger|warning|destructive|status-[a-z]+)\/\d+|foreground\/(?:[1-4]\d|[0-9]))\b/g;
 
 const RAW_PALETTE_UTILITY = /\b(?:bg|text|border|ring|from|to|via)-(?:slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-\d+/g;
 

@@ -478,7 +478,7 @@ function HostNotConfiguredBlock({
   onClose: () => void;
 }) {
   return (
-    <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2.5 text-body-sm text-warning/95 leading-relaxed space-y-2">
+    <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2.5 text-body-sm text-warning leading-relaxed space-y-2">
       <p>
         This workspace lives on a device you haven't configured here
         yet
@@ -491,7 +491,7 @@ function HostNotConfiguredBlock({
           "."
         )}
       </p>
-      <p className="text-warning/85">
+      <p className="text-warning">
         Add the device in Settings → Connections → Devices, then come back and pull.
       </p>
       <Button
@@ -545,13 +545,13 @@ function CloneFallbackBlock({
         </SummaryRow>
       </dl>
 
-      <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-body-sm text-warning/90 leading-relaxed">
+      <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-body-sm text-warning leading-relaxed">
         <AlertTriangle className="size-3.5 shrink-0 mt-0.5" />
         <div>
           <p className="font-medium text-warning">
             Uncommitted work on the other device will NOT come over.
           </p>
-          <p className="text-warning/80">
+          <p className="text-warning">
             Only committed history clones. If you want the in-flight
             edits, open the other device first and commit (or push
             the workspace to a shared device instead, then pull from
@@ -575,12 +575,12 @@ function NoOptionsBlock() {
 
 function PathInUseBlock({ path }: { path: string }) {
   return (
-    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-body-sm text-destructive/95 leading-relaxed">
+    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-body-sm text-destructive leading-relaxed">
       <p className="mb-1">A different workspace is already using:</p>
-      <p className="font-mono text-label text-destructive/85 break-all">
+      <p className="font-mono text-label text-destructive break-all">
         {path}
       </p>
-      <p className="mt-2 text-destructive/85">
+      <p className="mt-2 text-destructive">
         Close that workspace first, or wait for the upcoming "choose
         different path" picker.
       </p>
@@ -636,7 +636,7 @@ function AlreadyAdoptedBlock({ onOpen }: { onOpen: () => void }) {
 
 function ErrorBlock({ message }: { message: string }) {
   return (
-    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-body-sm text-destructive/95">
+    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-body-sm text-destructive">
       {message}
     </div>
   );

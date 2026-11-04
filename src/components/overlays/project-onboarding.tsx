@@ -499,7 +499,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         type="button"
         onClick={() => setError(null)}
         aria-label="Dismiss error"
-        className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors duration-100"
+        className="shrink-0 rounded-sm p-0.5 text-destructive hover:bg-destructive/10 transition-colors duration-100"
       >
         <X className="size-3.5" />
       </button>

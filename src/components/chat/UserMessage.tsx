@@ -206,7 +206,7 @@ export const UserMessage = memo(function UserMessage({
                   aria-label="Cancel queued message"
                   title="Remove from queue and return to the composer"
                   onClick={() => onCancelQueued(queued.queuedId, item.text)}
-                  className="inline-flex size-4 items-center justify-center rounded-sm text-subtle-foreground transition-colors duration-150 hover:bg-destructive/10 hover:text-destructive/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
+                  className="inline-flex size-4 items-center justify-center rounded-sm text-subtle-foreground transition-colors duration-150 hover:bg-destructive/10 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
                 >
                   <X className="size-3" aria-hidden />
                 </button>

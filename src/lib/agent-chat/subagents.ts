@@ -449,8 +449,8 @@ export function statusTone(status: SubagentViewStatus): SubagentToneClasses {
       // Same hue as running (status-working) but dimmed, so it reads as
       // "was working, now halted" rather than success/failure.
       return {
-        text: "text-status-working/80",
-        chipBg: "bg-status-working/10 text-status-working/80",
+        text: "text-status-working",
+        chipBg: "bg-status-working/10 text-status-working",
         softBg: "bg-status-working/[0.05]",
         border: "border-status-working/20",
       };

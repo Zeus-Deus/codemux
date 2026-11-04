@@ -111,7 +111,7 @@ const STATUS_META: Record<string, { icon: React.ReactNode; color: string; label:
   modified:   { icon: <VscDiffModified className="size-3" />, color: "text-warning",  label: "Modified" },
   removed:    { icon: <VscDiffRemoved className="size-3" />,  color: "text-danger",   label: "Removed" },
   renamed:    { icon: <VscDiffRenamed className="size-3" />,  color: "text-info",     label: "Renamed" },
-  untracked:  { icon: <VscDiffAdded className="size-3" />,    color: "text-success/70", label: "Untracked" },
+  untracked:  { icon: <VscDiffAdded className="size-3" />,    color: "text-success", label: "Untracked" },
   conflicted: { icon: <AlertTriangle className="size-3" />,   color: "text-danger",   label: "Conflict" },
 };
 

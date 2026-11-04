@@ -587,7 +587,7 @@ export function QueuedTurnsList({
                       aria-label="Remove queued message"
                       title="Remove from the queue"
                       onClick={() => remove(item)}
-                      className={cn(ICON_ACTION, REVEAL_ON_INTENT, "hover:bg-destructive/10 hover:text-destructive/80")}
+                      className={cn(ICON_ACTION, REVEAL_ON_INTENT, "hover:bg-destructive/10 hover:text-destructive")}
                     >
                       <X className="size-3.5" aria-hidden />
                     </button>

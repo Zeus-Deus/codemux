@@ -183,7 +183,7 @@ export function BashToolBody({
         // not a status billboard.
         <span
           aria-label={`Exit code ${exitCode}`}
-          className="font-mono text-label text-destructive/80"
+          className="font-mono text-label text-destructive"
         >
           exit {exitCode}
         </span>

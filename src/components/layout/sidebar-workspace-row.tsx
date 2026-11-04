@@ -1581,10 +1581,10 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                       "transition-opacity duration-150 group-hover/row:opacity-0",
                     )}>
                       {workspace.git_behind > 0 && (
-                        <span className="text-warning/80">↓{workspace.git_behind}</span>
+                        <span className="text-warning">↓{workspace.git_behind}</span>
                       )}
                       {workspace.git_ahead > 0 && (
-                        <span className="text-success/80">↑{workspace.git_ahead}</span>
+                        <span className="text-success">↑{workspace.git_ahead}</span>
                       )}
                     </span>
                   )}
@@ -1598,10 +1598,10 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                       "transition-opacity duration-150 group-hover/row:opacity-0",
                     )}>
                       {workspace.git_additions > 0 && (
-                        <span className="text-success/80">+{workspace.git_additions}</span>
+                        <span className="text-success">+{workspace.git_additions}</span>
                       )}
                       {workspace.git_deletions > 0 && (
-                        <span className="text-danger/80">−{workspace.git_deletions}</span>
+                        <span className="text-danger">−{workspace.git_deletions}</span>
                       )}
                     </span>
                   )}
