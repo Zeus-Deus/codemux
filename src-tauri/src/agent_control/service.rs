@@ -513,7 +513,7 @@ pub(crate) fn validate_permission_mode(provider: ProviderKind, mode: Option<&str
     if plan || (caps.permission_modes.is_empty() && mode.is_none()) || caps.permission_modes.iter().any(|option| Some(option.value.as_str()) == mode) {
         Ok(())
     } else {
-        Err(ControlError::new(ErrorCode::UnsupportedPermissionMode, "Select an exact mode from orchestrator_capabilities"))
+        Err(ControlError::new(ErrorCode::UnsupportedPermissionMode, "Select an exact mode from agent_capabilities (orchestrator_capabilities in a chat)"))
     }
 }
 

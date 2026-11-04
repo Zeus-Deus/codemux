@@ -217,7 +217,7 @@ pub(crate) async fn resolve<R: Runtime>(
                 .ok_or_else(|| {
                     ControlError::new(
                         ErrorCode::ProviderNotConfigured,
-                        "Select an exact configured instance from orchestrator_capabilities",
+                        "Select an exact configured instance from agent_capabilities (orchestrator_capabilities in a chat)",
                     )
                 })?;
             let extra = if crate::provider_accounts::supports(kind) {

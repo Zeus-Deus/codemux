@@ -138,7 +138,7 @@ mod defs {
     }
 
     pub(super) fn worktree_create(view: &CallerView) -> Option<Definition> {
-        only_outside(view, outside("Create a git worktree and its workspace under ~/.codemux/worktrees. new_branch (default true) creates branch from base (default: the repository's default branch, freshened from origin when possible); start_from_origin true requires a fresh origin base, false uses the local ref exactly. An existing checkout of the branch that is already open is returned with adopted true. Runs setup scripts and needs full access. agent_preset_id starts a terminal CLI preset with initial_prompt; for native chats use thread_launch. Presets and prompts are available only on this computer. Never takes focus unless select is true. Pass client_request_id to make retries safe.", json!({
+        only_outside(view, outside("Create a git worktree and its workspace under ~/.codemux/worktrees. new_branch (default true) creates branch from base (default: the repository's default branch, freshened from origin when possible); start_from_origin true requires a fresh origin base, false uses the local ref exactly. An existing checkout of the branch that is already open is returned with adopted true. Runs setup scripts and needs full access. agent_preset_id starts a terminal CLI preset with initial_prompt; for native chats use thread_launch. Presets are available only on this computer; without one, initial_prompt is ignored. Never takes focus unless select is true. Pass client_request_id to make retries safe.", json!({
             "repo_path": {"type": "string", "minLength": 1, "maxLength": 4096},
             "branch": {"type": "string", "minLength": 1, "maxLength": 256},
             "new_branch": {"type": "boolean", "default": true},
@@ -186,12 +186,20 @@ mod defs {
         }), &["workspace_id"]), Some(|definition| in_app(definition, None)))
     }
 
+    /// The launch target as outside callers name it. They discover instances
+    /// with agent_capabilities; orchestrator_capabilities is the chats' tool.
+    fn outside_target() -> Value {
+        let mut target = super::super::selection::schema();
+        target["properties"]["instance_id"]["description"] = json!("Exact provider_instance_id from agent_capabilities");
+        target
+    }
+
     pub(super) fn thread_launch(view: &CallerView) -> Option<Definition> {
         for_audience(view, outside("Launch a CodeMux-owned native thread in an existing workspace or in a new git worktree of its repository. Select configured accounts, Hermes profiles and ACP instances through target. Returns an operation receipt; use operation_status. Explicit permission_mode is mandatory (null only for providers without a mode). With worktree, the thread starts in a NEW git worktree and workspace branched from workspace_id's repository: branch defaults to a name from title, base to the repository's default branch, freshened from origin when possible (start_from_origin true requires a fresh origin base, false uses the local ref exactly). Worktree launch needs full access because the new worktree runs the project's setup scripts. It never adopts an existing branch or checkout. The receipt names the new workspace id at once. No raw environment or filesystem attachment inputs.", json!({
             "workspace_id": {"type": "string", "minLength": 1},
             "client_request_id": {"type": "string", "minLength": 1, "maxLength": 128},
             "provider": {"type": "string"},
-            "target": super::super::selection::schema(),
+            "target": outside_target(),
             "service_tier": {"type": ["string", "null"]},
             "model": {"type": ["string", "null"]},
             "permission_mode": {"type": ["string", "null"]},
@@ -387,6 +395,18 @@ mod review_tests {
         let in_app = registry::list(&view).into_iter().find(|tool| tool.spec.name() == "thread_launch").unwrap().definition;
         assert_eq!(in_app.input_schema["properties"]["worktree"], serde_json::json!({"description": "Unsupported in this version"}));
         assert!(in_app.description.contains("Worktree strategies are unsupported"), "{}", in_app.description);
+    }
+
+    /// Each audience is pointed at the capabilities tool it is offered:
+    /// orchestrator_capabilities is in-app only, so naming it to an outside
+    /// caller sends the model to an unknown tool.
+    #[test]
+    fn launch_target_names_the_callers_own_capabilities_tool() {
+        let hint = |definition: &registry::ToolDefinition| definition.input_schema["properties"]["target"]["properties"]["instance_id"]["description"].clone();
+        assert_eq!(hint(&outside_definition("thread_launch")), "Exact provider_instance_id from agent_capabilities");
+        let view = CallerView::in_app(crate::agent_provider::ProviderKind::Claude, Some("bypassPermissions"), true);
+        let in_app = registry::list(&view).into_iter().find(|tool| tool.spec.name() == "thread_launch").unwrap().definition;
+        assert_eq!(hint(&in_app), "Exact provider_instance_id from orchestrator_capabilities");
     }
 
     /// The workspace tools are registry tools for outside callers only: chats

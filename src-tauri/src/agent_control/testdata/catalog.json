@@ -990,7 +990,7 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
-      "description": "Create a git worktree and its workspace under ~/.codemux/worktrees. new_branch (default true) creates branch from base (default: the repository's default branch, freshened from origin when possible); start_from_origin true requires a fresh origin base, false uses the local ref exactly. An existing checkout of the branch that is already open is returned with adopted true. Runs setup scripts and needs full access. agent_preset_id starts a terminal CLI preset with initial_prompt; for native chats use thread_launch. Presets and prompts are available only on this computer. Never takes focus unless select is true. Pass client_request_id to make retries safe.",
+      "description": "Create a git worktree and its workspace under ~/.codemux/worktrees. new_branch (default true) creates branch from base (default: the repository's default branch, freshened from origin when possible); start_from_origin true requires a fresh origin base, false uses the local ref exactly. An existing checkout of the branch that is already open is returned with adopted true. Runs setup scripts and needs full access. agent_preset_id starts a terminal CLI preset with initial_prompt; for native chats use thread_launch. Presets are available only on this computer; without one, initial_prompt is ignored. Never takes focus unless select is true. Pass client_request_id to make retries safe.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1223,7 +1223,7 @@
             "additionalProperties": false,
             "properties": {
               "instance_id": {
-                "description": "Exact provider_instance_id from orchestrator_capabilities",
+                "description": "Exact provider_instance_id from agent_capabilities",
                 "type": "string"
               },
               "model": {

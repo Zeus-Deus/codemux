@@ -525,7 +525,7 @@ async fn connector_worktree_create_refuses_presets() {
         refused(call(&app, &connector(ControlAccess::FullAccess), "worktree_create", args).await, ErrorCode::InvalidArguments);
     }
     let description = registry::tools_for(&connector(ControlAccess::FullAccess)).into_iter().find(|tool| tool.name == "worktree_create").unwrap().description;
-    assert!(description.contains("Presets and prompts are available only on this computer"), "{description}");
+    assert!(description.contains("Presets are available only on this computer; without one, initial_prompt is ignored"), "{description}");
 }
 
 // ── thread_launch into a new worktree ─────────────────────────────────────
