@@ -273,20 +273,15 @@ fn local_url(port: u16) -> String {
 /// The `codemux` outside assistants should launch. The bare name when it
 /// resolves on PATH to this same binary, so a saved entry survives upgrades;
 /// otherwise the durable absolute path (an AppImage's wrapper path survives
-/// the app exiting, not an upgrade).
+/// the app exiting, not an upgrade). Both come from the install path
+/// `codemux_mcp_command` names, also once an upgrade replaced the binary.
 pub(crate) fn outside_executable() -> String {
     let running = crate::mcp_server::codemux_mcp_command();
     stable_executable(which::which("codemux").ok(), std::path::Path::new(&running))
 }
 
+/// `running` is an install path (`mcp_server::install_path`).
 fn stable_executable(on_path: Option<std::path::PathBuf>, running: &std::path::Path) -> String {
-    // Linux names a running binary that an upgrade replaced or removed
-    // `<path> (deleted)`. The install path is the one to launch: after an
-    // upgrade it holds the new binary.
-    let running = running
-        .to_str()
-        .and_then(|path| path.strip_suffix(" (deleted)"))
-        .map_or(running, std::path::Path::new);
     let same_binary = || {
         let found = on_path.and_then(|path| std::fs::canonicalize(path).ok());
         found.is_some() && found == std::fs::canonicalize(running).ok()
@@ -1070,12 +1065,16 @@ mod tests {
         assert_eq!(stable_executable(Some(binary.clone()), &on_path), "codemux", "the running path is a link to it");
         assert_eq!(stable_executable(Some(other), &binary), absolute, "PATH names another install");
         assert_eq!(stable_executable(None, &binary), absolute, "codemux is not on PATH");
-        // How Linux reports the running binary once a package upgrade replaced it.
+        // How Linux reports the running binary once a package upgrade
+        // replaced it, through the install path codemux_mcp_command names.
         let deleted = |path: &std::path::Path| std::path::PathBuf::from(format!("{} (deleted)", path.display()));
-        assert_eq!(stable_executable(Some(on_path.clone()), &deleted(&binary)), "codemux", "an upgrade replaced the running binary");
-        assert_eq!(stable_executable(None, &deleted(&binary)), absolute, "replaced, and codemux is not on PATH");
+        let launched = |on_path: Option<std::path::PathBuf>, running: &std::path::Path| {
+            stable_executable(on_path, crate::mcp_server::install_path(&deleted(running)))
+        };
+        assert_eq!(launched(Some(on_path.clone()), &binary), "codemux", "an upgrade replaced the running binary");
+        assert_eq!(launched(None, &binary), absolute, "replaced, and codemux is not on PATH");
         let gone = dir.path().join("uninstalled");
-        assert_eq!(stable_executable(Some(on_path), &deleted(&gone)), gone.display().to_string(), "removed: its clean install path");
+        assert_eq!(launched(Some(on_path), &gone), gone.display().to_string(), "removed: its clean install path");
     }
 
     #[test]

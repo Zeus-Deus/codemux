@@ -2162,15 +2162,23 @@ fn codemux_mcp_entry() -> Value {
 /// Resolve a durable command for the on-disk entry. `current_exe()` points
 /// inside a transient mount for a raw AppImage launch; the wrapper named by
 /// `$APPIMAGE` survives after the desktop process exits and accepts the same
-/// `mcp` argument.
+/// `mcp` argument. A binary that a package upgrade replaced while the app
+/// runs is named by its install path, so entries written then still launch.
 pub(crate) fn codemux_mcp_command() -> String {
     std::env::var_os("APPIMAGE")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .filter(|path| path.is_file())
-        .or_else(|| std::env::current_exe().ok())
+        .or_else(|| std::env::current_exe().ok().map(|running| install_path(&running).to_path_buf()))
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "codemux".to_string())
+}
+
+/// Linux names a running binary that an upgrade replaced or removed
+/// `<path> (deleted)`. The install path is the one to launch: after an
+/// upgrade it holds the new binary.
+pub(crate) fn install_path(running: &Path) -> &Path {
+    running.to_str().and_then(|path| path.strip_suffix(" (deleted)")).map_or(running, Path::new)
 }
 
 /// One unique checkout that needs an MCP config reconciliation.
@@ -2573,6 +2581,13 @@ mod tests {
     use super::*;
     use crate::mcp::protocol::{Incoming, RequestId, Response};
     use std::time::Duration;
+
+    #[test]
+    fn install_path_drops_the_suffix_linux_gives_a_replaced_binary() {
+        assert_eq!(install_path(Path::new("/usr/bin/codemux (deleted)")), Path::new("/usr/bin/codemux"));
+        assert_eq!(install_path(Path::new("/usr/bin/codemux")), Path::new("/usr/bin/codemux"));
+        assert_eq!(install_path(Path::new("/opt/x (deleted)/codemux")), Path::new("/opt/x (deleted)/codemux"), "only a trailing suffix");
+    }
 
     /// An outside caller at full access: no provider origin, no agent marker.
     fn outside() -> StdioCaller {
