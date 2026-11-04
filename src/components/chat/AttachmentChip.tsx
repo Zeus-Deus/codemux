@@ -345,7 +345,7 @@ export function AttachmentChip({
       )}
       {truncationLabel && (
         <span
-          className="text-micro opacity-60"
+          className="text-micro text-subtle-foreground"
           aria-hidden
           data-testid="attachment-chip-truncation"
         >
