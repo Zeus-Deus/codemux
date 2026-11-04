@@ -22,9 +22,10 @@ pub(crate) const FALLBACK_TICK: Duration = Duration::from_secs(5);
 /// Bursts (subagent updates, queue churn) re-evaluate a waiter at most this often.
 const MIN_EVALUATION_GAP: Duration = Duration::from_millis(100);
 
-/// Outside clients choose; 60 s suits common MCP clients (Codex and Hermes
-/// allow 300 s per tool call).
-pub(crate) const DEFAULT_WAIT_MS: u64 = 60_000;
+/// Outside clients choose up to the maximum. The default stops short of the
+/// 60 s at which Codex cuts a tool call unless its `tool_timeout_sec` allows
+/// more, so a wait that names no timeout returns before its client gives up.
+pub(crate) const DEFAULT_WAIT_MS: u64 = 50_000;
 pub(crate) const MAX_OUTSIDE_WAIT_MS: u64 = 600_000;
 /// Agents inside Codemux call tools under their provider's ~60 s tool-call
 /// limit (see secret_requests::CALL_WAIT), so their waits stop short of it.

@@ -45,7 +45,7 @@ codex mcp add codemux -- codemux mcp --client codex
   codex mcp add codemux --env "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" -- codemux mcp --client codex
   ```
 
-- Codex gives up on a tool call after its own timeout. To allow long waits, open `~/.codex/config.toml` and add `tool_timeout_sec = 660` under `[mcp_servers.codemux]`, the table `codex mcp add` wrote. Leave the rest of that table as it is.
+- Codex gives up on a tool call after 60 seconds unless you allow more. A `thread_wait` that names no `timeout_ms` returns within 50 seconds, so it fits. To allow longer waits, open `~/.codex/config.toml` and add `tool_timeout_sec = 660` under `[mcp_servers.codemux]`, the table `codex mcp add` wrote. Leave the rest of that table as it is.
 
 ### Hermes
 
@@ -340,7 +340,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
 5. **Wait for the result.**
 
    ```text
-   thread_wait {"workspace_id": "workspace-9", "thread_id": "8a1f…", "turn_id": "c41b…", "timeout_ms": 60000}
+   thread_wait {"workspace_id": "workspace-9", "thread_id": "8a1f…", "turn_id": "c41b…", "timeout_ms": 50000}
    → {"state": "running", "timed_out": true, "wait_cursor": "9c41d07e2b6a8f15", …}
    → {"state": "done", "final_text": "The test raced the session cleanup. …", "pending": {"approvals": [], "questions": [], "secrets": []}, …}
    ```
@@ -355,7 +355,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
    <!-- wait-states:end -->
 
    - `failure` is one of `error`, `interrupted`, `max_turns`, `max_budget`, `usage_limit`, `no_final_message`, `went_idle` and `delivery_needs_attention`.
-   - `timeout_ms` defaults to 60000 (one minute). The most is 600000 (ten minutes). Keep it below your client's tool timeout. A timeout never cancels work.
+   - `timeout_ms` defaults to 50000 (50 seconds), which stays under the 60-second tool timeout Codex uses unless told otherwise. The most is 600000 (ten minutes). Keep it below your client's tool timeout. A timeout never cancels work.
    - `turn_id` keeps the wait on one run. Without it, the wait follows the thread's current run.
    - A wait returns when something changes. Input that was already pending when the wait began is reported only at its timeout. After a reconnect, call `thread_status` first: it returns the same `state`, `pending` and `wait_cursor` at once.
    - To wait for the next change of any kind, pass the previous `wait_cursor` as `since`:
@@ -500,7 +500,7 @@ A paired phone or browser can remove a clean worktree, for example with **Device
   - Control tools return compact JSON with `structuredContent`, and errors as `isError` results with a code.
 - **`--access` narrows `codemux mcp`.** A supervised or read-only client is offered fewer tools.
 - **`thread_launch` needs `permission_mode`.** Without it, it fails with `invalid_arguments` (missing field `permission_mode`).
-- **`thread_wait` returns `state`, `final_text`, `pending` and `wait_cursor`.** It waits up to 60 seconds by default and 10 minutes at most.
+- **`thread_wait` returns `state`, `final_text`, `pending` and `wait_cursor`.** It waits up to 50 seconds by default and 10 minutes at most.
 - **Outside assistants can answer worker questions** with `thread_answer`.
 - **New worktrees branch from the repository's default branch**, not always `main`.
 - **`codemux json` and the older `codemux` commands exit `1` when the reply is not ok.** Check scripts that use `set -e`.

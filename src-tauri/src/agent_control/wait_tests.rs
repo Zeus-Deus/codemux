@@ -517,7 +517,7 @@ async fn wait_limits_depend_on_the_caller() {
         assert_eq!(code(wait_for(&app, &trusted, args).await), ErrorCode::InvalidArguments, "{field}");
     }
     assert_eq!(code(wait_for(&app, &trusted, target(&workspace, idle, json!({"poll": true}))).await), ErrorCode::InvalidArguments);
-    // Omitted timeouts default to 60 s outside and 50 s for a chat.
+    // Omitted timeouts default to 50 s, outside and for a chat alike.
     let busy = "limits-busy";
     persisted(&app, &workspace, busy);
     running(&app, busy, "t1");
