@@ -125,10 +125,10 @@ needs `ORCH_LIVE_PROVIDERS` to include `hermes`, because up.sh mounts its
 runtime and login only then; it adds a `codemux` server to the run-local
 `<root>/private/hermes/config.yaml` in place and restores it afterwards. Its
 budget is 25 minutes (`budgetMs`). The `http` part runs the connector on a
-free port and puts the previous settings back; its access-token expiry check
-runs only when serve has `CODEMUX_E2E_CONNECTOR_ACCESS_TTL_SECS` (debug
-builds, 5–3600 s) in its environment, and is recorded as not exercised
-otherwise.
+free port and puts the previous settings back. The sandbox gives serve
+`CODEMUX_E2E_CONNECTOR_ACCESS_TTL_SECS=20` (`lib.sh`; debug builds honour
+5–3600 s), so the part sees an access token lapse before it refreshes; a
+serve without it records that step as not exercised.
 
 `sandbox-run.sh [--root DIR] [--cwd DIR] [--timeout SEC] [--env KEY=VALUE]… -- CMD ARGS…`
 runs a command with serve's mounts, environment allow-list and isolation, in

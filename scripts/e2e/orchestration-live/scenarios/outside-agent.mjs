@@ -477,13 +477,23 @@ async function oauth(ctx, url, tag) {
   ctx.check("http: the refresh token rotates both tokens",
     rotated.status === 200 && second.refresh_token !== tokens.refresh_token && second.access_token !== tokens.access_token
       && (await renewed.ping()) === 200, { status: rotated.status });
-  // Past the 30 s reuse grace, a spent refresh token revokes the family.
+  // Past the 30 s reuse grace, a spent refresh token revokes the family: its
+  // refresh tokens and its live access tokens. The sleep outlasts a short
+  // access-token TTL, so the access token checked is one renewed just before
+  // the replay and seen working: its 401 then comes from the revocation, not
+  // from expiry.
   await sleep(31_000, undefined, { signal });
+  const third = await (await refresh(second.refresh_token)).json();
+  const live = new HttpMcpClient(url, third.access_token, { signal });
+  const liveBefore = await live.ping();
   const replayed = await refresh(tokens.refresh_token);
   const replayBody = await replayed.json().catch(() => null);
-  const familyGone = (await renewed.ping()) === 401 && (await refresh(second.refresh_token)).status === 400;
+  const liveAfter = await live.ping();
+  const refreshAfter = (await refresh(third.refresh_token)).status;
+  const familyGone = liveBefore === 200 && liveAfter === 401 && refreshAfter === 400;
   ctx.check("http: reusing a spent refresh token after 31 s revokes the sign-in",
-    replayed.status === 400 && replayBody?.error === "invalid_grant" && familyGone, { status: replayed.status, body: replayBody });
+    replayed.status === 400 && replayBody?.error === "invalid_grant" && familyGone,
+    { status: replayed.status, body: replayBody, liveBefore, liveAfter, refreshAfter });
 }
 
 // ── cli: the CLI verbs ────────────────────────────────────────────────────
