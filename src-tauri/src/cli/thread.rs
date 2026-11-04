@@ -198,12 +198,10 @@ pub struct RespondArgs {
 
 #[derive(Args)]
 pub struct AnswerArgs {
+    pub thread: String,
     /// Workspace of the thread (default $CODEMUX_WORKSPACE_ID).
     #[arg(long, value_name = "ID")]
     pub workspace: Option<String>,
-    /// The thread whose worker asked.
-    #[arg(long, value_name = "ID")]
-    pub thread: String,
     /// The question's id, from `thread status` or a wait's pending questions.
     #[arg(long, value_name = "ID")]
     pub question: String,
@@ -967,7 +965,7 @@ fn print_report(report: RunReport, json: bool) -> Result<Exit, String> {
             }
             if let Some(question) = report.pending.as_ref().and_then(|pending| pending["questions"][0]["question_id"].as_str()) {
                 output::note(&format!(
-                    "Answer: codemux thread answer --workspace {workspace} --thread {thread} --question {question} --answer <text>"
+                    "Answer: codemux thread answer {thread} --question {question} --answer <text> --workspace {workspace}"
                 ));
             }
         }
@@ -1465,7 +1463,7 @@ mod tests {
     }
 
     fn answer_args(extra: &[&str]) -> AnswerArgs {
-        let argv = [&["codemux", "thread", "answer", "--workspace", "ws", "--thread", "th", "--question", "q1"][..], extra].concat();
+        let argv = [&["codemux", "thread", "answer", "th", "--workspace", "ws", "--question", "q1"][..], extra].concat();
         match Cli::try_parse_from(argv).unwrap().command {
             Some(CommandSet::Thread { command: ThreadCommand::Answer(args) }) => args,
             _ => panic!("expected thread answer"),
@@ -1491,8 +1489,11 @@ mod tests {
         assert!(door.script().finished());
 
         // The tool needs an answer, so the CLI refuses none before calling.
-        let none = Cli::try_parse_from(["codemux", "thread", "answer", "--workspace", "ws", "--thread", "th", "--question", "q1"]);
+        let none = Cli::try_parse_from(["codemux", "thread", "answer", "th", "--workspace", "ws", "--question", "q1"]);
         assert!(none.is_err());
+        // The thread is positional, as in every other thread verb.
+        let flagged = Cli::try_parse_from(["codemux", "thread", "answer", "--thread", "th", "--question", "q1", "--answer", "a"]);
+        assert!(flagged.is_err());
     }
 
     #[tokio::test(start_paused = true)]

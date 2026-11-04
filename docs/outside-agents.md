@@ -432,7 +432,7 @@ codemux workspace close "$WS" --remove-worktree
 - `thread respond "$THREAD" "$REQUEST_ID" deny --workspace "$WS"` answers an approval. `thread answer` answers a question, with one `--answer` per prompt, in order. It prints the `turn_id` of the run that continues:
 
   ```sh
-  TURN=$(codemux thread answer --workspace "$WS" --thread "$THREAD" --question "$QUESTION" --answer "Use the staging database")
+  TURN=$(codemux thread answer "$THREAD" --workspace "$WS" --question "$QUESTION" --answer "Use the staging database")
   codemux thread wait "$THREAD" --workspace "$WS" --turn "$TURN"
   ```
 

@@ -401,6 +401,36 @@ fn waits_carry_the_client_and_map_run_states_to_exit_codes() {
 }
 
 #[test]
+fn the_needs_input_hint_answers_a_question_as_printed() {
+    let pending = json!({"approvals": [], "secrets": [],
+        "questions": [{"question_id": "q1", "turn_id": "t1", "text": "Which database?", "questions": [{"title": "Database", "options": []}]}]});
+    let app = FakeApp::start(move |request| match (request["command"].as_str(), tool_name(request)) {
+        (Some("status"), _) => ok_reply(json!({})),
+        (_, Some("thread_status")) => tool_result(thread_status("needs_input", json!({"pending": pending.clone()}))),
+        (_, Some("thread_answer")) => tool_result(json!({"workspace_id": "ws", "thread_id": "th", "question_id": "q1",
+            "turn_id": "t2", "operation_id": "op", "state": "succeeded"})),
+        _ => json!({"ok": false, "protocol_version": 2, "data": null, "error": "unknown_tool: Unknown tool"}),
+    });
+    let asks = app.cli(&["thread", "wait", "th", "--workspace", "ws"]);
+    assert_eq!(exit_code(&asks), 2);
+    let stderr = String::from_utf8_lossy(&asks.stderr);
+    let hint = stderr.lines().find_map(|line| line.strip_prefix("Answer: codemux ")).unwrap_or_else(|| panic!("no answer hint:\n{stderr}"));
+    assert_eq!(hint, "thread answer th --question q1 --answer <text> --workspace ws", "the thread comes first, as in the other verbs");
+
+    // The hint runs as printed once its placeholder is filled in.
+    let argv: Vec<&str> = hint.split_whitespace().map(|word| if word == "<text>" { "staging" } else { word }).collect();
+    let answered = app.cli(&argv);
+    assert_eq!(exit_code(&answered), 0, "{}", String::from_utf8_lossy(&answered.stderr));
+    assert_eq!(String::from_utf8_lossy(&answered.stdout), "t2\n");
+    let request = app.requests().into_iter().find(|request| tool_name(request) == Some("thread_answer")).unwrap();
+    let arguments = &request["params"]["arguments"];
+    assert_eq!(
+        [&arguments["workspace_id"], &arguments["thread_id"], &arguments["question_id"], &arguments["answers"]],
+        [&json!("ws"), &json!("th"), &json!("q1"), &json!(["staging"])]
+    );
+}
+
+#[test]
 fn a_queued_send_waits_for_the_run_its_message_starts() {
     // The server's shapes: the receipt names only the queue entry; a wait
     // without a turn adopts the busy run t1, which settles once the entry has
