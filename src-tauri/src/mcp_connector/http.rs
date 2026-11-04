@@ -2894,8 +2894,20 @@ mod tests {
         json!({"name": "CodeMux", "version": env!("CARGO_PKG_VERSION")})
     }
 
+    /// The `stateless_*` tests check stateless serving. With the kill switch
+    /// off every request is initialize-era, which the other tests cover.
+    fn stateless_era_off() -> bool {
+        if !mcp_protocol::MODERN_ERA_ENABLED {
+            eprintln!("skipped: the stateless era is switched off (mcp::protocol::MODERN_ERA_ENABLED)");
+        }
+        !mcp_protocol::MODERN_ERA_ENABLED
+    }
+
     #[tokio::test]
     async fn stateless_clients_discover_list_and_call_beside_initialize_era_ones() {
+        if stateless_era_off() {
+            return;
+        }
         let f = fixture().await;
         let token = grant(&f);
         let response = invoke(&f, modern_request(&f, 1, "server/discover", json!({}), Some(&token))).await;
@@ -2947,6 +2959,9 @@ mod tests {
 
     #[tokio::test]
     async fn stateless_headers_must_mirror_the_body() {
+        if stateless_era_off() {
+            return;
+        }
         let f = fixture().await;
         let token = grant(&f);
         let call = || modern_request(&f, 7, "tools/call", json!({"name": "thread_list", "arguments": {}}), Some(&token));
@@ -2971,6 +2986,9 @@ mod tests {
 
     #[tokio::test]
     async fn stateless_revision_errors_are_modern_json_rpc_errors() {
+        if stateless_era_off() {
+            return;
+        }
         let f = fixture().await;
         let token = grant(&f);
         // A revision Codemux does not speak lists the ones it does, so a

@@ -2965,8 +2965,20 @@ mod tests {
         json!({ "name": "codemux", "version": env!("CARGO_PKG_VERSION") })
     }
 
+    /// The `stateless_*` tests check stateless serving. With the kill switch
+    /// off every request is initialize-era, which the other tests cover.
+    fn stateless_era_off() -> bool {
+        if !protocol::MODERN_ERA_ENABLED {
+            eprintln!("skipped: the stateless era is switched off (mcp::protocol::MODERN_ERA_ENABLED)");
+        }
+        !protocol::MODERN_ERA_ENABLED
+    }
+
     #[tokio::test]
     async fn stateless_discover_describes_both_eras_and_the_same_instructions() {
+        if stateless_era_off() {
+            return;
+        }
         for (caller, instructions) in [
             (outside(), crate::agent_control::INSTRUCTIONS),
             (StdioCaller { provider_origin: true, ..outside() }, PROVIDER_INSTRUCTIONS),
@@ -2988,6 +3000,9 @@ mod tests {
 
     #[tokio::test]
     async fn stateless_and_initialize_era_clients_share_one_server() {
+        if stateless_era_off() {
+            return;
+        }
         let Gated { server, .. } = gated_server();
         // An initialize-era client first, then a stateless one, interleaved.
         let init = rpc(&server, json!({
@@ -3035,6 +3050,9 @@ mod tests {
 
     #[tokio::test]
     async fn stateless_requests_name_the_client_and_the_first_name_sticks() {
+        if stateless_era_off() {
+            return;
+        }
         let slot = Arc::new(std::sync::OnceLock::new());
         let server = named_server(&slot);
         rpc(&server, modern(1, "tools/list", json!({}))).await.unwrap();
@@ -3048,6 +3066,9 @@ mod tests {
 
     #[tokio::test]
     async fn stateless_requests_refuse_unknown_revisions_and_methods_outside_the_revision() {
+        if stateless_era_off() {
+            return;
+        }
         let server = server();
         let mut future = modern(1, "server/discover", json!({}));
         future["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2099-01-01");

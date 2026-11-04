@@ -340,13 +340,27 @@ fn modern(version: &'static str, client: Option<&str>) -> Era {
     })
 }
 
+/// [`Era::of`] with the kill switch on, whatever [`MODERN_ERA_ENABLED`] says,
+/// so the stateless-era rules stay checked while it is off.
+fn switched_on(method: &str, params: &Value) -> Result<Era, RpcError> {
+    super::era_of(true, method, params)
+}
+
+/// [`Era::of_http`] with the kill switch on.
+fn switched_on_http(header: Option<&str>, method: &str, params: &Value) -> Result<Era, RpcError> {
+    super::era_of_http(true, header, method, params)
+}
+
 #[test]
-fn the_kill_switch_is_on_and_both_eras_are_advertised() {
-    assert!(MODERN_ERA_ENABLED);
+fn both_eras_are_advertised_and_the_kill_switch_gates_the_stateless_one() {
     assert_eq!(MODERN_PROTOCOL_VERSIONS, ["2026-07-28"]);
     assert_eq!(supported_versions(), ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]);
-    assert!(is_modern_version("2026-07-28"));
+    assert_eq!(is_modern_version("2026-07-28"), MODERN_ERA_ENABLED);
     assert!(!is_modern_version("2025-11-25"));
+    let stateless = |era: Result<Era, RpcError>| matches!(era, Ok(Era::Modern(_)));
+    assert_eq!(stateless(Era::of("tools/list", &modern_params("2026-07-28"))), MODERN_ERA_ENABLED);
+    let header = Some("2026-07-28");
+    assert_eq!(stateless(Era::of_http(header, "tools/list", &modern_params("2026-07-28"))), MODERN_ERA_ENABLED);
     // `initialize` still never selects the stateless revision.
     assert_eq!(negotiate(Some("2026-07-28")), LATEST_PROTOCOL_VERSION);
 }
@@ -363,14 +377,14 @@ fn requests_name_their_era_in_meta() {
         (modern_params("2024-11-05"), Era::Legacy),
         (modern_params("2026-07-28"), modern("2026-07-28", Some("Hermes Agent"))),
     ] {
-        assert_eq!(Era::of("tools/list", &params), Ok(era), "{params}");
+        assert_eq!(switched_on("tools/list", &params), Ok(era), "{params}");
     }
     let unnamed = json!({ "_meta": {
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
         "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} },
         "io.modelcontextprotocol/clientInfo": { "version": "1" }
     } });
-    assert_eq!(Era::of("tools/call", &unnamed), Ok(modern("2026-07-28", None)), "clientInfo is optional");
+    assert_eq!(switched_on("tools/call", &unnamed), Ok(modern("2026-07-28", None)), "clientInfo is optional");
 }
 
 #[test]
@@ -383,7 +397,7 @@ fn initialize_always_selects_the_initialize_era() {
 #[test]
 fn an_unknown_revision_is_refused_with_every_supported_one() {
     for requested in ["2099-01-01", "1900-01-01", "", "2026-07-28 "] {
-        let error = Era::of("server/discover", &modern_params(requested)).unwrap_err();
+        let error = switched_on("server/discover", &modern_params(requested)).unwrap_err();
         assert_eq!(error.code, -32022, "{requested:?}");
         assert_eq!(error.message, format!("Unsupported protocol version: {requested}"));
         assert_eq!(error.data, Some(json!({ "supported": supported_versions(), "requested": requested })));
@@ -397,11 +411,11 @@ fn a_stateless_request_must_carry_a_well_formed_envelope() {
     let mut capabilities_not_an_object = modern_params("2026-07-28");
     capabilities_not_an_object["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!([]);
     for params in [no_capabilities, capabilities_not_an_object] {
-        let error = Era::of("tools/list", &params).unwrap_err();
+        let error = switched_on("tools/list", &params).unwrap_err();
         assert_eq!(error.code, -32602, "{params}");
         assert!(error.message.contains("io.modelcontextprotocol/clientCapabilities"), "{}", error.message);
     }
-    let error = Era::of("tools/list", &json!({ "_meta": { "io.modelcontextprotocol/protocolVersion": 20260728 } })).unwrap_err();
+    let error = switched_on("tools/list", &json!({ "_meta": { "io.modelcontextprotocol/protocolVersion": 20260728 } })).unwrap_err();
     assert_eq!(error.code, -32602);
 }
 
@@ -416,15 +430,15 @@ fn with_the_kill_switch_off_every_request_is_initialize_era() {
 #[test]
 fn http_requests_mirror_their_revision_in_the_version_header() {
     let body = modern_params("2026-07-28");
-    assert_eq!(Era::of_http(Some("2026-07-28"), "tools/list", &body), Ok(modern("2026-07-28", Some("Hermes Agent"))));
+    assert_eq!(switched_on_http(Some("2026-07-28"), "tools/list", &body), Ok(modern("2026-07-28", Some("Hermes Agent"))));
     // Initialize-era requests keep their own header rules.
     for header in [None, Some("2025-11-25"), Some("2025-03-26")] {
-        assert_eq!(Era::of_http(header, "tools/list", &json!({})), Ok(Era::Legacy), "{header:?}");
-        assert_eq!(Era::of_http(header, "tools/list", &modern_params("2025-06-18")), Ok(Era::Legacy), "{header:?}");
+        assert_eq!(switched_on_http(header, "tools/list", &json!({})), Ok(Era::Legacy), "{header:?}");
+        assert_eq!(switched_on_http(header, "tools/list", &modern_params("2025-06-18")), Ok(Era::Legacy), "{header:?}");
     }
 
     let mismatch = |header: Option<&str>, params: &Value| {
-        let error = Era::of_http(header, "tools/call", params).unwrap_err();
+        let error = switched_on_http(header, "tools/call", params).unwrap_err();
         assert_eq!(error.code, -32020, "{header:?} {params}");
         error.message
     };
@@ -436,17 +450,17 @@ fn http_requests_mirror_their_revision_in_the_version_header() {
     assert!(mismatch(Some("2026-07-28"), &modern_params("2025-11-25")).contains("body value '2025-11-25'"));
 
     // A stateless header on a body that lost its envelope is malformed, not legacy.
-    let error = Era::of_http(Some("2026-07-28"), "tools/list", &json!({})).unwrap_err();
+    let error = switched_on_http(Some("2026-07-28"), "tools/list", &json!({})).unwrap_err();
     assert_eq!((error.code, error.message.as_str()), (-32602, "Missing required _meta field io.modelcontextprotocol/protocolVersion"));
 
     // A header naming a revision Codemux does not speak lists the ones it does.
     for header in ["2099-01-01", "wrong", "2025-6-18"] {
-        let error = Era::of_http(Some(header), "tools/list", &json!({})).unwrap_err();
+        let error = switched_on_http(Some(header), "tools/list", &json!({})).unwrap_err();
         assert_eq!(error.code, -32022, "{header}");
         assert_eq!(error.data.unwrap()["requested"], header);
     }
     // The body's revision is checked before the header.
-    assert_eq!(Era::of_http(Some("2026-07-28"), "tools/list", &modern_params("2099-01-01")).unwrap_err().code, -32022);
+    assert_eq!(switched_on_http(Some("2026-07-28"), "tools/list", &modern_params("2099-01-01")).unwrap_err().code, -32022);
 }
 
 #[test]

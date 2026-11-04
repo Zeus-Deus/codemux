@@ -161,6 +161,11 @@ fn modern(id: u64, method: &str, version: &str, mut params: Value) -> Value {
 
 #[test]
 fn stateless_and_initialize_era_clients_share_one_codemux_mcp() {
+    if !codemux_lib::mcp::protocol::MODERN_ERA_ENABLED {
+        // Switched off, every request is initialize-era, which the other tests cover.
+        eprintln!("skipped: the stateless era is switched off (mcp::protocol::MODERN_ERA_ENABLED)");
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut server = Server::spawn(root.path());
 
@@ -482,7 +487,8 @@ impl Drop for Serve {
 /// The MCP Python SDK connects to the same `codemux mcp` build three ways:
 /// probing (`auto`, which goes stateless), pinned to 2026-07-28, and with
 /// `initialize`. All three list one catalog and run a local tool and a
-/// registry tool that reaches the app.
+/// registry tool that reaches the app. With the stateless era switched off,
+/// the probing client falls back to `initialize` and nothing is pinned.
 #[cfg(unix)]
 #[test]
 fn a_real_dual_era_sdk_drives_codemux_mcp_in_both_eras() {
@@ -490,6 +496,8 @@ fn a_real_dual_era_sdk_drives_codemux_mcp_in_both_eras() {
         eprintln!("skipped: no MCP Python SDK with the stateless era (set CODEMUX_TEST_MCP_PYTHON)");
         return;
     };
+    let stateless = codemux_lib::mcp::protocol::MODERN_ERA_ENABLED;
+    let modes: &[&str] = if stateless { &["auto", "2026-07-28", "legacy"] } else { &["auto", "legacy"] };
     let serve = Serve::start();
     let env: serde_json::Map<String, Value> =
         Serve::env(serve.root.path()).into_iter().map(|(key, value)| (key, Value::String(value))).collect();
@@ -499,7 +507,7 @@ fn a_real_dual_era_sdk_drives_codemux_mcp_in_both_eras() {
         .arg(DUAL_ERA_CLIENT)
         .arg(env!("CARGO_BIN_EXE_codemux"))
         .arg(Value::Object(env).to_string())
-        .args(["auto", "2026-07-28", "legacy"])
+        .args(modes)
         .env_clear()
         .envs(Serve::env(serve.root.path()))
         .env("PATH", "/usr/bin:/bin")
@@ -512,14 +520,18 @@ fn a_real_dual_era_sdk_drives_codemux_mcp_in_both_eras() {
         .unwrap_or_else(|error| panic!("{error}: {}\n{stderr}", String::from_utf8_lossy(&output.stdout)));
 
     let auto = &report["auto"];
-    assert_eq!(auto["version"], "2026-07-28", "a dual-era client goes stateless: {report}");
-    assert_eq!(auto["supported"][0], "2026-07-28");
-    assert!(auto["supported"].as_array().unwrap().contains(&json!("2025-11-25")), "{report}");
+    if stateless {
+        assert_eq!(auto["version"], "2026-07-28", "a dual-era client goes stateless: {report}");
+        assert_eq!(auto["supported"][0], "2026-07-28");
+        assert!(auto["supported"].as_array().unwrap().contains(&json!("2025-11-25")), "{report}");
+        assert_eq!(report["2026-07-28"]["version"], "2026-07-28");
+    } else {
+        assert_eq!(auto["version"], "2025-11-25", "a dual-era client falls back to initialize: {report}");
+    }
     assert_eq!(auto["server"], "codemux");
-    assert_eq!(report["2026-07-28"]["version"], "2026-07-28");
     assert_eq!(report["legacy"]["version"], "2025-11-25", "{report}");
     assert_eq!(report["legacy"]["server"], "codemux");
-    for mode in ["auto", "2026-07-28", "legacy"] {
+    for &mode in modes {
         let session = &report[mode];
         assert_eq!(session["tools"], auto["tools"], "{mode}: one catalog");
         assert!(session["tools"].as_array().unwrap().contains(&json!("thread_launch")), "{mode}: {session}");

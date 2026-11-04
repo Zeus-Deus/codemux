@@ -39,8 +39,10 @@ pub const SESSION_HEADER: &str = "mcp-session-id";
 
 /// Serve the stateless 2026-07-28 revision beside the initialize era. `false`
 /// makes every request an initialize-era one again: per-request versions are
-/// ignored and `server/discover` is method-not-found, which tells dual-era
-/// clients to fall back to `initialize`.
+/// ignored and `server/discover` is method-not-found (on the connector before
+/// authentication), which tells dual-era clients to fall back to `initialize`.
+/// Flipping it needs no test edits: tests of stateless serving skip themselves
+/// while it is off, and the real-SDK tests then expect the fallback.
 pub const MODERN_ERA_ENABLED: bool = true;
 
 /// Revisions served per request, without `initialize`, newest first.
