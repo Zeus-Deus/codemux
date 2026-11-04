@@ -152,6 +152,18 @@ impl DatabaseStore {
         event.map(|event|serde_json::from_str(&event).map_err(|e|e.to_string())).transpose()
     }
 
+    /// The first row of `thread` that names `turn` (its prompt's correlation,
+    /// a queue dispatch, the answer that started it, an item or its end), or
+    /// `None` when the thread never recorded that run. A run's first row
+    /// lands as it starts, so these order a thread's runs.
+    pub(crate) fn control_turn_first_row(&self, thread: &str, turn: &str) -> Result<Option<i64>, String> {
+        self.conn.lock().unwrap().query_row(
+            "SELECT MIN(id) FROM agent_chat_messages WHERE thread_id=?1 AND json_valid(payload)
+             AND ?2 IN (json_extract(payload,'$.turn_id'),json_extract(payload,'$.resolution.delivery.turn_id'))",
+            params![thread, turn], |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
     /// The run's last top-level assistant message: the prose `thread_read`
     /// shows. The filter is the search index's, so the id is always a
     /// `thread_read` row. Subagent text, reasoning and blank text never count.
@@ -1396,5 +1408,24 @@ mod tests {
             "SELECT rowid FROM agent_chat_search WHERE agent_chat_search MATCH 'PONG'", [], |row| row.get(0),
         ).unwrap();
         assert_eq!(indexed, last);
+    }
+
+    #[test]
+    fn control_turn_first_row_orders_runs_by_their_first_record() {
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("t", "w", None, "claude").unwrap();
+        let append = |payload: serde_json::Value| db.append_agent_chat_message("t", &payload.to_string()).unwrap().unwrap();
+        assert_eq!(db.control_turn_first_row("t", "a").unwrap(), None);
+        let started = append(serde_json::json!({"type":"item_completed","thread_id":"t","turn_id":"a","item":{"kind":"assistant_text","text":"x"}}));
+        append(serde_json::json!({"type":"turn_completed","thread_id":"t","turn_id":"a","status":{"kind":"success"}}));
+        // An answered question names the turn its answer started.
+        let answered = append(serde_json::json!({"type":"question_resolved","thread_id":"t","question_id":"q",
+            "resolution":{"status":"answered","submission_id":"s","answers":["yes"],"delivery":{"kind":"new_turn","turn_id":"b"}}}));
+        append(serde_json::json!({"type":"item_completed","thread_id":"t","turn_id":"b","item":{"kind":"assistant_text","text":"y"}}));
+        assert_eq!(db.control_turn_first_row("t", "a").unwrap(), Some(started));
+        assert_eq!(db.control_turn_first_row("t", "b").unwrap(), Some(answered));
+        assert!(started < answered);
+        assert_eq!(db.control_turn_first_row("other", "a").unwrap(), None);
+        assert_eq!(db.control_turn_first_row("t", "never").unwrap(), None);
     }
 }

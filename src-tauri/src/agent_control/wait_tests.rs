@@ -54,6 +54,17 @@ fn completed(app: &App, thread: &str, turn: &str, status: TurnStatus) {
     });
 }
 
+/// A person's message that started `turn`, persisted as the send path does
+/// once the provider took it.
+fn person_started(app: &App, thread: &str, turn: &str) {
+    let message = json!({"type": "user_message", "thread_id": thread, "text": "Next task", "message_id": format!("message-{thread}-{turn}")});
+    app.state::<DatabaseStore>().control_append_user_message(thread, &message.to_string(), turn, false).unwrap();
+}
+
+fn session(app: &App, thread: &str, status: SessionStatus) {
+    forward_event(app.handle(), Event::SessionStateChanged { thread_id: ThreadId(thread.into()), status });
+}
+
 fn target(workspace: &str, thread: &str, extra: Value) -> Value {
     let mut args = json!({"workspace_id": workspace, "thread_id": thread});
     args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
@@ -491,6 +502,87 @@ async fn turn_wait_on_a_closed_session_reads_went_idle() {
     }
     assert_eq!(again["timed_out"], false);
     assert_eq!(again["wait_cursor"], stopped["wait_cursor"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_wait_on_a_run_stopped_before_a_newer_one_reads_went_idle() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let thread = "wait-superseded";
+    persisted(&app, &workspace, thread);
+    person_started(&app, thread, "t1");
+    running(&app, thread, "t1");
+    reply(&app, thread, "t1", "Halfway there");
+    // The person presses Stop, which records no end for t1, and sends a new
+    // message: the session starts again and runs t2.
+    session(&app, thread, SessionStatus::Closed);
+    session(&app, thread, SessionStatus::Starting);
+    person_started(&app, thread, "t2");
+    running(&app, thread, "t2");
+    let trusted = ControlCaller::trusted();
+    let started = Instant::now();
+    let stopped = wait_for(&app, &trusted, target(&workspace, thread, json!({"turn_id": "t1", "timeout_ms": 2000}))).await.unwrap();
+    assert!(started.elapsed() < PROMPT, "t1 is over, so the wait returns at once: {:?}", started.elapsed());
+    assert_eq!(stopped["state"], "failed", "{stopped}");
+    assert_eq!(stopped["failure"], "went_idle");
+    assert_eq!(stopped["turn_id"], "t1");
+    assert_eq!(stopped["timed_out"], false);
+    assert_eq!(stopped["final_text"], "Halfway there");
+    // The legacy flag still needs a recorded end.
+    assert_eq!(stopped["settled"], false);
+    assert_eq!(stopped["selected_turn"], Value::Null);
+    // The newer run is unaffected.
+    let current = wait_for(&app, &trusted, target(&workspace, thread, json!({"turn_id": "t2", "timeout_ms": 100}))).await.unwrap();
+    assert_eq!((current["state"].as_str(), current["timed_out"].as_bool()), (Some("running"), Some(true)), "{current}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_wait_on_a_new_run_the_live_view_has_not_reached_keeps_waiting() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let thread = "wait-ahead-of-the-live-view";
+    persisted(&app, &workspace, thread);
+    person_started(&app, thread, "t1");
+    running(&app, thread, "t1");
+    session(&app, thread, SessionStatus::Closed);
+    // A receipt can name t2 before the restarted session's events arrive:
+    // the live view still shows the stopped t1, which is the older run.
+    person_started(&app, thread, "t2");
+    let trusted = ControlCaller::trusted();
+    let ahead = wait_for(&app, &trusted, target(&workspace, thread, json!({"turn_id": "t2", "timeout_ms": 300}))).await.unwrap();
+    assert_eq!((ahead["state"].as_str(), ahead["timed_out"].as_bool()), (Some("running"), Some(true)), "{ahead}");
+    let stopped = wait_for(&app, &trusted, target(&workspace, thread, json!({"turn_id": "t1", "timeout_ms": 300}))).await.unwrap();
+    assert_eq!(stopped["failure"], "went_idle", "{stopped}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_wait_on_a_turn_the_thread_never_ran_is_an_invalid_target() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let (thread, other) = ("wait-unknown-turn", "wait-unknown-turn-other");
+    for (thread, turn) in [(thread, "t1"), (other, "theirs")] {
+        persisted(&app, &workspace, thread);
+        running(&app, thread, turn);
+        reply(&app, thread, turn, "done");
+        completed(&app, thread, turn, TurnStatus::Success);
+    }
+    let trusted = ControlCaller::trusted();
+    // A typo, and a run of another thread.
+    for turn in ["no-such-turn", "theirs"] {
+        let started = Instant::now();
+        let refused = wait_for(&app, &trusted, target(&workspace, thread, json!({"turn_id": turn, "timeout_ms": 2000}))).await.unwrap_err();
+        assert_eq!(refused.code, ErrorCode::InvalidTarget, "{turn}: {refused}");
+        assert!(started.elapsed() < PROMPT, "{turn}: {:?}", started.elapsed());
+    }
+    // While the thread is busy the turn may be a run whose first row has yet
+    // to land, so the wait goes on, and ends once the thread is idle without it.
+    running(&app, thread, "t2");
+    let waiter = spawn_wait(&app, &trusted, target(&workspace, thread, json!({"turn_id": "no-such-turn", "timeout_ms": 5000})));
+    parked().await;
+    assert!(!waiter.is_finished());
+    let started = Instant::now();
+    reply(&app, thread, "t2", "done too");
+    completed(&app, thread, "t2", TurnStatus::Success);
+    let refused = waiter.await.unwrap().unwrap_err();
+    assert_eq!(refused.code, ErrorCode::InvalidTarget, "{refused}");
+    assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
 }
 
 #[tokio::test]

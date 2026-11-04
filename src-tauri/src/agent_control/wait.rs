@@ -353,11 +353,33 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
         .filter(|last| turn_id.is_some_and(|turn| last.get("turn_id").and_then(Value::as_str) == Some(turn)))
         .and_then(|last| last.get("status"));
     let end = end_event.as_ref().map(|event| TurnEnd::of_json(&event["status"])).or(live_end.map(TurnEnd::of_json));
+    // A selected run that is not current and has no end: it was cut off once
+    // a newer run started after it, or the thread never ran it. The first
+    // rows naming the two runs order them. The live view can name a new run
+    // before its row lands, or still show an older one after a receipt named
+    // the new one, so a run with no row yet proves nothing.
+    let (superseded, unknown) = match selected {
+        Some(turn) if !is_current && end.is_none() => {
+            let first = db.control_turn_first_row(thread, turn)?;
+            let newer = match (first, current) {
+                (Some(first), Some(current)) => db.control_turn_first_row(thread, current)?.is_some_and(|row| row > first),
+                _ => false,
+            };
+            (newer, first.is_none())
+        }
+        _ => (false, false),
+    };
+    // While the thread is busy, an unknown turn may be a run whose first row
+    // has yet to land; an idle thread will not run it.
+    if unknown && status["settled"] == true {
+        return Err(ControlError::new(ErrorCode::InvalidTarget, "This thread has no run with this turn_id"));
+    }
     // A stopped session records no end for the run it cut off. Once the thread
-    // is idle on that run, it is over, though the legacy rule never settles it.
-    // The live end above covers a run whose end row has not landed yet.
+    // is idle on that run, or has moved on to a newer one, it is over, though
+    // the legacy rule never settles it. The live end above covers a run whose
+    // end row has not landed yet.
     let vanished = is_current && status["settled"] == true && end.is_none();
-    let ended = settled || vanished;
+    let ended = settled || vanished || superseded;
     let final_message = match turn_id {
         Some(turn) if ended => db.control_turn_final_text(thread, turn)?.map(FinalMessage::bounded),
         _ => None,
