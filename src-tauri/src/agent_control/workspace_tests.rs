@@ -235,7 +235,18 @@ async fn workspace_create_retry_replays_after_the_folder_is_gone() {
         let args = json!({"path": folder, "client_request_id": key});
         let created = call(&app, &caller, "workspace_create", args.clone()).await.unwrap();
         assert_eq!(created["created"], true, "{key}: {created}");
-        std::fs::rename(&folder, folder.with_extension("moved")).unwrap();
+        // Close it first: on Windows a folder can't be moved while the
+        // workspace's shell still runs in it, and the shell may take a
+        // moment to exit after the close.
+        let close = json!({"workspace_id": created["workspace_id"], "client_request_id": format!("{key}-close")});
+        call(&app, &named(ControlAccess::FullAccess), "workspace_close", close).await.unwrap();
+        let moved = folder.with_extension("moved");
+        let mut attempts = 0;
+        while let Err(error) = std::fs::rename(&folder, &moved) {
+            attempts += 1;
+            assert!(attempts < 50, "{key}: could not move the folder: {error}");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         let after = count(&app);
 
         let retry = call(&app, &caller, "workspace_create", args).await.expect("a retry replays, not a path error");
