@@ -322,8 +322,8 @@ fn rpc_error(id: Value, code: i64, message: &str, status: StatusCode) -> Respons
     )
 }
 
-/// The connector as a stateless-era (2026-07-28) server names itself the way
-/// its `initialize` does.
+/// How the connector names itself to both eras: `initialize` and the
+/// stateless-era (2026-07-28) `server/discover` and results.
 const SERVER_INFO: mcp_protocol::ServerInfo =
     mcp_protocol::ServerInfo { name: "CodeMux", version: env!("CARGO_PKG_VERSION") };
 
@@ -426,11 +426,14 @@ async fn mcp<R: Runtime>(
             instructions: Some(agent_control::INSTRUCTIONS),
         }
         .to_value(),
-        "initialize" => {
+        "initialize" => mcp_protocol::InitializeResult {
             // Echo the offer when Codemux speaks it, else the latest revision.
-            let version = crate::mcp::protocol::negotiate(rpc.params["protocolVersion"].as_str());
-            json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"CodeMux","version":env!("CARGO_PKG_VERSION")},"instructions":agent_control::INSTRUCTIONS})
+            protocol_version: mcp_protocol::negotiate(rpc.params["protocolVersion"].as_str()),
+            tools_list_changed: Some(false),
+            server_info: SERVER_INFO,
+            instructions: Some(agent_control::INSTRUCTIONS),
         }
+        .to_value(),
         "ping" => json!({}),
         "tools/list" => {
             let tools = json!({"tools":agent_control::registry::tools_for(caller)});
@@ -2854,6 +2857,29 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{header}");
             assert_eq!(value(response).await["result"]["protocolVersion"], "2025-11-25");
         }
+    }
+
+    /// The two eras describe one server: `initialize` names the connector
+    /// and its capabilities exactly as `server/discover` does.
+    #[tokio::test]
+    async fn initialize_describes_the_connector_as_discover_does() {
+        let f = fixture().await;
+        let token = grant(&f);
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"hermes","version":"1"}}}"#;
+        let response = invoke(&f, request(&f, "/mcp", "POST", body, Some(&token))).await;
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_MCP_BODY).await.unwrap();
+        // The reply the connector used to build by hand, byte for byte.
+        let by_hand = json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"CodeMux","version":env!("CARGO_PKG_VERSION")},"instructions":agent_control::INSTRUCTIONS});
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains(&format!(r#""result":{by_hand}"#)), "{text}");
+        let initialized: Value = serde_json::from_slice(&bytes).unwrap();
+        if stateless_era_off() {
+            return;
+        }
+        let discovered = value(invoke(&f, modern_request(&f, 2, "server/discover", json!({}), Some(&token))).await).await;
+        assert_eq!(discovered["result"]["capabilities"], initialized["result"]["capabilities"], "{discovered}");
+        assert_eq!(discovered["result"]["_meta"]["io.modelcontextprotocol/serverInfo"], initialized["result"]["serverInfo"]);
+        assert_eq!(discovered["result"]["instructions"], initialized["result"]["instructions"]);
     }
 
     #[tokio::test]
