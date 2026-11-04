@@ -315,6 +315,129 @@ describe("PaneTabStrip — overflow", () => {
     }
   });
 
+  // Hiding labels is what lets folded pane actions come back inline, and
+  // labels coming back is what folds them again. Each hook must budget for
+  // the other's next layout, or the two flip together forever.
+  it("settles instead of alternating labels and folded actions", () => {
+    const proto = HTMLElement.prototype;
+    const original = {
+      scrollWidth: Object.getOwnPropertyDescriptor(Element.prototype, "scrollWidth")!,
+      clientWidth: Object.getOwnPropertyDescriptor(Element.prototype, "clientWidth")!,
+      offsetWidth: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetWidth")!,
+    };
+    let header = 0;
+    // The row's other children, as the tab fit measures them.
+    Object.defineProperty(proto, "offsetWidth", {
+      configurable: true,
+      get() {
+        const id = (this as HTMLElement).dataset?.testid;
+        if (id === "right-panel-pane-actions") return 100;
+        if (
+          id === "right-panel-add-pane" ||
+          id === "right-panel-pane-actions-more" ||
+          id === "right-panel-tabs-overflow"
+        ) {
+          return 24;
+        }
+        return 0;
+      },
+    });
+    Object.defineProperty(proto, "scrollWidth", {
+      configurable: true,
+      get() {
+        const id = (this as HTMLElement).dataset?.testid;
+        if (id === "right-panel-pane-actions") return 100;
+        if (id === "right-panel-tabs-scroll" || id === "right-panel-tabs-content") {
+          // The labelled run is 230px; icon-only it is 120px.
+          return document.querySelector("[data-compact]") ? 120 : 230;
+        }
+        return 0;
+      },
+    });
+    Object.defineProperty(proto, "clientWidth", {
+      configurable: true,
+      get() {
+        const id = (this as HTMLElement).dataset?.testid;
+        if (id === "right-panel-tabs-header") return header;
+        if (id === "right-panel-tabs-scroll") return 100;
+        return 0;
+      },
+    });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      for (header = 400; header <= 800; header += 5) {
+        const { unmount } = renderStrip({
+          actions: <button type="button" aria-label="Refresh">R</button>,
+        });
+        unmount();
+      }
+      const loops = errors.mock.calls.filter((call) =>
+        String(call[0]).includes("Maximum update depth"),
+      );
+      expect(loops).toEqual([]);
+    } finally {
+      errors.mockRestore();
+      delete (proto as unknown as Record<string, unknown>).scrollWidth;
+      delete (proto as unknown as Record<string, unknown>).clientWidth;
+      Object.defineProperty(Element.prototype, "scrollWidth", original.scrollWidth);
+      Object.defineProperty(Element.prototype, "clientWidth", original.clientWidth);
+      Object.defineProperty(HTMLElement.prototype, "offsetWidth", original.offsetWidth);
+    }
+  });
+
+  // A count can grow in place (Changes, Tasks) without a new tab set or a
+  // pane switch; a compact row must fit the active tab against its current
+  // width, not the one it measured when the labels were last shown.
+  it("refits the active tab when its count grows in place", () => {
+    const restore = stubLayout({ header: 600, tabs: 700, scroller: 100 });
+    const rect = Object.getOwnPropertyDescriptor(Element.prototype, "getBoundingClientRect")!;
+    let badgeWidth = 10;
+    Object.defineProperty(Element.prototype, "getBoundingClientRect", {
+      configurable: true,
+      value(this: Element) {
+        const el = this as HTMLElement;
+        const width = el.hasAttribute("data-tab-badge")
+          ? badgeWidth
+          : el.getAttribute("data-state") === "active" && el.hasAttribute("data-tab-id")
+            ? 80 + badgeWidth
+            : 0;
+        return { left: 0, right: width, width, top: 0, bottom: 26, height: 26, x: 0, y: 0, toJSON() {} } as DOMRect;
+      },
+    });
+    try {
+      // A fresh element each time, so the rerender actually commits.
+      const strip = () => (
+        <TooltipProvider>
+          <PaneTabStrip
+            tabs={TABS}
+            activeTab="changes"
+            onSelect={() => {}}
+            onClose={() => {}}
+            onCloseMany={() => {}}
+            onReorder={() => {}}
+            surfaces={[]}
+            onOpenFile={() => {}}
+            openFileKeys=""
+            inTitlebar
+            onToggleExpand={() => {}}
+            expanded={false}
+            onCollapsePanel={() => {}}
+          />
+        </TooltipProvider>
+      );
+      const { rerender } = render(strip());
+      const active = () => screen.getByTestId("changes-tab");
+      expect(active()).not.toHaveAttribute("data-fit");
+      // Same tabs, same badge prop: only its rendered width grew.
+      badgeWidth = 400;
+      rerender(strip());
+      expect(active()).toHaveAttribute("data-fit");
+    } finally {
+      Object.defineProperty(Element.prototype, "getBoundingClientRect", rect);
+      restore();
+    }
+  });
+
   it("brings the labels back once the row has room for them", () => {
     const widths = { header: 600, tabs: 700, scroller: 100 };
     const restore = stubLayout(widths);

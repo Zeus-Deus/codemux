@@ -919,6 +919,15 @@ describe("SidebarInboxCard — meta line", () => {
     expect(metaLine(container)).not.toBeNull();
     expect(container.querySelector("[data-inline-providers]")).toBeNull();
   });
+
+  // jsdom has no layout, so this pins the rule rather than the pixels: the
+  // branch's readable floor is capped at a share of the row, so a 180px
+  // sidebar still truncates it to make room for the PR chip and marks.
+  it("caps the branch's floor so a narrow rail can still truncate it", () => {
+    const { container } = renderCard();
+    const branch = within(metaLine(container)).getByText("main");
+    expect(branch).toHaveClass("min-w-[min(8ch,30%)]", "truncate");
+  });
 });
 
 describe("SidebarInboxCard — another machine's workspace", () => {

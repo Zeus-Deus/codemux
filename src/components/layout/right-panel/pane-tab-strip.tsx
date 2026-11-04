@@ -609,7 +609,13 @@ function useCollapsedActions({
     [measure],
   );
 
-  return { collapsed, tabsOverflow: layout.tabsOverflow, onPopoverOpenChange };
+  return {
+    collapsed,
+    tabsOverflow: layout.tabsOverflow,
+    onPopoverOpenChange,
+    /** The actions' last measured inline width (kept while folded). */
+    naturalWidth: natural.current?.width ?? 0,
+  };
 }
 
 /** Slack a compact row needs before its labels come back, so a row sitting
@@ -665,12 +671,18 @@ function useCompactTabs({
   contentRef,
   tabsKey,
   dragGapPx,
+  foldedActionsRef,
 }: {
   headerRef: React.RefObject<HTMLElement | null>;
   scrollerRef: React.RefObject<HTMLDivElement | null>;
   contentRef: React.RefObject<HTMLDivElement | null>;
   tabsKey: string;
   dragGapPx: number;
+  /** What the row would spend more if folded pane actions came back inline
+   *  (0 while they are inline). Labels coming back is what lets the
+   *  actions unfold, so the labels only return if they'd fit beside them;
+   *  otherwise both flip back together and the two layouts alternate. */
+  foldedActionsRef: React.RefObject<number>;
 }) {
   const [layout, setLayout] = useState<{ compact: boolean; active: ActiveFit }>({
     compact: false,
@@ -724,6 +736,20 @@ function useCompactTabs({
       commit(() => false);
       return;
     }
+    if (compactRef.current) {
+      // A count can change in place (Changes, Tasks, a Review badge that
+      // updates itself) without a new tab set. While the active chip still
+      // shows it, keep its width current so the fit never decides on a
+      // stale one.
+      const shown = content
+        .querySelector<HTMLElement>('[data-state="active"]')
+        ?.querySelector<HTMLElement>("[data-tab-badge]");
+      if (shown) {
+        const live = shown.getBoundingClientRect().width + 7;
+        known.active += live - known.badge;
+        known.badge = live;
+      }
+    }
     const style = getComputedStyle(header);
     const gap = parseFloat(style.columnGap) || 0;
     // Not the "All tabs" button: it only shows while the tabs overflow, which
@@ -775,10 +801,13 @@ function useCompactTabs({
             : { kind: "icon", badge: ICON_TAB_PX + known.badge <= forActive };
     commit(
       (prev) =>
-        prev ? known.width > room - COMPACT_HYSTERESIS_PX : known.width > room,
+        prev
+          ? known.width >
+            room - (foldedActionsRef.current ?? 0) - COMPACT_HYSTERESIS_PX
+          : known.width > room,
       active,
     );
-  }, [commit, contentRef, dragGapPx, headerRef, scrollerRef, tabsKey]);
+  }, [commit, contentRef, dragGapPx, foldedActionsRef, headerRef, scrollerRef, tabsKey]);
 
   useLayoutEffect(measure);
   useLayoutEffect(() => {
@@ -786,8 +815,10 @@ function useCompactTabs({
     if (!header || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(measure);
     observer.observe(header);
+    // The tabs' own width changes when a count changes in place.
+    if (contentRef.current) observer.observe(contentRef.current);
     return () => observer.disconnect();
-  }, [headerRef, measure]);
+  }, [contentRef, headerRef, measure]);
 
   return layout;
 }
@@ -1050,14 +1081,20 @@ export const PaneTabStrip = memo(function PaneTabStrip({
 
   const headerRef = useRef<HTMLElement>(null);
   const actionsRef = useRef<HTMLDivElement>(null);
+  const foldedActionsRef = useRef(0);
   // Before the action budget, which needs to know whether the row is
   // compact: a compact row reserves no drag-gap floor.
   const { compact: compactTabs, active: activeFit } = useCompactTabs({
     headerRef,
     scrollerRef: containerRef,
     contentRef,
-    tabsKey: `${tabs.map((tab) => `${tab.id}:${tab.label}`).join("|")}#${activeTab ?? ""}`,
+    // Badges are part of the key so a count that changes while hidden is
+    // measured again rather than fitted from its old width.
+    tabsKey: `${tabs
+      .map((tab) => `${tab.id}:${tab.label}:${actionsShape(tab.badge)}`)
+      .join("|")}#${activeTab ?? ""}`,
     dragGapPx: remPx,
+    foldedActionsRef,
   });
   const budgets = useMemo(
     () => rowBudgets(remPx, !inTitlebar, compactTabs),
@@ -1067,6 +1104,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     collapsed: actionsCollapsed,
     tabsOverflow,
     onPopoverOpenChange,
+    naturalWidth: naturalActionsWidth,
   } = useCollapsedActions({
     headerRef,
     actionsRef,
@@ -1076,6 +1114,9 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     hasActions: actions != null,
     budgets,
   });
+  foldedActionsRef.current = actionsCollapsed
+    ? naturalActionsWidth + budgets.inline - budgets.folded
+    : 0;
   // An inline row grows an "All tabs" button once the tabs overflow beside
   // it; a folded row lists them in its "…" whenever any are out of view.
   const inlineTabList = !actionsCollapsed && tabsOverflow;

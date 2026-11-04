@@ -1187,9 +1187,11 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 )}
               >
                 {workspace.git_branch && (
-                  // The branch keeps a readable floor: without it the ↑ahead,
+                  // The branch keeps a readable floor (8ch, but never more than 30%
+                  // of the row, so a narrow sidebar still fits what trails it):
+                  // without it the ↑ahead,
                   // ± stats and PR chip won the row and cut it to "de…".
-                  <span className="min-w-[8ch] truncate">{workspace.git_branch}</span>
+                  <span className="min-w-[min(8ch,30%)] truncate">{workspace.git_branch}</span>
                 )}
                 {hasAhead && (
                   <span className="shrink-0 tabular-nums">
