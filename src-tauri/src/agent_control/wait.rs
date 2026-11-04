@@ -541,10 +541,12 @@ pub(super) struct Args {
 /// Without `since`, returns when the selected run settles or is otherwise
 /// over, when its view changes from the start of the call (an approval opens,
 /// a question appears, the state flips) or at the deadline; something pending
-/// at the start does not return early, so `while !settled` loops never spin.
-/// With `since` (a previous `wait_cursor`), returns once the view differs
-/// from it. `operation_id` selects the run a launch's or send's message
-/// starts, once it starts; until then the wait reads `running`.
+/// at the start does not return early. A run that is over without a recorded
+/// end (a stop cut it off, or a newer run replaced it) returns at once on
+/// every call with `settled: false`, so loops stop on `state`, not on
+/// `settled`. With `since` (a previous `wait_cursor`), returns once the view
+/// differs from it. `operation_id` selects the run a launch's or send's
+/// message starts, once it starts; until then the wait reads `running`.
 pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     let args: Args = service::parse(args)?;
     let maximum = max_wait_ms(caller);
