@@ -282,9 +282,10 @@ it("issues a synthetic token once and lists it as a token client", () => {
   expect(status.clients).toEqual([expect.objectContaining({ id: issued.clientId, kind: "token", clientName: "hermes-bot",
     label: "hermes-bot", callbackOrigin: null, access: "supervised", renews: false, expiresAt: issued.expiresAt })]);
   expect(JSON.stringify(status)).not.toContain(issued.token);
-  // The same label (in any case) rotates that bot's token and keeps its client id.
+  // The same label (in any case) rotates that bot's token and keeps its client id and first spelling.
   const again = mock.handlers.agent_connector_issue({ label: "Hermes-Bot", access: "read_only", expiresInHours: 48 }) as AgentConnectorIssuedToken;
-  expect(again).toMatchObject({ clientId: issued.clientId, replaced: true, access: "read_only" });
+  expect(again).toMatchObject({ clientId: issued.clientId, label: "hermes-bot", replaced: true, access: "read_only" });
+  expect(read(mock).clients).toEqual([expect.objectContaining({ clientName: "hermes-bot", label: "hermes-bot" })]);
   expect(again.token).not.toBe(issued.token);
   expect(Date.parse(again.expiresAt) - Date.now()).toBe(48 * 3_600_000);
   expect(read(mock).clients).toHaveLength(1);
@@ -314,17 +315,27 @@ it("requires network connections, not a bound listener, to issue a token", () =>
   expect(issued.mcpUrl).toBe("http://127.0.0.1:4378/mcp");
 });
 
-it("revokes every sign-in and token at once but keeps pending requests", () => {
+it("revokes every sign-in and token at once, withdraws unexchanged approvals and keeps undecided requests", () => {
   const changed = vi.fn();
   const mock = listening(changed);
   signIn(mock);
   mock.handlers.agent_connector_issue({ label: "hermes-bot", access: "supervised" });
   const waiting = mock.addPendingClient("Waiting");
+  const denied = mock.addPendingClient("Denied");
+  mock.handlers.agent_connector_deny({ requestId: denied });
+  const approved = mock.addPendingClient("Approved");
+  mock.handlers.agent_connector_approve({ requestId: approved, access: "read_only" });
+  const continued = mock.addPendingClient("Continued");
+  mock.handlers.agent_connector_approve({ requestId: continued, access: "read_only" });
+  mock.continuePendingClient(continued);
   changed.mockClear();
   mock.handlers.agent_connector_revoke_all({});
   expect(changed).toHaveBeenCalledTimes(1);
   expect(read(mock).clients).toEqual([]);
-  expect(read(mock).pending.map((request) => request.id)).toEqual([waiting]);
+  expect(read(mock).pending.map((request) => request.id)).toEqual([waiting, denied]);
+  // An approval that already reached the client can no longer mint a grant.
+  expect(() => mock.exchangePendingClient(continued)).toThrow(/No synthetic exchange/);
+  expect(read(mock).clients).toEqual([]);
 });
 
 it("does not add a double slash to a public-origin MCP endpoint", async () => {

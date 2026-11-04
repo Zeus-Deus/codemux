@@ -30,8 +30,8 @@ export function createAgentConnectorMock(changed: () => void) {
   let clients: AgentConnectorClient[] = [];
   /** The resource each grant is bound to; an address change revokes the others. */
   const grantResource = new Map<string, string>();
-  /** Token clients keep their id across reissues, keyed by lower-case label. */
-  const tokenClients = new Map<string, string>();
+  /** Token clients keep their id and first label spelling across reissues, keyed by lower-case label. */
+  const tokenClients = new Map<string, { clientId: string; label: string }>();
   /** OAuth clients approved before, so a new request reads as reconnecting. */
   const approvedBefore = new Set<string>();
   const awaitingExchange = new Map<string, { request: Extract<AgentConnectorPending, { phase: "approved_awaiting_client" }>; expiresAt: number }>();
@@ -122,31 +122,40 @@ export function createAgentConnectorMock(changed: () => void) {
     },
     agent_connector_revoke_all: () => {
       clients = [];
+      // Approvals not yet exchanged for a token are withdrawn too, so nothing
+      // mints right after the incident switch. Undecided requests stay.
+      pending = pending.filter((request) => request.phase !== "approved_awaiting_client");
+      awaitingExchange.clear();
       changed();
     },
     agent_connector_issue: (args): AgentConnectorIssuedToken => {
       prune();
       if (!enabled) throw new Error("Turn the connector on first: codemux connector enable");
       const label = typeof args.label === "string" ? args.label.trim() : "";
-      if (!TOKEN_LABEL.test(label)) throw new Error("Use a label of 1 to 64 letters, digits, spaces or . _ @ -");
+      if (!TOKEN_LABEL.test(label)) {
+        throw new Error("Token labels are 1-64 letters, digits, spaces or . _ @ -, starting with a letter or digit");
+      }
       if (!ACCESS_LEVELS.includes(String(args.access))) throw new Error("Invalid access level");
       const hours = args.expiresInHours === undefined ? DEFAULT_TOKEN_HOURS : args.expiresInHours;
       if (typeof hours !== "number" || !Number.isInteger(hours) || hours < 1 || hours > MAX_TOKEN_HOURS) {
-        throw new Error("Invalid expiry");
+        throw new Error("Token expiry must be between 1 hour and 365 days");
       }
       const access = args.access as AgentConnectorAccess;
-      const clientId = tokenClients.get(label.toLowerCase()) ?? `mock-token-${++sequence}`;
-      tokenClients.set(label.toLowerCase(), clientId);
+      // A label matches in any case and keeps its first spelling, as the store does.
+      const known = tokenClients.get(label.toLowerCase());
+      const clientId = known?.clientId ?? `mock-token-${++sequence}`;
+      const firstLabel = known?.label ?? label;
+      tokenClients.set(label.toLowerCase(), { clientId, label: firstLabel });
       const replaced = clients.some((client) => client.id === clientId);
       const now = Date.now();
       const expiresAt = new Date(now + hours * 3_600_000).toISOString();
       grant({
-        id: clientId, kind: "token", clientName: label, callbackOrigin: null, access,
-        createdAt: new Date(now).toISOString(), expiresAt, label, renews: false,
+        id: clientId, kind: "token", clientName: firstLabel, callbackOrigin: null, access,
+        createdAt: new Date(now).toISOString(), expiresAt, label: firstLabel, renews: false,
       });
       changed();
       return {
-        token: `mock-token-not-a-credential-${++sequence}`, clientId, label, access, expiresAt,
+        token: `mock-token-not-a-credential-${++sequence}`, clientId, label: firstLabel, access, expiresAt,
         mcpUrl: resource(), localUrl: localUrl(), replaced,
       };
     },
