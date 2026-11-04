@@ -901,10 +901,24 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                 .and_then(|status|serde_json::to_value(status).map_err(|e|e.to_string()))
         }
         "agent_connector_set_config" => {
+            // `port` omitted keeps the configured one.
             #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-            struct Args { enabled: bool, public_origin: Option<String> }
+            struct Args { enabled: bool, public_origin: Option<String>, #[serde(default)] port: Option<u16> }
             serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
-                .and_then(|args|crate::mcp_connector::agent_connector_set_config(app.clone(),args.enabled,args.public_origin,None))
+                .and_then(|args|crate::mcp_connector::agent_connector_set_config(app.clone(),args.enabled,args.public_origin,args.port))
+                .and_then(|status|serde_json::to_value(status).map_err(|e|e.to_string()))
+        }
+        "agent_connector_issue" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct Args { label: String, access: crate::agent_control::ControlAccess, #[serde(default)] expires_in_hours: Option<u32> }
+            serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
+                .and_then(|args|crate::mcp_connector::agent_connector_issue(app.clone(),args.label,args.access,args.expires_in_hours))
+                .and_then(|issued|serde_json::to_value(issued).map_err(|e|e.to_string()))
+        }
+        "agent_connector_revoke_all" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct Args {}
+            serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
+                .and_then(|_|crate::mcp_connector::agent_connector_revoke_all(app.clone()))
                 .and_then(|status|serde_json::to_value(status).map_err(|e|e.to_string()))
         }
         "agent_connector_approve" => {
@@ -2293,6 +2307,54 @@ mod tests {
         assert_eq!(status["listenerRunning"],false);
     }
 
+    /// The CLI's `connector enable --port`, `issue` and `revoke --all` reach
+    /// the connector through these arms, with exactly the fields they send.
+    #[tokio::test]
+    async fn connector_port_tokens_and_revoke_all_are_socket_commands() {
+        use tauri::Manager;
+        let app = tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(crate::web_remote::WebRemoteState::default());
+        app.manage(crate::mcp_connector::McpConnectorState::default());
+        let call = |command: &str, params: Value| dispatch_request(app.handle(), request(command, params));
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+
+        let enabled = call("agent_connector_set_config", serde_json::json!({"enabled":true,"public_origin":null,"port":port})).await;
+        assert!(enabled.ok, "{:?}", enabled.error);
+        let enabled = enabled.data.unwrap();
+        assert_eq!((enabled["port"].clone(), enabled["listenerRunning"].clone()), (serde_json::json!(port), serde_json::json!(true)), "{enabled}");
+        // Callers that predate `port` keep the configured one.
+        let kept = call("agent_connector_set_config", serde_json::json!({"enabled":true,"public_origin":null})).await;
+        assert_eq!(kept.data.unwrap()["port"], port);
+
+        let issued = call("agent_connector_issue", serde_json::json!({"label":"socket-bot","access":"supervised","expires_in_hours":2})).await;
+        assert!(issued.ok, "{:?}", issued.error);
+        let issued = issued.data.unwrap();
+        assert!(issued["token"].as_str().unwrap().starts_with(crate::mcp_connector::oauth::ACCESS_PREFIX), "{issued}");
+        assert_eq!((issued["label"].clone(), issued["access"].clone()), (serde_json::json!("socket-bot"), serde_json::json!("supervised")));
+        assert_eq!(issued["localUrl"], format!("http://127.0.0.1:{port}/mcp"));
+        let default_expiry = call("agent_connector_issue", serde_json::json!({"label":"other-bot","access":"read_only"})).await;
+        assert!(default_expiry.ok, "expires_in_hours is optional: {:?}", default_expiry.error);
+        for (command, params) in [
+            ("agent_connector_issue", serde_json::json!({"label":"x","access":"supervised","scope":"all"})),
+            ("agent_connector_revoke_all", serde_json::json!({"client_id":"x"})),
+            ("agent_connector_set_config", serde_json::json!({"enabled":true,"listen":"0.0.0.0"})),
+        ] {
+            let refused = call(command, params).await;
+            assert!(!refused.ok && refused.error.as_deref().is_some_and(|e| e.contains("unknown field")), "{command}: {:?}", refused.error);
+        }
+        let status = call("agent_connector_status", serde_json::json!({})).await.data.unwrap();
+        assert_eq!(status["clients"].as_array().unwrap().len(), 2, "{status}");
+
+        let revoked = call("agent_connector_revoke_all", serde_json::json!({})).await;
+        assert!(revoked.ok, "{:?}", revoked.error);
+        let status = call("agent_connector_status", serde_json::json!({})).await.data.unwrap();
+        assert_eq!(status["clients"], serde_json::json!([]));
+        assert_eq!(status["enabled"], true, "revoke all keeps the connector on");
+        let disabled = call("agent_connector_set_config", serde_json::json!({"enabled":false,"public_origin":null})).await;
+        assert_eq!(disabled.data.unwrap()["listenerRunning"], false);
+    }
+
     fn request(command: &str, params: Value) -> ControlRequest {
         ControlRequest { command: command.into(), params }
     }
@@ -2322,9 +2384,11 @@ mod tests {
         for (command, params) in [
             ("agent_connector_approve", serde_json::json!({"request_id":"x","access":"full_access"})),
             ("agent_connector_status", serde_json::json!({})),
-            ("agent_connector_set_config", serde_json::json!({"enabled":true})),
+            ("agent_connector_set_config", serde_json::json!({"enabled":true,"port":4399})),
             ("agent_connector_deny", serde_json::json!({"request_id":"x"})),
             ("agent_connector_revoke", serde_json::json!({"client_id":"x"})),
+            ("agent_connector_issue", serde_json::json!({"label":"agent-made","access":"full_access"})),
+            ("agent_connector_revoke_all", serde_json::json!({})),
         ] {
             let response = dispatch_request_as(app.handle(), &full, request(command, params)).await;
             assert!(refused_with(&response, "admin_refused"), "{command}: {:?}", response.error);

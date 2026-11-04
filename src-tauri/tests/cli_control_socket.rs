@@ -578,8 +578,12 @@ fn connector_status_enable_and_disable_round_trip() {
     let serve = Serve::start();
     let status = serve.ok(&["connector", "status", "--json"]);
     assert_eq!((status["tool"].clone(), status["result"]["enabled"].clone()), (json!("agent_connector_status"), json!(false)));
-    let enabled = serve.ok(&["connector", "enable", "--json"]);
+    // Integration builds default to the real 4378; never take it here.
+    let port = free_loopback_port();
+    let enabled = serve.ok(&["connector", "enable", "--port", &port.to_string(), "--json"]);
     assert_eq!(enabled["result"]["enabled"], true, "{enabled}");
+    assert_eq!(enabled["result"]["port"], port, "{enabled}");
+    assert_eq!(enabled["result"]["localUrl"], format!("http://127.0.0.1:{port}/mcp"), "{enabled}");
     let listed = serve.ok(&["connector", "list", "--json"]);
     assert!(listed["result"]["clients"].is_array(), "{listed}");
     let pending = serve.ok(&["connector", "pending", "--json"]);
@@ -608,5 +612,12 @@ fn connector_tokens_issue_list_and_revoke() {
     serve.ok(&["connector", "revoke", "ITEST-BOT", "--json"]);
     let listed = serve.ok(&["connector", "list", "--json"]);
     assert!(!listed.to_string().contains("itest-bot"), "{listed}");
+
+    serve.ok(&["connector", "issue", "--label", "second-bot", "--access", "read-only", "--json"]);
+    serve.ok(&["connector", "issue", "--label", "third-bot", "--json"]);
+    assert_eq!(serve.ok(&["connector", "list", "--json"])["result"]["clients"].as_array().map(Vec::len), Some(2));
     serve.ok(&["connector", "revoke", "--all", "--json"]);
+    let status = serve.ok(&["connector", "status", "--json"]);
+    assert_eq!(status["result"]["clients"], json!([]), "{status}");
+    assert_eq!(status["result"]["enabled"], true, "revoke --all leaves the door on: {status}");
 }
