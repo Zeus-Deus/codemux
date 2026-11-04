@@ -507,20 +507,23 @@ async fn worktree_create_finishes_when_the_caller_goes_away() {
 }
 
 #[tokio::test]
-async fn connector_worktree_create_refuses_presets_and_prompts() {
+async fn connector_worktree_create_refuses_presets() {
     let (app, _provider, root, _workspace) = fixture().await;
     // An invalid branch stops every call that passes the preset rule before
     // anything is created.
     let preset = json!({"repo_path": root.path(), "branch": "-not-a-branch", "agent_preset_id": "claude"});
-    let prompt = json!({"repo_path": root.path(), "branch": "-not-a-branch", "initial_prompt": "Fix the parser"});
-    for args in [&preset, &prompt] {
+    let prompted = json!({"repo_path": root.path(), "branch": "-not-a-branch", "agent_preset_id": "claude", "initial_prompt": "Fix the parser"});
+    for args in [&preset, &prompted] {
         let error = refused(call(&app, &connector(ControlAccess::FullAccess), "worktree_create", args.clone()).await, ErrorCode::AccessDenied);
         assert!(error.message.contains("Only the Codemux owner"), "{error}");
         refused(call(&app, &named(ControlAccess::FullAccess), "worktree_create", args.clone()).await, ErrorCode::InvalidArguments);
         refused(call(&app, &ControlCaller::trusted(), "worktree_create", args.clone()).await, ErrorCode::InvalidArguments);
     }
-    // Without a preset or prompt the connector client is past that rule too.
-    refused(call(&app, &connector(ControlAccess::FullAccess), "worktree_create", json!({"repo_path": root.path(), "branch": "-not-a-branch"})).await, ErrorCode::InvalidArguments);
+    // Without a preset nothing launches (a prompt alone is dropped), so the
+    // connector client is past that rule.
+    for args in [json!({"repo_path": root.path(), "branch": "-not-a-branch"}), json!({"repo_path": root.path(), "branch": "-not-a-branch", "initial_prompt": "Fix the parser"})] {
+        refused(call(&app, &connector(ControlAccess::FullAccess), "worktree_create", args).await, ErrorCode::InvalidArguments);
+    }
     let description = registry::tools_for(&connector(ControlAccess::FullAccess)).into_iter().find(|tool| tool.name == "worktree_create").unwrap().description;
     assert!(description.contains("Presets and prompts are available only on this computer"), "{description}");
 }

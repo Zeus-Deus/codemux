@@ -6,7 +6,7 @@
 //! where the caller is: connector clients reach this computer over the network,
 //! so they only open or branch folders of projects already opened here, never
 //! force a deletion and never check out the branch the project root has
-//! checked out. A terminal preset or prompt needs Admin. Keyed calls run under
+//! checked out. A terminal preset needs Admin. Keyed calls run under
 //! a durable receipt (`service::run_receipted`), and the lifecycle asks for
 //! the caller's authority again wherever it waited ([`checkpoint`]).
 use super::{registry, service, Access, ControlCaller, ControlError, ErrorCode};
@@ -131,8 +131,9 @@ pub(super) async fn create_worktree<R: Runtime>(app: &AppHandle<R>, caller: &Con
     let args = without_nulls(args);
     let mut input: WorktreeArgs = service::parse(args.clone())?;
     // A preset types its prompt into a terminal CLI that runs as the person,
-    // outside any chat's permission mode.
-    if input.agent_preset_id.is_some() || input.initial_prompt.is_some() {
+    // outside any chat's permission mode. Without a preset the prompt is
+    // dropped (`WorktreeArgs::into_request`) and nothing launches.
+    if input.agent_preset_id.is_some() {
         registry::require(caller, Access::Admin)?;
     }
     if let Some(key) = &input.client_request_id {

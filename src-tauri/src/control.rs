@@ -2401,7 +2401,7 @@ mod tests {
             ("write_terminal", serde_json::json!({"data":"codemux json agent_connector_approve
 "})),
             ("apply_preset", serde_json::json!({"workspace_id":"w","preset_id":"p"})),
-            ("create_worktree_workspace", serde_json::json!({"repo_path":"/r","branch":"b","initial_prompt":"go"})),
+            ("create_worktree_workspace", serde_json::json!({"repo_path":"/r","branch":"b","agent_preset_id":"p","initial_prompt":"go"})),
             ("delegation_respond", serde_json::json!({})),
             ("no_such_command", serde_json::json!({})),
         ] {
@@ -2447,6 +2447,8 @@ mod tests {
         for (command, params) in [
             ("create_workspace", serde_json::json!({"path":"/tmp/project"})),
             ("create_worktree_workspace", serde_json::json!({"repo_path":"/r","branch":"b"})),
+            // A prompt without a preset is dropped: nothing launches.
+            ("create_worktree_workspace", serde_json::json!({"repo_path":"/r","branch":"b","initial_prompt":"go"})),
             ("close_workspace", serde_json::json!({"workspace_id":"w","delete_worktree":true})),
             ("unarchive_workspace", serde_json::json!({})),
         ] {

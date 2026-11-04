@@ -370,10 +370,11 @@ fn browser_action_access(action: &Value) -> Access {
     }
 }
 
-/// A worktree that starts a preset CLI agent, or types a prompt into one, is
-/// `apply_preset` by another name.
+/// A worktree that starts a preset CLI agent is `apply_preset` by another
+/// name. `initial_prompt` only goes to that preset; without one the handler
+/// drops it and nothing launches.
 fn launches_an_agent(params: &Value) -> bool {
-    ["agent_preset_id", "initial_prompt"].iter().any(|key| params.get(key).is_some_and(|value| !value.is_null()))
+    params.get("agent_preset_id").is_some_and(|value| !value.is_null())
 }
 
 fn removes_files(params: &Value) -> bool {
@@ -598,7 +599,8 @@ mod tests {
         }
         assert_eq!(mcp_tool_access("workspace_close", &json!({})), Some(Access::Write));
         assert_eq!(mcp_tool_access("workspace_close", &json!({"delete_worktree": true})), Some(Access::Machine));
-        assert_eq!(mcp_tool_access("worktree_create", &json!({"initial_prompt": "go"})), Some(Access::Admin));
+        assert_eq!(mcp_tool_access("worktree_create", &json!({"agent_preset_id": "claude"})), Some(Access::Admin));
+        assert_eq!(mcp_tool_access("worktree_create", &json!({"initial_prompt": "go"})), Some(Access::Machine));
     }
 
     #[test]
@@ -644,7 +646,15 @@ mod tests {
     fn worktree_with_a_preset_is_admin() {
         let access = |params: Value| command_access("create_worktree_workspace", &params);
         assert_eq!(access(json!({ "repo_path": "/r", "branch": "b", "agent_preset_id": "claude" })), Access::Admin);
-        assert_eq!(access(json!({ "repo_path": "/r", "branch": "b", "initial_prompt": "fix it" })), Access::Admin);
+        assert_eq!(
+            access(json!({ "repo_path": "/r", "branch": "b", "agent_preset_id": "claude", "initial_prompt": "fix it" })),
+            Access::Admin
+        );
+        assert_eq!(
+            access(json!({ "repo_path": "/r", "branch": "b", "initial_prompt": "fix it" })),
+            Access::Machine,
+            "without a preset the prompt is dropped, so nothing launches"
+        );
         assert_eq!(access(json!({ "repo_path": "/r", "branch": "b" })), Access::Machine);
         assert_eq!(
             access(json!({ "repo_path": "/r", "branch": "b", "agent_preset_id": null, "initial_prompt": null })),
