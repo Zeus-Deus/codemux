@@ -2688,8 +2688,10 @@ impl AppStateStore {
     /// folder could both find nothing and both insert, each then starting
     /// terminals and setup scripts in it.
     ///
-    /// `probe` runs under the state lock; it must only read the snapshot.
-    /// A returned workspace keeps the focus as it is; the caller selects it.
+    /// `probe` runs under the state lock: it reads the snapshot and may
+    /// resolve paths on disk, as finding an open folder does, but must not
+    /// touch this store or take any other lock. A returned workspace keeps
+    /// the focus as it is; the caller selects it.
     pub fn open_or_create_workspace<F>(
         &self,
         cwd_path: PathBuf,
