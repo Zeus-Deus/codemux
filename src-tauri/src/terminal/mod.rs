@@ -3504,7 +3504,8 @@ mod tests {
         for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
             assert!(!daemon_backed.contains(key), "daemon_backed.rs names {key}");
         }
-        let in_process = include_str!("mod.rs");
+        // A Windows checkout can carry CRLF line endings.
+        let in_process = include_str!("mod.rs").replace("\r\n", "\n");
         let spawn = &in_process[in_process.find("strip_renderer_env(&mut cmd);").unwrap()..];
         assert!(spawn.starts_with("strip_renderer_env(&mut cmd);\n    strip_agent_identity_env(&mut cmd);"));
         assert!(include_str!("../pty_daemon/server.rs").contains("crate::terminal::strip_agent_identity_env(&mut cmd);"));

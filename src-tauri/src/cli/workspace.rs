@@ -260,9 +260,11 @@ mod tests {
         assert_eq!(run(&door, workspace(&["create", "/abs", "--select", "--request-id", "k"])).await.unwrap(), Exit::Done);
         let calls = door.script().calls();
         let path = calls[0].1["path"].as_str().unwrap();
-        assert!(Path::new(path).is_absolute() && path.ends_with("rel/dir"), "{path}");
+        assert!(Path::new(path).is_absolute() && Path::new(path).ends_with("rel/dir"), "{path}");
         assert!(calls[0].1.get("select").is_none());
-        assert_eq!(calls[1].1, json!({"path": "/abs", "select": true, "client_request_id": "k"}));
+        // `/abs` gains a drive on Windows, as it does for the real CLI.
+        let abs = absolute(Path::new("/abs")).unwrap();
+        assert_eq!(calls[1].1, json!({"path": abs, "select": true, "client_request_id": "k"}));
     }
 
     #[tokio::test]
@@ -276,8 +278,9 @@ mod tests {
         run_worktree(&door, worktree(&["--repo", "/r", "--branch", "b", "--base", "trunk", "--request-id", "k"])).await.unwrap();
         run_worktree(&door, worktree(&["--repo", "/r", "--branch", "b", "--existing", "--request-id", "k"])).await.unwrap();
         let calls = door.script().calls();
-        assert_eq!(calls[0].1, json!({"repo_path": "/r", "branch": "b", "base": "trunk", "client_request_id": "k"}));
-        assert_eq!(calls[1].1, json!({"repo_path": "/r", "branch": "b", "new_branch": false, "client_request_id": "k"}));
+        let repo = absolute(Path::new("/r")).unwrap();
+        assert_eq!(calls[0].1, json!({"repo_path": repo, "branch": "b", "base": "trunk", "client_request_id": "k"}));
+        assert_eq!(calls[1].1, json!({"repo_path": repo, "branch": "b", "new_branch": false, "client_request_id": "k"}));
     }
 
     #[tokio::test]

@@ -2326,8 +2326,22 @@ fn existing_worktree_matches(repo_path: &Path, target_path: &str, branch: &str) 
     // `git_create_worktree` is skipped and git re-runs `worktree add`,
     // failing with `fatal: '<path>' already exists`. `Path` equality
     // treats `/` and `\` as equivalent separators on Windows.
+    //
+    // Git also records the path in its resolved form, so a path we pass
+    // with a Windows 8.3 short name (`C:\Users\RUNNER~1\...`, common under
+    // `%TEMP%`) is listed with the long one (`C:/Users/runneradmin/...`).
+    // Comparing the canonical forms catches that; the plain `Path`
+    // comparison stays for paths that can't be resolved.
     let target = Path::new(target_path);
-    let path_matches = |p: &Option<String>| p.as_deref().map(Path::new) == Some(target);
+    let canonical_target = dunce::canonicalize(target).ok();
+    let path_matches = |p: &Option<String>| {
+        p.as_deref().map(Path::new).is_some_and(|listed| {
+            listed == target
+                || canonical_target
+                    .as_deref()
+                    .is_some_and(|wanted| dunce::canonicalize(listed).is_ok_and(|seen| seen == wanted))
+        })
+    };
     let mut current_path: Option<String> = None;
     let mut current_branch: Option<String> = None;
     for raw in output.lines() {
@@ -3735,6 +3749,26 @@ mod tests {
         );
 
         git_remove_worktree(Path::new(&wt_a), Some(&branch_a), true).expect("cleanup");
+    }
+
+    /// Git lists a worktree by its resolved path. A caller that names the
+    /// same directory another way (a Windows 8.3 short name under %TEMP%;
+    /// here a symlinked parent) must still find it, or the second create
+    /// re-runs `git worktree add` and fails with `already exists`.
+    #[cfg(unix)]
+    #[test]
+    fn existing_worktree_matches_a_path_named_another_way() {
+        let (dir, repo) = setup_test_repo();
+        let branch = unique_branch("alias");
+        let real = dir.path().join("checkouts");
+        std::fs::create_dir(&real).unwrap();
+        let worktree = real.join("wt");
+        run_git(&repo, &["worktree", "add", "-b", &branch, worktree.to_str().unwrap()]).expect("worktree add");
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let named_otherwise = alias.join("wt");
+        assert!(existing_worktree_matches(&repo, named_otherwise.to_str().unwrap(), &branch));
+        assert!(!existing_worktree_matches(&repo, named_otherwise.to_str().unwrap(), "some-other-branch"));
     }
 
     #[test]
