@@ -6,7 +6,7 @@
 //! adds no business defaults: the server mints the caller and enforces
 //! access, permission modes and argument schemas.
 
-use super::output::{CliError, ErrorBody};
+use super::output::{CliError, ErrorBody, Exit};
 use crate::control::{send_control_request, ControlRequest};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -59,11 +59,7 @@ impl Door {
                 mcp_result_value(&reply).map_err(CliError::from)
             }
             #[cfg(test)]
-            Door::Fake(fake) => {
-                let answer = fake.answer(tool, arguments.clone());
-                fake::elapse(tool, &arguments, &answer).await;
-                answer
-            }
+            Door::Fake(fake) => fake.reply(tool, arguments).await,
         }
     }
 
@@ -107,6 +103,22 @@ impl Door {
             }
         }
     }
+}
+
+/// Runs `call`, with any retries and their pauses, until the invocation's
+/// `--timeout` passes, and reports a call still unanswered then as
+/// `timed_out` (exit 3). Giving up hangs up the connection, which ends only a
+/// parked wait: the app runs every other request to its end, so a mutation
+/// it took keeps going.
+pub(crate) async fn by_deadline<T>(deadline: Option<Instant>, call: impl std::future::Future<Output = Result<T, CliError>>) -> Result<T, CliError> {
+    let Some(deadline) = deadline else { return call.await };
+    tokio::time::timeout_at(deadline, call).await.unwrap_or_else(|_| {
+        Err(CliError::new(
+            Exit::TimedOut,
+            code::TIMED_OUT,
+            "Codemux had not answered by the deadline. Nothing was cancelled: the request may still run; retry it with the same --request-id.",
+        ))
+    })
 }
 
 fn call_bound(tool: &str, arguments: &Value) -> Duration {
@@ -227,8 +239,8 @@ fn in_progress(state: &str) -> bool {
 
 /// Waits until a receipt is final (`succeeded`, `failed`, `needs_attention`)
 /// by polling `operation_status`. A value that is not a receipt passes
-/// through. The deadline elapsing is `timed_out` (exit 3) with the last
-/// receipt attached; the work keeps going.
+/// through. The deadline elapsing, also during a poll, is `timed_out`
+/// (exit 3) with the last receipt attached; the work keeps going.
 pub(crate) async fn settle(door: &Door, receipt: Value, deadline: Instant) -> Result<Value, CliError> {
     let (Some(operation), Some(_)) = (receipt["operation_id"].as_str().map(str::to_owned), receipt["state"].as_str()) else {
         return Ok(receipt);
@@ -237,18 +249,27 @@ pub(crate) async fn settle(door: &Door, receipt: Value, deadline: Instant) -> Re
     let mut pause = Duration::from_millis(100);
     while receipt["state"].as_str().is_some_and(in_progress) {
         if Instant::now() + pause > deadline {
-            return Err(CliError::new(
-                super::output::Exit::TimedOut,
-                code::TIMED_OUT,
-                format!("Operation {operation} is still {} at the deadline. It keeps going; check it with `codemux call operation_status`.", receipt["state"].as_str().unwrap_or("running")),
-            )
-            .with_last(receipt));
+            return Err(still_going(&operation, receipt));
         }
         tokio::time::sleep(pause).await;
         pause = (pause * 2).min(Duration::from_secs(1));
-        receipt = door.call_in_loop(super::verbs::OPERATION_STATUS, json!({"operation_id": operation})).await?;
+        let poll = door.call_in_loop(super::verbs::OPERATION_STATUS, json!({"operation_id": operation}));
+        receipt = match tokio::time::timeout_at(deadline, poll).await {
+            Ok(polled) => polled?,
+            Err(_) => return Err(still_going(&operation, receipt)),
+        };
     }
     Ok(receipt)
+}
+
+/// A settle deadline, with the receipt it last read.
+fn still_going(operation: &str, receipt: Value) -> CliError {
+    CliError::new(
+        Exit::TimedOut,
+        code::TIMED_OUT,
+        format!("Operation {operation} is still {} at the deadline. It keeps going; check it with `codemux call operation_status`.", receipt["state"].as_str().unwrap_or("running")),
+    )
+    .with_last(receipt)
 }
 
 #[cfg(test)]
@@ -260,28 +281,55 @@ pub(crate) mod fake {
     /// A scripted door: each call must match the next scripted name, gets
     /// its scripted answer, and is recorded with its arguments.
     pub(crate) struct FakeDoor {
-        script: Mutex<VecDeque<(String, Result<Value, CliError>)>>,
+        script: Mutex<VecDeque<Step>>,
         calls: Mutex<Vec<(String, Value)>>,
+    }
+
+    /// One scripted call: the name it must have, its answer, and how long
+    /// that answer takes to arrive.
+    struct Step {
+        name: String,
+        delay: Duration,
+        answer: Result<Value, CliError>,
     }
 
     impl FakeDoor {
         pub(crate) fn new(script: Vec<(&str, Result<Value, CliError>)>) -> Self {
+            Self::slow(script.into_iter().map(|(name, answer)| (name, Duration::ZERO, answer)).collect())
+        }
+
+        /// Each answer arrives its scripted time after the call, as from a
+        /// slow or stalled app.
+        pub(crate) fn slow(script: Vec<(&str, Duration, Result<Value, CliError>)>) -> Self {
             Self {
-                script: Mutex::new(script.into_iter().map(|(name, answer)| (name.to_owned(), answer)).collect()),
+                script: Mutex::new(script.into_iter().map(|(name, delay, answer)| Step { name: name.to_owned(), delay, answer }).collect()),
                 calls: Mutex::new(Vec::new()),
             }
         }
 
         pub(crate) fn answer(&self, name: &str, arguments: Value) -> Result<Value, CliError> {
+            self.next(name, arguments).answer
+        }
+
+        /// The answer a registry call gets: after its scripted delay and,
+        /// for a wait that timed out, its whole `timeout_ms`.
+        pub(crate) async fn reply(&self, name: &str, arguments: Value) -> Result<Value, CliError> {
+            let step = self.next(name, arguments.clone());
+            tokio::time::sleep(step.delay).await;
+            elapse(name, &arguments, &step.answer).await;
+            step.answer
+        }
+
+        fn next(&self, name: &str, arguments: Value) -> Step {
             self.calls.lock().unwrap().push((name.to_owned(), arguments.clone()));
-            let (expected, answer) = self
+            let step = self
                 .script
                 .lock()
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| panic!("unscripted call {name} {arguments}"));
-            assert_eq!(expected, name, "unexpected call with {arguments}");
-            answer
+            assert_eq!(step.name, name, "unexpected call with {arguments}");
+            step
         }
 
         pub(crate) fn calls(&self) -> Vec<(String, Value)> {
@@ -300,7 +348,7 @@ pub(crate) mod fake {
 
     /// A scripted wait that timed out took its whole `timeout_ms`, as the
     /// server's would, so paused-clock tests see deadlines come.
-    pub(crate) async fn elapse(tool: &str, arguments: &Value, answer: &Result<Value, CliError>) {
+    async fn elapse(tool: &str, arguments: &Value, answer: &Result<Value, CliError>) {
         if let (super::super::verbs::THREAD_WAIT, Ok(waited)) = (tool, answer) {
             if waited["timed_out"] == true {
                 tokio::time::sleep(Duration::from_millis(arguments["timeout_ms"].as_u64().unwrap_or(0))).await;
@@ -311,6 +359,11 @@ pub(crate) mod fake {
     impl Door {
         pub(crate) fn fake(script: Vec<(&str, Result<Value, CliError>)>) -> Self {
             Door::Fake(FakeDoor::new(script))
+        }
+
+        /// A fake whose answers each take their scripted time.
+        pub(crate) fn fake_slow(script: Vec<(&str, Duration, Result<Value, CliError>)>) -> Self {
+            Door::Fake(FakeDoor::slow(script))
         }
 
         pub(crate) fn script(&self) -> &FakeDoor {

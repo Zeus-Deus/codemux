@@ -361,9 +361,9 @@ async fn start(door: &Door, start: StartArgs) -> Result<Exit, String> {
 
 /// Calls a mutation and settles its receipt within `deadline` (default
 /// [`SETTLE_BUDGET`]). The call itself is the verb's first, so it is never
-/// retried.
+/// retried, and `deadline` bounds it too.
 async fn mutate(door: &Door, tool: &str, arguments: Value, deadline: Option<Instant>) -> Result<Value, CliError> {
-    let receipt = door.call(tool, arguments).await?;
+    let receipt = door::by_deadline(deadline, door.call(tool, arguments)).await?;
     door::settle(door, receipt, deadline.unwrap_or_else(|| Instant::now() + SETTLE_BUDGET)).await
 }
 
@@ -803,21 +803,25 @@ impl Target {
     }
 }
 
-/// One call of the follow loop. Retried, except as the verb's first call, so
-/// a stopped app fails fast.
-async fn follow_call(door: &Door, retry: bool, tool: &str, arguments: Value) -> Result<Value, CliError> {
-    if retry {
-        door.call_in_loop(tool, arguments).await
-    } else {
-        door.call(tool, arguments).await
-    }
+/// One call of the follow loop, given up at `deadline`. Retried, except as
+/// the verb's first call, so a stopped app fails fast.
+async fn follow_call(door: &Door, retry: bool, tool: &str, arguments: Value, deadline: Option<Instant>) -> Result<Value, CliError> {
+    door::by_deadline(deadline, async {
+        if retry {
+            door.call_in_loop(tool, arguments).await
+        } else {
+            door.call(tool, arguments).await
+        }
+    })
+    .await
 }
 
 /// Follows a run with `thread_wait` slices until it is done, failed or needs
-/// input, or `deadline` passes. Each later slice passes the last
-/// `wait_cursor` as `since`, so it parks until something changes. Never
-/// interrupts or stops anything. `retry_first` is false when the first call
-/// is the verb's first, so a stopped app fails fast.
+/// input, or `deadline` passes, which also cuts off a call still under way.
+/// Each later slice passes the last `wait_cursor` as `since`, so it parks
+/// until something changes. Never interrupts or stops anything.
+/// `retry_first` is false when the first call is the verb's first, so a
+/// stopped app fails fast.
 pub(crate) async fn follow_run(door: &Door, run: Followed, deadline: Option<Instant>, retry_first: bool) -> RunReport {
     let mut report = RunReport::of(&run);
     let target = Target::of(&run);
@@ -827,6 +831,21 @@ pub(crate) async fn follow_run(door: &Door, run: Followed, deadline: Option<Inst
     // The follow starts with a thread_status read, which does not park.
     let mut checked = false;
     loop {
+        if !checked {
+            let status = match follow_call(door, retry, verbs::THREAD_STATUS, thread.clone(), deadline).await {
+                Ok(status) => status,
+                Err(failure) => return report.stopped(failure),
+            };
+            retry = true;
+            checked = true;
+            // A wait does not return for input already pending when it
+            // starts, so a run that is already blocked would cost a slice.
+            if status["state"] == "needs_input" && target.turn().is_none_or(|turn| status["turn_id"] == turn) {
+                report.absorb(&status);
+                return report.finish(RunState::NeedsInput);
+            }
+        }
+        // Sized from what is left now, after the status read took its time.
         let slice = match deadline {
             None => WAIT_SLICE,
             Some(deadline) => {
@@ -841,27 +860,13 @@ pub(crate) async fn follow_run(door: &Door, run: Followed, deadline: Option<Inst
                 left.min(WAIT_SLICE)
             }
         };
-        if !checked {
-            let status = match follow_call(door, retry, verbs::THREAD_STATUS, thread.clone()).await {
-                Ok(status) => status,
-                Err(failure) => return report.stopped(failure),
-            };
-            retry = true;
-            checked = true;
-            // A wait does not return for input already pending when it
-            // starts, so a run that is already blocked would cost a slice.
-            if status["state"] == "needs_input" && target.turn().is_none_or(|turn| status["turn_id"] == turn) {
-                report.absorb(&status);
-                return report.finish(RunState::NeedsInput);
-            }
-        }
         let mut arguments = thread.clone();
         arguments["timeout_ms"] = json!(slice.as_millis() as u64);
         target.select(&mut arguments);
         if let Some(since) = &since {
             arguments["since"] = json!(since);
         }
-        let waited = match follow_call(door, retry, verbs::THREAD_WAIT, arguments).await {
+        let waited = match follow_call(door, retry, verbs::THREAD_WAIT, arguments, deadline).await {
             Ok(waited) => waited,
             Err(failure) => return report.stopped(failure),
         };
@@ -913,6 +918,13 @@ fn print_report(report: RunReport, json: bool) -> Result<Exit, String> {
                 output::note(&format!(
                     "Answer: codemux thread answer {thread} --question {question} --answer <text> --workspace {workspace}"
                 ));
+            }
+        }
+        // A launch the deadline cut off before Codemux answered names no
+        // thread to wait on yet.
+        RunState::TimedOut if thread.is_empty() => {
+            if let Some(error) = &report.error {
+                output::note(&error.to_string());
             }
         }
         RunState::TimedOut => output::note(&format!(
@@ -1003,9 +1015,22 @@ mod tests {
         value
     }
 
+    /// The tool every follow reads first.
+    const FIRST_READ: &str = "thread_status";
+
     /// The status read every follow starts with, for a run still going.
     fn busy() -> (&'static str, Result<Value, CliError>) {
-        ("thread_status", Ok(status_reply("running", json!({}))))
+        (FIRST_READ, Ok(status_reply("running", json!({}))))
+    }
+
+    /// A call to an app that took the request and never answers: the door
+    /// reports no reply once the call's own bound has passed.
+    fn stalled(name: &str) -> (&str, Duration, Result<Value, CliError>) {
+        (name, Duration::from_secs(120), Err(CliError::failed(code::NO_REPLY, "Codemux sent no reply within 120s.")))
+    }
+
+    fn quick((name, answer): (&'static str, Result<Value, CliError>)) -> (&'static str, Duration, Result<Value, CliError>) {
+        (name, Duration::ZERO, answer)
     }
 
     async fn follow(door: &Door, deadline: Option<Instant>) -> RunReport {
@@ -1182,6 +1207,82 @@ mod tests {
         // Two slices fit the deadline exactly; nothing else was called.
         assert_eq!(door.script().names(), ["thread_status", "thread_wait", "thread_wait"]);
         assert_eq!(door.script().calls()[2].1["timeout_ms"], 30_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_bounds_every_call_to_a_stalled_app() {
+        let second = Duration::from_secs(1);
+        let timed_out = |error: Option<ErrorBody>| error.map(|error| error.code) == Some(code::TIMED_OUT.to_owned());
+        // The follow's first read, and a later wait whose reply never comes.
+        for script in [vec![stalled(FIRST_READ)], vec![quick(busy()), stalled("thread_wait")]] {
+            let door = Door::fake_slow(script);
+            let started = Instant::now();
+            let report = follow(&door, Some(started + second)).await;
+            assert_eq!((report.state, started.elapsed()), (RunState::TimedOut, second));
+            assert!(timed_out(report.error), "the deadline, not the call's own bound");
+        }
+
+        // A slow first read leaves the first wait only the time that is left.
+        let door = Door::fake_slow(vec![
+            (busy().0, Duration::from_millis(400), busy().1),
+            quick(("thread_wait", Ok(waited("running", json!({"timed_out": true}))))),
+        ]);
+        let started = Instant::now();
+        let report = follow(&door, Some(started + second)).await;
+        assert_eq!((report.state, started.elapsed()), (RunState::TimedOut, second));
+        assert_eq!(door.script().calls()[1].1["timeout_ms"], 600);
+
+        // The mutation itself, which is the verb's first call.
+        let door = Door::fake_slow(vec![stalled("thread_launch")]);
+        let started = Instant::now();
+        let exit = start(&door, start_args(&[base().as_slice(), &["--json", "--request-id", "k", "--timeout", "1s"]].concat())).await.unwrap();
+        assert_eq!((exit, started.elapsed()), (Exit::TimedOut, second));
+
+        // A settle poll keeps the receipt it had when the deadline came.
+        let accepted = receipt("accepted", Value::Null);
+        let door = Door::fake_slow(vec![quick(("thread_launch", Ok(accepted.clone()))), stalled("operation_status")]);
+        let started = Instant::now();
+        let failure = mutate(&door, "thread_launch", json!({"client_request_id": "k"}), Some(started + second)).await.unwrap_err();
+        assert_eq!((failure.exit, started.elapsed()), (Exit::TimedOut, second));
+        assert_eq!((failure.error.code.as_str(), failure.last), (code::TIMED_OUT, Some(accepted)));
+        assert_eq!(door.script().names(), ["thread_launch", "operation_status"], "a deadline never cancels work");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_bounds_retries_and_their_backoff() {
+        let unavailable = || ("thread_wait", Err(CliError::failed(code::UNAVAILABLE, "restarting")));
+        let door = Door::fake(vec![
+            busy(),
+            ("thread_wait", Ok(waited("running", json!({})))),
+            unavailable(),
+            unavailable(),
+            unavailable(),
+            unavailable(),
+            unavailable(),
+            ("thread_wait", Ok(waited("done", json!({"final_text": "after the deadline"})))),
+        ]);
+        let started = Instant::now();
+        let report = follow(&door, Some(started + Duration::from_secs(2))).await;
+        assert_eq!((report.state, started.elapsed()), (RunState::TimedOut, Duration::from_secs(2)));
+        // The report keeps what the last wait said.
+        assert_eq!((report.turn_id.as_deref(), report.final_text), (Some("t1"), None));
+        assert!(!door.script().finished(), "retries stop at the deadline");
+
+        // A settle's polls too.
+        let polling = || ("operation_status", Err(CliError::failed(code::UNAVAILABLE, "restarting")));
+        let accepted = receipt("accepted", Value::Null);
+        let door = Door::fake(vec![
+            ("thread_launch", Ok(accepted.clone())),
+            polling(),
+            polling(),
+            polling(),
+            polling(),
+            ("operation_status", Ok(receipt("succeeded", json!({"turn": {"turn_id": "t1"}})))),
+        ]);
+        let started = Instant::now();
+        let failure = mutate(&door, "thread_launch", json!({"client_request_id": "k"}), Some(started + Duration::from_secs(1))).await.unwrap_err();
+        assert_eq!((failure.exit, started.elapsed()), (Exit::TimedOut, Duration::from_secs(1)));
+        assert_eq!(failure.last, Some(accepted));
     }
 
     #[tokio::test(start_paused = true)]

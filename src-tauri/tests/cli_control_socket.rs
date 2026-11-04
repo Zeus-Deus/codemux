@@ -461,6 +461,30 @@ fn a_queued_send_waits_for_the_run_its_message_starts() {
     assert!(!requests.iter().any(|request| tool_name(request) == Some("operation_status")), "the server resolves the operation");
 }
 
+#[test]
+fn timeout_bounds_calls_to_an_app_that_stops_answering() {
+    // The app takes every request and answers only long after the deadline.
+    let app = FakeApp::start(|request| {
+        if request["command"] == "status" {
+            return ok_reply(json!({}));
+        }
+        std::thread::sleep(Duration::from_secs(8));
+        json!({"ok": false, "protocol_version": 2, "data": null, "error": "operation_failed: too late"})
+    });
+    for args in [
+        &["thread", "wait", "th", "--workspace", "ws", "--timeout", "1s", "--json"][..],
+        &["thread", "start", "--workspace", "ws", "--provider", "cursor", "--permission-mode", "agent", "-m", "hi",
+            "--request-id", "k", "--timeout", "1s", "--json"],
+    ] {
+        let started = Instant::now();
+        let output = app.cli(args);
+        let elapsed = started.elapsed();
+        assert_eq!(exit_code(&output), 3, "{args:?}: {}", String::from_utf8_lossy(&output.stdout));
+        assert_eq!(stdout_json(&output)["error"]["code"], "timed_out", "{args:?}");
+        assert!(elapsed < Duration::from_secs(5), "{args:?} took {elapsed:?}");
+    }
+}
+
 // ── Against a real app ────────────────────────────────────────────────────
 
 #[test]
