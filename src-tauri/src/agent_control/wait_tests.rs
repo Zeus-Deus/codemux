@@ -712,7 +712,7 @@ async fn observe_while(app: &App, workspace: &str, thread: &str, during: impl st
         Ok::<_, ControlError>(status)
     };
     let target = service::Target { workspace_id: workspace.into(), thread_id: thread.into() };
-    wait::observe_with(app.handle(), &target, None, read).await.unwrap().into_status()
+    wait::observe_with(app.handle(), &target, wait::Selected::Thread(None), read).await.unwrap().into_status()
 }
 
 /// A launch can admit its message, start its run and settle its receipt
@@ -1141,6 +1141,67 @@ async fn wait_delivery_needing_attention_reads_failed() {
     assert_eq!(result["settled"], true);
     assert_eq!(result["state"], "failed");
     assert_eq!(result["failure"], "delivery_needs_attention");
+}
+
+/// Message A ran t1 to its end; a later message B was refused before it
+/// started a run, so t1 is still the thread's current run while the thread
+/// needs the person for B. A wait on t1, by its turn or by A's operation,
+/// reports t1's own result; a wait on the thread reports B.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_run_reads_its_own_result_after_a_later_message_is_rejected() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, &workspace, "named-run-launch").await;
+    let trusted = ControlCaller::trusted();
+    let sent = execute(app.handle(), &trusted, "thread_send", target(&workspace, &thread, json!({
+        "client_request_id": "named-run-a", "message": "Say PONG",
+    }))).await.unwrap();
+    let a = settle_operation(&app, &sent).await;
+    assert_eq!((a["state"].as_str(), a["result"]["turn"]["turn_id"].as_str()), (Some("succeeded"), Some("mock-turn")), "{a}");
+    running(&app, &thread, "mock-turn");
+    reply(&app, &thread, "mock-turn", "PONG");
+    completed(&app, &thread, "mock-turn", TurnStatus::Success);
+    let db = app.state::<DatabaseStore>();
+    db.admit_message_delivery("named-run-b", &thread, "named-run-b", &json!({"origin": "controller"}), "epoch", 0, None, true).unwrap();
+    db.refuse_message_delivery("named-run-b", "permission_ceiling: refused before send").unwrap();
+    let status = wait::thread_status(app.handle(), target(&workspace, &thread, json!({}))).await.unwrap();
+    assert_eq!((status["phase"].as_str(), status["turn_id"].as_str()), (Some("needs_attention"), Some("mock-turn")), "{status}");
+    for named in [json!({"turn_id": "mock-turn"}), json!({"operation_id": a["operation_id"]})] {
+        let mut args = target(&workspace, &thread, json!({"timeout_ms": 2000}));
+        args.as_object_mut().unwrap().extend(named.as_object().unwrap().clone());
+        let waited = wait_for(&app, &trusted, args).await.unwrap();
+        assert_eq!((waited["state"].as_str(), &waited["failure"], waited["final_text"].as_str()), (Some("done"), &Value::Null, Some("PONG")), "{named}: {waited}");
+        assert_eq!((waited["turn_id"].as_str(), waited["timed_out"].as_bool()), (Some("mock-turn"), Some(false)), "{named}: {waited}");
+    }
+    // The thread's next work is B's, and B never started a run.
+    let thread_wide = wait_for(&app, &trusted, target(&workspace, &thread, json!({"timeout_ms": 1000}))).await.unwrap();
+    assert_eq!((thread_wide["state"].as_str(), thread_wide["failure"].as_str()), (Some("failed"), Some("delivery_needs_attention")), "{thread_wide}");
+}
+
+/// A queue entry nobody can confirm (the provider took it, then the app
+/// crashed) holds the thread for the person, and the legacy rule never
+/// settles a run while it is listed. A wait on the run before it still ends
+/// with that run's own result instead of parking.
+#[tokio::test]
+async fn a_named_run_ends_while_its_thread_holds_an_unconfirmed_queue_entry() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let thread = "named-run-unconfirmed-entry";
+    persisted(&app, &workspace, thread);
+    person_started(&app, thread, "t1");
+    running(&app, thread, "t1");
+    reply(&app, thread, "t1", "PONG");
+    completed(&app, thread, "t1", TurnStatus::Success);
+    app.state::<DatabaseStore>().control_record_queue_admission(thread, "unconfirmed-entry").unwrap();
+    let status = wait::thread_status(app.handle(), target(&workspace, thread, json!({}))).await.unwrap();
+    assert_eq!((status["phase"].as_str(), status["settled"].as_bool()), (Some("needs_attention"), Some(false)), "{status}");
+    assert_eq!(status["uncertain_queued_ids"], json!(["unconfirmed-entry"]));
+    let trusted = ControlCaller::trusted();
+    let started = Instant::now();
+    let named = wait_for(&app, &trusted, target(&workspace, thread, json!({"turn_id": "t1", "timeout_ms": 5000}))).await.unwrap();
+    assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
+    assert_eq!((named["state"].as_str(), &named["failure"], named["final_text"].as_str()), (Some("done"), &Value::Null, Some("PONG")), "{named}");
+    assert_eq!(named["timed_out"], false);
+    let thread_wide = wait_for(&app, &trusted, target(&workspace, thread, json!({"timeout_ms": 200}))).await.unwrap();
+    assert_eq!((thread_wide["state"].as_str(), thread_wide["failure"].as_str()), (Some("failed"), Some("delivery_needs_attention")), "{thread_wide}");
 }
 
 #[tokio::test]

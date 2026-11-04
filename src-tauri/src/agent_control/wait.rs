@@ -323,8 +323,37 @@ impl WaitView {
     }
 }
 
-/// Read `target` as a waiter on `selected` (or on its current run) sees it.
-pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Target, selected: Option<&str>) -> Result<WaitView, ControlError> {
+/// The run a read describes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Selected<'a> {
+    /// The thread's current run, or the run a wait on the thread adopted.
+    /// Such a read follows the thread's next work too, so a delivery the
+    /// thread holds for the person fails it: the run it asked for never
+    /// started.
+    Thread(Option<&'a str>),
+    /// A run the caller named by `turn_id`, or the run its operation's
+    /// message started. It reads as that run alone; another message's
+    /// delivery never decides its result.
+    Run(&'a str),
+}
+
+impl<'a> Selected<'a> {
+    /// A wait's run: the turn it names, else the thread's (`adopted`, once
+    /// the wait has taken the run in progress).
+    fn of(named: Option<&'a str>, adopted: Option<&'a str>) -> Self {
+        named.map_or(Selected::Thread(adopted), Selected::Run)
+    }
+
+    fn turn(self) -> Option<&'a str> {
+        match self {
+            Selected::Thread(turn) => turn,
+            Selected::Run(turn) => Some(turn),
+        }
+    }
+}
+
+/// Read `target` as a waiter on `selected` sees it.
+pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Target, selected: Selected<'_>) -> Result<WaitView, ControlError> {
     let status = service::thread_status(app, json!({"workspace_id": target.workspace_id, "thread_id": target.thread_id}));
     observe_with(app, target, selected, status).await
 }
@@ -334,9 +363,11 @@ pub(crate) async fn observe<R: Runtime>(app: &AppHandle<R>, target: &service::Ta
 pub(super) async fn observe_with<R: Runtime>(
     app: &AppHandle<R>,
     target: &service::Target,
-    selected: Option<&str>,
+    selected: Selected<'_>,
     status: impl Future<Output = Result<Value, ControlError>>,
 ) -> Result<WaitView, ControlError> {
+    let follows_thread = matches!(selected, Selected::Thread(_));
+    let selected = selected.turn();
     let thread = target.thread_id.as_str();
     // A launch saves its new thread and shows its pane, then starts the
     // provider session, which can take seconds while MCP servers start, and
@@ -428,12 +459,18 @@ pub(super) async fn observe_with<R: Runtime>(
     let never_ran = turn_id.is_none()
         && !starting
         && (settled || (at_rest(&db, thread, &status)? && on_record.is_none()));
-    let ended = settled || vanished || superseded || never_ran;
+    // A delivery or queue entry the thread holds for the person: nothing
+    // starts on the thread until they act. A named run whose end is on
+    // record is then over, though the legacy rule settles it only once the
+    // thread is idle or has moved on.
+    let held = is_current && status["phase"] == "needs_attention";
+    let named_end = !follows_thread && held && end_event.is_some();
+    let ended = settled || vanished || superseded || never_ran || named_end;
     let final_message = match turn_id {
         Some(turn) if ended => db.control_turn_final_text(thread, turn)?.map(FinalMessage::bounded),
         _ => None,
     };
-    let (state, failure) = if is_current && status["phase"] == "needs_attention" && pending.is_empty() {
+    let (state, failure) = if follows_thread && held && pending.is_empty() {
         // A message delivery needs the person: the run it asked for never started.
         (RunState::Failed, Some("delivery_needs_attention"))
     } else if never_ran {
@@ -533,7 +570,7 @@ async fn observe_operation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
     }
     let placement = Placement::of(&app.state::<DatabaseStore>(), &caller.principal, &receipt)?;
     let mut view = match placement {
-        Placement::Run(turn) => observe(app, target, Some(&turn)).await?,
+        Placement::Run(turn) => observe(app, target, Selected::Run(&turn)).await?,
         Placement::NotStarted => before_run(app, target, None).await?,
         Placement::Ended(failure) => before_run(app, target, Some(failure)).await?,
     };
@@ -545,7 +582,7 @@ async fn observe_operation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
 /// waits in the queue, or (`failure`) it never will. Input the thread waits
 /// on holds the queue, so it reads as this message's too.
 async fn before_run<R: Runtime>(app: &AppHandle<R>, target: &service::Target, failure: Option<&'static str>) -> Result<WaitView, ControlError> {
-    let thread = match observe(app, target, None).await {
+    let thread = match observe(app, target, Selected::Thread(None)).await {
         Ok(view) => Some(view),
         // A launch names its thread, and a worktree launch its workspace, before it creates them.
         Err(error) if matches!(error.code, ErrorCode::ThreadNotFound | ErrorCode::WorkspaceNotFound) => None,
@@ -569,9 +606,8 @@ async fn before_run<R: Runtime>(app: &AppHandle<R>, target: &service::Target, fa
     })
 }
 
-/// One read of what a wait follows: an operation's run, else `selected`, else
-/// the thread's current run.
-async fn read<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, target: &service::Target, operation: Option<&str>, selected: Option<&str>) -> Result<WaitView, ControlError> {
+/// One read of what a wait follows: an operation's run, else `selected`.
+async fn read<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, target: &service::Target, operation: Option<&str>, selected: Selected<'_>) -> Result<WaitView, ControlError> {
     match operation {
         Some(operation) => observe_operation(app, caller, target, operation).await,
         None => observe(app, target, selected).await,
@@ -620,7 +656,8 @@ pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &Control
     let operation = args.operation_id.as_deref();
     let mut changes = subscribe(&target.thread_id);
     service::authorize(app, caller)?;
-    let first = read(app, caller, &target, operation, args.turn_id.as_deref()).await?;
+    let named = args.turn_id.as_deref();
+    let first = read(app, caller, &target, operation, Selected::of(named, None)).await?;
     // Legacy: a thread already settled at call start returns at once.
     if args.turn_id.is_none() && operation.is_none() && args.since.is_none() && first.settled {
         return Ok(first.into_result(false));
@@ -638,7 +675,7 @@ pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &Control
     // appearing changes the view, and the next wait adopts it.
     // An operation's receipt selects its run on every read.
     let adopt = operation.is_none() && !first.settled && !first.end_known;
-    let selected = args.turn_id.clone().or_else(|| adopt.then(|| first.turn_id.clone()).flatten());
+    let adopted = adopt.then(|| first.turn_id.clone()).flatten();
     let baseline = args.since.clone().unwrap_or_else(|| first.cursor.clone());
     let mut view = first;
     let mut evaluated = Instant::now();
@@ -662,7 +699,7 @@ pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &Control
         }
         // A revoked grant reads grant_revoked; a disabled connector, connector_disabled.
         service::authorize(app, caller)?;
-        view = read(app, caller, &target, operation, selected.as_deref()).await?;
+        view = read(app, caller, &target, operation, Selected::of(named, adopted.as_deref())).await?;
         evaluated = Instant::now();
     }
 }
@@ -671,5 +708,5 @@ pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &Control
 /// `paused_until_ms` and `wait_cursor` for the thread's current run.
 pub(crate) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
     let target: service::Target = service::parse(args)?;
-    Ok(observe(app, &target, None).await?.into_status())
+    Ok(observe(app, &target, Selected::Thread(None)).await?.into_status())
 }
