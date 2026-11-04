@@ -1387,15 +1387,28 @@ pub(super) async fn thread_answer<R: Runtime>(app: &AppHandle<R>, caller: &Contr
 }
 
 /// Codemux's refusal of `control`'s caller on its thread, when its authority
-/// no longer holds for a reason only the person can change: the grant was
-/// revoked, the thread's mode is above the caller's ceiling, or a supervised
-/// caller's worker runs in a mode Codemux cannot confirm. Checked once an
-/// answer has failed: either Codemux refused it for this, or a new answer
-/// would be.
-fn authority_refusal<R: Runtime>(app: &AppHandle<R>, control: &NativeControlGuard) -> Option<ControlError> {
+/// no longer holds for a reason only the person can change: the network door
+/// is off, the grant was revoked or no longer matches the caller, the web
+/// remote session ended, the thread's mode is above the caller's ceiling, or
+/// a supervised caller's worker runs in a mode Codemux cannot confirm.
+/// These are every authority code the guard gives a caller that may answer
+/// (never a chat, nor a read-only caller). `connector_unavailable` is not
+/// one: the grant could not be read, which says nothing about it. Checked
+/// once an answer has failed: either Codemux refused it for this, or a new
+/// answer would be.
+pub(super) fn authority_refusal<R: Runtime>(app: &AppHandle<R>, control: &NativeControlGuard) -> Option<ControlError> {
     let refusal = ControlError::from(control.verify(app).err()?);
-    matches!(refusal.code, ErrorCode::GrantRevoked | ErrorCode::PermissionCeiling | ErrorCode::PermissionStateUnconfirmed)
-        .then_some(refusal)
+    matches!(
+        refusal.code,
+        ErrorCode::ConnectorDisabled
+            | ErrorCode::GrantRevoked
+            | ErrorCode::GrantChanged
+            | ErrorCode::InvalidGrant
+            | ErrorCode::StaleCaller
+            | ErrorCode::PermissionCeiling
+            | ErrorCode::PermissionStateUnconfirmed
+    )
+    .then_some(refusal)
 }
 
 /// A question whose answer is being delivered, or was sent without the

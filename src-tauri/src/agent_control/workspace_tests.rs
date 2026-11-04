@@ -1276,28 +1276,46 @@ async fn reaches(gate: &tokio::sync::Notify, what: &str) {
 }
 
 /// An outside answer keeps its caller's authority until it reaches the
-/// worker. Revoking the connector grant while the answer waits in delivery
-/// stops it there, and the person can still answer the question.
+/// worker. Revoking the connector grant, or pausing the network door, while
+/// the answer waits in delivery stops it there with that refusal's own code,
+/// and the person can still answer the question.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn answer_waiting_in_delivery_stops_when_the_grant_is_revoked() {
+async fn answer_waiting_in_delivery_stops_when_the_grant_is_revoked_or_paused() {
     let (app, _, _root, workspace) = fixture().await;
     let recorder = Arc::new(ModeRecorder::new(Arc::new(MockAgentProvider::new(ProviderKind::Claude))));
     app.state::<crate::commands::agent_chat::ProviderRegistry>().set_claude(recorder.clone()).await;
-    let thread = launched(&app, "revoked-launch", &workspace, "default").await;
-    ask(&app, &thread, "t1", "storage");
-    let bot = super::tests::connector_caller(&app, "answer-client", "answer-grant", ControlAccess::FullAccess).await;
+    // The connector never changes a live grant's client or access, so the
+    // refusal for a grant that no longer matches its caller is checked on its own.
+    let thread = launched(&app, "changed-launch", &workspace, "default").await;
+    super::tests::connector_caller(&app, "changed-client", "changed-grant", ControlAccess::FullAccess).await;
+    let caller = ControlCaller::outside("changed-client".into(), "changed-grant".into(), ControlAccess::Supervised);
+    let standing = super::NativeControlGuard { caller, workspace_id: workspace.clone(), thread_id: thread, provider: ProviderKind::Claude, admission: None };
+    let refusal = super::service::authority_refusal(app.handle(), &standing).map(|error| error.code);
+    assert_eq!(refusal, Some(ErrorCode::GrantChanged));
 
-    let (waiting, release) = recorder.hold_next_answer();
-    let answering = answer_in_background(&app, &bot, answer(&workspace, &thread, "revoked-answer", "storage"));
-    reaches(&waiting, "delivery").await;
-    crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "answer-client".into()).unwrap();
-    release.notify_one();
+    for (case, code) in [("revoked", ErrorCode::GrantRevoked), ("paused", ErrorCode::ConnectorDisabled)] {
+        let thread = launched(&app, &format!("{case}-launch"), &workspace, "default").await;
+        ask(&app, &thread, "t1", "storage");
+        let client = format!("{case}-client");
+        let bot = super::tests::connector_caller(&app, &client, &format!("{case}-grant"), ControlAccess::FullAccess).await;
 
-    // Codemux refused it, not the worker: answering again would not help.
-    refused(answering.await.unwrap(), ErrorCode::GrantRevoked);
-    assert!(recorder.overrides.lock().unwrap().is_empty(), "the answer never reached the worker");
-    let (_, resolution) = app.state::<DatabaseStore>().async_question(&thread, "storage").unwrap();
-    assert!(matches!(resolution, QuestionResolution::Failed { .. }), "the person can still answer it: {resolution:?}");
+        let (waiting, release) = recorder.hold_next_answer();
+        let answering = answer_in_background(&app, &bot, answer(&workspace, &thread, &format!("{case}-answer"), "storage"));
+        reaches(&waiting, "delivery").await;
+        if code == ErrorCode::GrantRevoked {
+            crate::mcp_connector::agent_connector_revoke(app.handle().clone(), client).unwrap();
+        } else {
+            super::tests::connector_off(&app);
+        }
+        release.notify_one();
+
+        // Codemux refused it, not the worker: answering again would not help.
+        let error = answering.await.unwrap().expect_err("the answer must be refused");
+        assert_eq!(error.code, code, "{case}: {error}");
+        assert!(recorder.overrides.lock().unwrap().is_empty(), "{case}: the answer never reached the worker");
+        let (_, resolution) = app.state::<DatabaseStore>().async_question(&thread, "storage").unwrap();
+        assert!(matches!(resolution, QuestionResolution::Failed { .. }), "{case}: the person can still answer it: {resolution:?}");
+    }
     super::tests::connector_off(&app);
 }
 

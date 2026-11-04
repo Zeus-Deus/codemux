@@ -396,7 +396,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
      → {"question_id": "…", "turn_id": "c41b…", "operation_id": "…", "state": "succeeded", …}
      ```
 
-     An answer never changes the thread's permission mode. `question_closed` means someone answered or dismissed it already. `question_answer_failed` means the answer wasn't delivered, or its delivery isn't confirmed. If the message says the worker didn't take the answer, you can answer again with a new `client_request_id`. Otherwise don't: the person settles it in Codemux. If Codemux refused the answer because your access no longer covers the thread, you get that reason instead: `grant_revoked`, `permission_ceiling` or `permission_state_unconfirmed`. Answering again won't help until the person changes that.
+     An answer never changes the thread's permission mode. `question_closed` means someone answered or dismissed it already. `question_answer_failed` means the answer wasn't delivered, or its delivery isn't confirmed. If the message says the worker didn't take the answer, you can answer again with a new `client_request_id`. Otherwise don't: the person settles it in Codemux. If Codemux refused the answer because your access no longer covers the thread, you get that reason instead: `connector_disabled`, `grant_revoked`, `grant_changed`, `permission_ceiling` or `permission_state_unconfirmed`. Answering again won't help until the person changes that.
    - **Secrets** (`pending.secrets`): only the person can enter a secret, in Codemux. You see its label and reason, never a value. Tell the person, then wait again.
 
 6. **Read more, or follow up.**
