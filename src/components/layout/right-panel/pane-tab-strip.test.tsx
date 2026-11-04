@@ -31,6 +31,13 @@ const TABS: DeckTab[] = [
   },
 ];
 
+/** Enough extra tabs that the run overflows even with every tab icon-only. */
+const EXTRA_TABS: DeckTab[] = Array.from({ length: 20 }, (_, i) => ({
+  id: `doc:/p/extra-${i}.md`,
+  label: `extra-${i}.md`,
+  icon: FileText,
+}));
+
 function renderStrip(
   overrides: Partial<React.ComponentProps<typeof PaneTabStrip>> = {},
 ) {
@@ -331,7 +338,7 @@ describe("PaneTabStrip — overflow", () => {
       configurable: true,
       get() {
         const id = (this as HTMLElement).dataset?.testid;
-        if (id === "right-panel-pane-actions") return 100;
+        if (id === "right-panel-pane-actions") return 110;
         if (
           id === "right-panel-add-pane" ||
           id === "right-panel-pane-actions-more" ||
@@ -346,10 +353,12 @@ describe("PaneTabStrip — overflow", () => {
       configurable: true,
       get() {
         const id = (this as HTMLElement).dataset?.testid;
-        if (id === "right-panel-pane-actions") return 100;
+        if (id === "right-panel-pane-actions") return 110;
         if (id === "right-panel-tabs-scroll" || id === "right-panel-tabs-content") {
-          // The labelled run is 230px; icon-only it is 120px.
-          return document.querySelector("[data-compact]") ? 120 : 230;
+          // Labelled, the run is 260px. Compact, it depends on how the
+          // active tab is fitted too: 172px with its count, 132px without.
+          if (!document.querySelector("[data-compact]")) return 260;
+          return document.querySelector('[data-state="active"][data-fit]') ? 132 : 172;
         }
         return 0;
       },
@@ -363,19 +372,37 @@ describe("PaneTabStrip — overflow", () => {
         return 0;
       },
     });
+    // The active chip measures 120px with its count, 80px without.
+    const rect = Object.getOwnPropertyDescriptor(Element.prototype, "getBoundingClientRect")!;
+    Object.defineProperty(Element.prototype, "getBoundingClientRect", {
+      configurable: true,
+      value(this: Element) {
+        const el = this as HTMLElement;
+        const width = el.hasAttribute("data-tab-badge")
+          ? 33
+          : el.getAttribute("data-state") === "active" && el.hasAttribute("data-tab-id")
+            ? el.querySelector("[data-tab-badge]") ? 120 : 80
+            : 0;
+        return { left: 0, right: width, width, top: 0, bottom: 26, height: 26, x: 0, y: 0, toJSON() {} } as DOMRect;
+      },
+    });
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       for (header = 400; header <= 800; header += 5) {
-        const { unmount } = renderStrip({
-          actions: <button type="button" aria-label="Refresh">R</button>,
-        });
-        unmount();
+        for (const activeTab of ["files", "changes"] as const) {
+          const { unmount } = renderStrip({
+            activeTab,
+            actions: <button type="button" aria-label="Refresh">R</button>,
+          });
+          unmount();
+        }
       }
       const loops = errors.mock.calls.filter((call) =>
         String(call[0]).includes("Maximum update depth"),
       );
       expect(loops).toEqual([]);
     } finally {
+      Object.defineProperty(Element.prototype, "getBoundingClientRect", rect);
       errors.mockRestore();
       delete (proto as unknown as Record<string, unknown>).scrollWidth;
       delete (proto as unknown as Record<string, unknown>).clientWidth;
@@ -432,6 +459,66 @@ describe("PaneTabStrip — overflow", () => {
       badgeWidth = 400;
       rerender(strip());
       expect(active()).toHaveAttribute("data-fit");
+    } finally {
+      Object.defineProperty(Element.prototype, "getBoundingClientRect", rect);
+      restore();
+    }
+  });
+
+  // A component badge (Review's PR status) is sized by what its props point
+  // at. Hidden by the fit, it can't be measured, so a different PR or
+  // workspace has to count as a new badge and be measured afresh.
+  it("re-measures a hidden component badge when its props change", () => {
+    const restore = stubLayout({ header: 600, tabs: 700, scroller: 100 });
+    const rect = Object.getOwnPropertyDescriptor(Element.prototype, "getBoundingClientRect")!;
+    const widths: Record<string, number> = { "1": 400, "2": 10 };
+    Object.defineProperty(Element.prototype, "getBoundingClientRect", {
+      configurable: true,
+      value(this: Element) {
+        const el = this as HTMLElement;
+        const badge = el.querySelector?.("[data-pr]") as HTMLElement | null;
+        const own = el.hasAttribute("data-tab-badge")
+          ? widths[(el.querySelector("[data-pr]") as HTMLElement | null)?.dataset.pr ?? ""] ?? 0
+          : el.getAttribute("data-state") === "active" && el.hasAttribute("data-tab-id")
+            ? 80 + (badge ? widths[badge.dataset.pr ?? ""] ?? 0 : 0)
+            : 0;
+        return { left: 0, right: own, width: own, top: 0, bottom: 26, height: 26, x: 0, y: 0, toJSON() {} } as DOMRect;
+      },
+    });
+    function PrBadge({ prNumber }: { prNumber: number }) {
+      return <span data-pr={String(prNumber)}>#{prNumber}</span>;
+    }
+    const strip = (prNumber: number) => (
+      <TooltipProvider>
+        <PaneTabStrip
+          tabs={TABS.map((tab) =>
+            tab.id === "changes" ? { ...tab, badge: <PrBadge prNumber={prNumber} /> } : tab,
+          )}
+          activeTab="changes"
+          onSelect={() => {}}
+          onClose={() => {}}
+          onCloseMany={() => {}}
+          onReorder={() => {}}
+          surfaces={[]}
+          onOpenFile={() => {}}
+          openFileKeys=""
+          inTitlebar
+          onToggleExpand={() => {}}
+          expanded={false}
+          onCollapsePanel={() => {}}
+        />
+      </TooltipProvider>
+    );
+    try {
+      const { rerender } = render(strip(1));
+      const active = () => screen.getByTestId("changes-tab");
+      // PR 1's badge is too wide: the fit hides it.
+      expect(active()).toHaveAttribute("data-fit");
+      expect(active().querySelector("[data-pr]")).toBeNull();
+      // Another PR, same tab set: its narrower badge is measured and shown.
+      rerender(strip(2));
+      expect(active()).not.toHaveAttribute("data-fit");
+      expect(active().querySelector('[data-pr="2"]')).not.toBeNull();
     } finally {
       Object.defineProperty(Element.prototype, "getBoundingClientRect", rect);
       restore();
@@ -760,13 +847,16 @@ describe("PaneTabStrip — overflow", () => {
 
     it("adds an All tabs button beside inline actions, budgeted in the row", async () => {
       const restore = stubLayout({
-        header: 2000,
+        header: 600,
         tabs: 2500,
         scroller: 400,
         actions: 50,
       });
       try {
-        const { onSelect } = renderStrip({ actions });
+        const { onSelect } = renderStrip({
+          actions,
+          tabs: [...EXTRA_TABS, ...TABS],
+        });
         // The actions stay inline; only the tabs needed help.
         expect(screen.getByTestId("right-panel-pane-actions")).toHaveTextContent(
           "Refresh",
@@ -799,7 +889,7 @@ describe("PaneTabStrip — overflow", () => {
 
     it("starts keyboard navigation from the active tab when it is not first", async () => {
       const restore = stubLayout({
-        header: 2000,
+        header: 600,
         tabs: 2500,
         scroller: 400,
         actions: 50,
@@ -808,6 +898,7 @@ describe("PaneTabStrip — overflow", () => {
         const user = userEvent.setup();
         const { onSelect } = renderStrip({
           actions,
+          tabs: [...EXTRA_TABS, ...TABS],
           activeTab: "doc:/p/README.md",
         });
         screen.getByLabelText("All tabs").focus();
@@ -845,14 +936,14 @@ describe("PaneTabStrip — overflow", () => {
     // Picking the tab that is already active must still bring it back into
     // view — the user may have panned it behind the fade.
     it("scrolls a picked tab into view even when it is already active", async () => {
-      const restore = stubLayout({ header: 2000, tabs: 2500, scroller: 400 });
+      const restore = stubLayout({ header: 600, tabs: 2500, scroller: 400 });
       const scrollIntoView = vi.fn();
       Object.defineProperty(Element.prototype, "scrollIntoView", {
         value: scrollIntoView,
         configurable: true,
       });
       try {
-        const { chip } = renderStrip();
+        const { chip } = renderStrip({ tabs: [...EXTRA_TABS, ...TABS] });
         scrollIntoView.mockClear();
         fireEvent.click(screen.getByLabelText("All tabs"));
         const popover = await screen.findByTestId(

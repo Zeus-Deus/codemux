@@ -921,12 +921,13 @@ describe("SidebarInboxCard — meta line", () => {
   });
 
   // jsdom has no layout, so this pins the rule rather than the pixels: the
-  // branch's readable floor is capped at a share of the row, so a 180px
-  // sidebar still truncates it to make room for the PR chip and marks.
-  it("caps the branch's floor so a narrow rail can still truncate it", () => {
+  // branch has no width floor, so on a busy card it truncates rather than
+  // pushing the PR chip and marks past the card's clipped edge.
+  it("lets the branch give way to the trailing metadata", () => {
     const { container } = renderCard();
     const branch = within(metaLine(container)).getByText("main");
-    expect(branch).toHaveClass("min-w-[min(8ch,30%)]", "truncate");
+    expect(branch).toHaveClass("min-w-0", "truncate");
+    expect(branch.className).not.toMatch(/min-w-\[/);
   });
 });
 
