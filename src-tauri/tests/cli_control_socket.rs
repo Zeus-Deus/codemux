@@ -621,3 +621,16 @@ fn connector_tokens_issue_list_and_revoke() {
     assert_eq!(status["result"]["clients"], json!([]), "{status}");
     assert_eq!(status["result"]["enabled"], true, "revoke --all leaves the door on: {status}");
 }
+
+/// Settings and the guide print setup commands from these two fields.
+#[test]
+fn connector_status_names_the_executable_outside_assistants_launch() {
+    let serve = Serve::start();
+    let status = serve.ok(&["connector", "status", "--json"])["result"].clone();
+    let executable = status["localExecutable"].as_str().expect("localExecutable");
+    // This serve's PATH has no `codemux`, so it names the binary itself.
+    assert!(Path::new(executable).is_absolute(), "{status}");
+    assert_eq!(std::fs::canonicalize(executable).unwrap(), std::fs::canonicalize(CODEMUX).unwrap());
+    let command = status["localCommand"].as_str().expect("localCommand");
+    assert!(command.ends_with(" mcp") && command.contains(executable), "{status}");
+}

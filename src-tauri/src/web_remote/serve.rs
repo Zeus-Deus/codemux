@@ -415,6 +415,7 @@ mod tests {
             bind_error: (!running).then(|| "bind 127.0.0.1:4378: Address in use".into()),
             local_url: running.then(|| "http://127.0.0.1:4378/mcp".into()),
             mcp_url: None,
+            local_executable: "codemux".into(),
             local_command: "codemux mcp".into(),
             revoked_grants: None,
             pending: Vec::new(),

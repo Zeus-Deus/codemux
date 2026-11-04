@@ -2297,12 +2297,8 @@ mod tests {
         assert!(response.ok,"{:?}",response.error);
         let status = response.data.unwrap();
         let fields: std::collections::BTreeSet<_> = status.as_object().unwrap().keys().map(String::as_str).collect();
-        // The connector's own listener work adds fields; this pins only what
-        // must be there and what may be.
-        let allowed = ["clients","enabled","bindError","listenerRunning","localCommand","localExecutable","localUrl","mcpUrl","pending","port","publicOrigin","revokedGrants"];
-        let required = ["clients","enabled","listenerRunning","localCommand","mcpUrl","pending","publicOrigin"];
-        assert!(fields.iter().all(|field| allowed.contains(field)),"unexpected status fields: {fields:?}");
-        assert!(required.iter().all(|field| fields.contains(field)),"missing status fields: {fields:?}");
+        // `revokedGrants` appears only in set_config replies.
+        assert_eq!(fields, ["bindError","clients","enabled","listenerRunning","localCommand","localExecutable","localUrl","mcpUrl","pending","port","publicOrigin"].into());
         assert_eq!(status["enabled"],false);
         assert_eq!(status["listenerRunning"],false);
     }

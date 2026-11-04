@@ -161,6 +161,9 @@ pub struct ConnectorStatus {
     /// `http://127.0.0.1:<port>/mcp` while listening: what a proxy points at.
     pub local_url: Option<String>,
     pub mcp_url: Option<String>,
+    /// The `codemux` outside assistants launch for local setup, unquoted.
+    pub local_executable: String,
+    /// `<local_executable, shell-quoted> mcp`.
     pub local_command: String,
     /// Only in `agent_connector_set_config` replies: grants an address change revoked.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -265,6 +268,44 @@ fn issuer_port<R: Runtime>(app: &AppHandle<R>, cfg: &Config) -> u16 {
 }
 fn local_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/mcp")
+}
+
+/// The `codemux` outside assistants should launch. The bare name when it
+/// resolves on PATH to this same binary, so a saved entry survives upgrades;
+/// otherwise the durable absolute path (an AppImage's wrapper path survives
+/// the app exiting, not an upgrade).
+pub(crate) fn outside_executable() -> String {
+    let running = crate::mcp_server::codemux_mcp_command();
+    stable_executable(which::which("codemux").ok(), std::path::Path::new(&running))
+}
+
+fn stable_executable(on_path: Option<std::path::PathBuf>, running: &std::path::Path) -> String {
+    let same_binary = || {
+        let found = on_path.and_then(|path| std::fs::canonicalize(path).ok());
+        found.is_some() && found == std::fs::canonicalize(running).ok()
+    };
+    // Clients started from a Windows GUI do not share one PATH reliably.
+    if cfg!(not(windows)) && same_binary() {
+        return "codemux".into();
+    }
+    running.display().to_string()
+}
+
+/// One shell word for `executable`, quoted only when a shell would split or
+/// expand it: Windows-looking paths get double quotes, everything else POSIX
+/// single quotes. Settings quotes the same way (`outside-assistants-setup.ts`).
+fn quoted_command(executable: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+    let bytes = executable.as_bytes();
+    let windows_path = executable.starts_with(r"\\")
+        || (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/'));
+    if !executable.is_empty() && executable.chars().all(safe) {
+        executable.into()
+    } else if windows_path {
+        format!("\"{executable}\"")
+    } else {
+        format!("'{}'", executable.replace('\'', r"'\''"))
+    }
 }
 
 /// Serving: enabled and the own listener bound. The port is the bound one,
@@ -393,6 +434,8 @@ pub(crate) fn apply_config<R: Runtime>(
 
 #[tauri::command]
 pub fn agent_connector_status<R: Runtime>(app: AppHandle<R>) -> Result<ConnectorStatus, String> {
+    // Reads PATH and the filesystem; done before taking the lock.
+    let local_executable = outside_executable();
     let state = app.state::<McpConnectorState>();
     let mut auth = state.auth.lock().map_err(|_| "Connector unavailable")?;
     let db = app.state::<DatabaseStore>();
@@ -465,7 +508,8 @@ pub fn agent_connector_status<R: Runtime>(app: AppHandle<R>) -> Result<Connector
         bind_error,
         local_url: running.then(|| local_url(bound)),
         mcp_url: (cfg.enabled && running).then(|| format!("{issuer}/mcp")),
-        local_command: "codemux mcp".into(),
+        local_command: format!("{} mcp", quoted_command(&local_executable)),
+        local_executable,
         revoked_grants: None,
         pending,
         clients,
@@ -991,6 +1035,55 @@ mod tests {
         assert!(agent_connector_issue(handle.clone(), "bot".into(), ControlAccess::ReadOnly, Some(0)).is_err());
         assert!(agent_connector_issue(handle.clone(), "bot".into(), ControlAccess::ReadOnly, Some(365 * 24 + 1)).is_err());
         set(handle, false, None, None).unwrap();
+    }
+
+    #[test]
+    fn status_reports_the_durable_local_executable() {
+        let app = app();
+        let status = agent_connector_status(app.handle().clone()).unwrap();
+        assert_eq!(status.local_executable, outside_executable());
+        assert_eq!(status.local_command, format!("{} mcp", quoted_command(&status.local_executable)));
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["localExecutable"], status.local_executable.as_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_executable_prefers_the_path_name_only_for_the_same_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("codemux-real");
+        let other = dir.path().join("codemux-other");
+        std::fs::write(&binary, "binary").unwrap();
+        std::fs::write(&other, "another binary").unwrap();
+        let on_path = dir.path().join("codemux");
+        std::os::unix::fs::symlink(&binary, &on_path).unwrap();
+        let absolute = binary.display().to_string();
+
+        assert_eq!(stable_executable(Some(on_path.clone()), &binary), "codemux", "PATH reaches this binary");
+        assert_eq!(stable_executable(Some(binary.clone()), &on_path), "codemux", "the running path is a link to it");
+        assert_eq!(stable_executable(Some(other), &binary), absolute, "PATH names another install");
+        assert_eq!(stable_executable(None, &binary), absolute, "codemux is not on PATH");
+        let gone = dir.path().join("deleted");
+        assert_eq!(stable_executable(Some(on_path), &gone), gone.display().to_string());
+    }
+
+    #[test]
+    fn quoted_command_quotes_only_when_needed() {
+        for (executable, quoted) in [
+            ("codemux", "codemux"),
+            ("/usr/bin/codemux", "/usr/bin/codemux"),
+            ("/home/me/Apps/Codemux-1.2.AppImage", "/home/me/Apps/Codemux-1.2.AppImage"),
+            ("/opt/My Apps/codemux", "'/opt/My Apps/codemux'"),
+            ("/home/o'neil/codemux", r"'/home/o'\''neil/codemux'"),
+            ("/tmp/$HOME/codemux", "'/tmp/$HOME/codemux'"),
+            (r"C:\Program Files\Codemux\codemux.exe", r#""C:\Program Files\Codemux\codemux.exe""#),
+            ("C:/Codemux/codemux.exe", "C:/Codemux/codemux.exe"),
+            ("C:/My Apps/codemux.exe", r#""C:/My Apps/codemux.exe""#),
+            (r"\\server\share\codemux.exe", r#""\\server\share\codemux.exe""#),
+            ("", "''"),
+        ] {
+            assert_eq!(quoted_command(executable), quoted, "{executable}");
+        }
     }
 
     #[test]
