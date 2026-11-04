@@ -35,6 +35,8 @@
 //!         and holds the turn until the client answers it: the answer's
 //!         option id (or `cancelled`) is streamed as `permission:<id>`, then
 //!         the turn ends. A `session/cancel` ends it as cancelled.
+//!         `hold-permission-after:<ms>` first works for `<ms>` (reading no
+//!         input meanwhile), so a client can be waiting before it asks.
 //!       * `await-cancel` holds the turn open — it responds only once a
 //!         `session/cancel` notification arrives, and then with
 //!         `stopReason: cancelled`. A client that never delivers the
@@ -144,6 +146,13 @@ fn prompt_text(params: &Value) -> String {
 
 fn requested_chunk_count(text: &str) -> Option<usize> {
     let rest = text.split_once("chunks:")?.1;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// `<ms>` in `hold-permission-after:<ms>`.
+fn requested_permission_delay(text: &str) -> Option<u64> {
+    let rest = text.split_once("hold-permission-after:")?.1;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
 }
@@ -359,6 +368,9 @@ fn main() {
                 }
                 if text.contains("hold-permission") {
                     // Checked before `permission`, which it contains.
+                    if let Some(ms) = requested_permission_delay(&text) {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
                     next_request_id += 1;
                     write_line(&json!({
                         "jsonrpc": "2.0",

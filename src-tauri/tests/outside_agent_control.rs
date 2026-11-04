@@ -220,12 +220,19 @@ fn boot() -> World {
     Box::leak(Box::new(app));
 
     eventually("the control socket answers", Duration::from_secs(30), || env.cli(&["json", "status", "{}"], &[]).status.success());
-    let mut status = None;
-    eventually("the connector listens", Duration::from_secs(10), || {
-        status = mcp_connector::agent_connector_status(handle.clone()).ok().filter(|status| status.listener_running);
-        status.is_some()
-    });
-    let mcp_url = status.and_then(|status| status.local_url).expect("the connector's local URL");
+    // Setup bound the saved port. Something may have taken it since it was
+    // probed; then move the connector to another free port (the bind is
+    // synchronous, so the status says at once whether it listens).
+    let mut status = mcp_connector::agent_connector_status(handle.clone()).expect("the connector's status");
+    for _ in 0..8 {
+        if status.listener_running {
+            break;
+        }
+        status = mcp_connector::agent_connector_set_config(handle.clone(), true, None, Some(free_loopback_port()))
+            .expect("move the connector to a free port");
+    }
+    assert!(status.listener_running, "the connector never bound a free loopback port: {:?}", status.bind_error);
+    let mcp_url = status.local_url.expect("the connector's local URL");
 
     let mut fixture = StdioDoor::named(&env, "fixture", None);
     let opened = fixture
@@ -774,6 +781,38 @@ fn send(door: &mut dyn Door, workspace: &str, thread: &str, message: &str, key: 
     turn_of(&settled)
 }
 
+/// The thread's status once `turn` (else any run) has begun at the provider.
+/// A launch or send receipt can succeed before a queued adapter dispatches
+/// the run. The run's start changes the wait cursor, so a wait parked before
+/// it would answer then instead of staying parked.
+fn until_started(door: &mut dyn Door, workspace: &str, thread: &str, turn: Option<&str>) -> Value {
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        let status = door.ok("thread_status", json!({"workspace_id": workspace, "thread_id": thread}));
+        let current = status["turn_id"].as_str();
+        if current.is_some() && (turn.is_none() || current == turn) {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "the run never started: {status}");
+        std::thread::sleep(door.poll());
+    }
+}
+
+/// A `thread_wait` meant to park. A probe of the same client can hold the
+/// last wait slot for a moment, so a refusal for the waiter budget is
+/// retried, for a bounded time.
+fn parked_wait(door: &mut dyn Door, wait: &Value) -> Result<Value, ToolError> {
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        match door.call("thread_wait", wait.clone()) {
+            Err(error) if error.code == "wait_budget_exhausted" && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// The thread's status once its run needs input. A wait without `since`
 /// does not return for input already pending when it starts, so this reads
 /// the status first and then waits for the next change, as the guide says.
@@ -875,6 +914,7 @@ fn stdio_door_drives_the_full_outside_flow() {
 
     // A held run: a short wait times out without ending it; an interrupt does.
     let held = send(&mut door, &workspace, &thread, "await-cancel", &format!("hold-{t}")).expect("the held run");
+    until_started(&mut door, &workspace, &thread, Some(&held));
     let early = door.wait(&workspace, &thread, Some(&held), 500);
     assert_eq!((early["timed_out"].clone(), early["state"].clone()), (json!(true), json!("running")), "{early}");
     let interrupted = door.run("thread_interrupt", json!({"workspace_id": workspace, "thread_id": thread, "turn_id": held,
@@ -1024,6 +1064,25 @@ fn read_only_credentials_cannot_mutate_on_either_door() {
         assert!(rows.is_empty(), "{principal}: {rows:?}");
     }
     assert_eq!(worktrees_on(&w.repo, &format!("ro-{t}")), 0);
+
+    // `codemux mcp` also serves the legacy write tools, which run locally:
+    // a read-only connection must not commit, even with a change staged.
+    let mut cleanup = Cleanup::default();
+    let name = format!("ro-git-{t}");
+    let checkout = w.root.join("folders").join(&name);
+    std::fs::create_dir_all(&checkout).unwrap();
+    git(&checkout, &["init", "-q"]);
+    git(&checkout, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+    std::fs::write(checkout.join("staged.txt"), "staged\n").unwrap();
+    git(&checkout, &["add", "staged.txt"]);
+    let head = git(&checkout, &["rev-parse", "HEAD"]);
+    let target = w.fresh_workspace(&name, &mut cleanup);
+    let mut call = json!({"name": "git_commit", "arguments": {"message": "x"}, "_meta": {}});
+    call["_meta"][codemux_lib::mcp::WORKSPACE_META_KEY] = json!(target);
+    let id = stdio.send("tools/call", call);
+    let refused = tool_result(&stdio.response(id, Duration::from_secs(20))["result"]).expect_err("a read-only git_commit");
+    assert_eq!(refused.code, "access_denied", "{refused:?}");
+    assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), head, "the staged change was committed");
 }
 
 #[test]
@@ -1063,25 +1122,34 @@ fn token_revoked_mid_wait_ends_the_wait_with_grant_revoked() {
     let label = format!("rev-{t}");
     let mut door = w.http(&w.issue(&label, ControlAccess::FullAccess));
     let workspace = w.repo_workspace.clone();
-    let (thread, _) = launch(&mut door, &workspace, "agent", "await-cancel", &format!("launch-{t}"));
+    let (thread, turn) = launch(&mut door, &workspace, "agent", "await-cancel", &format!("launch-{t}"));
     cleanup.threads.push((workspace.clone(), thread.clone()));
+    until_started(&mut door, &workspace, &thread, turn.as_deref());
 
-    let waiter = {
-        let mut door = door.clone();
-        let (workspace, thread) = (workspace.clone(), thread.clone());
-        std::thread::spawn(move || {
-            let result = door.call("thread_wait", json!({"workspace_id": workspace, "thread_id": thread, "timeout_ms": 60_000}));
-            (result, Instant::now())
+    // Every wait this client may hold, so a refused extra one proves they all
+    // parked: a request that reached the connector after the revoke would get
+    // a 401 instead of a wait to end.
+    let wait = json!({"workspace_id": workspace, "thread_id": thread, "timeout_ms": 60_000});
+    let waiters: Vec<_> = (0..WAITS_PER_CLIENT)
+        .map(|_| {
+            let (mut door, wait) = (door.clone(), wait.clone());
+            std::thread::spawn(move || (parked_wait(&mut door, &wait), Instant::now()))
         })
-    };
-    // Let the wait park before the revoke.
-    std::thread::sleep(Duration::from_millis(500));
+        .collect();
+    let mut probe = wait.clone();
+    probe["timeout_ms"] = json!(1);
+    eventually("every wait parked", Duration::from_secs(10), || {
+        door.call("thread_wait", probe.clone()).err().is_some_and(|error| error.code == "wait_budget_exhausted")
+    });
     let revoked_at = Instant::now();
     let revoked = w.cli(&["connector", "revoke", &label, "--json"], &[]);
     assert_eq!(exit_code(&revoked), 0, "{}", describe(&revoked));
-    let (result, returned_at) = waiter.join().unwrap();
-    assert_eq!(result.expect_err("the wait ends with the grant").code, "grant_revoked");
-    assert!(returned_at.duration_since(revoked_at) < Duration::from_secs(5), "the wait ended {:?} after the revoke", returned_at.duration_since(revoked_at));
+    for waiter in waiters {
+        let (result, returned_at) = waiter.join().unwrap();
+        assert_eq!(result.expect_err("the wait ends with the grant").code, "grant_revoked");
+        let after = returned_at.duration_since(revoked_at);
+        assert!(after < Duration::from_secs(5), "a wait ended {after:?} after the revoke");
+    }
     assert_eq!(door.ping(), 401);
 
     // The owner can still stop what the revoked client started.
@@ -1096,25 +1164,34 @@ fn parked_http_waits_release_permits_and_respect_the_waiter_budget() {
     let t = tag();
     let mut cleanup = Cleanup::default();
     let mut door = w.http(&w.issue(&format!("budget-{t}"), ControlAccess::FullAccess));
+    // A second client: two full budgets park as many waits as the connector
+    // has request permits (16), so a wait that kept its permit would leave
+    // none for the calls below.
+    let mut other = w.http(&w.issue(&format!("budget-b-{t}"), ControlAccess::FullAccess));
     let workspace = w.repo_workspace.clone();
     let (thread, turn) = launch(&mut door, &workspace, "agent", "await-cancel", &format!("launch-{t}"));
     cleanup.threads.push((workspace.clone(), thread.clone()));
+    until_started(&mut door, &workspace, &thread, turn.as_deref());
     let wait = json!({"workspace_id": workspace, "thread_id": thread, "timeout_ms": 60_000});
-    let parked: Vec<_> = (0..WAITS_PER_CLIENT)
-        .map(|_| {
-            let (mut door, wait) = (door.clone(), wait.clone());
-            std::thread::spawn(move || door.call("thread_wait", wait))
+    let parked: Vec<_> = [&door, &other]
+        .into_iter()
+        .flat_map(|client| std::iter::repeat_n(client, WAITS_PER_CLIENT))
+        .map(|client| {
+            let (mut client, wait) = (client.clone(), wait.clone());
+            std::thread::spawn(move || parked_wait(&mut client, &wait))
         })
         .collect();
-    std::thread::sleep(Duration::from_millis(500));
     let mut probe = wait.clone();
     probe["timeout_ms"] = json!(1);
-    eventually("one more wait is refused", Duration::from_secs(10), || {
-        door.call("thread_wait", probe.clone()).err().is_some_and(|error| error.code == "wait_budget_exhausted")
-    });
-    // Parked waits hold no request permits: the same client is still served.
+    for client in [&mut door, &mut other] {
+        eventually("one more wait is refused", Duration::from_secs(10), || {
+            client.call("thread_wait", probe.clone()).err().is_some_and(|error| error.code == "wait_budget_exhausted")
+        });
+    }
+    // Parked waits hold no request permits: both clients are still served.
     assert_eq!(door.rpc("tools/list", json!({})).0, 200);
     door.ok("thread_status", json!({"workspace_id": workspace, "thread_id": thread}));
+    assert_eq!(other.rpc("tools/list", json!({})).0, 200);
 
     let interrupted_at = Instant::now();
     let mut interrupt = json!({"workspace_id": workspace, "thread_id": thread, "client_request_id": format!("int-{t}")});
@@ -1233,6 +1310,7 @@ fn interrupt_during_a_wait_on_one_stdio_connection() {
     let workspace = w.repo_workspace.clone();
     let (thread, turn) = launch(&mut door, &workspace, "agent", "await-cancel", &format!("launch-{t}"));
     cleanup.threads.push((workspace.clone(), thread.clone()));
+    until_started(&mut door, &workspace, &thread, turn.as_deref());
     let mut wait = json!({"workspace_id": workspace, "thread_id": thread, "timeout_ms": 60_000});
     let mut interrupt = json!({"workspace_id": workspace, "thread_id": thread, "client_request_id": format!("int-{t}")});
     if let Some(turn) = &turn {
@@ -1381,46 +1459,12 @@ fn agent_processes_are_refused_admin_and_native_tools() {
     let mut cleanup = Cleanup::default();
     let mut owner = StdioDoor::named(&w.env, &format!("agents-{t}"), None);
     let workspace = w.repo_workspace.clone();
-    let label = format!("agent-{t}");
     let list = json!({"workspace_id": workspace}).to_string();
     let approve = json!({"request_id": "x", "access": "full_access"}).to_string();
-    let runs = json!([
-        {"args": ["json", "agent_connector_approve", approve]},
-        {"args": ["json", "web_remote_pair", "{}"]},
-        {"args": ["connector", "issue", "--label", label, "--access", "full-access", "--json"]},
-        {"args": ["call", "thread_list", list]},
-        {"args": ["json", "status", "{}"]},
-    ]);
-    let web_before = w.cli_ok(&["json", "web_remote_status", "{}"])["data"]["running"].clone();
-    // The fake agent runs each command with no agent marker in its env: only
-    // its ancestry tells the app it is an agent.
-    let (thread, turn) = launch(&mut owner, &workspace, "agent", &format!("exec-codemux {runs}"), &format!("exec-{t}"));
-    cleanup.threads.push((workspace.clone(), thread.clone()));
-    let waited = owner.finish(&workspace, &thread, turn.as_deref());
-    assert_eq!((waited["state"].clone(), waited["final_text_truncated"].clone()), (json!("done"), json!(false)), "{waited}");
-    let results: Vec<Value> = serde_json::from_str(text(&waited["final_text"])).expect("the fake's run results");
-    for run in &results[..3] {
-        assert_eq!(run["code"], 1, "{run}");
-        assert!(text(&run["stdout"]).contains("admin_refused"), "{run}");
-    }
-    let called: Value = serde_json::from_str(text(&results[3]["stdout"])).unwrap();
-    assert_eq!((results[3]["code"].clone(), called["error"]["code"].clone()), (json!(1), json!("agent_identity_required")), "{called}");
-    assert_eq!(results[4]["code"], 0, "{}", results[4]);
-    // Nothing happened.
-    let status = mcp_connector::agent_connector_status(w.handle.clone()).unwrap();
-    assert!(!status.clients.iter().any(|client| client.label.as_deref() == Some(label.as_str())));
-    assert_eq!(w.cli_ok(&["json", "web_remote_status", "{}"])["data"]["running"], web_before);
-
-    // The env marker alone refuses too (the only signal off Linux).
-    let marker = [("CODEMUX_AGENT_PROCESS", "1")];
-    let marked = w.cli(&["json", "agent_connector_approve", &approve], &marker);
-    assert_eq!(exit_code(&marked), 1, "{}", describe(&marked));
-    assert!(String::from_utf8_lossy(&marked.stdout).contains("admin_refused"), "{}", describe(&marked));
-    let marked = w.cli(&["call", "thread_list", &list], &marker);
-    assert_eq!(stdout_json(&marked)["error"]["code"], "agent_identity_required", "{}", describe(&marked));
 
     // The chat's own credential keeps `mcp-call` (ACP prompts) working.
-    let turn = send(&mut owner, &workspace, &thread, "mcp-servers", &format!("servers-{t}"));
+    let (thread, turn) = launch(&mut owner, &workspace, "agent", "mcp-servers", &format!("servers-{t}"));
+    cleanup.threads.push((workspace.clone(), thread.clone()));
     let servers = owner.finish(&workspace, &thread, turn.as_deref());
     let servers: Value = serde_json::from_str(text(&servers["final_text"])).expect("the injected MCP servers");
     let (url, token) = servers
@@ -1435,6 +1479,49 @@ fn agent_processes_are_refused_admin_and_native_tools() {
     let listed = w.cli(&["mcp-call", "--list"], &[("CODEMUX_MCP_GATEWAY_URL", &url), ("CODEMUX_MCP_GATEWAY_TOKEN", &token)]);
     assert_eq!(exit_code(&listed), 0, "{}", describe(&listed));
     assert!(String::from_utf8_lossy(&listed.stdout).contains("thread_send"), "{}", describe(&listed));
+
+    // The env marker alone refuses (the only signal off Linux).
+    let marker = [("CODEMUX_AGENT_PROCESS", "1")];
+    let marked = w.cli(&["json", "agent_connector_approve", &approve], &marker);
+    assert_eq!(exit_code(&marked), 1, "{}", describe(&marked));
+    assert!(String::from_utf8_lossy(&marked.stdout).contains("admin_refused"), "{}", describe(&marked));
+    let marked = w.cli(&["call", "thread_list", &list], &marker);
+    assert_eq!(stdout_json(&marked)["error"]["code"], "agent_identity_required", "{}", describe(&marked));
+
+    #[cfg(target_os = "linux")]
+    refused_by_ancestry(w, &mut owner, &workspace, &thread, &t);
+}
+
+/// The fake agent runs each command with no agent marker in its env: only
+/// its process ancestry tells the app it is an agent. Linux only.
+#[cfg(target_os = "linux")]
+fn refused_by_ancestry(w: &World, owner: &mut StdioDoor, workspace: &str, thread: &str, t: &str) {
+    let label = format!("agent-{t}");
+    let list = json!({"workspace_id": workspace}).to_string();
+    let approve = json!({"request_id": "x", "access": "full_access"}).to_string();
+    let runs = json!([
+        {"args": ["json", "agent_connector_approve", approve]},
+        {"args": ["json", "web_remote_pair", "{}"]},
+        {"args": ["connector", "issue", "--label", label, "--access", "full-access", "--json"]},
+        {"args": ["call", "thread_list", list]},
+        {"args": ["json", "status", "{}"]},
+    ]);
+    let web_before = w.cli_ok(&["json", "web_remote_status", "{}"])["data"]["running"].clone();
+    let turn = send(owner, workspace, thread, &format!("exec-codemux {runs}"), &format!("exec-{t}"));
+    let waited = owner.finish(workspace, thread, turn.as_deref());
+    assert_eq!((waited["state"].clone(), waited["final_text_truncated"].clone()), (json!("done"), json!(false)), "{waited}");
+    let results: Vec<Value> = serde_json::from_str(text(&waited["final_text"])).expect("the fake's run results");
+    for run in &results[..3] {
+        assert_eq!(run["code"], 1, "{run}");
+        assert!(text(&run["stdout"]).contains("admin_refused"), "{run}");
+    }
+    let called: Value = serde_json::from_str(text(&results[3]["stdout"])).unwrap();
+    assert_eq!((results[3]["code"].clone(), called["error"]["code"].clone()), (json!(1), json!("agent_identity_required")), "{called}");
+    assert_eq!(results[4]["code"], 0, "{}", results[4]);
+    // Nothing happened.
+    let status = mcp_connector::agent_connector_status(w.handle.clone()).unwrap();
+    assert!(!status.clients.iter().any(|client| client.label.as_deref() == Some(label.as_str())));
+    assert_eq!(w.cli_ok(&["json", "web_remote_status", "{}"])["data"]["running"], web_before);
 }
 
 #[test]
@@ -1445,11 +1532,16 @@ fn approvals_from_outside_follow_the_access_level() {
     let mut owner = StdioDoor::named(&w.env, &format!("approver-{t}"), None);
     let workspace = w.repo_workspace.clone();
     // Ask mode: the fake's approval reaches the person (here, outside clients).
-    let (thread, turn) = launch(&mut owner, &workspace, "ask", &format!("hold-permission ap-{t}"), &format!("ap-{t}"));
+    // It asks 2 s into the run, so the wait below parks first.
+    let (thread, turn) =
+        launch(&mut owner, &workspace, "ask", &format!("hold-permission-after:2000 ap-{t}"), &format!("ap-{t}"));
     cleanup.threads.push((workspace.clone(), thread.clone()));
-    // Event-driven: the wait answers once the approval opens, not at its timeout.
+    let before = until_started(&mut owner, &workspace, &thread, turn.as_deref());
+    assert_eq!(before["state"], "running", "the approval opened before the wait could park: {before}");
+    // Event-driven: a parked wait answers once the approval opens, not at its timeout.
     let started = Instant::now();
-    let asking = until_input(&mut owner, &workspace, &thread);
+    let asking = owner.wait(&workspace, &thread, turn.as_deref(), 20_000);
+    assert_eq!((asking["state"].clone(), asking["timed_out"] == true), (json!("needs_input"), false), "{asking}");
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     let first = text(&asking["pending"]["approvals"][0]["request_id"]).to_owned();
     assert!(!first.is_empty(), "{asking}");
@@ -1644,6 +1736,8 @@ fn thread_launch_into_a_new_worktree_is_one_idempotent_operation() {
     assert_eq!(git(&w.repo, &["branch", "--list", &narrowed]), "");
 }
 
+/// Ancestry is the only signal here, and it is Linux-only.
+#[cfg(target_os = "linux")]
 #[test]
 fn user_scope_codemux_mcp_inside_an_agent_is_refused_admin() {
     let w = world();
