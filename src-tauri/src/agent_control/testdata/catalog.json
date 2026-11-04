@@ -310,7 +310,7 @@
         "additionalProperties": false,
         "properties": {
           "provider": {
-            "description": "Only this provider; its catalog is discovered if it has not been yet. Without it, only catalogs already discovered are listed.",
+            "description": "Only this provider. For a caller that can start threads, its catalog is discovered if it has not been yet; a read-only caller gets only catalogs Codemux has already read. Without it, only catalogs already discovered are listed.",
             "type": "string"
           },
           "workspace_id": {
@@ -765,7 +765,7 @@
         "additionalProperties": false,
         "properties": {
           "provider": {
-            "description": "Only this provider; its catalog is discovered if it has not been yet. Without it, only catalogs already discovered are listed.",
+            "description": "Only this provider. For a caller that can start threads, its catalog is discovered if it has not been yet; a read-only caller gets only catalogs Codemux has already read. Without it, only catalogs already discovered are listed.",
             "type": "string"
           },
           "workspace_id": {
@@ -1112,7 +1112,7 @@
         "additionalProperties": false,
         "properties": {
           "provider": {
-            "description": "Only this provider; its catalog is discovered if it has not been yet. Without it, only catalogs already discovered are listed.",
+            "description": "Only this provider. For a caller that can start threads, its catalog is discovered if it has not been yet; a read-only caller gets only catalogs Codemux has already read. Without it, only catalogs already discovered are listed.",
             "type": "string"
           },
           "workspace_id": {

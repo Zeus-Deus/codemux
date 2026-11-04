@@ -308,7 +308,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
    It returns each provider's `provider_instance_id`, its models, efforts and permission modes, and `allowed_permission_modes`: the modes your access level may use. Use only values it returns.
 
    - Name the `provider` you want. If Codemux hasn't read its catalog yet, it reads it now for a Supervised or Full access caller. That runs the provider's CLI, or for an ACP agent or Hermes opens a session and closes it without sending a prompt. No chat starts. A Read-only caller never starts this: it gets only catalogs Codemux has already read, and `catalog_not_discovered` for the others.
-   - Without `provider`, it lists every provider, but only the catalogs Codemux has already read. The others have the `discovery_error` `catalog_not_discovered`: ask for that provider alone.
+   - Without `provider`, it lists every provider, but only the catalogs Codemux has already read. The others have the `discovery_error` `catalog_not_discovered`: ask for that provider alone. A Read-only caller gets only catalogs Codemux has already read, even then.
    - Any other `discovery_error`, such as `provider_not_ready`, means that provider can't start yet.
 
 3. **Start a thread, in a new worktree if you like.**
@@ -468,7 +468,7 @@ Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` 
 
 | | Read-only | Supervised | Full access |
 |---|---|---|---|
-| Read workspaces, threads, providers and models; wait for results | Yes | Yes | Yes |
+| Read workspaces, threads, providers and models; wait for results | Yes, but only the model catalogs Codemux has already read | Yes | Yes |
 | Start threads, send messages, interrupt, stop, answer questions, run plugin actions | No | Yes, for threads in supervised permission modes | Yes |
 | Answer approvals | No | Deny only | Allow once or deny |
 | Open workspaces, create worktrees (also `thread_launch` with `worktree`), close and remove them | No | No | Yes |
