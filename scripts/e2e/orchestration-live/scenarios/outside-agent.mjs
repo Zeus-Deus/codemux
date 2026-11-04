@@ -706,7 +706,7 @@ async function userScope(ctx) {
     ctx.check("user-scope: nothing reached the receiver as a local client", outsiders.length === 0, outsiders);
     // In-app Codex turns its user-level codemux entry off (D7).
     const appServer = below(env.INIT_PID).map(cmdline).find((argv) => argv.some((arg) => arg === "app-server")
-      && argv.some((arg) => arg.includes('mcp_servers."codemux".enabled=false')));
+      && argv.some((arg) => arg === "mcp_servers.codemux.enabled=false"));
     ctx.check("user-scope: in-app Codex starts with the user's codemux entry disabled", !!appServer);
   } finally {
     if (added.includes("claude")) await sandboxRun(env, ["claude", "mcp", "remove", "--scope", "user", "codemux"], { timeoutSec: 120 }).catch(() => {});

@@ -85,9 +85,11 @@ fn switch_off_user_codemux_server(args: &mut Vec<String>, env: &HashMap<String, 
         .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok())
         .is_some_and(|config| codex_config_declares_codemux(&config));
     if declared {
-        // The key is quoted exactly as `managed_codex_args` quotes server names.
-        let key = serde_json::to_string(USER_CODEMUX_SERVER).unwrap_or_default();
-        args.extend(["-c".into(), format!("mcp_servers.{key}.enabled=false")]);
+        // Bare, never quoted: Codex splits a `-c` key on every `.` and keeps
+        // quote characters, so `mcp_servers."codemux"` names another server,
+        // `"codemux"` with no transport, and Codex then refuses to load its
+        // configuration at all ("invalid transport").
+        args.extend(["-c".into(), format!("mcp_servers.{USER_CODEMUX_SERVER}.enabled=false")]);
     }
 }
 
@@ -389,6 +391,10 @@ mod user_codemux_server_tests {
         assert_eq!(args, ["app-server"], "only a declared codemux entry is overridden");
         std::fs::write(home.path().join("config.toml"), "[mcp_servers.codemux]\ncommand = \"codemux\"\nargs = [\"mcp\"]\n").unwrap();
         switch_off_user_codemux_server(&mut args, &env);
-        assert_eq!(args, ["app-server", "-c", "mcp_servers.\"codemux\".enabled=false"]);
+        assert_eq!(args, ["app-server", "-c", "mcp_servers.codemux.enabled=false"]);
+        // Codex reads the key as its `.`-separated segments, quotes included,
+        // so each one must be the plain name it overrides.
+        let key = args[2].split_once('=').unwrap().0;
+        assert_eq!(key.split('.').collect::<Vec<_>>(), ["mcp_servers", USER_CODEMUX_SERVER, "enabled"]);
     }
 }
