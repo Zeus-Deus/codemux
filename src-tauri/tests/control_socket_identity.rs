@@ -105,6 +105,27 @@ impl Serve {
             .unwrap_or_else(|| panic!("`codemux json {command}` printed no reply:\n{}", self.log()))
     }
 
+    /// [`Serve::json`] as the owner, but a reply slower than `limit` fails
+    /// the test (the CLI is stopped by its pid) instead of hanging it.
+    fn json_within(&self, command: &str, params: &str, limit: Duration) -> Value {
+        let out = self.root.path().join(format!("{command}.reply"));
+        let mut cmd = Command::new(CODEMUX);
+        isolate(&mut cmd, self.root.path());
+        let stdout = std::fs::File::create(&out).unwrap();
+        let mut child = cmd.args(["json", command, params]).stdout(stdout).spawn().unwrap();
+        let deadline = Instant::now() + limit;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("`codemux json {command}` got no reply within {limit:?}:\n{}", self.log());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let reply = std::fs::read_to_string(&out).unwrap();
+        serde_json::from_str(&reply).unwrap_or_else(|_| panic!("`codemux json {command}` printed {reply:?}:\n{}", self.log()))
+    }
+
     /// Stops the serve and keeps its home. This test started it; stop it by
     /// its pid, and never signal a pid already reaped, which may be reused.
     fn stop(&mut self) {
@@ -326,6 +347,50 @@ fn setup_scripts_are_agent_processes() {
     }
     let owner = serve.json("agent_connector_status", "{}", &[]);
     assert_eq!(owner["ok"], true, "the owner keeps admin commands: {owner}");
+}
+
+/// A socket `rerun_setup`, and a socket close that runs a worktree's
+/// teardown, wait for their scripts, and a script may call `codemux` back.
+/// The server must still answer that call while the command waits, so the
+/// script gets its agent refusal and the command returns.
+#[test]
+fn socket_setup_and_teardown_scripts_can_call_codemux_back() {
+    let serve = Serve::start(&[]);
+    let root = serve.root.path();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "trunk"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+    let params = json!({ "repo_path": repo, "branch": "feat", "layout": "empty" });
+    let created = serve.json("create_worktree_workspace", &params.to_string(), &[]);
+    assert_eq!(created["ok"], true, "{created}");
+    let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
+    let checkout = Path::new(created["data"]["cwd"].as_str().unwrap()).to_path_buf();
+
+    // Written after creation, so only the commands below run these scripts.
+    // The refusal exits non-zero; the script still succeeds, so the command
+    // completes and the reply file is what this test checks.
+    let reply_file = |phase: &str| root.join(format!("{phase}.json"));
+    let script = |phase: &str| {
+        format!("'{CODEMUX}' json agent_connector_status '{{}}' > '{}' || true", reply_file(phase).display())
+    };
+    std::fs::create_dir_all(checkout.join(".codemux")).unwrap();
+    let config = json!({ "setup": [script("setup")], "teardown": [script("teardown")] });
+    std::fs::write(checkout.join(".codemux/config.json"), config.to_string()).unwrap();
+    let reply = |phase: &str| -> Value {
+        serde_json::from_str(&std::fs::read_to_string(reply_file(phase)).unwrap()).unwrap()
+    };
+
+    let limit = Duration::from_secs(60);
+    let rerun = serve.json_within("rerun_setup", &json!({ "workspace_id": id }).to_string(), limit);
+    assert_eq!(rerun["data"]["status"], "complete", "{rerun}");
+    let setup = reply("setup");
+    assert_eq!(error_code(&setup), "admin_refused", "the setup script was answered as an agent: {setup}");
+
+    let closed = serve.json_within("close_workspace", &json!({ "workspace_id": id }).to_string(), limit);
+    assert_eq!(closed["data"]["closed"], true, "{closed}");
+    let teardown = reply("teardown");
+    assert_eq!(error_code(&teardown), "admin_refused", "the teardown script was answered as an agent: {teardown}");
 }
 
 #[test]

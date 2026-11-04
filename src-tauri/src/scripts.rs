@@ -498,29 +498,36 @@ pub fn run_setup_scripts_with_config<R: Runtime>(
     )
 }
 
-pub fn run_teardown_scripts(
-    workspace_path: &Path,
-    workspace_name: &str,
-    workspace_id: &str,
-    db: Option<&DatabaseStore>,
-) -> Result<(), String> {
+/// The folder's teardown commands: its `.codemux/config.json`, else the
+/// project's saved scripts when `db` is given.
+pub fn teardown_commands(workspace_path: &Path, db: Option<&DatabaseStore>) -> Vec<String> {
     let config = if let Some(db) = db {
         read_effective_config(workspace_path, db)
     } else {
         read_workspace_config(workspace_path)
     };
+    config.map(|config| config.teardown).unwrap_or_default()
+}
 
-    let config = match config {
-        Some(c) if !c.teardown.is_empty() => c,
-        _ => return Ok(()),
-    };
+/// Runs `commands` (see [`teardown_commands`]) in order, stopping at the
+/// first failure. It blocks until they finish, so an async caller runs it on
+/// the blocking pool.
+pub fn run_teardown_scripts(
+    workspace_path: &Path,
+    workspace_name: &str,
+    workspace_id: &str,
+    commands: &[String],
+) -> Result<(), String> {
+    if commands.is_empty() {
+        return Ok(());
+    }
 
     let root_path = resolve_root_path(workspace_path);
     let mut env_vars = script_env(workspace_path, &root_path, None, None);
     env_vars.push(("CODEMUX_WORKSPACE_NAME", workspace_name.to_string()));
     env_vars.push(("CODEMUX_WORKSPACE_ID", workspace_id.to_string()));
 
-    for command in &config.teardown {
+    for command in commands {
         let output = run_script_command(command, workspace_path, &env_vars, TEARDOWN_SCRIPT)
             .map_err(|e| format!("Failed to run teardown command `{command}`: {e}"))?;
 
@@ -649,7 +656,7 @@ mod tests {
             let (folder, config) = (dir.path().to_path_buf(), config.clone());
             let run = std::thread::spawn(move || match name {
                 "setup" => run_setup_commands(&folder, "ws", "ws-1", &config, &folder, None, None, &mut |_| {}),
-                _ => run_teardown_scripts(&folder, "ws", "ws-1", None),
+                _ => run_teardown_scripts(&folder, "ws", "ws-1", &teardown_commands(&folder, None)),
             });
             let out = dir.path().join(format!("{name}.out"));
             let deadline = Instant::now() + Duration::from_secs(20);

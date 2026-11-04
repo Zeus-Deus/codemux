@@ -1775,17 +1775,20 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // meanwhile runs no teardown script and closes nothing.
     checkpoint.check()?;
     // Run teardown scripts before closing. Never for a chat child
-    // workspace: its folder is its parent's, still in use.
+    // workspace: its folder is its parent's, still in use. The scripts
+    // block until they finish, and one may call `codemux` back, so they run
+    // on the blocking pool: a blocked async worker can leave nobody polling
+    // the control socket to answer it.
     if !force && !hermes_pending {
-        if let Some(ref folder) = teardown {
-            if let Err(e) = crate::scripts::run_teardown_scripts(
-                Path::new(folder),
-                &ws_title,
-                &workspace_id,
-                Some(db),
-            ) {
-                return Err(format!("Teardown failed: {e}\nUse force delete to skip teardown."));
-            }
+        if let Some(folder) = teardown {
+            let commands = crate::scripts::teardown_commands(Path::new(&folder), Some(db));
+            let (title, id) = (ws_title.clone(), workspace_id.clone());
+            tokio::task::spawn_blocking(move || {
+                crate::scripts::run_teardown_scripts(Path::new(&folder), &title, &id, &commands)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("teardown task failed: {error}")))
+            .map_err(|e| format!("Teardown failed: {e}\nUse force delete to skip teardown."))?;
         }
     }
 
