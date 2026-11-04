@@ -35,25 +35,10 @@ fn hide_console_for_release_build() {
 
 #[cfg(all(debug_assertions, unix))]
 mod native_signal_log {
-    use std::env;
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd;
-    use std::path::PathBuf;
 
     static mut NATIVE_LOG_FD: i32 = -1;
-
-    fn path() -> Option<PathBuf> {
-        let cwd = env::current_dir().ok()?;
-        let dot = cwd.join(".codemux");
-        if dot.exists() || cwd.join("package.json").exists() {
-            return Some(dot.join("native-startup.log"));
-        }
-        let dot_alt = cwd.join("..").join(".codemux");
-        if dot_alt.exists() {
-            return Some(dot_alt.join("native-startup.log"));
-        }
-        Some(dot.join("native-startup.log"))
-    }
 
     extern "C" fn handle_signal(sig: i32) {
         let msg: &[u8] = match sig {
@@ -75,13 +60,11 @@ mod native_signal_log {
     }
 
     pub fn install() {
-        let path = match path() {
-            Some(p) => p,
-            None => return,
+        // The startup breadcrumbs' file, which exists only where a
+        // `.codemux` folder already does.
+        let Some(path) = codemux_lib::diagnostics::native_startup_log_path() else {
+            return;
         };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         if let Ok(f) = OpenOptions::new().create(true).append(true).open(&path) {
             let fd = f.as_raw_fd();
             std::mem::forget(f);

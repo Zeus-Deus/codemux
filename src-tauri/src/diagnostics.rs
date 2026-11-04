@@ -126,18 +126,26 @@ pub fn get_performance_diagnostics() -> NativePerformanceDiagnostics {
     performance_diagnostics_snapshot()
 }
 
+/// The project-local startup log of this process's working directory (see
+/// [`native_startup_log_path_in`]). Debug builds only; `main.rs`'s signal log
+/// writes to the same file.
 #[cfg(debug_assertions)]
-fn native_startup_log_path() -> Option<PathBuf> {
-    let cwd = env::current_dir().ok()?;
-    let dot = cwd.join(".codemux");
-    if dot.exists() || cwd.join("package.json").exists() {
-        return Some(dot.join("native-startup.log"));
-    }
-    let dot_alt = cwd.join("..").join(".codemux");
-    if dot_alt.exists() {
-        return Some(dot_alt.join("native-startup.log"));
-    }
-    Some(dot.join("native-startup.log"))
+pub fn native_startup_log_path() -> Option<PathBuf> {
+    native_startup_log_path_in(&env::current_dir().ok()?)
+}
+
+/// `.codemux/native-startup.log` in `cwd`, or in its parent (a run from the
+/// checkout's `src-tauri/`), where a `.codemux` folder already exists, as it
+/// does in a Codemux checkout. It never creates one: every debug `codemux`
+/// process logs here, including the `codemux mcp` an agent's chat starts in
+/// its worktree, and a new untracked `.codemux/` there made the worktree look
+/// dirty, so removing it was refused.
+#[cfg(debug_assertions)]
+fn native_startup_log_path_in(cwd: &std::path::Path) -> Option<PathBuf> {
+    [cwd.join(".codemux"), cwd.join("..").join(".codemux")]
+        .into_iter()
+        .find(|dot| dot.is_dir())
+        .map(|dot| dot.join("native-startup.log"))
 }
 
 #[cfg(debug_assertions)]
@@ -199,6 +207,30 @@ pub fn stderr_line(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_startup_log_goes_only_into_an_existing_codemux_folder() {
+        let root = tempfile::tempdir().unwrap();
+        // A project folder (an agent's worktree, a JavaScript project) gets no
+        // log and no new `.codemux/`.
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("package.json"), "{}").unwrap();
+        assert_eq!(native_startup_log_path_in(&project), None);
+        assert!(!project.join(".codemux").exists());
+
+        // A checkout that has one logs into it, also from its `src-tauri/`.
+        let checkout = root.path().join("checkout");
+        std::fs::create_dir_all(checkout.join(".codemux")).unwrap();
+        std::fs::create_dir_all(checkout.join("src-tauri")).unwrap();
+        let log = checkout.join(".codemux").join("native-startup.log");
+        assert_eq!(native_startup_log_path_in(&checkout), Some(log));
+        assert_eq!(
+            native_startup_log_path_in(&checkout.join("src-tauri")),
+            Some(checkout.join("src-tauri").join("..").join(".codemux").join("native-startup.log"))
+        );
+    }
 
     #[test]
     fn percentile_uses_nearest_rank() {
