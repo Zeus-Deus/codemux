@@ -6,9 +6,8 @@
 //! calling chat or the target thread and end with chat-link guidance. The
 //! descriptions and schemas are a contract with in-app providers and outside
 //! clients; `testdata/catalog.json` pins them.
-use super::registry::{self, Effect, Presentation, Scope, ToolId, ToolSpec};
-use super::{Audience, CallerView, ControlAccess};
-use serde_json::Value;
+use super::registry::{Effect, Presentation, Scope, ToolId, ToolSpec};
+use super::Audience;
 
 pub const INSTRUCTIONS: &str = "Control CodeMux-owned native threads, not the outside client's conversation. Discover workspaces, then providers/models. Use explicit workspace and thread IDs. Select a provider-advertised permission mode; omission is an error. Mutations require a stable client_request_id: retry the same request unchanged. Workspace and worktree tools accept an optional client_request_id; pass one so retries return the recorded outcome. Workspace lifecycle tools need full access and never take focus unless select is true. An operation accepted or a message queued is NOT completed work. Read operation_status, then thread_wait: it returns state, final_text and pending input in one call; call it again with since set to the previous wait_cursor to wait for the next change. Never blindly resend an operation marked needs_attention. Supervised clients leave worker approvals to the human in CodeMux. Answer worker questions with thread_answer; secret cards are answered by the person in CodeMux.";
 
@@ -353,35 +352,9 @@ mod defs {
     }
 }
 
-/// An outside stdio tool. Its text is static, as the legacy stdio tool type needs.
-pub struct NativeTool {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub input_schema: Value,
-}
-
-/// Shim until `codemux mcp` lists registry tools itself: the socket-alias
-/// tools it appends after its legacy tools, in today's order.
-pub fn native_tools() -> Vec<NativeTool> {
-    registry::list(&CallerView::outside(ControlAccess::FullAccess))
-        .into_iter()
-        .filter(|tool| registry::is_socket_alias(tool.definition.name))
-        .filter_map(|tool| {
-            let description = registry::static_text(&tool.definition.description)?;
-            Some(NativeTool { name: tool.definition.name, description, input_schema: tool.definition.input_schema })
-        })
-        .collect()
-}
-
-/// Shim until the socket names its registry route itself: the bare socket
-/// commands that reach the registry.
-pub fn is_native_tool(name: &str) -> bool {
-    registry::is_socket_alias(name)
-}
-
 #[cfg(test)]
-fn outside_definition(name: &str) -> registry::ToolDefinition {
-    registry::list(&CallerView::outside(ControlAccess::FullAccess))
+fn outside_definition(name: &str) -> super::registry::ToolDefinition {
+    super::registry::list(&super::CallerView::outside(super::ControlAccess::FullAccess))
         .into_iter()
         .find(|tool| tool.spec.name() == name)
         .unwrap_or_else(|| panic!("{name} is an outside tool"))
@@ -390,6 +363,7 @@ fn outside_definition(name: &str) -> registry::ToolDefinition {
 
 #[cfg(test)]
 mod review_tests {
+    use super::super::{registry, CallerView, ControlAccess};
     use super::*;
     /// Outside callers launch into a new worktree in one call; chats start
     /// worktrees with workspace_launch, so their launch keeps refusing it.
@@ -419,7 +393,7 @@ mod review_tests {
         use super::super::Audience;
         let names = ["workspace_list", "workspace_info", "workspace_create", "worktree_create", "workspace_close"];
         for name in names {
-            assert!(!is_native_tool(name), "{name} is reachable only through tool_call");
+            assert!(!registry::is_socket_alias(name), "{name} is reachable only through tool_call");
             assert!(registry::served(name, Audience::Outside).is_some(), "{name}");
             assert!(registry::served(name, Audience::InApp).is_none(), "{name} would shadow the chat's legacy tool");
             assert!(crate::mcp_server::is_legacy_tool(name), "{name} keeps its legacy name");
@@ -453,16 +427,21 @@ mod review_tests {
         assert!(answer.description.contains("pass it to thread_wait as turn_id"), "{}", answer.description);
     }
 
+    /// The bare socket commands are the outside tools that predate
+    /// `tool_call`, in catalog order; newer tools are reachable only through it.
     #[test]
-    fn stdio_keeps_the_socket_alias_tools_in_order() {
-        let names: Vec<&str> = native_tools().iter().map(|tool| tool.name).collect();
-        assert_eq!(names, [
+    fn socket_aliases_are_the_original_outside_tools_in_order() {
+        let aliases: Vec<&str> = registry::list(&CallerView::outside(ControlAccess::FullAccess))
+            .into_iter()
+            .map(|tool| tool.spec.name())
+            .filter(|name| registry::is_socket_alias(name))
+            .collect();
+        assert_eq!(aliases, [
             "agent_capabilities", "thread_list", "thread_launch", "thread_send", "thread_read", "thread_status",
             "thread_wait", "thread_interrupt", "thread_stop", "thread_respond", "operation_status", "plugin_list",
             "plugin_invoke",
         ]);
-        assert!(names.iter().all(|name| is_native_tool(name)));
-        assert!(!is_native_tool("workspace_list"), "workspace_list is not a socket command");
+        assert!(!registry::is_socket_alias("workspace_list"), "workspace_list is not a socket command");
     }
 
     /// The schema numbers come from the wait handler's limits; the

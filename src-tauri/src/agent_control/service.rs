@@ -241,7 +241,7 @@ pub(crate) async fn launch_placed<R: Runtime>(app: &AppHandle<R>, caller: &Contr
     validate_worker(app, caller, &input).await?;
     authorize(app, caller)?;
     let epoch = app.state::<NativeControlState>().epoch.clone();
-    let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&args).map_err(|e|ControlError::new(ErrorCode::InvalidArguments,e.to_string()))?));
+    let fingerprint = fingerprint(&args)?;
     let thread = uuid::Uuid::new_v4().to_string();
     // Named before admission so the receipt and any retry point at it.
     let target = if child_workspace || worktree.is_some() { AppStateStore::reserve_workspace_id().0 } else { workspace.workspace_id.0.clone() };
@@ -558,13 +558,6 @@ async fn validate_worker<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller,
 pub(crate) struct PreparedWorkspaceChat(Launch);
 
 impl PreparedWorkspaceChat {
-    pub(crate) async fn prepare<R: Runtime>(
-        app: &AppHandle<R>, caller: &ControlCaller, provider: ProviderKind,
-        title: String, message: String, model: Option<String>, effort: Option<String>,
-    ) -> Result<Self, ControlError> {
-        Self::prepare_selected(app, caller, provider, None, "", title, message, model, effort).await
-    }
-
     /// `target` selects a configured instance (a Hermes profile, an
     /// account); `cwd` is where a cold instance catalog is discovered.
     #[allow(clippy::too_many_arguments)]
@@ -870,13 +863,7 @@ pub(super) async fn thread_send<R: Runtime>(
         pr_watch: None,
     })
     .map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))?;
-    let hash = format!(
-        "{:x}",
-        Sha256::digest(
-            serde_json::to_vec(&args)
-                .map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))?
-        )
-    );
+    let hash = fingerprint(&args)?;
     let epoch = app.state::<NativeControlState>().epoch.clone();
     let db = app.state::<DatabaseStore>();
     let generation = db.delivery_generation(&input.thread_id)?.0;
@@ -934,12 +921,13 @@ fn retry_receipt<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, tool: &
     }
     let key = args["client_request_id"].as_str().ok_or_else(|| ControlError::new(ErrorCode::InvalidArguments, "client_request_id is required"))?;
     identifier(key, "client_request_id", 128)?;
-    let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(args).map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))?));
+    let hash = fingerprint(args)?;
     app.state::<DatabaseStore>().control_operation_by_key(&caller.principal, key, tool, &hash, &app.state::<NativeControlState>().epoch)
         .map_err(|e| ControlError::from_text(e, ErrorCode::OperationLookupFailed))?
         .map(serde_json::to_value).transpose().map_err(|e| ControlError::new(ErrorCode::SerializationFailed, e.to_string()))
 }
 
+/// A keyed call's arguments, hashed: a retry must send the same ones.
 fn fingerprint(args: &Value) -> Result<String, ControlError> {
     let bytes = serde_json::to_vec(args).map_err(|e| ControlError::new(ErrorCode::InvalidArguments, e.to_string()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -1084,7 +1072,7 @@ fn admit_mutation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, tool: 
     authorize(app,caller)?;
     let key = args["client_request_id"].as_str().ok_or_else(||ControlError::new(ErrorCode::InvalidArguments,"client_request_id is required"))?;
     identifier(key,"client_request_id",128)?;
-    let hash = format!("{:x}",Sha256::digest(serde_json::to_vec(args).map_err(|e|ControlError::new(ErrorCode::InvalidArguments,e.to_string()))?));
+    let hash = fingerprint(args)?;
     let epoch = app.state::<NativeControlState>().epoch.clone();
     caller.admit(||app.state::<DatabaseStore>().admit_control_operation_for_thread(&caller.principal,key,tool,&hash,&epoch,Some(&target.workspace_id),Some(&target.thread_id),caller.thread_id().zip(caller.admission_generation())))
         .map_err(|e|ControlError::from_text(e, ErrorCode::OperationAdmissionFailed))

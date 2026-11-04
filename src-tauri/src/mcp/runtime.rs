@@ -29,9 +29,9 @@ use crate::json_rpc_child::{JsonRpcChild, RpcChildError, SpawnConfig};
 use super::http_client::HttpMcpClient;
 use super::{McpConfigSource, McpServerConfig, McpTransport};
 
-/// Per the spec — clients SHOULD send the highest version they support.
-/// The Codemux MCP server (`mcp_server.rs:411`) speaks the same version,
-/// so user-installed servers should agree.
+/// The revision this client offers in `initialize`. A server answers with it
+/// or with another revision it supports; Codemux's own `codemux mcp` accepts
+/// it among `mcp::protocol::SUPPORTED_PROTOCOL_VERSIONS`.
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Handshake budget. Generous because npx-launched servers may pull

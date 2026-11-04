@@ -1331,8 +1331,8 @@ async fn workspace_chat_launch_shares_native_start_without_selecting_workspace()
     let target = app.state::<crate::state::AppStateStore>().create_empty_workspace_at_path(root.path().join("worktree"));
     app.state::<crate::state::AppStateStore>().activate_workspace(&parent);
     let caller = ControlCaller { admitted: None, identity: super::CallerPrincipal::LocalController, created_by: crate::agent_provider::message::CreatedBy::Agent, principal: "thread:parent".into(), access: ControlAccess::FullAccess, grant_id: None, label: None };
-    let prepared = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
-        crate::agent_provider::ProviderKind::Claude, "Fix sidebar tests".into(), "Self-contained fixture brief".into(), None, None,
+    let prepared = service::PreparedWorkspaceChat::prepare_selected(app.handle(), &caller,
+        crate::agent_provider::ProviderKind::Claude, None, "", "Fix sidebar tests".into(), "Self-contained fixture brief".into(), None, None,
     ).await.unwrap();
     let launched = prepared.materialize(app.handle(), &caller, target.0.clone(), "prepared-workspace-child").await.unwrap();
     let thread = launched["thread_id"].as_str().unwrap();
@@ -1350,17 +1350,17 @@ async fn workspace_chat_launch_shares_native_start_without_selecting_workspace()
 async fn workspace_chat_launch_validates_models_and_keeps_permission_ceiling() {
     let (app, provider, _root, _workspace) = fixture().await;
     let caller = ControlCaller::trusted();
-    let invalid = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
-        crate::agent_provider::ProviderKind::Claude, "Fixture".into(), "Brief".into(), Some("not-advertised".into()), None,
+    let invalid = service::PreparedWorkspaceChat::prepare_selected(app.handle(), &caller,
+        crate::agent_provider::ProviderKind::Claude, None, "", "Fixture".into(), "Brief".into(), Some("not-advertised".into()), None,
     ).await.err().unwrap();
     assert_eq!(invalid.code, "unsupported_model");
-    let invalid = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
-        crate::agent_provider::ProviderKind::Claude, "Fixture".into(), "Brief".into(), None, Some("high".into()),
+    let invalid = service::PreparedWorkspaceChat::prepare_selected(app.handle(), &caller,
+        crate::agent_provider::ProviderKind::Claude, None, "", "Fixture".into(), "Brief".into(), None, Some("high".into()),
     ).await.err().unwrap();
     assert_eq!(invalid.code, "unsupported_effort");
     let supervised = ControlCaller { access: ControlAccess::Supervised, ..caller };
-    let denied = service::PreparedWorkspaceChat::prepare(app.handle(), &supervised,
-        crate::agent_provider::ProviderKind::Claude, "Fixture".into(), "Brief".into(), None, None,
+    let denied = service::PreparedWorkspaceChat::prepare_selected(app.handle(), &supervised,
+        crate::agent_provider::ProviderKind::Claude, None, "", "Fixture".into(), "Brief".into(), None, None,
     ).await.err().unwrap();
     assert_eq!(denied.code, "unsupported_permission_ceiling");
     assert!(provider.calls.snapshot().is_empty());
@@ -2279,7 +2279,7 @@ async fn native_callers_workspace_launch_routes_and_keeps_admitted_thread_author
     let pane=app.state::<crate::state::AppStateStore>().agent_chat_pane_id_for_thread(&thread).unwrap();
     app.state::<crate::state::AppStateStore>().close_pane(&pane).unwrap();
     let child_workspace=app.state::<crate::state::AppStateStore>().create_empty_workspace_at_path(root.path().into());
-    let prepared=service::PreparedWorkspaceChat::prepare(app.handle(),&caller,crate::agent_provider::ProviderKind::Claude,"Independent workspace".into(),"Work independently on this fixture".into(),None,None).await.unwrap();
+    let prepared=service::PreparedWorkspaceChat::prepare_selected(app.handle(),&caller,crate::agent_provider::ProviderKind::Claude,None,"","Independent workspace".into(),"Work independently on this fixture".into(),None,None).await.unwrap();
     let launched=prepared.materialize(app.handle(),&caller,child_workspace.0,"independent-child").await.unwrap();
     let child=launched["thread_id"].as_str().unwrap();
     assert!(provider.calls.snapshot().iter().any(|c|matches!(c,mock_agent_provider::MockCall::SendTurn(t,_) if t.0==child)));
@@ -2527,7 +2527,7 @@ async fn native_callers_round3_workspace_provider_listing_matches_ceiling_dispat
             // Exercise actual preparation and startup, not just the enum.
             let admitted = app.state::<crate::database::DatabaseStore>().admit_control_operation(&control.principal, "opencode-workspace", "workspace_launch", "payload", &app.state::<NativeControlState>().epoch, None, Some("opencode-child")).unwrap();
             control.admitted = Some(AdmittedAuthority::Operation {operation_id:admitted.receipt.operation_id});
-            let prepared = service::PreparedWorkspaceChat::prepare(app.handle(), &control, ProviderKind::OpenCode, "OpenCode workspace".into(), "A complete OpenCode brief".into(), None, None).await.unwrap();
+            let prepared = service::PreparedWorkspaceChat::prepare_selected(app.handle(), &control, ProviderKind::OpenCode, None, "", "OpenCode workspace".into(), "A complete OpenCode brief".into(), None, None).await.unwrap();
             let launched = prepared.materialize(app.handle(), &control, caller.workspace_id.clone().unwrap(), "opencode-child").await.unwrap();
             let child = launched["thread_id"].as_str().unwrap();
             let start = opencode.start_inputs().into_iter().find(|input| input.thread_id.0 == child).unwrap();

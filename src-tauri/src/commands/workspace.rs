@@ -153,22 +153,9 @@ pub(crate) async fn populate_git_info_async(
     apply_workspace_git_info(state, workspace_id, info)
 }
 
-/// `async fn` so the git-info gather runs on the blocking pool instead of
-/// whichever thread drives the caller (the GTK main thread for the Tauri
-/// command, a Tokio worker for the control socket). Both callers are
-/// already async, so the `.await` plumbs straight through.
-pub(crate) async fn create_workspace_impl<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    state: &AppStateStore,
-    db: &crate::database::DatabaseStore,
-    cwd: Option<String>,
-) -> Result<String, String> {
-    create_workspace_impl_with_selection(app, state, db, cwd, true).await
-}
-
-/// Always creates a new workspace at `cwd` (unarchive and the legacy socket
-/// command). `state` and `db` are the app's own; [`open_workspace_impl`]
-/// reads them from `app`.
+/// Always creates a new workspace at `cwd` (the desktop's `create_workspace`
+/// command and unarchive). `state` and `db` are the app's own;
+/// [`open_workspace_impl`] reads them from `app`.
 pub(crate) async fn create_workspace_impl_with_selection<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     _state: &AppStateStore,
@@ -694,48 +681,6 @@ pub(crate) fn find_live_workspace_for_worktree_path(
             }
         })
         .map(|w| w.workspace_id.0.clone())
-}
-
-/// The control socket's `create_worktree_workspace` arm, with its positional
-/// arguments: selects the new workspace and forks `base` (or HEAD). Kept
-/// until that arm builds a [`WorktreeRequest`] itself.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    _state: &AppStateStore,
-    _db: &crate::database::DatabaseStore,
-    _pty_state: &crate::terminal::PtyState,
-    _presets: &crate::presets::PresetStoreState,
-    repo_path: String,
-    branch: String,
-    new_branch: bool,
-    base: Option<String>,
-    layout: String,
-    initial_prompt: Option<String>,
-    agent_preset_id: Option<String>,
-    model_selection: Option<crate::agent_capability::ModelSelection>,
-    pr_number: Option<u32>,
-) -> Result<WorkspaceCreated, String> {
-    create_worktree_from_request(
-        app,
-        WorktreeRequest {
-            repo_path,
-            branch,
-            new_branch,
-            base: base.map(WorktreeBase::Ref).unwrap_or(WorktreeBase::RepoHead),
-            layout: crate::workspace_service::parse_layout(&layout)?,
-            preset: agent_preset_id.map(|preset_id| PresetLaunch {
-                preset_id,
-                initial_prompt,
-                model_selection,
-            }),
-            pr_number,
-            select: true,
-            initial_chat: None,
-            reserved_id: None,
-        },
-    )
-    .await
 }
 
 /// Create a git worktree and its workspace, or adopt the live workspace that
@@ -3543,8 +3488,8 @@ mod empty_workspace_skip_setup_tests {
 mod phase_1_5_workspace_create_path_tests {
     //! Phase 1.5 regression coverage for the `workspace_create` MCP tool's
     //! `path` argument. The bug pre-fix was at `control.rs:573`: the
-    //! socket arm hardcoded `None` as the fourth argument to
-    //! `create_workspace_impl`, dropping the path the brain asked for.
+    //! socket arm hardcoded `None` as the path it passed to the workspace
+    //! create helper, dropping the path the brain asked for.
     //! These tests pin the state-layer contract the fix relies on —
     //! `create_workspace_at_path(path)` must produce a workspace whose
     //! `cwd` matches the path the caller supplied. If the underlying
@@ -3580,10 +3525,9 @@ mod phase_1_5_workspace_create_path_tests {
 
     #[test]
     fn create_workspace_without_path_falls_back_to_current_root() {
-        // The None path of `create_workspace_impl` calls
-        // `state.create_workspace()` (no path), which falls back to
-        // `current_project_root()` resolution downstream. Here we just
-        // pin that the no-path constructor produces a workspace at all.
+        // With no path, `open_workspace_impl` falls back to
+        // `current_project_root()`. Here we just pin that the no-path
+        // constructor produces a workspace at all.
         let store = AppStateStore::default();
         let snap_before = store.snapshot();
         let ws_id = store.create_workspace();
