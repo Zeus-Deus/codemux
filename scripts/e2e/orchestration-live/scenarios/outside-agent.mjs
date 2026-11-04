@@ -631,7 +631,10 @@ async function claude(ctx) {
       `Then call ${call("operation_status")} with its operation_id until its state is "succeeded", and take thread_id from it.`,
     `3. Call ${call("thread_wait")} with {"workspace_id":"<the workspace_id>","thread_id":"<the thread_id>","timeout_ms":120000}. ` +
       `Call it again while state is "running".`,
-    `4. Call ${call("thread_read")} with {"workspace_id":"<the workspace_id>","thread_id":"<the thread_id>"} to read the assistant's reply.`,
+    // thread_wait already carries final_text, so without the "even though"
+    // Haiku can skip this step as redundant; the part checks thread_read too.
+    `4. Call ${call("thread_read")} with {"workspace_id":"<the workspace_id>","thread_id":"<the thread_id>"} to read the assistant's reply, ` +
+      `even though thread_wait already returned final_text. Do not skip this step.`,
     `5. Call ${call("workspace_close")} with {"workspace_id":"<the workspace_id>","client_request_id":"oc-close-${tag}","delete_worktree":true}.`,
     "6. Reply with exactly one line: REPORT: followed by the assistant's reply from step 4.",
   ].join("\n");
