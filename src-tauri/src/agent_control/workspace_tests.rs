@@ -6,7 +6,7 @@
 //! isolated child process (`test_isolation::isolated`): worktrees, the layout
 //! file and terminals then live in a private root, never in the developer's
 //! own Codemux state.
-use super::tests::{connector_caller, connector_off, fixture, mock_agent_provider, native_caller_fixture, settle_operation};
+use super::tests::{connector_caller, connector_off, fixture, mock_agent_provider, native_caller_fixture, settle_operation, web_remote_on};
 use super::{execute, registry, ClientName, ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlState};
 use crate::agent_provider::{
     CompletedItem, ProviderKind, ProviderRuntimeEvent as Event, QuestionResolution, RequestId, SessionStatus, ThreadId,
@@ -994,6 +994,7 @@ async fn workspace_close_revoked_during_teardown_leaves_the_workspace_open() {
 async fn setup_checkpoint_outlives_a_connection_and_a_turn_but_not_revocation_or_stop() {
     let (app, _provider, _root, _workspace, thread, authority, actor) = native_caller_fixture("default").await;
     app.manage(crate::web_remote::WebRemoteState::default());
+    web_remote_on(&app);
     let shared = app.state::<crate::web_remote::WebRemoteState>().shared();
     let connections = &shared.connections;
     app.state::<DatabaseStore>().web_remote_insert_session("paired", None, None, "paired-hash", true).unwrap();
@@ -1019,6 +1020,25 @@ async fn setup_checkpoint_outlives_a_connection_and_a_turn_but_not_revocation_or
     let refusal = chat.background().check().unwrap_err();
     assert!(refusal.starts_with("stale_caller: "), "{refusal}");
     authority.revoke();
+}
+
+/// Turning Remote Access off withdraws every paired device at once, as
+/// switching the network door off withdraws every grant: setup a device's
+/// call left running stops, while the device itself stays paired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_checkpoint_stops_once_remote_access_is_turned_off() {
+    let (app, _provider, _root, _workspace) = fixture().await;
+    app.manage(crate::web_remote::WebRemoteState::default());
+    web_remote_on(&app);
+    let db = app.state::<DatabaseStore>();
+    db.web_remote_insert_session("paired", None, None, "paired-hash", true).unwrap();
+    let device = super::workspace_tools::checkpoint(app.handle(), &ControlCaller::remote("paired".into()));
+    device.background().check().unwrap();
+
+    crate::web_remote::web_remote_disable(app.handle().clone()).unwrap();
+    let refusal = device.background().check().unwrap_err();
+    assert!(refusal.starts_with("stale_caller: Remote Access was turned off"), "{refusal}");
+    assert!(db.web_remote_get_session("paired").is_some_and(|session| session.approved && !session.revoked));
 }
 
 // ── outside answers: approvals and questions ──────────────────────────────

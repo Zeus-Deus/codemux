@@ -1895,6 +1895,14 @@ pub(crate) fn connector_off(app: &tauri::App<tauri::test::MockRuntime>) {
     crate::mcp_connector::agent_connector_set_config(app.handle().clone(),false,None,None).unwrap();
 }
 
+/// Saves Remote Access as switched on, as it is while a person uses a paired
+/// device, without binding a listener. Call it before anything reads the
+/// Remote Access config, which loads the saved one once.
+pub(crate) fn web_remote_on(app: &tauri::App<tauri::test::MockRuntime>) {
+    let config = crate::web_remote::WebRemoteConfig { enabled: true, ..Default::default() };
+    crate::web_remote::save_config_to_db(&app.state::<crate::database::DatabaseStore>(), &config).unwrap();
+}
+
 #[tokio::test]
 async fn orchestration_message_saved_replay_rechecks_revoked_caller_before_rearm() {
     use crate::agent_provider::{message::*,types::MessageDelivery,ProviderKind,ThreadId};

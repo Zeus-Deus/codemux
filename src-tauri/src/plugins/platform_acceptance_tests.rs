@@ -937,15 +937,19 @@ fn setup_outcomes(f: &Fixture) -> mpsc::UnboundedReceiver<(&'static str, Value)>
 /// A paired device invokes a plugin action that creates a worktree, then
 /// goes away while the new worktree's setup waits to start. A device that
 /// only disconnected leaves its setup running, as the setup outlives the
-/// call; one revoked in Settings starts no setup command.
+/// call; one revoked in Settings, or Remote Access turned off, starts no
+/// setup command.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn platform_worktree_setup_stops_once_its_paired_device_is_revoked() {
     if isolated("platform_worktree_setup_stops_once_its_paired_device_is_revoked") {
         return;
     }
-    for revoked in [true, false] {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Withdrawal { Revoked, RemoteAccessOff, Disconnected }
+    for withdrawal in [Withdrawal::Revoked, Withdrawal::RemoteAccessOff, Withdrawal::Disconnected] {
         let f = Fixture::new().await;
         f.app.manage(crate::web_remote::WebRemoteState::default());
+        crate::agent_control::tests::web_remote_on(&f.app);
         let shared = f.app.state::<crate::web_remote::WebRemoteState>().shared();
         f.app
             .state::<DatabaseStore>()
@@ -961,7 +965,11 @@ async fn platform_worktree_setup_stops_once_its_paired_device_is_revoked() {
         )
         .unwrap();
         let mut outcomes = setup_outcomes(&f);
-        let branch = if revoked { "device-revoked" } else { "device-disconnected" };
+        let branch = match withdrawal {
+            Withdrawal::Revoked => "device-revoked",
+            Withdrawal::RemoteAccessOff => "remote-access-off",
+            Withdrawal::Disconnected => "device-disconnected",
+        };
         let mut request = f.request(branch);
         request["workspaceStrategy"] = json!({
             "type":"worktree","branch":branch,"baseRef":"main","startFromOrigin":false
@@ -981,10 +989,14 @@ async fn platform_worktree_setup_stops_once_its_paired_device_is_revoked() {
                 })
                 .await
                 .expect("the create makes its workspace");
-                if revoked {
-                    crate::web_remote::web_remote_revoke_session(app, "paired".into()).unwrap();
-                } else {
-                    shared.connections.disconnect_for_test(connection);
+                match withdrawal {
+                    Withdrawal::Revoked => {
+                        crate::web_remote::web_remote_revoke_session(app, "paired".into()).unwrap();
+                    }
+                    Withdrawal::RemoteAccessOff => {
+                        crate::web_remote::web_remote_disable(app).unwrap();
+                    }
+                    Withdrawal::Disconnected => shared.connections.disconnect_for_test(connection),
                 }
             })
         };
@@ -996,12 +1008,12 @@ async fn platform_worktree_setup_stops_once_its_paired_device_is_revoked() {
             .await
             .expect("the setup ends")
             .unwrap();
-        if revoked {
+        if withdrawal != Withdrawal::Disconnected {
             assert_eq!(event, "workspace-setup-failed", "{payload}");
             assert_eq!(payload["command"], "touch setup-first", "{payload}");
             let stderr = payload["stderr"].as_str().unwrap();
             assert!(stderr.starts_with("stale_caller: "), "{payload}");
-            assert!(!path.join("setup-first").exists(), "no setup command starts once the device is revoked");
+            assert!(!path.join("setup-first").exists(), "no setup command starts once the device is withdrawn");
         } else {
             assert_eq!(event, "workspace-setup-complete", "{payload}");
             assert!(path.join("setup-first").exists(), "a disconnect alone leaves setup running");

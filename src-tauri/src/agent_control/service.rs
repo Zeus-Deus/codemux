@@ -82,9 +82,15 @@ pub(crate) fn authorize_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &
 /// create did. What is scoped to the call has normally ended by then (a
 /// paired device's connection, a chat's turn, a launch receipt), so this asks
 /// only what a person withdraws: a connector grant, a paired device's
-/// session, or a chat's own authority (stopped, narrowed or deleted).
+/// session or Remote Access as a whole, or a chat's own authority (stopped,
+/// narrowed or deleted).
 pub(crate) fn authorize_background<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller) -> Result<(), ControlError> {
     match &caller.identity {
+        // Turning Remote Access off withdraws every paired device at once, as
+        // switching the network door off withdraws every grant.
+        super::CallerPrincipal::RemoteClient { .. } if !web_remote_enabled(app) => {
+            return Err(ControlError::new(ErrorCode::StaleCaller, "Remote Access was turned off"));
+        }
         super::CallerPrincipal::RemoteClient { session_id } if !remote_session_approved(app, session_id) => {
             return Err(ControlError::new(ErrorCode::StaleCaller, "The paired device's session was revoked"));
         }
@@ -112,6 +118,16 @@ pub(crate) fn authorize_background<R: Runtime>(app: &AppHandle<R>, caller: &Cont
 fn remote_session_approved<R: Runtime>(app: &AppHandle<R>, session_id: &str) -> bool {
     app.state::<DatabaseStore>().web_remote_get_session(session_id)
         .is_some_and(|session| session.approved && !session.revoked)
+}
+
+/// Remote Access's master switch, read from the persisted setting: before
+/// anything hydrated it, the in-memory config is a default nobody chose.
+fn web_remote_enabled<R: Runtime>(app: &AppHandle<R>) -> bool {
+    app.try_state::<crate::web_remote::WebRemoteState>().is_some_and(|state| {
+        let shared = state.shared();
+        crate::web_remote::ensure_config_hydrated(app, &shared);
+        shared.config.lock().is_ok_and(|config| config.enabled)
+    })
 }
 
 fn authorize_with_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, orchestration: bool, retry_held: bool) -> Result<(), ControlError> {
