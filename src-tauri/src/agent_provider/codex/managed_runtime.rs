@@ -67,38 +67,66 @@ pub(super) async fn spawn_child(
         })
 }
 
-/// The MCP server name a user gives Codemux when setting up an outside agent.
+/// The MCP server name the guide gives Codemux when setting up an outside agent.
 const USER_CODEMUX_SERVER: &str = "codemux";
 
 /// A regular in-app session reads the user's `config.toml`, so a user-level
-/// `codemux` MCP server (set up for outside agents) would run inside the chat
+/// Codemux MCP server (set up for outside agents) would run inside the chat
 /// with the owner's reach, around the chat's own ceiling. The chat already
-/// gets Codemux's tools as host tools, so the session switches that entry
-/// off. Only a declared entry is overridden, so a session without one starts
+/// gets Codemux's tools as host tools, so the session switches those entries
+/// off. Only declared entries are overridden, so a session without one starts
 /// exactly as before.
 fn switch_off_user_codemux_server(args: &mut Vec<String>, env: &HashMap<String, String>) {
     let home = env
         .get("CODEX_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| crate::provider_accounts::homes::default_home(crate::agent_provider::ProviderKind::Codex));
-    let declared = home
-        .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok())
-        .is_some_and(|config| codex_config_declares_codemux(&config));
-    if declared {
+    let Some(config) = home.and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok()) else { return };
+    let own = crate::mcp_server::codemux_mcp_command();
+    for name in user_codemux_servers(&config, std::path::Path::new(&own)) {
         // Bare, never quoted: Codex splits a `-c` key on every `.` and keeps
         // quote characters, so `mcp_servers."codemux"` names another server,
         // `"codemux"` with no transport, and Codex then refuses to load its
         // configuration at all ("invalid transport").
-        args.extend(["-c".into(), format!("mcp_servers.{USER_CODEMUX_SERVER}.enabled=false")]);
+        args.extend(["-c".into(), format!("mcp_servers.{name}.enabled=false")]);
     }
 }
 
-/// Whether a Codex `config.toml` declares a top-level `[mcp_servers.codemux]`.
-fn codex_config_declares_codemux(config_toml: &str) -> bool {
-    toml::from_str::<toml::Table>(config_toml)
-        .ok()
-        .and_then(|config| Some(config.get("mcp_servers")?.as_table()?.contains_key(USER_CODEMUX_SERVER)))
-        .unwrap_or(false)
+/// The top-level `[mcp_servers.*]` entries of a Codex `config.toml` that are
+/// Codemux: each one that runs `codemux mcp`, under any name, and the one
+/// named `codemux` (the guide's name, which a `--url` entry for the network
+/// door also uses). `own` is this app's executable, as Settings offers it.
+fn user_codemux_servers(config_toml: &str, own: &std::path::Path) -> Vec<String> {
+    let Ok(config) = toml::from_str::<toml::Table>(config_toml) else { return Vec::new() };
+    let Some(servers) = config.get("mcp_servers").and_then(toml::Value::as_table) else { return Vec::new() };
+    servers
+        .iter()
+        .filter(|(name, entry)| name.as_str() == USER_CODEMUX_SERVER || runs_codemux_mcp(entry, own))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Whether an entry runs a Codemux executable whose command line parses to
+/// `codemux mcp`, so root flags before it count (`codemux --client codex mcp`).
+fn runs_codemux_mcp(entry: &toml::Value, own: &std::path::Path) -> bool {
+    use clap::Parser;
+    let Some(command) = entry.get("command").and_then(toml::Value::as_str) else { return false };
+    let args: Option<Vec<&str>> = match entry.get("args") {
+        None => Some(Vec::new()),
+        Some(args) => args.as_array().and_then(|args| args.iter().map(toml::Value::as_str).collect()),
+    };
+    let Some(args) = args else { return false };
+    is_codemux_executable(command, own)
+        && crate::cli::Cli::try_parse_from(std::iter::once("codemux").chain(args))
+            .is_ok_and(|cli| matches!(cli.command, Some(crate::cli::CommandSet::Mcp { .. })))
+}
+
+/// `codemux` by name on any platform (`codemux.exe`, an install path), or
+/// this app's own executable under another name (an AppImage).
+fn is_codemux_executable(command: &str, own: &std::path::Path) -> bool {
+    let path = std::path::Path::new(command);
+    let named = path.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| stem.eq_ignore_ascii_case("codemux"));
+    named || std::fs::canonicalize(path).is_ok_and(|path| std::fs::canonicalize(own).is_ok_and(|own| own == path))
 }
 
 /// Preserve opaque IDs and ordering, including all pages. No bundled/default fallback here.
@@ -361,22 +389,57 @@ mod user_codemux_server_tests {
     use super::*;
 
     #[test]
-    fn codex_config_declares_codemux_reads_only_the_mcp_servers_table() {
-        for (config, declared) in [
-            ("[mcp_servers.codemux]\ncommand = \"codemux\"\nargs = [\"mcp\"]\n", true),
-            ("[mcp_servers.\"codemux\"]\ncommand = \"codemux\"\n", true),
-            ("mcp_servers = { codemux = { command = \"codemux\" } }\n", true),
-            ("[mcp_servers.codemux]\nenabled = false\n", true),
-            ("[mcp_servers.other]\ncommand = \"codemux\"\n", false),
-            ("[mcp_servers.codemux-dev]\ncommand = \"codemux\"\n", false),
-            ("[profiles.work.mcp_servers.codemux]\ncommand = \"codemux\"\n", false),
-            ("# [mcp_servers.codemux]\nmodel = \"codemux\"\n", false),
-            ("mcp_servers = \"codemux\"\n", false),
-            ("[mcp_servers.codemux\n", false),
-            ("", false),
+    fn user_codemux_servers_reads_only_the_mcp_servers_table() {
+        let own = std::path::Path::new("/nonexistent/own-codemux");
+        for (config, servers) in [
+            ("[mcp_servers.codemux]\ncommand = \"codemux\"\nargs = [\"mcp\"]\n", &["codemux"][..]),
+            ("[mcp_servers.\"codemux\"]\ncommand = \"codemux\"\n", &["codemux"]),
+            ("mcp_servers = { codemux = { command = \"codemux\" } }\n", &["codemux"]),
+            ("[mcp_servers.codemux]\nenabled = false\n", &["codemux"]),
+            ("[mcp_servers.codemux]\nurl = \"http://127.0.0.1:4378/mcp\"\n", &["codemux"]),
+            ("[mcp_servers.other]\ncommand = \"codemux\"\n", &[]),
+            ("[mcp_servers.codemux-dev]\ncommand = \"codemux\"\n", &[]),
+            ("[profiles.work.mcp_servers.codemux]\ncommand = \"codemux\"\n", &[]),
+            ("# [mcp_servers.codemux]\nmodel = \"codemux\"\n", &[]),
+            ("mcp_servers = \"codemux\"\n", &[]),
+            ("[mcp_servers.codemux\n", &[]),
+            ("", &[]),
         ] {
-            assert_eq!(codex_config_declares_codemux(config), declared, "{config:?}");
+            assert_eq!(user_codemux_servers(config, own), servers, "{config:?}");
         }
+    }
+
+    /// By what it runs: a Codemux executable whose command line is `mcp`.
+    #[test]
+    fn user_codemux_servers_finds_codemux_mcp_under_any_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // An AppImage, which Settings offers by its own path.
+        let own = dir.path().join("Codemux_1.0.0_amd64.AppImage");
+        std::fs::write(&own, "").unwrap();
+        let entry = |command: &str, args: &str| format!("[mcp_servers.x]\ncommand = {command:?}\nargs = {args}\n");
+        for (command, args, found) in [
+            ("codemux", r#"["mcp"]"#, true),
+            ("codemux", r#"["mcp", "--client", "codex", "--access", "supervised"]"#, true),
+            ("codemux", r#"["--client", "codex", "mcp"]"#, true),
+            ("codemux", r#"["--access=read-only", "--disable-plugins", "mcp"]"#, true),
+            ("/usr/local/bin/codemux", r#"["mcp"]"#, true),
+            ("Codemux.exe", r#"["mcp"]"#, true),
+            (own.to_str().unwrap(), r#"["mcp"]"#, true),
+            ("codemux", "[]", false),
+            ("codemux", r#"["mcp-call", "--list"]"#, false),
+            ("codemux", r#"["notify", "mcp"]"#, false),
+            ("codemux", r#"["mcp", "--no-such-flag"]"#, false),
+            ("codemux", r#"["mcp", 1]"#, false),
+            ("codemux-remote", r#"["mcp"]"#, false),
+            ("ssh", r#"["-T", "desktop", "codemux", "mcp"]"#, false),
+            ("npx", r#"["codemux", "mcp"]"#, false),
+            (dir.path().join("other.AppImage").to_str().unwrap(), r#"["mcp"]"#, false),
+        ] {
+            let config = entry(command, args);
+            assert_eq!(!user_codemux_servers(&config, &own).is_empty(), found, "{config}");
+        }
+        let config = entry("codemux", r#"["--client", "codex", "mcp"]"#);
+        assert_eq!(user_codemux_servers(&format!("{config}[mcp_servers.codemux]\nurl = \"u\"\n"), &own), ["codemux", "x"]);
     }
 
     #[test]
@@ -396,5 +459,23 @@ mod user_codemux_server_tests {
         // so each one must be the plain name it overrides.
         let key = args[2].split_once('=').unwrap().0;
         assert_eq!(key.split('.').collect::<Vec<_>>(), ["mcp_servers", USER_CODEMUX_SERVER, "enabled"]);
+    }
+
+    /// `codex mcp add cmux -- codemux mcp` must not load inside in-app chats
+    /// either: what an entry runs decides, not what it is called.
+    #[test]
+    fn in_app_codex_switches_off_codemux_mcp_under_any_name() {
+        let home = tempfile::tempdir().unwrap();
+        let env = HashMap::from([("CODEX_HOME".to_string(), home.path().to_string_lossy().into_owned())]);
+        let config = "[mcp_servers.cmux]\ncommand = \"codemux\"\nargs = [\"mcp\", \"--client\", \"codex\"]\n\n\
+                      [mcp_servers.tools]\ncommand = \"/usr/bin/codemux\"\nargs = [\"--client\", \"codex\", \"mcp\"]\n\n\
+                      [mcp_servers.other]\ncommand = \"codemux\"\nargs = [\"notify\"]\n";
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        let mut args = vec!["app-server".to_string()];
+        switch_off_user_codemux_server(&mut args, &env);
+        assert_eq!(
+            args,
+            ["app-server", "-c", "mcp_servers.cmux.enabled=false", "-c", "mcp_servers.tools.enabled=false"]
+        );
     }
 }
