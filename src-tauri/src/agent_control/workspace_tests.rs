@@ -6,7 +6,7 @@
 //! isolated child process (`test_isolation::isolated`): worktrees, the layout
 //! file and terminals then live in a private root, never in the developer's
 //! own Codemux state.
-use super::tests::{fixture, mock_agent_provider, native_caller_fixture, settle_operation};
+use super::tests::{connector_caller, connector_off, fixture, mock_agent_provider, native_caller_fixture, settle_operation};
 use super::{execute, registry, ClientName, ControlAccess, ControlCaller, ControlError, ErrorCode, NativeControlState};
 use crate::agent_provider::{
     CompletedItem, ProviderKind, ProviderRuntimeEvent as Event, QuestionResolution, RequestId, SessionStatus, ThreadId,
@@ -643,6 +643,184 @@ async fn thread_launch_worktree_keeps_checkout_when_start_fails() {
     assert!(message.contains(reserved) && message.contains("kept for inspection"), "{message}");
     assert!(app.state::<AppStateStore>().find_workspace(reserved).is_some(), "setup scripts may have written to it");
     assert!(crate::git::conventional_worktree_path(&repo, "kept").unwrap().exists());
+}
+
+// ── authority withdrawn while queued on the lifecycle lock ───────────────
+//
+// A checkout removal holds the lifecycle lock exclusively for as long as its
+// delete takes, and an open holds it shared. A lifecycle call queued behind
+// either must ask again for its caller's authority once it gets the lock:
+// the owner may have revoked the grant meanwhile.
+
+/// Runs a call in a task of its own, as a door does.
+fn spawn_call(app: &App, caller: &ControlCaller, tool: &'static str, args: &Value) -> tokio::task::JoinHandle<Result<Value, ControlError>> {
+    let (handle, caller, args) = (app.handle().clone(), caller.clone(), args.clone());
+    tokio::spawn(async move { execute(&handle, &caller, tool, args).await })
+}
+
+/// The receipt a keyed call was admitted under, once it is.
+async fn admitted(app: &App, caller: &ControlCaller, tool: &str, args: &Value) -> Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(receipt) = super::service::recorded(app.handle(), caller, tool, args).unwrap() {
+                break receipt;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the call is admitted")
+}
+
+/// Nothing a lifecycle call does before the lock takes this long. Whatever it
+/// reached, it must not go on once the grant is gone.
+async fn reach_the_lock() {
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+/// A receipt once it settled, read directly: a revoked caller can no longer
+/// ask for it.
+async fn settled(app: &App, caller: &ControlCaller, operation_id: &Value) -> crate::database::agent_control::OperationReceipt {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let found = receipt(app, caller, operation_id);
+            if found.state != "accepted" && found.state != "running" {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the receipt settles")
+}
+
+#[track_caller]
+fn failed_as_revoked(receipt: &crate::database::agent_control::OperationReceipt) {
+    assert_eq!(receipt.state, "failed", "{receipt:?}");
+    assert_eq!(receipt.error.as_ref().map(|error| error["code"].clone()), Some(json!("grant_revoked")), "{receipt:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_create_revoked_while_queued_on_the_lifecycle_lock_opens_nothing() {
+    if isolated(&format!("{MODULE}workspace_create_revoked_while_queued_on_the_lifecycle_lock_opens_nothing")) {
+        return;
+    }
+    without_terminal_daemon();
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    let caller = connector_caller(&app, "queued-open-client", "queued-open-grant", ControlAccess::FullAccess).await;
+    std::fs::create_dir(repo.join("sub")).unwrap();
+    let args = json!({"path": repo.join("sub"), "client_request_id": "queued-open"});
+    let before = count(&app);
+
+    let removal = crate::worktree_cleanup::removal_guard().await;
+    let queued = spawn_call(&app, &caller, "workspace_create", &args);
+    let running = admitted(&app, &caller, "workspace_create", &args).await;
+    let reserved = running["workspace_id"].as_str().unwrap().to_string();
+    reach_the_lock().await;
+    assert_eq!(count(&app), before, "nothing opens while a removal holds the lock");
+    crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "queued-open-client".into()).unwrap();
+    drop(removal);
+
+    refused(queued.await.unwrap(), ErrorCode::GrantRevoked);
+    failed_as_revoked(&settled(&app, &caller, &running["operation_id"]).await);
+    assert!(app.state::<AppStateStore>().find_workspace(&reserved).is_none());
+    assert_eq!(count(&app), before, "no workspace, so no terminal and no setup script");
+    connector_off(&app);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worktree_create_revoked_while_queued_on_the_lifecycle_lock_checks_out_nothing() {
+    if isolated(&format!("{MODULE}worktree_create_revoked_while_queued_on_the_lifecycle_lock_checks_out_nothing")) {
+        return;
+    }
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    let caller = connector_caller(&app, "queued-wt-client", "queued-wt-grant", ControlAccess::FullAccess).await;
+    let args = json!({"repo_path": repo, "branch": "queued-branch", "layout": "empty", "client_request_id": "queued-wt"});
+    let path = crate::git::conventional_worktree_path(&repo.canonicalize().unwrap(), "queued-branch").unwrap();
+    let before = count(&app);
+
+    let removal = crate::worktree_cleanup::removal_guard().await;
+    let queued = spawn_call(&app, &caller, "worktree_create", &args);
+    let running = admitted(&app, &caller, "worktree_create", &args).await;
+    let reserved = running["workspace_id"].as_str().unwrap().to_string();
+    reach_the_lock().await;
+    assert!(!path.exists(), "no checkout while a removal holds the lock");
+    crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "queued-wt-client".into()).unwrap();
+    drop(removal);
+
+    refused(queued.await.unwrap(), ErrorCode::GrantRevoked);
+    failed_as_revoked(&settled(&app, &caller, &running["operation_id"]).await);
+    assert!(!path.exists(), "no checkout");
+    assert_eq!(git(&repo, &["branch", "--list", "queued-branch"]), "", "no branch");
+    assert!(app.state::<AppStateStore>().find_workspace(&reserved).is_none());
+    assert_eq!(count(&app), before);
+    connector_off(&app);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_launch_worktree_revoked_while_queued_on_the_lifecycle_lock_starts_nothing() {
+    if isolated(&format!("{MODULE}thread_launch_worktree_revoked_while_queued_on_the_lifecycle_lock_starts_nothing")) {
+        return;
+    }
+    let (app, provider, _root, workspace, repo) = git_fixture().await;
+    let caller = connector_caller(&app, "queued-launch-client", "queued-launch-grant", ControlAccess::FullAccess).await;
+    let path = crate::git::conventional_worktree_path(&repo, "queued-launch").unwrap();
+    let before = count(&app);
+
+    let removal = crate::worktree_cleanup::removal_guard().await;
+    let launched = call(&app, &caller, "thread_launch", launch_args(&workspace, "queued-launch", json!({"branch": "queued-launch"}))).await.unwrap();
+    let reserved = launched["workspace_id"].as_str().unwrap().to_string();
+    reach_the_lock().await;
+    assert!(!path.exists(), "no checkout while a removal holds the lock");
+    crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "queued-launch-client".into()).unwrap();
+    drop(removal);
+
+    failed_as_revoked(&settled(&app, &caller, &launched["operation_id"]).await);
+    assert!(!path.exists(), "no checkout, so no setup script");
+    assert_eq!(git(&repo, &["branch", "--list", "queued-launch"]), "", "no branch");
+    assert!(app.state::<AppStateStore>().find_workspace(&reserved).is_none());
+    assert_eq!(count(&app), before);
+    assert!(provider.start_inputs().is_empty(), "no thread started");
+    connector_off(&app);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_close_revoked_while_queued_on_the_lifecycle_lock_deletes_nothing() {
+    if isolated(&format!("{MODULE}workspace_close_revoked_while_queued_on_the_lifecycle_lock_deletes_nothing")) {
+        return;
+    }
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    let parent = tempfile::tempdir().unwrap();
+    let checkout = parent.path().join("queued-close");
+    git(&repo, &["worktree", "add", "-b", "queued-close", checkout.to_str().unwrap()]);
+    let state = app.state::<AppStateStore>();
+    let closing = state.create_empty_workspace_at_path(checkout.clone()).0;
+    state.set_workspace_worktree(&closing, checkout.display().to_string(), "queued-close".into());
+    let caller = connector_caller(&app, "queued-close-client", "queued-close-grant", ControlAccess::FullAccess).await;
+    let args = json!({"workspace_id": closing, "delete_worktree": true, "delete_branch": true, "client_request_id": "queued-close"});
+
+    // An open holds the lock shared, so the removal waits for it.
+    let opening = crate::worktree_cleanup::opening_guard().await;
+    let queued = spawn_call(&app, &caller, "workspace_close", &args);
+    let running = admitted(&app, &caller, "workspace_close", &args).await;
+    // The close itself does not wait for the lock: the workspace goes first.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while state.find_workspace(&closing).is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the workspace closes before the delete");
+    reach_the_lock().await;
+    assert!(checkout.exists(), "nothing is deleted while an open holds the lock");
+    crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "queued-close-client".into()).unwrap();
+    drop(opening);
+
+    refused(queued.await.unwrap(), ErrorCode::GrantRevoked);
+    failed_as_revoked(&settled(&app, &caller, &running["operation_id"]).await);
+    assert!(checkout.join(".git").exists(), "the checkout's files stay");
+    git(&repo, &["rev-parse", "--verify", "refs/heads/queued-close"]);
+    connector_off(&app);
 }
 
 // ── outside answers: approvals and questions ──────────────────────────────

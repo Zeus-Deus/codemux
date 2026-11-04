@@ -7,11 +7,12 @@
 //! so they only open or branch folders of projects already opened here, never
 //! force a deletion and never check out the branch the project root has
 //! checked out. A terminal preset or prompt needs Admin. Keyed calls run under
-//! a durable receipt (`service::run_receipted`).
+//! a durable receipt (`service::run_receipted`), and the lifecycle asks for
+//! the caller's authority again wherever it waited ([`checkpoint`]).
 use super::{registry, service, Access, ControlCaller, ControlError, ErrorCode};
 use crate::workspace_service::{
-    self as workspaces, CloseWorkspace, InfoError, OpenWorkspace, WorkspaceService, WorkspaceTarget,
-    WorktreeArgs,
+    self as workspaces, Checkpoint, CloseWorkspace, InfoError, OpenWorkspace, WorkspaceService,
+    WorkspaceTarget, WorktreeArgs,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -113,9 +114,9 @@ pub(super) async fn create<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
         // The legacy default: the folder Codemux itself was started in.
         None => None,
     };
-    let owned = app.clone();
+    let workspaces = WorkspaceService::new(app).checked(checkpoint(app, caller));
     service::run_receipted(app, caller, "workspace_create", &args, true, None, move |reserved| async move {
-        let opened = WorkspaceService::new(&owned)
+        let opened = workspaces
             .open(OpenWorkspace { path, select, reuse_open: true, reserved_id: reserved })
             .await
             .map_err(|error| ControlError::from_text(error, ErrorCode::WorkspaceCreateFailed))?;
@@ -163,13 +164,12 @@ pub(super) async fn create_worktree<R: Runtime>(app: &AppHandle<R>, caller: &Con
     } else {
         local_folder(&input.repo_path)?
     };
-    let (owned, requester) = (app.clone(), caller.clone());
+    let workspaces = WorkspaceService::new(app).checked(checkpoint(app, caller));
     service::run_receipted(app, caller, "worktree_create", &args, true, None, move |reserved| async move {
+        // Resolving the base may fetch from origin. A grant revoked meanwhile
+        // fails the checkpoint the service asks before the checkout.
         let request = input.into_request(None, reserved).await.map_err(request_error)?;
-        // Resolving the base may have fetched from origin: a grant revoked
-        // meanwhile gets no checkout and no setup scripts.
-        service::authorize(&owned, &requester)?;
-        let created = WorkspaceService::new(&owned)
+        let created = workspaces
             .create_worktree(request)
             .await
             .map_err(|error| git_error(error, ErrorCode::WorktreeCreateFailed))?;
@@ -202,16 +202,26 @@ pub(super) async fn close<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller
     }
     service::workspace(app, &workspace_id, false)?;
     let receipt_workspace = workspace_id.clone();
-    let owned = app.clone();
+    let workspaces = WorkspaceService::new(app).checked(checkpoint(app, caller));
     service::run_receipted(app, caller, "workspace_close", &args, false, Some(&receipt_workspace), move |_| async move {
-        let closed = WorkspaceService::new(&owned)
+        let closed = workspaces
             .close(CloseWorkspace { workspace_id, remove_worktree: delete_worktree, delete_branch, force: force_delete })
             .await
-            // Verbatim: the text says why (uncommitted work, a shared checkout).
-            .map_err(|error| ControlError::new(ErrorCode::WorkspaceCloseRefused, error))?;
+            // Verbatim: the text says why (uncommitted work, a shared
+            // checkout). A withdrawn grant keeps its own code.
+            .map_err(|error| ControlError::from_text(error, ErrorCode::WorkspaceCloseRefused))?;
         serde_json::to_value(closed).map_err(serialization)
     })
     .await
+}
+
+/// The caller's authority, as the workspace lifecycle asks for it again after
+/// each wait: on the lifecycle lock, a fetch, a large checkout, stopping a
+/// closing workspace's agents. A grant revoked or a connector disabled
+/// meanwhile stops the operation there, and its receipt records why.
+pub(super) fn checkpoint<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller) -> Checkpoint {
+    let (app, caller) = (app.clone(), caller.clone());
+    Checkpoint::new(move || service::authorize(&app, &caller).map_err(|error| error.to_string()))
 }
 
 /// Maps the workspace and git layers' `prefix: message` errors to codes. Text

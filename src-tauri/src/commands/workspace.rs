@@ -19,7 +19,8 @@ use crate::state::{
 use crate::terminal;
 use crate::workspace_paths::paths_equal;
 use crate::workspace_service::{
-    OpenWorkspace, OpenedWorkspace, PresetLaunch, WorktreeBase, WorktreeRequest,
+    Checkpoint, CloseWorkspace, OpenWorkspace, OpenedWorkspace, PresetLaunch, WorktreeBase,
+    WorktreeRequest,
 };
 use notify_rust::Notification;
 use serde::Serialize;
@@ -166,6 +167,7 @@ pub(crate) async fn create_workspace_impl_with_selection<R: tauri::Runtime>(
     open_workspace_impl(
         app,
         OpenWorkspace { path: cwd, select, reuse_open: false, reserved_id: None },
+        &Checkpoint::default(),
     )
     .await
     .map(|opened| opened.workspace_id)
@@ -173,15 +175,20 @@ pub(crate) async fn create_workspace_impl_with_selection<R: tauri::Runtime>(
 
 /// Open a folder as a workspace: return the live one already there when
 /// `reuse_open` asks for it, else create one (under `reserved_id` when
-/// given) with one terminal, its setup scripts and `.mcp.json`.
+/// given) with one terminal, its setup scripts and `.mcp.json`. `checkpoint`
+/// is asked again after each wait.
 pub(crate) async fn open_workspace_impl<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     request: OpenWorkspace,
+    checkpoint: &Checkpoint,
 ) -> Result<OpenedWorkspace, String> {
     let state = app.state::<AppStateStore>();
     let db = app.state::<crate::database::DatabaseStore>();
     // Cleanup must not delete a checkout while it is being opened.
     let _opening = crate::worktree_cleanup::opening_guard().await;
+    // The lock may have waited out a checkout removal: a requester whose
+    // authority was withdrawn meanwhile opens and focuses nothing.
+    checkpoint.check()?;
     // A workspace cwd must be absolute so its terminals can `chdir` into it;
     // a hand-typed `~` path would otherwise be stored verbatim.
     let repo_path = request
@@ -224,6 +231,13 @@ pub(crate) async fn open_workspace_impl<R: tauri::Runtime>(
         .unwrap_or_else(|| repo_path.clone());
     state.set_workspace_project_root(&workspace_id.0, project_root.display().to_string());
     populate_git_info_async(&state, &workspace_id.0, repo_path.clone()).await;
+    // So may reading git. Then nothing starts in the new workspace, which
+    // goes again: no terminal has started in it yet.
+    if let Err(error) = checkpoint.check() {
+        let _ = state.close_workspace(&workspace_id.0);
+        crate::state::emit_app_state(&app);
+        return Err(error);
+    }
 
     terminal::spawn_missing_ptys_for_workspace(app.clone(), &workspace_id.0);
 
@@ -696,6 +710,16 @@ pub(crate) async fn create_worktree_from_request<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     request: WorktreeRequest,
 ) -> Result<WorkspaceCreated, String> {
+    create_worktree_checked(app, request, &Checkpoint::default()).await
+}
+
+/// [`create_worktree_from_request`], asking `checkpoint` again once the
+/// lifecycle lock is held and once the checkout exists.
+pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    request: WorktreeRequest,
+    checkpoint: &Checkpoint,
+) -> Result<WorkspaceCreated, String> {
     let WorktreeRequest {
         repo_path,
         branch,
@@ -721,6 +745,9 @@ pub(crate) async fn create_worktree_from_request<R: tauri::Runtime>(
 
     // Cleanup must not delete a checkout while it is being opened.
     let _opening = crate::worktree_cleanup::opening_guard().await;
+    // The lock may have waited out a checkout removal: a requester whose
+    // authority was withdrawn meanwhile checks nothing out.
+    checkpoint.check()?;
 
     // Validate repo_path is a git repository before creating anything
     if crate::config::workspace_config::find_git_root(Path::new(&repo_path)).is_none() {
@@ -769,6 +796,22 @@ pub(crate) async fn create_worktree_from_request<R: tauri::Runtime>(
         .map_err(|e| format!("git_create_worktree task join failed: {e}"))??
     };
     let wt_path_buf = PathBuf::from(&worktree_path);
+    // Read before the claim, so that no wait comes between the check below
+    // and what starts in the workspace.
+    let git_info = {
+        let path = wt_path_buf.clone();
+        tokio::task::spawn_blocking(move || gather_workspace_git_info(&path))
+            .await
+            .unwrap_or_default()
+    };
+    // The checkout can take long (a fetch, a large tree). A requester whose
+    // authority was withdrawn meanwhile gets no workspace, terminals, setup
+    // scripts or preset. The checkout stays: nothing ran in it, a later
+    // create of the branch reuses it, and removing it here could race a
+    // concurrent create that adopts it.
+    checkpoint.check().map_err(|error| {
+        format!("{error}; the checkout at {worktree_path} was kept and nothing was started in it")
+    })?;
 
     // ADOPT-EXISTING GUARD. `git_create_worktree` does not always create
     // something: when the conventional path is already on disk and
@@ -844,7 +887,7 @@ pub(crate) async fn create_worktree_from_request<R: tauri::Runtime>(
     state.set_workspace_project_root(&workspace_id.0, repo_path.clone());
     state.set_workspace_base_branch(&workspace_id.0, base_branch.clone());
 
-    populate_git_info_async(&state, &workspace_id.0, wt_path_buf.clone()).await;
+    apply_workspace_git_info(&state, &workspace_id.0, git_info);
 
     if let Some(pr_num) = pr_number {
         // Seed values only — the pollers replace all four the moment they
@@ -1233,6 +1276,31 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         remove_worktree,
         delete_branch,
         force_delete,
+        &Checkpoint::default(),
+    )
+    .await
+    .map(drop)
+}
+
+/// [`close_workspace_with_worktree_impl`], asking `checkpoint` again before
+/// teardown scripts run and before any file is deleted.
+pub(crate) async fn close_workspace_checked<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    request: CloseWorkspace,
+    checkpoint: &Checkpoint,
+) -> Result<(), String> {
+    let state = app.state::<AppStateStore>();
+    let db = app.state::<crate::database::DatabaseStore>();
+    close_workspace_tracked(
+        app.clone(),
+        &state,
+        &db,
+        request.workspace_id,
+        CloseRoute::Tracked,
+        request.remove_worktree,
+        Some(request.delete_branch),
+        Some(request.force),
+        checkpoint,
     )
     .await
     .map(drop)
@@ -1571,6 +1639,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     remove_worktree: bool,
     delete_branch: Option<bool>,
     force_delete: Option<bool>,
+    checkpoint: &Checkpoint,
 ) -> Result<String, String> {
     // Fast refusal while the workspace is still intact. Not under the
     // Hermes lifecycle lock: teardown must not serialize every close, so
@@ -1670,6 +1739,10 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
             }
         }
     }
+    // The pre-flight and stopping Hermes may have taken a while: a requester
+    // whose authority was withdrawn meanwhile runs no teardown script and
+    // closes nothing.
+    checkpoint.check()?;
     // Run teardown scripts before closing. Never for a chat child
     // workspace: its folder is its parent's, still in use.
     if !force && !hermes_pending {
@@ -1703,7 +1776,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // its chats closes the workspaces of the tasks they delegated (see
     // `delegation::close_tasks`), and their stops are awaited too. A stop
     // that was not acknowledged keeps the files.
-    let Detached { claim, earlier, threads, .. } = detached;
+    let Detached { closing, claim, earlier, threads, .. } = detached;
     if let Err(error) = crate::commands::agent_chat::shutdown_agent_chat_threads_and_wait(
         &app,
         &workspace_id,
@@ -1741,6 +1814,15 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // either the hold is visible here or the start finds the
     // directory gone. Held only for this check and the delete.
     let _hermes_lifecycle = crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await;
+    // Stopping the agents and taking the lock can take long. A requester
+    // whose authority was withdrawn meanwhile deletes nothing: the close
+    // stands, and cleanup treats the checkout as after a close that kept it.
+    if let Err(error) = checkpoint.check() {
+        if let (Some(ws), Some(claim)) = (closing.as_ref(), claim) {
+            crate::worktree_cleanup::retire_workspace(&app, claim, ws, Default::default(), Default::default(), true);
+        }
+        return Err(format!("{error}; the workspace was closed and its files were kept"));
+    }
     if db.hermes_cleanup_pending(&workspace_id)? || db.hermes_cleanup_pending_path(&wt_path)? {
         return Err("Hermes worktree cleanup pending: files retained until background completion can be verified.".into());
     }
@@ -2570,7 +2652,7 @@ pub async fn close_workspace<R: tauri::Runtime>(
     workspace_id: String,
     force_delete: Option<bool>,
 ) -> Result<String, String> {
-    close_workspace_tracked(app, &state, &db, workspace_id, CloseRoute::Plain, false, None, force_delete).await
+    close_workspace_tracked(app, &state, &db, workspace_id, CloseRoute::Plain, false, None, force_delete, &Checkpoint::default()).await
 }
 
 #[tauri::command]

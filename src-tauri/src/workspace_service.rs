@@ -3,7 +3,8 @@
 //!
 //! The requests are typed and the service never sees a caller. Desktop
 //! commands pass every choice explicitly; callers that act for an agent
-//! decide authorization themselves and only then come here.
+//! decide authorization themselves and only then come here, with a
+//! [`Checkpoint`] the service asks again wherever it waited.
 use crate::commands::workspace::WorkspaceCreated;
 use crate::state::{
     AppStateStore, InitialChatPane, WorkspaceId, WorkspacePresetLayout, WorkspaceSnapshot,
@@ -11,7 +12,29 @@ use crate::state::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tauri::{AppHandle, Manager, Runtime};
+
+/// Asks again whether whoever requested a lifecycle operation still may, at
+/// the points it cannot take back after a wait: once the shared lifecycle
+/// lock is held (a checkout removal holds it for as long as its delete
+/// takes), before the checkout is made, and before terminals, setup or
+/// teardown scripts start or files are deleted. Outside callers pass their
+/// grant check. The desktop and the control socket act for the person at
+/// this computer and pass the default, which always passes.
+#[derive(Clone, Default)]
+pub(crate) struct Checkpoint(Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>);
+
+impl Checkpoint {
+    pub(crate) fn new(check: impl Fn() -> Result<(), String> + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(check)))
+    }
+
+    /// The refusal reads `code: message`, as the caller's own check words it.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        self.0.as_ref().map_or(Ok(()), |check| check())
+    }
+}
 
 /// Where a new branch forks from.
 #[derive(Debug, Clone, PartialEq)]
@@ -252,39 +275,46 @@ pub(crate) struct ResolvedBase {
 
 pub(crate) struct WorkspaceService<R: Runtime> {
     app: AppHandle<R>,
+    checkpoint: Checkpoint,
 }
 
 impl<R: Runtime> WorkspaceService<R> {
     pub(crate) fn new(app: &AppHandle<R>) -> Self {
-        Self { app: app.clone() }
+        Self { app: app.clone(), checkpoint: Checkpoint::default() }
+    }
+
+    /// Open, create and close ask `checkpoint` again at their points of no
+    /// return.
+    pub(crate) fn checked(self, checkpoint: Checkpoint) -> Self {
+        Self { checkpoint, ..self }
     }
 
     /// Create or open a workspace at a folder. Runs setup scripts and writes
     /// `.mcp.json` only when it creates one.
     pub(crate) async fn open(&self, request: OpenWorkspace) -> Result<OpenedWorkspace, String> {
-        crate::commands::workspace::open_workspace_impl(self.app.clone(), request).await
+        crate::commands::workspace::open_workspace_impl(self.app.clone(), request, &self.checkpoint)
+            .await
     }
 
     pub(crate) async fn create_worktree(
         &self,
         request: WorktreeRequest,
     ) -> Result<WorkspaceCreated, String> {
-        crate::commands::workspace::create_worktree_from_request(self.app.clone(), request).await
+        crate::commands::workspace::create_worktree_checked(
+            self.app.clone(),
+            request,
+            &self.checkpoint,
+        )
+        .await
     }
 
     /// Close a workspace through the same teardown and deletion guards as the
     /// desktop's close dialog. Error text passes through verbatim.
     pub(crate) async fn close(&self, request: CloseWorkspace) -> Result<ClosedWorkspace, String> {
-        let state = self.app.state::<AppStateStore>();
-        let db = self.app.state::<crate::database::DatabaseStore>();
-        crate::commands::workspace::close_workspace_with_worktree_impl(
+        crate::commands::workspace::close_workspace_checked(
             self.app.clone(),
-            &state,
-            &db,
-            request.workspace_id.clone(),
-            request.remove_worktree,
-            Some(request.delete_branch),
-            Some(request.force),
+            request.clone(),
+            &self.checkpoint,
         )
         .await?;
         // A close that was asked to remove the worktree and succeeded did:
@@ -789,6 +819,145 @@ mod tests {
         assert_eq!(state.snapshot().workspaces.len(), count);
         assert!(state.find_workspace(&unused.0).is_none());
         assert_eq!(state.snapshot().active_workspace_id, focused);
+    }
+
+    /// Passes `passes` times, then refuses as a revoked grant does.
+    fn withdrawn_after(passes: usize) -> Checkpoint {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        Checkpoint::new(move || {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < passes {
+                Ok(())
+            } else {
+                Err("grant_revoked: withdrawn".into())
+            }
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_worktree_stops_where_its_checkpoint_is_withdrawn() {
+        if isolated("workspace_service::tests::create_worktree_stops_where_its_checkpoint_is_withdrawn") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let project = repo(dir.path(), "project", "main");
+        let state = AppStateStore::default();
+        state.create_empty_workspace_at_path(project.clone());
+        let app = mock_app(state);
+        let state = app.state::<AppStateStore>();
+        let count = state.snapshot().workspaces.len();
+        let request = |branch: &str, reserved: &WorkspaceId| WorktreeRequest {
+            repo_path: project.display().to_string(),
+            branch: branch.into(),
+            new_branch: true,
+            base: WorktreeBase::RepoHead,
+            layout: WorkspacePresetLayout::Empty,
+            preset: None,
+            pr_number: None,
+            select: false,
+            initial_chat: None,
+            reserved_id: Some(reserved.clone()),
+        };
+        let checked = |checkpoint| WorkspaceService::new(app.handle()).checked(checkpoint);
+
+        // Withdrawn while it waited for the lifecycle lock: no checkout.
+        let reserved = AppStateStore::reserve_workspace_id();
+        let error = checked(withdrawn_after(0)).create_worktree(request("early", &reserved)).await.unwrap_err();
+        assert_eq!(error, "grant_revoked: withdrawn");
+        assert!(!crate::git::conventional_worktree_path(&project, "early").unwrap().exists());
+        assert_eq!(git(&project, &["branch", "--list", "early"]), "");
+
+        // Withdrawn while git checked out: the checkout stays, and no
+        // workspace claims it or starts anything in it.
+        let error = checked(withdrawn_after(1)).create_worktree(request("late", &reserved)).await.unwrap_err();
+        let path = crate::git::conventional_worktree_path(&project, "late").unwrap();
+        assert_eq!(
+            error,
+            format!("grant_revoked: withdrawn; the checkout at {} was kept and nothing was started in it", path.display())
+        );
+        assert!(path.join(".git").exists());
+        assert!(state.find_workspace(&reserved.0).is_none());
+        assert_eq!(state.snapshot().workspaces.len(), count);
+
+        // A later create of that branch takes the kept checkout.
+        let created = WorkspaceService::new(app.handle()).create_worktree(request("late", &reserved)).await.unwrap();
+        assert_eq!((created.workspace_id.as_str(), created.cwd.as_str()), (reserved.0.as_str(), path.to_str().unwrap()));
+        assert!(!created.adopted);
+    }
+
+    // Creation through `open` starts a terminal; a checkpoint withdrawn
+    // after the git reads stops it before that, so this test starts none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_stops_where_its_checkpoint_is_withdrawn() {
+        if isolated("workspace_service::tests::open_stops_where_its_checkpoint_is_withdrawn") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh");
+        std::fs::create_dir(&fresh).unwrap();
+        let state = AppStateStore::default();
+        state.create_empty_workspace_at_path(dir.path().to_path_buf());
+        let other = state.create_empty_workspace_at_path(dir.path().join("elsewhere"));
+        state.activate_workspace(&other.0);
+        let app = mock_app(state);
+        let state = app.state::<AppStateStore>();
+        let count = state.snapshot().workspaces.len();
+        let open = |path: &Path, select| OpenWorkspace {
+            path: Some(path.display().to_string()),
+            select,
+            reuse_open: true,
+            reserved_id: None,
+        };
+        let checked = |checkpoint| WorkspaceService::new(app.handle()).checked(checkpoint);
+
+        // Withdrawn while it waited for the lifecycle lock: an open folder
+        // is not even focused.
+        let error = checked(withdrawn_after(0)).open(open(dir.path(), true)).await.unwrap_err();
+        assert_eq!(error, "grant_revoked: withdrawn");
+        assert_eq!(state.snapshot().active_workspace_id, other);
+
+        // Withdrawn while it read git: the new workspace goes again.
+        let error = checked(withdrawn_after(1)).open(open(&fresh, false)).await.unwrap_err();
+        assert_eq!(error, "grant_revoked: withdrawn");
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.workspaces.len(), count);
+        assert!(snapshot.workspaces.iter().all(|w| Path::new(&w.cwd) != fresh), "{:?}", snapshot.workspaces);
+        assert_eq!(snapshot.active_workspace_id, other);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_stops_where_its_checkpoint_is_withdrawn() {
+        if isolated("workspace_service::tests::close_stops_where_its_checkpoint_is_withdrawn") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let project = repo(dir.path(), "project", "main");
+        let checkout = dir.path().join("checkout");
+        git(&project, &["worktree", "add", "-b", "feat", checkout.to_str().unwrap()]);
+        let state = AppStateStore::default();
+        let closing = state.create_empty_workspace_at_path(checkout.clone()).0;
+        state.set_workspace_worktree(&closing, checkout.display().to_string(), "feat".into());
+        let app = mock_app(state);
+        let state = app.state::<AppStateStore>();
+        let close = || CloseWorkspace {
+            workspace_id: closing.clone(),
+            remove_worktree: true,
+            delete_branch: true,
+            force: false,
+        };
+        let checked = |checkpoint| WorkspaceService::new(app.handle()).checked(checkpoint);
+
+        // Withdrawn before teardown: the workspace stays as it was.
+        let error = checked(withdrawn_after(0)).close(close()).await.unwrap_err();
+        assert_eq!(error, "grant_revoked: withdrawn");
+        assert!(state.find_workspace(&closing).is_some());
+
+        // Withdrawn while its agents stopped and the lifecycle lock was taken:
+        // the close stands, and the files and the branch stay.
+        let error = checked(withdrawn_after(1)).close(close()).await.unwrap_err();
+        assert_eq!(error, "grant_revoked: withdrawn; the workspace was closed and its files were kept");
+        assert!(state.find_workspace(&closing).is_none());
+        assert!(checkout.join(".git").exists());
+        git(&project, &["rev-parse", "--verify", "refs/heads/feat"]);
     }
 
     #[test]

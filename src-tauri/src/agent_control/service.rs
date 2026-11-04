@@ -412,9 +412,11 @@ async fn launch_in_worktree<R: Runtime>(
     workspaces::check_new_worktree(&plan.repo, &plan.branch)
         .await
         .map_err(|error| super::workspace_tools::git_error(error, ErrorCode::WorktreeCreateFailed))?;
-    // A grant revoked during the fetch gets no checkout and no setup scripts.
-    authorize(app, caller)?;
+    // A grant revoked during the fetch, or while a checkout removal holds the
+    // lifecycle lock, fails the checkpoint the service asks before the
+    // checkout and again before setup scripts start.
     let created = WorkspaceService::new(app)
+        .checked(super::workspace_tools::checkpoint(app, caller))
         .create_worktree(WorktreeRequest {
             repo_path: plan.repo.display().to_string(),
             branch: plan.branch.clone(),
