@@ -1273,10 +1273,10 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                     .close(crate::workspace_service::CloseWorkspace {
                         workspace_id: workspace_id.to_string(),
                         remove_worktree: flag("delete_worktree"),
-                        // As the desktop dialog: `git branch -D`.
-                        delete_branch: flag("delete_branch")
-                            .then_some(crate::workspace_service::BranchDeletion::Force),
+                        delete_branch: flag("delete_branch"),
                         force: flag("force_delete"),
+                        // As the desktop dialog.
+                        commits: crate::workspace_service::CommitLoss::Allow,
                     })
                     .await
                     .and_then(|closed| serde_json::to_value(closed).map_err(|error| error.to_string())),

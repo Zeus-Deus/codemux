@@ -423,7 +423,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
    → {"workspace_id": "workspace-9", "closed": true, "worktree_removed": true, …}
    ```
 
-   It stops the workspace's agents and terminals and runs its teardown. `delete_worktree` removes a worktree, never a project folder, and refuses one with uncommitted or unpushed work (`workspace_close_refused`). `delete_branch` also deletes its branch. `force_delete` removes it anyway; only assistants on this computer can use it.
+   It stops the workspace's agents and terminals and runs its teardown. `delete_worktree` removes a worktree, never a project folder. It refuses one with uncommitted or unpushed work, including commits made on a detached HEAD that no branch holds (`workspace_close_refused`). `delete_branch` also deletes its branch, but only if a remote branch or the default branch holds all of its commits; another local branch doesn't count. Otherwise the close is refused, and a branch that gains such a commit while the close runs is kept. `force_delete` removes the worktree and branch anyway; only assistants on this computer can use it.
 
 **Errors.** A failed call is an MCP tool error (`isError: true`) whose text reads `code: message` and whose `structuredContent.error` holds `code`, `message` and `retryable`. An unknown tool is a JSON-RPC error.
 

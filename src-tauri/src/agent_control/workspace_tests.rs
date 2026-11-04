@@ -521,6 +521,43 @@ async fn workspace_close_keeps_a_branch_holding_the_only_copy_of_its_commits() {
     assert!(!branch_exists(&repo, "forced"), "force_delete deletes it as before");
 }
 
+/// A worker that committed on a detached HEAD (`git checkout --detach`, or a
+/// rebase stopped at an edit) holds commits no branch has, so removing the
+/// checkout would lose them. A close that is not forced refuses before any
+/// teardown, with or without `delete_branch`. Once a branch holds them, the
+/// checkout may go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_close_keeps_commits_only_a_detached_head_holds() {
+    if isolated(&format!("{MODULE}workspace_close_keeps_commits_only_a_detached_head_holds")) {
+        return;
+    }
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    let owner = named(ControlAccess::FullAccess);
+    let full = connector(ControlAccess::FullAccess);
+    let created = call(&app, &owner, "worktree_create", json!({"repo_path": repo, "branch": "detached", "layout": "empty"})).await.unwrap();
+    let id = created["workspace_id"].as_str().unwrap().to_string();
+    let cwd = PathBuf::from(created["cwd"].as_str().unwrap());
+    git(&cwd, &["checkout", "--detach"]);
+    git(&cwd, &["commit", "--allow-empty", "-m", "only on HEAD"]);
+    let only = git(&cwd, &["rev-parse", "HEAD"]);
+    assert_eq!(git(&repo, &["for-each-ref", "--contains", &only]), "", "the premise: no ref holds it");
+
+    for (caller, key, delete_branch) in [(&full, "connector", false), (&full, "connector-branch", true), (&owner, "local", false)] {
+        let close = json!({"workspace_id": id, "delete_worktree": true, "delete_branch": delete_branch, "client_request_id": key});
+        let error = refused(call(&app, caller, "workspace_close", close).await, ErrorCode::WorkspaceCloseRefused);
+        assert!(error.message.contains("detached HEAD") && error.message.contains("1 commit"), "{key}: {error}");
+        assert!(app.state::<AppStateStore>().find_workspace(&id).is_some(), "{key}: refused before any teardown");
+        assert_eq!(git(&cwd, &["rev-parse", "HEAD"]), only, "{key}: the checkout keeps the commit");
+    }
+
+    // A branch holds the commit now, so removing the checkout loses nothing.
+    git(&repo, &["branch", "saved", &only]);
+    let closed = call(&app, &full, "workspace_close", json!({"workspace_id": id, "delete_worktree": true, "client_request_id": "connector-saved"})).await.unwrap();
+    assert_eq!(closed["worktree_removed"], true, "{closed}");
+    assert!(!cwd.exists());
+    assert_eq!(git(&repo, &["rev-parse", "saved"]), only);
+}
+
 // ── worktree_create ───────────────────────────────────────────────────────
 
 /// A bare origin seeded from `seed`, cloned into the fixture repository,
@@ -992,8 +1029,9 @@ async fn workspace_close_withdrawn_during_its_preflight_stops_no_hermes_chat() {
         .close(crate::workspace_service::CloseWorkspace {
             workspace_id: closing.clone(),
             remove_worktree: true,
-            delete_branch: Some(crate::workspace_service::BranchDeletion::Force),
+            delete_branch: true,
             force: false,
+            commits: crate::workspace_service::CommitLoss::Allow,
         })
         .await
         .unwrap_err();

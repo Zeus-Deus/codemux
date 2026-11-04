@@ -6,7 +6,7 @@
 //! decide authorization themselves and only then come here, with a
 //! [`Checkpoint`] the service asks again wherever it waited.
 use crate::commands::workspace::WorkspaceCreated;
-pub(crate) use crate::git::BranchDeletion;
+pub(crate) use crate::git::CommitLoss;
 use crate::state::{
     AppStateStore, InitialChatPane, WorkspaceId, WorkspacePresetLayout, WorkspaceSnapshot,
     WorkspaceType,
@@ -206,10 +206,10 @@ pub(crate) struct OpenedWorkspace {
 pub(crate) struct CloseWorkspace {
     pub workspace_id: String,
     pub remove_worktree: bool,
-    /// With `remove_worktree`, also delete the branch the worktree had
-    /// checked out, as this says; `None` keeps it.
-    pub delete_branch: Option<BranchDeletion>,
+    pub delete_branch: bool,
     pub force: bool,
+    /// Whether removing the worktree may lose commits nothing else keeps.
+    pub commits: CommitLoss,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -992,8 +992,9 @@ mod tests {
         let close = || CloseWorkspace {
             workspace_id: closing.clone(),
             remove_worktree: true,
-            delete_branch: Some(BranchDeletion::Force),
+            delete_branch: true,
             force: false,
+            commits: CommitLoss::Allow,
         };
         let checked = |checkpoint| WorkspaceService::new(app.handle()).checked(checkpoint);
 

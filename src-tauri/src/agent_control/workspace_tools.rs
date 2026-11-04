@@ -11,7 +11,7 @@
 //! the caller's authority again wherever it waited ([`checkpoint`]).
 use super::{registry, service, Access, ControlCaller, ControlError, ErrorCode};
 use crate::workspace_service::{
-    self as workspaces, BranchDeletion, Checkpoint, CloseWorkspace, InfoError, OpenWorkspace,
+    self as workspaces, Checkpoint, CloseWorkspace, CommitLoss, InfoError, OpenWorkspace,
     WorkspaceService, WorkspaceTarget, WorktreeArgs,
 };
 use serde::Deserialize;
@@ -201,10 +201,11 @@ pub(super) async fn close<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller
     if force_delete && caller.is_network() {
         return Err(ControlError::new(ErrorCode::PermissionDenied, "force_delete is only available on this computer"));
     }
-    // Unforced, a branch holding the only copy of some commit stays: a
+    // Unforced, a close loses no commit that nothing else keeps: not one a
+    // detached HEAD made, nor one only the branch it deletes holds. A
     // worker's new branch has no upstream, so the unpushed-work check alone
-    // would let it go.
-    let delete_branch = delete_branch.then_some(if force_delete { BranchDeletion::Force } else { BranchDeletion::Retained });
+    // would let them go.
+    let commits = if force_delete { CommitLoss::Allow } else { CommitLoss::Refuse };
     // A retry after the close replays it instead of finding no workspace.
     if let Some(done) = service::recorded(app, caller, "workspace_close", &args)? {
         return Ok(done);
@@ -214,7 +215,7 @@ pub(super) async fn close<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller
     let workspaces = WorkspaceService::new(app).checked(checkpoint(app, caller));
     service::run_receipted(app, caller, "workspace_close", &args, false, Some(&receipt_workspace), move |_| async move {
         let closed = workspaces
-            .close(CloseWorkspace { workspace_id, remove_worktree: delete_worktree, delete_branch, force: force_delete })
+            .close(CloseWorkspace { workspace_id, remove_worktree: delete_worktree, delete_branch, force: force_delete, commits })
             .await
             // Verbatim: the text says why (uncommitted work, a shared
             // checkout). A withdrawn grant keeps its own code.

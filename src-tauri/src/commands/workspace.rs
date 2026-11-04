@@ -6,7 +6,7 @@ use crate::config::{
     ShellAppearance,
     ThemeColors,
 };
-use crate::git::BranchDeletion;
+use crate::git::CommitLoss;
 use crate::state::{
     AppStateSnapshot,
     AppStateStore,
@@ -1345,10 +1345,12 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         workspace_id,
         CloseRoute::Tracked,
         remove_worktree,
-        // The close dialog's own behaviour: it warns from the workspace's
-        // ahead count, and the branch goes with `git branch -D`.
-        delete_branch.unwrap_or(false).then_some(BranchDeletion::Force),
+        delete_branch,
         force_delete,
+        // The close dialog's own behaviour: it warns only from the
+        // workspace's ahead count. A detached HEAD's commits go with the
+        // checkout, and the branch with `git branch -D`.
+        CommitLoss::Allow,
         &Checkpoint::default(),
     )
     .await
@@ -1372,8 +1374,9 @@ pub(crate) async fn close_workspace_checked<R: tauri::Runtime>(
         request.workspace_id,
         CloseRoute::Tracked,
         request.remove_worktree,
-        request.delete_branch,
+        Some(request.delete_branch),
         Some(request.force),
+        request.commits,
         checkpoint,
     )
     .await
@@ -1711,8 +1714,9 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     workspace_id: String,
     route: CloseRoute,
     remove_worktree: bool,
-    delete_branch: Option<BranchDeletion>,
+    delete_branch: Option<bool>,
     force_delete: Option<bool>,
+    commits: CommitLoss,
     checkpoint: &Checkpoint,
 ) -> Result<String, String> {
     // Fast refusal while the workspace is still intact. Not under the
@@ -1796,18 +1800,20 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
             }
         }
     }
-    // Nor may the branch go while it holds the only copy of some commit,
-    // when the caller may not discard work: a branch with no upstream
-    // passes the check above. Refused here for the same reason, before any
-    // teardown; the deletion checks again.
-    if remove_worktree && delete_branch == Some(BranchDeletion::Retained) {
-        if let (Some(wt_path), Some(branch)) = (worktree_path.clone(), branch.clone()) {
+    // Nor may a close that must not discard work lose a commit nothing
+    // else keeps: one a detached HEAD made, or one only the branch it
+    // deletes holds. The check above sees neither without an upstream.
+    // Refused here for the same reason, before any teardown. The branch
+    // deletion checks again; the checkout's HEAD, like its files, only here.
+    if remove_worktree && commits == CommitLoss::Refuse {
+        if let Some(wt_path) = worktree_path.clone() {
             if Path::new(&wt_path).exists() {
+                let branch = branch.clone().filter(|_| delete_branch.unwrap_or(false));
                 tokio::task::spawn_blocking(move || {
-                    crate::git::ensure_branch_retained(Path::new(&wt_path), &branch)
+                    crate::git::ensure_commits_kept(Path::new(&wt_path), branch.as_deref())
                 })
                 .await
-                .map_err(|e| format!("branch deletion pre-flight task join failed: {e}"))??;
+                .map_err(|e| format!("commit pre-flight task join failed: {e}"))??;
             }
         }
     }
@@ -1901,7 +1907,11 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
         .await
         .map_err(|error| format!("Agent session did not stop ({error}); worktree files retained."))?;
 
-    let branch_to_delete = branch.zip(delete_branch);
+    let branch_to_delete = if delete_branch.unwrap_or(false) {
+        branch
+    } else {
+        None
+    };
     // No workspace opens from the final check through the delete, as for
     // background cleanup; the fence below covers chat workspaces, which
     // open without waiting. Taken before the Hermes lock, in cleanup's order.
@@ -1949,8 +1959,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // that hole; the pre-flight remains the only place uncommitted
     // work can block the close.
     tokio::task::spawn_blocking(move || {
-        let branch = branch_to_delete.as_ref().map(|(name, deletion)| (name.as_str(), *deletion));
-        crate::git::remove_worktree(Path::new(&wt_path), branch, true)
+        crate::git::remove_worktree(Path::new(&wt_path), branch_to_delete.as_deref(), commits, true)
     })
     .await
     .map_err(|e| format!("git_remove_worktree task join failed: {e}"))??;
@@ -2749,7 +2758,7 @@ pub async fn close_workspace<R: tauri::Runtime>(
     workspace_id: String,
     force_delete: Option<bool>,
 ) -> Result<String, String> {
-    close_workspace_tracked(app, &state, &db, workspace_id, CloseRoute::Plain, false, None, force_delete, &Checkpoint::default()).await
+    close_workspace_tracked(app, &state, &db, workspace_id, CloseRoute::Plain, false, None, force_delete, CommitLoss::Allow, &Checkpoint::default()).await
 }
 
 #[tauri::command]

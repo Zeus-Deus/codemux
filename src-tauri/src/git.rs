@@ -3102,17 +3102,17 @@ pub fn git_branch_exists(repo_path: &Path, branch: &str) -> bool {
     })
 }
 
-/// How a worktree removal deletes the branch the worktree had checked out.
+/// Whether removing a worktree may lose commits that nothing else keeps:
+/// ones its detached HEAD made, and ones only the branch it deletes holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BranchDeletion {
-    /// `git branch -D`, even when the branch is the only reference to some
-    /// of its commits: the desktop close dialog and the legacy close tools.
-    Force,
-    /// Only while other refs keep all of its commits: a remote-tracking
-    /// branch (an upstream among them) or the repository's default branch.
-    /// A branch holding the only copy of a commit stays, so a close that may
-    /// not discard work checks [`ensure_branch_retained`] before teardown.
-    Retained,
+pub(crate) enum CommitLoss {
+    /// They go: the checkout with its HEAD, the branch with `git branch -D`.
+    /// The desktop close dialog, the legacy close tools and forced closes.
+    Allow,
+    /// They stay. A close checks [`ensure_commits_kept`] before teardown, and
+    /// the removal deletes the branch only while a remote-tracking branch or
+    /// the default branch holds all of its commits.
+    Refuse,
 }
 
 /// The repository a worktree belongs to: the main checkout its `.git` file
@@ -3147,9 +3147,11 @@ fn deletable_branch(repo_path: &Path, branch: &str) -> bool {
         && run_git(repo_path, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
 }
 
-/// How many of `branch`'s commits no other ref keeps: no remote-tracking
-/// branch and not the repository's default branch. 0 means deleting the
-/// branch loses no commit.
+/// How many of `branch`'s commits neither a remote-tracking branch nor the
+/// repository's default branch holds. 0 means deleting the branch loses no
+/// commit. Another local branch does not count: a later close may delete
+/// that one too, and two closes each relying on the other's branch would
+/// lose the commits between them.
 fn commits_only_on(repo_path: &Path, branch: &str) -> Result<usize, String> {
     let mut args = vec![
         "rev-list".to_string(),
@@ -3174,13 +3176,50 @@ fn commits_only_on(repo_path: &Path, branch: &str) -> Result<usize, String> {
         .map_err(|e| format!("git rev-list gave {count:?}: {e}"))
 }
 
-/// Refuses to delete `branch` together with the worktree at `worktree_path`
-/// while the branch holds commits no other ref keeps: never pushed, or
-/// pushed and then amended, and not merged into the default branch. Without
-/// an upstream, [`ensure_worktree_removable`] cannot see such commits. Like
-/// it, this runs before any teardown, so a refusal leaves the workspace as
-/// it was. A branch the removal would not delete passes.
-pub(crate) fn ensure_branch_retained(worktree_path: &Path, branch: &str) -> Result<(), String> {
+/// How many commits the worktree's HEAD holds that no branch, remote-tracking
+/// branch or tag does: ones made on a detached HEAD (`git checkout
+/// --detach`, a rebase stopped at an edit). Removing the checkout loses
+/// them. A HEAD on a branch holds none.
+fn commits_only_at_head(worktree_path: &Path) -> Result<usize, String> {
+    // Not `--all`: it counts every worktree's HEAD, this one's included.
+    let count = run_git(
+        worktree_path,
+        &["rev-list", "--count", "HEAD", "--not", "--branches", "--remotes", "--tags"],
+    )?;
+    count
+        .trim()
+        .parse()
+        .map_err(|e| format!("git rev-list gave {count:?}: {e}"))
+}
+
+/// Refuses to remove the worktree at `worktree_path`, and with `branch` to
+/// delete that branch too, while the removal would lose a commit nothing
+/// else keeps:
+/// - one its detached HEAD made, which no branch, remote branch or tag holds;
+/// - one `branch` holds that no remote-tracking branch or the default branch
+///   does: never pushed, or pushed and then amended, and not merged.
+///
+/// Without an upstream, [`ensure_worktree_removable`] sees neither. Like it,
+/// this runs before any teardown, so a refusal leaves the workspace as it
+/// was. A branch the removal would not delete passes. A check that cannot
+/// run refuses.
+pub(crate) fn ensure_commits_kept(worktree_path: &Path, branch: Option<&str>) -> Result<(), String> {
+    match commits_only_at_head(worktree_path) {
+        Ok(0) => {}
+        Ok(count) => {
+            return Err(format!(
+                "The worktree's detached HEAD has {count} commit(s) that no branch, remote branch or tag holds. Put them on a branch first, or keep the worktree."
+            ))
+        }
+        Err(error) => {
+            return Err(format!(
+                "Could not check that the commits at the worktree's HEAD are kept elsewhere ({error}). Keep the worktree."
+            ))
+        }
+    }
+    let Some(branch) = branch else {
+        return Ok(());
+    };
     let repo_path = main_checkout_of(worktree_path)?;
     if !deletable_branch(&repo_path, branch) {
         return Ok(());
@@ -3197,14 +3236,16 @@ pub(crate) fn ensure_branch_retained(worktree_path: &Path, branch: &str) -> Resu
 }
 
 pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>, force: bool) -> Result<(), String> {
-    remove_worktree(worktree_path, branch.map(|branch| (branch, BranchDeletion::Force)), force)
+    remove_worktree(worktree_path, branch, CommitLoss::Allow, force)
 }
 
-/// [`git_remove_worktree`], deleting the branch as its [`BranchDeletion`]
-/// says.
+/// [`git_remove_worktree`], deleting `branch` only as `commits` allows. The
+/// checkout itself goes either way: a close checks its HEAD before teardown
+/// ([`ensure_commits_kept`]), when nothing removes it yet.
 pub(crate) fn remove_worktree(
     worktree_path: &Path,
-    branch: Option<(&str, BranchDeletion)>,
+    branch: Option<&str>,
+    commits: CommitLoss,
     force: bool,
 ) -> Result<(), String> {
     let repo_path = main_checkout_of(worktree_path)?;
@@ -3226,11 +3267,11 @@ pub(crate) fn remove_worktree(
     }
 
     // Delete the branch if requested (skip main/master and the repo's current branch)
-    if let Some((branch_name, deletion)) = branch {
+    if let Some(branch_name) = branch {
         if deletable_branch(&repo_path, branch_name) {
             // Checked again now nothing works in the checkout: its agents
             // and teardown may have committed since the pre-flight.
-            if deletion == BranchDeletion::Retained && !matches!(commits_only_on(&repo_path, branch_name), Ok(0)) {
+            if commits == CommitLoss::Refuse && !matches!(commits_only_on(&repo_path, branch_name), Ok(0)) {
                 eprintln!("[codemux::git] kept branch {branch_name}: it holds commits no other ref keeps");
             } else {
                 let _ = run_git(&repo_path, &["branch", "-D", branch_name]);
@@ -5032,13 +5073,13 @@ mod tests {
         assert!(!PathBuf::from(&wt_path).exists(), "worktree dir should be gone");
     }
 
-    /// Under `BranchDeletion::Retained` a branch holding the only copy of a
-    /// commit (no upstream, never pushed, not merged) is refused by the
-    /// pre-flight and kept by the removal. One whose commits a
-    /// remote-tracking branch or the default branch holds is deleted, and
-    /// `Force` deletes as before.
+    /// Under `CommitLoss::Refuse` a branch holding the only copy of a commit
+    /// (no upstream, never pushed, not merged) is refused by the pre-flight
+    /// and kept by the removal, and so is a detached HEAD's commit. One whose
+    /// commits a remote-tracking branch or the default branch holds is
+    /// deleted, and `Allow` deletes as before.
     #[test]
-    fn retained_branch_deletion_keeps_the_only_copy_of_a_commit() {
+    fn refused_commit_loss_keeps_the_only_copy_of_a_commit() {
         let (dir, local, _remote) = setup_test_repo_with_remote();
         let commit = |path: &Path| {
             run_git(path, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "work"])
@@ -5055,37 +5096,56 @@ mod tests {
 
         // No commits of its own: the default branch holds them all.
         let fresh = add("fresh");
-        ensure_branch_retained(&fresh, "fresh").expect("nothing to lose");
+        ensure_commits_kept(&fresh, Some("fresh")).expect("nothing to lose");
 
         let unpushed = add("unpushed");
         commit(&unpushed);
         ensure_worktree_removable(&unpushed).expect("the premise: no upstream, so the unpushed check passes");
-        let error = ensure_branch_retained(&unpushed, "unpushed").unwrap_err();
+        ensure_commits_kept(&unpushed, None).expect("kept with its branch, the checkout may go");
+        let error = ensure_commits_kept(&unpushed, Some("unpushed")).unwrap_err();
         assert!(error.contains("'unpushed' has 1 commit(s)"), "{error}");
-        remove_worktree(&unpushed, Some(("unpushed", BranchDeletion::Retained)), true).expect("remove");
+        remove_worktree(&unpushed, Some("unpushed"), CommitLoss::Refuse, true).expect("remove");
         assert!(!unpushed.exists(), "the checkout goes");
         assert!(exists("unpushed"), "the only copy of the commit stays");
+
+        // Another local branch holds the commit: that keeps a detached HEAD's
+        // commit, but not a deleted branch's, as a close may delete it next.
+        let based = add("based");
+        run_git(&based, &["reset", "--hard", "unpushed"]).expect("reset");
+        let error = ensure_commits_kept(&based, Some("based")).unwrap_err();
+        assert!(error.contains("'based' has 1 commit(s)"), "{error}");
+        run_git(&based, &["checkout", "--detach"]).expect("detach");
+        ensure_commits_kept(&based, None).expect("the branch unpushed holds HEAD");
+
+        // A commit made on a detached HEAD: no branch holds it, and an
+        // upstream check cannot see it.
+        commit(&based);
+        ensure_worktree_removable(&based).expect("the premise: a detached HEAD has no upstream");
+        let error = ensure_commits_kept(&based, None).unwrap_err();
+        assert!(error.contains("detached HEAD has 1 commit(s)"), "{error}");
+        run_git(&local, &["tag", "kept", &run_git(&based, &["rev-parse", "HEAD"]).unwrap()]).expect("tag");
+        ensure_commits_kept(&based, None).expect("a tag holds it");
 
         // Pushed without setting an upstream: origin/pushed holds it.
         let pushed = add("pushed");
         commit(&pushed);
         run_git(&pushed, &["push", "origin", "pushed"]).expect("push");
-        ensure_branch_retained(&pushed, "pushed").expect("a remote-tracking branch holds it");
-        remove_worktree(&pushed, Some(("pushed", BranchDeletion::Retained)), true).expect("remove");
+        ensure_commits_kept(&pushed, Some("pushed")).expect("a remote-tracking branch holds it");
+        remove_worktree(&pushed, Some("pushed"), CommitLoss::Refuse, true).expect("remove");
         assert!(!exists("pushed"));
 
         // Merged into the default branch here, never pushed.
         let merged = add("merged");
         commit(&merged);
         run_git(&local, &["merge", "--ff-only", "merged"]).expect("merge");
-        ensure_branch_retained(&merged, "merged").expect("the default branch holds it");
-        remove_worktree(&merged, Some(("merged", BranchDeletion::Retained)), true).expect("remove");
+        ensure_commits_kept(&merged, Some("merged")).expect("the default branch holds it");
+        remove_worktree(&merged, Some("merged"), CommitLoss::Refuse, true).expect("remove");
         assert!(!exists("merged"));
 
         let forced = add("forced");
         commit(&forced);
-        remove_worktree(&forced, Some(("forced", BranchDeletion::Force)), true).expect("remove");
-        assert!(!exists("forced"), "forcing deletes the only copy, as before");
+        remove_worktree(&forced, Some("forced"), CommitLoss::Allow, true).expect("remove");
+        assert!(!exists("forced"), "allowed, the only copy goes, as before");
     }
 
     // ── merge_branch comprehensive integration tests ──
