@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 
 #[derive(Subcommand)]
 pub enum ConnectorCommand {
-    /// Show whether the network door is on, where it listens and who is
-    /// connected.
+    /// Show whether the network door is on, where it listens, and how many
+    /// assistants are connected or waiting to sign in.
     Status {
         #[command(flatten)]
         out: OutputArgs,
