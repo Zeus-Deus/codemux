@@ -333,6 +333,7 @@ describe("PaneTabStrip — overflow", () => {
       offsetWidth: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetWidth")!,
     };
     let header = 0;
+    let run = { labelled: 0, compact: 0 };
     // The row's other children, as the tab fit measures them.
     Object.defineProperty(proto, "offsetWidth", {
       configurable: true,
@@ -355,10 +356,12 @@ describe("PaneTabStrip — overflow", () => {
         const id = (this as HTMLElement).dataset?.testid;
         if (id === "right-panel-pane-actions") return 110;
         if (id === "right-panel-tabs-scroll" || id === "right-panel-tabs-content") {
-          // Labelled, the run is 220px. Compact, it depends on how the
-          // active tab is fitted too: 132px with its count, 92px without.
-          if (!document.querySelector("[data-compact]")) return 220;
-          return document.querySelector('[data-state="active"][data-fit]') ? 92 : 132;
+          // Compact, the run depends on how the active tab is fitted too:
+          // with its count, or 40px narrower without.
+          if (!document.querySelector("[data-compact]")) return run.labelled;
+          return document.querySelector('[data-state="active"][data-fit]')
+            ? run.compact - 40
+            : run.compact;
         }
         return 0;
       },
@@ -388,15 +391,23 @@ describe("PaneTabStrip — overflow", () => {
     });
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      // Every width across the band where either fit flips, 1px apart: the
-      // cycles live on narrow boundaries.
-      for (header = 400; header <= 800; header += 1) {
-        for (const activeTab of ["files", "changes"] as const) {
-          const { unmount } = renderStrip({
-            activeTab,
-            actions: <button type="button" aria-label="Refresh">R</button>,
-          });
-          unmount();
+      // The cycles live on narrow boundaries, so sweep 1px apart across the
+      // band where these runs and 110px of actions flip either fit (every
+      // past loop here sat between 517 and 554px). Two runs: one where the
+      // labels come back while the actions fold, one where the active
+      // tab's count does.
+      for (run of [
+        { labelled: 220, compact: 132 },
+        { labelled: 260, compact: 172 },
+      ]) {
+        for (header = 500; header <= 570; header += 1) {
+          for (const activeTab of ["files", "changes"] as const) {
+            const { unmount } = renderStrip({
+              activeTab,
+              actions: <button type="button" aria-label="Refresh">R</button>,
+            });
+            unmount();
+          }
         }
       }
       const loops = errors.mock.calls.filter((call) =>
@@ -412,7 +423,8 @@ describe("PaneTabStrip — overflow", () => {
       Object.defineProperty(Element.prototype, "clientWidth", original.clientWidth);
       Object.defineProperty(HTMLElement.prototype, "offsetWidth", original.offsetWidth);
     }
-  });
+    // ~280 renders: slow CI runners need more than the default 5s.
+  }, 20_000);
 
   // A count can grow in place (Changes, Tasks) without a new tab set or a
   // pane switch; a compact row must fit the active tab against its current
