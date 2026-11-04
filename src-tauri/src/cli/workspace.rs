@@ -163,7 +163,13 @@ pub(crate) async fn run(door: &Door, command: WorkspaceCommand) -> Result<Exit, 
             let outcome = mutate(door, verbs::WORKSPACE_CLOSE, arguments).await;
             output::report(verbs::WORKSPACE_CLOSE, outcome, out.json, Some(&key), |closed| {
                 let removed = closed["worktree_removed"] == true || closed["result"]["worktree_removed"] == true;
-                output::out(&format!("Closed {}{}.", workspace_id(closed), if removed { " and removed its worktree" } else { "" }))
+                output::out(&format!("Closed {}{}.", workspace_id(closed), if removed { " and removed its worktree" } else { "" }))?;
+                // A non-forced close keeps a worktree or branch that gained a
+                // commit while it ran, and says why.
+                match closed["kept_because"].as_str().or_else(|| closed["result"]["kept_because"].as_str()) {
+                    Some(reason) => output::out(&format!("Kept: {reason}")),
+                    None => Ok(()),
+                }
             })
         }
         WorkspaceCommand::RerunSetup { workspace_id } => {

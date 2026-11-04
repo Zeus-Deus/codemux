@@ -154,7 +154,7 @@ mod defs {
     }
 
     pub(super) fn workspace_close(view: &CallerView) -> Option<Definition> {
-        only_outside(view, outside("Close a workspace: stop its agents and terminals and run teardown. delete_worktree also removes a disposable worktree (never a project root; refuses uncommitted or unpushed work unless force_delete), and delete_branch its branch. Connector clients cannot force_delete. Needs full access. Pass client_request_id to make retries safe.", json!({
+        only_outside(view, outside("Close a workspace: stop its agents and terminals and run teardown. delete_worktree also removes a disposable worktree (never a project root; refuses uncommitted or unpushed work unless force_delete), and delete_branch its branch. Connector clients cannot force_delete. Without force_delete, a worktree or branch that gains a commit while the close runs is kept, and kept_because says why. Needs full access. Pass client_request_id to make retries safe.", json!({
             "workspace_id": {"type": "string", "minLength": 1, "maxLength": 256},
             "delete_worktree": {"type": "boolean", "default": false},
             "delete_branch": {"type": "boolean", "default": false},
