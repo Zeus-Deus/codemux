@@ -628,7 +628,8 @@ fn connector_status_names_the_executable_outside_assistants_launch() {
     let serve = Serve::start();
     let status = serve.ok(&["connector", "status", "--json"])["result"].clone();
     let executable = status["localExecutable"].as_str().expect("localExecutable");
-    // This serve's PATH has no `codemux`, so it names the binary itself.
+    // PATH reaches no codemux, or another install, never this test build, so
+    // it names the binary itself.
     assert!(Path::new(executable).is_absolute(), "{status}");
     assert_eq!(std::fs::canonicalize(executable).unwrap(), std::fs::canonicalize(CODEMUX).unwrap());
     let command = status["localCommand"].as_str().expect("localCommand");
