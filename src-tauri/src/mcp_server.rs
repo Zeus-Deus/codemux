@@ -1730,20 +1730,24 @@ async fn handle_tool_call(call: CallToolParams) -> Value {
         }
 
         // -- Git tools (shell out) --
+        // A caller's file name goes after `--`, so git reads it as a path,
+        // never an option: `--output=<file>` would make `git diff` write
+        // that file, even through a read-only connection.
         "git_status" => run_git(&["status", "--porcelain"], &workspace_id).await,
         "git_diff" => {
             let file = arguments.get("file").and_then(Value::as_str);
             match file {
-                Some(f) => run_git(&["diff", f], &workspace_id).await,
+                Some(f) => run_git(&["diff", "--", f], &workspace_id).await,
                 None => run_git(&["diff"], &workspace_id).await,
             }
         }
         "git_stage" => {
             let file = arguments.get("file").and_then(Value::as_str).unwrap_or(".");
-            run_git(&["add", file], &workspace_id).await
+            run_git(&["add", "--", file], &workspace_id).await
         }
         "git_commit" => {
             let message = arguments.get("message").and_then(Value::as_str).unwrap_or_default();
+            // `-m` takes the next argument as the message, whatever it starts with.
             run_git(&["commit", "-m", message], &workspace_id).await
         }
         "git_push" => run_git(&["push"], &workspace_id).await,

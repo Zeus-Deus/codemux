@@ -214,6 +214,13 @@ impl Mcp {
     fn call(&mut self, name: &str, arguments: Value) -> Value {
         self.request("tools/call", json!({"name": name, "arguments": arguments}))["result"].clone()
     }
+
+    /// [`Mcp::call`] tagged with `workspace`, as a chat's calls are, so the
+    /// git tools run in that workspace's folder.
+    fn call_in(&mut self, workspace: &str, name: &str, arguments: Value) -> Value {
+        let meta = json!({"codemux/workspace_id": workspace});
+        self.request("tools/call", json!({"name": name, "arguments": arguments, "_meta": meta}))["result"].clone()
+    }
 }
 
 impl Drop for Mcp {
@@ -437,6 +444,57 @@ fn mcp_supervised_client_sees_no_admin_tools_and_is_refused_them() {
     assert_eq!(denied["structuredContent"]["error"]["code"], "access_denied", "{denied}");
     let reached = supervised.call("thread_send", send);
     assert_eq!(reached["structuredContent"]["error"]["code"], "workspace_not_found", "{reached}");
+}
+
+/// The legacy git tools run inside `codemux mcp`, so no gate in the app sees
+/// their arguments. A file name must stay a path: as a git option,
+/// `--output=<file>` made `git diff` write that file through a read-only
+/// connection.
+#[test]
+fn mcp_git_tools_take_file_names_as_paths() {
+    let serve = Serve::start(&[]);
+    let root = serve.root.path();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "trunk"]);
+    git(&repo, &["config", "user.name", "Codemux test"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    std::fs::write(repo.join("tracked"), "one\n").unwrap();
+    git(&repo, &["add", "tracked"]);
+    git(&repo, &["commit", "-m", "first"]);
+    // A change, so a diff written anywhere would not be empty.
+    std::fs::write(repo.join("tracked"), "two\n").unwrap();
+    let created = serve.json("create_workspace", &json!({ "path": repo }).to_string(), &[]);
+    assert_eq!(created["ok"], true, "{created}");
+    let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
+
+    let (kept, fresh) = (root.join("kept.txt"), root.join("fresh.txt"));
+    std::fs::write(&kept, "keep\n").unwrap();
+    let mut read_only = Mcp::start(&serve, &["--client", "integration-bot", "--access", "read-only"]);
+    for target in [&kept, &fresh] {
+        let file = format!("--output={}", target.display());
+        let reply = read_only.call_in(&id, "git_diff", json!({ "file": file }));
+        assert_ne!(reply["isError"], true, "{reply}");
+        assert_eq!(reply["content"][0]["text"], "", "no file has that name: {reply}");
+    }
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "keep\n", "git_diff overwrote a file");
+    assert!(!fresh.exists(), "git_diff created a file");
+    let diff = read_only.call_in(&id, "git_diff", json!({ "file": "tracked" }));
+    assert!(diff["content"][0]["text"].as_str().unwrap().contains("+two"), "{diff}");
+
+    // `--all` as an option would stage the untracked file too.
+    std::fs::write(repo.join("untracked"), "new\n").unwrap();
+    let mut supervised = Mcp::start(&serve, &["--client", "integration-bot", "--access", "supervised"]);
+    let staged = supervised.call_in(&id, "git_stage", json!({ "file": "--all" }));
+    assert_eq!(staged["isError"], true, "no file has that name: {staged}");
+    assert_eq!(git(&repo, &["diff", "--cached", "--name-only"]), "", "nothing was staged");
+    let staged = supervised.call_in(&id, "git_stage", json!({ "file": "tracked" }));
+    assert_ne!(staged["isError"], true, "{staged}");
+    assert_eq!(git(&repo, &["diff", "--cached", "--name-only"]), "tracked");
+    // `-m` takes the next argument whatever it looks like.
+    let committed = supervised.call_in(&id, "git_commit", json!({ "message": "--amend" }));
+    assert_ne!(committed["isError"], true, "{committed}");
+    assert_eq!(git(&repo, &["log", "--format=%s"]), "--amend\nfirst", "a new commit, not an amended one");
 }
 
 /// A control socket like a Codemux build from before `client.access`
