@@ -14,6 +14,13 @@ pub(crate) enum RunState {
     Failed,
 }
 
+#[cfg(test)]
+impl RunState {
+    /// Every state. A new state belongs here too: the guide's wait-states
+    /// table is checked against this list (`docs_tests`).
+    pub(crate) const ALL: [Self; 4] = [Self::Running, Self::NeedsInput, Self::Done, Self::Failed];
+}
+
 /// A run's terminal status as Codemux recorded it, live or persisted.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TurnEnd<'a> {

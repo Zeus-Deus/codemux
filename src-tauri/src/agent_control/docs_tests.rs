@@ -82,6 +82,20 @@ fn outside_agents_guide_counts_the_stdio_tools() {
     assert!(GUIDE.contains(&claim), "the guide's release notes say {claim:?}");
 }
 
+#[test]
+fn outside_agents_guide_names_the_mcp_versions_codemux_speaks() {
+    use crate::mcp::protocol::{MODERN_ERA_ENABLED, MODERN_PROTOCOL_VERSIONS, SUPPORTED_PROTOCOL_VERSIONS};
+    for version in SUPPORTED_PROTOCOL_VERSIONS {
+        assert!(GUIDE.contains(version), "the guide names MCP {version}");
+    }
+    // Switched off, the stateless era is gone and server/discover is unknown
+    // again, so the guide must stop offering it.
+    assert_eq!(GUIDE.contains("server/discover"), MODERN_ERA_ENABLED, "the guide offers server/discover only while the stateless era is on");
+    for version in MODERN_PROTOCOL_VERSIONS {
+        assert_eq!(GUIDE.contains(version), MODERN_ERA_ENABLED, "the guide names MCP {version} only while the stateless era is on");
+    }
+}
+
 /// One example call from a `text` fence: `tool {json arguments}`, the JSON on
 /// that line or spread over the following ones.
 struct ExampleCall {
@@ -150,16 +164,14 @@ fn outside_agents_guide_tool_calls_match_the_schemas() {
 
 #[test]
 fn outside_agents_guide_names_real_wait_states_and_error_codes() {
-    // The test compares the guide with `states`, not with the enum itself. A
-    // new state stops the match below compiling, which points here: add it to
-    // `states` too, and the guide's table must then explain it.
-    let states = [RunState::Running, RunState::NeedsInput, RunState::Done, RunState::Failed];
-    for state in states {
+    // A new state stops this match compiling; add it to `RunState::ALL`, and
+    // the guide's table must then explain it.
+    for state in RunState::ALL {
         match state {
             RunState::Running | RunState::NeedsInput | RunState::Done | RunState::Failed => {}
         }
     }
-    let expected: BTreeSet<String> = states
+    let expected: BTreeSet<String> = RunState::ALL
         .iter()
         .map(|state| serde_json::to_value(state).unwrap().as_str().unwrap().to_owned())
         .collect();
