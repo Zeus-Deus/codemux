@@ -573,8 +573,8 @@ pub fn spawn_control_server<R: Runtime>(app: AppHandle<R>) {
     });
 }
 
-/// Lines a client may send ahead while a request parks. Past this many the
-/// server stops reading until the request returns.
+/// Lines a client may send ahead while a request parks. One more ends the
+/// parked request with `resource_limit` and closes the connection.
 const MAX_PIPELINED_LINES: usize = 64;
 
 /// Answers each request line with one response line, in order.
@@ -583,7 +583,9 @@ const MAX_PIPELINED_LINES: usize = 64;
 /// request that parks (`thread_wait`) ends when the client hangs up, since
 /// nobody is left to read its result; lines the client pipelines meanwhile
 /// are kept and answered after it, and the hang-up is still watched for.
-/// Other requests always run to the end.
+/// The server keeps reading so it can see the hang-up, so a line past
+/// [`MAX_PIPELINED_LINES`] is refused rather than left unread. Other
+/// requests always run to the end.
 async fn handle_client<R: Runtime, S>(app: AppHandle<R>, stream: S, peer_pid: Option<u32>) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -608,6 +610,7 @@ where
             continue;
         }
 
+        let mut overflowed = false;
         let response = match serde_json::from_str::<ControlEnvelope>(&line) {
             // A line this server cannot read (for example an access level a
             // newer client knows) is answered, so the client can say why.
@@ -625,14 +628,21 @@ where
                     let work = dispatch_request_as(&app, &caller, request);
                     tokio::pin!(work);
                     loop {
-                        if pipelined.len() >= MAX_PIPELINED_LINES {
-                            break work.await;
-                        }
                         tokio::select! {
                             response = &mut work => break response,
                             // `next_line` is cancel safe: no line is lost here.
                             next = lines.next_line() => match next {
-                                Ok(Some(line)) => pipelined.push_back(line),
+                                Ok(Some(line)) if pipelined.len() < MAX_PIPELINED_LINES => pipelined.push_back(line),
+                                // Holding it would grow without bound, and
+                                // leaving it unread would stop the hang-up watch.
+                                Ok(Some(_)) => {
+                                    overflowed = true;
+                                    break control_response(Err(crate::agent_control::ControlError::new(
+                                        crate::agent_control::ErrorCode::ResourceLimit,
+                                        format!("More than {MAX_PIPELINED_LINES} lines arrived while this request waited; send further requests after its reply"),
+                                    )
+                                    .to_string()));
+                                }
                                 Ok(None) | Err(_) => return Ok(()),
                             },
                         }
@@ -646,6 +656,10 @@ where
             .write_all(format!("{payload}\n").as_bytes())
             .await
             .map_err(|error| format!("Failed to write control response: {error}"))?;
+        // The held lines go unanswered; the client learned why above.
+        if overflowed {
+            return Ok(());
+        }
     }
 
     Ok(())
@@ -2670,6 +2684,46 @@ mod tests {
             .await
             .expect("a held line does not keep a ten-minute wait alive after its client hung up");
         assert_eq!(ended.unwrap(), Ok(()));
+    }
+
+    /// `thread_wait` that parks, followed by `held` pipelined status lines.
+    fn wait_then_status_lines(wait: &Value, held: usize) -> String {
+        let status = serde_json::json!({"command": "status"});
+        format!("{}\n", serde_json::json!({"command": "thread_wait", "params": wait})) + &format!("{status}\n").repeat(held)
+    }
+
+    #[tokio::test]
+    async fn socket_wait_ends_when_a_client_pipelines_to_the_limit_and_hangs_up() {
+        let (app, _root, wait) = waitable().await;
+        let mut long = wait;
+        long["timeout_ms"] = serde_json::json!(600_000);
+        let (served, mut replies, mut writer) = connect(&app);
+        writer.write_all(wait_then_status_lines(&long, MAX_PIPELINED_LINES).as_bytes()).await.unwrap();
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), replies.next_line()).await;
+        assert!(early.is_err(), "the wait parks with {MAX_PIPELINED_LINES} lines held: {early:?}");
+        drop((replies, writer));
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), served)
+            .await
+            .expect("lines held at the limit do not keep a ten-minute wait alive after its client hung up");
+        assert_eq!(ended.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn socket_refuses_a_line_past_the_pipeline_limit() {
+        let (app, _root, wait) = waitable().await;
+        let mut long = wait;
+        long["timeout_ms"] = serde_json::json!(600_000);
+        let (served, mut replies, mut writer) = connect(&app);
+        writer.write_all(wait_then_status_lines(&long, MAX_PIPELINED_LINES + 1).as_bytes()).await.unwrap();
+        // The parked wait answers with the reason, then the connection closes
+        // without answering the held lines.
+        let refused = reply(&mut replies).await;
+        assert!(refused_with(&refused, "resource_limit"), "{:?}", refused.error);
+        let after = tokio::time::timeout(std::time::Duration::from_secs(5), replies.next_line())
+            .await
+            .expect("the connection closes after the refusal");
+        assert!(matches!(after, Ok(None)), "no held line is answered: {after:?}");
+        assert_eq!(served.await.unwrap(), Ok(()));
     }
 
     #[tokio::test]
