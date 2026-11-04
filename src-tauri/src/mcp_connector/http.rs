@@ -444,7 +444,8 @@ async fn mcp<R: Runtime>(
         "tools/call" => {
             // validate_method guarantees a name.
             let name = rpc.params["name"].as_str().unwrap_or_default();
-            let arguments = rpc.params.get("arguments").cloned().unwrap_or(json!({}));
+            // `null` arguments mean none, as on stdio and the socket.
+            let arguments = rpc.params.get("arguments").filter(|a| !a.is_null()).cloned().unwrap_or(json!({}));
             // A call that may park trades its request permit for a wait slot,
             // so parked waits never starve token refresh or other calls.
             let parks = agent_control::registry::lookup(name).is_some_and(|(_, spec)| spec.may_wait());
@@ -2997,6 +2998,15 @@ mod tests {
         let legacy = r#"{"jsonrpc":"2.0","id":3,"method":"server/discover","params":{}}"#;
         let response = value(invoke(&f, request(&f, "/mcp", "POST", legacy, Some(&token))).await).await;
         assert_eq!((response["id"].clone(), response["error"]["code"].clone()), (json!(3), json!(-32601)));
+    }
+
+    #[tokio::test]
+    async fn null_arguments_read_as_no_arguments() {
+        let f = fixture().await;
+        let token = grant(&f);
+        let result = call_tool(&f, &token, "workspace_list", Value::Null).await;
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result, call_tool(&f, &token, "workspace_list", json!({})).await);
     }
 
     #[tokio::test]

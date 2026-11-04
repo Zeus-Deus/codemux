@@ -888,7 +888,11 @@ pub mod protocol {
                 "tools/call" => {
                     keys(&self.params, &["name", "arguments", "_meta"])
                         && label(&self.params["name"])
-                        && self.params.get("arguments").is_none_or(Value::is_object)
+                        // `null` reads as no arguments, as on stdio and the socket.
+                        && self
+                            .params
+                            .get("arguments")
+                            .is_none_or(|arguments| arguments.is_null() || arguments.is_object())
                 }
                 _ => return Err((-32601, "Method not found")),
             };
@@ -1060,6 +1064,9 @@ pub mod protocol {
             let list = |params| Rpc::parse(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":params})).unwrap();
             assert_eq!(list(json!({"cursor":"next"})).validate_method(), Err((-32602, "Invalid cursor")));
             assert!(list(json!({"_meta":{}})).validate_method().is_ok());
+            let call = |params| Rpc::parse(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":params})).unwrap();
+            assert!(call(json!({"name":"thread_list","arguments":null})).validate_method().is_ok(), "null arguments mean none");
+            assert_eq!(call(json!({"name":"thread_list","arguments":[]})).validate_method(), Err((-32602, "Invalid params")));
             let discover = |params| Rpc::parse(json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":params})).unwrap();
             assert!(discover(json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}})).validate_method().is_ok());
             assert_eq!(discover(json!({"extra":1})).validate_method(), Err((-32602, "Invalid params")));
