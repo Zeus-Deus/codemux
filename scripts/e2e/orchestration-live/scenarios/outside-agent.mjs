@@ -540,10 +540,18 @@ async function cli(ctx) {
     ctx.check("cli: a run that needs approval exits 2 with the approval", asking.code === 2 && !!approval?.request_id,
       { code: asking.code, state: pending?.state, pending: pending?.pending });
     if (approval) {
-      const denied = await run(["thread", "respond", pending.thread_id, approval.request_id, "deny", "--workspace", workspaceId, "--json"]);
-      const waited = await run(["thread", "wait", pending.thread_id, "--workspace", workspaceId, "--json"]);
-      ctx.check("cli: deny, then thread wait reports the run's end", denied.code === 0 && [0, 1].includes(waited.code),
-        { respond: denied.code, wait: waited.code, state: printed(waited)?.state });
+      // A denied run may try another way (a shell command, then the Write
+      // tool), and each try asks again: deny every request the run opens, as
+      // an assistant that never allows does, until the run ends.
+      const denied = [];
+      let waited = null;
+      for (let request = approval; request && denied.length < 4;) {
+        denied.push((await run(["thread", "respond", pending.thread_id, request.request_id, "deny", "--workspace", workspaceId, "--json"])).code);
+        waited = await run(["thread", "wait", pending.thread_id, "--workspace", workspaceId, "--json"]);
+        request = waited.code === 2 ? printed(waited)?.pending?.approvals?.[0] : null;
+      }
+      ctx.check("cli: deny, then thread wait reports the run's end", denied.every((code) => code === 0) && [0, 1].includes(waited.code),
+        { respond: denied, wait: waited.code, state: printed(waited)?.state });
     }
 
     const third = challenge(tag);
