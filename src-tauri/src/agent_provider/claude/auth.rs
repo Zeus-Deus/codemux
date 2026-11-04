@@ -24,6 +24,16 @@ use super::protocol::{
 /// Ceiling for the whole probe round trip (spawn + RPC + shutdown).
 const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
+/// settings.json keys naming commands that fetch credentials. They are
+/// commands, not secrets, so helpers pass them through `--settings`.
+/// Keep in step with `ROUTING_SETTING_KEYS` in sidecar/claude-agent/src/user-routing.ts.
+pub(crate) const CLAUDE_ROUTING_SETTING_KEYS: &[&str] = &[
+    "apiKeyHelper",
+    "awsCredentialExport",
+    "awsAuthRefresh",
+    "gcpAuthRefresh",
+];
+
 /// Provider routing accepted by Claude Code. Helpers forward only these
 /// settings in the child environment so user instructions stay isolated.
 /// Keep in step with `ROUTING_ENV_KEYS` in sidecar/claude-agent/src/user-routing.ts.

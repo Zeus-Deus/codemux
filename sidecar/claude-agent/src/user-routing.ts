@@ -11,7 +11,8 @@
 //
 // - routing `env` values go into the child environment, never argv (the
 //   SDK puts `settings` on the command line, and these can be secrets);
-// - `apiKeyHelper` is a command, not a secret, so it rides in `settings`.
+// - credential helper commands (`apiKeyHelper`, the cloud refresh/export
+//   commands) are commands, not secrets, so they ride in `settings`.
 //
 // The values are passed through unread; the CLI authenticates with them
 // exactly as it would when loading the file itself. That is why this file
@@ -79,13 +80,26 @@ export const ROUTING_ENV_KEYS: readonly string[] = [
   "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
 ];
 
+/** settings.json keys naming commands that fetch credentials. Forwarded
+ *  so an isolated helper authenticates as the user's main session does.
+ *  Keep in step with `CLAUDE_ROUTING_SETTING_KEYS` in
+ *  src-tauri/src/agent_provider/claude/auth.rs. */
+export const ROUTING_SETTING_KEYS = [
+  "apiKeyHelper",
+  "awsCredentialExport",
+  "awsAuthRefresh",
+  "gcpAuthRefresh",
+] as const;
+
+type RoutingSettings = Partial<Record<(typeof ROUTING_SETTING_KEYS)[number], string>>;
+
 export interface UserRouting {
   /** `baseEnv` with the settings.json routing values laid over it.
    *  Settings values win, matching the CLI, which applies its `env`
    *  block over the inherited environment. */
   env: Env;
   /** Flag-settings entries to merge into the SDK `settings` option. */
-  settings: { apiKeyHelper?: string };
+  settings: RoutingSettings;
 }
 
 /** The settings.json the CLI would read for this environment: the
@@ -111,15 +125,16 @@ export function userRouting(baseEnv: Env, read = readSettings): UserRouting {
       }
     }
   }
-  const helper = settings?.["apiKeyHelper"];
-  return {
-    env,
-    settings: typeof helper === "string" && helper.trim() ? { apiKeyHelper: helper } : {},
-  };
+  const routingSettings: RoutingSettings = {};
+  for (const key of ROUTING_SETTING_KEYS) {
+    const value = settings?.[key];
+    if (typeof value === "string" && value.trim()) routingSettings[key] = value;
+  }
+  return { env, settings: routingSettings };
 }
 
 /** Options for a minimal isolated query (model list, usage): no setting
- *  sources, the routed environment, and `apiKeyHelper` when set. */
+ *  sources, the routed environment, and any credential helper commands. */
 export function routedOptions(
   baseEnv: Env = process.env as Env,
 ): Pick<Options, "env" | "settingSources" | "settings"> {
@@ -127,7 +142,7 @@ export function routedOptions(
   return {
     env: routing.env,
     settingSources: [],
-    ...(routing.settings.apiKeyHelper ? { settings: routing.settings } : {}),
+    ...(Object.keys(routing.settings).length > 0 ? { settings: routing.settings } : {}),
   };
 }
 

@@ -93,12 +93,14 @@ fn build_invocation(
                 "disableAllHooks": true,
                 "autoMemoryEnabled": false,
             });
-            if let Some(helper) = claude_settings
-                .and_then(|settings| settings.get("apiKeyHelper"))
-                .and_then(serde_json::Value::as_str)
-                .filter(|helper| !helper.trim().is_empty())
-            {
-                settings["apiKeyHelper"] = helper.into();
+            for key in crate::agent_provider::claude::auth::CLAUDE_ROUTING_SETTING_KEYS {
+                if let Some(command) = claude_settings
+                    .and_then(|settings| settings.get(*key))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|command| !command.trim().is_empty())
+                {
+                    settings[*key] = command.into();
+                }
             }
             let mut args = vec![
                 "--print".into(),
@@ -435,6 +437,8 @@ SessionStart = []
                 "UNRELATED_SETTING": "must-not-leak",
             },
             "apiKeyHelper": "test-key-helper",
+            "awsCredentialExport": "test-aws-export",
+            "gcpAuthRefresh": "test-gcp-refresh",
             "outputStyle": "Explanatory",
             "hooks": {"SessionStart": [{"command": "unsafe-command"}]},
         });
@@ -477,6 +481,9 @@ SessionStart = []
             .unwrap();
         let settings: serde_json::Value = serde_json::from_str(&settings[1]).unwrap();
         assert_eq!(settings["apiKeyHelper"], "test-key-helper");
+        assert_eq!(settings["awsCredentialExport"], "test-aws-export");
+        assert_eq!(settings["gcpAuthRefresh"], "test-gcp-refresh");
+        assert!(settings.get("outputStyle").is_none());
         assert_eq!(settings["disableAllHooks"], true);
         assert!(settings.get("env").is_none());
     }

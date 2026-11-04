@@ -99,5 +99,21 @@ describe("userRouting", () => {
     expect(proxy.settings).toBeUndefined();
     const helper = routedOptions({ CLAUDE_CONFIG_DIR: homeWith({ apiKeyHelper: "key-cmd" }) });
     expect(helper.settings).toEqual({ apiKeyHelper: "key-cmd" });
+    // Bedrock/Vertex credential commands travel without any apiKeyHelper.
+    const cloud = routedOptions({
+      CLAUDE_CONFIG_DIR: homeWith({
+        env: { CLAUDE_CODE_USE_BEDROCK: "1" },
+        awsCredentialExport: "aws-export-cmd",
+        awsAuthRefresh: "aws-sso-cmd",
+        gcpAuthRefresh: "gcloud-cmd",
+        outputStyle: "Explanatory",
+      }),
+    });
+    expect(cloud.env?.CLAUDE_CODE_USE_BEDROCK).toBe("1");
+    expect(cloud.settings).toEqual({
+      awsCredentialExport: "aws-export-cmd",
+      awsAuthRefresh: "aws-sso-cmd",
+      gcpAuthRefresh: "gcloud-cmd",
+    });
   });
 });

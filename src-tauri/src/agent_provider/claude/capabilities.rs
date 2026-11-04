@@ -604,9 +604,11 @@ fn api_models_request(
     let request = client
         .get(endpoint)
         .header("anthropic-version", ANTHROPIC_API_VERSION);
-    Ok(match key {
-        Some(key) => request.header("x-api-key", key),
-        None => request.bearer_auth(token.expect("credentials checked above")),
+    // Claude Code prefers ANTHROPIC_AUTH_TOKEN over ANTHROPIC_API_KEY, so a
+    // proxy token wins over an API key inherited from the shell.
+    Ok(match token {
+        Some(token) => request.bearer_auth(token),
+        None => request.header("x-api-key", key.expect("credentials checked above")),
     })
 }
 
@@ -1341,8 +1343,8 @@ mod tests {
                 Some("http://localhost:8080/proxy/"),
                 Some("test-key"),
                 Some("test-token"),
-                "x-api-key",
-                "test-key",
+                "authorization",
+                "Bearer test-token",
                 "http://localhost:8080/proxy/v1/models?limit=1000",
             ),
             (
