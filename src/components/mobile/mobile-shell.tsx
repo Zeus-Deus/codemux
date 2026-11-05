@@ -32,7 +32,7 @@ import { useActiveWorkspace, useAppStore } from "@/stores/app-store";
 import { useUIStore, type RightPanelTab } from "@/stores/ui-store";
 import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
-import { activateWorkspace } from "@/tauri/commands";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import {
   getWorkspaceStatus,
   STATUS_DOT_CLASS,
@@ -128,7 +128,7 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
   }, [draft]);
   const openWorkspace = async (id: string) => {
     try {
-      await activateWorkspace(id);
+      await activateWorkspaceInteraction(id);
       setHome(false);
     } catch (error) {
       toast.error("Could not open workspace", { description: String(error) });
@@ -238,7 +238,9 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
             <ChevronDown size={14} className="shrink-0 text-muted-foreground" />
           </button>
         ) : (
-          <div className="min-w-0 flex-1 truncate font-semibold">
+          // With no back button on the list, inset the title to the
+          // content's 16px edge instead of the header's 8px.
+          <div className={cn("min-w-0 flex-1 truncate font-semibold", home && "pl-2")}>
             {home ? "Workspaces" : "New workspace"}
           </div>
         )}
@@ -306,11 +308,15 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
           </div>
           <div className="mobile-workspaces">
             {workspaces.map((w) => {
-              const status = getWorkspaceStatus(
+              const liveStatus = getWorkspaceStatus(
                 w.surfaces,
                 snapshot?.pane_statuses ?? {},
               );
               const isSettled = settled.some((s) => s.id === w.workspace_id);
+              // A settled workspace's leftover "Done · review" is old news:
+              // show it as Settled. Live work (working / needs you) still wins.
+              const status =
+                isSettled && liveStatus === "review" ? null : liveStatus;
               const project = (w.project_root ?? w.cwd).split(/[\\/]/).pop();
               return (
                 <article key={w.workspace_id} className="mobile-workspace">
@@ -358,9 +364,9 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
                     className="mobile-settle"
                     disabled={
                       !isSettled &&
-                      (status === "working" ||
-                        status === "permission" ||
-                        status === "monitoring")
+                      (liveStatus === "working" ||
+                        liveStatus === "permission" ||
+                        liveStatus === "monitoring")
                     }
                     aria-label={`${isSettled ? "Unsettle" : "Settle"} ${w.title}`}
                     onClick={() =>

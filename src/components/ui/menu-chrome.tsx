@@ -123,7 +123,8 @@ interface KeycapProps {
 }
 
 /**
- * The one keycap used across every restyled menu. Right-aligned, mono, and
+ * The one keycap used across every restyled menu. Right-aligned, sans with
+ * tabular figures (the same face as the `Kbd` chips in tooltips), and
  * quiet enough that a menu where only half the rows have a binding still reads
  * as a calm column rather than a ragged one.
  */
@@ -137,7 +138,7 @@ export function MenuKeycap({ actionId, keys, className }: KeycapProps) {
       // the item is called, so it stays out of the row's accessible name.
       aria-hidden
       className={cn(
-        "ml-auto shrink-0 font-mono text-caption font-normal tracking-normal text-subtle-foreground",
+        "ml-auto shrink-0 pl-4 font-sans text-caption font-normal tracking-normal tabular-nums text-subtle-foreground",
         className,
       )}
     >

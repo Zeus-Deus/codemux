@@ -128,6 +128,7 @@ export function ComposerCommandMenu({
         // rows survive the filter); cmdk just renders + navigates them.
         shouldFilter={false}
         loop
+        label="Search commands"
         className="flex min-h-0 flex-col"
       >
         <div className="flex shrink-0 items-center gap-2.5 px-3.5 pt-3 pb-2">

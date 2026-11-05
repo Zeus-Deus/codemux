@@ -113,6 +113,25 @@ describe("MessageTrail", () => {
     ).toBeInTheDocument();
   });
 
+  it("is one Tab stop; arrows and Home/End move between turns without jumping", () => {
+    renderTrail(turns(4));
+    const buttons = screen.getAllByRole("button");
+    // Only the newest turn is in the Tab order.
+    expect(buttons.map((b) => b.tabIndex)).toEqual([-1, -1, -1, 0]);
+
+    buttons[3].focus();
+    fireEvent.keyDown(buttons[3], { key: "ArrowUp" });
+    expect(document.activeElement).toBe(buttons[2]);
+    expect(buttons.map((b) => b.tabIndex)).toEqual([-1, -1, 0, -1]);
+
+    fireEvent.keyDown(buttons[2], { key: "Home" });
+    expect(document.activeElement).toBe(buttons[0]);
+    fireEvent.keyDown(buttons[0], { key: "End" });
+    expect(document.activeElement).toBe(buttons[3]);
+    // Moving focus previews a turn; only activation scrolls.
+    expect(scrollToIndex).not.toHaveBeenCalled();
+  });
+
   it("jumps to the turn's row on click (align start)", () => {
     renderTrail(turns(4));
     fireEvent.click(

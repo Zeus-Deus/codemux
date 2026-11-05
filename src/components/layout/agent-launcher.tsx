@@ -25,7 +25,11 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ScrollEdgeFade, useScrollEdges } from "@/components/ui/scroll-edge-fade";
 import { PresetIcon } from "@/components/icons/preset-icon";
-import { BAND_CONTROL_RADIUS } from "@/components/layout/titlebar-control-style";
+import {
+  BAND_ACTIVE_FILL,
+  BAND_CONTROL_HOVER,
+  BAND_CONTROL_RADIUS,
+} from "@/components/layout/titlebar-control-style";
 import {
   isPresetInstalled,
   usePresetAvailability,
@@ -376,11 +380,10 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
               aria-label="Launch an agent"
               data-testid="agent-launcher-trigger"
               className={cn(
-                "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
+                "flex size-7 shrink-0 items-center justify-center",
                 BAND_CONTROL_RADIUS,
-                open
-                  ? "bg-accent text-foreground"
-                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                BAND_CONTROL_HOVER,
+                open ? cn(BAND_ACTIVE_FILL, "text-foreground") : "text-muted-foreground",
               )}
             >
               <Plus className="size-4" />
@@ -408,7 +411,7 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
           pointerClose.current = false;
         }}
       >
-        <Command>
+        <Command label="Search agents and tools">
           <CommandInput
             placeholder="Launch an agent…"
             // cmdk fires onSelect without the DOM event, so mirror the live
@@ -578,11 +581,10 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
               data-testid="draft-agent-launcher-trigger"
               disabled={draft.promoting}
               className={cn(
-                "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
+                "flex size-7 shrink-0 items-center justify-center",
                 BAND_CONTROL_RADIUS,
-                open
-                  ? "bg-accent text-foreground"
-                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                BAND_CONTROL_HOVER,
+                open ? cn(BAND_ACTIVE_FILL, "text-foreground") : "text-muted-foreground",
                 draft.promoting && "opacity-40 pointer-events-none",
               )}
             >
@@ -610,7 +612,7 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
           pointerClose.current = false;
         }}
       >
-        <Command>
+        <Command label="Search agents and tools">
           <CommandInput placeholder="Start with an agent…" />
           <LauncherCommandList
             testId="draft-agent-launcher"

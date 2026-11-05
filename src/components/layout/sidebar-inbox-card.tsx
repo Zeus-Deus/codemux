@@ -31,10 +31,12 @@ import {
 } from "@/components/github/pr-status-icon";
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
 import { WorkspaceHoverCard } from "./workspace-hover-card";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import {
   useSidebarDensityStore,
   formatElapsed,
+  PERMISSION_BLOCKER_FALLBACK,
   permissionBlockerText,
 } from "@/stores/sidebar-density-store";
 import { useProjectAppearance } from "./use-project-appearance";
@@ -499,6 +501,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
 
   const isWorking = status === "working";
   const isNeeds = status === "permission";
+  const blockerText = isNeeds ? permissionBlockerText(workspace) : null;
   const isMonitoring = status === "monitoring";
   const isDone = status === "review";
 
@@ -635,6 +638,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   const eyebrowGlyphClass = cn(
     "flex shrink-0 items-center border-none bg-transparent p-0",
     "text-subtle-foreground transition-colors duration-150 hover:text-foreground",
+    // The glyph is 12px; the target is 18×24, so a near miss doesn't fall
+    // through to the card and navigate away. Narrower sideways to keep a
+    // pixel between neighbours in the 7px gap.
+    "relative after:absolute after:-inset-x-[3px] after:-inset-y-1.5 after:content-['']",
   );
 
   const projectAvatar = (
@@ -1001,47 +1008,57 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       : "hidden group-hover/card:flex group-focus-within/card:flex",
                   )}
                 >
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      // Every action here stops propagation: these buttons sit
-                      // inside the card's own click target, and without this a
-                      // pin or a snooze would also yank the main pane onto the
-                      // workspace the user was only filing away.
-                      e.stopPropagation();
-                      if (pinned) onUnpin?.(workspace.workspace_id);
-                      else onPin?.(workspace.workspace_id);
-                    }}
-                    aria-label={
-                      pinned
-                        ? `Unpin "${workspace.title}"`
-                        : `Pin "${workspace.title}" to top`
-                    }
-                    title={pinned ? "Unpin" : "Pin to top"}
-                    className={eyebrowGlyphClass}
-                  >
-                    {pinned ? (
-                      <PinOff className="size-3" />
-                    ) : (
-                      <Pin className="size-3" />
-                    )}
-                  </button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          // Every action here stops propagation: these buttons sit
+                          // inside the card's own click target, and without this a
+                          // pin or a snooze would also yank the main pane onto the
+                          // workspace the user was only filing away.
+                          e.stopPropagation();
+                          if (pinned) onUnpin?.(workspace.workspace_id);
+                          else onPin?.(workspace.workspace_id);
+                        }}
+                        aria-label={
+                          pinned
+                            ? `Unpin "${workspace.title}"`
+                            : `Pin "${workspace.title}" to top`
+                        }
+                        className={eyebrowGlyphClass}
+                      >
+                        {pinned ? (
+                          <PinOff className="size-3" />
+                        ) : (
+                          <Pin className="size-3" />
+                        )}
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="top">
+                      {pinned ? "Unpin" : "Pin to top"}
+                    </TooltipContent>
+                  </Tooltip>
                 {canSnooze && (
                   <DropdownMenu
                     open={snoozeMenuOpen}
                     onOpenChange={handleSnoozeMenuOpenChange}
                   >
-                    <DropdownMenuTrigger asChild>
-                      <button
-                        type="button"
-                        onClick={(e) => e.stopPropagation()}
-                        aria-label={`Snooze "${workspace.title}"`}
-                        title="Snooze"
-                        className={eyebrowGlyphClass}
-                      >
-                        <AlarmClock className="size-3" />
-                      </button>
-                    </DropdownMenuTrigger>
+                    <Tooltip>
+                      <DropdownMenuTrigger asChild>
+                        <TooltipTrigger asChild>
+                          <button
+                            type="button"
+                            onClick={(e) => e.stopPropagation()}
+                            aria-label={`Snooze "${workspace.title}"`}
+                            className={eyebrowGlyphClass}
+                          >
+                            <AlarmClock className="size-3" />
+                          </button>
+                        </TooltipTrigger>
+                      </DropdownMenuTrigger>
+                      <TooltipContent side="top">Snooze</TooltipContent>
+                    </Tooltip>
                     {/* Radix portals this into document.body, but React events
                         still bubble along the *component* tree — without these
                         stoppers every preset click and every Enter inside the
@@ -1123,10 +1140,12 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 <div className="mt-0.5">{titleLine}</div>
               )}
 
-              {/* Blocker line — needs-you cards only */}
-              {isNeeds && (
+              {/* Blocker line — needs-you cards only, and only when it adds
+                  something: the generic fallback just repeats the red
+                  "Needs you" status on the same card. */}
+              {isNeeds && blockerText !== PERMISSION_BLOCKER_FALLBACK && (
                 <div className="mt-0.5 truncate text-label text-status-attention">
-                  {permissionBlockerText(workspace)}
+                  {blockerText}
                 </div>
               )}
 

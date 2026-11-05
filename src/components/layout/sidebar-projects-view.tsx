@@ -51,7 +51,6 @@ import {
   STATUS_TEXT_CLASS,
 } from "@/lib/pane-status";
 import { useCoarseClock } from "@/lib/use-coarse-clock";
-import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import { useProjectAppearance } from "./use-project-appearance";
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
@@ -916,8 +915,6 @@ export function SidebarProjectsView() {
  *  the same gesture as the header's New agent button. */
 function ChatsHeader() {
   const handleNewAgent = useNewAgentAction();
-  const { getKeysForAction } = useResolvedKeybinds();
-  const keys = getKeysForAction("newAgent");
   return (
     <SidebarGroupLabel className="group/chats relative h-7 pt-1">
       <Eyebrow className="flex-1">Chats</Eyebrow>
@@ -934,8 +931,8 @@ function ChatsHeader() {
             <Plus />
           </SidebarGroupAction>
         </TooltipTrigger>
-        <TooltipContent side="bottom">
-          New chat in home directory{keys ? ` · ${keys}` : ""}
+        <TooltipContent side="bottom" shortcut="newAgent">
+          New chat in home directory
         </TooltipContent>
       </Tooltip>
     </SidebarGroupLabel>
@@ -962,8 +959,6 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
   needsYou: boolean;
   onToggle: (path: string, folded: boolean) => void;
 }) {
-  const { getKeysForAction } = useResolvedKeybinds();
-  const newKeys = getKeysForAction("newWorkspaceInProject");
   return (
     <div className="group/proj relative grid h-8 grid-cols-[minmax(0,1fr)_auto] items-center rounded-lg pr-1 transition-colors duration-150 hover:bg-surface-2">
       <button
@@ -1019,9 +1014,9 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
             <Plus />
           </SidebarMenuAction>
         </TooltipTrigger>
-        <TooltipContent side="bottom">
-          New chat in {name} · Shift+click for workspace dialog
-          {newKeys ? ` · ${newKeys}` : ""}
+        <TooltipContent side="bottom" shortcut="newWorkspaceInProject">
+          New chat in {name}
+          <span className="text-muted-foreground">Shift-click for a workspace</span>
         </TooltipContent>
       </Tooltip>
     </div>

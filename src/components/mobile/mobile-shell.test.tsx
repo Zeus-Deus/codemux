@@ -13,10 +13,15 @@ vi.mock("@/tauri/commands", () => ({
   dbSetUiState: vi.fn().mockResolvedValue(undefined),
   undockBrowserFromRightPanel: vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock("@/stores/chat-draft-store", () => ({
-  useChatDraftStore: (selector: (state: { activeDraftId: null }) => unknown) =>
-    selector({ activeDraftId: null }),
-}));
+vi.mock("@/stores/chat-draft-store", () => {
+  const state = { activeDraftId: null, draftsById: {}, setActiveDraft: vi.fn() };
+  return {
+    useChatDraftStore: Object.assign(
+      (selector: (s: typeof state) => unknown) => selector(state),
+      { getState: () => state },
+    ),
+  };
+});
 vi.mock("@/components/layout/workspace-main", () => ({
   // An uncontrolled input makes an accidental remount observable: its value
   // belongs to this mounted conversation, not to a mocked persistent store.

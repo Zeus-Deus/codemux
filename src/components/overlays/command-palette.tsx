@@ -1257,6 +1257,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
 
   return (
     <CommandPrimitive
+      label="Search workspaces, conversations and commands"
       shouldFilter={false}
       loop
       // Controlled selection: cmdk only reports the highlighted row through
@@ -1561,8 +1562,10 @@ function PaletteItem({
 /** The "press enter" affordance that replaces a row's keybind hint while the
  *  row is selected — the palette's one moving part. The shared neutral
  *  keycap, like the footer's: the row's fill already says which one it is. */
+/** Reserves its slot on every row (invisible, not hidden) so the status
+ *  column doesn't jump sideways as the selection moves. */
 function EnterBadge() {
-  return <Kbd className="hidden group-data-selected/pal-row:inline-flex">↵</Kbd>;
+  return <Kbd className="invisible group-data-selected/pal-row:visible">↵</Kbd>;
 }
 
 /** "project · branch" under a row's title: the name is prose, the branch is
