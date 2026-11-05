@@ -2,7 +2,7 @@ import { useRef, type ReactElement, type ReactNode } from "react";
 import { LandingBackdropHost } from "@/contrib/react/landing-backdrop";
 import { Slot } from "@/contrib/react/slot";
 import { LANDING_BELOW_COMPOSER_AREA } from "@/sdk/areas";
-import { ChevronDown, FolderOpen } from "lucide-react";
+import { ChevronDown, Home } from "lucide-react";
 import { useProjectPickerHintStore } from "@/stores/project-picker-hint-store";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import type { AgentChatProviderKind } from "@/tauri/types";
@@ -30,10 +30,11 @@ interface Props {
    *  headline (surfaces with no project scope); `null` means no project. */
   projectName?: string | null;
   /** Wraps a project trigger in a project picker: the project name in the
-   *  headline, or the "No project" link under it. Receives the trigger
+   *  headline, or the "Home" pill under it. Receives the trigger
    *  element and returns it wrapped (e.g. in a popover). */
   projectPicker?: (trigger: ReactElement) => ReactNode;
-  /** Shown under a project headline; switches the thread to no project. */
+  /** Shown under a project headline; switches the thread to Home (no
+   *  project). */
   onStartWithoutProject?: () => void;
   /** The workspace this landing will run in, for plugin areas. */
   workspaceId?: string | null;
@@ -70,9 +71,9 @@ export function ChatHomeLanding({
   const firstRunAgents = useFirstRunAgents(checkAgents);
   const connectAgent = checkAgents && firstRunAgents.needsAgent;
   useReprobeOnReturn(firstRunAgents.providers, connectAgent);
-  // "or start without a project" unmounts once clicked, and the "No
-  // project" picker takes its slot; focus follows so keyboard users
-  // don't drop back to the document body.
+  // "or start in Home" unmounts once clicked, and the "Home" picker takes
+  // its slot; focus follows so keyboard users don't drop back to the
+  // document body.
   const focusNoProjectRef = useRef(false);
 
   // Until the picker has been opened once, a dotted arrow points at it.
@@ -80,10 +81,10 @@ export function ChatHomeLanding({
   const markHintSeen = useProjectPickerHintStore((s) => s.markSeen);
   const showHint = !!projectPicker && !hintSeen;
 
-  let headline: ReactNode = "What should we do today?";
+  // One question for every new chat, with or without a project picker.
+  let headline: ReactNode = "What should we work on?";
   let subline: ReactNode = null;
   if (projectName === null) {
-    headline = "What should we work on?";
     if (projectPicker) {
       subline = (
         <span className="relative inline-flex">
@@ -99,8 +100,8 @@ export function ChatHomeLanding({
               onClick={markHintSeen}
               className="inline-flex h-8 items-center gap-1.5 rounded-full border border-border/80 px-3 text-body text-muted-foreground transition-colors duration-150 hover:border-foreground/30 hover:bg-surface-2 hover:text-foreground data-[state=open]:border-foreground/30 data-[state=open]:text-foreground"
             >
-              <FolderOpen className="size-4" aria-hidden />
-              No project
+              <Home className="size-4" aria-hidden />
+              Home
               <ChevronDown className="size-3.5 opacity-70" aria-hidden />
             </button>,
           )}
@@ -148,7 +149,7 @@ export function ChatHomeLanding({
           }}
           className="text-body-sm text-muted-foreground transition-colors duration-150 hover:text-foreground"
         >
-          or start without a project
+          or start in Home
         </button>
       );
     }
@@ -159,7 +160,11 @@ export function ChatHomeLanding({
     // from the top in a short pane, where flex centring would clip the
     // headline off the top.
     <LandingBackdropHost>
-    <div className="@container flex h-full w-full flex-col items-center overflow-x-hidden overflow-y-auto">
+    <div
+      // The project picker hands focus to this landing's composer.
+      data-chat-landing
+      className="@container flex h-full w-full flex-col items-center overflow-x-hidden overflow-y-auto"
+    >
       <div className="my-auto flex w-full flex-col items-center gap-8 pt-6 pb-12">
         {connectAgent ? (
           <ConnectAgentCard agents={firstRunAgents} />

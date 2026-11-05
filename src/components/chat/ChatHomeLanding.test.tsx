@@ -121,7 +121,7 @@ describe("ChatHomeLanding", () => {
       <ChatHomeLanding composer={<div data-testid="composer-slot" />} />,
     );
     const heading = container.querySelector("h1");
-    expect(heading?.textContent).toBe("What should we do today?");
+    expect(heading?.textContent).toBe("What should we work on?");
   });
 
   it("asks what to work on when the thread has no project", () => {
@@ -132,11 +132,11 @@ describe("ChatHomeLanding", () => {
       "What should we work on?",
     );
     expect(
-      screen.queryByRole("button", { name: "or start without a project" }),
+      screen.queryByRole("button", { name: "or start in Home" }),
     ).toBeNull();
   });
 
-  it("offers the project picker as 'No project' under the no-project headline", () => {
+  it("offers the project picker as 'Home' under the no-project headline", () => {
     render(
       <ChatHomeLanding
         composer={<div />}
@@ -144,7 +144,7 @@ describe("ChatHomeLanding", () => {
         projectPicker={(trigger) => <span data-testid="picker">{trigger}</span>}
       />,
     );
-    const trigger = screen.getByRole("button", { name: "No project" });
+    const trigger = screen.getByRole("button", { name: "Home" });
     expect(screen.getByTestId("picker")).toContainElement(trigger);
     // Under the heading, not inside it.
     expect(trigger.closest("h1")).toBeNull();
@@ -174,7 +174,7 @@ describe("ChatHomeLanding", () => {
     expect(screen.queryByTestId("landing-subline")).toBeNull();
   });
 
-  it("moves focus to the 'No project' picker after starting without a project", () => {
+  it("moves focus to the 'Home' picker after starting without a project", () => {
     function Harness() {
       const [projectName, setProjectName] = useState<string | null>("codemux");
       return (
@@ -188,9 +188,9 @@ describe("ChatHomeLanding", () => {
     }
     render(<Harness />);
     fireEvent.click(
-      screen.getByRole("button", { name: "or start without a project" }),
+      screen.getByRole("button", { name: "or start in Home" }),
     );
-    expect(screen.getByRole("button", { name: "No project" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Home" })).toHaveFocus();
   });
 
   it("names the project through the picker and offers to drop it", () => {
@@ -210,7 +210,7 @@ describe("ChatHomeLanding", () => {
     const name = screen.getByRole("button", { name: "codemux" });
     expect(screen.getByTestId("picker")).toContainElement(name);
     fireEvent.click(
-      screen.getByRole("button", { name: "or start without a project" }),
+      screen.getByRole("button", { name: "or start in Home" }),
     );
     expect(onStartWithoutProject).toHaveBeenCalledTimes(1);
   });

@@ -243,12 +243,33 @@ export function ProjectScopePopover({
     }
   };
 
+  // Choosing a place is the step before typing, so a choice hands focus to
+  // the landing's composer instead of back to the trigger (which is often
+  // gone: the Home pill and the project headline swap places). Esc and an
+  // outside click still return to the trigger. Not on touch, where focusing
+  // the field raises the on-screen keyboard.
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const landingRef = useRef<Element | null>(null);
+  const chosenRef = useRef(false);
+  const noteChoice = () => {
+    chosenRef.current = !(window.matchMedia?.("(pointer: coarse)").matches ?? false);
+    landingRef.current = triggerRef.current?.closest("[data-chat-landing]") ?? null;
+  };
+  const focusComposer = () => {
+    chosenRef.current = false;
+    landingRef.current
+      ?.querySelector<HTMLElement>("[data-composer-input]")
+      ?.focus({ preventScroll: true });
+  };
+
   const handleSelectHome = () => {
+    noteChoice();
     handleOpenChange(false);
     onChangeTarget({ kind: "home" });
   };
 
   const handleSelectProject = (targetProjectPath: string) => {
+    noteChoice();
     handleOpenChange(false);
     onChangeTarget({ kind: "project", projectPath: targetProjectPath });
   };
@@ -283,8 +304,9 @@ export function ProjectScopePopover({
 
   return (
     <Popover open={open} onOpenChange={handleOpenChange}>
-      <PopoverTrigger asChild>{trigger}</PopoverTrigger>
+      <PopoverTrigger ref={triggerRef} asChild>{trigger}</PopoverTrigger>
       <PopoverContent
+        aria-label="Choose project"
         // Bounded by the space Radix actually has beside the trigger, so the
         // taller sectioned popover can't clip off a short window —
         // `CommandList` is the flex child that gives way.
@@ -293,12 +315,17 @@ export function ProjectScopePopover({
         side={side}
         collisionPadding={10}
         onOpenAutoFocus={focusCmdkOnOpen}
+        onCloseAutoFocus={(event) => {
+          if (!chosenRef.current) return;
+          event.preventDefault();
+          focusComposer();
+        }}
       >
         {/* `shouldFilter={false}`: cmdk's built-in scorer ranks by its
             own rules; we filter each section with `fuzzyFilter` so
             initials-style queries win and the Active/Settled split
             survives a search. cmdk still owns highlight + Enter. */}
-        <Command shouldFilter={false} loop>
+        <Command label="Search projects" shouldFilter={false} loop>
           <Eyebrow className="px-2.5 pb-1 pt-2">
             Run in
           </Eyebrow>
@@ -328,7 +355,7 @@ export function ProjectScopePopover({
                   <Home className="size-3" />
                 </span>
                 <span className="min-w-0 flex-1 truncate">
-                  Home directory (~)
+                  Home (~)
                 </span>
               </CommandItem>
             )}
@@ -376,6 +403,9 @@ export function ProjectScopePopover({
                 const result = await openProject();
                 if (result.success && result.path) {
                   handleSelectProject(result.path);
+                  // The popover closed before the folder picker opened, so
+                  // there is no close to hand focus over on.
+                  if (chosenRef.current) requestAnimationFrame(focusComposer);
                 }
               }}
               className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-body-sm text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"

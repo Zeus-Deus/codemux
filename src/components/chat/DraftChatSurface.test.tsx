@@ -1635,7 +1635,7 @@ describe("DraftChatSurface", () => {
       ).toEqual({ kind: "project", projectPath: "/projects/bar" });
     });
 
-    it("a home draft picks its project from the 'No project' link under the headline", () => {
+    it("a home draft picks its project from the 'Home' pill under the headline", () => {
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       const { container, getByRole, getByTestId } = renderSurface();
@@ -1643,7 +1643,7 @@ describe("DraftChatSurface", () => {
         "What should we work on?",
       );
       expect(getByTestId("project-scope-popover-stub")).toContainElement(
-        getByRole("button", { name: "No project" }),
+        getByRole("button", { name: "Home" }),
       );
       expect(lastProjectScopePopoverProps.current).toMatchObject({
         isHome: true,
@@ -1660,14 +1660,14 @@ describe("DraftChatSurface", () => {
       );
     });
 
-    it("'or start without a project' sticks to home even with a project workspace active", () => {
+    it("'or start in Home' sticks to home even with a project workspace active", () => {
       seedActiveProjectWorkspace();
       const draft = useChatDraftStore
         .getState()
         .getOrCreateProjectDraft("/projects/foo");
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       const { getByRole, container } = renderSurface();
-      fireEvent.click(getByRole("button", { name: "or start without a project" }));
+      fireEvent.click(getByRole("button", { name: "or start in Home" }));
       const next = useChatDraftStore.getState().draftsById[draft.draftId];
       expect(next.target).toEqual({ kind: "home" });
       expect(next.lockedToHome).toBe(true);
