@@ -29,7 +29,7 @@ describe("computeDevicesIndicator", () => {
         divergedRows: [],
         transferError: null,
       }),
-    ).toEqual({ dot: null, tooltip: "Devices — all offline" });
+    ).toEqual({ dot: null, tooltip: "Devices · all offline" });
 
     expect(
       computeDevicesIndicator({
@@ -38,7 +38,7 @@ describe("computeDevicesIndicator", () => {
         divergedRows: [],
         transferError: null,
       }),
-    ).toEqual({ dot: null, tooltip: "Devices — 1 offline" });
+    ).toEqual({ dot: null, tooltip: "Devices · 1 offline" });
   });
 
   it("counts a device updating itself as online, without the amber dot", () => {
@@ -54,7 +54,7 @@ describe("computeDevicesIndicator", () => {
         divergedRows: [],
         transferError: null,
       }),
-    ).toEqual({ dot: "green", tooltip: "Devices — 1 online" });
+    ).toEqual({ dot: "green", tooltip: "Devices · 1 online" });
   });
 
   it("goes green and counts only reachable devices", () => {
@@ -65,7 +65,7 @@ describe("computeDevicesIndicator", () => {
         divergedRows: [],
         transferError: null,
       }),
-    ).toEqual({ dot: "green", tooltip: "Devices — 1 online" });
+    ).toEqual({ dot: "green", tooltip: "Devices · 1 online" });
 
     expect(
       computeDevicesIndicator({
@@ -74,7 +74,7 @@ describe("computeDevicesIndicator", () => {
         divergedRows: [],
         transferError: null,
       }).tooltip,
-    ).toBe("Devices — 2 online");
+    ).toBe("Devices · 2 online");
   });
 
   it("turns amber for a reachable device that reports a problem", () => {
@@ -90,7 +90,7 @@ describe("computeDevicesIndicator", () => {
       }),
     ).toEqual({
       dot: "amber",
-      tooltip: "Devices — pandora: codemux-remote is not installed",
+      tooltip: "Devices · pandora: codemux-remote is not installed",
     });
   });
 
@@ -104,7 +104,7 @@ describe("computeDevicesIndicator", () => {
       }),
     ).toEqual({
       dot: "amber",
-      tooltip: "Devices — bypass-share-limit-owner diverged on zeus",
+      tooltip: "Devices · bypass-share-limit-owner diverged on zeus",
     });
   });
 
@@ -119,7 +119,7 @@ describe("computeDevicesIndicator", () => {
         ],
         transferError: null,
       }).tooltip,
-    ).toBe("Devices — feat/a diverged (+1 more)");
+    ).toBe("Devices · feat/a diverged (+1 more)");
   });
 
   it("lets a failed transfer beat both divergence and an online device", () => {
@@ -130,6 +130,6 @@ describe("computeDevicesIndicator", () => {
         divergedRows: [{ title: "main", hostName: "zeus" }],
         transferError: "Pull failed: partpilot",
       }),
-    ).toEqual({ dot: "amber", tooltip: "Devices — Pull failed: partpilot" });
+    ).toEqual({ dot: "amber", tooltip: "Devices · Pull failed: partpilot" });
   });
 });

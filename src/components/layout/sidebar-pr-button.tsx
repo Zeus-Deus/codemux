@@ -39,6 +39,9 @@ export function SidebarPullRequestsButton({
     () => badgeCount(badgeKeys(rows, viewerByRoot), new Set(seen)),
     [rows, viewerByRoot, seen],
   );
+  const label = count > 0
+    ? `Pull requests · ${count} waiting on you`
+    : "Pull requests";
 
   return (
     <Tooltip>
@@ -46,7 +49,7 @@ export function SidebarPullRequestsButton({
         <Button
           variant="ghost"
           size={labeled ? "sm" : "icon-sm"}
-          aria-label="Pull requests"
+          aria-label={label}
           data-testid="sidebar-pull-requests"
           onClick={() => setShowPullRequests(true)}
           className={cn("relative text-muted-foreground hover:bg-surface-2 hover:text-foreground", labeled ? "w-full justify-start gap-2 text-label" : "")}
@@ -61,9 +64,7 @@ export function SidebarPullRequestsButton({
         </Button>
       </TooltipTrigger>
       <TooltipContent side={tooltipSide}>
-        {count > 0
-          ? `Pull requests — ${count} waiting on you`
-          : "Pull requests"}
+        {label}
       </TooltipContent>
     </Tooltip>
   );

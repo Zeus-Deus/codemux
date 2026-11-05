@@ -175,6 +175,8 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
     navigator.clipboard.writeText(`http://localhost:${port.port}`);
   }, []);
 
+  const portsLabel = portCount > 0 ? `Ports · ${portCount} active` : "Ports · none active";
+
   const handleKill = useCallback((port: PortInfoSnapshot) => {
     killPort(port.port).catch(console.error);
   }, []);
@@ -187,7 +189,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
             <Button
               variant="ghost"
               size={labeled ? "sm" : "icon-sm"}
-              aria-label="Ports"
+              aria-label={portsLabel}
               className={cn(
                 "relative text-muted-foreground hover:text-foreground hover:bg-sidebar-accent",
                 portCount > 0 && "text-foreground",
@@ -203,7 +205,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
           </PopoverTrigger>
         </TooltipTrigger>
         <TooltipContent side={tooltipSide}>
-          {portCount > 0 ? `Ports · ${portCount} active` : "Ports · none active"}
+          {portsLabel}
         </TooltipContent>
       </Tooltip>
       <PopoverContent

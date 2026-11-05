@@ -51,7 +51,7 @@ export function computeDevicesIndicator({
   transferError,
 }: DevicesIndicatorInput): DevicesIndicator {
   if (transferError) {
-    return { dot: "amber", tooltip: `Devices — ${transferError}` };
+    return { dot: "amber", tooltip: `Devices · ${transferError}` };
   }
 
   if (divergedRows.length > 0) {
@@ -61,7 +61,7 @@ export function computeDevicesIndicator({
       divergedRows.length > 1 ? ` (+${divergedRows.length - 1} more)` : "";
     return {
       dot: "amber",
-      tooltip: `Devices — ${first.title} diverged${where}${more}`,
+      tooltip: `Devices · ${first.title} diverged${where}${more}`,
     };
   }
 
@@ -83,18 +83,18 @@ export function computeDevicesIndicator({
     // pushing there would fail, and only setup fixes it. A device updating
     // itself fixes itself, so it counts as online.
     if (status.last_error && !isUpdating(status)) {
-      return { dot: "amber", tooltip: `Devices — ${host.name}: ${status.last_error}` };
+      return { dot: "amber", tooltip: `Devices · ${host.name}: ${status.last_error}` };
     }
     online += 1;
   }
 
   if (online > 0) {
-    return { dot: "green", tooltip: `Devices — ${online} online` };
+    return { dot: "green", tooltip: `Devices · ${online} online` };
   }
   if (offline > 0) {
     return {
       dot: null,
-      tooltip: unprobed === 0 ? "Devices — all offline" : `Devices — ${offline} offline`,
+      tooltip: unprobed === 0 ? "Devices · all offline" : `Devices · ${offline} offline`,
     };
   }
   // Nothing probed yet (or no devices at all): say nothing rather than

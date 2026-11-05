@@ -162,14 +162,14 @@ describe("SidebarFooterBar — expanded", () => {
       Array.from(footer.querySelectorAll("button")).map((el) =>
         el.getAttribute("aria-label"),
       ),
-    ).toEqual(["Menu", "Automations", "Devices", "Pull requests", "Usage", "Ports"]);
+    ).toEqual(["Menu", "Automations", "Devices · 1 online", "Pull requests", "Usage", "Ports"]);
     // The menu is pinned first and is not a drag handle; every destination is.
     expect(footer.firstElementChild?.getAttribute("aria-label")).toBe("Menu");
     expect(
       Array.from(footer.querySelectorAll('[data-testid^="footer-pin-"]')).map(
         (el) => el.querySelector("button")?.getAttribute("aria-label"),
       ),
-    ).toEqual(["Automations", "Devices", "Pull requests", "Usage", "Ports"]);
+    ).toEqual(["Automations", "Devices · 1 online", "Pull requests", "Usage", "Ports"]);
     // Nothing pushes a group to the right, so the strip stays left-aligned.
     expect(footer.querySelector(".ml-auto")).toBeNull();
   });
@@ -187,7 +187,8 @@ describe("SidebarFooterBar — expanded", () => {
     const devices = container.querySelector(
       '[data-testid="sidebar-devices"]',
     ) as HTMLElement;
-    expect(devices).toHaveAttribute("aria-label", "Devices");
+    // The dot's meaning is in the name, not only in the hover tooltip.
+    expect(devices).toHaveAttribute("aria-label", "Devices · 1 online");
     expect(
       container.querySelector('[data-testid="sidebar-devices-dot"]'),
     ).toHaveAttribute("data-tone", "green");
