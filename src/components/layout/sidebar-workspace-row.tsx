@@ -96,7 +96,8 @@ import {
   providerRef,
   providerRefLabel,
 } from "@/lib/source-control";
-import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore, useHomeDir } from "@/stores/app-store";
+import { isChatWorkspace } from "./sidebar-projects-model";
 import {
   useTunnelStatusStore,
   tunnelStatusKind,
@@ -163,6 +164,89 @@ interface Props {
  *  On a paired browser or phone the branch is always kept and there is
  *  no force step: the web-remote guard refuses both, so the dialog does
  *  not offer them (the dirty refusal becomes an error toast). */
+/** Every sidebar row shape that stands for one workspace: inbox cards,
+ *  settled and snoozed one-liners, and the Projects view's rows. */
+const WORKSPACE_ROW_ATTRS = ["data-inbox-card", "data-settled-row", "data-snoozed-row", "data-ws-id"];
+
+function workspaceRowElement(workspaceId: string): HTMLElement | null {
+  const id = CSS.escape(workspaceId);
+  return document.querySelector<HTMLElement>(
+    WORKSPACE_ROW_ATTRS.map((attr) => `[${attr}="${id}"]`).join(","),
+  );
+}
+
+/** The workspace whose row sits after this one (or before it, when it is
+ *  the last), so focus has somewhere to go once the row is gone. */
+function neighbourWorkspaceId(workspaceId: string): string | null {
+  const rows = [
+    ...document.querySelectorAll<HTMLElement>(WORKSPACE_ROW_ATTRS.map((attr) => `[${attr}]`).join(",")),
+  ].filter((row) => row.getClientRects().length > 0);
+  const ids = rows.map((row) => WORKSPACE_ROW_ATTRS.map((attr) => row.getAttribute(attr)).find(Boolean) ?? "");
+  const index = ids.indexOf(workspaceId);
+  if (index < 0) return null;
+  return ids[index + 1] || ids[index - 1] || null;
+}
+
+/** Focus a workspace's row once it renders, unless the user has put focus
+ *  somewhere other than the list meanwhile (a toast's own button and the
+ *  row of the workspace `leaving`, which may linger, don't count).
+ *  Whatever had focus can take it back a moment later: the menu that ran
+ *  the action returns it to the row it opened on, and the toaster returns it
+ *  to where it was before an Undo click once its last toast is gone. So the
+ *  row is held for a few frames, and through the toasts when `holdThroughToasts`. */
+function focusWorkspaceRow(
+  workspaceId: string,
+  { leaving = null, holdThroughToasts = false }: { leaving?: string | null; holdThroughToasts?: boolean } = {},
+) {
+  let held = 0;
+  const step = (left: number) => {
+    const retry = () => {
+      if (left > 0) requestAnimationFrame(() => step(left - 1));
+    };
+    const row = workspaceRowElement(workspaceId);
+    const focused = document.activeElement;
+    if (row && focused === row) {
+      const toasts = holdThroughToasts && document.querySelector("[data-sonner-toast]") !== null;
+      if (++held < 4 || toasts) retry();
+      return;
+    }
+    const free =
+      !focused ||
+      focused === document.body ||
+      !!focused.closest("[data-sonner-toast]") ||
+      WORKSPACE_ROW_ATTRS.some((attr) => focused.hasAttribute(attr)) ||
+      (leaving !== null && !!workspaceRowElement(leaving)?.contains(focused));
+    // Still in the closing menu: wait for it. Anywhere else: the user moved on.
+    if (!free) return focused.closest('[role="menu"]') ? retry() : undefined;
+    row?.focus();
+    retry();
+  };
+  requestAnimationFrame(() => step(60));
+}
+
+/**
+ * Archive from a sidebar row: remove it, keep everything on disk, and offer
+ * Undo on the toast through the archive id the backend returned. Focus moves
+ * to the next row. Undo puts the workspace back and focuses its row; it only
+ * reopens the workspace if it was the one on screen, so undoing never pulls
+ * the user away from what they were reading.
+ */
+export async function archiveWorkspaceWithUndo(workspace: WorkspaceSnapshot): Promise<void> {
+  const workspaceId = workspace.workspace_id;
+  const wasActive = selectActiveWorkspaceId(useAppStore.getState()) === workspaceId;
+  const neighbour = neighbourWorkspaceId(workspaceId);
+  const archiveId = await archiveWorkspace(workspaceId);
+  if (neighbour) focusWorkspaceRow(neighbour, { leaving: workspaceId });
+  toast.undoable({
+    message: `Archived "${workspace.title}"`,
+    description: "Restore anytime from Settings → Workspaces → Archive.",
+    onUndo: async () => {
+      const restoredId = await unarchiveWorkspace(archiveId, { select: wasActive });
+      focusWorkspaceRow(restoredId, { holdThroughToasts: true });
+    },
+  });
+}
+
 export function DeleteWorktreeDialog({
   workspace,
   open,
@@ -551,6 +635,7 @@ export function WorkspaceContextMenuItems({
   const defaultBranch = useDefaultBranch(
     workspace.project_root ?? (isWorktree ? null : workspace.cwd),
   );
+  const homeDir = useHomeDir();
 
   const hosts = useHosts();
 
@@ -707,7 +792,12 @@ export function WorkspaceContextMenuItems({
     }
   };
 
-  const showCheckoutDefault = !isWorktree;
+  // Rows that don't apply to this card are left out, not greyed: a Home
+  // chat has no repository or project, so branch and setup actions mean
+  // nothing there.
+  const isChat = isChatWorkspace(workspace, homeDir);
+  const hasRepo = !isChat && workspace.is_git !== false;
+  const showCheckoutDefault = !isWorktree && hasRepo;
   const isOnDefault =
     defaultBranch !== null && workspace.git_branch === defaultBranch;
 
@@ -840,14 +930,12 @@ export function WorkspaceContextMenuItems({
           );
         })()
       ) : null}
-      <ContextMenuItem
-        className={MENU_ROW}
-        onClick={handleCopyBranch}
-        disabled={!workspace.git_branch}
-      >
-        <Copy />
-        <span className="flex-1">Copy branch name</span>
-      </ContextMenuItem>
+      {workspace.git_branch && (
+        <ContextMenuItem className={MENU_ROW} onClick={handleCopyBranch}>
+          <Copy />
+          <span className="flex-1">Copy branch name</span>
+        </ContextMenuItem>
+      )}
       {showCheckoutDefault && (
         <ContextMenuItem
           className={MENU_ROW}
@@ -858,13 +946,15 @@ export function WorkspaceContextMenuItems({
           <span className="flex-1">Checkout default branch</span>
         </ContextMenuItem>
       )}
-      <ContextMenuItem
-        className={MENU_ROW}
-        onClick={() => runWorkspaceSetup(workspace.workspace_id).catch(console.error)}
-      >
-        <RotateCcw />
-        <span className="flex-1">Re-run setup</span>
-      </ContextMenuItem>
+      {!isChat && (
+        <ContextMenuItem
+          className={MENU_ROW}
+          onClick={() => runWorkspaceSetup(workspace.workspace_id).catch(console.error)}
+        >
+          <RotateCcw />
+          <span className="flex-1">Re-run setup</span>
+        </ContextMenuItem>
+      )}
       <ContextMenuItem className={MENU_ROW} onClick={handleToggleMute}>
         <BellOff />
         <span className="flex-1">
@@ -1024,19 +1114,11 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
     activateWorkspaceInteraction(workspace.workspace_id).catch(console.error);
   };
 
-  // Archive: remove from sidebar, keep everything on disk. Undo on the
-  // toast restores (and re-activates) the workspace via the archive id
-  // the backend returned — same 10s escape-hatch machinery as push/pull.
+  // Archive: same 10s Undo escape hatch as push/pull (see
+  // `archiveWorkspaceWithUndo`).
   const handleArchive = async () => {
     try {
-      const archiveId = await archiveWorkspace(workspace.workspace_id);
-      toast.undoable({
-        message: `Archived "${workspace.title}"`,
-        description: "Restore anytime from Settings → Workspaces → Archive.",
-        onUndo: async () => {
-          await unarchiveWorkspace(archiveId);
-        },
-      });
+      await archiveWorkspaceWithUndo(workspace);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       toast.error("Archive failed", { description: message });

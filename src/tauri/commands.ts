@@ -734,11 +734,15 @@ export const archiveWorkspace = (workspaceId: string) => {
 };
 
 /** Restore an archived workspace. Resolves with the restored workspace id;
- *  the backend also activates it. Rejects (entry kept) when nothing is
+ *  the backend also activates it unless `select` is false (an Undo of an
+ *  archive the user wasn't looking at). Rejects (entry kept) when nothing is
  *  left on disk to restore. */
-export const unarchiveWorkspace = async (archiveId: string) => {
-  const id = await invoke<string>("unarchive_workspace", { archiveId });
-  if (isRemoteClient()) await activateWorkspace(id);
+export const unarchiveWorkspace = async (
+  archiveId: string,
+  { select = true }: { select?: boolean } = {},
+) => {
+  const id = await invoke<string>("unarchive_workspace", { archiveId, select });
+  if (select && isRemoteClient()) await activateWorkspace(id);
   return id;
 };
 
