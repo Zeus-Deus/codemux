@@ -481,12 +481,14 @@ export function UsageSection({
       <div className="mb-6 flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
         <div className="min-w-0">
           {showTitle && (
-            <h2 className="text-body-lg font-semibold tracking-tight">Usage</h2>
+            // The same page-title size every other settings page's
+            // SectionHeader uses; its filters keep their own wrapping row.
+            <h2 className="text-title font-bold tracking-tight text-foreground">Usage</h2>
           )}
           <p
             className={cn(
               "flex items-center gap-1.5 text-body-sm text-muted-foreground",
-              showTitle && "mt-1",
+              showTitle && "mt-1.5",
             )}
           >
             {view === "limits"

@@ -381,10 +381,13 @@ describe("SettingsPanel", () => {
     // The shell is one tree with a per-section width, so locate the
     // content wrapper by the padding it always carries.
     const wrapper = () =>
-      container.querySelector("div.mx-auto.px-11.pt-8.pb-20") as HTMLElement;
+      container.querySelector("div.px-11.pt-8.pb-20") as HTMLElement;
+    // Every page starts at the same left edge (the stacked page's), so
+    // moving between pages never slides the column sideways.
+    const sharedLeftEdge = "ml-[max(0px,calc((100%-61rem)/2))]";
 
     // Default section (Account) is a form — reading measure.
-    expect(wrapper()).toHaveClass("max-w-3xl");
+    expect(wrapper()).toHaveClass("max-w-3xl", sharedLeftEdge, "mr-auto");
 
     // Scope every query to THIS render: the file has no per-test
     // cleanup, so earlier renders are still mounted and a `screen`
@@ -394,7 +397,7 @@ describe("SettingsPanel", () => {
     });
     fireEvent.click(usageButtons[0]);
     // Usage is a dashboard — wide column.
-    expect(wrapper()).toHaveClass("max-w-[1400px]");
+    expect(wrapper()).toHaveClass("max-w-[1400px]", sharedLeftEdge);
     expect(wrapper()).not.toHaveClass("max-w-3xl");
 
     // Switching away restores the reading measure.

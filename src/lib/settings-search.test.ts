@@ -107,7 +107,7 @@ describe("searchSettings", () => {
     expect(searchSettings(query, false, true).flatMap((group) => group.results.map((result) => result.anchor))).not.toContain(query);
   });
 
-  it.each(["Email", "Skills sync", "Session"])("hides Account's %s row when signed out", (query) => {
+  it.each(["Email", "Skills sync", "Sign out of Codemux"])("hides Account's %s row when signed out", (query) => {
     const accountAnchors = (signedIn: boolean) => searchSettings(query, true, signedIn)
       .filter((group) => group.section === "account")
       .flatMap((group) => group.results.map((result) => result.anchor));

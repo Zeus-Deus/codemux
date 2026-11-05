@@ -295,9 +295,9 @@ function StudioBody({
                 aria-checked={tab === value}
                 onClick={() => setTab(value)}
                 className={cn(
-                  "inline-flex h-[26px] items-center rounded-md px-3.5 text-body-sm font-semibold transition-colors duration-150",
+                  "inline-flex h-[26px] items-center rounded-md px-3.5 text-body-sm font-semibold transition-[color,background-color,box-shadow] duration-150",
                   tab === value
-                    ? "bg-foreground text-background"
+                    ? "bg-surface-3 text-foreground shadow-[inset_0_0_0_1px_var(--border)]"
                     : "text-muted-foreground hover:text-foreground",
                 )}
               >

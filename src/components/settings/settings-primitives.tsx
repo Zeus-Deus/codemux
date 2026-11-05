@@ -58,32 +58,36 @@ export function SectionHeader({
 }) {
   const stacked = useContext(SectionHeadingLevel) === "section";
   const Heading = stacked ? "h3" : "h2";
+  // In a narrow container (a phone, a slim pane) the action drops under the
+  // full-width copy instead of squeezing it.
   return (
-    <div className={cn("flex items-start justify-between gap-4", stacked ? "mb-5" : "mb-7", className)}>
-      <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          {icon}
-          <Heading
-            className={cn(
-              "tracking-tight text-foreground",
-              stacked ? "text-[1.0625rem] leading-snug font-semibold" : "text-title font-bold",
-            )}
-          >
-            {title}
-          </Heading>
+    <div className={cn("@container", stacked ? "mb-5" : "mb-7", className)}>
+      <div className="flex items-start justify-between gap-4 @max-[30rem]:flex-col @max-[30rem]:gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            {icon}
+            <Heading
+              className={cn(
+                "tracking-tight text-foreground",
+                stacked ? "text-[1.0625rem] leading-snug font-semibold" : "text-title font-bold",
+              )}
+            >
+              {title}
+            </Heading>
+          </div>
+          {description && (
+            <p
+              className={cn(
+                "max-w-prose leading-relaxed text-subtle-foreground",
+                stacked ? "mt-1 text-body" : "mt-1.5 text-body-lg",
+              )}
+            >
+              {description}
+            </p>
+          )}
         </div>
-        {description && (
-          <p
-            className={cn(
-              "max-w-prose leading-relaxed text-subtle-foreground",
-              stacked ? "mt-1 text-body" : "mt-1.5 text-body-lg",
-            )}
-          >
-            {description}
-          </p>
-        )}
+        {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
       </div>
-      {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
     </div>
   );
 }
@@ -168,32 +172,43 @@ export function SettingRow({
     id: controlId,
     "aria-describedby": describedBy,
   });
+  // A switch is compact enough to stay beside its copy at any width; wider
+  // controls drop under the full-width copy once the row is narrow (a phone,
+  // a slim pane) instead of squeezing it into a tall ribbon.
+  const compact = isValidElement(children) && children.type === Switch;
   return (
     <div
       data-settings-row
       role={control.labelled ? undefined : "group"}
       aria-labelledby={control.labelled ? undefined : labelId}
       aria-describedby={control.labelled ? undefined : describedBy}
-      className="flex items-center justify-between gap-8 py-4"
+      className="@container py-4"
     >
-      <div className="min-w-0 space-y-1">
-        <div className="flex items-center gap-1.5">
-          <label
-            id={labelId}
-            htmlFor={control.labelled ? controlId : undefined}
-            className="text-body-lg leading-tight font-semibold text-foreground"
-          >
-            {label}
-          </label>
-          {scopeId && <DeviceOnlyMark id={scopeId} />}
-        </div>
-        {description && (
-          <p id={descriptionId} className="text-body-sm leading-relaxed text-subtle-foreground">
-            {description}
-          </p>
+      <div
+        className={cn(
+          "flex items-center justify-between gap-8",
+          !compact && "@max-[30rem]:flex-col @max-[30rem]:items-start @max-[30rem]:gap-3",
         )}
+      >
+        <div className="min-w-0 space-y-1">
+          <div className="flex items-center gap-1.5">
+            <label
+              id={labelId}
+              htmlFor={control.labelled ? controlId : undefined}
+              className="text-body-lg leading-tight font-semibold text-foreground"
+            >
+              {label}
+            </label>
+            {scopeId && <DeviceOnlyMark id={scopeId} />}
+          </div>
+          {description && (
+            <p id={descriptionId} className="text-body-sm leading-relaxed text-subtle-foreground">
+              {description}
+            </p>
+          )}
+        </div>
+        <div className="max-w-full shrink-0">{control.node}</div>
       </div>
-      <div className="shrink-0">{control.node}</div>
     </div>
   );
 }
@@ -214,20 +229,23 @@ export function SubsectionHeader({
   className?: string;
 }) {
   return (
-    <div data-settings-row className={cn("mb-3 flex items-end justify-between gap-4", className)}>
-      <div className="min-w-0">
-        {/* A step up from an eyebrow: it heads a described block, so it has
-            to hold its own above the muted description. */}
-        <h3 className="text-body-sm font-medium text-foreground/85">
-          {title}
-        </h3>
-        {description && (
-          <p className="text-body-sm text-subtle-foreground mt-1.5 leading-relaxed max-w-prose">
-            {description}
-          </p>
-        )}
+    <div data-settings-row className={cn("@container mb-3", className)}>
+      <div className="flex items-end justify-between gap-4 @max-[30rem]:flex-col @max-[30rem]:items-start @max-[30rem]:gap-3">
+        <div className="min-w-0">
+          {/* A step up from an eyebrow: it heads a described block, so it has
+              to hold its own above the muted description. It sits under a
+              section's h3, so it is the next level down. */}
+          <h4 className="text-body-sm font-medium text-foreground/85">
+            {title}
+          </h4>
+          {description && (
+            <p className="text-body-sm text-subtle-foreground mt-1.5 leading-relaxed max-w-prose">
+              {description}
+            </p>
+          )}
+        </div>
+        {action && <div className="shrink-0">{action}</div>}
       </div>
-      {action && <div className="shrink-0">{action}</div>}
     </div>
   );
 }
@@ -258,8 +276,9 @@ export function SettingsCard({
 }
 
 /** Segmented control — a bordered pill of mutually-exclusive options
- *  with a neutral foreground-filled active segment (the design system's
- *  "white is the baseline" rule for toggles/selection).
+ *  whose active segment is the raised surface every other selection in
+ *  the app uses (`ui/toggle.tsx`), not a solid fill that reads as a
+ *  primary button.
  *
  *  Lifted out of `settings-view.tsx` when the Usage section needed the
  *  same control for its period and metric pickers. Importing it back
@@ -343,12 +362,12 @@ export function SegmentedControl<T extends string>({
             disabled={disabled}
             onClick={() => onChange(opt.value)}
             className={cn(
-              "rounded-md font-medium transition-colors duration-150",
+              "rounded-md font-medium transition-[color,background-color,box-shadow] duration-150",
               size === "sm"
                 ? "px-2.5 py-0.5 text-label"
                 : "px-3 py-1 text-body-sm",
               active
-                ? "bg-foreground text-background"
+                ? "bg-surface-3 text-foreground shadow-[inset_0_0_0_1px_var(--border)]"
                 : "text-muted-foreground enabled:hover:text-foreground",
               disabled && "cursor-not-allowed",
             )}

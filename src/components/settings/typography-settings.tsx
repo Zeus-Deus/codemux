@@ -43,7 +43,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import type { AppearanceSettings } from "@/tauri/types";
-import { SegmentedControl, SubsectionHeader } from "./settings-primitives";
+import { SectionHeader, SegmentedControl } from "./settings-primitives";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
 type TypographyField =
@@ -172,7 +172,7 @@ export function TypographySettings() {
 
   return (
     <section className="mt-10" data-testid="typography-settings">
-      <SubsectionHeader
+      <SectionHeader
         title="Typography"
         description={
           typography.mode === "simple"
