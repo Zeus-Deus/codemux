@@ -387,7 +387,7 @@ export function WorkspaceDetailsToggle({ disabled = false }: { disabled?: boolea
     : agentsRunning
       ? "bg-status-working"
       : browserLive
-        ? "bg-status-remote"
+        ? "bg-status-monitoring"
         : null;
 
   return (

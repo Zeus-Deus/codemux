@@ -704,6 +704,6 @@ describe("WorkspaceDetailsToggle — issue and live rows", () => {
     renderToggle();
     expect(screen.queryByTestId("workspace-details-activity-dot")).toBeNull();
     await userEvent.click(screen.getByTestId("workspace-details-toggle"));
-    expect(screen.getByTestId("workspace-details-activity-dot")).toHaveClass("bg-status-remote");
+    expect(screen.getByTestId("workspace-details-activity-dot")).toHaveClass("bg-status-monitoring");
   });
 });
