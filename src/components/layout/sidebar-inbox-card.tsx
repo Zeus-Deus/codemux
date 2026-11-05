@@ -432,7 +432,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // so the sidebar always shows where you are. Keyed on `isActive` alone:
   // re-renders never touch the user's own scroll. The first paint jumps (a
   // glide on load is motion for nothing); later switches glide unless the
-  // user asked for reduced motion.
+  // user asked for reduced motion. The sticky header reserves its height as
+  // the scroller's scroll-padding (`SidebarStickyHeader`), so `nearest` stops
+  // below it rather than under it.
   const cardRef = useRef<HTMLDivElement>(null);
   const painted = useRef(false);
   useEffect(() => {

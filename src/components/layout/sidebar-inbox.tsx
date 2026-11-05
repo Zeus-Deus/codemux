@@ -43,6 +43,7 @@ import {
   type InboxRepo,
 } from "./sidebar-inbox-card";
 import { SidebarNeedsYouStrip } from "./sidebar-needs-you-strip";
+import { SidebarStickyHeader } from "./sidebar-sticky-header";
 import { PendingWorkspaceRow } from "./pending-workspace-row";
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
 import {
@@ -1737,6 +1738,42 @@ export function SidebarInbox() {
     setFilter(null);
   }, [appStateLoaded, filter, projectGroups, setFilter]);
 
+  // The open workspace's card scrolls itself into view when it becomes active
+  // (see `SidebarInboxCard`), but it can then change section without being
+  // re-activated — opening a finished card marks it seen and drops it into
+  // Wrapping up, settling turns it into a shelf row. Follow it once per move so
+  // "you are here" never ends up below the fold.
+  const activeWs = activeWorkspaceId ? workspaceById.get(activeWorkspaceId) : undefined;
+  const activeSection = !activeWs
+    ? null
+    : activeWs.pinned_at != null
+      ? "pinned"
+      : settledIds.has(activeWorkspaceId)
+        ? "settled"
+        : snoozedIds.has(activeWorkspaceId)
+          ? "snoozed"
+          : wrappingIds.has(activeWorkspaceId)
+            ? "wrapping"
+            : "active";
+  const placedRef = useRef<{ id: string; section: string | null } | null>(null);
+  useEffect(() => {
+    const prev = placedRef.current;
+    placedRef.current = { id: activeWorkspaceId, section: activeSection };
+    if (!prev || prev.id !== activeWorkspaceId || prev.section === activeSection) return;
+    if (activeSection === null) return;
+    const frame = requestAnimationFrame(() => {
+      const id = CSS.escape(activeWorkspaceId);
+      const reduceMotion =
+        window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+      inboxRef.current
+        ?.querySelector<HTMLElement>(
+          `[data-inbox-card="${id}"],[data-settled-row="${id}"],[data-snoozed-row="${id}"]`,
+        )
+        ?.scrollIntoView?.({ block: "nearest", behavior: reduceMotion ? "auto" : "smooth" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeWorkspaceId, activeSection]);
+
   /** One active card. Both tiers render the identical component — a card that
    *  is wrapping up loses no affordance, only altitude. `visualIndex` is its
    *  position in `orderedActiveCards`, i.e. counted straight through the
@@ -1794,7 +1831,7 @@ export function SidebarInbox() {
           Both stay put while the card list scrolls beneath them, so blocked
           work is reachable from anywhere in a long list — that reachability
           is what lets the list below keep its static, status-blind order. */}
-      <div className="sticky top-0 z-10 bg-sidebar">
+      <SidebarStickyHeader>
         <div className="flex items-center gap-1 px-2.5 pb-2.5 min-w-0">
           <SidebarProjectFilter
             projectGroups={projectGroups}
@@ -1816,7 +1853,7 @@ export function SidebarInbox() {
           projectGroups={projectGroups}
           filterPath={filter}
         />
-      </div>
+      </SidebarStickyHeader>
 
       {/* A flex column that fills the sidebar, so the empty state can grow
           into the free space and push the parked shelves to the bottom. */}
