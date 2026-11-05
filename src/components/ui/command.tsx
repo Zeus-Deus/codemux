@@ -19,11 +19,15 @@ import { SearchIcon, CheckIcon } from "lucide-react"
 
 function Command({
   className,
+  // cmdk points its input's aria-labelledby at this label, so an empty one
+  // leaves the search box unnamed. Callers pass something specific.
+  label = "Search",
   ...props
 }: React.ComponentProps<typeof CommandPrimitive>) {
   return (
     <CommandPrimitive
       data-slot="command"
+      label={label}
       className={cn(
         "flex size-full flex-col overflow-hidden rounded-lg! bg-popover p-1 text-popover-foreground",
         className

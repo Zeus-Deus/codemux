@@ -376,6 +376,18 @@ describe("SidebarInboxCard — unread / woke", () => {
     expect(card).toHaveAttribute("data-unread", "true");
   });
 
+  it("keeps inline actions out of Tab order and opens the menu with Shift+F10", async () => {
+    const { card } = renderCard({ status: "review" });
+    for (const name of ['Pin "Ship it" to top', 'Snooze "Ship it"', 'Settle "Ship it"']) {
+      expect(screen.getByRole("button", { name })).toHaveAttribute("tabindex", "-1");
+    }
+    expect(card).toHaveAttribute("aria-description", "Shift+F10 for actions");
+
+    card.focus();
+    await userEvent.keyboard("{Shift>}{F10}{/Shift}");
+    expect(await screen.findByText("Rename workspace")).toBeInTheDocument();
+  });
+
   it("offers Mark unread only while the card is read", async () => {
     const { props, card } = renderCard();
     await userEvent.pointer({ keys: "[MouseRight]", target: card });

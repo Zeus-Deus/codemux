@@ -213,7 +213,9 @@ function AppMenu({
               aria-label="Menu"
               className="text-muted-foreground hover:text-foreground hover:bg-surface-2"
             >
-              <Settings className="size-[18px]" />
+              {/* An ellipsis, not a gear: the gear means Settings inside
+                  this menu, and this trigger opens a collection of actions. */}
+              <MoreHorizontal className="size-[18px]" />
             </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>

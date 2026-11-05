@@ -56,17 +56,26 @@ export const MessageTrail = memo(function MessageTrail({
   slots,
   listRef,
   topInset = 0,
+  onNavigate,
 }: {
   slots: TranscriptSlot[];
   listRef: React.RefObject<LegendListRef | null>;
   /** Chrome floating over the viewport's top edge; jumps land below it. */
   topInset?: number;
+  /** Called just before a jump, so the list can hand the viewport to the
+   *  reader; otherwise live-follow pins it straight back to the tail. */
+  onNavigate?: () => void;
 }) {
   const entries = useMemo(() => buildTrailEntries(slots), [slots]);
 
   if (entries.length < TRAIL_MIN_TURNS) return null;
   return (
-    <TrailRail entries={entries} listRef={listRef} topInset={topInset} />
+    <TrailRail
+      entries={entries}
+      listRef={listRef}
+      topInset={topInset}
+      onNavigate={onNavigate}
+    />
   );
 });
 
@@ -74,10 +83,12 @@ const TrailRail = memo(function TrailRail({
   entries,
   listRef,
   topInset,
+  onNavigate,
 }: {
   entries: TrailEntry[];
   listRef: React.RefObject<LegendListRef | null>;
   topInset: number;
+  onNavigate?: () => void;
 }) {
   const railRef = useRef<HTMLElement | null>(null);
   const tickRefs = useRef(new Map<number, HTMLSpanElement>());
@@ -238,6 +249,7 @@ const TrailRail = memo(function TrailRail({
 
   const jumpTo = useCallback(
     (slotIndex: number) => {
+      onNavigate?.();
       void listRef.current?.scrollToIndex({
         index: slotIndex,
         animated: false,
@@ -245,8 +257,33 @@ const TrailRail = memo(function TrailRail({
         viewOffset: SCROLL_MARGIN_PX + topInset,
       });
     },
-    [listRef, topInset],
+    [listRef, topInset, onNavigate],
   );
+
+  // Roving tab stop: the rail is one Tab stop, arrows move between turns.
+  // Defaults to the newest turn, where a reader usually is.
+  const [rovingPos, setRovingPos] = useState<number | null>(null);
+  const tabStop =
+    rovingPos != null && rovingPos < ticks.length ? rovingPos : ticks.length - 1;
+  const onRailKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
+    const buttons = railRef.current?.querySelectorAll<HTMLButtonElement>(
+      "button[data-trail-tick]",
+    );
+    if (!buttons?.length) return;
+    const from = [...buttons].indexOf(e.target as HTMLButtonElement);
+    if (from < 0) return;
+    const last = buttons.length - 1;
+    const to =
+      e.key === "ArrowUp" ? Math.max(0, from - 1)
+      : e.key === "ArrowDown" ? Math.min(last, from + 1)
+      : e.key === "Home" ? 0
+      : e.key === "End" ? last
+      : null;
+    if (to == null) return;
+    e.preventDefault();
+    setRovingPos(to);
+    buttons[to].focus();
+  };
 
   const hoveredEntry = hovered ? entries[hovered.entryIndex] : null;
   const hoveredTickPosition = hovered
@@ -261,6 +298,7 @@ const TrailRail = memo(function TrailRail({
       onWheel={forwardWheel}
       onMouseLeave={hidePreview}
       onBlur={hidePreview}
+      onKeyDown={onRailKeyDown}
       className="absolute inset-y-0 left-0 z-20 flex w-7 flex-col items-center justify-center gap-[1.5px] opacity-55 transition-opacity duration-150 group-hover/transcript-list:opacity-100"
     >
       {ticks.map((entryIndex, tickPosition) => {
@@ -273,10 +311,15 @@ const TrailRail = memo(function TrailRail({
           <button
             key={entry.messageId}
             type="button"
+            data-trail-tick=""
+            tabIndex={tickPosition === tabStop ? 0 : -1}
             aria-label={`Jump to turn ${entry.turnIndex + 1}: ${firstWords(entry.userText)}`}
             onClick={() => jumpTo(entry.slotIndex)}
             onMouseEnter={(e) => showPreview(entryIndex, e.currentTarget)}
-            onFocus={(e) => showPreview(entryIndex, e.currentTarget)}
+            onFocus={(e) => {
+              setRovingPos(tickPosition);
+              showPreview(entryIndex, e.currentTarget);
+            }}
             className="group/tick flex w-full items-center justify-center py-[3px]"
           >
             <span

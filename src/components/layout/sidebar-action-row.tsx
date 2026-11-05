@@ -9,7 +9,7 @@ import { startNewHomeAgent } from "@/lib/agent-chat/new-home-agent";
 import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { ListTree, Search as SearchIcon, SquarePen } from "lucide-react";
-import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
+import { Button } from "@/components/ui/button";
 import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
 import { cn } from "@/lib/utils";
 import { useSidebarViewStore } from "./sidebar-view-store";
@@ -45,9 +45,6 @@ export function SidebarActionRow() {
   // in-flow `h-9` bar already sits above the sidebar, so the extra clearance
   // would just be dead padding above the header row.
   const titlebarOverlay = useTitlebarOverlay();
-  const { getKeysForAction } = useResolvedKeybinds();
-  const newAgentKeys = getKeysForAction("newAgent");
-  const paletteKeys = getKeysForAction("commandPalette");
   const setShowCommandPalette = useUIStore((s) => s.setShowCommandPalette);
   const handleNewAgent = useNewAgentAction();
 
@@ -68,33 +65,35 @@ export function SidebarActionRow() {
         >
           <Tooltip delayDuration={300}>
             <TooltipTrigger asChild>
-              <button
-                type="button"
+              <Button
+                variant="ghost"
+                size="icon-sm"
                 aria-label="New agent"
                 onClick={handleNewAgent}
-                className="flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
+                className="text-muted-foreground"
               >
                 <SquarePen className="size-[13px]" />
-              </button>
+              </Button>
             </TooltipTrigger>
-            <TooltipContent side="right">
-              New agent{newAgentKeys ? ` · ${newAgentKeys}` : ""} · Shift+click for workspace dialog
+            <TooltipContent side="right" shortcut="newAgent" hint="Shift-click for a workspace">
+              New agent
             </TooltipContent>
           </Tooltip>
 
           <Tooltip delayDuration={300}>
             <TooltipTrigger asChild>
-              <button
-                type="button"
+              <Button
+                variant="ghost"
+                size="icon-sm"
                 aria-label="Search"
                 onClick={() => setShowCommandPalette(true)}
-                className="flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
+                className="text-muted-foreground"
               >
                 <SearchIcon className="size-3.5" />
-              </button>
+              </Button>
             </TooltipTrigger>
-            <TooltipContent side="right">
-              Search{paletteKeys ? ` · ${paletteKeys}` : ""}
+            <TooltipContent side="right" shortcut="commandPalette">
+              Search
             </TooltipContent>
           </Tooltip>
 
@@ -121,8 +120,6 @@ export function SidebarActionRow() {
 export function SidebarViewSwitch() {
   const view = useSidebarViewStore((s) => s.view);
   const setView = useSidebarViewStore((s) => s.setView);
-  const { getKeysForAction } = useResolvedKeybinds();
-  const toggleKeys = getKeysForAction("toggleSidebarView");
 
   return (
     <Tooltip>
@@ -139,8 +136,8 @@ export function SidebarViewSwitch() {
           <ListTree className="size-[15px]" />
         </TooltipTrigger>
       </Toggle>
-      <TooltipContent side="bottom">
-        Projects view{toggleKeys ? ` · ${toggleKeys}` : ""}
+      <TooltipContent side="bottom" shortcut="toggleSidebarView">
+        Projects view
       </TooltipContent>
     </Tooltip>
   );
@@ -152,9 +149,6 @@ export function SidebarViewSwitch() {
  *  No outlines: the switch is grouped by its fill and the two actions are
  *  plain ghosts, so the row reads as one calm toolbar. */
 export function SidebarHeaderActions() {
-  const { getKeysForAction } = useResolvedKeybinds();
-  const newAgentKeys = getKeysForAction("newAgent");
-  const paletteKeys = getKeysForAction("commandPalette");
   const setShowCommandPalette = useUIStore((s) => s.setShowCommandPalette);
   const handleNewAgent = useNewAgentAction();
 
@@ -164,32 +158,34 @@ export function SidebarHeaderActions() {
       <PluginSidebarLayoutMenu />
       <Tooltip>
         <TooltipTrigger asChild>
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="icon"
             aria-label="Search"
             onClick={() => setShowCommandPalette(true)}
-            className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
+            className="text-muted-foreground"
           >
             <SearchIcon className="size-[15px]" />
-          </button>
+          </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom">
-          Search{paletteKeys ? ` · ${paletteKeys}` : ""}
+        <TooltipContent side="bottom" shortcut="commandPalette">
+          Search
         </TooltipContent>
       </Tooltip>
       <Tooltip>
         <TooltipTrigger asChild>
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="icon"
             aria-label="New agent"
             onClick={handleNewAgent}
-            className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
+            className="text-muted-foreground"
           >
             <SquarePen className="size-[15px]" />
-          </button>
+          </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom">
-          New chat in home directory{newAgentKeys ? ` · ${newAgentKeys}` : ""} · Shift+click for workspace dialog
+        <TooltipContent side="bottom" shortcut="newAgent" hint="Shift-click for a workspace">
+          New chat in home directory
         </TooltipContent>
       </Tooltip>
     </>

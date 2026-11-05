@@ -28,11 +28,22 @@ export function LandingBackdropHost({ children }: { children: ReactNode }) {
       handlers.current.delete(handler);
     };
   }, []);
-  const calmRect = useCallback(
-    () =>
-      rootRef.current?.querySelector<HTMLElement>("[data-backdrop-calm]")?.getBoundingClientRect() ?? null,
-    [],
-  );
+  const calmRect = useCallback(() => {
+    const calm = rootRef.current?.querySelector<HTMLElement>("[data-backdrop-calm]");
+    if (!calm) return null;
+    // Union with the block's descendants: the project hint is positioned
+    // outside the headline column, and it needs the same quiet ground.
+    let { left, top, right, bottom } = calm.getBoundingClientRect();
+    for (const el of calm.querySelectorAll<HTMLElement>("*")) {
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      left = Math.min(left, r.left);
+      top = Math.min(top, r.top);
+      right = Math.max(right, r.right);
+      bottom = Math.max(bottom, r.bottom);
+    }
+    return DOMRect.fromRect({ x: left, y: top, width: right - left, height: bottom - top });
+  }, []);
   const calmHandlers = useRef(new Set<() => void>());
   const onCalmChange = useCallback((handler: () => void) => {
     calmHandlers.current.add(handler);

@@ -11,6 +11,7 @@ import { MessageTrail } from "./MessageTrail";
 import { buildTranscriptSlots } from "./transcript-slots";
 
 const scrollToIndex = vi.fn(() => Promise.resolve());
+const onNavigate = vi.fn();
 let viewport: HTMLDivElement;
 let listRef: React.RefObject<LegendListRef | null>;
 let scrollTop = 0;
@@ -37,6 +38,7 @@ function resize(target: Element) {
 afterEach(() => {
   cleanup();
   scrollToIndex.mockClear();
+  onNavigate.mockClear();
   resizeObservers.length = 0;
 });
 
@@ -89,7 +91,9 @@ function renderTrail(messages: ChatViewItem[]) {
       scrollToIndex,
     } as unknown as LegendListRef,
   };
-  return render(<MessageTrail slots={slots} listRef={listRef} />);
+  return render(
+    <MessageTrail slots={slots} listRef={listRef} onNavigate={onNavigate} />,
+  );
 }
 
 describe("MessageTrail", () => {
@@ -113,10 +117,35 @@ describe("MessageTrail", () => {
     ).toBeInTheDocument();
   });
 
+  it("is one Tab stop; arrows and Home/End move between turns without jumping", () => {
+    renderTrail(turns(4));
+    const buttons = screen.getAllByRole("button");
+    // Only the newest turn is in the Tab order.
+    expect(buttons.map((b) => b.tabIndex)).toEqual([-1, -1, -1, 0]);
+
+    buttons[3].focus();
+    fireEvent.keyDown(buttons[3], { key: "ArrowUp" });
+    expect(document.activeElement).toBe(buttons[2]);
+    expect(buttons.map((b) => b.tabIndex)).toEqual([-1, -1, 0, -1]);
+
+    fireEvent.keyDown(buttons[2], { key: "Home" });
+    expect(document.activeElement).toBe(buttons[0]);
+    fireEvent.keyDown(buttons[0], { key: "End" });
+    expect(document.activeElement).toBe(buttons[3]);
+    // Moving focus previews a turn; only activation scrolls.
+    expect(scrollToIndex).not.toHaveBeenCalled();
+  });
+
   it("jumps to the turn's row on click (align start)", () => {
     renderTrail(turns(4));
     fireEvent.click(
       screen.getByRole("button", { name: /Jump to turn 2:/ }),
+    );
+    // The list releases live-follow first, or its end pin reclaims the
+    // viewport the moment the jump lands.
+    expect(onNavigate).toHaveBeenCalledTimes(1);
+    expect(onNavigate.mock.invocationCallOrder[0]).toBeLessThan(
+      scrollToIndex.mock.invocationCallOrder[0],
     );
     expect(scrollToIndex).toHaveBeenCalledWith({
       index: 2,

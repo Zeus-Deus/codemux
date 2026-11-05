@@ -4,6 +4,18 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, Square, Copy, X } from "lucide-react";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { TitlebarActions } from "@/contrib/react/titlebar-actions";
+import { cn } from "@/lib/utils";
+import {
+  BAND_CONTROL_HOVER,
+  BAND_CONTROL_RADIUS,
+} from "@/components/layout/titlebar-control-style";
+
+/** Window buttons share the band's 28px radius, hover step and timing, so
+ *  they don't read as a separate square-cornered toolbar. */
+const WINDOW_CONTROL = cn(
+  "flex h-7 w-8 items-center justify-center text-muted-foreground",
+  BAND_CONTROL_RADIUS,
+);
 
 /**
  * Standalone window controls (minimize / maximize / close) used by full-
@@ -57,7 +69,7 @@ export function WindowControls() {
       <button
         type="button"
         aria-label="Minimize"
-        className="flex h-7 w-8 items-center justify-center text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
+        className={cn(WINDOW_CONTROL, BAND_CONTROL_HOVER, "active:bg-surface-3")}
         onClick={() => appWindow.minimize()}
       >
         <Minus className="size-3" />
@@ -65,7 +77,7 @@ export function WindowControls() {
       <button
         type="button"
         aria-label={isMaximized ? "Restore" : "Maximize"}
-        className="flex h-7 w-8 items-center justify-center text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
+        className={cn(WINDOW_CONTROL, BAND_CONTROL_HOVER, "active:bg-surface-3")}
         onClick={() => appWindow.toggleMaximize()}
       >
         {isMaximized ? (
@@ -77,7 +89,10 @@ export function WindowControls() {
       <button
         type="button"
         aria-label="Close"
-        className="flex h-7 w-8 items-center justify-center text-muted-foreground transition-colors duration-150 hover:bg-destructive hover:text-destructive-foreground"
+        className={cn(
+          WINDOW_CONTROL,
+          "transition-colors duration-100 hover:bg-destructive hover:text-destructive-foreground active:bg-destructive/85",
+        )}
         onClick={() => appWindow.close()}
       >
         <X className="size-3.5" />

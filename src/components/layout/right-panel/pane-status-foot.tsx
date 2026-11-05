@@ -1,6 +1,9 @@
 /**
- * The deck's 26px status foot: a 5px accent dot, the active pane's status
- * line, and — on the right — the focused thread's running token total.
+ * The deck's 26px status foot: the active pane's status line and — on the
+ * right — the focused thread's running token total.
+ *
+ * No leading dot. Coloured dots elsewhere mean working / needs you / review;
+ * a permanent accent dot here read as live activity even on "idle".
  *
  * The token figure is the provider's own `total_processed_tokens` (the
  * lifetime count the composer's context meter already reads), formatted
@@ -19,9 +22,9 @@
  * The status line and token total are prose and counts, not code, so they
  * are sans with tabular figures.
  *
- * The dot and the text stay on their tokens (`accent-ember`,
- * `muted-foreground`), which are mixed against the foreground rather than
- * against the removed card fill, so contrast is unaffected.
+ * The text stays on `muted-foreground`, which is mixed against the
+ * foreground rather than against the removed card fill, so contrast is
+ * unaffected.
  */
 import { formatContextTokens } from "@/lib/agent-chat/context-usage";
 import { cn } from "@/lib/utils";
@@ -43,10 +46,6 @@ export function PaneStatusFoot({
       data-testid="right-panel-status-foot"
       className="flex h-[26px] shrink-0 items-center gap-2 border-t border-border/60 bg-transparent px-3"
     >
-      <span
-        className="size-[5px] shrink-0 rounded-full bg-accent-ember"
-        aria-hidden
-      />
       <span className="min-w-0 flex-1 truncate text-caption text-muted-foreground">
         {status}
       </span>

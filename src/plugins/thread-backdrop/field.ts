@@ -123,7 +123,9 @@ export function setCalmZone(
 ): void {
   const { cols, calm, active } = field;
   const FEATHER = 56;
-  const DEPTH = 0.55;
+  // Deep enough that the headline and project picker sit on quiet ground;
+  // the plate still reads in full around them.
+  const DEPTH = 0.85;
   for (let k = 0; k < active.length; k++) {
     const i = active[k];
     if (!rect) {

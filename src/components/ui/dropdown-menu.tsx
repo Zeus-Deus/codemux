@@ -202,7 +202,8 @@ function DropdownMenuShortcut({
     <span
       data-slot="dropdown-menu-shortcut"
       className={cn(
-        "ml-auto font-mono text-caption tracking-[0.02em] text-muted-foreground group-focus/dropdown-menu-item:text-accent-foreground",
+        // Same face as `MenuKeycap`, so every menu's shortcut column matches.
+        "ml-auto pl-4 font-sans text-caption tabular-nums text-subtle-foreground group-focus/dropdown-menu-item:text-accent-foreground",
         className
       )}
       {...props}

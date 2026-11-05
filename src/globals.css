@@ -60,6 +60,7 @@
     --color-input: var(--input);
     --color-border: var(--border);
     --color-destructive: var(--destructive);
+    --color-destructive-foreground: var(--destructive-foreground);
     --color-accent-foreground: var(--accent-foreground);
     --color-accent: var(--accent);
     --color-muted-foreground: var(--muted-foreground);
@@ -206,6 +207,9 @@
     --accent: oklch(0.97 0.001 106.424);
     --accent-foreground: oklch(0.216 0.006 56.043);
     --destructive: oklch(0.577 0.245 27.325);
+    /* Ink on a solid destructive fill (a red Close hover): white on the
+     * deep light-theme red, near-black on the brighter dark-theme red. */
+    --destructive-foreground: oklch(1 0 0);
     --border: oklch(0.923 0.003 48.717);
     --input: oklch(0.923 0.003 48.717);
     --ring: oklch(0.709 0.01 56.259);
@@ -253,6 +257,7 @@
     --accent: oklch(0.268 0.007 34.298);
     --accent-foreground: oklch(0.985 0.001 106.423);
     --destructive: oklch(0.704 0.191 22.216);
+    --destructive-foreground: oklch(0.145 0.005 56);
     --border: oklch(1 0 0 / 10%);
     --input: oklch(1 0 0 / 15%);
     /* Focus ring is a muted neutral — ember is reserved for primary

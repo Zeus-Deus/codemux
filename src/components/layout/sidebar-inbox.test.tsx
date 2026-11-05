@@ -372,11 +372,11 @@ describe("SidebarInbox — cards", () => {
     expect(screen.getByText("Working")).toBeInTheDocument();
     expect(screen.getByText("Needs you")).toBeInTheDocument();
     expect(screen.getByText("Done · review")).toBeInTheDocument();
-    // Needs-you card carries the blocker line. The pinned "needs you" strip
-    // above the list names the workspace instead and keeps the blocker in its
-    // jump-link's accessible name, so it stays one click away however far
-    // down its card sits.
-    expect(screen.getAllByText("Waiting for your input")).toHaveLength(1);
+    // The generic blocker fallback would only repeat "Needs you", so the card
+    // omits it. The pinned "needs you" strip keeps it in its jump-link's
+    // accessible name, so it stays one click away however far down its card
+    // sits.
+    expect(screen.queryByText("Waiting for your input")).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /^Jump to .+ — waiting for your input$/ }),
     ).toBeInTheDocument();

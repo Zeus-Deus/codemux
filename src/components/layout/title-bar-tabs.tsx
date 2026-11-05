@@ -109,9 +109,12 @@ const CLOSE_X =
 /** The pill's leading control: the tab's kind icon, a × on reveal. */
 function TabCloseButton({
   icon,
+  title,
   onClose,
 }: {
   icon: React.ReactNode;
+  /** Names the tab, so a screen reader's button list tells closes apart. */
+  title: string;
   onClose: (e: React.MouseEvent) => void;
 }) {
   return (
@@ -119,7 +122,7 @@ function TabCloseButton({
       type="button"
       data-no-drag
       onClick={onClose}
-      aria-label="Close tab"
+      aria-label={`Close ${title}`}
       title="Close tab"
       className={CLOSE_BTN}
     >
@@ -404,7 +407,11 @@ function TitleBarTab({
             {status && <StatusIndicator status={status} />}
           </button>
         )}
-        <TabCloseButton icon={tabIcon(tab, isChat)} onClose={handleClose} />
+        <TabCloseButton
+          icon={tabIcon(tab, isChat)}
+          title={tab.title}
+          onClose={handleClose}
+        />
       </div>
     </TabContextMenu>
   );
@@ -513,6 +520,7 @@ function ActiveChatTab({
         )}
         <TabCloseButton
           icon={<MessageSquare className="size-3" />}
+          title={tab.title}
           onClose={handleClose}
         />
       </div>

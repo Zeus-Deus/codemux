@@ -411,7 +411,9 @@ function OnThisPage({
           aria-current={current === item.id ? "location" : undefined}
           onClick={() => onSelect(item.id, index)}
           className={cn(
-            "-ml-px block w-full truncate border-l-2 py-1 pl-3 text-left text-body-sm transition-colors duration-150 outline-none focus-visible:text-foreground",
+            // The global focus outline shows here: a colour change alone is
+            // invisible on the item that is already current.
+            "-ml-px block w-full truncate rounded-r-sm border-l-2 py-1 pl-3 text-left text-body-sm transition-colors duration-150 focus-visible:text-foreground",
             current === item.id
               ? "border-accent-ember text-foreground"
               : "border-transparent text-subtle-foreground hover:text-foreground",

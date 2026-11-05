@@ -753,8 +753,10 @@ export const RightPanel = memo(function RightPanel({
   const surfaces: SurfaceAction[] = [
     {
       id: "terminal",
-      label: "Terminal",
-      description: "Start a shell in this workspace.",
+      // Named for where it lands: unlike every other entry it opens a
+      // workspace tab, not content in this panel.
+      label: "Terminal tab",
+      description: "Opens a shell as a new workspace tab.",
       icon: Terminal,
       onOpen: handleOpenTerminal,
     },
