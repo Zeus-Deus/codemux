@@ -213,7 +213,7 @@ export function ContentSearchDialog() {
             inputRef={inputRef}
             value={query}
             onChange={setQuery}
-            placeholder="Search in files..."
+            placeholder="Search in files…"
             loading={loading}
           />
           <div className="flex items-center gap-1">

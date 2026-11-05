@@ -223,8 +223,9 @@ export function BranchPicker({
           <ChevronDown className="size-3 opacity-40" />
         </button>
       </PopoverTrigger>
-      <PopoverContent className="w-[380px] p-0" align="start">
+      <PopoverContent aria-label="Choose branch" className="w-[380px] p-0" align="start">
         <Command
+          label="Search branches"
           shouldFilter={false}
           onKeyDown={baseOnly ? undefined : (e) => {
             if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
@@ -239,7 +240,7 @@ export function BranchPicker({
           }}
         >
           <CommandInput
-            placeholder="Search branches..."
+            placeholder="Search branches…"
             className="h-8"
             value={search}
             onValueChange={setSearch}
@@ -291,7 +292,7 @@ export function BranchPicker({
             {loading ? (
               <div className="flex items-center justify-center py-8 text-label text-muted-foreground">
                 <Spinner className="mr-2 size-3.5" aria-hidden />
-                Loading branches...
+                Loading branches…
               </div>
             ) : (
               <>

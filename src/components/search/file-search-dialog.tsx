@@ -233,7 +233,7 @@ export function FileSearchDialog() {
             inputRef={inputRef}
             value={query}
             onChange={setQuery}
-            placeholder="Search files by name..."
+            placeholder="Search files by name…"
             loading={loading}
           />
         </div>
