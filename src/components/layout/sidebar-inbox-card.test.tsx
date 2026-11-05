@@ -202,7 +202,7 @@ describe("SidebarInboxCard — branch named like the title", () => {
     expect(metaLine(container)).toBeNull();
   });
 
-  it("keeps the meta line for its other facts", () => {
+  it("keeps the branch when the line is drawn for other facts anyway", () => {
     const { container } = renderCard({
       workspace: makeWorkspace({
         title: "Installer-Detect",
@@ -210,8 +210,10 @@ describe("SidebarInboxCard — branch named like the title", () => {
         git_ahead: 2,
       }),
     });
+    // The line exists for ↑2 regardless, so the branch fills its left column
+    // instead of leaving the right-hand facts floating alone.
     expect(metaLine(container)).toHaveTextContent("↑2");
-    expect(metaLine(container)).not.toHaveTextContent("fix/installer-detect");
+    expect(metaLine(container)).toHaveTextContent("fix/installer-detect");
   });
 
   it("still prints a branch that names something else", () => {

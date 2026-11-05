@@ -585,12 +585,12 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   const titleRepeatsProject =
     displayTitle.trim().toLowerCase() === repo.name.trim().toLowerCase();
   /** Worktree cards are usually named after their branch's last segment
-   *  (`fix/installer-detect` → "installer-detect"), and printing both says the
-   *  name twice. The full branch stays in the hover card and context menu. */
+   *  (`fix/installer-detect` → "installer-detect"), and a meta line holding
+   *  only that branch says the name twice. The full branch stays in the hover
+   *  card and context menu. */
   const branchRepeatsTitle =
     (workspace.git_branch?.split("/").pop() ?? "").trim().toLowerCase() ===
     displayTitle.trim().toLowerCase();
-  const showBranch = Boolean(workspace.git_branch) && !branchRepeatsTitle;
 
   // The workspace's whole PR set, not just the scalar head: an agent handed a
   // multi-part plan lands a branch and a PR per concern, and a badge that names
@@ -633,14 +633,19 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // with no branch, stats, PR or indicators) is not drawn: the mark rides at
   // the end of the title line instead, so the card isn't a row taller for a
   // single glyph.
-  const metaHasContent =
-    showBranch ||
+  const metaHasOtherContent =
     hasAhead ||
     hasStats ||
     Boolean(prState) ||
     Boolean(deviceName) ||
     runningPort != null ||
     workspace.notification_count > 0;
+  // A repeated branch is dropped only when it would be the line's sole reason
+  // to exist. When the line is drawn anyway (a PR chip, stats), the branch
+  // keeps its left column so the right-hand chips aren't left floating alone.
+  const showBranch =
+    Boolean(workspace.git_branch) && (!branchRepeatsTitle || metaHasOtherContent);
+  const metaHasContent = showBranch || metaHasOtherContent;
   const inlineProviders =
     !metaHasContent && providers.length > 0 && !titleRepeatsProject;
   // A meta line with nothing on it is not drawn either: an empty row would
