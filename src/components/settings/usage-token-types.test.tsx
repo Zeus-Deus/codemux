@@ -189,7 +189,8 @@ describe("UsageTokenTypes", () => {
 describe("TermHint", () => {
   it("opens its hint on focus", async () => {
     render(<TermHint hint="Explained.">Jargon</TermHint>, { wrapper: TooltipProvider });
-    screen.getByRole("button", { name: "Jargon" }).focus();
+    await userEvent.tab();
+    expect(screen.getByRole("button", { name: "Jargon" })).toHaveFocus();
     expect(await screen.findByRole("tooltip")).toHaveTextContent("Explained.");
   });
 });

@@ -28,6 +28,20 @@ function Tooltip({
   return <TooltipPrimitive.Root data-slot="tooltip" {...props} />
 }
 
+/** Whether the last key pressed was Tab. Focus that arrives without a
+ *  previous element is either the user tabbing in from the page or a popup
+ *  handing focus back as it closes (after Esc or a click), and only this
+ *  tells the two apart. */
+let tabbing = false
+if (typeof document !== "undefined") {
+  document.addEventListener("keydown", (event) => {
+    tabbing = event.key === "Tab"
+  }, true)
+  document.addEventListener("pointerdown", () => {
+    tabbing = false
+  }, true)
+}
+
 function TooltipTrigger({
   onFocus,
   ...props
@@ -38,10 +52,18 @@ function TooltipTrigger({
       // Only keyboard focus opens a tooltip. A popover that moves focus into
       // itself on a mouse click would otherwise pop a label over the content
       // the user just opened. Radix skips its handler once default is prevented.
+      // Focus handed back by a closing menu, popover or dialog isn't the user
+      // arriving either: it comes from nowhere (the popup that held it was
+      // removed) or straight out of a popup's content around something else.
+      // Tab navigation shows the label wherever it comes from.
       onFocus={(event) => {
         onFocus?.(event)
         const target = event.currentTarget
-        if (target.ownerDocument.activeElement === target && !target.matches(":focus-visible")) {
+        if (target.ownerDocument.activeElement !== target) return
+        const from = event.relatedTarget
+        const popup = from instanceof Element ? from.closest('[data-slot$="-content"]') : null
+        const returned = !tabbing && (from === null || (popup !== null && !popup.contains(target)))
+        if (returned || !target.matches(":focus-visible")) {
           event.preventDefault()
         }
       }}

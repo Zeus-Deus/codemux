@@ -4,6 +4,7 @@ import * as React from "react"
 import { Dialog as DialogPrimitive } from "radix-ui"
 
 import { cn } from "@/lib/utils"
+import { currentFocus, focusIsLost, restoreFocus } from "@/lib/focus-return"
 import { Button } from "@/components/ui/button"
 import { XIcon } from "lucide-react"
 
@@ -95,18 +96,61 @@ function DialogOverlay({
 export const DIALOG_CRISP_POSITION =
   "inset-x-0 top-24 mx-auto translate-x-0 translate-y-0"
 
+/**
+ * Records what had focus just before the dialog's content mounted. It runs
+ * during render, ahead of any `autoFocus` inside the dialog: once a child has
+ * taken focus, Radix never fires `onOpenAutoFocus` at all.
+ */
+function FocusOrigin({
+  into,
+}: {
+  into: React.RefObject<HTMLElement | null>
+}) {
+  const [origin] = React.useState(currentFocus)
+  React.useEffect(() => {
+    into.current = origin
+  }, [into, origin])
+  return null
+}
+
 function DialogContent({
   className,
   children,
   showCloseButton = true,
   overlayClassName,
   motion = "default",
+  onCloseAutoFocus,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean
   overlayClassName?: string
   motion?: DialogMotion
 }) {
+  const focusOrigin = React.useRef<HTMLElement | null>(null)
+  // Radix returns focus only to a `<DialogTrigger>`; a dialog opened from the
+  // store or a shortcut has none, and focus fell to <body>. Give it back to
+  // whatever had it before, unless the caller handled it or something the
+  // dialog started (a command that navigated, a dialog opened from this one)
+  // already owns focus.
+  const handleCloseAutoFocus = (event: Event) => {
+    onCloseAutoFocus?.(event)
+    if (event.defaultPrevented) return
+    if (!focusIsLost()) {
+      event.preventDefault()
+      return
+    }
+    const origin = focusOrigin.current
+    if (origin?.isConnected) {
+      event.preventDefault()
+      restoreFocus(origin)
+      return
+    }
+    // Let Radix focus the trigger if there is one; otherwise land in the
+    // composer. Radix's own handler runs right after this one.
+    queueMicrotask(() => {
+      if (focusIsLost()) restoreFocus(null)
+    })
+  }
   return (
     <DialogPortal>
       <DialogOverlay motion={motion} className={overlayClassName} />
@@ -117,8 +161,10 @@ function DialogContent({
           CONTENT_MOTION[motion],
           className
         )}
+        onCloseAutoFocus={handleCloseAutoFocus}
         {...props}
       >
+        <FocusOrigin into={focusOrigin} />
         {children}
         {showCloseButton && (
           <DialogPrimitive.Close data-slot="dialog-close" asChild>

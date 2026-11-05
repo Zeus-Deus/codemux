@@ -14,6 +14,7 @@ import type {
 import { selectUtilityPage } from "@/lib/utility-pages";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { remoteViewHost } from "@/remote/client-view";
+import { composerFallback, currentFocus, focusWhenRendered, isTouchScreen } from "@/lib/focus-return";
 
 /** Panes the right-panel deck can host that aren't tied to a file path. */
 export type RightPanelCorePane =
@@ -383,6 +384,30 @@ const NO_UTILITY_PAGE = {
  *  dismissals is enough and keeps the persisted list from growing forever. */
 const MAX_DISMISSED_SUBAGENTS = 200;
 
+/** Settings' search field (in its left nav), where opening Settings lands. */
+export const SETTINGS_SEARCH_SELECTOR = 'input[aria-label="Search settings"]';
+
+/** What had focus when Settings opened. Settings replaces the whole shell,
+ *  so focus would otherwise land on <body> both ways. */
+let settingsFocusOrigin: HTMLElement | null = null;
+
+/** Call with Settings' visibility before and after a change. Opening lands
+ *  in the settings search (not on touch screens, where it would raise the
+ *  keyboard); closing hands focus back to where it was, or to the composer. */
+function moveFocusForSettings(wasOpen: boolean, open: boolean): void {
+  if (typeof document === "undefined" || wasOpen === open) return;
+  if (open) {
+    settingsFocusOrigin = currentFocus();
+    if (!isTouchScreen()) {
+      focusWhenRendered(() => [document.querySelector<HTMLElement>(SETTINGS_SEARCH_SELECTOR)]);
+    }
+    return;
+  }
+  const origin = settingsFocusOrigin;
+  settingsFocusOrigin = null;
+  focusWhenRendered(() => [origin, composerFallback()]);
+}
+
 export const useUIStore = create<UIStore>()(
   persist(
     (set, get) => ({
@@ -694,26 +719,32 @@ export const useUIStore = create<UIStore>()(
           newWorkspaceDraft: null,
         }),
 
-      setShowSettings: (show, section = null) =>
+      setShowSettings: (show, section = null) => {
+        moveFocusForSettings(get().showSettings, show);
         set((state) => ({
           showSettings: show,
           settingsSection: show ? (section ?? null) : null,
           pendingPluginSettingsSelection: null,
           settingsNavigationVersion: state.settingsNavigationVersion + 1,
-        })),
-      openPluginSettings: (installationId = null) =>
+        }));
+      },
+      openPluginSettings: (installationId = null) => {
+        moveFocusForSettings(get().showSettings, true);
         set((state) => ({
           showSettings: true,
           settingsSection: "plugins",
           pendingPluginSettingsSelection: installationId,
           settingsNavigationVersion: state.settingsNavigationVersion + 1,
-        })),
-      requestNewPreset: () =>
+        }));
+      },
+      requestNewPreset: () => {
+        moveFocusForSettings(get().showSettings, true);
         set({
           showSettings: true,
           settingsSection: "presets",
           pendingPresetCreate: true,
-        }),
+        });
+      },
       clearPendingPresetCreate: () => set({ pendingPresetCreate: false }),
       // Utility pages share the main area beside the sidebar, so opening
       // one replaces whichever other one was showing.
