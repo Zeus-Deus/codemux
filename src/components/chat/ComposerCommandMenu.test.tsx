@@ -74,3 +74,18 @@ it("lets the embedded access picker own Enter without selecting a composer comma
   await user.keyboard("{Enter}");
   expect(onSelect).toHaveBeenCalledOnce();
 });
+
+it("names a group's shortcut as a key chip in its heading", () => {
+  const { container } = render(<ComposerCommandMenu
+    open submode="main" query="" onQueryChange={vi.fn()} onSelect={vi.fn()} onEscape={vi.fn()}
+    items={[
+      { id: "mode:plan", label: "Plan", command: "/plan", group: "MODES", onSelect: vi.fn() },
+      { id: "attach:file", label: "File", command: "", group: "ATTACH", onSelect: vi.fn() },
+    ]}
+    groupShortcuts={{ MODES: "Shift+Tab" }}
+  />);
+  const headings = [...container.querySelectorAll("[cmdk-group-heading]")];
+  expect(headings[0]).toHaveTextContent(/^MODESShift\+Tab$/);
+  expect(headings[0].querySelectorAll('[data-slot="kbd"]')).toHaveLength(2);
+  expect(headings[1]).toHaveTextContent(/^ATTACH$/);
+});

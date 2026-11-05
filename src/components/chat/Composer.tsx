@@ -505,6 +505,9 @@ export function nextFooterFit(
   return prev;
 }
 
+/** The `+` menu's MODES heading names the textarea's mode-cycle key. */
+const MODE_CYCLE_SHORTCUT = { MODES: "Shift+Tab" } as const;
+
 export function Composer({
   draft,
   readOnly = false,
@@ -3423,6 +3426,11 @@ export function Composer({
               onEscape={handleAttachEscape}
               footerNote={attachPopupFooter}
               submode={attachSubmode}
+              // Shift+Tab in the textarea cycles these modes; nothing
+              // else names that shortcut.
+              groupShortcuts={
+                configurationEnabled && provider !== "acp" ? MODE_CYCLE_SHORTCUT : undefined
+              }
               headerSlot={
                 footerLadder.configInMenu && provider !== "acp" && attachSubmode === "main" ? (
                   <>
