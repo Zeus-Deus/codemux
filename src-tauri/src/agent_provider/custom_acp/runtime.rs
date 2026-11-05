@@ -87,7 +87,10 @@ fn launch_environment(
     // identities, which must come from the backend's actual pane binding.
     let mut environment = host.cloned().unwrap_or_default();
     environment.extend(definition.clone());
-    for key in ["CODEMUX_WORKSPACE_ID", "CODEMUX_PANE_ID"] {
+    // The agent-process marker is the backend's too: a saved definition
+    // cannot replace it (the spawn sets it when the host overlay has none).
+    environment.remove(crate::control_identity::AGENT_PROCESS_ENV);
+    for key in ["CODEMUX_WORKSPACE_ID", "CODEMUX_PANE_ID", crate::control_identity::AGENT_PROCESS_ENV] {
         if let Some(value) = host.and_then(|env| env.get(key)) {
             environment.insert(key.into(), value.clone());
         }
@@ -247,6 +250,11 @@ mod parsing_tests {
         assert_eq!(env["FAKE_LITERAL"], " literal $(value) ");
         assert_eq!(env["HOST_CONTEXT"], "backend");
         assert_eq!(launch_environment(&definition, None), definition);
+        let marker = crate::control_identity::AGENT_PROCESS_ENV;
+        let saved = HashMap::from([(marker.to_string(), String::new())]);
+        assert!(!launch_environment(&saved, None).contains_key(marker), "the spawn's own marker stands");
+        let host = HashMap::from([(marker.to_string(), "acp".to_string())]);
+        assert_eq!(launch_environment(&saved, Some(&host))[marker], "acp", "the host's marker wins");
     }
     #[test]
     fn command_resume_cursor_uses_durable_namespaced_id() {

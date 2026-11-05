@@ -188,6 +188,7 @@ mod on_device {
             workspace_id: workspace_id.0,
             cwd,
             adopted: false,
+            base_branch: None,
         })
     }
 

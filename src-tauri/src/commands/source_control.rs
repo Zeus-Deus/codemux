@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::execution::{host_command, sanitize_gui_env_std};
+use crate::execution::sanitize_gui_env_std;
 use crate::git_provider::exec::run_timed;
 use crate::git_provider::{
     self, Capabilities, DetectedProvider, GitLabProvider, OperationCapabilities, ProviderKind,
@@ -351,7 +351,7 @@ fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
 /// Returns `None` on any failure — a missing version is cosmetic, and a
 /// broken probe must not turn into an error the pane has to render.
 fn cli_version(cli: &str) -> Option<String> {
-    let mut cmd = host_command(cli);
+    let mut cmd = crate::git::source_control_cli_command(cli);
     cmd.arg("--version");
     // No DBus needed: `--version` never touches the keyring.
     sanitize_gui_env_std(&mut cmd);

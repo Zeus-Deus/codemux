@@ -194,8 +194,19 @@ vi.mock("@/tauri/commands", () => ({
   // throwing on an undefined command wrapper.
   usageSummary: vi.fn().mockResolvedValue(null),
   usageExportCsv: vi.fn().mockResolvedValue(""),
-  agentConnectorStatus: vi.fn().mockResolvedValue({ enabled: true, publicOrigin: null, listenerRunning: false, mcpUrl: null, localCommand: "codemux mcp", pending: [], clients: [] }),
+  agentConnectorStatus: vi.fn().mockResolvedValue({ enabled: true, publicOrigin: null, listenerRunning: false, port: 4378, bindError: null,
+    localUrl: null, mcpUrl: null, localExecutable: "codemux", localCommand: "codemux mcp", pending: [], clients: [] }),
   agentConnectorRevoke: vi.fn().mockResolvedValue(undefined),
+  agentConnectorRevokeAll: vi.fn().mockResolvedValue(undefined),
+  agentConnectorIssue: vi.fn().mockResolvedValue(undefined),
+  // Connections: no devices, Remote Access off.
+  HOSTS_STATUS_CHANGED_EVENT: "hosts-status-changed",
+  hostsStatusList: vi.fn().mockResolvedValue([]),
+  hostsSshConfigHosts: vi.fn().mockResolvedValue([]),
+  webRemoteStatus: vi.fn().mockResolvedValue({ enabled: false, running: false, port: 4377, require_approval: true,
+    active_connections: 0, connected_sessions: 0, sessions: [] }),
+  webRemoteListEndpoints: vi.fn().mockResolvedValue([]),
+  webRemoteRegistrationStatus: vi.fn().mockResolvedValue({ registered: false }),
   listMcpServers: vi.fn().mockResolvedValue([]),
   getMcpRuntimeStatus: vi.fn().mockResolvedValue([]),
   setMcpDisabledIds: vi.fn().mockResolvedValue(undefined),
@@ -317,6 +328,18 @@ describe("SettingsPanel", () => {
     ]);
     expect(within(onThisPage).getByRole("button", { name: "Chat interface" }))
       .toHaveAttribute("aria-current", "location");
+    view.unmount();
+  });
+
+  it("stacks Connections' sections, Outside assistants last", () => {
+    const view = render(<SettingsView />);
+    fireEvent.click(within(view.container.querySelector("nav")!).getByRole("button", { name: "Connections" }));
+    expect(view.getByText("Reach this machine from other devices and outside assistants.")).toBeInTheDocument();
+    const onThisPage = view.getByRole("navigation", { name: "On this page" });
+    expect(within(onThisPage).getAllByRole("button").map((b) => b.textContent)).toEqual([
+      "Devices", "Remote Access", "Outside assistants",
+    ]);
+    expect(view.getByRole("heading", { level: 3, name: "Outside assistants" })).toBeInTheDocument();
     view.unmount();
   });
 
@@ -702,18 +725,19 @@ describe("Settings footer navigation", () => {
     view.unmount();
   });
 
-  it("keeps inbound administration on the shared MCP route in classic CLI mode without mounting outbound runtime", async () => {
+  it("keeps Outside assistants on the Connections page in classic CLI mode without mounting outbound MCP", async () => {
     const { useFeatureFlags } = await import("@/stores/feature-flags");
     useFeatureFlags.setState({ enableAgentChat: false });
     vi.clearAllMocks();
-    const status = { enabled: true, publicOrigin: null, listenerRunning: false, mcpUrl: null,
-      localCommand: "codemux mcp", pending: [], clients: [{ id: "synthetic-granted", clientName: "Synthetic read-only assistant", callbackOrigin: "https://client.example",
-        access: "read_only" as const, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString() }] };
+    const status = { enabled: true, publicOrigin: null, listenerRunning: false, port: 4378, bindError: null, localUrl: null, mcpUrl: null,
+      localExecutable: "codemux", localCommand: "codemux mcp", pending: [], clients: [{ id: "synthetic-granted", grantId: "synthetic-grant", kind: "oauth" as const,
+        clientName: "Synthetic read-only assistant", callbackOrigin: "https://client.example", access: "read_only" as const,
+        createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString(), label: null, renews: true }] };
     vi.mocked(commands.agentConnectorStatus).mockResolvedValue(status);
-    requestedSection = "mcp";
+    requestedSection = "outside_assistants";
     const view = render(<SettingsView />);
     try {
-      expect(view.getByRole("button", { name: "Extensions" })).toHaveAttribute("aria-current", "page");
+      expect(view.getByRole("button", { name: "Connections" })).toHaveAttribute("aria-current", "page");
       fireEvent.click(await view.findByRole("button", { name: "Revoke" }));
       vi.mocked(commands.agentConnectorStatus).mockResolvedValue({ ...status, clients: [] });
       fireEvent.click(view.getByRole("button", { name: "Revoke access" }));
@@ -722,7 +746,18 @@ describe("Settings footer navigation", () => {
       expect(commands.agentConnectorStatus).toHaveBeenCalledTimes(2);
       for (const fn of [commands.listMcpServers, commands.getMcpRuntimeStatus, commands.setMcpDisabledIds, commands.primeMcpRuntime]) expect(fn).not.toHaveBeenCalled();
       expect(view.queryByLabelText("Refresh MCP servers")).not.toBeInTheDocument();
+      expect(view.queryByRole("button", { name: "MCP Servers" })).not.toBeInTheDocument();
       expect(useFeatureFlags.getState().enableAgentChat).toBe(false);
+    } finally { view.unmount(); useFeatureFlags.setState({ enableAgentChat: true }); requestedSection = null; }
+  });
+
+  it("shows MCP Servers as unavailable in classic CLI mode", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: false });
+    requestedSection = "mcp";
+    const view = render(<SettingsView />);
+    try {
+      expect(view.getByRole("status")).toHaveTextContent("Settings section unavailable");
     } finally { view.unmount(); useFeatureFlags.setState({ enableAgentChat: true }); requestedSection = null; }
   });
 

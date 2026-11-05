@@ -1281,7 +1281,7 @@ fn execute(
     timeout: Duration,
     stdin: Option<&str>,
 ) -> Result<String, String> {
-    let mut command = crate::execution::host_command("gh");
+    let mut command = crate::git::source_control_cli_command("gh");
     command.args(args).current_dir(path);
     crate::execution::sanitize_gui_env_std_keep_dbus(&mut command);
     let output = if let Some(body) = stdin {

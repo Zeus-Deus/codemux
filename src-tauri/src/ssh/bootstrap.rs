@@ -431,9 +431,11 @@ pub async fn provision_scheduler(
 ///
 /// Installs a systemd **user** unit that runs `codemux-remote serve`,
 /// enables lingering so it survives logout and reboot, and starts it.
-/// After this returns successfully an MCP-capable agent on the host
-/// (configured with `codemux-remote mcp`) can drive Codemux locally
-/// without any further setup — that's the auto-magic UX target.
+/// After this returns successfully, an MCP client on the host configured
+/// with `codemux-remote mcp` can manage the host's folders, git worktrees
+/// and shells with no further setup; the workspaces it registers show up
+/// under Devices in the Codemux app. It does not run Codemux chats or
+/// control the app.
 ///
 /// Best-effort by contract: callers treat a failure as non-fatal —
 /// a host's push-workspace capability does not depend on serve, and
@@ -552,6 +554,34 @@ fn shell_arg(s: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// The `.mcp.json` a pushed workspace gets on its host: the file the push just
+/// copied there, with its `codemux` entry pointed at the host's
+/// codemux-remote. Other servers stay. `None` when the copied file is not a
+/// JSON object (or its `mcpServers` is not one), so it stays as the user wrote it.
+///
+/// Same shape Claude Code, Codex, and friends consume: a top-level
+/// "mcpServers" map keyed by server name. The "codemux" key matches the
+/// desktop's per-workspace entry so users get a consistent tool name
+/// whether they're on their laptop or on a pushed host.
+pub fn host_mcp_json(pushed: Option<&str>, exec_path: &str) -> Option<String> {
+    let mut config = match pushed {
+        Some(text) => serde_json::from_str::<serde_json::Value>(text).ok()?,
+        None => serde_json::json!({}),
+    };
+    let servers = config
+        .as_object_mut()?
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()?;
+    // Replaced whole: the desktop's entry carries a provider-origin `env`
+    // that only means something to the desktop's own `codemux mcp`.
+    servers.insert(
+        "codemux".into(),
+        serde_json::json!({ "command": exec_path, "args": ["mcp"] }),
+    );
+    serde_json::to_string_pretty(&config).ok()
+}
+
 /// Write a `.mcp.json` in the pushed workspace's directory on the
 /// remote so an agent CLI (Claude Code, etc.) launched in that
 /// directory auto-discovers Codemux via `codemux-remote mcp`. Mirrors
@@ -562,6 +592,9 @@ fn shell_arg(s: &str) -> String {
 /// pushed workspace's worktree lives. `remote_install_path` is the
 /// absolute path to the installed `codemux-remote` binary (so the
 /// MCP config points at a stable binary path regardless of `$PATH`).
+/// `pushed_mcp_json` is the workspace's local `.mcp.json`, which the
+/// push has just mirrored to the host; its other servers are kept (see
+/// [`host_mcp_json`]).
 ///
 /// Best-effort: a failure to write `.mcp.json` doesn't fail the push
 /// — the agent can still be configured manually, and the daemon
@@ -570,13 +603,9 @@ pub async fn provision_workspace_mcp_config(
     ssh_target: &str,
     workspace_remote_path: &str,
     remote_install_path: &str,
+    pushed_mcp_json: Option<&str>,
     deadline: Duration,
 ) -> Result<(), String> {
-    // Build the .mcp.json content. Same shape Claude Code, Codex, and
-    // friends consume: a top-level "mcpServers" map keyed by server
-    // name. The "codemux" key here matches the desktop's per-workspace
-    // entry so users get a consistent tool name whether they're on
-    // their laptop or on a pushed host.
     // The `.mcp.json` "command" must be an ABSOLUTE path. Agent CLIs
     // (Claude Code, Codex, …) spawn this command directly — they do NOT
     // run it through a shell (so `~` is not expanded) and they certainly
@@ -592,20 +621,18 @@ pub async fn provision_workspace_mcp_config(
     } else {
         remote_install_path.to_string()
     };
-    let content = serde_json::to_string_pretty(&serde_json::json!({
-        "mcpServers": {
-            "codemux": {
-                "command": exec_path,
-                "args": ["mcp"]
-            }
-        }
-    }))
-    .map_err(|e| format!("serialise .mcp.json: {e}"))?;
-
     // The file lives inside the workspace tree, which has already
-    // been rsync'd by the push step. We overwrite if it exists so a
-    // stale entry from a previous Codemux version is refreshed.
+    // been rsync'd by the push step. Only its `codemux` entry is
+    // replaced, so a stale entry from a previous Codemux version is
+    // refreshed and the repo's other servers survive.
     let target_path = format!("{}/.mcp.json", workspace_remote_path.trim_end_matches('/'));
+    let Some(content) = host_mcp_json(pushed_mcp_json, &exec_path) else {
+        eprintln!(
+            "[codemux::ssh::bootstrap] left {target_path} as pushed: it is not a JSON object \
+             with an mcpServers object, so codemux-remote was not added to it"
+        );
+        return Ok(());
+    };
     ssh_write_file(ssh_target, &target_path, &content, deadline)
         .await
         .map_err(|e| format!("writing .mcp.json: {e}"))
@@ -857,6 +884,67 @@ async fn ssh_write_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HOST_EXE: &str = "/home/deus/.local/bin/codemux-remote";
+
+    fn parsed(content: Option<String>) -> serde_json::Value {
+        serde_json::from_str(&content.expect("a host .mcp.json")).unwrap()
+    }
+
+    #[test]
+    fn host_mcp_json_keeps_other_servers_and_points_codemux_at_the_host() {
+        let pushed = r#"{
+            "mcpServers": {
+                "shadcn": { "command": "npx", "args": ["shadcn@latest", "mcp"] },
+                "codemux": { "command": "/usr/bin/codemux", "args": ["mcp"] }
+            },
+            "projectNote": "kept"
+        }"#;
+        let host = parsed(host_mcp_json(Some(pushed), HOST_EXE));
+        assert_eq!(
+            host["mcpServers"]["codemux"],
+            serde_json::json!({ "command": HOST_EXE, "args": ["mcp"] })
+        );
+        assert_eq!(
+            host["mcpServers"]["shadcn"],
+            serde_json::json!({ "command": "npx", "args": ["shadcn@latest", "mcp"] })
+        );
+        assert_eq!(host["projectNote"], "kept");
+    }
+
+    #[test]
+    fn host_mcp_json_creates_the_file_when_none_was_pushed() {
+        let host = parsed(host_mcp_json(None, HOST_EXE));
+        assert_eq!(
+            host,
+            serde_json::json!({ "mcpServers": { "codemux": { "command": HOST_EXE, "args": ["mcp"] } } })
+        );
+        // A pushed file without servers gains the container.
+        let host = parsed(host_mcp_json(Some(r#"{"other":1}"#), HOST_EXE));
+        assert_eq!(host["mcpServers"]["codemux"]["command"], HOST_EXE);
+        assert_eq!(host["other"], 1);
+    }
+
+    #[test]
+    fn host_mcp_json_leaves_an_unparseable_file_alone() {
+        for pushed in ["not json {{{", "", "[]", r#"{"mcpServers":[]}"#, r#"{"mcpServers":"x"}"#] {
+            assert_eq!(host_mcp_json(Some(pushed), HOST_EXE), None, "{pushed:?}");
+        }
+    }
+
+    #[test]
+    fn host_mcp_json_drops_the_desktop_env_from_the_codemux_entry() {
+        let pushed = r#"{"mcpServers":{"codemux":{
+            "command": "/usr/bin/codemux",
+            "args": ["mcp"],
+            "env": { "CODEMUX_MCP_PROVIDER_ORIGIN": "1" }
+        }}}"#;
+        let host = parsed(host_mcp_json(Some(pushed), HOST_EXE));
+        assert_eq!(
+            host["mcpServers"]["codemux"],
+            serde_json::json!({ "command": HOST_EXE, "args": ["mcp"] })
+        );
+    }
 
     #[test]
     fn target_for_uname_covers_all_four_release_targets() {

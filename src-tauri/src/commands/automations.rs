@@ -129,7 +129,7 @@ pub struct RepoAccessResult {
 /// without `project_path` clones from. `None` for a repo with no
 /// `origin` (such an automation can only run on "This machine").
 fn resolve_project_remote(project_path: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::git_command()
         .arg("-C")
         .arg(project_path)
         .args(["remote", "get-url", "origin"])

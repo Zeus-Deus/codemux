@@ -45,22 +45,41 @@ export function loadEnv(rootArg = process.env.ORCH_LIVE_ROOT) {
 /** `codemux json <cmd> <args>` against the isolated instance (see lib.sh cmx).
  *  An aborted `signal` kills the call. */
 export async function codemux(env, cmd, args = {}, { signal } = {}) {
-  const { stdout } = await run(env.BIN, ["json", cmd, JSON.stringify(args)], {
-    signal,
-    env: {
-      HOME: process.env.HOME,
-      PATH: "/usr/bin:/bin",
-      XDG_CONFIG_HOME: `${env.ROOT}/config`,
-      XDG_DATA_HOME: `${env.ROOT}/data`,
-      XDG_CACHE_HOME: `${env.ROOT}/cache`,
-      XDG_STATE_HOME: `${env.ROOT}/state`,
-      XDG_RUNTIME_DIR: `${env.ROOT}/runtime`,
-    },
-    maxBuffer: 64 << 20,
-  });
-  const reply = JSON.parse(stdout);
+  let reply;
+  try {
+    const { stdout } = await run(env.BIN, ["json", cmd, JSON.stringify(args)], {
+      signal,
+      env: {
+        HOME: process.env.HOME,
+        PATH: "/usr/bin:/bin",
+        XDG_CONFIG_HOME: `${env.ROOT}/config`,
+        XDG_DATA_HOME: `${env.ROOT}/data`,
+        XDG_CACHE_HOME: `${env.ROOT}/cache`,
+        XDG_STATE_HOME: `${env.ROOT}/state`,
+        XDG_RUNTIME_DIR: `${env.ROOT}/runtime`,
+      },
+      maxBuffer: 64 << 20,
+    });
+    reply = JSON.parse(stdout);
+  } catch (error) {
+    reply = printedReply(error);
+  }
   if (reply && reply.ok === false) throw new Error(`${cmd}: ${reply.error}`);
   return reply && "data" in reply ? reply.data : reply;
+}
+
+/** The reply a failed `codemux json` still printed: it exits 1 on an ok:false
+ *  reply, and that reply's error is the message scenarios match on. Any other
+ *  failure throws its own error: an aborted, killed or unstartable call or an
+ *  overflowed buffer (`code` is not an exit status), and an exit whose stdout
+ *  is empty or cut short mid-print (not valid JSON). */
+function printedReply(error) {
+  if (typeof error.code !== "number" || !error.stdout) throw error;
+  try {
+    return JSON.parse(error.stdout);
+  } catch {
+    throw error;
+  }
 }
 
 export class Driver {

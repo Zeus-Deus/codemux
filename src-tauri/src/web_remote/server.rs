@@ -256,6 +256,20 @@ impl ConnectionRegistry {
         self.plaintext.lock().unwrap().remove(&id);
     }
 
+    /// A paired device's live socket, for tests outside this module that
+    /// act as that device. [`Self::disconnect_for_test`] hangs it up.
+    #[cfg(test)]
+    pub(crate) fn connect_for_test(&self, session_id: &str) -> u64 {
+        let close = watch::channel(false).0;
+        let (out, _) = outbound_channel(close.clone());
+        self.register(session_id, Transport::Lan, out, close)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnect_for_test(&self, id: u64) {
+        self.unregister(id);
+    }
+
     pub(super) fn mark_plaintext(&self, id: u64) {
         self.plaintext.lock().unwrap().insert(id);
     }
@@ -369,7 +383,6 @@ pub fn router<R: Runtime>(app: AppHandle<R>) -> Router {
         .route("/proxy/browser/:port/ws", get(super::proxy::ws_proxy::<R>))
         .route("/proxy/browser/:port/api/*rest", any(super::proxy::http_forward::<R>))
         .route("/ws", get(ws_upgrade::<R>))
-        .merge(crate::mcp_connector::router::<R>())
         // Webhook-triggered automations; the URL token is the credential.
         .merge(crate::automations::webhook_http::router::<R>())
         .merge(compressible)

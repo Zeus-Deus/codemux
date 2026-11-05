@@ -27,6 +27,7 @@ import {
   Boxes,
   Blocks,
   SlidersHorizontal,
+  Cable,
 } from "lucide-react";
 
 export type Section =
@@ -50,6 +51,7 @@ export type Section =
   | "mcp"
   | "hosts"
   | "remote_access"
+  | "outside_assistants"
   | "updates"
   | "browser"
   | "shortcuts"
@@ -166,9 +168,12 @@ export function buildSettingsPages(agentChatEnabled: boolean): SettingsPage[] {
       // provider installed, and would otherwise push the rest down.
       sections: [
         { id: "plugins", label: "Plugins", icon: Blocks },
-        // Inbound administration stays available in the CLI interface too.
-        { id: "mcp", label: "MCP Servers", icon: Plug },
-        ...chatOnly([{ id: "skills", label: "Skills", icon: BookOpen }]),
+        // Only the servers in-app agents use, so it needs the GUI. Inbound
+        // control (Outside assistants) lives on Connections in either mode.
+        ...chatOnly([
+          { id: "mcp", label: "MCP Servers", icon: Plug },
+          { id: "skills", label: "Skills", icon: BookOpen },
+        ]),
       ],
     },
     {
@@ -212,12 +217,14 @@ export function buildSettingsPages(agentChatEnabled: boolean): SettingsPage[] {
       id: "connections",
       label: "Connections",
       icon: MonitorSmartphone,
-      description: "Reach this machine and its sessions from other devices.",
-      // Always visible: the daemon is built in, and remote access is
-      // default-off behind its own toggle.
+      description: "Reach this machine from other devices and outside assistants.",
+      // Always visible: the daemon is built in, and remote access and
+      // network connections for outside assistants are default-off behind
+      // their own toggles.
       sections: [
         { id: "hosts", label: "Devices", icon: Laptop },
         { id: "remote_access", label: "Remote Access", icon: MonitorSmartphone },
+        { id: "outside_assistants", label: "Outside assistants", icon: Cable },
       ],
     },
     {

@@ -76,9 +76,24 @@ describe("searchSettings", () => {
     expect(labels("permissions", false)).not.toContain("Permissions › Permissions");
   });
 
-  it("keeps inbound MCP administration searchable when Agent Chat is off", () => {
-    expect(labels("mcp servers", false)).toContain("MCP Servers › MCP Servers");
-    expect(settingsPagesForQuery("settings mcp servers", false, true)).toContain("mcp");
+  it("keeps Outside assistants searchable when Agent Chat is off", () => {
+    expect(labels("outside assistants", false)).toContain("Outside assistants › Outside assistants");
+    expect(labels("hermes token", false)).toContain("Outside assistants › Assistants with access");
+    expect(labels("tailscale", false)).toContain("Outside assistants › Over the network");
+    expect(settingsPagesForQuery("settings mcp", false, true)).toContain("outside_assistants");
+  });
+
+  it("hides MCP Servers when Agent Chat is off", () => {
+    expect(labels("mcp servers", true)).toContain("MCP Servers › MCP Servers");
+    expect(labels("mcp servers", false)).not.toContain("MCP Servers › MCP Servers");
+    expect(settingsPagesForQuery("settings mcp servers", false, true)).not.toContain("mcp");
+  });
+
+  it("leaves Outside assistants' desktop rows out on the web remote", () => {
+    expect(labels("stdio")).toContain("Outside assistants › On this computer");
+    remoteClient = true;
+    expect(labels("stdio")).not.toContain("Outside assistants › On this computer");
+    expect(labels("outside assistants")).toContain("Outside assistants › Outside assistants");
   });
 
   it.each([

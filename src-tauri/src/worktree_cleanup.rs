@@ -26,7 +26,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -233,16 +232,38 @@ pub(crate) fn retire_workspace<R: tauri::Runtime>(
 /// Remember that `ws` was closed with its worktree left on disk.
 fn remember_closed(db: &crate::database::DatabaseStore, ws: &WorkspaceSnapshot) {
     let Some(path) = ws.worktree_path.clone() else { return };
+    record_closed(db, path, ws.title.clone(), ws.git_branch.clone());
+}
+
+/// Remember a checkout made for a workspace that never opened, because its
+/// requester's authority was withdrawn first. Nothing ran in it; cleanup
+/// offers it once stale, as it does a closed workspace's checkout, until a
+/// workspace opens it.
+pub(crate) fn remember_unclaimed_checkout(
+    db: &crate::database::DatabaseStore,
+    path: &str,
+    branch: &str,
+) {
+    record_closed(db, path.into(), branch.into(), Some(branch.into()));
+}
+
+fn record_closed(
+    db: &crate::database::DatabaseStore,
+    path: String,
+    title: String,
+    branch: Option<String>,
+) {
     let _guard = CLOSED_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut closed = load_closed(db);
     closed.retain(|c| c.path != path);
-    closed.push(ClosedWorktree {
-        path,
-        title: ws.title.clone(),
-        branch: ws.git_branch.clone(),
-        closed_at: now_secs(),
-    });
+    closed.push(ClosedWorktree { path, title, branch, closed_at: now_secs() });
     store_closed(db, &closed);
+}
+
+/// The paths of the closed worktrees this device remembers.
+#[cfg(test)]
+pub(crate) fn closed_paths(db: &crate::database::DatabaseStore) -> Vec<String> {
+    load_closed(db).into_iter().map(|closed| closed.path).collect()
 }
 
 /// Every path a live workspace has open, in [`path_key`] spelling,
@@ -358,7 +379,7 @@ fn prune_closed(snapshot: &AppStateSnapshot, closed: &[ClosedWorktree]) -> Vec<C
 /// Git without optional locks: a scan must not refresh the index (that
 /// would also be a write inside a worktree nobody is using).
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = crate::git::git_command()
         .arg("--no-optional-locks")
         .args(args)
         .current_dir(dir)

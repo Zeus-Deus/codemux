@@ -140,7 +140,10 @@ impl Git {
                 cmd.env(key, value);
             }
         }
-        cmd.env("GIT_DIR", self.dir.path())
+        // Marked like every git Codemux runs (`crate::git::git_command`); the
+        // env was cleared above.
+        cmd.env(crate::control_identity::AGENT_PROCESS_ENV, crate::git::GIT_PROCESS_KIND)
+            .env("GIT_DIR", self.dir.path())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
             .env("GIT_TERMINAL_PROMPT", "0")

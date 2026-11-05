@@ -94,11 +94,18 @@ export async function run(ctx) {
   ctx.observe("coordinator workspace", { id: coordinatorId, cwd: coordinator.cwd });
   const rootBefore = layoutOf(root);
   const countBefore = (await workspaces(ctx)).length;
+  // thread_launch takes only a model id from the provider's catalog
+  // (`unsupported_model` otherwise). Claude's catalog lists aliases such as
+  // `haiku`, so take the cheap one from it, as providers.mjs does.
+  const claudeCatalog = (await ctx.driver.invoke("list_chat_provider_capabilities", { provider: "claude", force: false, accountId: null }))
+    .models.map((model) => model.id);
+  const claudeLaunchModel = claudeCatalog.find((id) => id === CLAUDE_MODEL) ?? claudeCatalog.find((id) => /haiku/i.test(id));
+  ctx.check("Claude's catalog lists a cheap model to launch", !!claudeLaunchModel, claudeCatalog);
 
   const prompt = [
     "Use the codemux orchestration tools exactly as follows, without asking questions.",
     `1. Call thread_launch with no workspace_id and these arguments: {"provider":"codex","model":"${CODEX_MODEL}","effort":"low","title":"${TITLES.codex}","message":"Reply with the single word READY.","client_request_id":"live-codex-1"}.`,
-    `2. Call thread_launch with no workspace_id and these arguments: {"provider":"claude","model":"${CLAUDE_MODEL}","title":"${TITLES.claude}","message":"Reply with the single word READY.","client_request_id":"live-claude-1"}.`,
+    `2. Call thread_launch with no workspace_id and these arguments: {"provider":"claude","model":"${claudeLaunchModel}","title":"${TITLES.claude}","message":"Reply with the single word READY.","client_request_id":"live-claude-1"}.`,
     `3. Call delegate_task with {"provider":"claude","model":"${CLAUDE_MODEL}","title":"${TITLES.delegated}","task":"List the files in the current directory and reply with how many there are.","client_request_id":"live-delegate-1"}.`,
     "4. Then reply with the single word LAUNCHED and end your turn.",
   ].join("\n");

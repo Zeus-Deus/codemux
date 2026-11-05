@@ -1,9 +1,9 @@
 //! `codemux-remote` — server-side binary.
 //!
 //! Runs on the remote host the laptop pushes workspaces to, **and**
-//! (new in this revision) hosts a headless Codemux daemon so an
-//! agent running on the host can drive Codemux through MCP — create
-//! workspaces, list them, write to terminals — without any UI.
+//! hosts a headless daemon so an agent running on the host can manage
+//! the host's folders, git worktrees and shells through MCP, without any
+//! UI. It does not run Codemux chats or control the Codemux app.
 //!
 //! Subcommands:
 //!
@@ -17,7 +17,8 @@
 //! - `serve stop` — find the daemon via the manifest and SIGTERM it.
 //!   New.
 //! - `mcp` — stdio MCP server that talks to the local `serve`
-//!   daemon over HTTP. Configure your CLI agent to launch this. New.
+//!   daemon over HTTP. Configure your CLI agent to launch this. It
+//!   starts without a daemon and follows it across restarts.
 //! - `version` — JSON version string. The laptop's bootstrap probe
 //!   parses it. Unchanged.
 //! - `project ensure` / `worktree create` — one-shot calls the desktop
@@ -56,8 +57,9 @@ use clap::{Parser, Subcommand};
     about = "Headless Codemux daemon + PTY proxy for remote hosts.",
     long_about = "Runs on the remote host the laptop's Codemux pushes \
                   workspaces to, and (with `serve`) hosts a headless \
-                  Codemux daemon so an agent on the host can drive \
-                  Codemux through MCP."
+                  daemon so an agent on this host can manage this host's \
+                  folders, worktrees and shells through MCP. It does not \
+                  control the Codemux app."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -83,10 +85,14 @@ enum Command {
     Version,
     /// Run the headless Codemux daemon (axum HTTP on loopback,
     /// bearer auth from manifest). An agent on this host points its
-    /// MCP client at `codemux-remote mcp` to drive it.
+    /// MCP client at `codemux-remote mcp` to drive it. Registers
+    /// `codemux-remote mcp` as the `codemux` MCP server for Claude Code
+    /// and Vexis when no Codemux app uses this machine.
     Serve(ServeArgs),
     /// Run the stdio MCP server that bridges an agent CLI to the
-    /// local `serve` daemon over HTTP.
+    /// local `serve` daemon over HTTP. It starts even when `serve` isn't
+    /// running (tool calls then say so) and finds a restarted `serve`
+    /// on its own.
     Mcp {
         /// State directory the daemon used. Defaults to the same
         /// path `serve` defaults to (~/.local/share/codemux-remote).
@@ -657,29 +663,49 @@ async fn run_serve_async(port: Option<u16>, state_dir: PathBuf) -> Result<(), St
         manifest_value.secret.len()
     );
 
-    // Best-effort: register `codemux-remote mcp` in known agent
-    // MCP configs (~/.claude.json, ~/.vexis/mcp-servers.yaml) so
-    // any agent CLI the user runs on this host already knows about
-    // Codemux without manual config edits. Runs on every daemon
-    // start because it's idempotent — if the entries are already
-    // correct, no writes happen.
+    // Best-effort: register `codemux-remote mcp` as the `codemux` MCP
+    // server in known agent configs (~/.claude.json,
+    // ~/.vexis/mcp-servers.yaml) so an agent CLI the user runs on this
+    // host can manage it without manual config edits. Runs on every
+    // daemon start; a current entry is never rewritten.
     //
-    // The function we call is defensive: malformed config files
-    // are logged and skipped, never overwritten. Missing
-    // agent-specific dirs (~/.vexis nonexistent) are skipped
-    // silently — we never create an opt-in we weren't asked for.
+    // Ownership rule: codemux-remote only ever writes a missing entry or
+    // one that already runs codemux-remote, and never touches an entry
+    // that runs another program. Where the Codemux app has run as this
+    // user, `codemux` means the app's `codemux mcp`, so codemux-remote
+    // adds nothing there and withdraws the entry it wrote before.
+    // Malformed config files are logged and skipped, never
+    // overwritten. Missing agent-specific dirs (~/.vexis nonexistent)
+    // are skipped silently — we never create an opt-in we weren't
+    // asked for.
     let exec_path = std::env::current_exe()
         .unwrap_or_else(|_| std::path::PathBuf::from("codemux-remote"));
     let report = codemux_lib::remote::mcp_register::ensure_codemux_in_agent_configs(&exec_path);
+    let joined = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     if !report.modified.is_empty() {
         eprintln!(
             "[codemux-remote] auto-registered codemux MCP in: {}",
-            report
-                .modified
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            joined(&report.modified)
+        );
+    }
+    if !report.removed.is_empty() {
+        eprintln!(
+            "[codemux-remote] the Codemux app owns the codemux MCP name on this machine; \
+             removed codemux-remote's entry from: {}",
+            joined(&report.removed)
+        );
+    }
+    for (path, command) in &report.foreign {
+        eprintln!(
+            "[codemux-remote] left the codemux entry in {} alone: it runs {}, not codemux-remote",
+            path.display(),
+            if command.is_empty() { "no command" } else { command },
         );
     }
     for (path, reason) in &report.failed {
@@ -1078,10 +1104,10 @@ fn run_project_ensure(
 #[cfg(unix)]
 const DAEMON_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Cap on one `worktree_create` call through the daemon: a base fetch
-/// (itself capped at 10s), the checkout, and the include-file copy.
+/// Cap on one `worktree_create` call through the daemon, the same cap
+/// `codemux-remote mcp` applies to every tool call.
 #[cfg(unix)]
-const DAEMON_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const DAEMON_TOOL_TIMEOUT: std::time::Duration = codemux_lib::remote::tools::CALL_TIMEOUT;
 
 /// Implementation for `codemux-remote worktree create`. Prefers the
 /// `serve` daemon, which outlives this call and so can own the setup

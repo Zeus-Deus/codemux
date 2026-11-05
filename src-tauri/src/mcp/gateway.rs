@@ -410,11 +410,8 @@ async fn handle_post(
 
     match method {
         "initialize" => {
-            let requested = params
-                .get("protocolVersion")
-                .and_then(Value::as_str)
-                .unwrap_or("2025-11-25");
-            let version = supported_protocol_version(requested);
+            let version =
+                super::protocol::negotiate(params.get("protocolVersion").and_then(Value::as_str));
             let session = uuid::Uuid::new_v4().simple().to_string();
             let mut response = rpc_result(
                 id,
@@ -617,13 +614,6 @@ async fn caller_tools(state: &GatewayState, caller: &GatewayCaller) -> Vec<McpTo
     tools
 }
 
-fn supported_protocol_version(requested: &str) -> &str {
-    match requested {
-        "2024-11-05" | "2025-03-26" | "2025-06-18" | "2025-11-25" | "2026-07-28" => requested,
-        _ => "2025-11-25",
-    }
-}
-
 /// The caller a request's bearer token speaks for.
 fn authenticate(headers: &HeaderMap, state: &GatewayState) -> Option<GatewayCaller> {
     let token = headers
@@ -731,6 +721,56 @@ mod tests {
             value["result"]["capabilities"]["tools"]["listChanged"],
             true
         );
+    }
+
+    /// 2026-07-28 has no `initialize`; selecting it there would make an
+    /// initialize-era client (the Python SDK raises) refuse the session.
+    #[tokio::test]
+    async fn gateway_never_negotiates_2026_07_28_via_initialize() {
+        for (offer, answer) in [
+            (json!("2026-07-28"), "2025-11-25"),
+            (json!("2024-11-05"), "2024-11-05"),
+            (json!("2025-06-18"), "2025-06-18"),
+            (json!("2030-01-01"), "2025-11-25"),
+            (Value::Null, "2025-11-25"),
+        ] {
+            let response = router(state())
+                .oneshot(request(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": { "protocolVersion": offer, "capabilities": {} }
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["result"]["protocolVersion"], answer, "offer {offer}");
+        }
+    }
+
+    /// A stateless-era probe must read as an initialize-era server, with the
+    /// probe's own id, so the client falls back to `initialize`.
+    #[tokio::test]
+    async fn gateway_answers_server_discover_with_method_not_found() {
+        let response = router(state())
+            .oneshot(request(json!({
+                "jsonrpc": "2.0",
+                "id": "probe",
+                "method": "server/discover",
+                "params": {}
+            })))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["id"], "probe");
+        assert_eq!(value["error"]["code"], -32601);
     }
 
     #[tokio::test]

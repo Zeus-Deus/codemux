@@ -52,6 +52,7 @@ const SECTION_KEYWORDS: Partial<Record<Section, string>> = {
   plugins: "extensions add-ons addons install catalog github",
   hosts: "devices machines hosts ssh cloud remote",
   remote_access: "phone mobile pairing qr web browser access",
+  outside_assistants: "mcp inbound external agents claude code codex hermes bot token oauth connector stdio",
   updates: "update all upgrade version providers agents cli claude codex mise omarchy npm devices",
   about: "version update diagnostics logs reset help bug report",
 };
@@ -137,6 +138,11 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   { section: "git", label: "AI Tools" },
   { section: "git", label: "AI commit messages", keywords: "generate commit" },
   { section: "git", label: "Merge Conflict Resolver", keywords: "conflicts merge rebase" },
+
+  // Outside assistants (the remote client shows only a pointer to the desktop)
+  { section: "outside_assistants", label: "On this computer", keywords: "local stdio command", desktopOnly: true },
+  { section: "outside_assistants", label: "Over the network", keywords: "http url https tailscale origin port", desktopOnly: true },
+  { section: "outside_assistants", label: "Assistants with access", keywords: "tokens revoke approve oauth sign in", desktopOnly: true },
 
   // About
   { section: "about", label: "Version", keywords: "build channel release" },

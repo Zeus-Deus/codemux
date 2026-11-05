@@ -1,4 +1,5 @@
 import { Checkbox } from "@/components/ui/checkbox";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import { AgentQuestionBadge } from "./agent-question-badge";
 import { useEffect, useState } from "react";
@@ -157,7 +158,11 @@ interface Props {
  *  `USE_FORCE_PATTERN`, the dialog stays open, shows that message
  *  verbatim in the warning box, and the button flips to "Force delete",
  *  which reissues the same call with `forceDelete: true`. Any other
- *  rejection surfaces as an error toast and closes the dialog. */
+ *  rejection surfaces as an error toast and closes the dialog.
+ *
+ *  On a paired browser or phone the branch is always kept and there is
+ *  no force step: the web-remote guard refuses both, so the dialog does
+ *  not offer them (the dirty refusal becomes an error toast). */
 export function DeleteWorktreeDialog({
   workspace,
   open,
@@ -167,7 +172,8 @@ export function DeleteWorktreeDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const [deleteBranch, setDeleteBranch] = useState(true);
+  const remote = isRemoteClient();
+  const [deleteBranch, setDeleteBranch] = useState(() => !remote);
 
   const hasUnpushed = workspace.git_ahead > 0;
   const hasUncommitted = workspace.git_changed_files > 0;
@@ -200,7 +206,7 @@ export function DeleteWorktreeDialog({
     if (!next) {
       // Reset per-open state so a re-open starts un-escalated.
       reset();
-      setDeleteBranch(true);
+      setDeleteBranch(!remote);
     }
     onOpenChange(next);
   }
@@ -213,8 +219,9 @@ export function DeleteWorktreeDialog({
             Delete worktree &ldquo;{workspace.title}&rdquo;?
           </DialogTitle>
           <DialogDescription>
-            Permanently removes the worktree directory from disk. To keep
-            the files, archive the workspace instead.
+            {remote
+              ? "Permanently removes the worktree directory from disk. The branch is kept."
+              : "Permanently removes the worktree directory from disk. To keep the files, archive the workspace instead."}
           </DialogDescription>
         </DialogHeader>
 
@@ -225,15 +232,17 @@ export function DeleteWorktreeDialog({
           </div>
         )}
 
-        <label className="flex items-center gap-2 cursor-pointer select-none">
-          <Checkbox
-            checked={deleteBranch}
-            onCheckedChange={(checked) => setDeleteBranch(checked === true)}
-          />
-          <span className="text-label text-muted-foreground">
-            Also delete local branch
-          </span>
-        </label>
+        {!remote && (
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <Checkbox
+              checked={deleteBranch}
+              onCheckedChange={(checked) => setDeleteBranch(checked === true)}
+            />
+            <span className="text-label text-muted-foreground">
+              Also delete local branch
+            </span>
+          </label>
+        )}
 
         <div className="flex justify-end gap-2 pt-1">
           <Button

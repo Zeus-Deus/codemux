@@ -90,65 +90,7 @@ process.stdout.write(JSON.stringify(choices(JSON.parse(process.argv[2]), JSON.pa
 /// Worktree placement and layout emits use test-only path overrides, including on
 /// Windows where Known Folders ignore HOME. Set paths only on a new process.
 fn isolated(name: &str) -> bool {
-    if let Some(root) = std::env::var_os("CODEMUX_PLATFORM_ACCEPTANCE_ROOT") {
-        assert_eq!(
-            Path::new(&std::env::var_os("CODEMUX_TEST_WORKTREE_HOME").unwrap()),
-            Path::new(&root)
-        );
-        assert!(
-            Path::new(&std::env::var_os("CODEMUX_TEST_LAYOUT_PATH").unwrap()).starts_with(&root)
-        );
-        return false;
-    }
-    let root = tempfile::tempdir().unwrap();
-    let profile = root.path().join("profile");
-    std::fs::create_dir(&profile).unwrap();
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command
-        .current_dir(root.path())
-        .args([
-            "--exact",
-            &format!("plugins::platform_acceptance_tests::{name}"),
-            "--nocapture",
-        ])
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        // Keep HOME different so Unix runs exercise the explicit override too.
-        .env("HOME", &profile)
-        .env("USERPROFILE", &profile)
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("XDG_DATA_HOME", root.path().join("data"))
-        .env("XDG_CACHE_HOME", root.path().join("cache"))
-        .env("TMPDIR", root.path())
-        .env("TEMP", root.path())
-        .env("TMP", root.path())
-        .env("CODEMUX_PLATFORM_ACCEPTANCE_ROOT", root.path())
-        .env("CODEMUX_TEST_WORKTREE_HOME", root.path())
-        .env("CODEMUX_TEST_LAYOUT_PATH", root.path().join("layout.json"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", root.path().join("gitconfig"))
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_AUTHOR_NAME", "Native acceptance")
-        .env("GIT_AUTHOR_EMAIL", "acceptance@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Native acceptance")
-        .env("GIT_COMMITTER_EMAIL", "acceptance@example.invalid");
-    if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") {
-        command.env("LD_LIBRARY_PATH", path);
-    }
-    #[cfg(windows)]
-    for key in ["SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
-    let output = command.output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success() && stdout.contains("1 passed"),
-        "isolated {name}: {stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    true
+    crate::test_isolation::isolated(&format!("plugins::platform_acceptance_tests::{name}"))
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -387,8 +329,7 @@ impl Fixture {
 
     fn worktree_path(&self, branch: &str) -> std::path::PathBuf {
         let path = crate::git::conventional_worktree_path(self.root.path(), branch).unwrap();
-        let root =
-            std::path::PathBuf::from(std::env::var_os("CODEMUX_PLATFORM_ACCEPTANCE_ROOT").unwrap());
+        let root = crate::test_isolation::isolated_root().unwrap();
         assert!(path.starts_with(root.join(".codemux").join("worktrees")));
         path
     }
@@ -864,6 +805,263 @@ async fn platform_native_launch_authority_is_checked_before_checkout_or_provider
         );
         drop(authority);
     }
+}
+
+/// `plugin_invoke` carries an outside client's authority into the plugin's
+/// host calls. A checkout removal holds the lifecycle lock for as long as its
+/// delete takes; a worktree create queued behind it must ask for that
+/// authority again once it gets the lock, since revoking a grant does not end
+/// a plugin invocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn platform_native_worktree_revoked_while_queued_on_the_lifecycle_lock_checks_out_nothing() {
+    if isolated(
+        "platform_native_worktree_revoked_while_queued_on_the_lifecycle_lock_checks_out_nothing",
+    ) {
+        return;
+    }
+    let f = Fixture::new().await;
+    let mut actor = caller(&f.record);
+    actor.control = crate::agent_control::tests::connector_caller(
+        &f.app,
+        "queued-plugin-client",
+        "queued-plugin-grant",
+        ControlAccess::FullAccess,
+    )
+    .await;
+    let mut request = f.request("queued-plugin-worktree");
+    request["workspaceStrategy"] = json!({
+        "type":"worktree","branch":"queued-plugin","baseRef":"main","startFromOrigin":false
+    });
+    let path = f.worktree_path("queued-plugin");
+    let before = git(f.root.path(), &["worktree", "list", "--porcelain"]);
+    let workspaces = f.app.state::<AppStateStore>().snapshot().workspaces.len();
+
+    let removal = crate::worktree_cleanup::removal_guard().await;
+    let revoker = {
+        let (app, repo, path) = (f.app.handle().clone(), f.root.path().to_path_buf(), path.clone());
+        tokio::spawn(async move {
+            // The create freezes its base ref, then waits for the lock.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while git(&repo, &["for-each-ref", "refs/codemux/plugin-worktrees/"]).is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the create freezes its base");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!path.exists(), "no checkout while a removal holds the lock");
+            crate::mcp_connector::agent_connector_revoke(app, "queued-plugin-client".into())
+                .unwrap();
+            drop(removal);
+        })
+    };
+    let error = f.create(&actor, request).await.unwrap_err();
+    revoker.await.unwrap();
+
+    assert!(error.contains("grant_revoked"), "{error}");
+    assert!(!path.exists(), "no checkout, so no setup script");
+    assert_eq!(git(f.root.path(), &["worktree", "list", "--porcelain"]), before);
+    assert_eq!(git(f.root.path(), &["branch", "--list", "queued-plugin"]), "");
+    assert_eq!(
+        f.app.state::<AppStateStore>().snapshot().workspaces.len(),
+        workspaces
+    );
+    assert!(f.starts().is_empty());
+    crate::agent_control::tests::connector_off(&f.app);
+}
+
+/// A plugin worktree's setup scripts run on after the invocation that made it
+/// ended, which cancels its caller. They still stop once the plugin, or the
+/// connector client that invoked it, loses its grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn platform_worktree_setup_outlives_the_invocation_but_not_the_grants() {
+    if isolated("platform_worktree_setup_outlives_the_invocation_but_not_the_grants") {
+        return;
+    }
+    let f = Fixture::new().await;
+    let invocation = super::platform_runtime::RuntimeCancellation::default();
+    let plugin = caller(&f.record).with_cancellation(invocation.clone());
+    let mut connector = plugin.clone();
+    connector.control = crate::agent_control::tests::connector_caller(
+        &f.app,
+        "setup-plugin-client",
+        "setup-plugin-grant",
+        ControlAccess::FullAccess,
+    )
+    .await;
+    let checkpoint = |actor: &PlatformCaller| {
+        f.platform
+            .checkpoint(f.app.handle(), actor, "worktrees.create", &f.project)
+    };
+    let (by_plugin, by_connector) = (checkpoint(&plugin), checkpoint(&connector));
+    for checkpoint in [&by_plugin, &by_connector] {
+        checkpoint.check().unwrap();
+        checkpoint.background().check().unwrap();
+    }
+
+    // The invocation returned.
+    invocation.cancel();
+    for checkpoint in [&by_plugin, &by_connector] {
+        assert!(checkpoint.check().unwrap_err().starts_with("cancelled:"));
+        checkpoint.background().check().unwrap();
+    }
+
+    crate::mcp_connector::agent_connector_revoke(
+        f.app.handle().clone(),
+        "setup-plugin-client".into(),
+    )
+    .unwrap();
+    let refusal = by_connector.background().check().unwrap_err();
+    assert!(refusal.starts_with("grant_revoked:"), "{refusal}");
+    by_plugin.background().check().unwrap();
+
+    // Disabling the plugin moves it to a new generation.
+    f.platform.set_enabled(INSTALLATION, false).unwrap();
+    let refusal = by_plugin.background().check().unwrap_err();
+    assert!(refusal.starts_with("stale_generation:"), "{refusal}");
+    crate::agent_control::tests::connector_off(&f.app);
+}
+
+/// How each setup ends, as the desktop is told: (event, payload).
+fn setup_outcomes(f: &Fixture) -> mpsc::UnboundedReceiver<(&'static str, Value)> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    for name in ["workspace-setup-failed", "workspace-setup-complete"] {
+        let sender = sender.clone();
+        f.app.listen_any(name, move |event| {
+            let _ = sender.send((name, serde_json::from_str(event.payload()).unwrap_or_default()));
+        });
+    }
+    receiver
+}
+
+/// A paired device invokes a plugin action that creates a worktree, then
+/// goes away while the new worktree's setup waits to start. A device that
+/// only disconnected leaves its setup running, as the setup outlives the
+/// call; one revoked in Settings, or Remote Access turned off, starts no
+/// setup command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn platform_worktree_setup_stops_once_its_paired_device_is_revoked() {
+    if isolated("platform_worktree_setup_stops_once_its_paired_device_is_revoked") {
+        return;
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Withdrawal { Revoked, RemoteAccessOff, Disconnected }
+    for withdrawal in [Withdrawal::Revoked, Withdrawal::RemoteAccessOff, Withdrawal::Disconnected] {
+        let f = Fixture::new().await;
+        f.app.manage(crate::web_remote::WebRemoteState::default());
+        crate::agent_control::tests::web_remote_on(&f.app);
+        let shared = f.app.state::<crate::web_remote::WebRemoteState>().shared();
+        f.app
+            .state::<DatabaseStore>()
+            .web_remote_insert_session("paired", None, None, "paired-hash", true)
+            .unwrap();
+        let connection = shared.connections.connect_for_test("paired");
+        let mut device = caller(&f.record);
+        device.control = ControlCaller::remote("paired".into());
+        std::fs::create_dir_all(f.root.path().join(".codemux")).unwrap();
+        std::fs::write(
+            f.root.path().join(".codemux/config.json"),
+            json!({"setup": ["touch setup-first"]}).to_string(),
+        )
+        .unwrap();
+        let mut outcomes = setup_outcomes(&f);
+        let branch = match withdrawal {
+            Withdrawal::Revoked => "device-revoked",
+            Withdrawal::RemoteAccessOff => "remote-access-off",
+            Withdrawal::Disconnected => "device-disconnected",
+        };
+        let mut request = f.request(branch);
+        request["workspaceStrategy"] = json!({
+            "type":"worktree","branch":branch,"baseRef":"main","startFromOrigin":false
+        });
+        let path = f.worktree_path(branch);
+        // The workspace appears after the create's last check of the caller
+        // and just before its setup starts waiting.
+        let gone = {
+            let (app, path) = (f.app.handle().clone(), path.clone());
+            tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    while !app.state::<AppStateStore>().snapshot().workspaces.iter().any(|workspace| {
+                        workspace.worktree_path.as_deref().map(Path::new) == Some(path.as_path())
+                    }) {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .expect("the create makes its workspace");
+                match withdrawal {
+                    Withdrawal::Revoked => {
+                        crate::web_remote::web_remote_revoke_session(app, "paired".into()).unwrap();
+                    }
+                    Withdrawal::RemoteAccessOff => {
+                        crate::web_remote::web_remote_disable(app).unwrap();
+                    }
+                    Withdrawal::Disconnected => shared.connections.disconnect_for_test(connection),
+                }
+            })
+        };
+        // The call itself may then be refused: the device is gone.
+        let _ = f.create(&device, request).await;
+        gone.await.unwrap();
+
+        let (event, payload) = tokio::time::timeout(Duration::from_secs(15), outcomes.recv())
+            .await
+            .expect("the setup ends")
+            .unwrap();
+        if withdrawal != Withdrawal::Disconnected {
+            assert_eq!(event, "workspace-setup-failed", "{payload}");
+            assert_eq!(payload["command"], "touch setup-first", "{payload}");
+            let stderr = payload["stderr"].as_str().unwrap();
+            assert!(stderr.starts_with("stale_caller: "), "{payload}");
+            assert!(!path.join("setup-first").exists(), "no setup command starts once the device is withdrawn");
+        } else {
+            assert_eq!(event, "workspace-setup-complete", "{payload}");
+            assert!(path.join("setup-first").exists(), "a disconnect alone leaves setup running");
+        }
+    }
+}
+
+/// A chat's plugin call creates a worktree too. Its setup runs past the
+/// chat's turn, but stops once the person narrows the chat's mode or stops
+/// the chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn platform_worktree_setup_outlives_the_turn_but_not_a_stop() {
+    if isolated("platform_worktree_setup_outlives_the_turn_but_not_a_stop") {
+        return;
+    }
+    let f = Fixture::new().await;
+    let (chat, authority) = f.policy_caller("acceptEdits");
+    let checkpoint = f
+        .platform
+        .checkpoint(f.app.handle(), &chat, "worktrees.create", &f.project);
+    checkpoint.check().unwrap();
+    checkpoint.background().check().unwrap();
+
+    authority.finish("fixture-turn");
+    let refusal = checkpoint.check().unwrap_err();
+    assert!(refusal.starts_with("stale_caller: "), "{refusal}");
+    checkpoint.background().check().unwrap();
+
+    let db = f.app.state::<DatabaseStore>();
+    let mode = |mode: &str| {
+        db.update_agent_chat_session_config(
+            SOURCE,
+            &AgentChatSessionConfig {
+                permission_mode: Some(Some(mode.into())),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    mode("plan");
+    let refusal = checkpoint.background().check().unwrap_err();
+    assert!(refusal.starts_with("permission_ceiling: "), "{refusal}");
+    mode("acceptEdits");
+    checkpoint.background().check().unwrap();
+
+    db.stop_message_deliveries(SOURCE).unwrap();
+    let refusal = checkpoint.background().check().unwrap_err();
+    assert!(refusal.starts_with("stale_caller: "), "{refusal}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

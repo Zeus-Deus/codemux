@@ -1,0 +1,689 @@
+//! The control socket end to end through the built `codemux` binary: it tells
+//! the owner from processes Codemux started for agents, `codemux mcp` carries
+//! a client's name and access, and the legacy workspace commands keep their
+//! shapes.
+//!
+//! Each test runs its own `codemux serve` child in a throwaway home with its
+//! own `XDG_RUNTIME_DIR`, and drives it with the `codemux` CLI. Every child
+//! starts from a cleared environment plus an allow-list, so neither a
+//! developer's running app nor the agent identity of a chat this suite runs
+//! under can leak in.
+
+#![cfg(unix)]
+
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
+use std::path::Path;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const CODEMUX: &str = env!("CARGO_BIN_EXE_codemux");
+const AGENT_PROCESS: &str = "CODEMUX_AGENT_PROCESS";
+const PROVIDER_ORIGIN: &str = "CODEMUX_MCP_PROVIDER_ORIGIN";
+const IDENTITY_VARS: [&str; 4] =
+    [AGENT_PROCESS, "CODEMUX_MCP_GATEWAY_URL", "CODEMUX_MCP_GATEWAY_TOKEN", PROVIDER_ORIGIN];
+
+/// A `codemux serve` child, stopped (SIGTERM, then kill) when dropped.
+struct Serve {
+    child: Child,
+    root: tempfile::TempDir,
+}
+
+/// Clears the env and points every state dir (and the control socket) into `root`.
+fn isolate(cmd: &mut Command, root: &Path) {
+    cmd.env_clear().current_dir(root);
+    cmd.env("HOME", root).env("PATH", "/usr/bin:/bin").env("LANG", "C.UTF-8");
+    for (key, sub) in [
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_RUNTIME_DIR", "run"),
+    ] {
+        let dir = root.join(sub);
+        std::fs::create_dir_all(&dir).unwrap();
+        cmd.env(key, dir);
+    }
+}
+
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+impl Serve {
+    fn start(env: &[(&str, &str)]) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let log = std::fs::File::create(root.path().join("serve.log")).unwrap();
+        let mut cmd = Command::new(CODEMUX);
+        isolate(&mut cmd, root.path());
+        // In-process terminals (no detached daemon outlives the test), no
+        // reachable account API, and a predictable shell.
+        cmd.env("CODEMUX_DISABLE_PTY_DAEMON", "1")
+            .env("CODEMUX_API_URL", "http://127.0.0.1:1")
+            .env("SHELL", "/bin/sh")
+            .envs(env.iter().copied())
+            .args(["serve", "--scope", "loopback", "--port", &free_loopback_port().to_string()])
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        let mut serve = Self { child: cmd.spawn().unwrap(), root };
+        serve.wait_ready();
+        serve
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.root.path().join("serve.log")).unwrap_or_default()
+    }
+
+    fn wait_ready(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!("codemux serve exited early ({status}):\n{}", self.log());
+            }
+            if self.try_json("status", "{}", &[]).is_some_and(|reply| reply["ok"] == true) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "codemux serve never answered on its socket:\n{}", self.log());
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// `codemux json <command> <params>` with an isolated env plus `env`.
+    /// `None` when the CLI printed no reply (the server is not up yet).
+    fn try_json(&self, command: &str, params: &str, env: &[(&str, &str)]) -> Option<Value> {
+        let mut cmd = Command::new(CODEMUX);
+        isolate(&mut cmd, self.root.path());
+        let output = cmd.envs(env.iter().copied()).args(["json", command, params]).output().unwrap();
+        serde_json::from_slice(&output.stdout).ok()
+    }
+
+    fn json(&self, command: &str, params: &str, env: &[(&str, &str)]) -> Value {
+        self.try_json(command, params, env)
+            .unwrap_or_else(|| panic!("`codemux json {command}` printed no reply:\n{}", self.log()))
+    }
+
+    /// [`Serve::json`] as the owner, but a reply slower than `limit` fails
+    /// the test (the CLI is stopped by its pid) instead of hanging it.
+    fn json_within(&self, command: &str, params: &str, limit: Duration) -> Value {
+        let out = self.root.path().join(format!("{command}.reply"));
+        let mut cmd = Command::new(CODEMUX);
+        isolate(&mut cmd, self.root.path());
+        let stdout = std::fs::File::create(&out).unwrap();
+        let mut child = cmd.args(["json", command, params]).stdout(stdout).spawn().unwrap();
+        let deadline = Instant::now() + limit;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("`codemux json {command}` got no reply within {limit:?}:\n{}", self.log());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let reply = std::fs::read_to_string(&out).unwrap();
+        serde_json::from_str(&reply).unwrap_or_else(|_| panic!("`codemux json {command}` printed {reply:?}:\n{}", self.log()))
+    }
+
+    /// Stops the serve and keeps its home. This test started it; stop it by
+    /// its pid, and never signal a pid already reaped, which may be reused.
+    fn stop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Serve {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A `codemux mcp` child speaking to a [`Serve`], stopped when dropped.
+struct Mcp {
+    child: Child,
+    stdin: ChildStdin,
+    lines: mpsc::Receiver<String>,
+    next_id: u64,
+    log: std::path::PathBuf,
+}
+
+impl Mcp {
+    fn start(serve: &Serve, args: &[&str]) -> Self {
+        let log = serve.root.path().join(format!("mcp-{}.log", args.join("_")));
+        let mut cmd = Command::new(CODEMUX);
+        isolate(&mut cmd, serve.root.path());
+        let mut child = cmd
+            .arg("mcp")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let stdin = child.stdin.take().unwrap();
+        let mut mcp = Self { child, stdin, lines, next_id: 0, log };
+        let init = mcp.request(
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "ignored", "version": "1"}}),
+        );
+        assert!(init["result"]["protocolVersion"].is_string(), "{init}");
+        mcp
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let message = json!({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params});
+        // A child that already exited (an unknown flag) fails the write or
+        // the read; its stderr says why.
+        let sent = writeln!(self.stdin, "{message}").and_then(|()| self.stdin.flush());
+        let line = sent.ok().and_then(|()| self.lines.recv_timeout(Duration::from_secs(30)).ok()).unwrap_or_else(|| {
+            panic!("codemux mcp gave no reply to {method}:\n{}", std::fs::read_to_string(&self.log).unwrap_or_default())
+        });
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["id"], self.next_id, "{reply}");
+        reply
+    }
+
+    fn tool_names(&mut self) -> Vec<String> {
+        let listed = self.request("tools/list", json!({}));
+        listed["result"]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].as_str().unwrap().to_owned()).collect()
+    }
+
+    fn call(&mut self, name: &str, arguments: Value) -> Value {
+        self.request("tools/call", json!({"name": name, "arguments": arguments}))["result"].clone()
+    }
+
+    /// [`Mcp::call`] tagged with `workspace`, as a chat's calls are, so the
+    /// git tools run in that workspace's folder.
+    fn call_in(&mut self, workspace: &str, name: &str, arguments: Value) -> Value {
+        let meta = json!({"codemux/workspace_id": workspace});
+        self.request("tools/call", json!({"name": name, "arguments": arguments, "_meta": meta}))["result"].clone()
+    }
+}
+
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        // This test started it; stop it by its own handle.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn error_code(reply: &Value) -> &str {
+    reply["error"].as_str().and_then(|error| error.split(':').next()).unwrap_or("")
+}
+
+#[test]
+fn agent_marked_cli_is_refused_admin_but_owner_is_not() {
+    let serve = Serve::start(&[]);
+    let marker = [(AGENT_PROCESS, "1")];
+
+    let refused = serve.json("agent_connector_status", "{}", &marker);
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(error_code(&refused), "admin_refused", "{refused}");
+    assert_eq!(refused["protocol_version"], 2);
+
+    let codemux_self = serve.json("web_remote_pair", r#"{"name":"phone"}"#, &[(PROVIDER_ORIGIN, "1")]);
+    assert_eq!(error_code(&codemux_self), "admin_refused", "a provider-origin `codemux mcp` is an agent: {codemux_self}");
+
+    let owner = serve.json("agent_connector_status", "{}", &[]);
+    assert_eq!(owner["ok"], true, "{owner}");
+
+    let status = serve.json("status", "{}", &marker);
+    assert_eq!(status["ok"], true, "agents keep read commands: {status}");
+    let notify = serve.json("notify", r#"{"message":"from an agent"}"#, &marker);
+    assert_eq!(notify["ok"], true, "agents keep write commands: {notify}");
+
+    let native = serve.json("thread_list", r#"{"workspace_id":"none"}"#, &marker);
+    assert_eq!(error_code(&native), "agent_identity_required", "{native}");
+}
+
+#[test]
+fn pty_shell_is_the_owner() {
+    // An instance started from an agent's shell: every identity var is set.
+    let serve = Serve::start(&[
+        (AGENT_PROCESS, "1"),
+        (PROVIDER_ORIGIN, "1"),
+        ("CODEMUX_MCP_GATEWAY_URL", "http://127.0.0.1:1/mcp"),
+        ("CODEMUX_MCP_GATEWAY_TOKEN", "inherited"),
+    ]);
+    let root = serve.root.path();
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let created = serve.json("create_workspace", &json!({ "path": project }).to_string(), &[]);
+    assert_eq!(created["ok"], true, "{created}");
+
+    // Type into the new workspace's terminal, as the owner.
+    let (env_dump, out) = (root.join("env.txt"), root.join("out.json"));
+    let line = format!(
+        "env > '{env}'; '{CODEMUX}' json agent_connector_status '{{}}' > '{out}.part' && mv '{out}.part' '{out}'\n",
+        env = env_dump.display(),
+        out = out.display(),
+    );
+    let params = json!({ "data": line }).to_string();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        // The terminal registers shortly after the workspace opens.
+        let written = serve.json("write_terminal", &params, &[]);
+        if written["ok"] == true {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the terminal never accepted input: {written}\n{}", serve.log());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    while !out.exists() {
+        assert!(Instant::now() < deadline, "the terminal never ran the command:\n{}", serve.log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let reply: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(reply["ok"], true, "a user's terminal is the owner: {reply}");
+    let env = std::fs::read_to_string(&env_dump).unwrap();
+    for key in IDENTITY_VARS {
+        assert!(!env.lines().any(|line| line.starts_with(&format!("{key}="))), "{key} reached the terminal");
+    }
+    assert!(env.contains("CODEMUX_SESSION_ID="), "the dump is the terminal's env");
+}
+
+/// Setup scripts come from the folder's `.codemux/config.json`, which an
+/// agent can write, and an agent may run them (`create_workspace` and
+/// `rerun_setup` are Machine class). A `codemux` they start is an agent
+/// process whoever triggered the setup, so it cannot answer for the person
+/// or mint a connector token.
+#[test]
+fn setup_scripts_are_agent_processes() {
+    let serve = Serve::start(&[]);
+    let root = serve.root.path();
+    // Who opens the folder: the owner, then an agent's shell.
+    for (name, env) in [("owner", &[][..]), ("agent", &[(AGENT_PROCESS, "1")][..])] {
+        let project = root.join(name);
+        std::fs::create_dir_all(project.join(".codemux")).unwrap();
+        let file = |suffix: &str| root.join(format!("{name}.{suffix}"));
+        let (env_dump, marked, unmarked, done) = (file("env"), file("marked.json"), file("unmarked.json"), file("done"));
+        // An admin command, the way an agent's script would ask; the second
+        // call clears the marker, which only the process ancestry still catches.
+        let script = format!(
+            "env > '{env}'; '{CODEMUX}' json agent_connector_status '{{}}' > '{marked}'; \
+             env -u {AGENT_PROCESS} '{CODEMUX}' json agent_connector_status '{{}}' > '{unmarked}'; touch '{done}'",
+            env = env_dump.display(),
+            marked = marked.display(),
+            unmarked = unmarked.display(),
+            done = done.display(),
+        );
+        std::fs::write(project.join(".codemux/config.json"), json!({ "setup": [script] }).to_string()).unwrap();
+
+        // The setup runs in the background once the folder is open.
+        let created = serve.json("create_workspace", &json!({ "path": project }).to_string(), env);
+        assert_eq!(created["ok"], true, "{name}: {created}");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !done.exists() {
+            assert!(Instant::now() < deadline, "{name}: the setup script never finished:\n{}", serve.log());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let reply = |file: &Path| -> Value { serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap() };
+        let marked = reply(&marked);
+        assert_eq!(error_code(&marked), "admin_refused", "{name}: a setup script is an agent: {marked}");
+        if cfg!(target_os = "linux") {
+            let unmarked = reply(&unmarked);
+            assert_eq!(error_code(&unmarked), "admin_refused", "{name}: ancestry marks it too: {unmarked}");
+        }
+        let env = std::fs::read_to_string(&env_dump).unwrap();
+        assert!(env.lines().any(|line| line == format!("{AGENT_PROCESS}=setup-script")), "{name}: {env}");
+    }
+    let owner = serve.json("agent_connector_status", "{}", &[]);
+    assert_eq!(owner["ok"], true, "the owner keeps admin commands: {owner}");
+}
+
+/// A socket `rerun_setup`, and a socket close that runs a worktree's
+/// teardown, wait for their scripts, and a script may call `codemux` back.
+/// The server must still answer that call while the command waits, so the
+/// script gets its agent refusal and the command returns.
+#[test]
+fn socket_setup_and_teardown_scripts_can_call_codemux_back() {
+    let serve = Serve::start(&[]);
+    let root = serve.root.path();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "trunk"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+    let params = json!({ "repo_path": repo, "branch": "feat", "layout": "empty" });
+    let created = serve.json("create_worktree_workspace", &params.to_string(), &[]);
+    assert_eq!(created["ok"], true, "{created}");
+    let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
+    let checkout = Path::new(created["data"]["cwd"].as_str().unwrap()).to_path_buf();
+
+    // Written after creation, so only the commands below run these scripts.
+    // The refusal exits non-zero; the script still succeeds, so the command
+    // completes and the reply file is what this test checks.
+    let reply_file = |phase: &str| root.join(format!("{phase}.json"));
+    let script = |phase: &str| {
+        format!("'{CODEMUX}' json agent_connector_status '{{}}' > '{}' || true", reply_file(phase).display())
+    };
+    std::fs::create_dir_all(checkout.join(".codemux")).unwrap();
+    let config = json!({ "setup": [script("setup")], "teardown": [script("teardown")] });
+    std::fs::write(checkout.join(".codemux/config.json"), config.to_string()).unwrap();
+    let reply = |phase: &str| -> Value {
+        serde_json::from_str(&std::fs::read_to_string(reply_file(phase)).unwrap()).unwrap()
+    };
+
+    let limit = Duration::from_secs(60);
+    let rerun = serve.json_within("rerun_setup", &json!({ "workspace_id": id }).to_string(), limit);
+    assert_eq!(rerun["data"]["status"], "complete", "{rerun}");
+    let setup = reply("setup");
+    assert_eq!(error_code(&setup), "admin_refused", "the setup script was answered as an agent: {setup}");
+
+    let closed = serve.json_within("close_workspace", &json!({ "workspace_id": id }).to_string(), limit);
+    assert_eq!(closed["data"]["closed"], true, "{closed}");
+    let teardown = reply("teardown");
+    assert_eq!(error_code(&teardown), "admin_refused", "the teardown script was answered as an agent: {teardown}");
+}
+
+#[test]
+fn mcp_supervised_client_sees_no_admin_tools_and_is_refused_them() {
+    let serve = Serve::start(&[]);
+    let mut supervised = Mcp::start(&serve, &["--client", "integration-bot", "--access", "supervised"]);
+    let names = supervised.tool_names();
+    for hidden in ["automation_create", "terminal_write", "preset_apply", "workspace_create", "worktree_create", "workspace_unarchive"] {
+        assert!(!names.iter().any(|name| name == hidden), "supervised lists {hidden}: {names:?}");
+    }
+    for shown in ["thread_launch", "thread_wait", "notify", "git_commit", "workspace_list"] {
+        assert!(names.iter().any(|name| name == shown), "supervised lacks {shown}: {names:?}");
+    }
+    let refused = supervised.call("automation_create", json!({"name": "n", "prompt": "p", "schedule": "0 * * * *"}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(refused["content"][0]["text"].as_str().unwrap().starts_with("access_denied: "), "{refused}");
+    // Registry tools reach the app through the socket as this client.
+    let listed = supervised.call("thread_list", json!({"workspace_id": "none"}));
+    assert_eq!(listed["isError"], true, "{listed}");
+    assert_eq!(listed["structuredContent"]["error"]["code"], "workspace_not_found", "{listed}");
+    let automations = serve.json("automation_list", "{}", &[]);
+    assert_eq!(automations["data"], json!([]), "nothing was created: {automations}");
+
+    let mut read_only = Mcp::start(&serve, &["--client", "integration-bot", "--access", "read-only"]);
+    let listed = read_only.request("tools/list", json!({}));
+    for tool in listed["result"]["tools"].as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        let reads = match tool.get("annotations") {
+            Some(annotations) => annotations["readOnlyHint"] == true,
+            None => codemux_lib::control_identity::mcp_tool_access(name, &json!({}))
+                == Some(codemux_lib::agent_control::Access::Read),
+        };
+        assert!(reads, "read-only lists {name}");
+    }
+    let refused = read_only.call("notify", json!({"message": "x"}));
+    assert!(refused["content"][0]["text"].as_str().unwrap().starts_with("access_denied: "), "{refused}");
+    // Outside stdio relays registry tools without a local access check, so
+    // the app's gate on the access this client carries is what refuses a
+    // write. It runs before the target checks: a client the app took for full
+    // access would get `workspace_not_found` here, as the supervised one does.
+    let send = json!({"workspace_id": "none", "thread_id": "t", "client_request_id": "k", "message": "x"});
+    let denied = read_only.call("thread_send", send.clone());
+    assert_eq!(denied["isError"], true, "{denied}");
+    assert_eq!(denied["structuredContent"]["error"]["code"], "access_denied", "{denied}");
+    let reached = supervised.call("thread_send", send);
+    assert_eq!(reached["structuredContent"]["error"]["code"], "workspace_not_found", "{reached}");
+}
+
+/// The legacy git tools run inside `codemux mcp`, so no gate in the app sees
+/// their arguments. A file name must stay a path: as a git option,
+/// `--output=<file>` made `git diff` write that file through a read-only
+/// connection.
+#[test]
+fn mcp_git_tools_take_file_names_as_paths() {
+    let serve = Serve::start(&[]);
+    let root = serve.root.path();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "trunk"]);
+    git(&repo, &["config", "user.name", "Codemux test"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    std::fs::write(repo.join("tracked"), "one\n").unwrap();
+    git(&repo, &["add", "tracked"]);
+    git(&repo, &["commit", "-m", "first"]);
+    // A change, so a diff written anywhere would not be empty.
+    std::fs::write(repo.join("tracked"), "two\n").unwrap();
+    let created = serve.json("create_workspace", &json!({ "path": repo }).to_string(), &[]);
+    assert_eq!(created["ok"], true, "{created}");
+    let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
+
+    let (kept, fresh) = (root.join("kept.txt"), root.join("fresh.txt"));
+    std::fs::write(&kept, "keep\n").unwrap();
+    let mut read_only = Mcp::start(&serve, &["--client", "integration-bot", "--access", "read-only"]);
+    for target in [&kept, &fresh] {
+        let file = format!("--output={}", target.display());
+        let reply = read_only.call_in(&id, "git_diff", json!({ "file": file }));
+        assert_ne!(reply["isError"], true, "{reply}");
+        assert_eq!(reply["content"][0]["text"], "", "no file has that name: {reply}");
+    }
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "keep\n", "git_diff overwrote a file");
+    assert!(!fresh.exists(), "git_diff created a file");
+    let diff = read_only.call_in(&id, "git_diff", json!({ "file": "tracked" }));
+    assert!(diff["content"][0]["text"].as_str().unwrap().contains("+two"), "{diff}");
+
+    // `--all` as an option would stage the untracked file too.
+    std::fs::write(repo.join("untracked"), "new\n").unwrap();
+    let mut supervised = Mcp::start(&serve, &["--client", "integration-bot", "--access", "supervised"]);
+    let staged = supervised.call_in(&id, "git_stage", json!({ "file": "--all" }));
+    assert_eq!(staged["isError"], true, "no file has that name: {staged}");
+    assert_eq!(git(&repo, &["diff", "--cached", "--name-only"]), "", "nothing was staged");
+    let staged = supervised.call_in(&id, "git_stage", json!({ "file": "tracked" }));
+    assert_ne!(staged["isError"], true, "{staged}");
+    assert_eq!(git(&repo, &["diff", "--cached", "--name-only"]), "tracked");
+    // `-m` takes the next argument whatever it looks like.
+    let committed = supervised.call_in(&id, "git_commit", json!({ "message": "--amend" }));
+    assert_ne!(committed["isError"], true, "{committed}");
+    assert_eq!(git(&repo, &["log", "--format=%s"]), "--amend\nfirst", "a new commit, not an amended one");
+}
+
+/// Whether `id` is an open workspace.
+fn is_open(serve: &Serve, id: &str) -> bool {
+    let state = serve.json("get_app_state", "{}", &[]);
+    let workspaces = state["data"]["workspaces"].as_array().unwrap_or_else(|| panic!("no workspaces: {state}"));
+    workspaces.iter().any(|ws| ws["workspace_id"] == id || ws["workspace_id"]["0"] == id)
+}
+
+/// Archiving or closing a worktree workspace runs its teardown scripts, also
+/// when the worktree stays, and they run any command as the person. So a
+/// supervised client is refused both on the stdio and the socket route
+/// before any teardown starts.
+#[test]
+fn supervised_clients_cannot_run_teardown_through_archive_or_close() {
+    let serve = Serve::start(&[]);
+    let root = serve.root.path();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "trunk"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+    let params = json!({ "repo_path": repo, "branch": "feat", "layout": "empty" });
+    let created = serve.json("create_worktree_workspace", &params.to_string(), &[]);
+    assert_eq!(created["ok"], true, "{created}");
+    let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
+    let checkout = Path::new(created["data"]["cwd"].as_str().unwrap()).to_path_buf();
+    let ran = root.join("teardown-ran");
+    std::fs::create_dir_all(checkout.join(".codemux")).unwrap();
+    let config = json!({ "teardown": [format!("touch '{}'", ran.display())] });
+    std::fs::write(checkout.join(".codemux/config.json"), config.to_string()).unwrap();
+
+    let mut supervised = Mcp::start(&serve, &["--client", "integration-bot", "--access", "supervised"]);
+    let archived = supervised.call("workspace_archive", json!({ "workspace_id": id }));
+    assert!(!ran.exists(), "a supervised workspace_archive ran the teardown: {archived}");
+    assert_eq!(archived["isError"], true, "{archived}");
+    assert!(archived["content"][0]["text"].as_str().unwrap().starts_with("access_denied: "), "{archived}");
+    let closed = supervised.call("workspace_close", json!({ "workspace_id": id }));
+    assert_eq!(closed["structuredContent"]["error"]["code"], "access_denied", "{closed}");
+    // The socket commands behind the legacy tools, from a supervised CLI.
+    let as_bot = [("CODEMUX_CLIENT", "integration-bot"), ("CODEMUX_ACCESS", "supervised")];
+    for command in ["archive_workspace", "close_workspace"] {
+        let refused = serve.json(command, &json!({ "workspace_id": id }).to_string(), &as_bot);
+        assert!(!ran.exists(), "a supervised {command} ran the teardown: {refused}");
+        assert_eq!(error_code(&refused), "access_denied", "{command}: {refused}");
+    }
+    assert!(is_open(&serve, &id), "a refused call closed the workspace");
+    let names = supervised.tool_names();
+    for hidden in ["workspace_archive", "workspace_close"] {
+        assert!(!names.iter().any(|name| name == hidden), "supervised lists {hidden}: {names:?}");
+    }
+
+    // The owner's archive runs it, so the refusals above are what kept it from running.
+    let archived = serve.json_within("archive_workspace", &json!({ "workspace_id": id }).to_string(), Duration::from_secs(60));
+    assert_eq!(archived["ok"], true, "{archived}");
+    assert!(ran.exists(), "the owner's archive ran the teardown");
+}
+
+/// A control socket like a Codemux build from before `client.access`
+/// (protocol 1), bound where `path`'s app was: it answers every line the way
+/// that build would (no `tool_call`, the legacy commands succeed) and records
+/// each command.
+fn old_app_at(path: &Path) -> Arc<Mutex<Vec<String>>> {
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            for line in BufReader::new(&stream).lines() {
+                let Ok(line) = line else { break };
+                let command = serde_json::from_str::<Value>(&line).unwrap()["command"].as_str().unwrap().to_owned();
+                recorded.lock().unwrap().push(command.clone());
+                let reply = match command.as_str() {
+                    "tool_call" => json!({"ok": false, "protocol_version": 1, "data": null, "error": "Unknown control command: tool_call"}),
+                    _ => json!({"ok": true, "protocol_version": 1, "data": {}, "error": null}),
+                };
+                if writeln!(&stream, "{reply}").is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    seen
+}
+
+/// `codemux mcp --access read-only` outlives the app it first reached, and an
+/// older build comes up on the same socket. That build ignores `client`, so
+/// the client must refuse before the call reaches it, including a registry
+/// twin it would answer from its legacy arm on an app without `tool_call`.
+#[test]
+fn narrowed_mcp_refuses_an_old_app_that_replaced_a_new_one() {
+    let mut serve = Serve::start(&[]);
+    let status = serve.json("status", "{}", &[]);
+    let socket = std::path::PathBuf::from(status["data"]["socket_path"].as_str().unwrap_or_else(|| panic!("{status}")));
+    let mut mcp = Mcp::start(&serve, &["--access", "read-only"]);
+    let listed = mcp.call("workspace_list", json!({}));
+    assert_eq!(listed["isError"], false, "the new app answers: {listed}");
+
+    serve.stop();
+    let seen = old_app_at(&socket);
+    let project = serve.root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let refused = mcp.call("workspace_create", json!({"path": project}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(refused["structuredContent"]["error"]["code"], "server_too_old", "{refused}");
+    assert_eq!(*seen.lock().unwrap(), ["status"], "only the version probe reached the older app");
+}
+
+/// `get_app_state`'s focused workspace id.
+fn active_workspace(serve: &Serve) -> String {
+    let state = serve.json("get_app_state", "{}", &[]);
+    let active = &state["data"]["active_workspace_id"];
+    active.as_str().or_else(|| active["0"].as_str()).unwrap_or_else(|| panic!("no active workspace: {state}")).to_owned()
+}
+
+#[test]
+fn socket_legacy_create_arms_keep_shapes_and_focus() {
+    let serve = Serve::start(&[]);
+    let root = serve.root.path();
+    let (first, second) = (root.join("first"), root.join("second"));
+    for dir in [&first, &second] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+
+    let created = serve.json("create_workspace", &json!({ "path": first }).to_string(), &[]);
+    assert_eq!(created["ok"], true, "{created}");
+    let id = created["data"]["workspace_id"].as_str().unwrap().to_owned();
+    assert_eq!(created["data"]["cwd"], first.display().to_string());
+    assert_eq!(created["data"]["created"], true);
+    assert_eq!(active_workspace(&serve), id, "the legacy command still takes focus");
+
+    let background = serve.json("create_workspace", &json!({ "path": second, "select": false }).to_string(), &[]);
+    assert_eq!(background["ok"], true, "{background}");
+    let other = background["data"]["workspace_id"].as_str().unwrap().to_owned();
+    assert_ne!(other, id);
+    assert_eq!(active_workspace(&serve), id, "select:false keeps focus where it was");
+
+    let closed = serve.json("close_workspace", &json!({ "workspace_id": other }).to_string(), &[]);
+    assert_eq!(closed["data"], json!({"workspace_id": other, "closed": true, "worktree_removed": false}), "{closed}");
+    let missing = serve.json("close_workspace", "{}", &[]);
+    assert_eq!(missing["error"], "Missing required parameter: workspace_id", "{missing}");
+}
+
+/// `git` in `dir` with a fixed identity; its trimmed stdout.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Codemux test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Codemux test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", dir.join(".no-global-gitconfig"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn socket_worktree_default_base_is_repo_default_branch() {
+    let serve = Serve::start(&[]);
+    // A repository whose only branch is `trunk`: the old default base `main`
+    // does not exist there.
+    let repo = serve.root.path().join("trunk-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "trunk"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+    let trunk = git(&repo, &["rev-parse", "HEAD"]);
+
+    let params = json!({ "repo_path": repo, "branch": "feat", "layout": "empty" });
+    let created = serve.json("create_worktree_workspace", &params.to_string(), &[]);
+    assert_eq!(created["ok"], true, "{created}");
+    let data = &created["data"];
+    assert_eq!(data["base_branch"], "trunk", "{created}");
+    assert_eq!(data["adopted"], false);
+    let checkout = Path::new(data["cwd"].as_str().unwrap());
+    assert_eq!(git(checkout, &["rev-parse", "HEAD"]), trunk);
+    assert_eq!(git(checkout, &["branch", "--show-current"]), "feat");
+    let id = data["workspace_id"].as_str().unwrap().to_owned();
+    assert_eq!(active_workspace(&serve), id, "the legacy command still takes focus");
+
+    let params = json!({ "repo_path": repo, "branch": "feat-2", "layout": "empty", "select": false });
+    let background = serve.json("create_worktree_workspace", &params.to_string(), &[]);
+    assert_eq!(background["data"]["base_branch"], "trunk", "{background}");
+    assert_eq!(active_workspace(&serve), id, "select:false keeps focus where it was");
+
+    let missing = serve.json("create_worktree_workspace", &json!({ "branch": "x" }).to_string(), &[]);
+    assert_eq!(missing["error"], "Missing required parameter: repo_path", "{missing}");
+}
