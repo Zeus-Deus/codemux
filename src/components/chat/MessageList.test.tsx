@@ -516,6 +516,44 @@ describe("MessageList transcript continuity", () => {
     expect(scrollToEndSpy).not.toHaveBeenCalled();
   });
 
+  it("glides an opened disclosure into view above the composer", async () => {
+    const view = renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    await nextFrames();
+    const viewport = view.container.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
+    const scrollBy = vi.fn();
+    viewport.scrollBy = scrollBy as typeof viewport.scrollBy;
+    viewport.getBoundingClientRect = () => new DOMRect(0, 0, 800, 500);
+    const toggle = document.createElement("button");
+    toggle.setAttribute("aria-expanded", "false");
+    // The toggle sits 80px above the viewport's bottom, so its body opens
+    // almost entirely out of view.
+    toggle.getBoundingClientRect = () => new DOMRect(0, 400, 100, 20);
+    toggle.addEventListener("click", () => toggle.setAttribute("aria-expanded", "true"));
+    viewport.appendChild(toggle);
+    act(() => toggle.click());
+    await waitFor(() => expect(scrollBy).toHaveBeenCalledTimes(1), { timeout: 2000 });
+    // 96px of body wanted, 80px already visible below the toggle.
+    expect(scrollBy.mock.calls[0][0]).toMatchObject({ top: 16 });
+  });
+
+  it("leaves a collapsed disclosure where it is", async () => {
+    const view = renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    await nextFrames();
+    const viewport = view.container.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
+    const scrollBy = vi.fn();
+    viewport.scrollBy = scrollBy as typeof viewport.scrollBy;
+    viewport.getBoundingClientRect = () => new DOMRect(0, 0, 800, 500);
+    const toggle = document.createElement("button");
+    toggle.setAttribute("aria-expanded", "true");
+    toggle.getBoundingClientRect = () => new DOMRect(0, 470, 100, 20);
+    toggle.addEventListener("click", () => toggle.setAttribute("aria-expanded", "false"));
+    viewport.appendChild(toggle);
+    act(() => toggle.click());
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    await nextFrames(2);
+    expect(scrollBy).not.toHaveBeenCalled();
+  });
+
   it("follows footer-only growth while the eased follower holds the tail", async () => {
     listState.isAtEnd = true;
     listState.isNearEnd = true;

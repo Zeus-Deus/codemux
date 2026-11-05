@@ -501,6 +501,8 @@ export const MessageList = memo(function MessageList({
   // Disclosure hold. Expanding or collapsing a row (a tool card, a turn's
   // "Worked for" fold, reasoning) must leave the toggle the reader clicked
   // under their pointer. For a short settle window the end pin and the tail
+  const streamingRef = useRef(streaming);
+  streamingRef.current = streaming;
   // advance stand down, and each frame cancels any drift of the toggle by
   // nudging the offset. Holds the stop function while active.
   const disclosureHoldRef = useRef<(() => void) | null>(null);
@@ -607,6 +609,35 @@ export const MessageList = memo(function MessageList({
    *  next token must not drag them back to the tail. */
   const holdDisclosure = useCallback(
     (toggle: HTMLElement) => {
+  /** A disclosure opened just above the composer can render its whole body
+   *  under the composer overlay, leaving a rotated chevron as the only
+   *  feedback. Glide just far enough to show the start of the body, never
+   *  so far that the toggle the reader clicked leaves the top of the view. */
+  const revealOpenedDisclosure = useCallback(
+    (viewport: HTMLElement, toggle: HTMLElement) => {
+      if (!toggle.isConnected || toggle.getAttribute("aria-expanded") !== "true") {
+        return;
+      }
+      const viewRect = viewport.getBoundingClientRect();
+      const toggleRect = toggle.getBoundingClientRect();
+      const overlay =
+        parseFloat(
+          getComputedStyle(viewport).getPropertyValue("--composer-overlay-height"),
+        ) || 0;
+      const visibleBelow = viewRect.bottom - overlay - toggleRect.bottom;
+      const need = DISCLOSURE_REVEAL_PX - visibleBelow;
+      if (need <= 1) return;
+      const room = toggleRect.top - (viewRect.top + topInsetRef.current) - 8;
+      const distance = Math.min(need, room);
+      if (distance <= 1) return;
+      viewport.scrollBy({
+        top: distance,
+        behavior: prefersReducedMotion() ? "auto" : "smooth",
+      });
+    },
+    [],
+  );
+
       const viewport = listRef.current?.getScrollableNode();
       if (!viewport) return;
       disclosureHoldRef.current?.();
@@ -642,10 +673,14 @@ export const MessageList = memo(function MessageList({
         }
       };
       disclosureHoldRef.current = stop;
+        // A live turn keeps the tail in charge: no reveal glide while it
+        // streams and we still follow it.
+        const followingLiveTail = ownsScroll() && streamingRef.current;
       setDisclosureHold(true);
       frame = requestAnimationFrame(pin);
     },
-    [cancelFollowForUserNavigation, ownsScroll, tailGlide],
+    [cancelFollowForUserNavigation, ownsScroll, revealOpenedDisclosure, tailGlide],
+        if (!followingLiveTail) revealOpenedDisclosure(viewport, toggle);
   );
 
   // Apply a send's navigation intent synchronously, during the same render
@@ -1891,6 +1926,10 @@ const WS_FADE_STYLE: CSSProperties = {
   WebkitMaskPosition: WS_FADE_MASK_POSITION,
   WebkitMaskRepeat: "no-repeat",
 };
+
+/** How much of a freshly opened disclosure's body must sit above the
+ *  composer overlay; less than this and the opening glides to show it. */
+const DISCLOSURE_REVEAL_PX = 96;
 
 /** Whether a rendered slot body carries the item with `id`. */
 function slotBodyContains(body: SlotBody, id: string): boolean {
