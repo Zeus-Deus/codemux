@@ -1,5 +1,5 @@
 import { AgentQuestionBadge } from "./agent-question-badge";
-import { memo, useEffect, useId, useState } from "react";
+import { memo, useEffect, useId, useRef, useState } from "react";
 import {
   AlarmClock,
   Check,
@@ -428,6 +428,23 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
 }: Props) {
   const appearance = useProjectAppearance(repo.path);
   const hosts = useHosts();
+  // The open workspace's card is brought into view when it becomes active,
+  // so the sidebar always shows where you are. Keyed on `isActive` alone:
+  // re-renders never touch the user's own scroll. The first paint jumps (a
+  // glide on load is motion for nothing); later switches glide unless the
+  // user asked for reduced motion.
+  const cardRef = useRef<HTMLDivElement>(null);
+  const painted = useRef(false);
+  useEffect(() => {
+    const firstPaint = !painted.current;
+    painted.current = true;
+    if (!isActive) return;
+    const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    cardRef.current?.scrollIntoView?.({
+      block: "nearest",
+      behavior: firstPaint || reduceMotion ? "auto" : "smooth",
+    });
+  }, [isActive]);
 
   // Observe status transitions so elapsed labels (idle "26m") can be derived
   // client-side — the backend stamps no status-changed-at.
@@ -567,6 +584,13 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
    *  Distinct work titles retain the project eyebrow. */
   const titleRepeatsProject =
     displayTitle.trim().toLowerCase() === repo.name.trim().toLowerCase();
+  /** Worktree cards are usually named after their branch's last segment
+   *  (`fix/installer-detect` → "installer-detect"), and printing both says the
+   *  name twice. The full branch stays in the hover card and context menu. */
+  const branchRepeatsTitle =
+    (workspace.git_branch?.split("/").pop() ?? "").trim().toLowerCase() ===
+    displayTitle.trim().toLowerCase();
+  const showBranch = Boolean(workspace.git_branch) && !branchRepeatsTitle;
 
   // The workspace's whole PR set, not just the scalar head: an agent handed a
   // multi-part plan lands a branch and a PR per concern, and a badge that names
@@ -610,7 +634,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // the end of the title line instead, so the card isn't a row taller for a
   // single glyph.
   const metaHasContent =
-    Boolean(workspace.git_branch) ||
+    showBranch ||
     hasAhead ||
     hasStats ||
     Boolean(prState) ||
@@ -619,6 +643,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
     workspace.notification_count > 0;
   const inlineProviders =
     !metaHasContent && providers.length > 0 && !titleRepeatsProject;
+  // A meta line with nothing on it is not drawn either: an empty row would
+  // still add its top margin and make the card a step taller than its peers.
+  const showMetaLine = metaHasContent || (providers.length > 0 && !inlineProviders);
 
   // With the Snooze menu open the swap can no longer be driven by hover/focus
   // (both have left the card for the portal), so it is driven by state
@@ -891,6 +918,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
               // more) through the context menu on the focused card.
               aria-description="Shift+F10 for actions"
               data-inbox-card={workspace.workspace_id}
+              ref={cardRef}
               aria-current={isActive ? "page" : undefined}
               data-selected={selected || undefined}
               data-unread={unread || undefined}
@@ -1209,7 +1237,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   `prStatusSettledHoverClass`), so at rest the settled copy is
                   the grey version of this chip and under the pointer it is
                   this chip exactly. */}
-              {!inlineProviders && (
+              {showMetaLine && (
               <div
                 data-meta-line
                 className={cn(
@@ -1221,7 +1249,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     : "text-muted-foreground",
                 )}
               >
-                {workspace.git_branch && (
+                {showBranch && (
                   // The branch is what gives way when the row is full. Any floor
                   // here pushes the ↑ahead, ± stats, PR chip and marks (all
                   // shrink-0) past the card's clipped edge on a busy card, even

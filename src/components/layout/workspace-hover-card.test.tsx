@@ -520,7 +520,7 @@ describe("WorkspaceHoverCardBody — location, mute, path", () => {
 });
 
 describe("WorkspaceHoverCard — hover timing", () => {
-  const OPEN_DELAY_MS = 150;
+  const OPEN_DELAY_MS = 400;
   const CLOSE_DELAY_MS = 100;
   const GROUP_TIMEOUT_MS = 400;
 

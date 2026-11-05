@@ -193,6 +193,72 @@ describe("SidebarInboxCard — repeated project title", () => {
   );
 });
 
+describe("SidebarInboxCard — branch named like the title", () => {
+  it("drops a branch whose last segment repeats the title, and the empty meta line with it", () => {
+    const { card, container } = renderCard({
+      workspace: makeWorkspace({ title: "installer-detect", git_branch: "fix/installer-detect" }),
+    });
+    expect(within(card).queryByText("fix/installer-detect")).toBeNull();
+    expect(metaLine(container)).toBeNull();
+  });
+
+  it("keeps the meta line for its other facts", () => {
+    const { container } = renderCard({
+      workspace: makeWorkspace({
+        title: "Installer-Detect",
+        git_branch: "fix/installer-detect",
+        git_ahead: 2,
+      }),
+    });
+    expect(metaLine(container)).toHaveTextContent("↑2");
+    expect(metaLine(container)).not.toHaveTextContent("fix/installer-detect");
+  });
+
+  it("still prints a branch that names something else", () => {
+    const { container } = renderCard({
+      workspace: makeWorkspace({ title: "Ship it", git_branch: "feat/ship" }),
+    });
+    expect(metaLine(container)).toHaveTextContent("feat/ship");
+  });
+});
+
+describe("SidebarInboxCard — active card in view", () => {
+  const scrollIntoView = vi.fn();
+  beforeEach(() => {
+    scrollIntoView.mockClear();
+    Element.prototype.scrollIntoView = scrollIntoView;
+  });
+  afterEach(() => {
+    delete (Element.prototype as Partial<Element>).scrollIntoView;
+  });
+
+  it("jumps to the active card on first paint and glides on later activation", () => {
+    const { rerender, props } = renderCard({ isActive: true });
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenLastCalledWith({ block: "nearest", behavior: "auto" });
+
+    const draw = (isActive: boolean, now = 0) =>
+      rerender(
+        <TooltipProvider>
+          <SidebarInboxCard {...props} isActive={isActive} now={now} />
+        </TooltipProvider>,
+      );
+    draw(false);
+    draw(true);
+    expect(scrollIntoView).toHaveBeenCalledTimes(2);
+    expect(scrollIntoView).toHaveBeenLastCalledWith({ block: "nearest", behavior: "smooth" });
+
+    // A re-render that leaves the card active never scrolls again.
+    draw(true, 5_000);
+    expect(scrollIntoView).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not scroll for an inactive card", () => {
+    renderCard({ isActive: false });
+    expect(scrollIntoView).not.toHaveBeenCalled();
+  });
+});
+
 describe("SidebarInboxCard — git line labels", () => {
   it.each([
     [1, 0, "1 line added, 0 removed", "+1"],
