@@ -10,6 +10,7 @@ import {
   NEW_CHAT_SETTING_KEYS,
   firstUsableProvider,
   isAutomaticNewChatProvider,
+  providerKnownUsable,
   resolveNewChatModelDefaults,
 } from "@/lib/agent-chat/new-chat-defaults";
 import { normalizeChatModeForProvider } from "@/lib/agent-chat/mode-compatibility";
@@ -903,7 +904,11 @@ export function reseedBootstrapDrafts(): void {
  *  seeded before any probe answers, so without this it would stay on the
  *  fallback even when that agent turns out not to be installed. Drafts the
  *  user picked a provider or model on are left alone, and so are device
- *  drafts: the probes describe this computer only. */
+ *  drafts: the probes describe this computer only. So is a draft already on
+ *  an agent the probes found usable: opening the model picker probes every
+ *  agent, and a higher-ranked one answering must not swap the agent the
+ *  composer already shows. A connected ChatGPT plan still moves it, since
+ *  connecting is the user's own choice of Codex. */
 export function reseedAutomaticProviderDrafts(): void {
   const slots = useProviderHealth.getState().slots;
   // Moving on a partial answer could hop twice (to a later agent, then
@@ -915,11 +920,13 @@ export function reseedAutomaticProviderDrafts(): void {
   // fallback, and moving a draft there would just undo the last move.
   if (useChatGptStore.getState().status?.phase !== "connected" && !firstUsableProvider()) return;
   const appState = useAppStore.getState().appState;
+  const planConnected = useChatGptStore.getState().status?.phase === "connected";
   useChatDraftStore.setState((state) => {
     let draftsById: Record<DraftId, ChatDraft> | null = null;
     let config: NewChatConfig | null = null;
     for (const draft of Object.values(state.draftsById)) {
       if (draft.automaticProvider !== true || !isReusableDraft(draft)) continue;
+      if (!planConnected && providerKnownUsable(draft.provider)) continue;
       if (draft.target.kind === "existing_workspace") {
         const workspaceId = draft.target.workspaceId;
         const workspace = appState?.workspaces.find(
