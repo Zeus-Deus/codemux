@@ -28,17 +28,19 @@ function Tooltip({
   return <TooltipPrimitive.Root data-slot="tooltip" {...props} />
 }
 
-/** Whether the last key pressed was Tab. Focus that arrives without a
- *  previous element is either the user tabbing in from the page or a popup
- *  handing focus back as it closes (after Esc or a click), and only this
- *  tells the two apart. */
-let tabbing = false
+/** Whether the last key pressed moves focus by navigation: Tab, or an arrow
+ *  key roving through a toolbar or list. Everything else that lands focus on
+ *  a control — a popup auto-focusing its first item after Enter or a
+ *  shortcut, a closing popup handing focus back after Esc or a click, a
+ *  shortcut jumping to a control — happens after some other key or a pointer
+ *  press, and only this tells the two apart. */
+let navigating = false
 if (typeof document !== "undefined") {
   document.addEventListener("keydown", (event) => {
-    tabbing = event.key === "Tab"
+    navigating = event.key === "Tab" || event.key.startsWith("Arrow")
   }, true)
   document.addEventListener("pointerdown", () => {
-    tabbing = false
+    navigating = false
   }, true)
 }
 
@@ -49,21 +51,17 @@ function TooltipTrigger({
   return (
     <TooltipPrimitive.Trigger
       data-slot="tooltip-trigger"
-      // Only keyboard focus opens a tooltip. A popover that moves focus into
-      // itself on a mouse click would otherwise pop a label over the content
-      // the user just opened. Radix skips its handler once default is prevented.
-      // Focus handed back by a closing menu, popover or dialog isn't the user
-      // arriving either: it comes from nowhere (the popup that held it was
-      // removed) or straight out of a popup's content around something else.
-      // Tab navigation shows the label wherever it comes from.
+      // Only focus the user moved there by navigating opens a tooltip. A popup
+      // that focuses its first item as it opens (from a click, Enter or a
+      // shortcut) would otherwise pop a label over the content just opened,
+      // and the first Esc would only dismiss that label; focus handed back by
+      // a closing menu, popover or dialog isn't the user arriving either.
+      // Radix skips its handler once default is prevented.
       onFocus={(event) => {
         onFocus?.(event)
         const target = event.currentTarget
         if (target.ownerDocument.activeElement !== target) return
-        const from = event.relatedTarget
-        const popup = from instanceof Element ? from.closest('[data-slot$="-content"]') : null
-        const returned = !tabbing && (from === null || (popup !== null && !popup.contains(target)))
-        if (returned || !target.matches(":focus-visible")) {
+        if (!navigating || !target.matches(":focus-visible")) {
           event.preventDefault()
         }
       }}
