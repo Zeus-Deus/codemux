@@ -179,6 +179,9 @@ test("authenticated orchestration callbacks are available in supervised and plan
 });
 
 test("managed workflows expose only virtual tools and ignore native settings", async () => {
+  // An empty Claude home keeps the developer's own settings.json (an
+  // apiKeyHelper, say) out of the exact `settings` assertion below.
+  await withClaudeHome({}, async () => {
   const { emit } = recordingEmitter();
   const session = new ClaudeSession(minimalInput({
     managed: true,
@@ -209,6 +212,68 @@ test("managed workflows expose only virtual tools and ignore native settings", a
   expect((await options!.canUseTool!("Bash", { command: "unsafe" }, { signal: new AbortController().signal, toolUseID: "native" })).behavior).toBe("deny");
   expect((await options!.canUseTool!("mcp__codemux__workflow_submit_result", { output: true }, { signal: new AbortController().signal, toolUseID: "virtual" })).behavior).toBe("allow");
   await session.close();
+  });
+});
+
+/** Point the sidecar at a throwaway Claude home for one test. */
+async function withClaudeHome(settings: unknown, run: (home: string) => Promise<void>): Promise<void> {
+  const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const home = mkdtempSync(join(tmpdir(), "claude-home-"));
+  writeFileSync(join(home, "settings.json"), JSON.stringify(settings));
+  const previous = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = home;
+  try {
+    await run(home);
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = previous;
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+test("managed workflows carry provider routing from settings.json and nothing else", async () => {
+  const { emit } = recordingEmitter();
+  const previousHost = process.env.CLAUDE_CODE_HOST_SESSION_ID;
+  process.env.CLAUDE_CODE_HOST_SESSION_ID = "launching-session";
+  const previousUrl = process.env.ANTHROPIC_BASE_URL;
+  process.env.ANTHROPIC_BASE_URL = "http://shell-proxy:1";
+  try {
+    await withClaudeHome({
+      env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", ANTHROPIC_AUTH_TOKEN: "dummy", ENABLE_TOOL_SEARCH: "true", CLAUDE_CODE_ENTRYPOINT: "routing-test" },
+      apiKeyHelper: "print-key",
+      outputStyle: "Pirate",
+      enabledPlugins: { "x@y": true },
+      permissions: { allow: ["Bash(*)"] },
+    }, async () => {
+      const managed = new ClaudeSession(minimalInput({ managed: true }), emit);
+      const options = fake.capturedOptions!;
+      expect(options.settingSources).toEqual([]);
+      expect(options.plugins).toEqual([]);
+      // settings.json routing wins over the inherited shell value, as in the CLI.
+      expect(options.env?.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8317");
+      expect(options.env?.ANTHROPIC_AUTH_TOKEN).toBe("dummy");
+      expect(options.env?.CLAUDE_CODE_ENTRYPOINT).toBe("routing-test");
+      expect(options.env?.CLAUDE_CODE_HOST_SESSION_ID).toBeUndefined();
+      // A non-routing env entry cannot loosen the managed MCP setup.
+      expect(options.env?.ENABLE_TOOL_SEARCH).toBe("false");
+      // Only the helper command reaches `--settings`; the token never does.
+      expect(options.settings).toEqual({ disableAllHooks: true, ultracode: false, apiKeyHelper: "print-key" });
+      await managed.close();
+
+      // Ordinary chats load user settings themselves.
+      const ordinary = new ClaudeSession(minimalInput(), emit);
+      expect(fake.capturedOptions?.env?.ANTHROPIC_BASE_URL).toBe("http://shell-proxy:1");
+      expect(fake.capturedOptions?.env?.ANTHROPIC_AUTH_TOKEN).toBe(process.env.ANTHROPIC_AUTH_TOKEN);
+      await ordinary.close();
+    });
+  } finally {
+    if (previousHost === undefined) delete process.env.CLAUDE_CODE_HOST_SESSION_ID;
+    else process.env.CLAUDE_CODE_HOST_SESSION_ID = previousHost;
+    if (previousUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = previousUrl;
+  }
 });
 
 test("managed MCP discovery override preserves environment and does not affect ordinary chats", async () => {
@@ -225,9 +290,14 @@ test("managed MCP discovery override preserves environment and does not affect o
     expect(fake.capturedOptions?.env?.MCP_CONNECTION_NONBLOCKING).toBe("0");
     expect(fake.capturedOptions?.env?.ENABLE_CLAUDEAI_MCP_SERVERS).toBe("false");
     expect(fake.capturedOptions?.env?.PATH).toBe(process.env.PATH);
+    // Never the Agent SDK's `sdk-ts` (a settings.json override may rename it).
+    expect(fake.capturedOptions?.env?.CLAUDE_CODE_ENTRYPOINT).toBeTruthy();
+    expect(fake.capturedOptions?.env?.CLAUDE_CODE_ENTRYPOINT).not.toMatch(/^sdk-/);
     expect(fake.capturedOptions?.tools).toEqual([]);
     await managed.close();
     const ordinary = new ClaudeSession(minimalInput(), emit);
+    expect(fake.capturedOptions?.env?.CLAUDE_CODE_ENTRYPOINT).toBeTruthy();
+    expect(fake.capturedOptions?.env?.CLAUDE_CODE_ENTRYPOINT).not.toMatch(/^sdk-/);
     expect(fake.capturedOptions?.env?.ENABLE_TOOL_SEARCH).toBe("true");
     expect(fake.capturedOptions?.env?.MCP_CONNECTION_NONBLOCKING).toBe("1");
     expect(fake.capturedOptions?.env?.ENABLE_CLAUDEAI_MCP_SERVERS).toBe("true");

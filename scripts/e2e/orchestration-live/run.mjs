@@ -5,8 +5,8 @@
 //   node run.mjs [scenario…]        default: every scenarios/*.mjs
 //
 // A scenario module exports `name`, `description` and `async run(ctx)`; see
-// README.md for the ctx API. Each scenario gets a 10-minute budget
-// (ORCH_LIVE_SCENARIO_TIMEOUT_MS overrides it). When it runs out, the
+// README.md for the ctx API. Each scenario gets a 10-minute budget, or its own
+// `export const budgetMs` (ORCH_LIVE_SCENARIO_TIMEOUT_MS overrides both). When it runs out, the
 // scenario's signal aborts: in-flight browser, CLI and assert calls are killed
 // and every wait throws. A scenario that still hasn't stopped after a grace
 // period ends the whole run, so it can't keep driving the browser under the
@@ -24,7 +24,13 @@ const run = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
 const env = loadEnv();
 const driver = new Driver(env);
-const budget = Number(process.env.ORCH_LIVE_SCENARIO_TIMEOUT_MS ?? 600_000);
+const budgetOverride = process.env.ORCH_LIVE_SCENARIO_TIMEOUT_MS;
+const defaultBudget = 600_000;
+/** A scenario's time budget: the override, else its own `budgetMs`, else 10 min. */
+function budgetOf(scenario) {
+  if (budgetOverride !== undefined) return Number(budgetOverride);
+  return Number.isFinite(scenario.budgetMs) && scenario.budgetMs > 0 ? scenario.budgetMs : defaultBudget;
+}
 const abortGrace = 30_000;
 
 /** assert.sh wrappers. Each resolves to the parsed evidence or throws. */
@@ -138,6 +144,7 @@ for (const file of files) {
   console.log(`== ${scenario.name}`);
   const controller = new AbortController();
   driver.signal = controller.signal;
+  const budget = budgetOf(scenario);
   const timer = setTimeout(
     () => controller.abort(new Error(`scenario budget ${budget} ms exceeded`)), budget);
   const running = Promise.resolve().then(() => scenario.run(context(result, controller.signal)));

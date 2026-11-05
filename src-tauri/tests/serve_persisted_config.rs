@@ -39,7 +39,7 @@
 
 use std::time::Duration;
 
-use codemux_lib::control::{send_control_request, ControlRequest};
+use codemux_lib::control::{send_control_request_as, ControlRequest};
 use codemux_lib::web_remote::serve::{serve_startup, ServeOptions};
 use codemux_lib::web_remote;
 
@@ -215,10 +215,15 @@ fn serve_honours_persisted_config_and_never_clobbers_relay_mode() {
         codemux_lib::control::control_server_is_running(),
         "serve must hold the machine's control endpoint (mutual exclusion + CLI)"
     );
-    let pair = tauri::async_runtime::block_on(send_control_request(ControlRequest {
-        command: "web_remote_pair".to_string(),
-        params: serde_json::json!({ "name": "Phone" }),
-    }))
+    // Speak as the owner explicitly: a test run from an in-app chat inherits
+    // that chat's agent identity, which this admin command would refuse.
+    let pair = tauri::async_runtime::block_on(send_control_request_as(
+        ControlRequest {
+            command: "web_remote_pair".to_string(),
+            params: serde_json::json!({ "name": "Phone" }),
+        },
+        None,
+    ))
     .expect("control round-trip should reach the running serve instance");
     assert!(pair.ok, "web_remote_pair failed: {:?}", pair.error);
     let token = pair.data.as_ref().and_then(|d| d["token"].as_str());

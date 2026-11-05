@@ -6,6 +6,7 @@ use crate::config::{
     ShellAppearance,
     ThemeColors,
 };
+use crate::git::{CommitLoss, Kept};
 use crate::state::{
     AppStateSnapshot,
     AppStateStore,
@@ -18,6 +19,10 @@ use crate::state::{
 };
 use crate::terminal;
 use crate::workspace_paths::paths_equal;
+use crate::workspace_service::{
+    Checkpoint, CloseWorkspace, OpenWorkspace, OpenedWorkspace, PresetLaunch, WorktreeBase,
+    WorktreeRequest,
+};
 use notify_rust::Notification;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -150,57 +155,89 @@ pub(crate) async fn populate_git_info_async(
     apply_workspace_git_info(state, workspace_id, info)
 }
 
-/// `async fn` so the git-info gather runs on the blocking pool instead of
-/// whichever thread drives the caller (the GTK main thread for the Tauri
-/// command, a Tokio worker for the control socket). Both callers are
-/// already async, so the `.await` plumbs straight through.
-pub(crate) async fn create_workspace_impl<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    state: &AppStateStore,
-    db: &crate::database::DatabaseStore,
-    cwd: Option<String>,
-) -> Result<String, String> {
-    create_workspace_impl_with_selection(app, state, db, cwd, true).await
-}
-
+/// Always creates a new workspace at `cwd` (the desktop's `create_workspace`
+/// command and unarchive). `state` and `db` are the app's own;
+/// [`open_workspace_impl`] reads them from `app`.
 pub(crate) async fn create_workspace_impl_with_selection<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
-    state: &AppStateStore,
-    db: &crate::database::DatabaseStore,
+    _state: &AppStateStore,
+    _db: &crate::database::DatabaseStore,
     cwd: Option<String>,
     select: bool,
 ) -> Result<String, String> {
+    open_workspace_impl(
+        app,
+        OpenWorkspace { path: cwd, select, reuse_open: false, reserved_id: None },
+        &Checkpoint::default(),
+    )
+    .await
+    .map(|opened| opened.workspace_id)
+}
+
+/// Open a folder as a workspace: return the live one already there when
+/// `reuse_open` asks for it, else create one (under `reserved_id` when
+/// given) with one terminal, its setup scripts and `.mcp.json`. `checkpoint`
+/// is asked again after each wait.
+pub(crate) async fn open_workspace_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    request: OpenWorkspace,
+    checkpoint: &Checkpoint,
+) -> Result<OpenedWorkspace, String> {
+    let state = app.state::<AppStateStore>();
+    let db = app.state::<crate::database::DatabaseStore>();
     // Cleanup must not delete a checkout while it is being opened.
     let _opening = crate::worktree_cleanup::opening_guard().await;
+    // The lock may have waited out a checkout removal: a requester whose
+    // authority was withdrawn meanwhile opens and focuses nothing.
+    checkpoint.check()?;
     // A workspace cwd must be absolute so its terminals can `chdir` into it;
     // a hand-typed `~` path would otherwise be stored verbatim.
-    let cwd = cwd.map(|path| crate::project::expand_tilde(&path));
-    let workspace_id = match &cwd {
-        Some(path) => state.create_workspace_with_layout_with_selection(
-            PathBuf::from(path),
-            WorkspacePresetLayout::Single,
-            select,
-        ),
-        None => state.create_workspace_with_layout_with_selection(
-            crate::project::current_project_root(),
-            WorkspacePresetLayout::Single,
-            select,
-        ),
+    let repo_path = request
+        .path
+        .as_deref()
+        .map(|path| PathBuf::from(crate::project::expand_tilde(path)))
+        .unwrap_or_else(crate::project::current_project_root);
+
+    if let Some(opened) = reopen_workspace(&app, &state, &request, &repo_path)? {
+        return Ok(opened);
+    }
+    // Read before the workspace exists, so a requester whose authority was
+    // withdrawn during the read leaves nothing behind to undo.
+    let git_info = {
+        let path = repo_path.clone();
+        tokio::task::spawn_blocking(move || gather_workspace_git_info(&path))
+            .await
+            .unwrap_or_default()
+    };
+    checkpoint.check()?;
+    #[cfg(test)]
+    open_pause::reached(&repo_path).await;
+    // Another open of this folder may have made it during the read, or be
+    // making it now: the last look and the insert are one step under the
+    // state lock, so one open creates the workspace (and alone runs its
+    // terminal and setup below) and the others get it back.
+    let claim = state.open_or_create_workspace(
+        repo_path.clone(),
+        WorkspacePresetLayout::Single,
+        request.select,
+        request.reserved_id.clone(),
+        |snapshot| open_at(snapshot, &request, &repo_path),
+    );
+    let workspace_id = match claim {
+        WorktreeWorkspaceClaim::Adopted(existing) => return reopened(&app, &state, &request, existing),
+        WorktreeWorkspaceClaim::Created(id) => id,
     };
 
     // Set project root (resolve through git root for worktree grouping)
-    let repo_path = cwd
-        .map(PathBuf::from)
-        .unwrap_or_else(crate::project::current_project_root);
     let project_root = crate::config::workspace_config::find_git_root(&repo_path)
         .unwrap_or_else(|| repo_path.clone());
     state.set_workspace_project_root(&workspace_id.0, project_root.display().to_string());
-    populate_git_info_async(state, &workspace_id.0, repo_path.clone()).await;
+    apply_workspace_git_info(&state, &workspace_id.0, git_info);
 
     terminal::spawn_missing_ptys_for_workspace(app.clone(), &workspace_id.0);
 
     // Run setup scripts in background thread
-    spawn_setup_scripts(&app, state, db, &workspace_id.0, &repo_path);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path, checkpoint);
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
@@ -208,7 +245,97 @@ pub(crate) async fn create_workspace_impl_with_selection<R: tauri::Runtime>(
     }
 
     crate::state::emit_app_state(&app);
-    Ok(workspace_id.0)
+    Ok(OpenedWorkspace {
+        workspace_id: workspace_id.0,
+        cwd: repo_path.display().to_string(),
+        created: true,
+    })
+}
+
+/// Lines concurrent opens of one folder up just before the step that makes
+/// the workspace, so a test can run them through it together.
+#[cfg(test)]
+pub(crate) mod open_pause {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::Barrier;
+
+    static LINE_UP: Mutex<Option<(PathBuf, Arc<Barrier>)>> = Mutex::new(None);
+
+    /// The next `parties` opens of `path` wait there for each other.
+    pub(crate) fn line_up(path: &Path, parties: usize) {
+        *LINE_UP.lock().unwrap() = Some((path.to_path_buf(), Arc::new(Barrier::new(parties))));
+    }
+
+    pub(crate) async fn reached(path: &Path) {
+        let barrier = LINE_UP.lock().unwrap().as_ref().filter(|(at, _)| at == path).map(|(_, barrier)| barrier.clone());
+        if let Some(barrier) = barrier {
+            // Bounded, so a broken test fails on its assertions, not a hang.
+            let _ = tokio::time::timeout(Duration::from_secs(10), barrier.wait()).await;
+        }
+    }
+}
+
+/// A retry under the same reservation, or a folder that is already open, gets
+/// that workspace back (focused when asked) and runs none of the create-side
+/// effects again.
+fn reopen_workspace<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppStateStore,
+    request: &OpenWorkspace,
+    repo_path: &Path,
+) -> Result<Option<OpenedWorkspace>, String> {
+    let existing = {
+        let snapshot = state.snapshot();
+        request
+            .reserved_id
+            .as_ref()
+            .filter(|id| snapshot.workspaces.iter().any(|w| &w.workspace_id == *id))
+            .map(|id| id.0.clone())
+            .or_else(|| open_at(&snapshot, request, repo_path))
+    };
+    existing.map(|workspace_id| reopened(app, state, request, workspace_id)).transpose()
+}
+
+/// The live workspace an open that reuses one gets back for `path`.
+fn open_at(snapshot: &AppStateSnapshot, request: &OpenWorkspace, path: &Path) -> Option<String> {
+    request
+        .reuse_open
+        .then(|| find_open_workspace_at_path(snapshot, path))
+        .flatten()
+        .map(|w| w.workspace_id.0.clone())
+}
+
+/// An existing workspace returned for an open, focused when asked.
+fn reopened<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppStateStore,
+    request: &OpenWorkspace,
+    workspace_id: String,
+) -> Result<OpenedWorkspace, String> {
+    if request.select {
+        activate_workspace_impl(app.clone(), state, workspace_id.clone())?;
+    }
+    let cwd = state.workspace_cwd(&workspace_id).unwrap_or_default();
+    Ok(OpenedWorkspace { workspace_id, cwd, created: false })
+}
+
+/// The live top-level local workspace opened directly at `path`, if any.
+/// Remote and attach-only workspaces name another machine's folders, chat
+/// children only borrow their parent's, and imported snapshots are not live.
+fn find_open_workspace_at_path<'a>(
+    snapshot: &'a AppStateSnapshot,
+    path: &Path,
+) -> Option<&'a crate::state::WorkspaceSnapshot> {
+    snapshot.workspaces.iter().find(|w| {
+        w.host_id.is_none()
+            && !w.attach_only
+            && !w.is_chat_child()
+            && !w.is_local_import_snapshot_only()
+            && !w.cwd.is_empty()
+            && paths_equal(Path::new(&w.cwd), path)
+    })
 }
 
 pub(crate) fn split_pane_impl<R: tauri::Runtime>(
@@ -307,15 +434,21 @@ pub async fn create_workspace<R: tauri::Runtime>(
 ///
 /// `adopted` is true when no workspace was created because a live one
 /// already claimed the target worktree path and was focused instead (see
-/// the adopt-existing guard in `create_worktree_workspace_impl`). On that
+/// the adopt-existing guard in `create_worktree_from_request`). On that
 /// path any `initial_prompt`/`agent_preset_id` were dropped, so the
 /// frontend uses the flag to tell the user their prompt wasn't sent.
 /// Always false for `create_empty_workspace`.
+///
+/// `base_branch` is what a freshly created worktree branch forked from, as
+/// recorded on the workspace; absent when nothing was recorded (adopted or
+/// reused checkouts, plain folders), so older readers see the old shape.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceCreated {
     pub workspace_id: String,
     pub cwd: String,
     pub adopted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 // `async fn` so the git-info subprocesses run on the blocking pool instead
@@ -399,7 +532,7 @@ async fn create_empty_workspace_impl<R: tauri::Runtime>(
     // scripts, no .mcp.json injection. Git metadata still populates
     // (cheap, harmless for non-repo paths).
     if !skip_setup.unwrap_or(false) {
-        spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path);
+        spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path, &Checkpoint::default());
 
         if crate::mcp_server::is_auto_mcp_enabled(&app) {
             crate::mcp_server::upsert_mcp_config(&repo_path);
@@ -413,6 +546,7 @@ async fn create_empty_workspace_impl<R: tauri::Runtime>(
         // exact directory the workspace was anchored at.
         cwd,
         adopted: false,
+        base_branch: None,
     })
 }
 
@@ -510,7 +644,7 @@ pub async fn create_workspace_with_preset<R: tauri::Runtime>(
     }
 
     // Run setup scripts in background thread
-    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path, &Checkpoint::default());
 
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
@@ -524,10 +658,12 @@ pub async fn create_workspace_with_preset<R: tauri::Runtime>(
 #[tauri::command]
 pub async fn create_worktree_workspace<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
-    state: State<'_, AppStateStore>,
-    db: State<'_, crate::database::DatabaseStore>,
-    pty_state: State<'_, crate::terminal::PtyState>,
-    presets: State<'_, crate::presets::PresetStoreState>,
+    // The app's own stores, which `create_worktree_from_request` reads from
+    // `app`; kept so the command's injected arguments stay as they were.
+    _state: State<'_, AppStateStore>,
+    _db: State<'_, crate::database::DatabaseStore>,
+    _pty_state: State<'_, crate::terminal::PtyState>,
+    _presets: State<'_, crate::presets::PresetStoreState>,
     repo_path: String,
     branch: String,
     new_branch: bool,
@@ -540,41 +676,27 @@ pub async fn create_worktree_workspace<R: tauri::Runtime>(
     select: Option<bool>,
     initial_chat: Option<crate::state::InitialChatPane>,
 ) -> Result<WorkspaceCreated, String> {
-    let created = create_worktree_workspace_impl_with_selection(
+    create_worktree_from_request(
         app,
-        &state,
-        &db,
-        &pty_state,
-        &presets,
-        repo_path,
-        branch,
-        new_branch,
-        base,
-        layout,
-        initial_prompt,
-        agent_preset_id,
-        model_selection,
-        pr_number,
-        select.unwrap_or(true),
-        initial_chat,
+        WorktreeRequest {
+            repo_path,
+            branch,
+            new_branch,
+            // The desktop's "no base selected" forks the checkout's HEAD.
+            base: base.map(WorktreeBase::Ref).unwrap_or(WorktreeBase::RepoHead),
+            layout: crate::workspace_service::parse_layout(&layout)?,
+            preset: agent_preset_id.map(|preset_id| PresetLaunch {
+                preset_id,
+                initial_prompt,
+                model_selection,
+            }),
+            pr_number,
+            select: select.unwrap_or(true),
+            initial_chat,
+            reserved_id: None,
+        },
     )
-    .await?;
-    // Resolve the workspace's cwd (the worktree checkout path) from the
-    // snapshot the impl already populated + emitted, so the frontend gets it
-    // without polling app-state. Empty string only if the workspace somehow
-    // vanished between create and lookup (it never should).
-    let cwd = state
-        .snapshot()
-        .workspaces
-        .iter()
-        .find(|w| w.workspace_id.0 == created.workspace_id)
-        .map(|w| w.cwd.clone())
-        .unwrap_or_default();
-    Ok(WorkspaceCreated {
-        workspace_id: created.workspace_id,
-        cwd,
-        adopted: created.adopted,
-    })
+    .await
 }
 
 /// Find a live workspace that is already checked out at `worktree_path`
@@ -639,84 +761,41 @@ pub(crate) fn find_live_workspace_for_worktree_path(
         .map(|w| w.workspace_id.0.clone())
 }
 
-/// Result of [`create_worktree_workspace_impl`]: the resolved workspace id
-/// plus whether it was ADOPTED (a live workspace already claimed the
-/// worktree path, so `initial_prompt`/`agent_preset_id` were dropped and no
-/// create-side effects ran) rather than freshly created. Callers surface
-/// `adopted` so the frontend can tell the user their prompt wasn't sent.
-pub(crate) struct CreatedWorktreeWorkspace {
-    pub workspace_id: String,
-    pub adopted: bool,
+/// Create a git worktree and its workspace, or adopt the live workspace that
+/// already holds that checkout. Shared by the desktop's "+ New worktree" and
+/// branch-picker "Fork" flows, the control socket, agent launches, follow-up
+/// tasks, plugins and unarchive.
+///
+/// One atomic operation: git worktree creation, workspace and layout
+/// hydration, PTY spawn, setup scripts, `.mcp.json` autoconfig, and the
+/// preset launch with prompt injection. A new workspace takes
+/// `request.reserved_id` when given.
+pub(crate) async fn create_worktree_from_request<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    request: WorktreeRequest,
+) -> Result<WorkspaceCreated, String> {
+    create_worktree_checked(app, request, &Checkpoint::default()).await
 }
 
-/// Shared implementation behind both the Tauri command (frontend "+
-/// New worktree" / branch-picker "Fork" flow) and the
-/// `create_worktree_workspace` control-socket command exposed via the
-/// Phase 1.5 `worktree_create` MCP tool.
-///
-/// Takes refs instead of `State<>` wrappers so the socket dispatcher
-/// (which already pulls each state via `app.state()`) and any future
-/// non-Tauri caller can drive it. The body is byte-identical to the
-/// pre-extraction Tauri command — moving it preserves git worktree
-/// creation, workspace+layout hydration, PTY spawn, setup scripts,
-/// `.mcp.json` autoconfig, and the preset-launch-with-prompt-injection
-/// branch as one atomic operation.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
+/// [`create_worktree_from_request`], asking `checkpoint` again once the
+/// lifecycle lock is held and once the checkout exists.
+pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
-    state: &AppStateStore,
-    db: &crate::database::DatabaseStore,
-    pty_state: &crate::terminal::PtyState,
-    presets: &crate::presets::PresetStoreState,
-    repo_path: String,
-    branch: String,
-    new_branch: bool,
-    base: Option<String>,
-    layout: String,
-    initial_prompt: Option<String>,
-    agent_preset_id: Option<String>,
-    model_selection: Option<crate::agent_capability::ModelSelection>,
-    pr_number: Option<u32>,
-) -> Result<CreatedWorktreeWorkspace, String> {
-    create_worktree_workspace_impl_with_selection(
-        app,
-        state,
-        db,
-        pty_state,
-        presets,
+    request: WorktreeRequest,
+    checkpoint: &Checkpoint,
+) -> Result<WorkspaceCreated, String> {
+    let WorktreeRequest {
         repo_path,
         branch,
         new_branch,
         base,
         layout,
-        initial_prompt,
-        agent_preset_id,
-        model_selection,
+        preset,
         pr_number,
-        true,
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    state: &AppStateStore,
-    db: &crate::database::DatabaseStore,
-    pty_state: &crate::terminal::PtyState,
-    presets: &crate::presets::PresetStoreState,
-    repo_path: String,
-    branch: String,
-    new_branch: bool,
-    base: Option<String>,
-    layout: String,
-    initial_prompt: Option<String>,
-    agent_preset_id: Option<String>,
-    model_selection: Option<crate::agent_capability::ModelSelection>,
-    pr_number: Option<u32>,
-    select: bool,
-    initial_chat: Option<crate::state::InitialChatPane>,
-) -> Result<CreatedWorktreeWorkspace, String> {
+        select,
+        initial_chat,
+        reserved_id,
+    } = request;
     if let Some(chat) = &initial_chat {
         crate::commands::agent_chat::feature_flag_on(
             &app.state::<crate::observability::ObservabilityStore>(),
@@ -725,23 +804,14 @@ pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runt
             return Err("thread id is required".into());
         }
     }
-    let layout = match layout.as_str() {
-        "single" => WorkspacePresetLayout::Single,
-        "pair" => WorkspacePresetLayout::Pair,
-        "quad" => WorkspacePresetLayout::Quad,
-        "six" => WorkspacePresetLayout::Six,
-        "eight" => WorkspacePresetLayout::Eight,
-        "shell_browser" => WorkspacePresetLayout::ShellBrowser,
-        // The inline "+ New worktree…" chat flow uses `empty` so the
-        // resulting workspace has no terminal/PTY, no tab, and no
-        // surface — the chat pane is attached afterward by the
-        // frontend via `agent_chat_create_pane`.
-        "empty" => WorkspacePresetLayout::Empty,
-        _ => return Err(format!("Unsupported layout: {layout}")),
-    };
+    let state = app.state::<AppStateStore>();
+    let db = app.state::<crate::database::DatabaseStore>();
 
     // Cleanup must not delete a checkout while it is being opened.
     let _opening = crate::worktree_cleanup::opening_guard().await;
+    // The lock may have waited out a checkout removal: a requester whose
+    // authority was withdrawn meanwhile checks nothing out.
+    checkpoint.check()?;
 
     // Validate repo_path is a git repository before creating anything
     if crate::config::workspace_config::find_git_root(Path::new(&repo_path)).is_none() {
@@ -752,31 +822,67 @@ pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runt
     // blocking pool so it doesn't stall a Tokio worker.
     //
     // Also resolves the branch the new worktree forks from, for display.
-    // Only a freshly created branch has one: without an explicit `base`,
+    // Only a freshly created branch has one: without a base,
     // `git worktree add -b` forks the repo's checked-out branch, so that is
     // read BEFORE the add. A reused on-disk worktree keeps whatever it was
     // forked from originally, which we can't know, so it records nothing.
-    let (worktree_path, base_branch) = {
+    let (worktree_path, base_branch, made_here) = {
         let repo_path = repo_path.clone();
         let branch = branch.clone();
-        let base = base.clone();
         tokio::task::spawn_blocking(move || {
             let repo = Path::new(&repo_path);
-            let base_branch = if new_branch
-                && !crate::git::conventional_worktree_path(repo, &branch)
-                    .is_some_and(|p| p.exists())
-            {
-                base.clone().or_else(|| crate::git::current_branch(repo))
+            // What `git worktree add` starts from, and what the workspace
+            // records as its base (a commit records its label, else itself).
+            let (start, label) = match base {
+                WorktreeBase::RepoHead => (None, None),
+                WorktreeBase::DefaultBranch => {
+                    let name = crate::git::resolve_default_branch(repo);
+                    (name.clone(), name)
+                }
+                WorktreeBase::Ref(name) => (Some(name.clone()), Some(name)),
+                WorktreeBase::Commit { sha, label } => {
+                    let label = label.unwrap_or_else(|| sha.clone());
+                    (Some(sha), Some(label))
+                }
+            };
+            // Nothing at the path yet: the checkout below is this call's own.
+            let made_here = !crate::git::conventional_worktree_path(repo, &branch)
+                .is_some_and(|p| p.exists());
+            let base_branch = if new_branch && made_here {
+                label.or_else(|| crate::git::current_branch(repo))
             } else {
                 None
             };
-            crate::git::git_create_worktree(repo, &branch, new_branch, base.as_deref(), pr_number)
-                .map(|path| (path, base_branch))
+            crate::git::git_create_worktree(repo, &branch, new_branch, start.as_deref(), pr_number)
+                .map(|path| (path, base_branch, made_here))
         })
         .await
         .map_err(|e| format!("git_create_worktree task join failed: {e}"))??
     };
     let wt_path_buf = PathBuf::from(&worktree_path);
+    // Read before the claim, so that no wait comes between the check below
+    // and what starts in the workspace.
+    let git_info = {
+        let path = wt_path_buf.clone();
+        tokio::task::spawn_blocking(move || gather_workspace_git_info(&path))
+            .await
+            .unwrap_or_default()
+    };
+    // The checkout can take long (a fetch, a large tree). A requester whose
+    // authority was withdrawn meanwhile gets no workspace, terminals, setup
+    // scripts or preset. The checkout stays, since removing it here could
+    // race a concurrent create that adopts it. Nothing ran in it: a later
+    // worktree create of the branch takes it over, while a new-branch launch
+    // refuses the branch as taken. One this call made is remembered as a
+    // closed workspace's, so cleanup offers it once stale.
+    if let Err(error) = checkpoint.check() {
+        if made_here {
+            crate::worktree_cleanup::remember_unclaimed_checkout(&db, &worktree_path, &branch);
+        }
+        return Err(format!(
+            "{error}; the checkout at {worktree_path} was kept and nothing was started in it"
+        ));
+    }
 
     // ADOPT-EXISTING GUARD. `git_create_worktree` does not always create
     // something: when the conventional path is already on disk and
@@ -824,6 +930,7 @@ pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runt
         |snapshot| find_live_workspace_for_worktree_path(snapshot, &wt_path_buf, &branch),
         select,
         initial_chat,
+        reserved_id,
     );
     let workspace_id = match claim {
         WorktreeWorkspaceClaim::Adopted(existing_id) => {
@@ -832,27 +939,26 @@ pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runt
             // `active_workspace_id` itself). `activate_workspace_impl` is
             // the same call the unarchive flow uses for an already-open
             // workspace, and it emits app state itself — no second emit
-            // needed. `create_worktree_workspace` resolves the returned id's
-            // `cwd` from the snapshot afterwards, and the adopted workspace
-            // is in that snapshot, so the wrapper's cwd lookup keeps working
-            // unchanged.
+            // needed. The adopted workspace's `cwd` is the checkout it holds.
             if select {
-                activate_workspace_impl(app.clone(), state, existing_id.clone())?;
+                activate_workspace_impl(app.clone(), &state, existing_id.clone())?;
             } else {
-                hydrate_workspace(&app, state, &existing_id);
+                hydrate_workspace(&app, &state, &existing_id);
             }
-            return Ok(CreatedWorktreeWorkspace {
+            return Ok(WorkspaceCreated {
+                cwd: state.workspace_cwd(&existing_id).unwrap_or_default(),
                 workspace_id: existing_id,
                 adopted: true,
+                base_branch: None,
             });
         }
         WorktreeWorkspaceClaim::Created(id) => id,
     };
 
     state.set_workspace_project_root(&workspace_id.0, repo_path.clone());
-    state.set_workspace_base_branch(&workspace_id.0, base_branch);
+    state.set_workspace_base_branch(&workspace_id.0, base_branch.clone());
 
-    populate_git_info_async(&state, &workspace_id.0, wt_path_buf.clone()).await;
+    apply_workspace_git_info(&state, &workspace_id.0, git_info);
 
     if let Some(pr_num) = pr_number {
         // Seed values only — the pollers replace all four the moment they
@@ -882,7 +988,7 @@ pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runt
     }
 
     // Run setup scripts in background thread
-    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf, checkpoint);
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
@@ -890,10 +996,17 @@ pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runt
     }
 
     // Auto-launch agent preset if requested
-    if let Some(ref preset_id) = agent_preset_id {
-        let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let preset = store.presets.iter().find(|p| p.id == *preset_id).cloned();
-        drop(store);
+    if let Some(PresetLaunch {
+        preset_id,
+        initial_prompt,
+        model_selection,
+    }) = preset
+    {
+        let preset = {
+            let presets = app.state::<crate::presets::PresetStoreState>();
+            let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
+            store.presets.iter().find(|p| p.id == preset_id).cloned()
+        };
 
         if let Some(preset) = preset {
             let commands: Vec<String> = if preset.commands.is_empty() {
@@ -912,7 +1025,7 @@ pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runt
                     .collect()
             };
 
-            let sessions_arc = pty_state.sessions.clone();
+            let sessions_arc = app.state::<crate::terminal::PtyState>().sessions.clone();
 
             // Grab the default tab's ID and session so the first preset command
             // reuses it instead of creating a duplicate tab.
@@ -985,9 +1098,11 @@ pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runt
     }
 
     crate::state::emit_app_state(&app);
-    Ok(CreatedWorktreeWorkspace {
+    Ok(WorkspaceCreated {
         workspace_id: workspace_id.0,
+        cwd: worktree_path,
         adopted: false,
+        base_branch,
     })
 }
 
@@ -1014,7 +1129,7 @@ pub async fn import_worktree_workspace<R: tauri::Runtime>(
 /// "Import worktree" affordance and the unarchive restore path: an
 /// archived worktree recorded at a NON-conventional path still exists on
 /// disk (archiving touches nothing), so restore adopts it in place rather
-/// than routing through `create_worktree_workspace_impl`, whose
+/// than routing through `create_worktree_from_request`, whose
 /// `git worktree add` at the conventional path would fail with "<branch>
 /// is already used by worktree at <that path>".
 pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
@@ -1062,7 +1177,7 @@ pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
         terminal::spawn_pty_for_session(app.clone(), session_id);
     }
 
-    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf, &Checkpoint::default());
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
@@ -1232,9 +1347,41 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         remove_worktree,
         delete_branch,
         force_delete,
+        // The close dialog's own behaviour: it warns only from the
+        // workspace's ahead count. A detached HEAD's commits go with the
+        // checkout, and the branch with `git branch -D`.
+        CommitLoss::Allow,
+        &Checkpoint::default(),
     )
     .await
     .map(drop)
+}
+
+/// [`close_workspace_with_worktree_impl`], asking `checkpoint` again before
+/// it stops Hermes chats, before each teardown command, before the workspace
+/// leaves, and before any file is deleted. Returns what it kept of what it
+/// was asked to delete.
+pub(crate) async fn close_workspace_checked<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    request: CloseWorkspace,
+    checkpoint: &Checkpoint,
+) -> Result<Option<Kept>, String> {
+    let state = app.state::<AppStateStore>();
+    let db = app.state::<crate::database::DatabaseStore>();
+    close_workspace_tracked(
+        app.clone(),
+        &state,
+        &db,
+        request.workspace_id,
+        CloseRoute::Tracked,
+        request.remove_worktree,
+        Some(request.delete_branch),
+        Some(request.force),
+        request.commits,
+        checkpoint,
+    )
+    .await
+    .map(|closed| closed.kept)
 }
 
 /// Which route a close came in by. They differ only in where teardown
@@ -1559,8 +1706,16 @@ pub(crate) fn close_delegated_child_workspace<R: tauri::Runtime>(
     stops
 }
 
-/// The close itself, behind every close route. Resolves with the workspace
-/// the UI should show next.
+/// What a close did.
+struct Closed {
+    /// The workspace the UI should show next.
+    fallback: String,
+    /// What it kept of what it was asked to delete, with
+    /// [`CommitLoss::Refuse`] only.
+    kept: Option<Kept>,
+}
+
+/// The close itself, behind every close route.
 async fn close_workspace_tracked<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &AppStateStore,
@@ -1570,7 +1725,9 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     remove_worktree: bool,
     delete_branch: Option<bool>,
     force_delete: Option<bool>,
-) -> Result<String, String> {
+    commits: CommitLoss,
+    checkpoint: &Checkpoint,
+) -> Result<Closed, String> {
     // Fast refusal while the workspace is still intact. Not under the
     // Hermes lifecycle lock: teardown must not serialize every close, so
     // the hold is re-checked under the lock right before the delete.
@@ -1652,6 +1809,27 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
             }
         }
     }
+    // Nor may a close that must not discard work lose a commit nothing
+    // else keeps: one a detached HEAD made, or one only the branch it
+    // deletes holds. The check above sees neither without an upstream.
+    // Refused here for the same reason, before any teardown. Teardown and
+    // agents not yet stopped can still commit, so the removal checks both
+    // again and keeps what holds such a commit (`git::remove_worktree`).
+    if remove_worktree && commits == CommitLoss::Refuse {
+        if let Some(wt_path) = worktree_path.clone() {
+            if Path::new(&wt_path).exists() {
+                let branch = branch.clone().filter(|_| delete_branch.unwrap_or(false));
+                tokio::task::spawn_blocking(move || {
+                    crate::git::ensure_commits_kept(Path::new(&wt_path), branch.as_deref())
+                })
+                .await
+                .map_err(|e| format!("commit pre-flight task join failed: {e}"))??;
+            }
+        }
+    }
+    // The pre-flight read git: a requester whose authority was withdrawn
+    // meanwhile does not get to stop this workspace's Hermes chats either.
+    checkpoint.check()?;
 
     // Hermes owns background work with no drain acknowledgment. Await foreground
     // cancellation, retain files and defer teardown scripts while cleanup is pending.
@@ -1669,20 +1847,32 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
             }
         }
     }
+    // So may stopping Hermes: a requester whose authority was withdrawn
+    // meanwhile runs no teardown script and closes nothing.
+    checkpoint.check()?;
     // Run teardown scripts before closing. Never for a chat child
-    // workspace: its folder is its parent's, still in use.
+    // workspace: its folder is its parent's, still in use. The scripts
+    // block until they finish, and one may call `codemux` back, so they run
+    // on the blocking pool: a blocked async worker can leave nobody polling
+    // the control socket to answer it. Each asks the checkpoint first.
+    let mut torn_down = Ok(());
     if !force && !hermes_pending {
-        if let Some(ref folder) = teardown {
-            if let Err(e) = crate::scripts::run_teardown_scripts(
-                Path::new(folder),
-                &ws_title,
-                &workspace_id,
-                Some(db),
-            ) {
-                return Err(format!("Teardown failed: {e}\nUse force delete to skip teardown."));
-            }
+        if let Some(folder) = teardown {
+            let commands = crate::scripts::teardown_commands(Path::new(&folder), Some(db));
+            let (title, id, checkpoint) = (ws_title.clone(), workspace_id.clone(), checkpoint.clone());
+            torn_down = tokio::task::spawn_blocking(move || {
+                crate::scripts::run_teardown_scripts(Path::new(&folder), &title, &id, &commands, &checkpoint)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("teardown task failed: {error}")));
         }
     }
+    // So may teardown: a requester whose authority was withdrawn meanwhile
+    // closes nothing, so the workspace stays open and its chats keep
+    // running. Asked before the teardown's own result, so a teardown it
+    // stopped fails with the refusal's code.
+    checkpoint.check()?;
+    torn_down.map_err(|e| format!("Teardown failed: {e}\nUse force delete to skip teardown."))?;
 
     let detached = detach_workspace(&app, state, db, &workspace_id)?;
     #[cfg(test)]
@@ -1694,7 +1884,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     let Some(wt_path) = deleting else {
         detached.retire(&app);
         crate::state::emit_app_state(&app);
-        return Ok(fallback);
+        return Ok(Closed { fallback, kept: None });
     };
 
     // Agents run inside the worktree; deleting it while one is still
@@ -1702,7 +1892,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // its chats closes the workspaces of the tasks they delegated (see
     // `delegation::close_tasks`), and their stops are awaited too. A stop
     // that was not acknowledged keeps the files.
-    let Detached { claim, earlier, threads, .. } = detached;
+    let Detached { closing, claim, earlier, threads, .. } = detached;
     if let Err(error) = crate::commands::agent_chat::shutdown_agent_chat_threads_and_wait(
         &app,
         &workspace_id,
@@ -1740,6 +1930,15 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // either the hold is visible here or the start finds the
     // directory gone. Held only for this check and the delete.
     let _hermes_lifecycle = crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await;
+    // Stopping the agents and taking the lock can take long. A requester
+    // whose authority was withdrawn meanwhile deletes nothing: the close
+    // stands, and cleanup treats the checkout as after a close that kept it.
+    if let Err(error) = checkpoint.check() {
+        if let (Some(ws), Some(claim)) = (closing.as_ref(), claim) {
+            crate::worktree_cleanup::retire_workspace(&app, claim, ws, Default::default(), Default::default(), true);
+        }
+        return Err(format!("{error}; the workspace was closed and its files were kept"));
+    }
     if db.hermes_cleanup_pending(&workspace_id)? || db.hermes_cleanup_pending_path(&wt_path)? {
         return Err("Hermes worktree cleanup pending: files retained until background completion can be verified.".into());
     }
@@ -1769,14 +1968,25 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // with no live row left to escalate from. Forcing here closes
     // that hole; the pre-flight remains the only place uncommitted
     // work can block the close.
-    tokio::task::spawn_blocking(move || {
-        crate::git::git_remove_worktree(Path::new(&wt_path), branch_to_delete.as_deref(), true)
+    //
+    // Commits are another matter. With `CommitLoss::Refuse` the removal
+    // checks again what holds the only copy of one, now that nothing works
+    // in the checkout, and keeps it: the close stands and reports why.
+    let kept = tokio::task::spawn_blocking(move || {
+        crate::git::remove_worktree(Path::new(&wt_path), branch_to_delete.as_deref(), commits, true)
     })
     .await
     .map_err(|e| format!("git_remove_worktree task join failed: {e}"))??;
+    // A checkout kept for its HEAD's commits: cleanup treats it as after a
+    // close that kept it, and keeps it while its HEAD is detached.
+    if matches!(kept, Some(Kept::Checkout(_))) {
+        if let (Some(ws), Some(claim)) = (closing.as_ref(), claim) {
+            crate::worktree_cleanup::retire_workspace(&app, claim, ws, Default::default(), Default::default(), true);
+        }
+    }
 
     crate::state::emit_app_state(&app);
-    Ok(fallback)
+    Ok(Closed { fallback, kept })
 }
 
 /// The ONE root-protection predicate shared by every file-deletion
@@ -2015,8 +2225,9 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
-    pty_state: &crate::terminal::PtyState,
-    presets: &crate::presets::PresetStoreState,
+    // Read from `app` by the worktree restore; kept for the callers' shape.
+    _pty_state: &crate::terminal::PtyState,
+    _presets: &crate::presets::PresetStoreState,
     archive_id: String,
     select: bool,
 ) -> Result<String, String> {
@@ -2125,7 +2336,7 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
         // still exists on disk (archiving touched nothing) but lives
         // somewhere other than the `~/.codemux/worktrees/<repo>/<branch>`
         // path the create flow would target. Adopt it in place —
-        // `create_worktree_workspace_impl` would compute the conventional
+        // `create_worktree_from_request` would compute the conventional
         // path and its `git worktree add` would fail with "<branch> is
         // already used by worktree at <recorded path>". When the recorded
         // path IS the conventional one (or the dir is gone and the branch
@@ -2148,23 +2359,20 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
             )
             .await?
         } else {
-            create_worktree_workspace_impl_with_selection(
+            create_worktree_from_request(
                 app.clone(),
-                state,
-                db,
-                pty_state,
-                presets,
-                repo_path,
-                branch,
-                /*new_branch=*/ false,
-                /*base=*/ None,
-                "single".to_string(),
-                None,
-                None,
-                None,
-                None,
-                select,
-                None,
+                WorktreeRequest {
+                    repo_path,
+                    branch,
+                    new_branch: false,
+                    base: WorktreeBase::RepoHead,
+                    layout: WorkspacePresetLayout::Single,
+                    preset: None,
+                    pr_number: None,
+                    select,
+                    initial_chat: None,
+                    reserved_id: None,
+                },
             )
             .await?
             .workspace_id
@@ -2571,7 +2779,9 @@ pub async fn close_workspace<R: tauri::Runtime>(
     workspace_id: String,
     force_delete: Option<bool>,
 ) -> Result<String, String> {
-    close_workspace_tracked(app, &state, &db, workspace_id, CloseRoute::Plain, false, None, force_delete).await
+    close_workspace_tracked(app, &state, &db, workspace_id, CloseRoute::Plain, false, None, force_delete, CommitLoss::Allow, &Checkpoint::default())
+        .await
+        .map(|closed| closed.fallback)
 }
 
 #[tauri::command]
@@ -3175,13 +3385,16 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
 // ---- Setup/teardown scripts ----
 
 /// Spawn setup scripts in a background thread so workspace creation isn't blocked.
-/// Runs the full pipeline: .codemuxinclude file copy + setup commands.
+/// Runs the full pipeline: .codemuxinclude file copy + setup commands. The
+/// create has returned by then, so it asks `checkpoint`'s
+/// [`Checkpoint::background`] before the copy and before each command.
 fn spawn_setup_scripts<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     workspace_id: &str,
     workspace_path: &Path,
+    checkpoint: &Checkpoint,
 ) {
     // Pre-resolve root path on the calling thread to avoid race conditions.
     let root_path = crate::scripts::resolve_root_path(workspace_path);
@@ -3208,10 +3421,20 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
     let ws_path = workspace_path.to_path_buf();
     let ws_id = workspace_id.to_string();
     let app2 = app.clone();
+    let checkpoint = checkpoint.background();
 
     std::thread::spawn(move || {
         // Wait for frontend to mount the overlay and register event listeners
         std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // A requester whose grant was withdrawn since the create returned
+        // copies nothing and starts no command. The copy and each command can
+        // take long, so the runner asks again before every command.
+        if let Err(refusal) = checkpoint.check() {
+            let error = crate::scripts::report_setup_stopped(&app2, &ws_id, config.as_ref(), &refusal);
+            eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {error}");
+            return;
+        }
 
         // Step 1: Process worktree includes (file → setting → defaults)
         match crate::scripts::process_worktree_includes(&root_path, &ws_path, &setting_patterns) {
@@ -3235,7 +3458,7 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
             if !config.setup.is_empty() {
                 if let Err(e) = crate::scripts::run_setup_scripts_with_config(
                     &ws_path, &ws_title, &ws_id, &app2, &config, &root_path,
-                    ws_branch.as_deref(), Some(port),
+                    ws_branch.as_deref(), Some(port), &checkpoint,
                 ) {
                     eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {e}");
                 }
@@ -3489,8 +3712,8 @@ mod empty_workspace_skip_setup_tests {
 mod phase_1_5_workspace_create_path_tests {
     //! Phase 1.5 regression coverage for the `workspace_create` MCP tool's
     //! `path` argument. The bug pre-fix was at `control.rs:573`: the
-    //! socket arm hardcoded `None` as the fourth argument to
-    //! `create_workspace_impl`, dropping the path the brain asked for.
+    //! socket arm hardcoded `None` as the path it passed to the workspace
+    //! create helper, dropping the path the brain asked for.
     //! These tests pin the state-layer contract the fix relies on —
     //! `create_workspace_at_path(path)` must produce a workspace whose
     //! `cwd` matches the path the caller supplied. If the underlying
@@ -3526,10 +3749,9 @@ mod phase_1_5_workspace_create_path_tests {
 
     #[test]
     fn create_workspace_without_path_falls_back_to_current_root() {
-        // The None path of `create_workspace_impl` calls
-        // `state.create_workspace()` (no path), which falls back to
-        // `current_project_root()` resolution downstream. Here we just
-        // pin that the no-path constructor produces a workspace at all.
+        // With no path, `open_workspace_impl` falls back to
+        // `current_project_root()`. Here we just pin that the no-path
+        // constructor produces a workspace at all.
         let store = AppStateStore::default();
         let snap_before = store.snapshot();
         let ws_id = store.create_workspace();
@@ -4703,7 +4925,7 @@ mod archive_guard_tests {
 #[cfg(test)]
 mod worktree_adopt_tests {
     //! Coverage for the adopt-existing guard in
-    //! [`create_worktree_workspace_impl`].
+    //! [`create_worktree_from_request`].
     //!
     //! `git_create_worktree` short-circuits and returns an ALREADY-EXISTING
     //! checkout when the conventional path is on disk and registered to the
@@ -4726,7 +4948,7 @@ mod worktree_adopt_tests {
     use tempfile::TempDir;
 
     /// Build a worktree-backed workspace the way
-    /// `create_worktree_workspace_impl` does: create at the worktree path,
+    /// `create_worktree_from_request` does: create at the worktree path,
     /// then stamp `worktree_path` via `set_workspace_worktree`.
     fn worktree_workspace(store: &AppStateStore, path: &Path, branch: &str) -> String {
         let id = store.create_workspace_with_layout(path.to_path_buf(), WorkspacePresetLayout::Single);

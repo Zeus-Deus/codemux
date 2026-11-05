@@ -26,6 +26,27 @@ it("writes connector configuration with explicit enabled and nullable public ori
   expect(invoke).toHaveBeenCalledWith("agent_connector_set_config", { enabled: true, publicOrigin: null });
 });
 
+it("sends port only when given", async () => {
+  await commands.agentConnectorSetConfig({ enabled: true, publicOrigin: null, port: 5000 });
+  expect(invoke).toHaveBeenLastCalledWith("agent_connector_set_config", { enabled: true, publicOrigin: null, port: 5000 });
+  await commands.agentConnectorSetConfig({ enabled: false, publicOrigin: "https://box.example.test", port: undefined });
+  expect(invoke).toHaveBeenLastCalledWith("agent_connector_set_config", { enabled: false, publicOrigin: "https://box.example.test" });
+});
+
+it("issues a token with the exact label and access", async () => {
+  const issued = { token: "synthetic-not-a-credential", clientId: "cmcp_token_1", label: "hermes-bot", access: "supervised" };
+  vi.mocked(invoke).mockResolvedValueOnce(issued);
+  expect(await commands.agentConnectorIssue({ label: "hermes-bot", access: "supervised" })).toBe(issued);
+  expect(invoke).toHaveBeenCalledWith("agent_connector_issue", { label: "hermes-bot", access: "supervised" });
+  await commands.agentConnectorIssue({ label: "ci-bot", access: "read_only", expiresInHours: 48 });
+  expect(invoke).toHaveBeenLastCalledWith("agent_connector_issue", { label: "ci-bot", access: "read_only", expiresInHours: 48 });
+});
+
+it("revokes every grant through the exact native command", async () => {
+  await commands.agentConnectorRevokeAll();
+  expect(invoke).toHaveBeenCalledWith("agent_connector_revoke_all");
+});
+
 it.each(["read_only", "supervised", "full_access"] as const)("approves the exact request with %s access", async (access) => {
   await commands.agentConnectorApprove("request-exact", access);
   expect(invoke).toHaveBeenCalledWith("agent_connector_approve", { requestId: "request-exact", access });
@@ -45,7 +66,7 @@ it("uses connector change events only as a sanitized reload signal", async () =>
   expect(cb).toHaveBeenCalledWith(null);
 });
 
-it.each(["status", "config", "approve", "deny", "revoke"])("blocks remote-client %s calls before IPC", async (action) => {
+it.each(["status", "config", "approve", "deny", "revoke", "issue", "revokeAll"])("blocks remote-client %s calls before IPC", async (action) => {
   (window as unknown as { __CODEMUX_REMOTE__: boolean }).__CODEMUX_REMOTE__ = true;
   const call = () => {
     switch (action) {
@@ -53,6 +74,8 @@ it.each(["status", "config", "approve", "deny", "revoke"])("blocks remote-client
       case "config": return commands.agentConnectorSetConfig({ enabled: true, publicOrigin: null });
       case "approve": return commands.agentConnectorApprove("request-1", "read_only");
       case "deny": return commands.agentConnectorDeny("request-1");
+      case "issue": return commands.agentConnectorIssue({ label: "hermes-bot", access: "supervised" });
+      case "revokeAll": return commands.agentConnectorRevokeAll();
       default: return commands.agentConnectorRevoke("client-1");
     }
   };

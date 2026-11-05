@@ -3,9 +3,9 @@
 //! Routes:
 //!
 //! - `GET  /health`         — unauthenticated liveness probe.
-//! - `GET  /tools/list`     — list of MCP tools the daemon exposes
-//!                            (auth required). Used by `codemux-remote mcp`
-//!                            to populate its tools/list response.
+//! - `GET  /tools/list`     — the tool catalog over HTTP (auth required),
+//!                            for callers other than `codemux-remote mcp`,
+//!                            which lists the compiled catalog itself.
 //! - `POST /tools/call`     — invoke one tool by name. Body:
 //!                            `{ "name": "...", "arguments": {...} }`.
 //!                            Response: `{ "ok": true, "data": ... }`

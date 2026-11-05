@@ -398,7 +398,7 @@ pub fn resolve_claude_api_model_id(
 //
 // Anthropic's SDK / OAuth path exposes no model-list endpoint, so for
 // subscription users we still serve the hand-maintained `models()` list
-// above. Users with `ANTHROPIC_API_KEY` set get a live harvest:
+// above. API-key and proxy-token users can also get a live harvest:
 // `GET /v1/models` returns the current model id list, which we merge
 // against the maintained per-id metadata. Ids we recognise keep their
 // precise metadata; ids we don't (e.g. a freshly-released model) get
@@ -423,8 +423,8 @@ struct ApiModelsResponse {
 
 #[derive(Debug, Clone)]
 pub enum HarvestError {
-    /// `ANTHROPIC_API_KEY` is not set — caller should fall back to the
-    /// maintained list rather than treat this as a failure.
+    /// Neither an API key nor a bearer token is configured; the sidecar
+    /// remains the source of the model catalog.
     NoApiKey,
     /// Network / HTTP / decode failure — original message preserved.
     HarvestFailed { message: String },
@@ -520,24 +520,32 @@ impl ClaudeCapabilityCache {
 }
 
 /// Live-harvest the Claude model list from Anthropic's REST API.
-/// Requires `ANTHROPIC_API_KEY` in the environment; returns
+/// Uses the configured API key or bearer token and endpoint; returns
 /// [`HarvestError::NoApiKey`] otherwise so the caller (`get_or_harvest`)
 /// can fall through to the maintained bundle.
 async fn harvest_via_api() -> Result<ProviderChatCapabilities, HarvestError> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or(HarvestError::NoApiKey)?;
+    let settings = super::auth::config_home().and_then(|home| super::auth::read_settings(&home));
+    let configured = |name: &str| {
+        settings
+            .as_ref()
+            .and_then(|settings| settings.get("env"))
+            .and_then(|env| env.get(name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| std::env::var(name).ok())
+    };
+    let base = configured("ANTHROPIC_BASE_URL");
+    let key = configured("ANTHROPIC_API_KEY");
+    let token = configured("ANTHROPIC_AUTH_TOKEN");
     let client = reqwest::Client::builder()
+        // A proxy redirect must not forward its x-api-key to another host.
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(HARVEST_TIMEOUT)
         .build()
         .map_err(|e| HarvestError::HarvestFailed {
             message: format!("client build: {e}"),
         })?;
-    let resp = client
-        .get(format!("{ANTHROPIC_API_BASE}/v1/models?limit=1000"))
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_API_VERSION)
+    let resp = api_models_request(&client, base.as_deref(), key.as_deref(), token.as_deref())?
         .send()
         .await
         .map_err(|e| HarvestError::HarvestFailed {
@@ -550,13 +558,58 @@ async fn harvest_via_api() -> Result<ProviderChatCapabilities, HarvestError> {
             message: format!("HTTP {status}: {body}"),
         });
     }
-    let parsed: ApiModelsResponse =
-        resp.json()
-            .await
-            .map_err(|e| HarvestError::HarvestFailed {
-                message: format!("decode: {e}"),
-            })?;
-    Ok(build_capabilities_from_live(parsed.data))
+    let parsed: ApiModelsResponse = resp.json().await.map_err(|e| HarvestError::HarvestFailed {
+        message: format!("decode: {e}"),
+    })?;
+    let caps = build_capabilities_from_live(parsed.data);
+    nonempty_catalog(caps)
+}
+
+fn nonempty_catalog(caps: ProviderChatCapabilities) -> Result<ProviderChatCapabilities, HarvestError> {
+    if caps.models.is_empty() {
+        return Err(HarvestError::HarvestFailed {
+            message: "API returned an empty model list".into(),
+        });
+    }
+    Ok(caps)
+}
+
+fn api_models_request(
+    client: &reqwest::Client,
+    base: Option<&str>,
+    api_key: Option<&str>,
+    auth_token: Option<&str>,
+) -> Result<reqwest::RequestBuilder, HarvestError> {
+    let nonempty = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let key = nonempty(api_key);
+    let token = nonempty(auth_token);
+    if key.is_none() && token.is_none() {
+        return Err(HarvestError::NoApiKey);
+    }
+    let base = nonempty(base).unwrap_or_else(|| ANTHROPIC_API_BASE.into());
+    let endpoint = reqwest::Url::parse(&format!(
+        "{}/v1/models?limit=1000",
+        base.trim_end_matches('/')
+    ))
+    .ok()
+    .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+    .ok_or_else(|| HarvestError::HarvestFailed {
+        message: "invalid ANTHROPIC_BASE_URL".into(),
+    })?;
+    let request = client
+        .get(endpoint)
+        .header("anthropic-version", ANTHROPIC_API_VERSION);
+    // Claude Code prefers ANTHROPIC_AUTH_TOKEN over ANTHROPIC_API_KEY, so a
+    // proxy token wins over an API key inherited from the shell.
+    Ok(match token {
+        Some(token) => request.bearer_auth(token),
+        None => request.header("x-api-key", key.expect("credentials checked above")),
+    })
 }
 
 /// Merge a live model list with the hand-maintained per-id metadata.
@@ -1263,6 +1316,75 @@ fn merge_sdk_with_maintained(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_readiness_empty_api_catalog_falls_back() {
+        for response in [json!({"data": []}), json!({"data": [{"id":""}]})] {
+            let response: ApiModelsResponse = serde_json::from_value(response).unwrap();
+            assert!(matches!(
+                nonempty_catalog(build_capabilities_from_live(response.data)),
+                Err(HarvestError::HarvestFailed { .. })
+            ));
+        }
+        assert!(
+            nonempty_catalog(build_capabilities_from_live(vec![ApiModel {
+                id: "claude-haiku-4-5".into(),
+                display_name: "Haiku".into(),
+            }]))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn proxy_readiness_api_harvest_uses_endpoint_and_auth_precedence() {
+        let client = reqwest::Client::new();
+        for (base, key, token, header, expected, url) in [
+            (
+                Some("http://localhost:8080/proxy/"),
+                Some("test-key"),
+                Some("test-token"),
+                "authorization",
+                "Bearer test-token",
+                "http://localhost:8080/proxy/v1/models?limit=1000",
+            ),
+            (
+                Some("https://proxy.example"),
+                None,
+                Some("test-token"),
+                "authorization",
+                "Bearer test-token",
+                "https://proxy.example/v1/models?limit=1000",
+            ),
+            (
+                None,
+                Some("test-key"),
+                None,
+                "x-api-key",
+                "test-key",
+                "https://api.anthropic.com/v1/models?limit=1000",
+            ),
+        ] {
+            let request = api_models_request(&client, base, key, token)
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(request.url().as_str(), url);
+            assert_eq!(request.headers()[header], expected);
+            if header == "authorization" {
+                assert!(!request.headers().contains_key("x-api-key"));
+            } else {
+                assert!(!request.headers().contains_key("authorization"));
+            }
+        }
+        assert!(matches!(
+            api_models_request(&client, Some("https://proxy.example"), None, Some(" ")),
+            Err(HarvestError::NoApiKey)
+        ));
+        assert!(matches!(
+            api_models_request(&client, Some("invalid endpoint"), Some("test-key"), None),
+            Err(HarvestError::HarvestFailed { .. })
+        ));
+    }
 
     #[test]
     fn fallback_includes_core_roster() {

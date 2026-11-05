@@ -12,6 +12,7 @@ pub mod gateway;
 pub mod http_client;
 pub mod parser;
 pub mod paths;
+pub mod protocol;
 pub mod registry;
 pub mod runtime;
 pub(crate) mod thread_gateway;
@@ -95,6 +96,19 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
+    /// A provider config's own entry for Codemux: one named `codemux` (the
+    /// name provider CLIs and the outside-assistant guide use), or one that
+    /// runs `codemux mcp` under any other name. Codemux's built-in row already
+    /// serves those tools to every chat, under that chat's permission ceiling.
+    /// Started from the registry, a copy would reach the socket as an
+    /// agent process at full access, so it is never listed or started.
+    /// `own` is this app's executable ([`crate::mcp_server::codemux_mcp_command`]).
+    pub(crate) fn is_codemux_entry(&self, own: &std::path::Path) -> bool {
+        let args: Vec<&str> = self.args.iter().map(String::as_str).collect();
+        self.name == "codemux"
+            || (self.transport == McpTransport::Stdio && crate::mcp_server::runs_codemux_mcp(&self.command, &args, own))
+    }
+
     /// Listing is informational. Runtime credentials remain native-only.
     pub fn redacted(mut self) -> Self {
         if !self.args.is_empty() {

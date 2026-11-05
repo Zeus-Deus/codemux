@@ -28,6 +28,7 @@ import {
   useHomeDir,
 } from "@/stores/app-store";
 import { useForceDelete } from "@/hooks/use-force-delete";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { WorktreeCleanupSettings } from "@/components/worktree-cleanup/worktree-cleanup-settings";
 
@@ -46,6 +47,9 @@ import { WorktreeCleanupSettings } from "@/components/worktree-cleanup/worktree-
  *     the sidebar's delete dialog).
  *   - Protected repo-root entries only ever offer "Remove from archive"
  *     — the entry disappears, the files are never touched.
+ *
+ * A paired browser or phone only gets Unarchive: deleting archived
+ * workspaces is desktop-only (web_remote/policy.rs does not allow it).
  */
 
 // Stable empty-array fallback so the zustand selector doesn't hand out a
@@ -236,6 +240,7 @@ function ArchivedEntryRow({
   onDeleteRequest: () => void;
 }) {
   const [unarchiving, setUnarchiving] = useState(false);
+  const remote = isRemoteClient();
   const isRoot = isRootEntry(entry);
   const archivedDate = new Date(entry.archived_at * 1000);
   const isStale =
@@ -295,7 +300,7 @@ function ArchivedEntryRow({
           <ArchiveRestore className="size-3.5" />
           Unarchive
         </Button>
-        {isRoot ? (
+        {remote ? null : isRoot ? (
           <Button
             variant="ghost"
             size="sm"
@@ -415,6 +420,11 @@ export function ArchiveSection() {
           </div>
         </section>
       ))}
+      {isRemoteClient() && (
+        <p className="text-label text-subtle-foreground">
+          Delete archived workspaces from the Codemux desktop app.
+        </p>
+      )}
 
       {deleteTarget && (
         <DeleteArchivedDialog

@@ -1,5 +1,5 @@
 //! Conservative native policy conversion shared by control and delegation.
-use super::ControlError;
+use super::{ControlError, ErrorCode};
 use crate::agent_provider::ProviderKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -117,7 +117,7 @@ impl Ceiling {
         use ProviderKind::*;
         if self.opaque.is_some() {
             return Err(ControlError::new(
-                "unsupported_permission_ceiling",
+                ErrorCode::UnsupportedPermissionCeiling,
                 "Opaque ACP policy has no reviewed cross-provider mode mapping",
             ));
         }
@@ -136,7 +136,7 @@ impl Ceiling {
             // chat's intent; its start would turn `plan` into Ask.
             Grok if self.plan => {
                 return Err(ControlError::new(
-                    "unsupported_permission_ceiling",
+                    ErrorCode::UnsupportedPermissionCeiling,
                     "Grok has no planning mode within this chat's Plan policy",
                 ))
             }
@@ -147,7 +147,7 @@ impl Ceiling {
             OpenCode if self.filesystem == 2 && self.approvals == 2 => "plan",
             _ => {
                 return Err(ControlError::new(
-                    "unsupported_permission_ceiling",
+                    ErrorCode::UnsupportedPermissionCeiling,
                     "This provider has no reviewed native child policy mapping",
                 ))
             }
@@ -162,10 +162,10 @@ impl Ceiling {
             Claude | Codex | Cursor | Grok | Hermes => Some(self.inherited(provider)?),
             // OpenCode has no chat permission picker; its default is unset.
             OpenCode => Some(self.inherited(provider)?).filter(|mode| mode != "default"),
-            _ => return Err(ControlError::new("unsupported_permission_ceiling", "This provider has no workspace permission mapping within this chat's effective policy")),
+            _ => return Err(ControlError::new(ErrorCode::UnsupportedPermissionCeiling, "This provider has no workspace permission mapping within this chat's effective policy")),
         };
         if !Self::for_mode(provider, mode.as_deref()).is_some_and(|target| self.permits(target)) {
-            return Err(ControlError::new("unsupported_permission_ceiling", "This provider has no workspace permission mapping within this chat's effective policy"));
+            return Err(ControlError::new(ErrorCode::UnsupportedPermissionCeiling, "This provider has no workspace permission mapping within this chat's effective policy"));
         }
         Ok(mode)
     }

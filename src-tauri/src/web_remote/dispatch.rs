@@ -320,14 +320,8 @@ pub async fn dispatch_invoke<R: Runtime>(
         let _ = out.send(err_text(id, "web-remote: args must be an object"));
         return;
     };
-    if ["deleteWorktree", "deleteBranch", "forceDelete"]
-        .iter()
-        .any(|key| args_map.get(*key).and_then(Value::as_bool) == Some(true))
-    {
-        let _ = out.send(err_text(
-            id,
-            "web-remote: destructive workspace removal is not allowed",
-        ));
+    if let Some(reason) = super::policy::refused_flag(&cmd, args_map) {
+        let _ = out.send(err_text(id, reason));
         return;
     }
     // Identity is diagnostic, never authority; the server-issued connection id
@@ -804,6 +798,63 @@ mod plugins_boundary_tests {
             };
             assert!(frame.contains("REMOTE_UNSUPPORTED"));
             assert!(router.routes.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod destructive_flag_tests {
+    use super::*;
+
+    const BRANCH: &str = "web-remote: deleting a branch is only available in the Codemux desktop app";
+    const FORCE: &str = "web-remote: force delete is only available in the Codemux desktop app";
+    const FILES: &str = "web-remote: deleting worktree files is only available in the Codemux desktop app";
+
+    #[tokio::test]
+    async fn destructive_flags_are_refused_before_channels_or_dispatch() {
+        let app = tauri::test::mock_app();
+        let router = Arc::new(ChannelRouter::default());
+        let (out, mut frames) = crate::web_remote::server::test_outbound();
+        let cases = [
+            ("close_workspace_with_worktree", json!({"workspaceId":"ws","removeWorktree":true,"deleteBranch":true,"forceDelete":false}), BRANCH),
+            ("close_workspace_with_worktree", json!({"workspaceId":"ws","removeWorktree":true,"deleteBranch":false,"forceDelete":true}), FORCE),
+            ("close_workspace", json!({"workspaceId":"ws","forceDelete":true}), FORCE),
+            // `remove_worktree` itself is not allowlisted; an allowlisted
+            // command nobody reviewed for the flag fails closed.
+            ("close_workspace", json!({"workspaceId":"ws","removeWorktree":true}), FILES),
+        ];
+        for (command, mut args, message) in cases {
+            args["channel"] = json!("__CHANNEL__:12");
+            dispatch_invoke(app.handle(), &router, 7, &out, 1, command.into(), args).await;
+            let Message::Text(frame) = frames.recv().await.unwrap() else {
+                panic!("Expected rejection");
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(&frame).unwrap(),
+                json!({"t":"err","id":1,"error":message}),
+                "{command}"
+            );
+            assert!(router.routes.lock().unwrap().is_empty(), "{command}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewed_flags_reach_the_command() {
+        let app = tauri::test::mock_app();
+        let cases = [
+            ("merge_pull_request", json!({"path":"/x","prNumber":1,"method":"squash","deleteBranch":true,"channel":"__CHANNEL__:12"})),
+            ("close_workspace_with_worktree", json!({"workspaceId":"ws","removeWorktree":true,"deleteBranch":false,"forceDelete":false,"channel":"__CHANNEL__:12"})),
+        ];
+        for (command, args) in cases {
+            let router = Arc::new(ChannelRouter::default());
+            let (out, mut frames) = crate::web_remote::server::test_outbound();
+            dispatch_invoke(app.handle(), &router, 7, &out, 1, command.into(), args).await;
+            let Message::Text(frame) = frames.recv().await.unwrap() else {
+                panic!("Expected a reply");
+            };
+            assert!(!frame.contains("only available in the Codemux desktop app"), "{command}: {frame}");
+            // The channel was rewritten, so dispatch went past the guard.
+            assert_eq!(router.routes.lock().unwrap().len(), 1, "{command}: {frame}");
         }
     }
 }

@@ -1043,7 +1043,7 @@ async fn mutate<R: Runtime>(
             options: selected.options,
         };
         let (resolved, caps, _) =
-            agent_control::selection::resolve(app, selection.clone(), &workspace.cwd, true)
+            agent_control::selection::resolve(app, selection.clone(), &workspace.cwd, agent_control::selection::Discovery::Launch)
                 .await
                 .map_err(|e| e.to_string())?;
         let mode = native_mode(
@@ -1235,115 +1235,49 @@ async fn prepare_worktree<R: Runtime>(
         .clone()
         .unwrap_or_else(|| format!("plugins/{}", &command[7..23]));
     for (name, value) in [("branch", branch.as_str()), ("baseRef", base_ref.as_str())] {
-        if value.is_empty()
-            || value.len() > 256
-            || value.starts_with('-')
-            || value.chars().any(char::is_control)
-        {
-            return Err(format!("invalid_input: Invalid {name}"));
-        }
+        crate::workspace_service::check_ref_text(name, value)?;
     }
-    let git = |args: Vec<String>| {
-        let repo = repo.clone();
-        async move {
-            let args: Vec<_> = args.iter().map(String::as_str).collect();
-            super::platform_package::git_run_bounded(Path::new(&repo), &args, 4096, false)
-                .await
-                .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
-        }
-    };
-    if git(vec![
-        "check-ref-format".into(),
-        "--branch".into(),
-        branch.clone(),
-    ])
-    .await?
-        != branch
-    {
-        return Err("invalid_input: Worktree branch must be literal".into());
-    }
-    let exists = super::platform_package::git_run_bounded(
-        Path::new(&repo),
-        &[
-            "for-each-ref",
-            "--count=1",
-            "--format=%(refname)",
-            &format!("refs/heads/{branch}"),
-        ],
-        4096,
-        false,
-    )
-    .await?;
-    if !exists.is_empty()
-        || crate::git::conventional_worktree_path(Path::new(&repo), &branch)
-            .is_some_and(|path| path.exists())
-    {
-        return Err(
-            "conflict: Worktree branch/path already exists; no existing checkout is adopted".into(),
-        );
-    }
-    let base_revision = if *start_from_origin {
-        let remote_branch = base_ref.strip_prefix("origin/").unwrap_or(base_ref);
-        if git(vec![
-            "check-ref-format".into(),
-            "--branch".into(),
-            remote_branch.into(),
-        ])
-        .await?
-            != remote_branch
-        {
-            return Err("invalid_input: A remote base must name a literal origin branch".into());
-        }
-        let fetch_repo = repo.clone();
-        let fetch_branch = remote_branch.to_string();
-        let fetched = tokio::task::spawn_blocking(move || {
-            crate::git::fetch_origin_branch(Path::new(&fetch_repo), &fetch_branch)
-        })
-        .await
-        .map_err(|_| "operation_failed: Origin fetch worker failed")?;
-        if !fetched {
-            return Err("operation_failed: The requested origin base could not be fetched; no stale/local fallback was used".into());
-        }
-        format!("refs/remotes/origin/{remote_branch}")
+    let repo_path = Path::new(&repo);
+    crate::workspace_service::check_new_worktree(repo_path, &branch).await?;
+    let origin = if *start_from_origin {
+        crate::workspace_service::OriginPolicy::Required
     } else {
-        base_ref.clone()
+        crate::workspace_service::OriginPolicy::Local
     };
-    let commit = git(vec![
-        "rev-parse".into(),
-        "--verify".into(),
-        "--end-of-options".into(),
-        format!("{base_revision}^{{commit}}"),
-    ])
-    .await?;
+    let commit = crate::workspace_service::resolve_base(repo_path, base_ref, origin)
+        .await?
+        .commit;
     let base = format!("refs/codemux/plugin-worktrees/{command}");
     platform.authorize(app, caller, "worktrees.create", Some(project))?;
     // An absolute retained ref freezes the reviewed commit, without the shared
     // workspace helper's implicit best-effort origin fetch for a local base.
-    git(vec![
-        "update-ref".into(),
-        base.clone(),
-        commit,
-        String::new(),
-    ])
-    .await?;
-    platform.authorize(app, caller, "worktrees.create", Some(project))?;
-    let created = crate::commands::workspace::create_worktree_workspace_impl_with_selection(
-        app.clone(),
-        &app.state::<AppStateStore>(),
-        &app.state::<DatabaseStore>(),
-        &app.state::<crate::terminal::PtyState>(),
-        &app.state::<crate::presets::PresetStoreState>(),
-        repo,
-        branch,
-        true,
-        Some(base),
-        "empty".into(),
-        None,
-        None,
-        None,
-        None,
+    super::platform_package::git_run_bounded(
+        repo_path,
+        &["update-ref", &base, &commit, ""],
+        4096,
         false,
-        None,
+    )
+    .await?;
+    // The create may queue behind a checkout removal on the lifecycle lock.
+    // It asks for the caller's and the plugin's authority again once it holds
+    // the lock and once the checkout exists, so a grant withdrawn meanwhile
+    // gets no checkout, terminals or setup scripts.
+    let checkpoint = platform.checkpoint(app, caller, "worktrees.create", project);
+    let created = crate::commands::workspace::create_worktree_checked(
+        app.clone(),
+        crate::workspace_service::WorktreeRequest {
+            repo_path: repo,
+            branch,
+            new_branch: true,
+            base: crate::workspace_service::WorktreeBase::Ref(base),
+            layout: crate::state::WorkspacePresetLayout::Empty,
+            preset: None,
+            pr_number: None,
+            select: false,
+            initial_chat: None,
+            reserved_id: None,
+        },
+        &checkpoint,
     )
     .await?;
     if created.adopted {

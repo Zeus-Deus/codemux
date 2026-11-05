@@ -1,16 +1,21 @@
 //! One-shot probes for whether the `codex` CLI is installed and
 //! authenticated.
 //!
-//! These helpers are intentionally separate from the long-lived
-//! `codex app-server` session managed by [`CodexSession`](super::session::CodexSession):
-//! they shell out once, parse stdout, and return. No JSON-RPC involvement.
+//! Health uses the same app-server account contract as sessions. A custom
+//! provider can run without an OpenAI account, even when `login status`
+//! reports that no OAuth login exists.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use super::protocol::{AccountReadResponse, Capabilities, ClientInfo, InitializeParams};
+use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
+use serde_json::json;
 use std::time::Duration;
 
 use tokio::process::Command;
 
-use crate::agent_provider::{ProviderError, ProviderKind};
+use crate::agent_provider::ProviderError;
 
 /// Linux `ETXTBSY` (errno 26): "an attempt was made to execute a file that
 /// is currently open for writing." This is a *transient* kernel state, not
@@ -38,9 +43,7 @@ const ETXTBSY_MAX_ATTEMPTS: u32 = 25; // ~500 ms total worst case.
 async fn output_retrying_etxtbsy(mut cmd: Command) -> std::io::Result<std::process::Output> {
     for attempt in 0..ETXTBSY_MAX_ATTEMPTS {
         match cmd.output().await {
-            Err(e) if e.raw_os_error() == Some(ETXTBSY)
-                && attempt + 1 < ETXTBSY_MAX_ATTEMPTS =>
-            {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt + 1 < ETXTBSY_MAX_ATTEMPTS => {
                 tokio::time::sleep(ETXTBSY_RETRY_DELAY).await;
                 continue;
             }
@@ -50,40 +53,32 @@ async fn output_retrying_etxtbsy(mut cmd: Command) -> std::io::Result<std::proce
     unreachable!("loop above always returns when attempt+1 == MAX_ATTEMPTS")
 }
 
-/// Patterns that indicate the CLI is installed but the user is not logged
-/// in. Matched case-insensitively against both stdout and stderr.
-const UNAUTHENTICATED_PATTERNS: &[&str] = &[
-    "not logged in",
-    "run codex login",
-    "not authenticated",
-    "please log in",
-];
-
-/// Deadline for each subprocess probe. Keeps startup responsive even on
-/// flaky CLIs.
+/// Bound the initialize/account handshake; labels are best-effort.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Outcome of an auth-status probe.
 #[derive(Debug, Clone)]
 pub enum AuthStatus {
-    /// The user is authenticated. Optional hint string (email, org, or
-    /// similar) may be surfaced in the UI.
-    Authenticated {
-        /// Free-form, user-visible hint (e.g. an account label).
-        account_hint: Option<String>,
-    },
-    /// The user is not authenticated. The `message` field suggests next
-    /// steps.
-    Unauthenticated {
-        /// Suggested remediation, suitable for surfacing to the user.
-        message: String,
-    },
-    /// Output could not be parsed. The raw combined stdout+stderr is
-    /// surfaced so the UI can show the CLI's own diagnostic verbatim.
-    Unknown {
-        /// Raw combined output.
-        raw_output: String,
-    },
+    Authenticated { auth_label: Option<String> },
+    Unauthenticated { message: String },
+}
+
+/// The CLI home used when no account-specific home was selected.
+pub(crate) fn config_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+}
+
+pub(crate) fn read_user_config(home: &Path) -> Result<Option<toml::Value>, String> {
+    let raw = match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("could not read Codex provider configuration".into()),
+    };
+    toml::from_str(&raw)
+        .map(Some)
+        .map_err(|_| "could not parse Codex provider configuration".into())
 }
 
 /// Run `codex --version` and return the parsed version string if the CLI
@@ -91,7 +86,7 @@ pub enum AuthStatus {
 /// timeouts and other unexpected failures.
 pub async fn probe_installed(codex_binary: &Path) -> Result<Option<String>, ProviderError> {
     let mut cmd = Command::new(codex_binary);
-    cmd.arg("--version");
+    cmd.arg("--version").kill_on_drop(true);
     let result = tokio::time::timeout(PROBE_TIMEOUT, output_retrying_etxtbsy(cmd)).await;
     let output = match result {
         Ok(Ok(out)) => out,
@@ -133,72 +128,179 @@ pub async fn probe_installed(codex_binary: &Path) -> Result<Option<String>, Prov
     }
 }
 
-/// Run `codex login status` and classify its output.
+/// Probe native CLI routing. The Codemux-owned ChatGPT route is checked by
+/// the caller before reaching this function.
 pub async fn probe_authenticated(codex_binary: &Path) -> Result<AuthStatus, ProviderError> {
-    let mut cmd = Command::new(codex_binary);
-    cmd.arg("login").arg("status");
-    let result = tokio::time::timeout(PROBE_TIMEOUT, output_retrying_etxtbsy(cmd)).await;
-    let output = match result {
-        Ok(Ok(out)) => out,
-        Ok(Err(err)) => {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                return Err(ProviderError::NotInstalled {
-                    provider: ProviderKind::Codex,
-                    hint: "`codex` CLI not found on PATH".into(),
-                });
-            }
-            return Err(ProviderError::ProcessError {
-                message: "failed to run `codex login status`".into(),
-                source: Some(err.to_string()),
-            });
-        }
-        Err(_) => {
-            return Err(ProviderError::Timeout {
-                operation: "codex login status".into(),
-                elapsed_ms: PROBE_TIMEOUT.as_millis() as u64,
-            })
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}\n{stderr}");
-    Ok(classify_auth_output(&combined))
+    probe_authenticated_in_home(codex_binary, None).await
 }
 
-/// Pure helper: classify a combined stdout+stderr blob into an
-/// [`AuthStatus`]. Split out so it is unit-testable without spawning a
-/// real process.
-pub fn classify_auth_output(output: &str) -> AuthStatus {
-    let lower = output.to_lowercase();
-    for pat in UNAUTHENTICATED_PATTERNS {
-        if lower.contains(pat) {
-            return AuthStatus::Unauthenticated {
-                message: "Codex CLI is not authenticated. Run `codex login` and try again."
-                    .into(),
-            };
-        }
+pub(crate) async fn probe_authenticated_in_home(
+    codex_binary: &Path,
+    home: Option<&Path>,
+) -> Result<AuthStatus, ProviderError> {
+    // A malformed config can make account/read look like a fresh signed-out
+    // home. Preserve an advisory result instead of telling the user to log in.
+    let config = home
+        .map(Path::to_path_buf)
+        .or_else(config_home)
+        .map(|home| read_user_config(&home))
+        .transpose()
+        .map_err(|message| ProviderError::RpcError { message })?
+        .flatten();
+    let mut env = HashMap::new();
+    if let Some(home) = home {
+        env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
     }
-
-    // Heuristic: if the output clearly mentions "logged in" or shows an
-    // email address, treat as authenticated.
-    if lower.contains("logged in") || lower.contains("authenticated") {
-        let hint = output
-            .lines()
-            .find_map(|line| {
-                let t = line.trim();
-                if t.contains('@') && t.len() < 200 {
-                    Some(t.to_string())
-                } else {
+    let child = JsonRpcChild::spawn(SpawnConfig {
+        program: codex_binary.into(),
+        args: vec!["app-server".into()],
+        env,
+        cwd: dirs::home_dir(),
+        default_timeout: PROBE_TIMEOUT,
+    })
+    .await
+    .map_err(|error| ProviderError::ProcessError {
+        message: "failed to start Codex authentication probe".into(),
+        source: Some(error.to_string()),
+    })?;
+    let result = tokio::time::timeout(PROBE_TIMEOUT, async {
+        let init = serde_json::to_value(InitializeParams {
+            client_info: ClientInfo {
+                name: "codemux-health".into(),
+                title: "Codemux".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+            },
+            capabilities: Capabilities {
+                experimental_api: true,
+            },
+        })
+        .map_err(|error| ProviderError::RpcError {
+            message: error.to_string(),
+        })?;
+        child.request("initialize", init).await.map_err(rpc_error)?;
+        child
+            .notify("initialized", json!({}))
+            .await
+            .map_err(rpc_error)?;
+        // Reading cached account data must not refresh or replace credentials.
+        let response = child
+            .request("account/read", json!({"refreshToken": false}))
+            .await
+            .map_err(rpc_error)?;
+        if response
+            .get("requiresOpenaiAuth")
+            .and_then(serde_json::Value::as_bool)
+            .is_none()
+        {
+            return Err(ProviderError::RpcError {
+                message: "account/read omitted requiresOpenaiAuth".into(),
+            });
+        }
+        let account: AccountReadResponse =
+            serde_json::from_value(response).map_err(|error| ProviderError::RpcError {
+                message: format!("account/read: {error}"),
+            })?;
+        Ok(account)
+    })
+    .await
+    .map_err(|_| ProviderError::Timeout {
+        operation: "codex app-server account/read".into(),
+        elapsed_ms: PROBE_TIMEOUT.as_millis() as u64,
+    })
+    .and_then(|result| result);
+    let result = async {
+        let account = result?;
+        let name = if account.account.is_none() {
+            // A rejected config must not be mistaken for missing login. A
+            // Codex build without `config/read` simply names nothing.
+            let response = match tokio::time::timeout(
+                Duration::from_secs(1),
+                child.request("config/read", json!({"includeLayers": false})),
+            )
+            .await
+            .map_err(|_| ProviderError::Timeout {
+                operation: "codex app-server config/read".into(),
+                elapsed_ms: 1000,
+            })? {
+                Ok(response) => Some(response),
+                Err(crate::json_rpc_child::RpcChildError::RpcError(error))
+                    if error.code == METHOD_NOT_FOUND =>
+                {
                     None
                 }
-            });
-        AuthStatus::Authenticated { account_hint: hint }
-    } else {
-        AuthStatus::Unknown {
-            raw_output: output.to_string(),
-        }
+                Err(error) => return Err(rpc_error(error)),
+            };
+            response
+                .and_then(|response| custom_provider_name(&response["config"]))
+                .or_else(|| custom_provider_name(&serde_json::to_value(config.as_ref()?).ok()?))
+        } else {
+            None
+        };
+        Ok(classify_account_read(&account, name.as_deref()))
     }
+    .await;
+    let _ = child.shutdown().await;
+    result
+}
+
+/// JSON-RPC "method not found".
+const METHOD_NOT_FOUND: i64 = -32601;
+
+fn rpc_error(error: crate::json_rpc_child::RpcChildError) -> ProviderError {
+    ProviderError::RpcError {
+        message: format!("Codex authentication probe: {error}"),
+    }
+}
+
+fn custom_provider_name(config: &serde_json::Value) -> Option<String> {
+    let id = config.get("model_provider")?.as_str()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(
+        config
+            .get("model_providers")
+            .and_then(|providers| providers.get(id))
+            .and_then(|provider| provider.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(id)
+            .to_string(),
+    )
+}
+
+pub fn classify_account_read(
+    account: &AccountReadResponse,
+    custom_name: Option<&str>,
+) -> AuthStatus {
+    if account.needs_login() {
+        return AuthStatus::Unauthenticated {
+            message: "Codex CLI is not authenticated. Run `codex login` and try again.".into(),
+        };
+    }
+    let label = match account.account.as_ref() {
+        Some(info) => match info.account_type.as_deref() {
+            Some("apiKey") => Some("OpenAI API key".into()),
+            Some("chatgpt") | Some("chatgptDeviceCode") => Some(
+                super::session::codex_plan_label(
+                    info.plan_type
+                        .as_deref()
+                        .filter(|plan| !plan.eq_ignore_ascii_case("unknown")),
+                )
+                .unwrap_or_else(|| "ChatGPT".into()),
+            ),
+            _ => None,
+        },
+        None => Some(
+            custom_name
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| format!("Custom provider · {name}"))
+                .unwrap_or_else(|| "Custom provider".into()),
+        ),
+    };
+    AuthStatus::Authenticated { auth_label: label }
 }
 
 #[cfg(test)]
@@ -206,49 +308,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_not_logged_in() {
-        let out = "You are not logged in. Run `codex login` to continue.";
-        match classify_auth_output(out) {
-            AuthStatus::Unauthenticated { message } => assert!(message.contains("codex login")),
-            other => panic!("expected Unauthenticated, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classifies_run_codex_login() {
-        let out = "Session missing. Run codex login.";
-        assert!(matches!(
-            classify_auth_output(out),
-            AuthStatus::Unauthenticated { .. }
-        ));
-    }
-
-    #[test]
-    fn classifies_not_authenticated() {
-        let out = "Error: Not authenticated.";
-        assert!(matches!(
-            classify_auth_output(out),
-            AuthStatus::Unauthenticated { .. }
-        ));
-    }
-
-    #[test]
-    fn classifies_authenticated_with_email_hint() {
-        let out = "Logged in as\n  test@example.com\n";
-        match classify_auth_output(out) {
-            AuthStatus::Authenticated { account_hint } => {
-                assert!(account_hint.as_deref().unwrap().contains("@"))
+    fn proxy_readiness_account_rules_and_labels() {
+        for (account, requires, name, expected) in [
+            (
+                json!({"type":"chatgpt", "planType":"pro"}),
+                true,
+                None,
+                Some("ChatGPT Pro"),
+            ),
+            (json!({"type":"chatgpt"}), true, None, Some("ChatGPT")),
+            (
+                json!({"type":"chatgpt", "planType":"unknown"}),
+                false,
+                None,
+                Some("ChatGPT"),
+            ),
+            (json!({"type":"apiKey"}), true, None, Some("OpenAI API key")),
+            (json!(null), true, None, None),
+            (
+                json!(null),
+                false,
+                Some("ai-gateway"),
+                Some("Custom provider · ai-gateway"),
+            ),
+            (json!(null), false, None, Some("Custom provider")),
+        ] {
+            let response =
+                serde_json::from_value(json!({"account":account,"requiresOpenaiAuth":requires}))
+                    .unwrap();
+            match (classify_account_read(&response, name), expected) {
+                (AuthStatus::Authenticated { auth_label }, Some(expected)) => {
+                    assert_eq!(auth_label.as_deref(), Some(expected))
+                }
+                (AuthStatus::Unauthenticated { .. }, None) => {}
+                other => panic!("unexpected mapping: {other:?}"),
             }
-            other => panic!("expected Authenticated, got {other:?}"),
         }
     }
 
     #[test]
-    fn unknown_output_is_surfaced_raw() {
-        let out = "some unrelated output\n";
-        match classify_auth_output(out) {
-            AuthStatus::Unknown { raw_output } => assert_eq!(raw_output, out),
-            other => panic!("expected Unknown, got {other:?}"),
-        }
+    fn proxy_readiness_provider_config_fallback_reads_toml() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(read_user_config(home.path()).unwrap().is_none());
+        std::fs::write(
+            home.path().join("config.toml"),
+            r#"
+model_provider = "proxy"
+[model_providers.proxy]
+name = "My gateway"
+"#,
+        )
+        .unwrap();
+        let config = read_user_config(home.path()).unwrap().unwrap();
+        assert_eq!(
+            custom_provider_name(&serde_json::to_value(config).unwrap()).as_deref(),
+            Some("My gateway")
+        );
+        std::fs::write(home.path().join("config.toml"), "invalid TOML").unwrap();
+        assert!(read_user_config(home.path()).is_err());
+    }
+
+    #[test]
+    fn proxy_readiness_provider_display_name_then_id() {
+        assert_eq!(custom_provider_name(&json!({"model_provider":"proxy", "model_providers":{"proxy":{"name":"My gateway"}}})).as_deref(), Some("My gateway"));
+        assert_eq!(
+            custom_provider_name(&json!({"model_provider":"proxy"})).as_deref(),
+            Some("proxy")
+        );
+        assert_eq!(custom_provider_name(&json!({})), None);
     }
 }

@@ -551,7 +551,7 @@ pub(crate) async fn git_run_bounded(
     limit: usize,
     check_disk_budget: bool,
 ) -> Result<Vec<u8>, String> {
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = crate::git::git_command_tokio();
     cmd.current_dir(directory)
         .env_clear()
         .stdin(Stdio::null())
@@ -563,7 +563,10 @@ pub(crate) async fn git_run_bounded(
             cmd.env(key, v);
         }
     }
-    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+    // `env_clear` dropped the constructor's marker. Workflow ref checks run
+    // in a project checkout, whose `.git/config` an agent can write.
+    cmd.env(crate::control_identity::AGENT_PROCESS_ENV, crate::git::GIT_PROCESS_KIND)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env(
             "GIT_CONFIG_GLOBAL",
             if cfg!(windows) { "NUL" } else { "/dev/null" },

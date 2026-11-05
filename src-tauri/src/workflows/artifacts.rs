@@ -11,7 +11,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component, Path, PathBuf},
-    process::Command,
     sync::Mutex,
 };
 
@@ -465,7 +464,7 @@ impl ArtifactStore {
         } else {
             // Git's own ignore rules determine untracked inclusion. No
             // recursive scan of ignored runtime directories or personal data.
-            let output = Command::new("git")
+            let output = crate::git::git_command()
                 .arg("-C")
                 .arg(&source)
                 .args([
@@ -1047,6 +1046,7 @@ impl ArtifactStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     fn workspace() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         assert!(Command::new("git")

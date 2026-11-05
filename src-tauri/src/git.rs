@@ -103,8 +103,55 @@ pub(crate) fn sanitize_branch_for_worktree_path(branch: &str) -> String {
         .collect()
 }
 
+/// The agent-process kind on every git Codemux starts. Diagnostic only, like
+/// every `CODEMUX_AGENT_PROCESS` value.
+pub(crate) const GIT_PROCESS_KIND: &str = "git-hook";
+
+/// Builds every git command Codemux runs, in the app, the CLI and
+/// codemux-remote. A source-scan test keeps other `git` spawns out of
+/// production code.
+///
+/// Git runs repository content: hooks (`.git/hooks`, `core.hooksPath`) and
+/// commands named in `.git/config` such as `core.fsmonitor`, which any agent
+/// working in the checkout can write. So git carries the agent-process marker,
+/// and everything it starts inherits it: a `codemux` that a hook runs reaches
+/// the control socket as an agent, refused admin commands, never as the owner.
+/// Unlike setup scripts, git is not registered for ancestry (most callers wait
+/// on `output()`, which gives no pid), so the inherited marker is the signal.
+///
+/// The marker is the only change to git's environment besides the AppImage
+/// loader fixups of [`crate::execution::host_command`], so `GIT_*`, SSH
+/// agents and credential helpers work as before. A caller that clears the
+/// environment must set the marker again.
+pub(crate) fn git_command() -> Command {
+    let mut cmd = crate::execution::host_command("git");
+    cmd.env(crate::control_identity::AGENT_PROCESS_ENV, GIT_PROCESS_KIND);
+    cmd
+}
+
+/// Tokio form of [`git_command`].
+pub(crate) fn git_command_tokio() -> tokio::process::Command {
+    git_command().into()
+}
+
+/// Builds every `gh` and `glab` command Codemux runs. Both start git
+/// themselves (`gh pr create` reads the checkout with it, `gh pr merge
+/// --delete-branch` switches and deletes local branches), so they carry
+/// git's marker, and the repository hooks that git fires run as agents too.
+/// The same source-scan test keeps other `gh` and `glab` spawns out of
+/// production code.
+pub(crate) fn source_control_cli_command(program: &str) -> Command {
+    let mut cmd = crate::execution::host_command(program);
+    cmd.env(crate::control_identity::AGENT_PROCESS_ENV, GIT_PROCESS_KIND);
+    cmd
+}
+
+#[cfg(test)]
+#[path = "git_command_tests.rs"]
+mod command_tests;
+
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(repo_path)
         .output()
@@ -124,7 +171,7 @@ fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Run git and return stdout even on non-zero exit (for commands where failure is expected).
 fn run_git_permissive(repo_path: &Path, args: &[&str]) -> String {
-    Command::new("git")
+    git_command()
         .args(args)
         .current_dir(repo_path)
         .output()
@@ -189,7 +236,7 @@ pub fn git_clone(remote_url: &str, target_dir: &Path) -> Result<String, String> 
     // Use `--no-checkout` so the worktree-add we'll do next chooses
     // the right branch — clone's default checkout of the remote's
     // HEAD branch is wasted work for our flow.
-    let output = Command::new("git")
+    let output = git_command()
         .args(["clone", "--no-checkout", remote_url, &target_str])
         .current_dir(parent)
         .output()
@@ -256,7 +303,7 @@ mod git_clone_input_validation {
 
 /// Run git and return (stdout, stderr, success) regardless of exit code.
 fn run_git_full(repo_path: &Path, args: &[&str]) -> Result<(String, String, bool), String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(repo_path)
         .output()
@@ -554,7 +601,7 @@ fn run_git_with_index(
     index_file: &Path,
     args: &[&str],
 ) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .env("GIT_INDEX_FILE", index_file)
         .current_dir(repo_path)
@@ -2165,6 +2212,17 @@ pub fn find_remote_ref(repo_path: &Path, branch: &str) -> Option<String> {
     }
 }
 
+/// Whether `name` spells a full commit id (SHA-1 or SHA-256 hex), which no
+/// remote branch fetch can freshen.
+pub(crate) fn is_object_id(name: &str) -> bool {
+    matches!(name.len(), 40 | 64) && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Whether `name` is a full commit id that `repo_path` already holds.
+fn is_local_commit(repo_path: &Path, name: &str) -> bool {
+    is_object_id(name) && run_git(repo_path, &["cat-file", "-e", &format!("{name}^{{commit}}")]).is_ok()
+}
+
 /// Wall-clock cap for the best-effort base fetch in
 /// [`fetch_origin_branch`]. Matches the 10s per-fetch timeout used by the
 /// background sidebar-divergence fetcher: long enough for a healthy remote,
@@ -2206,7 +2264,7 @@ pub fn fetch_origin_branch(repo_path: &Path, branch: &str) -> bool {
     if !remotes.lines().any(|r| r.trim() == "origin") {
         return false;
     }
-    let Ok(mut child) = Command::new("git")
+    let Ok(mut child) = git_command()
         .args(["fetch", "--quiet", "--no-tags", "origin", branch])
         .current_dir(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -2268,8 +2326,22 @@ fn existing_worktree_matches(repo_path: &Path, target_path: &str, branch: &str) 
     // `git_create_worktree` is skipped and git re-runs `worktree add`,
     // failing with `fatal: '<path>' already exists`. `Path` equality
     // treats `/` and `\` as equivalent separators on Windows.
+    //
+    // Git also records the path in its resolved form, so a path we pass
+    // with a Windows 8.3 short name (`C:\Users\RUNNER~1\...`, common under
+    // `%TEMP%`) is listed with the long one (`C:/Users/runneradmin/...`).
+    // Comparing the canonical forms catches that; the plain `Path`
+    // comparison stays for paths that can't be resolved.
     let target = Path::new(target_path);
-    let path_matches = |p: &Option<String>| p.as_deref().map(Path::new) == Some(target);
+    let canonical_target = dunce::canonicalize(target).ok();
+    let path_matches = |p: &Option<String>| {
+        p.as_deref().map(Path::new).is_some_and(|listed| {
+            listed == target
+                || canonical_target
+                    .as_deref()
+                    .is_some_and(|wanted| dunce::canonicalize(listed).is_ok_and(|seen| seen == wanted))
+        })
+    };
     let mut current_path: Option<String> = None;
     let mut current_branch: Option<String> = None;
     for raw in output.lines() {
@@ -2817,7 +2889,7 @@ pub fn git_create_worktree(
     // `workspace_create`, the workspace gets a generic "Workspace N"
     // title, and any `initial_prompt` gets dropped because the fallback
     // doesn't run the preset-launch / prompt-injection block in
-    // `create_worktree_workspace_impl`. Detect-and-reuse keeps the
+    // `create_worktree_from_request`. Detect-and-reuse keeps the
     // happy path intact for the Telegram "spin up an agent in this
     // branch" flow even when the worktree is already on disk.
     //
@@ -2867,7 +2939,11 @@ pub fn git_create_worktree(
         // no-remote repos fall through to the stale/local refs below.
         // Callers run this whole function on a blocking pool
         // (`spawn_blocking`), so the fetch never stalls the UI thread.
-        if let Some(b) = base {
+        // A commit the repository already has is the base as it is: there is
+        // no origin branch to freshen, so no fetch (and no wait on an
+        // unreachable origin) runs. A commit only origin has, such as a SHA
+        // copied from a pull request page, is still fetched by id.
+        if let Some(b) = base.filter(|b| !is_local_commit(repo_path, b)) {
             fetch_origin_branch(repo_path, b);
         }
         let resolved_base = base.map(|b| find_remote_ref(repo_path, b).unwrap_or_else(|| b.to_string()));
@@ -2992,7 +3068,7 @@ pub(crate) fn ensure_worktree_removable(worktree_path: &Path) -> Result<(), Stri
 /// counts, matching the previous suffix behavior for non-origin remotes.
 pub fn git_branch_exists(repo_path: &Path, branch: &str) -> bool {
     // Local branch — exact ref path excludes tags.
-    let local = Command::new("git")
+    let local = git_command()
         .args([
             "show-ref",
             "--verify",
@@ -3026,30 +3102,208 @@ pub fn git_branch_exists(repo_path: &Path, branch: &str) -> bool {
     })
 }
 
-pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>, force: bool) -> Result<(), String> {
-    // Find the main repo by reading .git file in worktree
+/// Whether removing a worktree may lose commits that nothing else keeps:
+/// ones its detached HEAD made, and ones only the branch it deletes holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitLoss {
+    /// They go: the checkout with its HEAD, the branch with `git branch -D`.
+    /// The desktop close dialog, the legacy close tools and forced closes.
+    Allow,
+    /// They stay. A close checks [`ensure_commits_kept`] before teardown, and
+    /// the removal checks again right before it deletes anything: see
+    /// [`remove_worktree`] and what it [`Kept`].
+    Refuse,
+}
+
+/// What [`remove_worktree`] kept of what it was asked to remove, and why.
+/// Only [`CommitLoss::Refuse`] keeps anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Kept {
+    /// The checkout, and any branch it was to delete: its detached HEAD holds
+    /// commits nothing else keeps.
+    Checkout(String),
+    /// The branch: it holds commits no remote-tracking branch or the default
+    /// branch does. The checkout went.
+    Branch(String),
+}
+
+impl Kept {
+    pub(crate) fn into_reason(self) -> String {
+        match self {
+            Kept::Checkout(reason) | Kept::Branch(reason) => reason,
+        }
+    }
+}
+
+/// The repository a worktree belongs to: the main checkout its `.git` file
+/// points into, or `worktree_path` itself when that is the main checkout.
+fn main_checkout_of(worktree_path: &Path) -> Result<PathBuf, String> {
     let git_file = worktree_path.join(".git");
-    let repo_path = if git_file.is_file() {
-        let content = std::fs::read_to_string(&git_file)
-            .map_err(|e| format!("Failed to read .git file: {e}"))?;
-        // Content is "gitdir: /path/to/main/.git/worktrees/<name>"
-        let gitdir = content
-            .strip_prefix("gitdir: ")
-            .unwrap_or(&content)
-            .trim();
-        // Go up from .git/worktrees/<name> to the repo root
-        PathBuf::from(gitdir)
-            .parent() // worktrees/
-            .and_then(|p| p.parent()) // .git/
-            .and_then(|p| p.parent()) // repo root
-            .unwrap_or(worktree_path)
-            .to_path_buf()
-    } else {
-        worktree_path.to_path_buf()
+    if !git_file.is_file() {
+        return Ok(worktree_path.to_path_buf());
+    }
+    let content = std::fs::read_to_string(&git_file)
+        .map_err(|e| format!("Failed to read .git file: {e}"))?;
+    // Content is "gitdir: /path/to/main/.git/worktrees/<name>"
+    let gitdir = content
+        .strip_prefix("gitdir: ")
+        .unwrap_or(&content)
+        .trim();
+    // Go up from .git/worktrees/<name> to the repo root
+    Ok(PathBuf::from(gitdir)
+        .parent() // worktrees/
+        .and_then(|p| p.parent()) // .git/
+        .and_then(|p| p.parent()) // repo root
+        .unwrap_or(worktree_path)
+        .to_path_buf())
+}
+
+/// Whether a worktree removal deletes `branch` at all: never main or
+/// master, nor the branch the main checkout has checked out, nor one that
+/// does not exist.
+fn deletable_branch(repo_path: &Path, branch: &str) -> bool {
+    !["main", "master"].contains(&branch)
+        && run_git_permissive(repo_path, &["branch", "--show-current"]) != branch
+        && run_git(repo_path, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+}
+
+/// How many of `branch`'s commits neither a remote-tracking branch nor the
+/// repository's default branch holds. 0 means deleting the branch loses no
+/// commit. Another local branch does not count: a later close may delete
+/// that one too, and two closes each relying on the other's branch would
+/// lose the commits between them.
+fn commits_only_on(repo_path: &Path, branch: &str) -> Result<usize, String> {
+    let mut args = vec![
+        "rev-list".to_string(),
+        "--count".into(),
+        format!("refs/heads/{branch}"),
+        "--not".into(),
+        "--remotes".into(),
+    ];
+    // A local-only repository's default may exist only locally; one read
+    // from origin/HEAD is among the remote-tracking branches already.
+    if let Some(default) = resolve_default_branch(repo_path).filter(|default| default != branch) {
+        let default = format!("refs/heads/{default}");
+        if run_git(repo_path, &["rev-parse", "--verify", "--quiet", &default]).is_ok() {
+            args.push(default);
+        }
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let count = run_git(repo_path, &args)?;
+    count
+        .trim()
+        .parse()
+        .map_err(|e| format!("git rev-list gave {count:?}: {e}"))
+}
+
+/// How many commits the worktree's HEAD holds that no branch, remote-tracking
+/// branch or tag does: ones made on a detached HEAD (`git checkout
+/// --detach`, a rebase stopped at an edit). Removing the checkout loses
+/// them. A HEAD on a branch holds none.
+fn commits_only_at_head(worktree_path: &Path) -> Result<usize, String> {
+    // Not `--all`: it counts every worktree's HEAD, this one's included.
+    let count = run_git(
+        worktree_path,
+        &["rev-list", "--count", "HEAD", "--not", "--branches", "--remotes", "--tags"],
+    )?;
+    count
+        .trim()
+        .parse()
+        .map_err(|e| format!("git rev-list gave {count:?}: {e}"))
+}
+
+/// Why removing the checkout at `worktree_path` would lose commits only its
+/// HEAD holds, or `None` when it would not. A check that cannot run says so.
+fn head_commits_unkept(worktree_path: &Path) -> Option<String> {
+    match commits_only_at_head(worktree_path) {
+        Ok(0) => None,
+        Ok(count) => Some(format!(
+            "The worktree's detached HEAD has {count} commit(s) that no branch, remote branch or tag holds."
+        )),
+        Err(error) => Some(format!(
+            "Could not check that the commits at the worktree's HEAD are kept elsewhere ({error})."
+        )),
+    }
+}
+
+/// Why deleting `branch` would lose commits only it holds (see
+/// [`commits_only_on`]), or `None` when it would not. A check that cannot
+/// run says so.
+fn branch_commits_unkept(repo_path: &Path, branch: &str) -> Option<String> {
+    match commits_only_on(repo_path, branch) {
+        Ok(0) => None,
+        Ok(count) => Some(format!(
+            "Branch '{branch}' has {count} commit(s) that no remote branch or the default branch holds."
+        )),
+        Err(error) => Some(format!(
+            "Could not check that the commits of branch '{branch}' are kept elsewhere ({error})."
+        )),
+    }
+}
+
+/// Refuses to remove the worktree at `worktree_path`, and with `branch` to
+/// delete that branch too, while the removal would lose a commit nothing
+/// else keeps:
+/// - one its detached HEAD made, which no branch, remote branch or tag holds;
+/// - one `branch` holds that no remote-tracking branch or the default branch
+///   does: never pushed, or pushed and then amended, and not merged.
+///
+/// Without an upstream, [`ensure_worktree_removable`] sees neither. Like it,
+/// this runs before any teardown, so a refusal leaves the workspace as it
+/// was. A branch the removal would not delete passes. A check that cannot
+/// run refuses.
+pub(crate) fn ensure_commits_kept(worktree_path: &Path, branch: Option<&str>) -> Result<(), String> {
+    if let Some(unkept) = head_commits_unkept(worktree_path) {
+        return Err(format!("{unkept} Put them on a branch first, or keep the worktree."));
+    }
+    let Some(branch) = branch else {
+        return Ok(());
     };
+    let repo_path = main_checkout_of(worktree_path)?;
+    if !deletable_branch(&repo_path, branch) {
+        return Ok(());
+    }
+    match branch_commits_unkept(&repo_path, branch) {
+        Some(unkept) => Err(format!("{unkept} Push or merge them first, or keep the branch.")),
+        None => Ok(()),
+    }
+}
+
+pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>, force: bool) -> Result<(), String> {
+    remove_worktree(worktree_path, branch, CommitLoss::Allow, force).map(drop)
+}
+
+/// [`git_remove_worktree`], losing commits only as `commits` allows.
+///
+/// Under [`CommitLoss::Refuse`] it checks again right before it deletes
+/// anything, as [`ensure_commits_kept`] did before a close's teardown:
+/// whatever ran in the checkout since, the teardown or an agent not yet
+/// stopped, may have committed. It then keeps what holds the only copy of a
+/// commit and says so:
+/// - a detached HEAD keeps the checkout, and any branch it was to delete;
+/// - a branch it was to delete stays; the checkout still goes, as another ref
+///   holds every commit its HEAD does.
+pub(crate) fn remove_worktree(
+    worktree_path: &Path,
+    branch: Option<&str>,
+    commits: CommitLoss,
+    force: bool,
+) -> Result<Option<Kept>, String> {
+    let repo_path = main_checkout_of(worktree_path)?;
 
     if !force {
         ensure_worktree_removable(worktree_path)?;
+    }
+    // A checkout already gone holds no HEAD to keep, and fails to remove as
+    // before.
+    if commits == CommitLoss::Refuse && worktree_path.exists() {
+        if let Some(unkept) = head_commits_unkept(worktree_path) {
+            let with_branch = branch.map(|branch| format!(" and branch '{branch}'")).unwrap_or_default();
+            return Ok(Some(Kept::Checkout(format!(
+                "Kept the worktree at {}{with_branch}. {unkept}",
+                worktree_path.display()
+            ))));
+        }
     }
 
     if force {
@@ -3066,16 +3320,19 @@ pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>, force: bo
 
     // Delete the branch if requested (skip main/master and the repo's current branch)
     if let Some(branch_name) = branch {
-        let protected = ["main", "master"];
-        if !protected.contains(&branch_name) {
-            let current = run_git_permissive(&repo_path, &["branch", "--show-current"]);
-            if current != branch_name {
-                let _ = run_git(&repo_path, &["branch", "-D", branch_name]);
+        if deletable_branch(&repo_path, branch_name) {
+            // Checked again now nothing works in the checkout: its agents
+            // and teardown may have committed since the pre-flight.
+            if commits == CommitLoss::Refuse {
+                if let Some(unkept) = branch_commits_unkept(&repo_path, branch_name) {
+                    return Ok(Some(Kept::Branch(format!("Kept branch '{branch_name}'. {unkept}"))));
+                }
             }
+            let _ = run_git(&repo_path, &["branch", "-D", branch_name]);
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 pub fn git_list_worktrees(repo_path: &Path) -> Result<Vec<WorktreeInfo>, String> {
@@ -3599,7 +3856,7 @@ mod tests {
     // `workspace_create` with the same path) produced a workspace with
     // generic "Workspace N" title and silently dropped `initial_prompt`
     // because the fallback skips the preset-launch + prompt-injection
-    // block in `create_worktree_workspace_impl`.
+    // block in `create_worktree_from_request`.
     //
     // Fix: `git_create_worktree` now detects when the requested worktree
     // path is already registered against the requested branch and
@@ -3673,6 +3930,26 @@ mod tests {
         );
 
         git_remove_worktree(Path::new(&wt_a), Some(&branch_a), true).expect("cleanup");
+    }
+
+    /// Git lists a worktree by its resolved path. A caller that names the
+    /// same directory another way (a Windows 8.3 short name under %TEMP%;
+    /// here a symlinked parent) must still find it, or the second create
+    /// re-runs `git worktree add` and fails with `already exists`.
+    #[cfg(unix)]
+    #[test]
+    fn existing_worktree_matches_a_path_named_another_way() {
+        let (dir, repo) = setup_test_repo();
+        let branch = unique_branch("alias");
+        let real = dir.path().join("checkouts");
+        std::fs::create_dir(&real).unwrap();
+        let worktree = real.join("wt");
+        run_git(&repo, &["worktree", "add", "-b", &branch, worktree.to_str().unwrap()]).expect("worktree add");
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let named_otherwise = alias.join("wt");
+        assert!(existing_worktree_matches(&repo, named_otherwise.to_str().unwrap(), &branch));
+        assert!(!existing_worktree_matches(&repo, named_otherwise.to_str().unwrap(), "some-other-branch"));
     }
 
     #[test]
@@ -3861,6 +4138,60 @@ mod tests {
         assert_ne!(head, remote_tip, "remote tip is unreachable offline");
 
         git_remove_worktree(Path::new(&wt_path), Some("offline-base-test"), true).expect("cleanup");
+    }
+
+    #[test]
+    fn create_worktree_from_commit_id_skips_origin_fetch() {
+        // Isolated, so the worktree lands in a private home rather than the
+        // developer's ~/.codemux/worktrees.
+        if crate::test_isolation::isolated("git::tests::create_worktree_from_commit_id_skips_origin_fetch") {
+            return;
+        }
+        let (sha1, sha256) = ("0123456789abcdef".repeat(4), "ABCDEF0123456789".repeat(4));
+        assert!(is_object_id(&sha1[..40]) && is_object_id(&sha256));
+        let (short, long, not_hex) = ("a".repeat(39), "a".repeat(41), "g".repeat(40));
+        for name in ["main", "", short.as_str(), long.as_str(), not_hex.as_str()] {
+            assert!(!is_object_id(name), "{name}");
+        }
+
+        let (_dir, repo) = setup_test_repo();
+        let base = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        run_git(&repo, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "after the base"]).unwrap();
+        run_git(&repo, &["remote", "add", "origin", "file:///nonexistent/codemux-origin.git"]).unwrap();
+        // Any `git fetch`, even one git answers locally, writes FETCH_HEAD.
+        let fetch_head = repo.join(".git").join("FETCH_HEAD");
+        assert!(!fetch_head.exists());
+
+        let started = std::time::Instant::now();
+        let wt_path = git_create_worktree(&repo, "from-commit", true, Some(&base), None)
+            .expect("create worktree from a commit");
+        let elapsed = started.elapsed();
+        let head = run_git(Path::new(&wt_path), &["rev-parse", "HEAD"]).unwrap();
+        git_remove_worktree(Path::new(&wt_path), Some("from-commit"), true).expect("cleanup");
+        assert_eq!(head, base, "the worktree starts at exactly that commit");
+        assert!(!fetch_head.exists(), "a commit base never fetches");
+        assert!(
+            elapsed < std::time::Duration::from_secs(BASE_FETCH_TIMEOUT_SECS / 2),
+            "a commit base must not wait on origin: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn create_worktree_from_an_origin_only_commit_fetches_it() {
+        if crate::test_isolation::isolated("git::tests::create_worktree_from_an_origin_only_commit_fetches_it") {
+            return;
+        }
+        let (_dir, local, remote_tip) = setup_stale_clone_with_remote("origin-commit");
+        assert!(
+            run_git(&local, &["cat-file", "-e", &format!("{remote_tip}^{{commit}}")]).is_err(),
+            "precondition: only origin has the commit"
+        );
+
+        let wt_path = git_create_worktree(&local, "from-origin-commit", true, Some(&remote_tip), None)
+            .expect("a commit only origin has is fetched by id");
+        let head = run_git(Path::new(&wt_path), &["rev-parse", "HEAD"]).unwrap();
+        git_remove_worktree(Path::new(&wt_path), Some("from-origin-commit"), true).expect("cleanup");
+        assert_eq!(head, remote_tip);
     }
 
     #[test]
@@ -4793,6 +5124,115 @@ mod tests {
         // Clean working tree, no upstream — force=false should succeed (lenient policy)
         git_remove_worktree(Path::new(&wt_path), Some("local-only-wt"), false).expect("clean local-only worktree should be deletable without force");
         assert!(!PathBuf::from(&wt_path).exists(), "worktree dir should be gone");
+    }
+
+    /// Under `CommitLoss::Refuse` a branch holding the only copy of a commit
+    /// (no upstream, never pushed, not merged) is refused by the pre-flight
+    /// and kept by the removal, and so is a detached HEAD's commit. One whose
+    /// commits a remote-tracking branch or the default branch holds is
+    /// deleted, and `Allow` deletes as before.
+    #[test]
+    fn refused_commit_loss_keeps_the_only_copy_of_a_commit() {
+        let (dir, local, _remote) = setup_test_repo_with_remote();
+        let commit = |path: &Path| {
+            run_git(path, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "work"])
+                .expect("commit");
+        };
+        let add = |branch: &str| {
+            let path = dir.path().join(branch);
+            run_git(&local, &["worktree", "add", "-b", branch, path.to_str().unwrap()]).expect("worktree add");
+            path
+        };
+        let exists = |branch: &str| {
+            run_git(&local, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+        };
+
+        // No commits of its own: the default branch holds them all.
+        let fresh = add("fresh");
+        ensure_commits_kept(&fresh, Some("fresh")).expect("nothing to lose");
+
+        let unpushed = add("unpushed");
+        commit(&unpushed);
+        ensure_worktree_removable(&unpushed).expect("the premise: no upstream, so the unpushed check passes");
+        ensure_commits_kept(&unpushed, None).expect("kept with its branch, the checkout may go");
+        let error = ensure_commits_kept(&unpushed, Some("unpushed")).unwrap_err();
+        assert!(error.contains("'unpushed' has 1 commit(s)"), "{error}");
+        let kept = remove_worktree(&unpushed, Some("unpushed"), CommitLoss::Refuse, true).expect("remove");
+        assert!(matches!(&kept, Some(Kept::Branch(why)) if why.contains("'unpushed' has 1 commit(s)")), "{kept:?}");
+        assert!(!unpushed.exists(), "the checkout goes");
+        assert!(exists("unpushed"), "the only copy of the commit stays");
+
+        // Another local branch holds the commit: that keeps a detached HEAD's
+        // commit, but not a deleted branch's, as a close may delete it next.
+        let based = add("based");
+        run_git(&based, &["reset", "--hard", "unpushed"]).expect("reset");
+        let error = ensure_commits_kept(&based, Some("based")).unwrap_err();
+        assert!(error.contains("'based' has 1 commit(s)"), "{error}");
+        run_git(&based, &["checkout", "--detach"]).expect("detach");
+        ensure_commits_kept(&based, None).expect("the branch unpushed holds HEAD");
+
+        // A commit made on a detached HEAD: no branch holds it, and an
+        // upstream check cannot see it.
+        commit(&based);
+        ensure_worktree_removable(&based).expect("the premise: a detached HEAD has no upstream");
+        let error = ensure_commits_kept(&based, None).unwrap_err();
+        assert!(error.contains("detached HEAD has 1 commit(s)"), "{error}");
+        run_git(&local, &["tag", "kept", &run_git(&based, &["rev-parse", "HEAD"]).unwrap()]).expect("tag");
+        ensure_commits_kept(&based, None).expect("a tag holds it");
+
+        // Pushed without setting an upstream: origin/pushed holds it.
+        let pushed = add("pushed");
+        commit(&pushed);
+        run_git(&pushed, &["push", "origin", "pushed"]).expect("push");
+        ensure_commits_kept(&pushed, Some("pushed")).expect("a remote-tracking branch holds it");
+        assert_eq!(remove_worktree(&pushed, Some("pushed"), CommitLoss::Refuse, true).expect("remove"), None);
+        assert!(!exists("pushed"));
+
+        // Merged into the default branch here, never pushed.
+        let merged = add("merged");
+        commit(&merged);
+        run_git(&local, &["merge", "--ff-only", "merged"]).expect("merge");
+        ensure_commits_kept(&merged, Some("merged")).expect("the default branch holds it");
+        assert_eq!(remove_worktree(&merged, Some("merged"), CommitLoss::Refuse, true).expect("remove"), None);
+        assert!(!exists("merged"));
+
+        let forced = add("forced");
+        commit(&forced);
+        assert_eq!(remove_worktree(&forced, Some("forced"), CommitLoss::Allow, true).expect("remove"), None);
+        assert!(!exists("forced"), "allowed, the only copy goes, as before");
+    }
+
+    /// The removal checks the checkout's HEAD again under
+    /// `CommitLoss::Refuse`: a close's teardown or a worker may have
+    /// committed on a detached HEAD after the close's pre-flight passed. The
+    /// checkout holding the only copy of that commit stays, and so does the
+    /// branch it was to delete. `Allow` removes both as before.
+    #[test]
+    fn refused_commit_loss_keeps_a_checkout_whose_detached_head_holds_the_only_copy() {
+        let (dir, local, _remote) = setup_test_repo_with_remote();
+        let detached_commit = |branch: &str| {
+            let path = dir.path().join(branch);
+            run_git(&local, &["worktree", "add", "-b", branch, path.to_str().unwrap()]).expect("worktree add");
+            run_git(&path, &["checkout", "--detach"]).expect("detach");
+            ensure_commits_kept(&path, Some(branch)).expect("the premise: the pre-flight passes");
+            run_git(&path, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "late"])
+                .expect("commit");
+            path
+        };
+
+        let late = detached_commit("late");
+        let only = run_git(&late, &["rev-parse", "HEAD"]).expect("HEAD");
+        let kept = remove_worktree(&late, Some("late"), CommitLoss::Refuse, true).expect("remove");
+        assert!(
+            matches!(&kept, Some(Kept::Checkout(why)) if why.contains("and branch 'late'") && why.contains("detached HEAD has 1 commit(s)")),
+            "{kept:?}"
+        );
+        assert_eq!(run_git(&late, &["rev-parse", "HEAD"]).expect("HEAD"), only, "the checkout keeps the commit");
+        run_git(&local, &["rev-parse", "--verify", "--quiet", "refs/heads/late"]).expect("the branch stays");
+
+        let forced = detached_commit("forced");
+        assert_eq!(remove_worktree(&forced, Some("forced"), CommitLoss::Allow, true).expect("remove"), None);
+        assert!(!forced.exists(), "allowed, the checkout goes as before");
     }
 
     // ── merge_branch comprehensive integration tests ──

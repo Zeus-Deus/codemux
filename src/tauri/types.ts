@@ -8,29 +8,74 @@ export type AgentConnectorPending = {
   callbackOrigin: string;
   requestedAt: string;
   expiresAt: string;
+  /** A client approved before is asking again (its sign-in lapsed). */
+  reconnecting: boolean;
 } & (
   | { phase: "awaiting_approval"; access: null }
   | { phase: "approved_awaiting_client"; access: AgentConnectorAccess }
   | { phase: "denied"; access: null }
 );
 
+/** `oauth`: an assistant that signed in; `token`: a labelled personal token. */
+export type AgentConnectorClientKind = "oauth" | "token";
+
 export interface AgentConnectorClient {
   id: string;
+  /** The live grant behind this row; not a credential. Reissuing a token
+   *  keeps the client id and changes this. */
+  grantId: string;
+  kind: AgentConnectorClientKind;
+  /** OAuth client name or token label: untrusted plain text. */
   clientName: string;
-  callbackOrigin: string;
+  /** Null for tokens. */
+  callbackOrigin: string | null;
   access: AgentConnectorAccess;
   createdAt: string;
+  /** When access lapses. A renewing sign-in lapses only if left unused. */
   expiresAt: string;
+  /** The token label; null for OAuth sign-ins. */
+  label: string | null;
+  /** The sign-in renews itself with a refresh token. */
+  renews: boolean;
 }
 
 export interface AgentConnectorStatus {
   enabled: boolean;
   publicOrigin: string | null;
+  /** The connector's own loopback listener is bound. */
   listenerRunning: boolean;
+  /** The bound port, else the configured one. */
+  port: number;
+  /** Sanitized bind failure while enabled. */
+  bindError: string | null;
+  /** `http://127.0.0.1:<port>/mcp` while listening: the proxy target. */
+  localUrl: string | null;
+  /** The address assistants use: the public origin's, else `localUrl`. */
   mcpUrl: string | null;
+  /** The durable `codemux` executable (raw, unquoted) for local setup. */
+  localExecutable: string;
+  /** `<quoted executable> mcp`, kept for JSON consumers. */
   localCommand: string;
+  /** Only in `agent_connector_set_config` replies: grants an address change revoked. */
+  revokedGrants?: number;
   pending: AgentConnectorPending[];
   clients: AgentConnectorClient[];
+}
+
+/** A personal token, returned once by `agent_connector_issue`. */
+export interface AgentConnectorIssuedToken {
+  /** Shown once; never stored by the UI. */
+  token: string;
+  clientId: string;
+  /** The grant this token belongs to: the client row's `grantId` while it still works. */
+  grantId: string;
+  label: string;
+  access: AgentConnectorAccess;
+  expiresAt: string;
+  mcpUrl: string;
+  localUrl: string;
+  /** An earlier token for the same label stopped working. */
+  replaced: boolean;
 }
 
 // ── Feature flags ──
@@ -1048,6 +1093,10 @@ export interface ProviderHealthReport {
   /** Set only when the CLI is installed but signed out: the command that
    *  signs it in. Optional because older backends omit it. */
   login_command?: string | null;
+  /** How the CLI reaches its model when known, e.g. "Claude Max" or
+   *  "Custom endpoint · gateway.example.com". Optional because older
+   *  backends omit it. */
+  auth_label?: string | null;
 }
 
 // ── Chat-side provider capabilities ───────────────────────────────────

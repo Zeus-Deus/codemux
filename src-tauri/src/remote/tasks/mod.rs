@@ -92,7 +92,7 @@ async fn provider_capabilities(provider: ProviderKind) -> Result<ProviderChatCap
                 return Err("Claude CLI is unavailable; repair the host installation".into());
             }
             match claude::auth::probe_authenticated(&sidecar,Some(&binary)).await.map_err(|e|e.to_string())? {
-                claude::auth::AuthStatus::Authenticated => {},
+                claude::auth::AuthStatus::Authenticated { .. } => {},
                 claude::auth::AuthStatus::Unauthenticated {message} => return Err(message),
                 claude::auth::AuthStatus::Unknown {..} => return Err("Claude authentication could not be verified on this host; authenticate Claude Code and retry".into()),
             }
@@ -205,7 +205,7 @@ fn validate_launch(
                 && Path::new(&w.path).canonicalize().ok().as_ref() == Some(&canonical)
         })
         .ok_or("checkout is not registered in this remote host's workspace registry")?;
-    let git = std::process::Command::new("git")
+    let git = crate::git::git_command()
         .args([
             "-C",
             &request.workspace_path,

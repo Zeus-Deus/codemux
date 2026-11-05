@@ -105,7 +105,7 @@ pub fn prepare_worktree(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create worktree parent directory: {error}"))?;
     }
-    let mut cmd = crate::execution::host_command("git");
+    let mut cmd = crate::git::git_command();
     cmd.arg("-C")
         .arg(project)
         .args(["worktree", "add"])
@@ -212,7 +212,7 @@ fn resolve_repo(automation: &AutomationRecord) -> Result<ResolvedRepo, String> {
 /// no token (matching Superset's clone behaviour).
 fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
     if clone_dir.join(".git").exists() {
-        let output = crate::execution::host_command("git")
+        let output = crate::git::git_command()
             .arg("-C")
             .arg(clone_dir)
             .args(["fetch", "--prune", "origin"])
@@ -230,7 +230,7 @@ fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create clone directory: {error}"))?;
     }
-    let output = crate::execution::host_command("git")
+    let output = crate::git::git_command()
         .args(["clone", remote])
         .arg(clone_dir)
         .output()
@@ -246,7 +246,7 @@ fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
 
 /// `origin/<default-branch>` for a clone, resolved via `origin/HEAD`.
 fn default_remote_branch(clone_dir: &Path) -> Option<String> {
-    let output = crate::execution::host_command("git")
+    let output = crate::git::git_command()
         .arg("-C")
         .arg(clone_dir)
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
@@ -426,17 +426,28 @@ async fn run_inner(
     let (program, args) = agent_command(&automation.agent, &automation.prompt)
         .map_err(|error| (Some(workdir.clone()), error))?;
 
-    let status = crate::execution::host_command_tokio(&program)
+    let launch_failed = |error: std::io::Error| {
+        (
+            Some(workdir.clone()),
+            format!("Failed to launch '{program}': {error}"),
+        )
+    };
+    // An unattended run is an agent process: it and its tools are refused
+    // admin commands on the control socket.
+    let mut command = crate::execution::host_command_tokio(&program);
+    if program == "claude" {
+        crate::claude_env::apply_claude_cli_env(&mut command, &worktree_dir);
+    }
+    let mut child = command
         .args(&args)
         .current_dir(&worktree_dir)
-        .status()
-        .await
-        .map_err(|error| {
-            (
-                Some(workdir.clone()),
-                format!("Failed to launch '{program}': {error}"),
-            )
-        })?;
+        .env(crate::control_identity::AGENT_PROCESS_ENV, "automation")
+        .spawn()
+        .map_err(launch_failed)?;
+    if let Some(pid) = child.id() {
+        crate::control_identity::register_agent_process(pid);
+    }
+    let status = child.wait().await.map_err(launch_failed)?;
 
     if status.success() {
         // Best-effort: if the agent pushed a branch and opened a PR,

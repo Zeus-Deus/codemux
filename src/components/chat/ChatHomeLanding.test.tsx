@@ -68,7 +68,7 @@ beforeEach(() => {
   });
   // A fresh window session on a device that has never had a project open.
   useFirstRunSession.setState({
-    pastProjectsChecked: true, listFailed: {}, accountsFailed: false, connectDismissed: false,
+    pastProjectsChecked: true, listFailed: {}, accountsFailed: false, accountsProbedAt: 0, connectDismissed: false,
   });
   useUIStore.setState({ firstRunDone: false });
   // A fresh machine: Hermes is enabled but not installed, so listing its
@@ -866,6 +866,80 @@ describe("ChatHomeLanding", () => {
           listAccounts(async () => ({ accounts: [workAccount(false)], defaults: { claude: "work" } }));
           await renderWithAgents();
           expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+        });
+
+        it("asks to set up the default account even when the CLI itself is ready", async () => {
+          health = { ...health, claude: READY };
+          listAccounts(async () => ({ accounts: [workAccount(false)], defaults: { claude: "work" } }));
+          await renderWithAgents();
+          const row = screen.getByTestId("connect-agent-claude");
+          expect(row).toHaveTextContent("Default account · not signed in");
+          fireEvent.click(within(row).getByRole("button", { name: "Set up" }));
+          expect(useUIStore.getState()).toMatchObject({ showSettings: true, settingsSection: "providers" });
+          expect(signInMock).not.toHaveBeenCalled();
+        });
+
+        it("does not call a signed-out default account ready when another agent works", async () => {
+          health = { ...health, claude: READY, opencode: READY };
+          listAccounts(async () => ({ accounts: [workAccount(false)], defaults: { claude: "work" } }));
+          await renderWithAgents("opencode");
+          expect(screen.getByTestId("agent-status-line")).toHaveTextContent("OpenCode is ready·Claude Code needs setup·Set up");
+        });
+
+        it("waits for accounts before calling a healthy CLI ready", async () => {
+          health = { ...health, claude: READY };
+          let resolve!: (value: unknown) => void;
+          listAccounts(() => new Promise((done) => { resolve = done; }));
+          await renderWithAgents();
+          expect(screen.getByTestId("agent-status-line")).toBeEmptyDOMElement();
+          await act(async () => resolve({ accounts: [workAccount(false)], defaults: { claude: "work" } }));
+          await flush();
+          expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+        });
+
+        it("refreshes the default account after returning from sign-in", async () => {
+          health = { ...health, claude: READY };
+          let signedIn = false;
+          listAccounts(async () => ({ accounts: [workAccount(signedIn)], defaults: { claude: "work" } }));
+          const base = invokeMock.getMockImplementation()!;
+          invokeMock.mockImplementation(async (cmd: string, ...rest: unknown[]) =>
+            cmd === "provider_accounts_refresh"
+              ? { accounts: [workAccount(signedIn)], defaults: { claude: "work" } }
+              : base(cmd, ...rest),
+          );
+          const view = await renderWithAgents();
+          expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
+          view.unmount();
+          signedIn = true;
+          await renderWithAgents();
+          expect(screen.queryByTestId("connect-agent")).toBeNull();
+          expect(screen.getByTestId("composer")).toBeInTheDocument();
+          expect(screen.getByTestId("agent-status-line")).toHaveTextContent("Claude Code is ready");
+          expect(invokeMock).toHaveBeenCalledWith("provider_accounts_refresh");
+        });
+
+        it("throttles focus identity probes and recovers after an external sign-in", async () => {
+          health = { ...health, claude: READY };
+          let signedIn = false;
+          const state = () => ({ accounts: [workAccount(signedIn)], defaults: { claude: "work" } });
+          listAccounts(async () => state());
+          const refresh = vi.fn(async () => state());
+          const base = invokeMock.getMockImplementation()!;
+          invokeMock.mockImplementation(async (cmd: string, ...rest: unknown[]) =>
+            cmd === "provider_accounts_refresh" ? refresh() : base(cmd, ...rest),
+          );
+          await renderWithAgents();
+          expect(refresh).toHaveBeenCalledTimes(1);
+          window.dispatchEvent(new Event("focus"));
+          await flush();
+          expect(refresh).toHaveBeenCalledTimes(1);
+          signedIn = true;
+          vi.setSystemTime(Date.now() + 11_000);
+          window.dispatchEvent(new Event("focus"));
+          await flush();
+          expect(refresh).toHaveBeenCalledTimes(2);
+          expect(screen.queryByTestId("connect-agent")).toBeNull();
+          expect(screen.getByTestId("composer")).toBeInTheDocument();
         });
 
         it("waits for the account list before asking, and asks if it fails", async () => {

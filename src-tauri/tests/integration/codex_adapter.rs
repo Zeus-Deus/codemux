@@ -26,7 +26,7 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 use codemux_lib::agent_provider::codex::auth::{
-    classify_auth_output, probe_authenticated, probe_installed, AuthStatus,
+    classify_account_read, probe_authenticated, probe_installed, AuthStatus,
 };
 use codemux_lib::agent_provider::codex::capabilities::{harvest_codex_capabilities, HarvestError};
 use codemux_lib::agent_provider::codex::protocol::ClientInfo;
@@ -1925,11 +1925,8 @@ async fn auth_probe_installed_returns_version_when_codex_works() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auth_probe_unauthenticated_matches_common_patterns() {
-    let wrapper = write_bash_script(
-        "codex-auth-",
-        "#!/usr/bin/env bash\nif [ \"$1 $2\" = \"login status\" ]; then echo 'Not logged in. Run codex login.'; exit 0; fi\necho 'wrong status command' >&2\nexit 2\n",
-    );
+async fn auth_probe_unauthenticated_uses_app_server_account() {
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_UNAUTHENTICATED", "1")]);
     let status = probe_authenticated(wrapper.path()).await.unwrap();
     assert!(matches!(status, AuthStatus::Unauthenticated { .. }));
 }
@@ -2010,14 +2007,20 @@ async fn auth_probe_installed_returns_none_when_binary_missing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn classify_auth_output_pure_function() {
+async fn classify_account_read_pure_function() {
+    let response =
+        serde_json::from_value(serde_json::json!({"account": null,"requiresOpenaiAuth": true}))
+            .unwrap();
     assert!(matches!(
-        classify_auth_output("not logged in"),
+        classify_account_read(&response, None),
         AuthStatus::Unauthenticated { .. }
     ));
+    let response =
+        serde_json::from_value(serde_json::json!({"account": null,"requiresOpenaiAuth": false}))
+            .unwrap();
     assert!(matches!(
-        classify_auth_output(""),
-        AuthStatus::Unknown { .. }
+        classify_account_read(&response, None),
+        AuthStatus::Authenticated { .. }
     ));
 }
 

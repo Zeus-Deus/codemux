@@ -152,6 +152,33 @@ impl DatabaseStore {
         event.map(|event|serde_json::from_str(&event).map_err(|e|e.to_string())).transpose()
     }
 
+    /// The first row of `thread` that names `turn` (its prompt's correlation,
+    /// a queue dispatch, the answer that started it, an item or its end), or
+    /// `None` when the thread never recorded that run. A run's first row
+    /// lands as it starts, so these order a thread's runs.
+    pub(crate) fn control_turn_first_row(&self, thread: &str, turn: &str) -> Result<Option<i64>, String> {
+        self.conn.lock().unwrap().query_row(
+            "SELECT MIN(id) FROM agent_chat_messages WHERE thread_id=?1 AND json_valid(payload)
+             AND ?2 IN (json_extract(payload,'$.turn_id'),json_extract(payload,'$.resolution.delivery.turn_id'))",
+            params![thread, turn], |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
+    /// The run's last top-level assistant message: the prose `thread_read`
+    /// shows. The filter is the search index's, so the id is always a
+    /// `thread_read` row. Subagent text, reasoning and blank text never count.
+    pub fn control_turn_final_text(&self, thread: &str, turn: &str) -> Result<Option<(i64, String)>, String> {
+        self.conn.lock().unwrap().query_row(
+            "SELECT id, json_extract(payload,'$.item.text') FROM agent_chat_messages WHERE thread_id=?1
+             AND json_valid(payload) AND json_extract(payload,'$.type')='item_completed'
+             AND json_extract(payload,'$.turn_id')=?2 AND json_extract(payload,'$.item.kind')='assistant_text'
+             AND json_extract(payload,'$.subagent_id') IS NULL
+             AND length(trim(COALESCE(json_extract(payload,'$.item.text'),'')))>0
+             ORDER BY id DESC LIMIT 1",
+            params![thread, turn], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|e| e.to_string())
+    }
+
     /// Append the unchanged visible envelope and its ID-only run correlation
     /// atomically. A crash must not leave a late envelope without its identity.
     /// Neither this journal nor historical IDs restore runtime authority.
@@ -325,6 +352,35 @@ impl DatabaseStore {
                 })
             },
         ).optional().map_err(|e|e.to_string())
+    }
+
+    /// Whether a launch admitted in this run of Codemux (`epoch`) is still
+    /// starting `thread`: its receipt stays accepted or running until the
+    /// thread's session is up and its first message admitted. One from before
+    /// a restart never finishes and starts nothing.
+    pub(crate) fn control_thread_launch_open(&self, thread: &str, epoch: &str) -> Result<bool, String> {
+        self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_control_operations
+             WHERE thread_id=?1 AND epoch=?2 AND tool IN ('thread_launch','workspace_launch') AND state IN ('accepted','running'))",
+            params![thread, epoch], |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
+    /// The delivery of the message `operation`, a `thread_launch` of
+    /// `principal`, sent: the launch sends it under its request key as the
+    /// message ID. The receipt stays unlinked from it, because a delivery
+    /// rewrites a linked receipt's result, which would drop the launch's pane
+    /// and selection.
+    pub(crate) fn control_launch_delivery(&self, principal: &str, operation: &str) -> Result<Option<super::message_delivery::DeliveryRecord>, String> {
+        let message: Option<(String, String)> = self.conn.lock().unwrap().query_row(
+            "SELECT thread_id, request_key FROM agent_control_operations
+             WHERE principal=?1 AND id=?2 AND tool='thread_launch' AND thread_id IS NOT NULL",
+            params![principal, operation], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        match message {
+            Some((thread, key)) => self.message_delivery_for_message(&thread, &key),
+            None => Ok(None),
+        }
     }
 }
 
@@ -1354,5 +1410,51 @@ mod tests {
         assert!(!retry.newly_admitted);
         assert_eq!(first.receipt.operation_id, retry.receipt.operation_id);
         assert_eq!(retry.receipt.state, "needs_attention", "a restart must not turn uncertain dispatch into a duplicate run");
+    }
+
+    #[test]
+    fn control_turn_final_text_ignores_subagents_blank_text_and_other_turns() {
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("t", "w", None, "claude").unwrap();
+        let item = |turn: &str, kind: &str, text: &str, subagent: Option<&str>| {
+            serde_json::json!({"type":"item_completed","thread_id":"t","turn_id":turn,
+                "item":{"kind":kind,"text":text},"subagent_id":subagent}).to_string()
+        };
+        let append = |payload: String| db.append_agent_chat_message("t", &payload).unwrap().unwrap();
+        assert_eq!(db.control_turn_final_text("t", "a").unwrap(), None);
+        append(item("a", "assistant_text", "First draft", None));
+        let last = append(item("a", "assistant_text", "Final answer PONG", None));
+        append(item("a", "assistant_text", "   ", None));
+        append(item("a", "assistant_thinking", "Private reasoning", None));
+        append(item("a", "assistant_text", "Subagent report", Some("sub-1")));
+        append(item("b", "assistant_text", "A later run", None));
+        append(serde_json::json!({"type":"turn_completed","thread_id":"t","turn_id":"a","status":{"kind":"success"}}).to_string());
+        assert_eq!(db.control_turn_final_text("t", "a").unwrap(), Some((last, "Final answer PONG".into())));
+        assert_eq!(db.control_turn_final_text("t", "b").unwrap().unwrap().1, "A later run");
+        assert_eq!(db.control_turn_final_text("other", "a").unwrap(), None);
+        // The id is the search row thread_read pages through.
+        let indexed: i64 = db.conn.lock().unwrap().query_row(
+            "SELECT rowid FROM agent_chat_search WHERE agent_chat_search MATCH 'PONG'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(indexed, last);
+    }
+
+    #[test]
+    fn control_turn_first_row_orders_runs_by_their_first_record() {
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("t", "w", None, "claude").unwrap();
+        let append = |payload: serde_json::Value| db.append_agent_chat_message("t", &payload.to_string()).unwrap().unwrap();
+        assert_eq!(db.control_turn_first_row("t", "a").unwrap(), None);
+        let started = append(serde_json::json!({"type":"item_completed","thread_id":"t","turn_id":"a","item":{"kind":"assistant_text","text":"x"}}));
+        append(serde_json::json!({"type":"turn_completed","thread_id":"t","turn_id":"a","status":{"kind":"success"}}));
+        // An answered question names the turn its answer started.
+        let answered = append(serde_json::json!({"type":"question_resolved","thread_id":"t","question_id":"q",
+            "resolution":{"status":"answered","submission_id":"s","answers":["yes"],"delivery":{"kind":"new_turn","turn_id":"b"}}}));
+        append(serde_json::json!({"type":"item_completed","thread_id":"t","turn_id":"b","item":{"kind":"assistant_text","text":"y"}}));
+        assert_eq!(db.control_turn_first_row("t", "a").unwrap(), Some(started));
+        assert_eq!(db.control_turn_first_row("t", "b").unwrap(), Some(answered));
+        assert!(started < answered);
+        assert_eq!(db.control_turn_first_row("other", "a").unwrap(), None);
+        assert_eq!(db.control_turn_first_row("t", "never").unwrap(), None);
     }
 }

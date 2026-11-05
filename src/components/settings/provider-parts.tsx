@@ -30,7 +30,7 @@ export function StatusLine({ status, className }: { status: ProviderStatus; clas
   return (
     <span className={cn("inline-flex min-w-0 items-center gap-1.5 text-label text-muted-foreground", className)}>
       <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", DOT[status.tone])} />
-      <span className="truncate">{status.label}</span>
+      <span className="truncate" title={status.label}>{status.label}</span>
     </span>
   );
 }

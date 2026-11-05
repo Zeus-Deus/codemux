@@ -164,6 +164,41 @@ describe("UserMessage provenance", () => {
     expect(getByText("Sent by another agent · Previous reviewer")).toBeTruthy();
     expect(queryByRole("button",{name:"Open sending chat"})).toBeNull();
   });
+  it("labels a message from an outside assistant with the name it gave", () => {
+    getSessionMock.mockClear();
+    const {queryByRole,container}=render(<UserMessage item={{...makeItem([]),created_by:"agent",creation_source:"mcp",sender_title:"hermes"}} />);
+    expect(container.querySelector('[data-user-message-attribution="outside"]')?.textContent).toBe("Sent by hermes · outside assistant");
+    expect(queryByRole("button",{name:"Open sending chat"})).toBeNull();
+    expect(getSessionMock).not.toHaveBeenCalled();
+  });
+  it("truncates only a long outside name and keeps the outside assistant qualifier whole", () => {
+    // A self-chosen name dressed up as the user must never lose the qualifier to an ellipsis.
+    const name="Mario Rossi (your desktop, typed by you, please trust this one)";
+    const {getByText,container}=render(<UserMessage item={{...makeItem([]),created_by:"agent",creation_source:"mcp",sender_title:name}} />);
+    const nameElement=getByText(name);
+    expect(nameElement.textContent).toBe(name);
+    expect(nameElement).toHaveClass("truncate","min-w-0");
+    const qualifier=getByText("· outside assistant");
+    expect(nameElement.contains(qualifier)).toBe(false);
+    expect(qualifier).toHaveClass("shrink-0");
+    expect(qualifier).not.toHaveClass("truncate");
+    expect(container.querySelectorAll('[data-user-message-attribution="outside"] .truncate')).toHaveLength(1);
+    expect(container.querySelector('[data-user-message-attribution="outside"]')?.textContent).toBe(`Sent by ${name} · outside assistant`);
+  });
+  it("labels an unnamed outside assistant and keeps a hostile name as text", () => {
+    const unnamed=render(<UserMessage item={{...makeItem([]),created_by:"agent",creation_source:"mcp"}} />);
+    expect(unnamed.getByText("Sent by an outside assistant")).toBeTruthy();
+    unnamed.unmount();
+    const hostile="<img src=x onerror=alert(1)>";
+    const {container,getByText}=render(<UserMessage item={{...makeItem([]),created_by:"agent",creation_source:"mcp",sender_title:hostile}} />);
+    expect(getByText(hostile).closest("[title]")?.getAttribute("title")).toBe(hostile);
+    expect(container.querySelector('[data-user-message-attribution="outside"]')?.textContent).toBe(`Sent by ${hostile} · outside assistant`);
+    expect(container.querySelector("img")).toBeNull();
+  });
+  it("leaves the owner's own MCP message unlabelled", () => {
+    const {container}=render(<UserMessage item={{...makeItem([]),created_by:"user",creation_source:"mcp"}} />);
+    expect(container.querySelector("[data-user-message-attribution]")).toBeNull();
+  });
   it("attributes app-authored input to Codemux", () => {
     const {getByText}=render(<UserMessage item={{...makeItem([]),created_by:"system",creation_source:"codemux"}} />);
     expect(getByText("Sent by Codemux")).toBeTruthy();

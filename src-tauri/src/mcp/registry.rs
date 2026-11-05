@@ -241,15 +241,20 @@ impl Default for McpRegistry {
     }
 }
 
+/// The legacy self tools a chat below full access may still call: they read,
+/// or (remote delegation) are granted per host.
+pub(crate) const RELAY_READ_TOOLS: [&str; 26] = [
+    "browser_snapshot", "browser_accessibility_snapshot", "browser_screenshot", "browser_console_logs", "browser_get_styles", "browser_viewport_presets", "browser_wait",
+    "app_status", "pane_list", "port_list",
+    "conversation_read", "conversation_search", "workspace_list", "workspace_info", "workspace_archive_list",
+    "automation_list", "automation_get", "automation_runs", "git_status", "git_diff", "terminal_read",
+    "issue_list", "issue_get", "preset_list", "delegation_targets", "delegate_remote_task",
+];
+
 /// Full-access native callers retain the base self-server catalog.
 /// Provider adapters apply the same predicate to discovery and dispatch.
 pub(crate) fn native_relay_allowed(raw:&str, full_access:bool)->bool {
-    full_access || matches!(raw,
-        "browser_snapshot" | "browser_accessibility_snapshot" | "browser_screenshot" | "browser_console_logs" | "browser_get_styles" | "browser_viewport_presets" | "browser_wait" |
-        "app_status" | "pane_list" | "port_list" |
-        "conversation_read" | "conversation_search" | "workspace_list" | "workspace_info" | "workspace_archive_list" |
-        "automation_list" | "automation_get" | "automation_runs" | "git_status" | "git_diff" | "terminal_read" |
-        "issue_list" | "issue_get" | "preset_list" | "delegation_targets" | "delegate_remote_task")
+    full_access || RELAY_READ_TOOLS.contains(&raw)
 }
 pub(crate) fn native_tool_visible(tool:&McpTool, caller:&HostCaller)->bool {
     if matches!(
@@ -1024,7 +1029,7 @@ impl McpRegistry {
                         .tools
                         .iter()
                         .filter(|tool| {
-                            !is_self || !crate::agent_control::is_native_tool(&tool.name)
+                            !is_self || !crate::agent_control::registry::relay_refuses(&tool.name)
                         })
                         .cloned(),
                 );
@@ -1224,7 +1229,7 @@ impl McpRegistry {
         // This relay has provider identity only, never a local controller or
         // connector grant. In particular a persisted Codex dynamic tool can
         // outlive its catalog. Omission alone is not an authority boundary.
-        if is_codemux_self && crate::agent_control::is_native_tool(&raw_name) {
+        if is_codemux_self && crate::agent_control::registry::relay_refuses(&raw_name) {
             return Err("provider_control_denied: native controller tools are not available through provider MCP relays".into());
         }
         let params = tool_call_params(&raw_name, arguments, is_codemux_self, workspace_id);
@@ -1365,6 +1370,7 @@ fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConf
 
     let project_path: Option<PathBuf> = project_root.map(|p| p.to_path_buf());
     let scan = enumerate_mcp_paths(project_path.as_deref());
+    let own = PathBuf::from(crate::mcp_server::codemux_mcp_command());
 
     for (path, source) in scan.paths {
         let parsed = if is_claude_wrapped_path(&path) {
@@ -1383,8 +1389,9 @@ fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConf
             Ok(parsed) => {
                 for srv in parsed {
                     // Same filter as the list command: drop provider-written
-                    // `codemux` entries so we don't spawn the built-in twice.
-                    if srv.name == "codemux" {
+                    // Codemux entries, whatever their name, so we don't spawn
+                    // the built-in twice.
+                    if srv.is_codemux_entry(&own) {
                         continue;
                     }
                     out.push(srv);
@@ -1826,9 +1833,7 @@ mod tests {
             .iter()
             .any(|t| t.name == "thread_launch"));
         // Controller discovery itself and Settings retain the native catalog.
-        assert!(crate::agent_control::native_tools()
-            .iter()
-            .any(|t| t.name == "thread_launch"));
+        assert!(crate::agent_control::registry::lookup("thread_launch").is_some());
         assert!(registry
             .list_tools_for_server("codemux-remote")
             .await
@@ -2304,6 +2309,27 @@ mod tests {
         let rows = reg.list_runtime().await;
         let row = rows.iter().find(|r| r.id == "x").unwrap();
         assert!(matches!(row.status, McpServerStatus::Stopped));
+    }
+
+    /// A user's `codemux mcp` entry under another name (`codex mcp add cmux
+    /// -- codemux mcp`) is never started for chats: its tools would reach
+    /// every chat outside the permission ceiling Codemux's own row keeps.
+    #[test]
+    fn chats_never_start_a_codemux_mcp_entry_under_another_name() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers": {
+                "cmux": {"command": "codemux", "args": ["mcp", "--client", "codex"]},
+                "demo": {"command": "echo"}
+            }}"#,
+        )
+        .unwrap();
+        let configs = discover_configs(Some(project.path()));
+        let names: Vec<&str> = configs.iter().map(|config| config.name.as_str()).collect();
+        assert!(!names.contains(&"cmux"), "{names:?}");
+        assert!(names.contains(&"demo"), "{names:?}");
+        assert_eq!(configs.iter().filter(|config| config.sources.contains(&McpConfigSource::Codemux)).count(), 1, "{names:?}");
     }
 }
 

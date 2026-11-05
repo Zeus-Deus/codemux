@@ -53,6 +53,9 @@ pub struct ProviderHealthReport {
     /// and to hold a first send instead of creating a workspace for it.
     #[serde(default)]
     pub login_command: Option<String>,
+    /// How this CLI is authenticated, when the probe knows.
+    #[serde(default)]
+    pub auth_label: Option<String>,
 }
 
 /// The interactive command that signs `provider`'s CLI in. `None` when the
@@ -95,6 +98,7 @@ impl ProviderHealthReport {
             message: None,
             version,
             login_command: None,
+            auth_label: None,
         }
     }
 
@@ -106,6 +110,7 @@ impl ProviderHealthReport {
             message: Some(message),
             version: None,
             login_command: None,
+            auth_label: None,
         }
     }
 
@@ -126,6 +131,7 @@ impl ProviderHealthReport {
             message: Some(message),
             version,
             login_command: None,
+            auth_label: None,
         }
     }
 }
@@ -218,9 +224,10 @@ fn claude_report_from_auth(
     version: Option<String>,
 ) -> ProviderHealthReport {
     match auth {
-        Ok(claude::auth::AuthStatus::Authenticated) => {
-            ProviderHealthReport::ready(ProviderKind::Claude, version)
-        }
+        Ok(claude::auth::AuthStatus::Authenticated { auth_label }) => ProviderHealthReport {
+            auth_label,
+            ..ProviderHealthReport::ready(ProviderKind::Claude, version)
+        },
         // The probe's wording names a retired command; the report carries
         // the current one in `login_command`.
         Ok(claude::auth::AuthStatus::Unauthenticated { .. }) => ProviderHealthReport::signed_out(
@@ -231,11 +238,18 @@ fn claude_report_from_auth(
         // Inconclusive output / probe failure after a confirmed install:
         // advisory only — sessions may still work (e.g. API-key auth the
         // probe can't see), so don't block with a red banner.
-        Ok(claude::auth::AuthStatus::Unknown { .. }) => ProviderHealthReport::warning(
-            ProviderKind::Claude,
-            version,
-            "Could not verify Claude authentication status.".into(),
-        ),
+        Ok(claude::auth::AuthStatus::Unknown { raw, auth_label }) => ProviderHealthReport {
+            auth_label,
+            ..ProviderHealthReport::warning(
+                ProviderKind::Claude,
+                version,
+                if raw.trim().is_empty() {
+                    "Could not verify Claude authentication status.".into()
+                } else {
+                    raw
+                },
+            )
+        },
         Err(err) => ProviderHealthReport::warning(
             ProviderKind::Claude,
             version,
@@ -295,17 +309,13 @@ fn codex_report_from_auth(
     version: Option<String>,
 ) -> ProviderHealthReport {
     match auth {
-        Ok(codex::auth::AuthStatus::Authenticated { .. }) => {
-            ProviderHealthReport::ready(ProviderKind::Codex, version)
-        }
+        Ok(codex::auth::AuthStatus::Authenticated { auth_label }) => ProviderHealthReport {
+            auth_label,
+            ..ProviderHealthReport::ready(ProviderKind::Codex, version)
+        },
         Ok(codex::auth::AuthStatus::Unauthenticated { message }) => {
             ProviderHealthReport::signed_out(ProviderKind::Codex, version, message)
         }
-        Ok(codex::auth::AuthStatus::Unknown { .. }) => ProviderHealthReport::warning(
-            ProviderKind::Codex,
-            version,
-            "Could not verify Codex authentication status.".into(),
-        ),
         Err(err) => ProviderHealthReport::warning(
             ProviderKind::Codex,
             version,
@@ -498,6 +508,230 @@ mod tests {
 
 
     #[test]
+    fn proxy_readiness_health_labels_and_probe_failures() {
+        let report = claude_report_from_auth(
+            Ok(claude::auth::AuthStatus::Authenticated {
+                auth_label: Some("Custom endpoint · localhost:8080".into()),
+            }),
+            None,
+        );
+        assert_eq!(
+            report.auth_label.as_deref(),
+            Some("Custom endpoint · localhost:8080")
+        );
+        assert_eq!(report.status, ProviderHealthStatus::Ready);
+        let legacy =
+            serde_json::to_value(ProviderHealthReport::ready(ProviderKind::Claude, None)).unwrap();
+        let mut legacy = legacy.as_object().unwrap().clone();
+        legacy.remove("auth_label");
+        let decoded: ProviderHealthReport =
+            serde_json::from_value(serde_json::Value::Object(legacy)).unwrap();
+        assert!(decoded.auth_label.is_none());
+        for (account, requires, name, expected) in [
+            (
+                serde_json::json!({"type":"chatgpt","planType":"plus"}),
+                true,
+                None,
+                Some("ChatGPT Plus"),
+            ),
+            (serde_json::json!(null), true, None, None),
+            (
+                serde_json::json!(null),
+                false,
+                Some("ai-gateway"),
+                Some("Custom provider · ai-gateway"),
+            ),
+        ] {
+            let response = serde_json::from_value(
+                serde_json::json!({"account":account,"requiresOpenaiAuth":requires}),
+            )
+            .unwrap();
+            let report = codex_report_from_auth(
+                Ok(codex::auth::classify_account_read(&response, name)),
+                None,
+            );
+            assert_eq!(report.auth_label.as_deref(), expected);
+            assert_eq!(
+                report.status,
+                if expected.is_some() {
+                    ProviderHealthStatus::Ready
+                } else {
+                    ProviderHealthStatus::Error
+                }
+            );
+            assert_eq!(report.login_command.is_some(), expected.is_none());
+        }
+        let report = codex_report_from_auth(
+            Err(ProviderError::RpcError {
+                message: "probe failed".into(),
+            }),
+            None,
+        );
+        assert_eq!(report.status, ProviderHealthStatus::Warning);
+        assert!(report.login_command.is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_readiness_broken_codex_config_is_warning() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "invalid TOML").unwrap();
+        let report = codex_report_from_auth(
+            codex::auth::probe_authenticated_in_home(
+                std::path::Path::new("unused-codex-binary"),
+                Some(home.path()),
+            )
+            .await,
+            None,
+        );
+        assert_eq!(report.status, ProviderHealthStatus::Warning);
+        assert!(report.login_command.is_none());
+        assert!(report
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("could not parse"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_readiness_codex_config_rpc_failure_is_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let binary = home.path().join("codex-fixture");
+        std::fs::write(
+            &binary,
+            r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    if 'id' not in req:
+        continue
+    if req['method'] == 'config/read':
+        response = {'error': {'code': -32600, 'message': 'invalid provider configuration'}}
+    elif req['method'] == 'account/read':
+        response = {'result': {'account': None, 'requiresOpenaiAuth': True}}
+    else:
+        response = {'result': {}}
+    print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], **response}), flush=True)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let report = codex_report_from_auth(
+            codex::auth::probe_authenticated_in_home(&binary, Some(home.path())).await,
+            None,
+        );
+        assert_eq!(report.status, ProviderHealthStatus::Warning);
+        assert!(report.login_command.is_none());
+        assert!(report
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("invalid provider configuration"));
+    }
+
+    #[test]
+    fn proxy_readiness_claude_unverified_endpoint_keeps_label_and_message() {
+        let message =
+            "Custom endpoint · localhost:8080 is set, but Claude Code reports no credentials for it.";
+        let report = claude_report_from_auth(
+            Ok(claude::auth::AuthStatus::Unknown {
+                raw: message.into(),
+                auth_label: Some("Custom endpoint · localhost:8080".into()),
+            }),
+            None,
+        );
+        assert_eq!(report.status, ProviderHealthStatus::Warning);
+        assert_eq!(
+            report.auth_label.as_deref(),
+            Some("Custom endpoint · localhost:8080")
+        );
+        assert_eq!(report.message.as_deref(), Some(message));
+        assert!(report.login_command.is_none());
+    }
+
+    /// Read-only smoke probe; no model requests and no credential refresh.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires the installed Codex CLI and user's configured homes"]
+    async fn proxy_readiness_live_codex_health() {
+        let binary = which::which("codex").unwrap();
+        let user_home = dirs::home_dir().unwrap().join(".codex");
+        let empty = tempfile::tempdir().unwrap();
+        let proxy = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            user_home.join("config.toml"),
+            proxy.path().join("config.toml"),
+        )
+        .unwrap();
+        let native = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(user_home.join("auth.json"), native.path().join("auth.json"))
+            .unwrap();
+        let custom = tempfile::tempdir().unwrap();
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join("config.toml"), "invalid TOML").unwrap();
+        std::fs::write(
+            custom.path().join("config.toml"),
+            r#"
+model_provider = "proxy"
+[model_providers.proxy]
+name = "Env gateway"
+base_url = "http://localhost:8080/v1"
+wire_api = "responses"
+env_key = "CODEMUX_PROXY_READINESS_TEST_KEY"
+"#,
+        )
+        .unwrap();
+        for (name, home, status, label) in [
+            ("empty", empty.path(), ProviderHealthStatus::Error, None),
+            ("broken config", broken.path(), ProviderHealthStatus::Warning, None),
+            (
+                "proxy-only ai-gateway",
+                proxy.path(),
+                ProviderHealthStatus::Ready,
+                Some("Custom provider · ai-gateway"),
+            ),
+            (
+                "env_key without auth.json",
+                custom.path(),
+                ProviderHealthStatus::Ready,
+                Some("Custom provider · Env gateway"),
+            ),
+            (
+                "real home",
+                user_home.as_path(),
+                ProviderHealthStatus::Ready,
+                None,
+            ),
+            (
+                "auth-only native provider",
+                native.path(),
+                ProviderHealthStatus::Ready,
+                Some("ChatGPT Pro"),
+            ),
+        ] {
+            let report = codex_report_from_auth(
+                codex::auth::probe_authenticated_in_home(&binary, Some(home)).await,
+                None,
+            );
+            println!(
+                "{name}: status={:?}, label={:?}, login_command={:?}",
+                report.status, report.auth_label, report.login_command
+            );
+            assert_eq!(report.status, status, "{name}");
+            if status == ProviderHealthStatus::Warning {
+                assert!(report.login_command.is_none());
+            }
+            if let Some(label) = label {
+                assert_eq!(report.auth_label.as_deref(), Some(label));
+            }
+            if name == "real home" {
+                assert!(report.auth_label.is_some());
+            }
+        }
+    }
+
+    #[test]
     fn claude_sidecar_missing_maps_to_not_installed_error() {
         let report = claude_probe_failure_report(&ProviderError::NotInstalled {
             provider: ProviderKind::Claude,
@@ -564,7 +798,7 @@ mod tests {
         assert_eq!(signed_out.status, ProviderHealthStatus::Error);
         assert!(signed_out.login_command.is_some());
         let ready = claude_unresponsive_report(claude_report_from_auth(
-            Ok(claude::auth::AuthStatus::Authenticated),
+            Ok(claude::auth::AuthStatus::Authenticated { auth_label: None }),
             None,
         ));
         assert_eq!(ready.status, ProviderHealthStatus::Ready);
@@ -585,7 +819,7 @@ mod tests {
             hint: "sidecar binary not found".into(),
         });
         assert!(missing.login_command.is_none());
-        let ready = claude_report_from_auth(Ok(claude::auth::AuthStatus::Authenticated), None);
+        let ready = claude_report_from_auth(Ok(claude::auth::AuthStatus::Authenticated { auth_label: None }), None);
         assert!(ready.login_command.is_none());
         assert!(provider_login_command(ProviderKind::Hermes).is_none());
     }
@@ -606,7 +840,7 @@ mod tests {
     #[test]
     fn claude_authenticated_is_ready_with_no_message() {
         let report =
-            claude_report_from_auth(Ok(claude::auth::AuthStatus::Authenticated), Some("2.1.0".into()));
+            claude_report_from_auth(Ok(claude::auth::AuthStatus::Authenticated { auth_label: None }), Some("2.1.0".into()));
         assert_eq!(report.status, ProviderHealthStatus::Ready);
         assert!(report.message.is_none());
     }

@@ -14,6 +14,7 @@
 mod agent_delegation;
 mod app_command_wiring_contract;
 mod claude_adapter;
+mod codemux_mcp_stdio_protocol;
 mod codemux_remote_binary;
 mod codemux_remote_inventory;
 mod codemux_remote_serve_mcp;

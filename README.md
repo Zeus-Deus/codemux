@@ -56,9 +56,24 @@ chmod +x Codemux-*.AppImage
 
 Split panes with keybinds, open a browser pane for testing, and use the changes panel to review diffs and commit when ready.
 
-## MCP Server
+## Outside agents (MCP)
 
-Codemux ships an MCP server (`codemux mcp`) that lets any MCP-compatible client drive a running Codemux app programmatically — managing workspaces and git worktrees, launching agent presets, reading and writing terminals, controlling the browser pane, and browsing GitHub issues. It's bundled with the binary; no separate install. See the [MCP Server docs](https://docs.codemux.org/mcp-server) for setup and the full tool surface.
+Codemux is an MCP server. Claude Code, Codex, a Hermes chat bot, or any MCP client can drive it:
+
+- open workspaces and create worktrees;
+- start Codemux threads with a chosen provider, model and permission mode;
+- send messages, wait for the result and read it;
+- answer approvals and questions.
+
+On this computer, with Codemux running:
+
+```bash
+claude mcp add --scope user codemux -- codemux mcp --client claude-code
+```
+
+From another device, run the same `codemux mcp` over SSH, or turn on **Settings → Connections → Outside assistants → Over the network** (or run `codemux connector enable`), put HTTPS in front of it, and sign in with OAuth or a token. Scripts can use the same tools with `codemux call` and the `codemux thread` commands.
+
+[docs/outside-agents.md](docs/outside-agents.md) covers per-client setup (including Hermes), the end-to-end flow, access levels and security. The [MCP Server docs](https://docs.codemux.org/mcp-server) list every tool.
 
 ## Build from Source
 

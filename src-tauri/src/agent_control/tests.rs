@@ -5,9 +5,9 @@ use tauri::Manager;
 
 #[allow(dead_code)]
 #[path = "../../tests/helpers/mock_agent_provider.rs"]
-mod mock_agent_provider;
+pub(super) mod mock_agent_provider;
 
-async fn fixture() -> (tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String) {
+pub(super) async fn fixture() -> (tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String) {
     let app = tauri::test::mock_app();
     let state = crate::state::AppStateStore::default();
     let root = tempfile::tempdir().unwrap();
@@ -1065,7 +1065,7 @@ async fn review_s4_outside_approval_handle_survives_no_provider_id_recycling() {
     assert_eq!(settle_operation(&app, &receipt).await["state"], "succeeded");
 }
 
-async fn settle_operation(app: &tauri::App<tauri::test::MockRuntime>, receipt: &serde_json::Value) -> serde_json::Value {
+pub(super) async fn settle_operation(app: &tauri::App<tauri::test::MockRuntime>, receipt: &serde_json::Value) -> serde_json::Value {
     let id = receipt["operation_id"].as_str().unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
@@ -1119,6 +1119,56 @@ async fn capabilities_discover_provider_owned_models_and_operations() {
     assert_eq!(response["providers"][0]["capabilities"], serde_json::to_value(expected).unwrap());
     assert_eq!(response["providers"][0]["operations"]["supports_interrupt"], true);
     assert!(provider.calls.snapshot().is_empty(), "metadata must not launch a coding session");
+}
+
+/// Naming a provider targets it, as a launch does: a catalog the composer
+/// has not cached yet is discovered, so an outside agent can pick an exact
+/// model id before its first launch. Discovery starts no coding session, and
+/// listing every provider still reads caches only.
+#[tokio::test]
+async fn naming_a_provider_discovers_its_uncached_catalog() {
+    use crate::agent_provider::ProviderKind::Claude;
+    let (app, provider, _root, workspace) = fixture().await;
+    let state = app.state::<NativeControlState>();
+    state.fixture_uncached.lock().unwrap().insert(Claude);
+    let expected = state.fixture_capabilities.lock().unwrap().get(&Claude).cloned().unwrap();
+    let trusted = ControlCaller::trusted();
+
+    let all = execute(app.handle(), &trusted, "agent_capabilities", json!({"workspace_id":workspace})).await.unwrap();
+    let listed = all["providers"].as_array().unwrap().iter().find(|p| p["provider"] == "claude").unwrap();
+    assert_eq!(listed["discovery_error"]["code"], "catalog_not_discovered", "{listed}");
+
+    let named = execute(app.handle(), &trusted, "agent_capabilities", json!({"workspace_id":workspace,"provider":"claude"})).await.unwrap();
+    assert_eq!(named["providers"][0]["discovery_error"], serde_json::Value::Null, "{named}");
+    assert_eq!(named["providers"][0]["capabilities"], serde_json::to_value(expected).unwrap());
+    assert!(provider.calls.snapshot().is_empty(), "discovery must not launch a coding session");
+}
+
+/// Discovery can start a provider's CLI or an ACP session, so only a caller
+/// that may start threads gets it. A read-only one naming a provider with a
+/// cold cache reads caches only, and Codemux starts nothing for it.
+#[tokio::test]
+async fn read_only_callers_naming_a_provider_start_no_discovery() {
+    use crate::agent_provider::ProviderKind::Claude;
+    use std::sync::atomic::Ordering::SeqCst;
+    let (app, provider, _root, workspace) = fixture().await;
+    let state = app.state::<NativeControlState>();
+    state.fixture_uncached.lock().unwrap().insert(Claude);
+    let args = json!({"workspace_id":workspace,"provider":"claude"});
+    let harvests = || state.fixture_harvests.load(SeqCst);
+    let before = harvests();
+
+    let reader = ControlCaller::local(None, ControlAccess::ReadOnly);
+    let read_only = execute(app.handle(), &reader, "agent_capabilities", args.clone()).await.unwrap();
+    assert_eq!(read_only["providers"][0]["discovery_error"]["code"], "catalog_not_discovered", "{read_only}");
+    assert!(read_only["providers"][0]["discovery_error"]["message"].as_str().unwrap().contains("read-only"), "{read_only}");
+    assert_eq!(harvests(), before, "a read-only caller started catalog discovery");
+
+    let writer = ControlCaller::local(None, ControlAccess::Supervised);
+    let supervised = execute(app.handle(), &writer, "agent_capabilities", args).await.unwrap();
+    assert_eq!(supervised["providers"][0]["discovery_error"], serde_json::Value::Null, "{supervised}");
+    assert_eq!(harvests(), before + 1, "a caller that may start threads discovers");
+    assert!(provider.calls.snapshot().is_empty(), "discovery must not launch a coding session");
 }
 
 /// Listing reads caches only. With every catalog cold it reports each
@@ -1226,6 +1276,9 @@ async fn wait_is_bounded_and_never_mistakes_missing_runtime_for_completion() {
     let (app, provider, _root, workspace) = fixture().await;
     let db = app.state::<crate::database::DatabaseStore>();
     db.upsert_agent_chat_session("wait-thread", &workspace, None, "claude").unwrap();
+    // A run on record with no runtime behind it. A thread with no run at all
+    // has nothing to wait for and reads done (wait_tests).
+    db.append_agent_chat_message("wait-thread", &json!({"type":"user_message","thread_id":"wait-thread","text":"Wait fixture task"}).to_string()).unwrap();
     let response = execute(app.handle(), &ControlCaller::trusted(), "thread_wait", json!({
         "workspace_id":workspace,"thread_id":"wait-thread","timeout_ms":20,
     })).await.unwrap();
@@ -1330,9 +1383,9 @@ async fn workspace_chat_launch_shares_native_start_without_selecting_workspace()
     std::fs::create_dir(root.path().join("worktree")).unwrap();
     let target = app.state::<crate::state::AppStateStore>().create_empty_workspace_at_path(root.path().join("worktree"));
     app.state::<crate::state::AppStateStore>().activate_workspace(&parent);
-    let caller = ControlCaller { admitted: None, identity: super::CallerPrincipal::LocalController, created_by: crate::agent_provider::message::CreatedBy::Agent, principal: "thread:parent".into(), access: ControlAccess::FullAccess, grant_id: None };
-    let prepared = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
-        crate::agent_provider::ProviderKind::Claude, "Fix sidebar tests".into(), "Self-contained fixture brief".into(), None, None,
+    let caller = ControlCaller { admitted: None, identity: super::CallerPrincipal::LocalController, created_by: crate::agent_provider::message::CreatedBy::Agent, principal: "thread:parent".into(), access: ControlAccess::FullAccess, grant_id: None, label: None };
+    let prepared = service::PreparedWorkspaceChat::prepare_selected(app.handle(), &caller,
+        crate::agent_provider::ProviderKind::Claude, None, "", "Fix sidebar tests".into(), "Self-contained fixture brief".into(), None, None,
     ).await.unwrap();
     let launched = prepared.materialize(app.handle(), &caller, target.0.clone(), "prepared-workspace-child").await.unwrap();
     let thread = launched["thread_id"].as_str().unwrap();
@@ -1350,17 +1403,17 @@ async fn workspace_chat_launch_shares_native_start_without_selecting_workspace()
 async fn workspace_chat_launch_validates_models_and_keeps_permission_ceiling() {
     let (app, provider, _root, _workspace) = fixture().await;
     let caller = ControlCaller::trusted();
-    let invalid = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
-        crate::agent_provider::ProviderKind::Claude, "Fixture".into(), "Brief".into(), Some("not-advertised".into()), None,
+    let invalid = service::PreparedWorkspaceChat::prepare_selected(app.handle(), &caller,
+        crate::agent_provider::ProviderKind::Claude, None, "", "Fixture".into(), "Brief".into(), Some("not-advertised".into()), None,
     ).await.err().unwrap();
     assert_eq!(invalid.code, "unsupported_model");
-    let invalid = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
-        crate::agent_provider::ProviderKind::Claude, "Fixture".into(), "Brief".into(), None, Some("high".into()),
+    let invalid = service::PreparedWorkspaceChat::prepare_selected(app.handle(), &caller,
+        crate::agent_provider::ProviderKind::Claude, None, "", "Fixture".into(), "Brief".into(), None, Some("high".into()),
     ).await.err().unwrap();
     assert_eq!(invalid.code, "unsupported_effort");
     let supervised = ControlCaller { access: ControlAccess::Supervised, ..caller };
-    let denied = service::PreparedWorkspaceChat::prepare(app.handle(), &supervised,
-        crate::agent_provider::ProviderKind::Claude, "Fixture".into(), "Brief".into(), None, None,
+    let denied = service::PreparedWorkspaceChat::prepare_selected(app.handle(), &supervised,
+        crate::agent_provider::ProviderKind::Claude, None, "", "Fixture".into(), "Brief".into(), None, None,
     ).await.err().unwrap();
     assert_eq!(denied.code, "unsupported_permission_ceiling");
     assert!(provider.calls.snapshot().is_empty());
@@ -1818,6 +1871,38 @@ async fn orchestration_message_controller_queue_release_refreshes_only_stop_fenc
     assert!(checkpoint.authorize_dispatch().is_err());
 }
 
+/// A connector client holding a live grant, as `validate_caller` sees it. This
+/// starts the connector's own listener on a free loopback port; call
+/// `connector_off` when done.
+pub(crate) async fn connector_caller(app: &tauri::App<tauri::test::MockRuntime>, client_id: &str, grant_id: &str, access: ControlAccess) -> ControlCaller {
+    app.manage(crate::mcp_connector::McpConnectorState::default());
+    let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port=listener.local_addr().unwrap().port();drop(listener);
+    let status=crate::mcp_connector::agent_connector_set_config(app.handle().clone(),true,None,Some(port)).unwrap();
+    assert!(status.listener_running,"{:?}",status.bind_error);
+    let db=app.state::<crate::database::DatabaseStore>();
+    let now=chrono::Utc::now().timestamp_millis();
+    db.mcp_register_client(crate::database::mcp_connector::NewMcpClient {id:client_id.into(),name:"Synthetic connector client".into(),redirects:vec!["https://client.example/cb".into()],created_at:now},now).unwrap();
+    let access_name=serde_json::to_value(access).unwrap().as_str().unwrap().to_string();
+    db.mcp_mint_grant(crate::database::mcp_connector::NewMcpGrant {id:grant_id.into(),client_id:client_id.into(),token_hash:format!("synthetic-hash-{grant_id}"),redirect_uri:"https://client.example/cb".into(),resource:format!("http://127.0.0.1:{port}/mcp"),access:access_name,created_at:now,expires_at:now+60_000}).unwrap();
+    let caller=ControlCaller::outside(client_id.into(),grant_id.into(),access);
+    crate::mcp_connector::validate_caller(app.handle(),&caller).unwrap();
+    caller
+}
+
+/// Stops the listener `connector_caller` started.
+pub(crate) fn connector_off(app: &tauri::App<tauri::test::MockRuntime>) {
+    crate::mcp_connector::agent_connector_set_config(app.handle().clone(),false,None,None).unwrap();
+}
+
+/// Saves Remote Access as switched on, as it is while a person uses a paired
+/// device, without binding a listener. Call it before anything reads the
+/// Remote Access config, which loads the saved one once.
+pub(crate) fn web_remote_on(app: &tauri::App<tauri::test::MockRuntime>) {
+    let config = crate::web_remote::WebRemoteConfig { enabled: true, ..Default::default() };
+    crate::web_remote::save_config_to_db(&app.state::<crate::database::DatabaseStore>(), &config).unwrap();
+}
+
 #[tokio::test]
 async fn orchestration_message_saved_replay_rechecks_revoked_caller_before_rearm() {
     use crate::agent_provider::{message::*,types::MessageDelivery,ProviderKind,ThreadId};
@@ -1828,16 +1913,7 @@ async fn orchestration_message_saved_replay_rechecks_revoked_caller_before_rearm
         let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"saved-revoked-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
         let launched=settle_operation(&app,&receipt).await;let thread=launched["thread_id"].as_str().unwrap();
         let db=app.state::<crate::database::DatabaseStore>();
-        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port=listener.local_addr().unwrap().port();drop(listener);
-        crate::web_remote::web_remote_set_config(app.handle().clone(),Some(port),None,Some("loopback".into()),Some(false),Some(false),Some(false),Some(true)).await.unwrap();
-        crate::web_remote::web_remote_enable(app.handle().clone()).await.unwrap();
-        crate::mcp_connector::agent_connector_set_config(app.handle().clone(),true,None).unwrap();
-        let now=chrono::Utc::now().timestamp_millis();
-        db.mcp_register_client(crate::database::mcp_connector::NewMcpClient {id:"revoked-client".into(),name:"Synthetic replay client".into(),redirects:vec!["https://client.example/cb".into()],created_at:now},now).unwrap();
-        db.mcp_mint_grant(crate::database::mcp_connector::NewMcpGrant {id:"revoked-grant".into(),client_id:"revoked-client".into(),token_hash:"synthetic-hash".into(),redirect_uri:"https://client.example/cb".into(),resource:format!("http://127.0.0.1:{port}/mcp"),access:"full_access".into(),created_at:now,expires_at:now+60_000}).unwrap();
-        let caller=ControlCaller::outside("revoked-client".into(),"revoked-grant".into(),ControlAccess::FullAccess);
-        crate::mcp_connector::validate_caller(app.handle(),&caller).unwrap();
+        let caller=connector_caller(&app,"revoked-client","revoked-grant",ControlAccess::FullAccess).await;
         let provenance=MessageProvenance {message_id:Some("B".into()),delivery_id:Some("B".into()),origin:Some(crate::commands::agent_chat::TurnOrigin::Controller),created_by:CreatedBy::User,creation_source:CreationSource::Mcp,..Default::default()};
         db.admit_message_delivery("B",thread,"B",&json!({"provider":"claude","origin":"controller","input":{"thread_id":thread,"text":"must not send"},"provenance":provenance,"caller":caller}),"old",0,None,true).unwrap();
         db.finish_message_delivery("B","queued",Some(&json!({"queued_id":"saved-B"})),None).unwrap();
@@ -1865,7 +1941,7 @@ async fn orchestration_message_saved_replay_rechecks_revoked_caller_before_rearm
             assert!(db.get_queued_turn(thread,"saved-D").is_none(),"a refused saved item must not block later replay");
             assert!(provider.calls.snapshot().iter().any(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(_,text) if text=="allowed saved D")));
         }
-        crate::web_remote::web_remote_disable(app.handle().clone()).unwrap();
+        connector_off(&app);
     }
 }
 
@@ -1976,11 +2052,11 @@ async fn orchestration_message_queue_promotion_checks_authority_before_recording
     assert!(db.message_delivery("B").unwrap().unwrap().attempted);
 }
 
-async fn native_caller_fixture(mode:&str)->(tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String, String, Arc<crate::delegation::authority::NativeAuthority>, crate::delegation::app::NativeActor) {
+pub(super) async fn native_caller_fixture(mode:&str)->(tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String, String, Arc<crate::delegation::authority::NativeAuthority>, crate::delegation::app::NativeActor) {
     native_caller_provider_fixture(crate::agent_provider::ProviderKind::Claude, mode).await
 }
 
-async fn native_caller_provider_fixture(kind:crate::agent_provider::ProviderKind, mode:&str)->(tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String, String, Arc<crate::delegation::authority::NativeAuthority>, crate::delegation::app::NativeActor) {
+pub(super) async fn native_caller_provider_fixture(kind:crate::agent_provider::ProviderKind, mode:&str)->(tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String, String, Arc<crate::delegation::authority::NativeAuthority>, crate::delegation::app::NativeActor) {
     let (app, mut provider, root, workspace)=fixture().await;
     app.manage(crate::commands::delegation::DelegationState::default());
     if kind == crate::agent_provider::ProviderKind::Codex {
@@ -2264,7 +2340,7 @@ async fn native_callers_workspace_launch_routes_and_keeps_admitted_thread_author
     let pane=app.state::<crate::state::AppStateStore>().agent_chat_pane_id_for_thread(&thread).unwrap();
     app.state::<crate::state::AppStateStore>().close_pane(&pane).unwrap();
     let child_workspace=app.state::<crate::state::AppStateStore>().create_empty_workspace_at_path(root.path().into());
-    let prepared=service::PreparedWorkspaceChat::prepare(app.handle(),&caller,crate::agent_provider::ProviderKind::Claude,"Independent workspace".into(),"Work independently on this fixture".into(),None,None).await.unwrap();
+    let prepared=service::PreparedWorkspaceChat::prepare_selected(app.handle(),&caller,crate::agent_provider::ProviderKind::Claude,None,"","Independent workspace".into(),"Work independently on this fixture".into(),None,None).await.unwrap();
     let launched=prepared.materialize(app.handle(),&caller,child_workspace.0,"independent-child").await.unwrap();
     let child=launched["thread_id"].as_str().unwrap();
     assert!(provider.calls.snapshot().iter().any(|c|matches!(c,mock_agent_provider::MockCall::SendTurn(t,_) if t.0==child)));
@@ -2512,7 +2588,7 @@ async fn native_callers_round3_workspace_provider_listing_matches_ceiling_dispat
             // Exercise actual preparation and startup, not just the enum.
             let admitted = app.state::<crate::database::DatabaseStore>().admit_control_operation(&control.principal, "opencode-workspace", "workspace_launch", "payload", &app.state::<NativeControlState>().epoch, None, Some("opencode-child")).unwrap();
             control.admitted = Some(AdmittedAuthority::Operation {operation_id:admitted.receipt.operation_id});
-            let prepared = service::PreparedWorkspaceChat::prepare(app.handle(), &control, ProviderKind::OpenCode, "OpenCode workspace".into(), "A complete OpenCode brief".into(), None, None).await.unwrap();
+            let prepared = service::PreparedWorkspaceChat::prepare_selected(app.handle(), &control, ProviderKind::OpenCode, None, "", "OpenCode workspace".into(), "A complete OpenCode brief".into(), None, None).await.unwrap();
             let launched = prepared.materialize(app.handle(), &control, caller.workspace_id.clone().unwrap(), "opencode-child").await.unwrap();
             let child = launched["thread_id"].as_str().unwrap();
             let start = opencode.start_inputs().into_iter().find(|input| input.thread_id.0 == child).unwrap();
@@ -3153,4 +3229,276 @@ async fn all_provider_premium_codex_tiers_start_delegated_children() {
             }
         }).await.unwrap_or_else(|_| panic!("the {tier} child started"));
     }
+}
+
+/// Every catalog the native tools are served from, as JSON: the HTTP connector's
+/// `tools/list` for a full-access client, and the in-app host tools
+/// (orchestration plus plugins) for a full-access Claude chat, a Codex Plan chat
+/// and a chat with Agent collaboration off.
+async fn recorded_catalogs() -> serde_json::Value {
+    use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, _provider, _root, workspace) = fixture().await;
+    let in_app = |provider: ProviderKind, mode: &str| {
+        let caller = HostCaller {
+            control: None,
+            thread_id: "catalog-snapshot".into(),
+            provider,
+            workspace_id: Some(workspace.clone()),
+            permission_mode: Some(mode.into()),
+        };
+        let mut tools = native::OrchestrationHost(app.handle().clone()).tools_for(&caller);
+        tools.extend(crate::plugins::platform_transport::PluginToolsHost(app.handle().clone()).tools_for(&caller));
+        serde_json::to_value(tools).unwrap()
+    };
+    let in_app_full = in_app(ProviderKind::Claude, "bypassPermissions");
+    let in_app_plan_codex = in_app(ProviderKind::Codex, "plan");
+    app.state::<crate::database::DatabaseStore>()
+        .set_setting("agents.cross_provider_delegation", "false")
+        .unwrap();
+    let in_app_off = in_app(ProviderKind::Claude, "bypassPermissions");
+    let outside_client = ControlCaller::outside("catalog-snapshot".into(), "catalog-snapshot".into(), ControlAccess::FullAccess);
+    json!({
+        "outside": serde_json::to_value(registry::tools_for(&outside_client)).unwrap(),
+        "in_app_full": in_app_full,
+        "in_app_plan_codex": in_app_plan_codex,
+        "in_app_off": in_app_off,
+    })
+}
+
+const CATALOG_SNAPSHOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/agent_control/testdata/catalog.json");
+
+/// The first JSON path where two values differ, for a readable failure. A key
+/// present on one side only is a difference even when its value is `null`, so a
+/// new field serialized as `null` cannot slip past the snapshot.
+fn first_difference(path: String, expected: &serde_json::Value, actual: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    match (expected, actual) {
+        (Value::Object(e), Value::Object(a)) => e.keys().chain(a.keys().filter(|k| !e.contains_key(*k)))
+            .find_map(|k| match (e.get(k), a.get(k)) {
+                (Some(e), Some(a)) => first_difference(format!("{path}/{k}"), e, a),
+                (Some(_), None) => Some(format!("{path}/{k}: missing")),
+                (None, Some(a)) => Some(format!("{path}/{k}: unexpected {a}")),
+                (None, None) => None,
+            }),
+        (Value::Array(e), Value::Array(a)) if e.len() == a.len() => e.iter().zip(a).enumerate()
+            .find_map(|(i, (e, a))| first_difference(format!("{path}/{i}"), e, a)),
+        _ if expected == actual => None,
+        _ => Some(format!("{path}: expected {expected}, got {actual}")),
+    }
+}
+
+/// The catalogs are a contract with in-app providers (prefixed tool names and
+/// schemas) and outside clients. A change must be deliberate: review the diff,
+/// then re-record with `write_catalog_snapshot`.
+#[tokio::test]
+async fn catalogs_match_the_recorded_snapshot() {
+    let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(CATALOG_SNAPSHOT).unwrap()).unwrap();
+    let actual = recorded_catalogs().await;
+    if let Some(difference) = first_difference(String::new(), &recorded, &actual) {
+        panic!("catalog changed at {difference}; if intended, re-record with `cargo test --lib agent_control::tests::write_catalog_snapshot -- --ignored`");
+    }
+}
+
+#[test]
+fn snapshot_comparator_reports_keys_on_one_side_only() {
+    let recorded = json!({"tools": [{"name": "a"}]});
+    assert_eq!(first_difference(String::new(), &recorded, &recorded), None);
+    assert_eq!(
+        first_difference(String::new(), &recorded, &json!({"tools": [{"name": "a", "outputSchema": null}]})),
+        Some("/tools/0/outputSchema: unexpected null".to_owned()),
+    );
+    assert_eq!(
+        first_difference(String::new(), &json!({"tools": [{"name": "a", "title": null}]}), &recorded),
+        Some("/tools/0/title: missing".to_owned()),
+    );
+}
+
+#[tokio::test]
+#[ignore = "rewrites testdata/catalog.json"]
+async fn write_catalog_snapshot() {
+    let mut text = serde_json::to_string_pretty(&recorded_catalogs().await).unwrap();
+    text.push('\n');
+    std::fs::write(CATALOG_SNAPSHOT, text).unwrap();
+}
+
+/// A `create_threads` retry without client_request_id must find the receipts of
+/// the first attempt, so the implicit batch key is a contract: a hash of the
+/// calling session and run, the arguments after the caller's workspace is
+/// filled in, and whether each chat gets its own child workspace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_app_create_threads_retry_keys_are_unchanged() {
+    use sha2::{Digest, Sha256};
+    let (app, _provider, _root, workspace, _thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
+    let run = actor.permit.identity().unwrap().run_id;
+    let expected = |args: &serde_json::Value, child_workspace: bool| format!("batch:{:x}", Sha256::digest(
+        serde_json::to_vec(&json!({"session":actor.session_id,"run":run,"args":args,"child_workspace":child_workspace})).unwrap(),
+    ));
+    let threads = json!([{"title":"Implicit key child","message":"Synthetic fixture task"}]);
+    let call = |args: serde_json::Value| native::call(app.handle().clone(), actor.clone(), "create_threads".into(), args);
+
+    let tab = json!({"workspace_id":workspace,"threads":threads});
+    let first = call(tab.clone()).await.unwrap();
+    assert!(first["error"].is_null(), "{first}");
+    assert_eq!(first["client_request_id"], expected(&tab, false));
+    let retry = call(tab.clone()).await.unwrap();
+    assert_eq!(retry["client_request_id"], first["client_request_id"]);
+    assert_eq!(retry["threads"][0]["operation_id"], first["threads"][0]["operation_id"], "{retry}");
+
+    let nested = call(json!({"threads":threads})).await.unwrap();
+    assert!(nested["error"].is_null(), "{nested}");
+    assert_eq!(nested["client_request_id"], expected(&json!({"workspace_id":workspace,"threads":threads}), true));
+}
+
+/// A named local client's message is an assistant's, attributed to its name;
+/// the owner's stays the person's (`orchestration_message_controller_retries_and_persists_caller_provenance`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_client_messages_are_attributed_to_the_client() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let launched = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
+        "workspace_id":workspace,"client_request_id":"named-launch","provider":"claude","permission_mode":"default",
+    })).await.unwrap();
+    let launched = settle_operation(&app, &launched).await;
+    assert_eq!(launched["state"], "succeeded", "{launched}");
+    let thread = launched["thread_id"].as_str().unwrap();
+    let hermes = ControlCaller::local(Some(&ClientName::parse("Hermes").unwrap()), ControlAccess::FullAccess);
+    let receipt = execute(app.handle(), &hermes, "thread_send", json!({
+        "workspace_id":workspace,"thread_id":thread,"client_request_id":"named-send","message":"From an outside assistant","delivery":"queue",
+    })).await.unwrap();
+    let operation = json!({"operation_id":receipt["operation_id"]});
+    assert_eq!(execute(app.handle(), &ControlCaller::trusted(), "operation_status", operation.clone()).await.unwrap_err().code, "operation_not_found",
+        "the named client's receipt is its own");
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let status = execute(app.handle(), &hermes, "operation_status", operation.clone()).await.unwrap();
+            if status["state"] != "accepted" && status["state"] != "running" { break status; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(delivered["state"], "succeeded", "{delivered}");
+    let messages: Vec<serde_json::Value> = app.state::<crate::database::DatabaseStore>().list_agent_chat_messages(thread).iter()
+        .map(|row| serde_json::from_str(row).unwrap()).filter(|row: &serde_json::Value| row["type"] == "user_message").collect();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0]["created_by"], "agent");
+    assert_eq!(messages[0]["creation_source"], "mcp");
+    assert_eq!(messages[0]["sender_title"], "Hermes");
+    assert!(messages[0]["sender_thread_id"].is_null(), "{}", messages[0]);
+}
+
+/// Each route serves only its audience's tools. Anything else is unknown, or,
+/// for an in-app chat, a legacy self tool behind the relay's own policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_refuses_tools_off_their_route() {
+    let (app, _provider, _root, workspace, thread, _authority, actor) = native_caller_fixture("default").await;
+    for name in ["create_threads", "orchestrator_capabilities", "thread_search", "nope"] {
+        let error = execute(app.handle(), &ControlCaller::trusted(), name, json!({"workspace_id":workspace})).await.unwrap_err();
+        assert_eq!(error.code, "unknown_tool", "{name}: {error}");
+        assert_eq!(error.message, format!("Unknown tool: {name}"));
+    }
+    // Chats have no thread_status: the name falls through to the legacy relay,
+    // which refuses it below full access.
+    let error = native::call(app.handle().clone(), actor, "thread_status".into(), json!({"thread_id":thread})).await.unwrap_err();
+    assert!(error.starts_with("provider_control_denied:"), "{error}");
+}
+
+/// A caller learns nothing about the arguments of a tool it may not run.
+#[tokio::test]
+async fn dispatch_checks_access_before_arguments() {
+    let (app, _provider, _root, _workspace) = fixture().await;
+    let reader = ControlCaller::local(None, ControlAccess::ReadOnly);
+    let error = execute(app.handle(), &reader, "thread_stop", json!({"x":1})).await.unwrap_err();
+    assert_eq!(error.code, "access_denied", "{error}");
+    let error = execute(app.handle(), &reader, "thread_list", json!({"x":1})).await.unwrap_err();
+    assert_eq!(error.code, "invalid_arguments", "a tool the caller may run still checks its arguments: {error}");
+}
+
+/// The socket aliases and in-process callers get the schema check every other
+/// route gets, with the field named.
+#[tokio::test]
+async fn dispatch_validates_arguments_on_socket_routes() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let owner = ControlCaller::trusted();
+    let error = execute(app.handle(), &owner, "thread_list", json!({"workspace_id":workspace,"bogus":1})).await.unwrap_err();
+    assert_eq!((error.code, error.message.as_str()), (ErrorCode::InvalidArguments, "unknown field `bogus`"));
+    let error = execute(app.handle(), &owner, "thread_list", json!({"workspace_id":workspace,"limit":0})).await.unwrap_err();
+    assert_eq!(error.to_string(), "invalid_arguments: /limit is below the minimum 1");
+    let error = execute(app.handle(), &owner, "workspace_list", json!([])).await.unwrap_err();
+    assert_eq!(error.to_string(), "invalid_arguments: Arguments must be an object");
+    let listed = execute(app.handle(), &owner, "workspace_list", json!({})).await.unwrap();
+    assert!(listed["workspaces"].as_array().unwrap().iter().any(|w| w["workspace_id"] == workspace), "{listed}");
+}
+
+/// A null optional argument means "absent" on every route, as serde's `Option`
+/// does, and a defaulted one takes its default.
+#[tokio::test]
+async fn dispatch_accepts_null_optionals_everywhere() {
+    let (app, _provider, _root, workspace, thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
+    let outside = execute(app.handle(), &ControlCaller::trusted(), "thread_read", json!({
+        "workspace_id":workspace,"thread_id":thread,"cursor":null,"limit":null,
+    })).await.unwrap();
+    assert!(outside["messages"].is_array(), "{outside}");
+    let in_app = native::call(app.handle().clone(), actor, "thread_read".into(), json!({
+        "workspace_id":null,"thread_id":thread,"cursor":null,"text_offset":null,"max_chars":null,
+    })).await.unwrap();
+    assert!(in_app["messages"].is_array(), "{in_app}");
+    // Defaulted handler arguments read null as their default too, so these
+    // calls get past argument parsing to the missing thread or workspace.
+    let owner = ControlCaller::trusted();
+    let error = execute(app.handle(), &owner, "thread_send", json!({
+        "workspace_id":workspace,"thread_id":"missing-thread","client_request_id":"null-delivery","message":"Null delivery","delivery":null,
+    })).await.unwrap_err();
+    assert_eq!(error.code, "thread_not_found", "{error}");
+    let error = execute(app.handle(), &owner, "thread_launch", json!({
+        "workspace_id":"missing-workspace","client_request_id":"null-flags","provider":"claude","permission_mode":"default",
+        "fast_mode":null,"select":null,
+    })).await.unwrap_err();
+    assert_eq!(error.code, "workspace_not_found", "{error}");
+    let error = execute(app.handle(), &owner, "thread_launch", json!({
+        "workspace_id":"missing-workspace","client_request_id":"null-options","provider":"claude","permission_mode":"default",
+        "target":{"instance_id":"claude","model":null,"options":null},
+    })).await.unwrap_err();
+    assert_eq!(error.code, "workspace_not_found", "{error}");
+    // thread_send fingerprints its parsed arguments, so a null delivery keys
+    // the same receipt as an omitted one.
+    let parsed: service::ThreadSendArgs = service::parse(json!({
+        "workspace_id":workspace,"thread_id":thread,"client_request_id":"null-delivery","message":"Null delivery","delivery":null,
+    })).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap()["delivery"], "auto");
+}
+
+/// orchestrator_capabilities advertises instances as provider_instance_id, so
+/// a chat's launch takes that key inside target too. Outside callers keep the
+/// documented strict target.
+#[tokio::test]
+async fn in_app_launch_accepts_the_target_instance_alias() {
+    let (app, _provider, _root, workspace, _thread, _authority, actor) = native_caller_fixture("plan").await;
+    let receipt = native::call(app.handle().clone(), actor.clone(), "thread_launch".into(), json!({
+        "target":{"provider_instance_id":"claude"},"title":"Alias child","message":"Synthetic fixture task",
+    })).await.unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let status = native::call(app.handle().clone(), actor.clone(), "operation_status".into(), json!({"operation_id":receipt["operation_id"]})).await.unwrap();
+            if !matches!(status["state"].as_str(), Some("accepted" | "running")) { break status; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(outcome["state"], "succeeded", "{outcome}");
+    let error = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
+        "workspace_id":workspace,"client_request_id":"outside-alias","provider":"claude","permission_mode":"default",
+        "target":{"provider_instance_id":"claude"},
+    })).await.unwrap_err();
+    assert_eq!(error.to_string(), "invalid_arguments: unknown field `provider_instance_id` at /target");
+}
+
+/// Plugin tools are not Agent collaboration tools: with collaboration off, a
+/// chat's plugin call passes dispatch and reaches the plugin layer (which
+/// applies its own authorization), while its thread tools stay refused.
+#[tokio::test]
+async fn in_app_plugin_tools_skip_the_collaboration_gate() {
+    let (app, _provider, _root, _workspace, _thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
+    app.state::<crate::database::DatabaseStore>().set_setting("agents.cross_provider_delegation", "false").unwrap();
+    let error = native::call(app.handle().clone(), actor.clone(), "plugin_list".into(), json!({})).await.unwrap_err();
+    assert!(error.starts_with("plugin_operation_failed:"), "the plugin layer answered: {error}");
+    let error = native::call(app.handle().clone(), actor, "thread_list".into(), json!({})).await.unwrap_err();
+    assert!(error.starts_with("orchestration_disabled:"), "{error}");
 }

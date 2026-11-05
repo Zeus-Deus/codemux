@@ -153,6 +153,14 @@ pub struct NativeControlState {
             crate::agent_provider::ProviderChatCapabilities,
         >,
     >,
+    /// Providers whose fixture catalog only a discovery returns, as with a
+    /// cold composer cache: a cache read finds nothing for them.
+    #[cfg(test)]
+    pub(crate) fixture_uncached: Mutex<std::collections::HashSet<crate::agent_provider::ProviderKind>>,
+    /// Catalog harvests the fixture answered: each one would run a provider
+    /// CLI in the app.
+    #[cfg(test)]
+    pub(crate) fixture_harvests: std::sync::atomic::AtomicUsize,
 }
 impl Default for NativeControlState {
     fn default() -> Self {
@@ -165,6 +173,10 @@ impl Default for NativeControlState {
             worker_modes: Default::default(),
             #[cfg(test)]
             fixture_capabilities: Default::default(),
+            #[cfg(test)]
+            fixture_uncached: Default::default(),
+            #[cfg(test)]
+            fixture_harvests: Default::default(),
         }
     }
 }
@@ -458,6 +470,10 @@ impl NativeControlState {
             }
             _ => {}
         }
+        // This view lives in memory, so waiters can read the change as soon as
+        // the lock is released. Events the early returns skipped wake nobody.
+        drop(runtime);
+        super::wait::signal(Some(thread));
     }
     pub fn thread_runtime(&self, thread: &str) -> Option<ThreadRuntimeView> {
         self.runtime

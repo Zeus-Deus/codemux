@@ -32,7 +32,7 @@ pub struct CreatedWorktree {
 /// Run `git -C <dir> <args>`, returning trimmed stdout on success or a
 /// human-readable error (including git's stderr) on failure.
 fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
+    let out = crate::git::git_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -85,7 +85,7 @@ fn fetch_origin_branch(repo_root: &Path, branch: &str) -> bool {
     if !has_origin {
         return false;
     }
-    let Ok(mut child) = Command::new("git")
+    let Ok(mut child) = crate::git::git_command()
         .arg("-C")
         .arg(repo_root)
         .args(["fetch", "--quiet", "--no-tags", "origin", branch])
@@ -378,7 +378,7 @@ pub const ORIGIN_HEAD_TIMEOUT: Duration = Duration::from_secs(20);
 /// hanging, and the clone is killed after `timeout`. Errors carry the tail
 /// of git's stderr on one line.
 pub fn clone_repo(url: &str, target: &Path, timeout: Duration) -> Result<(), String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::git::git_command();
     cmd.args(["clone", "--quiet", "--"]).arg(url).arg(target);
     if let Some(parent) = target.parent() {
         cmd.current_dir(parent);
@@ -400,7 +400,7 @@ pub fn ensure_origin_head(repo_root: &Path) {
     if !has_origin {
         return;
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::git::git_command();
     cmd.arg("-C")
         .arg(repo_root)
         .args(["remote", "set-head", "origin", "--auto"]);
@@ -417,7 +417,7 @@ fn non_interactive(cmd: &mut Command, config_dir: Option<&Path>) {
     let user_ssh = std::env::var_os("GIT_SSH_COMMAND").is_some()
         || std::env::var_os("GIT_SSH").is_some()
         || {
-            let mut probe = Command::new("git");
+            let mut probe = crate::git::git_command();
             if let Some(dir) = config_dir {
                 probe.current_dir(dir);
             }

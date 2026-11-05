@@ -2004,6 +2004,16 @@ function mockThreadPayloads(threadId: string): string[] {
     ].map((message)=>JSON.stringify(message));
   }
 
+  // `?mockScenario=outside-launch`: a chat an outside assistant started with
+  // `codemux mcp --client hermes`, then the worker's reply.
+  if (new URLSearchParams(window.location.search).get("mockScenario") === "outside-launch" && threadId === MOCK_CHAT_THREAD_ID) {
+    return [
+      {type:"user_message",thread_id:threadId,message_id:"outside-launch",created_by:"agent",creation_source:"mcp",sender_title:"hermes",input_intent:"turn_start",text:"Run the parser tests and tell me which ones fail."},
+      {type:"item_completed",thread_id:threadId,turn_id:"outside-launch-turn",item_id:"outside-launch-answer",item:{kind:"assistant_text",text:"All 42 parser tests pass. The two that failed yesterday were fixed by the Unicode boundary change."},subagent_id:null},
+      {type:"turn_completed",thread_id:threadId,turn_id:"outside-launch-turn",status:{kind:"success"},usage:null},
+    ].map((message)=>JSON.stringify(message));
+  }
+
   if (new URLSearchParams(window.location.search).get("mockScenario") === "message-provenance" && threadId === MOCK_CHAT_THREAD_ID) {
     return [
       {message_id:"provenance-agent",created_by:"agent",creation_source:"provider",sender_thread_id:MOCK_SECOND_CHAT_THREAD_ID,sender_title:"Parser review",input_intent:"turn_start",text:"Review the parser changes and run the focused checks."},
@@ -3642,6 +3652,13 @@ const mockProviderHealth: Partial<
   Record<MockProviderKind, ProviderHealthReport>
 > = {};
 
+/** How healthy mock agents report signing in: Claude behind a proxy and
+ *  Codex on a custom model provider. */
+const MOCK_AUTH_LABELS: Partial<Record<MockProviderKind, string>> = {
+  claude: "Custom endpoint · gateway.example.com",
+  codex: "Custom provider · cliproxy",
+};
+
 // `?providerHealth=mixed` seeds a machine with one signed-out and two
 // missing agents, for the first-run agent strip and the automation form.
 if (new URLSearchParams(location.search).get("providerHealth") === "mixed") {
@@ -4409,7 +4426,6 @@ function buildWebRemoteStatus(): WebRemoteStatus {
 
 function emitWebRemoteState(): void {
   emitEvent("web-remote-state-changed", buildWebRemoteStatus());
-  emitEvent("agent-connector-changed", null);
 }
 
 // Console/automation hooks: inject devices so the live "device wants to
@@ -4799,13 +4815,29 @@ function markMockHostInstalled(id: number): void {
 
 const customAcpMock = createCustomAcpMock(emitEvent);
 
-const agentConnectorMock = createAgentConnectorMock(
-  () => ({ running: webRemoteLanRunning(), port: webRemotePort }),
-  () => emitEvent("agent-connector-changed", null),
-);
+const agentConnectorMock = createAgentConnectorMock(() => emitEvent("agent-connector-changed", null));
 
 // Dev-only console hook for the outside-assistant approval screenshots.
 (window as unknown as { __codemuxAgentConnectorMock: typeof agentConnectorMock }).__codemuxAgentConnectorMock = agentConnectorMock;
+
+// `?fixture=outside-assistants`: network connections on behind a saved HTTPS
+// origin, with one signed-in assistant, one bot token and one request
+// waiting for approval. `?fixture=outside-assistants-failed`: the listener
+// could not bind its port. Synthetic names and hosts only.
+const outsideAssistantsFixture = new URLSearchParams(window.location.search).get("fixture");
+if (outsideAssistantsFixture === "outside-assistants") {
+  const { handlers } = agentConnectorMock;
+  handlers.agent_connector_set_config({ enabled: true, publicOrigin: "https://studio.example.ts.net" });
+  const signIn = agentConnectorMock.addPendingClient("Claude Code", "https://claude-code.example.test");
+  handlers.agent_connector_approve({ requestId: signIn, access: "read_only" });
+  agentConnectorMock.continuePendingClient(signIn);
+  agentConnectorMock.exchangePendingClient(signIn);
+  handlers.agent_connector_issue({ label: "hermes-bot", access: "supervised" });
+  agentConnectorMock.addPendingClient("Example assistant");
+} else if (outsideAssistantsFixture === "outside-assistants-failed") {
+  agentConnectorMock.handlers.agent_connector_set_config({ enabled: true, publicOrigin: null });
+  agentConnectorMock.failListener("bind 127.0.0.1:4378: Address already in use");
+}
 
 /** Live mock side chats and their pending stream timers. */
 const mockSideChats = new Map<string, { timers: number[] }>();
@@ -6069,6 +6101,7 @@ const handlers: Record<string, Handler> = {
         installed: true,
         message: null,
         version: "0.0.0-mock",
+        auth_label: MOCK_AUTH_LABELS[provider] ?? null,
       }
     );
   },

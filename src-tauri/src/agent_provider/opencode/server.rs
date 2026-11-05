@@ -368,6 +368,8 @@ impl OpenCodeServer {
         // could surprise a user whose Codemux pane suddenly behaves
         // differently from their CLI.
         cmd.env("OPENCODE_CONFIG_CONTENT", CONFIG_CONTENT);
+        // The shared server runs every OpenCode chat's tools.
+        cmd.env(crate::control_identity::AGENT_PROCESS_ENV, "opencode");
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -380,9 +382,10 @@ impl OpenCodeServer {
             .spawn()
             .map(ServerProcess)
             .map_err(|err| format!("spawn_failed: {} ({err})", binary_path.display()))?;
-        #[cfg(target_os = "linux")]
         if let Some(pid) = child.0.id() {
+            #[cfg(target_os = "linux")]
             orphans::record(pid);
+            crate::control_identity::register_agent_process(pid);
         }
         let stdout = child
             .0

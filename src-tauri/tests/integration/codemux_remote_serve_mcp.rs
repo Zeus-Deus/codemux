@@ -14,6 +14,9 @@
 //! 5. Assert the workspace shows up in the list.
 //! 6. Send SIGTERM to the daemon and verify the manifest is gone.
 //!
+//! `codemux-remote mcp` also starts with no daemon, and keeps working
+//! when `serve` restarts under it with a new port and secret.
+//!
 //! Unix-only — `codemux-remote` itself is Unix-only (the PTY daemon
 //! and the new serve mode both use Unix-only signals).
 
@@ -55,6 +58,20 @@ struct ServeFixture {
 
 impl ServeFixture {
     fn start() -> Self {
+        Self::start_with_home(TempDir::new().expect("home tempdir"))
+    }
+
+    /// Start the daemon with a `HOME` the caller seeded first (agent
+    /// configs, an app layout). Its config dir is `<home>/.config`, so the
+    /// developer's own Codemux app never decides who owns the `codemux`
+    /// MCP name here.
+    fn start_with_home(home: TempDir) -> Self {
+        Self::start_in(TempDir::new().expect("tempdir"), home)
+    }
+
+    /// Start the daemon on an existing state dir and `HOME`, as a restart
+    /// does. Every start picks a new port and secret.
+    fn start_in(state_dir: TempDir, home: TempDir) -> Self {
         let bin = binary_path();
         assert!(
             bin.exists(),
@@ -62,8 +79,6 @@ impl ServeFixture {
              run `cargo build --bin codemux-remote` first",
             bin
         );
-        let state_dir = TempDir::new().expect("tempdir");
-        let home = TempDir::new().expect("home tempdir");
         // Spawn the daemon. Inherit stderr so test failures surface
         // the daemon's own diagnostics. Redirect stdout to /dev/null
         // because we don't care about it (the daemon logs to stderr).
@@ -72,18 +87,22 @@ impl ServeFixture {
             .arg("--state-dir")
             .arg(state_dir.path())
             .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         let child = cmd.spawn().expect("spawn codemux-remote serve");
 
-        // Wait for the manifest to appear (the daemon writes it
-        // *after* bind succeeds). Up to 10s.
+        // Wait for this daemon's manifest to appear (the daemon writes
+        // it *after* bind succeeds; a restart may find the last one's).
+        // Up to 10s.
         let manifest_path = state_dir.path().join("manifest.json");
         let deadline = Instant::now() + Duration::from_secs(10);
         let manifest: Value = loop {
             if let Ok(bytes) = std::fs::read(&manifest_path) {
                 if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                    break v;
+                    if v["pid"] == json!(child.id()) {
+                        break v;
+                    }
                 }
             }
             if Instant::now() > deadline {
@@ -122,6 +141,17 @@ impl ServeFixture {
     }
 
     fn stop(mut self) {
+        self.terminate();
+    }
+
+    /// Stop the daemon but keep its state dir and `HOME` for
+    /// [`ServeFixture::start_in`].
+    fn stop_and_keep_dirs(mut self) -> (TempDir, TempDir) {
+        self.terminate();
+        (self.state_dir, self.home)
+    }
+
+    fn terminate(&mut self) {
         // Send SIGTERM; serve handles it gracefully and cleans up.
         let pid = self.child.id() as i32;
         unsafe {
@@ -224,6 +254,25 @@ fn http_workspace_create_then_list() {
     let body: Value = resp.json().unwrap();
     let workspaces = body["data"]["workspaces"].as_array().unwrap();
     assert!(workspaces.iter().any(|w| w["id"] == json!(id)));
+
+    // A body without `arguments` is a call with none. A tool that takes
+    // none still refuses a key it doesn't know.
+    let resp = client
+        .post(format!("{}/tools/call", fx.endpoint))
+        .bearer_auth(&fx.secret)
+        .json(&json!({ "name": "workspace_list" }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .post(format!("{}/tools/call", fx.endpoint))
+        .bearer_auth(&fx.secret)
+        .json(&json!({ "name": "workspace_list", "arguments": { "detail": "full" } }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().unwrap();
+    assert_eq!(body["error"]["kind"], json!("invalid_input"));
 
     fx.stop();
 }
@@ -379,6 +428,100 @@ fn http_worktree_create_provisions_like_desktop() {
     fx.stop();
 }
 
+/// Where the `codemux` MCP name belongs to another program (here the
+/// Codemux app's `codemux mcp`), the daemon leaves both agent configs
+/// byte-identical.
+#[test]
+fn serve_keeps_a_foreign_codemux_mcp_entry() {
+    let home = TempDir::new().unwrap();
+    let claude = home.path().join(".claude.json");
+    let claude_before = r#"{"mcpServers":{"codemux":{"command":"/usr/bin/codemux","args":["mcp"]}}}"#;
+    std::fs::write(&claude, claude_before).unwrap();
+    let vexis = home.path().join(".vexis").join("mcp-servers.yaml");
+    let vexis_before = "servers:\n  - name: codemux\n    command: /usr/bin/codemux\n    args: [\"mcp\"]\n";
+    std::fs::create_dir_all(vexis.parent().unwrap()).unwrap();
+    std::fs::write(&vexis, vexis_before).unwrap();
+
+    // Healthy means serve is past registration: it runs before the router.
+    let fx = ServeFixture::start_with_home(home);
+
+    assert_eq!(std::fs::read_to_string(&claude).unwrap(), claude_before);
+    assert_eq!(std::fs::read_to_string(&vexis).unwrap(), vexis_before);
+    fx.stop();
+}
+
+/// The daemon refreshes an entry that runs another copy of codemux-remote
+/// and adds a missing one, in both agent configs.
+#[test]
+fn serve_updates_its_own_entry() {
+    let home = TempDir::new().unwrap();
+    let claude = home.path().join(".claude.json");
+    std::fs::write(
+        &claude,
+        r#"{"mcpServers":{"codemux":{"command":"/opt/old/codemux-remote","args":["mcp"]},"github":{"command":"gh-mcp"}}}"#,
+    )
+    .unwrap();
+    let vexis = home.path().join(".vexis").join("mcp-servers.yaml");
+    std::fs::create_dir_all(vexis.parent().unwrap()).unwrap();
+    std::fs::write(
+        &vexis,
+        "servers:\n  - name: codemux\n    command: /opt/old/codemux-remote\n    args: [\"mcp\"]\n",
+    )
+    .unwrap();
+
+    let fx = ServeFixture::start_with_home(home);
+    let exe = std::fs::canonicalize(binary_path()).unwrap();
+    let exe = exe.to_string_lossy();
+
+    let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
+    assert_eq!(parsed["mcpServers"]["codemux"]["command"], json!(exe), "{parsed}");
+    assert_eq!(parsed["mcpServers"]["codemux"]["args"], json!(["mcp"]));
+    assert_eq!(parsed["mcpServers"]["github"]["command"], json!("gh-mcp"));
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&vexis).unwrap()).unwrap();
+    assert_eq!(yaml["servers"][0]["command"].as_str(), Some(exe.as_ref()), "{yaml:?}");
+    fx.stop();
+
+    // A home with no entry yet gets one added.
+    let home = TempDir::new().unwrap();
+    let claude = home.path().join(".claude.json");
+    std::fs::write(&claude, r#"{"theme":"dark"}"#).unwrap();
+    let fx = ServeFixture::start_with_home(home);
+    let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
+    assert_eq!(parsed["mcpServers"]["codemux"]["command"], json!(exe), "{parsed}");
+    assert_eq!(parsed["theme"], json!("dark"));
+    fx.stop();
+}
+
+/// Once the Codemux app has saved its layout under this user's config dir,
+/// `codemux` is the app's name: the daemon withdraws the entry it wrote and
+/// keeps the user's other servers.
+#[test]
+fn serve_withdraws_its_entry_where_the_app_has_run() {
+    let home = TempDir::new().unwrap();
+    let layout = home.path().join(".config").join("codemux").join("layout.json");
+    std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
+    std::fs::write(&layout, "{}").unwrap();
+    let exe = std::fs::canonicalize(binary_path()).unwrap();
+    let claude = home.path().join(".claude.json");
+    std::fs::write(
+        &claude,
+        json!({ "mcpServers": {
+            "codemux": { "command": exe, "args": ["mcp"] },
+            "github": { "command": "gh-mcp" },
+        }})
+        .to_string(),
+    )
+    .unwrap();
+
+    let fx = ServeFixture::start_with_home(home);
+
+    let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
+    assert!(parsed["mcpServers"].get("codemux").is_none(), "{parsed}");
+    assert_eq!(parsed["mcpServers"]["github"]["command"], json!("gh-mcp"));
+    fx.stop();
+}
+
 /// Drive `codemux-remote mcp` over stdio: initialize → tools/list →
 /// tools/call workspace_create → tools/call workspace_list. This is
 /// the actual code path a CLI agent (Claude Code, Codex) takes.
@@ -422,6 +565,14 @@ fn mcp_stdio_roundtrip() {
         .as_str()
         .unwrap()
         .contains("codemux-remote"));
+    assert_eq!(resp["result"]["protocolVersion"], json!("2024-11-05"));
+    assert!(
+        resp["result"]["instructions"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not run Codemux chats"),
+        "{resp}"
+    );
 
     // initialized notification (no response expected)
     send(&mut stdin, &json!({
@@ -478,33 +629,168 @@ fn mcp_stdio_roundtrip() {
         "workspace_list missing the workspace we just created: {list_text}"
     );
 
-    // 5) Close stdin → MCP server exits cleanly on EOF.
+    // 5) The workspace is named `workspace_id`, and vexis-agent's `id`
+    //    still works; desktop-only arguments are refused.
+    let created: Value = serde_json::from_str(text).unwrap();
+    let id = created["workspace"]["id"].as_str().unwrap();
+    for (n, arguments) in [json!({ "workspace_id": id }), json!({ "id": id })]
+        .into_iter()
+        .enumerate()
+    {
+        let result = call_tool(
+            &mut stdin,
+            &mut reader,
+            10 + n as u64,
+            "workspace_info",
+            arguments,
+        );
+        assert_eq!(result["isError"], json!(false), "{result}");
+        assert!(tool_text(&result).contains("via-mcp"), "{result}");
+    }
+    let result = call_tool(
+        &mut stdin,
+        &mut reader,
+        12,
+        "workspace_close",
+        json!({ "workspace_id": id, "delete_worktree": true }),
+    );
+    assert_eq!(result["isError"], json!(true), "{result}");
+    assert!(
+        tool_text(&result).contains("\"kind\": \"invalid_input\""),
+        "{result}"
+    );
+    assert!(tool_text(&result).contains("delete_worktree"), "{result}");
+
+    // 6) Close stdin → MCP server exits cleanly on EOF.
     drop(stdin);
     let _ = mcp.wait();
 
     fx.stop();
 }
 
+/// Without a daemon, `codemux-remote mcp` still starts, lists its tools,
+/// and answers a call with a tool error the model can read, instead of
+/// exiting before the client's `initialize`.
 #[test]
-fn mcp_fails_cleanly_when_daemon_not_running() {
+fn mcp_without_a_daemon_still_answers_and_says_so() {
     let bin = binary_path();
     let state_dir = TempDir::new().unwrap();
 
-    let output = Command::new(&bin)
+    let mut mcp = Command::new(&bin)
         .arg("mcp")
         .arg("--state-dir")
         .arg(state_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .expect("invoke mcp without daemon");
-    assert!(!output.status.success(), "expected non-zero exit");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+        .spawn()
+        .expect("spawn codemux-remote mcp");
+    let mut stdin = mcp.stdin.take().unwrap();
+    for request in [
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } }),
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "name": "workspace_list", "arguments": {} } }),
+    ] {
+        send(&mut stdin, &request);
+    }
+    drop(stdin);
+    let output = mcp.wait_with_output().expect("mcp exits at EOF");
     assert!(
-        stderr.contains("no daemon manifest"),
-        "expected manifest-not-found message, got: {stderr}"
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
+
+    let replies: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 3, "{replies:?}");
+    assert_eq!(replies[0]["result"]["protocolVersion"], json!("2025-06-18"));
+    assert_eq!(
+        replies[1]["result"]["tools"].as_array().map(Vec::len),
+        Some(12)
+    );
+    let result = &replies[2]["result"];
+    assert_eq!(result["isError"], json!(true), "{result}");
+    assert!(
+        tool_text(result).contains("\"kind\": \"unavailable\""),
+        "{result}"
+    );
+    assert!(tool_text(result).contains("isn't running"), "{result}");
+}
+
+/// A host upgrade restarts `serve` with a new port and secret under the
+/// agents already running `codemux-remote mcp`. Their bridges must find
+/// the new daemon without being restarted themselves.
+#[test]
+fn mcp_follows_the_daemon_across_restarts() {
+    let fx = ServeFixture::start();
+    let mut mcp = Command::new(binary_path())
+        .arg("mcp")
+        .arg("--state-dir")
+        .arg(fx.state_dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn codemux-remote mcp");
+    let mut stdin = mcp.stdin.take().unwrap();
+    let mut reader = BufReader::new(mcp.stdout.take().unwrap());
+    let started_at = |result: &Value| -> String {
+        assert_eq!(result["isError"], json!(false), "{result}");
+        let status: Value = serde_json::from_str(tool_text(result)).unwrap();
+        status["started_at"].as_str().unwrap().to_string()
+    };
+
+    let first = started_at(&call_tool(
+        &mut stdin,
+        &mut reader,
+        1,
+        "app_status",
+        json!({}),
+    ));
+
+    // Down: a call says so, as a tool error.
+    let secret = fx.secret.clone();
+    let (state_dir, home) = fx.stop_and_keep_dirs();
+    let result = call_tool(&mut stdin, &mut reader, 2, "workspace_list", json!({}));
+    assert_eq!(result["isError"], json!(true), "{result}");
+    assert!(
+        tool_text(&result).contains("\"kind\": \"unavailable\""),
+        "{result}"
+    );
+
+    // Back up with a new secret: the next call reaches it.
+    let fx = ServeFixture::start_in(state_dir, home);
+    assert_ne!(fx.secret, secret);
+    let second = started_at(&call_tool(
+        &mut stdin,
+        &mut reader,
+        3,
+        "app_status",
+        json!({}),
+    ));
+    assert_ne!(second, first);
+
+    // Restarted between two calls, with nothing in between.
+    let (state_dir, home) = fx.stop_and_keep_dirs();
+    let fx = ServeFixture::start_in(state_dir, home);
+    let third = started_at(&call_tool(
+        &mut stdin,
+        &mut reader,
+        4,
+        "app_status",
+        json!({}),
+    ));
+    assert_ne!(third, second);
+
+    drop(stdin);
+    assert!(mcp.wait().unwrap().success());
+    fx.stop();
 }
 
 #[test]
@@ -740,6 +1026,36 @@ fn send<W: Write>(w: &mut W, value: &Value) {
     let line = serde_json::to_string(value).unwrap();
     writeln!(w, "{line}").unwrap();
     w.flush().unwrap();
+}
+
+/// One `tools/call` over stdio; returns its `result`.
+fn call_tool<W: Write, R: BufRead>(
+    w: &mut W,
+    r: &mut R,
+    id: u64,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    send(
+        w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }),
+    );
+    let resp = recv(r);
+    assert_eq!(resp["id"], json!(id), "{resp}");
+    assert!(
+        resp.get("error").is_none(),
+        "a tool call is not a JSON-RPC error: {resp}"
+    );
+    resp["result"].clone()
+}
+
+fn tool_text(result: &Value) -> &str {
+    result["content"][0]["text"].as_str().unwrap_or_default()
 }
 
 fn recv<R: BufRead>(r: &mut R) -> Value {

@@ -3,7 +3,8 @@ import { ChatGptConnectionErrors } from "@/components/auth/chatgpt-connection";
 import { Button } from "@/components/ui/button";
 import { installProvider, signInToProvider } from "@/lib/agent-chat/provider-sign-in";
 import { useChatGptStore } from "@/stores/chatgpt-store";
-import { providerReadiness } from "@/stores/provider-health-store";
+import { newChatReadiness } from "@/lib/agent-chat/new-chat-defaults";
+import { defaultAccountSignedIn, useProviderAccounts } from "@/stores/provider-accounts-store";
 import { useUIStore } from "@/stores/ui-store";
 import type { AgentChatProviderKind, ProviderHealthReport } from "@/tauri/types";
 import { AGENT_NAME, dismissConnectAgent, type FirstRunAgents } from "./first-run-agents";
@@ -87,9 +88,12 @@ function AgentRow({
 }) {
   const name = AGENT_NAME[provider];
   const chatGpt = useChatGptStore((s) => s.status?.phase);
+  const accounts = useProviderAccounts((s) => s.accounts);
+  const defaults = useProviderAccounts((s) => s.defaults);
   const [opening, setOpening] = useState(false);
   if (!report) return null;
-  const readiness = providerReadiness(report);
+  const readiness = newChatReadiness(provider, report, accounts, defaults);
+  const defaultSignedOut = accounts && defaultAccountSignedIn(accounts, defaults, provider) === false;
 
   const run = (action: () => Promise<void>) => {
     setOpening(true);
@@ -99,7 +103,7 @@ function AgentRow({
   let detail: string;
   let action: ReactNode = null;
   if (readiness === "ready") {
-    detail = "Ready";
+    detail = report.auth_label ? `Ready · ${report.auth_label}` : "Ready";
   } else if (readiness === "not_installed") {
     detail = provider === "opencode" ? "Not installed · has free models" : "Not installed";
     action = (
@@ -107,6 +111,11 @@ function AgentRow({
         Install
       </Button>
     );
+  } else if (defaultSignedOut) {
+    // The CLI login command would sign in a different account. Settings
+    // offers sign-in for the selected extra account or a new default.
+    detail = "Default account · not signed in";
+    action = <Button variant="outline" size="sm" onClick={openProvidersSettings}>Set up</Button>;
   } else if (report.login_command) {
     detail = "Installed · not signed in";
     action = (

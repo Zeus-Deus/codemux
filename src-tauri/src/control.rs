@@ -1,3 +1,4 @@
+use crate::control_identity::{ControlClient, SocketCaller};
 use crate::indexing;
 use crate::memory;
 use crate::state::AppStateStore;
@@ -46,8 +47,16 @@ mod unix_transport {
     }
 
     impl Listener {
-        pub async fn accept(&self) -> std::io::Result<ServerStream> {
-            self.0.accept().await.map(|(stream, _)| stream)
+        /// The stream and the peer's pid (`SO_PEERCRED`), when the kernel
+        /// reports one. A peer in another pid namespace reads as 0.
+        pub async fn accept(&self) -> std::io::Result<(ServerStream, Option<u32>)> {
+            let (stream, _) = self.0.accept().await?;
+            let peer_pid = stream
+                .peer_cred()
+                .ok()
+                .and_then(|cred| cred.pid())
+                .and_then(|pid| u32::try_from(pid).ok());
+            Ok((stream, peer_pid))
         }
     }
 
@@ -98,7 +107,9 @@ mod windows_transport {
     }
 
     impl Listener {
-        pub async fn accept(&self) -> std::io::Result<ServerStream> {
+        /// The stream and the peer's pid. Named pipes report none here, so
+        /// only the env marker identifies agent processes on Windows.
+        pub async fn accept(&self) -> std::io::Result<(ServerStream, Option<u32>)> {
             let mut guard = self.pending.lock().await;
             let server = guard.take().ok_or_else(|| {
                 std::io::Error::new(
@@ -112,7 +123,7 @@ mod windows_transport {
             // to its handler task.
             let next = ServerOptions::new().create(&self.pipe_name)?;
             *guard = Some(next);
-            Ok(server)
+            Ok((server, None))
         }
     }
 
@@ -176,13 +187,27 @@ use unix_transport as transport;
 #[cfg(windows)]
 use windows_transport as transport;
 
-const CONTROL_PROTOCOL_VERSION: u32 = 1;
+/// 2: requests may carry `client` (who is calling), and the server enforces
+/// the access a client asks for. Do not reuse 2 for another change.
+const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ControlRequest {
     pub command: String,
     #[serde(default)]
     pub params: Value,
+}
+
+/// One line on the control socket: the command plus who is asking.
+///
+/// With `client: None` the bytes are exactly a bare `ControlRequest`, and an
+/// older server (no `deny_unknown_fields`) reads a newer line as one.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ControlEnvelope {
+    #[serde(flatten)]
+    pub request: ControlRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<ControlClient>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -210,12 +235,7 @@ pub fn control_socket_path() -> Option<PathBuf> {
 
     // Fallback for systems without XDG_RUNTIME_DIR (e.g. minimal distros, some AppImage environments).
     let uid = unsafe { libc::getuid() };
-    // This whole function is `#[cfg(unix)]` — the hardcoded /tmp path is
-    // reachable only on Unix and matches the XDG fallback convention
-    // for systems that don't set XDG_RUNTIME_DIR. The tmp-literal-ok
-    // marker tells the meta-test in agent_context.rs that this is
-    // intentional and not a Windows regression.
-    let fallback_dir = PathBuf::from(format!("/tmp/codemux-{uid}")); // tmp-literal-ok
+    let fallback_dir = fallback_runtime_dir(uid);
     if fallback_dir.exists() {
         // Verify the existing directory is owned by us and has safe permissions.
         use std::os::unix::fs::MetadataExt;
@@ -254,6 +274,75 @@ pub fn control_socket_path() -> Option<PathBuf> {
         fallback_dir.display()
     ));
     Some(fallback_dir.join(&socket_file))
+}
+
+/// The runtime dir the server falls back to without `XDG_RUNTIME_DIR`.
+#[cfg(unix)]
+fn fallback_runtime_dir(uid: u32) -> PathBuf {
+    // `#[cfg(unix)]` — the hardcoded /tmp path is reachable only on Unix and
+    // matches the XDG fallback convention for systems that don't set
+    // XDG_RUNTIME_DIR. The tmp-literal-ok marker tells the meta-test in
+    // agent_context.rs that this is intentional and not a Windows regression.
+    PathBuf::from(format!("/tmp/codemux-{uid}")) // tmp-literal-ok
+}
+
+/// Where a client looks for the app's socket, in the order it tries them
+/// (see [`Connection::open`]). The server binds only [`control_socket_path`].
+#[cfg(unix)]
+pub(crate) fn control_socket_candidates() -> Vec<PathBuf> {
+    let uid = unsafe { libc::getuid() };
+    socket_candidates(
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        std::path::Path::new("/run/user"),
+        uid,
+        || client_fallback_socket(fallback_runtime_dir(uid), uid),
+    )
+}
+
+/// The `/tmp` fallback socket as a client sees it. Creating the dir and
+/// logging the fallback belong to the server ([`control_socket_path`]); a
+/// client runs this on every request. Like the server, it never uses a dir
+/// another uid owns. A dir that is not there yet still names the socket, so
+/// the connection error says where the server would listen.
+#[cfg(unix)]
+fn client_fallback_socket(dir: PathBuf, uid: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::metadata(&dir) {
+        Ok(meta) if meta.uid() != uid => None,
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => None,
+        _ => Some(dir.join(format!("{SOCKET_BASENAME}.sock"))),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn control_socket_candidates() -> Vec<PathBuf> {
+    control_socket_path().into_iter().collect()
+}
+
+/// MCP clients such as Codex and Hermes start servers with an env allow-list
+/// that drops `XDG_RUNTIME_DIR`, while the app still listens in the systemd
+/// runtime dir. So when the variable is unset, try `/run/user/<uid>` (only if
+/// that uid owns it) before the server's own fallback. When it is set, use
+/// only it: tests point it at a temp dir to stay away from a real app.
+#[cfg(unix)]
+fn socket_candidates(
+    xdg_runtime_dir: Option<PathBuf>,
+    run_user: &std::path::Path,
+    uid: u32,
+    fallback: impl FnOnce() -> Option<PathBuf>,
+) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let socket_file = format!("{SOCKET_BASENAME}.sock");
+    if let Some(runtime_dir) = xdg_runtime_dir {
+        return vec![runtime_dir.join(socket_file)];
+    }
+    let runtime_dir = run_user.join(uid.to_string());
+    let mut candidates = Vec::new();
+    if fs::metadata(&runtime_dir).is_ok_and(|meta| meta.is_dir() && meta.uid() == uid) {
+        candidates.push(runtime_dir.join(&socket_file));
+    }
+    candidates.extend(fallback());
+    candidates
 }
 
 /// Build the Windows named-pipe path for the given username.
@@ -298,11 +387,27 @@ pub fn control_socket_path() -> Option<PathBuf> {
 
 /// Blocking check: is another Codemux control server currently listening?
 /// Safe to call from sync contexts (e.g. before the Tauri runtime spins up).
+///
+/// For a server's own "is another instance running" check: it probes only the
+/// path this process would bind. Clients use [`control_server_reachable`].
 pub fn control_server_is_running() -> bool {
     match control_socket_path() {
         Some(path) => transport::sync_liveness_probe(&path),
         None => false,
     }
+}
+
+/// Blocking check: does a Codemux app or `codemux serve` answer where clients
+/// look for one ([`control_socket_candidates`])? This is what
+/// [`send_control_request`] would reach, including the `/run/user/<uid>`
+/// socket when an MCP client stripped `XDG_RUNTIME_DIR`. A stale socket file
+/// does not count.
+pub fn control_server_reachable() -> bool {
+    any_answers(&control_socket_candidates())
+}
+
+fn any_answers(candidates: &[PathBuf]) -> bool {
+    candidates.iter().any(|path| transport::sync_liveness_probe(path))
 }
 
 /// Resolve "default" or empty browser_id to the first active browser session's actual ID.
@@ -447,10 +552,10 @@ pub fn spawn_control_server<R: Runtime>(app: AppHandle<R>) {
 
         loop {
             match listener.accept().await {
-                Ok(stream) => {
+                Ok((stream, peer_pid)) => {
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        if let Err(error) = handle_client(app, stream).await {
+                        if let Err(error) = handle_client(app, stream, peer_pid).await {
                             crate::diagnostics::stderr_line(&format!(
                                 "[codemux::control] Client error: {error}"
                             ));
@@ -468,74 +573,337 @@ pub fn spawn_control_server<R: Runtime>(app: AppHandle<R>) {
     });
 }
 
-async fn handle_client<R: Runtime, S>(app: AppHandle<R>, stream: S) -> Result<(), String>
+/// Lines a client may send ahead while a request parks. One more ends the
+/// parked request with `resource_limit` and closes the connection.
+const MAX_PIPELINED_LINES: usize = 64;
+
+/// Answers each request line with one response line, in order.
+///
+/// A client must keep the connection open until it has read its reply. A
+/// request that parks (`thread_wait`) ends when the client hangs up, since
+/// nobody is left to read its result; lines the client pipelines meanwhile
+/// are kept and answered after it, and the hang-up is still watched for.
+/// The server keeps reading so it can see the hang-up, so a line past
+/// [`MAX_PIPELINED_LINES`] is refused rather than left unread. Other
+/// requests always run to the end.
+async fn handle_client<R: Runtime, S>(app: AppHandle<R>, stream: S, peer_pid: Option<u32>) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
+    let mut pipelined: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|error| format!("Failed to read control request: {error}"))?
-    {
+    loop {
+        let line = match pipelined.pop_front() {
+            Some(line) => line,
+            None => match lines
+                .next_line()
+                .await
+                .map_err(|error| format!("Failed to read control request: {error}"))?
+            {
+                Some(line) => line,
+                None => break,
+            },
+        };
         if line.trim().is_empty() {
             continue;
         }
 
-        let request: ControlRequest = serde_json::from_str(&line)
-            .map_err(|error| format!("Invalid control request JSON: {error}"))?;
-        let response = dispatch_request(&app, request).await;
+        let mut overflowed = false;
+        let response = match serde_json::from_str::<ControlEnvelope>(&line) {
+            // A line this server cannot read (for example an access level a
+            // newer client knows) is answered, so the client can say why.
+            Err(error) => control_response(Err(crate::agent_control::ControlError::new(
+                crate::agent_control::ErrorCode::InvalidArguments,
+                format!("Invalid control request JSON: {error}"),
+            )
+            .to_string())),
+            Ok(envelope) => {
+                let caller = crate::control_identity::resolve_socket_caller(envelope.client, peer_pid);
+                let request = envelope.request;
+                if !may_park(&request) {
+                    dispatch_request_as(&app, &caller, request).await
+                } else {
+                    let work = dispatch_request_as(&app, &caller, request);
+                    tokio::pin!(work);
+                    loop {
+                        tokio::select! {
+                            response = &mut work => break response,
+                            // `next_line` is cancel safe: no line is lost here.
+                            next = lines.next_line() => match next {
+                                Ok(Some(line)) if pipelined.len() < MAX_PIPELINED_LINES => pipelined.push_back(line),
+                                // Holding it would grow without bound, and
+                                // leaving it unread would stop the hang-up watch.
+                                Ok(Some(_)) => {
+                                    overflowed = true;
+                                    break control_response(Err(crate::agent_control::ControlError::new(
+                                        crate::agent_control::ErrorCode::ResourceLimit,
+                                        format!("More than {MAX_PIPELINED_LINES} lines arrived while this request waited; send further requests after its reply"),
+                                    )
+                                    .to_string()));
+                                }
+                                Ok(None) | Err(_) => return Ok(()),
+                            },
+                        }
+                    }
+                }
+            }
+        };
         let payload = serde_json::to_string(&response)
             .map_err(|error| format!("Failed to encode control response: {error}"))?;
         writer
             .write_all(format!("{payload}\n").as_bytes())
             .await
             .map_err(|error| format!("Failed to write control response: {error}"))?;
+        // The held lines go unanswered; the client learned why above.
+        if overflowed {
+            return Ok(());
+        }
     }
 
     Ok(())
 }
 
+/// Whether `request` runs a registry tool that may park for a time the client
+/// chooses: the same predicate the stdio and HTTP doors use.
+fn may_park(request: &ControlRequest) -> bool {
+    let tool = match request.command.as_str() {
+        "tool_call" => request.params.get("name").and_then(Value::as_str),
+        alias if crate::agent_control::registry::is_socket_alias(alias) => Some(alias),
+        _ => None,
+    };
+    tool.and_then(crate::agent_control::registry::lookup).is_some_and(|(_, spec)| spec.may_wait())
+}
+
 /// Send a request to the running Codemux control endpoint and return the response.
 /// Used by both the CLI and the MCP server to communicate with the Codemux app.
 /// Transparently uses a Unix socket on Linux/macOS and a named pipe on Windows.
+///
+/// The request carries this process's identity (`ControlClient::current`).
 pub async fn send_control_request(request: ControlRequest) -> Result<ControlResponse, String> {
-    let socket_path = control_socket_path()
-        .ok_or_else(|| "Control socket path unavailable".to_string())?;
-    let stream = transport::connect(&socket_path)
-        .await
-        .map_err(|error| format!("Failed to connect to Codemux control endpoint: {error}"))?;
-    let (reader, mut writer) = tokio::io::split(stream);
-
-    let payload = serde_json::to_string(&request).map_err(|error| error.to_string())?;
-    writer
-        .write_all(format!("{payload}\n").as_bytes())
-        .await
-        .map_err(|error| format!("Failed to send request: {error}"))?;
-
-    let mut lines = BufReader::new(reader).lines();
-    let response = lines
-        .next_line()
-        .await
-        .map_err(|error| format!("Failed to read response: {error}"))?
-        .ok_or_else(|| "No response received from Codemux".to_string())?;
-
-    serde_json::from_str(&response).map_err(|error| format!("Invalid response JSON: {error}"))
+    send_control_request_as(request, ControlClient::current().as_ref()).await
 }
 
+/// [`send_control_request`] with an explicit identity. `client = None` speaks
+/// as the owner: tests that drive a real socket pass `None` so a developer's
+/// own agent identity never leaks into them.
+pub async fn send_control_request_as(
+    request: ControlRequest,
+    client: Option<&ControlClient>,
+) -> Result<ControlResponse, String> {
+    send_control_request_to(&control_socket_candidates(), request, client).await
+}
+
+async fn send_control_request_to(
+    candidates: &[PathBuf],
+    request: ControlRequest,
+    client: Option<&ControlClient>,
+) -> Result<ControlResponse, String> {
+    let mut connection = Connection::open(candidates).await?;
+    if client.is_some_and(ControlClient::narrows) {
+        ensure_server_enforces_access(&mut connection).await?;
+    }
+    connection.exchange(&ControlEnvelope { request, client: client.cloned() }).await
+}
+
+/// An older app ignores `client`, so a narrowed client would silently run
+/// with full access. Ask the server's protocol version first, on the
+/// connection the request then uses, and refuse. Nothing is remembered: a
+/// long-lived `codemux mcp` may outlive its app, and the next connection may
+/// reach an older build on the same socket.
+async fn ensure_server_enforces_access(connection: &mut Connection) -> Result<(), String> {
+    let probe = ControlEnvelope {
+        request: ControlRequest { command: "status".into(), params: serde_json::json!({}) },
+        client: None,
+    };
+    let status = connection.exchange(&probe).await?;
+    if status.protocol_version < CONTROL_PROTOCOL_VERSION {
+        return Err(crate::agent_control::ControlError::new(
+            crate::agent_control::ErrorCode::ServerTooOld,
+            "the running Codemux does not enforce --access; restart Codemux",
+        )
+        .to_string());
+    }
+    Ok(())
+}
+
+/// A client's connection to the control endpoint. Every server version
+/// answers any number of request lines on one connection, in order, so the
+/// access probe and the request share it.
+struct Connection {
+    lines: tokio::io::Lines<BufReader<tokio::io::ReadHalf<transport::ClientStream>>>,
+    writer: tokio::io::WriteHalf<transport::ClientStream>,
+}
+
+impl Connection {
+    /// Connects to the first candidate that accepts. A missing socket, or a
+    /// stale one a crashed app left behind (connection refused), moves on to
+    /// the next, so a dead `/run/user` socket never hides a live `/tmp` one.
+    /// Any other error stops the search. The last error is reported.
+    ///
+    /// No existence check comes first: on Windows, opening a pipe name to
+    /// look at it is itself a connection the server accepts.
+    async fn open(candidates: &[PathBuf]) -> Result<Self, String> {
+        let mut last_error = None;
+        for path in candidates {
+            match transport::connect(path).await {
+                Ok(stream) => {
+                    let (reader, writer) = tokio::io::split(stream);
+                    return Ok(Self { lines: BufReader::new(reader).lines(), writer });
+                }
+                Err(error) => {
+                    let try_next = matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    );
+                    last_error = Some(error);
+                    if !try_next {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(match last_error {
+            Some(error) => format!("Failed to connect to Codemux control endpoint: {error}"),
+            None => "Control socket path unavailable".to_string(),
+        })
+    }
+
+    /// One request line, one response line.
+    async fn exchange(&mut self, envelope: &ControlEnvelope) -> Result<ControlResponse, String> {
+        let payload = serde_json::to_string(envelope).map_err(|error| error.to_string())?;
+        self.writer
+            .write_all(format!("{payload}\n").as_bytes())
+            .await
+            .map_err(|error| format!("Failed to send request: {error}"))?;
+
+        let response = self
+            .lines
+            .next_line()
+            .await
+            .map_err(|error| format!("Failed to read response: {error}"))?
+            .ok_or_else(|| "No response received from Codemux".to_string())?;
+
+        serde_json::from_str(&response).map_err(|error| format!("Invalid response JSON: {error}"))
+    }
+}
+
+/// Runs a request as the owner. Only tests call it: every socket request
+/// goes through [`dispatch_request_as`] with the caller it resolved.
+#[cfg(test)]
 pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlRequest) -> ControlResponse {
+    dispatch_request_as(app, &SocketCaller::owner(), request).await
+}
+
+/// The caller registry tools run as. The socket cannot tell which chat an
+/// agent process belongs to, so it never runs registry tools as one (and
+/// never as the owner).
+fn registry_caller(caller: &SocketCaller) -> Result<&crate::agent_control::ControlCaller, String> {
+    match caller {
+        SocketCaller::Local(caller) => Ok(caller),
+        SocketCaller::Agent { .. } => Err(crate::agent_control::ControlError::new(
+            crate::agent_control::ErrorCode::AgentIdentityRequired,
+            "This process runs under a Codemux agent; use your chat's own Codemux tools for thread control",
+        )
+        .to_string()),
+    }
+}
+
+/// Absent or null params read as `{}`.
+fn params_object(params: &Value) -> Value {
+    if params.is_null() { serde_json::json!({}) } else { params.clone() }
+}
+
+/// `tool_call {name, arguments}`: any outside registry tool, by name. `data`
+/// is the MCP CallToolResult, tool errors included; `ok:false` only for
+/// malformed params, agent callers and unknown tools (`unknown_tool: …`).
+async fn tool_call<R: Runtime>(
+    app: &AppHandle<R>,
+    caller: &crate::agent_control::ControlCaller,
+    params: &Value,
+) -> Result<Value, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Args {
+        name: String,
+        #[serde(default)]
+        arguments: Value,
+    }
+    let args: Args = serde_json::from_value(params_object(params)).map_err(|error| {
+        crate::agent_control::ControlError::new(crate::agent_control::ErrorCode::InvalidArguments, error.to_string()).to_string()
+    })?;
+    crate::agent_control::registry::call(app, caller, &args.name, params_object(&args.arguments))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// `tools_list {}`: the outside catalog this caller may run, and who the
+/// socket took it for.
+fn tools_list(caller: &crate::agent_control::ControlCaller, params: &Value) -> Result<Value, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Args {}
+    serde_json::from_value::<Args>(params_object(params)).map_err(|error| {
+        crate::agent_control::ControlError::new(crate::agent_control::ErrorCode::InvalidArguments, error.to_string()).to_string()
+    })?;
+    Ok(serde_json::json!({
+        "tools": crate::agent_control::registry::tools_for(caller),
+        "caller": { "principal": caller.principal, "access": caller.access },
+    }))
+}
+
+fn control_response(result: Result<Value, String>) -> ControlResponse {
+    match result {
+        Ok(data) => ControlResponse {
+            ok: true,
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            data: Some(data),
+            error: None,
+        },
+        Err(error) => ControlResponse {
+            ok: false,
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            data: None,
+            error: Some(error),
+        },
+    }
+}
+
+/// Runs a request for `caller`: the access gate (`command_access` then
+/// `SocketCaller::permits`), then the command's handler.
+pub(crate) async fn dispatch_request_as<R: Runtime>(
+    app: &AppHandle<R>,
+    caller: &SocketCaller,
+    request: ControlRequest,
+) -> ControlResponse {
+    let required = crate::control_identity::command_access(&request.command, &request.params);
+    if let Err(error) = caller.permits(&request.command, required) {
+        if let SocketCaller::Agent { kind, .. } = caller {
+            crate::diagnostics::stderr_line(&format!(
+                "[codemux::control] refused `{}` to an agent process ({kind}): {}",
+                request.command, error.code
+            ));
+        }
+        return control_response(Err(error.to_string()));
+    }
     let result = match request.command.as_str() {
         "delegation_local_context" => match request.params.get("threadId").or_else(||request.params.get("thread_id")).and_then(Value::as_str) {
             Some(thread)=>crate::commands::delegation::delegation_local_context(app.clone(),thread.into()).await,
             None=>Err("threadId is required".into()),
         },
         "delegation_host_info" | "delegation_grants" | "delegation_authorize" | "delegation_revoke" | "delegate_task" | "delegation_list" | "delegation_read" | "delegation_cancel" | "delegation_respond" | "delegation_deliver" => crate::delegation::app::invoke(app, &request.command, request.params).await,
-        name if crate::agent_control::is_native_tool(name) => {
-            crate::agent_control::execute(app,&crate::agent_control::ControlCaller::trusted(),name,request.params.clone())
-                .await.map_err(|error|error.to_string())
-        }
+        // The bare aliases keep returning raw data or `code: message`.
+        name if crate::agent_control::registry::is_socket_alias(name) => match registry_caller(caller) {
+            Ok(caller) => crate::agent_control::execute(app, caller, name, request.params.clone())
+                .await.map_err(|error| error.to_string()),
+            Err(refused) => Err(refused),
+        },
+        "tool_call" => match registry_caller(caller) {
+            Ok(caller) => tool_call(app, caller, &request.params).await,
+            Err(refused) => Err(refused),
+        },
+        "tools_list" => registry_caller(caller).and_then(|caller| tools_list(caller, &request.params)),
         "agent_connector_status" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct Args {}
             serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
@@ -543,10 +911,24 @@ pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: Co
                 .and_then(|status|serde_json::to_value(status).map_err(|e|e.to_string()))
         }
         "agent_connector_set_config" => {
+            // `port` omitted keeps the configured one.
             #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-            struct Args { enabled: bool, public_origin: Option<String> }
+            struct Args { enabled: bool, public_origin: Option<String>, #[serde(default)] port: Option<u16> }
             serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
-                .and_then(|args|crate::mcp_connector::agent_connector_set_config(app.clone(),args.enabled,args.public_origin))
+                .and_then(|args|crate::mcp_connector::agent_connector_set_config(app.clone(),args.enabled,args.public_origin,args.port))
+                .and_then(|status|serde_json::to_value(status).map_err(|e|e.to_string()))
+        }
+        "agent_connector_issue" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct Args { label: String, access: crate::agent_control::ControlAccess, #[serde(default)] expires_in_hours: Option<u32> }
+            serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
+                .and_then(|args|crate::mcp_connector::agent_connector_issue(app.clone(),args.label,args.access,args.expires_in_hours))
+                .and_then(|issued|serde_json::to_value(issued).map_err(|e|e.to_string()))
+        }
+        "agent_connector_revoke_all" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct Args {}
+            serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
+                .and_then(|_|crate::mcp_connector::agent_connector_revoke_all(app.clone()))
                 .and_then(|status|serde_json::to_value(status).map_err(|e|e.to_string()))
         }
         "agent_connector_approve" => {
@@ -675,22 +1057,15 @@ pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: Co
                 .and_then(|hits| serde_json::to_value(hits).map_err(|error| error.to_string()))
         })(),
         "create_workspace" => {
-            let state: State<'_, AppStateStore> = app.state();
-            let db: State<'_, crate::database::DatabaseStore> = app.state();
-            // Phase 1.5 fix: the MCP `workspace_create` tool advertises an
-            // optional `path` argument in its schema and the MCP dispatcher
-            // (mcp_server.rs::workspace_create) packs it into params, but
-            // this arm previously hardcoded `None` — so every call landed
-            // at `current_project_root()` regardless of what the brain
-            // asked for. Reading the param closes the silent-drop.
-            let path = request
-                .params
-                .get("path")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            crate::commands::workspace::create_workspace_impl(app.clone(), &state, &db, path)
+            // Backs the legacy `workspace_create` stdio tool. It always
+            // creates, and takes focus unless `select: false` asks it not to
+            // (registry `workspace_create` is the no-focus door).
+            let path = request.params.get("path").and_then(Value::as_str).map(str::to_string);
+            let select = request.params.get("select").and_then(Value::as_bool).unwrap_or(true);
+            crate::workspace_service::WorkspaceService::new(app)
+                .open(crate::workspace_service::OpenWorkspace { path, select, reuse_open: false, reserved_id: None })
                 .await
-                .map(|workspace_id| serde_json::json!({ "workspace_id": workspace_id }))
+                .and_then(|opened| serde_json::to_value(opened).map_err(|error| error.to_string()))
         }
         "split_pane" => {
             let state: State<'_, AppStateStore> = app.state();
@@ -740,104 +1115,48 @@ pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: Co
             .map(|()| serde_json::json!({ "ok": true }))
         }
         "create_worktree_workspace" => {
-            // Phase 1.5: backs the `worktree_create` MCP tool. The
-            // underlying impl already handles git worktree + workspace
-            // hydration + PTY spawn + setup scripts + .mcp.json autoconfig
-            // + preset launch with prompt injection in one atomic call —
-            // we only parse params and pass through.
-            let state: State<'_, AppStateStore> = app.state();
-            let db: State<'_, crate::database::DatabaseStore> = app.state();
-            let pty_state: State<'_, PtyState> = app.state();
-            let presets: State<'_, crate::presets::PresetStoreState> = app.state();
-            let repo_path = request
-                .params
-                .get("repo_path")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| "Missing required parameter: repo_path".to_string());
-            let branch = request
-                .params
-                .get("branch")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| "Missing required parameter: branch".to_string());
-            // Defaults match Phase 1.5 plan §5: new_branch=true so the
-            // brain's natural "spin up a new feature branch" flow doesn't
-            // need an extra arg, base="main" since that's where almost
-            // every project forks from, layout="single" because the brain
-            // typically wants one terminal pane to attach a CLI agent to.
-            let new_branch = request
-                .params
-                .get("new_branch")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            let base = request
-                .params
-                .get("base")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| Some("main".to_string()));
-            let layout = request
-                .params
-                .get("layout")
-                .and_then(Value::as_str)
-                .unwrap_or("single")
-                .to_string();
-            let initial_prompt = request
-                .params
-                .get("initial_prompt")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let agent_preset_id = request
-                .params
-                .get("agent_preset_id")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let pr_number = request
-                .params
-                .get("pr_number")
-                .and_then(Value::as_u64)
-                .map(|n| n as u32);
-            match (repo_path, branch) {
-                (Ok(rp), Ok(br)) => crate::commands::workspace::create_worktree_workspace_impl(
-                    app.clone(),
-                    &state,
-                    &db,
-                    &pty_state,
-                    &presets,
-                    rp,
-                    br,
-                    new_branch,
-                    base,
-                    layout,
-                    initial_prompt,
-                    agent_preset_id,
-                    request
-                        .params
-                        .get("model_selection")
-                        .cloned()
-                        .and_then(|v| {
-                            serde_json::from_value(v)
-                                .map_err(|e| {
-                                    eprintln!(
-                                        "[control] create_worktree_workspace: ignoring malformed model_selection: {e}"
-                                    )
-                                })
-                                .ok()
-                        }),
-                    pr_number,
-                )
-                .await
-                // `adopted` is additive: true when a live workspace already
-                // claimed the worktree path and was focused instead of a new
-                // one being created (any initial_prompt was dropped).
-                .map(|created| {
-                    serde_json::json!({
-                        "workspace_id": created.workspace_id,
-                        "adopted": created.adopted,
+            // Backs the legacy `worktree_create` stdio tool: git worktree,
+            // workspace and layout, PTYs, setup scripts, `.mcp.json` and an
+            // optional preset launch with its prompt, in one call. Params are
+            // read as leniently as they always were; the defaults are a new
+            // branch from the repository's default branch, one terminal, and
+            // focus on the new workspace unless `select: false`.
+            let text = |key: &str| request.params.get(key).and_then(Value::as_str).map(str::to_string);
+            let required = |key: &str| text(key).ok_or_else(|| format!("Missing required parameter: {key}"));
+            let model_selection = request.params.get("model_selection").cloned().and_then(|value| {
+                serde_json::from_value(value)
+                    .map_err(|error| {
+                        eprintln!("[control] create_worktree_workspace: ignoring malformed model_selection: {error}")
                     })
-                }),
-                (Err(e), _) | (_, Err(e)) => Err(e),
+                    .ok()
+            });
+            match (required("repo_path"), required("branch")) {
+                (Ok(repo_path), Ok(branch)) => {
+                    let args = crate::workspace_service::WorktreeArgs {
+                        repo_path,
+                        branch,
+                        new_branch: request.params.get("new_branch").and_then(Value::as_bool),
+                        base: text("base"),
+                        start_from_origin: None,
+                        layout: text("layout"),
+                        agent_preset_id: text("agent_preset_id"),
+                        initial_prompt: text("initial_prompt"),
+                        pr_number: request.params.get("pr_number").and_then(Value::as_u64).map(|n| n as u32),
+                        select: request.params.get("select").and_then(Value::as_bool).unwrap_or(true),
+                        client_request_id: None,
+                    };
+                    match args.into_request(model_selection, None).await {
+                        Ok(worktree) => crate::workspace_service::WorkspaceService::new(app)
+                            .create_worktree(worktree)
+                            .await
+                            // `adopted` is true when a live workspace already
+                            // held the checkout and was returned instead (any
+                            // initial_prompt was dropped).
+                            .and_then(|created| serde_json::to_value(created).map_err(|error| error.to_string())),
+                        Err(error) => Err(error),
+                    }
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error),
             }
         }
         "get_presets" => {
@@ -945,47 +1264,23 @@ pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: Co
             })
         }
         "close_workspace" => {
-            // Phase 1.6: backs the `workspace_close` MCP tool. Wraps the
-            // existing `close_workspace_with_worktree_impl` so both the
-            // Tauri command and the socket arm share teardown, PTY
-            // termination, agent-chat shutdown, MCP cleanup, and (when
-            // requested) `git worktree remove`. Safe default:
-            // `delete_worktree=false` — closing never destroys a worktree
-            // unless the brain asks for it.
-            let state: State<'_, AppStateStore> = app.state();
-            let db: State<'_, crate::database::DatabaseStore> = app.state();
-            let workspace_id = request
-                .params
-                .get("workspace_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| "Missing required parameter: workspace_id".to_string());
-            let delete_worktree = request
-                .params
-                .get("delete_worktree")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let delete_branch = request.params.get("delete_branch").and_then(Value::as_bool);
-            let force = request.params.get("force_delete").and_then(Value::as_bool);
-            match workspace_id {
-                Ok(ws_id) => crate::commands::workspace::close_workspace_with_worktree_impl(
-                    app.clone(),
-                    &state,
-                    &db,
-                    ws_id.clone(),
-                    delete_worktree,
-                    delete_branch,
-                    force,
-                )
-                .await
-                .map(|_| {
-                    serde_json::json!({
-                        "workspace_id": ws_id,
-                        "closed": true,
-                        "worktree_removed": delete_worktree,
+            // Backs the legacy `workspace_close` stdio tool, through the
+            // desktop close dialog's teardown and deletion guards. Closing
+            // never removes a worktree unless asked to.
+            let flag = |key: &str| request.params.get(key).and_then(Value::as_bool).unwrap_or(false);
+            match request.params.get("workspace_id").and_then(Value::as_str) {
+                Some(workspace_id) => crate::workspace_service::WorkspaceService::new(app)
+                    .close(crate::workspace_service::CloseWorkspace {
+                        workspace_id: workspace_id.to_string(),
+                        remove_worktree: flag("delete_worktree"),
+                        delete_branch: flag("delete_branch"),
+                        force: flag("force_delete"),
+                        // As the desktop dialog.
+                        commits: crate::workspace_service::CommitLoss::Allow,
                     })
-                }),
-                Err(e) => Err(e),
+                    .await
+                    .and_then(|closed| serde_json::to_value(closed).map_err(|error| error.to_string())),
+                None => Err("Missing required parameter: workspace_id".to_string()),
             }
         }
         "archive_workspace" => {
@@ -1587,26 +1882,38 @@ pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: Co
         }
         "rerun_setup" => {
             let state: State<'_, AppStateStore> = app.state();
-            let db: State<'_, crate::database::DatabaseStore> = app.state();
             let workspace_id = request.params.get("workspace_id").and_then(Value::as_str)
                 .map(str::to_string)
                 .or_else(|| state.active_workspace_cwd().map(|(id, _)| id))
                 .ok_or_else(|| "No workspace_id and no active workspace".to_string());
-            workspace_id.and_then(|ws_id| {
-                let (cwd, title, branch) = {
-                    let snapshot = state.snapshot();
-                    let ws = snapshot.workspaces.iter()
-                        .find(|w| w.workspace_id.0 == ws_id)
-                        .ok_or_else(|| format!("No workspace found for {ws_id}"))?;
-                    Ok::<_, String>((ws.cwd.clone(), ws.title.clone(), ws.git_branch.clone()))
-                }?;
-                let port = crate::scripts::allocate_workspace_port(&ws_id);
-                crate::scripts::run_setup_scripts(
-                    std::path::Path::new(&cwd), &title, &ws_id, app, Some(&db),
-                    branch.as_deref(), Some(port),
-                )?;
-                Ok(serde_json::json!({ "workspace_id": ws_id, "status": "complete" }))
-            })
+            let target = workspace_id.and_then(|ws_id| {
+                let snapshot = state.snapshot();
+                let ws = snapshot.workspaces.iter()
+                    .find(|w| w.workspace_id.0 == ws_id)
+                    .ok_or_else(|| format!("No workspace found for {ws_id}"))?;
+                Ok((ws.cwd.clone(), ws.title.clone(), ws.git_branch.clone(), ws_id))
+            });
+            match target {
+                Err(error) => Err(error),
+                // Setup scripts block until they finish, and one may call
+                // `codemux` back. On an async worker that call could never be
+                // answered: the blocked worker can leave nobody polling the
+                // socket.
+                Ok((cwd, title, branch, ws_id)) => {
+                    let app = app.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let db: State<'_, crate::database::DatabaseStore> = app.state();
+                        let port = crate::scripts::allocate_workspace_port(&ws_id);
+                        crate::scripts::run_setup_scripts(
+                            std::path::Path::new(&cwd), &title, &ws_id, &app, Some(&db),
+                            branch.as_deref(), Some(port),
+                        )?;
+                        Ok::<_, String>(serde_json::json!({ "workspace_id": ws_id, "status": "complete" }))
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(format!("rerun_setup task failed: {error}")))
+                }
+            }
         }
         // ── Automations ──
         //
@@ -1791,20 +2098,7 @@ pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: Co
         _ => Err(format!("Unknown control command: {}", request.command)),
     };
 
-    match result {
-        Ok(data) => ControlResponse {
-            ok: true,
-            protocol_version: CONTROL_PROTOCOL_VERSION,
-            data: Some(data),
-            error: None,
-        },
-        Err(error) => ControlResponse {
-            ok: false,
-            protocol_version: CONTROL_PROTOCOL_VERSION,
-            data: None,
-            error: Some(error),
-        },
-    }
+    control_response(result)
 }
 
 /// Filter `ports` to entries whose `workspace_id` matches `workspace_filter`.
@@ -2026,11 +2320,684 @@ mod tests {
         }).await;
         assert!(response.ok,"{:?}",response.error);
         let status = response.data.unwrap();
-        let mut fields: Vec<_> = status.as_object().unwrap().keys().map(String::as_str).collect();
-        fields.sort_unstable();
-        assert_eq!(fields,vec!["clients","enabled","listenerRunning","localCommand","mcpUrl","pending","publicOrigin"]);
+        let fields: std::collections::BTreeSet<_> = status.as_object().unwrap().keys().map(String::as_str).collect();
+        // `revokedGrants` appears only in set_config replies.
+        assert_eq!(fields, ["bindError","clients","enabled","listenerRunning","localCommand","localExecutable","localUrl","mcpUrl","pending","port","publicOrigin"].into());
         assert_eq!(status["enabled"],false);
         assert_eq!(status["listenerRunning"],false);
+    }
+
+    /// The CLI's `connector enable --port`, `issue` and `revoke --all` reach
+    /// the connector through these arms, with exactly the fields they send.
+    #[tokio::test]
+    async fn connector_port_tokens_and_revoke_all_are_socket_commands() {
+        use tauri::Manager;
+        let app = tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(crate::web_remote::WebRemoteState::default());
+        app.manage(crate::mcp_connector::McpConnectorState::default());
+        let call = |command: &str, params: Value| dispatch_request(app.handle(), request(command, params));
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+
+        let enabled = call("agent_connector_set_config", serde_json::json!({"enabled":true,"public_origin":null,"port":port})).await;
+        assert!(enabled.ok, "{:?}", enabled.error);
+        let enabled = enabled.data.unwrap();
+        assert_eq!((enabled["port"].clone(), enabled["listenerRunning"].clone()), (serde_json::json!(port), serde_json::json!(true)), "{enabled}");
+        // Callers that predate `port` keep the configured one.
+        let kept = call("agent_connector_set_config", serde_json::json!({"enabled":true,"public_origin":null})).await;
+        assert_eq!(kept.data.unwrap()["port"], port);
+
+        let issued = call("agent_connector_issue", serde_json::json!({"label":"socket-bot","access":"supervised","expires_in_hours":2})).await;
+        assert!(issued.ok, "{:?}", issued.error);
+        let issued = issued.data.unwrap();
+        assert!(issued["token"].as_str().unwrap().starts_with(crate::mcp_connector::oauth::ACCESS_PREFIX), "{issued}");
+        assert_eq!((issued["label"].clone(), issued["access"].clone()), (serde_json::json!("socket-bot"), serde_json::json!("supervised")));
+        assert_eq!(issued["localUrl"], format!("http://127.0.0.1:{port}/mcp"));
+        let default_expiry = call("agent_connector_issue", serde_json::json!({"label":"other-bot","access":"read_only"})).await;
+        assert!(default_expiry.ok, "expires_in_hours is optional: {:?}", default_expiry.error);
+        for (command, params) in [
+            ("agent_connector_issue", serde_json::json!({"label":"x","access":"supervised","scope":"all"})),
+            ("agent_connector_revoke_all", serde_json::json!({"client_id":"x"})),
+            ("agent_connector_set_config", serde_json::json!({"enabled":true,"listen":"0.0.0.0"})),
+        ] {
+            let refused = call(command, params).await;
+            assert!(!refused.ok && refused.error.as_deref().is_some_and(|e| e.contains("unknown field")), "{command}: {:?}", refused.error);
+        }
+        let status = call("agent_connector_status", serde_json::json!({})).await.data.unwrap();
+        assert_eq!(status["clients"].as_array().unwrap().len(), 2, "{status}");
+
+        let revoked = call("agent_connector_revoke_all", serde_json::json!({})).await;
+        assert!(revoked.ok, "{:?}", revoked.error);
+        let status = call("agent_connector_status", serde_json::json!({})).await.data.unwrap();
+        assert_eq!(status["clients"], serde_json::json!([]));
+        assert_eq!(status["enabled"], true, "revoke all keeps the connector on");
+        let disabled = call("agent_connector_set_config", serde_json::json!({"enabled":false,"public_origin":null})).await;
+        assert_eq!(disabled.data.unwrap()["listenerRunning"], false);
+    }
+
+    fn request(command: &str, params: Value) -> ControlRequest {
+        ControlRequest { command: command.into(), params }
+    }
+
+    fn local(name: Option<&str>, access: crate::agent_control::ControlAccess) -> SocketCaller {
+        let name = name.and_then(crate::agent_control::ClientName::parse);
+        SocketCaller::Local(crate::agent_control::ControlCaller::local(name.as_ref(), access))
+    }
+
+    fn agent(access: crate::agent_control::ControlAccess) -> SocketCaller {
+        SocketCaller::Agent { kind: "test".into(), access }
+    }
+
+    fn refused_with(response: &ControlResponse, code: &str) -> bool {
+        !response.ok && response.error.as_deref().is_some_and(|error| error.starts_with(&format!("{code}: ")))
+    }
+
+    #[tokio::test]
+    async fn agent_processes_are_refused_connector_administration() {
+        let app = tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(crate::web_remote::WebRemoteState::default());
+        app.manage(crate::mcp_connector::McpConnectorState::default());
+        let full = agent(crate::agent_control::ControlAccess::FullAccess);
+        let before = dispatch_request(app.handle(), request("agent_connector_status", serde_json::json!({}))).await;
+        assert!(before.ok, "{:?}", before.error);
+        for (command, params) in [
+            ("agent_connector_approve", serde_json::json!({"request_id":"x","access":"full_access"})),
+            ("agent_connector_status", serde_json::json!({})),
+            ("agent_connector_set_config", serde_json::json!({"enabled":true,"port":4399})),
+            ("agent_connector_deny", serde_json::json!({"request_id":"x"})),
+            ("agent_connector_revoke", serde_json::json!({"client_id":"x"})),
+            ("agent_connector_issue", serde_json::json!({"label":"agent-made","access":"full_access"})),
+            ("agent_connector_revoke_all", serde_json::json!({})),
+        ] {
+            let response = dispatch_request_as(app.handle(), &full, request(command, params)).await;
+            assert!(refused_with(&response, "admin_refused"), "{command}: {:?}", response.error);
+        }
+        let after = dispatch_request(app.handle(), request("agent_connector_status", serde_json::json!({}))).await;
+        assert_eq!(after.data, before.data, "the refused calls changed nothing");
+        assert_eq!(after.data.unwrap()["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn agent_processes_are_refused_remote_access_and_automation_writes() {
+        let app = tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        let full = agent(crate::agent_control::ControlAccess::FullAccess);
+        let input = serde_json::json!({"name":"n","prompt":"p","agent":"claude","schedule":"0 * * * *"});
+        for (command, params) in [
+            ("web_remote_enable", serde_json::json!({"scope":"all"})),
+            ("web_remote_pair", serde_json::json!({"name":"phone"})),
+            ("web_remote_set_relay", serde_json::json!({"enabled":true})),
+            ("web_remote_disable", serde_json::json!({})),
+            ("automation_create", serde_json::json!({"input": input})),
+            ("automation_update", serde_json::json!({"id":1,"input": input})),
+            ("automation_set_enabled", serde_json::json!({"id":1,"enabled":true})),
+            ("automation_delete", serde_json::json!({"id":1})),
+            ("write_terminal", serde_json::json!({"data":"codemux json agent_connector_approve
+"})),
+            ("apply_preset", serde_json::json!({"workspace_id":"w","preset_id":"p"})),
+            ("create_worktree_workspace", serde_json::json!({"repo_path":"/r","branch":"b","agent_preset_id":"p","initial_prompt":"go"})),
+            ("delegation_respond", serde_json::json!({})),
+            ("no_such_command", serde_json::json!({})),
+        ] {
+            let response = dispatch_request_as(app.handle(), &full, request(command, params)).await;
+            assert!(refused_with(&response, "admin_refused"), "{command}: {:?}", response.error);
+        }
+        let listed = dispatch_request_as(app.handle(), &full, request("automation_list", serde_json::json!({}))).await;
+        assert!(listed.ok, "agents keep reading automations: {:?}", listed.error);
+        assert_eq!(listed.data.unwrap(), serde_json::json!([]), "no automation was created");
+    }
+
+    #[tokio::test]
+    async fn agent_processes_keep_workspace_and_browser_commands() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        let full = agent(crate::agent_control::ControlAccess::FullAccess);
+        for command in ["status", "get_app_state"] {
+            let response = dispatch_request_as(app.handle(), &full, request(command, serde_json::json!({}))).await;
+            assert!(response.ok, "{command}: {:?}", response.error);
+        }
+        let notify = dispatch_request_as(app.handle(), &full, request("notify", serde_json::json!({"message":"hi"}))).await;
+        assert!(notify.ok, "{:?}", notify.error);
+        assert_eq!(app.state::<AppStateStore>().snapshot().notifications.len(), 1);
+        // `codemux browser` from an agent's shell: every action passes the
+        // gate (the handler itself needs a live browser).
+        for action in [serde_json::json!({"kind":"open","url":"about:blank"}), serde_json::json!({"kind":"snapshot"}),
+            serde_json::json!({"kind":"click_os"}), serde_json::json!({"kind":"eval","script":"1"})] {
+            let required = crate::control_identity::command_access("browser_automation", &serde_json::json!({"action": action}));
+            assert!(full.permits("browser_automation", required).is_ok(), "{action}");
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_socket_callers_keep_machine_class_legacy_commands() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        let full = agent(crate::agent_control::ControlAccess::FullAccess);
+        // The gate lets it through; the handler then fails on the unknown
+        // workspace without side effects.
+        let rerun = dispatch_request_as(app.handle(), &full, request("rerun_setup", serde_json::json!({"workspace_id":"missing"}))).await;
+        assert_eq!(rerun.error.as_deref(), Some("No workspace found for missing"));
+        for (command, params) in [
+            ("create_workspace", serde_json::json!({"path":"/tmp/project"})),
+            ("create_worktree_workspace", serde_json::json!({"repo_path":"/r","branch":"b"})),
+            // A prompt without a preset is dropped: nothing launches.
+            ("create_worktree_workspace", serde_json::json!({"repo_path":"/r","branch":"b","initial_prompt":"go"})),
+            ("close_workspace", serde_json::json!({"workspace_id":"w","delete_worktree":true})),
+            ("close_workspace", serde_json::json!({"workspace_id":"w"})),
+            ("archive_workspace", serde_json::json!({"workspace_id":"w"})),
+            ("unarchive_workspace", serde_json::json!({})),
+        ] {
+            let required = crate::control_identity::command_access(command, &params);
+            assert_eq!(required, crate::agent_control::Access::Machine, "{command}");
+            assert!(full.permits(command, required).is_ok(), "{command}");
+        }
+        let automation = dispatch_request_as(app.handle(), &full, request("automation_create", serde_json::json!({}))).await;
+        assert!(refused_with(&automation, "admin_refused"), "{:?}", automation.error);
+        let supervised = agent(crate::agent_control::ControlAccess::Supervised);
+        let create = dispatch_request_as(app.handle(), &supervised, request("create_workspace", serde_json::json!({"path":"relative/dir"}))).await;
+        assert!(refused_with(&create, "access_denied"), "{:?}", create.error);
+    }
+
+    /// Closing and archiving run the worktree's teardown scripts even when
+    /// the worktree stays, so a supervised caller is refused both before
+    /// anything closes.
+    #[tokio::test]
+    async fn supervised_callers_cannot_close_or_archive() {
+        use crate::agent_control::ControlAccess::Supervised;
+        let app = tauri::test::mock_app();
+        let state = AppStateStore::default();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = state.create_empty_workspace_at_path(root.path().to_path_buf()).0;
+        app.manage(state);
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        for caller in [local(Some("hermes"), Supervised), agent(Supervised)] {
+            for command in ["close_workspace", "archive_workspace"] {
+                let params = serde_json::json!({"workspace_id": workspace});
+                let response = dispatch_request_as(app.handle(), &caller, request(command, params)).await;
+                assert!(refused_with(&response, "access_denied"), "{caller:?} {command}: {:?}", response.error);
+            }
+        }
+        let snapshot = app.state::<AppStateStore>().snapshot();
+        assert!(snapshot.workspaces.iter().any(|ws| ws.workspace_id.0 == workspace), "the workspace stays open");
+        assert!(snapshot.archived_workspaces.is_empty(), "nothing was archived");
+    }
+
+    #[tokio::test]
+    async fn agent_without_chat_cannot_use_registry_tools() {
+        let app = tauri::test::mock_app();
+        let state = AppStateStore::default();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = state.create_empty_workspace_at_path(root.path().to_path_buf()).0;
+        app.manage(state);
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        let full = agent(crate::agent_control::ControlAccess::FullAccess);
+        for (tool, params) in [
+            ("thread_list", serde_json::json!({"workspace_id": workspace})),
+            ("thread_launch", serde_json::json!({"workspace_id": workspace, "client_request_id":"k", "provider":"claude", "message":"hi"})),
+            ("tool_call", serde_json::json!({"name":"thread_list", "arguments":{"workspace_id": workspace}})),
+            ("tools_list", serde_json::json!({})),
+        ] {
+            let response = dispatch_request_as(app.handle(), &full, request(tool, params)).await;
+            assert!(refused_with(&response, "agent_identity_required"), "{tool}: {:?}", response.error);
+        }
+        let owner = dispatch_request(app.handle(), request("thread_list", serde_json::json!({"workspace_id": workspace}))).await;
+        assert!(owner.ok, "{:?}", owner.error);
+    }
+
+    fn operation_app() -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(crate::agent_control::NativeControlState::default());
+        app
+    }
+
+    #[tokio::test]
+    async fn socket_tool_call_matches_the_alias() {
+        let app = operation_app();
+        let arguments = serde_json::json!({"operation_id": "missing"});
+        let called = dispatch_request(app.handle(), request("tool_call", serde_json::json!({"name": "operation_status", "arguments": arguments}))).await;
+        assert!(called.ok, "a tool error is a result, not a failed request: {:?}", called.error);
+        let result = called.data.unwrap();
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["structuredContent"]["error"]["code"], "operation_not_found");
+        assert_eq!(result["structuredContent"]["error"]["retryable"], false);
+        let alias = dispatch_request(app.handle(), request("operation_status", arguments)).await;
+        assert!(!alias.ok);
+        assert_eq!(alias.error.as_deref(), result["content"][0]["text"].as_str(), "the alias keeps its `code: message` text");
+
+        // Bad arguments are tool errors with detail; null arguments are `{}`.
+        let bogus = dispatch_request(app.handle(), request("tool_call", serde_json::json!({"name": "operation_status", "arguments": {"bogus": 1}}))).await;
+        let bogus = bogus.data.unwrap();
+        assert_eq!(bogus["structuredContent"]["error"]["code"], "invalid_arguments", "{bogus}");
+        assert!(bogus["structuredContent"]["error"]["message"].as_str().unwrap().contains("bogus"), "{bogus}");
+        let null = dispatch_request(app.handle(), request("tool_call", serde_json::json!({"name": "operation_status", "arguments": null}))).await;
+        let null = null.data.unwrap();
+        assert!(null["content"][0]["text"].as_str().unwrap().contains("operation_id"), "null reads as no arguments: {null}");
+
+        // Unknown tools and malformed requests are failed requests.
+        let unknown = dispatch_request(app.handle(), request("tool_call", serde_json::json!({"name": "nope"}))).await;
+        assert_eq!(unknown.error.as_deref(), Some("unknown_tool: Unknown tool: nope"));
+        let in_app_only = dispatch_request(app.handle(), request("tool_call", serde_json::json!({"name": "create_threads", "arguments": {}}))).await;
+        assert!(refused_with(&in_app_only, "unknown_tool"), "{:?}", in_app_only.error);
+        for params in [serde_json::json!({}), serde_json::json!({"name": 1}), serde_json::json!({"name": "thread_list", "extra": true}), Value::Null] {
+            let malformed = dispatch_request(app.handle(), request("tool_call", params.clone())).await;
+            assert!(refused_with(&malformed, "invalid_arguments"), "{params}: {:?}", malformed.error);
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_tools_list_serves_the_outside_catalog() {
+        use crate::agent_control::{ClientName, ControlAccess, ControlCaller};
+        let app = tauri::test::mock_app();
+        let owner = dispatch_request(app.handle(), request("tools_list", serde_json::json!({}))).await;
+        assert!(owner.ok, "{:?}", owner.error);
+        let owner = owner.data.unwrap();
+        let catalog = |caller: &ControlCaller| serde_json::to_value(crate::agent_control::registry::tools_for(caller)).unwrap();
+        assert_eq!(owner["tools"], catalog(&ControlCaller::trusted()));
+        assert_eq!(owner["caller"], serde_json::json!({"principal": "local", "access": "full_access"}));
+
+        let hermes = local(Some("Hermes Agent"), ControlAccess::ReadOnly);
+        let narrowed = dispatch_request_as(app.handle(), &hermes, request("tools_list", Value::Null)).await;
+        let narrowed = narrowed.data.unwrap();
+        let name = ClientName::parse("Hermes Agent").unwrap();
+        assert_eq!(narrowed["tools"], catalog(&ControlCaller::local(Some(&name), ControlAccess::ReadOnly)));
+        assert_eq!(narrowed["caller"], serde_json::json!({"principal": "local:hermes-agent", "access": "read_only"}));
+        let listed = narrowed["tools"].as_array().unwrap();
+        assert!(listed.len() < owner["tools"].as_array().unwrap().len());
+        assert!(listed.iter().all(|tool| tool["annotations"]["readOnlyHint"] == true), "read-only callers see read tools only");
+
+        let extra = dispatch_request(app.handle(), request("tools_list", serde_json::json!({"cursor": "x"}))).await;
+        assert!(refused_with(&extra, "invalid_arguments"), "{:?}", extra.error);
+    }
+
+    /// A persisted chat with no live session. A wait with `since` set to its
+    /// current cursor parks until something changes or it times out.
+    async fn waitable() -> (tauri::App<tauri::test::MockRuntime>, tempfile::TempDir, Value) {
+        let app = operation_app();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = app.state::<AppStateStore>().create_empty_workspace_at_path(root.path().to_path_buf()).0;
+        app.manage(crate::commands::agent_chat::ProviderRegistry::new());
+        app.state::<crate::database::DatabaseStore>()
+            .upsert_agent_chat_session("socket-wait", &workspace, None, "claude")
+            .unwrap();
+        let target = serde_json::json!({"workspace_id": workspace, "thread_id": "socket-wait"});
+        let status = dispatch_request(app.handle(), request("thread_status", target.clone())).await;
+        assert!(status.ok, "{:?}", status.error);
+        let mut wait = target;
+        wait["since"] = status.data.unwrap()["wait_cursor"].clone();
+        (app, root, wait)
+    }
+
+    /// A client connection served by `handle_client`, as the socket server
+    /// runs it.
+    fn connect(
+        app: &tauri::App<tauri::test::MockRuntime>,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), String>>,
+        tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let served = tokio::spawn(handle_client(app.handle().clone(), server, None));
+        let (reader, writer) = tokio::io::split(client);
+        (served, BufReader::new(reader).lines(), writer)
+    }
+
+    async fn reply(replies: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>) -> ControlResponse {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), replies.next_line())
+            .await
+            .expect("a reply within 5 s")
+            .unwrap()
+            .expect("the connection is open");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn socket_wait_ends_when_the_client_hangs_up() {
+        let (app, _root, wait) = waitable().await;
+        let mut long = wait;
+        long["timeout_ms"] = serde_json::json!(600_000);
+        for line in [
+            serde_json::json!({"command": "thread_wait", "params": long}),
+            serde_json::json!({"command": "tool_call", "params": {"name": "thread_wait", "arguments": long}}),
+        ] {
+            let (served, mut replies, mut writer) = connect(&app);
+            writer.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+            let early = tokio::time::timeout(std::time::Duration::from_millis(300), replies.next_line()).await;
+            assert!(early.is_err(), "the wait parks: {early:?}");
+            drop((replies, writer));
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(5), served)
+                .await
+                .expect("a ten-minute wait ends as soon as its client hangs up");
+            assert_eq!(ended.unwrap(), Ok(()), "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_keeps_a_pipelined_line_during_a_wait() {
+        let (app, _root, wait) = waitable().await;
+        let mut short = wait;
+        short["timeout_ms"] = serde_json::json!(400);
+        let (served, mut replies, mut writer) = connect(&app);
+        // The later lines arrive while the wait is parked.
+        let status = serde_json::json!({"command": "status"});
+        let lines = format!("{}\n{status}\n{status}\n", serde_json::json!({"command": "thread_wait", "params": short}));
+        writer.write_all(lines.as_bytes()).await.unwrap();
+        let first = reply(&mut replies).await;
+        assert!(first.ok, "{:?}", first.error);
+        assert_eq!(first.data.unwrap()["timed_out"], true, "replies keep request order");
+        for _ in 0..2 {
+            let kept = reply(&mut replies).await;
+            assert!(kept.ok, "every pipelined line was kept: {:?}", kept.error);
+        }
+        drop((replies, writer));
+        assert_eq!(served.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn socket_wait_ends_when_a_client_pipelines_and_hangs_up() {
+        let (app, _root, wait) = waitable().await;
+        let mut long = wait;
+        long["timeout_ms"] = serde_json::json!(600_000);
+        let (served, mut replies, mut writer) = connect(&app);
+        let lines = format!("{}\n{}\n", serde_json::json!({"command": "thread_wait", "params": long}), serde_json::json!({"command": "status"}));
+        writer.write_all(lines.as_bytes()).await.unwrap();
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), replies.next_line()).await;
+        assert!(early.is_err(), "the wait parks with the second line held: {early:?}");
+        drop((replies, writer));
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), served)
+            .await
+            .expect("a held line does not keep a ten-minute wait alive after its client hung up");
+        assert_eq!(ended.unwrap(), Ok(()));
+    }
+
+    /// `thread_wait` that parks, followed by `held` pipelined status lines.
+    fn wait_then_status_lines(wait: &Value, held: usize) -> String {
+        let status = serde_json::json!({"command": "status"});
+        format!("{}\n", serde_json::json!({"command": "thread_wait", "params": wait})) + &format!("{status}\n").repeat(held)
+    }
+
+    #[tokio::test]
+    async fn socket_wait_ends_when_a_client_pipelines_to_the_limit_and_hangs_up() {
+        let (app, _root, wait) = waitable().await;
+        let mut long = wait;
+        long["timeout_ms"] = serde_json::json!(600_000);
+        let (served, mut replies, mut writer) = connect(&app);
+        writer.write_all(wait_then_status_lines(&long, MAX_PIPELINED_LINES).as_bytes()).await.unwrap();
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), replies.next_line()).await;
+        assert!(early.is_err(), "the wait parks with {MAX_PIPELINED_LINES} lines held: {early:?}");
+        drop((replies, writer));
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), served)
+            .await
+            .expect("lines held at the limit do not keep a ten-minute wait alive after its client hung up");
+        assert_eq!(ended.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn socket_refuses_a_line_past_the_pipeline_limit() {
+        let (app, _root, wait) = waitable().await;
+        let mut long = wait;
+        long["timeout_ms"] = serde_json::json!(600_000);
+        let (served, mut replies, mut writer) = connect(&app);
+        writer.write_all(wait_then_status_lines(&long, MAX_PIPELINED_LINES + 1).as_bytes()).await.unwrap();
+        // The parked wait answers with the reason, then the connection closes
+        // without answering the held lines.
+        let refused = reply(&mut replies).await;
+        assert!(refused_with(&refused, "resource_limit"), "{:?}", refused.error);
+        let after = tokio::time::timeout(std::time::Duration::from_secs(5), replies.next_line())
+            .await
+            .expect("the connection closes after the refusal");
+        assert!(matches!(after, Ok(None)), "no held line is answered: {after:?}");
+        assert_eq!(served.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn socket_answers_a_line_it_cannot_read() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        let (served, mut replies, mut writer) = connect(&app);
+        // A newer client may send an access level this server does not know.
+        let lines = "{\"command\":\"status\",\"client\":{\"access\":\"root\"}}\nnot json\n{\"command\":\"status\"}\n";
+        writer.write_all(lines.as_bytes()).await.unwrap();
+        for _ in 0..2 {
+            let refused = reply(&mut replies).await;
+            assert!(refused_with(&refused, "invalid_arguments"), "{:?}", refused.error);
+            assert!(refused.error.unwrap().contains("Invalid control request JSON"));
+            assert_eq!(refused.protocol_version, CONTROL_PROTOCOL_VERSION);
+        }
+        assert!(reply(&mut replies).await.ok, "the connection keeps serving");
+        drop((replies, writer));
+        assert_eq!(served.await.unwrap(), Ok(()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unix_accept_reports_the_peer_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer.sock");
+        let listener = transport::bind(&path).unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await.map(|(_, pid)| pid) });
+        let _client = transport::connect(&path).await.unwrap();
+        assert_eq!(accepted.await.unwrap().unwrap(), Some(std::process::id()));
+    }
+
+    #[test]
+    fn envelope_is_backward_compatible() {
+        let line = r#"{"command":"notify","params":{"message":"hi"},"client":{"name":"hermes","access":"supervised"}}"#;
+        let old_server: ControlRequest = serde_json::from_str(line).unwrap();
+        assert_eq!((old_server.command.as_str(), &old_server.params), ("notify", &serde_json::json!({"message":"hi"})));
+        let envelope: ControlEnvelope = serde_json::from_str(line).unwrap();
+        assert_eq!(envelope.client, Some(ControlClient { name: Some("hermes".into()), access: Some(crate::agent_control::ControlAccess::Supervised), agent: None }));
+        let old_client: ControlEnvelope = serde_json::from_str(r#"{"command":"status"}"#).unwrap();
+        assert_eq!((old_client.request.command.as_str(), old_client.client), ("status", None));
+        assert_eq!(old_client.request.params, Value::Null, "params keep their default");
+        let today = request("notify", serde_json::json!({"message":"hi","n":1}));
+        let bare = serde_json::to_string(&today).unwrap();
+        let wrapped = serde_json::to_string(&ControlEnvelope { request: today, client: None }).unwrap();
+        assert_eq!(wrapped, bare, "an owner's line is byte-identical to a bare request");
+    }
+
+    #[tokio::test]
+    async fn read_only_local_clients_cannot_write() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        let read_only = local(Some("reader"), crate::agent_control::ControlAccess::ReadOnly);
+        let refused = dispatch_request_as(app.handle(), &read_only, request("notify", serde_json::json!({"message":"x"}))).await;
+        assert!(!refused.ok);
+        assert!(refused.error.as_deref().unwrap().starts_with("access_denied: "), "{:?}", refused.error);
+        assert_eq!(refused.protocol_version, CONTROL_PROTOCOL_VERSION);
+        assert!(app.state::<AppStateStore>().snapshot().notifications.is_empty(), "the handler never ran");
+        let status = dispatch_request_as(app.handle(), &read_only, request("status", serde_json::json!({}))).await;
+        assert!(status.ok, "{:?}", status.error);
+        let unnamed = local(None, crate::agent_control::ControlAccess::ReadOnly);
+        let refused = dispatch_request_as(app.handle(), &unnamed, request("web_remote_disable", serde_json::json!({}))).await;
+        assert!(refused.error.as_deref().unwrap().starts_with("access_denied: "), "narrowing applies to the owner too");
+    }
+
+    #[tokio::test]
+    async fn supervised_local_clients_cannot_run_setup_scripts() {
+        let app = tauri::test::mock_app();
+        app.manage(AppStateStore::default());
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        let supervised = local(Some("hermes"), crate::agent_control::ControlAccess::Supervised);
+        for command in ["create_workspace", "rerun_setup", "unarchive_workspace", "create_worktree_workspace"] {
+            let refused = dispatch_request_as(app.handle(), &supervised, request(command, serde_json::json!({"path":"/nonexistent"}))).await;
+            assert!(refused.error.as_deref().unwrap().starts_with("access_denied: "), "{command}: {:?}", refused.error);
+        }
+        let notify = dispatch_request_as(app.handle(), &supervised, request("notify", serde_json::json!({"message":"x"}))).await;
+        assert!(notify.ok, "supervised clients keep ordinary writes: {:?}", notify.error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_candidates_fall_back_to_run_user_only_when_xdg_is_unset() {
+        use std::os::unix::fs::MetadataExt;
+        let run_user = tempfile::tempdir().unwrap();
+        let uid = fs::metadata(run_user.path()).unwrap().uid();
+        let socket_file = format!("{SOCKET_BASENAME}.sock");
+        let fallback = PathBuf::from("/fallback-dir/codemux.sock");
+        let tmp = || Some(fallback.clone());
+
+        let xdg = PathBuf::from("/xdg/runtime");
+        let only_xdg = socket_candidates(Some(xdg.clone()), run_user.path(), uid, || panic!("the fallback is not consulted"));
+        assert_eq!(only_xdg, vec![xdg.join(&socket_file)], "a set XDG_RUNTIME_DIR is the only candidate");
+
+        assert_eq!(socket_candidates(None, run_user.path(), uid, tmp), vec![fallback.clone()], "no runtime dir yet");
+        let own = run_user.path().join(uid.to_string());
+        fs::create_dir(&own).unwrap();
+        assert_eq!(
+            socket_candidates(None, run_user.path(), uid, tmp),
+            vec![own.join(&socket_file), fallback.clone()],
+            "the systemd runtime dir comes before the /tmp fallback"
+        );
+        let foreign = run_user.path().join((uid + 1).to_string());
+        fs::create_dir(&foreign).unwrap();
+        assert_eq!(
+            socket_candidates(None, run_user.path(), uid + 1, tmp),
+            vec![fallback.clone()],
+            "a runtime dir the uid does not own is never used"
+        );
+    }
+
+    /// Clients look up the /tmp fallback on every request, so the lookup must
+    /// not create the dir (or log), which is the server's part.
+    #[cfg(unix)]
+    #[test]
+    fn client_fallback_lookup_creates_nothing_and_skips_foreign_dirs() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let uid = fs::metadata(root.path()).unwrap().uid();
+        let socket_file = format!("{SOCKET_BASENAME}.sock");
+        let missing = root.path().join("not-yet");
+        assert_eq!(client_fallback_socket(missing.clone(), uid), Some(missing.join(&socket_file)), "names where the server would listen");
+        assert!(!missing.exists(), "a client never creates the fallback dir");
+        let own = root.path().to_path_buf();
+        assert_eq!(client_fallback_socket(own.clone(), uid), Some(own.join(&socket_file)));
+        assert_eq!(client_fallback_socket(own, uid + 1), None, "a dir another uid owns is never used");
+    }
+
+    /// A one-connection-at-a-time line server: answers every line with
+    /// `version` and records `(connection, command)`.
+    #[cfg(unix)]
+    fn spawn_line_server(
+        path: &std::path::Path,
+        version: u32,
+    ) -> (tokio::task::JoinHandle<()>, std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>>) {
+        let listener = transport::bind(path).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let server = tokio::spawn(async move {
+            for connection in 0.. {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let command = serde_json::from_str::<Value>(&line).unwrap()["command"].as_str().unwrap().to_owned();
+                    recorded.lock().unwrap().push((connection, command));
+                    let reply = serde_json::json!({"ok":true,"protocol_version":version,"data":{},"error":null});
+                    writer.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+                }
+            }
+        });
+        (server, seen)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reachable_means_a_candidate_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.sock");
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        let live = dir.path().join("live.sock");
+        let (server, _) = spawn_line_server(&live, CONTROL_PROTOCOL_VERSION);
+        assert!(!any_answers(&[]));
+        assert!(!any_answers(&[missing.clone(), stale.clone()]), "a stale socket file is not a running app");
+        assert!(any_answers(&[missing, stale, live]));
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clients_skip_missing_and_stale_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.sock");
+        // A crashed app leaves its socket file behind: connecting is refused.
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        let live = dir.path().join("live.sock");
+        let (server, seen) = spawn_line_server(&live, CONTROL_PROTOCOL_VERSION);
+
+        let candidates = [missing.clone(), stale.clone(), live];
+        let reply = send_control_request_to(&candidates, request("status", serde_json::json!({})), None).await.unwrap();
+        assert!(reply.ok);
+        assert_eq!(*seen.lock().unwrap(), vec![(0, "status".to_owned())]);
+
+        // A narrowed client's probe and request share one connection.
+        let read_only = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly), agent: None };
+        let reply = send_control_request_to(&candidates, request("notify", serde_json::json!({})), Some(&read_only)).await.unwrap();
+        assert!(reply.ok);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(0, "status".to_owned()), (1, "status".to_owned()), (1, "notify".to_owned())]
+        );
+
+        let error = send_control_request_to(&[missing, stale], request("status", serde_json::json!({})), None)
+            .await.unwrap_err();
+        assert!(error.starts_with("Failed to connect to Codemux control endpoint: ") && error.contains("refused"), "the last error: {error}");
+        let error = send_control_request_to(&[], request("status", serde_json::json!({})), None).await.unwrap_err();
+        assert_eq!(error, "Control socket path unavailable");
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn narrowed_access_refuses_an_old_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = [dir.path().join("old.sock")];
+        let (server, seen) = spawn_line_server(&path[0], 1);
+        let commands = || seen.lock().unwrap().iter().map(|(_, command)| command.clone()).collect::<Vec<_>>();
+        let read_only = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly), agent: None };
+        let error = send_control_request_to(&path, request("notify", serde_json::json!({"message":"x"})), Some(&read_only))
+            .await.unwrap_err();
+        assert!(error.starts_with("server_too_old: "), "{error}");
+        assert_eq!(commands(), vec!["status"], "the real request never reached the old server");
+        // A full-access or unnamed client keeps today's behaviour with an old app.
+        let named = ControlClient { name: Some("bot".into()), access: None, agent: None };
+        let reply = send_control_request_to(&path, request("notify", serde_json::json!({})), Some(&named)).await.unwrap();
+        assert!(reply.ok);
+        assert_eq!(commands(), vec!["status", "notify"]);
+        server.abort();
+    }
+
+    /// A long-lived narrowed client (`codemux mcp --access read-only`) can
+    /// outlive the app it first reached: an older build may come up on the
+    /// same socket. The answer of one connection says nothing about the
+    /// server behind the next one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn narrowed_client_refuses_an_old_server_that_replaced_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = [dir.path().join("app.sock")];
+        let read_only = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly), agent: None };
+
+        let (new_app, seen) = spawn_line_server(&path[0], CONTROL_PROTOCOL_VERSION);
+        let reply = send_control_request_to(&path, request("notify", serde_json::json!({})), Some(&read_only))
+            .await.unwrap();
+        assert!(reply.ok);
+        assert_eq!(*seen.lock().unwrap(), vec![(0, "status".to_owned()), (0, "notify".to_owned())]);
+        new_app.abort();
+
+        // `bind` replaces the socket file, as a restarted app does.
+        let (old_app, seen) = spawn_line_server(&path[0], 1);
+        let error = send_control_request_to(&path, request("notify", serde_json::json!({})), Some(&read_only))
+            .await.unwrap_err();
+        assert!(error.starts_with("server_too_old: "), "{error}");
+        assert_eq!(*seen.lock().unwrap(), vec![(0, "status".to_owned())], "the request never reached the older app");
+        old_app.abort();
     }
 
     fn port(port: u16, ws: Option<&str>, label: Option<&str>) -> PortInfoSnapshot {
@@ -2542,7 +3509,7 @@ mod tests {
 
         let listener = transport::bind(&path).expect("bind unix socket");
         let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept");
+            let (stream, _) = listener.accept().await.expect("accept");
             echo_loop(stream).await.expect("echo_loop");
         });
 
@@ -2633,7 +3600,7 @@ mod tests {
 
         let listener = transport::bind(&path).expect("bind named pipe");
         let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept");
+            let (stream, _) = listener.accept().await.expect("accept");
             echo_loop(stream).await.expect("echo_loop");
         });
 

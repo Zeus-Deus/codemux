@@ -4,7 +4,7 @@ import { applyEvent, appendUserMessage, createEmptyThreadState } from "./reducer
 import { applyReplayTail, replayPayloads } from "./hydrate";
 import type { UserMessageItem } from "./types";
 import { editQueuedTurn } from "./queue-edits";
-import { isDelegationResultsMessage, messageAttribution } from "./message-provenance";
+import { attributionText, isDelegationResultsMessage, messageAttribution, outsideAttribution } from "./message-provenance";
 
 const message = {
   type:"user_message",thread_id:"receiver",text:"Review this change.",message_id:"stable-message",
@@ -82,5 +82,35 @@ describe("legacy presentation",()=>{
   it("hydrates legacy steered_turn_id as steer intent",()=>{
     const state=replayPayloads([JSON.stringify({type:"user_message",thread_id:"t",text:"Follow up",steered_turn_id:"running"})]);
     expect(state.messages[0]).toMatchObject({input_intent:"steer"});
+  });
+});
+
+describe("outside attribution", () => {
+  const outside = {type:"user_message",thread_id:"receiver",text:"Run the parser tests.",message_id:"outside-message",
+    created_by:"agent",creation_source:"mcp",sender_title:"hermes",input_intent:"turn_start"} satisfies ProviderRuntimeEvent;
+
+  it("attributes an agent's MCP message with no sending chat to an outside assistant, through replay", () => {
+    const item = replayPayloads([JSON.stringify(outside)]).messages[0] as UserMessageItem;
+    expect(messageAttribution(item)).toBe("outside");
+    expect(attributionText(item)).toBe("Sent by hermes · outside assistant");
+    const unnamed = replayPayloads([JSON.stringify({...outside,sender_title:undefined})]).messages[0] as UserMessageItem;
+    expect(attributionText(unnamed)).toBe("Sent by an outside assistant");
+  });
+
+  it("keeps in-app agents, the owner and Codemux itself apart from outside assistants", () => {
+    expect(messageAttribution({...outside,sender_thread_id:"sender"})).toBe("agent");
+    expect(messageAttribution({...outside,creation_source:"provider"})).toBe("agent");
+    // The unnamed local owner (`codemux mcp` with no --client) stays unlabelled.
+    expect(messageAttribution({...outside,created_by:"user"})).toBeNull();
+    expect(messageAttribution({...outside,creation_source:"codemux"})).toBe("codemux");
+    expect(messageAttribution({...outside,automation_id:"automation"})).toBe("automation");
+  });
+
+  it("writes every attribution as one plain line", () => {
+    expect(attributionText({...outside,sender_thread_id:"sender",sender_title:"Review agent"})).toBe("Sent by another agent · Review agent");
+    expect(attributionText({...outside,created_by:"system",creation_source:"codemux",sender_title:undefined})).toBe("Sent by Codemux");
+    expect(attributionText({...outside,automation_id:"automation",sender_title:"Nightly"})).toBe("Sent by automation · Nightly");
+    expect(attributionText({...outside,created_by:"user"})).toBeNull();
+    expect(outsideAttribution("<img src=x>")).toBe("Sent by <img src=x> · outside assistant");
   });
 });

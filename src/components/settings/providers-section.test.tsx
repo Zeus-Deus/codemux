@@ -39,7 +39,7 @@ beforeEach(() => {
       return agents[0];
     }
     if (cmd === "hermes_profiles") return [];
-    if (cmd === "agent_chat_provider_health") return { provider: "claude", status: "ready", installed: true, message: null, version: "1.0.0" };
+    if (cmd === "agent_chat_provider_health") return { provider: "claude", status: "ready", installed: true, message: null, version: "1.0.0", auth_label: "Custom endpoint · gateway.example.com" };
     if (cmd === "get_chatgpt_status") return { phase: "disconnected", attemptId: null, email: null, error: null, profiles: [], activeProfileId: null, welcomePending: false, installed: true };
     if (cmd === "get_local_workbench") return false;
     return null;
@@ -104,4 +104,15 @@ it("a pending editor save keeps the list switch locked after navigating away", a
   await waitFor(() => expect(listSwitch()).toBeEnabled());
   expect(agents[0]).toMatchObject({ executable: "/bin/kimi2" });
   expect(Object.keys(agents[0].environment).sort()).toEqual(["KEY", "NEW"]);
+});
+
+it("a ready provider says how it signs in", async () => {
+  render(<ProvidersSection />);
+  const header = await screen.findByRole("heading", { name: "Claude" });
+  await waitFor(() =>
+    expect(header.parentElement!.parentElement!).toHaveTextContent("Ready · Custom endpoint · gateway.example.com"),
+  );
+  expect(within(nav()).getByRole("button", { name: /^Claude/ })).toHaveTextContent(
+    "Ready · Custom endpoint · gateway.example.com",
+  );
 });

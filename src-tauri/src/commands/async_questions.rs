@@ -5,9 +5,10 @@ use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use super::agent_chat::{
-    ensure_live_session_mode, fan_out_to_thread_channels, feature_flag_on, lookup_provider,
+    ensure_live_session_guarded, fan_out_to_thread_channels, feature_flag_on, lookup_provider,
     run_checkpoints_enabled, AgentChatEventPayload, GitTurnDispatchCheckpoint, ProviderRegistry,
 };
+use crate::agent_control::{GuardedTurnCheckpoint, NativeControlGuard};
 use crate::agent_provider::{
     AnswerQuestionInput, ProviderKind, ProviderRuntimeEvent, QuestionDelivery, QuestionDeliveryError,
     QuestionResolution, ThreadId, TurnDispatchCheckpoint,
@@ -62,6 +63,9 @@ fn publish<R: Runtime>(
     // delegation directly: a delegated child waiting on this question is
     // working again (or done) once it is answered or dismissed.
     super::delegation::observe(app, &event, Some(row_id));
+    // Every answer, dismissal and reopen is committed before it is published,
+    // so a thread wait woken here reads the question's new state.
+    crate::agent_control::wait::signal(Some(&thread_id.0));
     fan_out_to_thread_channels(
         app,
         thread_id,
@@ -130,6 +134,21 @@ pub async fn agent_chat_answer_question<R: Runtime>(
     question_id: String,
     action: QuestionAction,
 ) -> Result<QuestionResolution, String> {
+    answer_question_guarded(app, thread_id, question_id, action, None).await
+}
+
+/// The question card's action, taken for an outside controller when
+/// `control` is set. Its authority (grant, thread binding, mode ceiling and
+/// live worker mode) is rechecked before the answer claims the question,
+/// through any resume, and again at the provider's dispatch, so an answer
+/// still waiting for delivery stops once that authority is withdrawn.
+pub(crate) async fn answer_question_guarded<R: Runtime>(
+    app: AppHandle<R>,
+    thread_id: ThreadId,
+    question_id: String,
+    action: QuestionAction,
+    control: Option<NativeControlGuard>,
+) -> Result<QuestionResolution, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let db: State<'_, DatabaseStore> = app.state();
@@ -145,6 +164,10 @@ pub async fn agent_chat_answer_question<R: Runtime>(
         return Err("This provider does not support asynchronous questions.".into());
     }
     let (question, previous) = db.async_question(&thread_id.0, &question_id)?;
+    if let Some(control) = &control {
+        control.verify_target(provider_kind, &thread_id.0)?;
+        control.verify(&app)?;
+    }
 
     let permission_mode_override = match &action {
         QuestionAction::Answer { permission_mode_override, .. } => permission_mode_override.clone(),
@@ -205,7 +228,7 @@ pub async fn agent_chat_answer_question<R: Runtime>(
         return Ok(db.async_question(&thread_id.0, &question_id)?.1);
     }
     let expected = if reconcile { previous } else { submitting };
-    let resume = ensure_live_session_mode(&app, provider_kind, &thread_id, true).await;
+    let resume = ensure_live_session_guarded(&app, provider_kind, &thread_id, true, control.as_ref()).await;
     let result = match resume {
         Err(message) => if reconcile { Err(QuestionDeliveryError::Unknown(message)) } else { Err(QuestionDeliveryError::Rejected(message)) },
         Ok(()) if reconcile => match provider.find_question_answer(thread_id.clone(), question.target.clone(), submission_id.clone()).await {
@@ -219,7 +242,17 @@ pub async fn agent_chat_answer_question<R: Runtime>(
             } else { None };
             let checkpoint = Some(Arc::new(AnswerCheckpoint {app:app.clone(),thread:thread_id.0.clone(),generation,inner:checkpoint}) as Arc<dyn TurnDispatchCheckpoint>);
             let checkpoint = super::turn_diff::wrap_dispatch_checkpoint(&app, &thread_id.0, record.cwd, Some(&submission_id), checkpoint);
-            let delivered = provider.answer_question(AnswerQuestionInput { thread_id: thread_id.clone(), question, answers: answers.clone(), submission_id: submission_id.clone(), checkpoint, permission_mode_override }).await;
+            let checkpoint = match control {
+                Some(control) => Some(Arc::new(GuardedTurnCheckpoint { app: app.clone(), control, inner: checkpoint }) as Arc<dyn TurnDispatchCheckpoint>),
+                None => checkpoint,
+            };
+            // Resume may have waited on the worker's startup. The provider
+            // authorizes again at the wire, before `turn/steer` or a new turn.
+            let ready = checkpoint.as_ref().map_or(Ok(()), |checkpoint| checkpoint.verify_dispatch());
+            let delivered = match ready {
+                Err(error) => Err(QuestionDeliveryError::Rejected(error.to_string())),
+                Ok(()) => provider.answer_question(AnswerQuestionInput { thread_id: thread_id.clone(), question, answers: answers.clone(), submission_id: submission_id.clone(), checkpoint, permission_mode_override }).await,
+            };
             if let Ok(QuestionDelivery::NewTurn { turn_id }) = &delivered {
                 super::turn_diff::on_turn_bound(&app, &thread_id.0, Some(&submission_id), &turn_id.0);
             }
@@ -315,5 +348,47 @@ mod tests {
             assert_eq!(identity.stop_generation, expected_generation, "the answer must retain admission's durable Stop generation");
             app.state::<DatabaseStore>().verify_delivery_generation(&thread, identity.stop_generation).unwrap();
         }
+    }
+
+    /// A checkpoint whose authority was withdrawn: a revoked grant, a Stop.
+    #[derive(Debug)]
+    struct Withdrawn;
+    #[async_trait::async_trait]
+    impl TurnDispatchCheckpoint for Withdrawn {
+        fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+        fn authorize_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> {
+            Err(crate::agent_provider::ProviderError::ValidationError { message: "grant_revoked: withdrawn while the answer waited".into() })
+        }
+        async fn prepare(&self) {}
+        async fn commit(&self) {}
+        async fn abort(&self) {}
+    }
+
+    /// An answer steered into a running turn is authorized at the wire, as a
+    /// new turn is before `turn/start`: withdrawn authority keeps it off the
+    /// turn, and the same answer goes through once authorized.
+    #[tokio::test]
+    async fn steered_answer_is_authorized_before_turn_steer() {
+        let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("fake_codex_app_server");
+        assert!(binary.exists(), "build the fake_codex_app_server test fixture first");
+        let root = tempfile::tempdir().unwrap();
+        let trace = root.path().join("trace.jsonl");
+        let thread = ThreadId("steered-answer-authority".into());
+        let provider = crate::agent_provider::codex::CodexAgentProvider::new(crate::agent_provider::codex::CodexProviderConfig {codex_binary:binary, ..Default::default()});
+        let input = serde_json::from_value(serde_json::json!({"thread_id":thread,"cwd":root.path(),"permission_mode":"danger-full-access","additional_directories":[],"env":{"FAKE_CODEX_ASYNC_MODE":"running","FAKE_CODEX_TRACE":trace}})).unwrap();
+        provider.start_session(input).await.unwrap();
+        provider.send_turn(serde_json::from_value(serde_json::json!({"thread_id":thread,"text":"Build"})).unwrap()).await.unwrap();
+        let question = UserQuestionSet { id:"q".into(),target:"c-1".into(),source_item_id:"q-1".into(),source_turn_id:"t-1".into(),text:String::new(),subagent_id:None,questions:vec![UserQuestion {title:"Which storage?".into(),options:vec![]}] };
+        let submission = uuid::Uuid::new_v4().to_string();
+        let answer = |checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>>| AnswerQuestionInput {thread_id:thread.clone(),question:question.clone(),answers:vec!["SQLite".into()],submission_id:submission.clone(),checkpoint,permission_mode_override:None};
+        let steers = || std::fs::read_to_string(&trace).unwrap().lines().filter(|line| line.contains("\"turn/steer\"")).count();
+
+        let refused = provider.answer_question(answer(Some(Arc::new(Withdrawn)))).await;
+        assert!(matches!(&refused, Err(QuestionDeliveryError::Rejected(message)) if message.contains("grant_revoked")), "{refused:?}");
+        assert_eq!(steers(), 0, "nothing was steered into the running turn");
+        let delivered = provider.answer_question(answer(None)).await;
+        assert!(matches!(delivered, Ok(QuestionDelivery::Inflight { .. })), "{delivered:?}");
+        assert_eq!(steers(), 1);
+        provider.stop_session(thread).await.unwrap();
     }
 }

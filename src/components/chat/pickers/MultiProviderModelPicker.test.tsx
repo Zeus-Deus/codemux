@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import userEvent from "@testing-library/user-event";
@@ -424,6 +424,36 @@ describe("MultiProviderModelPicker — provider rail", () => {
       "Continues this chat in Codex. The conversation so far carries over.",
     );
     useAgentChatStore.setState({ threads: {} });
+  });
+
+  it("names how a provider signs in in its rail tooltip", async () => {
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+    // Seeded after opening, so the picker's own health refresh cannot
+    // replace it.
+    act(() => {
+      useProviderHealth.setState((state) => ({
+        slots: {
+          ...state.slots,
+          claude: {
+            ...emptyHealthSlot(),
+            report: {
+              provider: "claude",
+              status: "ready",
+              installed: true,
+              message: null,
+              version: "1.0.0",
+              auth_label: "Custom endpoint · gateway.example.com",
+            },
+          },
+        },
+      }));
+    });
+    fireEvent.focus(screen.getByTestId("provider-rail-claude"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Custom endpoint · gateway.example.com",
+    );
   });
 
   it("shows no switch note before a chat has started", async () => {

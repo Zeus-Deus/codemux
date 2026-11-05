@@ -13,6 +13,9 @@
 // "no limits available" rather than as an empty quota.
 
 import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { claudeProcessEnv } from "../claude-env.ts";
+
+import { routedOptions } from "../user-routing.ts";
 
 export interface GetUsageInput {
   cwd: string;
@@ -76,8 +79,9 @@ export async function getUsage(input: GetUsageInput): Promise<unknown> {
     options: {
       cwd: input.cwd,
       pathToClaudeCodeExecutable: input.pathToClaudeCodeExecutable,
-      env: process.env as Record<string, string | undefined>,
-      settingSources: [],
+      // Ask the account the user's chats use, including one reached
+      // through settings.json routing.
+      ...routedOptions(claudeProcessEnv({ cwd: input.cwd })),
       includePartialMessages: false,
     },
   });

@@ -1,11 +1,13 @@
-//! Headless Codemux for `codemux-remote serve`.
+//! The host side of `codemux-remote serve` and `codemux-remote mcp`.
 //!
-//! Self-contained subsystem that runs on a remote host (VPS, home
-//! server, anywhere `codemux-remote` is installed) and exposes the
-//! same shape of MCP tool surface the desktop's `codemux mcp` does,
-//! so an agent on that host can drive Codemux locally — create
-//! workspaces, list them, write to terminals — without any
-//! Tauri/UI dependency.
+//! Self-contained subsystem that runs on a managed host (VPS, home
+//! server, anywhere `codemux-remote` is installed) with no Tauri/UI
+//! dependency. It lets an agent on that host manage the host's own
+//! folders, git worktrees and shells through MCP; the workspaces it
+//! registers show up under Devices in the Codemux app. It is not the
+//! desktop's `codemux mcp`: it has its own tools, does not run Codemux
+//! chats and does not control the Codemux app. It listens on loopback
+//! only, so it is not a door into the app from other machines either.
 //!
 //! Design constraints baked in for a future optional cloud relay
 //! (paid tier, not on the v1 roadmap):

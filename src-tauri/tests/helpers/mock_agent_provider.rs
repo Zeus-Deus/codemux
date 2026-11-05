@@ -270,7 +270,10 @@ impl AgentProvider for MockAgentProvider {
     async fn send_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
         if self.queue_next_send.swap(false, std::sync::atomic::Ordering::SeqCst) {
             *self.queued_input.lock().unwrap() = Some(input);
-            return Ok(TurnStartResult { steered: false, turn_id: TurnId(String::new()), queued_id: Some("deferred-native-queue".into()) });
+            // Unique per send: the event bridge keys queued messages by this ID
+            // process-wide, and tests run in parallel.
+            let queued_id = format!("deferred-native-queue-{}", uuid::Uuid::new_v4());
+            return Ok(TurnStartResult { steered: false, turn_id: TurnId(String::new()), queued_id: Some(queued_id) });
         }
         let gate = self.send_gate.lock().unwrap().take();
         if let Some((entered, release)) = gate {

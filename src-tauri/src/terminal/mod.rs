@@ -6,13 +6,14 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 /// Opaque poll handle passed to `batched_reader_loop`. On Unix this is the
-/// raw fd of the PTY master (used by `poll()`); on Windows it is unused because
-/// the placeholder reader does blocking reads.
+/// reader's own duplicate of the PTY master fd (see [`reader_poll_fd`]), used
+/// by `poll()`; on Windows it is unused because the placeholder reader does
+/// blocking reads.
 #[cfg(unix)]
-type PollFd = RawFd;
+type PollFd = OwnedFd;
 #[cfg(windows)]
 type PollFd = ();
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -879,11 +880,28 @@ fn poll_read_ready(fd: RawFd, timeout_ms: i32) -> bool {
     }
 }
 
+/// The descriptor a reader thread polls: a duplicate of the master fd that the
+/// thread owns and closes when its loop ends. The master itself lives in the
+/// session runtime, which closes it when the session ends while the reader can
+/// still be running, and the kernel hands its number to the next file opened.
+/// Polling that number would poll whatever file took it, and a parked `poll()`
+/// keeps that file open: once it held the write end of a `git` output pipe, so
+/// the git call never saw EOF.
+#[cfg(unix)]
+fn reader_poll_fd(master: &dyn MasterPty) -> std::io::Result<PollFd> {
+    let fd = master
+        .as_raw_fd()
+        .ok_or_else(|| std::io::Error::other("the PTY master has no fd"))?;
+    // Safety: `master` owns `fd` and is borrowed for the whole call.
+    unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()
+}
+
 /// Batched PTY reader loop. Uses poll() to guarantee pending data is flushed
 /// within PTY_BATCH_INTERVAL even when no more output arrives.
 ///
-/// `poll_fd` is the raw fd for the PTY master (used for poll readiness checks).
-/// `reader` is the cloned reader (a dup of the same fd, used for actual reads).
+/// `poll_fd` is the loop's own dup of the PTY master fd (used for poll
+/// readiness checks; see [`reader_poll_fd`]).
+/// `reader` is the cloned reader (another dup, used for actual reads).
 /// `flow_paused` is the session's back-pressure flag: while set, the loop stops
 /// draining the master fd so the kernel PTY buffer fills and the child blocks on
 /// `write()` (real back-pressure). It is polled (not condvar-waited) so a missed
@@ -938,7 +956,7 @@ fn batched_reader_loop(
         // If the batch is empty, block indefinitely until data arrives.
         let poll_timeout = if batch.is_empty() { -1 } else { timeout_ms };
 
-        if !poll_read_ready(poll_fd, poll_timeout) {
+        if !poll_read_ready(poll_fd.as_raw_fd(), poll_timeout) {
             // Timeout with no new data — flush pending batch.
             flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
             continue;
@@ -1373,6 +1391,15 @@ impl Drop for ChildGuard {
 /// than ours or the user's; see `execution::appimage_env_fixups`.)
 pub(crate) fn strip_renderer_env(cmd: &mut CommandBuilder) {
     for key in crate::webview_tuning::RENDERER_ENV_VARS {
+        cmd.env_remove(key);
+    }
+}
+
+/// Remove every agent identity var from a user terminal's environment, so
+/// `codemux ...` typed there is always the owner. The app scrubs them at
+/// startup too; this also covers a daemon adopted from an older instance.
+pub(crate) fn strip_agent_identity_env(cmd: &mut CommandBuilder) {
+    for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
         cmd.env_remove(key);
     }
 }
@@ -1899,6 +1926,7 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
 
     // Renderer transport flags are an app-process concern only.
     strip_renderer_env(&mut cmd);
+    strip_agent_identity_env(&mut cmd);
 
     let child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,
@@ -1988,15 +2016,32 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
         }
     };
 
-    // All resources acquired — disarm the guard and hand child to the waiter thread.
-    let mut child = guard.disarm();
-
-    // Extract the raw fd for poll() before moving master into SessionRuntime.
-    // The reader fd is a dup of this fd, so polling either detects data on both.
+    // The reader thread polls its own dup of the master fd: the master moves
+    // into the SessionRuntime, which closes it when the session ends while the
+    // reader may still be running (see `reader_poll_fd`).
     #[cfg(unix)]
-    let poll_fd: PollFd = pty_pair.master.as_raw_fd().unwrap_or(-1);
+    let poll_fd: PollFd = match reader_poll_fd(&*pty_pair.master) {
+        Ok(fd) => fd,
+        Err(error) => {
+            emit_terminal_status(
+                &app,
+                &sessions,
+                TerminalStatusPayload {
+                    session_id: session_id.clone(),
+                    state: TerminalLifecycleState::Failed,
+                    message: Some(format!("Failed to duplicate the PTY fd for polling: {error}")),
+                    exit_code: None,
+                },
+            );
+            remove_session_runtime(&sessions, &session_id);
+            return; // guard drops here, kills+waits on child
+        }
+    };
     #[cfg(windows)]
     let poll_fd: PollFd = ();
+
+    // All resources acquired — disarm the guard and hand child to the waiter thread.
+    let mut child = guard.disarm();
 
     // Clone the back-pressure flag out under the same lock that publishes the
     // runtime, so the reader thread and the `pause_pty_output`/`resume_pty_output`
@@ -3442,6 +3487,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn user_terminals_never_carry_an_agent_identity() {
+        let mut cmd = CommandBuilder::new("sh");
+        for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
+            cmd.env(key, "inherited");
+        }
+        cmd.env("CODEMUX_WORKSPACE_ID", "ws");
+        strip_agent_identity_env(&mut cmd);
+        for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
+            assert_eq!(cmd.get_env(key), None, "{key} reached a user terminal");
+        }
+        assert!(cmd.get_env("CODEMUX_WORKSPACE_ID").is_some(), "routing vars stay");
+        // Every PTY spawn strips them, and the daemon-backed env list never
+        // adds them back.
+        let daemon_backed = include_str!("daemon_backed.rs");
+        for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
+            assert!(!daemon_backed.contains(key), "daemon_backed.rs names {key}");
+        }
+        // A Windows checkout can carry CRLF line endings.
+        let in_process = include_str!("mod.rs").replace("\r\n", "\n");
+        let spawn = &in_process[in_process.find("strip_renderer_env(&mut cmd);").unwrap()..];
+        assert!(spawn.starts_with("strip_renderer_env(&mut cmd);\n    strip_agent_identity_env(&mut cmd);"));
+        assert!(include_str!("../pty_daemon/server.rs").contains("crate::terminal::strip_agent_identity_env(&mut cmd);"));
+        assert!(include_str!("../pty_daemon/supervisor.rs").contains("in crate::control_identity::AGENT_IDENTITY_ENV_VARS"));
+    }
+
+    #[test]
     fn restored_session_pty_starts_at_saved_size() {
         let app = AppStateStore::default();
         let id = app.active_terminal_session_id().unwrap().0;
@@ -4606,7 +4677,7 @@ mod tests {
             })
             .expect("failed to open pty");
 
-        let poll_fd = pair.master.as_raw_fd().expect("no raw fd");
+        let poll_fd = reader_poll_fd(&*pair.master).expect("poll fd");
         let mut reader = pair.master.try_clone_reader().expect("clone reader");
         let mut writer = pair.master.take_writer().expect("take writer");
 
@@ -4716,6 +4787,61 @@ mod tests {
         reader_handle.join().expect("reader thread panicked");
     }
 
+    /// Closing a terminal drops its session runtime, and with it the PTY
+    /// master, before the shell is signalled, while the reader thread still
+    /// runs. The loop must keep polling a descriptor it owns: the master's
+    /// number is free from then on, and the next file opened takes it. Once
+    /// that was the write end of the output pipe of the close's own
+    /// `git worktree remove`; a parked `poll()` held it open, so that git
+    /// call never saw EOF and the close never returned, holding the lock
+    /// every workspace opening waits on.
+    ///
+    /// Here the master is dropped before the loop starts, so every poll the
+    /// loop makes comes after the close: output written afterwards must
+    /// still arrive. (Polling the stale number gets `POLLNVAL`, which the
+    /// loop takes as "nothing to read", so the bytes never come.) Same
+    /// slave-lifetime sequencing as
+    /// `test_batch_flushes_on_timeout_without_further_writes`.
+    #[cfg(unix)]
+    #[test]
+    fn reader_polls_its_own_fd_after_the_master_closes() {
+        use portable_pty::{native_pty_system, PtySize};
+
+        let sessions = make_sessions();
+        with_session_runtime(&sessions, "closed-master", || SessionRuntime::new("closed-master"), |_| {});
+        let pair = native_pty_system()
+            .openpty(PtySize { rows: 2, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("failed to open pty");
+        let poll_fd = reader_poll_fd(&*pair.master).expect("poll fd");
+        let mut reader = pair.master.try_clone_reader().expect("clone reader");
+        let mut writer = pair.master.take_writer().expect("take writer");
+        // The session ends: the runtime's master closes.
+        drop(pair.master);
+
+        let read_sessions = sessions.clone();
+        let flow_paused = Arc::new(AtomicBool::new(false));
+        let reader_handle = std::thread::spawn(move || {
+            batched_reader_loop(&mut reader, poll_fd, &read_sessions, "closed-master", &flow_paused, |_| {});
+        });
+        writer.write_all(b"after the master closed\r\n").expect("write failed");
+        writer.flush().expect("flush failed");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut content = String::new();
+        while std::time::Instant::now() < deadline && !content.contains("after the master closed") {
+            std::thread::sleep(Duration::from_millis(5));
+            let guard = sessions.lock().unwrap();
+            let runtime = guard.get("closed-master").unwrap();
+            content = String::from_utf8_lossy(&runtime.pending_output.iter().flat_map(|c| c.iter().copied()).collect::<Vec<u8>>())
+                .into_owned();
+        }
+        assert!(content.contains("after the master closed"), "the reader stopped delivering output: {content:?}");
+
+        drop(pair.slave);
+        drop(writer);
+        reader_handle.join().expect("reader thread panicked");
+    }
+
     /// In-process flow control: while `flow_paused` is set the batched reader
     /// loop must NOT drain the PTY master fd (so the kernel buffer fills and the
     /// child blocks on write — real back-pressure), and once cleared it must
@@ -4748,7 +4874,7 @@ mod tests {
             })
             .expect("failed to open pty");
 
-        let poll_fd = pair.master.as_raw_fd().expect("no raw fd");
+        let poll_fd = reader_poll_fd(&*pair.master).expect("poll fd");
         let mut reader = pair.master.try_clone_reader().expect("clone reader");
         let mut writer = pair.master.take_writer().expect("take writer");
 
@@ -4864,7 +4990,7 @@ mod tests {
             .spawn_command(CommandBuilder::new("yes"))
             .expect("spawn yes");
 
-        let poll_fd = pair.master.as_raw_fd().expect("raw fd");
+        let poll_fd = reader_poll_fd(&*pair.master).expect("poll fd");
         let mut reader = pair.master.try_clone_reader().expect("clone reader");
 
         // Real Channel consumer: count the bytes it receives. Installing it on

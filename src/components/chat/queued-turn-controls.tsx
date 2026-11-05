@@ -1,4 +1,4 @@
-import { messageAttribution, messageProvenance } from "@/lib/agent-chat/message-provenance";
+import { attributionText, messageProvenance } from "@/lib/agent-chat/message-provenance";
 /**
  * The follow-up queue, shown as a list in the composer's top chin.
  *
@@ -505,7 +505,7 @@ export function QueuedTurnsList({
                     <span className="min-w-0 flex-1 truncate text-body-sm text-foreground/80">{preview}</span>
                   </TooltipTrigger>
                   <TooltipContent side="top" className="max-w-96 whitespace-pre-wrap break-words">
-                    {messageAttribution(item) && <div className="mb-1 text-caption text-muted-foreground">{messageAttribution(item) === "agent" ? "Sent by another agent" : messageAttribution(item) === "automation" ? "Sent by automation" : "Sent by Codemux"}{item.sender_title ? ` · ${item.sender_title}` : ""}</div>}
+                    {attributionText(item) && <div className="mb-1 text-caption text-muted-foreground">{attributionText(item)}</div>}
                     {item.text}
                   </TooltipContent>
                 </Tooltip>

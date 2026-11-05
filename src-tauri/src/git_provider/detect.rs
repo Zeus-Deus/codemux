@@ -499,7 +499,7 @@ pub(crate) fn run_git(repo_path: &Path, args: &[&str]) -> Option<String> {
 /// failure. Provider refreshers use that distinction to cache authoritative
 /// negative detection while preserving last-known UI state on failures.
 pub(crate) fn run_git_allow_empty(repo_path: &Path, args: &[&str]) -> Result<String, ()> {
-    let mut cmd = crate::execution::host_command("git");
+    let mut cmd = crate::git::git_command();
     cmd.args(args).current_dir(repo_path);
     sanitize_gui_env_std(&mut cmd);
     let output = super::exec::run_timed(cmd, LOCAL_GIT_TIMEOUT).map_err(|_| ())?;

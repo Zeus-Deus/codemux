@@ -1,35 +1,114 @@
-use crate::control::{send_control_request, ControlRequest};
+use crate::control::{send_control_request, ControlRequest, ControlResponse};
 use clap::{Parser, Subcommand};
+use door::Door;
+use output::Exit;
 use serde_json::{json, Value};
+use std::ffi::OsString;
+use std::io::Write;
 
+pub mod args;
+mod capabilities;
+pub mod connector;
+#[cfg(test)]
+mod docs_tests;
+mod door;
+mod output;
 pub mod ports;
+pub mod thread;
+mod tools;
+mod verbs;
+pub mod workspace;
+
+/// Help footer of the root and of `thread`: the statuses scripts branch on.
+pub(crate) const EXIT_CODES_HELP: &str =
+    "Exit codes: 0 done · 1 failed · 2 needs input · 3 timed out · 64 usage error. Guide: docs/outside-agents.md";
 
 #[derive(Parser)]
-#[command(name = "codemux", about = "Codemux desktop and control CLI")]
+#[command(name = "codemux", about = "Codemux desktop and control CLI", after_help = EXIT_CODES_HELP)]
 pub struct Cli {
     /// Launch the desktop with every plugin off (same as
     /// `CODEMUX_DISABLE_PLUGINS=1`).
     #[arg(long, global = true, alias = "disable-addons")]
     pub disable_plugins: bool,
+    /// Who the control socket records this invocation's calls as. Given
+    /// before the command: `codemux --client hermes thread start …`.
+    #[command(flatten)]
+    pub caller: args::CallerArgs,
     #[command(subcommand)]
     pub command: Option<CommandSet>,
 }
 
+// Declaration order is help order: the app, then the control verbs, then
+// the other commands, with debug and internal ones last.
 #[derive(Subcommand)]
 pub enum CommandSet {
+    /// Open the desktop app (same as no command)
     App,
+    /// Show the running app's workspaces and focused pane
     Status,
-    Json { command: String, params: Option<String> },
+    /// List the control tools this caller can use, from the running app
+    Tools {
+        /// Print the MCP tool definitions as JSON.
+        #[arg(long, conflicts_with = "markdown")]
+        json: bool,
+        /// Print a Markdown reference.
+        #[arg(long)]
+        markdown: bool,
+    },
+    /// Call one control tool with JSON arguments and print the result as JSON
+    Call {
+        /// Tool name, as `codemux tools` lists it.
+        tool: String,
+        /// Arguments as a JSON object, or - to read them from stdin (default {}).
+        arguments: Option<String>,
+    },
+    /// Open, list, inspect and close workspaces
+    Workspace {
+        #[command(subcommand)]
+        command: workspace::WorkspaceCommand,
+    },
+    /// Create git worktrees as workspaces
+    Worktree {
+        #[command(subcommand)]
+        command: workspace::WorktreeCommand,
+    },
+    /// Launch agent threads, send them messages, and wait for and read
+    /// their replies
+    #[command(after_help = EXIT_CODES_HELP)]
+    Thread {
+        #[command(subcommand)]
+        command: thread::ThreadCommand,
+    },
+    /// Run the network door that assistants on other devices sign in to
+    Connector {
+        #[command(subcommand)]
+        command: connector::ConnectorCommand,
+    },
+    /// Serve Codemux tools to an MCP client over stdio
+    Mcp {
+        /// Name this client's calls are recorded under (default: the MCP
+        /// client's own name).
+        #[arg(long, value_name = "NAME", value_parser = args::client_name)]
+        client: Option<String>,
+        /// The most this client's calls may do (default: full-access).
+        #[arg(long, value_enum, value_name = "LEVEL")]
+        access: Option<args::AccessArg>,
+    },
+    /// Send a notification to the user
     Notify { message: String },
+    /// Generate a project handoff summary
     Handoff,
+    /// Project memory management
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
     },
+    /// Code index for search
     Index {
         #[command(subcommand)]
         command: IndexCommand,
     },
+    /// Control the browser pane
     Browser {
         #[command(subcommand)]
         command: BrowserCommand,
@@ -38,11 +117,6 @@ pub enum CommandSet {
     Issue {
         #[command(subcommand)]
         command: IssueCommand,
-    },
-    /// Workspace operations
-    Workspace {
-        #[command(subcommand)]
-        command: WorkspaceCommand,
     },
     /// Web remote-access operations
     Remote {
@@ -161,14 +235,12 @@ pub enum CommandSet {
     /// Check the local environment for common problems (file dialogs,
     /// logs). Works without a running Codemux instance.
     Doctor,
-    /// List all available codemux commands and capabilities
+    /// Describe every command, control tool, exit code and environment
+    /// variable as JSON (no running app needed)
     Capabilities,
-    /// Start MCP server (JSON-RPC over stdio)
-    Mcp,
-    /// Relay a stdio MCP client to the desktop app's MCP gateway. Codemux
-    /// starts this for agents that only take stdio MCP servers.
-    #[command(hide = true)]
-    McpBridge,
+    /// Debug: send one raw control-socket command and print the reply.
+    /// Exits 1 when the reply is not ok. Scripts should prefer `codemux call`.
+    Json { command: String, params: Option<String> },
     /// Call an injected chat MCP tool with the chat's own authority. Reads
     /// the credential the agent process was started with.
     McpCall {
@@ -177,23 +249,19 @@ pub enum CommandSet {
         #[arg(long)]
         list: bool,
     },
+    /// Relay a stdio MCP client to the desktop app's MCP gateway. Codemux
+    /// starts this for agents that only take stdio MCP servers.
+    #[command(hide = true)]
+    McpBridge,
     /// Run as the persistent PTY daemon (internal subcommand spawned by the
     /// Tauri app; long-lived process that owns agent PTYs so they survive
     /// the app being closed).
+    #[command(hide = true)]
     PtyDaemon {
         /// Absolute path of the Unix socket to bind. The Tauri app passes
         /// this when spawning the daemon.
         #[arg(long)]
         socket: std::path::PathBuf,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum WorkspaceCommand {
-    /// Re-run setup scripts (.codemuxinclude + setup commands) for a workspace
-    RerunSetup {
-        /// Workspace ID (defaults to active workspace)
-        workspace_id: Option<String>,
     },
 }
 
@@ -268,32 +336,40 @@ pub enum MonitorCommand {
 
 #[derive(Subcommand)]
 pub enum BrowserCommand {
+    /// Create a new browser pane
     Create,
+    /// Navigate to a URL
     Open { url: String },
+    /// Get the page element tree
     Snapshot {
+        #[arg(hide = true)]
         browser_id: Option<String>,
         /// Use DOM-based query instead of ARIA tree
         #[arg(long)]
         dom: bool,
     },
-    Click { selector: String, browser_id: Option<String> },
-    Fill { selector: String, value: String, browser_id: Option<String> },
-    Screenshot { browser_id: Option<String> },
-    ConsoleLogs { browser_id: Option<String> },
+    /// Click an element
+    Click { selector: String, #[arg(hide = true)] browser_id: Option<String> },
+    /// Type into an input
+    Fill { selector: String, value: String, #[arg(hide = true)] browser_id: Option<String> },
+    /// Capture a screenshot (base64 PNG)
+    Screenshot { #[arg(hide = true)] browser_id: Option<String> },
+    /// Get the browser console output
+    ConsoleLogs { #[arg(hide = true)] browser_id: Option<String> },
     /// Click at pixel coordinates via CDP
-    ClickAt { x: f64, y: f64, #[arg(long, default_value = "left")] click_type: String, browser_id: Option<String> },
+    ClickAt { x: f64, y: f64, #[arg(long, default_value = "left")] click_type: String, #[arg(hide = true)] browser_id: Option<String> },
     /// Type text at coordinates or cursor position via CDP
-    TypeAt { text: String, #[arg(long)] x: Option<f64>, #[arg(long)] y: Option<f64>, browser_id: Option<String> },
+    TypeAt { text: String, #[arg(long)] x: Option<f64>, #[arg(long)] y: Option<f64>, #[arg(hide = true)] browser_id: Option<String> },
     /// Scroll at coordinates via CDP
-    ScrollAt { x: f64, y: f64, #[arg(long, default_value = "down")] direction: String, #[arg(long, default_value = "3")] amount: i32, browser_id: Option<String> },
+    ScrollAt { x: f64, y: f64, #[arg(long, default_value = "down")] direction: String, #[arg(long, default_value = "3")] amount: i32, #[arg(hide = true)] browser_id: Option<String> },
     /// Press a key or combo via CDP
-    KeyPress { key: String, browser_id: Option<String> },
+    KeyPress { key: String, #[arg(hide = true)] browser_id: Option<String> },
     /// Drag between coordinates via CDP
-    Drag { start_x: f64, start_y: f64, end_x: f64, end_y: f64, browser_id: Option<String> },
+    Drag { start_x: f64, start_y: f64, end_x: f64, end_y: f64, #[arg(hide = true)] browser_id: Option<String> },
     /// Click at coordinates using OS-level input (ydotool)
-    ClickOs { x: f64, y: f64, browser_id: Option<String> },
+    ClickOs { x: f64, y: f64, #[arg(hide = true)] browser_id: Option<String> },
     /// Type text using OS-level input (ydotool)
-    TypeOs { text: String, #[arg(long)] x: Option<f64>, #[arg(long)] y: Option<f64>, browser_id: Option<String> },
+    TypeOs { text: String, #[arg(long)] x: Option<f64>, #[arg(long)] y: Option<f64>, #[arg(hide = true)] browser_id: Option<String> },
     /// Set the browser viewport to a preset (mobile / tablet / desktop / ...),
     /// a custom WxH like `390x844`, or `reset` to return to the default.
     /// Use `codemux browser viewport-presets` to list every preset.
@@ -305,6 +381,7 @@ pub enum BrowserCommand {
         /// 1.0 for desktop / custom dimensions).
         #[arg(long)]
         dpr: Option<f64>,
+        #[arg(hide = true)]
         browser_id: Option<String>,
     },
     /// List the available viewport presets and their CSS dimensions.
@@ -313,7 +390,9 @@ pub enum BrowserCommand {
 
 #[derive(Subcommand)]
 pub enum MemoryCommand {
+    /// Show project memory
     Show,
+    /// Update memory fields
     Set {
         #[arg(long)]
         brief: Option<String>,
@@ -324,6 +403,7 @@ pub enum MemoryCommand {
         #[arg(long = "constraint")]
         constraints: Vec<String>,
     },
+    /// Add a memory entry
     Add {
         kind: String,
         content: String,
@@ -361,8 +441,11 @@ pub enum IssueCommand {
 
 #[derive(Subcommand)]
 pub enum IndexCommand {
+    /// Build or rebuild the search index
     Build,
+    /// Show index status
     Status,
+    /// Search indexed code
     Search {
         query: String,
         #[arg(long)]
@@ -375,8 +458,8 @@ pub enum IndexCommand {
 /// control-socket round-trip, so it is signalled back to `main` instead of
 /// being driven inside `maybe_run_cli`'s async body.
 pub enum CliOutcome {
-    /// The CLI fully handled the command; the process should exit cleanly.
-    Handled,
+    /// The CLI fully handled the command; the process exits with this status.
+    Handled(Exit),
     /// No subcommand (or `app`): fall through to launching the desktop GUI.
     LaunchGui,
     /// `codemux serve [...]`: run the headless web-remote server on the main
@@ -385,7 +468,14 @@ pub enum CliOutcome {
 }
 
 pub async fn maybe_run_cli() -> Result<CliOutcome, String> {
-    let cli = Cli::parse();
+    let cli = match parse_outcome(std::env::args_os()) {
+        Ok(cli) => cli,
+        Err((exit, error)) => {
+            // clap picks the stream: help on stdout, rejections on stderr.
+            let _ = error.print();
+            return Ok(CliOutcome::Handled(exit));
+        }
+    };
     if cli.disable_plugins {
         std::env::set_var("CODEMUX_DISABLE_PLUGINS", "1");
     }
@@ -398,31 +488,143 @@ pub async fn maybe_run_cli() -> Result<CliOutcome, String> {
             relay: *relay,
         }));
     }
-    match run_control_cli(cli).await? {
-        true => Ok(CliOutcome::Handled),
-        false => Ok(CliOutcome::LaunchGui),
+    if matches!(cli.command, None | Some(CommandSet::App)) {
+        return Ok(CliOutcome::LaunchGui);
+    }
+    run_control_cli(cli).await.map(CliOutcome::Handled)
+}
+
+/// Parse argv without letting clap exit the process from inside `block_on`.
+/// Help is exit 0 and every rejection is 64 (EX_USAGE), so a 2 only ever
+/// means "needs input". The caller prints the returned clap message.
+fn parse_outcome<I, T>(argv: I) -> Result<Cli, (Exit, clap::Error)>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    Cli::try_parse_from(argv).map_err(|error| {
+        let exit = if error.use_stderr() { Exit::Usage } else { Exit::Done };
+        (exit, error)
+    })
+}
+
+/// Print a control reply as the legacy verbs always have, failing the
+/// process when it is not ok. The reply still goes to stdout either way, so
+/// scripts keep reading the error from it.
+fn print_response(response: &ControlResponse) -> Result<Exit, String> {
+    write_response(&mut std::io::stdout().lock(), response)
+}
+
+fn write_response(writer: &mut impl Write, response: &ControlResponse) -> Result<Exit, String> {
+    output::write_json(writer, response)?;
+    Ok(if response.ok { Exit::Done } else { Exit::Failed })
+}
+
+impl CommandSet {
+    /// Whether this command calls the control socket, so the caller env
+    /// defaults (`CODEMUX_CLIENT`, `CODEMUX_ACCESS`) apply to it. No wildcard:
+    /// a new command has to choose.
+    fn calls_control_socket(&self) -> bool {
+        match self {
+            CommandSet::Status
+            | CommandSet::Tools { .. }
+            | CommandSet::Call { .. }
+            | CommandSet::Workspace { .. }
+            | CommandSet::Worktree { .. }
+            | CommandSet::Thread { .. }
+            | CommandSet::Connector { .. }
+            | CommandSet::Mcp { .. }
+            | CommandSet::Notify { .. }
+            | CommandSet::Handoff
+            | CommandSet::Memory { .. }
+            | CommandSet::Index { .. }
+            | CommandSet::Browser { .. }
+            | CommandSet::Issue { .. }
+            | CommandSet::Remote { .. }
+            | CommandSet::Monitor { .. }
+            | CommandSet::Connect { .. }
+            | CommandSet::ReloadUi
+            | CommandSet::Json { .. } => true,
+            // The app, `serve` and the internal children must start whatever
+            // the env says; the rest never reach the socket as a client.
+            CommandSet::App
+            | CommandSet::Serve { .. }
+            | CommandSet::Ports { .. }
+            | CommandSet::Login { .. }
+            | CommandSet::Logout
+            | CommandSet::Whoami
+            | CommandSet::Logs { .. }
+            | CommandSet::Doctor
+            | CommandSet::Capabilities
+            | CommandSet::McpCall { .. }
+            | CommandSet::McpBridge
+            | CommandSet::PtyDaemon { .. } => false,
+        }
     }
 }
 
-/// Drive every control-socket / local CLI subcommand. Returns `Ok(true)` when
-/// the command was handled (process should exit) and `Ok(false)` when there is
-/// no subcommand and the GUI should launch. `serve` is intercepted by
-/// [`maybe_run_cli`] before this runs.
-async fn run_control_cli(cli: Cli) -> Result<bool, String> {
-    match cli.command {
-        None | Some(CommandSet::App) => Ok(false),
-        // Intercepted in `maybe_run_cli`; never reached here.
-        Some(CommandSet::Serve { .. }) => {
-            unreachable!("serve is handled by maybe_run_cli before run_control_cli")
+/// Who this invocation's control calls run as. `codemux mcp` takes its own
+/// flags first, then the root's. Commands that call the control socket fill
+/// the rest from the env (`var`); no other command reads it, so a blank or
+/// misspelled variable cannot stop the app, `serve` or a child from
+/// starting. Unnamed calls run as the owner.
+fn caller_of(cli: &Cli, var: impl Fn(&str) -> Option<String>) -> Result<args::CallerArgs, String> {
+    let flags = match &cli.command {
+        Some(CommandSet::Mcp { client, access }) => args::CallerArgs {
+            client: client.clone().or_else(|| cli.caller.client.clone()),
+            access: access.or(cli.caller.access),
+        },
+        _ => cli.caller.clone(),
+    };
+    match &cli.command {
+        Some(command) if command.calls_control_socket() => flags.or_env(var),
+        _ => Ok(flags),
+    }
+}
+
+/// Names this process's control identity before any socket call: every
+/// request then carries it (`ControlClient::current`).
+fn adopt_caller(caller: &args::CallerArgs) {
+    if let Some(name) = &caller.client {
+        crate::control_identity::set_client_name(name);
+    }
+    if let Some(access) = caller.access {
+        crate::control_identity::set_client_access(access.into());
+    }
+}
+
+/// Drive every control-socket / local CLI subcommand and return the exit
+/// status. No subcommand, `app` and `serve` are handled by [`maybe_run_cli`]
+/// before this runs.
+async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
+    let env = |key: &str| std::env::var_os(key).map(|value| value.to_string_lossy().into_owned());
+    let caller = match caller_of(&cli, env) {
+        Ok(caller) => caller,
+        Err(message) => {
+            // A usage error, like the same value given as a flag.
+            output::note(&format!("error: {message}"));
+            return Ok(Exit::Usage);
         }
+    };
+    adopt_caller(&caller);
+    let args::CallerArgs { client, access } = caller;
+    match cli.command {
+        None | Some(CommandSet::App) | Some(CommandSet::Serve { .. }) => {
+            unreachable!("maybe_run_cli handles the GUI launch and serve before run_control_cli")
+        }
+        Some(CommandSet::Tools { json, markdown }) => tools::run_tools(&Door::Socket, json, markdown).await,
+        Some(CommandSet::Call { tool, arguments }) => tools::run_call(&Door::Socket, &tool, arguments.as_deref()).await,
+        Some(CommandSet::Workspace { command }) => workspace::run(&Door::Socket, command).await,
+        Some(CommandSet::Worktree { command }) => workspace::run_worktree(&Door::Socket, command).await,
+        Some(CommandSet::Thread { command }) => thread::run(&Door::Socket, command).await,
+        Some(CommandSet::Connector { command }) => connector::run(&Door::Socket, command).await,
         Some(CommandSet::Status) => {
             let response = send_control_request(ControlRequest {
                 command: "status".into(),
                 params: json!({}),
             })
             .await?;
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Json { command, params }) => {
             let params = params
@@ -430,8 +632,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 .transpose()?
                 .unwrap_or_else(|| json!({}));
             let response = send_control_request(ControlRequest { command, params }).await?;
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Notify { message }) => {
             let response = send_control_request(ControlRequest {
@@ -439,8 +640,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 params: json!({ "message": message }),
             })
             .await?;
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Handoff) => {
             let response = send_control_request(ControlRequest {
@@ -448,8 +648,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 params: json!({}),
             })
             .await?;
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Memory { command }) => {
             let response = match command {
@@ -501,8 +700,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 }
             };
 
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Index { command }) => {
             let response = match command {
@@ -529,8 +727,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 }
             };
 
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Issue { command }) => {
             let response = match command {
@@ -558,7 +755,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                                     println!("#{:<6} {:8} {}", num, state_str, title);
                                 }
                             }
-                            return Ok(true);
+                            return Ok(Exit::Done);
                         }
                     }
                     response
@@ -588,7 +785,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                         }
                         println!();
                         println!("{}", body);
-                        return Ok(true);
+                        return Ok(Exit::Done);
                     }
                     response
                 }
@@ -601,8 +798,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 }
             };
 
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         Some(CommandSet::Browser { command }) => {
             let ws_id = std::env::var("CODEMUX_WORKSPACE_ID").unwrap_or_default();
@@ -813,27 +1009,8 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     }))
                 }
             }?;
-            println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?);
-            Ok(true)
-        }
-        Some(CommandSet::Workspace { command }) => {
-            let response = match command {
-                WorkspaceCommand::RerunSetup { workspace_id } => {
-                    let mut params = json!({});
-                    if let Some(id) = workspace_id {
-                        params["workspace_id"] = json!(id);
-                    } else if let Ok(id) = std::env::var("CODEMUX_WORKSPACE_ID") {
-                        params["workspace_id"] = json!(id);
-                    }
-                    send_control_request(ControlRequest {
-                        command: "rerun_setup".into(),
-                        params,
-                    })
-                    .await?
-                }
-            };
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            output::emit_json(&result)?;
+            Ok(Exit::Done)
         }
         Some(CommandSet::Monitor { command }) => {
             // The pane/workspace ids come from the agent's own injected
@@ -870,14 +1047,13 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 params,
             })
             .await?;
-            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
-            Ok(true)
+            print_response(&response)
         }
         // Purely local: the allocation table is a file on disk, so this works
         // from a bare shell with no Codemux instance running.
         Some(CommandSet::Ports { command }) => {
             ports::run(command)?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::Remote { command }) => {
             match command {
@@ -938,7 +1114,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     println!("Web remote access disabled. Every live connection was severed.");
                 }
             }
-            Ok(true)
+            Ok(Exit::Done)
         }
         // Account commands are deliberately local: they open the same
         // SQLite store the app uses and talk to the auth API directly,
@@ -951,7 +1127,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
             status,
         }) => {
             crate::auth::cli_login::run_login(email, token, status).await?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         // `connect` is local for the same reason `login` is — it exists to set
         // up a machine that has nothing running yet. It reaches for the control
@@ -972,15 +1148,15 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     .await?
                 }
             }
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::Logout) => {
             crate::auth::cli_login::run_logout()?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::Whoami) => {
             crate::auth::cli_login::run_whoami()?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::ReloadUi) => {
             let response = send_control_request(ControlRequest {
@@ -994,18 +1170,18 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     .unwrap_or_else(|| "Codemux could not reload its interface".to_string()));
             }
             println!("Reloading the Codemux interface. Terminals and agents keep running.");
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::Logs { tail }) => {
             // Purely local — reads the file tauri-plugin-log writes, so
             // it works even when (especially when) the app won't start.
             match crate::app_logs::app_log_file() {
                 Some(path) if path.exists() => {
-                    eprintln!("# {}", path.display());
+                    output::note(&format!("# {}", path.display()));
                     for line in
                         crate::app_logs::tail_lines(&path, tail).map_err(|e| e.to_string())?
                     {
-                        println!("{line}");
+                        output::out(&line)?;
                     }
                 }
                 Some(path) => {
@@ -1016,19 +1192,20 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                 }
                 None => println!("Could not resolve the platform log directory."),
             }
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::Doctor) => {
             crate::doctor::run().await;
-            Ok(true)
+            Ok(Exit::Done)
         }
-        Some(CommandSet::Mcp) => {
-            crate::mcp_server::run_mcp_server().await?;
-            Ok(true)
+        Some(CommandSet::Mcp { .. }) => {
+            let options = crate::mcp_server::McpServerOptions { client, access: access.map(Into::into) };
+            crate::mcp_server::run_mcp_server_with(options).await?;
+            Ok(Exit::Done)
         }
         Some(CommandSet::McpBridge) => {
             crate::mcp::bridge::run().await?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::McpCall {
             tool,
@@ -1036,7 +1213,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
             list,
         }) => {
             crate::mcp::bridge::call(tool, arguments, list).await?;
-            Ok(true)
+            Ok(Exit::Done)
         }
         Some(CommandSet::PtyDaemon { socket }) => {
             // The daemon's `run` only returns on a fatal listener error;
@@ -1049,7 +1226,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
             #[cfg(unix)]
             {
                 crate::pty_daemon::server::run(socket).await?;
-                Ok(true)
+                Ok(Exit::Done)
             }
             #[cfg(not(unix))]
             {
@@ -1058,118 +1235,8 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
             }
         }
         Some(CommandSet::Capabilities) => {
-            let caps = json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "commands": {
-                    "browser": {
-                        "description": "Control the browser pane",
-                        "subcommands": {
-                            "open": { "args": "<url>", "description": "Navigate to a URL" },
-                            "snapshot": { "args": "[--dom]", "description": "Get page element tree" },
-                            "click": { "args": "<selector>", "description": "Click an element" },
-                            "fill": { "args": "<selector> <value>", "description": "Type into an input" },
-                            "screenshot": { "description": "Capture screenshot (base64 PNG)" },
-                            "console-logs": { "description": "Get browser console output" },
-                            "create": { "description": "Create a new browser pane" },
-                            "viewport": {
-                                "args": "<preset|WxH|reset> [--dpr N]",
-                                "description": "Set viewport for mobile/tablet/desktop testing"
-                            },
-                            "viewport-presets": { "description": "List available viewport presets" }
-                        }
-                    },
-                    "memory": {
-                        "description": "Project memory management",
-                        "subcommands": {
-                            "show": { "description": "Show project memory" },
-                            "set": { "args": "--brief/--goal/--focus", "description": "Update memory fields" },
-                            "add": { "args": "<kind> <content>", "description": "Add memory entry" }
-                        }
-                    },
-                    "index": {
-                        "description": "Code index for search",
-                        "subcommands": {
-                            "build": { "description": "Build/rebuild search index" },
-                            "status": { "description": "Show index status" },
-                            "search": { "args": "<query>", "description": "Search indexed code" }
-                        }
-                    },
-                    "issue": {
-                        "description": "GitHub issue operations",
-                        "subcommands": {
-                            "list": { "args": "[--search <query>]", "description": "List open issues for the current workspace's repo" },
-                            "view": { "args": "<number>", "description": "View a specific GitHub issue" },
-                            "link": { "args": "<number>", "description": "Link a GitHub issue to the active workspace" }
-                        }
-                    },
-                    "workspace": {
-                        "description": "Workspace operations",
-                        "subcommands": {
-                            "rerun-setup": { "args": "[workspace-id]", "description": "Re-run setup (.codemuxinclude + scripts) for a workspace" }
-                        }
-                    },
-                    "remote": {
-                        "description": "Web remote-access operations",
-                        "subcommands": {
-                            "enable": { "args": "[--scope all|tailscale|loopback] [--port N]", "description": "Turn web remote access on and print the reachable endpoint (requires the desktop app running)" },
-                            "disable": { "description": "Turn web remote access off, severing every live connection" },
-                            "pair": { "args": "[--name <label>]", "description": "Mint a one-time web-remote pairing code + QR (requires remote access enabled)" }
-                        }
-                    },
-                    "monitor": {
-                        "description": "Declare that this pane is watching something in the background (calm 'Monitoring' status). Provider-agnostic; targets CODEMUX_PANE_ID / CODEMUX_WORKSPACE_ID",
-                        "subcommands": {
-                            "start": { "args": "[--reason <text>] [--pane-id <id>]", "description": "Mark this pane as monitoring in the background" },
-                            "stop": { "args": "[--pane-id <id>]", "description": "Clear this pane's monitoring status" },
-                            "status": { "args": "[--pane-id <id>]", "description": "Report whether this pane currently reads as monitoring" }
-                        }
-                    },
-                    "ports": {
-                        "description": "Reserve host ports no other worktree will be handed, so parallel worktrees of one project can each run their own stack",
-                        "subcommands": {
-                            "allocate": { "args": "<name>", "description": "Print a free port reserved for this worktree under <name>; the same name always returns the same port" },
-                            "list": { "description": "List the ports this worktree owns" },
-                            "release": { "args": "<name>", "description": "Give a previously allocated port back" }
-                        }
-                    },
-                    "serve": {
-                        "args": "[--scope all|tailscale|loopback] [--port N] [--relay]",
-                        "description": "Run headless as a web-remote server (no GUI); prints a pairing QR + link and runs until Ctrl-C"
-                    },
-                    "connect": {
-                        "args": "[--email <address>] [--scope all|tailscale|loopback] [--port N]",
-                        "description": "One-command remote-access setup: sign in, turn relay mode on, and install a background service so this machine stays reachable",
-                        "subcommands": {
-                            "status": { "description": "Show the account, remote-access config, background service, and running-instance state" },
-                            "off": { "description": "Turn from-anywhere access off and remove the background service (stays signed in)" }
-                        }
-                    },
-                    "login": {
-                        "args": "[--email <address>] [--token <token>] [--status]",
-                        "description": "Sign this machine into a Codemux account (headless-friendly; no GUI or running instance needed)"
-                    },
-                    "logout": { "description": "Clear the cached account session on this machine" },
-                    "whoami": { "description": "Print the signed-in account; exits 1 when signed out" },
-                    "status": { "description": "Show Codemux app status" },
-                    "notify": { "args": "<message>", "description": "Send a notification to the user" },
-                    "handoff": { "description": "Generate project handoff summary" },
-                    "logs": { "args": "[--tail <n>]", "description": "Print recent lines from the desktop app's log file" },
-                    "doctor": { "description": "Diagnose the local environment (file dialogs, logs)" },
-                    "capabilities": { "description": "List all available commands (this output)" }
-                },
-                "environment": {
-                    "CODEMUX": "Set to '1' when running inside Codemux",
-                    "CODEMUX_VERSION": "Codemux version",
-                    "CODEMUX_WORKSPACE_ID": "Current workspace ID",
-                    "CODEMUX_PANE_ID": "Current pane ID (the default target for `codemux monitor`)",
-                    "CODEMUX_BROWSER_CMD": "Command prefix for browser control",
-                    "CODEMUX_PASSWORD": "Password for a non-interactive `codemux login` (warns; for automated runs only)",
-                    "CODEMUX_API_URL": "Override the Codemux API base URL (default https://api.codemux.org)",
-                    "BROWSER": "Set to 'codemux browser open' for URL handling"
-                }
-            });
-            println!("{}", serde_json::to_string_pretty(&caps).map_err(|e| e.to_string())?);
-            Ok(true)
+            capabilities::print()?;
+            Ok(Exit::Done)
         }
     }
 }
@@ -1376,6 +1443,275 @@ mod tests {
         // that otherwise only surface when a user runs the command.
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn usage_errors_are_64_and_help_is_0() {
+        let exit_of = |argv: &[&str]| match parse_outcome(argv) {
+            Ok(_) => None,
+            Err((exit, _)) => Some(exit.code()),
+        };
+
+        // Help at any level prints on stdout and succeeds.
+        for argv in [
+            &["codemux", "--help"][..],
+            &["codemux", "-h"],
+            &["codemux", "help"],
+            &["codemux", "help", "memory"],
+            &["codemux", "status", "--help"],
+            &["codemux", "remote", "enable", "--help"],
+        ] {
+            assert_eq!(exit_of(argv), Some(0), "{argv:?}");
+        }
+
+        // Every rejection is EX_USAGE, never clap's 2, which means "needs input".
+        for argv in [
+            &["codemux", "no-such-command"][..],
+            &["codemux", "status", "--bogus"],
+            &["codemux", "notify"],
+            &["codemux", "memory"],
+            &["codemux", "serve", "--scope", "wan"],
+            &["codemux", "logs", "--tail", "many"],
+        ] {
+            assert_eq!(exit_of(argv), Some(64), "{argv:?}");
+        }
+
+        // Valid argv still parses, including the bare GUI launch.
+        for argv in [
+            &["codemux"][..],
+            &["codemux", "--disable-plugins"],
+            &["codemux", "json", "status"],
+            &["codemux", "json", "conversation_read", "{\"limit\":5}"],
+        ] {
+            assert_eq!(exit_of(argv), None, "{argv:?}");
+        }
+
+        // The control verbs follow the same rule.
+        assert_eq!(exit_of(&["codemux", "thread", "--help"]), Some(0));
+        for argv in [
+            &["codemux", "thread", "start", "--provider", "codex", "-m", "hi"][..],
+            &["codemux", "thread", "wait", "t", "--timeout", "forever"],
+            &["codemux", "call"],
+            &["codemux", "--access", "root", "tools"],
+        ] {
+            assert_eq!(exit_of(argv), Some(64), "{argv:?}");
+        }
+    }
+
+    fn parse(argv: &[&str]) -> CommandSet {
+        Cli::try_parse_from(argv).unwrap_or_else(|error| panic!("{argv:?}: {error}")).command.expect("a command")
+    }
+
+    #[test]
+    fn control_verbs_parse() {
+        use thread::{Decision, ThreadCommand};
+        let start = ["codemux", "thread", "start", "--workspace", "ws", "--provider", "codex"];
+        let message = ["-m", "hi"];
+        let full = [&start[..], &["--permission-mode", "read-only"], &message, &["--wait", "--timeout", "10m", "--json"]].concat();
+        match parse(&full) {
+            CommandSet::Thread { command: ThreadCommand::Start(args) } => {
+                assert_eq!((args.provider.as_str(), args.permission_mode.as_deref(), args.message.as_str()), ("codex", Some("read-only"), "hi"));
+                assert!(args.run.wait && args.out.json);
+                assert_eq!(args.run.timeout, Some(std::time::Duration::from_secs(600)));
+            }
+            _ => panic!("expected thread start"),
+        }
+        // Exactly one of the permission flags, and never neither.
+        let both = [&start[..], &["--permission-mode", "x", "--no-permission-mode"], &message].concat();
+        assert!(Cli::try_parse_from(both).is_err());
+        assert!(Cli::try_parse_from([&start[..], &message].concat()).is_err());
+        assert!(Cli::try_parse_from([&start[..], &["--no-permission-mode"], &message].concat()).is_ok());
+        // A worktree base needs the worktree branch.
+        let base_only = [&start[..], &["--no-permission-mode", "--worktree-base", "trunk"], &message].concat();
+        assert!(Cli::try_parse_from(base_only).is_err());
+
+        // Branch deletion and force only come with worktree removal.
+        assert!(Cli::try_parse_from(["codemux", "workspace", "close", "ws", "--delete-branch"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "workspace", "close", "ws", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "workspace", "close", "ws", "--remove-worktree", "--delete-branch", "--force"]).is_ok());
+
+        for (word, decision) in [("allow-once", Decision::AllowOnce), ("allow-always", Decision::AllowAlways), ("deny", Decision::Deny)] {
+            match parse(&["codemux", "thread", "respond", "t", "r", word]) {
+                CommandSet::Thread { command: ThreadCommand::Respond(args) } => assert_eq!(args.decision, decision),
+                _ => panic!("expected thread respond"),
+            }
+        }
+        assert!(Cli::try_parse_from(["codemux", "thread", "respond", "t", "r", "allow_once"]).is_err());
+
+        for argv in [
+            &["codemux", "tools", "--json"][..],
+            &["codemux", "tools", "--markdown"],
+            &["codemux", "call", "thread_list", "{}"],
+            &["codemux", "call", "thread_list", "-"],
+            &["codemux", "workspace", "create", ".", "--select", "--request-id", "k", "--json"],
+            &["codemux", "workspace", "list"],
+            &["codemux", "workspace", "info"],
+            &["codemux", "workspace", "rerun-setup", "ws"],
+            &["codemux", "worktree", "create", "--repo", ".", "--branch", "b", "--base", "trunk"],
+            &["codemux", "thread", "send", "t", "--workspace", "ws", "-m", "-", "--delivery", "queue", "--wait"],
+            &["codemux", "thread", "wait", "t", "--turn", "t1", "--timeout", "90s"],
+            &["codemux", "thread", "read", "t", "--all"],
+            &["codemux", "thread", "list", "--limit", "5"],
+            &["codemux", "thread", "status", "t", "--json"],
+            &["codemux", "thread", "interrupt", "t", "--turn", "t1"],
+            &["codemux", "thread", "stop", "t"],
+            &["codemux", "connector", "status"],
+            &["codemux", "connector", "enable", "--port", "4378", "--origin", "https://desk.example"],
+            &["codemux", "connector", "issue", "--label", "bot", "--access", "supervised", "--expires", "30d"],
+            &["codemux", "connector", "revoke", "--all"],
+            &["codemux", "connector", "approve", "req", "--access", "read-only"],
+        ] {
+            parse(argv);
+        }
+        assert!(Cli::try_parse_from(["codemux", "tools", "--json", "--markdown"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "worktree", "create", "--repo", ".", "--branch", "b", "--base", "x", "--existing"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "thread", "read", "t", "--all", "--cursor", "3"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "thread", "read", "t", "--limit", "101"]).is_err());
+    }
+
+    #[test]
+    fn caller_flags_name_and_narrow_the_client() {
+        // Root flags, before the command, for every verb.
+        let cli = Cli::try_parse_from(["codemux", "--client", "Hermes Bot", "--access", "supervised", "tools"]).unwrap();
+        assert_eq!(cli.caller.client.as_deref(), Some("Hermes Bot"));
+        assert_eq!(cli.caller.access, Some(args::AccessArg::Supervised));
+        for (spelling, access) in [
+            ("read-only", args::AccessArg::ReadOnly),
+            ("read_only", args::AccessArg::ReadOnly),
+            ("full-access", args::AccessArg::FullAccess),
+            ("full_access", args::AccessArg::FullAccess),
+            ("full", args::AccessArg::FullAccess),
+        ] {
+            let cli = Cli::try_parse_from(["codemux", "--access", spelling, "status"]).unwrap();
+            assert_eq!(cli.caller.access, Some(access), "{spelling}");
+        }
+        // A name with nothing usable would silently run as the owner.
+        assert!(Cli::try_parse_from(["codemux", "--client", "!!!", "status"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "--client", "x", "tools", "--client", "y"]).is_err());
+        assert_eq!(crate::agent_control::ControlAccess::from(args::AccessArg::Supervised), crate::agent_control::ControlAccess::Supervised);
+    }
+
+    #[test]
+    fn only_socket_commands_read_the_caller_env() {
+        use args::{AccessArg, CallerArgs};
+        let bad = |key: &str| match key {
+            "CODEMUX_CLIENT" => Some("---".to_owned()),
+            "CODEMUX_ACCESS" => Some("readonly".to_owned()),
+            _ => None,
+        };
+        let caller = |argv: &[&str], var: &dyn Fn(&str) -> Option<String>| caller_of(&Cli::try_parse_from(argv).unwrap(), var);
+        // A bad variable never stops the app, serve or the internal children.
+        for argv in [
+            &["codemux"][..],
+            &["codemux", "app"],
+            &["codemux", "serve"],
+            &["codemux", "pty-daemon", "--socket", "/tmp/x.sock"],
+            &["codemux", "mcp-bridge"],
+            &["codemux", "mcp-call", "--list"],
+            &["codemux", "capabilities"],
+        ] {
+            assert_eq!(caller(argv, &bad), Ok(CallerArgs::default()), "{argv:?}");
+        }
+        // Commands that call the socket refuse it rather than run as the owner.
+        for argv in [&["codemux", "tools"][..], &["codemux", "mcp"], &["codemux", "json", "status"]] {
+            assert!(caller(argv, &bad).unwrap_err().starts_with("CODEMUX_"), "{argv:?}");
+        }
+        // `codemux mcp` flags, then the root's, then the env.
+        let env = |key: &str| match key {
+            "CODEMUX_CLIENT" => Some("env-bot".to_owned()),
+            "CODEMUX_ACCESS" => Some("supervised".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            caller(&["codemux", "mcp"], &env),
+            Ok(CallerArgs { client: Some("env-bot".into()), access: Some(AccessArg::Supervised) })
+        );
+        assert_eq!(
+            caller(&["codemux", "--client", "root", "mcp", "--access", "read-only"], &env),
+            Ok(CallerArgs { client: Some("root".into()), access: Some(AccessArg::ReadOnly) })
+        );
+        assert_eq!(caller(&["codemux", "--client", "root", "mcp", "--client", "own"], &env).unwrap().client.as_deref(), Some("own"));
+    }
+
+    #[test]
+    fn bare_mcp_still_serves_stdio() {
+        // `.mcp.json` entries, the Vexis config and Settings run exactly this.
+        assert!(matches!(parse(&["codemux", "mcp"]), CommandSet::Mcp { client: None, access: None }));
+        match parse(&["codemux", "mcp", "--client", "hermes", "--access", "supervised"]) {
+            CommandSet::Mcp { client, access } => {
+                assert_eq!(client.as_deref(), Some("hermes"));
+                assert_eq!(access, Some(args::AccessArg::Supervised));
+            }
+            _ => panic!("expected mcp"),
+        }
+        assert!(Cli::try_parse_from(["codemux", "mcp", "--client", "---"]).is_err());
+        assert!(Cli::try_parse_from(["codemux", "mcp", "install"]).is_err());
+    }
+
+    #[test]
+    fn mcp_call_still_parses() {
+        // ACP prompts tell agents to run exactly these.
+        assert!(matches!(parse(&["codemux", "mcp-call", "--list"]), CommandSet::McpCall { tool: None, list: true, .. }));
+        match parse(&["codemux", "mcp-call", "thread_list", "{}"]) {
+            CommandSet::McpCall { tool, arguments, list } => {
+                assert_eq!((tool.as_deref(), arguments.as_deref(), list), (Some("thread_list"), Some("{}"), false));
+            }
+            _ => panic!("expected mcp-call"),
+        }
+    }
+
+    #[test]
+    fn internal_commands_are_hidden_but_still_run() {
+        use clap::CommandFactory;
+        let root = Cli::command();
+        for name in ["mcp-bridge", "pty-daemon"] {
+            assert!(root.find_subcommand(name).is_some_and(|command| command.is_hide_set()), "{name}");
+        }
+        assert!(matches!(parse(&["codemux", "pty-daemon", "--socket", "/tmp/x.sock"]), CommandSet::PtyDaemon { .. }));
+        // The ignored browser ids are hidden from help but still accepted.
+        assert!(matches!(parse(&["codemux", "browser", "screenshot", "default"]), CommandSet::Browser { .. }));
+        let help = root.find_subcommand("browser").unwrap().find_subcommand("screenshot").unwrap().clone().render_help().to_string();
+        assert!(!help.contains("BROWSER_ID"), "{help}");
+    }
+
+    #[test]
+    fn ok_false_replies_exit_1_and_still_print() {
+        let print = |response: &ControlResponse| {
+            let mut printed = Vec::new();
+            let exit = write_response(&mut printed, response).expect("writes to memory");
+            (exit, String::from_utf8(printed).expect("utf-8"))
+        };
+        // The exact pretty JSON the legacy verbs always printed.
+        let as_before = |response: &ControlResponse| {
+            format!("{}\n", serde_json::to_string_pretty(response).unwrap())
+        };
+
+        let ok = ControlResponse {
+            ok: true,
+            protocol_version: 1,
+            data: Some(json!({ "workspace_id": "ws-1" })),
+            error: None,
+        };
+        let (exit, printed) = print(&ok);
+        assert_eq!((exit, exit.code()), (Exit::Done, 0));
+        assert_eq!(printed, as_before(&ok));
+
+        let refused = ControlResponse {
+            ok: false,
+            protocol_version: 1,
+            data: None,
+            error: Some("workspace_not_found: Select an existing workspace explicitly".into()),
+        };
+        let (exit, printed) = print(&refused);
+        assert_eq!((exit, exit.code()), (Exit::Failed, 1));
+        // stdout is unchanged, so scripts still read the error from the reply.
+        assert_eq!(printed, as_before(&refused));
+        let reply: Value = serde_json::from_str(&printed).unwrap();
+        assert_eq!(reply["ok"], json!(false));
+        assert_eq!(
+            reply["error"],
+            json!("workspace_not_found: Select an existing workspace explicitly")
+        );
     }
 
     /// The `ports` module is only reachable if it is registered on

@@ -38,6 +38,10 @@ pub struct ServeOptions {
 /// returns. Returns an error — before booting — if another Codemux instance
 /// already holds this machine's control endpoint.
 pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
+    // 0. A serve started from an agent's shell must not pass that agent's
+    //    identity to the terminals and tools it starts.
+    crate::control_identity::scrub_inherited_agent_identity();
+
     // 1. Mutual exclusion: never boot a second backend alongside a running GUI
     //    or serve instance (they would fight over the control socket, the DB,
     //    the PTY daemon, and the web-remote port).
@@ -120,7 +124,13 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
                 }
             }
         }
-        print_footer(relay_only);
+        // The outside-assistant connector is independent of web remote and
+        // was restored (or not) by setup; report it for relay-only too.
+        let connector = crate::mcp_connector::agent_connector_status(handle.clone()).ok();
+        if let Some(line) = connector.as_ref().and_then(connector_line) {
+            println!("  {line}");
+        }
+        print_footer(relay_only, connector.is_some_and(|status| status.enabled));
 
         // 5. Keep-alive: block until SIGINT / SIGTERM. Still no `app.run()` —
         //    `MockRuntime::run` is an infinite polling loop with no windowing
@@ -135,6 +145,9 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     // Mirror the GUI's `RunEvent::Exit` cleanup, then let `app` drop normally
     // so managed provider/server state gets its destructors. A success-path
     // `process::exit` would skip those destructors and leak child processes.
+    // Stop taking outside-assistant connections first, so no network client
+    // starts work against managers that are shutting down.
+    crate::mcp_connector::listener::stop(app.handle());
     if let Some(platform) =
         tauri::Manager::try_state::<crate::plugins::platform_transport::PluginPlatformState>(&app)
     {
@@ -271,6 +284,9 @@ fn print_banner<R: tauri::Runtime>(
     }
     println!("  Port:         {port}");
     println!("  Access scope: {scope} ({scope_note})");
+    if scope == BIND_SCOPE_ALL {
+        println!("                Plain HTTP on every interface. On untrusted networks use --scope tailscale or --relay.");
+    }
     if let Some(err) = &result.status.bind_error {
         // Relay mode kept the server up without its LAN listener; say so
         // rather than printing addresses nothing is listening on.
@@ -291,14 +307,37 @@ fn print_banner<R: tauri::Runtime>(
     }
 }
 
+/// The banner line for the outside-assistant connector, `None` while it is off.
+/// The connector listens on loopback only, so an origin is a proxy's address.
+fn connector_line(status: &crate::mcp_connector::ConnectorStatus) -> Option<String> {
+    if !status.enabled {
+        return None;
+    }
+    Some(match (&status.local_url, &status.public_origin) {
+        (Some(_), Some(origin)) => format!(
+            "Agent connector: {origin}/mcp (proxy target http://127.0.0.1:{})",
+            status.port
+        ),
+        (Some(local), None) => format!("Agent connector: {local} (this machine only)"),
+        (None, _) => format!(
+            "Agent connector: not running — {}",
+            status.bind_error.as_deref().unwrap_or("the listener is stopped")
+        ),
+    })
+}
+
 /// Print the closing lines: how to mint more codes (or, relay-only, how to add
-/// the network listener), the account-mode note, and the stop hint.
-fn print_footer(relay_only: bool) {
+/// the network listener), how to turn the connector on, the account-mode note,
+/// and the stop hint.
+fn print_footer(relay_only: bool, connector_enabled: bool) {
     println!();
     if relay_only {
         println!("Run `codemux remote enable` from another SSH session to also listen on your network.");
     } else {
         println!("Run `codemux remote pair` from another SSH session to mint more pairing codes.");
+    }
+    if !connector_enabled {
+        println!("Run `codemux connector enable` to let outside agents connect over HTTP.");
     }
     println!("Account-mode / hosted access continues to work if it was configured.");
     println!("Press Ctrl-C (or send SIGTERM) to stop the server.");
@@ -365,6 +404,40 @@ mod tests {
         // enable. This is what makes the `codemux connect` systemd unit's bare
         // `ExecStart=… serve` honour a tuned setup instead of resetting it.
         assert_eq!(resolve_scope(None, true), None);
+    }
+
+    fn connector(enabled: bool, origin: Option<&str>, running: bool) -> crate::mcp_connector::ConnectorStatus {
+        crate::mcp_connector::ConnectorStatus {
+            enabled,
+            public_origin: origin.map(str::to_owned),
+            listener_running: running,
+            port: 4378,
+            bind_error: (!running).then(|| "bind 127.0.0.1:4378: Address in use".into()),
+            local_url: running.then(|| "http://127.0.0.1:4378/mcp".into()),
+            mcp_url: None,
+            local_executable: "codemux".into(),
+            local_command: "codemux mcp".into(),
+            revoked_grants: None,
+            pending: Vec::new(),
+            clients: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn banner_names_the_connector_address_or_why_it_is_not_running() {
+        assert_eq!(connector_line(&connector(false, None, false)), None);
+        assert_eq!(
+            connector_line(&connector(true, None, true)).as_deref(),
+            Some("Agent connector: http://127.0.0.1:4378/mcp (this machine only)")
+        );
+        assert_eq!(
+            connector_line(&connector(true, Some("https://box.example"), true)).as_deref(),
+            Some("Agent connector: https://box.example/mcp (proxy target http://127.0.0.1:4378)")
+        );
+        assert_eq!(
+            connector_line(&connector(true, Some("https://box.example"), false)).as_deref(),
+            Some("Agent connector: not running — bind 127.0.0.1:4378: Address in use")
+        );
     }
 
     #[test]

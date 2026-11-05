@@ -206,6 +206,9 @@ sandbox_args() {
 # refuse to run). ORCH_LIVE_RUN_ID marks this run's processes for down.sh.
 sandbox_env() {
   xdg_env
+  # CODEMUX_E2E_CONNECTOR_ACCESS_TTL_SECS (honoured by debug builds only)
+  # makes the connector's OAuth access tokens lapse after 20 s, so
+  # outside-agent's http part sees one expire before it refreshes.
   printf '%s\n' \
     "HOME=$HOME" \
     "USER=${USER:-$(id -un)}" \
@@ -217,6 +220,7 @@ sandbox_env() {
     "CLAUDE_SECURESTORAGE_CONFIG_DIR=$CLAUDE_AUTH_MOUNT" \
     "CODEMUX_CLAUDE_SIDECAR_PATH=$SIDECAR" \
     "CODEMUX_E2E_LOCAL_REMOTE=1" \
+    "CODEMUX_E2E_CONNECTOR_ACCESS_TTL_SECS=20" \
     "CODEMUX_DISABLE_PTY_DAEMON=1" \
     "DISABLE_AUTOUPDATER=1" \
     "ORCH_LIVE_RUN_ID=${RUN_ID:-}" \

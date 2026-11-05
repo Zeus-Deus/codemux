@@ -41,6 +41,11 @@ vi.mock("@/lib/toast", () => ({
   toast: mockToast,
 }));
 
+const remote = vi.hoisted(() => ({ value: false }));
+vi.mock("@/components/remote/is-remote-client", () => ({
+  isRemoteClient: () => remote.value,
+}));
+
 // Keep the store module's PURE helpers (resolveProjectRoot,
 // projectDisplayName) real — the section shares them with the sidebar
 // grouping and the tests assert on that shared labeling — while the
@@ -99,6 +104,7 @@ function setArchived(entries: ArchivedWorkspaceSnapshot[]) {
 beforeEach(() => {
   cleanup();
   vi.clearAllMocks();
+  remote.value = false;
   mockUnarchive.mockResolvedValue("ws-1");
   mockDeleteArchived.mockResolvedValue(undefined);
   mockState.homeDir = null;
@@ -344,5 +350,44 @@ describe("ArchiveSection — delete", () => {
         true,
       ),
     );
+  });
+});
+
+describe("ArchiveSection — paired browser or phone", () => {
+  it("a remote client can unarchive but not delete archived workspaces", async () => {
+    remote.value = true;
+    setArchived([
+      makeEntry({ archive_id: "a-wt", title: "feature-work" }),
+      makeEntry({
+        archive_id: "a-root",
+        title: "myapp",
+        worktree_path: null,
+        workspace_kind: "main",
+        protected: true,
+      }),
+    ]);
+    render(<ArchiveSection />);
+
+    expect(screen.getAllByRole("button", { name: /Unarchive/i })).toHaveLength(2);
+    expect(
+      screen.queryByRole("button", { name: /Delete archived workspace/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Remove from archive/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Delete archived workspaces from the Codemux desktop app."),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getAllByRole("button", { name: /Unarchive/i })[0]);
+    await waitFor(() => expect(mockUnarchive).toHaveBeenCalledTimes(1));
+  });
+
+  it("the desktop shows no remote note", () => {
+    setArchived([makeEntry()]);
+    render(<ArchiveSection />);
+    expect(
+      screen.queryByText("Delete archived workspaces from the Codemux desktop app."),
+    ).not.toBeInTheDocument();
   });
 });

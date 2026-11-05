@@ -1,21 +1,25 @@
-//! Headless MCP tool implementations.
+//! The tools `codemux-remote serve` runs for agents on this host.
 //!
-//! Each tool is a thin function taking the dispatcher's shared
-//! state, an [`Identity`], and tool-specific params; returning a
-//! `serde_json::Value` payload. Handlers don't branch on `Identity`
-//! in v1 — see `identity.rs` for why the argument exists anyway.
+//! They manage this host's folders, git worktrees and shells: the
+//! workspaces they register show up under Devices in the Codemux app.
+//! They do not run Codemux chats and do not control the Codemux app.
 //!
-//! The tool surface is deliberately narrower than the desktop's
-//! `mcp_server.rs` (which advertises 50+ tools). On a headless
-//! host there are no panes, no browser, no system tray. The set
-//! below covers the headline use case: an agent on the remote can
-//! create workspaces, list them, write to and read from shells,
-//! and inspect state.
+//! Each tool is a thin function taking the daemon's shared state, an
+//! [`Identity`] and its arguments, and returning a `serde_json::Value`
+//! payload. Handlers don't branch on `Identity` in v1; see `identity.rs`
+//! for why the argument exists anyway.
 //!
-//! New tools should be added here and registered in [`Catalog`] and
-//! the dispatch table in `server.rs`. Tests in `tests/remote_e2e.rs`
-//! exercise the dispatcher end-to-end so a forgotten registration
-//! is caught at CI time.
+//! Arguments follow the desktop's names where both have the concept
+//! (`workspace_id`), and unknown arguments are refused, so a call written
+//! for the desktop's tools fails loudly here instead of half-working. The
+//! terminal tools keep their own names (`terminal_id`, `max_bytes`) and
+//! every tool keeps its output shape: vexis-agent's remote dialect
+//! depends on both.
+//!
+//! A new tool goes in [`catalog`] and in [`dispatch`], both in this file.
+//! `codemux-remote mcp` lists [`catalog`] directly and the daemon's HTTP
+//! routes serve it. Tests live in this file's `mod tests` and in
+//! `remote/server.rs` and `remote/mcp.rs`.
 
 use std::path::{Path, PathBuf};
 
@@ -26,8 +30,14 @@ use super::identity::Identity;
 use super::pty::PtyManager;
 use super::workspace::{Workspace, WorkspaceStore};
 
-/// Static metadata for every tool the daemon exposes. The MCP
-/// `tools/list` JSON-RPC response is built directly from this slice.
+/// Longest one tool call to the daemon may take. `worktree_create` is the
+/// slow one: it fetches the base (itself capped at 10 s), checks out the
+/// branch and copies the include files before it answers.
+pub const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Static metadata for every tool the daemon exposes. `codemux-remote mcp`
+/// builds its `tools/list` reply from this list, and the daemon's
+/// `/tools/list` route serves it as is.
 #[derive(Debug, Serialize, Clone)]
 pub struct ToolSpec {
     pub name: &'static str,
@@ -37,11 +47,17 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
+/// The argument that names a workspace. Models only see `workspace_id`;
+/// `id` stays accepted for older callers.
+fn workspace_id_property() -> Value {
+    json!({ "type": "string", "description": "The workspace's id, from workspace_list or workspace_create." })
+}
+
 pub fn catalog() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "workspace_create",
-            description: "Create a new workspace on this host. Records it in the daemon's registry. Returns the new workspace's id and metadata. This does not materialise files on disk — create the project folder first (e.g. `git clone`/`git init` via the terminal tools), then register it here by passing its `path`.",
+            description: "Registers a folder in this host's codemux-remote registry (shown under Devices in the Codemux app) and returns the new workspace. It doesn't create files: make the folder first (for example `git clone` or `git init` in a terminal), then pass its `path`. To branch off a repository that is already on this host, use worktree_create instead.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -56,7 +72,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "worktree_create",
-            description: "Create a git worktree + register a Codemux workspace in one call — the headless equivalent of the desktop's worktree_create. Runs `git worktree add` under ~/.codemux/worktrees/<repo>/<branch> (fetching `base` from origin first so new branches start at the remote tip) and records the resulting workspace. Also provisions the worktree like the desktop: gitignored include files (.env & co) are copied from the parent repo before this returns, and the project's `.codemux/config.json` setup commands run in the background with CODEMUX_ROOT_PATH/CODEMUX_WORKSPACE_PATH/CODEMUX_BRANCH/CODEMUX_PORT set (see the `setup` field of the response). Asking again for a branch that already has a worktree returns it with `created: false`. Use this (NOT workspace_create) to fork a branch off an existing git repo on this host. For a brand-new project, first `git init` a folder (e.g. via terminal_spawn/terminal_write), then call this against it.",
+            description: "Creates a git worktree on this host and registers it in this host's codemux-remote registry (shown under Devices in the Codemux app), in one call. Runs `git worktree add` under ~/.codemux/worktrees/<repo>/<branch>, fetching `base` from origin first so new branches start at the remote tip. Also provisions the worktree like the desktop: gitignored include files (.env & co) are copied from the parent repo before this returns, and the project's `.codemux/config.json` setup commands run in the background with CODEMUX_ROOT_PATH/CODEMUX_WORKSPACE_PATH/CODEMUX_BRANCH/CODEMUX_PORT set (see the `setup` field of the response). Asking again for a branch that already has a worktree returns it with `created: false`. Use this (NOT workspace_create) to fork a branch off an existing git repo on this host. For a brand-new project, first `git init` a folder (e.g. via terminal_spawn/terminal_write), then call this against it.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -72,47 +88,47 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "workspace_list",
-            description: "List every workspace registered with this daemon, newest first.",
+            description: "Lists the workspaces in this host's codemux-remote registry, newest first.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
         ToolSpec {
             name: "workspace_info",
-            description: "Get full metadata for a single workspace by id.",
+            description: "Returns one workspace from this host's codemux-remote registry. `id` is accepted too.",
             input_schema: json!({
                 "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
+                "properties": { "workspace_id": workspace_id_property() },
+                "required": ["workspace_id"],
                 "additionalProperties": false
             }),
         },
         ToolSpec {
             name: "workspace_update",
-            description: "Update mutable fields on a workspace (name, branch, notes). Other fields stay as-is.",
+            description: "Updates a workspace's name, recorded branch or notes in this host's codemux-remote registry. Only the fields you pass change, and nothing on disk does. `id` is accepted too.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string" },
+                    "workspace_id": workspace_id_property(),
                     "name": { "type": "string" },
                     "branch": { "type": "string" },
                     "notes": { "type": "string" }
                 },
-                "required": ["id"],
+                "required": ["workspace_id"],
                 "additionalProperties": false
             }),
         },
         ToolSpec {
             name: "workspace_close",
-            description: "Remove a workspace from the daemon's registry. Does not delete the worktree files on disk — that's the caller's job.",
+            description: "Removes a workspace from this host's codemux-remote registry. It never deletes files: there is no delete_worktree, delete_branch or force_delete here. Remove a worktree with git, or close it from the Codemux app. `id` is accepted too.",
             input_schema: json!({
                 "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
+                "properties": { "workspace_id": workspace_id_property() },
+                "required": ["workspace_id"],
                 "additionalProperties": false
             }),
         },
         ToolSpec {
             name: "terminal_spawn",
-            description: "Spawn a new shell PTY in a given working directory. Returns the terminal id used by terminal_write/terminal_read.",
+            description: "Starts a shell on this host in `cwd`. Returns the terminal id that terminal_write, terminal_read and terminal_close take.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -125,7 +141,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "terminal_write",
-            description: "Write bytes to a terminal's stdin. Include `\\n` for newline; the daemon does not append one.",
+            description: "Writes to the stdin of a shell on this host. Include `\\n` for newline; the daemon does not append one.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -138,7 +154,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "terminal_read",
-            description: "Read accumulated output from a terminal's PTY buffer. Returns up to 1 MiB. Use max_bytes to cap to a tail.",
+            description: "Reads the buffered output of a shell on this host. Returns up to 1 MiB. Use max_bytes to cap to a tail.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -151,12 +167,12 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "terminal_list",
-            description: "List every PTY the daemon currently owns.",
+            description: "Lists the shells codemux-remote is running on this host.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
         ToolSpec {
             name: "terminal_close",
-            description: "Kill the terminal (SIGHUP to the shell, drop PTY).",
+            description: "Ends a shell on this host (SIGHUP to the shell) and drops its terminal.",
             input_schema: json!({
                 "type": "object",
                 "properties": { "terminal_id": { "type": "string" } },
@@ -166,7 +182,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "app_status",
-            description: "Daemon status: version, host id, uptime, workspace count, terminal count.",
+            description: "Status of this host's codemux-remote daemon: version, host id, start time, workspace count and terminal count. It says nothing about the Codemux app.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
     ]
@@ -206,21 +222,40 @@ pub fn dispatch(
     match name {
         "workspace_create" => workspace_create(params, workspaces),
         "worktree_create" => worktree_create(params, workspaces),
-        "workspace_list" => workspace_list(workspaces),
+        "workspace_list" => workspace_list(params, workspaces),
         "workspace_info" => workspace_info(params, workspaces),
         "workspace_update" => workspace_update(params, workspaces),
         "workspace_close" => workspace_close(params, workspaces),
         "terminal_spawn" => terminal_spawn(params, ptys),
         "terminal_write" => terminal_write(params, ptys),
         "terminal_read" => terminal_read(params, ptys),
-        "terminal_list" => terminal_list(ptys),
+        "terminal_list" => terminal_list(params, ptys),
         "terminal_close" => terminal_close(params, ptys),
-        "app_status" => app_status(workspaces, ptys, started_at),
+        "app_status" => app_status(params, workspaces, ptys, started_at),
         other => Err(ToolError::not_found(format!("unknown tool: {other}"))),
     }
 }
 
+// Every input refuses unknown fields: the schemas say
+// `additionalProperties: false`, and a desktop-style call such as
+// `workspace_close{delete_worktree: true}` must fail instead of quietly
+// doing less than asked.
+
+/// The input of a tool that takes no arguments. It refuses every key too,
+/// so `terminal_list{workspace_id}` fails instead of listing every shell.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoInput {}
+
+/// Accepts `{}`, or null: the daemon reads a missing `arguments` as null.
+fn no_arguments(params: &Value) -> Result<(), ToolError> {
+    serde_json::from_value::<Option<NoInput>>(params.clone())
+        .map(|_| ())
+        .map_err(|e| ToolError::invalid(e.to_string()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateInput {
     name: Option<String>,
     path: String,
@@ -238,6 +273,7 @@ fn workspace_create(params: &Value, store: &WorkspaceStore) -> ToolResult {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorktreeCreateInput {
     repo_path: String,
     branch: String,
@@ -506,26 +542,34 @@ pub fn run_worktree_setup(
     )
 }
 
-fn workspace_list(store: &WorkspaceStore) -> ToolResult {
+fn workspace_list(params: &Value, store: &WorkspaceStore) -> ToolResult {
+    no_arguments(params)?;
     let list = store.list().map_err(workspace_err)?;
     Ok(json!({ "workspaces": list }))
 }
 
 #[derive(Debug, Deserialize)]
-struct IdInput {
-    id: String,
+#[serde(deny_unknown_fields)]
+struct WorkspaceIdInput {
+    /// `id` was this tool's first name for it; vexis-agent's remote
+    /// dialect still sends `{"id": …}`. Sending both is a duplicate field.
+    #[serde(alias = "id")]
+    workspace_id: String,
 }
 
 fn workspace_info(params: &Value, store: &WorkspaceStore) -> ToolResult {
-    let input: IdInput =
+    let input: WorkspaceIdInput =
         serde_json::from_value(params.clone()).map_err(|e| ToolError::invalid(e.to_string()))?;
-    let ws = store.get(&input.id).map_err(workspace_err)?;
+    let ws = store.get(&input.workspace_id).map_err(workspace_err)?;
     Ok(json!({ "workspace": ws }))
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateInput {
-    id: String,
+    /// Also accepted as `id`, like [`WorkspaceIdInput`].
+    #[serde(alias = "id")]
+    workspace_id: String,
     name: Option<String>,
     branch: Option<String>,
     notes: Option<String>,
@@ -535,13 +579,13 @@ fn workspace_update(params: &Value, store: &WorkspaceStore) -> ToolResult {
     let input: UpdateInput =
         serde_json::from_value(params.clone()).map_err(|e| ToolError::invalid(e.to_string()))?;
     let ws = store
-        .update(&input.id, input.name, input.branch, input.notes)
+        .update(&input.workspace_id, input.name, input.branch, input.notes)
         .map_err(workspace_err)?;
     Ok(json!({ "workspace": ws }))
 }
 
 fn workspace_close(params: &Value, store: &WorkspaceStore) -> ToolResult {
-    let input: IdInput =
+    let input: WorkspaceIdInput =
         serde_json::from_value(params.clone()).map_err(|e| ToolError::invalid(e.to_string()))?;
     // Registry-only: `WorkspaceStore::close` deletes the SQLite row and
     // touches nothing on disk, so the protected-root file-deletion
@@ -549,11 +593,12 @@ fn workspace_close(params: &Value, store: &WorkspaceStore) -> ToolResult {
     // (`commands::workspace::refuse_worktree_removal`) has no
     // equivalent here — there are no files this tool could delete. If a
     // future revision adds worktree removal, it must adopt that guard.
-    store.close(&input.id).map_err(workspace_err)?;
-    Ok(json!({ "closed": input.id }))
+    store.close(&input.workspace_id).map_err(workspace_err)?;
+    Ok(json!({ "closed": input.workspace_id }))
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpawnInput {
     cwd: String,
     command: Option<String>,
@@ -569,6 +614,7 @@ fn terminal_spawn(params: &Value, ptys: &PtyManager) -> ToolResult {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteInput {
     terminal_id: String,
     data: String,
@@ -583,6 +629,7 @@ fn terminal_write(params: &Value, ptys: &PtyManager) -> ToolResult {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadInput {
     terminal_id: String,
     max_bytes: Option<usize>,
@@ -603,11 +650,13 @@ fn terminal_read(params: &Value, ptys: &PtyManager) -> ToolResult {
     }))
 }
 
-fn terminal_list(ptys: &PtyManager) -> ToolResult {
+fn terminal_list(params: &Value, ptys: &PtyManager) -> ToolResult {
+    no_arguments(params)?;
     Ok(json!({ "terminals": ptys.list() }))
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TerminalIdInput {
     terminal_id: String,
 }
@@ -620,10 +669,12 @@ fn terminal_close(params: &Value, ptys: &PtyManager) -> ToolResult {
 }
 
 fn app_status(
+    params: &Value,
     workspaces: &WorkspaceStore,
     ptys: &PtyManager,
     started_at: &str,
 ) -> ToolResult {
+    no_arguments(params)?;
     let workspace_count = workspaces.list().map_err(workspace_err)?.len();
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -1065,5 +1116,313 @@ mod tests {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    /// Runs `body` with `HOME` pointed at a fresh temp dir, so anything a
+    /// tool writes under `~/.codemux` lands somewhere disposable. Callers
+    /// are `#[serial]`: the environment is process-wide.
+    fn with_temp_home(body: impl FnOnce(&std::path::Path)) {
+        let home = TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(home.path())));
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn call(name: &str, params: Value, store: &WorkspaceStore) -> ToolResult {
+        dispatch(
+            name,
+            &params,
+            &Identity::local(),
+            store,
+            &PtyManager::new(),
+            "2026-01-01T00:00:00Z",
+        )
+    }
+
+    fn registered(store: &WorkspaceStore) -> String {
+        let out = call(
+            "workspace_create",
+            json!({ "path": "/tmp/remote-tools-ws", "name": "ws" }),
+            store,
+        )
+        .expect("workspace_create");
+        out["workspace"]["id"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn workspace_tools_accept_workspace_id_and_the_older_id() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        let id = registered(&store);
+
+        for args in [json!({ "workspace_id": id }), json!({ "id": id })] {
+            let out = call("workspace_info", args.clone(), &store)
+                .unwrap_or_else(|e| panic!("{args}: {e:?}"));
+            assert_eq!(out["workspace"]["id"], json!(id), "{args}");
+        }
+        let updated = call(
+            "workspace_update",
+            json!({ "id": id, "notes": "n" }),
+            &store,
+        )
+        .expect("update by id");
+        assert_eq!(updated["workspace"]["notes"], json!("n"));
+        let updated = call(
+            "workspace_update",
+            json!({ "workspace_id": id, "name": "renamed" }),
+            &store,
+        )
+        .expect("update by workspace_id");
+        assert_eq!(updated["workspace"]["name"], json!("renamed"));
+
+        for tool in ["workspace_info", "workspace_update", "workspace_close"] {
+            let both = call(tool, json!({ "workspace_id": id, "id": id }), &store).unwrap_err();
+            assert_eq!(both.kind, "invalid_input", "{tool} with both keys");
+            assert!(
+                both.message.contains("duplicate field `workspace_id`"),
+                "{tool}: {}",
+                both.message
+            );
+            let neither = call(tool, json!({}), &store).unwrap_err();
+            assert_eq!(neither.kind, "invalid_input", "{tool} with neither key");
+            assert!(
+                neither.message.contains("missing field `workspace_id`"),
+                "{tool}: {}",
+                neither.message
+            );
+        }
+        assert_eq!(
+            store.list().unwrap().len(),
+            1,
+            "no failed call closed the row"
+        );
+
+        let closed = call("workspace_close", json!({ "id": id }), &store).expect("close by id");
+        assert_eq!(closed, json!({ "closed": id }));
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn workspace_close_refuses_desktop_delete_flags() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        let id = registered(&store);
+
+        for flag in ["delete_worktree", "delete_branch", "force_delete"] {
+            let err = call(
+                "workspace_close",
+                json!({ "workspace_id": id, flag: true }),
+                &store,
+            )
+            .unwrap_err();
+            assert_eq!(err.kind, "invalid_input", "{flag}");
+            assert!(
+                err.message.contains(&format!("unknown field `{flag}`")),
+                "{flag}: {}",
+                err.message
+            );
+        }
+        assert_eq!(store.get(&id).unwrap().id, id, "the row still exists");
+    }
+
+    /// Every tool that takes arguments refuses one it doesn't know, before it
+    /// does any work. The desktop's argument names are the likely mistakes.
+    #[test]
+    #[serial]
+    fn tool_inputs_reject_unknown_fields() {
+        with_temp_home(|home| {
+            let repo = TempDir::new().unwrap();
+            init_repo(repo.path());
+            let dir = TempDir::new().unwrap();
+            let store = open_store(&dir);
+            let repo_path = repo.path().to_string_lossy().to_string();
+
+            let err = call(
+                "worktree_create",
+                json!({ "repo_path": repo_path, "branch": "b", "layout": "single" }),
+                &store,
+            )
+            .unwrap_err();
+            assert_eq!(err.kind, "invalid_input");
+            assert!(
+                err.message.contains("unknown field `layout`"),
+                "{}",
+                err.message
+            );
+            assert!(
+                store.list().unwrap().is_empty(),
+                "no workspace was registered"
+            );
+            assert!(!home.join(".codemux").exists(), "no worktree was created");
+            let worktrees = Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["worktree", "list"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&worktrees.stdout).lines().count(),
+                1,
+                "only the main checkout"
+            );
+
+            let id = registered(&store);
+            let cases = [
+                (
+                    "workspace_create",
+                    json!({ "path": "/tmp/x", "select": true }),
+                    "select",
+                ),
+                (
+                    "worktree_create",
+                    json!({ "repo_path": repo_path, "branch": "b", "initial_prompt": "go" }),
+                    "initial_prompt",
+                ),
+                (
+                    "workspace_info",
+                    json!({ "workspace_id": id, "detail": "full" }),
+                    "detail",
+                ),
+                (
+                    "workspace_update",
+                    json!({ "workspace_id": id, "title": "t" }),
+                    "title",
+                ),
+                (
+                    "workspace_close",
+                    json!({ "workspace_id": id, "remove_worktree": true }),
+                    "remove_worktree",
+                ),
+                (
+                    "terminal_spawn",
+                    json!({ "cwd": "/tmp", "workspace_id": id }),
+                    "workspace_id",
+                ),
+                (
+                    "terminal_write",
+                    json!({ "terminal_id": "t", "data": "x", "session_id": "s" }),
+                    "session_id",
+                ),
+                (
+                    "terminal_read",
+                    json!({ "terminal_id": "t", "lines": 5 }),
+                    "lines",
+                ),
+                (
+                    "terminal_close",
+                    json!({ "terminal_id": "t", "force": true }),
+                    "force",
+                ),
+                ("workspace_list", json!({ "detail": "full" }), "detail"),
+                (
+                    "terminal_list",
+                    json!({ "workspace_id": id }),
+                    "workspace_id",
+                ),
+                ("app_status", json!({ "verbose": true }), "verbose"),
+            ];
+            for (tool, args, field) in cases {
+                let err = call(tool, args, &store).unwrap_err();
+                assert_eq!(err.kind, "invalid_input", "{tool}");
+                assert!(
+                    err.message.contains(&format!("unknown field `{field}`")),
+                    "{tool}: {}",
+                    err.message
+                );
+            }
+            // The tools with no arguments still take `{}`, and null, which
+            // is what the daemon reads when a call leaves `arguments` out.
+            for tool in ["workspace_list", "terminal_list", "app_status"] {
+                for args in [json!({}), Value::Null] {
+                    call(tool, args.clone(), &store)
+                        .unwrap_or_else(|e| panic!("{tool}({args}): {}", e.message));
+                }
+            }
+            assert_eq!(
+                store.list().unwrap().len(),
+                1,
+                "only the workspace registered above"
+            );
+        });
+    }
+
+    #[test]
+    fn catalog_names_workspaces_by_workspace_id() {
+        let catalog = catalog();
+        assert_eq!(catalog.len(), 12);
+        for tool in ["workspace_info", "workspace_update", "workspace_close"] {
+            let spec = catalog.iter().find(|spec| spec.name == tool).unwrap();
+            assert_eq!(
+                spec.input_schema["required"],
+                json!(["workspace_id"]),
+                "{tool}"
+            );
+            assert_eq!(
+                spec.input_schema["additionalProperties"],
+                json!(false),
+                "{tool}"
+            );
+            // One name for models; `id` is only mentioned, never advertised.
+            assert!(
+                spec.input_schema["properties"].get("id").is_none(),
+                "{tool}"
+            );
+            assert!(spec.description.contains("`id` is accepted too"), "{tool}");
+        }
+        for spec in &catalog {
+            assert_eq!(
+                spec.input_schema["additionalProperties"],
+                json!(false),
+                "{}",
+                spec.name
+            );
+            assert!(
+                spec.description.contains("this host"),
+                "{} says what it acts on",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn app_status_keeps_the_fields_vexis_detects() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        let out = call("app_status", json!({}), &store).expect("app_status");
+        assert_eq!(out["host_id"], json!("test-host"));
+        assert_eq!(out["mode"], json!("headless"));
+        // The desktop dialect's discriminators must never appear here.
+        assert!(out.get("active_workspace_id").is_none());
+        assert!(out.get("focused_pane_id").is_none());
+    }
+
+    /// The arguments the desktop's `codemux-remote worktree create` builds
+    /// carry only keys the tool knows.
+    #[test]
+    #[serial]
+    fn desktop_worktree_create_arguments_still_work() {
+        with_temp_home(|_| {
+            let repo = TempDir::new().unwrap();
+            init_repo(repo.path());
+            let dir = TempDir::new().unwrap();
+            let store = open_store(&dir);
+            for base in [None, Some("main")] {
+                let branch = format!("desktop-{}", base.unwrap_or("default"));
+                let args =
+                    crate::remote::checkout::worktree_create_args(repo.path(), &branch, base)
+                        .unwrap();
+                let out = call("worktree_create", args.clone(), &store)
+                    .unwrap_or_else(|e| panic!("{args}: {e:?}"));
+                assert_eq!(out["created"], json!(true), "{args}");
+                assert_eq!(out["workspace"]["branch"], json!(branch));
+            }
+        });
     }
 }

@@ -591,7 +591,7 @@ fn git_remote_origin_url(dir: &str) -> Option<String> {
     if !std::path::Path::new(dir).join(".git").exists() {
         return None;
     }
-    let out = std::process::Command::new("git")
+    let out = crate::git::git_command()
         .args(["-C", dir, "config", "--get", "remote.origin.url"])
         .output()
         .ok()?;

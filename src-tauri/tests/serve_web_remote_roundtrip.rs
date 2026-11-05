@@ -371,14 +371,72 @@ fn serve_web_remote_pair_connect_and_invoke_roundtrip() {
             assert_eq!(denied["t"], "err", "{cmd}: {denied}");
             assert!(denied["error"].as_str().unwrap().contains("not allowed"));
         }
-        let denied = remote_invoke(
+        // The destructive-flag guard is per command. Each refusal is the
+        // guard's exact text, so the call never reached the backend.
+        const BRANCH: &str =
+            "web-remote: deleting a branch is only available in the Codemux desktop app";
+        const FORCE: &str =
+            "web-remote: force delete is only available in the Codemux desktop app";
+        for (id, cmd, args, message) in [
+            (
+                30,
+                "close_workspace_with_worktree",
+                json!({"workspaceId": workspace_id, "removeWorktree": true, "deleteBranch": true, "forceDelete": false}),
+                BRANCH,
+            ),
+            (
+                31,
+                "close_workspace_with_worktree",
+                json!({"workspaceId": workspace_id, "removeWorktree": true, "deleteBranch": false, "forceDelete": true}),
+                FORCE,
+            ),
+            (
+                32,
+                "close_workspace",
+                json!({"workspaceId": workspace_id, "removeWorktree": false, "forceDelete": true}),
+                FORCE,
+            ),
+        ] {
+            let denied = remote_invoke(&mut socket, id, cmd, args).await;
+            assert_eq!(denied["t"], "err", "{id}: {denied}");
+            assert_eq!(denied["error"], message, "{id}: {denied}");
+        }
+        // A clean removal passes the guard. This workspace is a chat
+        // workspace, not a worktree, so the backend's own refusal answers:
+        // that proves Tauri parsed `removeWorktree` (no "missing required
+        // key") and the guard did not fire.
+        let removal = remote_invoke(
             &mut socket,
-            20,
+            33,
             "close_workspace_with_worktree",
-            json!({"workspaceId": workspace_id, "deleteWorktree": true}),
+            json!({"workspaceId": workspace_id, "removeWorktree": true, "deleteBranch": false, "forceDelete": false}),
         )
         .await;
-        assert_eq!(denied["t"], "err");
+        assert_eq!(removal["t"], "err", "{removal}");
+        assert!(
+            removal["error"].as_str().unwrap().contains("Archive or close it instead."),
+            "{removal}"
+        );
+        // Key pinning: a non-bool value passes the guard and Tauri names
+        // the key it read, so the guard checks exactly what Tauri reads.
+        for (id, key) in [(34, "deleteBranch"), (35, "forceDelete")] {
+            let mut args = json!({"workspaceId": workspace_id, "removeWorktree": false});
+            args[key] = json!("yes");
+            let typed = remote_invoke(&mut socket, id, "close_workspace_with_worktree", args).await;
+            assert_eq!(typed["t"], "err", "{key}: {typed}");
+            let error = typed["error"].as_str().unwrap();
+            assert!(error.contains(key), "{key}: {typed}");
+            assert!(!error.contains("only available in the Codemux desktop app"), "{key}: {typed}");
+        }
+        let snapshot = remote_invoke(&mut socket, 36, "get_app_state", json!({})).await;
+        assert!(
+            snapshot["data"]["workspaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["workspace_id"] == workspace_id),
+            "every refused or failed removal left the workspace in place"
+        );
         assert_eq!(
             handle
                 .state::<codemux_lib::state::AppStateStore>()

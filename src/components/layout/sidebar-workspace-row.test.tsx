@@ -78,6 +78,11 @@ vi.mock("@/lib/toast", () => ({
   toast: mockToast,
 }));
 
+const remote = vi.hoisted(() => ({ value: false }));
+vi.mock("@/components/remote/is-remote-client", () => ({
+  isRemoteClient: () => remote.value,
+}));
+
 // Radix UI's context menu uses a Portal that doesn't play nicely with
 // jsdom (pointer events, body-level rendering). Replace the primitives
 // with transparent wrappers that render children inline — the items and
@@ -236,6 +241,7 @@ async function flushDefaultBranchFetch() {
 
 beforeEach(() => {
   cleanup();
+  remote.value = false;
   // Default every row to idle (no agent status). Density tests set a pane
   // status explicitly. Reset the non-persisted density store so seen /
   // settled timestamps never leak between cases.
@@ -1006,6 +1012,51 @@ describe("Delete worktree dialog escalation", () => {
     expect(
       screen.queryByRole("button", { name: /Force delete/i }),
     ).not.toBeInTheDocument();
+  });
+
+  it("on a remote client the dialog keeps the branch and offers no force", async () => {
+    remote.value = true;
+    const user = userEvent.setup();
+    await openDialog(user);
+
+    expect(screen.queryByText(/Also delete local branch/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.getByText(/The branch is kept\./)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /^Delete$/i }));
+    await waitFor(() =>
+      expect(mockCloseWorkspaceWithWorktree).toHaveBeenCalledWith(
+        "ws-del",
+        true,
+        false,
+        false,
+      ),
+    );
+
+    // A dirty refusal closes the dialog with an error toast instead of
+    // escalating to a force the web-remote guard would refuse.
+    cleanup();
+    mockCloseWorkspaceWithWorktree.mockReset();
+    mockCloseWorkspaceWithWorktree.mockRejectedValueOnce(
+      "Worktree has 3 uncommitted change(s). Use force to override.",
+    );
+    await openDialog(user);
+    await user.click(screen.getByRole("button", { name: /^Delete$/i }));
+
+    await waitFor(() => expect(mockToast.error).toHaveBeenCalledTimes(1));
+    expect(mockToast.error).toHaveBeenCalledWith("Delete failed", {
+      description:
+        "Worktree has 3 uncommitted change(s). Force delete is only available in the Codemux desktop app.",
+    });
+    expect(mockCloseWorkspaceWithWorktree).toHaveBeenCalledTimes(1);
+    expect(
+      screen.queryByRole("button", { name: /Force delete/i }),
+    ).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("heading", { name: /Delete worktree/i }),
+      ).not.toBeInTheDocument(),
+    );
   });
 });
 

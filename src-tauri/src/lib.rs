@@ -29,6 +29,7 @@ pub mod agent_browser;
 pub mod browser_viewport;
 pub mod cli;
 pub mod checkout_claims;
+pub mod claude_env;
 pub mod commands;
 pub mod database;
 pub mod delegation;
@@ -39,6 +40,7 @@ pub mod github;
 pub mod github_budget;
 pub mod github_cache;
 pub mod control;
+pub mod control_identity;
 pub mod diagnostics;
 pub mod dialog_fallback;
 pub mod dialog_preflight;
@@ -88,6 +90,7 @@ pub mod fs_size;
 pub mod hosts_upgrade;
 pub mod hosts_inventory;
 pub mod workspace_paths;
+pub mod workspace_service;
 pub mod project_identity;
 pub mod workspaces_sync;
 pub mod worktree_cleanup;
@@ -96,6 +99,8 @@ pub mod state;
 pub mod hooks;
 pub mod stream_input;
 pub mod terminal;
+#[cfg(test)]
+pub(crate) mod test_isolation;
 pub mod utility_ai;
 // Opt-in cloud-push diagnostic tracing. Defines the crate-wide
 // `trace_cloud_push!` macro (gated on `CODEMUX_TRACE_CLOUD_PUSH`).
@@ -449,6 +454,10 @@ mod pr_publication_wiring_tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // An app started from an agent's shell must not pass that agent's
+    // identity to the terminals and tools it starts. First, before anything
+    // can start a thread or a child (pinned by a test in control_identity).
+    control_identity::scrub_inherited_agent_identity();
     diagnostics::record_startup_milestone("startup.run-enter");
     // Set WebKitGTK env vars before any GTK/Tauri initialization.
     //
@@ -530,6 +539,8 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Stop taking outside-assistant connections first.
+                mcp_connector::listener::stop(app);
                 let _ = tauri::async_runtime::block_on(tokio::time::timeout(
                     std::time::Duration::from_secs(3),
                     app.state::<plugins::platform_transport::PluginPlatformState>().shutdown(),
@@ -2130,7 +2141,7 @@ fn build_core_app<R: tauri::Runtime>(
                         .for_each_concurrent(FETCH_CONCURRENCY, |cwd| async move {
                             let _ = tokio::time::timeout(
                                 std::time::Duration::from_secs(PER_FETCH_TIMEOUT_SECS),
-                                tokio::process::Command::new("git")
+                                crate::git::git_command_tokio()
                                     .args(["fetch", "--prune", "--quiet", "--no-tags"])
                                     .current_dir(&cwd)
                                     .env("GIT_TERMINAL_PROMPT", "0")
@@ -2658,6 +2669,9 @@ fn build_core_app<R: tauri::Runtime>(
             // Restore web remote-access: if the user left it enabled, this
             // re-binds the server on boot (non-fatal if the port is taken).
             crate::web_remote::restore_on_boot(app.handle());
+            // The outside-assistant connector has its own loopback listener;
+            // bind it if it was left on (non-fatal if the port is taken).
+            crate::mcp_connector::restore_on_boot(app.handle());
 
             // Dev/test-only: an automated end-to-end harness can set
             // `CODEMUX_WEB_REMOTE_E2E=1` to have the server come up and a
@@ -2865,6 +2879,8 @@ fn build_core_app<R: tauri::Runtime>(
             mcp_connector::agent_connector_approve,
             mcp_connector::agent_connector_deny,
             mcp_connector::agent_connector_revoke,
+            mcp_connector::agent_connector_issue,
+            mcp_connector::agent_connector_revoke_all,
             commands::agent_chat_send_turn,
             commands::agent_chat_stage_image,
             commands::agent_chat_discard_staged_image,

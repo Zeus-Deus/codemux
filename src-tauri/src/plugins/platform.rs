@@ -5,6 +5,7 @@ use super::{
     platform_manifest::PlatformManifest,
     platform_store::{InstallationRecord, PlatformGrants, PlatformStore, MAX_JSON_BYTES},
 };
+use crate::workspace_service::Checkpoint;
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
@@ -18,6 +19,21 @@ use std::{
 };
 use tauri::{AppHandle, Runtime};
 use tokio::sync::watch;
+
+/// The caller's own authority, then the plugin's grant of `name` (and of
+/// `project`, when given) to it.
+fn authorize<R: Runtime>(
+    store: &PlatformStore,
+    app: &AppHandle<R>,
+    caller: &PlatformCaller,
+    name: &str,
+    project: Option<&str>,
+) -> Result<InstallationRecord, String> {
+    crate::agent_control::service::authorize(app, &caller.control).map_err(|e| e.to_string())?;
+    let record = store.read(&caller.installation_id)?;
+    platform_authority::capability(&record, caller, name, project)?;
+    Ok(record)
+}
 
 pub struct PlatformService {
     pub store: Arc<PlatformStore>,
@@ -264,11 +280,49 @@ impl PlatformService {
         name: &str,
         project: Option<&str>,
     ) -> Result<InstallationRecord, String> {
-        crate::agent_control::service::authorize(app, &caller.control)
-            .map_err(|e| e.to_string())?;
-        let record = self.store.read(&caller.installation_id)?;
-        platform_authority::capability(&record, caller, name, project)?;
-        Ok(record)
+        authorize(&self.store, app, caller, name, project)
+    }
+    /// [`Self::authorize`] for one capability on one project, as the workspace
+    /// lifecycle asks for it again after each of its waits. Revoking the
+    /// caller's grant does not end a plugin invocation, so this is what stops
+    /// one queued meanwhile.
+    ///
+    /// A new workspace's setup runs on after the invocation ended, which
+    /// cancels `caller`, and past an in-app chat's turn and a paired device's
+    /// connection. It asks only what a person withdraws: the authority behind
+    /// the call ([`crate::agent_control::service::authorize_background`]) and
+    /// the plugin's own grant.
+    pub(crate) fn checkpoint<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        caller: &PlatformCaller,
+        name: &'static str,
+        project: &str,
+    ) -> Checkpoint {
+        let (store, app, caller, project) = (
+            self.store.clone(),
+            app.clone(),
+            caller.clone(),
+            project.to_owned(),
+        );
+        let setup = (
+            store.clone(),
+            app.clone(),
+            PlatformCaller { cancellation: None, ..caller.clone() },
+            project.clone(),
+        );
+        Checkpoint::new(move || authorize(&store, &app, &caller, name, Some(&project)).map(drop))
+            .with_background(move || {
+                let (store, app, caller, project) = &setup;
+                crate::agent_control::service::authorize_background(app, &caller.control)
+                    .map_err(|error| error.to_string())?;
+                platform_authority::capability(
+                    &store.read(&caller.installation_id)?,
+                    caller,
+                    name,
+                    Some(project),
+                )
+            })
     }
     pub async fn dispatch<R: Runtime>(
         &self,
