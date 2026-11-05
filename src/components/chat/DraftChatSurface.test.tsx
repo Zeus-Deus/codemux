@@ -189,7 +189,9 @@ type ThreadScopeRowStubProps = {
 const lastThreadScopeRowProps: { current: ThreadScopeRowStubProps | null } = {
   current: null,
 };
-vi.mock("@/components/chat/pickers/ThreadScopeRow", () => ({
+vi.mock("@/components/chat/pickers/ThreadScopeRow", async (importOriginal) => ({
+  // The strip geometry is shared with the composer chin a sent draft shows.
+  ...(await importOriginal<typeof import("@/components/chat/pickers/ThreadScopeRow")>()),
   ThreadScopeRow: (props: ThreadScopeRowStubProps) => {
     lastThreadScopeRowProps.current = props;
     return (
@@ -343,6 +345,9 @@ function narrowsComposerColumn(token: string): boolean {
   }
   return false;
 }
+
+/** The pending view's inset mirroring the live pane's frame. */
+const PANE_FRAME_INSET = new Set(["p-0.5", "p-px"]);
 
 function columnNarrowingClasses(className: string): string[] {
   return className.split(/\s+/).filter(Boolean).filter(narrowsComposerColumn);
@@ -1350,17 +1355,45 @@ describe("DraftChatSurface", () => {
       expect(outer.className).toContain("px-4");
 
       // Nothing between the composer's own rails and the surface root
-      // may constrain width or add a horizontal gutter.
+      // may constrain width or add a horizontal gutter — except the inset
+      // that mirrors the live pane's frame, which the pane has too.
       for (
         let node = outer.parentElement;
         node && node !== container;
         node = node.parentElement
       ) {
         expect(
-          columnNarrowingClasses(node.className),
+          columnNarrowingClasses(node.className).filter(
+            (cls) => !PANE_FRAME_INSET.has(cls),
+          ),
           `ancestor <${node.tagName.toLowerCase()} class="${node.className}"> narrows the composer column`,
         ).toEqual([]);
       }
+    });
+
+    it("docks the sent composer the way the live pane rests it", async () => {
+      // The pane mounts the composer as the resting pill over its chin,
+      // with no scope row under it, inside a 2px frame (pane container
+      // padding + pane border). The pending view matches all of it, so the
+      // hand-off to the pane moves the composer 0px.
+      vi.mocked(materializeAndSend).mockImplementation(
+        () => new Promise(() => {}),
+      );
+      seedProjectDraft();
+      const { container, getByRole, queryByTestId, getByTestId } = renderSurface();
+      expect(getByTestId("thread-scope-row-stub")).toBeTruthy();
+      const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+      ta.focus();
+      fireEvent.keyDown(ta, { key: "Enter" });
+
+      const status = await vi.waitFor(() =>
+        getByRole("status", { name: "Starting the agent" }),
+      );
+      expect(queryByTestId("thread-scope-row-stub")).toBeNull();
+      expect(getByTestId("composer-controls-row")).toHaveAttribute("data-collapsed", "true");
+      expect(getByTestId("composer-chin")).toBeTruthy();
+      const frame = status.closest(".flex.h-full.w-full.flex-col") as HTMLElement;
+      expect(frame.className).toContain("p-0.5");
     });
 
     it("keeps the textarea focused when the first send docks the composer", async () => {

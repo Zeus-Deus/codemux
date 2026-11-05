@@ -104,6 +104,7 @@ import type { ActivePillMode } from "./pickers/ModeTab";
 import { ProjectScopePopover } from "./pickers/ProjectScopePopover";
 import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
 import { cn } from "@/lib/utils";
+import { useMobileLayout } from "@/hooks/use-mobile-layout";
 
 import { CHAT_COLUMN } from "./chat-column";
 import { randomUUID } from "@/lib/uuid";
@@ -1490,7 +1491,10 @@ function DraftChatSurfaceInner({
           />
         )
       }
-      belowComposerSlot={belowComposerSlot}
+      // Sent, the scope row leaves the way the live pane's context row
+      // does once a chat has a message: with it the card would stay open
+      // here, then fold to the pill on the hand-off.
+      belowComposerSlot={pending ? undefined : belowComposerSlot}
       mode={normalizedMode}
       stagedAttachments={stagedAttachments}
       onRemoveAttachment={(id) => {
@@ -1667,12 +1671,19 @@ function DraftPendingConversation({
     text: pending.text,
     images: pending.images.length > 0 ? pending.images : undefined,
   };
+  // The live pane sits inside a frame — the pane container's 1px padding
+  // plus the pane's 1px border on desktop, the border alone on a phone.
+  // Inset by the same amount, the docked composer and the sent bubble
+  // land where the pane will draw them, so the hand-off moves nothing.
+  const mobile = useMobileLayout();
   return (
-    <div className="flex h-full w-full flex-col">
+    <div className={cn("flex h-full w-full flex-col", mobile ? "p-px" : "p-0.5")}>
       {/* Both-edges gutter so the column stays concentric with the pane
           (and with the composer below) once this view can scroll. */}
       <div className="flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges]">
-        <div className={cn(CHAT_COLUMN, "flex flex-col gap-4 py-6")}>
+        {/* Fades in (opacity only) as the landing gives way, so the swap
+            reads as the composer settling rather than a cut. */}
+        <div className={cn(CHAT_COLUMN, "row-in flex flex-col gap-4 py-6")}>
           <UserMessage item={item} />
           <div
             className="flex items-center gap-[13px] pt-0.5"
@@ -1691,7 +1702,8 @@ function DraftPendingConversation({
         </div>
       </div>
       {/* The composer owns its own column rails (see chat-column.ts) and
-          its bottom gap, and AgentChatPane docks it flush the same way —
+          its bottom gap, and AgentChatPane docks it flush the same way. Sent,
+          it rests as the pane's does (the pill over its chin, no scope row),
           so the pill sits at the same height before and after the hand-off. */}
       {composer}
     </div>
