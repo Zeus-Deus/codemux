@@ -109,10 +109,11 @@ describe("Composer Stage 7 polish", () => {
       expect(wrapper.className).toContain(
         "focus-within:bg-[color-mix(in_oklab,var(--muted)_60%,var(--background))]",
       );
+      // Scheme-aware elevation: the token is lighter on a light canvas.
+      expect(wrapper.className).toContain("shadow-(--composer-shadow)");
       expect(wrapper.className).toContain(
-        "focus-within:shadow-[0_16px_38px_-14px]",
+        "focus-within:shadow-(--composer-shadow-focus)",
       );
-      expect(wrapper.className).toContain("focus-within:shadow-black/60");
     });
   });
 
