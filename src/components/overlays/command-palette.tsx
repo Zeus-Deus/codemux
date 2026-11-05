@@ -1250,6 +1250,13 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     row.open();
   };
 
+  const hasThemeResults = matchedThemes.length + matchedThemeStudio.length > 0;
+  // Omit empty siblings so hydration inserts rows without moving commands.
+  // Moving them replays cmdk's registration cleanup in StrictMode.
+  const hasOtherResults =
+    shownWorkspaces.length + matchedPrs.length + shownRecent.length +
+    shownProjects.length + conversationRows.length > 0;
+
   const themeResults = (
     <Fragment>
       {matchedThemes.length + matchedThemeStudio.length > 0 && (
@@ -1424,9 +1431,9 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
               lets cmdk reset the selection, so a highlighted command could be
               swapped for a workspace when the inbox finishes loading. */}
           {[
-            themeResultsFirst && <Fragment key="themes">{themeResults}</Fragment>,
+            themeResultsFirst && hasThemeResults && <Fragment key="themes">{themeResults}</Fragment>,
             commandsFirst && <Fragment key="commands">{commandResults}</Fragment>,
-            <Fragment key="results">
+            hasOtherResults && <Fragment key="results">
 
               {shownWorkspaces.length > 0 && (
                 <GroupHeader
@@ -1501,7 +1508,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
                 />
               ))}
             </Fragment>,
-            !themeResultsFirst && <Fragment key="themes">{themeResults}</Fragment>,
+            !themeResultsFirst && hasThemeResults && <Fragment key="themes">{themeResults}</Fragment>,
             !commandsFirst && <Fragment key="commands">{commandResults}</Fragment>,
           ]}
         </CommandPrimitive.List>

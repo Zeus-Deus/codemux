@@ -1,7 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { Profiler } from "react";
+import { Profiler, StrictMode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import type { AuthUser } from "@/tauri/types";
@@ -450,34 +450,30 @@ describe("command palette — stable async sections", () => {
     expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", selected);
   });
 
-  it("keeps a highlighted command when inbox ordering moves the command groups", async () => {
-    // Before the inbox loads no workspace is shown, so "settings" puts the
-    // command groups first. Once it loads, "Settings migration" matches by
-    // word prefix and the commands move below Workspaces. The move must not
-    // remount the command rows, or cmdk would select the leading workspace.
+  it.each([false, true])("preserves a selected settings command when inbox hydration moves its group (StrictMode: %s)", async (strict) => {
     useSidebarInboxStore.setState({ loaded: false });
     let resolveInbox!: (raw: string | null) => void;
     mocks.backend.dbGetUiState.mockImplementation(() => new Promise((resolve) => { resolveInbox = resolve; }));
-    mocks.app.appState = { active_workspace_id: "ws-0", pane_statuses: {}, workspaces: [
+    mocks.app.appState = { active_workspace_id: "ws-1", pane_statuses: {}, workspaces: [
       { workspace_id: "ws-1", title: "Settings migration", cwd: "/repo", surfaces: [], active_surface_id: "" },
     ] };
-    mocks.ui.takeCommandPaletteQuery.mockReturnValue("settings");
     const user = userEvent.setup();
-    renderPalette();
-    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).not.toBeNull());
-    await user.keyboard("{ArrowDown}");
-    const row = document.querySelector('[cmdk-item][aria-selected="true"]')!;
-    const selected = row.getAttribute("data-value");
-    expect(selected).toBeTruthy();
-    expect(selected).not.toMatch(/^ws:/);
+    const palette = <CommandPalette open onOpenChange={vi.fn()} />;
+    render(withClient(strict ? <StrictMode>{palette}</StrictMode> : palette));
+    await user.type(screen.getByRole("combobox"), "settings");
+    await user.keyboard("{End}");
+    expect(selectedValue()).toBe("cmd:settings:about");
+    const row = document.querySelector('[cmdk-item][aria-selected="true"]');
+
     await act(async () => resolveInbox(null));
-    expect(document.querySelector('[cmdk-item][data-value="ws:ws-1"]')).toBeInTheDocument();
-    // Same element, not a remounted copy: cmdk resets the selection to the
-    // first row when the selected item unmounts.
+    expect(screen.getAllByRole("option")[0]).toHaveAttribute("data-value", "ws:ws-1");
+    expect(selectedValue()).toBe("cmd:settings:about");
     expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toBe(row);
-    expect(row).toHaveAttribute("data-value", selected!);
+    // Enter runs after cmdk's scheduled item cleanup has had time to settle.
     await user.keyboard("{Enter}");
-    expect(activateWorkspaceInteraction).not.toHaveBeenCalledWith("ws-1");
+    expect(selectedValue()).toBe("cmd:settings:about");
+    expect(mocks.ui.setShowSettings).toHaveBeenCalledWith(true, "about");
+    expect(activateWorkspaceInteraction).not.toHaveBeenCalled();
   });
 
   it("does not announce no matches for a path until inbox ordering is ready", async () => {
