@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { CLAUDE_HOST_SESSION_ENV_VARS, claudeProcessEnv } from "../src/claude-env.ts";
 import { routedOptions, settingsPath, userRouting } from "../src/user-routing.ts";
 
 const homes: string[] = [];
@@ -90,6 +91,23 @@ describe("userRouting", () => {
       expect(routing.env).toEqual(env);
       expect(routing.settings).toEqual({});
     }
+  });
+
+  test("minimal helpers combine routing with the labelled, detached Claude environment", () => {
+    const base: Record<string, string> = {
+      CLAUDE_CONFIG_DIR: homeWith({
+        ...PROXY,
+        env: { ...PROXY.env, CLAUDE_CODE_ENTRYPOINT: "routing-test" },
+      }),
+      CLAUDE_CODE_ENTRYPOINT: "launching-app",
+    };
+    for (const key of CLAUDE_HOST_SESSION_ENV_VARS) base[key] = "launching-session";
+    const options = routedOptions(claudeProcessEnv({ base }));
+    expect(options.env?.ANTHROPIC_AUTH_TOKEN).toBe("dummy-token");
+    expect(options.env?.CLAUDE_CODE_ENTRYPOINT).toBe("routing-test");
+    for (const key of CLAUDE_HOST_SESSION_ENV_VARS) expect(options.env?.[key]).toBeUndefined();
+    expect(options.settingSources).toEqual([]);
+    expect(options.settings).toEqual({ apiKeyHelper: "/usr/local/bin/print-key" });
   });
 
   test("routedOptions stays isolated and only sets settings for a helper", () => {

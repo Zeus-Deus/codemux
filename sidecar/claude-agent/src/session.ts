@@ -40,6 +40,7 @@ import {
   type PendingApprovals,
   type PermissionsEmitter,
 } from "./permissions.ts";
+import { claudeProcessEnv } from "./claude-env.ts";
 import { logger } from "./logger.ts";
 import { createPluginPermissions } from "./plugin-permissions.ts";
 import { userRouting } from "./user-routing.ts";
@@ -247,10 +248,10 @@ function buildQueryOptions(
     // Rust-side.
     agentProgressSummaries: true,
     canUseTool,
-    // `env: process.env` pass-through matches the research finding.
-    // The SDK itself is responsible for reading the user's Claude
+    // The sidecar's env, labelled as Codemux (see `claude-env.ts`). The
+    // SDK itself is responsible for reading the user's Claude
     // credentials — the sidecar never peeks.
-    env: process.env as Record<string, string | undefined>,
+    env: claudeProcessEnv({ cwd: input.cwd }),
   };
 
   if (input.model !== undefined) opts.model = input.model;

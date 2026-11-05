@@ -22,6 +22,7 @@ import {
   type AccountProvider,
 } from "@/stores/provider-accounts-store";
 import { useUIStore } from "@/stores/ui-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import {
   activateWorkspace,
   getOrCreateHomeWorkspace,
@@ -42,6 +43,7 @@ async function signIn(account: ProviderAccount) {
   try {
     const workspace = await getOrCreateHomeWorkspace();
     await providerAccountOpenSignIn(workspace, account.id);
+    useChatDraftStore.getState().setActiveDraft(null);
     await activateWorkspace(workspace);
     useUIStore.getState().setShowSettings(false);
   } catch (error) {

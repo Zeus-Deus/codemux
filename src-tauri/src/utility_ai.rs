@@ -28,17 +28,6 @@ struct UtilityInvocation {
     output_file: Option<PathBuf>,
 }
 
-/// Nested-session markers Claude Code exports. When Codemux itself runs under
-/// a Claude session they would make the utility CLI treat itself as that
-/// session's child and pull in the parent's context.
-const CLAUDE_NESTED_SESSION_ENV_VARS: &[&str] = &[
-    "CLAUDECODE",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SSE_PORT",
-];
-
 /// Every provider receives the prompt on stdin, so the argv stays small
 /// enough for Windows' ~32k command-line limit regardless of transcript size.
 fn build_invocation(
@@ -121,11 +110,18 @@ fn build_invocation(
             if let Some(effort) = selection.effort.as_deref().filter(|v| !v.is_empty()) {
                 args.extend(["--effort".into(), effort.into()]);
             }
+            let mut env =
+                crate::agent_provider::claude::auth::settings_routing_env(claude_settings);
+            // Keep provider routing alongside the Codemux entrypoint.
+            env.push((
+                "CLAUDE_CODE_ENTRYPOINT".into(),
+                crate::claude_env::claude_entrypoint(temp_dir),
+            ));
             Ok(UtilityInvocation {
                 program: "claude".into(),
                 args,
-                env: crate::agent_provider::claude::auth::settings_routing_env(claude_settings),
-                env_remove: CLAUDE_NESTED_SESSION_ENV_VARS,
+                env,
+                env_remove: crate::claude_env::CLAUDE_HOST_SESSION_ENV_VARS,
                 output_file: None,
             })
         }
@@ -366,6 +362,11 @@ mod tests {
         assert_eq!(settings["disableAllHooks"], true);
         assert_eq!(settings["autoMemoryEnabled"], false);
         assert!(inv.env_remove.contains(&"CLAUDECODE"));
+        assert!(!inv.env_remove.contains(&"CLAUDE_CODE_ENTRYPOINT"));
+        assert!(inv
+            .env
+            .iter()
+            .any(|(key, value)| key == "CLAUDE_CODE_ENTRYPOINT" && !value.is_empty()));
         assert!(!inv.args.iter().any(|a| a.contains("dangerously")));
     }
 
@@ -463,6 +464,9 @@ SessionStart = []
         assert_eq!(env["HTTPS_PROXY"], "");
         assert_eq!(env["NODE_EXTRA_CA_CERTS"], "/tmp/test-ca.pem");
         assert!(!env.contains_key("UNRELATED_SETTING"));
+        assert!(!env["CLAUDE_CODE_ENTRYPOINT"].is_empty());
+        assert_eq!(inv.env_remove, crate::claude_env::CLAUDE_HOST_SESSION_ENV_VARS);
+        assert!(!inv.env_remove.contains(&"CLAUDE_CODE_ENTRYPOINT"));
         let args = inv.args.join(" ");
         for excluded in [
             "dummy-proxy-secret",

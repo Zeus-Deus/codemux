@@ -235,11 +235,13 @@ async function withClaudeHome(settings: unknown, run: (home: string) => Promise<
 
 test("managed workflows carry provider routing from settings.json and nothing else", async () => {
   const { emit } = recordingEmitter();
+  const previousHost = process.env.CLAUDE_CODE_HOST_SESSION_ID;
+  process.env.CLAUDE_CODE_HOST_SESSION_ID = "launching-session";
   const previousUrl = process.env.ANTHROPIC_BASE_URL;
   process.env.ANTHROPIC_BASE_URL = "http://shell-proxy:1";
   try {
     await withClaudeHome({
-      env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", ANTHROPIC_AUTH_TOKEN: "dummy", ENABLE_TOOL_SEARCH: "true" },
+      env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", ANTHROPIC_AUTH_TOKEN: "dummy", ENABLE_TOOL_SEARCH: "true", CLAUDE_CODE_ENTRYPOINT: "routing-test" },
       apiKeyHelper: "print-key",
       outputStyle: "Pirate",
       enabledPlugins: { "x@y": true },
@@ -252,6 +254,8 @@ test("managed workflows carry provider routing from settings.json and nothing el
       // settings.json routing wins over the inherited shell value, as in the CLI.
       expect(options.env?.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8317");
       expect(options.env?.ANTHROPIC_AUTH_TOKEN).toBe("dummy");
+      expect(options.env?.CLAUDE_CODE_ENTRYPOINT).toBe("routing-test");
+      expect(options.env?.CLAUDE_CODE_HOST_SESSION_ID).toBeUndefined();
       // A non-routing env entry cannot loosen the managed MCP setup.
       expect(options.env?.ENABLE_TOOL_SEARCH).toBe("false");
       // Only the helper command reaches `--settings`; the token never does.
@@ -265,6 +269,8 @@ test("managed workflows carry provider routing from settings.json and nothing el
       await ordinary.close();
     });
   } finally {
+    if (previousHost === undefined) delete process.env.CLAUDE_CODE_HOST_SESSION_ID;
+    else process.env.CLAUDE_CODE_HOST_SESSION_ID = previousHost;
     if (previousUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
     else process.env.ANTHROPIC_BASE_URL = previousUrl;
   }
@@ -284,9 +290,14 @@ test("managed MCP discovery override preserves environment and does not affect o
     expect(fake.capturedOptions?.env?.MCP_CONNECTION_NONBLOCKING).toBe("0");
     expect(fake.capturedOptions?.env?.ENABLE_CLAUDEAI_MCP_SERVERS).toBe("false");
     expect(fake.capturedOptions?.env?.PATH).toBe(process.env.PATH);
+    // Never the Agent SDK's `sdk-ts` (a settings.json override may rename it).
+    expect(fake.capturedOptions?.env?.CLAUDE_CODE_ENTRYPOINT).toBeTruthy();
+    expect(fake.capturedOptions?.env?.CLAUDE_CODE_ENTRYPOINT).not.toMatch(/^sdk-/);
     expect(fake.capturedOptions?.tools).toEqual([]);
     await managed.close();
     const ordinary = new ClaudeSession(minimalInput(), emit);
+    expect(fake.capturedOptions?.env?.CLAUDE_CODE_ENTRYPOINT).toBeTruthy();
+    expect(fake.capturedOptions?.env?.CLAUDE_CODE_ENTRYPOINT).not.toMatch(/^sdk-/);
     expect(fake.capturedOptions?.env?.ENABLE_TOOL_SEARCH).toBe("true");
     expect(fake.capturedOptions?.env?.MCP_CONNECTION_NONBLOCKING).toBe("1");
     expect(fake.capturedOptions?.env?.ENABLE_CLAUDEAI_MCP_SERVERS).toBe("true");

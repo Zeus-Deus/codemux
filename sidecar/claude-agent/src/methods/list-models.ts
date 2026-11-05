@@ -19,6 +19,7 @@ import {
   query,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { claudeProcessEnv } from "../claude-env.ts";
 
 import { routedOptions } from "../user-routing.ts";
 
@@ -67,7 +68,7 @@ export async function listModels(
       // no streaming chrome. Plenty for `supportedModels()` to resolve.
       // Provider routing still applies: a Bedrock or proxy setup in
       // settings.json changes which models exist.
-      ...routedOptions(),
+      ...routedOptions(claudeProcessEnv({ cwd: input.cwd })),
       includePartialMessages: false,
     },
   });

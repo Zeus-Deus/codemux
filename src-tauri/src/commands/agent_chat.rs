@@ -6231,6 +6231,7 @@ pub async fn agent_chat_stop_session_guarded<R: Runtime>(
     }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    crate::commands::secret_requests::stop_thread(&app, &thread_id.0);
     let native_gate = native_thread_gate(&app, &thread_id.0);
     native_gate.cancel();
     crate::delegation::app::user_activity(&app, &thread_id.0, true)?;
@@ -6288,6 +6289,7 @@ pub(crate) async fn restart_session_holding_gate<R: Runtime, T>(
     super::provider_switch::refuse_stale_send(&app.state(), provider, &thread_id.0)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    crate::commands::secret_requests::stop_thread(app, &thread_id.0);
     match impl_.stop_session(thread_id.clone()).await {
         Ok(()) | Err(ProviderError::SessionNotFound { .. }) => {}
         Err(err) => return Err(provider_err(err)),
@@ -6391,6 +6393,9 @@ fn begin_agent_chat_thread_shutdown<R: Runtime>(
     // on the async cleanup task being scheduled.
     let tracker: State<'_, SubagentTracker> = app.state();
     for (_, thread_id) in &threads {
+        // The pane is already gone. Do not depend on a provider's final
+        // event arriving after its callback reader has been torn down.
+        crate::commands::secret_requests::stop_thread(app, thread_id);
         tracker.clear_thread(thread_id);
         super::usage_resume::cancel_for_stopped_thread(app, thread_id);
         delegated.extend(super::delegation::on_thread_closed(app, thread_id));
@@ -8263,15 +8268,14 @@ fn delivery_transition(event: &ProviderRuntimeEvent) -> bool {
 /// UUID carried by `ResumeCursorUpdated` so the history dropdown can
 /// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeEvent) {
+    crate::commands::secret_requests::observe_event(app, &event);
     if let ProviderRuntimeEvent::TurnCompleted { thread_id, turn_id, ..
     } = &event
     {
         crate::delegation::authority::NativeAuthority::finish_thread(&thread_id.0, &turn_id.0);
     }
-    if let ProviderRuntimeEvent::TurnCompleted { thread_id, turn_id, .. } = &event {
+    if let ProviderRuntimeEvent::TurnCompleted { thread_id, .. } = &event {
         if let Some(db) = app.try_state::<DatabaseStore>() { let _ = db.orchestration_launch_finished(&thread_id.0); }
-        // A secret card outliving its turn would hand its answer to no one.
-        crate::commands::secret_requests::end_turn(app, &thread_id.0, &turn_id.0);
     }
     if let ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, queued_id } = &event {
         if app.state::<DatabaseStore>().is_disposed_delivery_queue(&thread_id.0, queued_id).unwrap_or(false) {
