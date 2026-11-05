@@ -450,6 +450,36 @@ describe("command palette — stable async sections", () => {
     expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", selected);
   });
 
+  it("keeps a highlighted command when inbox ordering moves the command groups", async () => {
+    // Before the inbox loads no workspace is shown, so "settings" puts the
+    // command groups first. Once it loads, "Settings migration" matches by
+    // word prefix and the commands move below Workspaces. The move must not
+    // remount the command rows, or cmdk would select the leading workspace.
+    useSidebarInboxStore.setState({ loaded: false });
+    let resolveInbox!: (raw: string | null) => void;
+    mocks.backend.dbGetUiState.mockImplementation(() => new Promise((resolve) => { resolveInbox = resolve; }));
+    mocks.app.appState = { active_workspace_id: "ws-0", pane_statuses: {}, workspaces: [
+      { workspace_id: "ws-1", title: "Settings migration", cwd: "/repo", surfaces: [], active_surface_id: "" },
+    ] };
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("settings");
+    const user = userEvent.setup();
+    renderPalette();
+    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).not.toBeNull());
+    await user.keyboard("{ArrowDown}");
+    const row = document.querySelector('[cmdk-item][aria-selected="true"]')!;
+    const selected = row.getAttribute("data-value");
+    expect(selected).toBeTruthy();
+    expect(selected).not.toMatch(/^ws:/);
+    await act(async () => resolveInbox(null));
+    expect(document.querySelector('[cmdk-item][data-value="ws:ws-1"]')).toBeInTheDocument();
+    // Same element, not a remounted copy: cmdk resets the selection to the
+    // first row when the selected item unmounts.
+    expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toBe(row);
+    expect(row).toHaveAttribute("data-value", selected!);
+    await user.keyboard("{Enter}");
+    expect(activateWorkspaceInteraction).not.toHaveBeenCalledWith("ws-1");
+  });
+
   it("does not announce no matches for a path until inbox ordering is ready", async () => {
     useSidebarInboxStore.setState({ loaded: false });
     let resolveInbox!: (raw: string | null) => void;
