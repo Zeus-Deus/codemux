@@ -1620,7 +1620,7 @@ export const MessageList = memo(function MessageList({
   return (
     <ChatFileLinkContext.Provider value={fileLinkContext}>
       <div
-        className="group/transcript-list relative size-full min-h-0 overflow-hidden"
+        className="group/transcript-list @container/transcript relative size-full min-h-0 overflow-hidden"
         data-transcript-edge-fade={fadeEnabled ? "on" : "off"}
         data-provider={provider ?? undefined}
       >
