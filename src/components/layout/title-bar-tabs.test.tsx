@@ -418,6 +418,35 @@ describe("TitleBarTabs", () => {
     });
     expect(mocks.activateTab).toHaveBeenCalledWith("ws-1", "tab-term");
   });
+
+  it("keeps an inactive chat tab as wide as when it is active", () => {
+    mocks.listSessions.mockResolvedValue([]);
+    const ws = makeWorkspace(chatPane("thread-1"), {
+      active_tab_id: "tab-term",
+      tabs: [
+        { tab_id: "tab-chat", kind: "terminal", title: "Agent Chat", surface_id: "surface-1", browser_id: null, icon: null },
+        { tab_id: "tab-term", kind: "terminal", title: "zsh", surface_id: "surface-2", browser_id: null, icon: null },
+      ],
+      surfaces: [
+        { surface_id: "surface-1", title: "s", active_pane_id: "pane-chat", root: chatPane("thread-1") },
+        {
+          surface_id: "surface-2",
+          title: "t",
+          active_pane_id: "pane-term",
+          root: { kind: "terminal", pane_id: "pane-term", session_id: "sess-2", title: "zsh" },
+        },
+      ],
+    });
+    render(<TitleBarTabs workspace={ws} />);
+    const label = (title: string) => screen.getByText(title).closest("button") as HTMLElement;
+    // The chat tab reserves its chevron's slot, unseen; the terminal tab never
+    // grows one, so it reserves nothing.
+    expect(label("Agent Chat").querySelector("svg.invisible")).not.toBeNull();
+    expect(label("zsh").querySelector("svg")).toBeNull();
+    // One weight for both states, so the label never changes width either.
+    expect(screen.getByText("zsh").closest("[data-tab-id]")).toHaveClass("font-medium");
+    expect(screen.getByText("zsh").closest("[data-tab-id]")).not.toHaveClass("font-semibold");
+  });
 });
 
 describe("TitleBarTabs tab actions", () => {
