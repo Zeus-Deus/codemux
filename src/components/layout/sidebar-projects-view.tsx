@@ -57,6 +57,7 @@ import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
 import { WorkspaceHoverCard } from "./workspace-hover-card";
 import { isRowActivationKey } from "./sidebar-row-activation";
 import { SidebarNeedsYouStrip } from "./sidebar-needs-you-strip";
+import { SidebarStickyHeader } from "./sidebar-sticky-header";
 import { SidebarHeaderActions, useNewAgentAction } from "./sidebar-action-row";
 import {
   SidebarProjectFilter,
@@ -757,7 +758,7 @@ export function SidebarProjectsView() {
 
   return (
     <div className="flex flex-1 flex-col" data-sidebar-projects-view>
-      <div className="sticky top-0 z-10 bg-sidebar">
+      <SidebarStickyHeader>
         <div className="flex min-w-0 items-center gap-1 px-2.5 pb-2.5">
           <SidebarProjectFilter
             projectGroups={projectGroups}
@@ -769,7 +770,7 @@ export function SidebarProjectsView() {
           <SidebarHeaderActions />
         </div>
         <SidebarNeedsYouStrip projectGroups={projectGroups} filterPath={filter} />
-      </div>
+      </SidebarStickyHeader>
 
       <div className="flex flex-1 flex-col px-2.5 pb-2.5">
         <SidebarDraftBlock

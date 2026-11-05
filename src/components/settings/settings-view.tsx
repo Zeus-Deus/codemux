@@ -633,7 +633,7 @@ function BrowserSection() {
             disabled={clearing !== null}
             onClick={handleClearCookies}
           >
-            {clearing === "cookies" ? "Clearing..." : "Clear cookies"}
+            {clearing === "cookies" ? "Clearing…" : "Clear cookies"}
           </Button>
         </SettingRow>
         <Separator />
@@ -647,7 +647,7 @@ function BrowserSection() {
             disabled={clearing !== null}
             onClick={handleClearAll}
           >
-            {clearing === "all" ? "Clearing..." : "Clear all data"}
+            {clearing === "all" ? "Clearing…" : "Clear all data"}
           </Button>
         </SettingRow>
       </div>
@@ -1386,8 +1386,8 @@ function PresetEditorSheet({
             <div />
           )}
           <Button
+            variant="inverse"
             size="sm"
-            className="bg-foreground text-background hover:bg-foreground/90"
             onClick={
               isDraft
                 ? () => onCreate?.(buildCreatePayload())
@@ -1982,6 +1982,24 @@ export function SettingsView() {
                   <SettingRow label="Name" description="Your display name.">
                     <span className="select-text text-body text-muted-foreground">{authUser.name ?? "—"}</span>
                   </SettingRow>
+                  <Separator />
+                  <SettingRow
+                    label="Sign out of Codemux"
+                    description="You'll need to sign in again to sync settings and use cloud features."
+                  >
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive hover:border-destructive/50"
+                      onClick={() => {
+                        signOut();
+                        setShowSettings(false);
+                      }}
+                    >
+                      <LogOut className="size-3.5" />
+                      Sign out
+                    </Button>
+                  </SettingRow>
                 </>
               ) : (
                 <div className="py-4 text-body text-muted-foreground">
@@ -2001,31 +2019,6 @@ export function SettingsView() {
               </SectionGroup>
             )}
 
-            {authUser && (
-              <SectionGroup>
-                <SubsectionHeader title="Session" />
-                <SettingsCard className="flex items-center justify-between gap-4">
-                  <div className="min-w-0">
-                    <p className="text-body-lg font-semibold text-foreground">Sign out of Codemux</p>
-                    <p className="text-body-sm text-subtle-foreground mt-0.5">
-                      You'll need to sign in again to sync settings and use cloud features.
-                    </p>
-                  </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="shrink-0 text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive hover:border-destructive/50"
-                    onClick={() => {
-                      signOut();
-                      setShowSettings(false);
-                    }}
-                  >
-                    <LogOut className="size-3.5" />
-                    Sign out
-                  </Button>
-                </SettingsCard>
-              </SectionGroup>
-            )}
           </div>
         );
 
@@ -2042,130 +2035,135 @@ export function SettingsView() {
               title="Appearance"
               description="Customize how Codemux looks. Theme changes apply immediately."
             />
-            <TypographySettings />
-            <div className="mt-10 space-y-1">
-              <SettingRow
-                label="Resource monitor"
-                description="Show the CPU/memory monitor icon in the title bar."
-              >
-                <Switch
-                  checked={syncedSettings.appearance.show_resource_monitor}
-                  onCheckedChange={(checked) => {
-                    updateSyncedSetting(
-                      "appearance",
-                      "show_resource_monitor",
-                      checked,
-                    ).catch(console.error);
-                  }}
-                />
-              </SettingRow>
-              <Separator />
-              <SettingRow
-                label="Reduce motion"
-                description="Stop looping and sliding animations, and swap spinners for a slow fade. Always on when your system asks for reduced motion."
-              >
-                <Switch
-                  aria-label="Reduce motion"
-                  checked={reduceMotion}
-                  onCheckedChange={(checked) =>
-                    storeSet("appearance.reduce_motion", checked ? "true" : "false")
-                  }
-                />
-              </SettingRow>
-            </div>
-
-            <SectionGroup>
-              <SubsectionHeader
-                title="Theme"
-                description="One palette drives the app shell, terminal ANSI colors, chat code, and the file editor. Pick one from the command palette — open it, then type a theme name — where the whole app repaints as you arrow through the list. Your selection and custom themes sync between devices."
-              />
-              <ThemeSettings />
-              <div className="mt-4 space-y-1">
+            {/* Typography, Theme and Sidebar are this page's sections, so
+                they take the section heading level other pages use. */}
+            <StackedSections>
+              <TypographySettings />
+              <div className="mt-10 space-y-1">
                 <SettingRow
-                  label="Density"
-                  description="Comfortable gives cards and lists more breathing room. Compact tightens padding and gaps to fit more on screen."
-                  scope="device"
-                >
-                  <SegmentedControl<AppearanceDensity>
-                    ariaLabel="Spacing density"
-                    value={density}
-                    onChange={(value) => storeSet("appearance.density", value)}
-                    options={[
-                      { value: "comfortable", label: "Comfortable" },
-                      { value: "compact", label: "Compact" },
-                    ]}
-                  />
-                </SettingRow>
-                <SettingRow
-                  label="Wrap code in chat"
-                  description="Soft-wrap long lines in agent chat code blocks. Off keeps each line intact behind a horizontal scroll, which is easier to read for diffs and command output."
-                  scope="device"
+                  label="Resource monitor"
+                  description="Show the CPU/memory monitor icon in the title bar."
                 >
                   <Switch
-                    checked={chatCodeWrap}
-                    onCheckedChange={(checked) =>
-                      storeSet("chat.code_wrap", checked ? "true" : "false")
-                    }
+                    checked={syncedSettings.appearance.show_resource_monitor}
+                    onCheckedChange={(checked) => {
+                      updateSyncedSetting(
+                        "appearance",
+                        "show_resource_monitor",
+                        checked,
+                      ).catch(console.error);
+                    }}
                   />
                 </SettingRow>
+                <Separator />
                 <SettingRow
-                  label="Time format"
-                  description={`How clock times read in chats, tasks, pull requests and snooze menus. System follows your locale (it reads ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} right now).`}
+                  label="Reduce motion"
+                  description="Stop looping and sliding animations, and swap spinners for a slow fade. Always on when your system asks for reduced motion."
                 >
-                  <SegmentedControl<TimeFormat>
-                    ariaLabel="Time format"
-                    value={timeFormat}
-                    onChange={(value) => storeSet("appearance.time_format", value)}
-                    options={[
-                      { value: "system", label: "System" },
-                      { value: "12h", label: "12-hour" },
-                      { value: "24h", label: "24-hour" },
-                    ]}
+                  <Switch
+                    aria-label="Reduce motion"
+                    checked={reduceMotion}
+                    onCheckedChange={(checked) =>
+                      storeSet("appearance.reduce_motion", checked ? "true" : "false")
+                    }
                   />
                 </SettingRow>
               </div>
-            </SectionGroup>
 
-            <SectionGroup>
-              <SubsectionHeader
-                title="Sidebar"
-                description="What the workspace inbox shows on each card."
-              />
-              <div className="space-y-1">
-                <SettingRow
-                  label="Show git stats"
-                  description="Show the ↑ahead and +/− diff numbers on workspace cards. The branch name always shows."
-                  scope="device"
-                >
-                  <Switch
-                    checked={showGitStats}
-                    onCheckedChange={(checked) =>
-                      storeSet("sidebar.show_git_stats", checked ? "true" : "false")
-                    }
-                  />
-                </SettingRow>
-                <SettingRow
-                  label="Auto-settle idle work"
-                  description="Sweep a workspace card into the Settled section after this many days without agent activity. Cards whose PR merges or closes settle once the agent has also been idle for an hour, so follow-up work stays visible while it is warm. Un-settling a card keeps it active until its agent runs again."
-                  scope="device"
-                >
-                  <SegmentedControl<AutoSettleDays>
-                    ariaLabel="Auto-settle idle work"
-                    value={autoSettleDays}
-                    onChange={(value) =>
-                      storeSet("sidebar.auto_settle_days", value)
-                    }
-                    options={[
-                      { value: "off", label: "Off" },
-                      { value: "1", label: "1d" },
-                      { value: "3", label: "3d" },
-                      { value: "7", label: "7d" },
-                      { value: "14", label: "14d" },
-                    ]}
-                  />
-                </SettingRow>
-              </div>
-            </SectionGroup>
+              <SectionGroup>
+                <SectionHeader
+                  title="Theme"
+                  description="One palette drives the app shell, terminal ANSI colors, chat code, and the file editor. Pick one from the command palette — open it, then type a theme name — where the whole app repaints as you arrow through the list. Your selection and custom themes sync between devices."
+                />
+                <ThemeSettings />
+                <div className="mt-4 space-y-1">
+                  <SettingRow
+                    label="Density"
+                    description="Comfortable gives cards and lists more breathing room. Compact tightens padding and gaps to fit more on screen."
+                    scope="device"
+                  >
+                    <SegmentedControl<AppearanceDensity>
+                      ariaLabel="Spacing density"
+                      value={density}
+                      onChange={(value) => storeSet("appearance.density", value)}
+                      options={[
+                        { value: "comfortable", label: "Comfortable" },
+                        { value: "compact", label: "Compact" },
+                      ]}
+                    />
+                  </SettingRow>
+                  <SettingRow
+                    label="Wrap code in chat"
+                    description="Soft-wrap long lines in agent chat code blocks. Off keeps each line intact behind a horizontal scroll, which is easier to read for diffs and command output."
+                    scope="device"
+                  >
+                    <Switch
+                      checked={chatCodeWrap}
+                      onCheckedChange={(checked) =>
+                        storeSet("chat.code_wrap", checked ? "true" : "false")
+                      }
+                    />
+                  </SettingRow>
+                  <SettingRow
+                    label="Time format"
+                    description={`How clock times read in chats, tasks, pull requests and snooze menus. System follows your locale (it reads ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} right now).`}
+                  >
+                    <SegmentedControl<TimeFormat>
+                      ariaLabel="Time format"
+                      value={timeFormat}
+                      onChange={(value) => storeSet("appearance.time_format", value)}
+                      options={[
+                        { value: "system", label: "System" },
+                        { value: "12h", label: "12-hour" },
+                        { value: "24h", label: "24-hour" },
+                      ]}
+                    />
+                  </SettingRow>
+                </div>
+              </SectionGroup>
+
+              <SectionGroup>
+                <SectionHeader
+                  title="Sidebar"
+                  description="What the workspace inbox shows on each card."
+                />
+                <div className="space-y-1">
+                  <SettingRow
+                    label="Show git stats"
+                    description="Show the ↑ahead and +/− diff numbers on workspace cards. The branch name always shows."
+                    scope="device"
+                  >
+                    <Switch
+                      checked={showGitStats}
+                      onCheckedChange={(checked) =>
+                        storeSet("sidebar.show_git_stats", checked ? "true" : "false")
+                      }
+                    />
+                  </SettingRow>
+                  <SettingRow
+                    label="Auto-settle idle work"
+                    description="Sweep a workspace card into the Settled section after this many days without agent activity. Cards whose PR merges or closes settle once the agent has also been idle for an hour, so follow-up work stays visible while it is warm. Un-settling a card keeps it active until its agent runs again."
+                    scope="device"
+                  >
+                    <SegmentedControl<AutoSettleDays>
+                      ariaLabel="Auto-settle idle work"
+                      value={autoSettleDays}
+                      onChange={(value) =>
+                        storeSet("sidebar.auto_settle_days", value)
+                      }
+                      options={[
+                        { value: "off", label: "Off" },
+                        { value: "1", label: "1d" },
+                        { value: "3", label: "3d" },
+                        { value: "7", label: "7d" },
+                        { value: "14", label: "14d" },
+                      ]}
+                    />
+                  </SettingRow>
+                </div>
+              </SectionGroup>
+
+            </StackedSections>
 
             {/* Plugin appearance options. Nothing renders without one. */}
             <Slot area={APPEARANCE_EXTRA_AREA} variant="block" />
@@ -3194,13 +3192,18 @@ export function SettingsView() {
         {/* Content */}
         <ScrollArea ref={contentScrollRef} className="flex-1 bg-background">
           {/* The container query shows "On this page" only where it fits
-              beside the reading measure. */}
+              beside the reading measure. Every page starts at the stacked
+              page's left edge and wider pages grow to the right, so moving
+              between pages never slides the column sideways; a single page's
+              48rem and a stacked page's reading column (61rem less the rail)
+              share one measure. `transition-none`: without it the enter
+              animation also tweens max-width from page to page. */}
           <div className="@container">
             <div
               ref={contentRef}
               className={cn(
-                "animate-in fade-in-0 slide-in-from-bottom-1 duration-150 motion-reduce:animate-none",
-                mobile ? "mx-auto min-w-0 px-4 pt-5 pb-20" : "mx-auto px-11 pt-8 pb-20",
+                "animate-in fade-in-0 slide-in-from-bottom-1 transition-none motion-reduce:animate-none",
+                mobile ? "mx-auto min-w-0 px-4 pt-5 pb-20" : "mr-auto ml-[max(0px,calc((100%-61rem)/2))] px-11 pt-8 pb-20",
                 wide
                   ? "max-w-[1400px]"
                   : split

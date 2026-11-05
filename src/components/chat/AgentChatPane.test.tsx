@@ -956,7 +956,7 @@ describe("AgentChatPane remote task launcher", () => {
     textarea.setSelectionRange(2, 10);
     vi.mocked(agentChatSendTurn).mockClear();
     setInputDraftMock.mockClear();
-    fireEvent.click(view.getByRole("button", { name: "Attach" }));
+    fireEvent.click(view.getByRole("button", { name: "Add context or change mode" }));
     fireEvent.click(await view.findByText("Run on host…"));
     expect(await view.findByRole("dialog", { name: "Run on host" })).toBeInTheDocument();
     expect(view.container.querySelector("textarea")).toBe(textarea);

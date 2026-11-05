@@ -211,7 +211,7 @@ function renderPicker(overrides: Partial<Props> = {}) {
 async function openPicker(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByTestId("multi-provider-model-picker-trigger"));
   // Wait for the popover content to mount.
-  await screen.findByPlaceholderText("Search models...");
+  await screen.findByPlaceholderText("Search models…");
 }
 
 /** Focus opens the trigger's tooltip at once (hover waits out a delay);
@@ -261,6 +261,46 @@ describe("MultiProviderModelPicker — trigger", () => {
     expect(screen.queryByRole("tooltip")).toBeNull();
   });
 
+  it("reveals beside a neighbour only when the row's gap can absorb it", () => {
+    // Beside the access chip the reveal grows in flow (never over the
+    // chip), so it needs room in the row's flexible gap; without it the
+    // tooltip names the model instead.
+    const row = (gapWidth: number) => (
+      <div style={{ display: "flex" }}>
+        <div>
+          <MultiProviderModelPicker
+            provider="opencode"
+            model="openai/gpt-5"
+            onProviderModelChange={vi.fn()}
+          />
+          <button type="button">Full access</button>
+        </div>
+        <div
+          data-testid="gap"
+          style={{ flexGrow: 1 }}
+          ref={(el) => {
+            if (el) el.getBoundingClientRect = () => ({ width: gapWidth }) as DOMRect;
+          }}
+        />
+      </div>
+    );
+    const { rerender } = render(row(20));
+    const trigger = screen.getByTestId("multi-provider-model-picker-trigger");
+    // The footprint-keeping overlay is for a pill alone in its row only.
+    expect(trigger.className).not.toMatch(/(^|\s)(?!only:)[\w:-]*-m[lr]-\(--model-reveal-w\)/);
+    fireEvent.focus(trigger);
+    expect(screen.getByRole("tooltip")).toBeInTheDocument();
+    expect(screen.getByTestId("multi-provider-model-picker-reveal").className)
+      .not.toContain("group-focus-visible/model:w-(--model-reveal-w)");
+
+    rerender(row(400));
+    fireEvent.blur(trigger);
+    fireEvent.focus(trigger);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(screen.getByTestId("multi-provider-model-picker-reveal"))
+      .toHaveClass("group-focus-visible/model:w-(--model-reveal-w)");
+  });
+
   it("reveals in the context row without a tooltip", () => {
     renderPicker({ provider: "opencode", model: "openai/gpt-5", placement: "context-row" });
     expect(screen.getByTestId("multi-provider-model-picker-reveal")).toHaveTextContent(/^openai·$/);
@@ -273,6 +313,23 @@ describe("MultiProviderModelPicker — trigger", () => {
     renderPicker({ provider: "claude", model: null });
     expect(screen.getByTestId("multi-provider-model-picker-trigger"))
       .toHaveTextContent("Loading…");
+  });
+
+  it("names the provider's default model when none is chosen", () => {
+    // The session starts on the catalog's leading model, so the pill
+    // names it rather than reading as a required step.
+    renderPicker({ provider: "codex", model: null });
+    const trigger = screen.getByTestId("multi-provider-model-picker-trigger");
+    expect(trigger).toHaveTextContent("GPT-5.4 (Codex)");
+    expect(trigger).not.toHaveTextContent("Select model");
+  });
+
+  it("names its dialog and search field for what they choose", async () => {
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+    expect(screen.getByRole("dialog", { name: "Choose model" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Search models" })).toBeInTheDocument();
   });
 
   it("names an unlisted Claude id instead of showing it raw", () => {
@@ -316,7 +373,7 @@ describe("MultiProviderModelPicker — trigger", () => {
     renderPicker({ disabled: true });
     await user.click(screen.getByTestId("multi-provider-model-picker-trigger"));
     expect(
-      screen.queryByPlaceholderText("Search models..."),
+      screen.queryByPlaceholderText("Search models…"),
     ).not.toBeInTheDocument();
   });
 });
@@ -376,7 +433,7 @@ describe("MultiProviderModelPicker — model descriptions", () => {
     const user = userEvent.setup();
     renderPicker({ provider: "opencode", model: "openai/gpt-5" });
     await openPicker(user);
-    expect(screen.getByPlaceholderText("Search models...")).toHaveFocus();
+    expect(screen.getByPlaceholderText("Search models…")).toHaveFocus();
     // The reveal and open styling key on the popover's `data-state`; the
     // tooltip around the same button must not overwrite it.
     expect(screen.getByTestId("multi-provider-model-picker-trigger"))
@@ -635,7 +692,7 @@ describe("MultiProviderModelPicker — search", () => {
     // The provider rail's buttons precede the input in the DOM, so a
     // default first-tabbable autofocus would land on the rail — the
     // open-autofocus handler must aim at the input itself.
-    const input = screen.getByPlaceholderText("Search models...");
+    const input = screen.getByPlaceholderText("Search models…");
     expect(input).toHaveFocus();
 
     // Deliberately NO click — keystrokes go wherever focus already is.
@@ -658,7 +715,7 @@ describe("MultiProviderModelPicker — search", () => {
     await openPicker(user);
 
     await user.type(
-      screen.getByPlaceholderText("Search models..."),
+      screen.getByPlaceholderText("Search models…"),
       "gpt",
     );
 
@@ -687,7 +744,7 @@ describe("MultiProviderModelPicker — search", () => {
     // Match by sub_provider name only — "openrouter" lives in
     // sub_provider, not in the label or id.
     await user.type(
-      screen.getByPlaceholderText("Search models..."),
+      screen.getByPlaceholderText("Search models…"),
       "openrouter",
     );
     await waitFor(() => {
@@ -707,7 +764,7 @@ describe("MultiProviderModelPicker — search", () => {
     await openPicker(user);
 
     await user.type(
-      screen.getByPlaceholderText("Search models..."),
+      screen.getByPlaceholderText("Search models…"),
       "nonexistent-zzz",
     );
 
@@ -1010,7 +1067,7 @@ describe("MultiProviderModelPicker — selection", () => {
 
     await waitFor(() => {
       expect(
-        screen.queryByPlaceholderText("Search models..."),
+        screen.queryByPlaceholderText("Search models…"),
       ).not.toBeInTheDocument();
     });
   });
@@ -1122,7 +1179,7 @@ describe("MultiProviderModelPicker — favorites", () => {
     expect(onProviderModelChange).not.toHaveBeenCalled();
     // Picker must still be open (selection would have closed it).
     expect(
-      screen.getByPlaceholderText("Search models..."),
+      screen.getByPlaceholderText("Search models…"),
     ).toBeInTheDocument();
   });
 
@@ -1152,7 +1209,7 @@ describe("MultiProviderModelPicker — favorites", () => {
     renderPicker();
     await openPicker(user);
 
-    await user.type(screen.getByPlaceholderText("Search models..."), "5");
+    await user.type(screen.getByPlaceholderText("Search models…"), "5");
 
     await waitFor(() => {
       const rows = screen.getAllByTestId("multi-provider-model-row");
@@ -1353,7 +1410,7 @@ describe("MultiProviderModelPicker — favorites", () => {
     renderPicker();
     await openPicker(user);
     expect(
-      screen.getByPlaceholderText("Search models..."),
+      screen.getByPlaceholderText("Search models…"),
     ).toBeInTheDocument();
     const rows = screen.getAllByTestId("multi-provider-model-row");
     expect(rows.length).toBeGreaterThan(0);
@@ -1373,7 +1430,7 @@ describe("MultiProviderModelPicker — openSignal", () => {
     );
 
   const isOpen = () =>
-    screen.queryByPlaceholderText("Search models...") !== null;
+    screen.queryByPlaceholderText("Search models…") !== null;
 
   it("consumes the signal once — re-enabling after a consumed signal does not reopen", async () => {
     // Signal arrives while the picker is disabled → stays closed.
@@ -1404,7 +1461,7 @@ describe("MultiProviderModelPicker — openSignal", () => {
         disabled={false}
       />,
     );
-    await screen.findByPlaceholderText("Search models...");
+    await screen.findByPlaceholderText("Search models…");
     expect(isOpen()).toBe(true);
   });
 });

@@ -15,7 +15,7 @@ import {
   requestCloseTab,
 } from "@/lib/close-guard";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
-import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
+import { RIGHT_PANEL_EMPTY, SETTINGS_SEARCH_SELECTOR, useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { startNewHomeAgent } from "@/lib/agent-chat/new-home-agent";
@@ -140,7 +140,14 @@ export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
     if (ui.showSettings) {
       // Settings hosts sheets, selects, dialogs and its own command palette.
       // Escape belongs to the innermost of those; a second press leaves.
-      if (event && escapeClaimedElsewhere(event)) return false;
+      // The settings search is where Settings opens, and it keeps Escape
+      // only while it holds a query (it clears it), so an empty one leaves.
+      const target = event?.target;
+      const emptySettingsSearch =
+        target instanceof HTMLInputElement &&
+        target.matches(SETTINGS_SEARCH_SELECTOR) &&
+        target.value === "";
+      if (event && !emptySettingsSearch && escapeClaimedElsewhere(event)) return false;
       ui.setShowSettings(false);
       return true;
     }

@@ -30,6 +30,7 @@ import {
   useState,
   useSyncExternalStore,
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
 } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -405,6 +406,11 @@ export const MessageList = memo(function MessageList({
   const modeRef = useRef<SendScrollMode>("following-end");
   const isAtEndRef = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  // The pill stays mounted for its exit animation after `showJumpToLatest`
+  // goes false, and unmounts on `animationend` (reduced motion collapses the
+  // animation to its end state, so that still fires).
+  const [jumpPillMounted, setJumpPillMounted] = useState(false);
+  if (showJumpToLatest && !jumpPillMounted) setJumpPillMounted(true);
   const approvalPending = useMemo(
     () =>
       messages.some(
@@ -495,6 +501,8 @@ export const MessageList = memo(function MessageList({
   const glideFollow = (streaming || glideLinger) && !reduceMotion;
   const glideFollowRef = useRef(glideFollow);
   glideFollowRef.current = glideFollow;
+  const streamingRef = useRef(streaming);
+  streamingRef.current = streaming;
   // A thread switch or unmount lands instantly; never carry a glide across.
   useEffect(() => () => tailGlide.cancel(), [tailGlide, threadKey]);
 
@@ -601,6 +609,35 @@ export const MessageList = memo(function MessageList({
     }
   }, [hideJumpToLatest, scheduleJumpToLatest, tailGlide]);
 
+  /** A disclosure opened just above the composer can render its whole body
+   *  under the composer overlay, leaving a rotated chevron as the only
+   *  feedback. Glide just far enough to show the start of the body, never
+   *  so far that the toggle the reader clicked leaves the top of the view. */
+  const revealOpenedDisclosure = useCallback(
+    (viewport: HTMLElement, toggle: HTMLElement) => {
+      if (!toggle.isConnected || toggle.getAttribute("aria-expanded") !== "true") {
+        return;
+      }
+      const viewRect = viewport.getBoundingClientRect();
+      const toggleRect = toggle.getBoundingClientRect();
+      const overlay =
+        parseFloat(
+          getComputedStyle(viewport).getPropertyValue("--composer-overlay-height"),
+        ) || 0;
+      const visibleBelow = viewRect.bottom - overlay - toggleRect.bottom;
+      const need = DISCLOSURE_REVEAL_PX - visibleBelow;
+      if (need <= 1) return;
+      const room = toggleRect.top - (viewRect.top + topInsetRef.current) - 8;
+      const distance = Math.min(need, room);
+      if (distance <= 1) return;
+      viewport.scrollBy({
+        top: distance,
+        behavior: prefersReducedMotion() ? "auto" : "smooth",
+      });
+    },
+    [],
+  );
+
   /** Start a disclosure hold for `toggle` (see `disclosureHoldRef`). When it
    *  ends with the live edge pushed out of view, the reader is reading the
    *  row they opened, so follow is released like any other navigation; the
@@ -636,16 +673,20 @@ export const MessageList = memo(function MessageList({
           return;
         }
         stop();
+        // A live turn keeps the tail in charge: no reveal glide while it
+        // streams and we still follow it.
+        const followingLiveTail = ownsScroll() && streamingRef.current;
         const maxScroll = viewport.scrollHeight - viewport.clientHeight;
         if (ownsScroll() && viewport.scrollTop < maxScroll - 1) {
           cancelFollowForUserNavigation();
         }
+        if (!followingLiveTail) revealOpenedDisclosure(viewport, toggle);
       };
       disclosureHoldRef.current = stop;
       setDisclosureHold(true);
       frame = requestAnimationFrame(pin);
     },
-    [cancelFollowForUserNavigation, ownsScroll, tailGlide],
+    [cancelFollowForUserNavigation, ownsScroll, revealOpenedDisclosure, tailGlide],
   );
 
   // Apply a send's navigation intent synchronously, during the same render
@@ -671,6 +712,7 @@ export const MessageList = memo(function MessageList({
     lastSendNonceRef.current = sendNonce;
     claimScroll("following-end");
     setShowJumpToLatest(false);
+    setJumpPillMounted(false);
     setEndPinRestoredNonce(null);
   } else if (sendNonce !== lastSendNonceRef.current) {
     lastSendNonceRef.current = sendNonce;
@@ -1274,11 +1316,62 @@ export const MessageList = memo(function MessageList({
   /** The pill is the deliberate way back to the live edge, so it re-claims
    *  follow rather than cancelling it. Animated for the same reason the send
    *  glide is: a long-distance return should read as travel. */
-  const handleJumpToLatest = useCallback(() => {
-    claimScroll("following-end");
-    setShowJumpToLatest(false);
-    void listRef.current?.scrollToEnd({ animated: !prefersReducedMotion() });
-  }, [claimScroll]);
+  const handleJumpToLatest = useCallback(
+    (event: ReactMouseEvent<HTMLButtonElement>) => {
+      // The pill unmounts under the reader's focus. Hand focus to where they
+      // will write next (the pane's composer), or on a phone, where opening
+      // the keyboard would be a surprise, to the transcript itself.
+      const viewport = listRef.current?.getScrollableNode();
+      const composer = mobile
+        ? null
+        : event.currentTarget
+            .closest("[data-agent-chat-pane]")
+            ?.querySelector<HTMLTextAreaElement>("textarea[data-composer-input]");
+      if (composer && !composer.disabled) {
+        composer.focus({ preventScroll: true });
+      } else if (viewport) {
+        if (!viewport.hasAttribute("tabindex")) viewport.tabIndex = -1;
+        viewport.focus({ preventScroll: true });
+      }
+      claimScroll("following-end");
+      setShowJumpToLatest(false);
+      const list = listRef.current;
+      if (!list) return;
+      if (prefersReducedMotion()) {
+        void list.scrollToEnd({ animated: false });
+        return;
+      }
+      // The list's own animated scroll defers every size correction it
+      // meets to the end of the glide, then lands with a jump past the end
+      // and a snap back. Instead: a long return cuts instantly to one
+      // viewport above the end, lets that stretch measure for a frame, and
+      // the eased tail follower glides the rest toward the live end, re-read
+      // every frame, so a correction only retargets it.
+      const epoch = claimEpochRef.current;
+      const glide = () =>
+        tailGlide.follow(() => {
+          if (claimEpochRef.current !== epoch || !ownsScroll()) return null;
+          const current = listRef.current?.getScrollableNode();
+          return current ? current.scrollHeight - current.clientHeight : null;
+        });
+      if (!viewport) {
+        void list.scrollToEnd({ animated: true });
+        return;
+      }
+      const viewportHeight = viewport.clientHeight;
+      const endOffset = viewport.scrollHeight - viewportHeight;
+      if (endOffset - viewport.scrollTop <= viewportHeight) {
+        glide();
+        return;
+      }
+      void list.scrollToOffset({
+        offset: Math.max(0, endOffset - viewportHeight),
+        animated: false,
+      });
+      requestAnimationFrame(() => requestAnimationFrame(glide));
+    },
+    [claimScroll, mobile, ownsScroll, tailGlide],
+  );
 
   // Lets the owning pane find this viewport to pin its scroll position
   // while the composer below changes height.
@@ -1620,7 +1713,7 @@ export const MessageList = memo(function MessageList({
   return (
     <ChatFileLinkContext.Provider value={fileLinkContext}>
       <div
-        className="group/transcript-list relative size-full min-h-0 overflow-hidden"
+        className="group/transcript-list @container/transcript relative size-full min-h-0 overflow-hidden"
         data-transcript-edge-fade={fadeEnabled ? "on" : "off"}
         data-provider={provider ?? undefined}
       >
@@ -1656,7 +1749,9 @@ export const MessageList = memo(function MessageList({
         extraData={renderItem}
         estimatedItemSize={112}
         estimatedHeaderSize={48}
-        drawDistance={250}
+        // More than a viewport plus a PageUp step, so rows are measured
+        // before they scroll into view instead of correcting mid-scroll.
+        drawDistance={1000}
         recycleItems={false}
         alwaysRender={
           alwaysRenderKeys.length > 0 ? { keys: alwaysRenderKeys } : undefined
@@ -1701,10 +1796,20 @@ export const MessageList = memo(function MessageList({
         ListHeaderComponent={listHeader}
         ListFooterComponent={listFooter}
       />
-      {showJumpToLatest && (
+      {jumpPillMounted && (
         <Button
           type="button"
           onClick={handleJumpToLatest}
+          data-state={showJumpToLatest ? "open" : "closed"}
+          // Leaving: out of the tab order and the accessibility tree while
+          // it fades, so nothing can land on it.
+          inert={!showJumpToLatest}
+          aria-hidden={showJumpToLatest ? undefined : true}
+          onAnimationEnd={(event) => {
+            if (event.target === event.currentTarget && !showJumpToLatest) {
+              setJumpPillMounted(false);
+            }
+          }}
           variant="secondary"
           size="sm"
           // Clears the composer overlay: the transcript now runs the full
@@ -1715,7 +1820,7 @@ export const MessageList = memo(function MessageList({
             bottom: "calc(1rem + var(--composer-overlay-height, 0px))",
           }}
           className={cn(
-            "absolute left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border bg-card font-semibold shadow-lg animate-in fade-in-0 slide-in-from-bottom-2 duration-150 ease-out hover:bg-card hover:text-foreground",
+            "absolute left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border bg-card font-semibold shadow-lg ease-out hover:bg-card hover:text-foreground data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:slide-in-from-bottom-2 data-[state=open]:duration-150 data-[state=closed]:pointer-events-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-bottom-1 data-[state=closed]:duration-100",
             approvalPending
               ? "border-status-working/50 text-foreground"
               : "border-border text-muted-foreground",
@@ -1821,6 +1926,10 @@ function prefersReducedMotion(): boolean {
 /** How long a disclosure toggle holds the viewport: the 150ms open/collapse
  *  plus a few frames for the list to measure the row at its new height. */
 const DISCLOSURE_SETTLE_MS = 400;
+
+/** How much of a freshly opened disclosure's body must sit above the
+ *  composer overlay; less than this and the opening glides to show it. */
+const DISCLOSURE_REVEAL_PX = 96;
 
 /** How long the eased follower keeps the tail after a turn stops streaming. */
 const TAIL_GLIDE_LINGER_MS = 600;

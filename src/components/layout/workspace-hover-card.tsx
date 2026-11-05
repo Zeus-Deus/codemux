@@ -76,11 +76,12 @@ interface Props {
 }
 
 /** How long the pointer must rest on a row before the FIRST card opens. Long
- *  enough that sweeping the mouse down the sidebar never flashes a card, short
- *  enough that a deliberate hover feels instant. Once a card is up the shared
+ *  enough that sweeping the mouse down the sidebar never flashes a card (and
+ *  above the tooltips' 300ms, so the richer card never beats them), short
+ *  enough that a deliberate hover still feels prompt. Once a card is up the shared
  *  group phase takes over and the rest open with no delay at all — see
  *  `@/lib/hover-card-group` for why the second card should not re-pay this. */
-const OPEN_DELAY_MS = 150;
+const OPEN_DELAY_MS = 400;
 /** Long enough for the pointer to cross the 10px offset gap into the card and
  *  select a path — but it never delays a sweep, because a card is superseded
  *  outright the moment another one opens (`registerOpenHoverCard`). */

@@ -516,6 +516,44 @@ describe("MessageList transcript continuity", () => {
     expect(scrollToEndSpy).not.toHaveBeenCalled();
   });
 
+  it("glides an opened disclosure into view above the composer", async () => {
+    const view = renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    await nextFrames();
+    const viewport = view.container.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
+    const scrollBy = vi.fn();
+    viewport.scrollBy = scrollBy as typeof viewport.scrollBy;
+    viewport.getBoundingClientRect = () => new DOMRect(0, 0, 800, 500);
+    const toggle = document.createElement("button");
+    toggle.setAttribute("aria-expanded", "false");
+    // The toggle sits 80px above the viewport's bottom, so its body opens
+    // almost entirely out of view.
+    toggle.getBoundingClientRect = () => new DOMRect(0, 400, 100, 20);
+    toggle.addEventListener("click", () => toggle.setAttribute("aria-expanded", "true"));
+    viewport.appendChild(toggle);
+    act(() => toggle.click());
+    await waitFor(() => expect(scrollBy).toHaveBeenCalledTimes(1), { timeout: 2000 });
+    // 96px of body wanted, 80px already visible below the toggle.
+    expect(scrollBy.mock.calls[0][0]).toMatchObject({ top: 16 });
+  });
+
+  it("leaves a collapsed disclosure where it is", async () => {
+    const view = renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    await nextFrames();
+    const viewport = view.container.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
+    const scrollBy = vi.fn();
+    viewport.scrollBy = scrollBy as typeof viewport.scrollBy;
+    viewport.getBoundingClientRect = () => new DOMRect(0, 0, 800, 500);
+    const toggle = document.createElement("button");
+    toggle.setAttribute("aria-expanded", "true");
+    toggle.getBoundingClientRect = () => new DOMRect(0, 470, 100, 20);
+    toggle.addEventListener("click", () => toggle.setAttribute("aria-expanded", "false"));
+    viewport.appendChild(toggle);
+    act(() => toggle.click());
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    await nextFrames(2);
+    expect(scrollBy).not.toHaveBeenCalled();
+  });
+
   it("follows footer-only growth while the eased follower holds the tail", async () => {
     listState.isAtEnd = true;
     listState.isNearEnd = true;
@@ -2829,9 +2867,77 @@ describe("MessageList jump-to-latest pill", () => {
     });
     await waitFor(() => expect(pill()).not.toBeNull());
 
+    const node = viewport();
+    Object.defineProperty(node, "scrollHeight", { configurable: true, value: 800 });
+    Object.defineProperty(node, "clientHeight", { configurable: true, value: 500 });
+    scrollToEndSpy.mockClear();
     fireEvent.click(pill()!);
-    expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: true });
     expect(pill()).toBeNull();
+    // The eased follower glides to the live end, re-reading it every frame;
+    // the list's own animated scroll is not used (it defers corrections to
+    // the end of the glide and snaps).
+    await waitFor(() => expect(node.scrollTop).toBe(300));
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+  });
+
+  const viewport = () =>
+    document.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
+
+  async function showPill() {
+    await flushFrames(2);
+    act(() => {
+      fireEvent.wheel(
+        document.querySelector<HTMLElement>('[data-slot="transcript-list"]')!,
+      );
+      emitIsAtEnd(false);
+    });
+    await waitFor(() => expect(pill()).not.toBeNull());
+  }
+
+  it("cuts a long return to the last viewport, then glides", async () => {
+    render(<MessageList messages={[userTurn]} {...noopHandlers} />);
+    await showPill();
+    const node = viewport();
+    Object.defineProperty(node, "scrollHeight", { configurable: true, value: 50_000 });
+    Object.defineProperty(node, "clientHeight", { configurable: true, value: 500 });
+    node.scrollTop = 1_000;
+    scrollToEndSpy.mockClear();
+    scrollToOffsetSpy.mockClear();
+
+    fireEvent.click(pill()!);
+    // end = 50_000 - 500; one viewport above it.
+    expect(scrollToOffsetSpy).toHaveBeenCalledWith({ offset: 49_000, animated: false });
+    // The double mock does not move the viewport; land it where the cut would.
+    node.scrollTop = 49_000;
+    await waitFor(() => expect(node.scrollTop).toBe(49_500));
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+  });
+
+  it("hands focus to the pane's composer before the pill goes away", async () => {
+    render(
+      <div data-agent-chat-pane="">
+        <MessageList messages={[userTurn]} {...noopHandlers} />
+        <textarea data-composer-input="" aria-label="Message" />
+      </div>,
+    );
+    await showPill();
+    const button = pill()!;
+    button.focus();
+    fireEvent.click(button);
+    expect(document.activeElement).toBe(screen.getByLabelText("Message"));
+  });
+
+  it("fades out instead of unmounting at once", async () => {
+    render(<MessageList messages={[userTurn]} {...noopHandlers} />);
+    await showPill();
+    const button = pill()!;
+    fireEvent.click(button);
+    // Leaving: still painted, but out of reach.
+    expect(button).toBeInTheDocument();
+    expect(button).toHaveAttribute("data-state", "closed");
+    expect(button).toHaveAttribute("aria-hidden", "true");
+    fireEvent.animationEnd(button);
+    expect(button).not.toBeInTheDocument();
   });
 });
 

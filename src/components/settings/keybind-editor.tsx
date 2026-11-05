@@ -162,7 +162,7 @@ export function KeybindEditor() {
   return (
     <div>
       <SectionHeader
-        title="Keyboard Shortcuts"
+        title="Keyboard shortcuts"
         description="Click a shortcut to rebind it. Press Escape to cancel."
         action={
           hasAnyOverrides && (

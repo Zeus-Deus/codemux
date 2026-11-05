@@ -1105,9 +1105,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
               <>
                 <Spinner className="size-6 text-muted-foreground mb-2" />
                 <p className="text-label text-muted-foreground">
-                  {status === "starting" && "Starting browser..."}
-                  {status === "connecting" && "Connecting to stream..."}
-                  {status === "waiting" && "Waiting for first frame..."}
+                  {status === "starting" && "Starting browser…"}
+                  {status === "connecting" && "Connecting to stream…"}
+                  {status === "waiting" && "Waiting for first frame…"}
                 </p>
               </>
             )}

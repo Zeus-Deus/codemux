@@ -8619,8 +8619,8 @@ const handlers: Record<string, Handler> = {
     appState = {
       ...appState,
       workspaces: [...appState.workspaces, ws],
-      // The real backend activates the restored workspace.
-      active_workspace_id: ws.workspace_id,
+      // The real backend activates the restored workspace unless told not to.
+      active_workspace_id: a.select === false ? appState.active_workspace_id : ws.workspace_id,
       archived_workspaces: entries.filter((e) => e.archive_id !== a.archiveId),
     };
     emitAppState();

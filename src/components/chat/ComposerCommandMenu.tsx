@@ -2,7 +2,9 @@ import { Command as CommandPrimitive } from "cmdk";
 import { Search } from "lucide-react";
 import { useEffect, useRef, type SyntheticEvent } from "react";
 
+import { KbdKeys } from "@/components/ui/kbd";
 import { KeyHint } from "@/components/ui/key-hint";
+import { formatKeyCombo } from "@/components/ui/menu-chrome";
 import { ScrollEdgeFade, useScrollEdges } from "@/components/ui/scroll-edge-fade";
 import { cn } from "@/lib/utils";
 import {
@@ -51,6 +53,9 @@ interface Props {
   /** Session-config controls that no longer fit the composer's controls
    *  row at narrow widths (effort + access), shown under the search box. */
   headerSlot?: React.ReactNode;
+  /** A shortcut that acts on a whole group (`MODES` → `Shift+Tab`), shown
+   *  as a quiet key chip at the end of that group's heading. */
+  groupShortcuts?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -77,6 +82,7 @@ export function ComposerCommandMenu({
   footerNote = null,
   submode,
   headerSlot = null,
+  groupShortcuts,
 }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -172,7 +178,18 @@ export function ComposerCommandMenu({
               groups.map(({ group, items: groupItems }) => (
                 <CommandPrimitive.Group
                   key={group}
-                  heading={group}
+                  heading={
+                    groupShortcuts?.[group] ? (
+                      <span className="flex items-center justify-between gap-2">
+                        {group}
+                        <span className="normal-case tracking-normal pointer-coarse:hidden">
+                          <KbdKeys keys={formatKeyCombo(groupShortcuts[group])} />
+                        </span>
+                      </span>
+                    ) : (
+                      group
+                    )
+                  }
                   className={COMMAND_MENU_GROUP_HEADING}
                 >
                   {groupItems.map((item) => {

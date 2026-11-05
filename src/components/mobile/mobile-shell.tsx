@@ -7,6 +7,7 @@ import {
   ArrowLeft,
   Bell,
   Check,
+  CheckCheck,
   CalendarClock,
   ChevronDown,
   MessageSquare,
@@ -360,25 +361,26 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
                       </span>
                     </span>
                   </button>
-                  <button
-                    className="mobile-settle"
-                    disabled={
-                      !isSettled &&
-                      (liveStatus === "working" ||
-                        liveStatus === "permission" ||
-                        liveStatus === "monitoring")
-                    }
-                    aria-label={`${isSettled ? "Unsettle" : "Settle"} ${w.title}`}
-                    onClick={() =>
-                      isSettled
-                        ? useSidebarInboxStore
-                            .getState()
-                            .unsettle(w.workspace_id, "user")
-                        : useSidebarInboxStore.getState().settle(w.workspace_id)
-                    }
-                  >
-                    {isSettled ? <Undo2 size={16} /> : <Check size={16} />}
-                  </button>
+                  {/* Live work can't be settled yet, so no button is drawn
+                      (a faint disabled ✓ read as "almost done"); the empty
+                      44px column keeps every row's text the same width. */}
+                  {!isSettled &&
+                  (liveStatus === "working" || liveStatus === "permission" || liveStatus === "monitoring") ? (
+                    <span className="mobile-settle w-11 shrink-0" aria-hidden="true" />
+                  ) : (
+                    <button
+                      className="mobile-settle"
+                      title={isSettled ? "Unsettle" : "Settle"}
+                      aria-label={`${isSettled ? "Unsettle" : "Settle"} ${w.title}`}
+                      onClick={() =>
+                        isSettled
+                          ? useSidebarInboxStore.getState().unsettle(w.workspace_id, "user")
+                          : useSidebarInboxStore.getState().settle(w.workspace_id)
+                      }
+                    >
+                      {isSettled ? <Undo2 size={16} /> : <CheckCheck size={16} />}
+                    </button>
+                  )}
                 </article>
               );
             })}

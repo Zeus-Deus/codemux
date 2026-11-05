@@ -43,6 +43,7 @@ import {
   type InboxRepo,
 } from "./sidebar-inbox-card";
 import { SidebarNeedsYouStrip } from "./sidebar-needs-you-strip";
+import { SidebarStickyHeader } from "./sidebar-sticky-header";
 import { PendingWorkspaceRow } from "./pending-workspace-row";
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
 import {
@@ -829,6 +830,20 @@ const SnoozeRow = memo(function SnoozeRow({
     </WorkspaceInboxMenu>
   );
 });
+
+/** How long after activating or moving the open workspace's row the inbox
+ *  keeps it in view through reflows, even before it has reached the view. */
+const ACTIVE_FOLLOW_MS = 1000;
+
+/** The open workspace's row in the inbox, whichever list it sits in. */
+function activeRowIn(root: HTMLElement | null, workspaceId: string): HTMLElement | null {
+  const id = CSS.escape(workspaceId);
+  return (
+    root?.querySelector<HTMLElement>(
+      `[data-inbox-card="${id}"],[data-settled-row="${id}"],[data-snoozed-row="${id}"]`,
+    ) ?? null
+  );
+}
 
 /** The flat workspace inbox that replaces the nested project tree in the
  *  expanded sidebar: a project filter dropdown, one multi-line card per active
@@ -1737,6 +1752,93 @@ export function SidebarInbox() {
     setFilter(null);
   }, [appStateLoaded, filter, projectGroups, setFilter]);
 
+  // The open workspace's card scrolls itself into view when it becomes active
+  // (see `SidebarInboxCard`), but the list can then move it without it being
+  // re-activated. Two cases keep "you are here" from ending up off screen:
+  //
+  // - It changes section: opening a finished card marks it seen and drops it
+  //   into Wrapping up, settling turns it into a shelf row. Followed once per
+  //   move, with the usual glide.
+  // - The list reflows around it — sections and folded follow-ups settle just
+  //   after load, a card above it arrives or leaves. Scroll anchoring keeps
+  //   some *other* row still, so the open one can drift past an edge. While it
+  //   was fully in view, it is put straight back; once the user has scrolled
+  //   it away, the list is left alone. For a moment after it is activated or
+  //   moved it is followed regardless: a scroll toward it can be cut short
+  //   while the section it lands in is still unfolding beneath it.
+  const activeWs = activeWorkspaceId ? workspaceById.get(activeWorkspaceId) : undefined;
+  const activeSection = !activeWs
+    ? null
+    : activeWs.pinned_at != null
+      ? "pinned"
+      : settledIds.has(activeWorkspaceId)
+        ? "settled"
+        : snoozedIds.has(activeWorkspaceId)
+          ? "snoozed"
+          : wrappingIds.has(activeWorkspaceId)
+            ? "wrapping"
+            : "active";
+  const placedRef = useRef<{ id: string; section: string | null } | null>(null);
+  const followUntilRef = useRef(0);
+  useEffect(() => {
+    const prev = placedRef.current;
+    placedRef.current = { id: activeWorkspaceId, section: activeSection };
+    if (!prev || prev.id !== activeWorkspaceId || prev.section === activeSection) return;
+    if (activeSection === null) return;
+    followUntilRef.current = performance.now() + ACTIVE_FOLLOW_MS;
+    const frame = requestAnimationFrame(() => {
+      const reduceMotion =
+        window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+      activeRowIn(inboxRef.current, activeWorkspaceId)?.scrollIntoView?.({
+        block: "nearest",
+        behavior: reduceMotion ? "auto" : "smooth",
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeWorkspaceId, activeSection]);
+  useEffect(() => {
+    const inbox = inboxRef.current;
+    const scroller = inbox?.closest<HTMLElement>('[data-sidebar="content"]');
+    if (!inbox || !scroller || !activeWorkspaceId || typeof ResizeObserver === "undefined") return;
+    const inView = () => {
+      const row = activeRowIn(inbox, activeWorkspaceId);
+      if (!row) return false;
+      const rect = row.getBoundingClientRect();
+      const header = inbox.querySelector("[data-sidebar-sticky-header]");
+      const top = header?.getBoundingClientRect().bottom ?? scroller.getBoundingClientRect().top;
+      return rect.top >= top - 1 && rect.bottom <= scroller.getBoundingClientRect().bottom + 1;
+    };
+    followUntilRef.current = performance.now() + ACTIVE_FOLLOW_MS;
+    let wasInView = inView();
+    const track = () => {
+      wasInView = inView();
+    };
+    // The user taking the scroll ends the follow window early.
+    const release = () => {
+      followUntilRef.current = 0;
+    };
+    // Resize observations land before the scroll event that anchoring's
+    // adjustment queues, so `wasInView` still describes the list as the user
+    // last saw it.
+    const observer = new ResizeObserver(() => {
+      const following = performance.now() < followUntilRef.current;
+      if ((wasInView || following) && !inView()) {
+        activeRowIn(inbox, activeWorkspaceId)?.scrollIntoView?.({ block: "nearest" });
+      }
+      track();
+    });
+    observer.observe(inbox);
+    scroller.addEventListener("scroll", track, { passive: true });
+    scroller.addEventListener("wheel", release, { passive: true });
+    scroller.addEventListener("touchstart", release, { passive: true });
+    return () => {
+      observer.disconnect();
+      scroller.removeEventListener("scroll", track);
+      scroller.removeEventListener("wheel", release);
+      scroller.removeEventListener("touchstart", release);
+    };
+  }, [activeWorkspaceId]);
+
   /** One active card. Both tiers render the identical component — a card that
    *  is wrapping up loses no affordance, only altitude. `visualIndex` is its
    *  position in `orderedActiveCards`, i.e. counted straight through the
@@ -1794,7 +1896,7 @@ export function SidebarInbox() {
           Both stay put while the card list scrolls beneath them, so blocked
           work is reachable from anywhere in a long list — that reachability
           is what lets the list below keep its static, status-blind order. */}
-      <div className="sticky top-0 z-10 bg-sidebar">
+      <SidebarStickyHeader>
         <div className="flex items-center gap-1 px-2.5 pb-2.5 min-w-0">
           <SidebarProjectFilter
             projectGroups={projectGroups}
@@ -1816,7 +1918,7 @@ export function SidebarInbox() {
           projectGroups={projectGroups}
           filterPath={filter}
         />
-      </div>
+      </SidebarStickyHeader>
 
       {/* A flex column that fills the sidebar, so the empty state can grow
           into the free space and push the parked shelves to the bottom. */}

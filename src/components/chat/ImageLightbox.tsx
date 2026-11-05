@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useRef, type ReactNode } from "react";
 import { X } from "lucide-react";
 import { useDismissOnDisconnect } from "./use-dismiss-on-disconnect";
 
@@ -29,6 +29,10 @@ export function ImageLightbox({
   children: ReactNode;
 }) {
   useDismissOnDisconnect(open, onOpenChange);
+  // The dialog has no Trigger, so it records its opener itself. On close the
+  // opener gets focus back without scrolling; if virtualization unmounted it
+  // meanwhile, the transcript it lived in takes focus instead of the page.
+  const openerRef = useRef<{ opener: HTMLElement; scroller: HTMLElement | null } | null>(null);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
@@ -36,6 +40,33 @@ export function ImageLightbox({
         overlayClassName="bg-black/75 supports-backdrop-filter:backdrop-blur-sm"
         className="w-fit max-w-[calc(100vw-2rem)] gap-0 border-0 bg-transparent p-0 ring-0 shadow-none sm:max-w-[calc(100vw-2rem)]"
         data-image-lightbox
+        onOpenAutoFocus={() => {
+          // Runs before focus moves in, so the opener still holds it.
+          const opener = document.activeElement;
+          openerRef.current =
+            opener instanceof HTMLElement && opener !== document.body
+              ? {
+                  opener,
+                  scroller: opener.closest<HTMLElement>("[data-transcript-viewport]"),
+                }
+              : null;
+        }}
+        onCloseAutoFocus={(event) => {
+          const record = openerRef.current;
+          openerRef.current = null;
+          if (!record) return;
+          const target = record.opener.isConnected
+            ? record.opener
+            : record.scroller?.isConnected
+              ? record.scroller
+              : null;
+          if (!target) return;
+          event.preventDefault();
+          if (target === record.scroller && !target.hasAttribute("tabindex")) {
+            target.tabIndex = -1;
+          }
+          target.focus({ preventScroll: true });
+        }}
       >
         <DialogTitle className="sr-only">{title}</DialogTitle>
         <DialogDescription className="sr-only">

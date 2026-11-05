@@ -116,7 +116,9 @@ export function ContextUsageMeter({
                   r={RING_RADIUS}
                   fill="none"
                   strokeWidth={RING_STROKE}
-                  className="stroke-current text-subtle-foreground"
+                  // The hairline tone, so the arc reads against its track
+                  // (≥3:1) in both schemes; a grey near the arc's hid it.
+                  className="stroke-border"
                 />
                 <circle
                   cx={RING_SIZE / 2}

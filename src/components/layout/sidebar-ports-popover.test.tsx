@@ -100,15 +100,15 @@ describe("SidebarPortsPopover", () => {
     );
   }
 
-  it("names the button in its tooltip, not only the count", async () => {
+  it("names the button and its count the same way the tooltip does", async () => {
     renderWithPorts([port({ port: 3000 })]);
-    fireEvent.focus(screen.getByRole("button", { name: "Ports" }));
+    fireEvent.focus(screen.getByRole("button", { name: "Ports · 1 active" }));
     expect((await screen.findAllByText("Ports · 1 active")).length).toBeGreaterThan(0);
   });
 
   it("shows a port's full name only when the row truncates it, never as a native title", async () => {
     renderWithPorts([port({ port: 3000, process_name: "python" })]);
-    fireEvent.click(screen.getByRole("button", { name: "Ports" }));
+    fireEvent.click(screen.getByRole("button", { name: "Ports · 1 active" }));
 
     const name = await screen.findByTestId("port-name");
     expect(name).not.toHaveAttribute("title");

@@ -3,7 +3,8 @@
 
 /** Composer pill / card: 22px radius in both states (a 44px pill is a
  *  stadium; the expanded card keeps the same corner), a hairline border,
- *  and a deep low-opacity shadow so the card lifts off the pane background.
+ *  and a deep low-opacity shadow so the card lifts off the pane background
+ *  (scheme-aware, see `--composer-shadow` in globals.css).
  *  The border stays identical at rest and on focus; focus comes from
  *  surface and elevation. The surface is the muted tint pre-composited over
  *  the pane background: opaque, so the strip's seam never shows through.
@@ -11,9 +12,9 @@
  *  the properties that change transition, so a re-render costs nothing. */
 export const COMPOSER_CARD =
   "rounded-[22px] border border-border/80 bg-[color-mix(in_oklab,var(--muted)_40%,var(--background))] " +
-  "shadow-[0_12px_28px_-18px] shadow-black/40 " +
+  "shadow-(--composer-shadow) " +
   "transition-[box-shadow,border-color,background-color] duration-150 " +
-  "focus-within:bg-[color-mix(in_oklab,var(--muted)_60%,var(--background))] focus-within:shadow-[0_16px_38px_-14px] focus-within:shadow-black/60";
+  "focus-within:bg-[color-mix(in_oklab,var(--muted)_60%,var(--background))] focus-within:shadow-(--composer-shadow-focus)";
 
 /** The strips docked above and below the card: one tonal step under the
  *  card, pre-composited over the pane background like the card itself. It

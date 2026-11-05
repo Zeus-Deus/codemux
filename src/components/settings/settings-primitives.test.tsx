@@ -10,7 +10,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { SectionHeader, SegmentedControl, SettingRow } from "./settings-primitives";
+import { SectionHeader, SegmentedControl, SettingRow, SubsectionHeader } from "./settings-primitives";
 
 afterEach(cleanup);
 
@@ -79,6 +79,30 @@ describe("SettingRow", () => {
     expect(screen.getByRole("switch", { name: "Density" })).toHaveAccessibleDescription(
       "Spacing. Only on this device",
     );
+  });
+});
+
+describe("narrow settings rows", () => {
+  it("lets a wide control drop under its copy but keeps a switch inline", () => {
+    const { container } = render(
+      <>
+        <SettingRow label="Time format">
+          <SegmentedControl value="a" onChange={() => {}} options={[{ value: "a", label: "A" }]} />
+        </SettingRow>
+        <SettingRow label="Wrap code">
+          <Switch />
+        </SettingRow>
+      </>,
+    );
+    const [wide, compact] = Array.from(container.querySelectorAll("[data-settings-row]"));
+    expect(wide).toHaveClass("@container");
+    expect(wide.firstElementChild).toHaveClass("@max-[30rem]:flex-col");
+    expect(compact.firstElementChild).not.toHaveClass("@max-[30rem]:flex-col");
+  });
+
+  it("titles a subsection one level under its section", () => {
+    render(<SubsectionHeader title="Skills sync" />);
+    expect(screen.getByRole("heading", { level: 4, name: "Skills sync" })).toBeInTheDocument();
   });
 });
 

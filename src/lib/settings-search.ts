@@ -61,7 +61,7 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   // Account
   { section: "account", label: "Email", signedInOnly: true },
   { section: "account", label: "Skills sync", keywords: "devices sync", agentChatOnly: true, signedInOnly: true },
-  { section: "account", label: "Session", keywords: "sign out log out logout", signedInOnly: true },
+  { section: "account", label: "Sign out of Codemux", keywords: "session log out logout", signedInOnly: true },
 
   // Appearance
   { section: "appearance", label: "Typography", keywords: "font size interface zoom text" },

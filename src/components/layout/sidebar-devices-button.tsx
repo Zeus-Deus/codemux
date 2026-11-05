@@ -108,7 +108,7 @@ export function SidebarDevicesButton({
         <Button
           variant="ghost"
           size={labeled ? "sm" : "icon-sm"}
-          aria-label="Devices"
+          aria-label={tooltip}
           data-testid="sidebar-devices"
           onClick={() => setShowDevices(true)}
           className={cn("relative text-muted-foreground hover:bg-surface-2 hover:text-foreground", labeled ? "w-full justify-start gap-2 text-label" : "")}

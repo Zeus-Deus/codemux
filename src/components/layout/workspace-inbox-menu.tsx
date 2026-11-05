@@ -6,6 +6,7 @@ import {
 import {
   WorkspaceContextMenuItems,
   DeleteWorktreeDialog,
+  archiveWorkspaceWithUndo,
 } from "./sidebar-workspace-row";
 import { ConfirmPushDialog } from "@/components/overlays/confirm-push-dialog";
 import { ProjectImageDialog } from "@/components/overlays/project-image-dialog";
@@ -15,10 +16,8 @@ import { useProjectAppearance } from "./use-project-appearance";
 import { WorkspaceMenuOpenContext } from "./workspace-menu-open-context";
 import { useProjectAppearanceStore } from "@/stores/project-appearance-store";
 import {
-  archiveWorkspace,
   closeWorkspace,
   closeWorkspaceWithWorktree,
-  unarchiveWorkspace,
   workspacePullBack,
   workspacePushToHost,
   type HostView,
@@ -112,14 +111,7 @@ export function WorkspaceInboxMenu({
           `Closed "${workspace.title}" — it stays available on its host under Devices`,
         );
       } else {
-        const archiveId = await archiveWorkspace(workspace.workspace_id);
-        toast.undoable({
-          message: `Archived "${workspace.title}"`,
-          description: "Restore anytime from Settings → Workspaces → Archive.",
-          onUndo: async () => {
-            await unarchiveWorkspace(archiveId);
-          },
-        });
+        await archiveWorkspaceWithUndo(workspace);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

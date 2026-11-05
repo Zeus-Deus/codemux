@@ -115,6 +115,13 @@ describe("PermissionModePicker — render", () => {
 });
 
 describe("PermissionModePicker — interaction", () => {
+  it("names its chooser by what it sets", async () => {
+    const user = userEvent.setup();
+    const { trigger } = renderPicker({ modes: CLAUDE_MODES });
+    await user.click(trigger!);
+    expect(await screen.findByRole("dialog", { name: "Access permissions" })).toBeInTheDocument();
+  });
+
   it("opens on a new composer command signal without changing permissions", async () => {
     const onChange = vi.fn();
     const view = (signal: number) => (

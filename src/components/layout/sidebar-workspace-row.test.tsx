@@ -161,13 +161,16 @@ const { appStateHolder } = vi.hoisted(() => ({
 }));
 vi.mock("@/stores/app-store", async (importOriginal) => ({
   ...await importOriginal<typeof import("@/stores/app-store")>(),
-  useAppStore: vi.fn((selector: (s: Record<string, unknown>) => unknown) =>
-    selector({
-      appState: appStateHolder.current,
-      setWorkspacePushPullInFlight: vi.fn(),
-      workspacePushPullInFlight: null,
-      workspacePushPullStartedAt: null,
-    }),
+  useAppStore: Object.assign(
+    vi.fn((selector: (s: Record<string, unknown>) => unknown) =>
+      selector({
+        appState: appStateHolder.current,
+        setWorkspacePushPullInFlight: vi.fn(),
+        workspacePushPullInFlight: null,
+        workspacePushPullStartedAt: null,
+      }),
+    ),
+    { getState: () => ({ appState: appStateHolder.current }) },
   ),
 }));
 
@@ -275,6 +278,44 @@ beforeEach(() => {
   useUIStore.setState({ renameWorkspaceId: null });
   __resetDefaultBranchCacheForTests();
   _resetEditorDiscoveryForTests();
+});
+
+describe("Repository-only menu items", () => {
+  it("leaves branch and setup actions out of a Home chat's menu", async () => {
+    const ws = makeWorkspace({
+      workspace_type: "home",
+      worktree_path: null,
+      project_root: null,
+      git_branch: null,
+      is_git: false,
+    });
+    render(
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
+    );
+
+    await flushDefaultBranchFetch();
+
+    for (const name of [/Copy branch name/i, /Checkout default branch/i, /Re-run setup/i]) {
+      expect(screen.queryByRole("menuitem", { name })).not.toBeInTheDocument();
+    }
+    expect(screen.getByRole("menuitem", { name: /Rename workspace/i })).toBeInTheDocument();
+  });
+
+  it("keeps them for a repository workspace", async () => {
+    render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({ worktree_path: null, git_branch: "feature/x" })}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+
+    await flushDefaultBranchFetch();
+
+    for (const name of [/Copy branch name/i, /Checkout default branch/i, /Re-run setup/i]) {
+      expect(screen.getByRole("menuitem", { name })).toBeInTheDocument();
+    }
+  });
 });
 
 describe("Checkout default branch menu item", () => {
@@ -720,10 +761,10 @@ describe("Hover-reveal archive button", () => {
     );
 
     // The toast's Undo closure restores via the archive id the backend
-    // returned.
+    // returned, without switching to it: it wasn't the open workspace.
     const { onUndo } = mockToast.undoable.mock.calls[0][0];
     await onUndo();
-    expect(mockUnarchiveWorkspace).toHaveBeenCalledWith("archive-42");
+    expect(mockUnarchiveWorkspace).toHaveBeenCalledWith("archive-42", { select: false });
   });
 
   it("surfaces an error toast when archiving fails", async () => {

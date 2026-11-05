@@ -69,16 +69,32 @@ export function newChatReadiness(
 export function firstUsableProvider(
   off: ReadonlySet<AgentChatProviderKind> = disabledProviders(),
 ): AgentChatProviderKind | null {
+  const readiness = cachedNewChatReadiness(off);
+  return AUTOMATIC_PROVIDER_ORDER.find((p) => readiness(p) === "ready") ??
+    AUTOMATIC_PROVIDER_ORDER.find((p) => readiness(p) === "unverified") ??
+    null;
+}
+
+/** Whether `provider` is switched on and its cached health report says a
+ *  new chat can start on it (ready, or installed but unverified). */
+export function providerKnownUsable(
+  provider: AgentChatProviderKind,
+  off: ReadonlySet<AgentChatProviderKind> = disabledProviders(),
+): boolean {
+  const readiness = cachedNewChatReadiness(off)(provider);
+  return readiness === "ready" || readiness === "unverified";
+}
+
+/** New-chat readiness from the health and account caches; null when the
+ *  provider is off or has no usable probe answer. */
+function cachedNewChatReadiness(off: ReadonlySet<AgentChatProviderKind>) {
   const slots = useProviderHealth.getState().slots;
   const { accounts, defaults } = useProviderAccounts.getState();
-  const readiness = (provider: AgentChatProviderKind) => {
+  return (provider: AgentChatProviderKind): ProviderReadiness | null => {
     const slot = slots[provider];
     if (off.has(provider) || slot.lastProbeFailed || !slot.report) return null;
     return newChatReadiness(provider, slot.report, accounts, defaults);
   };
-  return AUTOMATIC_PROVIDER_ORDER.find((p) => readiness(p) === "ready") ??
-    AUTOMATIC_PROVIDER_ORDER.find((p) => readiness(p) === "unverified") ??
-    null;
 }
 
 export const NEW_CHAT_SETTING_KEYS = {

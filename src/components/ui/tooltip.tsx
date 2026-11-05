@@ -28,6 +28,22 @@ function Tooltip({
   return <TooltipPrimitive.Root data-slot="tooltip" {...props} />
 }
 
+/** Whether the last key pressed moves focus by navigation: Tab, or an arrow
+ *  key roving through a toolbar or list. Everything else that lands focus on
+ *  a control — a popup auto-focusing its first item after Enter or a
+ *  shortcut, a closing popup handing focus back after Esc or a click, a
+ *  shortcut jumping to a control — happens after some other key or a pointer
+ *  press, and only this tells the two apart. */
+let navigating = false
+if (typeof document !== "undefined") {
+  document.addEventListener("keydown", (event) => {
+    navigating = event.key === "Tab" || event.key.startsWith("Arrow")
+  }, true)
+  document.addEventListener("pointerdown", () => {
+    navigating = false
+  }, true)
+}
+
 function TooltipTrigger({
   onFocus,
   ...props
@@ -35,13 +51,17 @@ function TooltipTrigger({
   return (
     <TooltipPrimitive.Trigger
       data-slot="tooltip-trigger"
-      // Only keyboard focus opens a tooltip. A popover that moves focus into
-      // itself on a mouse click would otherwise pop a label over the content
-      // the user just opened. Radix skips its handler once default is prevented.
+      // Only focus the user moved there by navigating opens a tooltip. A popup
+      // that focuses its first item as it opens (from a click, Enter or a
+      // shortcut) would otherwise pop a label over the content just opened,
+      // and the first Esc would only dismiss that label; focus handed back by
+      // a closing menu, popover or dialog isn't the user arriving either.
+      // Radix skips its handler once default is prevented.
       onFocus={(event) => {
         onFocus?.(event)
         const target = event.currentTarget
-        if (target.ownerDocument.activeElement === target && !target.matches(":focus-visible")) {
+        if (target.ownerDocument.activeElement !== target) return
+        if (!navigating || !target.matches(":focus-visible")) {
           event.preventDefault()
         }
       }}

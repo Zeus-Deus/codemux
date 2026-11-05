@@ -70,7 +70,7 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
       )}
       {!denying ? (
         // Allow is the primary affirmative path, so promote it to the
-        // overlay-button token (bg-foreground text-background) — same
+        // `inverse` Button variant (foreground ink on canvas) — same
         // pattern PlanProposalBlock's "Accept & execute" uses. Keeps
         // the approval hierarchy obvious without reaching for accent
         // colour inside the conversation.
@@ -78,7 +78,7 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
           <Button
             type="button"
             size="sm"
-            className="bg-foreground text-background hover:bg-foreground/90"
+            variant="inverse"
             onClick={allow}
           >
             Allow

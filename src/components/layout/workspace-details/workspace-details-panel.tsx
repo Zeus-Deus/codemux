@@ -93,6 +93,7 @@ import {
 } from "@/lib/agent-chat/subagents";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { openExternalUrl } from "@/lib/open-url";
+import { currentFocus, restoreFocus } from "@/lib/focus-return";
 import { providerForWorkspace, providerRef } from "@/lib/source-control";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
@@ -268,10 +269,13 @@ export function WorkspaceDetailsHost({
   const setHosted = useUIStore((s) => s.setWorkspaceDetailsHosted);
   const contentRef = useRef<HTMLDivElement>(null);
   /** Set when the popover closes while focus is inside it (Escape, the
-   *  shortcut, a row that navigates): focus goes back to the toggle rather
-   *  than being dropped on <body>. A click elsewhere still moves focus to
-   *  wherever that click lands, after this runs. */
+   *  shortcut, a row that navigates): focus goes back where it was before the
+   *  popover opened rather than being dropped on <body>. A click elsewhere
+   *  still moves focus to wherever that click lands, after this runs. */
   const restoreFocusRef = useRef(false);
+  /** What had focus as the popover opened — the toggle after a click or
+   *  Enter, the composer after the shortcut. */
+  const focusOriginRef = useRef<HTMLElement | null>(null);
 
   // The toggle and its shortcut act on whichever form is showing.
   useEffect(() => {
@@ -291,6 +295,9 @@ export function WorkspaceDetailsHost({
   useEffect(
     () =>
       useUIStore.subscribe((state, prev) => {
+        if (!prev.workspaceDetailsPopoverOpen && state.workspaceDetailsPopoverOpen) {
+          focusOriginRef.current = currentFocus();
+        }
         if (prev.workspaceDetailsPopoverOpen && !state.workspaceDetailsPopoverOpen) {
           restoreFocusRef.current =
             contentRef.current?.contains(document.activeElement) ?? false;
@@ -347,10 +354,16 @@ export function WorkspaceDetailsHost({
         style={{ width }}
         onCloseAutoFocus={(e) => {
           e.preventDefault();
+          const origin = focusOriginRef.current;
           if (restoreFocusRef.current) {
-            document.querySelector<HTMLElement>(TOGGLE_SELECTOR)?.focus();
+            restoreFocus(
+              origin?.isConnected
+                ? origin
+                : document.querySelector<HTMLElement>(TOGGLE_SELECTOR),
+            );
           }
           restoreFocusRef.current = false;
+          focusOriginRef.current = null;
         }}
         // The toggle closes it itself; letting the outside-press close it
         // first would make that click reopen it.
@@ -387,7 +400,7 @@ export function WorkspaceDetailsToggle({ disabled = false }: { disabled?: boolea
     : agentsRunning
       ? "bg-status-working"
       : browserLive
-        ? "bg-status-remote"
+        ? "bg-status-monitoring"
         : null;
 
   return (

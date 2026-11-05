@@ -1081,9 +1081,25 @@ describe("chat-draft-store", () => {
         const draft = store.getOrCreateHomeDraft();
         store.updateDraftConfig(draft.draftId, { serviceTier: "default" }, { automatic: true });
 
-        settle(["claude", "codex"]);
+        settle(["claude"]);
         expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
           provider: "claude",
+          automaticProvider: true,
+        });
+      });
+
+      it("keeps a draft on a usable agent when a higher-ranked one answers later", () => {
+        // Opening the model picker probes every agent; Claude answering
+        // ready must not swap the Codex the composer already shows.
+        settle(["codex"]);
+        const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+        expect(draft).toMatchObject({ provider: "codex", automaticProvider: true });
+
+        settle(["claude", "codex"]);
+        expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+          provider: "codex",
+          model: draft.model,
+          permissionMode: draft.permissionMode,
           automaticProvider: true,
         });
       });

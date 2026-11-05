@@ -170,7 +170,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   const statusRef = useRef<TerminalStatusPayload>({
     session_id: sessionId,
     state: "starting",
-    message: "Starting shell...",
+    message: "Starting shell…",
     exit_code: null,
   });
   const statusOverlayRef = useRef<HTMLDivElement>(null);
@@ -306,7 +306,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     const p = el.querySelector("p");
     const code = el.querySelector<HTMLElement>(".status-meta");
     if (h2) h2.textContent = view.heading;
-    if (p) p.textContent = status.message ?? "Waiting for shell status...";
+    if (p) p.textContent = status.message ?? "Waiting for shell status…";
     if (code) {
       code.textContent = view.exitCode?.label ?? "";
       code.className = view.exitCode
@@ -1040,7 +1040,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       updateStatusOverlay({
         session_id: sid,
         state: "starting",
-        message: "Restarting shell...",
+        message: "Restarting shell…",
         exit_code: null,
       });
       try {
@@ -1422,7 +1422,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
           </div>
           <div className="px-5 py-4 space-y-3">
             <p className="text-body text-muted-foreground leading-relaxed">
-              {statusRef.current.message ?? "Waiting for shell status..."}
+              {statusRef.current.message ?? "Waiting for shell status…"}
             </p>
             <span
               className="status-meta inline-flex items-center rounded-sm px-1.5 py-0.5 text-label font-mono"

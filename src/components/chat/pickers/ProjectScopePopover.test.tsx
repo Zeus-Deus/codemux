@@ -150,7 +150,7 @@ describe("ProjectScopePopover", () => {
       activeProjectPath: null,
     });
     await user.click(screen.getByText("No project"));
-    const home = await screen.findByText("Home directory (~)");
+    const home = await screen.findByText("Home (~)");
     expect(home.closest("[data-checked]")).toHaveAttribute(
       "data-checked",
       "true",
@@ -163,7 +163,7 @@ describe("ProjectScopePopover", () => {
       const { onChangeTarget } = renderPopover();
       await user.click(screen.getByText("foo"));
       await screen.findByText("Run in");
-      await user.click(screen.getByText("Home directory (~)"));
+      await user.click(screen.getByText("Home (~)"));
       expect(onChangeTarget).toHaveBeenCalledWith({ kind: "home" });
     });
 
@@ -202,6 +202,53 @@ describe("ProjectScopePopover", () => {
         kind: "project",
         projectPath: "/projects/opened",
       });
+    });
+  });
+
+  describe("focus", () => {
+    /** The picker inside a landing that also holds the composer. */
+    function renderInLanding() {
+      const onChangeTarget = vi.fn();
+      render(
+        <div data-chat-landing>
+          <ProjectScopePopover
+            trigger={<button type="button">foo</button>}
+            onChangeTarget={onChangeTarget}
+            isHome={false}
+            activeProjectPath="/projects/foo"
+          />
+          <textarea data-composer-input aria-label="Message" />
+        </div>,
+      );
+      return { onChangeTarget };
+    }
+
+    it("hands focus to the landing composer after a choice", async () => {
+      const user = userEvent.setup();
+      renderInLanding();
+      await user.click(screen.getByText("foo"));
+      await screen.findByText("Run in");
+      await user.click(screen.getByText("Home (~)"));
+      await waitFor(() =>
+        expect(screen.getByRole("textbox", { name: "Message" })).toHaveFocus(),
+      );
+    });
+
+    it("returns focus to the trigger on Escape", async () => {
+      const user = userEvent.setup();
+      renderInLanding();
+      await user.click(screen.getByText("foo"));
+      await screen.findByText("Run in");
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.getByText("foo")).toHaveFocus());
+    });
+
+    it("names the picker and its search field", async () => {
+      const user = userEvent.setup();
+      renderInLanding();
+      await user.click(screen.getByText("foo"));
+      expect(await screen.findByRole("dialog", { name: "Choose project" })).toBeInTheDocument();
+      expect(screen.getByRole("combobox", { name: "Search projects" })).toBeInTheDocument();
     });
   });
 
@@ -261,7 +308,7 @@ describe("ProjectScopePopover", () => {
       await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
       expect(screen.getByText("codemux")).toBeInTheDocument();
       expect(screen.getByText("codemux-sitev2")).toBeInTheDocument();
-      expect(screen.queryByText("Home directory (~)")).toBeNull();
+      expect(screen.queryByText("Home (~)")).toBeNull();
     });
 
     it("switches to path matching once the query contains a slash", async () => {

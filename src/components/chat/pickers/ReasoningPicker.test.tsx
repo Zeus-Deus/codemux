@@ -341,6 +341,13 @@ describe("ReasoningPicker — dropdown structure", () => {
 });
 
 describe("ReasoningPicker — interaction", () => {
+  it("names its chooser by what it sets", async () => {
+    const user = userEvent.setup();
+    const { trigger } = renderPicker();
+    await user.click(trigger!);
+    expect(await screen.findByRole("dialog", { name: "Reasoning options" })).toBeInTheDocument();
+  });
+
   it("clicking an effort row fires onEffortChange with the level id", async () => {
     const user = userEvent.setup();
     const { trigger, onEffortChange } = renderPicker();

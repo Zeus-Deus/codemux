@@ -104,6 +104,7 @@ import type { ActivePillMode } from "./pickers/ModeTab";
 import { ProjectScopePopover } from "./pickers/ProjectScopePopover";
 import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
 import { cn } from "@/lib/utils";
+import { useMobileLayout } from "@/hooks/use-mobile-layout";
 
 import { CHAT_COLUMN } from "./chat-column";
 import { randomUUID } from "@/lib/uuid";
@@ -1442,15 +1443,6 @@ function DraftChatSurfaceInner({
     />
   );
 
-  // Design D10/D12 → Thread Scope: home drafts read "Message the
-  // agent…"; project / existing_workspace drafts keep the existing
-  // isDraft-derived default ("Describe what you want the agent to
-  // do…") by passing `undefined`.
-  // Once the first prompt is sent the docked composer already speaks for
-  // the live thread, so it takes the live pane's copy (no override).
-  const placeholderOverride =
-    draft.target.kind === "home" && !pending ? "Message the agent…" : undefined;
-
   const composerEl = (
     <Composer
       draft={draft.inputDraft}
@@ -1481,7 +1473,6 @@ function DraftChatSurfaceInner({
       // shows no resize at all.
       isDraft={!pending}
       focusOnMount={focusOnMount || focusComposerAfterSubmit}
-      placeholderOverride={placeholderOverride}
       showProviderPicker={true}
       showStopButton={false}
       errorMessage={draft.lastSendError}
@@ -1500,7 +1491,10 @@ function DraftChatSurfaceInner({
           />
         )
       }
-      belowComposerSlot={belowComposerSlot}
+      // Sent, the scope row leaves the way the live pane's context row
+      // does once a chat has a message: with it the card would stay open
+      // here, then fold to the pill on the hand-off.
+      belowComposerSlot={pending ? undefined : belowComposerSlot}
       mode={normalizedMode}
       stagedAttachments={stagedAttachments}
       onRemoveAttachment={(id) => {
@@ -1569,9 +1563,14 @@ function DraftChatSurfaceInner({
   // as picking it in the location control below the composer.
   // A draft that starts without a model (an automatic pick made before the
   // provider's catalog was known) waits for that catalog to choose one.
-  // Nothing else asks for it until a picker opens, so fetch it here; it
-  // shares the picker's single flight.
-  const waitingForCatalog = draft.bootstrapModel === true && !draft.model;
+  // So does a landing with no catalog at all (a first run): the access chip
+  // and model label would otherwise appear on the first picker open and
+  // shift the landing under the pointer. Nothing else asks for it until a
+  // picker opens, so fetch it here; it shares the picker's single flight.
+  // A persisted catalog skips this, keeping discovery intent-driven.
+  const waitingForCatalog =
+    (draft.bootstrapModel === true && !draft.model) ||
+    (draft.provider !== "acp" && !nativeCapabilities);
   useEffect(() => {
     if (waitingForCatalog) void refreshProviderCapabilitiesForIntent(draft.provider);
   }, [waitingForCatalog, draft.provider]);
@@ -1672,12 +1671,19 @@ function DraftPendingConversation({
     text: pending.text,
     images: pending.images.length > 0 ? pending.images : undefined,
   };
+  // The live pane sits inside a frame — the pane container's 1px padding
+  // plus the pane's 1px border on desktop, the border alone on a phone.
+  // Inset by the same amount, the docked composer and the sent bubble
+  // land where the pane will draw them, so the hand-off moves nothing.
+  const mobile = useMobileLayout();
   return (
-    <div className="flex h-full w-full flex-col">
+    <div className={cn("flex h-full w-full flex-col", mobile ? "p-px" : "p-0.5")}>
       {/* Both-edges gutter so the column stays concentric with the pane
           (and with the composer below) once this view can scroll. */}
       <div className="flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges]">
-        <div className={cn(CHAT_COLUMN, "flex flex-col gap-4 py-6")}>
+        {/* Fades in (opacity only) as the landing gives way, so the swap
+            reads as the composer settling rather than a cut. */}
+        <div className={cn(CHAT_COLUMN, "row-in flex flex-col gap-4 py-6")}>
           <UserMessage item={item} />
           <div
             className="flex items-center gap-[13px] pt-0.5"
@@ -1696,7 +1702,8 @@ function DraftPendingConversation({
         </div>
       </div>
       {/* The composer owns its own column rails (see chat-column.ts) and
-          its bottom gap, and AgentChatPane docks it flush the same way —
+          its bottom gap, and AgentChatPane docks it flush the same way. Sent,
+          it rests as the pane's does (the pill over its chin, no scope row),
           so the pill sits at the same height before and after the hand-off. */}
       {composer}
     </div>

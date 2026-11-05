@@ -93,7 +93,9 @@ const PILL_BASE = cn(
   "group/tab flex h-7 shrink-0 items-center gap-1 pl-1 pr-2.5 text-label transition-colors duration-150",
   BAND_CONTROL_RADIUS,
 );
-const PILL_ACTIVE = cn(BAND_ACTIVE_FILL, "text-foreground font-semibold");
+// One weight for both states: a bolder active label would change the pill's
+// width on every switch. The fill and full ink carry "active".
+const PILL_ACTIVE = cn(BAND_ACTIVE_FILL, "text-foreground font-medium");
 const PILL_INACTIVE =
   "font-medium text-muted-foreground hover:bg-muted/40 hover:text-foreground";
 // `order-first`: drawn leading but kept after the label in the DOM, so the
@@ -405,6 +407,10 @@ function TitleBarTab({
             <span className="max-w-[130px] truncate">{tab.title}</span>
             {tab.kind === "editor" && <EditorDirtyDot tabId={tab.tab_id} />}
             {status && <StatusIndicator status={status} />}
+            {/* An inactive chat tab keeps the active one's chevron slot,
+                unseen, so switching tabs only repaints: no pill changes
+                width and nothing to its right shifts. */}
+            {isChat && <ChevronDown className="invisible size-3 shrink-0" aria-hidden />}
           </button>
         )}
         <TabCloseButton

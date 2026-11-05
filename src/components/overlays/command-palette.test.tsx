@@ -1,7 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { Profiler } from "react";
+import { Profiler, StrictMode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import type { AuthUser } from "@/tauri/types";
@@ -450,6 +450,32 @@ describe("command palette — stable async sections", () => {
     expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", selected);
   });
 
+  it.each([false, true])("preserves a selected settings command when inbox hydration moves its group (StrictMode: %s)", async (strict) => {
+    useSidebarInboxStore.setState({ loaded: false });
+    let resolveInbox!: (raw: string | null) => void;
+    mocks.backend.dbGetUiState.mockImplementation(() => new Promise((resolve) => { resolveInbox = resolve; }));
+    mocks.app.appState = { active_workspace_id: "ws-1", pane_statuses: {}, workspaces: [
+      { workspace_id: "ws-1", title: "Settings migration", cwd: "/repo", surfaces: [], active_surface_id: "" },
+    ] };
+    const user = userEvent.setup();
+    const palette = <CommandPalette open onOpenChange={vi.fn()} />;
+    render(withClient(strict ? <StrictMode>{palette}</StrictMode> : palette));
+    await user.type(screen.getByRole("combobox"), "settings");
+    await user.keyboard("{End}");
+    expect(selectedValue()).toBe("cmd:settings:about");
+    const row = document.querySelector('[cmdk-item][aria-selected="true"]');
+
+    await act(async () => resolveInbox(null));
+    expect(screen.getAllByRole("option")[0]).toHaveAttribute("data-value", "ws:ws-1");
+    expect(selectedValue()).toBe("cmd:settings:about");
+    expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toBe(row);
+    // Enter runs after cmdk's scheduled item cleanup has had time to settle.
+    await user.keyboard("{Enter}");
+    expect(selectedValue()).toBe("cmd:settings:about");
+    expect(mocks.ui.setShowSettings).toHaveBeenCalledWith(true, "about");
+    expect(activateWorkspaceInteraction).not.toHaveBeenCalled();
+  });
+
   it("does not announce no matches for a path until inbox ordering is ready", async () => {
     useSidebarInboxStore.setState({ loaded: false });
     let resolveInbox!: (raw: string | null) => void;
@@ -804,6 +830,39 @@ describe("command palette — switching away from the current workspace", () => 
     mocks.ui.takeCommandPaletteQuery.mockReturnValue("here");
     renderPalette();
     expect(optionValues("ws:")[0]).toBe("ws:ws-here");
+  });
+});
+
+describe("command palette — group order", () => {
+  const groups = () =>
+    [...document.querySelectorAll("[data-palette-group]")].map((el) =>
+      el.getAttribute("data-palette-group"),
+    );
+  // Both match "sett" only as a subsequence.
+  const subsequenceHits = [
+    workspace("ws-a", "Fix the select tooltip"),
+    workspace("ws-b", "Speed up startup tests"),
+  ];
+  const seed = (workspaces: ReturnType<typeof workspace>[]) => {
+    mocks.app.appState = { active_workspace_id: "ws-a", pane_statuses: {}, workspaces };
+  };
+
+  it("puts commands first when only a command names the query by a word prefix", async () => {
+    seed(subsequenceHits);
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("sett");
+    renderPalette();
+    await waitFor(() => expect(groups()).toContain("Workspaces"));
+    const order = groups();
+    expect(order.indexOf("Commands")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("Commands")).toBeLessThan(order.indexOf("Workspaces"));
+  });
+
+  it("keeps workspaces first when one matches by a word prefix too", async () => {
+    seed([...subsequenceHits, workspace("ws-c", "Settle the sidebar spacing")]);
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("sett");
+    renderPalette();
+    await waitFor(() => expect(groups()).toContain("Workspaces"));
+    expect(groups()[0]).toBe("Workspaces");
   });
 });
 

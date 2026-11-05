@@ -95,7 +95,7 @@ describe("Composer", () => {
       onDraftChange,
     } as Partial<ComposerProps>);
 
-    fireEvent.click(getByRole("button", { name: "Attach" }));
+    fireEvent.click(getByRole("button", { name: "Add context or change mode" }));
     fireEvent.click(await findByText("Run on host…"));
 
     expect(onDelegateTask).toHaveBeenCalledOnce();
@@ -509,6 +509,14 @@ describe("Composer", () => {
       });
       fireEvent.click(getByRole("button", { name: "Leave Debug mode" }));
       expect(onModeRemove).toHaveBeenCalled();
+    });
+
+    it("leaving a mode from its tab hands the caret back to the message", () => {
+      const { getByRole } = renderComposer({ mode: "plan" });
+      const leave = getByRole("button", { name: "Leave Plan mode" });
+      leave.focus();
+      fireEvent.click(leave);
+      expect(document.activeElement?.tagName).toBe("TEXTAREA");
     });
   });
 

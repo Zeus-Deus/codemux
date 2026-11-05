@@ -179,6 +179,33 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
     expect(useUIStore.getState().showSettings).toBe(false);
   });
 
+  it("leaves Settings from its empty search field, but not from other fields", () => {
+    useUIStore.setState({ showSettings: true });
+    const search = document.createElement("input");
+    search.setAttribute("aria-label", "Search settings");
+    const other = document.createElement("input");
+    document.body.append(search, other);
+    const escapeFrom = (target: HTMLElement) => {
+      const event = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+      Object.defineProperty(event, "target", { value: target });
+      return event;
+    };
+    try {
+      other.focus();
+      expect(dispatch("closeOverlay", escapeFrom(other))).toBe(false);
+      search.value = "theme";
+      search.focus();
+      expect(dispatch("closeOverlay", escapeFrom(search))).toBe(false);
+      expect(useUIStore.getState().showSettings).toBe(true);
+      search.value = "";
+      expect(dispatch("closeOverlay", escapeFrom(search))).toBe(true);
+      expect(useUIStore.getState().showSettings).toBe(false);
+    } finally {
+      search.remove();
+      other.remove();
+    }
+  });
+
   it("returns false for an unknown actionId", () => {
     // Sanity check — dispatch should not swallow unrelated actions even when
     // state that closeOverlay cares about is set.

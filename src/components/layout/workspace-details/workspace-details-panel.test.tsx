@@ -566,6 +566,25 @@ describe("WorkspaceDetailsToggle — round-2 regressions", () => {
     expect(toggle).toHaveFocus();
   });
 
+  it("hands focus back to where the shortcut was pressed, not the toggle", async () => {
+    const composer = document.createElement("textarea");
+    document.body.append(composer);
+    try {
+      renderToggle({ columnWidth: 900 });
+      await flush();
+      composer.focus();
+      act(() => useUIStore.getState().toggleWorkspaceDetails());
+      const card = await screen.findByTestId("workspace-details-card");
+      await flush();
+      expect(card.contains(document.activeElement)).toBe(true);
+      await userEvent.keyboard("{Escape}");
+      expect(screen.queryByTestId("workspace-details-card")).toBeNull();
+      expect(composer).toHaveFocus();
+    } finally {
+      composer.remove();
+    }
+  });
+
   it("does not let a publish of the old branch mark the new branch published", async () => {
     let finishPublish!: () => void;
     mocks.gitPushChanges.mockImplementationOnce(
@@ -704,6 +723,6 @@ describe("WorkspaceDetailsToggle — issue and live rows", () => {
     renderToggle();
     expect(screen.queryByTestId("workspace-details-activity-dot")).toBeNull();
     await userEvent.click(screen.getByTestId("workspace-details-toggle"));
-    expect(screen.getByTestId("workspace-details-activity-dot")).toHaveClass("bg-status-remote");
+    expect(screen.getByTestId("workspace-details-activity-dot")).toHaveClass("bg-status-monitoring");
   });
 });

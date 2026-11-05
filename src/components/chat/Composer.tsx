@@ -505,6 +505,9 @@ export function nextFooterFit(
   return prev;
 }
 
+/** The `+` menu's MODES heading names the textarea's mode-cycle key. */
+const MODE_CYCLE_SHORTCUT = { MODES: "Shift+Tab" } as const;
+
 export function Composer({
   draft,
   readOnly = false,
@@ -2995,6 +2998,14 @@ export function Composer({
     sessionReady || sessionAwaitingIntent
       ? (placeholderOverride ?? placeholderForMode(mode, isDraft))
       : "Starting session…";
+  // The tab's leave button goes inert as the tab slides out, which would
+  // drop focus to the document. Leaving is a return to writing, so the
+  // caret moves to the message first. Only this explicit action does it:
+  // a mode cleared from anywhere else never steals focus.
+  const handleModeTabLeave = useCallback(() => {
+    textareaRef.current?.focus({ preventScroll: true });
+    onModeRemove();
+  }, [onModeRemove]);
   const handleGapPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       if (e.button !== 0) return;
@@ -3274,7 +3285,7 @@ export function Composer({
             docked above the card, so the stack reads tab → strip → card. */}
         <ModeTab
           mode={mode === "default" ? null : (mode as ActivePillMode)}
-          onRemove={onModeRemove}
+          onRemove={handleModeTabLeave}
         />
         {stripSlot ?? null}
         <div
@@ -3415,6 +3426,11 @@ export function Composer({
               onEscape={handleAttachEscape}
               footerNote={attachPopupFooter}
               submode={attachSubmode}
+              // Shift+Tab in the textarea cycles these modes; nothing
+              // else names that shortcut.
+              groupShortcuts={
+                configurationEnabled && provider !== "acp" ? MODE_CYCLE_SHORTCUT : undefined
+              }
               headerSlot={
                 footerLadder.configInMenu && provider !== "acp" && attachSubmode === "main" ? (
                   <>

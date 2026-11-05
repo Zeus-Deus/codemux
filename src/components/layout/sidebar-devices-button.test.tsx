@@ -99,7 +99,7 @@ describe("SidebarDevicesButton", () => {
     );
     await userEvent.hover(screen.getByTestId("sidebar-devices"));
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      "Devices — 2 online",
+      "Devices · 2 online",
     );
   });
 
@@ -128,7 +128,7 @@ describe("SidebarDevicesButton", () => {
     );
     await userEvent.hover(screen.getByTestId("sidebar-devices"));
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      "Devices — bypass-share-limit-owner diverged on zeus",
+      "Devices · bypass-share-limit-owner diverged on zeus",
     );
   });
 
@@ -145,7 +145,7 @@ describe("SidebarDevicesButton", () => {
     );
     await userEvent.hover(screen.getByTestId("sidebar-devices"));
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      "Devices — nas: codemux-remote is not installed",
+      "Devices · nas: codemux-remote is not installed",
     );
   });
 
@@ -161,7 +161,7 @@ describe("SidebarDevicesButton", () => {
     );
     await userEvent.hover(screen.getByTestId("sidebar-devices"));
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      "Devices — Pull failed: partpilot",
+      "Devices · Pull failed: partpilot",
     );
   });
 });

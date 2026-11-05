@@ -24,8 +24,6 @@ export const MIN_PASSWORD_LENGTH = 8;
 
 const linkButtonClass =
   "mt-4 text-label text-muted-foreground hover:text-foreground transition-colors duration-150";
-const primaryButtonClass =
-  "w-full bg-foreground text-background hover:bg-foreground/90";
 
 export function LoginScreen() {
   const isLoading = useAuthStore((s) => s.isLoading);
@@ -133,7 +131,8 @@ export function LoginScreen() {
           to verify your account.
         </p>
         <Button
-          className={primaryButtonClass}
+          variant="inverse"
+          className="w-full"
           size="lg"
           onClick={() => switchView("signin")}
         >
@@ -154,7 +153,8 @@ export function LoginScreen() {
               If that email exists, we sent a reset link.
             </p>
             <Button
-              className={primaryButtonClass}
+              variant="inverse"
+              className="w-full"
               size="lg"
               onClick={() => switchView("signin")}
             >
@@ -174,7 +174,8 @@ export function LoginScreen() {
             />
             <Button
               type="submit"
-              className={primaryButtonClass}
+              variant="inverse"
+              className="w-full"
               size="lg"
               disabled={resetLoading}
             >
@@ -277,7 +278,8 @@ export function LoginScreen() {
 
         <Button
           type="submit"
-          className={primaryButtonClass}
+          variant="inverse"
+          className="w-full"
           size="lg"
           disabled={isSigningIn}
         >
@@ -304,12 +306,9 @@ export function LoginScreen() {
             <Button
               // One filled button at a time: GitHub leads until the email
               // form or the ChatGPT card brings its own primary action.
-              variant={emailOpen || chatGptConnected ? "outline" : "default"}
+              variant={emailOpen || chatGptConnected ? "outline" : "inverse"}
               size="lg"
-              className={cn(
-                "w-full gap-2.5",
-                !emailOpen && !chatGptConnected && primaryButtonClass,
-              )}
+              className="w-full gap-2.5"
               onClick={() => void startOAuthFlow()}
               disabled={isSigningIn}
             >

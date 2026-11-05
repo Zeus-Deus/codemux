@@ -26,12 +26,15 @@ import type { TranscriptSlot } from "./transcript-slots";
  *  (short threads scroll fine on their own). */
 const TRAIL_MIN_TURNS = 3;
 /** Hard ceiling on rendered ticks; a very long thread downsamples to this
- *  (see `sampleTrailIndices`). */
-const TRAIL_MAX_TICKS = 60;
-/** Approx vertical space one tick (bar + hit-area padding + gap) occupies;
- *  the effective tick cap is derived from the measured rail height so the
- *  gutter never overflows on a short viewport. */
-const TICK_SLOT_PX = 10;
+ *  (see `sampleTrailIndices`). 24 ticks on 24px targets keep the rail about
+ *  as tall as a third of a laptop screen, a calm column rather than a ruler
+ *  down the whole pane. */
+const TRAIL_MAX_TICKS = 24;
+/** Height of one tick's hit target. Targets touch (no gap), so a pointer
+ *  resting anywhere on the rail lands on a turn, and a 24px target forgives
+ *  a small vertical miss. The effective tick cap is derived from the
+ *  measured rail height, so the gutter never overflows on a short viewport. */
+const TICK_SLOT_PX = 24;
 /** Top/bottom breathing room reserved inside the rail. */
 const RAIL_PAD_PX = 12;
 /** Desired viewport-relative offset of a jumped-to turn's top. */
@@ -299,7 +302,11 @@ const TrailRail = memo(function TrailRail({
       onMouseLeave={hidePreview}
       onBlur={hidePreview}
       onKeyDown={onRailKeyDown}
-      className="absolute inset-y-0 left-0 z-20 flex w-7 flex-col items-center justify-center gap-[1.5px] opacity-55 transition-opacity duration-150 group-hover/transcript-list:opacity-100"
+      // Hidden when the pane is too narrow to keep ~16px between the rail
+      // and the text column (53rem = the 760px column + a 44px gutter each
+      // side), e.g. with the right panel open. The container is the
+      // transcript wrapper in MessageList.
+      className="group/rail absolute inset-y-0 left-0 z-20 flex w-7 flex-col items-center justify-center @max-[53rem]/transcript:hidden"
     >
       {ticks.map((entryIndex, tickPosition) => {
         const entry = entries[entryIndex];
@@ -320,7 +327,7 @@ const TrailRail = memo(function TrailRail({
               setRovingPos(tickPosition);
               showPreview(entryIndex, e.currentTarget);
             }}
-            className="group/tick flex w-full items-center justify-center py-[3px]"
+            className="group/tick flex h-6 w-full shrink-0 items-center justify-center"
           >
             <span
               ref={(node) => {
@@ -329,8 +336,11 @@ const TrailRail = memo(function TrailRail({
               }}
               data-current="false"
               data-in-view="false"
+              // The marks dim, not the rail: the preview card is the rail's
+              // child and must stay fully opaque. A keyboard-focused rail
+              // lights up like a hovered one, and the focused tick widens.
               className={cn(
-                "h-0.5 rounded-full bg-muted-foreground/30 transition-[width,background-color] duration-150 data-[current=true]:bg-foreground/70 data-[in-view=true]:bg-foreground/90",
+                "h-0.5 rounded-full bg-muted-foreground/30 opacity-55 transition-[width,background-color,opacity] duration-150 group-hover/transcript-list:opacity-100 group-focus-within/rail:opacity-100 data-[current=true]:bg-foreground/70 data-[in-view=true]:bg-foreground/90 group-focus-visible/tick:w-6 group-focus-visible/tick:bg-foreground",
                 hoverDistance === 0
                   ? "w-6 bg-muted-foreground/75"
                   : hoverDistance === 1

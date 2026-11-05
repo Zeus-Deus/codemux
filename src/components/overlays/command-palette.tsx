@@ -173,6 +173,14 @@ const EMPTY_THEME_PAYLOADS: unknown[] = [];
 
 const RECENT_COMMANDS_KEY = "codemux.commandPalette.recentCommands";
 
+/** Whether some word of `text` starts with `needle` ("sett" → "Settings ·
+ *  General"), as opposed to the needle merely appearing as a subsequence. */
+function hasWordPrefix(text: string, needle: string): boolean {
+  const words = (value: string) => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const prefix = words(needle);
+  return prefix !== "" && ` ${words(text)}`.includes(` ${prefix}`);
+}
+
 function readRecentCommands(): string[] {
   try {
     const parsed: unknown = JSON.parse(window.localStorage.getItem(RECENT_COMMANDS_KEY) ?? "[]");
@@ -1071,6 +1079,21 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     shownProjects.length === 0 &&
     conversationRows.length === 0 &&
     matchedThemes.length + matchedThemeStudio.length === 0;
+  // Workspaces lead the results, except when the query names a command or a
+  // settings page by a word prefix ("sett" → Settings) and no workspace
+  // matches that way — then the workspace hits are only subsequence noise, and
+  // the command groups move up rather than sinking below them.
+  const commandsFirst =
+    searching &&
+    !commandsOnly &&
+    !query.pathMode &&
+    [...matchedCommands, ...settingsRows].some((row) =>
+      hasWordPrefix(row.command.label, query.needle),
+    ) &&
+    !shownWorkspaces.some((row) =>
+      hasWordPrefix(workspaceSearchText(row.workspace), query.needle),
+    );
+  const commandsLead = commandsFirst ? !themeResultsFirst : nothingBeforeCommands;
   const prEmpty = prsOnly
     ? prModeEmptyState({
         needle: query.needle,
@@ -1227,6 +1250,13 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     row.open();
   };
 
+  const hasThemeResults = matchedThemes.length + matchedThemeStudio.length > 0;
+  // Omit empty siblings so hydration inserts rows without moving commands.
+  // Moving them replays cmdk's registration cleanup in StrictMode.
+  const hasOtherResults =
+    shownWorkspaces.length + matchedPrs.length + shownRecent.length +
+    shownProjects.length + conversationRows.length > 0;
+
   const themeResults = (
     <Fragment>
       {matchedThemes.length + matchedThemeStudio.length > 0 && (
@@ -1235,7 +1265,8 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           count={`${matchedThemes.length}`}
           first={
             themeResultsFirst ||
-            (shownWorkspaces.length === 0 &&
+            (!commandsFirst &&
+              shownWorkspaces.length === 0 &&
               shownProjects.length === 0 &&
               conversationRows.length === 0)
           }
@@ -1251,6 +1282,56 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
       ))}
       {matchedThemeStudio.map((row) => (
         <ThemeStudioItemRow key={row.key} row={row} onSelect={() => openStudio(row)} />
+      ))}
+    </Fragment>
+  );
+
+  const commandResults = (
+    <Fragment>
+      {matchedWorkspaceCommands.length > 0 && (
+        <GroupHeader
+          label="This workspace"
+          count={`${matchedWorkspaceCommands.length}`}
+          first={commandsLead}
+        />
+      )}
+      {matchedWorkspaceCommands.map((row) => (
+        <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+      ))}
+      {matchedCoreCommands.length > 0 && (
+        <GroupHeader
+          label="Commands"
+          count={`${matchedCoreCommands.length}`}
+          first={commandsLead && matchedWorkspaceCommands.length === 0}
+        />
+      )}
+      {matchedCoreCommands.map((row) => (
+        <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+      ))}
+      {settingsRows.length > 0 && (
+        <GroupHeader
+          label="Settings pages"
+          count={`${settingsRows.length}`}
+          first={commandsLead && matchedWorkspaceCommands.length === 0 && matchedCoreCommands.length === 0}
+        />
+      )}
+      {settingsRows.map((row) => (
+        <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+      ))}
+      {matchedPluginCommands.length > 0 && (
+        <GroupHeader
+          label="Plugins"
+          count={`${matchedPluginCommands.length}`}
+          first={
+            commandsLead &&
+            matchedWorkspaceCommands.length === 0 &&
+            matchedCoreCommands.length === 0 &&
+            settingsRows.length === 0
+          }
+        />
+      )}
+      {matchedPluginCommands.map((row) => (
+        <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
       ))}
     </Fragment>
   );
@@ -1303,7 +1384,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             selectionIntentRef.current = false;
             setRawQuery(value);
           }}
-          placeholder={`Search workspaces, conversations, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
+          placeholder={`Search workspaces, conversations, commands… (${COMMAND_MODE_PREFIX} for commands)`}
           className="h-8 min-w-0 flex-1 bg-transparent text-body outline-none placeholder:text-subtle-foreground"
         />
         <Kbd>esc</Kbd>
@@ -1344,128 +1425,92 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             </div>
           )}
 
-          {themeResultsFirst && themeResults}
+          {/* Groups that change place (themes and commands move to the top
+              for some queries) render as keyed siblings of one array, so a
+              reorder moves their items instead of remounting them. A remount
+              lets cmdk reset the selection, so a highlighted command could be
+              swapped for a workspace when the inbox finishes loading. */}
+          {[
+            themeResultsFirst && hasThemeResults && <Fragment key="themes">{themeResults}</Fragment>,
+            commandsFirst && <Fragment key="commands">{commandResults}</Fragment>,
+            hasOtherResults && <Fragment key="results">
 
-          {shownWorkspaces.length > 0 && (
-            <GroupHeader
-              label="Workspaces"
-              count={groupCountLabel(shownWorkspaces.length, matchedWorkspaces.length)}
-              first={!themeResultsFirst}
-            />
-          )}
-          {shownWorkspaces.map((row) => (
-            <WorkspaceItem
-              key={row.key}
-              row={row}
-              now={now}
-              current={row.workspace.workspace_id === activeWorkspaceId}
-              onSelect={() => openWorkspace(row.workspace.workspace_id)}
-            />
-          ))}
+              {shownWorkspaces.length > 0 && (
+                <GroupHeader
+                  label="Workspaces"
+                  count={groupCountLabel(shownWorkspaces.length, matchedWorkspaces.length)}
+                  first={!themeResultsFirst && !commandsFirst}
+                />
+              )}
+              {shownWorkspaces.map((row) => (
+                <WorkspaceItem
+                  key={row.key}
+                  row={row}
+                  now={now}
+                  current={row.workspace.workspace_id === activeWorkspaceId}
+                  onSelect={() => openWorkspace(row.workspace.workspace_id)}
+                />
+              ))}
 
-          {matchedPrs.length > 0 && (
-            <GroupHeader label="Pull requests" count={`${matchedPrs.length}`} first />
-          )}
-          {matchedPrs.map((row) => (
-            <PrPaletteItem
-              key={row.key}
-              row={row.row}
-              onSelect={() => {
-                close();
-                useUIStore.getState().setShowPullRequests(true, {
-                  projectRoot: row.row.projectRoot,
-                  number: row.row.number,
-                });
-              }}
-            />
-          ))}
+              {matchedPrs.length > 0 && (
+                <GroupHeader label="Pull requests" count={`${matchedPrs.length}`} first />
+              )}
+              {matchedPrs.map((row) => (
+                <PrPaletteItem
+                  key={row.key}
+                  row={row.row}
+                  onSelect={() => {
+                    close();
+                    useUIStore.getState().setShowPullRequests(true, {
+                      projectRoot: row.row.projectRoot,
+                      number: row.row.number,
+                    });
+                  }}
+                />
+              ))}
 
-          {shownRecent.length > 0 && (
-            <GroupHeader
-              label="Recent"
-              count={`${shownRecent.length}`}
-              first={!themeResultsFirst && shownWorkspaces.length === 0}
-            />
-          )}
-          {shownRecent.map((row) => (
-            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
-          ))}
+              {shownRecent.length > 0 && (
+                <GroupHeader
+                  label="Recent"
+                  count={`${shownRecent.length}`}
+                  first={!themeResultsFirst && shownWorkspaces.length === 0}
+                />
+              )}
+              {shownRecent.map((row) => (
+                <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+              ))}
 
-          {shownProjects.length > 0 && (
-            <GroupHeader
-              label="Projects"
-              count={groupCountLabel(shownProjects.length, matchedProjects.length)}
-              first={nothingBeforeProjects}
-            />
-          )}
-          {shownProjects.map((row) => (
-            <ProjectItem key={row.key} row={row} homeDir={homeDir} onSelect={() => openProject(row)} />
-          ))}
+              {shownProjects.length > 0 && (
+                <GroupHeader
+                  label="Projects"
+                  count={groupCountLabel(shownProjects.length, matchedProjects.length)}
+                  first={nothingBeforeProjects && !commandsFirst}
+                />
+              )}
+              {shownProjects.map((row) => (
+                <ProjectItem key={row.key} row={row} homeDir={homeDir} onSelect={() => openProject(row)} />
+              ))}
 
-          {conversationRows.length > 0 && (
-            <GroupHeader
-              label="Conversations"
-              count={`${conversationRows.length}`}
-              first={nothingBeforeProjects && shownProjects.length === 0}
-            />
-          )}
-          {conversationRows.map((row) => (
-            <ConversationItem
-              key={`conversation:${row.thread_id}:${row.message_id ?? "title"}`}
-              row={row}
-              query={query.needle}
-              workspace={workspaces.find((workspace) => workspace.workspace_id === row.workspace_id)}
-              onSelect={() => openConversation(row)}
-            />
-          ))}
-
-          {!themeResultsFirst && themeResults}
-
-          {matchedWorkspaceCommands.length > 0 && (
-            <GroupHeader
-              label="This workspace"
-              count={`${matchedWorkspaceCommands.length}`}
-              first={nothingBeforeCommands}
-            />
-          )}
-          {matchedWorkspaceCommands.map((row) => (
-            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
-          ))}
-          {matchedCoreCommands.length > 0 && (
-            <GroupHeader
-              label="Commands"
-              count={`${matchedCoreCommands.length}`}
-              first={nothingBeforeCommands && matchedWorkspaceCommands.length === 0}
-            />
-          )}
-          {matchedCoreCommands.map((row) => (
-            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
-          ))}
-          {settingsRows.length > 0 && (
-            <GroupHeader
-              label="Settings pages"
-              count={`${settingsRows.length}`}
-              first={nothingBeforeCommands && matchedWorkspaceCommands.length === 0 && matchedCoreCommands.length === 0}
-            />
-          )}
-          {settingsRows.map((row) => (
-            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
-          ))}
-          {matchedPluginCommands.length > 0 && (
-            <GroupHeader
-              label="Plugins"
-              count={`${matchedPluginCommands.length}`}
-              first={
-                nothingBeforeCommands &&
-                matchedWorkspaceCommands.length === 0 &&
-                matchedCoreCommands.length === 0 &&
-                settingsRows.length === 0
-              }
-            />
-          )}
-          {matchedPluginCommands.map((row) => (
-            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
-          ))}
+              {conversationRows.length > 0 && (
+                <GroupHeader
+                  label="Conversations"
+                  count={`${conversationRows.length}`}
+                  first={nothingBeforeProjects && !commandsFirst && shownProjects.length === 0}
+                />
+              )}
+              {conversationRows.map((row) => (
+                <ConversationItem
+                  key={`conversation:${row.thread_id}:${row.message_id ?? "title"}`}
+                  row={row}
+                  query={query.needle}
+                  workspace={workspaces.find((workspace) => workspace.workspace_id === row.workspace_id)}
+                  onSelect={() => openConversation(row)}
+                />
+              ))}
+            </Fragment>,
+            !themeResultsFirst && hasThemeResults && <Fragment key="themes">{themeResults}</Fragment>,
+            !commandsFirst && <Fragment key="commands">{commandResults}</Fragment>,
+          ]}
         </CommandPrimitive.List>
         <ScrollEdgeFade edge="top" visible={edges.top} />
         <ScrollEdgeFade edge="bottom" visible={edges.bottom} />
