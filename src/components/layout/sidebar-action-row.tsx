@@ -163,7 +163,7 @@ export function SidebarHeaderActions() {
             size="icon"
             aria-label="Search"
             onClick={() => setShowCommandPalette(true)}
-            className="rounded-md text-muted-foreground"
+            className="text-muted-foreground"
           >
             <SearchIcon className="size-[15px]" />
           </Button>
@@ -179,7 +179,7 @@ export function SidebarHeaderActions() {
             size="icon"
             aria-label="New agent"
             onClick={handleNewAgent}
-            className="rounded-md text-muted-foreground"
+            className="text-muted-foreground"
           >
             <SquarePen className="size-[15px]" />
           </Button>
