@@ -173,6 +173,14 @@ const EMPTY_THEME_PAYLOADS: unknown[] = [];
 
 const RECENT_COMMANDS_KEY = "codemux.commandPalette.recentCommands";
 
+/** Whether some word of `text` starts with `needle` ("sett" → "Settings ·
+ *  General"), as opposed to the needle merely appearing as a subsequence. */
+function hasWordPrefix(text: string, needle: string): boolean {
+  const words = (value: string) => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const prefix = words(needle);
+  return prefix !== "" && ` ${words(text)}`.includes(` ${prefix}`);
+}
+
 function readRecentCommands(): string[] {
   try {
     const parsed: unknown = JSON.parse(window.localStorage.getItem(RECENT_COMMANDS_KEY) ?? "[]");
@@ -1071,6 +1079,21 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     shownProjects.length === 0 &&
     conversationRows.length === 0 &&
     matchedThemes.length + matchedThemeStudio.length === 0;
+  // Workspaces lead the results, except when the query names a command or a
+  // settings page by a word prefix ("sett" → Settings) and no workspace
+  // matches that way — then the workspace hits are only subsequence noise, and
+  // the command groups move up rather than sinking below them.
+  const commandsFirst =
+    searching &&
+    !commandsOnly &&
+    !query.pathMode &&
+    [...matchedCommands, ...settingsRows].some((row) =>
+      hasWordPrefix(row.command.label, query.needle),
+    ) &&
+    !shownWorkspaces.some((row) =>
+      hasWordPrefix(workspaceSearchText(row.workspace), query.needle),
+    );
+  const commandsLead = commandsFirst ? !themeResultsFirst : nothingBeforeCommands;
   const prEmpty = prsOnly
     ? prModeEmptyState({
         needle: query.needle,
@@ -1235,7 +1258,8 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           count={`${matchedThemes.length}`}
           first={
             themeResultsFirst ||
-            (shownWorkspaces.length === 0 &&
+            (!commandsFirst &&
+              shownWorkspaces.length === 0 &&
               shownProjects.length === 0 &&
               conversationRows.length === 0)
           }
@@ -1251,6 +1275,56 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
       ))}
       {matchedThemeStudio.map((row) => (
         <ThemeStudioItemRow key={row.key} row={row} onSelect={() => openStudio(row)} />
+      ))}
+    </Fragment>
+  );
+
+  const commandResults = (
+    <Fragment>
+      {matchedWorkspaceCommands.length > 0 && (
+        <GroupHeader
+          label="This workspace"
+          count={`${matchedWorkspaceCommands.length}`}
+          first={commandsLead}
+        />
+      )}
+      {matchedWorkspaceCommands.map((row) => (
+        <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+      ))}
+      {matchedCoreCommands.length > 0 && (
+        <GroupHeader
+          label="Commands"
+          count={`${matchedCoreCommands.length}`}
+          first={commandsLead && matchedWorkspaceCommands.length === 0}
+        />
+      )}
+      {matchedCoreCommands.map((row) => (
+        <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+      ))}
+      {settingsRows.length > 0 && (
+        <GroupHeader
+          label="Settings pages"
+          count={`${settingsRows.length}`}
+          first={commandsLead && matchedWorkspaceCommands.length === 0 && matchedCoreCommands.length === 0}
+        />
+      )}
+      {settingsRows.map((row) => (
+        <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+      ))}
+      {matchedPluginCommands.length > 0 && (
+        <GroupHeader
+          label="Plugins"
+          count={`${matchedPluginCommands.length}`}
+          first={
+            commandsLead &&
+            matchedWorkspaceCommands.length === 0 &&
+            matchedCoreCommands.length === 0 &&
+            settingsRows.length === 0
+          }
+        />
+      )}
+      {matchedPluginCommands.map((row) => (
+        <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
       ))}
     </Fragment>
   );
@@ -1303,7 +1377,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             selectionIntentRef.current = false;
             setRawQuery(value);
           }}
-          placeholder={`Search workspaces, conversations, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
+          placeholder={`Search workspaces, conversations, commands… (${COMMAND_MODE_PREFIX} for commands)`}
           className="h-8 min-w-0 flex-1 bg-transparent text-body outline-none placeholder:text-subtle-foreground"
         />
         <Kbd>esc</Kbd>
@@ -1346,11 +1420,13 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
 
           {themeResultsFirst && themeResults}
 
+          {commandsFirst && commandResults}
+
           {shownWorkspaces.length > 0 && (
             <GroupHeader
               label="Workspaces"
               count={groupCountLabel(shownWorkspaces.length, matchedWorkspaces.length)}
-              first={!themeResultsFirst}
+              first={!themeResultsFirst && !commandsFirst}
             />
           )}
           {shownWorkspaces.map((row) => (
@@ -1395,7 +1471,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <GroupHeader
               label="Projects"
               count={groupCountLabel(shownProjects.length, matchedProjects.length)}
-              first={nothingBeforeProjects}
+              first={nothingBeforeProjects && !commandsFirst}
             />
           )}
           {shownProjects.map((row) => (
@@ -1406,7 +1482,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <GroupHeader
               label="Conversations"
               count={`${conversationRows.length}`}
-              first={nothingBeforeProjects && shownProjects.length === 0}
+              first={nothingBeforeProjects && !commandsFirst && shownProjects.length === 0}
             />
           )}
           {conversationRows.map((row) => (
@@ -1421,51 +1497,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
 
           {!themeResultsFirst && themeResults}
 
-          {matchedWorkspaceCommands.length > 0 && (
-            <GroupHeader
-              label="This workspace"
-              count={`${matchedWorkspaceCommands.length}`}
-              first={nothingBeforeCommands}
-            />
-          )}
-          {matchedWorkspaceCommands.map((row) => (
-            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
-          ))}
-          {matchedCoreCommands.length > 0 && (
-            <GroupHeader
-              label="Commands"
-              count={`${matchedCoreCommands.length}`}
-              first={nothingBeforeCommands && matchedWorkspaceCommands.length === 0}
-            />
-          )}
-          {matchedCoreCommands.map((row) => (
-            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
-          ))}
-          {settingsRows.length > 0 && (
-            <GroupHeader
-              label="Settings pages"
-              count={`${settingsRows.length}`}
-              first={nothingBeforeCommands && matchedWorkspaceCommands.length === 0 && matchedCoreCommands.length === 0}
-            />
-          )}
-          {settingsRows.map((row) => (
-            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
-          ))}
-          {matchedPluginCommands.length > 0 && (
-            <GroupHeader
-              label="Plugins"
-              count={`${matchedPluginCommands.length}`}
-              first={
-                nothingBeforeCommands &&
-                matchedWorkspaceCommands.length === 0 &&
-                matchedCoreCommands.length === 0 &&
-                settingsRows.length === 0
-              }
-            />
-          )}
-          {matchedPluginCommands.map((row) => (
-            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
-          ))}
+          {!commandsFirst && commandResults}
         </CommandPrimitive.List>
         <ScrollEdgeFade edge="top" visible={edges.top} />
         <ScrollEdgeFade edge="bottom" visible={edges.bottom} />

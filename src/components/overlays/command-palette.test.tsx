@@ -807,6 +807,39 @@ describe("command palette — switching away from the current workspace", () => 
   });
 });
 
+describe("command palette — group order", () => {
+  const groups = () =>
+    [...document.querySelectorAll("[data-palette-group]")].map((el) =>
+      el.getAttribute("data-palette-group"),
+    );
+  // Both match "sett" only as a subsequence.
+  const subsequenceHits = [
+    workspace("ws-a", "Fix the select tooltip"),
+    workspace("ws-b", "Speed up startup tests"),
+  ];
+  const seed = (workspaces: ReturnType<typeof workspace>[]) => {
+    mocks.app.appState = { active_workspace_id: "ws-a", pane_statuses: {}, workspaces };
+  };
+
+  it("puts commands first when only a command names the query by a word prefix", async () => {
+    seed(subsequenceHits);
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("sett");
+    renderPalette();
+    await waitFor(() => expect(groups()).toContain("Workspaces"));
+    const order = groups();
+    expect(order.indexOf("Commands")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("Commands")).toBeLessThan(order.indexOf("Workspaces"));
+  });
+
+  it("keeps workspaces first when one matches by a word prefix too", async () => {
+    seed([...subsequenceHits, workspace("ws-c", "Settle the sidebar spacing")]);
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("sett");
+    renderPalette();
+    await waitFor(() => expect(groups()).toContain("Workspaces"));
+    expect(groups()[0]).toBe("Workspaces");
+  });
+});
+
 describe("command palette — command catalogue", () => {
   it("offers every window-level keybind action", () => {
     // Pure slot actions and the guards that exist only to swallow a key.
