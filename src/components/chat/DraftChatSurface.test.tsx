@@ -1623,7 +1623,7 @@ describe("DraftChatSurface", () => {
       expect(container.querySelector("h1")?.textContent).toBe(
         "What should we build in foo?",
       );
-      expect(getByRole("button", { name: "foo" })).toBeInTheDocument();
+      expect(getByRole("button", { name: "Project: foo" })).toBeInTheDocument();
       expect(lastProjectScopePopoverProps.current).toMatchObject({
         isHome: false,
         activeProjectPath: "/projects/foo",
@@ -1676,7 +1676,7 @@ describe("DraftChatSurface", () => {
         "What should we work on?",
       );
       expect(getByTestId("project-scope-popover-stub")).toContainElement(
-        getByRole("button", { name: "Home" }),
+        getByRole("button", { name: "Project: Home" }),
       );
       expect(lastProjectScopePopoverProps.current).toMatchObject({
         isHome: true,

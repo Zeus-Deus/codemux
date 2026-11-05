@@ -144,7 +144,7 @@ describe("ChatHomeLanding", () => {
         projectPicker={(trigger) => <span data-testid="picker">{trigger}</span>}
       />,
     );
-    const trigger = screen.getByRole("button", { name: "Home" });
+    const trigger = screen.getByRole("button", { name: "Project: Home" });
     expect(screen.getByTestId("picker")).toContainElement(trigger);
     // Under the heading, not inside it.
     expect(trigger.closest("h1")).toBeNull();
@@ -190,7 +190,7 @@ describe("ChatHomeLanding", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "or start in Home" }),
     );
-    expect(screen.getByRole("button", { name: "Home" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Project: Home" })).toHaveFocus();
   });
 
   it("names the project through the picker and offers to drop it", () => {
@@ -207,7 +207,7 @@ describe("ChatHomeLanding", () => {
     expect(container.querySelector("h1")?.textContent).toBe(
       "What should we build in codemux?",
     );
-    const name = screen.getByRole("button", { name: "codemux" });
+    const name = screen.getByRole("button", { name: "Project: codemux" });
     expect(screen.getByTestId("picker")).toContainElement(name);
     fireEvent.click(
       screen.getByRole("button", { name: "or start in Home" }),
@@ -224,7 +224,7 @@ describe("ChatHomeLanding", () => {
       />,
     );
     expect(screen.getByTestId("project-picker-hint")).toHaveAttribute("aria-hidden");
-    fireEvent.click(screen.getByRole("button", { name: "codemux" }));
+    fireEvent.click(screen.getByRole("button", { name: "Project: codemux" }));
     expect(screen.queryByTestId("project-picker-hint")).toBeNull();
     expect(useProjectPickerHintStore.getState().seen).toBe(true);
     // Stays gone on the no-project picker too.
