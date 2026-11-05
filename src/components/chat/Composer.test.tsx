@@ -95,7 +95,7 @@ describe("Composer", () => {
       onDraftChange,
     } as Partial<ComposerProps>);
 
-    fireEvent.click(getByRole("button", { name: "Attach" }));
+    fireEvent.click(getByRole("button", { name: "Add context or change mode" }));
     fireEvent.click(await findByText("Run on host…"));
 
     expect(onDelegateTask).toHaveBeenCalledOnce();

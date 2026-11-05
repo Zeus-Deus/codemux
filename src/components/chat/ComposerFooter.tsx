@@ -52,6 +52,10 @@ const DELIVERY_SEND_TITLE: Record<MessageDelivery, string> = {
 
 const ROUND_CONTROL = COMPOSER_ROUND_CONTROL;
 
+/** The `+` menu adds context (files, folders, issues, images) and switches
+ *  modes; its name and tooltip say both, on every device. */
+const ATTACH_LABEL = "Add context or change mode";
+
 /** The footer's tooltip, placed like the context meter's. The app Tooltip
  *  rather than a native `title`, so sweeping along the row opens each label
  *  at once after the first instead of waiting out the OS delay on every
@@ -224,13 +228,16 @@ export function ComposerFooter({
       data-collapsed={collapsed || undefined}
       className={cn(
         "flex h-[42px] shrink-0 items-center gap-1 pr-1",
-        // Expanded, the first trigger's icon lines up with the textarea's
-        // text (20px), less the trigger's own 8px padding.
-        collapsed ? "pl-1" : "pl-3",
+        // Expanded, the first trigger sits where it does in the chin (the
+        // chin's 20px inset plus its 4px padding), so unfolding moves the
+        // model pill straight down instead of sideways.
+        collapsed ? "pl-1" : "pl-6",
       )}
     >
+      {/* The settings and the ring appear when the card unfolds; they fade
+          in (opacity only) so the swap from the chin reads as one move. */}
       {!collapsed && (
-        <div className="flex min-w-0 items-center">
+        <div className="row-in flex min-w-0 items-center">
           <ComposerSettings
             hermesThreadId={hermesThreadId}
             hermesProjectPath={hermesProjectPath}
@@ -282,7 +289,7 @@ export function ComposerFooter({
             clicks must not fall through to the gap's focus handler. */}
         {!collapsed && (
           <div
-            className="flex shrink-0 items-center"
+            className="row-in flex shrink-0 items-center"
             onPointerDown={(e) => e.stopPropagation()}
           >
             <ContextUsageMeter
@@ -300,7 +307,7 @@ export function ComposerFooter({
         )}
         {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} iconOnly={accessIconOnly} />}
         {onAttachClick && (
-          <FooterTooltip label="Attach (file, folder, mode, …)">
+          <FooterTooltip label={ATTACH_LABEL}>
           <button
             type="button"
             onClick={onAttachClick}
@@ -313,7 +320,7 @@ export function ComposerFooter({
               "data-[open=true]:bg-accent-ember/15 data-[open=true]:text-accent-ember data-[open=true]:hover:bg-accent-ember/15 data-[open=true]:hover:text-accent-ember",
               "disabled:opacity-40 disabled:pointer-events-none",
             )}
-            aria-label="Attach"
+            aria-label={ATTACH_LABEL}
             aria-expanded={attachOpen}
           >
             <Plus className="size-4" />

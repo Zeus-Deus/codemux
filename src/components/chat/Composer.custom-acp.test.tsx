@@ -402,9 +402,9 @@ it.each([360, 800])("hides conventional ACP controls at %ipx while retaining adv
   const p = props();
   render(<TooltipProvider><Composer {...p} model={model.id} activeModel={model} effort="low" /></TooltipProvider>);
   await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
-  fireEvent.click(screen.getByRole("button", { name: "Attach" }));
+  fireEvent.click(screen.getByRole("button", { name: "Add context or change mode" }));
   expect(screen.queryByRole("button", { name: /^Reasoning:/ })).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Attach" }));
+  fireEvent.click(screen.getByRole("button", { name: "Add context or change mode" }));
   fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
   fireEvent.change(await screen.findByLabelText("Agent reasoning"), { target: { value: "ultrathink" } });
   await waitFor(() => expect(invoke).toHaveBeenCalledWith("acp_set_config", { threadId: "draft-thread", configId: " exact effort /ID ", value: "ultrathink" }));
@@ -415,7 +415,7 @@ it("retains conventional native reasoning in a narrow attach menu", () => {
   const model = { id: "native", label: "Native", description: null, effort_levels: ["low", "high"], default_effort: "low", prompt_injected_effort_levels: [], context_window_options: [], supports_adaptive_thinking: false, supports_thinking_toggle: false, supports_fast_mode: false, supports_images: false, sub_provider: null, is_free: false };
   const p = props();
   render(<TooltipProvider><Composer {...p} provider="claude" activeModel={model} effort="low" /></TooltipProvider>);
-  fireEvent.click(screen.getByRole("button", { name: "Attach" }));
+  fireEvent.click(screen.getByRole("button", { name: "Add context or change mode" }));
   fireEvent.click(screen.getByRole("button", { name: /^Reasoning:/ }));
   fireEvent.click(screen.getByRole("option", { name: /high/ }));
   expect(p.onEffortChange).toHaveBeenCalledWith("high");
