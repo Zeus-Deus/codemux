@@ -1210,7 +1210,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="start"
-        className="w-[206px] rounded-lg p-[5px] [&_[role=menuitem]]:whitespace-nowrap"
+        className="w-auto min-w-[206px] rounded-lg p-[5px] [&_[role=menuitem]]:whitespace-nowrap"
       >
         <DropdownMenuLabel className={cn(MENU_SECTION_LABEL, "px-[9px]")}>
           Open pane

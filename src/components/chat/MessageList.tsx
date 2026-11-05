@@ -1637,7 +1637,12 @@ export const MessageList = memo(function MessageList({
         />
       )}
       {!mobile && (
-        <MessageTrail slots={slots} listRef={listRef} topInset={topInset} />
+        <MessageTrail
+          slots={slots}
+          listRef={listRef}
+          topInset={topInset}
+          onNavigate={cancelFollowForUserNavigation}
+        />
       )}
       <LegendList<TranscriptSlot>
         ref={listRef}

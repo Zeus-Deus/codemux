@@ -11,6 +11,7 @@ import { MessageTrail } from "./MessageTrail";
 import { buildTranscriptSlots } from "./transcript-slots";
 
 const scrollToIndex = vi.fn(() => Promise.resolve());
+const onNavigate = vi.fn();
 let viewport: HTMLDivElement;
 let listRef: React.RefObject<LegendListRef | null>;
 let scrollTop = 0;
@@ -37,6 +38,7 @@ function resize(target: Element) {
 afterEach(() => {
   cleanup();
   scrollToIndex.mockClear();
+  onNavigate.mockClear();
   resizeObservers.length = 0;
 });
 
@@ -89,7 +91,9 @@ function renderTrail(messages: ChatViewItem[]) {
       scrollToIndex,
     } as unknown as LegendListRef,
   };
-  return render(<MessageTrail slots={slots} listRef={listRef} />);
+  return render(
+    <MessageTrail slots={slots} listRef={listRef} onNavigate={onNavigate} />,
+  );
 }
 
 describe("MessageTrail", () => {
@@ -136,6 +140,12 @@ describe("MessageTrail", () => {
     renderTrail(turns(4));
     fireEvent.click(
       screen.getByRole("button", { name: /Jump to turn 2:/ }),
+    );
+    // The list releases live-follow first, or its end pin reclaims the
+    // viewport the moment the jump lands.
+    expect(onNavigate).toHaveBeenCalledTimes(1);
+    expect(onNavigate.mock.invocationCallOrder[0]).toBeLessThan(
+      scrollToIndex.mock.invocationCallOrder[0],
     );
     expect(scrollToIndex).toHaveBeenCalledWith({
       index: 2,

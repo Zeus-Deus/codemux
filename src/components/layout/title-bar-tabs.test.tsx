@@ -250,7 +250,7 @@ describe("TitleBarTabs drag-to-reorder", () => {
   it("keeps the close button working and never starts a drag from it", () => {
     const { pillFor } = renderThreeTabs();
     const pill = pillFor("term-a");
-    const closeBtn = pill.querySelector('[aria-label="Close tab"]') as HTMLElement;
+    const closeBtn = pill.querySelector('[aria-label^="Close "]') as HTMLElement;
 
     fireEvent.pointerDown(closeBtn, { pointerId: 1, button: 0, clientX: 5, clientY: 14 });
     fireEvent.pointerMove(document, { pointerId: 1, clientX: 260, clientY: 14 });
@@ -689,7 +689,7 @@ describe("TitleBarTabs overflow", () => {
   it("turns the tab's leading icon into its close button", () => {
     render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
     const pill = screen.getByText("term-b").closest("[data-tab-id]") as HTMLElement;
-    const close = within(pill).getByRole("button", { name: "Close tab" });
+    const close = within(pill).getByRole("button", { name: /^Close / });
     // Drawn leading, but the label stays the pill's first button.
     expect(pill.querySelector("button")).toHaveAttribute("title", "term-b");
     expect(close).toHaveClass("order-first");

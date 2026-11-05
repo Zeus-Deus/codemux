@@ -56,17 +56,26 @@ export const MessageTrail = memo(function MessageTrail({
   slots,
   listRef,
   topInset = 0,
+  onNavigate,
 }: {
   slots: TranscriptSlot[];
   listRef: React.RefObject<LegendListRef | null>;
   /** Chrome floating over the viewport's top edge; jumps land below it. */
   topInset?: number;
+  /** Called just before a jump, so the list can hand the viewport to the
+   *  reader; otherwise live-follow pins it straight back to the tail. */
+  onNavigate?: () => void;
 }) {
   const entries = useMemo(() => buildTrailEntries(slots), [slots]);
 
   if (entries.length < TRAIL_MIN_TURNS) return null;
   return (
-    <TrailRail entries={entries} listRef={listRef} topInset={topInset} />
+    <TrailRail
+      entries={entries}
+      listRef={listRef}
+      topInset={topInset}
+      onNavigate={onNavigate}
+    />
   );
 });
 
@@ -74,10 +83,12 @@ const TrailRail = memo(function TrailRail({
   entries,
   listRef,
   topInset,
+  onNavigate,
 }: {
   entries: TrailEntry[];
   listRef: React.RefObject<LegendListRef | null>;
   topInset: number;
+  onNavigate?: () => void;
 }) {
   const railRef = useRef<HTMLElement | null>(null);
   const tickRefs = useRef(new Map<number, HTMLSpanElement>());
@@ -238,6 +249,7 @@ const TrailRail = memo(function TrailRail({
 
   const jumpTo = useCallback(
     (slotIndex: number) => {
+      onNavigate?.();
       void listRef.current?.scrollToIndex({
         index: slotIndex,
         animated: false,
@@ -245,7 +257,7 @@ const TrailRail = memo(function TrailRail({
         viewOffset: SCROLL_MARGIN_PX + topInset,
       });
     },
-    [listRef, topInset],
+    [listRef, topInset, onNavigate],
   );
 
   // Roving tab stop: the rail is one Tab stop, arrows move between turns.
