@@ -255,6 +255,28 @@ const IS_MAC =
   typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
 const JUMP_MOD_LABEL = IS_MAC ? "⌘" : "Ctrl+";
 
+/** Room the composer row's flexible gap keeps once the reveal has taken its
+ *  share: the footer's minimum gap, so its fit ladder never steps. */
+const REVEAL_GAP_FLOOR_PX = 96;
+
+/** Whether the pill's hover reveal can open without covering or squeezing
+ *  a neighbour. Alone in its row it overlays the free space beside it;
+ *  with neighbours it grows in flow, which the row's nearest flexible gap
+ *  (a following sibling of the pill or of one of its wrappers) must
+ *  absorb. */
+function revealFits(trigger: HTMLElement, revealWidth: number): boolean {
+  if (trigger.parentElement?.childElementCount === 1) return true;
+  let el: HTMLElement | null = trigger;
+  for (let depth = 0; el && depth < 3; depth++, el = el.parentElement) {
+    for (let sib = el.nextElementSibling; sib; sib = sib.nextElementSibling) {
+      if (parseFloat(getComputedStyle(sib).flexGrow) > 0) {
+        return sib.getBoundingClientRect().width - REVEAL_GAP_FLOOR_PX >= revealWidth;
+      }
+    }
+  }
+  return false;
+}
+
 export function MultiProviderModelPicker({
   hermesThreadId, hermesProjectPath, customAgentsAllowed = true,
   provider,
@@ -593,22 +615,27 @@ export function MultiProviderModelPicker({
   const [listNode, setListNode] = useState<HTMLDivElement | null>(null);
   const listEdges = useScrollEdges(listNode);
   const showReveal = !iconOnly && !leafLabel && triggerReveal !== "";
-  // The reveal's natural width. The pill grows by exactly this and pulls
-  // the matching margin in by the same amount, so its layout footprint
-  // never changes: the footer and context-row fit ladders don't re-fit
-  // under the pointer, and the pill opens over the free space beside it.
-  // As the first control in its row (the footer and the chin) it grows
-  // right, since the row's clipped edge sits just left of it; elsewhere
-  // it grows left.
+  // The reveal's natural width. Alone in its row (the chin) the pill grows
+  // right by exactly this and pulls its margin in by the same amount, so
+  // its footprint never changes and it opens over the free space beside
+  // it. With neighbours it grows in flow instead, so they slide along
+  // rather than being covered — and only when the row's flexible gap can
+  // absorb it, so the fit ladders never re-fit under the pointer. Without
+  // room there is no reveal; the tooltip names the model instead.
   const revealRef = useRef<HTMLSpanElement | null>(null);
   const [revealWidth, setRevealWidth] = useState(0);
   useLayoutEffect(() => {
     setRevealWidth(showReveal ? (revealRef.current?.scrollWidth ?? 0) : 0);
   }, [showReveal, triggerReveal]);
+  const [revealOn, setRevealOn] = useState(false);
+  const measureReveal = (e: { currentTarget: HTMLElement }) => {
+    if (showReveal) setRevealOn(revealFits(e.currentTarget, revealWidth));
+  };
+  const revealing = showReveal && revealOn;
 
   return (
     <Popover open={open} onOpenChange={(v) => !disabled && setOpen(v)}>
-      <Tooltip open={!showReveal && tooltipOpen && !open} onOpenChange={setTooltipOpen}>
+      <Tooltip open={!revealing && tooltipOpen && !open} onOpenChange={setTooltipOpen}>
         {/* Popover outside the tooltip: Radix spreads incoming props
             after its own `data-state`, so the outer trigger's state is the
             one the button keeps, and the reveal and open styling key on
@@ -633,11 +660,10 @@ export function MultiProviderModelPicker({
                     ),
                 showReveal && [
                   "relative z-10 transition-[color,background-color,margin] duration-150 ease-out motion-reduce:transition-none",
-                  "not-first:hover:-ml-(--model-reveal-w) not-first:focus-visible:-ml-(--model-reveal-w) not-first:data-[state=open]:-ml-(--model-reveal-w)",
-                  "first:hover:-mr-(--model-reveal-w) first:focus-visible:-mr-(--model-reveal-w) first:data-[state=open]:-mr-(--model-reveal-w)",
-                  // Opaque, so the open pill covers what it overlaps (with
-                  // the picker open too): the hover tint over the surface
-                  // the pill sits on.
+                  "only:hover:-mr-(--model-reveal-w) only:focus-visible:-mr-(--model-reveal-w) only:data-[state=open]:-mr-(--model-reveal-w)",
+                  // Opaque, so the open pill covers the free space it
+                  // overlaps (with the picker open too): the hover tint
+                  // over the surface the pill sits on.
                   inContextRow
                     ? "hover:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_20%,var(--background)))] focus-visible:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_20%,var(--background)))] data-[state=open]:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_20%,var(--background)))]"
                     : "hover:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_40%,var(--background)))] focus-visible:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_40%,var(--background)))] data-[state=open]:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_40%,var(--background)))]",
@@ -649,6 +675,8 @@ export function MultiProviderModelPicker({
                   : undefined
               }
               aria-label={iconOnly ? `Model: ${triggerLabel}` : undefined}
+              onPointerEnter={measureReveal}
+              onFocus={measureReveal}
             >
               {currentAccount ? (
                 <span className="relative mr-1 inline-flex shrink-0">
@@ -667,9 +695,11 @@ export function MultiProviderModelPicker({
                         data-testid="multi-provider-model-picker-reveal"
                         className={cn(
                           "inline-flex w-0 shrink-0 overflow-hidden whitespace-nowrap opacity-0 transition-[width,opacity] duration-150 ease-out motion-reduce:transition-none",
-                          "group-hover/model:w-(--model-reveal-w) group-hover/model:opacity-70",
-                          "group-focus-visible/model:w-(--model-reveal-w) group-focus-visible/model:opacity-70",
-                          "group-data-[state=open]/model:w-(--model-reveal-w) group-data-[state=open]/model:opacity-70",
+                          revealOn && [
+                            "group-hover/model:w-(--model-reveal-w) group-hover/model:opacity-70",
+                            "group-focus-visible/model:w-(--model-reveal-w) group-focus-visible/model:opacity-70",
+                            "group-data-[state=open]/model:w-(--model-reveal-w) group-data-[state=open]/model:opacity-70",
+                          ],
                         )}
                       >
                         {triggerReveal}

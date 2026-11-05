@@ -261,6 +261,46 @@ describe("MultiProviderModelPicker — trigger", () => {
     expect(screen.queryByRole("tooltip")).toBeNull();
   });
 
+  it("reveals beside a neighbour only when the row's gap can absorb it", () => {
+    // Beside the access chip the reveal grows in flow (never over the
+    // chip), so it needs room in the row's flexible gap; without it the
+    // tooltip names the model instead.
+    const row = (gapWidth: number) => (
+      <div style={{ display: "flex" }}>
+        <div>
+          <MultiProviderModelPicker
+            provider="opencode"
+            model="openai/gpt-5"
+            onProviderModelChange={vi.fn()}
+          />
+          <button type="button">Full access</button>
+        </div>
+        <div
+          data-testid="gap"
+          style={{ flexGrow: 1 }}
+          ref={(el) => {
+            if (el) el.getBoundingClientRect = () => ({ width: gapWidth }) as DOMRect;
+          }}
+        />
+      </div>
+    );
+    const { rerender } = render(row(20));
+    const trigger = screen.getByTestId("multi-provider-model-picker-trigger");
+    // The footprint-keeping overlay is for a pill alone in its row only.
+    expect(trigger.className).not.toMatch(/(^|\s)(?!only:)[\w:-]*-m[lr]-\(--model-reveal-w\)/);
+    fireEvent.focus(trigger);
+    expect(screen.getByRole("tooltip")).toBeInTheDocument();
+    expect(screen.getByTestId("multi-provider-model-picker-reveal").className)
+      .not.toContain("group-focus-visible/model:w-(--model-reveal-w)");
+
+    rerender(row(400));
+    fireEvent.blur(trigger);
+    fireEvent.focus(trigger);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(screen.getByTestId("multi-provider-model-picker-reveal"))
+      .toHaveClass("group-focus-visible/model:w-(--model-reveal-w)");
+  });
+
   it("reveals in the context row without a tooltip", () => {
     renderPicker({ provider: "opencode", model: "openai/gpt-5", placement: "context-row" });
     expect(screen.getByTestId("multi-provider-model-picker-reveal")).toHaveTextContent(/^openai·$/);
