@@ -147,7 +147,11 @@ pub(crate) async fn run_resolver_cli(
 ) -> Result<Output, ResolverRunError> {
     // The resolver runs an agent CLI with permissions skipped, so it and its
     // tools are agent processes to the control socket.
-    let child = crate::execution::host_command_tokio(program)
+    let mut command = crate::execution::host_command_tokio(program);
+    if program == "claude" {
+        crate::claude_env::apply_claude_cli_env(&mut command, repo_path);
+    }
+    let child = command
         .args(args)
         .current_dir(repo_path)
         .env(crate::control_identity::AGENT_PROCESS_ENV, "resolver")

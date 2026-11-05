@@ -43,18 +43,20 @@ export function cliSignedOut(report: ProviderHealthReport): boolean {
   return providerReadiness(report) === "not_ready" && !!report.login_command;
 }
 
-/** `providerReadiness`, counting the account new chats on `provider` start
- *  on: a CLI signed out of its own login still runs a chat on a signed-in
- *  extra account set as the default. Until the account list loads
- *  (`accounts` null) the probe's answer stands. */
+/** Readiness of the account new chats actually start on. Extra accounts
+ *  replace the CLI's sign-in in either direction, but cannot repair a
+ *  missing or broken CLI. Until accounts load, the probe's answer stands. */
 export function newChatReadiness(
   provider: AgentChatProviderKind,
   report: ProviderHealthReport,
   accounts: ProviderAccount[] | null,
   defaults: Record<string, string>,
 ): ProviderReadiness {
-  if (!accounts || !cliSignedOut(report)) return providerReadiness(report);
+  const readiness = providerReadiness(report);
+  if (!accounts || readiness === "not_installed" ||
+      (readiness === "not_ready" && !cliSignedOut(report))) return readiness;
   const signedIn = defaultAccountSignedIn(accounts, defaults, provider);
+  if (signedIn === undefined) return readiness;
   return signedIn === true ? "ready" : signedIn === null ? "unverified" : "not_ready";
 }
 

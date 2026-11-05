@@ -9,6 +9,7 @@ import { ProviderAccountsSettings } from "./provider-accounts-settings";
 import { AccountsSection } from "./usage-accounts";
 import { parseQuotaKey } from "./usage-filter";
 import { startsOnSignedInAccount, useProviderAccounts, withAccountPick } from "@/stores/provider-accounts-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 
 const account = (over: Partial<ProviderAccount>): ProviderAccount => ({
   id: "default",
@@ -102,6 +103,27 @@ it("a pick for a chat that has not started rides along on its start, for its pro
   expect(withAccountPick("claude", { ...input, thread_id: "other" })).toEqual({ ...input, thread_id: "other" });
   // The draft switched to Codex: the Claude pick does not follow it.
   expect(withAccountPick("codex", input)).toEqual(input);
+});
+
+it("shows the extra account's sign-in terminal and preserves the setup draft", async () => {
+  const drafts = useChatDraftStore.getState();
+  const draft = drafts.getOrCreateHomeDraft();
+  drafts.updateDraftInput(draft.draftId, "Test setup draft");
+  drafts.setActiveDraft(draft.draftId);
+  const base = invoke.getMockImplementation()!;
+  let draftAtActivation: string | null = "unset";
+  invoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+    if (cmd === "get_or_create_home_workspace") return "home-setup";
+    if (cmd === "activate_workspace") draftAtActivation = useChatDraftStore.getState().activeDraftId;
+    return base(cmd, args);
+  });
+  render(<ProviderAccountsSettings provider="claude" />);
+  await screen.findByText("Work");
+  fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("activate_workspace", { workspaceId: "home-setup" }));
+  expect(invoke).toHaveBeenCalledWith("provider_account_open_sign_in", { workspaceId: "home-setup", accountId: "claude-work-1" });
+  expect(draftAtActivation).toBeNull();
+  expect(useChatDraftStore.getState().draftsById[draft.draftId].inputDraft).toBe("Test setup draft");
 });
 
 it("quota keys split into provider and account", () => {

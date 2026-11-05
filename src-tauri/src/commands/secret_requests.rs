@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::watch;
 
+use crate::agent_provider::{ProviderRuntimeEvent, SessionStatus};
 use crate::mcp::registry::{HostCaller, HostTools};
 use crate::mcp::runtime::{prefix_tool_name, McpTool};
 use crate::state::AppStateStore;
@@ -356,6 +357,22 @@ pub fn stop_thread<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
     }
 }
 
+/// Observe the lifecycle evidence that makes a request lose its caller.
+pub fn observe_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEvent) {
+    match event {
+        ProviderRuntimeEvent::TurnCompleted { thread_id, turn_id, .. } => {
+            end_turn(app, &thread_id.0, &turn_id.0);
+        }
+        // A broken or closed session can disappear without completing its
+        // turn. Its outstanding callbacks can no longer receive a secret.
+        ProviderRuntimeEvent::SessionStateChanged {
+            thread_id,
+            status: SessionStatus::Closed | SessionStatus::Error { .. },
+        } => stop_thread(app, &thread_id.0),
+        _ => {}
+    }
+}
+
 fn expire_and_emit<R: Runtime>(app: &AppHandle<R>) {
     let expired = registry().expire(now_ms());
     for thread in expired {
@@ -588,6 +605,8 @@ impl<R: Runtime> HostTools for SecretRequestHost<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_provider::{ProviderKind, RequestId, ThreadId, TurnId, TurnStatus};
+    use tauri::Listener;
 
     fn args(label: &str) -> ToolArgs {
         ToolArgs {
@@ -671,6 +690,81 @@ mod tests {
         assert_eq!(outcome(&reg, &next), None);
         assert!(reg.cancel_all("chat"));
         assert_eq!(outcome(&reg, &next), Some(Outcome::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn terminal_session_events_cancel_secret_requests_without_a_turn_completion() {
+        for status in [SessionStatus::Error { message: "test session failed".into() }, SessionStatus::Closed] {
+            let thread = format!("secret-terminal-{}", uuid::Uuid::new_v4());
+            let other = format!("secret-other-{}", uuid::Uuid::new_v4());
+            let provider = std::sync::Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(Default::default()));
+            let (app, _root, _, _) = crate::agent_control::guard_tests::fixture(provider, &thread).await;
+            let Opened::Created(id, waiter) = registry().open(&thread, Some("turn"), &args("Token"), now_ms()).unwrap() else { panic!() };
+            let (other_id, _) = id_of(registry().open(&other, Some("turn"), &args("Token"), now_ms()).unwrap());
+            let (events, changed) = std::sync::mpsc::channel();
+            let listener = app.listen_any(SECRET_REQUESTS_CHANGED_EVENT, move |event| {
+                events.send(serde_json::from_str::<Value>(event.payload()).unwrap()).unwrap();
+            });
+            super::super::agent_chat::forward_event(app.handle(), ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: ThreadId(thread.clone()), status,
+            });
+            assert!(agent_secret_requests(thread.clone()).is_empty());
+            assert_eq!(outcome(&registry(), &id), Some(Outcome::Cancelled));
+            assert_eq!(*waiter.borrow(), Some(Outcome::Cancelled));
+            let payload = changed.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(payload, json!({"thread_id": thread, "requests": []}));
+            app.unlisten(listener);
+            assert_eq!(outcome(&registry(), &other_id), None);
+            let dir = tempfile::tempdir().unwrap();
+            assert!(answer_request(&id, SecretAnswer::Save { secret: "test-only-value".into() }, Some(dir.path().into())).is_err());
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+            // A retry belongs to the replacement turn rather than reusing
+            // a card whose original caller has disappeared.
+            let (next, created) = id_of(registry().open(&thread, Some("next"), &args("Token"), now_ms()).unwrap());
+            assert!(created);
+            end_turn(app.handle(), &thread, "next");
+            assert_eq!(outcome(&registry(), &next), Some(Outcome::Cancelled));
+            stop_thread(app.handle(), &other);
+        }
+    }
+
+    #[test]
+    fn nonterminal_session_events_and_stale_completions_leave_secret_requests_open() {
+        let app = tauri::test::mock_app();
+        let thread = format!("secret-ready-{}", uuid::Uuid::new_v4());
+        let (id, _) = id_of(registry().open(&thread, Some("turn"), &args("Token"), now_ms()).unwrap());
+        for status in [
+            SessionStatus::Starting,
+            SessionStatus::Ready,
+            SessionStatus::Running { active_turn: TurnId("turn".into()) },
+            SessionStatus::WaitingApproval { request_id: RequestId("approval".into()) },
+        ] {
+            observe_event(app.handle(), &ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: ThreadId(thread.clone()), status,
+            });
+            assert_eq!(outcome(&registry(), &id), None);
+        }
+        let completed = |turn: &str| ProviderRuntimeEvent::TurnCompleted {
+            thread_id: ThreadId(thread.clone()), turn_id: TurnId(turn.into()),
+            status: TurnStatus::Success, usage: None,
+        };
+        observe_event(app.handle(), &completed("earlier"));
+        assert_eq!(outcome(&registry(), &id), None);
+        observe_event(app.handle(), &completed("turn"));
+        assert_eq!(outcome(&registry(), &id), Some(Outcome::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn closing_a_pane_cancels_secret_requests_without_provider_events() {
+        let thread = format!("secret-pane-close-{}", uuid::Uuid::new_v4());
+        let provider = std::sync::Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(Default::default()));
+        let (app, _root, _, _) = crate::agent_control::guard_tests::fixture(provider, &thread).await;
+        let (id, _) = id_of(registry().open(&thread, Some("turn"), &args("Token"), now_ms()).unwrap());
+        let stops = super::super::agent_chat::shutdown_agent_chat_threads(app.handle(), vec![(ProviderKind::Claude, thread.clone())]);
+        // Synchronous cleanup, before any provider can reply or emit Closed.
+        assert_eq!(outcome(&registry(), &id), Some(Outcome::Cancelled));
+        assert!(agent_secret_requests(thread).is_empty());
+        crate::checkout_claims::wait_for(stops).await.unwrap();
     }
 
     #[tokio::test]

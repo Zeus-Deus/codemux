@@ -28,17 +28,6 @@ struct UtilityInvocation {
     output_file: Option<PathBuf>,
 }
 
-/// Nested-session markers Claude Code exports. When Codemux itself runs under
-/// a Claude session they would make the utility CLI treat itself as that
-/// session's child and pull in the parent's context.
-const CLAUDE_NESTED_SESSION_ENV_VARS: &[&str] = &[
-    "CLAUDECODE",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SSE_PORT",
-];
-
 /// Every provider receives the prompt on stdin, so the argv stays small
 /// enough for Windows' ~32k command-line limit regardless of transcript size.
 fn build_invocation(
@@ -105,8 +94,13 @@ fn build_invocation(
             Ok(UtilityInvocation {
                 program: "claude".into(),
                 args,
-                env: Vec::new(),
-                env_remove: CLAUDE_NESTED_SESSION_ENV_VARS,
+                // Labelled as Codemux and detached from a launching Claude
+                // session (see `claude_env`).
+                env: vec![(
+                    "CLAUDE_CODE_ENTRYPOINT".into(),
+                    crate::claude_env::claude_entrypoint(temp_dir),
+                )],
+                env_remove: crate::claude_env::CLAUDE_HOST_SESSION_ENV_VARS,
                 output_file: None,
             })
         }
@@ -267,6 +261,11 @@ mod tests {
         assert!(inv.args.windows(2).any(|a| a == ["--tools", ""]));
         assert!(inv.args.windows(2).any(|a| a == ["--setting-sources", ""]));
         assert!(inv.env_remove.contains(&"CLAUDECODE"));
+        assert!(!inv.env_remove.contains(&"CLAUDE_CODE_ENTRYPOINT"));
+        assert!(inv
+            .env
+            .iter()
+            .any(|(key, value)| key == "CLAUDE_CODE_ENTRYPOINT" && !value.is_empty()));
         assert!(!inv.args.iter().any(|a| a.contains("dangerously")));
     }
 

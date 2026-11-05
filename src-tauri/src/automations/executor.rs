@@ -434,7 +434,11 @@ async fn run_inner(
     };
     // An unattended run is an agent process: it and its tools are refused
     // admin commands on the control socket.
-    let mut child = crate::execution::host_command_tokio(&program)
+    let mut command = crate::execution::host_command_tokio(&program);
+    if program == "claude" {
+        crate::claude_env::apply_claude_cli_env(&mut command, &worktree_dir);
+    }
+    let mut child = command
         .args(&args)
         .current_dir(&worktree_dir)
         .env(crate::control_identity::AGENT_PROCESS_ENV, "automation")
