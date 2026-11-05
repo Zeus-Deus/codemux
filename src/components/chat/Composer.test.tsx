@@ -510,6 +510,14 @@ describe("Composer", () => {
       fireEvent.click(getByRole("button", { name: "Leave Debug mode" }));
       expect(onModeRemove).toHaveBeenCalled();
     });
+
+    it("leaving a mode from its tab hands the caret back to the message", () => {
+      const { getByRole } = renderComposer({ mode: "plan" });
+      const leave = getByRole("button", { name: "Leave Plan mode" });
+      leave.focus();
+      fireEvent.click(leave);
+      expect(document.activeElement?.tagName).toBe("TEXTAREA");
+    });
   });
 
   describe("inline attachment chip in the mirror (Step 8 Stage 2.1)", () => {

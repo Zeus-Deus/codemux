@@ -96,13 +96,17 @@ export function ModeTab({
   const Icon = config.icon;
   return (
     // The clip box is the tab's slot: its bottom edge is the edge the tab
-    // slides through. It holds its height through the exit, then unmounts.
+    // slides through. Its height opens and closes with the slide, so the
+    // composer below moves with the tab instead of snapping once it's gone.
     <div
       data-testid="composer-mode-tab"
       data-leaving={leaving || undefined}
       aria-hidden={leaving || undefined}
       inert={leaving}
-      className="flex h-6 overflow-hidden pl-[34px]"
+      className={cn(
+        "flex items-end overflow-hidden pl-[34px] transition-[height] duration-150 ease-out motion-reduce:transition-none",
+        leaving ? "h-0" : "h-6 starting:h-0",
+      )}
     >
       <div
         role="status"
@@ -111,10 +115,15 @@ export function ModeTab({
           if (leaving) setShown(null);
         }}
         className={cn(
-          "group/tab inline-flex items-center gap-1.5 rounded-t-lg border border-b-0 px-2.5 text-label duration-150 ease-out",
+          // Fixed height on the slot's bottom edge, so the closing slot
+          // clips the tab instead of squeezing it.
+          "group/tab inline-flex h-6 shrink-0 items-center gap-1.5 rounded-t-lg border border-b-0 px-2.5 text-label duration-150 ease-out",
           leaving
             ? "animate-out slide-out-to-bottom fill-mode-forwards"
             : "animate-in slide-in-from-bottom",
+          // Reduced motion: no slide; the slot closes at once and the
+          // backstop unmounts the tab.
+          "motion-reduce:animate-none",
           config.bg,
           config.text,
           config.border,
