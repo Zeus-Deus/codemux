@@ -194,12 +194,12 @@ function RuleGroup({
         <h3 className={cn(eyebrowVariants())}>
           {group.heading}
         </h3>
-        <p className="text-label text-muted-foreground/70 font-mono mt-0.5">
+        <p className="text-label text-subtle-foreground font-mono mt-0.5">
           {group.filename}
         </p>
       </header>
       {group.rules.length === 0 ? (
-        <p className="text-label text-muted-foreground/70 italic">
+        <p className="text-label text-subtle-foreground italic">
           No rules in this scope.
         </p>
       ) : (

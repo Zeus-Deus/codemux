@@ -197,7 +197,7 @@ export function SlashCommandPopup({
                 "px-3 py-2 text-label border-t border-hairline",
                 footerNote.tone === "error"
                   ? "text-destructive"
-                  : "text-muted-foreground/80",
+                  : "text-subtle-foreground",
               )}
             >
               {footerNote.message}
@@ -380,7 +380,7 @@ const CommandRows = memo(function CommandRows({ items, onSelect }: Pick<Props, "
                         // `/<name> <hint>`; don't repeat it.
                         item.description !==
                           `${item.command} ${item.argumentHint}` && (
-                          <span className="truncate font-mono text-label text-muted-foreground/70">
+                          <span className="truncate font-mono text-label text-subtle-foreground">
                             {item.argumentHint}
                           </span>
                         )}
@@ -414,7 +414,7 @@ const CommandRows = memo(function CommandRows({ items, onSelect }: Pick<Props, "
                           {item.rightAdornment}
                         </span>
                       ) : (
-                        <span className="ml-auto max-w-[30%] shrink-0 truncate font-mono text-label text-muted-foreground/60 group-data-[selected=true]/row:text-foreground" title={item.command}>
+                        <span className="ml-auto max-w-[30%] shrink-0 truncate font-mono text-label text-subtle-foreground group-data-[selected=true]/row:text-foreground" title={item.command}>
                           {item.command}
                         </span>
                       )}

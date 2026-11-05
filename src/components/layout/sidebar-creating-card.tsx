@@ -92,7 +92,7 @@ export const SidebarCreatingCard = memo(function SidebarCreatingCard({
               className="shrink-0 font-bold"
             />
           )}
-          <span className="min-w-0 truncate text-label font-medium tracking-[0.01em] text-muted-foreground/80">
+          <span className="min-w-0 truncate text-label font-medium tracking-[0.01em] text-subtle-foreground">
             {projectName}
           </span>
           <span className="ml-auto flex shrink-0 items-center gap-1.5 text-label font-semibold text-muted-foreground">
@@ -106,7 +106,7 @@ export const SidebarCreatingCard = memo(function SidebarCreatingCard({
         <div className="mt-0.5 truncate text-body font-medium leading-[1.35] text-foreground">
           {title}
         </div>
-        <div className="mt-1 truncate font-mono text-label leading-tight text-muted-foreground/60">
+        <div className="mt-1 truncate font-mono text-label leading-tight text-subtle-foreground">
           {step}
         </div>
         <CardProgressSweep />

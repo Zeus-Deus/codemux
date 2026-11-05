@@ -259,7 +259,7 @@ export function PrPickerPanel({
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder={`Search ${provider.shortNoun}s… (or type a number)`}
-            className="flex-1 bg-transparent text-label text-foreground placeholder:text-muted-foreground/50 outline-none min-w-0"
+            className="flex-1 bg-transparent text-label text-foreground placeholder:text-subtle-foreground outline-none min-w-0"
           />
         </div>
       </div>
@@ -301,7 +301,7 @@ export function PrPickerPanel({
           ))
         )}
         {directSearching && displayPrs.length > 0 && (
-          <div className="flex items-center justify-center gap-1.5 py-2 text-muted-foreground/60 text-micro">
+          <div className="flex items-center justify-center gap-1.5 py-2 text-subtle-foreground text-micro">
             <Spinner className="size-3" />
             Searching…
           </div>

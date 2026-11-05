@@ -93,7 +93,7 @@ function WaitingLine({
       className={cn("group/waiting flex items-center gap-1.5", selected && "text-foreground")}
     >
       {children}
-      <span className="flex shrink-0 items-center gap-0.5 text-caption font-medium text-muted-foreground/70 transition-colors duration-150 group-hover/waiting:text-foreground/80">
+      <span className="flex shrink-0 items-center gap-0.5 text-caption font-medium text-subtle-foreground transition-colors duration-150 group-hover/waiting:text-foreground/80">
         View
         <ChevronRight
           className="size-3 transition-transform duration-150 group-hover/waiting:translate-x-0.5"

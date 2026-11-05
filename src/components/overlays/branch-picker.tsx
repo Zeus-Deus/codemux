@@ -258,7 +258,7 @@ export function BranchPicker({
               onClick={() => setFilterMode("all")}
             >
               All{" "}
-              <span className="text-caption opacity-60 tabular-nums">{allCount}</span>
+              <span className="text-caption text-subtle-foreground tabular-nums">{allCount}</span>
             </button>
             <button
               type="button"
@@ -271,7 +271,7 @@ export function BranchPicker({
               onClick={() => setFilterMode("worktrees")}
             >
               Worktrees{" "}
-              <span className="text-caption opacity-60 tabular-nums">{worktreeCount}</span>
+              <span className="text-caption text-subtle-foreground tabular-nums">{worktreeCount}</span>
             </button>
             {syncing && !loading && (
               <span
@@ -401,7 +401,7 @@ export function BranchPicker({
                               actions on hover and on the keyboard-selected
                               row, so arrowing shows what Enter will do. */}
                           {!alwaysShowActions && (
-                            <span className="text-label text-muted-foreground/60 tabular-nums shrink-0 group-hover/row:hidden group-data-[selected=true]/row:hidden">
+                            <span className="text-label text-subtle-foreground tabular-nums shrink-0 group-hover/row:hidden group-data-[selected=true]/row:hidden">
                               {formatRelativeTime(branch.last_commit_unix)}
                             </span>
                           )}

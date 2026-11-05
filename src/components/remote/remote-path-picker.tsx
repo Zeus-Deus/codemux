@@ -279,14 +279,14 @@ export function RemotePathPicker() {
                         )}
                       >
                         {entry.is_dir ? (
-                          <Folder className="size-3.5 shrink-0 text-status-remote/80" />
+                          <Folder className="size-3.5 shrink-0 text-status-remote" />
                         ) : (
                           <FileIcon className="size-3.5 shrink-0 text-muted-foreground" />
                         )}
                         <span
                           className={cn(
                             "truncate",
-                            entry.is_gitignored && "text-muted-foreground/70",
+                            entry.is_gitignored && "text-subtle-foreground",
                           )}
                         >
                           {entry.name}

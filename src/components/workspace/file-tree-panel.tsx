@@ -122,9 +122,9 @@ const TreeNode = memo(function TreeNode({
             ? "text-foreground/62 hover:bg-surface-2 hover:text-foreground/80"
             : selected
               ? "bg-surface-3 text-foreground"
-              : "text-foreground/44 hover:bg-surface-2 hover:text-foreground/70",
+              : "text-subtle-foreground hover:bg-surface-2 hover:text-foreground/70",
           entry.is_gitignored && "opacity-50",
-          activePath === entry.path && "group-focus-visible/files:ring-2 group-focus-visible/files:ring-inset group-focus-visible/files:ring-ring/60",
+          activePath === entry.path && "group-focus-visible/files:ring-2 group-focus-visible/files:ring-inset group-focus-visible/files:ring-focus-ring",
         )}
         style={{ paddingLeft: indentOf(depth) }}
         onClick={activate}
@@ -133,14 +133,14 @@ const TreeNode = memo(function TreeNode({
           <>
             <ChevronRight
               className={cn(
-                "size-3 shrink-0 text-foreground/35 transition-transform duration-150",
+                "size-3 shrink-0 text-subtle-foreground transition-transform duration-150",
                 isExpanded && "rotate-90",
               )}
             />
             <Folder className="size-3.5 shrink-0 text-primary/70" />
             <span className="truncate">{entry.name}</span>
             {isLoading && (
-              <Spinner className="ml-auto size-3 shrink-0 text-foreground/35" />
+              <Spinner className="ml-auto size-3 shrink-0 text-subtle-foreground" />
             )}
           </>
         ) : (
@@ -171,7 +171,7 @@ const TreeNode = memo(function TreeNode({
           ))}
           {children?.length === 0 && (
             <p
-              className="py-0.5 text-caption italic text-foreground/30"
+              className="py-0.5 text-caption italic text-subtle-foreground"
               style={{ paddingLeft: indentOf(depth + 1) }}
             >
               empty

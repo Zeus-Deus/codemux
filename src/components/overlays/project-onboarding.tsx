@@ -499,7 +499,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         type="button"
         onClick={() => setError(null)}
         aria-label="Dismiss error"
-        className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors duration-100"
+        className="shrink-0 rounded-sm p-0.5 text-destructive hover:bg-destructive/10 transition-colors duration-100"
       >
         <X className="size-3.5" />
       </button>
@@ -631,9 +631,9 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                       onChange={(e) => handleBranchChange(e.target.value)}
                       onKeyDown={handleKeyDown}
                       placeholder="branch-name"
-                      className="flex-1 min-w-0 bg-transparent font-mono text-body text-muted-foreground placeholder:text-muted-foreground/40 outline-none"
+                      className="flex-1 min-w-0 bg-transparent font-mono text-body text-muted-foreground placeholder:text-subtle-foreground outline-none"
                     />
-                    <span className="text-muted-foreground/50 shrink-0">from</span>
+                    <span className="text-subtle-foreground shrink-0">from</span>
                     <BranchPicker
                       baseBranch={baseBranch}
                       branches={detailedBranches}
@@ -718,7 +718,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                           key={action.id}
                           type="button"
                           onClick={() => toggleAction(action.id)}
-                          className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-muted/40 transition-colors duration-150 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
+                          className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-muted/40 transition-colors duration-150 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring"
                         >
                           <div
                             className={cn(
@@ -818,7 +818,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   open={teardownOpen}
                   onOpenChange={setTeardownOpen}
                 >
-                  <CollapsibleTrigger className="flex items-center gap-1.5 text-label text-muted-foreground/80 hover:text-muted-foreground transition-colors duration-150 py-1">
+                  <CollapsibleTrigger className="flex items-center gap-1.5 text-label text-subtle-foreground hover:text-muted-foreground transition-colors duration-150 py-1">
                     <ChevronDown
                       className={cn(
                         "size-3 transition-transform duration-150",

@@ -174,7 +174,7 @@ export function TasksPanel({
                   <span className="mt-[3px] flex size-4 shrink-0 items-center justify-center">
                     <StatusGlyph task={task} />
                   </span>
-                  <span className="mt-0.5 w-4 shrink-0 text-right text-caption tabular-nums leading-4 text-muted-foreground/70">
+                  <span className="mt-0.5 w-4 shrink-0 text-right text-caption tabular-nums leading-4 text-subtle-foreground">
                     {index + 1}
                   </span>
                   <div className="min-w-0 flex-1">
@@ -248,7 +248,7 @@ export function TasksPaneActions({ snapshot }: { snapshot: TasksSnapshot }) {
         type="button"
         onClick={handleCopy}
         data-testid="tasks-copy"
-        className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-semibold text-foreground/42 transition-colors duration-100 hover:bg-surface-2 hover:text-foreground"
+        className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-semibold text-subtle-foreground transition-colors duration-100 hover:bg-surface-2 hover:text-foreground"
       >
         {copied ? (
           <Check className="size-3" aria-hidden />

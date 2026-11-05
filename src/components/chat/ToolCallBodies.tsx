@@ -144,10 +144,10 @@ export function BashToolBody({
     <div className="space-y-2">
       {command && (
         <div className="group/copy code-surface relative select-text rounded-md bg-muted/40 px-3 py-2 text-foreground whitespace-pre-wrap break-words">
-          <span className="text-muted-foreground/70">$ </span>
+          <span className="text-subtle-foreground">$ </span>
           {command}
           {description && (
-            <div className="mt-1 font-sans text-label text-muted-foreground/80">
+            <div className="mt-1 font-sans text-label text-subtle-foreground">
               {description}
             </div>
           )}
@@ -183,7 +183,7 @@ export function BashToolBody({
         // not a status billboard.
         <span
           aria-label={`Exit code ${exitCode}`}
-          className="font-mono text-label text-destructive/80"
+          className="font-mono text-label text-destructive"
         >
           exit {exitCode}
         </span>
@@ -213,7 +213,7 @@ export function ReadToolBody({ item, input }: BodyProps) {
         <div className="select-text font-mono text-body-sm text-foreground">
           <ToolSourcePath path={path} line={offset ?? undefined} />
           {(offset != null || limit != null) && (
-            <span className="ml-2 text-muted-foreground/70">
+            <span className="ml-2 text-subtle-foreground">
               {rangeLabel(offset, limit)}
             </span>
           )}
@@ -259,7 +259,7 @@ export function GrepToolBody({ item, input }: BodyProps) {
         <div className="select-text font-mono text-body-sm text-foreground">
           {pattern && <span>{pattern}</span>}
           {path && (
-            <span className="ml-2 text-muted-foreground/70">
+            <span className="ml-2 text-subtle-foreground">
               in <ToolSourcePath path={path} />
             </span>
           )}
@@ -268,7 +268,7 @@ export function GrepToolBody({ item, input }: BodyProps) {
       {matches.length > 0 ? (
         <div className="select-text rounded-md bg-muted/40">
           <div className={cn("space-y-1 px-3 py-2", showAll && FULL_OUTPUT_CLASS)}>
-            <p className="text-label text-muted-foreground/80">
+            <p className="text-label text-subtle-foreground">
               {matches.length} match{matches.length === 1 ? "" : "es"}
             </p>
             <ul className="space-y-0.5">
@@ -277,7 +277,7 @@ export function GrepToolBody({ item, input }: BodyProps) {
                   key={i}
                   className="font-mono text-body-sm leading-5 text-foreground break-words"
                 >
-                  <span className="text-muted-foreground/70">
+                  <span className="text-subtle-foreground">
                     <ToolSourcePath path={m.location} />
                   </span>
                   {m.text && <span className="ml-2">{m.text}</span>}
@@ -589,7 +589,7 @@ function LazyToolResultBody({ stub }: { stub: LazyToolResultStub }) {
           <div className="px-3 py-2">
             {stub.preview}
             {(!stub.has_images || hidden > 0) && (
-              <span className="text-muted-foreground/60">{"\n"}…</span>
+              <span className="text-subtle-foreground">{"\n"}…</span>
             )}
           </div>
         )}

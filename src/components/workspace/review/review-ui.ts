@@ -65,7 +65,7 @@ export const underRowInset = "ml-3 mr-3 @md:ml-[72px]";
 const BASE =
   "inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-md border-0 " +
   "px-3.5 text-body font-medium transition-colors duration-150 outline-none " +
-  "focus-visible:ring-2 focus-visible:ring-ring/60";
+  "focus-visible:ring-2 focus-visible:ring-focus-ring";
 
 /** Neutral secondary — sits on the bar's card background. */
 export const btnCard = `${BASE} bg-card text-foreground/90 hover:bg-accent/50`;
@@ -130,7 +130,7 @@ export const spinnerRing =
 const BASE_XS =
   "inline-flex h-6 shrink-0 items-center justify-center gap-1 rounded-sm border-0 " +
   "px-2 text-body-sm font-medium transition-colors duration-150 outline-none " +
-  "focus-visible:ring-2 focus-visible:ring-ring/60";
+  "focus-visible:ring-2 focus-visible:ring-focus-ring";
 
 export const btnEmberXs = `${BASE_XS} bg-accent-ember/15 font-semibold text-accent-ember hover:bg-accent-ember/25`;
 

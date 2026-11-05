@@ -74,7 +74,7 @@ export function EmptyState() {
 
         {/* Other ways in */}
         <div className="mt-6 flex flex-col items-center gap-2">
-          <span className="text-label text-muted-foreground/60">
+          <span className="text-label text-subtle-foreground">
             Or start from somewhere else
           </span>
           <div className="flex flex-wrap items-center justify-center gap-1">

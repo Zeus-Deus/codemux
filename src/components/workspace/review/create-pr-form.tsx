@@ -113,21 +113,21 @@ const LABEL =
 
 const FIELD =
   `w-full rounded-md border-0 bg-muted/60 px-2.5 py-2 ${tzRowTitle} text-foreground ` +
-  "outline-none transition-colors duration-150 placeholder:text-muted-foreground/70 " +
-  "focus-visible:ring-2 focus-visible:ring-ring/60";
+  "outline-none transition-colors duration-150 placeholder:text-subtle-foreground " +
+  "focus-visible:ring-2 focus-visible:ring-focus-ring";
 
 /** A chip on the card background — the description's helpers. */
 const CHIP =
   "inline-flex h-[24px] shrink-0 items-center gap-1 rounded-sm border-0 bg-card px-2.5 " +
   `${tzMeta} text-foreground/90 transition-colors duration-100 hover:bg-accent/50 ` +
-  "disabled:opacity-50 outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
+  "disabled:opacity-50 outline-none focus-visible:ring-2 focus-visible:ring-focus-ring";
 
 /** A chip that is an invitation rather than an action. */
 const DASHED_CHIP =
   "inline-flex h-[24px] shrink-0 items-center gap-1 rounded-full border border-dashed " +
   `border-border px-2.5 ${tzBody} text-muted-foreground transition-colors duration-100 ` +
   "hover:border-foreground/40 hover:text-foreground outline-none " +
-  "focus-visible:ring-2 focus-visible:ring-ring/60";
+  "focus-visible:ring-2 focus-visible:ring-focus-ring";
 
 export interface CreatePrFormProps {
   cwd: string;
@@ -572,7 +572,7 @@ export function CreatePrForm({
             <input
               ref={reviewerInputRef}
               aria-label="Reviewer handle"
-              className={`h-[24px] w-28 rounded-full border-0 bg-muted/60 px-2.5 ${tzBody} outline-none focus-visible:ring-2 focus-visible:ring-ring/60`}
+              className={`h-[24px] w-28 rounded-full border-0 bg-muted/60 px-2.5 ${tzBody} outline-none focus-visible:ring-2 focus-visible:ring-focus-ring`}
               value={reviewerDraft}
               placeholder="handle"
               onChange={(event) => setReviewerDraft(event.target.value)}

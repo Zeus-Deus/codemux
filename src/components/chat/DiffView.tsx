@@ -95,7 +95,7 @@ export function DiffView({
           ) : (
             <>
               <FileText
-                className="size-3 shrink-0 text-muted-foreground/70"
+                className="size-3 shrink-0 text-subtle-foreground"
                 aria-hidden
               />
               <span className="truncate">{filename ?? "diff"}</span>
@@ -117,7 +117,7 @@ export function DiffView({
               <div
                 key={i}
                 className={cn(
-                  "flex w-max min-w-full bg-muted/30 text-muted-foreground/60",
+                  "flex w-max min-w-full bg-muted/30 text-subtle-foreground",
                   i > 0 && "mt-[9px]",
                 )}
               >
@@ -190,7 +190,7 @@ function CopyButton({ text }: { text: string }) {
           onClick={() => void copyDiff()}
           // A 24px target in a header sized for 14px glyphs: the negative
           // margin keeps the header height unchanged.
-          className="-my-1 text-muted-foreground/70 hover:text-foreground"
+          className="-my-1 text-subtle-foreground hover:text-foreground"
         >
           {copied ? (
             <Check className="size-3.5 text-status-open" aria-hidden />

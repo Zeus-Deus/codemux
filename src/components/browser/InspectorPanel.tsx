@@ -45,7 +45,7 @@ export function InspectorPanel({ element, agentTargetTitle, onDismiss, onTellAge
           </span>
         )}
         <span
-          className="truncate font-mono text-label text-muted-foreground/70"
+          className="truncate font-mono text-label text-subtle-foreground"
           title={element.selector}
         >
           {element.selector}

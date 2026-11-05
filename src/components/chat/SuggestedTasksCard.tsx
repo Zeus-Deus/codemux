@@ -389,7 +389,7 @@ function SuggestedTaskRow({
           onClick={() => setExpanded((open) => !open)}
           aria-expanded={expanded}
           className={cn(
-            "mt-0.5 block w-full rounded-sm text-left text-label text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+            "mt-0.5 block w-full rounded-sm text-left text-label text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
             expanded ? "whitespace-pre-wrap" : "line-clamp-2",
           )}
         >

@@ -494,7 +494,7 @@ function SolvedRoles({ theme }: { theme: ThemeDefinition }) {
         </span>
         {/* Which way the palette was solved, decided by the background you
             typed rather than by a switch you have to find. */}
-        <span className="font-mono text-caption text-muted-foreground/70">
+        <span className="font-mono text-caption text-subtle-foreground">
           · {theme.scheme}
         </span>
       </div>
@@ -661,11 +661,11 @@ function DerivedRoles({ result }: { result: ThemeImportResult }) {
           <span className="flex-1 truncate text-label text-muted-foreground">
             {humanizeToken(role)}
           </span>
-          <span className="font-mono text-caption text-muted-foreground/70">derived</span>
+          <span className="font-mono text-caption text-subtle-foreground">derived</span>
         </div>
       ))}
       {rest > 0 && (
-        <span className="text-label text-muted-foreground/70">
+        <span className="text-label text-subtle-foreground">
           and {rest} more — all listed under Edit roles by hand.
         </span>
       )}

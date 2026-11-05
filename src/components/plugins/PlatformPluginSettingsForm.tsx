@@ -86,7 +86,7 @@ export function PlatformPluginSettingsForm({ installation }: { installation: Plu
         void save();
       }}
     >
-      <DetailSection title="Settings" action={<span className="text-label text-muted-foreground/70">On this computer</span>}>
+      <DetailSection title="Settings" action={<span className="text-label text-subtle-foreground">On this computer</span>}>
         <div className="grid gap-4">
           {manifest.settings.map((setting) => {
             const id = `${idPrefix}-${setting.key}`;

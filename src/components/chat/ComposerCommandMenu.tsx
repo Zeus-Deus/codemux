@@ -143,7 +143,7 @@ export function ComposerCommandMenu({
             data-testid="composer-command-search"
             className={cn(
               "flex-1 bg-transparent text-body text-foreground caret-accent-ember",
-              "outline-none placeholder:text-muted-foreground/70",
+              "outline-none placeholder:text-subtle-foreground",
             )}
           />
         </div>
@@ -243,7 +243,7 @@ export function ComposerCommandMenu({
                             {item.description && (
                               <span
                                 className={cn(
-                                  "min-w-0 flex-1 truncate text-label text-muted-foreground/70",
+                                  "min-w-0 flex-1 truncate text-label text-subtle-foreground",
                                   // Highlighting only recolours: a row that
                                   // grew to show its whole description
                                   // would shove every row below it as the
@@ -277,7 +277,7 @@ export function ComposerCommandMenu({
                             {item.rightAdornment}
                           </span>
                         ) : item.command ? (
-                          <span className="ml-auto shrink-0 font-mono text-label text-muted-foreground/60 group-data-[selected=true]/row:text-foreground">
+                          <span className="ml-auto shrink-0 font-mono text-label text-subtle-foreground group-data-[selected=true]/row:text-foreground">
                             {item.command}
                           </span>
                         ) : null}
@@ -295,7 +295,7 @@ export function ComposerCommandMenu({
                   "border-t border-hairline px-3 py-2 text-label",
                   footerNote.tone === "error"
                     ? "text-destructive"
-                    : "text-muted-foreground/80",
+                    : "text-subtle-foreground",
                 )}
               >
                 {footerNote.message}

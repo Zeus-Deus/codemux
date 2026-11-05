@@ -26,6 +26,8 @@ function PopoverContent({
   className,
   align = "center",
   sideOffset = 4,
+  // Popups never sit flush with the window edge; callers may still override.
+  collisionPadding = 8,
   portal = true,
   ...props
 }: React.ComponentProps<typeof PopoverPrimitive.Content> & { portal?: boolean }) {
@@ -34,6 +36,7 @@ function PopoverContent({
       data-slot="popover-content"
       align={align}
       sideOffset={sideOffset}
+      collisionPadding={collisionPadding}
       className={cn(
         "z-50 w-72 origin-(--radix-popover-content-transform-origin) rounded-lg border border-border bg-popover p-4 text-popover-foreground shadow-popup outline-hidden",
         POP_MOTION,

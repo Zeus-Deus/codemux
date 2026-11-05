@@ -88,7 +88,7 @@ export function AccountsSection({
                     <button
                       type="button"
                       onClick={onOpenLimits}
-                      className="hidden min-w-[9rem] justify-end gap-3 rounded-sm text-label tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-ring/60 sm:flex"
+                      className="hidden min-w-[9rem] justify-end gap-3 rounded-sm text-label tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-focus-ring sm:flex"
                       title="Open Limits"
                     >
                       {windows.length > 0 ? (
@@ -98,7 +98,7 @@ export function AccountsSection({
                           </span>
                         ))
                       ) : (
-                        <span className="text-muted-foreground/70">No limits read</span>
+                        <span className="text-subtle-foreground">No limits read</span>
                       )}
                     </button>
                     <span className="flex flex-col items-end">

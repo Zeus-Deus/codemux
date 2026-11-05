@@ -453,8 +453,8 @@ describe("SidebarInboxCard — background recede", () => {
     const { card } = renderCard({ status: "working" });
     expect(card.className).not.toContain("opacity-70");
     expect(screen.getByText("M").className).toContain("grayscale");
-    expect(screen.getByText("Ship it").className).toContain(
-      "text-muted-foreground/55",
+    expect(screen.getByText("Ship it").className).toMatch(
+      /(^|\s)text-muted-foreground(\s|$)/,
     );
   });
 
@@ -487,28 +487,28 @@ describe("SidebarInboxCard — background recede", () => {
     expect(avatar.className).toContain("group-hover/card:grayscale-0");
 
     const title = screen.getByText("Ship it");
-    expect(title.className).toContain("text-muted-foreground/55");
+    expect(title.className).toMatch(/(^|\s)text-muted-foreground(\s|$)/);
     expect(title.className).toContain("group-hover/card:text-foreground");
 
     // The meta line mutes as a block, so branch and ↑ahead inherit it.
-    expect(metaLine(card).className).toContain("text-muted-foreground/40");
+    expect(metaLine(card).className).toContain("text-subtle-foreground");
     expect(metaLine(card).className).toContain(
-      "group-hover/card:text-muted-foreground/60",
+      "group-hover/card:text-muted-foreground",
     );
 
     const additions = screen.getByText("+38");
     const deletions = screen.getByText("−12");
-    expect(additions.className).toContain("text-muted-foreground/50");
+    expect(additions.className).toContain("text-subtle-foreground");
     expect(additions.className).toContain(
-      "group-hover/card:text-status-open/80",
+      "group-hover/card:text-status-open",
     );
-    expect(deletions.className).toContain("text-muted-foreground/50");
+    expect(deletions.className).toContain("text-subtle-foreground");
     expect(deletions.className).toContain(
-      "group-focus-within/card:text-status-attention/80",
+      "group-focus-within/card:text-status-attention",
     );
 
     const pr = screen.getByRole("button", { name: "Pull request #87 — open" });
-    expect(pr.className).toContain("text-muted-foreground/45");
+    expect(pr.className).toContain("text-subtle-foreground");
     expect(pr.className).toContain("group-hover/card:text-status-open");
     expect(pr.className).not.toMatch(/(^|\s)text-status-open\b/);
     expect(pr.querySelector("svg")?.getAttribute("class")).toContain(
@@ -526,14 +526,14 @@ describe("SidebarInboxCard — background recede", () => {
     const { card } = renderCard({ status: null, now: 26 * 60_000 });
 
     expect(card.className).not.toContain("opacity-70");
-    expect(screen.getByText("Ship it").className).toContain(
-      "text-muted-foreground/55",
+    expect(screen.getByText("Ship it").className).toMatch(
+      /(^|\s)text-muted-foreground(\s|$)/,
     );
 
     const idleState = screen.getByText("26m");
-    expect(idleState.className).toContain("text-muted-foreground/50");
+    expect(idleState.className).toContain("text-subtle-foreground");
     expect(idleState.className).toContain(
-      "group-hover/card:text-muted-foreground/70",
+      "group-hover/card:text-muted-foreground",
     );
     expect(idleState.className).toContain("font-medium");
     expect(idleState.className).not.toContain("text-status-");
@@ -564,9 +564,9 @@ describe("SidebarInboxCard — background recede", () => {
     // An SVG node, so `className` is an SVGAnimatedString — read the attribute.
     const marker = container.querySelector('[aria-label="Pinned workspace"]')!;
     const classes = marker.getAttribute("class") ?? "";
-    expect(classes).toContain("text-muted-foreground/55");
-    expect(classes).toContain("group-hover/card:text-muted-foreground/75");
-    expect(classes).not.toMatch(/(^|\s)text-muted-foreground\/75\b/);
+    expect(classes).toContain("text-subtle-foreground");
+    expect(classes).toContain("group-hover/card:text-muted-foreground");
+    expect(classes).not.toMatch(/(^|\s)text-muted-foreground(\s|$)/);
   });
 
   // A watch loop is background presence by definition, so its card recedes
@@ -575,8 +575,8 @@ describe("SidebarInboxCard — background recede", () => {
   it("recedes a monitoring card while its readout keeps its tone", () => {
     const { card } = renderCard({ status: "monitoring" as ActivePaneStatus });
     expect(card.className).not.toContain("opacity-70");
-    expect(screen.getByText("Ship it").className).toContain(
-      "text-muted-foreground/55",
+    expect(screen.getByText("Ship it").className).toMatch(
+      /(^|\s)text-muted-foreground(\s|$)/,
     );
 
     const label = screen.getByText("Monitoring");
@@ -607,12 +607,12 @@ describe("SidebarInboxCard — background recede", () => {
       expect(screen.getByText("Ship it").className, label).toContain(
         "text-foreground",
       );
-      expect(screen.getByText("Ship it").className, label).not.toContain(
-        "text-muted-foreground/55",
+      expect(screen.getByText("Ship it").className, label).not.toMatch(
+        /(^|\s)text-muted-foreground(\s|$)/,
       );
       expect(screen.getByText("M").className, label).not.toContain("grayscale");
       expect(metaLine(card).className, label).not.toContain(
-        "text-muted-foreground/40",
+        "text-subtle-foreground",
       );
       cleanup();
     }
@@ -633,9 +633,9 @@ describe("SidebarInboxCard — background recede", () => {
 
     expect(screen.getByText("M").className).not.toContain("grayscale");
     expect(screen.getByText("Ship it").className).toContain("text-foreground");
-    expect(screen.getByText("+8").className).toContain("text-status-open/80");
+    expect(screen.getByText("+8").className).toContain("text-status-open");
     expect(screen.getByText("−3").className).toContain(
-      "text-status-attention/80",
+      "text-status-attention",
     );
     expect(
       screen.getByRole("button", { name: "Pull request #12 — open" }).className,
@@ -860,7 +860,7 @@ describe("SidebarInboxCard — running-process indicator", () => {
 });
 
 describe("SidebarInboxCard — device label", () => {
-  it("names the device at the right end of the meta line", () => {
+  it("marks the device with a glyph at the right end of the meta line", () => {
     hosts = [{ id: 7, name: "zeus" }];
     const { container } = renderCard({
       workspace: makeWorkspace({ host_id: 7, git_branch: "feat/remote" }),
@@ -869,7 +869,8 @@ describe("SidebarInboxCard — device label", () => {
     const label = within(line).getByRole("img", { name: "Runs on zeus" });
 
     expect(label).toHaveAttribute("title", "Runs on zeus");
-    expect(label).toHaveTextContent("zeus");
+    // Glyph only: the tooltip names the device so the branch keeps its room.
+    expect(label).not.toHaveTextContent("zeus");
     // In the trailing cluster, after the PR chip; the branch still leads.
     expect(line.lastElementChild?.contains(label)).toBe(true);
     expect(line.firstElementChild).toHaveTextContent("feat/remote");
@@ -887,6 +888,46 @@ describe("SidebarInboxCard — device label", () => {
     const { container } = renderCard();
     expect(screen.queryByRole("img", { name: /^Runs on/ })).toBeNull();
     expect(metaLine(container).firstElementChild).toHaveTextContent("main");
+  });
+});
+
+describe("SidebarInboxCard — meta line", () => {
+  const chatSurface = {
+    root: { kind: "agent_chat", provider: "claude", pane_id: "p1" },
+  };
+
+  it("folds a provider-only meta line into the title line", () => {
+    const { container } = renderCard({
+      workspace: makeWorkspace({
+        git_branch: null,
+        surfaces: [chatSurface],
+      } as unknown as Partial<WorkspaceSnapshot>),
+    });
+    // No row drawn for a single glyph: the mark rides the title line.
+    expect(metaLine(container)).toBeNull();
+    const inline = container.querySelector("[data-inline-providers]");
+    expect(inline).not.toBeNull();
+    expect(inline?.parentElement).toHaveTextContent("Ship it");
+  });
+
+  it("keeps the meta line while it has a branch to show", () => {
+    const { container } = renderCard({
+      workspace: makeWorkspace({
+        surfaces: [chatSurface],
+      } as unknown as Partial<WorkspaceSnapshot>),
+    });
+    expect(metaLine(container)).not.toBeNull();
+    expect(container.querySelector("[data-inline-providers]")).toBeNull();
+  });
+
+  // jsdom has no layout, so this pins the rule rather than the pixels: the
+  // branch has no width floor, so on a busy card it truncates rather than
+  // pushing the PR chip and marks past the card's clipped edge.
+  it("lets the branch give way to the trailing metadata", () => {
+    const { container } = renderCard();
+    const branch = within(metaLine(container)).getByText("main");
+    expect(branch).toHaveClass("min-w-0", "truncate");
+    expect(branch.className).not.toMatch(/min-w-\[/);
   });
 });
 

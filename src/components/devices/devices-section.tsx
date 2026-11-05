@@ -159,7 +159,7 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
       <span className="text-body-sm font-semibold text-foreground">
         This device
       </span>
-      <span className="truncate font-mono text-caption text-muted-foreground/70">
+      <span className="truncate font-mono text-caption text-subtle-foreground">
         {workspaceCount} {workspaceCount === 1 ? "workspace" : "workspaces"} ·
         managed in the sidebar
       </span>
@@ -172,7 +172,7 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
           <Trash2 className="size-3" aria-hidden />
           Sweep {count} settled
           {knownBytes !== null && knownBytes > 0 && (
-            <span className="font-medium text-status-working/80 tabular-nums">
+            <span className="font-medium text-status-working tabular-nums">
               · ~{formatBytes(knownBytes)}
             </span>
           )}
@@ -202,8 +202,8 @@ const TONE_TEXT: Record<DeviceTone, string> = {
   online: "text-status-open",
   updating: "text-status-remote",
   attention: "text-status-working",
-  offline: "text-muted-foreground/70",
-  checking: "text-muted-foreground/60",
+  offline: "text-subtle-foreground",
+  checking: "text-subtle-foreground",
 };
 
 function DeviceCardView({
@@ -265,7 +265,7 @@ function DeviceCardView({
               "flex size-7 shrink-0 items-center justify-center rounded-md",
               reachable
                 ? "bg-status-remote/[0.13] text-status-remote"
-                : "bg-surface-2 text-muted-foreground/70",
+                : "bg-surface-2 text-subtle-foreground",
             )}
           >
             <DeviceGlyph className="size-[13px]" />
@@ -292,8 +292,8 @@ function DeviceCardView({
               className={cn(
                 "truncate font-mono text-caption",
                 card.tone === "attention"
-                  ? "text-status-working/80"
-                  : "text-muted-foreground/70",
+                  ? "text-status-working"
+                  : "text-subtle-foreground",
               )}
             >
               {card.tone === "attention" && card.statusDetail
@@ -325,7 +325,7 @@ function DeviceCardView({
           <ChevronRight
             aria-hidden
             className={cn(
-              "size-[11px] shrink-0 text-muted-foreground/70 transition-transform duration-150",
+              "size-[11px] shrink-0 text-subtle-foreground transition-transform duration-150",
               expanded && "rotate-90",
             )}
           />
@@ -352,7 +352,7 @@ function DeviceCardView({
         </div>
       )}
       {expanded && rowCount === 0 && card.host && card.serverId && (
-        <p className="px-[13px] pb-3 text-label text-muted-foreground/70">
+        <p className="px-[13px] pb-3 text-label text-subtle-foreground">
           Nothing on {card.name} yet — push a workspace here from its menu in
           the sidebar.
         </p>
@@ -397,17 +397,17 @@ function ProjectCluster({
           aria-expanded={expanded}
           className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
         >
-          <Folder className="size-[11px] shrink-0 text-muted-foreground/60" aria-hidden />
+          <Folder className="size-[11px] shrink-0 text-subtle-foreground" aria-hidden />
           <span className="truncate font-mono text-label font-semibold text-foreground/80">
             {project.name}
           </span>
-          <span className="font-mono text-caption text-muted-foreground/60">
+          <span className="font-mono text-caption text-subtle-foreground">
             {project.rows.length}
           </span>
           {!expanded && (
             <ChevronRight
               aria-hidden
-              className="ml-0.5 size-[11px] text-muted-foreground/60"
+              className="ml-0.5 size-[11px] text-subtle-foreground"
             />
           )}
         </button>
@@ -500,7 +500,7 @@ function WorkspaceRow({
           {sync.title}
         </span>
         {kindLabel && (
-          <span className="ml-1 shrink-0 rounded-full bg-surface-2 px-[7px] py-[2px] font-mono text-micro font-medium text-muted-foreground/70">
+          <span className="ml-1 shrink-0 rounded-full bg-surface-2 px-[7px] py-[2px] font-mono text-micro font-medium text-subtle-foreground">
             {kindLabel}
           </span>
         )}
@@ -513,7 +513,7 @@ function WorkspaceRow({
           </span>
         )}
       </span>
-      <span className="truncate font-mono text-caption text-muted-foreground/70">
+      <span className="truncate font-mono text-caption text-subtle-foreground">
         {sync.git_branch ?? ""}
       </span>
       <span className="inline-flex items-center gap-1">
@@ -572,7 +572,7 @@ function AddDeviceRow({ onClick }: { onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="flex items-center justify-center gap-1.5 rounded-lg bg-surface-1 p-2.5 text-body-sm font-semibold text-muted-foreground/70 transition-colors duration-150 hover:bg-surface-2 hover:text-muted-foreground"
+      className="flex items-center justify-center gap-1.5 rounded-lg bg-surface-1 p-2.5 text-body-sm font-semibold text-subtle-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-muted-foreground"
     >
       <Plus className="size-3" aria-hidden />
       Add device

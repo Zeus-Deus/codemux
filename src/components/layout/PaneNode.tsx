@@ -474,7 +474,7 @@ function PaneNodeImpl({
                 "flex h-6 min-w-0 max-w-[70%] items-center gap-1.5 rounded-md px-2 text-label shadow-sm ring-1 ring-border/30 backdrop-blur-md",
                 isActive
                   ? "bg-card/70 text-muted-foreground"
-                  : "bg-background/65 text-muted-foreground/70",
+                  : "bg-background/65 text-subtle-foreground",
               )}
               data-terminal-pane-context
             >
@@ -494,7 +494,7 @@ function PaneNodeImpl({
                   head to keep the meaningful tail. */}
               {cwdHint && (
                 <span
-                  className="min-w-0 truncate font-mono text-label text-muted-foreground/70"
+                  className="min-w-0 truncate font-mono text-label text-subtle-foreground"
                   title={cwdHint.full}
                   data-pane-cwd={cwdHint.full}
                 >

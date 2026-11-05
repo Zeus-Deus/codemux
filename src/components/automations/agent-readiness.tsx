@@ -77,7 +77,7 @@ export function AgentReadinessRow({
       <p
         data-testid="automation-agent-readiness"
         data-readiness="unknown"
-        className="text-body-sm leading-relaxed text-muted-foreground/70"
+        className="text-body-sm leading-relaxed text-subtle-foreground"
       >
         {label} sign-in on a remote host is checked when the automation runs.
       </p>
@@ -90,7 +90,7 @@ export function AgentReadinessRow({
       <div
         data-testid="automation-agent-readiness"
         data-readiness="checking"
-        className="flex items-center gap-2 text-body-sm leading-relaxed text-muted-foreground/70"
+        className="flex items-center gap-2 text-body-sm leading-relaxed text-subtle-foreground"
       >
         <Spinner className="size-3" aria-hidden />
         Checking {label} on this machine…
@@ -122,7 +122,7 @@ export function AgentReadinessRow({
       <span
         className={cn(
           "min-w-0 select-text",
-          blocked ? "text-warning" : "text-muted-foreground/75",
+          blocked ? "text-warning" : "text-subtle-foreground",
         )}
       >
         {message}

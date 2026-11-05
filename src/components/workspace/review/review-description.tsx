@@ -173,7 +173,7 @@ export function ReviewDescription({
             onChange={(e) => onChange(e.target.value)}
             rows={10}
             className={cn(
-              "w-full resize-y rounded-md border-0 bg-muted/40 px-2 py-2 font-mono leading-relaxed text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+              "w-full resize-y rounded-md border-0 bg-muted/40 px-2 py-2 font-mono leading-relaxed text-foreground outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
               tzBody,
             )}
             data-testid="description-editor"

@@ -175,7 +175,7 @@ export function KeybindEditor() {
       />
 
       <div className="relative mb-6">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground/60 pointer-events-none" />
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-3.5 text-subtle-foreground pointer-events-none" />
         <Input
           placeholder="Search shortcuts…"
           value={search}
@@ -283,14 +283,14 @@ function KeybindRow({
       <div className="space-y-0.5 min-w-0 flex-1 pt-1">
         <span className="text-body text-foreground">{entry.label}</span>
         {entry.description && (
-          <p className="text-body-sm text-muted-foreground/75 leading-relaxed">
+          <p className="text-body-sm text-subtle-foreground leading-relaxed">
             {entry.description}
           </p>
         )}
 
         {/* Recording timeout hint */}
         {isRecording && recordingTimedOut && !pendingConflict && (
-          <p className="text-body-sm text-muted-foreground/80 mt-1.5 leading-relaxed">
+          <p className="text-body-sm text-subtle-foreground mt-1.5 leading-relaxed">
             Some shortcuts (e.g. Ctrl+W, Ctrl+T) are captured by the system and
             can't be recorded. Press Escape to cancel.
           </p>
@@ -344,7 +344,7 @@ function KeybindRow({
                 </div>
               </div>
               {affectsCritical && (
-                <p className="text-label text-warning/80">
+                <p className="text-label text-warning">
                   This will unbind a navigation shortcut. You can always reach settings from the menu.
                 </p>
               )}
@@ -358,7 +358,7 @@ function KeybindRow({
         {entry.isCustom && !isRecording && (
           <button
             onClick={onReset}
-            className="opacity-0 group-hover/kb:opacity-100 text-muted-foreground/70 hover:text-foreground transition-opacity duration-150 p-1 rounded-sm hover:bg-muted/60"
+            className="opacity-0 group-hover/kb:opacity-100 text-subtle-foreground hover:text-foreground transition-opacity duration-150 p-1 rounded-sm hover:bg-muted/60"
             title="Reset to default"
           >
             <RotateCcw className="size-3" />
@@ -382,7 +382,7 @@ function KeybindRow({
               isRecording
                 ? "border-primary/40 bg-primary/10 text-primary-foreground motion-safe:animate-pulse cursor-default"
                 : isUnbound
-                  ? "text-muted-foreground/50 border-dashed border-border bg-transparent hover:border-border hover:bg-muted/40 cursor-pointer"
+                  ? "text-subtle-foreground border-dashed border-border bg-transparent hover:border-border hover:bg-muted/40 cursor-pointer"
                   : entry.isCustom
                     ? "text-foreground border-primary/30 bg-primary/5 hover:bg-primary/10 cursor-pointer"
                     : "text-foreground/85 border-border/60 bg-muted/40 hover:bg-muted hover:border-border cursor-pointer",

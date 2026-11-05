@@ -6,13 +6,17 @@ import { cn } from "@/lib/utils"
 import { useShortcutLabel } from "@/components/ui/menu-chrome"
 
 function TooltipProvider({
-  delayDuration = 0,
+  // Matches the app root, so a nested provider never makes its tooltips
+  // instant by accident.
+  delayDuration = 300,
+  skipDelayDuration = 300,
   ...props
 }: React.ComponentProps<typeof TooltipPrimitive.Provider>) {
   return (
     <TooltipPrimitive.Provider
       data-slot="tooltip-provider"
       delayDuration={delayDuration}
+      skipDelayDuration={skipDelayDuration}
       {...props}
     />
   )
@@ -25,9 +29,25 @@ function Tooltip({
 }
 
 function TooltipTrigger({
+  onFocus,
   ...props
 }: React.ComponentProps<typeof TooltipPrimitive.Trigger>) {
-  return <TooltipPrimitive.Trigger data-slot="tooltip-trigger" {...props} />
+  return (
+    <TooltipPrimitive.Trigger
+      data-slot="tooltip-trigger"
+      // Only keyboard focus opens a tooltip. A popover that moves focus into
+      // itself on a mouse click would otherwise pop a label over the content
+      // the user just opened. Radix skips its handler once default is prevented.
+      onFocus={(event) => {
+        onFocus?.(event)
+        const target = event.currentTarget
+        if (target.ownerDocument.activeElement === target && !target.matches(":focus-visible")) {
+          event.preventDefault()
+        }
+      }}
+      {...props}
+    />
+  )
 }
 
 /** The keycap a tooltip carries for its control's binding. Resolved through
@@ -46,6 +66,7 @@ function TooltipShortcut({ actionId }: { actionId: string }) {
 function TooltipContent({
   className,
   sideOffset = 4,
+  collisionPadding = 8,
   shortcut,
   children,
   ...props
@@ -58,6 +79,7 @@ function TooltipContent({
       <TooltipPrimitive.Content
         data-slot="tooltip-content"
         sideOffset={sideOffset}
+        collisionPadding={collisionPadding}
         className={cn(
           "z-50 inline-flex w-fit max-w-xs items-center gap-1.5 rounded-md border border-border bg-popover px-2 py-1 text-label text-popover-foreground shadow-md/5 inset-shadow-bevel has-data-[slot=kbd]:pr-1 **:data-[slot=kbd]:relative **:data-[slot=kbd]:isolate **:data-[slot=kbd]:z-50 **:data-[slot=kbd]:rounded-sm",
           // Only a tooltip that waited out its delay fades in. One that opens

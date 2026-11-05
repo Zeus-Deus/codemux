@@ -168,10 +168,10 @@ const SWEEP_STYLE = {
 } as React.CSSProperties;
 
 const STRIP_CHIP =
-  "inline-flex h-[26px] shrink-0 items-center justify-center gap-1 rounded-md bg-surface-1 px-2.5 text-label font-semibold text-foreground/80 outline-none transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60 disabled:pointer-events-none disabled:opacity-50";
+  "inline-flex h-[26px] shrink-0 items-center justify-center gap-1 rounded-md bg-surface-1 px-2.5 text-label font-semibold text-foreground/80 outline-none transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:ring-2 focus-visible:ring-focus-ring disabled:pointer-events-none disabled:opacity-50";
 
 // Goal row controls, drawn to Canvas-12 2a / 4a: 26px, 6px corners, 11px/600.
-const GOAL_FOCUS = "outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
+const GOAL_FOCUS = "outline-none focus-visible:ring-2 focus-visible:ring-focus-ring";
 /** Quiet text action (Copy, Clear beside Resume). */
 const GOAL_CHIP = cn(
   "inline-flex h-[26px] shrink-0 items-center justify-center gap-[5px] rounded-sm px-2 text-label font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground",
@@ -466,7 +466,7 @@ function TasksRowView({ tasks }: { tasks: StripTasks }) {
       title={tasks.open ? "Hide tasks" : "Show tasks"}
       onClick={tasks.onToggle}
       className={cn(
-        "relative flex w-full shrink-0 items-center gap-2.5 px-2 text-left outline-none transition-colors duration-150 hover:bg-surface-1 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
+        "relative flex w-full shrink-0 items-center gap-2.5 px-2 text-left outline-none transition-colors duration-150 hover:bg-surface-1 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring",
         STRIP_ROW_HEIGHT,
       )}
     >

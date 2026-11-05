@@ -206,7 +206,7 @@ export const ToolCallCard = memo(function ToolCallCard({
       <span
         className={cn(
           "block min-w-0 flex-1 truncate",
-          isDenied && "line-through text-muted-foreground/60",
+          isDenied && "line-through text-subtle-foreground",
         )}
       >
         <ToolCallStatus item={displayItem} />
@@ -226,7 +226,7 @@ export const ToolCallCard = memo(function ToolCallCard({
       {toggleable && (
         <ChevronDown
           className={cn(
-            "size-3 shrink-0 text-muted-foreground/60 transition-transform duration-150 motion-reduce:transition-none",
+            "size-3 shrink-0 text-subtle-foreground transition-transform duration-150 motion-reduce:transition-none",
             expanded && "rotate-180",
           )}
           aria-hidden
@@ -259,7 +259,7 @@ export const ToolCallCard = memo(function ToolCallCard({
           onClick={() => setExpanded((v) => !v)}
           className={cn(
             headerClass,
-            "text-left transition-colors duration-150 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
+            "text-left transition-colors duration-150 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring",
           )}
         >
           {headerContent}
@@ -294,7 +294,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 
       {/* In-flight decision marker */}
       {isResponding && (
-        <div className="border-t border-border/60 px-3 py-2 text-label text-muted-foreground/70">
+        <div className="border-t border-border/60 px-3 py-2 text-label text-subtle-foreground">
           Submitting decision…
         </div>
       )}
@@ -324,7 +324,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 });
 
 const ELAPSED_CLASS =
-  "shrink-0 whitespace-nowrap font-mono text-caption text-muted-foreground/60";
+  "shrink-0 whitespace-nowrap font-mono text-caption text-subtle-foreground";
 
 // ---------------------------------------------------------------------------
 // Approval footer
@@ -560,7 +560,7 @@ function ApprovalFooter({
           </Button>
           <span
             data-testid="approval-key-hints"
-            className="ml-auto hidden text-caption text-muted-foreground/70 group-focus-within/approval:inline"
+            className="ml-auto hidden text-caption text-subtle-foreground group-focus-within/approval:inline"
           >
             <Kbd>↵</Kbd> allow · <Kbd>A</Kbd> always · <Kbd>D</Kbd> deny
           </span>

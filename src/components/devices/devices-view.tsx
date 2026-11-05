@@ -32,7 +32,7 @@ export function DevicesView() {
       backLabel="Close devices"
       onBack={() => setShowDevices(false)}
       actions={
-        <span className="hidden truncate text-label text-muted-foreground/70 lg:inline">
+        <span className="hidden truncate text-label text-subtle-foreground lg:inline">
           Remote Control lets you <em>use</em> another device — this page
           moves work <em>between</em> them.
         </span>

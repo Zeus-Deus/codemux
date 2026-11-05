@@ -28,7 +28,7 @@ export function ImageViewer({ filePath }: Props) {
         <div className="flex max-w-[320px] flex-col items-center">
           <div className="mb-3 flex size-10 items-center justify-center rounded-full border border-border bg-muted/40">
             <ImageOff
-              className="size-[18px] text-muted-foreground/60"
+              className="size-[18px] text-subtle-foreground"
             />
           </div>
           <p className="text-label font-medium text-foreground">

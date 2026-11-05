@@ -337,7 +337,6 @@ export function WorkspaceDetailsHost({
         ref={contentRef}
         align="end"
         sideOffset={remPx / 4}
-        collisionPadding={8}
         data-testid="workspace-details-card"
         data-mode="popover"
         aria-label="Workspace details"
@@ -999,8 +998,8 @@ function DiffStat({
       className={cn(DETAILS_TRAILING, DETAILS_DIFF_STAT)}
       aria-label={`${additions} ${additions === 1 ? "line" : "lines"} added, ${deletions} removed`}
     >
-      <span className="text-success/80">+{additions}</span>
-      <span className="text-danger/80">−{deletions}</span>
+      <span className="text-success">+{additions}</span>
+      <span className="text-danger">−{deletions}</span>
     </span>
   );
 }

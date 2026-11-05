@@ -194,7 +194,7 @@ export function TabTitleInput({
         }
       }}
       className={cn(
-        "h-5 w-[130px] min-w-0 rounded-sm border border-input bg-background px-1 text-label text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+        "h-5 w-[130px] min-w-0 rounded-sm border border-input bg-background px-1 text-label text-foreground outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
         className,
       )}
     />

@@ -155,7 +155,7 @@ export function SubagentsPane({
   if (waves.length === 0) {
     return (
       <div className="flex h-full items-center justify-center px-6 text-center">
-        <p className="text-label text-muted-foreground/70">
+        <p className="text-label text-subtle-foreground">
           No subagents in this thread yet.
         </p>
       </div>
@@ -198,7 +198,7 @@ export function SubagentsPane({
       {model.attention.length > 0 && (
         <section aria-label="Needs attention" className="flex flex-col gap-1.5">
           <SectionHeader
-            label={`NEEDS ATTENTION · ${model.attention.length}`}
+            label={`Needs attention · ${model.attention.length}`}
           />
           {model.attention.map((view) => (
             <AttentionCard
@@ -419,7 +419,7 @@ function RowGlyph({ view }: { view: SubagentView }) {
           kind === "failed"
             ? "text-status-attention"
             : kind === "stopped"
-              ? "text-status-working/80"
+              ? "text-status-working"
               : "text-status-open",
         )}
         aria-hidden
@@ -535,7 +535,7 @@ function AttentionCard({
       </div>
       <p
         title={activity}
-        className="mt-0.5 truncate pl-7 font-mono text-caption leading-[1.45] text-status-attention/85"
+        className="mt-0.5 truncate pl-7 font-mono text-caption leading-[1.45] text-status-attention"
       >
         {activity}
       </p>
@@ -651,7 +651,7 @@ function HistoryView({
         >
           ‹ Subagents
         </button>
-        <span aria-hidden className="text-muted-foreground/50">
+        <span aria-hidden className="text-subtle-foreground">
           /
         </span>
         <span className="text-foreground/80">History</span>
@@ -726,9 +726,9 @@ function PromptDivider({ text }: { text: string }) {
     <p
       data-testid="wave-prompt"
       title={text}
-      className="mt-2 truncate px-1 text-caption text-muted-foreground/80 first:mt-0"
+      className="mt-2 truncate px-1 text-caption text-subtle-foreground first:mt-0"
     >
-      <span className="mr-1 text-muted-foreground/50" aria-hidden>
+      <span className="mr-1 text-subtle-foreground" aria-hidden>
         ›
       </span>
       {text}

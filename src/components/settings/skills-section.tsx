@@ -285,7 +285,7 @@ export function SkillsSection({ projectRoot }: Props) {
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <div className="relative min-w-40 flex-1">
               <Search
-                className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground/60"
+                className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-subtle-foreground"
                 aria-hidden
               />
               <Input

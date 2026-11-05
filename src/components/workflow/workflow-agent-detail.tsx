@@ -139,9 +139,9 @@ export function WorkflowAgentDetail({
                   key={tool.id}
                   className="flex min-w-0 items-center gap-2.5 px-0.5 py-1 font-mono text-label"
                 >
-                  <span className="shrink-0 text-muted-foreground/70">{d.verb}</span>
+                  <span className="shrink-0 text-subtle-foreground">{d.verb}</span>
                   <span className="min-w-0 flex-1 truncate text-foreground/80">{d.target}</span>
-                  {d.meta && <span className="shrink-0 text-muted-foreground/70">{d.meta}</span>}
+                  {d.meta && <span className="shrink-0 text-subtle-foreground">{d.meta}</span>}
                 </div>
               );
             })}

@@ -364,7 +364,7 @@ export function QuestionForm({
               <Eyebrow>
                 {active.header || "Input requested"}
               </Eyebrow>
-              <QuestionnaireProgress className="ml-auto min-w-0 font-mono text-caption text-muted-foreground/70">
+              <QuestionnaireProgress className="ml-auto min-w-0 font-mono text-caption text-subtle-foreground">
                 {qi + 1} of {questions.length}
               </QuestionnaireProgress>
             </div>
@@ -381,7 +381,7 @@ export function QuestionForm({
                   {q.question}
                 </QuestionnaireTitle>
                 {q.multiSelect && (
-                  <QuestionnaireDescription className="text-label text-muted-foreground/70">
+                  <QuestionnaireDescription className="text-label text-subtle-foreground">
                     Select one or more.
                   </QuestionnaireDescription>
                 )}
@@ -433,13 +433,13 @@ export function QuestionForm({
                   aria-label="Previous question"
                   size="sm"
                   variant="ghost"
-                  className="size-7 min-h-0 shrink-0 px-0 text-muted-foreground/70 sm:min-h-0"
+                  className="size-7 min-h-0 shrink-0 px-0 text-subtle-foreground sm:min-h-0"
                 >
                   <ChevronLeft className="size-3.5" />
                 </QuestionnairePrevious>
                 <div
                   data-testid="aq-hints"
-                  className="flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-muted-foreground/60"
+                  className="flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-subtle-foreground"
                 >
                   <span>
                     <Kbd>←</Kbd> <Kbd>→</Kbd> navigate
@@ -616,7 +616,7 @@ function OtherRow({
       />
       <Pencil
         aria-hidden
-        className="pointer-events-none absolute start-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground/70"
+        className="pointer-events-none absolute start-2.5 top-1/2 size-3.5 -translate-y-1/2 text-subtle-foreground"
       />
     </div>
   );

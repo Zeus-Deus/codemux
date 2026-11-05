@@ -339,13 +339,13 @@ export function AttachmentChip({
           </Eyebrow>
         )}
       {lineCountLabel && (
-        <span className="text-caption opacity-70" aria-hidden>
+        <span className="text-caption text-subtle-foreground" aria-hidden>
           {lineCountLabel}
         </span>
       )}
       {truncationLabel && (
         <span
-          className="text-micro opacity-60"
+          className="text-micro text-subtle-foreground"
           aria-hidden
           data-testid="attachment-chip-truncation"
         >

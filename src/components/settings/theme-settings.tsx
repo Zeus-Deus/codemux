@@ -38,7 +38,7 @@ export function ThemeSettings() {
           <span className="truncate">{activeTheme.label}</span>
           <ThemeSchemeBadge scheme={activeTheme.scheme} />
         </p>
-        <p className="text-body-sm text-muted-foreground/80">
+        <p className="text-body-sm text-subtle-foreground">
           {source === "omarchy"
             ? omarchy ? "Following this desktop’s theme. Changes apply automatically." : "Omarchy is unavailable. Using your saved theme until it returns."
             : "Shell, terminal, code and editor. Synced to your account."}

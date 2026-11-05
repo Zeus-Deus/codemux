@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { X } from "lucide-react";
+import { Wand2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { selectActiveWorkspaceId, useAppStore, useHomeDir } from "@/stores/app-store";
 import { basename } from "@/lib/path";
@@ -101,35 +101,29 @@ export function SidebarSetupBanner() {
     setShowSettings(true, "projects");
   };
 
+  // One quiet row rather than a card: the tip is optional and stays until
+  // dismissed, so it must not take a slab of the rail from the workspaces.
   return (
-    <div className="shrink-0">
-      <div className="px-3 py-2">
-        <div className="rounded-md border border-border bg-muted/30 px-3 pt-2.5 pb-3">
-          <div className="flex items-center justify-between">
-            <p className="text-label font-semibold text-foreground">Setup scripts</p>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              className="shrink-0 -mr-1 text-muted-foreground hover:text-foreground"
-              onClick={handleDismiss}
-              aria-label="Dismiss setup tip"
-            >
-              <X className="size-3" />
-            </Button>
-          </div>
-          <p className="text-label text-muted-foreground mt-0.5">
-            Automate workspace setup for {projectName} with setup scripts
-            and <code className="font-mono text-caption bg-muted/50 px-0.5 rounded-sm">.codemuxinclude</code>
-          </p>
-          <Button
-            variant="outline"
-            size="sm"
-            className="w-full mt-2.5"
-            onClick={handleConfigure}
-          >
-            Configure
-          </Button>
-        </div>
+    <div className="shrink-0 px-2 py-1">
+      <div className="group/setup flex h-8 items-center rounded-md transition-colors duration-150 hover:bg-surface-2">
+        <button
+          type="button"
+          onClick={handleConfigure}
+          title="Automate workspace setup with setup scripts and .codemuxinclude"
+          className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-md pl-2 text-left text-label text-muted-foreground transition-colors duration-150 group-hover/setup:text-foreground"
+        >
+          <Wand2 aria-hidden className="size-3.5 shrink-0" />
+          <span className="truncate">Add setup scripts for {projectName}</span>
+        </button>
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          className="mr-1 shrink-0 text-subtle-foreground hover:text-foreground"
+          onClick={handleDismiss}
+          aria-label="Dismiss setup tip"
+        >
+          <X className="size-3" />
+        </Button>
       </div>
     </div>
   );

@@ -214,7 +214,7 @@ export function PlatformPluginEditor({
               >
                 {manifest.name}
               </h4>
-              {version ? <span className="font-mono text-label break-all text-muted-foreground/70">v{version}</span> : null}
+              {version ? <span className="font-mono text-label break-all text-subtle-foreground">v{version}</span> : null}
             </div>
             <div className="mt-1 flex flex-wrap items-center gap-1.5">
               <Badge variant="outline" className={TONE_BADGE[status.tone]} data-plugin-status-label>
@@ -386,7 +386,7 @@ function FoldedSection({ title, children }: { title: string; children: ReactNode
         type="button"
         aria-expanded={open}
         aria-controls={`${id}-body`}
-        className="-mx-1.5 flex w-[calc(100%+0.75rem)] items-center gap-1.5 rounded-md px-1.5 py-2 text-left text-label font-medium text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60"
+        className="-mx-1.5 flex w-[calc(100%+0.75rem)] items-center gap-1.5 rounded-md px-1.5 py-2 text-left text-label font-medium text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-focus-ring"
         onClick={() => setOpen((current) => !current)}
       >
         <ChevronRight

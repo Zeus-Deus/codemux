@@ -310,7 +310,7 @@ function NativeOutsideAssistantsSection() {
               )}
               <SettingsCard className="p-0">
                 {status.pending.length === 0 && status.clients.length === 0 ? (
-                  <p className="px-4 py-3 text-body-sm text-muted-foreground/80">No assistants have network access yet.</p>
+                  <p className="px-4 py-3 text-body-sm text-subtle-foreground">No assistants have network access yet.</p>
                 ) : (
                   <ul className="divide-y divide-border/40">
                     {status.pending.map((request) => (

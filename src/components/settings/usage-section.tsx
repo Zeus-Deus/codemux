@@ -913,7 +913,7 @@ function HeadlineSection({
             <button
               type="button"
               onClick={onOpenPrices}
-              className="rounded-sm font-medium text-foreground underline underline-offset-[3px] hover:text-accent-ember focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+              className="rounded-sm font-medium text-foreground underline underline-offset-[3px] hover:text-accent-ember focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
             >
               Set prices
             </button>
@@ -1133,9 +1133,9 @@ function OverTimeSection({
                 onFocus={() => onHoverProvider(p.provider)}
                 onBlur={() => onHoverProvider(null)}
                 className={cn(
-                  "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-label transition-colors duration-150 hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+                  "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-label transition-colors duration-150 hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
                   hoveredProvider && hoveredProvider !== p.provider
-                    ? "text-muted-foreground/60"
+                    ? "text-subtle-foreground"
                     : "text-foreground",
                 )}
               >
@@ -1513,7 +1513,7 @@ function ToolGroup({
             aria-label={`${seriesLabel(provider.provider)} plan limits: ${bars
               .map((w) => `${WINDOW_LABEL[w.kind]} ${remainingPct(w)}% left`)
               .join(", ")}. Open Limits.`}
-            className="hidden flex-col gap-1.5 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 @2xl:flex"
+            className="hidden flex-col gap-1.5 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring @2xl:flex"
           >
             {bars.map((w) => (
               <Tooltip key={w.kind}>
@@ -1641,7 +1641,7 @@ function ToolGroup({
                     )}
                   </span>
                   <ChevronRight
-                    className="size-3.5 text-muted-foreground/60 transition-colors duration-150 group-hover:text-foreground group-focus-visible:text-foreground"
+                    className="size-3.5 text-subtle-foreground transition-colors duration-150 group-hover:text-foreground group-focus-visible:text-foreground"
                     aria-hidden
                   />
                 </button>
@@ -1653,7 +1653,7 @@ function ToolGroup({
               <button
                 type="button"
                 onClick={() => setShowAll((v) => !v)}
-                className="rounded-sm text-label text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                className="rounded-sm text-label text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
               >
                 {showAll ? "Show fewer" : `Show ${models.length - MODELS_SHOWN} more`}
               </button>

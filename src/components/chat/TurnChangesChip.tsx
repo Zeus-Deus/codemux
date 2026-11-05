@@ -71,7 +71,7 @@ export function TurnChangesChip({
             }
           }}
           aria-label={`${label}, ${changes.added} lines added, ${changes.removed} removed. ${onShowDiff ? "Show this turn's diff" : "Open changes"}`}
-          className="inline-flex min-w-0 items-center gap-1.5 rounded-sm px-1 text-label text-muted-foreground transition-colors duration-100 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+          className="inline-flex min-w-0 items-center gap-1.5 rounded-sm px-1 text-label text-muted-foreground transition-colors duration-100 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
           data-testid="turn-changes-chip"
         >
           <FileDiff className="size-3 shrink-0" aria-hidden />

@@ -157,7 +157,7 @@ export const ActivityBlock = memo(function ActivityBlock({
           <Trace>
             {hiddenCount > 0 && (
               <button type="button" onClick={() => setShowAll(true)}>
-                <TraceLine className="text-muted-foreground/70">
+                <TraceLine className="text-subtle-foreground">
                   <TraceTitle>Show {hiddenCount} earlier</TraceTitle>
                 </TraceLine>
               </button>
@@ -244,7 +244,7 @@ function StepTitle({ step }: { step: ActivityStep }) {
       {argument ? (
         <>
           {" "}
-          <span className="font-mono text-label opacity-60">{argument}</span>
+          <span className="font-mono text-label text-subtle-foreground">{argument}</span>
         </>
       ) : null}
     </TraceTitle>
@@ -272,7 +272,7 @@ function CollapsedLine({
         </TraceIcon>
         <TraceTitle>
           {status === "running" ? "Running subagents" : "Ran subagents"}{" "}
-          <span className="opacity-60">{subagentPreview(entry.subagents)}</span>
+          <span className="text-subtle-foreground">{subagentPreview(entry.subagents)}</span>
         </TraceTitle>
         {settledTotals}
       </TraceLine>
@@ -340,7 +340,7 @@ function StepLine({
             <StepIcon step={step} />
             <StepTitle step={step} />
             {ticking ? (
-              <StepElapsed step={step} className={cn(META_CLASS, "text-muted-foreground/60")} />
+              <StepElapsed step={step} className={cn(META_CLASS, "text-subtle-foreground")} />
             ) : description && !runningLive ? (
               <TraceDescription className={META_CLASS}>{description}</TraceDescription>
             ) : null}
@@ -406,11 +406,11 @@ function SubagentRunLine({
         </TraceIcon>
         <TraceTitle>
           {status === "running" ? "Running" : "Ran"} {count} subagent{count === 1 ? "" : "s"}{" "}
-          <span className="opacity-60">{subagentPreview(run.subagents)}</span>
+          <span className="text-subtle-foreground">{subagentPreview(run.subagents)}</span>
         </TraceTitle>
         <TickingText
           active={status === "running"}
-          className={cn(META_CLASS, "shrink-0 whitespace-nowrap text-muted-foreground/60 tabular-nums")}
+          className={cn(META_CLASS, "shrink-0 whitespace-nowrap text-subtle-foreground tabular-nums")}
           compute={(now) => subagentRunMeta(run, now)}
         />
         <TraceIcon>

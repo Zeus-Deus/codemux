@@ -76,7 +76,7 @@ export function SkillViewModal({ skill, onClose }: Props) {
             )}
             {skill.symlinked && (
               <span
-                className="inline-flex items-center gap-1 text-label text-muted-foreground/80"
+                className="inline-flex items-center gap-1 text-label text-subtle-foreground"
                 data-testid="skill-modal-symlink"
               >
                 <Link2 className="size-3" aria-hidden />

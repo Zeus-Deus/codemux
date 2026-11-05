@@ -155,6 +155,14 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
         (filter === "settled" && isSettled))
     );
   });
+  // Attention first, as the desktop rail does: blocked work, then work waiting
+  // for review, then everything else in its existing order. A stable sort on
+  // a coarse rank (no clocks), so rows only move when their state changes.
+  const attentionRank = (w: (typeof workspaces)[number]) => {
+    const status = getWorkspaceStatus(w.surfaces, snapshot?.pane_statuses ?? {});
+    return status === "permission" ? 0 : status === "review" ? 1 : 2;
+  };
+  workspaces.sort((a, b) => attentionRank(a) - attentionRank(b));
   const appAction = (
     label: string,
     Icon: typeof Search,
@@ -231,8 +239,15 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
           </button>
         ) : (
           <div className="min-w-0 flex-1 truncate font-semibold">
-            {home ? "Codemux" : "New workspace"}
+            {home ? "Workspaces" : "New workspace"}
           </div>
+        )}
+        {/* The list's title and its one primary action live in the app bar,
+            so the first workspace row starts right under the search. */}
+        {home && (
+          <button aria-label="New workspace" onClick={() => startChat()}>
+            <Plus size={20} />
+          </button>
         )}
         {home && (
           <button
@@ -264,15 +279,6 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
       </header>
       {home ? (
         <main className="mobile-home">
-          <div className="flex items-center justify-between gap-3">
-            <h1 className="text-2xl font-semibold tracking-tight">
-              Workspaces
-            </h1>
-            <button className="mobile-primary" onClick={() => startChat()}>
-              <Plus size={18} />
-              New
-            </button>
-          </div>
           <label className="mobile-search">
             <Search size={18} />
             <input

@@ -404,7 +404,7 @@ function WorkspaceMenuHeader({
           {workspace.title}
         </span>
         {project && (
-          <span className="truncate text-label text-muted-foreground/70">
+          <span className="truncate text-label text-subtle-foreground">
             {project.name}
           </span>
         )}
@@ -412,10 +412,10 @@ function WorkspaceMenuHeader({
       {hasStats && (
         <span className="flex shrink-0 gap-1.5 font-mono text-caption tabular-nums">
           {additions > 0 && (
-            <span className="text-status-open/80">+{additions}</span>
+            <span className="text-status-open">+{additions}</span>
           )}
           {deletions > 0 && (
-            <span className="text-status-attention/80">−{deletions}</span>
+            <span className="text-status-attention">−{deletions}</span>
           )}
         </span>
       )}
@@ -453,14 +453,14 @@ function MoveToDeviceSubmenu({
             "flex items-center text-foreground",
           )}
         >
-          <MonitorSmartphone className="size-3.5 shrink-0 text-muted-foreground/70" />
+          <MonitorSmartphone className="size-3.5 shrink-0 text-subtle-foreground" />
           <span className="flex min-w-0 flex-1 flex-col">
             <span className="truncate">This device</span>
           </span>
           <Check className="size-3 shrink-0 text-accent-ember" />
         </div>
         {hosts.length === 0 ? (
-          <p className="px-[9px] pt-2 pb-1.5 text-label leading-snug text-muted-foreground/70">
+          <p className="px-[9px] pt-2 pb-1.5 text-label leading-snug text-subtle-foreground">
             No other devices signed in.
           </p>
         ) : (
@@ -473,7 +473,7 @@ function MoveToDeviceSubmenu({
               <Server />
               <span className="flex min-w-0 flex-1 flex-col">
                 <span className="truncate">{host.name}</span>
-                <span className={cn("truncate text-caption text-muted-foreground/70", !host.dirty && "font-mono")}>
+                <span className={cn("truncate text-caption text-subtle-foreground", !host.dirty && "font-mono")}>
                   {host.dirty ? "not synced yet" : host.ssh_target}
                 </span>
               </span>
@@ -1430,7 +1430,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <BellOff
-                        className="size-3 shrink-0 text-muted-foreground/60"
+                        className="size-3 shrink-0 text-subtle-foreground"
                         aria-label="Notifications muted"
                       />
                     </TooltipTrigger>
@@ -1512,7 +1512,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                     {sidebarElapsedSec !== null && (
                       <span
                         title="Push/pull in progress — large workspaces can take a while."
-                        className="rounded-full bg-muted/60 px-1.5 py-0 text-caption font-medium tabular-nums leading-[14px] text-muted-foreground/85"
+                        className="rounded-full bg-muted/60 px-1.5 py-0 text-caption font-medium tabular-nums leading-[14px] text-muted-foreground"
                       >
                         {sidebarElapsedSec}s
                       </span>
@@ -1560,7 +1560,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                   rows (with its hover-slide affordance). */}
               {showGitLine && (
                 <div className={cn(
-                  "flex items-center gap-1.5 font-mono leading-tight text-muted-foreground/60",
+                  "flex items-center gap-1.5 font-mono leading-tight text-subtle-foreground",
                   isWorking ? "text-caption mt-1" : "text-label mt-0.5",
                 )}>
                   {workspace.git_branch && (
@@ -1590,10 +1590,10 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                       "transition-opacity duration-150 group-hover/row:opacity-0",
                     )}>
                       {workspace.git_behind > 0 && (
-                        <span className="text-warning/80">↓{workspace.git_behind}</span>
+                        <span className="text-warning">↓{workspace.git_behind}</span>
                       )}
                       {workspace.git_ahead > 0 && (
-                        <span className="text-success/80">↑{workspace.git_ahead}</span>
+                        <span className="text-success">↑{workspace.git_ahead}</span>
                       )}
                     </span>
                   )}
@@ -1607,10 +1607,10 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                       "transition-opacity duration-150 group-hover/row:opacity-0",
                     )}>
                       {workspace.git_additions > 0 && (
-                        <span className="text-success/80">+{workspace.git_additions}</span>
+                        <span className="text-success">+{workspace.git_additions}</span>
                       )}
                       {workspace.git_deletions > 0 && (
-                        <span className="text-danger/80">−{workspace.git_deletions}</span>
+                        <span className="text-danger">−{workspace.git_deletions}</span>
                       )}
                     </span>
                   )}
@@ -1647,7 +1647,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <BellOff
-                              className="size-3 text-muted-foreground/60"
+                              className="size-3 text-subtle-foreground"
                               aria-label="Notifications muted"
                             />
                           </TooltipTrigger>

@@ -692,7 +692,7 @@ export function MultiProviderModelPicker({
           className="flex-col items-start gap-0.5"
         >
           <span>{triggerLabel}</span>
-          {triggerDetails && <span className="opacity-70">{triggerDetails}</span>}
+          {triggerDetails && <span className="text-subtle-foreground">{triggerDetails}</span>}
         </TooltipContent>
       </Tooltip>
       <PopoverContent
@@ -1180,7 +1180,7 @@ function AccountRailEntry({
           <span>
             {label} <span className="text-muted-foreground">·</span> {accountSummary(account)}
           </span>
-          {waitsForTurn && <span className="opacity-70">Accounts can be switched once this turn finishes.</span>}
+          {waitsForTurn && <span className="text-subtle-foreground">Accounts can be switched once this turn finishes.</span>}
         </TooltipContent>
       </Tooltip>
     </div>
@@ -1273,7 +1273,7 @@ function ModelRow({
         <div className="text-label font-medium leading-snug">
           <span className="truncate">{model.label}</span>
         </div>
-        <div className="mt-0.5 flex items-center gap-1 text-label text-muted-foreground/70">
+        <div className="mt-0.5 flex items-center gap-1 text-label text-subtle-foreground">
           <ProviderLogo provider={provider} className="size-2.5 shrink-0" />
           <span className="truncate" title={subtitle}>
             {subtitle}
@@ -1324,7 +1324,7 @@ function ModelRow({
           "shrink-0 rounded-sm p-1 transition-colors duration-150 hover:bg-surface-3",
           isFavorite
             ? "text-status-working"
-            : "text-muted-foreground/40 hover:text-foreground focus-visible:text-foreground",
+            : "text-subtle-foreground hover:text-foreground focus-visible:text-foreground",
         )}
       >
         <Star

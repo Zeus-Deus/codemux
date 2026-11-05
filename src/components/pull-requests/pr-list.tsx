@@ -388,7 +388,7 @@ export function PrList({
                       )}
                       <Users aria-hidden className="size-3.5 shrink-0" />
                       <span className="shrink-0">{GROUP_LABEL.watching}</span>
-                      <span className="shrink-0 tabular-nums text-muted-foreground/60">
+                      <span className="shrink-0 tabular-nums text-subtle-foreground">
                         {watching.length}
                       </span>
                       <span aria-hidden className="h-px min-w-2 flex-1 bg-border/60" />
@@ -396,7 +396,7 @@ export function PrList({
                     {watchingOpen ? (
                       watching.map((row) => renderRow(row, true))
                     ) : (
-                      <p className={cn("px-3 leading-relaxed text-muted-foreground/80", tzMetaNum)}>
+                      <p className={cn("px-3 leading-relaxed text-subtle-foreground", tzMetaNum)}>
                         Repositories you have open but aren't involved in.
                       </p>
                     )}
@@ -443,7 +443,7 @@ export function PrList({
                 </>
               )}
             </span>
-            <span className={cn("shrink-0 font-mono text-muted-foreground/70", tzEyebrow)}>
+            <span className={cn("shrink-0 font-mono text-subtle-foreground", tzEyebrow)}>
               ↑↓ move · ↵ open
             </span>
           </div>
@@ -549,7 +549,7 @@ function GroupHeader({ id, count }: { id: "review" | "yours"; count: number }) {
         className={cn("size-3.5 shrink-0", id === "review" && "text-accent-ember")}
       />
       <h2 className="shrink-0">{GROUP_LABEL[id]}</h2>
-      <span className="shrink-0 tabular-nums text-muted-foreground/60">{count}</span>
+      <span className="shrink-0 tabular-nums text-subtle-foreground">{count}</span>
       <span aria-hidden className="h-px min-w-2 flex-1 bg-border/60" />
     </div>
   );

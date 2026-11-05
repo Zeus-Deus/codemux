@@ -315,7 +315,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
           <DialogTitle className="text-body-lg font-semibold">
             Pull workspace to this device
           </DialogTitle>
-          <DialogDescription className="text-body-sm text-muted-foreground/80">
+          <DialogDescription className="text-body-sm text-subtle-foreground">
             Bring{" "}
             <span className="font-medium text-foreground">
               {syncRow.title}
@@ -415,7 +415,7 @@ function HostBackedAdoptionForm({
       <dl className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body space-y-1.5">
         <SummaryRow
           label="From"
-          icon={<Cloud className="size-3 text-status-remote/80" />}
+          icon={<Cloud className="size-3 text-status-remote" />}
         >
           {preview.host_label ?? "—"}
         </SummaryRow>
@@ -428,7 +428,7 @@ function HostBackedAdoptionForm({
           </span>
         </SummaryRow>
         <SummaryRow label="Will land">
-          <span className="font-mono text-label text-muted-foreground/80 break-all">
+          <span className="font-mono text-label text-subtle-foreground break-all">
             {preview.suggested_path}
           </span>
         </SummaryRow>
@@ -437,7 +437,7 @@ function HostBackedAdoptionForm({
       <button
         type="button"
         onClick={onToggleDisclosure}
-        className="flex w-full items-center gap-1 text-body-sm text-muted-foreground/75 hover:text-foreground transition-colors duration-150"
+        className="flex w-full items-center gap-1 text-body-sm text-subtle-foreground hover:text-foreground transition-colors duration-150"
       >
         {disclosureOpen ? (
           <ChevronDown className="size-3" />
@@ -448,7 +448,7 @@ function HostBackedAdoptionForm({
       </button>
 
       {disclosureOpen && (
-        <ul className="rounded-md bg-muted/20 border border-border/40 px-3 py-2 text-body-sm text-muted-foreground/85 leading-relaxed space-y-1">
+        <ul className="rounded-md bg-muted/20 border border-border/40 px-3 py-2 text-body-sm text-muted-foreground leading-relaxed space-y-1">
           <li>
             • Copies the workspace files from{" "}
             <span className="font-medium text-foreground/90">
@@ -478,7 +478,7 @@ function HostNotConfiguredBlock({
   onClose: () => void;
 }) {
   return (
-    <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2.5 text-body-sm text-warning/95 leading-relaxed space-y-2">
+    <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2.5 text-body-sm text-warning leading-relaxed space-y-2">
       <p>
         This workspace lives on a device you haven't configured here
         yet
@@ -491,7 +491,7 @@ function HostNotConfiguredBlock({
           "."
         )}
       </p>
-      <p className="text-warning/85">
+      <p className="text-warning">
         Add the device in Settings → Connections → Devices, then come back and pull.
       </p>
       <Button
@@ -519,7 +519,7 @@ function CloneFallbackBlock({
 }) {
   return (
     <>
-      <p className="text-body-sm text-muted-foreground/85 leading-relaxed">
+      <p className="text-body-sm text-muted-foreground leading-relaxed">
         This workspace lives only on another device (no shared host).
         We'll clone it from git.
       </p>
@@ -532,26 +532,26 @@ function CloneFallbackBlock({
         </SummaryRow>
         <SummaryRow
           label="Branch"
-          icon={<GitBranch className="size-3 text-muted-foreground/70" />}
+          icon={<GitBranch className="size-3 text-subtle-foreground" />}
         >
           <span className="font-mono text-body-sm">
             {syncRow.git_branch ?? "main"}
           </span>
         </SummaryRow>
         <SummaryRow label="Will land">
-          <span className="font-mono text-label text-muted-foreground/80 break-all">
+          <span className="font-mono text-label text-subtle-foreground break-all">
             {preview.suggested_path}
           </span>
         </SummaryRow>
       </dl>
 
-      <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-body-sm text-warning/90 leading-relaxed">
+      <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-body-sm text-warning leading-relaxed">
         <AlertTriangle className="size-3.5 shrink-0 mt-0.5" />
         <div>
           <p className="font-medium text-warning">
             Uncommitted work on the other device will NOT come over.
           </p>
-          <p className="text-warning/80">
+          <p className="text-warning">
             Only committed history clones. If you want the in-flight
             edits, open the other device first and commit (or push
             the workspace to a shared device instead, then pull from
@@ -565,7 +565,7 @@ function CloneFallbackBlock({
 
 function NoOptionsBlock() {
   return (
-    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground/85 leading-relaxed">
+    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground leading-relaxed">
       We don't have a way to bring this workspace over yet — no shared
       host, no git remote URL. Open the device it lives on and push
       it to a shared device first, then pull from here.
@@ -575,12 +575,12 @@ function NoOptionsBlock() {
 
 function PathInUseBlock({ path }: { path: string }) {
   return (
-    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-body-sm text-destructive/95 leading-relaxed">
+    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-body-sm text-destructive leading-relaxed">
       <p className="mb-1">A different workspace is already using:</p>
-      <p className="font-mono text-label text-destructive/85 break-all">
+      <p className="font-mono text-label text-destructive break-all">
         {path}
       </p>
-      <p className="mt-2 text-destructive/85">
+      <p className="mt-2 text-destructive">
         Close that workspace first, or wait for the upcoming "choose
         different path" picker.
       </p>
@@ -599,12 +599,12 @@ function SameBranchProjectBlock({
   // is "you have a logically-equivalent workspace open — same
   // branch of the same project — just at a different path."
   return (
-    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground/85 leading-relaxed space-y-2">
+    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground leading-relaxed space-y-2">
       <p>
         You already have this branch open on this device, just at a
         different path.
       </p>
-      <p className="text-muted-foreground/65">
+      <p className="text-subtle-foreground">
         Pulling would create a parallel copy of work you're already
         doing. Open the existing workspace instead.
       </p>
@@ -621,7 +621,7 @@ function SameBranchProjectBlock({
 
 function AlreadyAdoptedBlock({ onOpen }: { onOpen: () => void }) {
   return (
-    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground/85 leading-relaxed space-y-2">
+    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground leading-relaxed space-y-2">
       <p>You've already pulled this workspace to this device.</p>
       <Button
         variant="secondary"
@@ -636,7 +636,7 @@ function AlreadyAdoptedBlock({ onOpen }: { onOpen: () => void }) {
 
 function ErrorBlock({ message }: { message: string }) {
   return (
-    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-body-sm text-destructive/95">
+    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-body-sm text-destructive">
       {message}
     </div>
   );

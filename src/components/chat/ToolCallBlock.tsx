@@ -41,7 +41,7 @@ export function ToolCallBlock({ content, error, text }: Props) {
       <div className="px-3 py-2">
         {visible}
         {showToggle && !expanded && (
-          <span className="text-muted-foreground/60">{"\n"}…</span>
+          <span className="text-subtle-foreground">{"\n"}…</span>
         )}
       </div>
       {showToggle && (

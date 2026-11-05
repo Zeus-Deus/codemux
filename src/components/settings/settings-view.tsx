@@ -274,14 +274,14 @@ function FormField({
           {status}
         </div>
         {helper && (
-          <p className="text-body-sm text-muted-foreground/85 leading-relaxed">
+          <p className="text-body-sm text-muted-foreground leading-relaxed">
             {helper}
           </p>
         )}
       </div>
       {children}
       {caption && (
-        <p className="text-label text-muted-foreground/70 leading-relaxed">
+        <p className="text-label text-subtle-foreground leading-relaxed">
           {caption}
         </p>
       )}
@@ -301,10 +301,10 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cn(
-        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-md text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-md text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
         active
           ? "bg-surface-3 text-foreground"
-          : "text-muted-foreground/90 hover:bg-surface-2 hover:text-foreground",
+          : "text-muted-foreground hover:bg-surface-2 hover:text-foreground",
       )}
     >
       <Icon
@@ -312,7 +312,7 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
           "size-4 shrink-0 transition-colors duration-150",
           active
             ? "text-foreground/85"
-            : "text-muted-foreground/70 group-hover/nav:text-foreground/80",
+            : "text-subtle-foreground group-hover/nav:text-foreground/80",
         )}
       />
       <span className="truncate">{label}</span>
@@ -414,7 +414,7 @@ function OnThisPage({
             "-ml-px block w-full truncate border-l-2 py-1 pl-3 text-left text-body-sm transition-colors duration-150 outline-none focus-visible:text-foreground",
             current === item.id
               ? "border-accent-ember text-foreground"
-              : "border-transparent text-muted-foreground/80 hover:text-foreground",
+              : "border-transparent text-subtle-foreground hover:text-foreground",
           )}
         >
           {item.label}
@@ -660,7 +660,7 @@ function BrowserSection() {
               message.failed ? "bg-destructive" : "bg-success",
             )}
           />
-          <p className="text-body-sm text-muted-foreground/90 leading-relaxed">{message.text}</p>
+          <p className="text-body-sm text-muted-foreground leading-relaxed">{message.text}</p>
         </SettingsCard>
       )}
       {confirmDialog}
@@ -1974,7 +1974,7 @@ export function SettingsView() {
               {authUser ? (
                 <>
                   <SettingRow label="Email" description="Your sign-in email address.">
-                    <span className="select-text font-mono text-body text-muted-foreground">{authUser.email}</span>
+                    <span className="select-text text-body text-muted-foreground">{authUser.email}</span>
                   </SettingRow>
                   <Separator />
                   <SettingRow label="Name" description="Your display name.">
@@ -2002,10 +2002,10 @@ export function SettingsView() {
             {authUser && (
               <SectionGroup>
                 <SubsectionHeader title="Session" />
-                <SettingsCard className="flex items-center justify-between gap-4 border-destructive/25 bg-destructive/[0.07]">
+                <SettingsCard className="flex items-center justify-between gap-4">
                   <div className="min-w-0">
                     <p className="text-body-lg font-semibold text-foreground">Sign out of Codemux</p>
-                    <p className="text-body-sm text-muted-foreground/80 mt-0.5">
+                    <p className="text-body-sm text-subtle-foreground mt-0.5">
                       You'll need to sign in again to sync settings and use cloud features.
                     </p>
                   </div>
@@ -2218,7 +2218,7 @@ export function SettingsView() {
                         <EditorIcon id={ed.id} className="size-4" />
                         {ed.name}
                       </span>
-                      <code className="text-label text-muted-foreground/85 font-mono bg-background/60 px-2 py-0.5 rounded-sm border border-border/40">
+                      <code className="text-label text-muted-foreground font-mono bg-background/60 px-2 py-0.5 rounded-sm border border-border/40">
                         {ed.command}
                       </code>
                     </div>
@@ -2348,7 +2348,7 @@ export function SettingsView() {
               )}
             </SectionGroup>
 
-            <p className="text-body-sm text-muted-foreground/70 leading-relaxed mt-8">
+            <p className="text-body-sm text-subtle-foreground leading-relaxed mt-8">
               Agents in Codemux terminals automatically receive workspace context.{" "}
               <a href="https://docs.codemux.org/agent-awareness" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors duration-150">
                 Learn how to configure it for your tools
@@ -2846,7 +2846,7 @@ export function SettingsView() {
             {hasConfigFile && (
               <SettingsCard className="mb-6 flex items-start gap-3">
                 <div className="size-1.5 rounded-full bg-warning shrink-0 mt-1.5" />
-                <p className="text-body-sm text-muted-foreground/90 leading-relaxed">
+                <p className="text-body-sm text-muted-foreground leading-relaxed">
                   A <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemux/config.json</code> file was found.
                   File-based configuration takes precedence over these settings.
                 </p>
@@ -2869,7 +2869,7 @@ export function SettingsView() {
               >
                 {hasIncludeFile && (
                   <SettingsCard className="py-2.5 px-3 mb-2">
-                    <p className="text-body-sm text-muted-foreground/90 leading-relaxed">
+                    <p className="text-body-sm text-muted-foreground leading-relaxed">
                       This project has a <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemuxinclude</code> file —
                       those patterns take priority over the settings below.
                     </p>
@@ -2947,7 +2947,7 @@ export function SettingsView() {
                     className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)] items-center gap-4 px-4 py-2"
                   >
                     <code className="font-mono text-body-sm text-foreground/90 truncate">{name}</code>
-                    <span className="text-body-sm text-muted-foreground/85 truncate">{desc}</span>
+                    <span className="text-body-sm text-muted-foreground truncate">{desc}</span>
                   </div>
                 ))}
               </SettingsCard>
@@ -3293,7 +3293,7 @@ function SortablePresetRow({
     >
       <button
         type="button"
-        className="p-1 rounded-sm text-muted-foreground/30 hover:text-muted-foreground hover:bg-surface-2 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 group-focus-within/preset:opacity-100 transition-opacity duration-150"
+        className="p-1 rounded-sm text-subtle-foreground hover:text-muted-foreground hover:bg-surface-2 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 group-focus-within/preset:opacity-100 transition-opacity duration-150"
         title="Drag to reorder"
         {...attributes}
         {...listeners}
@@ -3308,7 +3308,7 @@ function SortablePresetRow({
         onClick={onSelect}
         aria-label={`Edit ${preset.name}`}
         // Inset ring: the list clips anything drawn outside a row.
-        className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-sm py-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-sm py-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring"
       >
       {/* Glyph tile — the agent icon seated in a rounded tile, per the
           design's preset rows. */}
@@ -3325,7 +3325,7 @@ function SortablePresetRow({
           )}
         </div>
         {preset.commands.length > 0 && (
-          <code className="text-label text-muted-foreground/70 font-mono truncate block mt-0.5">
+          <code className="text-label text-subtle-foreground font-mono truncate block mt-0.5">
             {preset.commands[0]}
           </code>
         )}

@@ -172,7 +172,7 @@ function ProviderRow({
         <span className="text-body font-medium text-foreground truncate">
           {provider.name}
         </span>
-        <span className="ml-auto shrink-0 text-label text-muted-foreground/80">
+        <span className="ml-auto shrink-0 text-label text-subtle-foreground">
           {statusLabel(row)}
         </span>
         {row.detail && (
@@ -181,7 +181,7 @@ function ProviderRow({
             onClick={() => setOpen((v) => !v)}
             aria-label={open ? "Hide details" : "Show details"}
             aria-expanded={open}
-            className="shrink-0 rounded-sm p-0.5 text-muted-foreground/60 hover:text-foreground hover:bg-muted/60 transition-colors duration-150"
+            className="shrink-0 rounded-sm p-0.5 text-subtle-foreground hover:text-foreground hover:bg-muted/60 transition-colors duration-150"
           >
             <ChevronRight
               className={cn(
@@ -196,7 +196,7 @@ function ProviderRow({
 
       {row.supported && row.cli_installed && (
         <div className="mt-1.5 pl-[1.375rem] flex flex-wrap items-center gap-x-3 gap-y-1">
-          <span className="font-mono text-label text-muted-foreground/70">
+          <span className="font-mono text-label text-subtle-foreground">
             {row.cli_version ?? provider.cli}
           </span>
           {row.account && <AccountValue account={row.account} />}
@@ -204,13 +204,13 @@ function ProviderRow({
       )}
 
       {row.supported && servedFeatures(row, provider).length > 0 && (
-        <p className="mt-1.5 pl-[1.375rem] text-label text-muted-foreground/70">
+        <p className="mt-1.5 pl-[1.375rem] text-label text-subtle-foreground">
           Serves {formatList(servedFeatures(row, provider))}
         </p>
       )}
 
       {fixIt?.code && (
-        <p className="mt-1.5 pl-[1.375rem] text-label text-muted-foreground/80">
+        <p className="mt-1.5 pl-[1.375rem] text-label text-subtle-foreground">
           {fixIt.prefix}
           <code className="font-mono text-foreground/90 break-all">
             {fixIt.code}
@@ -219,7 +219,7 @@ function ProviderRow({
       )}
 
       {open && row.detail && (
-        <p className="mt-2 pl-[1.375rem] text-label leading-relaxed text-muted-foreground/70 max-w-prose">
+        <p className="mt-2 pl-[1.375rem] text-label leading-relaxed text-subtle-foreground max-w-prose">
           {row.detail}
         </p>
       )}
@@ -349,7 +349,7 @@ function CustomHostsEditor() {
             <div className="space-y-1.5 min-w-[12rem] flex-1">
               <Label
                 htmlFor="custom-host-name"
-                className="text-label text-muted-foreground/85 font-normal"
+                className="text-label text-muted-foreground font-normal"
               >
                 Hostname
               </Label>
@@ -371,7 +371,7 @@ function CustomHostsEditor() {
             <div className="space-y-1.5">
               <Label
                 htmlFor="custom-host-kind"
-                className="text-label text-muted-foreground/85 font-normal"
+                className="text-label text-muted-foreground font-normal"
               >
                 Runs
               </Label>
@@ -569,7 +569,7 @@ function PrLinkDestination() {
         <p className="text-body-lg font-semibold leading-tight text-foreground">
           Open pull request links in the browser
         </p>
-        <p className="text-body-sm leading-relaxed text-muted-foreground/80">
+        <p className="text-body-sm leading-relaxed text-subtle-foreground">
           Off, a link to a pull request in a project you have open goes to the Pull
           Requests page instead of your browser. Shift-click always goes to the
           browser either way.

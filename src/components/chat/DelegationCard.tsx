@@ -208,7 +208,7 @@ export const DelegationCard = memo(function DelegationCard({
                   compute={(now) => delegationElapsedLabel([entry.view], now)}
                 />
                 {child && (
-                  <ChevronRight className="size-3.5 shrink-0 text-muted-foreground/60 group-hover:text-foreground" />
+                  <ChevronRight className="size-3.5 shrink-0 text-subtle-foreground group-hover:text-foreground" />
                 )}
               </>
             );

@@ -154,7 +154,7 @@ function AnchorPill({
         // Ember on hover: the muted-on-muted accent fill this had was
         // close to invisible in dark mode, and the pill gave no sign of
         // being clickable.
-        "min-w-0 outline-none transition-colors duration-100 hover:bg-accent-ember/15 hover:text-accent-ember focus-visible:ring-2 focus-visible:ring-ring/60",
+        "min-w-0 outline-none transition-colors duration-100 hover:bg-accent-ember/15 hover:text-accent-ember focus-visible:ring-2 focus-visible:ring-focus-ring",
         tzMeta,
       )}
     >
@@ -267,7 +267,7 @@ function ThreadReplyBox({
         data-testid={`thread-reply-input-${threadId}`}
         aria-label="Reply to this thread"
         className={cn(
-          "w-full resize-none overflow-y-auto rounded-md border-0 bg-muted/40 px-2 py-1.5 leading-relaxed text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/60",
+          "w-full resize-none overflow-y-auto rounded-md border-0 bg-muted/40 px-2 py-1.5 leading-relaxed text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-focus-ring",
           tzBody,
         )}
       />

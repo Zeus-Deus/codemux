@@ -45,7 +45,7 @@ export function ProviderSwitchDivider({ item }: { item: ProviderSwitchItem }) {
       data-testid="provider-switch-divider"
       role="separator"
       aria-label={`Switched from ${from} to ${to}, ${carried}`}
-      className="flex w-full items-center gap-3 py-1 text-muted-foreground/70"
+      className="flex w-full items-center gap-3 py-1 text-subtle-foreground"
     >
       <span className="h-px flex-1 bg-border/60" />
       <span className="inline-flex min-w-0 items-center gap-1.5 font-mono text-label font-medium tracking-wide">

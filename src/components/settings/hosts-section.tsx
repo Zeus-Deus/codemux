@@ -257,7 +257,7 @@ export function HostsSection() {
           <p className="truncate text-body font-medium text-foreground">
             {localName ?? "This machine"}
           </p>
-          <p className="text-label text-muted-foreground/80">
+          <p className="text-label text-subtle-foreground">
             This computer · always available
           </p>
         </div>
@@ -286,7 +286,7 @@ export function HostsSection() {
             Loading devices…
           </p>
         ) : hosts.length === 0 ? (
-          <p className="px-4 py-4 text-body-sm leading-relaxed text-muted-foreground/80">
+          <p className="px-4 py-4 text-body-sm leading-relaxed text-subtle-foreground">
             {loadError
               ? `Couldn't load devices: ${loadError}`
               : "No devices yet. Add a home server, a desktop, or a cloud VM — anything you can SSH into."}
@@ -382,7 +382,7 @@ function DeviceRow({
       <div className="min-w-0 flex-1">
         <p className="truncate text-body font-medium text-foreground">{host.name}</p>
         <p
-          className="flex min-w-0 items-center gap-1.5 text-label text-muted-foreground/80"
+          className="flex min-w-0 items-center gap-1.5 text-label text-subtle-foreground"
           title={status.detail ?? undefined}
         >
           <span className="truncate">SSH {host.ssh_target}</span>
@@ -653,7 +653,7 @@ function AddDeviceForm({
         />
         {!running && matches.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-            <span className="text-label text-muted-foreground/70">From your SSH config</span>
+            <span className="text-label text-subtle-foreground">From your SSH config</span>
             {matches.map((suggestion) => (
               <button
                 key={suggestion}
@@ -673,7 +673,7 @@ function AddDeviceForm({
 
       <div className="grid gap-1.5">
         <Label htmlFor="add-device-name" className="text-body-sm">
-          Name <span className="font-normal text-muted-foreground/70">optional</span>
+          Name <span className="font-normal text-subtle-foreground">optional</span>
         </Label>
         <Input
           id="add-device-name"
@@ -696,19 +696,19 @@ function AddDeviceForm({
                 <p
                   className={cn(
                     "text-body-sm",
-                    steps[id] === "pending" ? "text-muted-foreground/70" : "text-foreground",
+                    steps[id] === "pending" ? "text-subtle-foreground" : "text-foreground",
                   )}
                 >
                   {label}
                   {steps[id] === "skipped" && (
-                    <span className="text-muted-foreground/70"> · already installed</span>
+                    <span className="text-subtle-foreground"> · already installed</span>
                   )}
                 </p>
                 {steps[id] === "failed" && failure && (
                   <div className="mt-0.5 space-y-0.5 text-label leading-relaxed">
                     <p className="select-text text-destructive">{failure.message}</p>
                     {failure.sshHint && (
-                      <p className="text-muted-foreground/80">
+                      <p className="text-subtle-foreground">
                         Make sure{" "}
                         <code className="font-mono text-foreground">ssh {sshTarget}</code>{" "}
                         works from a terminal without a password prompt.
@@ -721,7 +721,7 @@ function AddDeviceForm({
           ))}
         </ol>
       ) : (
-        <p className="text-label leading-relaxed text-muted-foreground/80">
+        <p className="text-label leading-relaxed text-subtle-foreground">
           If the small Codemux helper is missing, Connect installs it in your
           user account. No root needed.
         </p>
@@ -744,7 +744,7 @@ function StepIcon({ state }: { state: StepState }) {
     case "done":
       return <Check className="size-3.5 text-status-open" aria-hidden />;
     case "skipped":
-      return <Minus className="size-3.5 text-muted-foreground/60" aria-hidden />;
+      return <Minus className="size-3.5 text-subtle-foreground" aria-hidden />;
     case "failed":
       return <X className="size-3.5 text-destructive" aria-hidden />;
     default:

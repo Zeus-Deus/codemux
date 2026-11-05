@@ -24,7 +24,7 @@ export function ToolCallStatus({ item }: { item: ToolCallItem }) {
       {argument && (
         <>
           {" "}
-          <span className="text-muted-foreground/60">{argument}</span>
+          <span className="text-subtle-foreground">{argument}</span>
         </>
       )}
     </span>

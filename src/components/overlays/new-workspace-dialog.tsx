@@ -1226,7 +1226,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             value={workspaceName}
             onChange={(e) => setWorkspaceName(e.target.value)}
             placeholder="Workspace name (optional)"
-            className="h-6 text-label flex-1 border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-muted-foreground placeholder:text-muted-foreground/60"
+            className="h-6 text-label flex-1 border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-muted-foreground placeholder:text-subtle-foreground"
           />
           {isGitRepo === false ? null : branchMode === "create_new" ? (
             <label
@@ -1244,12 +1244,12 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 // Monospace, so `ch` sizes the field to its content and an
                 // issue-derived name shows in full up to the cap.
                 style={{ width: `${Math.max(branchName.length, 11) + 1}ch` }}
-                className="h-6 max-w-[260px] text-label border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 aria-invalid:ring-0 aria-invalid:text-destructive font-mono text-muted-foreground placeholder:text-muted-foreground/60"
+                className="h-6 max-w-[260px] text-label border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 aria-invalid:ring-0 aria-invalid:text-destructive font-mono text-muted-foreground placeholder:text-subtle-foreground"
               />
             </label>
           ) : (
             <span
-              className="h-6 text-label text-right font-mono text-muted-foreground/60 flex items-center truncate max-w-[260px]"
+              className="h-6 text-label text-right font-mono text-subtle-foreground flex items-center truncate max-w-[260px]"
               title={openExistingBranch ?? undefined}
             >
               on {openExistingBranch}
@@ -1304,7 +1304,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                     <button
                       type="button"
                       aria-label={`Remove issue #${linkedIssue.number}`}
-                      className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
+                      className="ml-0.5 rounded-full p-0.5 text-subtle-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
                       onClick={() => {
                         setLinkedIssue(null);
                         if (branchAutoFilled) {

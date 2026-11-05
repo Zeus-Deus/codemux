@@ -315,7 +315,7 @@ const TrailRail = memo(function TrailRail({
               {hoveredEntry.replySnippet}
             </p>
           ) : (
-            <p className="mt-1 italic leading-snug text-muted-foreground/70">
+            <p className="mt-1 italic leading-snug text-subtle-foreground">
               No reply yet
             </p>
           )}

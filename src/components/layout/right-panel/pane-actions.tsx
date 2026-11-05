@@ -62,7 +62,7 @@ export function PaneActionButton({
               ? "bg-surface-3 text-foreground"
               : size === "titlebar"
                 ? "text-muted-foreground hover:bg-muted hover:text-foreground dark:hover:bg-muted/50"
-                : "text-foreground/42 hover:bg-surface-2 hover:text-foreground/80",
+                : "text-subtle-foreground hover:bg-surface-2 hover:text-foreground/80",
           )}
         >
           <Icon

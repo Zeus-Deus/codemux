@@ -298,7 +298,7 @@ export function ChatForkMarker({ messages }: { messages: readonly ChatViewItem[]
   return (
     <div
       data-testid="chat-fork-marker"
-      className="mt-[13px] flex items-center gap-3 text-muted-foreground/70"
+      className="mt-[13px] flex items-center gap-3 text-subtle-foreground"
     >
       <span className="h-px flex-1 bg-border/60" />
       <span className="inline-flex min-w-0 items-center gap-1.5 font-mono text-label font-medium tracking-wide">

@@ -84,7 +84,7 @@ function CodeBlockContent({ className, ...props }: React.ComponentProps<"pre">) 
       data-slot="code-block-content"
       tabIndex={0}
       className={cn(
-        "min-w-0 overflow-auto px-3 pt-2 pb-3 font-mono text-label leading-relaxed outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+        "min-w-0 overflow-auto px-3 pt-2 pb-3 font-mono text-label leading-relaxed outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
         className,
       )}
       {...props}

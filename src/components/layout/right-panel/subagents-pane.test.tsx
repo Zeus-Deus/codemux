@@ -321,7 +321,7 @@ describe("SubagentsPane — needs attention", () => {
     );
 
     const card = screen.getByTestId("attention-card");
-    expect(screen.getByText("NEEDS ATTENTION · 1")).toBeInTheDocument();
+    expect(screen.getByText("Needs attention · 1")).toBeInTheDocument();
     expect(card).toHaveClass("border-status-attention/25");
     expect(card.querySelector('[data-row-glyph="failed"]')).not.toBeNull();
     expect(

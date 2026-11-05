@@ -208,7 +208,7 @@ function ParentLink({
   return (
     <div
       data-parent-link={parentWorkspaceId}
-      className="mt-0.5 flex min-w-0 items-center gap-1 text-label text-muted-foreground/70"
+      className="mt-0.5 flex min-w-0 items-center gap-1 text-label text-subtle-foreground"
     >
       <CornerDownRight aria-hidden className="size-3 shrink-0" />
       <span className="shrink-0">from</span>
@@ -598,6 +598,20 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // The official mark of each agent provider chatting in this workspace
   // shown on the meta line's right cluster.
   const providers = getWorkspaceProviders(workspace.surfaces);
+  // A meta line that would hold nothing but the provider mark (a Home chat
+  // with no branch, stats, PR or indicators) is not drawn: the mark rides at
+  // the end of the title line instead, so the card isn't a row taller for a
+  // single glyph.
+  const metaHasContent =
+    Boolean(workspace.git_branch) ||
+    hasAhead ||
+    hasStats ||
+    Boolean(prState) ||
+    Boolean(deviceName) ||
+    runningPort != null ||
+    workspace.notification_count > 0;
+  const inlineProviders =
+    !metaHasContent && providers.length > 0 && !titleRepeatsProject;
 
   // With the Snooze menu open the swap can no longer be driven by hover/focus
   // (both have left the card for the portal), so it is driven by state
@@ -620,7 +634,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
    *  and a check glyph alone doesn't name it. */
   const eyebrowGlyphClass = cn(
     "flex shrink-0 items-center border-none bg-transparent p-0",
-    "text-muted-foreground/75 transition-colors duration-150 hover:text-foreground",
+    "text-subtle-foreground transition-colors duration-150 hover:text-foreground",
   );
 
   const projectAvatar = (
@@ -639,6 +653,19 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
     />
   );
 
+  const providerMarks = providers.map((p) => (
+    <ProviderLogo
+      key={p}
+      provider={p}
+      className={cn(
+        "size-3.5 shrink-0 transition-[opacity,filter] duration-150",
+        visuallyReceded
+          ? "opacity-35 grayscale group-hover/card:opacity-80 group-hover/card:grayscale-0 group-focus-within/card:opacity-80 group-focus-within/card:grayscale-0"
+          : "opacity-80",
+      )}
+    />
+  ));
+
   const titleLine = (
     <div className="flex min-w-0 items-center gap-1.5">
       {titleRepeatsProject && projectAvatar}
@@ -650,7 +677,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
         className={cn(
           "truncate text-body leading-[1.35] transition-colors duration-150",
           visuallyReceded
-            ? "text-muted-foreground/55 group-hover/card:text-foreground group-focus-within/card:text-foreground"
+            ? "text-muted-foreground group-hover/card:text-foreground group-focus-within/card:text-foreground"
             : "text-foreground",
           // The extra weight is what makes an unread card readable
           // as unread at a glance down a scrolling list. Read cards
@@ -704,6 +731,11 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
           )}
         </span>
       )}
+      {inlineProviders && (
+        <span data-inline-providers className="ml-auto flex shrink-0 items-center gap-2 pl-1">
+          {providerMarks}
+        </span>
+      )}
     </div>
   );
 
@@ -735,8 +767,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
         // rather than outshining that card's own title.
         !status &&
           (visuallyReceded
-            ? "font-medium text-muted-foreground/50 transition-colors duration-150 group-hover/card:text-muted-foreground/70 group-focus-within/card:text-muted-foreground/70"
-            : "font-medium text-muted-foreground/70"),
+            ? "font-medium text-subtle-foreground transition-colors duration-150 group-hover/card:text-muted-foreground group-focus-within/card:text-muted-foreground"
+            : "font-medium text-muted-foreground"),
       )}
     >
       {/* Workspace navigation reports lifecycle, not the agent's current
@@ -899,8 +931,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     className={cn(
                       "min-w-0 truncate text-label font-medium tracking-[0.01em] transition-colors duration-150",
                       visuallyReceded
-                        ? "text-muted-foreground/55 group-hover/card:text-muted-foreground/80 group-focus-within/card:text-muted-foreground/80"
-                        : "text-muted-foreground/80",
+                        ? "text-subtle-foreground group-hover/card:text-muted-foreground group-focus-within/card:text-muted-foreground"
+                        : "text-muted-foreground",
                     )}
                   >
                     {repo.name}
@@ -922,8 +954,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       // elements; the marker also hides outright under the
                       // pointer, one line down.
                       visuallyReceded
-                        ? "text-muted-foreground/55 group-hover/card:text-muted-foreground/75 group-focus-within/card:text-muted-foreground/75"
-                        : "text-muted-foreground/75",
+                        ? "text-subtle-foreground group-hover/card:text-muted-foreground group-focus-within/card:text-muted-foreground"
+                        : "text-muted-foreground",
                       actionsPinned
                         ? "hidden"
                         : "group-hover/card:hidden group-focus-within/card:hidden",
@@ -1142,6 +1174,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   `prStatusSettledHoverClass`), so at rest the settled copy is
                   the grey version of this chip and under the pointer it is
                   this chip exactly. */}
+              {!inlineProviders && (
               <div
                 data-meta-line
                 className={cn(
@@ -1149,11 +1182,15 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   // Branch and ↑ahead inherit this, so one mute here covers
                   // the whole git-local run.
                   visuallyReceded
-                    ? "text-muted-foreground/40 group-hover/card:text-muted-foreground/60 group-focus-within/card:text-muted-foreground/60"
-                    : "text-muted-foreground/60",
+                    ? "text-subtle-foreground group-hover/card:text-muted-foreground group-focus-within/card:text-muted-foreground"
+                    : "text-muted-foreground",
                 )}
               >
                 {workspace.git_branch && (
+                  // The branch is what gives way when the row is full. Any floor
+                  // here pushes the ↑ahead, ± stats, PR chip and marks (all
+                  // shrink-0) past the card's clipped edge on a busy card, even
+                  // at the default rail width.
                   <span className="min-w-0 truncate">{workspace.git_branch}</span>
                 )}
                 {hasAhead && (
@@ -1172,8 +1209,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       <span
                         className={cn(
                           visuallyReceded
-                            ? "text-muted-foreground/50 transition-colors duration-150 group-hover/card:text-status-open/80 group-focus-within/card:text-status-open/80"
-                            : "text-status-open/80",
+                            ? "text-subtle-foreground transition-colors duration-150 group-hover/card:text-status-open group-focus-within/card:text-status-open"
+                            : "text-status-open",
                         )}
                       >
                         +{workspace.git_additions}
@@ -1183,8 +1220,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       <span
                         className={cn(
                           visuallyReceded
-                            ? "text-muted-foreground/50 transition-colors duration-150 group-hover/card:text-status-attention/80 group-focus-within/card:text-status-attention/80"
-                            : "text-status-attention/80",
+                            ? "text-subtle-foreground transition-colors duration-150 group-hover/card:text-status-attention group-focus-within/card:text-status-attention"
+                            : "text-status-attention",
                         )}
                       >
                         −{workspace.git_deletions}
@@ -1207,7 +1244,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       "transition-colors duration-150",
                       visuallyReceded
                         ? cn(
-                            "text-muted-foreground/45",
+                            "text-subtle-foreground",
                             prStatusRecededCardHoverClass(prState),
                           )
                         : prStatusTextClass(prState),
@@ -1250,7 +1287,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         specific PR the click opens — a bare count next to
                         `#372` would read as part of that reference. */}
                     {extraPrCount > 0 && (
-                      <span className="opacity-70">+{extraPrCount}</span>
+                      <span className="text-subtle-foreground">+{extraPrCount}</span>
                     )}
                   </button>
                 )}
@@ -1275,19 +1312,15 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       aria-label={`Runs on ${deviceLabel}`}
                       title={`Runs on ${deviceLabel}`}
                       className={cn(
-                        "flex max-w-[72px] shrink-0 items-center gap-1 transition-colors duration-150",
+                        "flex shrink-0 items-center transition-colors duration-150",
                         visuallyReceded
-                          ? "text-muted-foreground/40 group-hover/card:text-muted-foreground/70 group-focus-within/card:text-muted-foreground/70"
-                          : "text-muted-foreground/70",
+                          ? "text-subtle-foreground group-hover/card:text-muted-foreground group-focus-within/card:text-muted-foreground"
+                          : "text-muted-foreground",
                       )}
                     >
-                      <Server aria-hidden className="size-3 shrink-0" />
-                      {/* Another environment's card marks itself with the
-                          glyph alone; the machine is named by the tooltip and
+                      {/* Glyph only: the machine is named by the tooltip and
                           the hover card, so the branch keeps its room. */}
-                      {!machine && (
-                        <span className="min-w-0 truncate">{deviceName}</span>
-                      )}
+                      <Server aria-hidden className="size-3 shrink-0" />
                     </span>
                   )}
                   {/* Long-running process. Distinct from the agent-state
@@ -1305,32 +1338,22 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       className={cn(
                         "flex shrink-0 motion-safe:animate-pulse items-center transition-colors duration-150",
                         visuallyReceded
-                          ? "text-muted-foreground/40 group-hover/card:text-status-open group-focus-within/card:text-status-open"
+                          ? "text-subtle-foreground group-hover/card:text-status-open group-focus-within/card:text-status-open"
                           : "text-status-open",
                       )}
                     >
                       <Terminal className="size-3" />
                     </span>
                   )}
-                  {providers.map((p) => (
-                    <ProviderLogo
-                      key={p}
-                      provider={p}
-                      className={cn(
-                        "size-3.5 transition-[opacity,filter] duration-150",
-                        visuallyReceded
-                          ? "opacity-35 grayscale group-hover/card:opacity-80 group-hover/card:grayscale-0 group-focus-within/card:opacity-80 group-focus-within/card:grayscale-0"
-                          : "opacity-80",
-                      )}
-                    />
-                  ))}
+                  {providerMarks}
                   {workspace.notification_count > 0 && (
                     <span
                       className={cn(
-                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-surface-3 px-1 text-caption font-bold text-muted-foreground",
-                        "transition-opacity duration-150",
-                        visuallyReceded &&
-                          "opacity-70 group-hover/card:opacity-100 group-focus-within/card:opacity-100",
+                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-surface-3 px-1 text-caption font-bold",
+                        "transition-colors duration-150",
+                        visuallyReceded
+                          ? "text-subtle-foreground group-hover/card:text-muted-foreground group-focus-within/card:text-muted-foreground"
+                          : "text-muted-foreground",
                       )}
                     >
                       {workspace.notification_count}
@@ -1338,6 +1361,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   )}
                 </span>
               </div>
+              )}
             </div>
         </WorkspaceHoverCard>
         </div>

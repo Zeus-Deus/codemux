@@ -82,7 +82,7 @@ function TaskIcon({ task }: { task: WorkflowTaskSnapshot }) {
   if (LIVE_TASK.has(task.status)) return <Spinner className="size-3.5 text-status-working" label="Running" />;
   if (task.status === "failed" || task.status === "unknown") return <X className="size-3.5 text-status-attention" aria-label="Failed" />;
   if (task.status === "cancelled" || task.status === "blocked") return <X className="size-3.5 text-muted-foreground" aria-label="Stopped" />;
-  return <Circle className="size-2.5 text-muted-foreground/70" aria-label="Queued" />;
+  return <Circle className="size-2.5 text-subtle-foreground" aria-label="Queued" />;
 }
 
 /**
@@ -166,7 +166,7 @@ export function ChatWorkflowCard({ runId, workspaceId, threadId }: { runId: stri
       const done = tasks.length > 0 && tasks.every((task) => task.status === "succeeded");
       return <div key={key} className="border-b border-hairline px-3.5 py-2.5 last:border-b-0" data-testid={`chat-workflow-phase-${key}`}>
         <div className="flex items-center gap-2 text-body-sm">
-          <span className="w-4 font-mono text-caption text-muted-foreground/70">{String(index + 1).padStart(2, "0")}</span>
+          <span className="w-4 font-mono text-caption text-subtle-foreground">{String(index + 1).padStart(2, "0")}</span>
           <span className={cn("font-semibold", waiting ? "text-muted-foreground" : "text-foreground")}>{title}</span>
           <span className="text-label text-muted-foreground">{caption}</span>
           {key === "work" && tasks.length > 0 && <span className="ml-auto font-mono text-caption tabular-nums text-muted-foreground">{tasks.filter((task) => task.status === "succeeded").length}/{tasks.length}</span>}
@@ -188,7 +188,7 @@ export function ChatWorkflowCard({ runId, workspaceId, threadId }: { runId: stri
     })}
 
     {report && <div className="border-b border-hairline px-3.5 py-3" data-testid="chat-workflow-report">
-      <div className="mb-1.5 flex items-center gap-2 text-body-sm"><span className="w-4 font-mono text-caption text-muted-foreground/70">03</span><span className="font-semibold">Report</span></div>
+      <div className="mb-1.5 flex items-center gap-2 text-body-sm"><span className="w-4 font-mono text-caption text-subtle-foreground">03</span><span className="font-semibold">Report</span></div>
       <div className={cn("pl-6 text-body-sm", !expanded && "max-h-56 overflow-hidden [mask-image:linear-gradient(to_bottom,black_70%,transparent)]")}>
         <ChatMarkdown workspaceId={workspaceId}>{report}</ChatMarkdown>
       </div>

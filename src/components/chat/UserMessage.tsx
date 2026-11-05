@@ -151,7 +151,7 @@ export const UserMessage = memo(function UserMessage({
     // its own.
     <div className={cn(MESSAGE_GROUP_CLASS, "group flex justify-end")}>
       <div className="flex max-w-[82%] flex-col items-end gap-1">
-        {attribution && <p className="me-1 max-w-full text-caption text-muted-foreground/70" data-user-message-attribution={attribution}>
+        {attribution && <p className="me-1 max-w-full text-caption text-subtle-foreground" data-user-message-attribution={attribution}>
           {attribution === "agent" ? (item.sender_thread_id && senderExists === true
             ? <InlineButton tone="muted" aria-label="Open sending chat" title={item.sender_title} onClick={() => { if (item.sender_thread_id) void openDelegatedChat(item.sender_thread_id); }}>Sent by another agent</InlineButton>
             : <span title={item.sender_title}>Sent by another agent{item.sender_title ? ` · ${item.sender_title}` : ""}</span>)
@@ -175,12 +175,12 @@ export const UserMessage = memo(function UserMessage({
           className={cn(
             "conversation-text flex flex-col gap-2 rounded-[14px_14px_5px_14px] border px-[15px] py-[11px] leading-relaxed",
             queued
-              ? "border-hairline bg-surface-1 text-muted-foreground/75"
+              ? "border-hairline bg-surface-1 text-subtle-foreground"
               : "border-hairline bg-card text-foreground",
           )}
         >
           {images.length > 0 ? (
-            <div className="flex flex-wrap justify-end gap-2">
+            <div className="flex flex-wrap justify-start gap-2">
               {images.map((image, i) => (
                 <ImageThumbnail
                   key={`${image.src}-${i}`}
@@ -204,7 +204,7 @@ export const UserMessage = memo(function UserMessage({
                   aria-label="Interrupt and send queued message"
                   title="Stop current work and send this message"
                   onClick={() => onSendQueuedNow(queued.queuedId)}
-                  className="inline-flex items-center gap-1 rounded-sm px-1 text-caption text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                  className="inline-flex items-center gap-1 rounded-sm px-1 text-caption text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
                 >
                   <CornerDownLeft className="size-3" aria-hidden />
                   Interrupt
@@ -216,13 +216,13 @@ export const UserMessage = memo(function UserMessage({
                   aria-label="Cancel queued message"
                   title="Remove from queue and return to the composer"
                   onClick={() => onCancelQueued(queued.queuedId, item.text)}
-                  className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/55 transition-colors duration-150 hover:bg-destructive/10 hover:text-destructive/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                  className="inline-flex size-4 items-center justify-center rounded-sm text-subtle-foreground transition-colors duration-150 hover:bg-destructive/10 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
                 >
                   <X className="size-3" aria-hidden />
                 </button>
               ) : null}
             </div>
-            <span className="inline-flex h-4 items-center gap-1 text-caption font-medium text-muted-foreground/55">
+            <span className="inline-flex h-4 items-center gap-1 text-caption font-medium text-subtle-foreground">
               <span className="size-1 rounded-full bg-muted-foreground/45" aria-hidden />
               Queued
             </span>
@@ -301,7 +301,7 @@ function ImageThumbnail({
       type="button"
       onClick={onOpen}
       aria-label="Open attached image"
-      className="cursor-pointer overflow-hidden rounded-lg border border-hairline transition-opacity duration-150 hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+      className="cursor-pointer overflow-hidden rounded-lg border border-hairline transition-opacity duration-150 hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
     >
       <img
         src={src}

@@ -22,7 +22,7 @@ export const COMMAND_MENU_GROUP_HEADING = [
   "**:[[cmdk-group-heading]]:font-medium",
   "**:[[cmdk-group-heading]]:uppercase",
   "**:[[cmdk-group-heading]]:tracking-[0.08em]",
-  "**:[[cmdk-group-heading]]:text-muted-foreground/60",
+  "**:[[cmdk-group-heading]]:text-subtle-foreground",
 ].join(" ");
 
 /** Row chrome. The highlighted row gets a faint fill plus a short

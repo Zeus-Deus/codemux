@@ -126,7 +126,7 @@ export function DetailHeader({
         </h3>
         <div className="mt-0.5 flex items-center gap-2.5">
           <StatusLine status={status} />
-          {version && <span className="font-mono text-label text-muted-foreground/70">{version}</span>}
+          {version && <span className="font-mono text-label text-subtle-foreground">{version}</span>}
         </div>
       </div>
       {actions}

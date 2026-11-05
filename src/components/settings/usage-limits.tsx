@@ -153,7 +153,7 @@ function PaceLabel({ pace }: { pace: LimitPace }) {
           tabIndex={0}
           aria-label={`${PACE[pace].word}: ${PACE[pace].label}`}
           className={cn(
-            "inline-flex items-center gap-1.5 rounded-sm text-label outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+            "inline-flex items-center gap-1.5 rounded-sm text-label outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
             pace === "ahead" ? "text-status-attention" : "text-muted-foreground",
           )}
         >
@@ -217,10 +217,10 @@ function WindowBar({ window, now }: { window: PlanUsageWindow; now: number }) {
             {timeLeft !== null ? ` · ${timeLeft}% of the window left` : ""}
           </span>
           {timeLeft !== null && (
-            <span className="opacity-70">The line is where even spending would be.</span>
+            <span className="text-subtle-foreground">The line is where even spending would be.</span>
           )}
           {resetsAt && (
-            <span className="opacity-70">
+            <span className="text-subtle-foreground">
               Resets {resetsAt}
               {resetsIn ? ` · ${resetsIn.replace("resets ", "")}` : ""}
             </span>
@@ -282,13 +282,13 @@ function ProviderLimits({
           <span className="text-label text-muted-foreground">{quota.plan_label}</span>
         )}
         {account?.identity.email && (
-          <span className="truncate text-label text-muted-foreground/80">{account.identity.email}</span>
+          <span className="truncate text-label text-subtle-foreground">{account.identity.email}</span>
         )}
         {quota && windows.length > 0 && (
           <span
             className={cn(
               "ml-auto text-caption",
-              stale ? "text-status-attention" : "text-muted-foreground/80",
+              stale ? "text-status-attention" : "text-subtle-foreground",
             )}
             title={new Date(quota.received_at_ms).toLocaleString()}
           >

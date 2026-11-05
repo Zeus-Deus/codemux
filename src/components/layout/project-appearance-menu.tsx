@@ -138,7 +138,7 @@ export function ProjectAppearanceMenu({
           <span className="flex-1" />
           {/* Says out loud what the submenu title only implies: this is a
               project setting reached from one workspace's row. */}
-          <span className="font-mono text-caption text-muted-foreground/60">
+          <span className="font-mono text-caption text-subtle-foreground">
             applies to all workspaces
           </span>
         </div>

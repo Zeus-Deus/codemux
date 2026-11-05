@@ -414,11 +414,11 @@ describe("RightPanel deck", () => {
 
   // Tabs carry their state as a fill, not a box. A border on the active tab
   // was the single heaviest thing in the panel.
-  it("keeps the tabs light — filled active tab, faded inactive, no border", () => {
+  it("keeps the tabs light — filled active tab, muted inactive, no border", () => {
     renderDeck({ activeTab: "files" });
     const changes = screen.getByTestId("changes-tab");
     expect(changes).toHaveAttribute("data-state", "inactive");
-    expect(changes).toHaveClass("h-[26px]", "text-foreground/42", "font-medium");
+    expect(changes).toHaveClass("h-[26px]", "text-muted-foreground", "font-medium");
     expect(changes.className).not.toMatch(/(^|\s)border/);
 
     const review = screen.getByTestId("review-tab");

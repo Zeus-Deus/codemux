@@ -379,7 +379,7 @@ function ShelfHeader({
       <ChevronRight
         aria-hidden="true"
         className={cn(
-          "size-3 shrink-0 text-muted-foreground/70 transition-transform duration-150 ease-drawer",
+          "size-3 shrink-0 text-subtle-foreground transition-transform duration-150 ease-drawer",
           !collapsed && "rotate-90",
         )}
       />
@@ -387,7 +387,7 @@ function ShelfHeader({
         {label}
       </Eyebrow>
       {showCount && (
-        <span className="text-label tabular-nums text-muted-foreground/70">
+        <span className="text-label tabular-nums text-subtle-foreground">
           ({count})
         </span>
       )}
@@ -562,7 +562,7 @@ const SettledRow = memo(function SettledRow({
         className={cn(
           "min-w-0 truncate text-label font-medium transition-colors duration-150",
           dimmed
-            ? "text-muted-foreground/60 group-hover/settled:text-foreground group-focus-within/settled:text-foreground"
+            ? "text-subtle-foreground group-hover/settled:text-foreground group-focus-within/settled:text-foreground"
             : "text-foreground",
         )}
       >
@@ -607,7 +607,7 @@ const SettledRow = memo(function SettledRow({
               // second focal point.
               dimmed
                 ? cn(
-                    "text-muted-foreground/55",
+                    "text-subtle-foreground",
                     prStatusSettledHoverClass(prState),
                   )
                 : prStatusTextClass(prState),
@@ -657,7 +657,7 @@ const SettledRow = memo(function SettledRow({
         className="relative h-5 overflow-hidden whitespace-nowrap"
       >
         {time && (
-          <span className="absolute inset-y-0 right-0 flex items-center text-label tabular-nums text-muted-foreground/70 group-hover/settled:hidden group-focus-within/settled:hidden">
+          <span className="absolute inset-y-0 right-0 flex items-center text-label tabular-nums text-subtle-foreground group-hover/settled:hidden group-focus-within/settled:hidden">
             {time}
           </span>
         )}
@@ -791,7 +791,7 @@ const SnoozeRow = memo(function SnoozeRow({
         />
         <AlarmClock
           aria-hidden="true"
-          className="size-3 shrink-0 text-muted-foreground/60"
+          className="size-3 shrink-0 text-subtle-foreground"
         />
         <span className="min-w-0 flex-1 truncate text-label font-medium text-muted-foreground">
           {workspace.title}
@@ -802,7 +802,7 @@ const SnoozeRow = memo(function SnoozeRow({
             the eye reads as a mistake. */}
         <span
           aria-label={`Wakes in ${timeUntil}`}
-          className="shrink-0 text-label tabular-nums text-muted-foreground/70 group-hover/snoozed:hidden group-focus-within/snoozed:hidden"
+          className="shrink-0 text-label tabular-nums text-subtle-foreground group-hover/snoozed:hidden group-focus-within/snoozed:hidden"
         >
           {timeUntil}
         </span>
@@ -1997,7 +1997,7 @@ export function SidebarInbox() {
                         onClick={() =>
                           setSettledVisibleCount((c) => c + SETTLED_PAGE_COUNT)
                         }
-                        className="flex h-7 w-full items-center justify-center rounded-lg text-label text-muted-foreground/70 transition-colors duration-150 hover:text-foreground"
+                        className="flex h-7 w-full items-center justify-center rounded-lg text-label text-subtle-foreground transition-colors duration-150 hover:text-foreground"
                       >
                         {`Show ${next} more (${settledHidden} hidden)`}
                       </button>

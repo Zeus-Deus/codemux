@@ -100,7 +100,7 @@ export function ContextUsageMeter({
                 // The footer triggers' 30px hover plate.
                 "inline-flex size-[30px] shrink-0 items-center justify-center rounded-md",
                 "text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground",
-                "outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+                "outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
                 warning && "text-danger hover:text-danger",
               )}
             >
@@ -116,7 +116,7 @@ export function ContextUsageMeter({
                   r={RING_RADIUS}
                   fill="none"
                   strokeWidth={RING_STROKE}
-                  className="stroke-current text-muted-foreground/25"
+                  className="stroke-current text-subtle-foreground"
                 />
                 <circle
                   cx={RING_SIZE / 2}

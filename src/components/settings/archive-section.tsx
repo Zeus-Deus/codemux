@@ -278,14 +278,14 @@ function ArchivedEntryRow({
           )}
           {isStale && (
             <span
-              className="shrink-0 rounded-sm px-1.5 text-caption leading-[16px] text-muted-foreground/60 bg-muted/60"
+              className="shrink-0 rounded-sm px-1.5 text-caption leading-[16px] text-subtle-foreground bg-muted/60"
               title="Archived more than 30 days ago"
             >
               stale
             </span>
           )}
         </div>
-        <p className="truncate text-label text-muted-foreground/70">
+        <p className="truncate text-label text-subtle-foreground">
           Archived {relativeTime(archivedDate)}
         </p>
       </div>
@@ -372,11 +372,11 @@ export function ArchiveSection() {
         <LocalSessionImportEntry />
         <WorktreeCleanupSettings />
         <div className="flex flex-col items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-10 text-center">
-        <Archive className="size-5 text-muted-foreground/50" />
+        <Archive className="size-5 text-subtle-foreground" />
         <p className="text-body text-muted-foreground">
           No archived workspaces
         </p>
-        <p className="text-body-sm text-muted-foreground/70 max-w-prose">
+        <p className="text-body-sm text-subtle-foreground max-w-prose">
           Archive a workspace from the sidebar to park it here without
           touching its files.
         </p>
@@ -390,7 +390,7 @@ export function ArchiveSection() {
       <LocalSessionImportEntry />
       <WorktreeCleanupSettings />
       <div className="relative">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground/60 pointer-events-none" />
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-3.5 text-subtle-foreground pointer-events-none" />
         <Input
           placeholder="Search archived workspaces…"
           aria-label="Search archived workspaces"
@@ -421,7 +421,7 @@ export function ArchiveSection() {
         </section>
       ))}
       {isRemoteClient() && (
-        <p className="text-label text-muted-foreground/70">
+        <p className="text-label text-subtle-foreground">
           Delete archived workspaces from the Codemux desktop app.
         </p>
       )}

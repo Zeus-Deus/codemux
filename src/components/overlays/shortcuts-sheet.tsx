@@ -179,7 +179,7 @@ export function ShortcutsSheet() {
             aria-label="Filter shortcuts"
             autoComplete="off"
             spellCheck={false}
-            className="h-full min-w-0 flex-1 border-0 bg-transparent p-0 text-body text-foreground outline-none placeholder:text-muted-foreground/60"
+            className="h-full min-w-0 flex-1 border-0 bg-transparent p-0 text-body text-foreground outline-none placeholder:text-subtle-foreground"
           />
         </label>
 
@@ -222,7 +222,7 @@ export function ShortcutsSheet() {
         </div>
 
         <div className="flex shrink-0 items-center gap-2 border-t border-hairline bg-surface-1 px-4 py-2">
-          <span className="flex-1 font-mono text-caption text-muted-foreground/60">
+          <span className="flex-1 font-mono text-caption text-subtle-foreground">
             {closeKeys && `${closeKeys.toLowerCase()} to close`}
           </span>
           <Button variant="ghost" size="sm" onClick={customize}>

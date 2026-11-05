@@ -871,7 +871,7 @@ export const RightPanel = memo(function RightPanel({
                     "flex size-6 shrink-0 items-center justify-center rounded-md",
                     "transition-colors duration-100",
                     changesFilter === "all"
-                      ? "text-foreground/42 hover:bg-surface-2 hover:text-foreground/80"
+                      ? "text-subtle-foreground hover:bg-surface-2 hover:text-foreground/80"
                       : "bg-surface-3 text-foreground",
                   )}
                 >

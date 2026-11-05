@@ -377,7 +377,7 @@ export function WorkspaceHoverCardBody({
             shape="square"
             className="font-bold"
           />
-          <span className="min-w-0 flex-1 truncate text-label font-semibold tracking-[0.01em] text-muted-foreground/80">
+          <span className="min-w-0 flex-1 truncate text-label font-semibold tracking-[0.01em] text-subtle-foreground">
             {repo.name}
           </span>
           {providers.map((p) => (
@@ -390,12 +390,12 @@ export function WorkspaceHoverCardBody({
           <span
             className={cn(
               "shrink-0 text-label font-semibold",
-              status ? STATUS_TEXT_CLASS[status] : "text-muted-foreground/70",
+              status ? STATUS_TEXT_CLASS[status] : "text-subtle-foreground",
             )}
           >
             {status ? STATUS_LABEL[status] : "Idle"}
             {elapsed && (
-              <span className="ml-1 font-normal tabular-nums opacity-70">
+              <span className="ml-1 font-normal tabular-nums">
                 {elapsed}
               </span>
             )}
@@ -550,7 +550,7 @@ export function WorkspaceHoverCardBody({
       {/* Real path on disk, last: the least-scannable line, and the one users
           most often want to copy or confirm. Wraps rather than truncates. */}
       <div className="border-t px-3.5 py-2">
-        <div className="break-all font-mono text-caption leading-relaxed text-muted-foreground/70">
+        <div className="break-all font-mono text-caption leading-relaxed text-subtle-foreground">
           {shortenPath(path, homeDir)}
         </div>
       </div>

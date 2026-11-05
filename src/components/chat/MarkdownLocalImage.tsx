@@ -305,7 +305,7 @@ export function MarkdownLocalImage({
     >
       <button
         type="button"
-        className="group block w-full cursor-zoom-in text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
+        className="group block w-full cursor-zoom-in text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus-ring"
         aria-label={`Open ${caption}`}
         onClick={() => setOpen(true)}
       >

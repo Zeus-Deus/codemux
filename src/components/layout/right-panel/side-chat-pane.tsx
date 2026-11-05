@@ -242,7 +242,7 @@ export function SideChatPane({
             // 10px/12px padding. A whole-pixel 22px line keeps the box at
             // exactly 44px (relaxed leading would make it 44.75px and drop
             // the send circle off-centre).
-            className="conversation-text max-h-32 min-h-0 px-3 py-2.5 leading-[22px] placeholder:text-muted-foreground/60"
+            className="conversation-text max-h-32 min-h-0 px-3 py-2.5 leading-[22px] placeholder:text-subtle-foreground"
           />
           {/* 1px border + 4px = the main composer's 5px inset on every side.
               The primitive pulls an end button 0.3rem outward; undo that. */}

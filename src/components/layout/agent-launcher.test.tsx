@@ -716,7 +716,7 @@ describe("AgentLauncher — titlebar pin toggle", () => {
     openLauncher();
     expect(
       screen.getByTestId("launcher-preset-pinned-builtin-chat-agent"),
-    ).toHaveTextContent("PINNED");
+    ).toHaveTextContent("pinned");
   });
 
   it("does not select the row when Shift-clicking the pin toggle on a CLI row", () => {

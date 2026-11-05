@@ -1279,7 +1279,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     >
       {/* Header */}
       <div className="flex h-[52px] flex-none items-center gap-2.5 border-b border-hairline pr-3.5 pl-4">
-        <Search className="size-4 shrink-0 text-muted-foreground/70" />
+        <Search className="size-4 shrink-0 text-subtle-foreground" />
         {commandsOnly && (
           <span className="flex h-[22px] flex-none items-center rounded-sm bg-accent-ember/15 px-2 text-caption font-medium text-accent-ember">
             Commands
@@ -1303,7 +1303,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             setRawQuery(value);
           }}
           placeholder={`Search workspaces, conversations, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
-          className="h-8 min-w-0 flex-1 bg-transparent text-body outline-none placeholder:text-muted-foreground/70"
+          className="h-8 min-w-0 flex-1 bg-transparent text-body outline-none placeholder:text-subtle-foreground"
         />
         <Kbd>esc</Kbd>
       </div>
@@ -1336,7 +1336,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
                   </>
                 )}
               </span>
-              <span className="text-label text-muted-foreground/70">
+              <span className="text-label text-subtle-foreground">
                 Try a branch name, a repo, or{" "}
                 <span className="font-mono">{COMMAND_MODE_PREFIX}</span> for commands
               </span>
@@ -1480,7 +1480,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <KeyHint keys="↑↓" label="preview" />
             <KeyHint keys="↵" label="keep it" />
             <KeyHint keys="esc" label={`back to ${appliedTheme.label}`} />
-            <span className="ml-auto text-caption text-muted-foreground/70">
+            <span className="ml-auto text-caption text-muted-foreground">
               {previewTheme.id === OMARCHY_THEME_ID ? "follows this desktop" : "syncs to your account"}
             </span>
           </>
@@ -1490,7 +1490,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <KeyHint keys="↵" label="open" />
             <KeyHint keys={COMMAND_MODE_PREFIX} label="commands" />
             <KeyHint keys={PR_MODE_PREFIX.trim()} label="pull requests" />
-            <span className="ml-auto text-caption text-muted-foreground/70 tabular-nums">
+            <span className="ml-auto text-caption text-muted-foreground tabular-nums">
               {resultCountLabel(totalShown)}
             </span>
           </>
@@ -1523,7 +1523,7 @@ function GroupHeader({
         {label}
       </Eyebrow>
       <span className="h-px flex-1 bg-border/60" />
-      <span className="text-caption text-muted-foreground/60 tabular-nums">{count}</span>
+      <span className="text-caption text-subtle-foreground tabular-nums">{count}</span>
     </div>
   );
 }
@@ -1549,7 +1549,7 @@ function PaletteItem({
       value={value}
       onSelect={onSelect}
       className={cn(
-        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-selected:bg-accent data-selected:[--foreground:var(--accent-foreground)] data-selected:[--muted-foreground:color-mix(in_oklch,var(--accent-foreground)_70%,var(--accent))]",
+        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-selected:bg-accent data-selected:[--foreground:var(--accent-foreground)] data-selected:[--muted-foreground:color-mix(in_oklch,var(--accent-foreground)_70%,var(--accent))] data-selected:[--subtle-foreground:var(--muted-foreground)]",
         className,
       )}
     >
@@ -1572,7 +1572,7 @@ function EnterBadge() {
 function RowLocation({ name, branch }: { name: string | undefined; branch: string | null }) {
   if (!name && !branch) return null;
   return (
-    <span className="min-w-0 max-w-[220px] truncate text-label text-muted-foreground/70">
+    <span className="min-w-0 max-w-[220px] truncate text-label text-subtle-foreground">
       {name}
       {name && branch && <span className="mx-1.5">·</span>}
       {branch && <span className="font-mono">{branch}</span>}
@@ -1630,7 +1630,7 @@ function WorkspaceItem({
         <RowLocation name={row.projectName} branch={workspaceRowBranch(row.workspace)} />
       </span>
       {current && (
-        <span className="flex-none text-label text-muted-foreground/70">
+        <span className="flex-none text-label text-subtle-foreground">
           current
         </span>
       )}
@@ -1646,7 +1646,7 @@ function WorkspaceItem({
         </span>
       )}
       {!row.status && idleFor && (
-        <span className="flex-none text-label tabular-nums text-muted-foreground/70">
+        <span className="flex-none text-label tabular-nums text-subtle-foreground">
           {idleFor}
         </span>
       )}
@@ -1671,11 +1671,11 @@ function ProjectItem({
         <span className="truncate text-body font-medium text-foreground/90">
           {row.group.projectName}
         </span>
-        <span className="flex-none truncate font-mono text-label text-muted-foreground/70">
+        <span className="flex-none truncate font-mono text-label text-subtle-foreground">
           {shortenPath(row.group.projectPath, homeDir)}
         </span>
       </span>
-      <span className="flex-none text-label tabular-nums text-muted-foreground/70">
+      <span className="flex-none text-label tabular-nums text-subtle-foreground">
         {row.activeCount > 0 ? `${row.activeCount} active` : "idle"}
       </span>
       <EnterBadge />
@@ -1704,7 +1704,7 @@ function ConversationItem({
       onSelect={onSelect}
       className="h-[58px] py-1.5"
     >
-      <span className="flex size-6 flex-none items-center justify-center rounded-md border border-border/60 bg-surface-1 text-muted-foreground/80">
+      <span className="flex size-6 flex-none items-center justify-center rounded-md border border-border/60 bg-surface-1 text-subtle-foreground">
         <Icon className="size-3" />
       </span>
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
@@ -1715,7 +1715,7 @@ function ConversationItem({
           <RowLocation name={workspace?.title} branch={branch} />
         </span>
         <span className="flex min-w-0 items-baseline gap-1.5 text-label text-muted-foreground">
-          <span className="flex-none font-medium text-muted-foreground/75">{roleLabel}</span>
+          <span className="flex-none font-medium text-subtle-foreground">{roleLabel}</span>
           <span className="truncate">
             <HighlightedSearchText text={row.snippet} query={query} />
           </span>
@@ -1775,7 +1775,7 @@ function ThemeItemRow({
       </span>
       <ThemeSchemeBadge scheme={row.theme.scheme} />
       {applied && (
-        <span className="flex-none text-label text-muted-foreground/70">
+        <span className="flex-none text-label text-subtle-foreground">
           current
         </span>
       )}
@@ -1795,7 +1795,7 @@ function ThemeStudioItemRow({
   const Icon = row.icon;
   return (
     <PaletteItem value={row.key} onSelect={onSelect}>
-      <span className="flex size-5 flex-none items-center justify-center rounded-sm border border-border/60 text-muted-foreground/70">
+      <span className="flex size-5 flex-none items-center justify-center rounded-sm border border-border/60 text-subtle-foreground">
         <Icon className="size-3" />
       </span>
       <span className="min-w-0 flex-1 truncate text-body text-muted-foreground">
@@ -1810,7 +1810,7 @@ function CommandItemRow({ row, onSelect }: { row: CommandRow; onSelect: () => vo
   const Icon = row.command.icon;
   return (
     <PaletteItem value={row.key} onSelect={onSelect}>
-      <span className="flex size-5 flex-none items-center justify-center rounded-sm border border-border/60 text-muted-foreground/70">
+      <span className="flex size-5 flex-none items-center justify-center rounded-sm border border-border/60 text-subtle-foreground">
         <Icon className="size-3" />
       </span>
       <span className="min-w-0 flex-1 truncate text-body font-medium text-foreground/90">
@@ -1852,7 +1852,7 @@ function PrPaletteItem({ row, onSelect }: { row: PrRow; onSelect: () => void }) 
         {row.title}
       </span>
       {row.repo && (
-        <span className="flex-none truncate text-label text-muted-foreground/70">
+        <span className="flex-none truncate text-label text-subtle-foreground">
           {row.repo}
         </span>
       )}
@@ -1891,7 +1891,7 @@ function PrModeEmpty({ state, needle }: { state: PrModeEmptyState; needle: strin
   return (
     <div className="flex flex-col items-center gap-1.5 px-5 py-11 text-center">
       <span className="text-body text-muted-foreground">{headline}</span>
-      <span className="text-label text-muted-foreground/70">{hint}</span>
+      <span className="text-label text-subtle-foreground">{hint}</span>
     </div>
   );
 }

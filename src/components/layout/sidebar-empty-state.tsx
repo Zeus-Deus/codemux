@@ -106,7 +106,7 @@ export function SidebarEmptyState({ filterName }: { filterName: string | null })
       ) : (
         <Plate src={plate.src} />
       )}
-      <span className="font-mono text-micro uppercase tracking-[0.14em] text-muted-foreground/80">
+      <span className="font-mono text-micro uppercase tracking-[0.14em] text-subtle-foreground">
         <b className="font-medium text-status-working">{plate.fig}</b> — {plate.caption}
       </span>
       <figure className="flex flex-col items-center gap-2">
@@ -118,7 +118,7 @@ export function SidebarEmptyState({ filterName }: { filterName: string | null })
         >
           {`“${plate.quote}”`}
         </blockquote>
-        <figcaption className="font-mono text-micro uppercase tracking-[0.1em] text-muted-foreground/70">
+        <figcaption className="font-mono text-micro uppercase tracking-[0.1em] text-subtle-foreground">
           — {plate.source}
         </figcaption>
       </figure>
@@ -139,7 +139,7 @@ export function SidebarEmptyState({ filterName }: { filterName: string | null })
       >
         <span className="text-balance">Put them to work</span>
         {newAgentKeys && (
-          <span className="whitespace-nowrap text-muted-foreground/70">
+          <span className="whitespace-nowrap text-subtle-foreground">
             {formatKeyCombo(newAgentKeys)}
           </span>
         )}

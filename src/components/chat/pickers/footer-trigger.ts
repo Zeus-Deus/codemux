@@ -40,13 +40,13 @@ export const PICKER_LIST = "thin-scrollbar max-h-none min-h-0";
  *  everyday tasks") sit on one line; longer text wraps instead of
  *  truncating. */
 export const PICKER_GROUP =
-  "px-0 py-0.5 **:[[cmdk-group-heading]]:px-2 **:[[cmdk-group-heading]]:pt-1.5 **:[[cmdk-group-heading]]:pb-1 **:[[cmdk-group-heading]]:text-caption **:[[cmdk-group-heading]]:text-muted-foreground/70";
+  "px-0 py-0.5 **:[[cmdk-group-heading]]:px-2 **:[[cmdk-group-heading]]:pt-1.5 **:[[cmdk-group-heading]]:pb-1 **:[[cmdk-group-heading]]:text-caption **:[[cmdk-group-heading]]:text-subtle-foreground";
 
 /** Two-line option row: title over a muted description, check on the right. */
 export const PICKER_ROW = "h-auto items-start gap-2 px-2 py-[7px]";
 export const PICKER_ROW_TITLE = "text-label font-medium leading-4 text-foreground";
 export const PICKER_ROW_DESCRIPTION =
-  "text-label leading-4 text-pretty text-muted-foreground/70";
+  "text-label leading-4 text-pretty text-subtle-foreground";
 export const PICKER_ROW_CHECK = "mt-px size-3.5 text-foreground/70";
 export const PICKER_SEPARATOR = "mx-0 my-1 bg-border/60";
 

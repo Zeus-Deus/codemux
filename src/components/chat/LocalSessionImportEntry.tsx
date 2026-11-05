@@ -29,7 +29,7 @@ export function LocalSessionImportEntry({ firstRun = false }: { firstRun?: boole
     return <p className="px-4 text-center text-body-sm text-muted-foreground">
       Already working with Claude Code or Codex?{" "}
       <button type="button" className={INLINE_LINK} onClick={() => setOpen(true)}>Import recent chats</button>
-      <span aria-hidden className="mx-1.5 text-muted-foreground/50">·</span>
+      <span aria-hidden className="mx-1.5 text-subtle-foreground">·</span>
       <button type="button" className={INLINE_LINK} onClick={dismiss}>Not now</button>
     </p>;
   }

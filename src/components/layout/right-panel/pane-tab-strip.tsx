@@ -27,8 +27,9 @@
  *
  * **Overflow.** The deck grows: every file opened from the tree is another
  * tab, and a busy thread adds tasks, orchestration and subagents on top of
- * the three defaults. Tabs never shrink. Each one keeps its icon and a label
- * that is capped and truncated, and the row scrolls sideways (a plain
+ * the three defaults. Once the labels no longer fit, the inactive tabs drop
+ * theirs and show only their icon (named, with its count, by a tooltip) while the
+ * active tab keeps its label; past that, the row scrolls sideways (a plain
  * vertical wheel pans it) with a soft fade on whichever edge is clipped.
  * Panning alone left the clipped tabs hard to find at the default width,
  * where the row shows about one and a half, so while any tab is out of
@@ -44,7 +45,9 @@
  * the whole header jump by a row mid-drag and left a near-empty band above.
  *
  * **Close affordance.** A tab's leading icon doubles as its close button and
- * turns into an `×` on hover, so closing never covers the label's tail.
+ * turns into an `×` on hover (and stays one on touch), so closing never
+ * covers the label's tail. An icon-only tab has no close button: its icon
+ * is its whole face, so it selects; middle-click and the menu still close.
  * Right-click offers the bulk closes the main tab bar has.
  */
 import {
@@ -100,6 +103,7 @@ import {
 import { useTabReorder, type PillReorderHandlers } from "@/lib/tab-reorder";
 import { topRightReserve } from "@/lib/titlebar-geometry";
 import { useTitlebarActionsWidth } from "@/contrib/react/titlebar-actions";
+import { MENU_SECTION_LABEL } from "@/components/ui/menu-chrome";
 import { cn } from "@/lib/utils";
 import { useHorizontalWheelScroll } from "@/lib/wheel";
 import type { RightPanelTab } from "@/stores/ui-store";
@@ -138,6 +142,8 @@ export interface DeckTab {
 function DeckTabChip({
   tab,
   active,
+  compact,
+  activeFit,
   dragging,
   reorderProps,
   onSelect,
@@ -145,28 +151,123 @@ function DeckTabChip({
 }: {
   tab: DeckTab;
   active: boolean;
+  /** The row is too narrow for every label: an inactive tab shows only its
+   *  icon, named (with its count) by its tooltip. The active tab keeps its
+   *  label, fitted to what the icons leave it (`activeFit`). */
+  compact: boolean;
+  activeFit: ActiveFit;
   dragging: boolean;
   reorderProps: PillReorderHandlers;
   onSelect: () => void;
   onClose: () => void;
 }) {
   const Icon = tab.icon;
+  const name = tab.attribution ? `${tab.label} — ${tab.attribution}` : tab.label;
+  const chipClass = cn(
+    // No border, no shadow, no ring — the fill is the whole signal.
+    "group/tab relative flex h-[26px] shrink-0 items-center rounded-md",
+    "transition-colors duration-100",
+    active
+      ? "bg-surface-3 font-semibold text-foreground"
+      : "font-medium text-muted-foreground hover:bg-surface-2 hover:text-foreground",
+    dragging && "opacity-40",
+  );
+  if (compact && !active) {
+    // Icon-only: the icon is the select button here, never a close button,
+    // since it is the tab's whole face. Closing stays on middle-click and
+    // the right-click menu, or on the tab's own × once it is active.
+    return (
+      <div
+        {...reorderProps}
+        data-testid={tab.testId}
+        data-state="inactive"
+        data-compact="true"
+        {...middleClickCloseProps(onClose)}
+        className={chipClass}
+      >
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={onSelect}
+              aria-pressed={false}
+              aria-label={name}
+              className="relative flex h-[26px] w-6 items-center justify-center"
+            >
+              <Icon className="size-[13px] shrink-0" />
+              {/* The count moves into the tooltip; only a count that asks
+                  for the user (a failed subagent) keeps a mark on the tab. */}
+              {tab.badge != null && tab.badgeTone === "attention" && (
+                <span
+                  aria-hidden
+                  className="absolute right-[4px] top-[4px] size-[5px] rounded-full bg-status-attention"
+                />
+              )}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="flex items-center gap-[7px]">
+            {name}
+            <TabBadge tab={tab} active={false} />
+          </TooltipContent>
+        </Tooltip>
+      </div>
+    );
+  }
+  const fit = compact && active ? activeFit : ({ kind: "full" } as const);
+  if (fit.kind === "icon") {
+    // Active and icon-only: the fill still says "selected", the tooltip
+    // names it, and the icon is its close button as on a labelled tab.
+    return (
+      <div
+        {...reorderProps}
+        data-testid={tab.testId}
+        data-state="active"
+        data-fit="icon"
+        {...middleClickCloseProps(onClose)}
+        className={chipClass}
+      >
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              data-no-drag
+              aria-label={`Close ${tab.label}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                onClose();
+              }}
+              className="group/close flex size-6 shrink-0 items-center justify-center rounded-sm hover:bg-surface-3"
+            >
+              <Icon className="size-[13px] group-hover/tab:hidden group-focus-visible/close:hidden pointer-coarse:hidden" />
+              <X className="hidden size-[12px] group-hover/tab:block group-focus-visible/close:block pointer-coarse:block" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="flex items-center gap-[7px]">
+            {name}
+            <TabBadge tab={tab} active />
+          </TooltipContent>
+        </Tooltip>
+        {fit.badge && (
+          <span className="pl-[2px] pr-2">
+            <TabBadge tab={tab} active />
+          </span>
+        )}
+        <span className="sr-only">{`${name} (current tab)`}</span>
+      </div>
+    );
+  }
   return (
     <div
       {...reorderProps}
       data-testid={tab.testId}
       data-state={active ? "active" : "inactive"}
+      data-fit={fit.kind === "full" ? undefined : fit.kind}
       {...middleClickCloseProps(onClose)}
-      className={cn(
-        // No border, no shadow, no ring — the fill is the whole signal.
-        "group/tab relative flex h-[26px] shrink-0 items-center rounded-md pl-[5px]",
-        "transition-colors duration-100",
-        active
-          ? "bg-surface-3 font-semibold text-foreground"
-          : "font-medium text-foreground/42 hover:bg-surface-2 hover:text-foreground/70",
-        dragging && "opacity-40",
-      )}
+      className={cn(chipClass, "pl-[2px]")}
+      style={fit.kind === "truncate" ? { maxWidth: fit.maxWidth } : undefined}
     >
+      {/* A 24px target around a 13px glyph; the 2px insets on either side
+          keep the icon and label exactly where the 18px button left them. */}
       <button
         type="button"
         data-no-drag
@@ -175,10 +276,10 @@ function DeckTabChip({
           event.stopPropagation();
           onClose();
         }}
-        className="group/close flex size-[18px] shrink-0 items-center justify-center rounded-sm hover:bg-surface-3"
+        className="group/close flex size-6 shrink-0 items-center justify-center rounded-sm hover:bg-surface-3"
       >
-        <Icon className="size-[13px] group-hover/tab:hidden group-focus-visible/close:hidden" />
-        <X className="hidden size-[12px] group-hover/tab:block group-focus-visible/close:block" />
+        <Icon className="size-[13px] group-hover/tab:hidden group-focus-visible/close:hidden pointer-coarse:hidden" />
+        <X className="hidden size-[12px] group-hover/tab:block group-focus-visible/close:block pointer-coarse:block" />
       </button>
       <button
         type="button"
@@ -189,10 +290,10 @@ function DeckTabChip({
         }
         // The full name on hover, for labels the cap below truncates.
         title={tab.attribution ? `${tab.label} — ${tab.attribution}` : tab.label}
-        className="flex h-full min-w-0 items-center gap-[7px] whitespace-nowrap pl-[5px] pr-[9px] text-body-sm"
+        className="flex h-full min-w-0 items-center gap-[7px] whitespace-nowrap pl-[2px] pr-2 text-body-sm"
       >
-        <span className="max-w-[140px] truncate">{tab.label}</span>
-        <TabBadge tab={tab} active={active} />
+        <span className="min-w-0 max-w-[140px] truncate">{tab.label}</span>
+        {fit.kind === "full" && <TabBadge tab={tab} active={active} />}
       </button>
     </div>
   );
@@ -202,6 +303,7 @@ function TabBadge({ tab, active }: { tab: DeckTab; active: boolean }) {
   if (tab.badge == null) return null;
   return (
     <span
+      data-tab-badge
       className={cn(
         // A row, not a run of inline text: a badge can be a count plus a
         // status icon (Review), which must sit beside the count, not under it.
@@ -210,7 +312,7 @@ function TabBadge({ tab, active }: { tab: DeckTab; active: boolean }) {
           ? "text-status-attention"
           : active && tab.accentBadgeWhenActive
             ? "text-accent-ember"
-            : "text-foreground/38",
+            : "text-muted-foreground",
       )}
     >
       {tab.badge}
@@ -317,8 +419,9 @@ const TAB_FLOOR_PX = 140;
  * drag gap's floor (`min-w-4`), the "…" and legacy chrome's expand/close
  * buttons (`size-6`) are rem, so they grow with the interface-size setting.
  */
-function rowBudgets(remPx: number, legacy: boolean) {
-  const dragGap = remPx;
+function rowBudgets(remPx: number, legacy: boolean, compact: boolean) {
+  // A compact row has given the drag gap's floor to its tabs.
+  const dragGap = compact ? 0 : remPx;
   // Divider with its margins, two buttons, three row gaps.
   const legacyControls = legacy ? 11 + 3 * remPx + 6 : 0;
   return {
@@ -364,6 +467,37 @@ function actionsShape(node: ReactNode): string {
   walk(node);
   return parts.join("|");
 }
+/**
+ * A fingerprint of a tab badge: its text plus every primitive prop of the
+ * elements it is made of. A component badge (Review's PR status) is sized by
+ * what its props point at, so a different workspace or PR must count as a
+ * different badge even when it is hidden and can't be measured.
+ */
+function badgeShape(node: ReactNode): string {
+  const parts: string[] = [];
+  const walk = (child: ReactNode) => {
+    Children.forEach(child, (item) => {
+      if (typeof item === "string" || typeof item === "number") {
+        parts.push(String(item));
+        return;
+      }
+      if (!isValidElement<Record<string, unknown>>(item)) return;
+      const { type, props } = item;
+      parts.push(
+        typeof type === "string" ? type : typeof type === "function" ? type.name : "",
+      );
+      for (const [key, value] of Object.entries(props)) {
+        if (["string", "number", "boolean"].includes(typeof value)) {
+          parts.push(`${key}=${String(value)}`);
+        }
+      }
+      walk(props.children as ReactNode);
+    });
+  };
+  walk(node);
+  return parts.join("|");
+}
+
 /** Slack a collapsed row needs before it expands again, so a row sitting
  *  right on the line doesn't flip between the two layouts. */
 const COLLAPSE_HYSTERESIS_PX = 4;
@@ -386,14 +520,16 @@ const COLLAPSE_HYSTERESIS_PX = 4;
  *
  * It also says whether the tabs overflow beside inline actions, in which
  * case the inline row carries an "All tabs" button too and budgets for it.
- * That comes from the measured widths, not from the scroller's current
- * overflow: the button narrows the scroller, so reading the overflow back
- * would let the button decide its own presence.
+ * The tabs count at their narrowest (every tab icon-only, which tab
+ * compaction reaches on a short row), not at their rendered width or the
+ * scroller's current overflow: either would let the tabs' own fit, or the
+ * button itself, feed back into whether the actions fold.
  */
 function useCollapsedActions({
   headerRef,
   actionsRef,
   tabsRef,
+  tabCount,
   actionsKey,
   actionsShape,
   hasActions,
@@ -401,8 +537,10 @@ function useCollapsedActions({
 }: {
   headerRef: React.RefObject<HTMLElement | null>;
   actionsRef: React.RefObject<HTMLDivElement | null>;
-  /** The tab run's content, whose width is the tabs' natural width. */
+  /** The tab run's content; observed so a changed tab set re-measures. */
   tabsRef: React.RefObject<HTMLDivElement | null>;
+  /** How many tabs the run holds. */
+  tabCount: number;
   actionsKey: string;
   actionsShape: string;
   hasActions: boolean;
@@ -437,7 +575,13 @@ function useCollapsedActions({
       header.clientWidth -
       (parseFloat(style.paddingLeft) || 0) -
       (parseFloat(style.paddingRight) || 0);
-    const tabs = tabsRef.current?.scrollWidth ?? 0;
+    // The narrowest the tab run gets: every tab icon-only. Tab compaction
+    // reaches it whenever the row is short, so it is all the actions have to
+    // leave room for. Reading the rendered width instead would let the two
+    // fits answer each other (labels back → actions fold → room for labels
+    // → actions unfold → labels go), alternating forever; this way action
+    // folding never depends on how the tabs are currently drawn.
+    const tabs = tabCount * ICON_TAB_PX + Math.max(0, tabCount - 1) * TAB_GAP_PX;
     if (!hasActions) {
       commit(() => false, tabs > row - budgets.inline);
       return;
@@ -474,7 +618,7 @@ function useCollapsedActions({
     budgets,
     hasActions,
     headerRef,
-    tabsRef,
+    tabCount,
   ]);
 
   // Every commit: a pane switch, or actions that changed width in place.
@@ -507,6 +651,202 @@ function useCollapsedActions({
   );
 
   return { collapsed, tabsOverflow: layout.tabsOverflow, onPopoverOpenChange };
+}
+
+/** Slack a compact row needs before its labels come back, so a row sitting
+ *  right on the line doesn't flip between labelled and icon-only tabs. */
+const COMPACT_HYSTERESIS_PX = 16;
+/** An icon-only tab's width, and the gap between tabs. */
+const ICON_TAB_PX = 24;
+const TAB_GAP_PX = 2;
+/** An active label is truncated only while it keeps this share of its width
+ *  and this many px; any less leaves a stub ("Sub…"), so the active tab goes
+ *  icon-only instead. */
+const KEEP_LABEL_SHARE = 0.8;
+const ACTIVE_LABEL_FLOOR_PX = 44;
+/** Slack between the measured row and the action budget's model of it with
+ *  the "+" inline, so a row fitted to the pixel is never read back as
+ *  overflowing (which would bring the "All tabs" button back). */
+const FIT_SLACK_PX = 3;
+/** What a labelled chip spends besides its label: 2px inset, the 24px close
+ *  button, the label button's 2px and 8px insets. */
+const ACTIVE_CHIP_CHROME_PX = 36;
+
+/** How the active tab fits a compact row: as is, without its count (which
+ *  the pane itself shows), or with its label truncated as well. */
+export type ActiveFit =
+  | { kind: "full" }
+  | { kind: "no-badge" }
+  | { kind: "truncate"; maxWidth: number }
+  /** Icon-only, still filled, keeping its count when that fits. */
+  | { kind: "icon"; badge: boolean };
+
+/**
+ * Whether the inactive tabs have to drop their labels to fit. Labels that
+ * scroll out of view under the top-right cluster are as good as missing, so
+ * once the tabs' labelled width outgrows the room the row leaves them, the
+ * inactive tabs show their icon only and the active one keeps its label.
+ * The active tab is then budgeted against what the icons leave it: it drops
+ * its count first, then truncates its label (full name in its title and
+ * accessible name) while most of it stays readable, and rather than leave a
+ * stub it goes icon-only too, keeping its fill and count. The five default panes stay in view at
+ * the default panel width whichever one is active, instead of two and a
+ * half.
+ *
+ * The labelled width is read while the labels are shown and kept while they
+ * are hidden, keyed by the tab set and the active tab, so a changed set
+ * shows the labels for one layout pass to be measured afresh (before paint).
+ * The room is the header's inner width less every sibling the scroller
+ * shares it with (the "+", "…", "All tabs" and legacy controls, measured,
+ * not budgeted) and the drag gap's floor.
+ */
+function useCompactTabs({
+  headerRef,
+  scrollerRef,
+  contentRef,
+  tabsKey,
+  dragGapPx,
+}: {
+  headerRef: React.RefObject<HTMLElement | null>;
+  scrollerRef: React.RefObject<HTMLDivElement | null>;
+  contentRef: React.RefObject<HTMLDivElement | null>;
+  tabsKey: string;
+  dragGapPx: number;
+}) {
+  const [layout, setLayout] = useState<{ compact: boolean; active: ActiveFit }>({
+    compact: false,
+    active: { kind: "full" },
+  });
+  const compactRef = useRef(false);
+  compactRef.current = layout.compact;
+  const labelled = useRef<{
+    key: string;
+    width: number;
+    /** The active chip's labelled width, and what its count adds to it. */
+    active: number;
+    badge: number;
+  } | null>(null);
+  const commit = useCallback(
+    (compact: (prev: boolean) => boolean, active: ActiveFit = { kind: "full" }) =>
+      setLayout((prev) => {
+        const nextCompact = compact(prev.compact);
+        const nextActive = nextCompact ? active : ({ kind: "full" } as const);
+        const same =
+          prev.compact === nextCompact &&
+          prev.active.kind === nextActive.kind &&
+          JSON.stringify(prev.active) === JSON.stringify(nextActive);
+        return same ? prev : { compact: nextCompact, active: nextActive };
+      }),
+    [],
+  );
+
+  const measure = useCallback(() => {
+    const header = headerRef.current;
+    const scroller = scrollerRef.current;
+    const content = contentRef.current;
+    // No layout to measure (jsdom): keep every label.
+    if (!header || !scroller || !content || header.clientWidth === 0) {
+      commit(() => false);
+      return;
+    }
+    if (!compactRef.current) {
+      const chip = content.querySelector<HTMLElement>('[data-state="active"]');
+      const badge = chip?.querySelector<HTMLElement>("[data-tab-badge]");
+      labelled.current = {
+        key: tabsKey,
+        width: content.scrollWidth,
+        active: chip?.getBoundingClientRect().width ?? 0,
+        // The badge plus the label row's 7px gap before it.
+        badge: badge ? badge.getBoundingClientRect().width + 7 : 0,
+      };
+    }
+    const known = labelled.current;
+    if (known?.key !== tabsKey) {
+      commit(() => false);
+      return;
+    }
+    if (compactRef.current) {
+      // A count can change in place (Changes, Tasks, a Review badge that
+      // updates itself) without a new tab set. While the active chip still
+      // shows it, keep its width current so the fit never decides on a
+      // stale one.
+      const shown = content
+        .querySelector<HTMLElement>('[data-state="active"]')
+        ?.querySelector<HTMLElement>("[data-tab-badge]");
+      if (shown) {
+        const live = shown.getBoundingClientRect().width + 7;
+        known.active += live - known.badge;
+        known.badge = live;
+      }
+    }
+    const style = getComputedStyle(header);
+    const gap = parseFloat(style.columnGap) || 0;
+    // Not the "All tabs" button: it only shows while the tabs overflow, which
+    // is what fitting them removes, so counting it would let it keep itself.
+    const kids = ([...header.children] as HTMLElement[]).filter(
+      (kid) => kid.dataset.testid !== "right-panel-tabs-overflow",
+    );
+    let room =
+      header.clientWidth -
+      (parseFloat(style.paddingLeft) || 0) -
+      (parseFloat(style.paddingRight) || 0) -
+      gap * Math.max(0, kids.length - 1) -
+      dragGapPx;
+    for (const kid of kids) {
+      if (kid === scroller || kid.dataset.testid === "right-panel-drag-gap") {
+        continue;
+      }
+      const kidStyle = getComputedStyle(kid);
+      room -=
+        kid.offsetWidth +
+        (parseFloat(kidStyle.marginLeft) || 0) +
+        (parseFloat(kidStyle.marginRight) || 0);
+    }
+    // A compact row gives the drag gap's floor to the tabs as well: the gap
+    // still takes whatever they leave, it just stops reserving room.
+    const others = content.children.length - 1;
+    // With the "+" inline, the action budget models the row (and so
+    // whether "All tabs" shows) a few px tighter than measured.
+    const plusInline = kids.some(
+      (kid) => kid.dataset.testid === "right-panel-add-pane",
+    );
+    const forActive =
+      room +
+      dragGapPx -
+      others * (ICON_TAB_PX + TAB_GAP_PX) -
+      (plusInline ? FIT_SLACK_PX : 0);
+    const active: ActiveFit =
+      known.active <= forActive
+        ? { kind: "full" }
+        : known.active - known.badge <= forActive
+          ? { kind: "no-badge" }
+          : forActive - ACTIVE_CHIP_CHROME_PX >=
+              Math.max(
+                ACTIVE_LABEL_FLOOR_PX,
+                KEEP_LABEL_SHARE *
+                  (known.active - known.badge - ACTIVE_CHIP_CHROME_PX),
+              )
+            ? { kind: "truncate", maxWidth: Math.floor(forActive) }
+            : { kind: "icon", badge: ICON_TAB_PX + known.badge <= forActive };
+    commit(
+      (prev) =>
+        prev ? known.width > room - COMPACT_HYSTERESIS_PX : known.width > room,
+      active,
+    );
+  }, [commit, contentRef, dragGapPx, headerRef, scrollerRef, tabsKey]);
+
+  useLayoutEffect(measure);
+  useLayoutEffect(() => {
+    const header = headerRef.current;
+    if (!header || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(header);
+    // The tabs' own width changes when a count changes in place.
+    if (contentRef.current) observer.observe(contentRef.current);
+    return () => observer.disconnect();
+  }, [contentRef, headerRef, measure]);
+
+  return layout;
 }
 
 /**
@@ -566,7 +906,7 @@ function RowOverflowMenu({
               className={cn(
                 "flex size-6 shrink-0 items-center justify-center rounded-md",
                 "transition-colors duration-100",
-                "text-foreground/42 hover:bg-surface-2 hover:text-foreground/80",
+                "text-subtle-foreground hover:bg-surface-2 hover:text-foreground/80",
                 "data-[state=open]:bg-surface-3 data-[state=open]:text-foreground",
               )}
             >
@@ -580,7 +920,6 @@ function RowOverflowMenu({
       </Tooltip>
       <PopoverContent
         align="end"
-        collisionPadding={8}
         aria-label={label}
         data-testid={
           folded
@@ -768,8 +1107,33 @@ export const PaneTabStrip = memo(function PaneTabStrip({
 
   const headerRef = useRef<HTMLElement>(null);
   const actionsRef = useRef<HTMLDivElement>(null);
+  // Before the action budget, which needs to know whether the row is
+  // compact: a compact row reserves no drag-gap floor.
+  const { compact: compactTabs, active: activeFit } = useCompactTabs({
+    headerRef,
+    scrollerRef: containerRef,
+    contentRef,
+    // Badges are part of the key so a count that changes while hidden is
+    // measured again rather than fitted from its old width.
+    tabsKey: `${tabs
+      .map((tab) => `${tab.id}:${tab.label}:${badgeShape(tab.badge)}`)
+      .join("|")}#${activeTab ?? ""}`,
+    dragGapPx: remPx,
+  });
   const budgets = useMemo(
-    () => rowBudgets(remPx, !inTitlebar),
+    () => rowBudgets(remPx, !inTitlebar, compactTabs),
+    [compactTabs, inTitlebar, remPx],
+  );
+  // The fold decision budgets the row one fixed way, reserving the drag
+  // gap's floor as a labelled row does, whatever the tabs are doing right
+  // now. The reserve folds actions a little early, which is what keeps the
+  // active tab's label at the default panel width. Letting it follow
+  // `compactTabs` would hand the tabs' fit back to the actions: labels back →
+  // a 16px gap floor → actions fold → room for labels → compact → no floor →
+  // actions unfold, forever. The tabs' fit still reads the real row, so the
+  // dependency runs one way only.
+  const foldBudgets = useMemo(
+    () => rowBudgets(remPx, !inTitlebar, false),
     [inTitlebar, remPx],
   );
   const {
@@ -780,10 +1144,11 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     headerRef,
     actionsRef,
     tabsRef: contentRef,
+    tabCount: tabs.length,
     actionsKey: activeTab ?? "",
     actionsShape: actionsShape(actions),
     hasActions: actions != null,
-    budgets,
+    budgets: foldBudgets,
   });
   // An inline row grows an "All tabs" button once the tabs overflow beside
   // it; a folded row lists them in its "…" whenever any are out of view.
@@ -836,7 +1201,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           aria-label="Open pane"
           data-testid="right-panel-add-pane"
           className={cn(
-            "flex size-[24px] shrink-0 items-center justify-center rounded-md text-foreground/42 transition-colors duration-100 hover:bg-surface-2 hover:text-foreground data-[state=open]:bg-surface-3 data-[state=open]:text-foreground",
+            "flex size-[24px] shrink-0 items-center justify-center rounded-md text-subtle-foreground transition-colors duration-100 hover:bg-surface-2 hover:text-foreground data-[state=open]:bg-surface-3 data-[state=open]:text-foreground",
             !actionsCollapsed && "ml-[3px]",
           )}
         >
@@ -847,8 +1212,8 @@ export const PaneTabStrip = memo(function PaneTabStrip({
         align="start"
         className="w-[206px] rounded-lg p-[5px] [&_[role=menuitem]]:whitespace-nowrap"
       >
-        <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
-          OPEN PANE
+        <DropdownMenuLabel className={cn(MENU_SECTION_LABEL, "px-[9px]")}>
+          Open pane
         </DropdownMenuLabel>
         {/* Same `surfaces` array the empty-panel picker renders as cards,
             including Terminal, which is a *workspace* pane and routes to
@@ -868,8 +1233,8 @@ export const PaneTabStrip = memo(function PaneTabStrip({
         {pluginSurfaces.length > 0 && (
           <>
             <DropdownMenuSeparator className="mx-1 my-[5px]" />
-            <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
-              PLUGINS
+            <DropdownMenuLabel className={cn(MENU_SECTION_LABEL, "px-[9px]")}>
+              Plugins
             </DropdownMenuLabel>
             {pluginSurfaces.map((surface) => (
               <DropdownMenuItem
@@ -936,6 +1301,8 @@ export const PaneTabStrip = memo(function PaneTabStrip({
                   <DeckTabChip
                     tab={tab}
                     active={tab.id === activeTab}
+                    compact={compactTabs}
+                    activeFit={activeFit}
                     dragging={dragTabId === tab.id}
                     reorderProps={getPillProps(tab.id)}
                     onSelect={() => onSelect(tab.id)}
@@ -991,7 +1358,11 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     <div
       data-testid="right-panel-drag-gap"
       data-tauri-drag-region={inTitlebar && !remoteClient ? true : undefined}
-      className="min-w-4 flex-1 self-stretch"
+      className={cn(
+        "flex-1 self-stretch",
+        // A compact row has budgeted the gap's floor to the tabs.
+        compactTabs ? "min-w-0" : "min-w-4",
+      )}
     />
   );
 
