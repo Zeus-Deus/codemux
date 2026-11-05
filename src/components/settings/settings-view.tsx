@@ -1386,8 +1386,8 @@ function PresetEditorSheet({
             <div />
           )}
           <Button
+            variant="inverse"
             size="sm"
-            className="bg-foreground text-background hover:bg-foreground/90"
             onClick={
               isDraft
                 ? () => onCreate?.(buildCreatePayload())

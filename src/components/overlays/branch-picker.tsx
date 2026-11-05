@@ -13,6 +13,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   GitBranch,
   Globe,
@@ -414,9 +415,10 @@ export function BranchPicker({
                               ? "flex"
                               : "hidden group-hover/row:flex group-data-[selected=true]/row:flex",
                           )}>
-                            <button
+                            <Button
                               type="button"
-                              className="inline-flex items-center gap-1 rounded-sm px-2 py-0.5 text-label font-medium bg-foreground text-background hover:bg-foreground/90 transition-colors duration-150"
+                              variant="inverse"
+                              size="xs"
                               onClick={(e) => {
                                 e.stopPropagation();
                                 handlePrimaryAction(branch);
@@ -424,15 +426,16 @@ export function BranchPicker({
                             >
                               {primaryLabel}
                               <kbd className="opacity-50">↵</kbd>
-                            </button>
-                            {!baseOnly && <button
+                            </Button>
+                            {!baseOnly && <Button
                               type="button"
-                              className="inline-flex items-center gap-1 rounded-sm px-2 py-0.5 text-label font-medium bg-muted text-muted-foreground hover:bg-muted/80 transition-colors duration-150"
+                              variant="secondary"
+                              size="xs"
                               onClick={(e) => handleSecondaryAction(e, branch)}
                             >
                               {secondaryLabel}
                               <kbd className="opacity-50">⌃↵</kbd>
-                            </button>}
+                            </Button>}
                           </span>
                         </CommandItem>
                       );
