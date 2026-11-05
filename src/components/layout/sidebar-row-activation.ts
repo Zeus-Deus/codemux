@@ -16,3 +16,24 @@ export function isRowActivationKey(
   if (e.key !== "Enter" && e.key !== " ") return false;
   return e.target === e.currentTarget;
 }
+
+/** Shift+F10 or the Menu key: the keyboard's "open the context menu". */
+export function isContextMenuKey(e: React.KeyboardEvent<HTMLElement>): boolean {
+  return e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey);
+}
+
+/** Opens a Radix context menu bound to `el` from the keyboard. Webviews don't
+ *  all turn Shift+F10 into a `contextmenu` event, and the ones that do report
+ *  0,0, so dispatch one ourselves anchored just inside the element's top-left
+ *  corner. */
+export function openContextMenuAt(el: HTMLElement): void {
+  const r = el.getBoundingClientRect();
+  el.dispatchEvent(
+    new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: r.left + 12,
+      clientY: r.top + r.height / 2,
+    }),
+  );
+}

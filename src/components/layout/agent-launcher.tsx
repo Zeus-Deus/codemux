@@ -383,6 +383,7 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
                 "flex size-7 shrink-0 items-center justify-center",
                 BAND_CONTROL_RADIUS,
                 BAND_CONTROL_HOVER,
+                "active:bg-surface-3",
                 open ? cn(BAND_ACTIVE_FILL, "text-foreground") : "text-muted-foreground",
               )}
             >
@@ -584,6 +585,7 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
                 "flex size-7 shrink-0 items-center justify-center",
                 BAND_CONTROL_RADIUS,
                 BAND_CONTROL_HOVER,
+                "active:bg-surface-3",
                 open ? cn(BAND_ACTIVE_FILL, "text-foreground") : "text-muted-foreground",
                 draft.promoting && "opacity-40 pointer-events-none",
               )}

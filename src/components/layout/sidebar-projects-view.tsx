@@ -1014,9 +1014,8 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
             <Plus />
           </SidebarMenuAction>
         </TooltipTrigger>
-        <TooltipContent side="bottom" shortcut="newWorkspaceInProject">
+        <TooltipContent side="bottom" shortcut="newWorkspaceInProject" hint="Shift-click for a workspace">
           New chat in {name}
-          <span className="text-muted-foreground">Shift-click for a workspace</span>
         </TooltipContent>
       </Tooltip>
     </div>

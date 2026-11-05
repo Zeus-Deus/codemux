@@ -75,9 +75,8 @@ export function SidebarActionRow() {
                 <SquarePen className="size-[13px]" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent side="right" shortcut="newAgent">
+            <TooltipContent side="right" shortcut="newAgent" hint="Shift-click for a workspace">
               New agent
-              <span className="text-muted-foreground">Shift-click for a workspace</span>
             </TooltipContent>
           </Tooltip>
 
@@ -185,9 +184,8 @@ export function SidebarHeaderActions() {
             <SquarePen className="size-[15px]" />
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom" shortcut="newAgent">
+        <TooltipContent side="bottom" shortcut="newAgent" hint="Shift-click for a workspace">
           New chat in home directory
-          <span className="text-muted-foreground">Shift-click for a workspace</span>
         </TooltipContent>
       </Tooltip>
     </>

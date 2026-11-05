@@ -40,7 +40,11 @@ import {
   permissionBlockerText,
 } from "@/stores/sidebar-density-store";
 import { useProjectAppearance } from "./use-project-appearance";
-import { isRowActivationKey } from "./sidebar-row-activation";
+import {
+  isContextMenuKey,
+  isRowActivationKey,
+  openContextMenuAt,
+} from "./sidebar-row-activation";
 import { getWorkspaceProviders } from "@/lib/pane-status";
 import { computeSnoozePresets, type SnoozePreset } from "./sidebar-snooze";
 import { getTimeFormat } from "@/stores/settings-store";
@@ -882,6 +886,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
             <div
               role="button"
               tabIndex={0}
+              // Pin / Snooze / Settle are pointer shortcuts and stay out of
+              // the Tab order; the keyboard reaches the same actions (and
+              // more) through the context menu on the focused card.
+              aria-description="Shift+F10 for actions"
               data-inbox-card={workspace.workspace_id}
               aria-current={isActive ? "page" : undefined}
               data-selected={selected || undefined}
@@ -894,6 +902,11 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 // on the PR chip would open the PR *and* yank the main pane
                 // onto the workspace, and Space would never reach the button at
                 // all — the preventDefault below would eat its native click.
+                if (e.target === e.currentTarget && isContextMenuKey(e)) {
+                  e.preventDefault();
+                  openContextMenuAt(e.currentTarget);
+                  return;
+                }
                 if (!isRowActivationKey(e)) return;
                 // Space would otherwise scroll the sidebar as it activates
                 // the card.
@@ -1012,6 +1025,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     <TooltipTrigger asChild>
                       <button
                         type="button"
+                        tabIndex={-1}
                         onClick={(e) => {
                           // Every action here stops propagation: these buttons sit
                           // inside the card's own click target, and without this a
@@ -1049,6 +1063,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         <TooltipTrigger asChild>
                           <button
                             type="button"
+                            tabIndex={-1}
                             onClick={(e) => e.stopPropagation()}
                             aria-label={`Snooze "${workspace.title}"`}
                             className={eyebrowGlyphClass}
@@ -1095,6 +1110,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   {canSettle && (
                     <button
                       type="button"
+                      tabIndex={-1}
                       onClick={(e) => {
                         e.stopPropagation();
                         onSettle(workspace.workspace_id);

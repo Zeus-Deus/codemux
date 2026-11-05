@@ -68,11 +68,15 @@ function TooltipContent({
   sideOffset = 4,
   collisionPadding = 8,
   shortcut,
+  hint,
   children,
   ...props
 }: React.ComponentProps<typeof TooltipPrimitive.Content> & {
   /** A `keybind-registry` action id whose binding is shown after the label. */
   shortcut?: string
+  /** A secondary line under the label (e.g. a modifier-click variant). The
+   *  keycap stays on the right, centred against both lines. */
+  hint?: React.ReactNode
 }) {
   return (
     <TooltipPrimitive.Portal>
@@ -90,7 +94,14 @@ function TooltipContent({
         )}
         {...props}
       >
-        {children}
+        {hint ? (
+          <span className="flex flex-col gap-0.5">
+            <span>{children}</span>
+            <span className="text-caption text-muted-foreground">{hint}</span>
+          </span>
+        ) : (
+          children
+        )}
         {shortcut && <TooltipShortcut actionId={shortcut} />}
       </TooltipPrimitive.Content>
     </TooltipPrimitive.Portal>
