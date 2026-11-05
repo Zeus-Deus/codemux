@@ -103,7 +103,7 @@ function AgentRow({
   let detail: string;
   let action: ReactNode = null;
   if (readiness === "ready") {
-    detail = "Ready";
+    detail = report.auth_label ? `Ready · ${report.auth_label}` : "Ready";
   } else if (readiness === "not_installed") {
     detail = provider === "opencode" ? "Not installed · has free models" : "Not installed";
     action = (

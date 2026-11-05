@@ -92,7 +92,7 @@ async fn provider_capabilities(provider: ProviderKind) -> Result<ProviderChatCap
                 return Err("Claude CLI is unavailable; repair the host installation".into());
             }
             match claude::auth::probe_authenticated(&sidecar,Some(&binary)).await.map_err(|e|e.to_string())? {
-                claude::auth::AuthStatus::Authenticated => {},
+                claude::auth::AuthStatus::Authenticated { .. } => {},
                 claude::auth::AuthStatus::Unauthenticated {message} => return Err(message),
                 claude::auth::AuthStatus::Unknown {..} => return Err("Claude authentication could not be verified on this host; authenticate Claude Code and retry".into()),
             }

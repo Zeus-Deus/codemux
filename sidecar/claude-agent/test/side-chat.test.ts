@@ -2,6 +2,9 @@
 // the notification stream, driven through the RPC handlers with FakeQuery.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import type { EventEmitter } from "../src/session.ts";
@@ -77,6 +80,37 @@ describe("side chat options", () => {
     expect(options.mcpServers).toEqual({});
     expect(options.strictMcpConfig).toBe(true);
     expect(options.permissionMode).toBe("default");
+  });
+
+  test("carry provider routing from settings.json but no other user settings", () => {
+    const home = mkdtempSync(join(tmpdir(), "claude-home-"));
+    writeFileSync(join(home, "settings.json"), JSON.stringify({
+      env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", ANTHROPIC_AUTH_TOKEN: "dummy", DISABLE_TELEMETRY: "1", CLAUDE_CODE_ENTRYPOINT: "routing-test" },
+      apiKeyHelper: "print-key",
+      outputStyle: "Pirate",
+      enabledPlugins: { "x@y": true },
+    }));
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    const previousHost = process.env.CLAUDE_CODE_HOST_SESSION_ID;
+    process.env.CLAUDE_CODE_HOST_SESSION_ID = "launching-session";
+    process.env.CLAUDE_CONFIG_DIR = home;
+    try {
+      const options = buildSideChatOptions({ ...START, effort: "ultracode" });
+      expect(options.settingSources).toEqual([]);
+      expect(options.plugins).toEqual([]);
+      expect(options.env?.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8317");
+      expect(options.env?.ANTHROPIC_AUTH_TOKEN).toBe("dummy");
+      expect(options.env?.CLAUDE_CODE_ENTRYPOINT).toBe("routing-test");
+      expect(options.env?.CLAUDE_CODE_HOST_SESSION_ID).toBeUndefined();
+      expect(options.env?.DISABLE_TELEMETRY).toBe(process.env.DISABLE_TELEMETRY);
+      expect(options.settings).toEqual({ disableAllHooks: true, apiKeyHelper: "print-key", ultracode: true });
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previous;
+      if (previousHost === undefined) delete process.env.CLAUDE_CODE_HOST_SESSION_ID;
+      else process.env.CLAUDE_CODE_HOST_SESSION_ID = previousHost;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test("carry the main chat's model and effort", () => {

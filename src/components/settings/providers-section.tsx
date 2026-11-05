@@ -66,7 +66,9 @@ const sameSelection = (a: Selected, b: Selected) =>
 function healthStatus(report: ProviderHealthReport | null | undefined, pending: boolean): ProviderStatus {
   if (!report) return pending ? { tone: "pending", label: "Checking…" } : { tone: "warn", label: "Couldn't check" };
   if (!report.installed) return { tone: "off", label: "Not installed" };
-  if (report.status === "ready") return { tone: "ok", label: "Ready" };
+  if (report.status === "ready") {
+    return { tone: "ok", label: report.auth_label ? `Ready · ${report.auth_label}` : "Ready" };
+  }
   if (report.login_command) return { tone: "warn", label: "Signed out" };
   if (report.status === "warning") return { tone: "warn", label: "Couldn't verify" };
   return { tone: "error", label: "Not working" };

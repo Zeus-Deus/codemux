@@ -907,6 +907,7 @@ function ProviderRail({
 }) {
   const railRef = useRef<HTMLDivElement | null>(null);
   const railEdges = useScrollEdges(railRef);
+  const healthSlots = useProviderHealth((state) => state.slots);
   return (
     <TooltipProvider delayDuration={200}>
       <div className="flex min-h-0 flex-col border-r bg-surface-1">
@@ -979,6 +980,8 @@ function ProviderRail({
               // just a rail-level heads-up.
               const parsedError = parseProviderError(error);
               const isUnavailable = parsedError !== null;
+              // How the CLI signs in ("Claude Max", "Custom endpoint · …").
+              const authLabel = healthSlots[p.kind]?.report?.auth_label ?? null;
               const view = accountView(p.kind);
               if (view) {
                 return view.options.map((account) => (
@@ -1037,6 +1040,8 @@ function ProviderRail({
                         <div className="mt-0.5 text-muted-foreground">
                           {providerErrorTooltipLabel(parsedError)}
                         </div>
+                      ) : authLabel ? (
+                        <div className="mt-0.5 text-muted-foreground">{authLabel}</div>
                       ) : null}
                     </TooltipContent>
                   </Tooltip>

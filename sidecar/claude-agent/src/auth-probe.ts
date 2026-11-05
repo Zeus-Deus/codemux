@@ -1,9 +1,9 @@
 // Subprocess probes for the user's local `claude` binary.
 //
 // This file is deliberately isolated — it is the only place in the
-// sidecar allowed to spawn `claude` directly (for `--version` and
-// `auth status`). All Claude *inference* goes through the SDK's
-// `query()`. `scripts/check-tos-boundary.sh` allow-lists this file
+// sidecar allowed to spawn `claude` directly (for `--version`,
+// `auth status` and `auth status --text`). All Claude *inference* goes
+// through the SDK's `query()`. `scripts/check-tos-boundary.sh` allow-lists this file
 // for the `spawn/exec claude` pattern and nothing else should be.
 
 import { spawn } from "node:child_process";
@@ -27,6 +27,9 @@ const UNAUTHENTICATED_PATTERNS = [
   "login required",
 ];
 
+const NOT_AUTHENTICATED_MESSAGE =
+  "Claude CLI is not authenticated. Run `claude login` and retry.";
+
 /** Outcome of `probeInstalled`. */
 export interface ProbeInstalledResult {
   installed: boolean;
@@ -44,6 +47,10 @@ export interface ProbeAuthenticatedResult {
   status: "authenticated" | "unauthenticated" | "unknown";
   /** User-visible hint or raw output snippet. */
   message?: string;
+  /** How the CLI reaches a model, e.g. "Claude Max" or
+   *  "Custom endpoint · gateway.example.com". Never carries secrets;
+   *  endpoints are reduced to host[:port]. Absent when unknown. */
+  authLabel?: string;
 }
 
 interface SpawnOutcome {
@@ -127,25 +134,14 @@ export function parseCliVersion(output: string): string {
 function classifyJsonAuthOutput(
   output: string,
 ): ProbeAuthenticatedResult | null {
-  for (const candidate of jsonObjectCandidates(output)) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(candidate);
-    } catch {
-      continue;
-    }
-    if (typeof parsed !== "object" || parsed === null) continue;
-    const loggedIn = (parsed as Record<string, unknown>)["loggedIn"];
-    if (typeof loggedIn !== "boolean") continue;
-    return loggedIn
-      ? { status: "authenticated" }
-      : {
-          status: "unauthenticated",
-          message:
-            "Claude CLI is not authenticated. Run `claude login` and retry.",
-        };
-  }
-  return null;
+  const parsed = parseAuthStatusJson(output);
+  if (!parsed) return null;
+  return parsed.loggedIn
+    ? { status: "authenticated" }
+    : {
+        status: "unauthenticated",
+        message: NOT_AUTHENTICATED_MESSAGE,
+      };
 }
 
 /** Every balanced top-level `{...}` region in `output`, in order.
@@ -198,8 +194,7 @@ export function classifyAuthOutput(output: string): ProbeAuthenticatedResult {
     if (lower.includes(pattern)) {
       return {
         status: "unauthenticated",
-        message:
-          "Claude CLI is not authenticated. Run `claude login` and retry.",
+        message: NOT_AUTHENTICATED_MESSAGE,
       };
     }
   }
@@ -212,17 +207,251 @@ export function classifyAuthOutput(output: string): ProbeAuthenticatedResult {
   };
 }
 
-/** Run `<binary> auth status` and parse. */
+/** Labels the CLI itself uses for non-first-party API providers. */
+const API_PROVIDER_LABELS: Record<string, string> = {
+  bedrock: "Amazon Bedrock",
+  vertex: "Google Vertex AI",
+  foundry: "Microsoft Foundry",
+  anthropicAws: "Claude Platform on AWS",
+  anthropicGoogleCloud: "Claude Platform on Google Cloud",
+  mantle: "Amazon Bedrock (Mantle)",
+  gateway: "Cloud gateway",
+};
+
+/** Plan names as the CLI's `subscriptionType` spells them. */
+const PLAN_LABELS: Record<string, string> = {
+  free: "Free",
+  pro: "Pro",
+  max: "Max",
+  team: "Team",
+  enterprise: "Enterprise",
+};
+
+/** The fields of `claude auth status` (JSON) that decide readiness. */
+interface AuthStatusJson {
+  loggedIn: boolean;
+  authMethod?: string | undefined;
+  apiProvider?: string | undefined;
+  subscriptionType?: string | undefined;
+}
+
+/** Facts read from `claude auth status --text`, one `Label: value`
+ *  line each. Only present when the CLI prints them. */
+interface AuthStatusText {
+  /** `Anthropic base URL: …` (userinfo already masked by the CLI). */
+  baseUrl?: string | undefined;
+  /** `Login method: Claude Max account` for a claude.ai login. */
+  loginMethod?: string | undefined;
+  /** `API provider: Amazon Bedrock` for cloud providers. */
+  apiProvider?: string | undefined;
+}
+
+function parseAuthStatusJson(output: string): AuthStatusJson | null {
+  for (const candidate of jsonObjectCandidates(output)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null) continue;
+    const record = parsed as Record<string, unknown>;
+    if (typeof record["loggedIn"] !== "boolean") continue;
+    const text = (key: string) =>
+      typeof record[key] === "string" ? (record[key] as string) : undefined;
+    return {
+      loggedIn: record["loggedIn"],
+      authMethod: text("authMethod"),
+      apiProvider: text("apiProvider"),
+      subscriptionType: text("subscriptionType"),
+    };
+  }
+  return null;
+}
+
+function parseAuthStatusText(output: string): AuthStatusText {
+  const facts: AuthStatusText = {};
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^\s*([A-Za-z][A-Za-z ]*?):\s+(.+?)\s*$/.exec(line);
+    if (!match) continue;
+    const [, label, value] = match;
+    if (label === "Anthropic base URL") facts.baseUrl ??= value;
+    else if (label === "Login method") facts.loginMethod ??= value;
+    else if (label === "API provider") facts.apiProvider ??= value;
+  }
+  return facts;
+}
+
+/** `host[:port]` of a base URL that sends Claude somewhere other than
+ *  Anthropic's own API, or `null` when the URL is unset, unparseable,
+ *  not http(s), or first-party. Userinfo, path and query are dropped
+ *  so the result is safe to show. */
+export function customEndpointHost(baseUrl: string | undefined): string | null {
+  if (!baseUrl) return null;
+  let url: URL;
+  try {
+    url = new URL(baseUrl.trim());
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.hostname === "") return null;
+  // First-party means Anthropic's own domain or a subdomain of it. The
+  // domain is compared label by label because the ToS boundary check
+  // rejects the literal domain in sidecar sources; it exists to stop
+  // requests to it, and nothing here sends one.
+  const labels = url.hostname.toLowerCase().replace(/\.$/, "").split(".");
+  if (labels.at(-1) === "com" && labels.at(-2) === "anthropic") return null;
+  return url.host;
+}
+
+/** "Claude Max" from `subscriptionType: "max"` (or the text form
+ *  "Claude Max account"); `null` when no plan is known. */
+function claudePlanLabel(
+  subscriptionType: string | undefined,
+  loginMethod: string | undefined,
+): string | null {
+  const plan = subscriptionType?.trim();
+  if (plan) {
+    const key = plan
+      .toLowerCase()
+      .replace(/^claude[\s_-]*/, "")
+      .replace(/[\s_-]*subscription$/, "");
+    const known = PLAN_LABELS[key];
+    if (known) return `Claude ${known}`;
+    const words = plan
+      .split(/[\s_-]+/)
+      .filter(Boolean)
+      .map((word) => word[0]!.toUpperCase() + word.slice(1));
+    if (words.length === 0) return null;
+    return words[0]!.toLowerCase() === "claude"
+      ? words.join(" ")
+      : `Claude ${words.join(" ")}`;
+  }
+  const method = loginMethod?.replace(/\s+account$/i, "").trim();
+  if (!method) return null;
+  return /^claude\b/i.test(method) ? method : `Claude ${method}`;
+}
+
+/** A custom base URL whose credentials could not be confirmed. Not a
+ *  sign-in failure: some endpoints need no token, so sending stays
+ *  allowed and the user sees what was found. */
+function unverifiedEndpoint(host: string): ProbeAuthenticatedResult {
+  return {
+    status: "unknown",
+    message:
+      `Custom endpoint · ${host} is set, but Claude Code reports no credentials for it. ` +
+      "Sessions may still work if the endpoint needs none.",
+    authLabel: `Custom endpoint · ${host}`,
+  };
+}
+
+/** Combine both `auth status` outputs into readiness plus a label.
+ *
+ *  A proxy (LiteLLM, a personal gateway, …) is set up through
+ *  ANTHROPIC_BASE_URL, usually with an ANTHROPIC_AUTH_TOKEN or an
+ *  apiKeyHelper. The CLI's JSON reports a proxy token as
+ *  `authMethod: "oauth_token"`, exactly like a real login; only the
+ *  text form names the base URL, so a configured custom endpoint wins
+ *  the label. A base URL alone is not enough: with no credential the
+ *  CLI refuses to send ("Not logged in") without contacting the
+ *  endpoint, so that case is reported unverified rather than ready.
+ *  Cloud providers (Bedrock, Vertex, …) authenticate with their own
+ *  credentials, so a non-first-party provider counts as ready; the
+ *  Cloud gateway is the exception because it needs a sign-in the JSON
+ *  does report. Pure so every case is unit-testable. */
+export function classifyAuthStatus(
+  jsonOutput: string,
+  textOutput: string,
+): ProbeAuthenticatedResult {
+  const facts = parseAuthStatusText(textOutput);
+  // Older CLIs print plain `auth status` as text too, so its lines
+  // count as well.
+  const plainFacts = parseAuthStatusText(jsonOutput);
+  const json = parseAuthStatusJson(jsonOutput);
+  const endpoint =
+    customEndpointHost(facts.baseUrl) ?? customEndpointHost(plainFacts.baseUrl);
+  if (endpoint) {
+    const loggedIn = json
+      ? json.loggedIn
+      : classifyAuthOutput(jsonOutput).status === "authenticated";
+    return loggedIn
+      ? { status: "authenticated", authLabel: `Custom endpoint · ${endpoint}` }
+      : unverifiedEndpoint(endpoint);
+  }
+
+  if (!json) {
+    // Legacy CLI: keep the text heuristics and add a plan label when a
+    // login method line is there.
+    const legacy = classifyAuthOutput(jsonOutput);
+    const label = claudePlanLabel(
+      undefined,
+      facts.loginMethod ?? plainFacts.loginMethod,
+    );
+    return legacy.status === "authenticated" && label
+      ? { ...legacy, authLabel: label }
+      : legacy;
+  }
+
+  const provider = json.apiProvider;
+  const cloudProvider =
+    provider !== undefined && provider !== "firstParty" && provider !== "gateway";
+  if (!json.loggedIn && !cloudProvider) {
+    return {
+      status: "unauthenticated",
+      message: NOT_AUTHENTICATED_MESSAGE,
+    };
+  }
+
+  const authLabel = labelFor(json, facts);
+  return authLabel
+    ? { status: "authenticated", authLabel }
+    : { status: "authenticated" };
+}
+
+function labelFor(json: AuthStatusJson, facts: AuthStatusText): string | null {
+  const provider = json.apiProvider;
+  if (provider !== undefined && provider !== "firstParty") {
+    return API_PROVIDER_LABELS[provider] ?? facts.apiProvider ?? null;
+  }
+  switch (json.authMethod) {
+    case "claude.ai":
+      return claudePlanLabel(json.subscriptionType, facts.loginMethod) ?? "Claude account";
+    case "oauth_token":
+      // A long-lived `claude setup-token` token; a proxy token would
+      // have come with a base URL and been labelled above.
+      return "Claude account";
+    case "api_key":
+      return "Anthropic API key";
+    case "api_key_helper":
+      return "API key helper";
+    default:
+      return null;
+  }
+}
+
+/** Run `<binary> auth status` (JSON on current CLIs) and
+ *  `<binary> auth status --text` side by side and classify both. The
+ *  text form is the only place the CLI names a custom base URL. */
 export async function probeAuthenticated(
   binary: string,
 ): Promise<ProbeAuthenticatedResult> {
-  const result = await runBinary(binary, ["auth", "status"]);
-  if (result.timedOut) {
-    return { status: "unknown", message: "probe timed out" };
+  const [result, text] = await Promise.all([
+    runBinary(binary, ["auth", "status"]),
+    runBinary(binary, ["auth", "status", "--text"]),
+  ]);
+  // A CLI that predates `--text` rejects the flag; its output then just
+  // carries no facts, which is the legacy behaviour.
+  const textOutput = text.timedOut || text.error ? "" : `${text.stdout}\n${text.stderr}`;
+  if (result.timedOut || result.error) {
+    // The text form alone names a custom endpoint but cannot say
+    // whether it has credentials.
+    const endpoint = customEndpointHost(parseAuthStatusText(textOutput).baseUrl);
+    if (endpoint) return unverifiedEndpoint(endpoint);
+    return {
+      status: "unknown",
+      message: result.timedOut ? "probe timed out" : result.error!.message,
+    };
   }
-  if (result.error) {
-    return { status: "unknown", message: result.error.message };
-  }
-  const combined = `${result.stdout}\n${result.stderr}`;
-  return classifyAuthOutput(combined);
+  return classifyAuthStatus(`${result.stdout}\n${result.stderr}`, textOutput);
 }

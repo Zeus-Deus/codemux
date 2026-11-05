@@ -313,6 +313,8 @@ pub struct ProbeAuthenticatedResponse {
     pub status: String,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub auth_label: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

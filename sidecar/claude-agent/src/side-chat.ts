@@ -25,6 +25,7 @@ import type {
 
 import { AsyncPromptQueue } from "./async-queue.ts";
 import { claudeProcessEnv } from "./claude-env.ts";
+import { userRouting } from "./user-routing.ts";
 import type { EventEmitter, QueryFactory } from "./session.ts";
 
 export interface SideChatStartInput {
@@ -77,6 +78,7 @@ export const sideChatCanUseTool: CanUseTool = async (toolName, input) =>
       };
 
 export function buildSideChatOptions(input: SideChatStartInput): Options {
+  const routing = userRouting(claudeProcessEnv({ cwd: input.cwd }));
   const options: Partial<Options> = {
     cwd: input.cwd,
     pathToClaudeCodeExecutable: input.pathToClaudeCodeExecutable,
@@ -90,10 +92,12 @@ export function buildSideChatOptions(input: SideChatStartInput): Options {
     permissionMode: "default",
     canUseTool: sideChatCanUseTool,
     // No user/project settings: their hooks, permission rules and plugins
-    // could act. The fork still carries the main thread's context.
+    // could act. Only their provider routing is carried over. The fork
+    // still carries the main thread's context.
     settingSources: [],
     settings: {
       disableAllHooks: true,
+      ...routing.settings,
       ...(input.effort === "ultracode" ? { ultracode: true } : {}),
     } as unknown as NonNullable<Options["settings"]>,
     mcpServers: {},
@@ -104,7 +108,7 @@ export function buildSideChatOptions(input: SideChatStartInput): Options {
       preset: "claude_code",
       ...(input.appendSystemPrompt ? { append: input.appendSystemPrompt } : {}),
     },
-    env: claudeProcessEnv({ cwd: input.cwd }),
+    env: routing.env,
   };
   if (input.model) options.model = input.model;
   const effort = sideChatCliEffort(input.effort);

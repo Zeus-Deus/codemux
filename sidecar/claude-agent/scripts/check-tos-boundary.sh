@@ -13,6 +13,13 @@
 # spawn `claude --version` and `claude auth status`. That file (and
 # that file only) is allow-listed below.
 #
+# Rule 4 has exactly one exception: `src/user-routing.ts` names the
+# credential variables in its list of settings.json `env` keys that
+# isolated helper queries copy, unread, into the CLI child's
+# environment (the CLI would apply the same values itself if it loaded
+# that file). It never reads them from the sidecar's own environment
+# or uses them.
+#
 # Exit code: 0 if all checks pass, 1 otherwise. Intended to run on
 # every `bun test` and as a standalone CI step.
 
@@ -27,6 +34,9 @@ SRC_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/src"
 SPAWN_ALLOWLIST=(
   "$SRC_DIR/auth-probe.ts"
 )
+
+# File allowed to name credential env vars (forwarding list only).
+ENV_NAME_ALLOWLIST="$SRC_DIR/user-routing.ts"
 
 FAIL=0
 
@@ -87,11 +97,16 @@ check_claude_spawns() {
 
 check_env_peeks() {
   local matches
-  matches=$(grep -rn -E 'ANTHROPIC_API_KEY' "$SRC_DIR" || true)
+  matches=$(grep -rn -E 'ANTHROPIC_API_KEY' "$SRC_DIR" | grep -vF "$ENV_NAME_ALLOWLIST:" || true)
   report "Sidecar reads ANTHROPIC_API_KEY (SDK handles auth)" "$matches"
 
-  matches=$(grep -rn -E 'CLAUDE_CODE_OAUTH_TOKEN' "$SRC_DIR" || true)
+  matches=$(grep -rn -E 'CLAUDE_CODE_OAUTH_TOKEN' "$SRC_DIR" | grep -vF "$ENV_NAME_ALLOWLIST:" || true)
   report "Sidecar reads CLAUDE_CODE_OAUTH_TOKEN" "$matches"
+
+  # The exception covers quoted key names only: no `process.env` /
+  # `env.` lookups of a credential in that file either.
+  matches=$(grep -n -E '(process\.env|env)(\.|\[)[^]]*(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_AUTH_TOKEN)' "$ENV_NAME_ALLOWLIST" || true)
+  report "user-routing.ts looks up a credential env var" "$matches"
 }
 
 check_credentials

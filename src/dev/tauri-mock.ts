@@ -3642,6 +3642,13 @@ const mockProviderHealth: Partial<
   Record<MockProviderKind, ProviderHealthReport>
 > = {};
 
+/** How healthy mock agents report signing in: Claude behind a proxy and
+ *  Codex on a custom model provider. */
+const MOCK_AUTH_LABELS: Partial<Record<MockProviderKind, string>> = {
+  claude: "Custom endpoint · gateway.example.com",
+  codex: "Custom provider · cliproxy",
+};
+
 // `?providerHealth=mixed` seeds a machine with one signed-out and two
 // missing agents, for the first-run agent strip and the automation form.
 if (new URLSearchParams(location.search).get("providerHealth") === "mixed") {
@@ -6069,6 +6076,7 @@ const handlers: Record<string, Handler> = {
         installed: true,
         message: null,
         version: "0.0.0-mock",
+        auth_label: MOCK_AUTH_LABELS[provider] ?? null,
       }
     );
   },
