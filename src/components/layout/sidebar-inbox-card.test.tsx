@@ -202,18 +202,29 @@ describe("SidebarInboxCard — branch named like the title", () => {
     expect(metaLine(container)).toBeNull();
   });
 
-  it("keeps the branch when the line is drawn for other facts anyway", () => {
+  it("drops it when ahead or line stats can lead the meta line", () => {
     const { container } = renderCard({
       workspace: makeWorkspace({
         title: "Installer-Detect",
         git_branch: "fix/installer-detect",
         git_ahead: 2,
+        git_additions: 12,
       }),
     });
-    // The line exists for ↑2 regardless, so the branch fills its left column
-    // instead of leaving the right-hand facts floating alone.
     expect(metaLine(container)).toHaveTextContent("↑2");
-    expect(metaLine(container)).toHaveTextContent("fix/installer-detect");
+    expect(metaLine(container)).not.toHaveTextContent("fix/installer-detect");
+  });
+
+  it("keeps it when the line is drawn for right-hand chips alone", () => {
+    const { container } = renderCard({
+      workspace: makeWorkspace({
+        title: "cuda-variant",
+        git_branch: "feat/cuda-variant",
+        pr_state: "open",
+      }),
+    });
+    // Without the branch the PR chip would float alone on an empty row.
+    expect(metaLine(container)).toHaveTextContent("feat/cuda-variant");
   });
 
   it("still prints a branch that names something else", () => {

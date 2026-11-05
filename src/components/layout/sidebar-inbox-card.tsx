@@ -640,11 +640,14 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
     Boolean(deviceName) ||
     runningPort != null ||
     workspace.notification_count > 0;
-  // A repeated branch is dropped only when it would be the line's sole reason
-  // to exist. When the line is drawn anyway (a PR chip, stats), the branch
-  // keeps its left column so the right-hand chips aren't left floating alone.
+  // A repeated branch is dropped whenever something else can lead the line:
+  // with ↑ahead or ± stats on the left, "de…" before them is only noise. It
+  // stays in one case — the line is drawn for right-hand chips alone (a PR,
+  // the device, a port) — so those chips aren't left floating on an empty row.
+  const metaHasLeftContent = hasAhead || hasStats;
   const showBranch =
-    Boolean(workspace.git_branch) && (!branchRepeatsTitle || metaHasOtherContent);
+    Boolean(workspace.git_branch) &&
+    (!branchRepeatsTitle || (!metaHasLeftContent && metaHasOtherContent));
   const metaHasContent = showBranch || metaHasOtherContent;
   const inlineProviders =
     !metaHasContent && providers.length > 0 && !titleRepeatsProject;
