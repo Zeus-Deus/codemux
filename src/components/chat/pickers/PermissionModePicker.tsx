@@ -129,11 +129,12 @@ export function PermissionModePicker({
         </PopoverTrigger>
         <PopoverContent
           className={PICKER_CONTENT}
+          aria-label="Access permissions"
           {...(inContextRow ? CONTEXT_ROW_POPOVER : { align: "start" as const })}
           collisionPadding={PICKER_COLLISION_PADDING}
           onOpenAutoFocus={focusCmdkOnOpen}
         >
-          <Command className={PICKER_COMMAND} defaultValue={current}>
+          <Command label="Access permissions" className={PICKER_COMMAND} defaultValue={current}>
             <CommandList className={PICKER_LIST}>
               <CommandEmpty>No permission modes</CommandEmpty>
               <CommandGroup className={PICKER_GROUP}>

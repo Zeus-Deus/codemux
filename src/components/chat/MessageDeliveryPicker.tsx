@@ -56,9 +56,10 @@ export function MessageDeliveryPicker({
         align="end"
         side="top"
         className="w-[320px] max-w-[calc(100vw-24px)] p-0"
+        aria-label="Message delivery"
         onOpenAutoFocus={focusCmdkOnOpen}
       >
-        <Command>
+        <Command label="Message delivery">
           <CommandList>
             <CommandGroup heading="Send while the agent is working">
               {MESSAGE_DELIVERY_OPTIONS.map((option) => {

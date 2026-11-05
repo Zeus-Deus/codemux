@@ -300,11 +300,13 @@ export function ReasoningPicker({
         </PopoverTrigger>
         <PopoverContent
           className={PICKER_CONTENT}
+          aria-label="Reasoning options"
           {...(inContextRow ? CONTEXT_ROW_POPOVER : { align: "start" as const })}
           collisionPadding={PICKER_COLLISION_PADDING}
           onOpenAutoFocus={focusCmdkOnOpen}
         >
           <Command
+            label="Reasoning options"
             className={PICKER_COMMAND}
             // Start keyboard focus on the current choice, so the highlight
             // and the check mark never point at different rows on open.
