@@ -225,9 +225,14 @@ test("managed MCP discovery override preserves environment and does not affect o
     expect(fake.capturedOptions?.env?.MCP_CONNECTION_NONBLOCKING).toBe("0");
     expect(fake.capturedOptions?.env?.ENABLE_CLAUDEAI_MCP_SERVERS).toBe("false");
     expect(fake.capturedOptions?.env?.PATH).toBe(process.env.PATH);
+    // Never the Agent SDK's `sdk-ts` (a settings.json override may rename it).
+    expect(fake.capturedOptions?.env?.CLAUDE_CODE_ENTRYPOINT).toBeTruthy();
+    expect(fake.capturedOptions?.env?.CLAUDE_CODE_ENTRYPOINT).not.toMatch(/^sdk-/);
     expect(fake.capturedOptions?.tools).toEqual([]);
     await managed.close();
     const ordinary = new ClaudeSession(minimalInput(), emit);
+    expect(fake.capturedOptions?.env?.CLAUDE_CODE_ENTRYPOINT).toBeTruthy();
+    expect(fake.capturedOptions?.env?.CLAUDE_CODE_ENTRYPOINT).not.toMatch(/^sdk-/);
     expect(fake.capturedOptions?.env?.ENABLE_TOOL_SEARCH).toBe("true");
     expect(fake.capturedOptions?.env?.MCP_CONNECTION_NONBLOCKING).toBe("1");
     expect(fake.capturedOptions?.env?.ENABLE_CLAUDEAI_MCP_SERVERS).toBe("true");

@@ -19,6 +19,7 @@ import {
   type SDKUserMessage,
   type SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
+import { claudeProcessEnv } from "../claude-env.ts";
 
 export interface ListCommandsInput {
   cwd: string;
@@ -60,7 +61,7 @@ export async function listCommands(
     options: {
       cwd: input.cwd,
       pathToClaudeCodeExecutable: input.pathToClaudeCodeExecutable,
-      env: process.env as Record<string, string | undefined>,
+      env: claudeProcessEnv({ cwd: input.cwd }),
       // Full setting sources — custom user/project/local commands are
       // the whole point of a live probe.
       settingSources: ["user", "project", "local"],
