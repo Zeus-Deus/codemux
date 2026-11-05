@@ -29,17 +29,17 @@ describe("FullAccessNotice", () => {
     expect(useFullAccessNoticeStore.getState().dismissed).toBe(true);
   });
 
-  it("points at the access menu only once the composer shows it", () => {
+  it("keeps the same copy whether or not capabilities have loaded", () => {
     const view = render(
       <FullAccessNotice permissionMode="bypassPermissions" permissionModes={MODES} />,
     );
-    expect(screen.getByRole("note")).toHaveTextContent("from the Full access menu");
-    // Capabilities not harvested yet: the picker is hidden, so the
-    // explanation stands alone.
+    const loaded = screen.getByRole("note").textContent;
+    // Capabilities not harvested yet: the copy (and so the landing's
+    // layout) must not change when they arrive.
     view.rerender(
       <FullAccessNotice permissionMode="danger-full-access" permissionModes={null} />,
     );
-    expect(screen.getByRole("note")).toHaveTextContent("New chats start with Full access.");
+    expect(screen.getByRole("note").textContent).toBe(loaded);
     expect(screen.getByRole("note")).not.toHaveTextContent("menu");
   });
 

@@ -21,10 +21,10 @@ export function isFullAccessMode(mode: string | null | undefined): boolean {
  * Full access, so they run commands and edit files without asking. Shown
  * only while the draft is actually in that mode.
  *
- * Provider capabilities load on first picker intent, so on a fresh install
- * `permissionModes` can still be unknown (null) here. The explanation still
- * shows then; only the pointer to the access menu waits until that menu is
- * actually in the composer footer.
+ * On a fresh install `permissionModes` can still be unknown (null) here
+ * while the provider's catalog loads. The copy doesn't depend on it, so the
+ * notice keeps its height when the catalog arrives and the landing never
+ * shifts; the access chip in the message box names itself.
  */
 export function FullAccessNotice({
   permissionMode,
@@ -38,7 +38,6 @@ export function FullAccessNotice({
   // An empty list means the provider has no permission concept at all.
   if (dismissed || permissionModes?.length === 0) return null;
   if (!isFullAccessMode(permissionMode)) return null;
-  const hasPicker = !!permissionModes?.length;
   const label =
     permissionModes?.find((m) => m.value === permissionMode)?.label ??
     "Full access";
@@ -62,8 +61,6 @@ export function FullAccessNotice({
             New chats start with {label}.
           </span>{" "}
           Agents run commands and edit files without asking first.
-          {hasPicker &&
-            ` Change it for this chat from the ${label} menu in the message box.`}
         </p>
         <Button
           variant="ghost"

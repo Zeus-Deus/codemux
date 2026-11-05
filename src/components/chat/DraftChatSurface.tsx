@@ -1442,15 +1442,6 @@ function DraftChatSurfaceInner({
     />
   );
 
-  // Design D10/D12 → Thread Scope: home drafts read "Message the
-  // agent…"; project / existing_workspace drafts keep the existing
-  // isDraft-derived default ("Describe what you want the agent to
-  // do…") by passing `undefined`.
-  // Once the first prompt is sent the docked composer already speaks for
-  // the live thread, so it takes the live pane's copy (no override).
-  const placeholderOverride =
-    draft.target.kind === "home" && !pending ? "Message the agent…" : undefined;
-
   const composerEl = (
     <Composer
       draft={draft.inputDraft}
@@ -1481,7 +1472,6 @@ function DraftChatSurfaceInner({
       // shows no resize at all.
       isDraft={!pending}
       focusOnMount={focusOnMount || focusComposerAfterSubmit}
-      placeholderOverride={placeholderOverride}
       showProviderPicker={true}
       showStopButton={false}
       errorMessage={draft.lastSendError}
@@ -1569,9 +1559,14 @@ function DraftChatSurfaceInner({
   // as picking it in the location control below the composer.
   // A draft that starts without a model (an automatic pick made before the
   // provider's catalog was known) waits for that catalog to choose one.
-  // Nothing else asks for it until a picker opens, so fetch it here; it
-  // shares the picker's single flight.
-  const waitingForCatalog = draft.bootstrapModel === true && !draft.model;
+  // So does a landing with no catalog at all (a first run): the access chip
+  // and model label would otherwise appear on the first picker open and
+  // shift the landing under the pointer. Nothing else asks for it until a
+  // picker opens, so fetch it here; it shares the picker's single flight.
+  // A persisted catalog skips this, keeping discovery intent-driven.
+  const waitingForCatalog =
+    (draft.bootstrapModel === true && !draft.model) ||
+    (draft.provider !== "acp" && !nativeCapabilities);
   useEffect(() => {
     if (waitingForCatalog) void refreshProviderCapabilitiesForIntent(draft.provider);
   }, [waitingForCatalog, draft.provider]);
