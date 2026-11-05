@@ -63,7 +63,7 @@ export function DebugExitDialog({ open, onChoose }: Props) {
           </Button>
           <Button
             onClick={() => onChoose("cleanup")}
-            className="bg-foreground text-background hover:bg-foreground/90"
+            variant="inverse"
           >
             Remove markers
           </Button>

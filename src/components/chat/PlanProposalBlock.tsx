@@ -120,7 +120,7 @@ export const PlanProposalBlock = memo(function PlanProposalBlock({
           // foreground/background pair instead of the `--primary`
           // accent, so the card doesn't compete with the chat's tone.
           // Matches AskUserQuestionBlock's Submit and the Send button.
-          className="bg-foreground text-background hover:bg-foreground/90"
+          variant="inverse"
           onClick={submitAccept}
           disabled={submitted}
         >

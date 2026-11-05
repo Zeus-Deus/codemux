@@ -151,7 +151,7 @@ export function ProjectImageDialog({
               <Button
                 size="sm"
                 onClick={handleSave}
-                className="bg-foreground text-background hover:bg-foreground/90"
+                variant="inverse"
               >
                 Save
               </Button>

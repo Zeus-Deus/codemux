@@ -320,7 +320,7 @@ export function RemotePathPicker() {
                 size="sm"
                 onClick={handleConfirm}
                 disabled={selectDisabled}
-                className="bg-foreground text-background hover:bg-foreground/90"
+                variant="inverse"
               >
                 {selectLabel}
               </Button>

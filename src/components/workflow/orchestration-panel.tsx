@@ -189,7 +189,7 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
                     disabled={answering}
                     data-testid="workflow-approve"
                     onClick={() => respond("allow")}
-                    className="bg-foreground text-background hover:bg-foreground/90"
+                    variant="inverse"
                   >
                     {sending === "allow" ? "Starting…" : "Run once"}
                   </Button>

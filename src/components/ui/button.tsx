@@ -22,6 +22,12 @@ const buttonVariants = cva(
       variant: {
         default:
           "bg-primary text-primary-foreground shadow-xs shadow-primary/24 dark:shadow-black/40 inset-shadow-highlight hover:bg-primary/90 active:inset-shadow-pressed active:shadow-none disabled:shadow-none disabled:inset-shadow-none",
+        // Ink-on-canvas decisions (Allow, Accept & execute, Run once). Uses
+        // the foreground/background pair instead of `--primary`, so an
+        // accent theme never tints a choice inside the conversation, with
+        // the same highlight and pressed craft as `default`.
+        inverse:
+          "bg-foreground text-background shadow-xs shadow-black/12 dark:shadow-black/40 inset-shadow-highlight hover:bg-foreground/90 active:inset-shadow-pressed active:shadow-none disabled:shadow-none disabled:inset-shadow-none",
         outline:
           "border-input bg-popover text-foreground shadow-xs/5 [--control-icon-color:color-mix(in_oklch,currentColor_72%,transparent)] inset-shadow-bevel hover:bg-surface-2 hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground active:shadow-none active:inset-shadow-none disabled:shadow-none disabled:inset-shadow-none dark:bg-input/32 dark:hover:bg-input/64",
         toolbar:

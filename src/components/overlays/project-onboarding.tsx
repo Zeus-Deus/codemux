@@ -690,7 +690,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   <Button
                     onClick={handleContinue}
                     disabled={!task.trim()}
-                    className="bg-foreground text-background hover:bg-foreground/90"
+                    variant="inverse"
                   >
                     Continue
                     <ChevronRight className="size-4" />
@@ -860,7 +860,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                     <Button
                       onClick={() => handleCreateWorkspace(true)}
                       disabled={busy}
-                      className="bg-foreground text-background hover:bg-foreground/90"
+                      variant="inverse"
                     >
                       {isCreating ? "Creating…" : createLabel}
                       <ChevronRight className="size-4" />
@@ -887,7 +887,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleImportAll} className="bg-foreground text-background hover:bg-foreground/90">
+            <AlertDialogAction onClick={handleImportAll} variant="inverse">
               Import all
             </AlertDialogAction>
           </AlertDialogFooter>

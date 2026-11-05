@@ -132,7 +132,8 @@ export function UpdateToast() {
               <div className="flex gap-2">
                 <Button
                   size="sm"
-                  className="flex-1 bg-foreground text-background hover:bg-foreground/90"
+                  variant="inverse"
+                  className="flex-1"
                   onClick={requestDesktopUpdate}
                 >
                   Update &amp; restart desktop
@@ -174,7 +175,8 @@ export function UpdateToast() {
             <div className="flex gap-2">
               <Button
                 size="sm"
-                className="flex-1 bg-foreground text-background hover:bg-foreground/90"
+                variant="inverse"
+                className="flex-1"
                 onClick={installAndRestart}
               >
                 Restart Now
@@ -209,7 +211,8 @@ export function UpdateToast() {
             <div className="flex gap-2">
               <Button
                 size="sm"
-                className="flex-1 bg-foreground text-background hover:bg-foreground/90"
+                variant="inverse"
+                className="flex-1"
                 onClick={retry}
               >
                 Retry
@@ -248,7 +251,8 @@ export function UpdateToast() {
             {canAutoUpdate ? (
               <Button
                 size="sm"
-                className="flex-1 bg-foreground text-background hover:bg-foreground/90"
+                variant="inverse"
+                className="flex-1"
                 onClick={startDownload}
               >
                 Install &amp; Restart
@@ -256,7 +260,8 @@ export function UpdateToast() {
             ) : (
               <Button
                 size="sm"
-                className="flex-1 bg-foreground text-background hover:bg-foreground/90"
+                variant="inverse"
+                className="flex-1"
                 onClick={openRelease}
               >
                 {command ? "What's new" : "Download"}

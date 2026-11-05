@@ -205,7 +205,7 @@ function WorkflowApprovalCard({
         <Button
           type="button"
           size="sm"
-          className="bg-foreground text-background hover:bg-foreground/90"
+          variant="inverse"
           onClick={runOnce}
           disabled={busy}
         >
