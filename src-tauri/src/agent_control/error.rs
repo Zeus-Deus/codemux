@@ -100,6 +100,7 @@ codes! {
     QuestionAnswerFailed => "question_answer_failed",
     // Transports and protocol.
     AppUnavailable => "app_unavailable",
+    OutcomeUnknown => "outcome_unknown",
     ServerTooOld => "server_too_old",
     WaitBudgetExhausted => "wait_budget_exhausted",
     UnsupportedProtocolVersion => "unsupported_protocol_version",
