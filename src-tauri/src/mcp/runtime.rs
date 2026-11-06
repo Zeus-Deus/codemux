@@ -42,9 +42,9 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// callers (`tools/call`) override this per call.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The built-in browser backend allows 60 s. Its relay must leave time for
-/// that work and the control exchange to finish before giving up.
-pub(crate) const BROWSER_RELAY_TIMEOUT: Duration = Duration::from_secs(90);
+/// A fresh browser daemon may need 30 s for its viewport plus 60 s to open
+/// the page. Leave room for startup and the 105 s control exchange.
+pub(crate) const BROWSER_RELAY_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) fn tool_call_timeout(is_codemux_self: bool, tool: &str) -> Duration {
     select_tool_call_timeout(is_codemux_self, tool, DEFAULT_REQUEST_TIMEOUT, BROWSER_RELAY_TIMEOUT)
@@ -642,15 +642,15 @@ mod tests {
 
     #[test]
     fn browser_relay_deadline_is_only_for_builtin_browser_tools() {
-        assert_eq!(tool_call_timeout(true, "browser_wait"), Duration::from_secs(90));
-        assert_eq!(tool_call_timeout(true, "browser_navigate"), Duration::from_secs(90));
+        assert_eq!(tool_call_timeout(true, "browser_wait"), Duration::from_secs(120));
+        assert_eq!(tool_call_timeout(true, "browser_navigate"), Duration::from_secs(120));
         assert_eq!(tool_call_timeout(false, "browser_navigate"), Duration::from_secs(30));
         assert_eq!(tool_call_timeout(true, "workspace_info"), Duration::from_secs(30));
         assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(60));
     }
 
     fn injected_relay_budget(builtin: bool) -> Duration {
-        // Scale the former 30 s cutoff and the new 90 s budget to milliseconds.
+        // Use short injected budgets to exercise the ordinary and browser limits.
         select_tool_call_timeout(builtin, "browser_wait", Duration::from_millis(100), Duration::from_millis(300))
     }
 

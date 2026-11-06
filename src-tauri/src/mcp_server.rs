@@ -1293,16 +1293,15 @@ struct LegacyJob {
 }
 
 tokio::task_local! {
-    // Keep transport state out of the public tool result. This also catches
-    // socket failures inside helpers such as workspace lookup for local git.
-    static LEGACY_OUTCOME_UNKNOWN: std::cell::Cell<bool>;
+    // Keep transport recovery state out of the public tool result. Reads,
+    // including workspace lookup for local git, never pause mutations.
+    static LEGACY_PENDING_MUTATION: std::cell::RefCell<Option<tokio::sync::watch::Receiver<bool>>>;
 }
 
 impl LegacyLane {
     fn spawn(run: RunTool) -> Self {
         let (jobs, mut queue) = mpsc::unbounded_channel::<LegacyJob>();
-        tokio::spawn(async move {
-            let mut outcome_unknown = false;
+        tokio::spawn(LEGACY_PENDING_MUTATION.scope(std::cell::RefCell::new(None), async move {
             while let Some(LegacyJob { call, reply }) = queue.recv().await {
                 // A request cancelled while queued is skipped. One cancelled
                 // while running still runs to the end: dropping it would not
@@ -1311,28 +1310,24 @@ impl LegacyLane {
                 if reply.is_closed() {
                     continue;
                 }
-                if outcome_unknown {
+                let pending = LEGACY_PENDING_MUTATION.with(|state| state.borrow().as_ref().is_some_and(|pending| *pending.borrow()));
+                let reads = control_identity::mcp_tool_access(&call.name, &call.arguments) == Some(crate::agent_control::Access::Read);
+                if pending && !reads {
                     let _ = reply.send(Ok(protocol::error_result(
-                        "A previous Codemux request has an unknown outcome and may still be running. Later legacy tools are refused to prevent overlapping mutations. Check the earlier outcome and reconnect this MCP server before continuing.",
+                        "A previous Codemux mutation may still be running. Mutations are paused to prevent overlap; read-only tools remain available. This lane resumes automatically when the earlier request finishes.",
                     )));
                     continue;
                 }
                 let name = call.name.clone();
                 // A panicking tool must not end the lane: every later legacy
                 // call would fail while the process still looks healthy.
-                let (result, uncertain) = LEGACY_OUTCOME_UNKNOWN.scope(std::cell::Cell::new(false), async {
-                    let result = AssertUnwindSafe(async { run(ToolKind::Legacy, call).await })
-                        .catch_unwind()
-                        .await
-                        .unwrap_or_else(|_| Ok(protocol::error_result(format!("{name} failed unexpectedly"))));
-                    (result, LEGACY_OUTCOME_UNKNOWN.with(std::cell::Cell::get))
-                }).await;
-                // A new MCP connection creates a fresh lane. A new control
-                // socket alone cannot acknowledge completion of the old job.
-                outcome_unknown |= uncertain;
+                let result = AssertUnwindSafe(async { run(ToolKind::Legacy, call).await })
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| Ok(protocol::error_result(format!("{name} failed unexpectedly"))));
                 let _ = reply.send(result);
             }
-        });
+        }));
         Self { jobs }
     }
 
@@ -2047,10 +2042,11 @@ async fn mcp_socket_request(request: ControlRequest) -> Result<ControlResponse, 
 }
 
 fn mcp_socket_error(error: crate::control::McpControlError) -> String {
-    if error.outcome_unknown {
-        let _ = LEGACY_OUTCOME_UNKNOWN.try_with(|unknown| unknown.set(true));
+    let message = error.to_string();
+    if let Some(pending) = error.pending_mutation {
+        let _ = LEGACY_PENDING_MUTATION.try_with(|state| state.replace(Some(pending)));
     }
-    error.to_string()
+    message
 }
 
 /// Runs a registry tool in the app through socket `tool_call`, so every door
@@ -3675,8 +3671,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn legacy_lane_deadline_refuses_the_next_mutation_until_reconnected() {
+    async fn assert_legacy_lane_deadline_recovers(reply_late: bool) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();
@@ -3686,34 +3681,50 @@ mod tests {
         let finish_backend = finish.clone();
         let (started, running) = oneshot::channel();
         let backend = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (reader, mut writer) = tokio::io::split(stream);
-            let mut lines = BufReader::new(reader).lines();
-            assert!(lines.next_line().await.unwrap().unwrap().contains("notify"));
-            started.send(()).unwrap();
-            // App-side mutation keeps running after the caller times out.
-            finish_backend.notified().await;
-            let _ = writer.write_all(b"{\"ok\":true,\"protocol_version\":2,\"data\":null,\"error\":null}\n").await;
-            // A fresh MCP connection can resume after the outcome is checked.
+            let late_writer = {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut lines = BufReader::new(reader).lines();
+                assert!(lines.next_line().await.unwrap().unwrap().contains("notify"));
+                started.send(()).unwrap();
+                // App-side mutation keeps running after the caller times out.
+                finish_backend.notified().await;
+                if reply_late {
+                    writer.write_all(b"{\"ok\":true,\"protocol_version\":2,\"data\":null,\"error\":null}\n").await.unwrap();
+                    Some(writer)
+                } else {
+                    None
+                }
+            };
+            // Completion or EOF releases the same lane, without reconnecting MCP.
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, mut writer) = tokio::io::split(stream);
             BufReader::new(reader).lines().next_line().await.unwrap().unwrap();
             writer.write_all(b"{\"ok\":true,\"protocol_version\":2,\"data\":null,\"error\":null}\n").await.unwrap();
+            // In the late-reply case, the original socket stays open until
+            // the next mutation completes: recovery must not rely on EOF.
+            drop(late_writer);
         });
         let runs = Arc::new(AtomicUsize::new(0));
         let runs_in_tool = runs.clone();
-        let run: RunTool = Arc::new(move |_, _| {
+        let (recovery_tx, mut recovery_rx) = mpsc::unbounded_channel();
+        let run: RunTool = Arc::new(move |_, call| {
             let path = path.clone();
             let runs = runs_in_tool.clone();
+            let recovery = recovery_tx.clone();
             Box::pin(async move {
+                if control_identity::mcp_tool_access(&call.name, &call.arguments) == Some(crate::agent_control::Access::Read) {
+                    return Ok(protocol::text_result(call.name));
+                }
                 runs.fetch_add(1, Ordering::SeqCst);
                 let result = crate::control::send_mcp_control_request_to(
                     &[path], ControlRequest { command: "notify".into(), params: json!({}) }, None,
-                    Duration::from_millis(20), Duration::from_millis(50),
+                    Duration::from_millis(100), Duration::from_millis(300),
                 ).await;
                 Ok(match result {
                     Ok(_) => protocol::text_result("done"),
                     Err(error) => {
+                        recovery.send(error.pending_mutation.clone().expect("an admitted mutation timed out")).unwrap();
                         let text = mcp_socket_error(error);
                         let structured = registry::mcp_error(&ControlError::from_text(text.clone(), ErrorCode::AppUnavailable));
                         assert_eq!(structured["structuredContent"]["error"]["code"], "outcome_unknown");
@@ -3723,24 +3734,43 @@ mod tests {
                 })
             })
         });
-        let call = || CallToolParams { name: "notify".into(), arguments: json!({}), meta: None };
-        let lane = LegacyLane::spawn(run.clone());
-        let first = lane.submit(call());
-        let second = lane.submit(call());
+        // In-app agents route reads and writes through the same legacy lane.
+        let server = StdioServer::with_runner(caller(false, true, ControlAccess::FullAccess), unnamed(), run);
+        let (first, _) = later(server.request(request(1, "notify", json!({}))));
+        let (second, _) = later(server.request(request(2, "notify", json!({}))));
         running.await.unwrap();
         let result = first.await.unwrap();
         assert_eq!(result["isError"], true);
         assert!(result["content"][0]["text"].as_str().unwrap().contains("outcome is unknown"));
         let refused = second.await.unwrap();
         assert_eq!(refused["isError"], true);
-        assert!(refused["content"][0]["text"].as_str().unwrap().contains("reconnect"));
+        assert!(refused["content"][0]["text"].as_str().unwrap().contains("resumes automatically"));
         assert_eq!(runs.load(Ordering::SeqCst), 1, "the next mutation was never started");
         assert!(!backend.is_finished(), "the admitted mutation is still running");
+        for name in ["app_status", "workspace_list", "terminal_read", "git_status", "html_render"] {
+            let (read, _) = later(server.request(request(3, name, json!({}))));
+            assert_eq!(read.await.unwrap()["content"][0]["text"], name, "reads stay available during recovery");
+        }
+        let mut pending = recovery_rx.recv().await.unwrap();
+        assert!(*pending.borrow());
         finish.notify_one();
-        let fresh = LegacyLane::spawn(run);
-        assert_eq!(fresh.submit(call()).await.unwrap()["content"][0]["text"], "done");
+        pending.wait_for(|pending| !pending).await.unwrap();
+        let (next, _) = later(server.request(request(4, "notify", json!({}))));
+        assert_eq!(next.await.unwrap()["content"][0]["text"], "done");
         backend.await.unwrap();
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_lane_deadline_recovers_on_a_late_reply() {
+        assert_legacy_lane_deadline_recovers(true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_lane_deadline_recovers_on_eof() {
+        assert_legacy_lane_deadline_recovers(false).await;
     }
 
     async fn call_html_render(arguments: Value) -> Value {
