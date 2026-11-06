@@ -15,13 +15,20 @@ use std::sync::OnceLock;
 /// agent, and inherited by everything that process starts.
 pub const AGENT_PROCESS_ENV: &str = "CODEMUX_AGENT_PROCESS";
 
+/// Set by `.mcp.json` entries older Codemux builds wrote into workspace
+/// folders. Nothing sets it any more; a `codemux mcp` that still sees it
+/// without [`AGENT_PROCESS_ENV`] was started from such a stale file and
+/// serves nothing (see `mcp_server`). Kept in the scrub lists so it never
+/// passes from an old process into a new terminal.
+pub const LEGACY_PROVIDER_ORIGIN_ENV: &str = "CODEMUX_MCP_PROVIDER_ORIGIN";
+
 /// Env that carries an agent's identity. An app or `codemux serve` instance
 /// drops it at startup and no user terminal ever inherits it.
 pub const AGENT_IDENTITY_ENV_VARS: [&str; 4] = [
     AGENT_PROCESS_ENV,
     crate::mcp::gateway::BRIDGE_URL_ENV,
     crate::mcp::gateway::BRIDGE_TOKEN_ENV,
-    crate::mcp_server::PROVIDER_ORIGIN_ENV,
+    LEGACY_PROVIDER_ORIGIN_ENV,
 ];
 
 /// A client's own defaults for `--client` and `--access`. They describe the
@@ -110,13 +117,8 @@ impl ControlClient {
         name: Option<&str>,
         access: Option<ControlAccess>,
     ) -> Option<Self> {
-        // Presence fails closed: an empty marker still marks an agent. A
-        // provider-origin `codemux mcp` (the in-app `codemux` server and
-        // per-workspace `.mcp.json` entries) serves an agent too.
-        let agent = match var(AGENT_PROCESS_ENV) {
-            Some(value) => Some(AgentProcess::from_marker(&value.to_string_lossy())),
-            None => var(crate::mcp_server::PROVIDER_ORIGIN_ENV).map(|_| AgentProcess { kind: "mcp".into() }),
-        };
+        // Presence fails closed: an empty marker still marks an agent.
+        let agent = var(AGENT_PROCESS_ENV).map(|value| AgentProcess::from_marker(&value.to_string_lossy()));
         let client = Self { name: name.map(str::to_owned), access, agent };
         (client != Self::default()).then_some(client)
     }
@@ -130,10 +132,12 @@ impl ControlClient {
     }
 }
 
-/// Drops an agent identity this process inherited, and a launcher's client
-/// defaults. An app or `codemux serve` started from an agent's or a bot's
-/// shell would otherwise hand them to every terminal and in-app MCP server it
-/// starts. Never call it on CLI paths: they must send the identity.
+/// Drops an agent identity this process inherited, a launcher's client
+/// defaults, and Codemux's Claude Code plugin from an inherited
+/// `CLAUDE_CODE_PLUGIN_DIRS`. An app or `codemux serve` started from an
+/// agent's, a bot's or a Codemux terminal's shell would otherwise hand them
+/// to every terminal, chat sidecar and in-app MCP server it starts. Never
+/// call it on CLI paths: they must send the identity.
 pub fn scrub_inherited_agent_identity() {
     for key in inherited_identity_vars() {
         if std::env::var_os(key).is_some() {
@@ -142,6 +146,7 @@ pub fn scrub_inherited_agent_identity() {
             unsafe { std::env::remove_var(key) };
         }
     }
+    crate::claude_plugin::scrub_inherited_plugin_dirs();
 }
 
 /// What [`scrub_inherited_agent_identity`] drops.
@@ -483,10 +488,13 @@ mod tests {
     fn control_client_from_parts_marks_agents() {
         let marked = ControlClient::from_parts(env(&[(AGENT_PROCESS_ENV, "")]), None, None).unwrap();
         assert_eq!(marked.agent, Some(AgentProcess { kind: "agent".into() }), "presence alone marks an agent");
-        let origin = ControlClient::from_parts(env(&[(crate::mcp_server::PROVIDER_ORIGIN_ENV, "1")]), None, None).unwrap();
-        assert_eq!(origin.agent, Some(AgentProcess { kind: "mcp".into() }));
+        let terminal = ControlClient::from_parts(env(&[(AGENT_PROCESS_ENV, "terminal")]), None, None).unwrap();
+        assert_eq!(terminal.agent, Some(AgentProcess { kind: "terminal".into() }));
+        // The legacy marker is no proof of a current agent session: a stale
+        // file's `codemux mcp` refuses every call before it reaches the app.
+        assert_eq!(ControlClient::from_parts(env(&[(LEGACY_PROVIDER_ORIGIN_ENV, "1")]), None, None), None);
         let both = ControlClient::from_parts(
-            env(&[(AGENT_PROCESS_ENV, "opencode"), (crate::mcp_server::PROVIDER_ORIGIN_ENV, "1")]),
+            env(&[(AGENT_PROCESS_ENV, "opencode"), (LEGACY_PROVIDER_ORIGIN_ENV, "1")]),
             Some("hermes"),
             Some(Supervised),
         )

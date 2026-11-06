@@ -283,9 +283,9 @@ mod tests {
 
     #[tokio::test]
     async fn project_codemux_entry_is_filtered_out() {
-        // Codemux's `upsert_mcp_config` writes a `codemux` server entry
-        // into every workspace's `.mcp.json`. The list-discovery path
-        // should drop it so users don't see a second always-on row.
+        // Older Codemux builds wrote a `codemux` server entry into every
+        // workspace's `.mcp.json`. The list-discovery path should drop it
+        // so users don't see a second always-on row.
         let project = TempDir::new().unwrap();
         fs::write(
             project.path().join(".mcp.json"),

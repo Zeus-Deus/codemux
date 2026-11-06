@@ -101,11 +101,17 @@ For clients that read `mcpServers` JSON:
 - `CODEMUX_CLIENT` and `CODEMUX_ACCESS` set the same defaults for `codemux mcp` and the `codemux` commands you run yourself. A flag wins over the variable. The desktop app and `codemux serve` ignore both and don't pass them on to the terminals and agents they start. An unusable value makes `codemux mcp` and every control command stop with exit code 64.
 - The name is a label, not a lock. Any program running as you can use any name.
 
-### Inside a Codemux workspace folder
+### In a Codemux terminal
 
-Codemux writes a `.mcp.json` file into each workspace folder for the agents you start in its terminals. That file has an entry that is also named `codemux`, and Claude Code prefers it over your user entry. That entry is for agents working inside the workspace: it has the older tools (browser, git, terminals, and the older workspace tools), no thread control, and it is refused administration tools such as `terminal_write` and `automation_create`.
+Codemux writes no MCP config into your folders or your user config. Agents get its tools only when Codemux starts them:
 
-To drive Codemux from Claude Code in such a folder, start Claude Code from another folder, or give it the entry explicitly. Save this as `~/.claude/codemux-mcp.json`:
+- **Chats in Codemux** get their tools per session.
+- **Claude Code typed in a Codemux terminal** gets them from a small Claude Code plugin in Codemux's own data folder. Codemux points the terminal at it with `CLAUDE_CODE_PLUGIN_DIRS`; a Claude started anywhere else never sees it. Its tools are named `mcp__plugin_codemux_codemux__<tool>`. They are the agent tools (browser, git, terminals, and the older workspace tools) for that terminal's workspace, with no thread control, and administration tools such as `terminal_write` and `automation_create` are refused.
+- Terminals opened before you updated Codemux don't have the plugin yet. Open a new terminal.
+- **Terminals on a device** get the plugin from that device's terminal daemon, which runs the device's own `codemux-remote mcp`. A daemon that was already running when you updated keeps serving new terminals without it until it restarts: when the device reboots, or about an hour after its last Codemux terminal there closes. Codemux logs a warning when it connects to such a daemon.
+- **Other CLIs typed in a terminal** (Codex, OpenCode, Gemini, Pi) get no Codemux MCP server there. They can use the `codemux` command instead.
+
+To run Claude Code in a Codemux terminal without the plugin, start it with `CLAUDE_CODE_PLUGIN_DIRS= claude`, or with `--strict-mcp-config`, which also leaves out plugin servers. To drive Codemux from such a Claude Code with thread control, give it your entry explicitly. Save this as `~/.claude/codemux-mcp.json`:
 
 ```json
 { "mcpServers": { "codemux": { "command": "codemux", "args": ["mcp", "--client", "claude-code"] } } }
@@ -116,6 +122,15 @@ Then start Claude Code with it. `--strict-mcp-config` leaves out every other MCP
 ```sh
 claude --mcp-config ~/.claude/codemux-mcp.json --strict-mcp-config
 ```
+
+### Old entries Codemux wrote
+
+Codemux used to write a `codemux` entry into `.mcp.json` in every workspace folder, including your home folder when a workspace was opened there. Claude Code reads `.mcp.json` from parent folders too, so every Claude below such a folder got Codemux's tools, even ones another program started for an unrelated project.
+
+- Codemux now removes those entries on each start: in your home folder, in each open or archived workspace folder and its parents up to your home folder, and in Codemux's worktrees. Before it starts a terminal or chat in a folder it opens later, it does the same for that folder and its parents. It removes only an entry exactly as Codemux wrote it (`codemux mcp` with `CODEMUX_MCP_PROVIDER_ORIGIN` or `CODEMUX_WORKSPACE_ID`, and no other settings), deletes a `.mcp.json` only when nothing else was in it, and leaves symlinks and files it can't read alone.
+- An entry that might be yours, such as a bare `codemux mcp` or one with `--client`, is kept, and the Codemux log says so. Delete it yourself if you didn't add it.
+- An old entry in a folder Codemux never opens stays until you delete it. If the entry sets `CODEMUX_MCP_PROVIDER_ORIGIN` and its command is a current Codemux, that `codemux mcp` offers no tools, refuses every call, and says the entry is obsolete. Nothing disables an entry whose command is an older Codemux build, which still serves its tools, or one that sets only `CODEMUX_WORKSPACE_ID`, which runs a full `codemux mcp`. Delete those.
+- `~/.vexis/mcp-servers.yaml` is never changed.
 
 ## From another device
 
@@ -514,7 +529,9 @@ Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` 
 
 When you add a server under **Settings → Connections → Devices**, Codemux installs `codemux-remote` there. An agent on that server can use `codemux-remote mcp` to register folders and git worktrees on the server, run shells there and check the helper. Workspaces it registers show up under Devices in the Codemux app. It can't start or message Codemux chats.
 
-On a server where the Codemux app has never run, `codemux-remote` adds itself to Claude Code (`~/.claude.json`) and Vexis (`~/.vexis/mcp-servers.yaml`) as `codemux`, but only if no `codemux` entry exists. It never changes an entry that runs another program. On a machine where the Codemux app runs, it adds nothing and removes the entry it added earlier, because there `codemux` means `codemux mcp`.
+`codemux-remote` writes no agent config on the server. Codemux chats and remote tasks that run Claude Code on the server, and Claude Code typed in a Codemux terminal on it, get that server's `codemux-remote mcp` per session. To use it from another agent there, add it yourself, for example `claude mcp add --scope user codemux -- ~/.local/bin/codemux-remote mcp`. A Vexis entry for it in `~/.vexis/mcp-servers.yaml` keeps working.
+
+Older versions of `codemux-remote serve` added `codemux-remote mcp` to `~/.claude.json` as `codemux`, and keep doing so until the service is updated. On a machine where the Codemux app also runs, Codemux and `codemux-remote serve` remove that entry when they start, but only if it is exactly what was written: `codemux-remote` with the single argument `mcp` and no other settings. On a server that runs only `codemux-remote`, the entry stays. An entry you add with `claude mcp add` is never removed.
 
 Outside agents see workspaces on your devices in `workspace_list` with `native_control_available: false`. Thread tools can't target them yet.
 
@@ -538,7 +555,7 @@ A paired phone or browser can remove a clean worktree, for example with **Device
   - `workspace_create` and `worktree_create` don't take focus unless you pass `"select": true`.
   - `workspace_close` needs full access, also when it keeps the worktree.
   - `workspace_create`, `worktree_create` and `workspace_close` take a `client_request_id`, so a retry returns the first call's result.
-  - A `codemux mcp` that serves a Codemux agent, or that a workspace's `.mcp.json` starts, keeps the older versions unchanged.
+  - A `codemux mcp` that serves a Codemux agent keeps the older versions unchanged.
 - **`--access` narrows `codemux mcp`.** A supervised or read-only client is offered fewer tools, and it refuses to work with an older Codemux that can't enforce its access level (`server_too_old`). `workspace_archive` needs full access, like `workspace_close`, because both run teardown scripts. So do the `archive_workspace` and `close_workspace` commands of `codemux json`.
 - **`thread_launch` needs `permission_mode`.** Without it, it fails with `invalid_arguments` (missing field `permission_mode`).
 - **`agent_capabilities` with `provider` reads that provider's catalog** if Codemux hasn't yet, for a Supervised or Full access caller. It used to list only catalogs Codemux had already read, so a provider no chat had used yet offered no models. A Read-only caller still gets only those.
@@ -546,24 +563,26 @@ A paired phone or browser can remove a clean worktree, for example with **Device
 - **Outside assistants can answer worker questions** in `pending.questions` with `thread_answer`. A question that arrives as a `"user-input"` approval, such as Claude's AskUserQuestion, can only be allowed or denied.
 - **New worktrees branch from the repository's default branch**, not always `main`.
 - **`codemux json` and the older `codemux` commands exit `1` when the reply is not ok.** That includes the refusals below. Check scripts that use `set -e`.
-- **Agents that Codemux started are refused administration commands**, through MCP and through the `codemux` CLI, also on devices that run `codemux serve`. That includes Claude Code started in a workspace folder (see [Inside a Codemux workspace folder](#inside-a-codemux-workspace-folder)).
+- **Agents that Codemux started are refused administration commands**, through MCP and through the `codemux` CLI, also on devices that run `codemux serve`. That includes Claude Code typed in a Codemux terminal (see [In a Codemux terminal](#in-a-codemux-terminal)).
 - **Setup and teardown scripts and git hooks run as Codemux agents.** This covers a project's setup and teardown commands, and the hooks and `core.fsmonitor` commands of every git command Codemux runs, itself or through `gh` and `glab`. A `codemux` command in them gets `admin_refused` for administration commands and `agent_identity_required` for control tools, and exits `1`. Such a setup command now stops the setup, and such a teardown command stops the close, unless it ends with `|| true`.
 - **Codex chats that Codemux starts turn off your own Codemux MCP entries**: every entry that runs `codemux mcp`, whatever its name, and any entry named `codemux`. Those chats have their own Codemux tools.
 - **Chats with "Let agents work with other chats" turned off** (Settings → Agents → Models & behavior) are offered no Codemux thread or plugin tools.
 - **`codemux-remote` no longer replaces a `codemux` entry it doesn't own.**
+- **Codemux no longer writes `.mcp.json` into workspace folders**, and `codemux-remote serve` no longer registers itself in `~/.claude.json`. See [Old entries Codemux wrote](#old-entries-codemux-wrote). The **Auto-configure MCP for workspaces** setting and the **Regenerate MCP config** command are gone. Claude Code in a Codemux terminal names the tools `mcp__plugin_codemux_codemux__<tool>`, so permission rules for `mcp__codemux__<tool>` no longer match there.
 
 ## Troubleshooting
 
 - **`app_unavailable` from `codemux mcp`, `codemux_unavailable` from the `codemux` CLI, or a connection error.** Codemux isn't running, or the command can't find it: start the app or `codemux serve`, then retry the call. From Codex, see the `XDG_RUNTIME_DIR` note under [Codex](#codex).
 - **`server_too_old` from `codemux mcp` or the CLI, or `codemux_outdated` from the CLI.** The running Codemux is older than the `codemux` command: restart Codemux after an update. `server_too_old` means a read-only or supervised client refused to work with a Codemux that can't enforce its access level. From `codemux mcp`, a tool the older Codemux lacks fails with "Unknown control command".
-- **Only the older tools, no `thread_*`.** Claude Code is using a workspace folder's `.mcp.json`; see [Inside a Codemux workspace folder](#inside-a-codemux-workspace-folder). Or a Codemux agent started this program, so it counts as that agent.
+- **Only the older tools, no `thread_*`.** Claude Code runs in a Codemux terminal and uses its plugin; see [In a Codemux terminal](#in-a-codemux-terminal). Or a Codemux agent started this program, so it counts as that agent.
+- **No tools, and `obsolete_config` on every call.** That `codemux mcp` was started from an old entry Codemux wrote into a `.mcp.json`; see [Old entries Codemux wrote](#old-entries-codemux-wrote). Delete the entry.
 - **`admin_refused` or `agent_identity_required`.** A Codemux agent started this program, or it runs in a setup or teardown script or a git hook that Codemux ran. Run it from your own terminal.
 - **`access_denied`.** The access level is too low for that tool. Raise `--access`, or approve or issue the network assistant again with more access.
 - **`permission_ceiling`.** That permission mode needs full access. Pick one from `allowed_permission_modes`.
 - **A wait ends with a client timeout.** Lower `timeout_ms`, or raise the client's tool timeout (`timeout` for Hermes, `tool_timeout_sec` for Codex).
 - **"Couldn’t listen on port …".** Another program uses the port. Pick another one in Settings, then update your proxy and URLs.
 - **Sign-in asks again after you changed the origin or port.** Sign-ins and tokens are bound to the URL. Sign in again and issue new tokens.
-- **`~/.claude.json` has a `codemux` entry that runs `codemux-remote mcp`.** An older `codemux-remote` wrote it, and it has no thread tools. Current versions remove it on a machine where the Codemux app runs, the next time `codemux-remote` starts. To fix it now, run `claude mcp remove --scope user codemux`, then add the entry above. `codemux-remote` never touches an entry that runs another program.
+- **`~/.claude.json` has a `codemux` entry that runs `codemux-remote mcp`.** An older `codemux-remote` wrote it, or you added it, and it has no thread tools. Where the Codemux app runs too, Codemux and current `codemux-remote` remove it when they start, if it is exactly what was written. To fix it now, run `claude mcp remove --scope user codemux`, then add the entry above. Neither touches an entry that runs another program.
 - **`codemux-remote` refuses `workspace_info` with "missing field `id`".** Its background service still runs the old version. Run `systemctl --user restart codemux-remote` on that device.
 
 ## Error codes

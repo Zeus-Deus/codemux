@@ -1116,7 +1116,7 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
         }
         "create_worktree_workspace" => {
             // Backs the legacy `worktree_create` stdio tool: git worktree,
-            // workspace and layout, PTYs, setup scripts, `.mcp.json` and an
+            // workspace and layout, PTYs, setup scripts and an
             // optional preset launch with its prompt, in one call. Params are
             // read as leniently as they always were; the defaults are a new
             // branch from the repository's default branch, one terminal, and

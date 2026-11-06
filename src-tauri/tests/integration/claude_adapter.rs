@@ -92,6 +92,7 @@ async fn provider_with_fake() -> ClaudeAgentProvider {
         claude_binary: Some(PathBuf::from("/usr/bin/claude")),
         event_channel_capacity: 1024,
         mcp_registry: None,
+        host_mcp_server: None,
     })
     .await
     .expect("provider")
@@ -103,6 +104,7 @@ async fn provider_with_custom_sidecar(bin: PathBuf) -> ClaudeAgentProvider {
         claude_binary: Some(PathBuf::from("/usr/bin/claude")),
         event_channel_capacity: 1024,
         mcp_registry: None,
+        host_mcp_server: None,
     })
     .await
     .expect("provider")
@@ -2361,6 +2363,7 @@ async fn claude_real_session() {
         claude_binary: None,
         event_channel_capacity: 1024,
         mcp_registry: None,
+        host_mcp_server: None,
     })
     .await
     .unwrap();

@@ -47,7 +47,7 @@ pub enum McpConfigSource {
     /// per-project local scope ("local" in Claude Code's terminology).
     ClaudeLocal,
     /// `<project>/.mcp.json` — the project-checked-in scope shared with
-    /// the team. Codemux's own `upsert_mcp_config` writes here too.
+    /// the team. Older Codemux builds wrote a `codemux` entry here.
     ClaudeProject,
     /// `~/.cursor/mcp.json`
     CursorUser,

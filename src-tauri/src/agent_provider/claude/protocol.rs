@@ -82,10 +82,44 @@ pub struct StartSessionParams {
     /// constructed without an `mcp_registry`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_tools: Vec<McpToolEntry>,
+    /// A stdio MCP server on the machine the sidecar runs on, registered
+    /// as `codemux` for this session only. Set for sessions on a device or
+    /// a remote task host, which get that host's `codemux-remote mcp` and
+    /// none of this computer's tools; never for managed attempts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_mcp_server: Option<HostMcpServer>,
     /// Codemux instructions the sidecar appends to Claude Code's system
     /// prompt. See `session::system_prompt_append`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub append_system_prompt: Option<String>,
+}
+
+/// A stdio MCP server the sidecar registers for one session, on the
+/// machine the sidecar runs on. A leading `~/` is that machine's home; when
+/// nothing executable is there, the sidecar runs the file name from PATH.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostMcpServer {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl HostMcpServer {
+    /// A device's own `codemux-remote mcp` for the daemon state in its
+    /// default directory: the copy the device bootstrap installs, else the
+    /// `codemux-remote` on the device's PATH, the order `ssh::exec` uses.
+    pub fn device() -> Self {
+        Self { command: "~/.local/bin/codemux-remote".into(), args: vec!["mcp".into()] }
+    }
+
+    /// The `codemux-remote mcp` at `codemux_remote` for the daemon state
+    /// in `state_dir`.
+    pub fn codemux_remote(codemux_remote: &std::path::Path, state_dir: &std::path::Path) -> Self {
+        Self {
+            command: codemux_remote.display().to_string(),
+            args: vec!["mcp".into(), "--state-dir".into(), state_dir.display().to_string()],
+        }
+    }
 }
 
 /// Method name for Stage 4 dynamic tool refresh. The Claude session
@@ -577,6 +611,7 @@ mod tests {
             path_to_claude_code_executable: "/usr/bin/claude".into(),
             extra_args: None,
             mcp_tools: Vec::new(),
+            host_mcp_server: None,
             append_system_prompt: None,
         };
         let v = serde_json::to_value(&p).unwrap();
@@ -587,6 +622,13 @@ mod tests {
         assert_eq!(v["fastMode"], true);
         assert!(v.get("permissionMode").is_none());
         assert!(v.get("appendSystemPrompt").is_none());
+        assert!(v.get("hostMcpServer").is_none());
+
+        let host = StartSessionParams { host_mcp_server: Some(HostMcpServer::device()), ..p };
+        assert_eq!(
+            serde_json::to_value(&host).unwrap()["hostMcpServer"],
+            json!({"command": "~/.local/bin/codemux-remote", "args": ["mcp"]})
+        );
     }
 
     #[test]

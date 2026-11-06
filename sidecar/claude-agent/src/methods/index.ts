@@ -205,6 +205,19 @@ function makeStartSession(emit: EventEmitter): MethodHandler {
       });
     }
 
+    // A stdio server on the machine this sidecar runs on: a device's or a
+    // remote task host's own `codemux-remote mcp`. Typed and checked here,
+    // so free-form extras can never add or replace an MCP server.
+    const rawHostMcp = p["hostMcpServer"];
+    if (rawHostMcp !== undefined && rawHostMcp !== null) {
+      const obj = asObject(rawHostMcp, "hostMcpServer");
+      const args = optArray(obj["args"], "hostMcpServer.args") ?? [];
+      input.hostMcpServer = {
+        command: asString(obj["command"], "hostMcpServer.command"),
+        args: args.map((arg, idx) => asString(arg, `hostMcpServer.args[${idx}]`)),
+      };
+    }
+
     const session = new ClaudeSession(input, emit);
     try {
       await session.waitManagedReady();

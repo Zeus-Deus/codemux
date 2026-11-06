@@ -543,6 +543,17 @@ impl JsonRpcChild {
         // the marker. Set after the isolated clear and before the overlay, so
         // a provider's own value wins.
         cmd.env(crate::control_identity::AGENT_PROCESS_ENV, "1");
+        // A runtime started from a Codemux terminal (a `codemux-remote task`
+        // worker, say) inherits that terminal's Claude Code plugin; its
+        // agents get their own tools per session, so they never inherit it.
+        // The user's own plugin dirs stay.
+        if let Some(kept) = crate::claude_plugin::inherited_without_codemux_dirs() {
+            if kept.is_empty() {
+                cmd.env_remove(crate::claude_plugin::PLUGIN_DIRS_ENV);
+            } else {
+                cmd.env(crate::claude_plugin::PLUGIN_DIRS_ENV, kept);
+            }
+        }
         for (k, v) in &config.env {
             cmd.env(k, v);
         }

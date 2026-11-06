@@ -1395,6 +1395,16 @@ pub(crate) fn strip_renderer_env(cmd: &mut CommandBuilder) {
     }
 }
 
+/// `CLAUDE_CODE_PLUGIN_DIRS` for a local user terminal: this app's Claude Code
+/// plugin first (see `claude_plugin`). Never part of [`workspace_pty_env`]:
+/// chat sidecars share that, and managed chats get their tools per launch.
+pub(crate) fn claude_plugin_env() -> Option<(&'static str, String)> {
+    use crate::claude_plugin::{plugin_dirs_value, PLUGIN_DIRS_ENV};
+    let dir = crate::claude_plugin::local_plugin_dir()?;
+    let value = plugin_dirs_value(dir, std::env::var_os(PLUGIN_DIRS_ENV).as_deref());
+    Some((PLUGIN_DIRS_ENV, value.to_string_lossy().into_owned()))
+}
+
 /// Remove every agent identity var from a user terminal's environment, so
 /// `codemux ...` typed there is always the owner. The app scrubs them at
 /// startup too; this also covers a daemon adopted from an older instance.
@@ -1802,9 +1812,9 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
     let shell = default_shell();
     app_state.update_terminal_session_shell(&session_id, shell.clone());
 
-    let cwd = session_working_dir(&app_state, &session_id);
+    let mut cwd = session_working_dir(&app_state, &session_id);
     let mut cmd = CommandBuilder::new(shell.clone());
-    cmd.cwd(cwd);
+    cmd.cwd(&cwd);
 
     // Undo AppRun's loader/toolkit rewrites so system binaries in this shell
     // link against the host's libraries, not the AppImage's bundled ones.
@@ -1881,6 +1891,7 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
                     &session_working_dir(&app_state, &session_id),
                 );
                 cmd.cwd(&effective_cwd);
+                cwd = effective_cwd;
                 cmd.env("CODEMUX_PANE_ID", &pane_id);
                 if let Some(resume_command) =
                     resolve_resume_command(&snapshot, &meta, &adapter_state)
@@ -1922,6 +1933,16 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
         let prefixed = build_child_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
+    }
+
+    // Claude Code typed in this shell gets Codemux's tools, and none from an
+    // entry an older build wrote above its folder. A host's shell gets the
+    // host's own plugin from its daemon instead.
+    if !owning_ws.is_some_and(|ws| ws.host_id.is_some()) {
+        crate::mcp_cleanup::before_launch_blocking(std::path::Path::new(&cwd));
+        if let Some((key, value)) = claude_plugin_env() {
+            cmd.env(key, value);
+        }
     }
 
     // Renderer transport flags are an app-process concern only.

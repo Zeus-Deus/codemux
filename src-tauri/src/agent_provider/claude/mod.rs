@@ -60,6 +60,9 @@ pub struct ClaudeProviderConfig {
     /// requests for `mcp-tool-call` will be rejected with
     /// `method-not-found` semantics.
     pub mcp_registry: Option<crate::mcp::registry::McpRegistry>,
+    /// The host's own `codemux-remote mcp`, for a provider that runs on a
+    /// remote task host. Sessions on a device get theirs regardless.
+    pub host_mcp_server: Option<protocol::HostMcpServer>,
 }
 
 /// `AgentProvider` implementation for Claude Code, backed by the
@@ -70,6 +73,7 @@ pub struct ClaudeAgentProvider {
     sessions: Arc<RwLock<HashMap<ThreadId, Arc<ClaudeSession>>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     mcp_registry: Option<crate::mcp::registry::McpRegistry>,
+    host_mcp_server: Option<protocol::HostMcpServer>,
 }
 
 impl ClaudeAgentProvider {
@@ -96,6 +100,7 @@ impl ClaudeAgentProvider {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             mcp_registry: config.mcp_registry,
+            host_mcp_server: config.host_mcp_server,
         })
     }
 
@@ -104,6 +109,7 @@ impl ClaudeAgentProvider {
             sidecar_binary: self.sidecar_binary.clone(),
             claude_binary: self.claude_binary.clone(),
             mcp_registry: self.mcp_registry.clone(),
+            host_mcp_server: self.host_mcp_server.clone(),
         }
     }
 

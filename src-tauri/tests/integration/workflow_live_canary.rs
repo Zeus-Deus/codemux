@@ -407,6 +407,7 @@ async fn workflow_live_native_coordination() {
             claude_binary: Some(cli),
             event_channel_capacity: 4096,
             mcp_registry: None,
+            host_mcp_server: None,
         })
         .await
         .unwrap(),
@@ -627,6 +628,7 @@ async fn workflow_live_chat_planner() {
             claude_binary: Some(cli),
             event_channel_capacity: 4096,
             mcp_registry: None,
+            host_mcp_server: None,
         })
         .await
         .unwrap(),

@@ -84,10 +84,10 @@ enum Command {
     /// daemon start.
     Version,
     /// Run the headless Codemux daemon (axum HTTP on loopback,
-    /// bearer auth from manifest). An agent on this host points its
-    /// MCP client at `codemux-remote mcp` to drive it. Registers
-    /// `codemux-remote mcp` as the `codemux` MCP server for Claude Code
-    /// and Vexis when no Codemux app uses this machine.
+    /// bearer auth from manifest). Codemux terminals and remote tasks on
+    /// this host get its tools automatically; to use it from another
+    /// agent, register it yourself, e.g.
+    /// `claude mcp add --scope user codemux -- codemux-remote mcp`.
     Serve(ServeArgs),
     /// Run the stdio MCP server that bridges an agent CLI to the
     /// local `serve` daemon over HTTP. It starts even when `serve` isn't
@@ -307,6 +307,13 @@ enum ServeSubcommand {
 #[cfg(unix)]
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Started from a Codemux terminal, this process inherits that terminal's
+    // Claude Code plugin; the tasks, chats and services it runs get their own
+    // tools instead. Before any thread starts. `mcp` is that plugin's own
+    // server, and `pty-daemon` sets each shell's value itself.
+    if !matches!(cli.command, Some(Command::Mcp { .. } | Command::PtyDaemon { .. })) {
+        codemux_lib::claude_plugin::scrub_inherited_plugin_dirs();
+    }
     match cli.command {
         None | Some(Command::Version) => {
             let payload = serde_json::json!({
@@ -432,6 +439,15 @@ fn run_pty_daemon(socket: PathBuf) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Claude Code typed in a shell this daemon starts gets this host's
+    // tools through its own plugin, never through a config file other
+    // agents on the host would read.
+    let running = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("codemux-remote"));
+    let codemux_remote = codemux_lib::mcp_server::install_path(&running);
+    match codemux_lib::claude_plugin::ensure_remote_host_plugin(codemux_remote) {
+        Ok(dir) => codemux_lib::pty_daemon::server::set_host_claude_plugin(dir),
+        Err(error) => eprintln!("[codemux-remote] shells start without the Claude Code plugin: {error}"),
+    }
     let result = runtime.block_on(codemux_lib::pty_daemon::server::run(socket));
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -663,56 +679,24 @@ async fn run_serve_async(port: Option<u16>, state_dir: PathBuf) -> Result<(), St
         manifest_value.secret.len()
     );
 
-    // Best-effort: register `codemux-remote mcp` as the `codemux` MCP
-    // server in known agent configs (~/.claude.json,
-    // ~/.vexis/mcp-servers.yaml) so an agent CLI the user runs on this
-    // host can manage it without manual config edits. Runs on every
-    // daemon start; a current entry is never rewritten.
-    //
-    // Ownership rule: codemux-remote only ever writes a missing entry or
-    // one that already runs codemux-remote, and never touches an entry
-    // that runs another program. Where the Codemux app has run as this
-    // user, `codemux` means the app's `codemux mcp`, so codemux-remote
-    // adds nothing there and withdraws the entry it wrote before.
-    // Malformed config files are logged and skipped, never
-    // overwritten. Missing agent-specific dirs (~/.vexis nonexistent)
-    // are skipped silently — we never create an opt-in we weren't
-    // asked for.
-    let exec_path = std::env::current_exe()
-        .unwrap_or_else(|_| std::path::PathBuf::from("codemux-remote"));
-    let report = codemux_lib::remote::mcp_register::ensure_codemux_in_agent_configs(&exec_path);
-    let joined = |paths: &[PathBuf]| {
-        paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    if !report.modified.is_empty() {
-        eprintln!(
-            "[codemux-remote] auto-registered codemux MCP in: {}",
-            joined(&report.modified)
-        );
-    }
-    if !report.removed.is_empty() {
-        eprintln!(
-            "[codemux-remote] the Codemux app owns the codemux MCP name on this machine; \
-             removed codemux-remote's entry from: {}",
-            joined(&report.removed)
-        );
-    }
-    for (path, command) in &report.foreign {
-        eprintln!(
-            "[codemux-remote] left the codemux entry in {} alone: it runs {}, not codemux-remote",
-            path.display(),
-            if command.is_empty() { "no command" } else { command },
-        );
-    }
-    for (path, reason) in &report.failed {
-        eprintln!(
-            "[codemux-remote] could not register in {} (skipped): {reason}",
-            path.display()
-        );
+    // Older versions registered `codemux-remote mcp` as the `codemux`
+    // server in this user's `~/.claude.json`. Where the Codemux app has run
+    // here too, the name is the app's, so withdraw that exact entry, as
+    // 0.27.0 did. On a host that runs only codemux-remote, the entry stays:
+    // it may be how the user reaches this host. Anything else the user
+    // registered, and `~/.vexis`, is left alone.
+    if let Some(home) = dirs::home_dir() {
+        match codemux_lib::mcp_cleanup::withdraw_remote_registration(&home) {
+            codemux_lib::mcp_cleanup::Outcome::Removed | codemux_lib::mcp_cleanup::Outcome::Deleted => eprintln!(
+                "[codemux-remote] removed the codemux MCP entry older versions registered in {}",
+                home.join(".claude.json").display()
+            ),
+            codemux_lib::mcp_cleanup::Outcome::Ambiguous(reason) => eprintln!(
+                "[codemux-remote] left the codemux MCP entry in {} alone: {reason}",
+                home.join(".claude.json").display()
+            ),
+            codemux_lib::mcp_cleanup::Outcome::Untouched | codemux_lib::mcp_cleanup::Outcome::Skipped(_) => {}
+        }
     }
 
     let started_at = manifest_value.started_at.clone();

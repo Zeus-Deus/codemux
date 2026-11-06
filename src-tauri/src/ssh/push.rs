@@ -228,44 +228,6 @@ pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
         Err(reason) => return PushResult::RsyncFailed { reason },
     };
 
-    // Best-effort: drop a `.mcp.json` into the pushed workspace dir so
-    // an agent CLI (Claude Code, Codex, Gemini, …) launched on the
-    // remote inside this workspace auto-discovers Codemux via
-    // `codemux-remote mcp`. This mirrors the desktop's per-workspace
-    // `.mcp.json` pattern (`mcp_server::upsert_mcp_config`).
-    //
-    // A failure here does NOT roll back the push — the user's files
-    // are already on the remote, and the daemon itself doesn't need
-    // .mcp.json. The agent on the remote can still be configured by
-    // hand. We log so the host pane can show a soft warning later.
-    //
-    // rsync `--delete` has just mirrored the local `.mcp.json` to the
-    // host, so the local copy is what the host holds: the provisioning
-    // merges into it without another SSH round trip.
-    match read_pushed_mcp_json(opts.local_worktree) {
-        Ok(pushed_mcp_json) => {
-            if let Err(error) = crate::ssh::bootstrap::provision_workspace_mcp_config(
-                opts.ssh_target,
-                opts.remote_path,
-                "~/.local/bin/codemux-remote",
-                pushed_mcp_json.as_deref(),
-                opts.step_timeout,
-            )
-            .await
-            {
-                eprintln!(
-                    "[codemux::ssh::push] .mcp.json provisioning failed for {}: {error}",
-                    opts.remote_path
-                );
-            }
-        }
-        Err(error) => eprintln!(
-            "[codemux::ssh::push] left {}/.mcp.json as pushed: the local copy could not be \
-             read ({error}), so codemux-remote was not added to it",
-            opts.remote_path.trim_end_matches('/')
-        ),
-    }
-
     // Best-effort: register the pushed workspace in the remote
     // daemon's registry so it shows up in `workspace_list` from any
     // MCP-aware agent on the host. If the daemon isn't running yet
@@ -297,18 +259,6 @@ pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
     }
 
     pushed
-}
-
-/// The workspace's `.mcp.json` as rsync just mirrored it to the host.
-/// `Ok(None)` only when the workspace has none. Any other read error
-/// (not UTF-8, no permission) is returned, so the caller leaves the host
-/// copy as pushed instead of replacing it with a codemux-only file.
-fn read_pushed_mcp_json(local_worktree: &Path) -> std::io::Result<Option<String>> {
-    match std::fs::read_to_string(local_worktree.join(".mcp.json")) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
 }
 
 /// Pull the worktree back from the remote host.
@@ -866,25 +816,5 @@ mod tests {
         );
         // The tail should preserve the last meaningful lines.
         assert!(trimmed.contains("file-49"));
-    }
-
-    #[test]
-    fn pushed_mcp_json_is_none_only_when_the_workspace_has_no_file() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(read_pushed_mcp_json(dir.path()).unwrap().is_none());
-
-        std::fs::write(dir.path().join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
-        assert_eq!(
-            read_pushed_mcp_json(dir.path()).unwrap().as_deref(),
-            Some(r#"{"mcpServers":{}}"#)
-        );
-    }
-
-    #[test]
-    fn pushed_mcp_json_that_is_not_utf8_is_an_error_not_a_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".mcp.json"), [0xff, 0xfe, b'{', b'}']).unwrap();
-        let error = read_pushed_mcp_json(dir.path()).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }

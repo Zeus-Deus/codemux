@@ -10,30 +10,11 @@ use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use serde_json::{json, Value};
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
-
-// Serialize checkout-level config reconciliation. Deferred startup repair
-// rechecks live workspace ownership while holding this lock, so a concurrent
-// final-workspace close either happens before the check (and is skipped) or
-// removes the entry after the repair. It can never remove-then-resurrect it.
-static MCP_CONFIG_IO_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-/// Set by app-owned provider MCP descriptors, never per-call metadata.
-pub(crate) const PROVIDER_ORIGIN_ENV: &str = "CODEMUX_MCP_PROVIDER_ORIGIN";
-
-/// Check if auto-MCP config is enabled in settings (default: true).
-pub fn is_auto_mcp_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
-    use tauri::Manager;
-    let db: tauri::State<'_, crate::database::DatabaseStore> = app.state();
-    db.get_setting("auto_mcp_config")
-        .map(|v| v != "false")
-        .unwrap_or(true)
-}
 
 // ---------------------------------------------------------------------------
 // MCP tool definition
@@ -124,16 +105,20 @@ pub(crate) fn remote_delegation_tools_for_test() -> Vec<crate::mcp::runtime::Mcp
         .collect()
 }
 
-/// What `tools/list` serves. A process that serves an agent (provider origin
-/// or the agent marker) gets exactly the legacy tools. Any other caller gets
-/// the legacy tools the registry does not serve and its access can run, then
-/// the registry's outside catalog for that access. The count stays the same
-/// as registry tools take over legacy names.
+/// What `tools/list` serves. A process started from an obsolete written
+/// config gets nothing. A process that serves an agent (the agent marker)
+/// gets exactly the legacy tools. Any other caller gets the legacy tools the
+/// registry does not serve and its access can run, then the registry's
+/// outside catalog for that access. The count stays the same as registry
+/// tools take over legacy names.
 ///
 /// Pure: only [`run_mcp_server_with`] reads the env and options.
-fn stdio_tools(provider_origin: bool, agent: bool, access: ControlAccess) -> Vec<StdioTool> {
+fn stdio_tools(obsolete: bool, agent: bool, access: ControlAccess) -> Vec<StdioTool> {
+    if obsolete {
+        return Vec::new();
+    }
     let legacy = legacy_tools().into_iter().map(StdioTool::from);
-    if provider_origin || agent {
+    if agent {
         return legacy.collect();
     }
     let view = CallerView::outside(access);
@@ -717,7 +702,7 @@ fn legacy_tools() -> Vec<McpTool> {
         // -- Delegation primitives (Phase 1.5 vexis-agent integration) --
         McpTool {
             name: "worktree_create",
-            description: "Create a git worktree + Codemux workspace in one atomic call, optionally launching an agent inside with a starting prompt. Mirrors the in-app branch-picker \"Fork → \" flow. Does ALL of: `git worktree add` under ~/.codemux/worktrees/<repo>/<branch>, workspace state hydration with the requested layout, PTY spawn, setup-script run, `.mcp.json` autoconfig, and (if `agent_preset_id` is set) launching the preset's CLI with `initial_prompt` injected. Returns the new `workspace_id`. Pair with `preset_list` first if you need to know which agent presets are installed.",
+            description: "Create a git worktree + Codemux workspace in one atomic call, optionally launching an agent inside with a starting prompt. Mirrors the in-app branch-picker \"Fork → \" flow. Does ALL of: `git worktree add` under ~/.codemux/worktrees/<repo>/<branch>, workspace state hydration with the requested layout, PTY spawn, setup-script run, and (if `agent_preset_id` is set) launching the preset's CLI with `initial_prompt` injected. Returns the new `workspace_id`. Pair with `preset_list` first if you need to know which agent presets are installed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -799,7 +784,7 @@ fn legacy_tools() -> Vec<McpTool> {
         // -- Lifecycle + issue tools (Phase 1.6 vexis-agent integration) --
         McpTool {
             name: "workspace_close",
-            description: "Close a workspace by id. Runs teardown scripts, terminates PTYs, and removes Codemux's entry from the workspace's `.mcp.json`. Optionally also removes the underlying git worktree. Protected project-root checkouts can NEVER have their files deleted through this tool — `delete_worktree: true` on such a workspace errors; use `workspace_archive` instead to close it restorably.",
+            description: "Close a workspace by id. Runs teardown scripts and terminates PTYs. Optionally also removes the underlying git worktree. Protected project-root checkouts can NEVER have their files deleted through this tool — `delete_worktree: true` on such a workspace errors; use `workspace_archive` instead to close it restorably.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1071,8 +1056,17 @@ fn html_render_result(arguments: &Value) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 /// What stdio that serves an agent tells the model: those processes list no
-/// registry tools.
-const PROVIDER_INSTRUCTIONS: &str = "Use the advertised workspace and browser tools. Native thread control is unavailable on provider-injected MCP; it requires a separate authorized controller connection.";
+/// registry tools. It promises nothing about the app being reachable; a call
+/// made while Codemux is not running says so.
+const AGENT_INSTRUCTIONS: &str = "Codemux tools for the Codemux workspace this agent runs in. Native thread control is unavailable on this connection; it requires a separate authorized controller connection.";
+
+/// What a `codemux mcp` started from an obsolete written config tells the
+/// model, in place of any tools.
+const OBSOLETE_INSTRUCTIONS: &str = "This Codemux MCP server was started from an obsolete config entry that an older Codemux wrote automatically (it sets CODEMUX_MCP_PROVIDER_ORIGIN). It offers no tools and refuses every call. The entry is safe to delete; current Codemux removes such entries on its own. To use Codemux from this client on purpose, register `codemux mcp --client <name>` yourself.";
+
+/// The refusal every call to such a server gets.
+const OBSOLETE_CALL_DENIED: &str =
+    "obsolete_config: this Codemux MCP entry was written automatically by an older Codemux and is disabled; delete it, or register `codemux mcp --client <name>` on purpose";
 
 const SERVER_INFO: ServerInfo = ServerInfo { name: "codemux", version: env!("CARGO_PKG_VERSION") };
 
@@ -1092,24 +1086,31 @@ pub struct McpServerOptions {
 /// Who this `codemux mcp` serves, fixed when it starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StdioCaller {
-    /// Started from an app-installed config (`.mcp.json`, codemux-self).
-    provider_origin: bool,
-    /// Runs under an agent Codemux started (`CODEMUX_AGENT_PROCESS`).
+    /// Started from a config file an older Codemux wrote into a folder
+    /// (`CODEMUX_MCP_PROVIDER_ORIGIN` without a current agent marker). Such a
+    /// file reaches whatever agent happens to run below that folder, so the
+    /// process serves nothing.
+    obsolete: bool,
+    /// Runs under an agent Codemux started (`CODEMUX_AGENT_PROCESS`): a chat's
+    /// shared registry child, or Claude Code in a Codemux terminal.
     agent: bool,
     /// The most this process may do (`--access`, default full access).
     access: ControlAccess,
 }
 
 impl StdioCaller {
-    /// `var` stands in for the process env, so tests never read it.
+    /// `var` stands in for the process env, so tests never read it. A real
+    /// agent marker wins over the legacy one.
     fn from_env(var: impl Fn(&str) -> Option<OsString>, access: ControlAccess) -> Self {
-        Self { provider_origin: var(PROVIDER_ORIGIN_ENV).is_some(), agent: var(AGENT_PROCESS_ENV).is_some(), access }
+        let agent = var(AGENT_PROCESS_ENV).is_some();
+        let obsolete = !agent && var(control_identity::LEGACY_PROVIDER_ORIGIN_ENV).is_some();
+        Self { obsolete, agent, access }
     }
 
     /// Such a process lists legacy tools only and is refused registry tools:
     /// an agent controls threads through its own chat's tools.
     fn serves_an_agent(self) -> bool {
-        self.provider_origin || self.agent
+        self.agent
     }
 }
 
@@ -1151,8 +1152,10 @@ impl StdioServer {
     }
 
     fn instructions(&self) -> &'static str {
-        if self.caller.serves_an_agent() {
-            PROVIDER_INSTRUCTIONS
+        if self.caller.obsolete {
+            OBSOLETE_INSTRUCTIONS
+        } else if self.caller.serves_an_agent() {
+            AGENT_INSTRUCTIONS
         } else {
             crate::agent_control::INSTRUCTIONS
         }
@@ -1181,8 +1184,8 @@ impl StdioServer {
     }
 
     fn tools_list(&self) -> Value {
-        let StdioCaller { provider_origin, agent, access } = self.caller;
-        let tools: Vec<Value> = stdio_tools(provider_origin, agent, access)
+        let StdioCaller { obsolete, agent, access } = self.caller;
+        let tools: Vec<Value> = stdio_tools(obsolete, agent, access)
             .into_iter()
             .map(|tool| {
                 let mut listed = json!({
@@ -1204,6 +1207,11 @@ impl StdioServer {
             Ok(call) => call,
             Err(error) => return Reply::Now(Err(error)),
         };
+        // A cached catalog must not reach around the empty list: local tools
+        // (git, `html_render`) are refused here too.
+        if self.caller.obsolete {
+            return Reply::Now(Ok(protocol::error_result(OBSOLETE_CALL_DENIED.to_owned())));
+        }
         if self.caller.serves_an_agent() {
             // Legacy twins keep their legacy implementation here.
             if registry::relay_refuses(&call.name) {
@@ -1357,11 +1365,11 @@ fn pane_split_direction(tool: &str) -> &'static str {
 /// wins over the process env: every agent-chat session shares ONE
 /// `codemux mcp` child (spawned with no workspace env), so the registry
 /// tags each call with the calling session's workspace in
-/// `_meta[WORKSPACE_META_KEY]`. The env var still covers children the
-/// workspace lifecycle launches from its per-workspace PTYs via `.mcp.json`
-/// (which never send `_meta`); the path-level entry intentionally inherits
-/// that PTY env instead of overriding it. `env_fallback` is passed in so tests
-/// stay hermetic.
+/// `_meta[WORKSPACE_META_KEY]`. The env var still covers a Claude Code typed
+/// in a Codemux terminal, whose plugin server (see `claude_plugin`) never
+/// sends `_meta` and bakes in no workspace, so it inherits the terminal's
+/// `CODEMUX_WORKSPACE_ID`. `env_fallback` is passed in so tests stay
+/// hermetic.
 /// The id is forwarded as-is; the control layer drops one that names no
 /// live workspace (`resolve_browser_workspace_id`).
 fn resolve_workspace_id(meta: Option<&Value>, env_fallback: Option<String>) -> String {
@@ -2149,31 +2157,15 @@ pub async fn run_mcp_server_with(options: McpServerOptions) -> Result<(), String
 }
 
 // ---------------------------------------------------------------------------
-// .mcp.json auto-discovery helpers
+// Codemux's own MCP command
 // ---------------------------------------------------------------------------
 
-/// Build the codemux MCP server entry for `.mcp.json`.
-///
-/// The entry deliberately carries no `CODEMUX_WORKSPACE_ID`. Agents launched
-/// inside a Codemux terminal inherit that workspace-specific variable from
-/// their PTY, so copying one workspace id into a path-level file made the last
-/// workspace opened at a shared CWD steal every other workspace's tool calls.
-/// Callers without an inherited id continue to use the MCP server's cwd
-/// fallback.
-fn codemux_mcp_entry() -> Value {
-    let command = codemux_mcp_command();
-    json!({
-        "command": command,
-        "args": ["mcp"],
-        "env": { (PROVIDER_ORIGIN_ENV): "1" }
-    })
-}
-
-/// Resolve a durable command for the on-disk entry. `current_exe()` points
-/// inside a transient mount for a raw AppImage launch; the wrapper named by
+/// A durable command for `codemux mcp`, for the terminal Claude plugin and
+/// the copy-paste commands Settings shows. `current_exe()` points inside a
+/// transient mount for a raw AppImage launch; the wrapper named by
 /// `$APPIMAGE` survives after the desktop process exits and accepts the same
 /// `mcp` argument. A binary that a package upgrade replaced while the app
-/// runs is named by its install path, so entries written then still launch.
+/// runs is named by its install path, so it still launches.
 pub(crate) fn codemux_mcp_command() -> String {
     std::env::var_os("APPIMAGE")
         .filter(|path| !path.is_empty())
@@ -2207,399 +2199,8 @@ fn is_codemux_executable(command: &str, own: &Path) -> bool {
 /// Linux names a running binary that an upgrade replaced or removed
 /// `<path> (deleted)`. The install path is the one to launch: after an
 /// upgrade it holds the new binary.
-pub(crate) fn install_path(running: &Path) -> &Path {
+pub fn install_path(running: &Path) -> &Path {
     running.to_str().and_then(|path| path.strip_suffix(" (deleted)")).map_or(running, Path::new)
-}
-
-/// One unique checkout that needs an MCP config reconciliation.
-///
-/// `workspace_id` records the last workspace at the path to preserve the
-/// startup loop's historical last-writer semantics while the entry is being
-/// migrated. The generated entry is now path-level rather than
-/// workspace-level, so the id is retained only for call-site compatibility
-/// and diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McpConfigReconciliationTarget {
-    pub workspace_dir: PathBuf,
-    pub workspace_id: String,
-}
-
-/// Active-first boot plan. The caller should reconcile `active`
-/// synchronously before restored agents start, then schedule `inactive` after
-/// the renderer's first paint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McpConfigReconciliationPlan {
-    pub active: Option<McpConfigReconciliationTarget>,
-    pub inactive: Vec<McpConfigReconciliationTarget>,
-}
-
-/// Collapse a restored snapshot to one target per exact CWD while preserving
-/// the old loop's final value (the last workspace at a duplicate path wins).
-/// Target order follows each path's first appearance, making the inactive
-/// batch stable without canonicalizing or inspecting the filesystem.
-pub fn plan_boot_mcp_reconciliation(
-    snapshot: &crate::state::AppStateSnapshot,
-) -> McpConfigReconciliationPlan {
-    let mut targets = Vec::<McpConfigReconciliationTarget>::new();
-    let mut path_indexes = HashMap::<String, usize>::new();
-
-    for workspace in &snapshot.workspaces {
-        if workspace.is_local_import_snapshot_only() {
-            continue;
-        }
-        if let Some(index) = path_indexes.get(&workspace.cwd).copied() {
-            targets[index].workspace_id = workspace.workspace_id.0.clone();
-        } else {
-            path_indexes.insert(workspace.cwd.clone(), targets.len());
-            targets.push(McpConfigReconciliationTarget {
-                workspace_dir: PathBuf::from(&workspace.cwd),
-                workspace_id: workspace.workspace_id.0.clone(),
-            });
-        }
-    }
-
-    let active_path = snapshot
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.workspace_id == snapshot.active_workspace_id)
-        .map(|workspace| workspace.cwd.as_str());
-    let active_index = active_path.and_then(|path| path_indexes.get(path)).copied();
-    let active = active_index.map(|index| targets.remove(index));
-
-    McpConfigReconciliationPlan { active, inactive: targets }
-}
-
-/// Apply a planned batch. Keeping execution separate from planning lets boot
-/// run the active target synchronously and move the inactive vector to a
-/// blocking worker after first paint without inspecting a checkout twice.
-pub fn reconcile_mcp_config_targets<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    targets: &[McpConfigReconciliationTarget],
-) -> usize {
-    reconcile_live_mcp_config_targets(app, targets)
-}
-
-fn reconciliation_target_is_live(
-    snapshot: &crate::state::AppStateSnapshot,
-    target: &McpConfigReconciliationTarget,
-) -> bool {
-    snapshot.workspaces.iter().any(|workspace| {
-        !workspace.is_local_import_snapshot_only()
-            && Path::new(&workspace.cwd) == target.workspace_dir
-    })
-}
-
-fn reconcile_live_mcp_config_targets<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    targets: &[McpConfigReconciliationTarget],
-) -> usize {
-    use tauri::Manager as _;
-
-    // Re-read both preference and ownership at the final filesystem commit
-    // point. The startup plan is intentionally stale by the time first paint
-    // occurs: users can close workspaces or disable auto-MCP during that gap.
-    // The preference is global, not per checkout, so one SQLite read covers
-    // the whole batch.
-    if !is_auto_mcp_enabled(app) {
-        return 0;
-    }
-    let mut repaired = 0;
-    for target in targets {
-        let _io_guard = MCP_CONFIG_IO_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state: tauri::State<'_, crate::state::AppStateStore> = app.state();
-        if !reconciliation_target_is_live(&state.snapshot(), target) {
-            continue;
-        }
-        upsert_mcp_config_with_entry_locked(&target.workspace_dir, codemux_mcp_entry());
-        repaired += 1;
-    }
-    repaired
-}
-
-/// One-shot queue populated by startup and drained after the renderer's first
-/// paint. Keeping the planned targets (rather than recomputing against the
-/// then-current active workspace) makes a fast workspace switch harmless.
-#[derive(Debug, Default)]
-pub struct PendingMcpConfigRepairs {
-    targets: std::sync::Mutex<Vec<McpConfigReconciliationTarget>>,
-}
-
-impl PendingMcpConfigRepairs {
-    pub fn replace(&self, targets: Vec<McpConfigReconciliationTarget>) {
-        *self.targets.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = targets;
-    }
-
-    fn take(&self) -> Vec<McpConfigReconciliationTarget> {
-        std::mem::take(
-            &mut *self
-                .targets
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
-    }
-
-    fn restore_after_join_failure(&self, targets: Vec<McpConfigReconciliationTarget>) {
-        let mut pending = self.targets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if pending.is_empty() {
-            *pending = targets;
-        }
-    }
-}
-
-async fn repair_inactive_mcp_configs_inner<F>(
-    pending: &PendingMcpConfigRepairs,
-    repair: F,
-) -> Result<usize, String>
-where
-    F: FnOnce(&[McpConfigReconciliationTarget]) -> usize + Send + 'static,
-{
-    let targets = pending.take();
-    if targets.is_empty() {
-        return Ok(0);
-    }
-
-    let retry_targets = targets.clone();
-    match tokio::task::spawn_blocking(move || repair(&targets)).await {
-        Ok(repaired) => Ok(repaired),
-        Err(error) => {
-            pending.restore_after_join_failure(retry_targets);
-            Err(format!("inactive MCP config repair task failed: {error}"))
-        }
-    }
-}
-
-/// Drain the inactive boot-repair queue. The frontend calls this once after
-/// first paint; repeated or concurrent invocations return `0` without another
-/// filesystem inspection.
-#[tauri::command]
-pub async fn repair_inactive_mcp_configs<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    pending: tauri::State<'_, PendingMcpConfigRepairs>,
-) -> Result<usize, String> {
-    let repair_app = app.clone();
-    repair_inactive_mcp_configs_inner(&pending, move |targets| {
-        reconcile_live_mcp_config_targets(&repair_app, targets)
-    })
-    .await
-}
-
-/// Upsert the "codemux" entry in `.mcp.json`.
-///
-/// - If the file doesn't exist, creates it with the codemux entry.
-/// - If it exists with valid JSON, merges the codemux entry alongside any
-///   existing servers (shadcn, database tools, etc.) — never removes them.
-/// - If it exists but is invalid JSON, logs a warning and does NOT modify it.
-pub fn upsert_mcp_config(workspace_dir: &Path) {
-    upsert_mcp_config_with_entry(workspace_dir, codemux_mcp_entry());
-}
-
-fn upsert_mcp_config_with_entry(workspace_dir: &Path, desired_entry: Value) {
-    let _io_guard = MCP_CONFIG_IO_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    upsert_mcp_config_with_entry_locked(workspace_dir, desired_entry);
-}
-
-fn upsert_mcp_config_with_entry_locked(workspace_dir: &Path, desired_entry: Value) {
-    let mcp_path = workspace_dir.join(".mcp.json");
-
-    let mut config = if mcp_path.exists() {
-        match std::fs::read_to_string(&mcp_path) {
-            Ok(content) => match serde_json::from_str::<Value>(&content) {
-                Ok(val) => val,
-                Err(e) => {
-                    eprintln!(
-                        "[codemux::mcp] .mcp.json at {} is invalid JSON ({}), skipping",
-                        mcp_path.display(),
-                        e
-                    );
-                    return;
-                }
-            },
-            Err(e) => {
-                eprintln!(
-                    "[codemux::mcp] Failed to read .mcp.json at {}: {}",
-                    mcp_path.display(),
-                    e
-                );
-                return;
-            }
-        }
-    } else {
-        json!({})
-    };
-
-    // A semantic match is a true no-op: preserve the user's original bytes,
-    // key order, indentation, inode, and mtime. Git exclusion is independently
-    // idempotent and may still repair a missing exclude entry.
-    if config
-        .get("mcpServers")
-        .and_then(Value::as_object)
-        .and_then(|servers| servers.get("codemux"))
-        == Some(&desired_entry)
-    {
-        crate::git::ensure_git_exclude(workspace_dir, ".mcp.json");
-        return;
-    }
-
-    // Ensure mcpServers object exists.
-    if !config.get("mcpServers").is_some_and(Value::is_object) {
-        config["mcpServers"] = json!({});
-    }
-    config["mcpServers"]["codemux"] = desired_entry;
-
-    match serde_json::to_string_pretty(&config) {
-        Ok(json) => {
-            if let Err(e) = atomic_write(&mcp_path, json.as_bytes()) {
-                eprintln!("[codemux::mcp] Failed to write .mcp.json: {e}");
-                return;
-            }
-        }
-        Err(e) => {
-            eprintln!("[codemux::mcp] Failed to serialize .mcp.json: {e}");
-            return;
-        }
-    }
-
-    crate::git::ensure_git_exclude(workspace_dir, ".mcp.json");
-}
-
-/// Atomic-write helper used by `upsert_mcp_config` so a crash mid-write can
-/// never leave half-baked JSON at `.mcp.json` — Claude Code reads that file
-/// at agent start, and a single corrupted byte disables every MCP server the
-/// brain was supposed to see.
-///
-/// Pattern (cribbed from vexis-agent's `_write_yaml` in
-/// `vexis_agent/daemon/mcp.py`):
-///   1. write the new content to a sibling `.tmp` file
-///   2. fsync the tmp file so its bytes are durable before the rename
-///   3. `rename` over the destination (atomic on POSIX, atomic on Windows
-///      thanks to `MoveFileEx` semantics under `std::fs::rename`)
-///   4. fsync the parent directory on Unix so the rename itself is durable
-///      across a power loss
-///
-/// The tmp suffix is keyed on `path.file_name()` plus `.tmp` so concurrent
-/// writes to two different `.mcp.json` files don't collide on the same tmp.
-/// Two concurrent writes to the *same* `.mcp.json` will race on the rename,
-/// which is the same race std::fs::write already had — but neither side can
-/// observe a partially written file.
-fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("atomic_write: path has no parent: {}", path.display()),
-        )
-    })?;
-
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("atomic_write: path has no file name: {}", path.display()),
-            )
-        })?
-        .to_os_string();
-
-    let mut tmp_name = file_name;
-    tmp_name.push(".tmp");
-    let tmp_path = parent.join(&tmp_name);
-
-    // OpenOptions instead of File::create so a leftover tmp from a previous
-    // crashed write is truncated cleanly instead of confusing this attempt.
-    {
-        let mut tmp = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        tmp.write_all(contents)?;
-        tmp.flush()?;
-        // Best-effort: filesystems that don't support sync_all (e.g. some
-        // network mounts in tests) shouldn't break the write. The rename
-        // itself is still atomic; sync_all is the durability guarantee.
-        let _ = tmp.sync_all();
-    }
-
-    // Atomic rename over the destination. On Unix this is `rename(2)`; on
-    // Windows it's `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` semantics,
-    // both of which guarantee the destination is either fully old or fully
-    // new — never a half-written mix.
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        // Clean up the tmp file on rename failure so we don't leave debris.
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-
-    // fsync the directory on Unix so the rename is durable. POSIX only —
-    // Windows directory handles don't need this and `File::open` on a
-    // directory path fails on Windows anyway.
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-
-    Ok(())
-}
-
-/// Remove the "codemux" entry from `.mcp.json` on workspace close.
-///
-/// - If other servers remain, rewrites the file without codemux.
-/// - If codemux was the only server, deletes the file.
-/// - If the file doesn't exist or is invalid JSON, does nothing.
-pub fn remove_mcp_config(workspace_dir: &Path) {
-    let _io_guard = MCP_CONFIG_IO_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    remove_mcp_config_locked(workspace_dir);
-}
-
-fn remove_mcp_config_locked(workspace_dir: &Path) {
-    let mcp_path = workspace_dir.join(".mcp.json");
-    if !mcp_path.exists() {
-        return;
-    }
-
-    let content = match std::fs::read_to_string(&mcp_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let mut config: Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let servers = match config.get_mut("mcpServers").and_then(Value::as_object_mut) {
-        Some(s) => s,
-        None => return,
-    };
-
-    if servers.remove("codemux").is_none() {
-        return;
-    }
-
-    if servers.is_empty() {
-        // Drop our now-empty container, but keep unrelated top-level user
-        // configuration instead of deleting the entire file.
-        if let Some(root) = config.as_object_mut() {
-            root.remove("mcpServers");
-        }
-    }
-
-    if config.as_object().is_some_and(|root| root.is_empty()) {
-        let _ = std::fs::remove_file(&mcp_path);
-    } else if let Ok(json) = serde_json::to_string_pretty(&config) {
-        // Mirror upsert's atomic-write path so a crash on cleanup can't
-        // leave the file in a partially-written state either.
-        let _ = atomic_write(&mcp_path, json.as_bytes());
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2610,6 +2211,7 @@ fn remove_mcp_config_locked(workspace_dir: &Path) {
 mod tests {
     use super::*;
     use crate::mcp::protocol::{Incoming, RequestId, Response};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     #[test]
@@ -2619,9 +2221,9 @@ mod tests {
         assert_eq!(install_path(Path::new("/opt/x (deleted)/codemux")), Path::new("/opt/x (deleted)/codemux"), "only a trailing suffix");
     }
 
-    /// An outside caller at full access: no provider origin, no agent marker.
+    /// An outside caller at full access: no legacy marker, no agent marker.
     fn outside() -> StdioCaller {
-        StdioCaller { provider_origin: false, agent: false, access: ControlAccess::FullAccess }
+        StdioCaller { obsolete: false, agent: false, access: ControlAccess::FullAccess }
     }
 
     /// Tests never name the test process's own client.
@@ -2682,21 +2284,19 @@ mod tests {
 
     #[tokio::test]
     async fn review_s1_provider_stdio_has_no_trusted_native_controller_route() {
-        const MARKER: &str = "CODEMUX_MCP_PROVIDER_ORIGIN";
         if std::env::var_os("CODEMUX_REVIEW_STDIO_CHILD").is_none() {
-            // Process-owned origin, never mutable global test environment or
+            // Process-owned marker, never mutable global test environment or
             // caller-controlled request metadata. This invokes only this test.
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["mcp_server::tests::review_s1_provider_stdio_has_no_trusted_native_controller_route", "--exact", "--nocapture"])
-                .env(MARKER, "1").env("CODEMUX_REVIEW_STDIO_CHILD", "1").output().unwrap();
-            assert!(result.status.success(), "provider-origin stdio assertion failed: {}", String::from_utf8_lossy(&result.stderr));
-            assert_eq!(codemux_mcp_entry()["env"][MARKER], "1", "app-installed provider configs must bind the restricted invocation");
+                .env(AGENT_PROCESS_ENV, "1").env("CODEMUX_REVIEW_STDIO_CHILD", "1").output().unwrap();
+            assert!(result.status.success(), "agent stdio assertion failed: {}", String::from_utf8_lossy(&result.stderr));
             return;
         }
         let caller = StdioCaller::from_env(|key| std::env::var_os(key), ControlAccess::FullAccess);
-        assert!(caller.provider_origin, "the marker is read from the process env");
-        assert!(!stdio_tools(caller.provider_origin, caller.agent, caller.access).iter().any(|tool| registry::relay_refuses(&tool.name)),
-            "provider-origin stdio must omit trusted native tools");
+        assert!(caller.agent, "the marker is read from the process env");
+        assert!(!stdio_tools(caller.obsolete, caller.agent, caller.access).iter().any(|tool| registry::relay_refuses(&tool.name)),
+            "agent stdio must omit trusted native tools");
         let server = server_for(caller);
         let result = rpc(&server, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"thread_launch","arguments":{},
             "_meta":{"control_access":"full_access"}}})).await.unwrap();
@@ -2730,23 +2330,6 @@ mod tests {
         // match (they were inverted).
         assert_eq!(pane_split_direction("pane_split_right"), "horizontal");
         assert_eq!(pane_split_direction("pane_split_down"), "vertical");
-    }
-
-    /// Helper: create a unique temp directory for a test.
-    fn test_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("codemux_test_{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn cleanup(dir: &Path) {
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    fn read_mcp(dir: &Path) -> Value {
-        let content = std::fs::read_to_string(dir.join(".mcp.json")).unwrap();
-        serde_json::from_str(&content).unwrap()
     }
 
     // -----------------------------------------------------------------------
@@ -2917,26 +2500,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn path_level_entry_leaves_each_session_workspace_id_inherited() {
-        let entry = codemux_mcp_entry();
-        assert!(
-            entry["env"].get("CODEMUX_WORKSPACE_ID").is_none(),
-            "a shared path must not pin one workspace id in .mcp.json"
-        );
-        assert_eq!(entry["env"][PROVIDER_ORIGIN_ENV], "1");
-
-        let params = json!({ "name": "browser_navigate", "arguments": {} });
-        assert_eq!(
-            resolve_workspace_id(params.get("_meta"), Some("workspace-a".into())),
-            "workspace-a"
-        );
-        assert_eq!(
-            resolve_workspace_id(params.get("_meta"), Some("workspace-b".into())),
-            "workspace-b"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // Protocol handling (async)
     // -----------------------------------------------------------------------
@@ -3026,7 +2589,8 @@ mod tests {
         }
         for (caller, instructions) in [
             (outside(), crate::agent_control::INSTRUCTIONS),
-            (StdioCaller { provider_origin: true, ..outside() }, PROVIDER_INSTRUCTIONS),
+            (StdioCaller { agent: true, ..outside() }, AGENT_INSTRUCTIONS),
+            (StdioCaller { obsolete: true, ..outside() }, OBSOLETE_INSTRUCTIONS),
         ] {
             let resp = rpc(&server_for(caller), modern(1, "server/discover", json!({}))).await.unwrap();
             assert_eq!(resp["id"], 1);
@@ -3298,8 +2862,8 @@ mod tests {
         assert_eq!(legacy.await.unwrap()["content"][0]["text"], "git_status");
     }
 
-    fn caller(provider_origin: bool, agent: bool, access: ControlAccess) -> StdioCaller {
-        StdioCaller { provider_origin, agent, access }
+    fn caller(obsolete: bool, agent: bool, access: ControlAccess) -> StdioCaller {
+        StdioCaller { obsolete, agent, access }
     }
 
     /// A tool's access class: the registry's for registry tools, otherwise
@@ -3325,9 +2889,9 @@ mod tests {
         }
         let list = outside.iter().find(|tool| tool.name == "workspace_list").unwrap();
         assert_eq!(list.annotations.as_ref().unwrap()["readOnlyHint"], true);
-        let provider = stdio_tools(true, false, ControlAccess::FullAccess);
-        let legacy = provider.iter().find(|tool| tool.name == "workspace_list").unwrap();
-        assert!(legacy.input_schema.get("additionalProperties").is_none(), "provider-origin stdio keeps the legacy schema");
+        let agent = stdio_tools(false, true, ControlAccess::FullAccess);
+        let legacy = agent.iter().find(|tool| tool.name == "workspace_list").unwrap();
+        assert!(legacy.input_schema.get("additionalProperties").is_none(), "agent stdio keeps the legacy schema");
         assert!(legacy.annotations.is_none());
     }
 
@@ -3414,24 +2978,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_origin_stdio_keeps_every_legacy_name() {
+    async fn agent_stdio_keeps_every_legacy_name() {
         for access in [ControlAccess::ReadOnly, ControlAccess::Supervised, ControlAccess::FullAccess] {
-            let tools = stdio_tools(true, false, access);
+            let tools = stdio_tools(false, true, access);
             assert_eq!(names(&tools), LEGACY_TOOL_NAMES, "{access:?}");
             assert!(tools.iter().all(|tool| tool.annotations.is_none()));
         }
-        let listed = rpc(&server_for(caller(true, false, ControlAccess::FullAccess)), json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await.unwrap();
+        let listed = rpc(&server_for(caller(false, true, ControlAccess::FullAccess)), json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await.unwrap();
         assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), LEGACY_TOOL_NAMES.len());
+    }
+
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
+        move |key| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| OsString::from(v))
+    }
+
+    /// A `codemux mcp` started from a stale `.mcp.json` an older Codemux
+    /// wrote (legacy marker, no agent marker) lists nothing, says the entry
+    /// is obsolete, and refuses every call, including the ones that would
+    /// run locally and a guessed registry tool, so a cached catalog cannot
+    /// reach around the empty list.
+    #[tokio::test]
+    async fn legacy_written_entry_serves_nothing_and_refuses_every_call() {
+        const LEGACY: &str = control_identity::LEGACY_PROVIDER_ORIGIN_ENV;
+        assert_eq!(LEGACY, "CODEMUX_MCP_PROVIDER_ORIGIN");
+        let stale = StdioCaller::from_env(env(&[(LEGACY, "1")]), ControlAccess::FullAccess);
+        assert_eq!(stale, caller(true, false, ControlAccess::FullAccess));
+        // A real agent marker wins: a managed child keeps its tools.
+        assert_eq!(
+            StdioCaller::from_env(env(&[(LEGACY, "1"), (AGENT_PROCESS_ENV, "1")]), ControlAccess::FullAccess),
+            caller(false, true, ControlAccess::FullAccess)
+        );
+        for access in [ControlAccess::ReadOnly, ControlAccess::Supervised, ControlAccess::FullAccess] {
+            assert!(stdio_tools(true, false, access).is_empty(), "{access:?}");
+        }
+
+        let Gated { server, started, .. } = gated_server_for(stale, Default::default(), Default::default(), Default::default());
+        let listed = rpc(&server, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await.unwrap();
+        assert_eq!(listed["result"]["tools"], json!([]), "{listed}");
+        for (id, name) in [(2, "browser_navigate"), (3, "git_status"), (4, "html_render"), (5, "workspace_list"), (6, "thread_list")] {
+            let refused = rpc(&server, tools_call(id, name, json!({"url": "https://example.com", "html": "<p>x</p>"}))).await.unwrap();
+            assert_eq!(refused["result"]["isError"], true, "{name}: {refused}");
+            let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.starts_with("obsolete_config: "), "{name}: {text}");
+        }
+        assert!(started.lock().unwrap().is_empty(), "no refused call ran: {:?}", started.lock().unwrap());
+        let initialized = rpc(&server, json!({"jsonrpc": "2.0", "id": 7, "method": "initialize", "params": {}})).await.unwrap();
+        let instructions = initialized["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("obsolete") && instructions.contains("safe to delete"), "{instructions}");
+        assert!(!instructions.contains("browser"), "{instructions}");
+    }
+
+    /// An intentional registration keeps working whether or not it names
+    /// itself: `codemux mcp` and `codemux mcp --client x` are outside
+    /// controllers, with the full outside catalog.
+    #[test]
+    fn bare_and_named_registrations_stay_controllers() {
+        let bare = StdioCaller::from_env(env(&[]), ControlAccess::FullAccess);
+        assert_eq!(bare, outside());
+        assert!(!stdio_tools(bare.obsolete, bare.agent, bare.access).is_empty());
+        assert_eq!(names(&stdio_tools(false, false, ControlAccess::FullAccess)), names(&stdio_tools(bare.obsolete, bare.agent, bare.access)));
     }
 
     #[tokio::test]
     async fn agent_marked_stdio_lists_legacy_only() {
-        fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
-            move |key| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| OsString::from(v))
-        }
         let marked = StdioCaller::from_env(env(&[(AGENT_PROCESS_ENV, "")]), ControlAccess::FullAccess);
         assert_eq!(marked, caller(false, true, ControlAccess::FullAccess), "presence alone marks an agent");
-        assert_eq!(StdioCaller::from_env(env(&[(PROVIDER_ORIGIN_ENV, "1")]), ControlAccess::ReadOnly), caller(true, false, ControlAccess::ReadOnly));
+        assert_eq!(
+            StdioCaller::from_env(env(&[(AGENT_PROCESS_ENV, "terminal")]), ControlAccess::FullAccess),
+            caller(false, true, ControlAccess::FullAccess),
+            "Claude Code in a Codemux terminal is an agent"
+        );
         assert_eq!(StdioCaller::from_env(env(&[]), ControlAccess::Supervised), caller(false, false, ControlAccess::Supervised));
 
         assert_eq!(names(&stdio_tools(false, true, ControlAccess::FullAccess)), LEGACY_TOOL_NAMES);
@@ -3674,695 +3290,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // .mcp.json upsert tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn mcp_json_create_new() {
-        let dir = test_dir("mcp_create_new");
-        upsert_mcp_config(&dir);
-
-        let config = read_mcp(&dir);
-        assert!(config["mcpServers"]["codemux"]["command"].as_str().is_some_and(|c| !c.is_empty()));
-        assert_eq!(config["mcpServers"]["codemux"]["args"][0], "mcp");
-        assert_eq!(config["mcpServers"]["codemux"]["env"], json!({(PROVIDER_ORIGIN_ENV): "1"}));
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn mcp_json_append_to_existing() {
-        let dir = test_dir("mcp_append");
-        std::fs::write(
-            dir.join(".mcp.json"),
-            r#"{"mcpServers":{"shadcn":{"command":"npx","args":["shadcn@latest","mcp"]}}}"#,
-        ).unwrap();
-
-        upsert_mcp_config(&dir);
-
-        let config = read_mcp(&dir);
-        // shadcn preserved
-        assert_eq!(config["mcpServers"]["shadcn"]["command"], "npx");
-        assert_eq!(config["mcpServers"]["shadcn"]["args"][0], "shadcn@latest");
-        // codemux added
-        assert!(config["mcpServers"]["codemux"]["command"].as_str().is_some_and(|c| !c.is_empty()));
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn mcp_json_update_existing_codemux() {
-        let dir = test_dir("mcp_update");
-        std::fs::write(
-            dir.join(".mcp.json"),
-            r#"{"mcpServers":{"codemux":{"command":"old","args":["old"]},"other":{"command":"x"}}}"#,
-        ).unwrap();
-
-        upsert_mcp_config(&dir);
-
-        let config = read_mcp(&dir);
-        // codemux updated
-        assert!(config["mcpServers"]["codemux"]["command"].as_str().is_some_and(|c| !c.is_empty()));
-        assert_eq!(config["mcpServers"]["codemux"]["env"], json!({(PROVIDER_ORIGIN_ENV): "1"}));
-        // other server untouched
-        assert_eq!(config["mcpServers"]["other"]["command"], "x");
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn mcp_json_invalid_json_no_crash() {
-        let dir = test_dir("mcp_invalid");
-        let bad_content = "not json{{{";
-        std::fs::write(dir.join(".mcp.json"), bad_content).unwrap();
-
-        upsert_mcp_config(&dir);
-
-        // File unchanged
-        let content = std::fs::read_to_string(dir.join(".mcp.json")).unwrap();
-        assert_eq!(content, bad_content);
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn mcp_json_equivalent_entry_preserves_formatting_inode_and_mtime() {
-        let dir = test_dir("mcp_idempotent");
-        let path = dir.join(".mcp.json");
-        let desired = serde_json::to_string(&codemux_mcp_entry()).unwrap();
-        let original = format!(
-            "{{\n\t\"userFormatting\" : true,\n\t\"mcpServers\" : {{ \"codemux\" : {desired} }}\n}}\n"
-        );
-        std::fs::write(&path, &original).unwrap();
-        let before = std::fs::metadata(&path).unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        upsert_mcp_config(&dir);
-
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        let after = std::fs::metadata(&path).unwrap();
-        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            assert_eq!(before.ino(), after.ino());
-        }
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn mcp_json_binary_change_writes_once_then_becomes_noop() {
-        let dir = test_dir("mcp_binary_change");
-        let path = dir.join(".mcp.json");
-        let old_entry = json!({ "command": "/old/codemux", "args": ["mcp"] });
-        let new_entry = json!({ "command": "/new/codemux", "args": ["mcp"] });
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&json!({ "mcpServers": { "codemux": old_entry } })).unwrap(),
-        )
-        .unwrap();
-
-        upsert_mcp_config_with_entry(&dir, new_entry.clone());
-        assert_eq!(read_mcp(&dir)["mcpServers"]["codemux"], new_entry);
-        let after_update = std::fs::read(&path).unwrap();
-        let after_update_meta = std::fs::metadata(&path).unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        upsert_mcp_config_with_entry(&dir, new_entry);
-        assert_eq!(std::fs::read(&path).unwrap(), after_update);
-        let after_noop_meta = std::fs::metadata(&path).unwrap();
-        assert_eq!(
-            after_update_meta.modified().unwrap(),
-            after_noop_meta.modified().unwrap()
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            assert_eq!(after_update_meta.ino(), after_noop_meta.ino());
-        }
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn mcp_json_workspace_id_change_is_a_noop() {
-        let dir = test_dir("mcp_id_update");
-        upsert_mcp_config(&dir);
-        let before = std::fs::read(dir.join(".mcp.json")).unwrap();
-        upsert_mcp_config(&dir);
-
-        let config = read_mcp(&dir);
-        assert_eq!(config["mcpServers"]["codemux"]["env"], json!({(PROVIDER_ORIGIN_ENV): "1"}));
-        assert_eq!(std::fs::read(dir.join(".mcp.json")).unwrap(), before);
-
-        cleanup(&dir);
-    }
-
-    async fn assert_import_restart_is_readonly(completed: bool) {
-        use tauri::Manager;
-        const CHILD: &str = "CODEMUX_TEST_IMPORT_MCP_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let dir = tempfile::tempdir().unwrap();
-            let name = if completed {
-                "mcp_server::tests::local_import_mcp_completed_restart_is_readonly"
-            } else {
-                "mcp_server::tests::local_import_mcp_pending_restart_is_readonly"
-            };
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", name, "--nocapture"])
-                .env(CHILD, "1")
-                .env("XDG_CONFIG_HOME", dir.path())
-                .env("APPDATA", dir.path())
-                .env("CODEMUX_TEST_LAYOUT_PATH", dir.path().join("layout.json"))
-                .output()
-                .unwrap();
-            println!(
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(output.status.success(), "import restart child failed");
-            return;
-        }
-        let root = tempfile::tempdir().unwrap();
-        let db = crate::database::DatabaseStore::new_in_memory();
-        let store = crate::state::AppStateStore::default();
-        store.clear_workspaces();
-        let existing = b"{\"mcpServers\": {\"codemux\": {\"command\": \"user-owned\"}}, \"note\": \"preserve bytes\"}\n";
-        let mut projects = Vec::new();
-        let mut sessions = Vec::new();
-        let mut excludes = Vec::new();
-        for (index, name) in ["atlas", "beacon"].iter().enumerate() {
-            let project = root.path().join(name);
-            std::fs::create_dir(&project).unwrap();
-            assert!(std::process::Command::new("git")
-                .args(["init", "--quiet"])
-                .arg(&project)
-                .status()
-                .unwrap()
-                .success());
-            let exclude = project.join(".git/info/exclude");
-            std::fs::write(&exclude, b"# user-owned exclude\nkeep-me\n").unwrap();
-            excludes.push(std::fs::read(&exclude).unwrap());
-            if index == 0 {
-                std::fs::write(project.join(".mcp.json"), existing).unwrap();
-            }
-            sessions.push(crate::local_session_import::ParsedSession {
-                source_id: format!("{}1111111-1111-4111-8111-111111111111", index + 1),
-                provider: "claude".into(),
-                cwd: project.display().to_string(),
-                last_active_at: "2026-09-29T10:00:00Z".into(),
-                messages: vec![("user".into(), "Synthetic restart".into())],
-            });
-            projects.push(project);
-        }
-        store.import_local_sessions(&db, &sessions).unwrap();
-        let first = store.snapshot().workspaces[0].workspace_id.clone();
-        assert!(store.activate_workspace(&first.0)); // Selection is not setup intent.
-        let ids: Vec<_> = sessions.iter().map(|s| s.source_id.clone()).collect();
-        if completed {
-            store.persist_local_import_layout(&db, &ids).unwrap();
-        }
-        let restarted = crate::state::AppStateStore::default();
-        restarted.clear_workspaces();
-        if completed {
-            restarted.replace_snapshot(crate::state::load_persisted_state().unwrap());
-        }
-        let recovered = restarted.recover_local_import_layout(&db).unwrap();
-        assert_eq!(recovered.len(), if completed { 0 } else { 2 });
-        if !recovered.is_empty() {
-            restarted
-                .persist_local_import_layout(&db, &recovered)
-                .unwrap();
-        }
-        assert!(db.pending_local_imports().unwrap().is_empty());
-        assert!(restarted.activate_workspace(&restarted.snapshot().workspaces[0].workspace_id.0));
-        let app = tauri::test::mock_app();
-        app.manage(restarted);
-        app.manage(db);
-        assert!(is_auto_mcp_enabled(app.handle()));
-        let plan =
-            plan_boot_mcp_reconciliation(&app.state::<crate::state::AppStateStore>().snapshot());
-        if let Some(active) = &plan.active {
-            reconcile_mcp_config_targets(app.handle(), std::slice::from_ref(active));
-        }
-        let pending = PendingMcpConfigRepairs::default();
-        pending.replace(plan.inactive.clone());
-        let handle = app.handle().clone();
-        repair_inactive_mcp_configs_inner(&pending, move |targets| {
-            reconcile_live_mcp_config_targets(&handle, targets)
-        })
-        .await
-        .unwrap();
-        let preserved = std::fs::read(projects[0].join(".mcp.json")).unwrap() == existing;
-        let absent = !projects[1].join(".mcp.json").exists();
-        let exclude_unchanged: Vec<_> = projects
-            .iter()
-            .zip(&excludes)
-            .map(|(p, before)| std::fs::read(p.join(".git/info/exclude")).unwrap() == *before)
-            .collect();
-        println!("completed={completed}; existing_mcp_preserved={preserved}; new_mcp_absent={absent}; git_excludes_unchanged={exclude_unchanged:?}");
-        assert!(
-            preserved && absent && exclude_unchanged.iter().all(|v| *v),
-            "import-only restart mutated checkout files"
-        );
-        assert!(
-            plan.active.is_none() && plan.inactive.is_empty(),
-            "import-only targets must not be planned"
-        );
-        // Exercise both native close callers against the same source files.
-        // No provider/runtime is needed: the imported panes are also valid
-        // with provider=None, and the workspace provenance must still protect
-        // the checkout. This avoids instantiating any real provider driver.
-        let store = app.state::<crate::state::AppStateStore>();
-        let mut snapshot = store.snapshot();
-        let ids: Vec<_> = snapshot
-            .workspaces
-            .iter()
-            .map(|w| w.workspace_id.0.clone())
-            .collect();
-        for workspace in &mut snapshot.workspaces {
-            for surface in &mut workspace.surfaces {
-                if let crate::state::PaneNodeSnapshot::AgentChat { provider, .. } =
-                    &mut surface.root
-                {
-                    *provider = None;
-                }
-            }
-        }
-        store.replace_snapshot(snapshot);
-        app.manage(crate::terminal::PtyState {
-            sessions: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-        });
-        let db = app.state::<crate::database::DatabaseStore>();
-        crate::commands::workspace::close_workspace_with_worktree_impl(
-            app.handle().clone(),
-            &store,
-            &db,
-            ids[0].clone(),
-            false,
-            None,
-            Some(false),
-        )
-        .await
-        .unwrap();
-        crate::commands::workspace::close_workspace(
-            app.handle().clone(),
-            app.state(),
-            app.state(),
-            ids[1].clone(),
-            Some(false),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            std::fs::read(projects[0].join(".mcp.json")).unwrap(),
-            existing
-        );
-        assert!(!projects[1].join(".mcp.json").exists());
-        for (project, before) in projects.iter().zip(&excludes) {
-            assert_eq!(
-                std::fs::read(project.join(".git/info/exclude")).unwrap(),
-                *before
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn local_import_mcp_completed_restart_is_readonly() {
-        assert_import_restart_is_readonly(true).await;
-    }
-
-    #[tokio::test]
-    async fn local_import_mcp_pending_restart_is_readonly() {
-        assert_import_restart_is_readonly(false).await;
-    }
-
-    #[test]
-    fn local_import_mcp_stale_plan_rejects_import_only_but_live_same_cwd_reconciles() {
-        use tauri::Manager;
-        for preexisting in [false, true] {
-            let project = tempfile::tempdir().unwrap();
-            assert!(std::process::Command::new("git")
-                .args(["init", "--quiet"])
-                .arg(project.path())
-                .status()
-                .unwrap()
-                .success());
-            let exclude = project.path().join(".git/info/exclude");
-            let old_exclude = std::fs::read(&exclude).unwrap();
-            let mcp = project.path().join(".mcp.json");
-            let old_mcp = b"{\"note\": \"user owns this\"}\n";
-            if preexisting {
-                std::fs::write(&mcp, old_mcp).unwrap();
-            }
-            let store = crate::state::AppStateStore::default();
-            store.clear_workspaces();
-            let live = store.create_empty_workspace_at_path(project.path().to_path_buf());
-            let stale = plan_boot_mcp_reconciliation(&store.snapshot())
-                .active
-                .unwrap();
-            store.close_workspace(&live.0).unwrap();
-            let db = crate::database::DatabaseStore::new_in_memory();
-            let session = crate::local_session_import::ParsedSession {
-                source_id: "11111111-1111-4111-8111-111111111111".into(),
-                provider: "claude".into(),
-                cwd: project.path().display().to_string(),
-                last_active_at: "2026-09-29T10:00:00Z".into(),
-                messages: vec![("user".into(), "Synthetic".into())],
-            };
-            store.import_local_sessions(&db, &[session]).unwrap();
-            let imported = store.snapshot().workspaces[0].workspace_id.clone();
-            let app = tauri::test::mock_app();
-            app.manage(store);
-            app.manage(db);
-            assert_eq!(
-                reconcile_mcp_config_targets(app.handle(), &[stale.clone()]),
-                0
-            );
-            if preexisting {
-                assert_eq!(std::fs::read(&mcp).unwrap(), old_mcp);
-            } else {
-                assert!(!mcp.exists());
-            }
-            assert_eq!(std::fs::read(&exclude).unwrap(), old_exclude);
-            let store = app.state::<crate::state::AppStateStore>();
-            let independent = store.create_empty_workspace_at_path(project.path().to_path_buf());
-            assert!(store.activate_workspace(&imported.0));
-            let plan = plan_boot_mcp_reconciliation(&store.snapshot());
-            assert_eq!(plan.active.as_ref().unwrap().workspace_id, independent.0);
-            assert!(plan.inactive.is_empty());
-            assert_eq!(reconcile_mcp_config_targets(app.handle(), &[stale]), 1);
-            assert!(read_mcp(project.path())["mcpServers"]["codemux"].is_object());
-            assert!(std::fs::read_to_string(&exclude)
-                .unwrap()
-                .contains(".mcp.json"));
-        }
-    }
-
-    #[test]
-    fn boot_plan_deduplicates_cwds_and_keeps_active_first() {
-        let store = crate::state::AppStateStore::default();
-        store.clear_workspaces();
-        let first = store.create_workspace_at_path(PathBuf::from("shared-checkout"));
-        let active = store.create_workspace_at_path(PathBuf::from("active-checkout"));
-        let last = store.create_workspace_at_path(PathBuf::from("shared-checkout"));
-        assert!(store.activate_workspace(&active.0));
-
-        let plan = plan_boot_mcp_reconciliation(&store.snapshot());
-        assert_eq!(
-            plan.active.as_ref().map(|target| target.workspace_dir.as_path()),
-            Some(Path::new("active-checkout"))
-        );
-        assert_eq!(plan.inactive.len(), 1);
-        assert_eq!(plan.inactive[0].workspace_dir, PathBuf::from("shared-checkout"));
-        assert_eq!(
-            plan.inactive[0].workspace_id, last.0,
-            "duplicate paths retain the old loop's last-workspace result"
-        );
-        assert_ne!(first, last);
-    }
-
-    #[tokio::test]
-    async fn inactive_mcp_repair_command_drains_planned_targets_once() {
-        let first = test_dir("inactive_repair_first");
-        let second = test_dir("inactive_repair_second");
-        let pending = PendingMcpConfigRepairs::default();
-        pending.replace(vec![
-            McpConfigReconciliationTarget {
-                workspace_dir: first.clone(),
-                workspace_id: "workspace-first".into(),
-            },
-            McpConfigReconciliationTarget {
-                workspace_dir: second.clone(),
-                workspace_id: "workspace-second".into(),
-            },
-        ]);
-
-        assert_eq!(
-            repair_inactive_mcp_configs_inner(&pending, |targets| {
-                for target in targets {
-                    upsert_mcp_config(&target.workspace_dir);
-                }
-                targets.len()
-            })
-            .await
-            .unwrap(),
-            2
-        );
-        let first_bytes = std::fs::read(first.join(".mcp.json")).unwrap();
-        let second_bytes = std::fs::read(second.join(".mcp.json")).unwrap();
-
-        assert_eq!(
-            repair_inactive_mcp_configs_inner(&pending, |targets| {
-                for target in targets {
-                    upsert_mcp_config(&target.workspace_dir);
-                }
-                targets.len()
-            })
-            .await
-            .unwrap(),
-            0
-        );
-        assert_eq!(std::fs::read(first.join(".mcp.json")).unwrap(), first_bytes);
-        assert_eq!(std::fs::read(second.join(".mcp.json")).unwrap(), second_bytes);
-
-        cleanup(&first);
-        cleanup(&second);
-    }
-
-    #[test]
-    fn deferred_repair_rejects_a_target_after_its_last_workspace_closes() {
-        let checkout = test_dir("inactive_repair_closed_target");
-        let store = crate::state::AppStateStore::default();
-        store.clear_workspaces();
-        let workspace = store.create_workspace_at_path(checkout.clone());
-        let target = McpConfigReconciliationTarget {
-            workspace_dir: checkout.clone(),
-            workspace_id: workspace.0.clone(),
-        };
-
-        assert!(reconciliation_target_is_live(&store.snapshot(), &target));
-        store.close_workspace(&workspace.0).unwrap();
-        assert!(!reconciliation_target_is_live(&store.snapshot(), &target));
-
-        cleanup(&checkout);
-    }
-
-    // -----------------------------------------------------------------------
-    // .mcp.json removal tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn mcp_json_remove_codemux_keeps_others() {
-        let dir = test_dir("mcp_remove_keeps");
-        std::fs::write(
-            dir.join(".mcp.json"),
-            r#"{"mcpServers":{"codemux":{"command":"codemux"},"shadcn":{"command":"npx"}}}"#,
-        ).unwrap();
-
-        remove_mcp_config(&dir);
-
-        let config = read_mcp(&dir);
-        assert!(config["mcpServers"].get("codemux").is_none());
-        assert_eq!(config["mcpServers"]["shadcn"]["command"], "npx");
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn mcp_json_remove_codemux_deletes_empty() {
-        let dir = test_dir("mcp_remove_deletes");
-        std::fs::write(
-            dir.join(".mcp.json"),
-            r#"{"mcpServers":{"codemux":{"command":"codemux"}}}"#,
-        ).unwrap();
-
-        remove_mcp_config(&dir);
-        assert!(!dir.join(".mcp.json").exists(), "File should be deleted when empty");
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn mcp_json_remove_codemux_keeps_unrelated_top_level_config() {
-        let dir = test_dir("mcp_remove_keeps_top_level");
-        std::fs::write(
-            dir.join(".mcp.json"),
-            r#"{"userConfig":{"keep":true},"mcpServers":{"codemux":{"command":"codemux"}}}"#,
-        )
-        .unwrap();
-
-        remove_mcp_config(&dir);
-
-        let config = read_mcp(&dir);
-        assert_eq!(config["userConfig"]["keep"], true);
-        assert!(config.get("mcpServers").is_none());
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn mcp_json_remove_without_codemux_preserves_bytes() {
-        let dir = test_dir("mcp_remove_absent");
-        let path = dir.join(".mcp.json");
-        let original = "{ \"mcpServers\" : { \"other\" : { \"command\" : \"keep\" } } }\n";
-        std::fs::write(&path, original).unwrap();
-
-        remove_mcp_config(&dir);
-
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn mcp_json_remove_nonexistent_noop() {
-        let dir = test_dir("mcp_remove_noop");
-        // No .mcp.json — should not crash
-        remove_mcp_config(&dir);
-        assert!(!dir.join(".mcp.json").exists());
-
-        cleanup(&dir);
-    }
-
-    // -----------------------------------------------------------------------
-    // Git exclude tests (shared function lives in crate::git)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn git_exclude_creates_entry() {
-        let dir = test_dir("git_exclude_create");
-        let git_info = dir.join(".git").join("info");
-        std::fs::create_dir_all(&git_info).unwrap();
-        std::fs::write(git_info.join("exclude"), "*.log\n").unwrap();
-
-        crate::git::ensure_git_exclude(&dir, ".mcp.json");
-
-        let content = std::fs::read_to_string(git_info.join("exclude")).unwrap();
-        assert!(content.contains("*.log"));
-        assert!(content.contains(".mcp.json"));
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn git_exclude_no_duplicate() {
-        let dir = test_dir("git_exclude_nodup");
-        let git_info = dir.join(".git").join("info");
-        std::fs::create_dir_all(&git_info).unwrap();
-        std::fs::write(git_info.join("exclude"), ".mcp.json\n").unwrap();
-
-        crate::git::ensure_git_exclude(&dir, ".mcp.json");
-        crate::git::ensure_git_exclude(&dir, ".mcp.json");
-
-        let content = std::fs::read_to_string(git_info.join("exclude")).unwrap();
-        assert_eq!(content.matches(".mcp.json").count(), 1);
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn git_exclude_no_git_dir_noop() {
-        let dir = test_dir("git_exclude_nogit");
-        // No .git dir — should not crash
-        crate::git::ensure_git_exclude(&dir, ".mcp.json");
-
-        cleanup(&dir);
-    }
-
-    // -----------------------------------------------------------------------
-    // Atomic write tests
-    //
-    // Guards the temp+rename+fsync pattern that protects `.mcp.json` from
-    // partial writes. The most important invariant: if the temp file is
-    // written but the rename never happens (process crash, power loss),
-    // the destination must stay at its previous valid content. Claude
-    // Code reads `.mcp.json` at agent start, and a corrupted file disables
-    // every MCP server the brain is supposed to see.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn atomic_write_creates_new_file() {
-        let dir = test_dir("atomic_write_new");
-        let target = dir.join(".mcp.json");
-        atomic_write(&target, b"{\"hello\":\"world\"}").unwrap();
-
-        let content = std::fs::read_to_string(&target).unwrap();
-        assert_eq!(content, "{\"hello\":\"world\"}");
-        // The tmp file must be gone — its only job was to be renamed.
-        assert!(
-            !dir.join(".mcp.json.tmp").exists(),
-            "atomic_write should not leave a .tmp behind on success"
-        );
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn atomic_write_replaces_existing_file() {
-        let dir = test_dir("atomic_write_replace");
-        let target = dir.join(".mcp.json");
-        std::fs::write(&target, b"OLD CONTENT").unwrap();
-        atomic_write(&target, b"NEW CONTENT").unwrap();
-
-        let content = std::fs::read_to_string(&target).unwrap();
-        assert_eq!(content, "NEW CONTENT");
-
-        cleanup(&dir);
-    }
-
-    /// Simulates the crash-mid-write scenario: the tmp file lands but the
-    /// process dies before `rename`. The destination `.mcp.json` must still
-    /// hold the previous valid content — the agent must see the old, valid
-    /// config rather than a half-written replacement.
-    ///
-    /// We can't actually crash a unit test process, so we model the half-
-    /// completed write directly: write the previous content to the target,
-    /// drop a partial / corrupted .tmp next to it, and assert the target
-    /// stays at the old content. `atomic_write` succeeding *after* a crash
-    /// is also verified — the leftover tmp is truncated, not appended to.
-    #[test]
-    fn atomic_write_crash_during_write_preserves_destination() {
-        let dir = test_dir("atomic_write_crash");
-        let target = dir.join(".mcp.json");
-        let tmp = dir.join(".mcp.json.tmp");
-
-        // 1) Establish the pre-crash valid state.
-        let original = br#"{"mcpServers":{"codemux":{"command":"codemux","args":["mcp"]}}}"#;
-        std::fs::write(&target, original).unwrap();
-
-        // 2) Simulate a previous crashed write: a stale .tmp was created
-        //    with partial JSON, but the rename never fired.
-        std::fs::write(&tmp, b"{\"mcpServers\":{\"co").unwrap();
-
-        // 3) The destination MUST still match the pre-crash content — no
-        //    half-written bytes ever bled through. This is the core
-        //    invariant the atomic-write fix exists to guarantee.
-        let content = std::fs::read(&target).unwrap();
-        assert_eq!(
-            &content[..],
-            &original[..],
-            "destination .mcp.json was corrupted by a half-completed write"
-        );
-
-        // 4) Recovery: a subsequent atomic_write must succeed even with
-        //    the stale tmp present (it gets truncated, not appended), and
-        //    must clear the tmp on success.
-        let new_content = br#"{"mcpServers":{"codemux":{"command":"codemux2"}}}"#;
-        atomic_write(&target, new_content).unwrap();
-        let after = std::fs::read(&target).unwrap();
-        assert_eq!(&after[..], &new_content[..]);
-        assert!(
-            !tmp.exists(),
-            "atomic_write should reap its own .tmp on success even after a prior crash"
-        );
-
-        cleanup(&dir);
-    }
-
     #[test]
     fn native_thread_control_tools_are_discoverable() {
         let tools = stdio_tools(false, false, ControlAccess::FullAccess);
@@ -4385,24 +3312,6 @@ mod tests {
             assert!(names.contains(name), "native control tool {name} is missing from MCP discovery");
         }
         assert_eq!(names.len(), tools.len(), "MCP tool names must remain unique");
-    }
-
-    /// Upsert path uses atomic_write under the hood — verify a fresh
-    /// `.mcp.json` lands cleanly and no `.mcp.json.tmp` ghost is left
-    /// behind. Together with the explicit atomic_write tests above this
-    /// proves the production write path is atomic end-to-end.
-    #[test]
-    fn upsert_uses_atomic_write_no_tmp_leftover() {
-        let dir = test_dir("upsert_atomic");
-        upsert_mcp_config(&dir);
-
-        assert!(dir.join(".mcp.json").exists());
-        assert!(
-            !dir.join(".mcp.json.tmp").exists(),
-            "upsert_mcp_config must not leave a .tmp file behind"
-        );
-
-        cleanup(&dir);
     }
 
     #[tokio::test]

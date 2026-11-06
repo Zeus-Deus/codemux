@@ -135,6 +135,10 @@ pub enum ServerResponse {
         protocol_version: u32,
         daemon_pid: u32,
         daemon_version: String,
+        /// Whether this daemon gives its shells a remote host's own Claude
+        /// Code plugin. Daemons older than that feature omit it.
+        #[serde(default)]
+        host_claude_plugin: bool,
     },
     Spawned {
         request_id: u64,
@@ -224,4 +228,23 @@ pub struct DaemonSessionInfo {
 pub enum Frame {
     Response(ServerResponse),
     Event(ServerEvent),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A daemon from before host plugins omits the flag; the reply still
+    /// parses, and reads as "no plugin".
+    #[test]
+    fn hello_from_an_older_daemon_reads_as_no_host_plugin() {
+        let old = r#"{"type":"hello","request_id":1,"protocol_version":2,"daemon_pid":7,"daemon_version":"0.26.2"}"#;
+        match serde_json::from_str::<ServerResponse>(old).unwrap() {
+            ServerResponse::Hello { host_claude_plugin, daemon_version, .. } => {
+                assert!(!host_claude_plugin);
+                assert_eq!(daemon_version, "0.26.2");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }

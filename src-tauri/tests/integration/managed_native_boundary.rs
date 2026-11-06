@@ -171,6 +171,7 @@ async fn exercise(mode: &str) {
                 claude_binary: Some("/fake/never-executed-claude".into()),
                 event_channel_capacity: 1024,
                 mcp_registry: None,
+                host_mcp_server: None,
             })
             .await
             .unwrap(),
@@ -330,6 +331,7 @@ async fn managed_native_claude_readiness_rejection_proves_owned_process_stopped(
         claude_binary: Some("/fake/never-executed-claude".into()),
         event_channel_capacity: 1024,
         mcp_registry: None,
+        host_mcp_server: None,
     })
     .await
     .unwrap();
@@ -352,7 +354,7 @@ async fn managed_native_claude_readiness_rejection_proves_owned_process_stopped(
 
 async fn pre_start_provider(kind: &str, binary: PathBuf) -> Arc<dyn AgentProvider> {
     if kind == "claude" {
-        Arc::new(ClaudeAgentProvider::new(ClaudeProviderConfig { sidecar_binary:Some(binary), claude_binary:Some("/fake/never-executed-claude".into()), event_channel_capacity:1024, mcp_registry:None }).await.unwrap())
+        Arc::new(ClaudeAgentProvider::new(ClaudeProviderConfig { sidecar_binary:Some(binary), claude_binary:Some("/fake/never-executed-claude".into()), event_channel_capacity:1024, mcp_registry:None, host_mcp_server: None }).await.unwrap())
     } else {
         Arc::new(CodexAgentProvider::new(CodexProviderConfig { codex_binary:binary, codex_home:None,event_channel_capacity:1024,client_info:ClientInfo {name:"fixture".into(),title:"fixture".into(),version:"0".into()},mcp_registry:None }))
     }
