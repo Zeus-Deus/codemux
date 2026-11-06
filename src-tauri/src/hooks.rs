@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -530,33 +531,99 @@ fn write_active_hook_port(port: u16) -> Option<std::path::PathBuf> {
 fn write_active_hook_port_in(hooks_dir: &std::path::Path, port: u16) -> Option<std::path::PathBuf> {
     std::fs::create_dir_all(hooks_dir).ok()?;
     let path = hooks_dir.join(ACTIVE_HOOK_PORT_FILE);
-    // One short write during startup. A failed write leaves the prior port in
-    // place, while fresh terminals still use their inherited env value.
-    std::fs::write(&path, format!("{port}\n")).ok()?;
+    write_hook_artifact(&path, &format!("{port}\n"), false)?;
     Some(path)
 }
 
-/// Write a file into `~/.codemux/hooks/` with the given name and body,
-/// making it executable on Unix. Returns the absolute path.
-///
-/// Shared by every agent hook artifact — the main `notify.sh`, the
-/// Gemini wrapper script, and the OpenCode plugin.
+/// A snapshot pins a symlink's target once and detects intervening edits before
+/// replacing it. The final comparison is best-effort, not a filesystem CAS.
+struct HookFile {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+    permissions: Option<std::fs::Permissions>,
+}
+
+impl HookFile {
+    fn read(path: &Path) -> std::io::Result<Self> {
+        let path = match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)?,
+            Ok(_) => path.to_path_buf(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+            Err(error) => return Err(error),
+        };
+        let original = read_optional(&path)?;
+        let permissions = if original.is_some() {
+            Some(std::fs::metadata(&path)?.permissions())
+        } else {
+            None
+        };
+        Ok(Self {
+            path,
+            original,
+            permissions,
+        })
+    }
+
+    fn replace(&self, content: &[u8], executable: bool) -> std::io::Result<()> {
+        if self.original.as_deref() == Some(content) {
+            return Ok(());
+        }
+        let parent = self.path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "hook file has no parent")
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+        staged.write_all(content)?;
+        if let Some(permissions) = &self.permissions {
+            staged.as_file().set_permissions(permissions.clone())?;
+        } else {
+            #[cfg(unix)]
+            if executable {
+                use std::os::unix::fs::PermissionsExt;
+                staged
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = executable;
+        staged.as_file().sync_all()?;
+        if read_optional(&self.path)? != self.original {
+            return Err(std::io::Error::other(
+                "hook file changed during update; skipping",
+            ));
+        }
+        staged.persist(&self.path).map_err(|error| error.error)?;
+        Ok(())
+    }
+}
+
+fn read_optional(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_hook_artifact(path: &Path, body: &str, executable: bool) -> Option<()> {
+    match HookFile::read(path).and_then(|file| file.replace(body.as_bytes(), executable)) {
+        Ok(()) => Some(()),
+        Err(error) => {
+            eprintln!(
+                "[codemux::hooks] Failed to update {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Write a shared notifier only when its content changes, keeping existing mode.
 fn write_hook_file(name: &str, body: &str, executable: bool) -> Option<String> {
     let home = user_home_dir()?;
-    let hooks_dir = std::path::PathBuf::from(&home).join(".codemux/hooks");
-    std::fs::create_dir_all(&hooks_dir).ok()?;
-
-    let path = hooks_dir.join(name);
-    std::fs::write(&path, body).ok()?;
-
-    #[cfg(unix)]
-    if executable {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
-    }
-    #[cfg(not(unix))]
-    let _ = executable;
-
+    let path = PathBuf::from(home).join(".codemux/hooks").join(name);
+    write_hook_artifact(&path, body, executable)?;
     Some(path.to_string_lossy().into_owned())
 }
 
@@ -572,29 +639,59 @@ pub fn ensure_hook_script() -> Option<String> {
     write_hook_file(script_name, script_body, true)
 }
 
-/// Check if a hook entry (in Claude Code format) contains a codemux hook.
-/// Matches both the Unix `notify.sh` form and the Windows `notify.ps1` form
-/// so cleanup works regardless of which platform last registered the hook
-/// (e.g. dotfiles synced between Unix and Windows machines).
-fn entry_contains_codemux_hook(entry: &serde_json::Value) -> bool {
-    let is_codemux = |cmd: &str| {
-        cmd.contains(".codemux") && (cmd.contains("notify.sh") || cmd.contains("notify.ps1"))
-    };
-    // Check the nested format: { "hooks": [{ "command": "...codemux..." }] }
-    if let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) {
-        return hooks.iter().any(|h| {
-            h.get("command")
-                .and_then(|c| c.as_str())
-                .map(is_codemux)
-                .unwrap_or(false)
-        });
+fn is_codemux_hook(hook: &serde_json::Value) -> bool {
+    if hook.get("type").is_some_and(|kind| kind != "command") {
+        return false;
     }
-    // Also check legacy flat format for cleanup: { "command": "...codemux..." }
-    entry
-        .get("command")
-        .and_then(|c| c.as_str())
-        .map(is_codemux)
-        .unwrap_or(false)
+    let Some(command) = hook.get("command").and_then(|command| command.as_str()) else {
+        return false;
+    };
+    // Match generated invocations, not user commands that merely mention the
+    // script or combine it with other work in the same shell command.
+    let command = command
+        .strip_prefix("powershell -NoProfile -ExecutionPolicy Bypass -File \"")
+        .unwrap_or(command);
+    if !(command.starts_with('/')
+        || command.starts_with(r"\\")
+        || command.as_bytes().get(1) == Some(&b':'))
+        || command.contains([';', '|', '&', '<', '>', '\n'])
+    {
+        return false;
+    }
+    let normalized = command.replace('\\', "/");
+    let Some((_, suffix)) = normalized.rsplit_once(".codemux/hooks/") else {
+        return false;
+    };
+    ["notify.sh", "notify.ps1", "gemini-notify.sh"]
+        .iter()
+        .any(|name| {
+            let Some(tail) = suffix.strip_prefix(name) else {
+                return false;
+            };
+            let tail = tail.strip_prefix('"').unwrap_or(tail);
+            tail.is_empty()
+                || tail.strip_prefix(' ').is_some_and(|event| {
+                    !event.is_empty() && event.chars().all(|ch| ch.is_ascii_alphabetic())
+                })
+        })
+}
+
+/// Remove only our commands from a mixed entry, keeping its matcher and options.
+fn remove_codemux_hooks(entry: &mut serde_json::Value) -> bool {
+    if let Some(hooks) = entry
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.as_array_mut())
+    {
+        let had_codemux = hooks.iter().any(is_codemux_hook);
+        hooks.retain(|hook| !is_codemux_hook(hook));
+        return had_codemux
+            && hooks.is_empty()
+            && entry.as_object().is_some_and(|object| {
+                object.keys().all(|key| key == "hooks" || key == "matcher")
+                    && object.get("matcher").is_none_or(|matcher| matcher == "")
+            });
+    }
+    is_codemux_hook(entry)
 }
 
 /// Build the shell command an agent will invoke for a hook event.
@@ -638,8 +735,8 @@ fn build_hook_command(script_path: &str, event_type: &str) -> String {
 /// ```
 ///
 /// Only the `hooks` section is touched; every other user setting is
-/// preserved. A prior Codemux entry for an event is replaced in place so
-/// repeated startups never accumulate duplicates. `hook_events` maps each
+/// preserved. Only recognized Codemux commands are refreshed, so mixed user
+/// entries survive and repeated startups never accumulate duplicates. `hook_events` maps each
 /// agent's event name to the canonical event-type arg passed to the
 /// notify script.
 fn merge_nested_hooks_file(
@@ -647,68 +744,75 @@ fn merge_nested_hooks_file(
     hook_events: &[(&str, &str)],
     script_path: &str,
 ) {
-    // Read existing settings or start from an empty object.
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        match std::fs::read_to_string(settings_path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or(serde_json::json!({})),
-            Err(_) => serde_json::json!({}),
-        }
-    } else {
-        if let Some(parent) = settings_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        serde_json::json!({})
-    };
-
-    // Defensive: if the file existed but held a non-object (corrupt /
-    // hand-edited), don't clobber it — bail rather than overwrite.
-    if !settings.is_object() {
+    if let Err(error) = try_merge_nested_hooks_file(settings_path, hook_events, script_path) {
         eprintln!(
-            "[codemux::hooks] {} is not a JSON object; skipping hook merge",
+            "[codemux::hooks] Skipping hook merge for {}: {error}",
             settings_path.display()
         );
-        return;
     }
+}
 
-    let hooks = settings
+fn try_merge_nested_hooks_file(
+    settings_path: &Path,
+    hook_events: &[(&str, &str)],
+    script_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = HookFile::read(settings_path)?;
+    let mut settings: serde_json::Value = match &file.original {
+        Some(content) => serde_json::from_slice(content)?,
+        None => serde_json::json!({}),
+    };
+    let original = settings.clone();
+    let object = settings
         .as_object_mut()
-        .unwrap()
+        .ok_or("settings root must be an object")?;
+    let hooks = object
         .entry("hooks")
-        .or_insert(serde_json::json!({}));
-
-    for (event_name, event_type) in hook_events {
-        let hook_cmd = build_hook_command(script_path, event_type);
-
-        let hook_array = hooks
-            .as_object_mut()
-            .unwrap()
-            .entry(*event_name)
-            .or_insert(serde_json::json!([]));
-
-        // Nested hook format: each entry is
-        // { "matcher": "<pattern>", "hooks": [{ "type": "command", "command": "..." }] }
-        let codemux_entry = serde_json::json!({
-            "matcher": "",
-            "hooks": [{ "type": "command", "command": hook_cmd }]
-        });
-
-        if let Some(arr) = hook_array.as_array_mut() {
-            // Replace an existing codemux entry in place; otherwise append.
-            let existing_idx = arr.iter().position(entry_contains_codemux_hook);
-            if let Some(idx) = existing_idx {
-                arr[idx] = codemux_entry;
-            } else {
-                arr.push(codemux_entry);
+        .or_insert_with(|| serde_json::json!({}));
+    let hooks = hooks.as_object_mut().ok_or("hooks must be an object")?;
+    // Validate before editing anything, including events we don't register.
+    for entries in hooks.values() {
+        let entries = entries.as_array().ok_or("hook events must be arrays")?;
+        for entry in entries {
+            let entry = entry.as_object().ok_or("hook entries must be objects")?;
+            if let Some(nested) = entry.get("hooks") {
+                let nested = nested.as_array().ok_or("entry hooks must be an array")?;
+                if nested.iter().any(|hook| !hook.is_object()) {
+                    return Err("nested hook entries must be objects".into());
+                }
             }
         }
     }
-
-    match serde_json::to_string_pretty(&settings) {
-        Ok(json) => {
-            let _ = std::fs::write(settings_path, json);
+    for (event_name, event_type) in hook_events {
+        let entries = hooks
+            .entry(*event_name)
+            .or_insert_with(|| serde_json::json!([]));
+        let entries = entries.as_array_mut().ok_or("hook events must be arrays")?;
+        let desired = serde_json::json!({
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": build_hook_command(script_path, event_type) }]
+        });
+        let existing_commands = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(|hooks| hooks.as_array())
+                    .map(|hooks| hooks.iter().filter(|hook| is_codemux_hook(hook)).count())
+                    .unwrap_or_else(|| usize::from(is_codemux_hook(entry)))
+            })
+            .sum::<usize>();
+        if existing_commands == 1 && entries.contains(&desired) {
+            continue;
         }
-        Err(e) => eprintln!("[codemux::hooks] Failed to serialize settings: {e}"),
+        entries.retain_mut(|entry| !remove_codemux_hooks(entry));
+        entries.push(desired);
     }
+    // Preserve original bytes (including formatting) for semantic no-ops.
+    if settings != original {
+        file.replace(&serde_json::to_vec_pretty(&settings)?, false)?;
+    }
+    Ok(())
 }
 
 /// Register hooks with Claude Code's settings.json (~/.claude/settings.json).
@@ -892,7 +996,9 @@ const notify = (eventType) => {
 /// busy/idle transitions plus permission and question requests, normalizing
 /// to the canonical `Start` / `Stop` / `PermissionRequest` vocabulary.
 ///
-/// OpenCode 2 never loads this file (see [`OPENCODE_TUI_PLUGIN_TEMPLATE`]).
+/// This historical template is kept verbatim to recognize our generated legacy
+/// artifact during the 2.x migration. Contrary to its old inline comment,
+/// OpenCode 2 also discovers the singular path and rejects its export.
 /// Event shapes verified against OpenCode 1.19.0: `permission.asked` /
 /// `question.asked` carry `id`, their replies carry `requestID`. The
 /// `permission.ask` hook is kept for older 1.x releases; 1.19 never calls it.
@@ -1209,45 +1315,68 @@ fn render_opencode_plugin(template: &str, active_port_path: &str) -> String {
         .replace("{{ACTIVE_PORT_PATH}}", &path_literal)
 }
 
-/// Install the OpenCode notify plugins into OpenCode's config directory:
-/// the 1.x plugin at `plugin/codemux-notify.js` and the 2.x terminal plugin
-/// at `plugins/codemux/tui.js`. Each OpenCode major ignores the other's file.
-///
-/// Only runs if OpenCode's config dir already exists — i.e. the user
-/// actually has OpenCode. Unix-only, like the other agent hooks.
+/// Install only the plugin supported by the prepared OpenCode executable.
+/// Version probing uses passive discovery, never the package-manager launcher.
 #[cfg(not(target_os = "windows"))]
-pub fn register_opencode_plugin() {
-    let Some(config_dir) = opencode_config_dir() else { return };
+pub async fn register_opencode_plugin() {
+    let Some(config_dir) = opencode_config_dir() else {
+        return;
+    };
     if !config_dir.exists() {
-        return; // OpenCode not installed — don't create stray config.
+        return;
     }
     let Some(home) = user_home_dir() else { return };
-    let active_port_path = std::path::PathBuf::from(home)
+    let active_port_path = PathBuf::from(home)
         .join(".codemux/hooks")
         .join(ACTIVE_HOOK_PORT_FILE);
-    let active_port_path = active_port_path.to_string_lossy();
-
-    let plugins = [
-        ("plugin", OPENCODE_PLUGIN_TEMPLATE),
-        ("plugins/codemux", OPENCODE_TUI_PLUGIN_TEMPLATE),
-    ];
-    for (dir, template) in plugins {
-        let plugin_dir = config_dir.join(dir);
-        if std::fs::create_dir_all(&plugin_dir).is_err() {
-            eprintln!("[codemux::hooks] Failed to create OpenCode plugin dir {dir}");
-            continue;
+    let availability = crate::agent_provider::opencode::check_opencode_availability(None).await;
+    let major = availability
+        .version
+        .as_deref()
+        .and_then(|version| version.trim_start_matches('v').split('.').next())
+        .and_then(|major| major.parse::<u32>().ok());
+    match major {
+        Some(major @ (1 | 2)) => {
+            install_opencode_plugin_in(&config_dir, &active_port_path.to_string_lossy(), major);
         }
-        let file = if dir == "plugin" { "codemux-notify.js" } else { "tui.js" };
-        let _ = std::fs::write(
-            plugin_dir.join(file),
-            render_opencode_plugin(template, &active_port_path),
-        );
+        _ => eprintln!("[codemux::hooks] Unknown OpenCode version; skipping plugin installation"),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_opencode_plugin_in(config_dir: &Path, active_port_path: &str, major: u32) -> Option<()> {
+    let legacy_path = config_dir.join("plugin/codemux-notify.js");
+    let legacy = render_opencode_plugin(OPENCODE_PLUGIN_TEMPLATE, active_port_path);
+    match major {
+        1 => write_hook_artifact(&legacy_path, &legacy, false),
+        2 => {
+            let path = config_dir.join("plugins/codemux/tui.js");
+            let content = render_opencode_plugin(OPENCODE_TUI_PLUGIN_TEMPLATE, active_port_path);
+            write_hook_artifact(&path, &content, false)?;
+            // Retire only our exact legacy bytes, after confirming the replacement
+            // is on disk. Never follow a symlink or remove a customized plugin.
+            if std::fs::read(&path).ok().as_deref() == Some(content.as_bytes())
+                && std::fs::symlink_metadata(&legacy_path)
+                    .ok()
+                    .is_some_and(|meta| meta.is_file())
+                && std::fs::read(&legacy_path).ok().as_deref() == Some(legacy.as_bytes())
+            {
+                if let Err(error) = std::fs::remove_file(&legacy_path) {
+                    eprintln!(
+                        "[codemux::hooks] Failed to retire {}: {error}",
+                        legacy_path.display()
+                    );
+                }
+            }
+            Some(())
+        }
+        _ => None,
     }
 }
 
 /// No-op on Windows, like the other agent hook registrations.
 #[cfg(target_os = "windows")]
-pub fn register_opencode_plugin() {}
+pub async fn register_opencode_plugin() {}
 
 /// Pi notify extension. Like OpenCode, Pi has no hook-config file — it
 /// auto-discovers TypeScript extensions in `~/.pi/agent/extensions/` at
@@ -1353,63 +1482,12 @@ pub fn register_pi_extension() {
 
     let ext_path = ext_dir.join("codemux-notify.ts");
     let content = build_pi_extension(&script_path);
-    let _ = std::fs::write(&ext_path, content);
+    let _ = write_hook_artifact(&ext_path, &content, false);
 }
 
 /// No-op on Windows — the Pi extension shells out to a POSIX script.
 #[cfg(target_os = "windows")]
 pub fn register_pi_extension() {}
-
-/// Remove all Codemux hook entries from ~/.claude/settings.json.
-/// Preserves all other settings and non-Codemux hooks.
-pub fn unregister_claude_code_hooks() {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-
-    let settings_path = std::path::PathBuf::from(&home).join(".claude/settings.json");
-    if !settings_path.exists() {
-        return;
-    }
-
-    let mut settings: serde_json::Value = match std::fs::read_to_string(&settings_path) {
-        Ok(content) => match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => return,
-        },
-        Err(_) => return,
-    };
-
-    let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
-        return;
-    };
-
-    // Remove codemux entries from each hook event array
-    let event_keys: Vec<String> = hooks.keys().cloned().collect();
-    for key in &event_keys {
-        if let Some(arr) = hooks.get_mut(key).and_then(|v| v.as_array_mut()) {
-            arr.retain(|entry| !entry_contains_codemux_hook(entry));
-        }
-    }
-
-    // Remove empty event arrays
-    hooks.retain(|_, v| {
-        v.as_array().map(|a| !a.is_empty()).unwrap_or(true)
-    });
-
-    // Remove empty hooks object
-    if hooks.is_empty() {
-        settings.as_object_mut().unwrap().remove("hooks");
-    }
-
-    match serde_json::to_string_pretty(&settings) {
-        Ok(json) => {
-            let _ = std::fs::write(&settings_path, json);
-        }
-        Err(e) => eprintln!("[codemux::hooks] Failed to serialize settings: {e}"),
-    }
-}
 
 /// Build the nested hooks JSON for a given event set, without touching
 /// the filesystem. Useful for asserting the on-disk format in tests.
@@ -1959,192 +2037,440 @@ case "$URL" in *:43199/*) exit 7 ;; *) exit 0 ;; esac
         }
     }
 
-    #[test]
-    fn merge_preserves_existing_hooks() {
-        let script = "/home/test/.codemux/hooks/notify.sh";
+    fn fixture_settings(home: &Path, relative: &str, content: &[u8]) -> PathBuf {
+        let path = home.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        path
+    }
 
-        // Simulate existing settings with an external hook
-        let mut settings = serde_json::json!({
-            "effortLevel": "high",
-            "hooks": {
-                "UserPromptSubmit": [{
-                    "matcher": "*",
-                    "hooks": [{"type": "command", "command": "external-notify.sh"}]
-                }]
-            }
-        });
-
-        // Merge codemux hooks using the same logic as register_claude_code_hooks
-        let hooks = settings
-            .as_object_mut()
+    fn freeze_mtime(path: &Path) -> std::time::SystemTime {
+        let time = std::time::UNIX_EPOCH + Duration::from_secs(1_234_567);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
             .unwrap()
-            .entry("hooks")
-            .or_insert(serde_json::json!({}));
+            .set_modified(time)
+            .unwrap();
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
 
-        let hook_events = [
-            ("UserPromptSubmit", "UserPromptSubmit"),
-            ("Stop", "Stop"),
+    #[test]
+    fn hook_config_invalid_json_and_shapes_are_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        for relative in [
+            ".claude/settings.json",
+            ".codex/hooks.json",
+            ".gemini/settings.json",
+        ] {
+            for content in [
+                "",
+                "{broken",
+                "[]",
+                "null",
+                r#"{"hooks":[]}"#,
+                r#"{"hooks":{"Stop":{}}}"#,
+                r#"{"hooks":{"Other":null}}"#,
+                r#"{"hooks":{"Stop":[{"hooks":{}}]}}"#,
+                r#"{"hooks":{"Stop":[{"hooks":[null]}]}}"#,
+                r#"{"hooks":{"Stop":[false]}}"#,
+            ] {
+                let path = fixture_settings(home.path(), relative, content.as_bytes());
+                let modified = freeze_mtime(&path);
+                merge_nested_hooks_file(
+                    &path,
+                    &CLAUDE_HOOK_EVENTS,
+                    "/test/.codemux/hooks/notify.sh",
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    modified
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hook_config_read_failure_is_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(&path).unwrap();
+        merge_nested_hooks_file(&path, &CLAUDE_HOOK_EVENTS, "/test/.codemux/hooks/notify.sh");
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn hook_config_preserves_mixed_user_entries_and_settings() {
+        let home = tempfile::tempdir().unwrap();
+        let script = "/test/.codemux/hooks/notify.sh";
+        let user_hook = serde_json::json!({"type":"command", "command":"user-notify", "timeout":9});
+        let prompt_hook = serde_json::json!({"type":"prompt", "prompt":"keep this"});
+        let mixed = serde_json::json!({
+            "matcher":"Bash", "custom":"keep", "hooks":[
+                {"type":"command", "command":format!("{script} Stop")}, user_hook, prompt_hook
+            ]
+        });
+        let separate = serde_json::json!({"hooks":[{"type":"command", "command":"another-hook"}]});
+        let settings = serde_json::json!({
+            "permissions":{"allow":["Read"]}, "other":{"keep":[1,2]},
+            "hooks":{"Stop":[mixed, separate,
+                {"command":format!("{script} Stop")},
+                {"matcher":"", "hooks":[{"type":"command", "command":format!("{script} Stop")}]}],
+                "Other":[{"hooks":[{"type":"prompt", "prompt":"untouched"}]}]}
+        });
+        let path = fixture_settings(
+            home.path(),
+            ".claude/settings.json",
+            &serde_json::to_vec(&settings).unwrap(),
+        );
+        merge_nested_hooks_file(&path, &[("Stop", "Stop")], script);
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(result["permissions"], settings["permissions"]);
+        assert_eq!(result["other"], settings["other"]);
+        assert_eq!(result["hooks"]["Other"], settings["hooks"]["Other"]);
+        assert_eq!(
+            result["hooks"]["Stop"][0],
+            serde_json::json!({
+                "matcher":"Bash", "custom":"keep", "hooks":[user_hook, prompt_hook]
+            })
+        );
+        assert_eq!(result["hooks"]["Stop"][1], separate);
+        assert_eq!(result["hooks"]["Stop"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            result["hooks"]["Stop"][2],
+            build_nested_hooks_json(script, &[("Stop", "Stop")])["Stop"][0]
+        );
+        let modified = freeze_mtime(&path);
+        merge_nested_hooks_file(&path, &[("Stop", "Stop")], script);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    #[test]
+    fn hook_config_noop_preserves_bytes_and_mtime_for_each_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let script = "/test/.codemux/hooks/notify.sh";
+        let mut agents = vec![
+            (".claude/settings.json", CLAUDE_HOOK_EVENTS.as_slice()),
+            (".codex/hooks.json", CODEX_HOOK_EVENTS.as_slice()),
         ];
-
-        for (event_name, event_type) in &hook_events {
-            let hook_cmd = format!("{script} {event_type}");
-            let codemux_entry = serde_json::json!({
-                "matcher": "",
-                "hooks": [{ "type": "command", "command": hook_cmd }]
-            });
-
-            let hook_array = hooks
-                .as_object_mut()
+        #[cfg(not(target_os = "windows"))]
+        agents.push((".gemini/settings.json", GEMINI_HOOK_EVENTS.as_slice()));
+        for (relative, events) in agents {
+            let mut settings =
+                serde_json::json!({"user":true,"hooks":build_nested_hooks_json(script, events)});
+            settings["hooks"][events[0].0]
+                .as_array_mut()
                 .unwrap()
-                .entry(*event_name)
-                .or_insert(serde_json::json!([]));
+                .push(serde_json::json!({"hooks":[{"type":"command","command":"user-hook"}]}));
+            let content = format!("{}\n", serde_json::to_string(&settings).unwrap());
+            let path = fixture_settings(home.path(), relative, content.as_bytes());
+            let modified = freeze_mtime(&path);
+            merge_nested_hooks_file(&path, events, script);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+                modified
+            );
+        }
+    }
 
-            if let Some(arr) = hook_array.as_array_mut() {
-                let existing_idx = arr.iter().position(|entry| entry_contains_codemux_hook(entry));
-                if let Some(idx) = existing_idx {
-                    arr[idx] = codemux_entry;
-                } else {
-                    arr.push(codemux_entry);
+    #[test]
+    fn hook_config_creates_missing_file_and_refuses_conflicting_edit() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        merge_nested_hooks_file(&path, &CLAUDE_HOOK_EVENTS, "/test/.codemux/hooks/notify.sh");
+        let snapshot = HookFile::read(&path).unwrap();
+        std::fs::write(&path, b"user edit").unwrap();
+        assert!(snapshot.replace(b"replacement", false).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"user edit");
+        assert_eq!(
+            std::fs::read_dir(home.path().join(".claude"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_config_keeps_mode_and_updates_symlink_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let home = tempfile::tempdir().unwrap();
+        let target = fixture_settings(home.path(), "dotfiles/settings.json", b"{\"user\":true}");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let path = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        symlink("../dotfiles/settings.json", &path).unwrap();
+        merge_nested_hooks_file(&path, &CLAUDE_HOOK_EVENTS, "/test/.codemux/hooks/notify.sh");
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(&path).unwrap(),
+            PathBuf::from("../dotfiles/settings.json")
+        );
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(settings["user"], true);
+        assert!(settings["hooks"]["Stop"].is_array());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let dangling = home.path().join(".claude/dangling.json");
+        symlink("../missing.json", &dangling).unwrap();
+        merge_nested_hooks_file(
+            &dangling,
+            &CLAUDE_HOOK_EVENTS,
+            "/test/.codemux/hooks/notify.sh",
+        );
+        assert!(!home.path().join("missing.json").exists());
+        assert!(std::fs::symlink_metadata(dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn hook_artifacts_are_idempotent_and_keep_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let plugin = render_opencode_plugin(OPENCODE_TUI_PLUGIN_TEMPLATE, "/test/active-port");
+        let extension = build_pi_extension("/test/.codemux/hooks/notify.sh");
+        for (relative, body, executable) in [
+            (".codemux/hooks/notify.sh", HOOK_SCRIPT, true),
+            (".codemux/hooks/gemini-notify.sh", GEMINI_HOOK_SCRIPT, true),
+            (
+                ".config/opencode/plugins/codemux/tui.js",
+                plugin.as_str(),
+                false,
+            ),
+            (
+                ".pi/agent/extensions/codemux-notify.ts",
+                extension.as_str(),
+                false,
+            ),
+        ] {
+            let path = home.path().join(relative);
+            write_hook_artifact(&path, body, executable).unwrap();
+            if executable {
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o755
+                );
+            }
+            let modified = freeze_mtime(&path);
+            write_hook_artifact(&path, body, executable).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                modified
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
+            write_hook_artifact(&path, &format!("{body}\n"), executable).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o750
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn hook_opencode_installs_one_version_and_retires_only_generated_legacy() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".config/opencode");
+        let active = "/test/.codemux/hooks/active-port";
+        let legacy = config.join("plugin/codemux-notify.js");
+        let modern = config.join("plugins/codemux/tui.js");
+        install_opencode_plugin_in(&config, active, 1).unwrap();
+        let legacy_modified = freeze_mtime(&legacy);
+        install_opencode_plugin_in(&config, active, 1).unwrap();
+        assert_eq!(
+            std::fs::metadata(&legacy).unwrap().modified().unwrap(),
+            legacy_modified
+        );
+        assert!(legacy.exists());
+        assert!(!modern.exists());
+        install_opencode_plugin_in(&config, active, 2).unwrap();
+        assert!(modern.exists());
+        assert!(!legacy.exists());
+        let modified = freeze_mtime(&modern);
+        install_opencode_plugin_in(&config, active, 2).unwrap();
+        assert_eq!(
+            std::fs::metadata(&modern).unwrap().modified().unwrap(),
+            modified
+        );
+        std::fs::write(&legacy, "// user plugin").unwrap();
+        install_opencode_plugin_in(&config, active, 2).unwrap();
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "// user plugin");
+        std::fs::remove_file(&legacy).unwrap();
+        let target = home.path().join("legacy.js");
+        std::fs::write(
+            &target,
+            render_opencode_plugin(OPENCODE_PLUGIN_TEMPLATE, active),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &legacy).unwrap();
+        install_opencode_plugin_in(&config, active, 2).unwrap();
+        assert!(std::fs::symlink_metadata(&legacy)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(target.exists());
+        // A failed replacement must leave the generated legacy plugin alone.
+        let blocked = home.path().join("blocked");
+        install_opencode_plugin_in(&blocked, active, 1).unwrap();
+        std::fs::write(blocked.join("plugins"), "not a directory").unwrap();
+        assert!(install_opencode_plugin_in(&blocked, active, 2).is_none());
+        assert!(blocked.join("plugin/codemux-notify.js").exists());
+    }
+
+    #[test]
+    fn hook_config_does_not_claim_user_commands_that_mention_our_script() {
+        for command in [
+            "echo /test/.codemux/hooks/notify.sh",
+            "/test/.codemux/hooks/notify.sh Stop && user-command",
+            "/test/.codemux/hooks/notify.sh.custom",
+        ] {
+            assert!(!is_codemux_hook(
+                &serde_json::json!({"type":"command", "command":command})
+            ));
+        }
+        assert!(is_codemux_hook(&serde_json::json!({
+            "command":r#"powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\test\.codemux\hooks\notify.ps1" Stop"#
+        })));
+    }
+
+    #[test]
+    fn hook_artifact_readers_only_observe_complete_replacements() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("notify.sh");
+        let first = "a".repeat(64 * 1024);
+        let second = "b".repeat(64 * 1024);
+        write_hook_artifact(&path, &first, false).unwrap();
+        let reading = Arc::new(AtomicBool::new(true));
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let reader = {
+            let path = path.clone();
+            let reading = reading.clone();
+            let ready = ready.clone();
+            let first = first.clone();
+            let second = second.clone();
+            std::thread::spawn(move || {
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+                ready.wait();
+                let mut reads = 1;
+                while reading.load(Ordering::Relaxed) {
+                    let content = std::fs::read_to_string(&path).unwrap();
+                    assert!(
+                        content == first || content == second,
+                        "reader saw a partial artifact"
+                    );
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        ready.wait();
+        for body in [&second, &first, &second, &first] {
+            write_hook_artifact(&path, body, false).unwrap();
+        }
+        reading.store(false, Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0);
+    }
+
+    /// Set CODEMUX_TEST_OPENCODE_BINARY to a prepared native OpenCode 2.x binary.
+    /// No launcher, account, real HOME, background service, or model is used.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires an explicitly selected installed OpenCode executable"]
+    fn opencode_loader_smoke_isolated_home() {
+        use std::os::unix::process::CommandExt;
+        let binary = PathBuf::from(
+            std::env::var_os("CODEMUX_TEST_OPENCODE_BINARY")
+                .expect("select a prepared OpenCode executable"),
+        );
+        assert!(binary.is_absolute() && binary.is_file());
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config/opencode");
+        let run = |args: &[&str]| {
+            let stdout = tempfile::NamedTempFile::new_in(home.path()).unwrap();
+            let stderr = tempfile::NamedTempFile::new_in(home.path()).unwrap();
+            let mut command = std::process::Command::new(&binary);
+            command
+                .args(args)
+                .current_dir(home.path())
+                .env_clear()
+                .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
+                .env("OPENCODE_DISABLE_MODELS_FETCH", "true")
+                .env("OPENCODE_DISABLE_DEFAULT_PLUGINS", "true")
+                .env("HOME", home.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("XDG_CONFIG_HOME", home.path().join("config"))
+                .env("XDG_DATA_HOME", home.path().join("data"))
+                .env("XDG_CACHE_HOME", home.path().join("cache"))
+                .env("XDG_STATE_HOME", home.path().join("state"))
+                .stdin(std::process::Stdio::null())
+                .stdout(stdout.reopen().unwrap())
+                .stderr(stderr.reopen().unwrap())
+                .process_group(0);
+            struct Probe(std::process::Child);
+            impl Drop for Probe {
+                fn drop(&mut self) {
+                    // The private CLI may start its own server; stop our entire
+                    // process group even if the CLI already exited.
+                    unsafe {
+                        libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+                    }
+                    let _ = self.0.wait();
                 }
             }
-        }
-
-        // Verify: effortLevel preserved
-        assert_eq!(settings["effortLevel"], "high");
-
-        // Verify: external hook still present in UserPromptSubmit
-        let ups = settings["hooks"]["UserPromptSubmit"].as_array().unwrap();
-        assert_eq!(ups.len(), 2, "should have external + codemux hooks");
-        assert!(ups[0]["hooks"][0]["command"]
-            .as_str()
+            let mut probe = Probe(command.spawn().unwrap());
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let status = loop {
+                if let Some(status) = probe.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "OpenCode loader timed out"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            drop(probe);
+            let out = std::fs::read_to_string(stdout.path()).unwrap();
+            let err = std::fs::read_to_string(stderr.path()).unwrap();
+            assert!(status.success(), "OpenCode failed: {out}\n{err}");
+            (out, err)
+        };
+        let (version, _) = run(&["--version"]);
+        let version = version
+            .split_whitespace()
+            .last()
             .unwrap()
-            .contains("external"));
-
-        // Verify: codemux hook has correct format
-        assert_eq!(ups[1]["matcher"], "");
-        assert!(ups[1]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains(".codemux/hooks/notify.sh"));
-
-        // Verify: Stop has only codemux hook (newly created)
-        let stop = settings["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 1);
-    }
-
-    #[test]
-    fn unregister_removes_codemux_hooks_only() {
-        // Simulate settings with mixed external + Codemux hooks
-        let mut settings = serde_json::json!({
-            "effortLevel": "high",
-            "hooks": {
-                "UserPromptSubmit": [
-                    {
-                        "matcher": "*",
-                        "hooks": [{"type": "command", "command": "external-notify.sh"}]
-                    },
-                    {
-                        "matcher": "",
-                        "hooks": [{"type": "command", "command": "/home/user/.codemux/hooks/notify.sh UserPromptSubmit"}]
-                    }
-                ],
-                "Stop": [
-                    {
-                        "matcher": "",
-                        "hooks": [{"type": "command", "command": "/home/user/.codemux/hooks/notify.sh Stop"}]
-                    }
-                ],
-                "PostToolUse": [
-                    {
-                        "matcher": "*",
-                        "hooks": [{"type": "command", "command": "external-notify.sh"}]
-                    }
-                ]
-            }
-        });
-
-        // Run unregister logic (same as unregister_claude_code_hooks but on in-memory value)
-        let hooks = settings.get_mut("hooks").unwrap().as_object_mut().unwrap();
-        let event_keys: Vec<String> = hooks.keys().cloned().collect();
-        for key in &event_keys {
-            if let Some(arr) = hooks.get_mut(key).and_then(|v| v.as_array_mut()) {
-                arr.retain(|entry| !entry_contains_codemux_hook(entry));
-            }
-        }
-        hooks.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
-        if hooks.is_empty() {
-            settings.as_object_mut().unwrap().remove("hooks");
-        }
-
-        // effortLevel preserved
-        assert_eq!(settings["effortLevel"], "high");
-
-        let hooks = settings["hooks"].as_object().unwrap();
-
-        // UserPromptSubmit: external entry remains, codemux entry removed
-        let ups = hooks["UserPromptSubmit"].as_array().unwrap();
-        assert_eq!(ups.len(), 1);
-        assert!(ups[0]["hooks"][0]["command"].as_str().unwrap().contains("external"));
-
-        // Stop: was codemux-only, should be removed entirely
-        assert!(!hooks.contains_key("Stop"), "Stop should be removed (was codemux-only)");
-
-        // PostToolUse: external-only, untouched
-        let ptu = hooks["PostToolUse"].as_array().unwrap();
-        assert_eq!(ptu.len(), 1);
-    }
-
-    #[test]
-    fn unregister_removes_hooks_key_when_empty() {
-        let mut settings = serde_json::json!({
-            "effortLevel": "high",
-            "hooks": {
-                "Stop": [
-                    {
-                        "matcher": "",
-                        "hooks": [{"type": "command", "command": "/home/user/.codemux/hooks/notify.sh Stop"}]
-                    }
-                ]
-            }
-        });
-
-        let hooks = settings.get_mut("hooks").unwrap().as_object_mut().unwrap();
-        let event_keys: Vec<String> = hooks.keys().cloned().collect();
-        for key in &event_keys {
-            if let Some(arr) = hooks.get_mut(key).and_then(|v| v.as_array_mut()) {
-                arr.retain(|entry| !entry_contains_codemux_hook(entry));
-            }
-        }
-        hooks.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
-        if hooks.is_empty() {
-            settings.as_object_mut().unwrap().remove("hooks");
-        }
-
-        assert_eq!(settings["effortLevel"], "high");
-        assert!(settings.get("hooks").is_none(), "hooks key should be removed when empty");
-    }
-
-    #[test]
-    fn detects_codemux_hook_in_both_formats() {
-        // Correct nested format
-        let correct = serde_json::json!({
-            "matcher": "",
-            "hooks": [{"type": "command", "command": "/home/user/.codemux/hooks/notify.sh Stop"}]
-        });
-        assert!(entry_contains_codemux_hook(&correct));
-
-        // Legacy flat format (should also be detected for cleanup)
-        let legacy = serde_json::json!({
-            "type": "command",
-            "command": "/home/user/.codemux/hooks/notify.sh Stop"
-        });
-        assert!(entry_contains_codemux_hook(&legacy));
-
-        // Non-codemux entry
-        let other = serde_json::json!({
-            "matcher": "*",
-            "hooks": [{"type": "command", "command": "external-notify.sh"}]
-        });
-        assert!(!entry_contains_codemux_hook(&other));
+            .trim_start_matches('v');
+        let major: u32 = version.split('.').next().unwrap().parse().unwrap();
+        let active = home.path().join(".codemux/hooks/active-port");
+        let active = active.to_str().unwrap();
+        install_opencode_plugin_in(&config, active, 1).unwrap();
+        assert_eq!(major, 2, "select an installed OpenCode 2.x binary");
+        // Reproduce F17 using the actual legacy file, even outside Codemux.
+        let (_, errors) = run(&["plugin", "list", "--standalone", "--print-logs"]);
+        assert!(errors.contains("failed to load plugin") && errors.contains("codemux-notify.js"));
+        install_opencode_plugin_in(&config, active, 2).unwrap();
+        let (out, errors) = run(&["plugin", "list", "--standalone", "--print-logs"]);
+        assert!(
+            out.contains("plugins/codemux"),
+            "terminal plugin was not discovered: {out}"
+        );
+        assert!(!errors.contains("failed to load plugin"), "{errors}");
     }
 }
