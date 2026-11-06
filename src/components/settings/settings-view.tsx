@@ -2657,17 +2657,17 @@ export function SettingsView() {
               <SectionGroup>
                 <SubsectionHeader title="Tools" />
                 <div className="space-y-1">
-                <SettingRow
-                  label="Desktop-size background browser"
-                  description="Render the agent's background browser at the Browser section's default size (1280×800) and scale it to fit the peek."
-                >
-                  <Switch
-                    checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? true}
-                    onCheckedChange={(checked) => {
-                      updateSyncedSetting("agent_chat", "background_browser_desktop_viewport", checked).catch(console.error);
-                    }}
-                  />
-                </SettingRow>
+                  <SettingRow
+                    label="Desktop-size background browser"
+                    description="Render the agent's background browser at the Browser section's default size (1280×800) and scale it to fit the peek."
+                  >
+                    <Switch
+                      checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? true}
+                      onCheckedChange={(checked) => {
+                        updateSyncedSetting("agent_chat", "background_browser_desktop_viewport", checked).catch(console.error);
+                      }}
+                    />
+                  </SettingRow>
                 </div>
               </SectionGroup>
             )}
