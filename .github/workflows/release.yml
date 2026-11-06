@@ -279,6 +279,10 @@ jobs:
           # plugin-appimage `:continuous` rebuild — see pre-cache step above)
           # but cheap insurance against a future similar incident.
           NO_STRIP: "true"
+          # Keep linuxdeploy's patchelf away from the Bun-compiled sidecars;
+          # rewriting their rpath corrupts them and aborts the AppImage step.
+          # See scripts/patchelf-skip-bun.sh.
+          PATCHELF: ${{ github.workspace }}/scripts/patchelf-skip-bun.sh
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Codemux ${{ github.ref_name }}"
