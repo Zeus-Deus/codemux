@@ -42,6 +42,34 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// callers (`tools/call`) override this per call.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The built-in browser backend allows 60 s. Its relay must leave time for
+/// that work and the control exchange to finish before giving up.
+pub(crate) const BROWSER_RELAY_TIMEOUT: Duration = Duration::from_secs(90);
+
+pub(crate) fn tool_call_timeout(is_codemux_self: bool, tool: &str) -> Duration {
+    select_tool_call_timeout(is_codemux_self, tool, DEFAULT_REQUEST_TIMEOUT, BROWSER_RELAY_TIMEOUT)
+}
+
+fn select_tool_call_timeout(is_codemux_self: bool, tool: &str, ordinary: Duration, browser: Duration) -> Duration {
+    if is_codemux_self && tool.starts_with("browser_") { browser } else { ordinary }
+}
+
+/// Both transports use the same per-tool budget. The override belongs to
+/// built-in tools, never to third-party servers with similar tool names.
+pub(super) async fn relay_tool_call(
+    child: Option<&JsonRpcChild>, remote: Option<&HttpMcpClient>, params: Value, budget: Duration,
+) -> Result<Value, String> {
+    if let Some(child) = child {
+        child.request_with_timeout("tools/call", params, budget).await
+            .map_err(|e| format!("tools/call failed: {e}"))
+    } else if let Some(remote) = remote {
+        tokio::time::timeout(budget, remote.request("tools/call", params)).await
+            .map_err(|_| "tools/call timed out".to_string())?
+    } else {
+        Err("MCP transport disappeared before tools/call".into())
+    }
+}
+
 /// Tool descriptor as stored in the registry. The unprefixed `name` is
 /// what we send back to the server in `tools/call`; `prefixed_name` is
 /// what the agent sees so collisions across MCP servers are impossible.
@@ -609,6 +637,97 @@ mod tests {
             disabled: false,
             transport,
             raw: Value::Null,
+        }
+    }
+
+    #[test]
+    fn browser_relay_deadline_is_only_for_builtin_browser_tools() {
+        assert_eq!(tool_call_timeout(true, "browser_wait"), Duration::from_secs(90));
+        assert_eq!(tool_call_timeout(true, "browser_navigate"), Duration::from_secs(90));
+        assert_eq!(tool_call_timeout(false, "browser_navigate"), Duration::from_secs(30));
+        assert_eq!(tool_call_timeout(true, "workspace_info"), Duration::from_secs(30));
+        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(60));
+    }
+
+    fn injected_relay_budget(builtin: bool) -> Duration {
+        // Scale the former 30 s cutoff and the new 90 s budget to milliseconds.
+        select_tool_call_timeout(builtin, "browser_wait", Duration::from_millis(100), Duration::from_millis(300))
+    }
+
+    #[tokio::test]
+    async fn browser_relay_deadline_stdio_allows_slow_work_and_bounds_hangs() {
+        for (builtin, hung, succeeds) in [(true, false, true), (true, true, false), (false, false, false)] {
+            let script = format!(r#"
+import json, sys, time
+for line in sys.stdin:
+    request = json.loads(line)
+    if {hung}:
+        sys.stdin.read() # no response until shutdown closes stdin
+        break
+    time.sleep(0.15)
+    print(json.dumps({{"jsonrpc":"2.0", "id":request["id"], "result":{{"content":[{{"type":"text","text":"finished"}}]}}}}), flush=True)
+"#, hung = if hung { "True" } else { "False" });
+            let child = JsonRpcChild::spawn(SpawnConfig {
+                program: "python3".into(), args: vec!["-u".into(), "-c".into(), script],
+                env: HashMap::new(), cwd: None, default_timeout: Duration::from_millis(100),
+            }).await.unwrap();
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(Duration::from_secs(2), relay_tool_call(
+                Some(&child), None, json!({"name":"browser_wait","arguments":{"text":"ready"}}), injected_relay_budget(builtin),
+            )).await.unwrap();
+            child.shutdown().await.unwrap();
+            if succeeds {
+                assert_eq!(result.unwrap()["content"][0]["text"], "finished");
+                assert!(started.elapsed() > Duration::from_millis(100), "work exceeds the old relay budget");
+            } else {
+                assert!(result.unwrap_err().contains("timed out"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_relay_deadline_http_allows_slow_work_and_bounds_hangs() {
+        use mockito::Matcher;
+        for (builtin, hung, succeeds) in [(true, false, true), (true, true, false), (false, false, false)] {
+            let mut server = mockito::Server::new_async().await;
+            server.mock("POST", "/mcp")
+                .match_body(Matcher::PartialJson(json!({"method":"initialize"})))
+                .with_header("content-type", "application/json")
+                .with_body(json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}).to_string())
+                .create_async().await;
+            server.mock("POST", "/mcp")
+                .match_body(Matcher::PartialJson(json!({"method":"notifications/initialized"})))
+                .with_status(202).create_async().await;
+            let (release, resume) = std::sync::mpsc::channel();
+            let resume = std::sync::Mutex::new(resume);
+            let call = server.mock("POST", "/mcp")
+                .match_body(Matcher::PartialJson(json!({"method":"tools/call","params":{"name":"browser_wait","arguments":{"text":"ready"}}})))
+                .with_header("content-type", "application/json")
+                .with_chunked_body(move |writer| {
+                    if hung {
+                        let _ = resume.lock().unwrap().recv();
+                    } else {
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
+                    writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"finished\"}]}}")
+                }).create_async().await;
+            let mut config = make_config("fixture", "fixture", McpTransport::Http);
+            config.command = format!("{}/mcp", server.url());
+            let remote = HttpMcpClient::connect(&config).await.unwrap();
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(Duration::from_secs(2), relay_tool_call(
+                None, Some(&remote), json!({"name":"browser_wait","arguments":{"text":"ready"}}), injected_relay_budget(builtin),
+            )).await;
+            // Release the fixture even when the outer guard detects a hang.
+            let _ = release.send(());
+            let result = result.unwrap();
+            if succeeds {
+                assert_eq!(result.unwrap()["content"][0]["text"], "finished");
+                assert!(started.elapsed() > Duration::from_millis(100));
+            } else {
+                assert!(result.unwrap_err().contains("timed out"));
+            }
+            call.assert_async().await;
         }
     }
 
