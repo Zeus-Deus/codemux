@@ -1,5 +1,5 @@
 use crate::agent_control::{registry, Audience, CallerView, ControlAccess, ControlError, ErrorCode};
-use crate::control::{send_control_request, ControlRequest, ControlResponse};
+use crate::control::{send_mcp_control_request, ControlRequest, ControlResponse};
 use crate::control_identity::{self, AGENT_PROCESS_ENV};
 use crate::mcp::protocol::stdio::{Handler, Reply};
 use crate::mcp::protocol::{
@@ -1292,10 +1292,17 @@ struct LegacyJob {
     reply: oneshot::Sender<Result<Value, RpcError>>,
 }
 
+tokio::task_local! {
+    // Keep transport state out of the public tool result. This also catches
+    // socket failures inside helpers such as workspace lookup for local git.
+    static LEGACY_OUTCOME_UNKNOWN: std::cell::Cell<bool>;
+}
+
 impl LegacyLane {
     fn spawn(run: RunTool) -> Self {
         let (jobs, mut queue) = mpsc::unbounded_channel::<LegacyJob>();
         tokio::spawn(async move {
+            let mut outcome_unknown = false;
             while let Some(LegacyJob { call, reply }) = queue.recv().await {
                 // A request cancelled while queued is skipped. One cancelled
                 // while running still runs to the end: dropping it would not
@@ -1304,13 +1311,25 @@ impl LegacyLane {
                 if reply.is_closed() {
                     continue;
                 }
+                if outcome_unknown {
+                    let _ = reply.send(Ok(protocol::error_result(
+                        "A previous Codemux request has an unknown outcome and may still be running. Later legacy tools are refused to prevent overlapping mutations. Check the earlier outcome and reconnect this MCP server before continuing.",
+                    )));
+                    continue;
+                }
                 let name = call.name.clone();
                 // A panicking tool must not end the lane: every later legacy
                 // call would fail while the process still looks healthy.
-                let result = AssertUnwindSafe(async { run(ToolKind::Legacy, call).await })
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|_| Ok(protocol::error_result(format!("{name} failed unexpectedly"))));
+                let (result, uncertain) = LEGACY_OUTCOME_UNKNOWN.scope(std::cell::Cell::new(false), async {
+                    let result = AssertUnwindSafe(async { run(ToolKind::Legacy, call).await })
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| Ok(protocol::error_result(format!("{name} failed unexpectedly"))));
+                    (result, LEGACY_OUTCOME_UNKNOWN.with(std::cell::Cell::get))
+                }).await;
+                // A new MCP connection creates a fresh lane. A new control
+                // socket alone cannot acknowledge completion of the old job.
+                outcome_unknown |= uncertain;
                 let _ = reply.send(result);
             }
         });
@@ -2010,7 +2029,7 @@ fn automation_input_from_args(arguments: &Value) -> Value {
 // ---------------------------------------------------------------------------
 
 async fn call_socket(command: &str, params: Value) -> Result<Value, String> {
-    let response: ControlResponse = send_control_request(ControlRequest {
+    let response: ControlResponse = mcp_socket_request(ControlRequest {
         command: command.to_string(),
         params,
     })
@@ -2023,6 +2042,17 @@ async fn call_socket(command: &str, params: Value) -> Result<Value, String> {
     }
 }
 
+async fn mcp_socket_request(request: ControlRequest) -> Result<ControlResponse, String> {
+    send_mcp_control_request(request).await.map_err(mcp_socket_error)
+}
+
+fn mcp_socket_error(error: crate::control::McpControlError) -> String {
+    if error.outcome_unknown {
+        let _ = LEGACY_OUTCOME_UNKNOWN.try_with(|unknown| unknown.set(true));
+    }
+    error.to_string()
+}
+
 /// Runs a registry tool in the app through socket `tool_call`, so every door
 /// shares one dispatcher, and returns its CallToolResult as the app built it.
 async fn relay_registry_call(call: CallToolParams) -> Result<Value, RpcError> {
@@ -2033,8 +2063,9 @@ async fn relay_registry_call(call: CallToolParams) -> Result<Value, RpcError> {
     };
     // A refusal this client raised itself keeps its code (`server_too_old`
     // when a narrowed client meets an app that ignores `--access`, which a
-    // retry cannot fix); connect and read failures are `app_unavailable`.
-    let response = match send_control_request(request).await {
+    // retry cannot fix). Failures before admission are `app_unavailable`;
+    // failures after admission keep the non-retryable `outcome_unknown` code.
+    let response = match mcp_socket_request(request).await {
         Ok(response) => response,
         Err(detail) => return Ok(registry::mcp_error(&ControlError::from_text(detail, ErrorCode::AppUnavailable))),
     };
@@ -3641,6 +3672,75 @@ mod tests {
         assert_eq!(result["content"][0]["text"], "boom failed unexpectedly");
         let (next, _) = later(server.request(request(2, "pane_list", json!({}))));
         assert_eq!(next.await.unwrap()["content"][0]["text"], "pane_list");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_lane_deadline_refuses_the_next_mutation_until_reconnected() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mutation.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let finish_backend = finish.clone();
+        let (started, running) = oneshot::channel();
+        let backend = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut lines = BufReader::new(reader).lines();
+            assert!(lines.next_line().await.unwrap().unwrap().contains("notify"));
+            started.send(()).unwrap();
+            // App-side mutation keeps running after the caller times out.
+            finish_backend.notified().await;
+            let _ = writer.write_all(b"{\"ok\":true,\"protocol_version\":2,\"data\":null,\"error\":null}\n").await;
+            // A fresh MCP connection can resume after the outcome is checked.
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            BufReader::new(reader).lines().next_line().await.unwrap().unwrap();
+            writer.write_all(b"{\"ok\":true,\"protocol_version\":2,\"data\":null,\"error\":null}\n").await.unwrap();
+        });
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_in_tool = runs.clone();
+        let run: RunTool = Arc::new(move |_, _| {
+            let path = path.clone();
+            let runs = runs_in_tool.clone();
+            Box::pin(async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                let result = crate::control::send_mcp_control_request_to(
+                    &[path], ControlRequest { command: "notify".into(), params: json!({}) }, None,
+                    Duration::from_millis(20), Duration::from_millis(50),
+                ).await;
+                Ok(match result {
+                    Ok(_) => protocol::text_result("done"),
+                    Err(error) => {
+                        let text = mcp_socket_error(error);
+                        let structured = registry::mcp_error(&ControlError::from_text(text.clone(), ErrorCode::AppUnavailable));
+                        assert_eq!(structured["structuredContent"]["error"]["code"], "outcome_unknown");
+                        assert_eq!(structured["structuredContent"]["error"]["retryable"], false);
+                        protocol::error_result(text)
+                    }
+                })
+            })
+        });
+        let call = || CallToolParams { name: "notify".into(), arguments: json!({}), meta: None };
+        let lane = LegacyLane::spawn(run.clone());
+        let first = lane.submit(call());
+        let second = lane.submit(call());
+        running.await.unwrap();
+        let result = first.await.unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("outcome is unknown"));
+        let refused = second.await.unwrap();
+        assert_eq!(refused["isError"], true);
+        assert!(refused["content"][0]["text"].as_str().unwrap().contains("reconnect"));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the next mutation was never started");
+        assert!(!backend.is_finished(), "the admitted mutation is still running");
+        finish.notify_one();
+        let fresh = LegacyLane::spawn(run);
+        assert_eq!(fresh.submit(call()).await.unwrap()["content"][0]["text"], "done");
+        backend.await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 
     async fn call_html_render(arguments: Value) -> Value {
