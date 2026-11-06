@@ -113,10 +113,7 @@ pub fn plugin_dirs_value(ours: &Path, inherited: Option<&OsStr>) -> OsString {
 /// sidecars and helper agents. Call it first thing at startup, next to
 /// [`crate::control_identity::scrub_inherited_agent_identity`].
 pub fn scrub_inherited_plugin_dirs() {
-    let Some(inherited) = std::env::var_os(PLUGIN_DIRS_ENV) else {
-        return;
-    };
-    let Some(kept) = without_codemux_dirs(&inherited) else {
+    let Some(kept) = inherited_without_codemux_dirs() else {
         return;
     };
     // Same placement as the identity scrub: before other threads read the env.
@@ -127,6 +124,15 @@ pub fn scrub_inherited_plugin_dirs() {
             std::env::set_var(PLUGIN_DIRS_ENV, kept);
         }
     }
+}
+
+/// This process's `CLAUDE_CODE_PLUGIN_DIRS` without Codemux's directories, or
+/// `None` when it holds none. Every agent child Codemux spawns gets this
+/// value (see `json_rpc_child`), so a runtime started from a Codemux
+/// terminal never hands that terminal's tools to the agents it launches;
+/// they get their own tools per session instead.
+pub fn inherited_without_codemux_dirs() -> Option<OsString> {
+    without_codemux_dirs(&std::env::var_os(PLUGIN_DIRS_ENV)?)
 }
 
 /// `value` without Codemux's directories, or `None` when it had none.

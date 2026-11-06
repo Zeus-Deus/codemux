@@ -108,6 +108,7 @@ Codemux writes no MCP config into your folders or your user config. Agents get i
 - **Chats in Codemux** get their tools per session.
 - **Claude Code typed in a Codemux terminal** gets them from a small Claude Code plugin in Codemux's own data folder. Codemux points the terminal at it with `CLAUDE_CODE_PLUGIN_DIRS`; a Claude started anywhere else never sees it. Its tools are named `mcp__plugin_codemux_codemux__<tool>`. They are the agent tools (browser, git, terminals, and the older workspace tools) for that terminal's workspace, with no thread control, and administration tools such as `terminal_write` and `automation_create` are refused.
 - Terminals opened before you updated Codemux don't have the plugin yet. Open a new terminal.
+- **Terminals on a device** get the plugin from that device's terminal daemon, which runs the device's own `codemux-remote mcp`. A daemon that was already running when you updated keeps serving new terminals without it until it restarts: when the device reboots, or about an hour after its last Codemux terminal there closes. Codemux logs a warning when it connects to such a daemon.
 - **Other CLIs typed in a terminal** (Codex, OpenCode, Gemini, Pi) get no Codemux MCP server there. They can use the `codemux` command instead.
 
 To run Claude Code in a Codemux terminal without the plugin, start it with `CLAUDE_CODE_PLUGIN_DIRS= claude`, or with `--strict-mcp-config`, which also leaves out plugin servers. To drive Codemux from such a Claude Code with thread control, give it your entry explicitly. Save this as `~/.claude/codemux-mcp.json`:
@@ -126,9 +127,9 @@ claude --mcp-config ~/.claude/codemux-mcp.json --strict-mcp-config
 
 Codemux used to write a `codemux` entry into `.mcp.json` in every workspace folder, including your home folder when a workspace was opened there. Claude Code reads `.mcp.json` from parent folders too, so every Claude below such a folder got Codemux's tools, even ones another program started for an unrelated project.
 
-- Codemux now removes those entries on each start: in your home folder, in each workspace folder and its parents up to your home folder, and in Codemux's worktrees. It removes only an entry exactly as Codemux wrote it (with `CODEMUX_MCP_PROVIDER_ORIGIN` or `CODEMUX_WORKSPACE_ID`, and no other settings), deletes a `.mcp.json` only when nothing else was in it, and leaves symlinks and files it can't read alone.
+- Codemux now removes those entries on each start: in your home folder, in each open or archived workspace folder and its parents up to your home folder, and in Codemux's worktrees. Before it starts a terminal or chat in a folder it opens later, it does the same for that folder and its parents. It removes only an entry exactly as Codemux wrote it (`codemux mcp` with `CODEMUX_MCP_PROVIDER_ORIGIN` or `CODEMUX_WORKSPACE_ID`, and no other settings), deletes a `.mcp.json` only when nothing else was in it, and leaves symlinks and files it can't read alone.
 - An entry that might be yours, such as a bare `codemux mcp` or one with `--client`, is kept, and the Codemux log says so. Delete it yourself if you didn't add it.
-- If an old entry is still started somewhere, its `codemux mcp` offers no tools and refuses every call, and its instructions say the entry is obsolete.
+- An old entry in a folder Codemux never opens stays until you delete it. If the entry sets `CODEMUX_MCP_PROVIDER_ORIGIN` and its command is a current Codemux, that `codemux mcp` offers no tools, refuses every call, and says the entry is obsolete. Nothing disables an entry whose command is an older Codemux build, which still serves its tools, or one that sets only `CODEMUX_WORKSPACE_ID`, which runs a full `codemux mcp`. Delete those.
 - `~/.vexis/mcp-servers.yaml` is never changed.
 
 ## From another device
@@ -530,7 +531,7 @@ When you add a server under **Settings → Connections → Devices**, Codemux in
 
 `codemux-remote` writes no agent config on the server. Codemux chats and remote tasks that run Claude Code on the server, and Claude Code typed in a Codemux terminal on it, get that server's `codemux-remote mcp` per session. To use it from another agent there, add it yourself, for example `claude mcp add --scope user codemux -- ~/.local/bin/codemux-remote mcp`. A Vexis entry for it in `~/.vexis/mcp-servers.yaml` keeps working.
 
-Older versions of `codemux-remote serve` added `codemux-remote mcp` to `~/.claude.json` as `codemux`. It now removes that entry when it starts, but only if it is exactly what it wrote (`codemux-remote` with the single argument `mcp`).
+Older versions of `codemux-remote serve` added `codemux-remote mcp` to `~/.claude.json` as `codemux`, and keep doing so until the service is updated. On a machine where the Codemux app also runs, Codemux and `codemux-remote serve` remove that entry when they start, but only if it is exactly what was written: `codemux-remote` with the single argument `mcp` and no other settings. On a server that runs only `codemux-remote`, the entry stays. An entry you add with `claude mcp add` is never removed.
 
 Outside agents see workspaces on your devices in `workspace_list` with `native_control_available: false`. Thread tools can't target them yet.
 
@@ -581,7 +582,7 @@ A paired phone or browser can remove a clean worktree, for example with **Device
 - **A wait ends with a client timeout.** Lower `timeout_ms`, or raise the client's tool timeout (`timeout` for Hermes, `tool_timeout_sec` for Codex).
 - **"Couldn’t listen on port …".** Another program uses the port. Pick another one in Settings, then update your proxy and URLs.
 - **Sign-in asks again after you changed the origin or port.** Sign-ins and tokens are bound to the URL. Sign in again and issue new tokens.
-- **`~/.claude.json` has a `codemux` entry that runs `codemux-remote mcp`.** An older `codemux-remote` wrote it, and it has no thread tools. Codemux and current `codemux-remote` remove it when they start, if it is exactly what was written. To fix it now, run `claude mcp remove --scope user codemux`, then add the entry above. Neither touches an entry that runs another program.
+- **`~/.claude.json` has a `codemux` entry that runs `codemux-remote mcp`.** An older `codemux-remote` wrote it, or you added it, and it has no thread tools. Where the Codemux app runs too, Codemux and current `codemux-remote` remove it when they start, if it is exactly what was written. To fix it now, run `claude mcp remove --scope user codemux`, then add the entry above. Neither touches an entry that runs another program.
 - **`codemux-remote` refuses `workspace_info` with "missing field `id`".** Its background service still runs the old version. Run `systemctl --user restart codemux-remote` on that device.
 
 ## Error codes

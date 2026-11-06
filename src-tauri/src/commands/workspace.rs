@@ -3624,7 +3624,6 @@ mod phase_1_6_close_tests {
     //! phases.
     use super::*;
     use crate::state::{AppStateStore, SplitDirection, WorkspacePresetLayout};
-    use tempfile::TempDir;
 
     #[test]
     fn close_workspace_removes_workspace_from_state() {

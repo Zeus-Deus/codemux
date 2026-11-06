@@ -11,6 +11,7 @@ import {
   resetMcpRefreshTimeoutForTests,
   setMcpRefreshTimeoutForTests,
   resetQueryFactoryForTests,
+  resolveHostCommand,
   setInterruptExitTimeoutForTests,
   setQueryFactoryForTests,
   type SessionStartInput,
@@ -1659,11 +1660,10 @@ test("MCP round 4: managed sessions exclude plugin bridge names", async () => {
 });
 
 test("a host MCP server is this session's own codemux stdio server", async () => {
-  const { homedir } = await import("node:os");
-  const hostMcpServer = { command: "~/.local/bin/codemux-remote", args: ["mcp", "--state-dir", "/srv/state"] };
+  const hostMcpServer = { command: "/srv/bin/codemux-remote", args: ["mcp", "--state-dir", "/srv/state"] };
   const session = new ClaudeSession(minimalInput({ hostMcpServer }), recordingEmitter().emit);
   expect(fake.capturedOptions?.mcpServers).toEqual({
-    codemux: { type: "stdio", command: `${homedir()}/.local/bin/codemux-remote`, args: ["mcp", "--state-dir", "/srv/state"] },
+    codemux: { type: "stdio", command: "/srv/bin/codemux-remote", args: ["mcp", "--state-dir", "/srv/state"] },
   });
   await session.close();
 
@@ -1680,6 +1680,25 @@ test("a host MCP server is this session's own codemux stdio server", async () =>
   }), recordingEmitter().emit);
   expect(fake.capturedOptions?.mcpServers?.codemux?.type).toBe("sdk");
   await local.close();
+});
+
+test("a device's helper is the bootstrap copy, else codemux-remote on PATH", async () => {
+  const { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const home = mkdtempSync(join(tmpdir(), "host-mcp-"));
+  try {
+    // Only a packaged or PATH install: no copy in ~/.local/bin.
+    expect(resolveHostCommand("~/.local/bin/codemux-remote", home)).toBe("codemux-remote");
+    mkdirSync(join(home, ".local/bin"), { recursive: true });
+    writeFileSync(join(home, ".local/bin/codemux-remote"), "");
+    expect(resolveHostCommand("~/.local/bin/codemux-remote", home)).toBe("codemux-remote");
+    chmodSync(join(home, ".local/bin/codemux-remote"), 0o755);
+    expect(resolveHostCommand("~/.local/bin/codemux-remote", home)).toBe(join(home, ".local/bin/codemux-remote"));
+    expect(resolveHostCommand("/srv/bin/codemux-remote", home)).toBe("/srv/bin/codemux-remote");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("start-session validates the host MCP server", async () => {

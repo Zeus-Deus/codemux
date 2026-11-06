@@ -307,6 +307,13 @@ enum ServeSubcommand {
 #[cfg(unix)]
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Started from a Codemux terminal, this process inherits that terminal's
+    // Claude Code plugin; the tasks, chats and services it runs get their own
+    // tools instead. Before any thread starts. `mcp` is that plugin's own
+    // server, and `pty-daemon` sets each shell's value itself.
+    if !matches!(cli.command, Some(Command::Mcp { .. } | Command::PtyDaemon { .. })) {
+        codemux_lib::claude_plugin::scrub_inherited_plugin_dirs();
+    }
     match cli.command {
         None | Some(Command::Version) => {
             let payload = serde_json::json!({
@@ -673,10 +680,11 @@ async fn run_serve_async(port: Option<u16>, state_dir: PathBuf) -> Result<(), St
     );
 
     // Older versions registered `codemux-remote mcp` as the `codemux`
-    // server in this user's `~/.claude.json`, so every Claude on the host
-    // got it. Agents get this host's tools per launch now (remote tasks and
-    // Codemux terminals), so withdraw that exact entry. Anything the user
-    // registered by hand, and `~/.vexis`, is left alone.
+    // server in this user's `~/.claude.json`. Where the Codemux app has run
+    // here too, the name is the app's, so withdraw that exact entry, as
+    // 0.27.0 did. On a host that runs only codemux-remote, the entry stays:
+    // it may be how the user reaches this host. Anything else the user
+    // registered, and `~/.vexis`, is left alone.
     if let Some(home) = dirs::home_dir() {
         match codemux_lib::mcp_cleanup::withdraw_remote_registration(&home) {
             codemux_lib::mcp_cleanup::Outcome::Removed | codemux_lib::mcp_cleanup::Outcome::Deleted => eprintln!(

@@ -328,6 +328,12 @@ async fn spawn_local_sidecar(
     cwd: PathBuf,
     managed: bool,
 ) -> Result<JsonRpcChild, ProviderError> {
+    // The chat's Claude reads `.mcp.json` from `cwd` and its parents; an
+    // entry an older build wrote there would add a second Codemux server.
+    // Managed attempts read no project config.
+    if !managed {
+        crate::mcp_cleanup::before_launch(&cwd);
+    }
     let sidecar_config = SpawnConfig {
         program: sidecar_binary.to_path_buf(),
         args: vec![],

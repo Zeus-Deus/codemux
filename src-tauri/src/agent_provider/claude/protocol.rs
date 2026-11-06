@@ -95,7 +95,8 @@ pub struct StartSessionParams {
 }
 
 /// A stdio MCP server the sidecar registers for one session, on the
-/// machine the sidecar runs on. A leading `~/` is that machine's home.
+/// machine the sidecar runs on. A leading `~/` is that machine's home; when
+/// nothing executable is there, the sidecar runs the file name from PATH.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostMcpServer {
@@ -104,8 +105,9 @@ pub struct HostMcpServer {
 }
 
 impl HostMcpServer {
-    /// A device's own `codemux-remote mcp`, where the device bootstrap
-    /// installs it, for the daemon state in its default directory.
+    /// A device's own `codemux-remote mcp` for the daemon state in its
+    /// default directory: the copy the device bootstrap installs, else the
+    /// `codemux-remote` on the device's PATH, the order `ssh::exec` uses.
     pub fn device() -> Self {
         Self { command: "~/.local/bin/codemux-remote".into(), args: vec!["mcp".into()] }
     }

@@ -702,7 +702,7 @@ fn legacy_tools() -> Vec<McpTool> {
         // -- Delegation primitives (Phase 1.5 vexis-agent integration) --
         McpTool {
             name: "worktree_create",
-            description: "Create a git worktree + Codemux workspace in one atomic call, optionally launching an agent inside with a starting prompt. Mirrors the in-app branch-picker \"Fork → \" flow. Does ALL of: `git worktree add` under ~/.codemux/worktrees/<repo>/<branch>, workspace state hydration with the requested layout, PTY spawn, setup-script run, `.mcp.json` autoconfig, and (if `agent_preset_id` is set) launching the preset's CLI with `initial_prompt` injected. Returns the new `workspace_id`. Pair with `preset_list` first if you need to know which agent presets are installed.",
+            description: "Create a git worktree + Codemux workspace in one atomic call, optionally launching an agent inside with a starting prompt. Mirrors the in-app branch-picker \"Fork → \" flow. Does ALL of: `git worktree add` under ~/.codemux/worktrees/<repo>/<branch>, workspace state hydration with the requested layout, PTY spawn, setup-script run, and (if `agent_preset_id` is set) launching the preset's CLI with `initial_prompt` injected. Returns the new `workspace_id`. Pair with `preset_list` first if you need to know which agent presets are installed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -784,7 +784,7 @@ fn legacy_tools() -> Vec<McpTool> {
         // -- Lifecycle + issue tools (Phase 1.6 vexis-agent integration) --
         McpTool {
             name: "workspace_close",
-            description: "Close a workspace by id. Runs teardown scripts, terminates PTYs, and removes Codemux's entry from the workspace's `.mcp.json`. Optionally also removes the underlying git worktree. Protected project-root checkouts can NEVER have their files deleted through this tool — `delete_worktree: true` on such a workspace errors; use `workspace_archive` instead to close it restorably.",
+            description: "Close a workspace by id. Runs teardown scripts and terminates PTYs. Optionally also removes the underlying git worktree. Protected project-root checkouts can NEVER have their files deleted through this tool — `delete_worktree: true` on such a workspace errors; use `workspace_archive` instead to close it restorably.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1365,11 +1365,11 @@ fn pane_split_direction(tool: &str) -> &'static str {
 /// wins over the process env: every agent-chat session shares ONE
 /// `codemux mcp` child (spawned with no workspace env), so the registry
 /// tags each call with the calling session's workspace in
-/// `_meta[WORKSPACE_META_KEY]`. The env var still covers children the
-/// workspace lifecycle launches from its per-workspace PTYs via `.mcp.json`
-/// (which never send `_meta`); the path-level entry intentionally inherits
-/// that PTY env instead of overriding it. `env_fallback` is passed in so tests
-/// stay hermetic.
+/// `_meta[WORKSPACE_META_KEY]`. The env var still covers a Claude Code typed
+/// in a Codemux terminal, whose plugin server (see `claude_plugin`) never
+/// sends `_meta` and bakes in no workspace, so it inherits the terminal's
+/// `CODEMUX_WORKSPACE_ID`. `env_fallback` is passed in so tests stay
+/// hermetic.
 /// The id is forwarded as-is; the control layer drops one that names no
 /// live workspace (`resolve_browser_workspace_id`).
 fn resolve_workspace_id(meta: Option<&Value>, env_fallback: Option<String>) -> String {

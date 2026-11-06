@@ -11,9 +11,12 @@
 //! Only an entry with exactly the shape Codemux wrote, carrying its marker env
 //! and naming a Codemux executable, is removed. Anything a user could have
 //! written by hand (a bare `codemux mcp`, `--client`, other keys) is kept and,
-//! when it looks like Codemux, logged as ambiguous. `~/.vexis` is never read
-//! or touched. Symlinks, unreadable and invalid files are skipped. Every run
-//! is idempotent and cheap, so it repeats on each start.
+//! when it looks like Codemux, logged as ambiguous. The `~/.claude.json`
+//! entry is withdrawn only where the Codemux app has run, as 0.27.0 did.
+//! `~/.vexis` is never read or touched. Symlinks, unreadable and invalid
+//! files are skipped. Every run is idempotent and cheap, so the full run
+//! repeats on each start, and [`before_launch`] covers a folder opened later
+//! before its first terminal or chat starts.
 
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
@@ -76,23 +79,34 @@ fn looks_like_codemux(entry: &Value) -> bool {
     entry.get("command").and_then(Value::as_str).is_some_and(is_codemux_command)
 }
 
-/// Whether a `~/.claude.json` top-level `codemux` entry is the one
-/// `codemux-remote serve` registered: `codemux-remote` with args `["mcp"]` and
-/// nothing else but the `type: "stdio"` / empty `env` Claude adds when it
-/// normalises an entry. The same entries v0.27.0 withdrew, narrowed to that
-/// exact shape.
+/// Whether a `~/.claude.json` top-level `codemux` entry is exactly the one
+/// `codemux-remote serve` registered: `{command: <…/codemux-remote>, args:
+/// ["mcp"]}` and nothing else. `claude mcp add` writes the same server with
+/// `type` and `env` added, so an entry with those keys is the user's own.
 pub fn is_registered_remote_entry(entry: &Value) -> bool {
     let Some(entry) = entry.as_object() else {
         return false;
     };
-    only_keys(entry, &["command", "args", "env", "type"])
-        && stdio_type(entry)
+    entry.len() == 2
         && mcp_args(entry)
-        && entry.get("env").is_none_or(|env| env.as_object().is_some_and(Map::is_empty))
         && entry
             .get("command")
             .and_then(Value::as_str)
             .is_some_and(|command| basename(command) == "codemux-remote")
+}
+
+/// Whether the Codemux app (desktop or `codemux serve`) has run here as this
+/// user: its window layout in `<config>/codemux*/layout.json`. Only then is
+/// the global `codemux` entry the app's, so only then is `codemux-remote`'s
+/// old registration withdrawn; on a host that runs only `codemux-remote`,
+/// such an entry is how the user reaches it and stays. codemux-remote never
+/// writes that file.
+pub fn desktop_has_run(config_dir: Option<&Path>) -> bool {
+    // Both names whichever build this is: a release helper must see a dev
+    // desktop's layout, and a dev helper a release desktop's.
+    config_dir.is_some_and(|dir| {
+        ["codemux", "codemux-dev"].iter().any(|name| dir.join(name).join("layout.json").is_file())
+    })
 }
 
 fn only_keys(entry: &Map<String, Value>, allowed: &[&str]) -> bool {
@@ -135,14 +149,18 @@ pub fn clean_project_file(dir: &Path) -> Outcome {
     })
 }
 
-/// Withdraws `codemux-remote serve`'s registration from `<home>/.claude.json`.
-/// The file itself is never deleted.
-pub fn clean_claude_json(home: &Path) -> Outcome {
+/// Withdraws `codemux-remote serve`'s registration from `<home>/.claude.json`
+/// where the Codemux app has run (see [`desktop_has_run`]). The file itself
+/// is never deleted.
+pub fn clean_claude_json(home: &Path, config_dir: Option<&Path>) -> Outcome {
+    if !desktop_has_run(config_dir) {
+        return Outcome::Untouched;
+    }
     let path = home.join(".claude.json");
     edit(&path, false, |servers| match servers.get(SERVER) {
         Some(entry) if is_registered_remote_entry(entry) => Ok(true),
         Some(entry) if entry.get("command").and_then(Value::as_str).is_some_and(|c| basename(c) == "codemux-remote") => {
-            Err(Outcome::Ambiguous("a codemux-remote entry with custom args or settings; it may be yours".into()))
+            Err(Outcome::Ambiguous("a codemux-remote entry with other args or settings; it may be yours".into()))
         }
         _ => Ok(false),
     })
@@ -201,15 +219,7 @@ fn edit(
 pub fn project_dirs(home: &Path, workspace_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     let mut dirs = BTreeSet::from([home.to_path_buf()]);
     for dir in workspace_dirs {
-        if !dir.is_absolute() {
-            continue;
-        }
-        if dir.starts_with(home) {
-            // Claude Code reads `.mcp.json` from every parent folder.
-            dirs.extend(dir.ancestors().take_while(|ancestor| ancestor.starts_with(home)).map(Path::to_path_buf));
-        } else {
-            dirs.insert(dir);
-        }
+        dirs.extend(launch_dirs(home, &dir));
     }
     let mut budget = MAX_SCANNED_DIRS;
     for root in WORKTREE_ROOTS {
@@ -219,6 +229,20 @@ pub fn project_dirs(home: &Path, workspace_dirs: impl IntoIterator<Item = PathBu
         }
     }
     dirs.into_iter().collect()
+}
+
+/// The folders whose `.mcp.json` a Claude started in `dir` reads: `dir` and
+/// its parents up to HOME, or only `dir` outside HOME. None for a relative
+/// path.
+fn launch_dirs(home: &Path, dir: &Path) -> Vec<PathBuf> {
+    if !dir.is_absolute() {
+        Vec::new()
+    } else if dir.starts_with(home) {
+        // Claude Code reads `.mcp.json` from every parent folder.
+        dir.ancestors().take_while(|ancestor| ancestor.starts_with(home)).map(Path::to_path_buf).collect()
+    } else {
+        vec![dir.to_path_buf()]
+    }
 }
 
 /// Real (non-symlink) subdirectories of `dir`, while `budget` lasts.
@@ -271,14 +295,15 @@ impl Report {
     }
 }
 
-/// One full run against `home` and the given workspace folders.
-pub fn run(home: &Path, workspace_dirs: impl IntoIterator<Item = PathBuf>) -> Report {
+/// One full run against `home`, this user's config dir and the given
+/// workspace folders.
+pub fn run(home: &Path, config_dir: Option<&Path>, workspace_dirs: impl IntoIterator<Item = PathBuf>) -> Report {
     let mut report = Report::default();
     for dir in project_dirs(home, workspace_dirs) {
         let outcome = clean_project_file(&dir);
         report.record(dir.join(".mcp.json"), outcome);
     }
-    report.record(home.join(".claude.json"), clean_claude_json(home));
+    report.record(home.join(".claude.json"), clean_claude_json(home, config_dir));
     report
 }
 
@@ -302,15 +327,47 @@ pub fn schedule<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         folders.extend(archived.project_root);
     }
     tauri::async_runtime::spawn_blocking(move || {
-        run(&home, folders.into_iter().map(PathBuf::from)).log();
+        run(&home, dirs::config_dir().as_deref(), folders.into_iter().map(PathBuf::from)).log();
     });
 }
 
+/// Cleans the folders a Claude started in `dir` reads, before Codemux starts
+/// a terminal or chat there. The startup run covers only the folders known
+/// at start; a workspace opened, created, imported or restored later may sit
+/// below a folder an older build wrote into. Each folder is checked once per
+/// process, so later launches cost a set lookup.
+pub fn before_launch(dir: &Path) {
+    use std::sync::{Mutex, OnceLock};
+    static CHECKED: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    // Tests clean only inside an isolated root, never the developer's HOME.
+    #[cfg(test)]
+    if crate::test_isolation::isolated_root().is_none() {
+        return;
+    }
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    before_launch_in(&home, CHECKED.get_or_init(Default::default), dir).log();
+}
+
+fn before_launch_in(home: &Path, checked: &std::sync::Mutex<BTreeSet<PathBuf>>, dir: &Path) -> Report {
+    let pending: Vec<PathBuf> = {
+        let checked = checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        launch_dirs(home, dir).into_iter().filter(|dir| !checked.contains(dir)).collect()
+    };
+    let mut report = Report::default();
+    for dir in pending {
+        report.record(dir.join(".mcp.json"), clean_project_file(&dir));
+        checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(dir);
+    }
+    report
+}
+
 /// `codemux-remote serve`'s start: withdraws the registration its older
-/// versions wrote into this host's `~/.claude.json`. Returns what it did, for
-/// the daemon's own log.
+/// versions wrote into this host's `~/.claude.json`, where the Codemux app
+/// has run too. Returns what it did, for the daemon's own log.
 pub fn withdraw_remote_registration(home: &Path) -> Outcome {
-    clean_claude_json(home)
+    clean_claude_json(home, dirs::config_dir().as_deref())
 }
 
 #[cfg(test)]
@@ -430,34 +487,49 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), bytes);
     }
 
+    /// A config dir where the Codemux app has run (its layout exists).
+    fn desktop_config() -> tempfile::TempDir {
+        let config = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(config.path().join("codemux-dev")).unwrap();
+        std::fs::write(config.path().join("codemux-dev/layout.json"), "{}").unwrap();
+        config
+    }
+
     #[test]
     fn claude_json_loses_only_the_registered_remote_entry() {
         let home = tempfile::tempdir().unwrap();
+        let config = desktop_config();
+        let config = Some(config.path());
         let path = home.path().join(".claude.json");
         write(&path, &json!({
             "numStartups": 7,
             "mcpServers": {
-                "codemux": {"type": "stdio", "command": "/home/u/.local/bin/codemux-remote", "args": ["mcp"], "env": {}},
+                "codemux": {"command": "/home/u/.local/bin/codemux-remote", "args": ["mcp"]},
                 "user": {"command": "y"}
             },
             "projects": {"/p": {"mcpServers": {"codemux": {"command": "/usr/bin/codemux", "args": ["mcp"]}}}}
         }));
-        assert_eq!(clean_claude_json(home.path()), Outcome::Removed);
+        assert_eq!(clean_claude_json(home.path(), config), Outcome::Removed);
         let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(after["mcpServers"], json!({"user": {"command": "y"}}));
         assert_eq!(after["numStartups"], 7);
         assert_eq!(after["projects"]["/p"]["mcpServers"]["codemux"]["command"], "/usr/bin/codemux", "never touched");
-        assert_eq!(clean_claude_json(home.path()), Outcome::Untouched);
+        assert_eq!(clean_claude_json(home.path(), config), Outcome::Untouched);
 
         // The file itself is never deleted, even when nothing else is left.
         write(&path, &json!({"mcpServers": {"codemux": {"command": "/x/codemux-remote", "args": ["mcp"]}}}));
-        assert_eq!(clean_claude_json(home.path()), Outcome::Removed);
+        assert_eq!(clean_claude_json(home.path(), config), Outcome::Removed);
         assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "{}");
     }
 
     #[test]
     fn claude_json_keeps_every_other_codemux_entry() {
+        let config = desktop_config();
         for entry in [
+            // What `claude mcp add --scope user codemux -- <codemux-remote> mcp` writes.
+            json!({"type": "stdio", "command": "/home/u/.local/bin/codemux-remote", "args": ["mcp"], "env": {}}),
+            json!({"command": "/x/codemux-remote", "args": ["mcp"], "type": "stdio"}),
+            json!({"command": "/x/codemux-remote", "args": ["mcp"], "env": {}}),
             json!({"command": "/usr/bin/codemux", "args": ["mcp", "--client", "claude-code"]}),
             json!({"command": "/usr/bin/codemux", "args": ["mcp"]}),
             json!({"command": "/x/codemux-remote", "args": ["mcp", "--state-dir", "/s"]}),
@@ -466,10 +538,29 @@ mod tests {
         ] {
             let home = tempfile::tempdir().unwrap();
             let bytes = write(&home.path().join(".claude.json"), &json!({"mcpServers": {"codemux": entry}}));
-            let outcome = clean_claude_json(home.path());
+            let outcome = clean_claude_json(home.path(), Some(config.path()));
             assert!(matches!(outcome, Outcome::Untouched | Outcome::Ambiguous(_)), "{outcome:?}");
             assert_eq!(std::fs::read(home.path().join(".claude.json")).unwrap(), bytes);
         }
+    }
+
+    /// On a host where only `codemux-remote` runs, the user-level `codemux`
+    /// entry is how the user reaches it, even in the exact shape older
+    /// versions registered, so it is never withdrawn there.
+    #[test]
+    fn claude_json_is_left_alone_where_the_app_never_ran() {
+        let home = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        // codemux-remote's scheduler creates the database there, never a layout.
+        std::fs::create_dir_all(config.path().join("codemux")).unwrap();
+        std::fs::write(config.path().join("codemux/codemux.db"), "").unwrap();
+        let bytes = write(&home.path().join(".claude.json"), &json!({"mcpServers": {"codemux": {"command": "/h/.local/bin/codemux-remote", "args": ["mcp"]}}}));
+        for config in [None, Some(config.path())] {
+            assert_eq!(clean_claude_json(home.path(), config), Outcome::Untouched);
+            assert_eq!(std::fs::read(home.path().join(".claude.json")).unwrap(), bytes);
+        }
+        assert!(!desktop_has_run(Some(config.path())));
+        assert!(desktop_has_run(Some(desktop_config().path())));
     }
 
     #[test]
@@ -491,6 +582,33 @@ mod tests {
         assert!(!dirs.iter().any(|dir| dir.is_relative()));
     }
 
+    /// A folder no startup run knew about: launching in it cleans the
+    /// generated entry in its parent before the launch, keeps everything
+    /// else, and checks each folder once.
+    #[test]
+    fn a_launch_cleans_the_folders_above_it_once() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let generated = json!({"command": "/old/target/debug/codemux", "args": ["mcp"], "env": {PROVIDER_ORIGIN: "1"}});
+        write(&home.join("Projects/old/.mcp.json"), &json!({"mcpServers": {"codemux": generated.clone()}}));
+        let mine = write(&home.join("Projects/old/repo/.mcp.json"), &json!({"mcpServers": {"codemux": {"command": "codemux", "args": ["mcp", "--client", "me"]}}}));
+        let checked = std::sync::Mutex::default();
+
+        let report = before_launch_in(home, &checked, &home.join("Projects/old/repo"));
+        assert_eq!(report.cleaned, [home.join("Projects/old/.mcp.json")], "{report:?}");
+        assert!(!home.join("Projects/old/.mcp.json").exists());
+        assert_eq!(std::fs::read(home.join("Projects/old/repo/.mcp.json")).unwrap(), mine);
+        assert_eq!(report.ambiguous.len(), 1);
+
+        // Checked folders are not read again this process; a sibling checks
+        // only its own folder.
+        write(&home.join("Projects/old/.mcp.json"), &json!({"mcpServers": {"codemux": generated}}));
+        assert_eq!(before_launch_in(home, &checked, &home.join("Projects/old/repo")), Report::default());
+        std::fs::create_dir_all(home.join("Projects/old/other")).unwrap();
+        assert_eq!(before_launch_in(home, &checked, &home.join("Projects/old/other")), Report::default());
+        assert_eq!(checked.lock().unwrap().len(), 5, "HOME, Projects, old, repo, other");
+    }
+
     /// The incident's layout: a generated entry in HOME and a project, a
     /// user's own `--client` entry, and Vexis's YAML. One run removes only
     /// what Codemux wrote; a second run changes nothing.
@@ -507,7 +625,8 @@ mod tests {
         std::fs::write(home.join(".vexis/mcp-servers.yaml"), vexis_yaml).unwrap();
         write(&home.join(".claude.json"), &json!({"mcpServers": {"codemux": {"command": "/h/.local/bin/codemux-remote", "args": ["mcp"]}}, "k": 1}));
 
-        let report = run(home, [home.join("Projects/p"), home.join("Projects/mine")]);
+        let config = desktop_config();
+        let report = run(home, Some(config.path()), [home.join("Projects/p"), home.join("Projects/mine")]);
         assert_eq!(report.cleaned.len(), 3, "{report:?}");
         assert!(!home.join(".mcp.json").exists());
         assert_eq!(
@@ -519,7 +638,7 @@ mod tests {
         assert_eq!(std::fs::read(home.join(".vexis/mcp-servers.yaml")).unwrap(), vexis_yaml, "Vexis is never touched");
         assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(home.join(".claude.json")).unwrap()).unwrap(), json!({"k": 1}));
 
-        let again = run(home, [home.join("Projects/p"), home.join("Projects/mine")]);
+        let again = run(home, Some(config.path()), [home.join("Projects/p"), home.join("Projects/mine")]);
         assert!(again.cleaned.is_empty() && again.skipped.is_empty(), "{again:?}");
     }
 }

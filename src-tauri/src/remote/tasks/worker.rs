@@ -752,8 +752,23 @@ child.stdin.close();child.wait()
             "prestart cancellation never dispatches native work"
         );
     }
-    #[tokio::test]
-    async fn claude_native_adapter_executes_one_fresh_run_and_reaps_sidecar() {
+    /// Also a task started from a Codemux terminal (the worker inherits that
+    /// terminal's Claude Code plugin): its Claude gets only the task's host
+    /// server, and keeps the user's own plugin dirs.
+    #[test]
+    fn claude_native_adapter_executes_one_fresh_run_and_reaps_sidecar() {
+        if crate::test_isolation::isolated("remote::tasks::worker::tests::claude_native_adapter_executes_one_fresh_run_and_reaps_sidecar") {
+            return;
+        }
+        // The isolated process runs only this test, and no other thread has
+        // started yet.
+        unsafe {
+            std::env::set_var(crate::claude_plugin::PLUGIN_DIRS_ENV, "/h/.local/share/codemux/claude-plugin:/u/mine:/h/.local/state/codemux-remote/claude-plugin");
+        }
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(claude_native_adapter_run());
+    }
+
+    async fn claude_native_adapter_run() {
         use crate::agent_provider::claude::{ClaudeAgentProvider, ClaudeProviderConfig};
         let dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(TaskStore::open(dir.path()).unwrap());
@@ -777,7 +792,7 @@ child.stdin.close();child.wait()
         let path = dir.path().join("claude-script.json");
         std::fs::write(&path, serde_json::to_vec(&script).unwrap()).unwrap();
         let wrapper = dir.path().join("sidecar");
-        std::fs::write(&wrapper,format!("#!/bin/sh\nexport FAKE_CLAUDE_SIDECAR_SCRIPT='{}'\nexport FAKE_CLAUDE_SIDECAR_CAPTURE='{}'\nexec '{}' \"$@\"\n",path.display(),dir.path().join("claude-calls.jsonl").display(),helper.display())).unwrap();
+        std::fs::write(&wrapper,format!("#!/bin/sh\nprintf %s \"${{CLAUDE_CODE_PLUGIN_DIRS-unset}}\" > '{}'\nexport FAKE_CLAUDE_SIDECAR_SCRIPT='{}'\nexport FAKE_CLAUDE_SIDECAR_CAPTURE='{}'\nexec '{}' \"$@\"\n",dir.path().join("plugin-dirs").display(),path.display(),dir.path().join("claude-calls.jsonl").display(),helper.display())).unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let provider: Arc<dyn AgentProvider> = Arc::new(
             ClaudeAgentProvider::new(ClaudeProviderConfig {
@@ -832,5 +847,6 @@ child.stdin.close();child.wait()
         assert_eq!(host["args"], json!(["mcp", "--state-dir", dir.path().display().to_string()]), "{call}");
         assert!(host["command"].as_str().is_some_and(|command| !command.is_empty()));
         assert!(call["params"].get("mcpTools").is_none(), "no desktop tools reach a remote task: {call}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("plugin-dirs")).unwrap(), "/u/mine", "no inherited Codemux plugin");
     }
 }

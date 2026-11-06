@@ -518,6 +518,7 @@ async fn handle_request(
             protocol_version: PROTOCOL_VERSION,
             daemon_pid: std::process::id(),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            host_claude_plugin: HOST_CLAUDE_PLUGIN.get().is_some(),
         },
         ClientRequest::Spawn {
             request_id,

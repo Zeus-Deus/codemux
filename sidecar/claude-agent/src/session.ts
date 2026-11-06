@@ -29,8 +29,9 @@ import {
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 
+import { accessSync, constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { AsyncPromptQueue } from "./async-queue.ts";
 import {
@@ -143,6 +144,29 @@ export type QueryFactory = (args: {
 let queryFactory: QueryFactory = defaultQuery;
 
 /** Swap the factory so tests can hand in a fake `Query`. */
+/** A host MCP server's command on this machine. A `~/` path is under this
+ *  machine's home; when nothing executable is there, its file name is looked
+ *  up on PATH instead, the way Codemux finds `codemux-remote` on a device
+ *  (the bootstrap copy in `~/.local/bin` wins over a packaged one). */
+export function resolveHostCommand(
+  command: string,
+  home: string = homedir(),
+  isExecutable: (path: string) => boolean = executable,
+): string {
+  if (!command.startsWith("~/")) return command;
+  const path = join(home, command.slice(2));
+  return isExecutable(path) ? path : basename(path);
+}
+
+function executable(path: string): boolean {
+  try {
+    accessSync(path, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function setQueryFactoryForTests(factory: QueryFactory): void {
   queryFactory = factory;
 }
@@ -342,7 +366,7 @@ function buildQueryOptions(
     opts.mcpServers = {
       codemux: {
         type: "stdio",
-        command: command.startsWith("~/") ? join(homedir(), command.slice(2)) : command,
+        command: resolveHostCommand(command),
         args: [...args],
       },
     };

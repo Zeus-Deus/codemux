@@ -833,6 +833,11 @@ async fn spawn_prepared_session<R: Runtime>(
             "[trace:{session_id}] DECISION=fresh_spawn at t={}ms",
             entry_ts.elapsed().as_millis()
         );
+        // A Claude typed in this shell must not find an entry an older build
+        // wrote above its folder (see `mcp_cleanup::before_launch`).
+        if !is_remote {
+            crate::mcp_cleanup::before_launch(std::path::Path::new(&effective_cwd));
+        }
         match client
             .spawn(
                 session_id.clone(),

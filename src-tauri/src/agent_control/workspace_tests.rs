@@ -356,7 +356,7 @@ async fn workspace_lifecycle_writes_no_mcp_config() {
         call(&app, &owner, "workspace_close", json!({"workspace_id": opened["workspace_id"]})).await.unwrap();
     }
     // The startup cleanup finds nothing to do on a clean machine.
-    let report = crate::mcp_cleanup::run(&home, [project.clone(), worktree_cwd.clone(), repo.clone()]);
+    let report = crate::mcp_cleanup::run(&home, dirs::config_dir().as_deref(), [project.clone(), worktree_cwd.clone(), repo.clone()]);
     assert_eq!(report, crate::mcp_cleanup::Report::default());
 
     for checked in [&home, &repo, &worktree_cwd] {
@@ -366,6 +366,44 @@ async fn workspace_lifecycle_writes_no_mcp_config() {
         let exclude = std::fs::read_to_string(checkout.join(".git/info/exclude")).unwrap_or_default();
         assert!(!exclude.contains(".mcp.json"), "{checkout:?}: {exclude}");
     }
+}
+
+/// A folder the startup cleanup never saw: an older build wrote a `codemux`
+/// entry into its parent. Opening it removes that entry before its terminal
+/// starts, so a Claude typed there never loads it. The shell's own startup
+/// file records what it found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_a_folder_cleans_an_old_entry_above_it_before_its_terminal_starts() {
+    if isolated(&format!("{MODULE}opening_a_folder_cleans_an_old_entry_above_it_before_its_terminal_starts")) {
+        return;
+    }
+    without_terminal_daemon();
+    let (app, _provider, _root, _workspace, _repo) = git_fixture().await;
+    let owner = named(ControlAccess::FullAccess);
+    let home = dirs::home_dir().unwrap();
+    assert!(home.starts_with(crate::test_isolation::isolated_root().unwrap()), "an isolated HOME");
+    let old = home.join("Projects").join("old");
+    let repo = old.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let entry = json!({"mcpServers": {"codemux": {"command": "/old/target/debug/codemux", "args": ["mcp"], "env": {"CODEMUX_MCP_PROVIDER_ORIGIN": "1"}}}});
+    std::fs::write(old.join(".mcp.json"), serde_json::to_vec(&entry).unwrap()).unwrap();
+    let seen = home.join("seen-at-shell-start");
+    let probe = format!("[ -e '{}' ] && echo present > '{}' || echo absent > '{}'\n", old.join(".mcp.json").display(), seen.display(), seen.display());
+    for rc in [".bashrc", ".bash_profile"] {
+        std::fs::write(home.join(rc), &probe).unwrap();
+    }
+
+    let created = call(&app, &owner, "workspace_create", json!({"path": repo})).await.unwrap();
+    assert_eq!(created["created"], true, "{created}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !seen.exists() {
+        assert!(std::time::Instant::now() < deadline, "the workspace's shell never started");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), "absent", "cleaned before the shell started");
+    assert!(!old.join(".mcp.json").exists());
+    call(&app, &owner, "workspace_close", json!({"workspace_id": created["workspace_id"]})).await.unwrap();
 }
 
 // ── access ────────────────────────────────────────────────────────────────
