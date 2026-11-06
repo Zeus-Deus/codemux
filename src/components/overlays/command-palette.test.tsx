@@ -101,7 +101,6 @@ vi.mock("@/tauri/commands", () => ({
   createBrowserPane: vi.fn(),
   cyclePane: vi.fn(),
   getPresets: vi.fn().mockResolvedValue({ bar_visible: false }),
-  regenerateMcpConfig: vi.fn(),
   reloadInterface: mocks.backend.reloadInterface,
   setPresetBarVisible: vi.fn(),
   agentChatInterruptTurn: mocks.backend.agentChatInterruptTurn,

@@ -1395,6 +1395,16 @@ pub(crate) fn strip_renderer_env(cmd: &mut CommandBuilder) {
     }
 }
 
+/// `CLAUDE_CODE_PLUGIN_DIRS` for a local user terminal: this app's Claude Code
+/// plugin first (see `claude_plugin`). Never part of [`workspace_pty_env`]:
+/// chat sidecars share that, and managed chats get their tools per launch.
+pub(crate) fn claude_plugin_env() -> Option<(&'static str, String)> {
+    use crate::claude_plugin::{plugin_dirs_value, PLUGIN_DIRS_ENV};
+    let dir = crate::claude_plugin::local_plugin_dir()?;
+    let value = plugin_dirs_value(dir, std::env::var_os(PLUGIN_DIRS_ENV).as_deref());
+    Some((PLUGIN_DIRS_ENV, value.to_string_lossy().into_owned()))
+}
+
 /// Remove every agent identity var from a user terminal's environment, so
 /// `codemux ...` typed there is always the owner. The app scrubs them at
 /// startup too; this also covers a daemon adopted from an older instance.
@@ -1922,6 +1932,14 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
         let prefixed = build_child_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
+    }
+
+    // Claude Code typed in this shell gets Codemux's tools. A host's shell
+    // gets the host's own plugin from its daemon instead.
+    if !owning_ws.is_some_and(|ws| ws.host_id.is_some()) {
+        if let Some((key, value)) = claude_plugin_env() {
+            cmd.env(key, value);
+        }
     }
 
     // Renderer transport flags are an app-process concern only.

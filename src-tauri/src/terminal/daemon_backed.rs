@@ -425,6 +425,9 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
                 workspace_env.push(("PATH".into(), prefixed));
                 workspace_env.push(("CODEMUX_CLI_SAFE_PATH".into(), current_exe));
             }
+            if let Some((key, value)) = super::claude_plugin_env() {
+                workspace_env.push((key.into(), value));
+            }
         }
         // One directory walk for the whole workspace: the per-session lookup
         // re-read and re-parsed every meta file on disk for each pane.

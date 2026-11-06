@@ -1635,7 +1635,7 @@ mod tests {
 
     #[test]
     fn bare_mcp_still_serves_stdio() {
-        // `.mcp.json` entries, the Vexis config and Settings run exactly this.
+        // User registrations, the Vexis config and Settings run exactly this.
         assert!(matches!(parse(&["codemux", "mcp"]), CommandSet::Mcp { client: None, access: None }));
         match parse(&["codemux", "mcp", "--client", "hermes", "--access", "supervised"]) {
             CommandSet::Mcp { client, access } => {

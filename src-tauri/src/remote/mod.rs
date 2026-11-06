@@ -42,7 +42,6 @@ pub mod host_status;
 pub mod identity;
 pub mod manifest;
 pub mod mcp;
-pub mod mcp_register;
 pub mod pty;
 pub mod server;
 pub mod tools;

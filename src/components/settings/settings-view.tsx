@@ -1495,7 +1495,6 @@ export function SettingsView() {
   const settingsSection = useUIStore((s) => s.settingsSection);
   const config = useAppStore((s) => s.appState?.config);
   const storeSet = useSettingsStore((s) => s.set);
-  const storeGet = useSettingsStore((s) => s.get);
   const defaultEditor = useSyncedSettingsStore(selectDefaultEditor);
   const cursorStyle = useSyncedSettingsStore(selectTerminalCursorStyle);
   const baseBranch = useSyncedSettingsStore(selectDefaultBaseBranch);
@@ -1517,7 +1516,6 @@ export function SettingsView() {
   const hideWhitespace = useSettingsStore(selectHideWhitespacePreference);
   const diffFileState = useSettingsStore(selectDiffFileState);
   const timeFormat = useSettingsStore(selectTimeFormat);
-  const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
 
   const authUser = useAuthStore((s) => s.user);
   const signOut = useAuthStore((s) => s.signOut);
@@ -1785,7 +1783,6 @@ export function SettingsView() {
     updateSyncedSetting("git", "default_base_branch", v).catch(console.error);
   };
   const setTerminalThemeMode = (v: string) => storeSet("terminal.color_theme", v);
-  const setAutoMcpConfig = (v: boolean) => storeSet("auto_mcp_config", v ? "true" : "false");
 
   // What the backend last confirmed for `scriptsRoot`, so a blur with no
   // edits does not write, and a failed save stays dirty for the next blur.
@@ -2654,42 +2651,26 @@ export function SettingsView() {
                 )}
               </div>
             </SectionGroup>
-            <SectionGroup>
-              <SubsectionHeader title="Tools" />
-              <div className="space-y-1">
+            {/* GUI-mode background browser viewport pin: the peek popover
+                it affects is a GUI-chrome surface. */}
+            {enableAgentChat && (
+              <SectionGroup>
+                <SubsectionHeader title="Tools" />
+                <div className="space-y-1">
                 <SettingRow
-                  label="Auto-configure MCP for workspaces"
-                  description="Write .mcp.json in each workspace so agents find Codemux tools. Turn off if you manage MCP config yourself."
-                  scope="device"
+                  label="Desktop-size background browser"
+                  description="Render the agent's background browser at the Browser section's default size (1280×800) and scale it to fit the peek."
                 >
                   <Switch
-                    checked={autoMcpConfig}
+                    checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? true}
                     onCheckedChange={(checked) => {
-                      setAutoMcpConfig(checked);
-                      storeSet("auto_mcp_config", String(checked));
+                      updateSyncedSetting("agent_chat", "background_browser_desktop_viewport", checked).catch(console.error);
                     }}
                   />
                 </SettingRow>
-                {/* GUI-mode background browser viewport pin: the peek
-                    popover it affects is a GUI-chrome surface. */}
-                {enableAgentChat && (
-                  <>
-                    <Separator />
-                    <SettingRow
-                      label="Desktop-size background browser"
-                      description="Render the agent's background browser at the Browser section's default size (1280×800) and scale it to fit the peek."
-                    >
-                      <Switch
-                        checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? true}
-                        onCheckedChange={(checked) => {
-                          updateSyncedSetting("agent_chat", "background_browser_desktop_viewport", checked).catch(console.error);
-                        }}
-                      />
-                    </SettingRow>
-                  </>
-                )}
-              </div>
-            </SectionGroup>
+                </div>
+              </SectionGroup>
+            )}
           </div>
         );
 

@@ -87,10 +87,11 @@ describe("settings-store", () => {
       expect(SETTINGS_DEFAULTS["terminal.color_theme"]).toBe("app");
       expect(SETTINGS_DEFAULTS["terminal.font_family"]).toBeDefined();
       expect(SETTINGS_DEFAULTS["ai_commit_message_enabled"]).toBe("true");
-      expect(SETTINGS_DEFAULTS["auto_mcp_config"]).toBe("true");
       // Sidebar keys present
       expect(SETTINGS_DEFAULTS["sidebar.show_git_stats"]).toBe("true");
       expect(SETTINGS_DEFAULTS["sidebar.auto_settle_days"]).toBe("3");
+      // Codemux no longer writes .mcp.json into workspaces, so its toggle is gone.
+      expect(SETTINGS_DEFAULTS["auto_mcp_config"]).toBeUndefined();
       // Retired activity-indicator keys are gone, not migrated.
       expect(SETTINGS_DEFAULTS["agents.orb_match_activity"]).toBeUndefined();
       expect(SETTINGS_DEFAULTS["sidebar.working_indicator"]).toBeUndefined();

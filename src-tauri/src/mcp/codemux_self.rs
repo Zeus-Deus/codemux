@@ -9,11 +9,11 @@ use std::collections::HashMap;
 
 use super::{McpConfigSource, McpServerConfig, McpTransport};
 
-/// Build the descriptor for Codemux's own MCP server. Mirrors what
-/// `mcp_server::codemux_mcp_entry` writes into project `.mcp.json` files
-/// today: `<current_exe> mcp` with no per-server env (Stage 2 will inject
-/// the workspace id at spawn time, the same way the workspace lifecycle
-/// upserts do at `commands/workspace.rs:75` etc.).
+/// Build the descriptor for Codemux's own MCP server: `<current_exe> mcp`
+/// with no env of its own. Every registry child starts with
+/// `CODEMUX_AGENT_PROCESS` (`JsonRpcChild`), so this process serves the
+/// agent tools and refuses trusted native-controller tools; the registry
+/// tags each call with the calling chat's workspace.
 pub fn codemux_self_config() -> McpServerConfig {
     let command = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -25,7 +25,7 @@ pub fn codemux_self_config() -> McpServerConfig {
         sources: vec![McpConfigSource::Codemux],
         command,
         args: vec!["mcp".to_string()],
-        env: HashMap::from([(crate::mcp_server::PROVIDER_ORIGIN_ENV.into(), "1".into())]),
+        env: HashMap::new(),
         // Always-on. Toggling is suppressed in the UI; the field is here
         // only to keep the type uniform with user-installed entries.
         disabled: false,
@@ -39,10 +39,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_s1_injected_self_process_is_bound_to_provider_origin() {
+    fn review_s1_injected_self_process_is_marked_as_an_agent_by_its_spawner() {
         let config = codemux_self_config();
-        assert_eq!(config.env.get("CODEMUX_MCP_PROVIDER_ORIGIN").map(String::as_str), Some("1"),
-            "provider registry must start a restricted self MCP process, not an indistinguishable local controller");
+        assert!(config.env.is_empty(), "the obsolete provider-origin marker is never written");
+        // The restriction comes from the marker every registry child gets.
+        assert!(include_str!("../json_rpc_child/mod.rs").contains("cmd.env(crate::control_identity::AGENT_PROCESS_ENV, \"1\");"));
     }
 
     #[test]
@@ -52,7 +53,7 @@ mod tests {
         assert_eq!(cfg.id, "codemux-self");
         assert_eq!(cfg.sources, vec![McpConfigSource::Codemux]);
         assert_eq!(cfg.args, vec!["mcp".to_string()]);
-        assert_eq!(cfg.env, HashMap::from([(crate::mcp_server::PROVIDER_ORIGIN_ENV.into(), "1".into())]));
+        assert!(cfg.env.is_empty());
         assert!(!cfg.disabled);
         assert!(matches!(cfg.transport, McpTransport::Stdio));
         // The command is non-empty even when current_exe fails (falls back

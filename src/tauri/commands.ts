@@ -461,17 +461,9 @@ export const openProviderInstallTerminal = (
 export const listLaunchGeminiModels = () =>
   invoke<Array<{ id: string; label: string }>>("list_launch_gemini_models");
 
-export const regenerateMcpConfig = (workspaceId: string) =>
-  invoke<void>("regenerate_mcp_config", { workspaceId });
-
 /** Reload the desktop window's page from the app process, the same native
  *  reload as Ctrl+Alt+R. The backend, terminals, and agents keep running. */
 export const reloadInterface = () => invoke<void>("reload_interface");
-
-/** Repair deferred MCP config writes for inactive workspaces. This may touch
- * disk and must be called only after the renderer's useful first paint. */
-export const repairInactiveMcpConfigs = () =>
-  invoke<number>("repair_inactive_mcp_configs");
 
 export const updateWorkspaceCwd = (workspaceId: string, cwd: string) =>
   invoke("update_workspace_cwd", { workspaceId, cwd });
