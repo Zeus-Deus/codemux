@@ -1283,8 +1283,7 @@ fn build_core_app<R: tauri::Runtime>(
             hooks::register_claude_code_hooks();
             hooks::register_codex_hooks();
             hooks::register_gemini_hooks();
-            // Retire incompatible legacy plugins before restored terminals start OpenCode.
-            tauri::async_runtime::block_on(hooks::register_opencode_plugin());
+            tauri::async_runtime::spawn(hooks::register_opencode_plugin());
             hooks::register_pi_extension();
 
             terminal::spawn_missing_ptys(handle);
