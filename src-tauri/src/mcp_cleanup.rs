@@ -31,6 +31,9 @@ const WORKTREE_ROOTS: [&str; 2] = [".codemux/worktrees", ".codemux-dev/worktrees
 /// Bounds a worktree-root scan, so a huge or slow tree cannot stall it.
 const MAX_SCANNED_DIRS: usize = 20_000;
 
+/// A project `.mcp.json` larger than this is skipped unread.
+const MAX_PROJECT_FILE_BYTES: u64 = 1024 * 1024;
+
 /// What the cleanup did to one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -140,6 +143,11 @@ fn is_codemux_command(command: &str) -> bool {
 /// emptied `mcpServers`, and deletes the file only when nothing else is left.
 pub fn clean_project_file(dir: &Path) -> Outcome {
     let path = dir.join(".mcp.json");
+    // Codemux wrote a few hundred bytes. A huge file is not ours to parse on
+    // a launch path that may be a UI thread (see [`before_launch_blocking`]).
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.len() > MAX_PROJECT_FILE_BYTES) {
+        return Outcome::Skipped("larger than any file Codemux wrote".into());
+    }
     edit(&path, true, |servers| match servers.get(SERVER) {
         Some(entry) if is_generated_project_entry(entry) => Ok(true),
         Some(entry) if looks_like_codemux(entry) => Err(Outcome::Ambiguous(
@@ -237,14 +245,15 @@ pub fn project_dirs(home: &Path, workspace_dirs: impl IntoIterator<Item = PathBu
 /// compared as the physical folders they resolve to (symlinks and `..`
 /// followed; on Windows, case and `\\?\` prefixes settled the way `dunce`
 /// does elsewhere), so `<home>/../elsewhere` or a symlink out of HOME counts
-/// as outside, and the results are canonical paths. None for a relative path
-/// or one whose identity cannot be established (missing, unreadable): no
-/// Claude starts there, and guessing could reach past HOME. `home` must
-/// already be canonical. A candidate `.mcp.json` itself is never resolved;
-/// [`edit`] skips a symlinked one.
+/// as outside, and the results are canonical paths. A relative path, or one
+/// whose identity cannot be established (missing, unreadable), yields only
+/// HOME: a terminal asked to start there starts in HOME instead (the PTY
+/// falls back to it), and guessing ancestors through an unresolved path could
+/// reach past HOME. `home` must already be canonical. A candidate `.mcp.json`
+/// itself is never resolved; [`edit`] skips a symlinked one.
 fn launch_dirs(home: &Path, dir: &Path) -> Vec<PathBuf> {
     let Some(dir) = dir.is_absolute().then(|| dunce::canonicalize(dir).ok()).flatten() else {
-        return Vec::new();
+        return vec![home.to_path_buf()];
     };
     if dir.starts_with(home) {
         // Claude Code reads `.mcp.json` from every parent folder.
@@ -365,10 +374,16 @@ pub async fn before_launch(dir: &Path) {
     }
 }
 
-/// [`before_launch`] for a caller already on a blocking thread. A folder
-/// whose check completed is not read again this process, so later launches
-/// cost a lookup; one that was skipped (unreadable, invalid, changed
+/// [`before_launch`] for a synchronous caller. A folder whose check
+/// completed is not read again this process, so later launches cost a
+/// lookup; one that was skipped (unreadable, invalid, too large, changed
 /// meanwhile) is tried again next launch.
+///
+/// The in-process terminal spawn calls this from synchronous Tauri commands,
+/// which run on the UI thread (Windows always; Unix when the terminal daemon
+/// is off). There, the first launch in each folder chain still costs a
+/// canonicalization and a small read per folder, bounded by the file-size
+/// cap; a stalled disk stalls that launch as it would the PTY spawn itself.
 pub fn before_launch_blocking(dir: &Path) {
     static CHECKED: std::sync::OnceLock<Checked> = std::sync::OnceLock::new();
     // Tests clean only inside an isolated root, never the developer's HOME.
@@ -730,6 +745,39 @@ mod tests {
         assert_eq!(before_launch_in(home, &checked, home).cleaned, [home.join(".mcp.json")]);
         std::fs::write(home.join(".mcp.json"), GENERATED).unwrap();
         assert_eq!(before_launch_in(home, &checked, home), Report::default(), "completed checks are not repeated");
+    }
+
+    /// A terminal asked to start in a missing folder starts in HOME instead,
+    /// so the check covers HOME (and guesses no ancestors through the
+    /// missing path). A folder created later is checked on its own launch.
+    #[test]
+    fn a_missing_launch_folder_cleans_home_before_the_spawn() {
+        let (_tmp, home) = real_tempdir();
+        std::fs::write(home.join(".mcp.json"), GENERATED).unwrap();
+        std::fs::create_dir_all(home.join("Projects")).unwrap();
+        std::fs::write(home.join("Projects/.mcp.json"), GENERATED).unwrap();
+        let checked = Checked::default();
+        let missing = home.join("Projects/not-yet-created/repo");
+
+        let report = before_launch_in(&home, &checked, &missing);
+        assert_eq!(report.cleaned, [home.join(".mcp.json")], "{report:?}");
+        assert!(!home.join(".mcp.json").exists());
+        assert!(home.join("Projects/.mcp.json").exists(), "no ancestry guessed through a missing path");
+
+        std::fs::create_dir_all(&missing).unwrap();
+        let report = before_launch_in(&home, &checked, &missing);
+        assert_eq!(report.cleaned, [home.join("Projects/.mcp.json")], "{report:?}");
+    }
+
+    /// A project file far larger than anything Codemux wrote is not read.
+    #[test]
+    fn an_oversized_project_file_is_skipped_unread() {
+        let (_tmp, home) = real_tempdir();
+        let mut bytes = GENERATED.as_bytes().to_vec();
+        bytes.resize(MAX_PROJECT_FILE_BYTES as usize + 1, b' ');
+        std::fs::write(home.join(".mcp.json"), &bytes).unwrap();
+        assert!(matches!(clean_project_file(&home), Outcome::Skipped(_)));
+        assert_eq!(std::fs::read(home.join(".mcp.json")).unwrap(), bytes);
     }
 
     /// Launches racing on the blocking pool check one folder once.
