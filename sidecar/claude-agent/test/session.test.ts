@@ -1658,6 +1658,38 @@ test("MCP round 4: managed sessions exclude plugin bridge names", async () => {
   await session.close();
 });
 
+test("a host MCP server is this session's own codemux stdio server", async () => {
+  const { homedir } = await import("node:os");
+  const hostMcpServer = { command: "~/.local/bin/codemux-remote", args: ["mcp", "--state-dir", "/srv/state"] };
+  const session = new ClaudeSession(minimalInput({ hostMcpServer }), recordingEmitter().emit);
+  expect(fake.capturedOptions?.mcpServers).toEqual({
+    codemux: { type: "stdio", command: `${homedir()}/.local/bin/codemux-remote`, args: ["mcp", "--state-dir", "/srv/state"] },
+  });
+  await session.close();
+
+  // Managed attempts keep their restricted map.
+  const managed = new ClaudeSession(minimalInput({ threadId: "t-2", managed: true, hostMcpServer }), recordingEmitter().emit);
+  expect(fake.capturedOptions?.mcpServers).toBeUndefined();
+  await managed.close();
+
+  // The in-process facade wins; the host server never shadows it.
+  const local = new ClaudeSession(minimalInput({
+    threadId: "t-3",
+    hostMcpServer,
+    mcpTools: [{ name: "workspace_info", prefixedName: "mcp__codemux__workspace_info", description: "x", inputSchema: { type: "object" }, serverId: "codemux-self" }],
+  }), recordingEmitter().emit);
+  expect(fake.capturedOptions?.mcpServers?.codemux?.type).toBe("sdk");
+  await local.close();
+});
+
+test("start-session validates the host MCP server", async () => {
+  const methods = buildMethods(recordingEmitter().emit);
+  const start = methods["start-session"]!;
+  await expect(start({ threadId: "bad", cwd: "/tmp", pathToClaudeCodeExecutable: "claude", hostMcpServer: { command: 7 } })).rejects.toThrow("hostMcpServer.command");
+  await expect(start({ threadId: "bad2", cwd: "/tmp", pathToClaudeCodeExecutable: "claude", hostMcpServer: { command: "x", args: [1] } })).rejects.toThrow("hostMcpServer.args[0]");
+  _resetSessionsForTests();
+});
+
 test("MCP round 3: query rebuild forgets CLI session-only target permissions", async () => {
   const { emit, events } = recordingEmitter();
   const session = new ClaudeSession(minimalInput(), emit);

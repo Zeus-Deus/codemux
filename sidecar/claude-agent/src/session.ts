@@ -29,6 +29,9 @@ import {
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import { AsyncPromptQueue } from "./async-queue.ts";
 import {
   buildCodemuxMcpServer,
@@ -96,6 +99,11 @@ export interface SessionStartInput {
    *  tool's prefixed name (`mcp__<server>__<tool>`) is what the
    *  agent sees and what permission rules key on. */
   mcpTools?: RegisteredMcpTool[];
+  /** A stdio MCP server on the machine this sidecar runs on, registered as
+   *  `codemux` for this session only: a device's or a remote task host's
+   *  own `codemux-remote mcp`. A leading `~/` is that machine's home.
+   *  Ignored when the in-process facade is present and for managed attempts. */
+  hostMcpServer?: { command: string; args: string[] };
   /** Codemux instructions appended to Claude Code's system prompt. */
   appendSystemPrompt?: string;
 }
@@ -329,6 +337,15 @@ function buildQueryOptions(
       .filter((tool) => AUTO_ALLOWED_HOST_TOOLS.has(tool.prefixedName))
       .map((tool) => `mcp__codemux__${tool.prefixedName}`);
     if (autoAllowed.length > 0) opts.allowedTools = autoAllowed;
+  } else if (input.hostMcpServer && !input.managed) {
+    const { command, args } = input.hostMcpServer;
+    opts.mcpServers = {
+      codemux: {
+        type: "stdio",
+        command: command.startsWith("~/") ? join(homedir(), command.slice(2)) : command,
+        args: [...args],
+      },
+    };
   }
 
   if (input.managed) {

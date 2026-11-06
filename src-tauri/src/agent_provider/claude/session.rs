@@ -64,6 +64,8 @@ pub struct ClaudeSpawnConfig {
     /// requests task forwards them to the registry's
     /// `dispatch_tool_call`. Tests pass `None`.
     pub mcp_registry: Option<crate::mcp::registry::McpRegistry>,
+    /// See [`super::ClaudeProviderConfig::host_mcp_server`].
+    pub host_mcp_server: Option<super::protocol::HostMcpServer>,
 }
 
 /// Mutable per-session state.
@@ -572,6 +574,7 @@ impl ClaudeSession {
                     .await
                 }
             },
+            host_mcp_server: host_mcp_server(managed.is_some(), input.remote.is_some(), spawn.host_mcp_server.as_ref()),
             append_system_prompt: None,
         };
         if managed.is_none() {
@@ -2296,6 +2299,24 @@ async fn push_mcp_refresh(
     }
 }
 
+/// The host MCP server a session's `start-session` carries: a device's own
+/// `codemux-remote mcp` for a session on a device, the provider's for one on
+/// a remote task host, and none for a managed attempt, whose MCP map stays
+/// restricted to its virtual tools.
+fn host_mcp_server(
+    managed: bool,
+    on_device: bool,
+    provider: Option<&super::protocol::HostMcpServer>,
+) -> Option<super::protocol::HostMcpServer> {
+    if managed {
+        None
+    } else if on_device {
+        Some(super::protocol::HostMcpServer::device())
+    } else {
+        provider.cloned()
+    }
+}
+
 /// Codemux's instructions for the tools this chat can call, appended to
 /// Claude Code's system prompt. Claude lists MCP tools by name only until it
 /// searches for one, so a tool's description alone does not tell the agent
@@ -2678,6 +2699,21 @@ async fn mutate_state_from_notification(
 mod tests {
     use super::*;
 
+    /// Sessions on a device or a remote task host get that host's own
+    /// `codemux-remote mcp`; managed attempts and local chats never do.
+    #[test]
+    fn host_mcp_server_reaches_only_unmanaged_remote_sessions() {
+        use super::super::protocol::HostMcpServer;
+        let task_host = HostMcpServer::codemux_remote(std::path::Path::new("/h/.local/bin/codemux-remote"), std::path::Path::new("/h/state"));
+        assert_eq!(host_mcp_server(false, true, None), Some(HostMcpServer::device()));
+        assert_eq!(host_mcp_server(false, true, Some(&task_host)), Some(HostMcpServer::device()), "a device chat uses the device's own");
+        assert_eq!(host_mcp_server(false, false, Some(&task_host)), Some(task_host.clone()));
+        assert_eq!(host_mcp_server(false, false, None), None, "a local chat keeps the in-process facade only");
+        assert_eq!(host_mcp_server(true, true, Some(&task_host)), None);
+        assert_eq!(host_mcp_server(true, false, Some(&task_host)), None);
+        assert_eq!(task_host.args, ["mcp", "--state-dir", "/h/state"]);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn review600_mid_turn_permission_change_allows_new_mcp_callbacks() {
@@ -2687,7 +2723,7 @@ mod tests {
             let thread = ThreadId(format!("review600-mode-{mode}"));
             let (tx, _) = broadcast::channel(128);
             let input = serde_json::from_value(json!({"thread_id":thread,"cwd":std::env::temp_dir(),"permission_mode":"default","additional_directories":[]})).unwrap();
-            let session = ClaudeSession::spawn_and_initialize(thread.clone(), input, ClaudeSpawnConfig {sidecar_binary:binary.clone(),claude_binary:"claude".into(),mcp_registry:None}, tx).await.unwrap();
+            let session = ClaudeSession::spawn_and_initialize(thread.clone(), input, ClaudeSpawnConfig {sidecar_binary:binary.clone(),claude_binary:"claude".into(),mcp_registry:None,host_mcp_server:None}, tx).await.unwrap();
             let generation = session.native_authority.begin(9);
             assert!(session.native_authority.bind(generation, "active-turn"));
             let old = session.native_authority.capture();

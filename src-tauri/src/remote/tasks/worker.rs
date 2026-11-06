@@ -783,6 +783,7 @@ child.stdin.close();child.wait()
             ClaudeAgentProvider::new(ClaudeProviderConfig {
                 sidecar_binary: Some(wrapper),
                 claude_binary: Some("/fixture/claude".into()),
+                host_mcp_server: Some(super::super::host_mcp_server(dir.path())),
                 ..Default::default()
             })
             .await
@@ -825,5 +826,11 @@ child.stdin.close();child.wait()
                 .unwrap();
         assert_eq!(call["params"]["permissionMode"], "default");
         assert!(call["params"].get("resume").is_none() || call["params"]["resume"].is_null());
+        // The task's own host server, per launch: no desktop tools, and no
+        // global or project config needed on the host.
+        let host = &call["params"]["hostMcpServer"];
+        assert_eq!(host["args"], json!(["mcp", "--state-dir", dir.path().display().to_string()]), "{call}");
+        assert!(host["command"].as_str().is_some_and(|command| !command.is_empty()));
+        assert!(call["params"].get("mcpTools").is_none(), "no desktop tools reach a remote task: {call}");
     }
 }
