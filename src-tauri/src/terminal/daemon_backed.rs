@@ -836,7 +836,7 @@ async fn spawn_prepared_session<R: Runtime>(
         // A Claude typed in this shell must not find an entry an older build
         // wrote above its folder (see `mcp_cleanup::before_launch`).
         if !is_remote {
-            crate::mcp_cleanup::before_launch(std::path::Path::new(&effective_cwd));
+            crate::mcp_cleanup::before_launch(std::path::Path::new(&effective_cwd)).await;
         }
         match client
             .spawn(

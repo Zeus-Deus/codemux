@@ -754,7 +754,8 @@ child.stdin.close();child.wait()
     }
     /// Also a task started from a Codemux terminal (the worker inherits that
     /// terminal's Claude Code plugin): its Claude gets only the task's host
-    /// server, and keeps the user's own plugin dirs.
+    /// server, and keeps the user's own plugin dirs, even one whose path ends
+    /// like Codemux's.
     #[test]
     fn claude_native_adapter_executes_one_fresh_run_and_reaps_sidecar() {
         if crate::test_isolation::isolated("remote::tasks::worker::tests::claude_native_adapter_executes_one_fresh_run_and_reaps_sidecar") {
@@ -762,8 +763,14 @@ child.stdin.close();child.wait()
         }
         // The isolated process runs only this test, and no other thread has
         // started yet.
+        let data = dirs::data_dir().unwrap();
+        let inherited = format!(
+            "{}:/work/plugins/codemux/claude-plugin:/u/mine:{}",
+            data.join("codemux/claude-plugin").display(),
+            data.join("codemux-remote/claude-plugin").display()
+        );
         unsafe {
-            std::env::set_var(crate::claude_plugin::PLUGIN_DIRS_ENV, "/h/.local/share/codemux/claude-plugin:/u/mine:/h/.local/state/codemux-remote/claude-plugin");
+            std::env::set_var(crate::claude_plugin::PLUGIN_DIRS_ENV, inherited);
         }
         tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(claude_native_adapter_run());
     }
@@ -847,6 +854,6 @@ child.stdin.close();child.wait()
         assert_eq!(host["args"], json!(["mcp", "--state-dir", dir.path().display().to_string()]), "{call}");
         assert!(host["command"].as_str().is_some_and(|command| !command.is_empty()));
         assert!(call["params"].get("mcpTools").is_none(), "no desktop tools reach a remote task: {call}");
-        assert_eq!(std::fs::read_to_string(dir.path().join("plugin-dirs")).unwrap(), "/u/mine", "no inherited Codemux plugin");
+        assert_eq!(std::fs::read_to_string(dir.path().join("plugin-dirs")).unwrap(), "/work/plugins/codemux/claude-plugin:/u/mine", "no inherited Codemux plugin");
     }
 }

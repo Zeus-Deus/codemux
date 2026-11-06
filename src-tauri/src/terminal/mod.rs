@@ -1939,7 +1939,7 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
     // entry an older build wrote above its folder. A host's shell gets the
     // host's own plugin from its daemon instead.
     if !owning_ws.is_some_and(|ws| ws.host_id.is_some()) {
-        crate::mcp_cleanup::before_launch(std::path::Path::new(&cwd));
+        crate::mcp_cleanup::before_launch_blocking(std::path::Path::new(&cwd));
         if let Some((key, value)) = claude_plugin_env() {
             cmd.env(key, value);
         }

@@ -28,8 +28,8 @@ pub const TERMINAL_AGENT_KIND: &str = "terminal";
 /// Directory name of the plugin under each Codemux data directory.
 const PLUGIN_DIR_NAME: &str = "claude-plugin";
 
-/// Data directories whose `claude-plugin` is Codemux's (release, dev, remote host).
-const CODEMUX_DATA_DIRS: [&str; 3] = ["codemux", "codemux-dev", "codemux-remote"];
+/// The app data directories (release, dev) whose plugin is Codemux's.
+const APP_DATA_DIRS: [&str; 2] = ["codemux", "codemux-dev"];
 
 #[cfg(windows)]
 const SEPARATOR: char = ';';
@@ -73,7 +73,7 @@ fn prepare_local_plugin() -> Option<PathBuf> {
     // developer's own data directory.
     #[cfg(test)]
     crate::test_isolation::isolated_root()?;
-    let dir = dirs::data_dir()?.join(crate::APP_DIR_NAME).join(PLUGIN_DIR_NAME);
+    let dir = plugin_dir_in(&dirs::data_dir()?.join(crate::APP_DIR_NAME));
     let command = crate::mcp_server::codemux_mcp_command();
     let env = [(crate::control_identity::AGENT_PROCESS_ENV, TERMINAL_AGENT_KIND)];
     match ensure_plugin(&dir, &command, &["mcp".to_owned()], &env) {
@@ -85,10 +85,36 @@ fn prepare_local_plugin() -> Option<PathBuf> {
     }
 }
 
+/// Where Codemux keeps its plugin under one of its data directories. Both
+/// the writers and [`owned_plugin_dirs`] derive paths from it.
+fn plugin_dir_in(data_dir: &Path) -> PathBuf {
+    data_dir.join(PLUGIN_DIR_NAME)
+}
+
+/// Every plugin directory this user's Codemux writes: the release and dev
+/// app's, and the remote host's under its default state root. Only these
+/// exact paths are Codemux's; a user directory that merely ends in
+/// `codemux/claude-plugin` is not.
+fn owned_plugin_dirs() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = dirs::data_dir()
+        .map(|data| APP_DATA_DIRS.iter().map(|name| data.join(name)).collect())
+        .unwrap_or_default();
+    #[cfg(unix)]
+    roots.push(crate::remote::config::default_state_dir());
+    roots.iter().map(|root| plugin_dir_in(root)).collect()
+}
+
 /// The plugin a remote host's terminals get: the host's own
-/// `codemux-remote mcp` for the daemon state in `state_dir`.
-pub fn ensure_remote_host_plugin(state_dir: &Path, codemux_remote: &Path) -> std::io::Result<PathBuf> {
-    let dir = state_dir.join(PLUGIN_DIR_NAME);
+/// `codemux-remote mcp` for the daemon state in the default state root,
+/// the one place [`owned_plugin_dirs`] recognizes as the host's.
+#[cfg(unix)]
+pub fn ensure_remote_host_plugin(codemux_remote: &Path) -> std::io::Result<PathBuf> {
+    ensure_remote_host_plugin_in(&crate::remote::config::default_state_dir(), codemux_remote)
+}
+
+#[cfg(unix)]
+fn ensure_remote_host_plugin_in(state_dir: &Path, codemux_remote: &Path) -> std::io::Result<PathBuf> {
+    let dir = plugin_dir_in(state_dir);
     let args = ["mcp".to_owned(), "--state-dir".to_owned(), state_dir.display().to_string()];
     ensure_plugin(&dir, &codemux_remote.display().to_string(), &args, &[])?;
     Ok(dir)
@@ -97,9 +123,13 @@ pub fn ensure_remote_host_plugin(state_dir: &Path, codemux_remote: &Path) -> std
 /// The `CLAUDE_CODE_PLUGIN_DIRS` value for a terminal: `ours` first, then the
 /// inherited directories that are not Codemux's own.
 pub fn plugin_dirs_value(ours: &Path, inherited: Option<&OsStr>) -> OsString {
+    plugin_dirs_value_with(ours, inherited, &owned_plugin_dirs())
+}
+
+fn plugin_dirs_value_with(ours: &Path, inherited: Option<&OsStr>, owned: &[PathBuf]) -> OsString {
     let mut value = OsString::from(ours);
     for dir in inherited.map(split).unwrap_or_default() {
-        if !is_codemux_plugin_dir(&dir) && dir != ours {
+        if !is_owned(&dir, owned) && !same_dir(&dir, ours) {
             value.push(SEPARATOR.to_string());
             value.push(dir);
         }
@@ -132,17 +162,17 @@ pub fn scrub_inherited_plugin_dirs() {
 /// terminal never hands that terminal's tools to the agents it launches;
 /// they get their own tools per session instead.
 pub fn inherited_without_codemux_dirs() -> Option<OsString> {
-    without_codemux_dirs(&std::env::var_os(PLUGIN_DIRS_ENV)?)
+    without_codemux_dirs(&std::env::var_os(PLUGIN_DIRS_ENV)?, &owned_plugin_dirs())
 }
 
-/// `value` without Codemux's directories, or `None` when it had none.
-fn without_codemux_dirs(value: &OsStr) -> Option<OsString> {
+/// `value` without the `owned` directories, or `None` when it had none.
+fn without_codemux_dirs(value: &OsStr, owned: &[PathBuf]) -> Option<OsString> {
     let dirs = split(value);
-    if !dirs.iter().any(|dir| is_codemux_plugin_dir(dir)) {
+    if !dirs.iter().any(|dir| is_owned(dir, owned)) {
         return None;
     }
     let mut kept = OsString::new();
-    for dir in dirs.into_iter().filter(|dir| !is_codemux_plugin_dir(dir)) {
+    for dir in dirs.into_iter().filter(|dir| !is_owned(dir, owned)) {
         if !kept.is_empty() {
             kept.push(SEPARATOR.to_string());
         }
@@ -160,14 +190,25 @@ fn split(value: &OsStr) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `<…>/codemux*/claude-plugin`, whichever build or host wrote it.
-fn is_codemux_plugin_dir(dir: &Path) -> bool {
-    dir.file_name() == Some(OsStr::new(PLUGIN_DIR_NAME))
-        && dir
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(OsStr::to_str)
-            .is_some_and(|name| CODEMUX_DATA_DIRS.contains(&name))
+fn is_owned(dir: &Path, owned: &[PathBuf]) -> bool {
+    owned.iter().any(|ours| same_dir(dir, ours))
+}
+
+/// The same path as Codemux spells it: a trailing separator or `.` does not
+/// matter, and on Windows neither do case and a `\\?\` prefix (as
+/// `dunce` strips it elsewhere). No filesystem access: this runs on every
+/// agent spawn, and Codemux writes the value from the same data paths.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let (a, b) = (dunce::simplified(a), dunce::simplified(b));
+    #[cfg(windows)]
+    {
+        let key = |path: &Path| path.components().map(|part| part.as_os_str().to_string_lossy().to_lowercase()).collect::<Vec<_>>();
+        key(a) == key(b)
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
 }
 
 #[cfg(test)]
@@ -208,10 +249,11 @@ mod tests {
         assert_eq!(read(&plugin.join(".mcp.json"))["mcpServers"]["codemux"]["command"], "/b/codemux");
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_host_plugin_runs_the_hosts_codemux_remote() {
         let state = tempfile::tempdir().unwrap();
-        let dir = ensure_remote_host_plugin(state.path(), Path::new("/home/u/.local/bin/codemux-remote")).unwrap();
+        let dir = ensure_remote_host_plugin_in(state.path(), Path::new("/home/u/.local/bin/codemux-remote")).unwrap();
         assert_eq!(dir, state.path().join(PLUGIN_DIR_NAME));
         assert_eq!(
             read(&dir.join(".mcp.json"))["mcpServers"]["codemux"],
@@ -219,31 +261,54 @@ mod tests {
         );
     }
 
+    /// What Codemux writes for a user whose data dir is `/h/.local/share`.
     #[cfg(unix)]
-    #[test]
-    fn terminal_value_puts_ours_first_and_drops_other_codemux_dirs() {
-        let ours = Path::new("/h/.local/share/codemux/claude-plugin");
-        assert_eq!(plugin_dirs_value(ours, None), OsString::from("/h/.local/share/codemux/claude-plugin"));
-        assert_eq!(plugin_dirs_value(ours, Some(OsStr::new(""))), OsString::from(ours));
-        let inherited = OsStr::new("/u/mine:/h/.local/share/codemux-dev/claude-plugin:/h/.local/share/codemux/claude-plugin::/u/other");
-        assert_eq!(
-            plugin_dirs_value(ours, Some(inherited)),
-            OsString::from("/h/.local/share/codemux/claude-plugin:/u/mine:/u/other")
-        );
+    fn owned() -> Vec<PathBuf> {
+        ["codemux", "codemux-dev", "codemux-remote"].iter().map(|name| plugin_dir_in(&Path::new("/h/.local/share").join(name))).collect()
     }
 
     #[cfg(unix)]
     #[test]
-    fn startup_scrub_keeps_only_the_users_dirs() {
-        assert_eq!(without_codemux_dirs(OsStr::new("/u/mine:/u/claude-plugin")), None, "nothing of ours");
+    fn terminal_value_puts_ours_first_and_drops_other_codemux_dirs() {
+        let ours = Path::new("/h/.local/share/codemux/claude-plugin");
+        assert_eq!(plugin_dirs_value_with(ours, None, &owned()), OsString::from("/h/.local/share/codemux/claude-plugin"));
+        assert_eq!(plugin_dirs_value_with(ours, Some(OsStr::new("")), &owned()), OsString::from(ours));
+        let inherited = OsStr::new("/u/mine:/h/.local/share/codemux-dev/claude-plugin/:/h/.local/share/codemux/claude-plugin::/u/other");
         assert_eq!(
-            without_codemux_dirs(OsStr::new("/h/.local/share/codemux/claude-plugin:/u/mine")),
-            Some(OsString::from("/u/mine"))
+            plugin_dirs_value_with(ours, Some(inherited), &owned()),
+            OsString::from("/h/.local/share/codemux/claude-plugin:/u/mine:/u/other")
+        );
+    }
+
+    /// Only the exact paths Codemux writes are its own: a user's checkout
+    /// whose path merely ends the same way stays.
+    #[cfg(unix)]
+    #[test]
+    fn startup_scrub_keeps_only_the_users_dirs() {
+        assert_eq!(without_codemux_dirs(OsStr::new("/u/mine:/u/claude-plugin"), &owned()), None, "nothing of ours");
+        assert_eq!(
+            without_codemux_dirs(OsStr::new("/work/plugins/codemux/claude-plugin:/u/codemux-remote/claude-plugin"), &owned()),
+            None,
+            "same names elsewhere are the user's"
         );
         assert_eq!(
-            without_codemux_dirs(OsStr::new("/s/codemux-remote/claude-plugin")),
+            without_codemux_dirs(OsStr::new("/h/.local/share/codemux/claude-plugin:/work/plugins/codemux/claude-plugin:/u/mine"), &owned()),
+            Some(OsString::from("/work/plugins/codemux/claude-plugin:/u/mine"))
+        );
+        assert_eq!(
+            without_codemux_dirs(OsStr::new("/h/.local/share/codemux-remote/claude-plugin"), &owned()),
             Some(OsString::new()),
             "an empty result removes the variable"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_match_regardless_of_case_and_prefix() {
+        let ours = Path::new(r"C:\Users\u\AppData\Roaming\codemux\claude-plugin");
+        for spelling in [r"c:\users\U\appdata\roaming\Codemux\claude-plugin", r"\\?\C:\Users\u\AppData\Roaming\codemux\claude-plugin", "C:/Users/u/AppData/Roaming/codemux/claude-plugin"] {
+            assert!(same_dir(Path::new(spelling), ours), "{spelling}");
+        }
+        assert!(!same_dir(Path::new(r"D:\work\codemux\claude-plugin"), ours));
     }
 }

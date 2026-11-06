@@ -218,8 +218,9 @@ fn edit(
 /// worktrees under Codemux's worktree roots. Sorted and deduplicated.
 pub fn project_dirs(home: &Path, workspace_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     let mut dirs = BTreeSet::from([home.to_path_buf()]);
+    let physical_home = dunce::canonicalize(home).ok();
     for dir in workspace_dirs {
-        dirs.extend(launch_dirs(home, &dir));
+        dirs.extend(physical_home.as_deref().map(|home| launch_dirs(home, &dir)).unwrap_or_default());
     }
     let mut budget = MAX_SCANNED_DIRS;
     for root in WORKTREE_ROOTS {
@@ -232,16 +233,24 @@ pub fn project_dirs(home: &Path, workspace_dirs: impl IntoIterator<Item = PathBu
 }
 
 /// The folders whose `.mcp.json` a Claude started in `dir` reads: `dir` and
-/// its parents up to HOME, or only `dir` outside HOME. None for a relative
-/// path.
+/// its parents up to HOME, or only `dir` when it is outside HOME. Both are
+/// compared as the physical folders they resolve to (symlinks and `..`
+/// followed; on Windows, case and `\\?\` prefixes settled the way `dunce`
+/// does elsewhere), so `<home>/../elsewhere` or a symlink out of HOME counts
+/// as outside, and the results are canonical paths. None for a relative path
+/// or one whose identity cannot be established (missing, unreadable): no
+/// Claude starts there, and guessing could reach past HOME. `home` must
+/// already be canonical. A candidate `.mcp.json` itself is never resolved;
+/// [`edit`] skips a symlinked one.
 fn launch_dirs(home: &Path, dir: &Path) -> Vec<PathBuf> {
-    if !dir.is_absolute() {
-        Vec::new()
-    } else if dir.starts_with(home) {
+    let Some(dir) = dir.is_absolute().then(|| dunce::canonicalize(dir).ok()).flatten() else {
+        return Vec::new();
+    };
+    if dir.starts_with(home) {
         // Claude Code reads `.mcp.json` from every parent folder.
         dir.ancestors().take_while(|ancestor| ancestor.starts_with(home)).map(Path::to_path_buf).collect()
     } else {
-        vec![dir.to_path_buf()]
+        vec![dir]
     }
 }
 
@@ -331,14 +340,37 @@ pub fn schedule<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     });
 }
 
+/// Folders already cleaned this process. Each has its own lock, so two
+/// launches in one folder check it once while launches elsewhere proceed;
+/// the map's lock is held only to look a folder up, never across I/O.
+#[derive(Default)]
+struct Checked(std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<bool>>>>);
+
+impl Checked {
+    fn slot(&self, dir: &Path) -> std::sync::Arc<std::sync::Mutex<bool>> {
+        let mut slots = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        slots.entry(dir.to_path_buf()).or_default().clone()
+    }
+}
+
 /// Cleans the folders a Claude started in `dir` reads, before Codemux starts
-/// a terminal or chat there. The startup run covers only the folders known
-/// at start; a workspace opened, created, imported or restored later may sit
-/// below a folder an older build wrote into. Each folder is checked once per
-/// process, so later launches cost a set lookup.
-pub fn before_launch(dir: &Path) {
-    use std::sync::{Mutex, OnceLock};
-    static CHECKED: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+/// a terminal or chat there, on the blocking pool so a slow disk never stalls
+/// the async runtime. Await it before spawning. The startup run covers only
+/// the folders known at start; a workspace opened, created, imported or
+/// restored later may sit below a folder an older build wrote into.
+pub async fn before_launch(dir: &Path) {
+    let dir = dir.to_path_buf();
+    if let Err(error) = tokio::task::spawn_blocking(move || before_launch_blocking(&dir)).await {
+        log::warn!("[codemux::mcp_cleanup] pre-launch check failed: {error}");
+    }
+}
+
+/// [`before_launch`] for a caller already on a blocking thread. A folder
+/// whose check completed is not read again this process, so later launches
+/// cost a lookup; one that was skipped (unreadable, invalid, changed
+/// meanwhile) is tried again next launch.
+pub fn before_launch_blocking(dir: &Path) {
+    static CHECKED: std::sync::OnceLock<Checked> = std::sync::OnceLock::new();
     // Tests clean only inside an isolated root, never the developer's HOME.
     #[cfg(test)]
     if crate::test_isolation::isolated_root().is_none() {
@@ -350,15 +382,21 @@ pub fn before_launch(dir: &Path) {
     before_launch_in(&home, CHECKED.get_or_init(Default::default), dir).log();
 }
 
-fn before_launch_in(home: &Path, checked: &std::sync::Mutex<BTreeSet<PathBuf>>, dir: &Path) -> Report {
-    let pending: Vec<PathBuf> = {
-        let checked = checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        launch_dirs(home, dir).into_iter().filter(|dir| !checked.contains(dir)).collect()
-    };
+fn before_launch_in(home: &Path, checked: &Checked, dir: &Path) -> Report {
     let mut report = Report::default();
-    for dir in pending {
-        report.record(dir.join(".mcp.json"), clean_project_file(&dir));
-        checked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(dir);
+    // Without a resolvable HOME, the boundary is unknown: clean nothing.
+    let Ok(home) = dunce::canonicalize(home) else {
+        return report;
+    };
+    for dir in launch_dirs(&home, dir) {
+        let slot = checked.slot(&dir);
+        let mut done = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *done {
+            continue;
+        }
+        let outcome = clean_project_file(&dir);
+        *done = !matches!(outcome, Outcome::Skipped(_));
+        report.record(dir.join(".mcp.json"), outcome);
     }
     report
 }
@@ -565,21 +603,23 @@ mod tests {
 
     #[test]
     fn targets_cover_home_ancestors_and_worktree_roots() {
-        let home = tempfile::tempdir().unwrap();
-        let home = home.path();
+        let (_tmp, home) = real_tempdir();
+        let home = home.as_path();
         let project = home.join("Projects/app");
         let worktree = home.join(".codemux/worktrees/app/feature");
         let tmp_fixture = home.join(".codemux/worktrees/.tmpAbc/lower-mode-fixture");
         for dir in [&project, &worktree, &tmp_fixture] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        let outside = PathBuf::from("/srv/elsewhere/repo");
-        let dirs = project_dirs(home, [project.clone(), outside.clone(), PathBuf::from("relative/dir")]);
+        let (_elsewhere, elsewhere) = real_tempdir();
+        let outside = elsewhere.join("repo");
+        std::fs::create_dir_all(&outside).unwrap();
+        let dirs = project_dirs(home, [project.clone(), outside.clone(), PathBuf::from("relative/dir"), home.join("missing")]);
         for expected in [home.to_path_buf(), home.join("Projects"), project, outside, worktree, tmp_fixture, home.join(".codemux/worktrees/app")] {
             assert!(dirs.contains(&expected), "{expected:?} missing from {dirs:?}");
         }
-        assert!(!dirs.iter().any(|dir| dir == Path::new("/srv") || dir == Path::new("/srv/elsewhere")), "no ancestors outside HOME");
-        assert!(!dirs.iter().any(|dir| dir.is_relative()));
+        assert!(!dirs.iter().any(|dir| *dir == elsewhere), "no ancestors outside HOME");
+        assert!(!dirs.iter().any(|dir| dir.is_relative() || dir.ends_with("missing")));
     }
 
     /// A folder no startup run knew about: launching in it cleans the
@@ -587,12 +627,12 @@ mod tests {
     /// else, and checks each folder once.
     #[test]
     fn a_launch_cleans_the_folders_above_it_once() {
-        let home = tempfile::tempdir().unwrap();
-        let home = home.path();
+        let (_tmp, home) = real_tempdir();
+        let home = home.as_path();
         let generated = json!({"command": "/old/target/debug/codemux", "args": ["mcp"], "env": {PROVIDER_ORIGIN: "1"}});
         write(&home.join("Projects/old/.mcp.json"), &json!({"mcpServers": {"codemux": generated.clone()}}));
         let mine = write(&home.join("Projects/old/repo/.mcp.json"), &json!({"mcpServers": {"codemux": {"command": "codemux", "args": ["mcp", "--client", "me"]}}}));
-        let checked = std::sync::Mutex::default();
+        let checked = Checked::default();
 
         let report = before_launch_in(home, &checked, &home.join("Projects/old/repo"));
         assert_eq!(report.cleaned, [home.join("Projects/old/.mcp.json")], "{report:?}");
@@ -606,7 +646,106 @@ mod tests {
         assert_eq!(before_launch_in(home, &checked, &home.join("Projects/old/repo")), Report::default());
         std::fs::create_dir_all(home.join("Projects/old/other")).unwrap();
         assert_eq!(before_launch_in(home, &checked, &home.join("Projects/old/other")), Report::default());
-        assert_eq!(checked.lock().unwrap().len(), 5, "HOME, Projects, old, repo, other");
+        assert_eq!(checked.0.lock().unwrap().len(), 5, "HOME, Projects, old, repo, other");
+    }
+
+    /// A temp dir by its physical path (macOS's is behind a symlink).
+    fn real_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = dunce::canonicalize(tmp.path()).unwrap();
+        (tmp, path)
+    }
+
+    const GENERATED: &str = r#"{"mcpServers": {"codemux": {"command": "/old/codemux", "args": ["mcp"], "env": {"CODEMUX_MCP_PROVIDER_ORIGIN": "1"}}}}"#;
+
+    /// A path spelled through HOME that resolves outside it is outside: only
+    /// the folder itself is checked, never the ancestors it walks through.
+    #[test]
+    fn a_dot_dot_path_out_of_home_checks_only_its_own_folder() {
+        let (_tmp, root) = real_tempdir();
+        let home = root.as_path().join("home");
+        std::fs::create_dir_all(home.join("Projects")).unwrap();
+        std::fs::create_dir_all(root.as_path().join("outside/repo")).unwrap();
+        std::fs::write(root.as_path().join("outside/.mcp.json"), GENERATED).unwrap();
+        std::fs::write(root.as_path().join(".mcp.json"), GENERATED).unwrap();
+        std::fs::write(root.as_path().join("outside/repo/.mcp.json"), GENERATED).unwrap();
+
+        let report = before_launch_in(&home, &Checked::default(), &home.join("../outside/repo"));
+        assert_eq!(report.cleaned, [root.join("outside/repo").join(".mcp.json")], "{report:?}");
+        assert!(root.as_path().join("outside/.mcp.json").exists(), "an outside ancestor is never touched");
+        assert!(root.as_path().join(".mcp.json").exists());
+
+        // The same spelling through a HOME-relative `..` that stays inside HOME
+        // still walks up to HOME.
+        std::fs::write(home.join(".mcp.json"), GENERATED).unwrap();
+        let report = before_launch_in(&home, &Checked::default(), &home.join("Projects/../Projects"));
+        assert_eq!(report.cleaned, [home.join(".mcp.json")], "{report:?}");
+        assert!(project_dirs(&home, [home.join("../outside/repo")]).iter().all(|dir| !dir.ends_with("outside") && dir != root.as_path()));
+    }
+
+    /// Folders are compared physically: a symlink inside HOME pointing out of
+    /// it is outside, and a HOME reached through a symlink still bounds the
+    /// walk. A symlinked `.mcp.json` itself is still never followed.
+    #[cfg(unix)]
+    #[test]
+    fn directory_symlinks_are_resolved_before_the_home_boundary() {
+        let (_tmp, root) = real_tempdir();
+        let home = root.as_path().join("home");
+        std::fs::create_dir_all(home.join("Projects/real")).unwrap();
+        std::fs::create_dir_all(root.as_path().join("outside/repo")).unwrap();
+        std::fs::write(root.as_path().join("outside/.mcp.json"), GENERATED).unwrap();
+        std::os::unix::fs::symlink(root.as_path().join("outside/repo"), home.join("Projects/link")).unwrap();
+
+        let report = before_launch_in(&home, &Checked::default(), &home.join("Projects/link"));
+        assert!(report.cleaned.is_empty() && report.skipped.is_empty(), "{report:?}");
+        assert!(root.as_path().join("outside/.mcp.json").exists(), "the link's physical parent is outside HOME");
+
+        // HOME given through a symlink: its ancestors stay out of the walk,
+        // and HOME's own entry is cleaned at its physical path.
+        std::os::unix::fs::symlink(&home, root.as_path().join("home-link")).unwrap();
+        std::fs::write(home.join(".mcp.json"), GENERATED).unwrap();
+        std::fs::write(root.as_path().join(".mcp.json"), GENERATED).unwrap();
+        let report = before_launch_in(&root.as_path().join("home-link"), &Checked::default(), &home.join("Projects/real"));
+        assert_eq!(report.cleaned, [home.join(".mcp.json")], "{report:?}");
+        assert!(root.as_path().join(".mcp.json").exists());
+
+        // A symlinked candidate file is skipped, not followed.
+        std::fs::write(root.as_path().join("target.json"), GENERATED).unwrap();
+        std::os::unix::fs::symlink(root.as_path().join("target.json"), home.join("Projects/.mcp.json")).unwrap();
+        let report = before_launch_in(&home, &Checked::default(), &home.join("Projects/real"));
+        assert_eq!(report.skipped, [(home.join("Projects/.mcp.json"), "a symlink".to_owned())], "{report:?}");
+        assert!(root.as_path().join("target.json").exists());
+    }
+
+    /// A check that was skipped (invalid JSON here) is not remembered, so the
+    /// next launch cleans the file once it is valid; a completed one is.
+    #[test]
+    fn a_skipped_check_is_retried_next_launch() {
+        let (_tmp, home) = real_tempdir();
+        let home = home.as_path();
+        std::fs::write(home.join(".mcp.json"), "{ not json").unwrap();
+        let checked = Checked::default();
+        assert_eq!(before_launch_in(home, &checked, home).skipped.len(), 1);
+        std::fs::write(home.join(".mcp.json"), GENERATED).unwrap();
+        assert_eq!(before_launch_in(home, &checked, home).cleaned, [home.join(".mcp.json")]);
+        std::fs::write(home.join(".mcp.json"), GENERATED).unwrap();
+        assert_eq!(before_launch_in(home, &checked, home), Report::default(), "completed checks are not repeated");
+    }
+
+    /// Launches racing on the blocking pool check one folder once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_launches_in_one_folder_check_it_once() {
+        let (_tmp, home) = real_tempdir();
+        let checked = std::sync::Arc::new(Checked::default());
+        std::fs::write(home.join(".mcp.json"), GENERATED).unwrap();
+        let (dir, shared) = (home.clone(), checked.clone());
+        let launches = (0..4).map(|_| {
+            let (dir, shared) = (dir.clone(), shared.clone());
+            tokio::task::spawn_blocking(move || before_launch_in(&dir, &shared, &dir))
+        });
+        let reports: Vec<Report> = futures_util::future::join_all(launches).await.into_iter().map(Result::unwrap).collect();
+        assert_eq!(reports.iter().map(|report| report.cleaned.len()).sum::<usize>(), 1, "concurrent launches check a folder once: {reports:?}");
+        assert!(!home.join(".mcp.json").exists());
     }
 
     /// The incident's layout: a generated entry in HOME and a project, a

@@ -444,7 +444,7 @@ fn run_pty_daemon(socket: PathBuf) -> ExitCode {
     // agents on the host would read.
     let running = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("codemux-remote"));
     let codemux_remote = codemux_lib::mcp_server::install_path(&running);
-    match codemux_lib::claude_plugin::ensure_remote_host_plugin(&resolve_state_dir(None), codemux_remote) {
+    match codemux_lib::claude_plugin::ensure_remote_host_plugin(codemux_remote) {
         Ok(dir) => codemux_lib::pty_daemon::server::set_host_claude_plugin(dir),
         Err(error) => eprintln!("[codemux-remote] shells start without the Claude Code plugin: {error}"),
     }

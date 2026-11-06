@@ -332,7 +332,7 @@ async fn spawn_local_sidecar(
     // entry an older build wrote there would add a second Codemux server.
     // Managed attempts read no project config.
     if !managed {
-        crate::mcp_cleanup::before_launch(&cwd);
+        crate::mcp_cleanup::before_launch(&cwd).await;
     }
     let sidecar_config = SpawnConfig {
         program: sidecar_binary.to_path_buf(),
