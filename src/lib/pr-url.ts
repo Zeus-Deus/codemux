@@ -119,18 +119,28 @@ export function _resetPrLinkIndex(): void {
   indexedRows = [];
 }
 
+function matchesHost(host: string, url: string): boolean {
+  try {
+    // URL parsing recognises www aliases, so repository matching must too.
+    return new URL(url).hostname.toLowerCase().replace(/^www\./, "") ===
+      host.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The open row this URL names, if any.
  *
- * Matched on repository slug *and* number: a number alone is only unique
- * within one repository, and two open projects can easily both have a
- * `#12`.
+ * Matched on host, repository slug and number: separate servers can host
+ * repositories with the same slug and pull-request numbers.
  */
 export function resolvePrLink(parsed: ParsedPrUrl, rows: PrRow[] = indexedRows): PrRow | null {
   const slug = parsed.slug.toLowerCase();
   return (
     rows.find(
-      (row) => row.number === parsed.number && (row.repo ?? "").toLowerCase() === slug,
+      (row) => row.number === parsed.number &&
+        (row.repo ?? "").toLowerCase() === slug && matchesHost(parsed.host, row.url),
     ) ?? null
   );
 }
@@ -152,7 +162,11 @@ export function resolvePrRoot(
   const exact = resolvePrLink(parsed, rows);
   if (exact) return exact.projectRoot;
   const slug = parsed.slug.toLowerCase();
-  const sameRepo = rows.find((row) => (row.repo ?? "").toLowerCase() === slug);
+  const sameRepo = rows.find((row) =>
+    (row.repo ?? "").toLowerCase() === slug && matchesHost(parsed.host, row.url),
+  );
   if (sameRepo) return sameRepo.projectRoot;
-  return known.find((k) => repoSlugFromUrl(k.url)?.toLowerCase() === slug)?.projectRoot ?? null;
+  return known.find((k) =>
+    repoSlugFromUrl(k.url)?.toLowerCase() === slug && matchesHost(parsed.host, k.url),
+  )?.projectRoot ?? null;
 }

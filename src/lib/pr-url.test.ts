@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { _resetPrLinkIndex, parsePrUrl, publishPrLinkIndex } from "./pr-url";
+import {
+  _resetPrLinkIndex,
+  parsePrUrl,
+  publishPrLinkIndex,
+  resolvePrLink,
+  resolvePrRoot,
+} from "./pr-url";
 import type { PrRow } from "./pr-overview";
 
 const openUrl = vi.hoisted(() => vi.fn(() => Promise.resolve()));
@@ -88,6 +94,45 @@ describe("parsePrUrl", () => {
   });
 });
 
+describe("repository matching", () => {
+  const parsed = {
+    kind: "github" as const,
+    host: "github.com",
+    slug: "example/codemux",
+    number: 285,
+  };
+  const otherHostRow = row({
+    url: "https://git.acme.internal/example/codemux/pull/285",
+    projectRoot: "/home/dev/projects/enterprise-codemux",
+  });
+
+  it("matches both host and repository for an indexed pull request", () => {
+    expect(resolvePrLink(parsed, [otherHostRow, row()])).toEqual(row());
+    expect(resolvePrLink(parsed, [otherHostRow])).toBeNull();
+  });
+
+  it("checks the host when falling back to another pull request in the repository", () => {
+    expect(resolvePrRoot({ ...parsed, number: 353 }, [otherHostRow])).toBeNull();
+  });
+
+  it("checks the host when falling back to a workspace URL", () => {
+    expect(resolvePrRoot(parsed, [], [{
+      url: otherHostRow.url,
+      projectRoot: otherHostRow.projectRoot,
+    }])).toBeNull();
+    expect(resolvePrRoot(parsed, [], [{
+      url: row().url,
+      projectRoot: row().projectRoot,
+    }])).toBe(row().projectRoot);
+  });
+
+  it("accepts the www alias supported by URL parsing", () => {
+    expect(resolvePrLink(parsed, [row({
+      url: "https://www.github.com/example/codemux/pull/285",
+    })])).not.toBeNull();
+  });
+});
+
 describe("openExternalUrl", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -133,6 +178,16 @@ describe("openExternalUrl", () => {
       number: 88,
       url: "https://gitlab.example.com/acme/vexis/-/merge_requests/88",
     });
+  });
+
+  it("opens a same-named repository on another host in the browser", async () => {
+    setCustomHosts({ "git.acme.internal": "github" });
+    publishPrLinkIndex([row()]);
+
+    const url = "https://git.acme.internal/example/codemux/pull/285";
+    expect(await openExternalUrl(url)).toBe("browser");
+    expect(openUrl).toHaveBeenCalledWith(url);
+    expect(useUIStore.getState().showPullRequests).toBe(false);
   });
 
   it("shift-click keeps the browser", async () => {
