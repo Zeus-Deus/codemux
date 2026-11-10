@@ -1687,14 +1687,18 @@ test("a device's helper is the bootstrap copy, else codemux-remote on PATH", asy
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
   const home = mkdtempSync(join(tmpdir(), "host-mcp-"));
+  const helper = join(home, ".local/bin/codemux-remote");
   try {
     // Only a packaged or PATH install: no copy in ~/.local/bin.
     expect(resolveHostCommand("~/.local/bin/codemux-remote", home)).toBe("codemux-remote");
     mkdirSync(join(home, ".local/bin"), { recursive: true });
-    writeFileSync(join(home, ".local/bin/codemux-remote"), "");
-    expect(resolveHostCommand("~/.local/bin/codemux-remote", home)).toBe("codemux-remote");
-    chmodSync(join(home, ".local/bin/codemux-remote"), 0o755);
-    expect(resolveHostCommand("~/.local/bin/codemux-remote", home)).toBe(join(home, ".local/bin/codemux-remote"));
+    writeFileSync(helper, "");
+    // Windows treats X_OK as an existence check; Unix requires execute bits.
+    expect(resolveHostCommand("~/.local/bin/codemux-remote", home)).toBe(
+      process.platform === "win32" ? helper : "codemux-remote",
+    );
+    chmodSync(helper, 0o755);
+    expect(resolveHostCommand("~/.local/bin/codemux-remote", home)).toBe(helper);
     expect(resolveHostCommand("/srv/bin/codemux-remote", home)).toBe("/srv/bin/codemux-remote");
   } finally {
     rmSync(home, { recursive: true, force: true });
