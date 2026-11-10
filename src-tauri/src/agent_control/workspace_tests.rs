@@ -297,6 +297,7 @@ async fn concurrent_creates_of_one_folder_open_one_workspace() {
 }
 
 /// Every `.mcp.json` below `dir`, symlinks not followed.
+#[cfg(unix)]
 fn mcp_json_files(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
@@ -318,6 +319,8 @@ fn mcp_json_files(dir: &Path) -> Vec<PathBuf> {
 /// not in the folders, not in their parents up to HOME, not in git's
 /// exclude file. Older builds wrote `.mcp.json` at each of these steps, and
 /// Claude Code then gave Codemux's tools to every agent below those folders.
+/// Unix only: Windows Known Folders ignore the fixture's HOME override.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_lifecycle_writes_no_mcp_config() {
     if isolated(&format!("{MODULE}workspace_lifecycle_writes_no_mcp_config")) {
@@ -372,6 +375,8 @@ async fn workspace_lifecycle_writes_no_mcp_config() {
 /// entry into its parent. Opening it removes that entry before its terminal
 /// starts, so a Claude typed there never loads it. The shell's own startup
 /// file records what it found.
+/// Unix only: the probe uses Bash startup files and a redirected HOME.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn opening_a_folder_cleans_an_old_entry_above_it_before_its_terminal_starts() {
     if isolated(&format!("{MODULE}opening_a_folder_cleans_an_old_entry_above_it_before_its_terminal_starts")) {
