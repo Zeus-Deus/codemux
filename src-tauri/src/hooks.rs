@@ -591,13 +591,31 @@ impl HookFile {
         #[cfg(not(unix))]
         let _ = executable;
         staged.as_file().sync_all()?;
-        if read_optional(&self.path)? != self.original {
-            return Err(std::io::Error::other(
-                "hook file changed during update; skipping",
-            ));
+        #[cfg(windows)]
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if read_optional(&self.path)? != self.original {
+                return Err(std::io::Error::other(
+                    "hook file changed during update; skipping",
+                ));
+            }
+            match staged.persist(&self.path) {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    #[cfg(windows)]
+                    if matches!(error.error.raw_os_error(), Some(5 | 32))
+                        && std::time::Instant::now() < deadline
+                    {
+                        // Readers and scanners can briefly block replacement on Windows.
+                        // Keep the staged file and recheck for edits before each retry.
+                        staged = error.file;
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    return Err(error.error);
+                }
+            }
         }
-        staged.persist(&self.path).map_err(|error| error.error)?;
-        Ok(())
     }
 }
 
@@ -2535,11 +2553,79 @@ case "$URL" in *:43199/*) exit 7 ;; *) exit 0 ;; esac
             })
         };
         ready.wait();
-        for body in [&second, &first, &second, &first] {
-            write_hook_artifact(&path, body, false).unwrap();
-        }
+        let written = [&second, &first, &second, &first]
+            .into_iter()
+            .try_for_each(|body| write_hook_artifact(&path, body, false));
         reading.store(false, Ordering::Relaxed);
         assert!(reader.join().unwrap() > 0);
+        written.expect("artifact replacement failed");
+    }
+
+    #[cfg(windows)]
+    fn hook_reader_without_share_delete(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hook_artifact_windows_retries_until_reader_closes() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("notify.ps1");
+        std::fs::write(&path, "old").unwrap();
+        let snapshot = HookFile::read(&path).unwrap();
+        let reader = hook_reader_without_share_delete(&path);
+        let writer = std::thread::spawn(move || snapshot.replace(b"new", false));
+        std::thread::sleep(Duration::from_millis(100));
+        let was_waiting = !writer.is_finished();
+        drop(reader);
+        writer.join().unwrap().unwrap();
+        assert!(was_waiting);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hook_artifact_windows_blocked_replace_preserves_file_and_cleans_temp() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("notify.ps1");
+        std::fs::write(&path, "old").unwrap();
+        let reader = hook_reader_without_share_delete(&path);
+        let started = std::time::Instant::now();
+        let error = HookFile::read(&path)
+            .unwrap()
+            .replace(b"new", false)
+            .unwrap_err();
+        drop(reader);
+        assert!(matches!(error.raw_os_error(), Some(5 | 32)));
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hook_artifact_windows_retry_refuses_intervening_edit() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("notify.ps1");
+        std::fs::write(&path, "old").unwrap();
+        let snapshot = HookFile::read(&path).unwrap();
+        let reader = hook_reader_without_share_delete(&path);
+        let writer = std::thread::spawn(move || snapshot.replace(b"new", false));
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(&path, "user edit").unwrap();
+        drop(reader);
+        let error = writer.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("changed during update"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "user edit");
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
     }
 
     /// Set CODEMUX_TEST_OPENCODE_BINARY to a prepared native OpenCode 2.x binary.
