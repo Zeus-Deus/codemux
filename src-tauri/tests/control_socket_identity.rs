@@ -245,8 +245,11 @@ fn agent_marked_cli_is_refused_admin_but_owner_is_not() {
     assert_eq!(error_code(&refused), "admin_refused", "{refused}");
     assert_eq!(refused["protocol_version"], 2);
 
-    let codemux_self = serve.json("web_remote_pair", r#"{"name":"phone"}"#, &[(PROVIDER_ORIGIN, "1")]);
-    assert_eq!(error_code(&codemux_self), "admin_refused", "a provider-origin `codemux mcp` is an agent: {codemux_self}");
+    let terminal_agent = serve.json("web_remote_pair", r#"{"name":"phone"}"#, &[(AGENT_PROCESS, "terminal")]);
+    assert_eq!(error_code(&terminal_agent), "admin_refused", "a terminal agent uses the current marker: {terminal_agent}");
+
+    let legacy = serve.json("agent_connector_status", "{}", &[(PROVIDER_ORIGIN, "1")]);
+    assert_eq!(legacy["ok"], true, "the retired MCP marker does not identify a CLI agent: {legacy}");
 
     let owner = serve.json("agent_connector_status", "{}", &[]);
     assert_eq!(owner["ok"], true, "{owner}");
