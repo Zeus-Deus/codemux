@@ -43,14 +43,8 @@ fn binary_path() -> PathBuf {
 struct ServeFixture {
     child: Child,
     state_dir: TempDir,
-    /// Isolated `HOME` for the daemon. Two reasons it must never be
-    /// the developer's real home: (1) `worktree_create` materialises
-    /// worktrees under `$HOME/.codemux/worktrees/...`; (2) on startup
-    /// the daemon auto-registers `codemux-remote mcp` into agent
-    /// configs (`~/.claude.json`, …) — pointing them at this build's
-    /// transient debug binary, which both pollutes the developer's
-    /// machine and breaks the `commands::mcp` discovery unit tests
-    /// that scan real user-level config paths.
+    /// Isolated `HOME` for the daemon: worktrees and legacy registration
+    /// cleanup must never reach the developer's own files.
     home: TempDir,
     endpoint: String,
     secret: String,
@@ -442,7 +436,7 @@ fn serve_keeps_a_foreign_codemux_mcp_entry() {
     std::fs::create_dir_all(vexis.parent().unwrap()).unwrap();
     std::fs::write(&vexis, vexis_before).unwrap();
 
-    // Healthy means serve is past registration: it runs before the router.
+    // Healthy means serve is past legacy cleanup: it runs before the router.
     let fx = ServeFixture::start_with_home(home);
 
     assert_eq!(std::fs::read_to_string(&claude).unwrap(), claude_before);
@@ -450,10 +444,10 @@ fn serve_keeps_a_foreign_codemux_mcp_entry() {
     fx.stop();
 }
 
-/// The daemon refreshes an entry that runs another copy of codemux-remote
-/// and adds a missing one, in both agent configs.
+/// On a remote-only host, the daemon leaves existing agent configs alone
+/// and never adds a registration or creates a config file.
 #[test]
-fn serve_updates_its_own_entry() {
+fn serve_keeps_remote_only_agent_configs_unchanged() {
     let home = TempDir::new().unwrap();
     let claude = home.path().join(".claude.json");
     std::fs::write(
@@ -469,27 +463,25 @@ fn serve_updates_its_own_entry() {
     )
     .unwrap();
 
+    let claude_before = std::fs::read(&claude).unwrap();
+    let vexis_before = std::fs::read(&vexis).unwrap();
     let fx = ServeFixture::start_with_home(home);
-    let exe = std::fs::canonicalize(binary_path()).unwrap();
-    let exe = exe.to_string_lossy();
-
-    let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
-    assert_eq!(parsed["mcpServers"]["codemux"]["command"], json!(exe), "{parsed}");
-    assert_eq!(parsed["mcpServers"]["codemux"]["args"], json!(["mcp"]));
-    assert_eq!(parsed["mcpServers"]["github"]["command"], json!("gh-mcp"));
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str(&std::fs::read_to_string(&vexis).unwrap()).unwrap();
-    assert_eq!(yaml["servers"][0]["command"].as_str(), Some(exe.as_ref()), "{yaml:?}");
+    assert_eq!(std::fs::read(&claude).unwrap(), claude_before);
+    assert_eq!(std::fs::read(&vexis).unwrap(), vexis_before);
     fx.stop();
 
-    // A home with no entry yet gets one added.
+    // A config with no entry stays byte-identical too.
     let home = TempDir::new().unwrap();
     let claude = home.path().join(".claude.json");
     std::fs::write(&claude, r#"{"theme":"dark"}"#).unwrap();
     let fx = ServeFixture::start_with_home(home);
-    let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
-    assert_eq!(parsed["mcpServers"]["codemux"]["command"], json!(exe), "{parsed}");
-    assert_eq!(parsed["theme"], json!("dark"));
+    assert_eq!(std::fs::read_to_string(&claude).unwrap(), r#"{"theme":"dark"}"#);
+    assert!(!fx.home.path().join(".vexis").exists());
+    fx.stop();
+
+    let fx = ServeFixture::start();
+    assert!(!fx.home.path().join(".claude.json").exists());
+    assert!(!fx.home.path().join(".vexis").exists());
     fx.stop();
 }
 
