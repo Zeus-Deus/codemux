@@ -247,6 +247,7 @@ const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
   codex: "Codex",
   cursor: "Cursor",
   grok: "Grok",
+  antigravity: "Antigravity",
   hermes: "Hermes",
   acp: "Custom agent",
   opencode: "OpenCode",

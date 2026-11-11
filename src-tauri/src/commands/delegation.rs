@@ -49,12 +49,13 @@ const CARD_RESULT_CHARS: usize = 4_000;
 const REASON_CHARS: usize = 200;
 /// Agents that can take a task, in the order the tool lists them. Hermes
 /// needs a profile binding and has no tool path, so it is left out.
-pub(super) const CANDIDATES: [ProviderKind; 5] = [
+pub(super) const CANDIDATES: [ProviderKind; 6] = [
     ProviderKind::Claude,
     ProviderKind::Codex,
     ProviderKind::OpenCode,
     ProviderKind::Cursor,
     ProviderKind::Grok,
+    ProviderKind::Antigravity,
 ];
 
 /// Agent-only instructions; display text contains the supplied brief.
@@ -554,6 +555,7 @@ pub(crate) fn provider_id(provider: ProviderKind) -> &'static str {
         ProviderKind::Codex => "codex",
         ProviderKind::Cursor => "cursor",
         ProviderKind::Grok => "grok",
+        ProviderKind::Antigravity => "antigravity",
         ProviderKind::Hermes => "hermes",
         ProviderKind::Acp => "acp",
         ProviderKind::OpenCode => "opencode",
@@ -566,6 +568,7 @@ pub(crate) fn provider_label(provider: ProviderKind) -> &'static str {
         ProviderKind::Codex => "Codex",
         ProviderKind::Cursor => "Cursor",
         ProviderKind::Grok => "Grok",
+        ProviderKind::Antigravity => "Antigravity",
         ProviderKind::Hermes => "Hermes",
         ProviderKind::Acp => "Custom agent",
         ProviderKind::OpenCode => "OpenCode",

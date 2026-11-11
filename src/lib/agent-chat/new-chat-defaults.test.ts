@@ -61,7 +61,7 @@ function resetHealth() {
   useProviderHealth.setState({
     slots: {
       claude: emptyHealthSlot(), codex: emptyHealthSlot(), cursor: emptyHealthSlot(),
-      grok: emptyHealthSlot(), hermes: emptyHealthSlot(), acp: emptyHealthSlot(),
+      grok: emptyHealthSlot(), antigravity: emptyHealthSlot(), hermes: emptyHealthSlot(), acp: emptyHealthSlot(),
       opencode: emptyHealthSlot(),
     },
   });

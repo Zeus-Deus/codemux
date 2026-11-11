@@ -30,13 +30,13 @@ impl Ceiling {
         }
         let (filesystem, approvals, plan) = match (provider, mode) {
             (Claude, "plan") | (Codex, "plan" | "read-only") => (0, 0, true),
-            (Cursor | Grok, "ask") => (0, 0, false),
-            (Cursor | Grok, "plan") => (0, 0, true),
+            (Cursor | Grok | Antigravity, "ask") => (0, 0, false),
+            (Cursor | Grok | Antigravity, "plan") => (0, 0, true),
             (Claude, "default") => (1, 0, false),
             (Claude, "acceptEdits") | (Codex, "workspace-write") => (1, 1, false),
             (Claude, "bypassPermissions")
             | (Codex, "danger-full-access")
-            | (Cursor | Grok, "agent") => (2, 2, false),
+            | (Cursor | Grok | Antigravity, "agent") => (2, 2, false),
             // Hermes modes only choose file-edit approval; its terminal runs
             // any command not on its dangerous-pattern list in every mode.
             (Hermes, "default" | "accept_edits" | "dont_ask") => (2, 2, false),
@@ -131,7 +131,7 @@ impl Ceiling {
             Codex if self.filesystem == 2 && self.approvals == 2 => "danger-full-access",
             Codex if self.filesystem >= 1 && self.approvals >= 1 => "workspace-write",
             Codex => "read-only",
-            Cursor if self.plan => "plan",
+            Cursor | Antigravity if self.plan => "plan",
             // Grok offers only Ask and Agent, neither of which keeps a Plan
             // chat's intent; its start would turn `plan` into Ask.
             Grok if self.plan => {
@@ -140,8 +140,8 @@ impl Ceiling {
                     "Grok has no planning mode within this chat's Plan policy",
                 ))
             }
-            Cursor | Grok if self.filesystem == 2 && self.approvals == 2 => "agent",
-            Cursor | Grok => "ask",
+            Cursor | Grok | Antigravity if self.filesystem == 2 && self.approvals == 2 => "agent",
+            Cursor | Grok | Antigravity => "ask",
             Hermes if self.full_access() => "dont_ask",
             OpenCode if self.full_access() => "default",
             OpenCode if self.filesystem == 2 && self.approvals == 2 => "plan",
@@ -159,7 +159,7 @@ impl Ceiling {
     pub fn inherited_workspace(self, provider: ProviderKind) -> Result<Option<String>, ControlError> {
         use ProviderKind::*;
         let mode = match provider {
-            Claude | Codex | Cursor | Grok | Hermes => Some(self.inherited(provider)?),
+            Claude | Codex | Cursor | Grok | Antigravity | Hermes => Some(self.inherited(provider)?),
             // OpenCode has no chat permission picker; its default is unset.
             OpenCode => Some(self.inherited(provider)?).filter(|mode| mode != "default"),
             _ => return Err(ControlError::new(ErrorCode::UnsupportedPermissionCeiling, "This provider has no workspace permission mapping within this chat's effective policy")),

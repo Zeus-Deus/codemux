@@ -461,7 +461,10 @@ pub(crate) async fn readiness<R: Runtime>(
 ) -> Result<(), ControlError> {
     if !matches!(
         provider,
-        ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::OpenCode
+        ProviderKind::Cursor
+            | ProviderKind::Grok
+            | ProviderKind::Antigravity
+            | ProviderKind::OpenCode
     ) {
         return Ok(());
     }

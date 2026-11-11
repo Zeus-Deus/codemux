@@ -56,6 +56,7 @@ pub fn provider_slug(provider: ProviderKind) -> &'static str {
         ProviderKind::Codex => "codex",
         ProviderKind::Cursor => "cursor",
         ProviderKind::Grok => "grok",
+        ProviderKind::Antigravity => "antigravity",
         ProviderKind::Hermes => "hermes",
         ProviderKind::Acp => "acp",
         ProviderKind::OpenCode => "opencode",

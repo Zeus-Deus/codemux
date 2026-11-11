@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// The set of CLI-backed coding agents the chat runtime can drive.
 ///
 /// Serialized as lowercase strings (`"claude"`, `"codex"`, `"cursor"`,
-/// `"grok"`, `"opencode"`) so
+/// `"grok"`, `"antigravity"`, `"opencode"`) so
 /// values round-trip cleanly through JSON settings and IPC surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -28,6 +28,8 @@ pub enum ProviderKind {
     Cursor,
     /// Grok Build via its official Agent Client Protocol server.
     Grok,
+    /// Google Antigravity via the `agy acp` Agent Client Protocol server.
+    Antigravity,
     /// Official Hermes ACP, bound to an existing local profile.
     Hermes,
     /// User-configured instances speaking the standard Agent Client Protocol.

@@ -218,6 +218,7 @@ fn main_session<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Result<MainS
         "codex" => ProviderKind::Codex,
         "cursor" => ProviderKind::Cursor,
         "grok" => ProviderKind::Grok,
+        "antigravity" => ProviderKind::Antigravity,
         "hermes" => ProviderKind::Hermes,
         "acp" => ProviderKind::Acp,
         "opencode" => ProviderKind::OpenCode,

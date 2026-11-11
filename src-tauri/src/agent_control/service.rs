@@ -57,7 +57,9 @@ pub(crate) fn permission_ceiling(caller: &ControlCaller, provider: ProviderKind,
     let supervised = match provider {
         ProviderKind::Claude => matches!(mode, Some("default" | "acceptEdits" | "plan")),
         ProviderKind::Codex => matches!(mode, Some("read-only" | "workspace-write" | "plan")),
-        ProviderKind::Cursor | ProviderKind::Grok => matches!(mode, Some("ask" | "plan")),
+        ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Antigravity => {
+            matches!(mode, Some("ask" | "plan"))
+        }
         ProviderKind::Hermes | ProviderKind::Acp | ProviderKind::OpenCode => false,
     };
     if supervised { Ok(()) } else {
@@ -220,6 +222,7 @@ pub(crate) async fn capabilities_for_account<R: Runtime>(
         app.state::<std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>>(),
         app.state::<std::sync::Arc<crate::agent_provider::cursor::capabilities::CursorCapabilityCache>>(),
         app.state::<std::sync::Arc<crate::agent_provider::grok::capabilities::GrokCapabilityCache>>(),
+        app.state::<std::sync::Arc<crate::agent_provider::antigravity::capabilities::AntigravityCapabilityCache>>(),
         app.state::<std::sync::Arc<crate::agent_provider::claude::capabilities::ClaudeCapabilityCache>>(),
         app.state::<std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>>(),
     ).await.map_err(ControlError::from)

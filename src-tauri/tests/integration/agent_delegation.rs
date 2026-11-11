@@ -1699,7 +1699,7 @@ mod delegation {
         // Claude lists by the setting alone; its live mode is checked per call.
         assert_eq!(
             listed(&h.caller(Some("plan"))),
-            vec![json!(["claude", "codex", "opencode", "grok"])]
+            vec![json!(["claude", "codex", "opencode", "grok", "antigravity"])]
         );
         // Codex decides once, from the mode its session started in.
         let codex = |mode: &str| HostCaller {

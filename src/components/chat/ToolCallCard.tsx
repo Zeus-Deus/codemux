@@ -382,6 +382,10 @@ function ApprovalFooter({
   // they do support instead of rules that would silently do nothing.
   const provider = useChatProvider();
   const claudeRules = provider === null || provider === "claude";
+  // Antigravity's own "allow always" can outlive the chat, and Codemux
+  // answers a session-wide allow there as a single allow, so it only
+  // offers Allow and Deny.
+  const offersAllowAlways = provider !== "antigravity";
 
   // Take keyboard focus only when nothing else holds it. A focused
   // composer, even an empty one, is where the user is about to type, and
@@ -506,6 +510,7 @@ function ApprovalFooter({
           >
             Allow
           </Button>
+          {offersAllowAlways && (
           <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
             <DropdownMenuTrigger asChild>
               <Button
@@ -549,6 +554,7 @@ function ApprovalFooter({
               )}
             </DropdownMenuContent>
           </DropdownMenu>
+          )}
           <Button
             type="button"
             variant="ghost"

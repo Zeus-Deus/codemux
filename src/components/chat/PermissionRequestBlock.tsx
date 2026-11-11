@@ -6,6 +6,7 @@ import type { PermissionRequestItem } from "@/lib/agent-chat/types";
 import type { ApprovalDecision } from "@/tauri/events";
 
 import { ToolCallBlock } from "./ToolCallBlock";
+import { useChatProvider } from "./chat-provider-context";
 
 interface Props {
   item: PermissionRequestItem;
@@ -24,6 +25,9 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
 }: Props) {
   const [denying, setDenying] = useState(false);
   const [reason, setReason] = useState("");
+  // Antigravity answers a session-wide allow as a single allow (its own
+  // "allow always" can outlive the chat), so the choice is not offered.
+  const offersAllowSession = useChatProvider() !== "antigravity";
 
   if (item.resolution.state === "resolved") {
     return (
@@ -83,14 +87,16 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
           >
             Allow
           </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={allowSession}
-          >
-            Allow for session
-          </Button>
+          {offersAllowSession && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={allowSession}
+            >
+              Allow for session
+            </Button>
+          )}
           <Button
             type="button"
             variant="ghost"

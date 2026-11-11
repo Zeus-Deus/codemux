@@ -103,7 +103,11 @@ pub(crate) fn select_delivery(
 pub(crate) fn deferred_acceptance(provider: ProviderKind) -> bool {
     matches!(
         provider,
-        ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Hermes | ProviderKind::Acp
+        ProviderKind::Cursor
+            | ProviderKind::Grok
+            | ProviderKind::Antigravity
+            | ProviderKind::Hermes
+            | ProviderKind::Acp
     )
 }
 

@@ -307,6 +307,16 @@ doctest = false
 bench = false
 required-features = ["test-fixtures"]
 
+# Test helper binary standing in for Google Antigravity's `agy acp` server.
+# Gated like the other fake provider executables above.
+[[bin]]
+name = "fake_antigravity_acp"
+path = "tests/helpers/fake_antigravity_acp/main.rs"
+test = false
+doctest = false
+bench = false
+required-features = ["test-fixtures"]
+
 # Test helper binary used by `tests/integration/claude_adapter.rs` — simulates the
 # claude-agent sidecar without involving the real SDK. Gated like
 # fake_rpc_child above.

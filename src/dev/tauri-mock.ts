@@ -1959,6 +1959,40 @@ const GROK_CAPABILITIES: ProviderChatCapabilities = {
   permission_granularity: "per_session",
 };
 
+/** Synthetic Antigravity catalogue: models and the thinking level come from
+ *  a signed-in `agy acp` session's config options. */
+const ANTIGRAVITY_CAPABILITIES: ProviderChatCapabilities = {
+  models: [
+    {
+      ...MOCK_CHAT_MODEL,
+      id: "mock-gemini-pro",
+      label: "Gemini Pro (mock)",
+      description: null,
+      effort_levels: ["low", "high"],
+      default_effort: "high",
+      supports_images: true,
+    },
+    {
+      ...MOCK_CHAT_MODEL,
+      id: "mock-gemini-flash",
+      label: "Gemini Flash (mock)",
+      description: null,
+      effort_levels: ["low", "high"],
+      default_effort: "high",
+      supports_images: true,
+    },
+  ],
+  effort_granularity: "per_turn",
+  effort_label_map: { low: "Low", high: "High" },
+  permission_modes: GROK_CAPABILITIES.permission_modes.map((mode) =>
+    mode.value === "agent"
+      ? { ...mode, description: "Allow Antigravity to work without approval prompts." }
+      : mode,
+  ),
+  default_permission_mode: "agent",
+  permission_granularity: "per_turn",
+};
+
 /** Number of simulated turns in the seeded transcript. Every 5th turn
  * includes an 8-call tool burst (exercises run folding). At 520 turns the
  * derived transcript still has more than 1,100 independently virtualized
@@ -3647,6 +3681,7 @@ type MockProviderKind =
   | "codex"
   | "cursor"
   | "grok"
+  | "antigravity"
   | "opencode";
 const mockProviderHealth: Partial<
   Record<MockProviderKind, ProviderHealthReport>
@@ -3684,6 +3719,7 @@ if (agentsFixture === "none" || agentsFixture === "opencode-only") {
     codex: missing("codex", "Codex CLI (`codex`)"),
     cursor: missing("cursor", "Cursor Agent CLI (`cursor-agent`)"),
     grok: missing("grok", "Grok CLI (`grok`)"),
+    antigravity: missing("antigravity", "Antigravity CLI (`agy`)"),
     ...(agentsFixture === "none" ? { opencode: missing("opencode", "OpenCode CLI (`opencode`)") } : {}),
   } satisfies Partial<Record<MockProviderKind, ProviderHealthReport>>);
 }
@@ -5361,6 +5397,8 @@ const handlers: Record<string, Handler> = {
           ? CURSOR_CAPABILITIES
           : a.provider === "grok"
             ? GROK_CAPABILITIES
+            : a.provider === "antigravity"
+              ? ANTIGRAVITY_CAPABILITIES
             : a.provider === "opencode"
               ? OPENCODE_CAPABILITIES
               : EMPTY_CAPABILITIES), supports_steering: a.provider === "claude" || a.provider === "codex" || a.provider === "opencode" }),

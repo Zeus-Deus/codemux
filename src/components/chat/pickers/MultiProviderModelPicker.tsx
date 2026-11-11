@@ -106,6 +106,7 @@ const ALL_PROVIDERS: ReadonlyArray<{
   { kind: "codex", label: "Codex" },
   { kind: "cursor", label: "Cursor" },
   { kind: "grok", label: "Grok" },
+  { kind: "antigravity", label: "Antigravity" },
   { kind: "hermes", label: "Hermes" },
   { kind: "acp", label: "Custom agents" },
   { kind: "opencode", label: "OpenCode" },
@@ -154,16 +155,19 @@ function parseProviderError(error: string | null): ParsedProviderError | null {
     case "codex_not_installed":
     case "cursor_not_installed":
     case "grok_not_installed":
+    case "antigravity_not_installed":
     case "opencode_not_installed":
       return { kind: "not_installed", detail };
     case "codex_not_authenticated":
     case "cursor_not_authenticated":
     case "grok_not_authenticated":
+    case "antigravity_not_authenticated":
     case "opencode_not_authenticated":
       return { kind: "not_authenticated", detail };
     case "codex_harvest_failed":
     case "cursor_harvest_failed":
     case "grok_harvest_failed":
+    case "antigravity_harvest_failed":
     case "opencode_harvest_failed":
       return { kind: "harvest_failed", detail };
     default:
@@ -171,16 +175,19 @@ function parseProviderError(error: string | null): ParsedProviderError | null {
   }
 }
 
-function grokHealthCapabilityError(
+/** Turn an ACP provider's failed health probe into the prefixed
+ *  capability-error vocabulary, so the rail can say why it is empty. */
+function healthCapabilityError(
+  provider: "grok" | "antigravity",
   report: ProviderHealthReport | null,
 ): string | null {
   if (!report || report.status !== "error") return null;
-  const detail = report.message ?? "Grok is unavailable.";
-  if (!report.installed) return `grok_not_installed: ${detail}`;
-  if (detail.toLowerCase().includes("not authenticated")) {
-    return `grok_not_authenticated: ${detail}`;
+  const detail = report.message ?? `${providerDisplayLabel(provider)} is unavailable.`;
+  if (!report.installed) return `${provider}_not_installed: ${detail}`;
+  if (report.login_command || detail.toLowerCase().includes("not authenticated")) {
+    return `${provider}_not_authenticated: ${detail}`;
   }
-  return `grok_harvest_failed: ${detail}`;
+  return `${provider}_harvest_failed: ${detail}`;
 }
 
 function providerErrorTooltipLabel(parsed: ParsedProviderError): string {
@@ -419,12 +426,22 @@ export function MultiProviderModelPicker({
   const codexCaps = codexCatalog.caps;
   const codexError = codexCatalog.error;
   const railError = (kind: RailKey): string | null =>
-    kind === "grok" ? grokAvailabilityError : kind === "codex" ? codexError : errorForRail(kind, allCaps);
+    kind === "grok"
+      ? grokAvailabilityError
+      : kind === "antigravity"
+        ? antigravityAvailabilityError
+        : kind === "codex"
+          ? codexError
+          : errorForRail(kind, allCaps);
   const cursorCaps = allCaps.cursor;
   const grokCaps = allCaps.grok;
+  const antigravityCaps = allCaps.antigravity;
   const opencodeCaps = allCaps.opencode;
   const grokHealthReport = useProviderHealth((state) => state.slots.grok.report);
-  // Grok is the one provider with a live health probe feeding the picker,
+  const antigravityHealthReport = useProviderHealth(
+    (state) => state.slots.antigravity.report,
+  );
+  // Grok and Antigravity have live health probes feeding the picker,
   // so a probe failure can describe WHY discovery is empty (not installed /
   // not signed in) more precisely than the cached capability error. It only
   // changes the message shown next to an empty rail — it never withdraws
@@ -432,7 +449,10 @@ export function MultiProviderModelPicker({
   // slow ACP handshake re-probed after any failed send) and blanking the
   // rail would also hide the model the session is currently running.
   const grokAvailabilityError =
-    allCaps.grokError ?? grokHealthCapabilityError(grokHealthReport);
+    allCaps.grokError ?? healthCapabilityError("grok", grokHealthReport);
+  const antigravityAvailabilityError =
+    allCaps.antigravityError ??
+    healthCapabilityError("antigravity", antigravityHealthReport);
 
   // Subscribe to the favorites array so toggling a star while the
   // popover is open re-sorts the visible rows immediately. Reading
@@ -471,11 +491,12 @@ export function MultiProviderModelPicker({
       codex: rowsFromCaps("codex", codexCaps),
       cursor: rowsFromCaps("cursor", cursorCaps),
       grok: rowsFromCaps("grok", grokCaps),
+      antigravity: rowsFromCaps("antigravity", antigravityCaps),
       hermes: [],
       acp: [],
       opencode: rowsFromCaps("opencode", opencodeCaps),
     };
-  }, [claudeCaps, codexCaps, cursorCaps, grokCaps, opencodeCaps]);
+  }, [claudeCaps, codexCaps, cursorCaps, grokCaps, antigravityCaps, opencodeCaps]);
 
   const visibleRows = useMemo<ResolvedRow[]>(() => {
     const trimmed = query.trim().toLowerCase();
@@ -778,7 +799,10 @@ export function MultiProviderModelPicker({
             onSelect={(next) => {
               setRailKey(next);
               setQuery("");
-              if (next === "grok" && grokAvailabilityError) {
+              if (
+                (next === "grok" && grokAvailabilityError) ||
+                (next === "antigravity" && antigravityAvailabilityError)
+              ) {
                 // An explicit rail click is also the recovery path after the
                 // user installs/signs in out-of-band. Refresh health first,
                 // then re-harvest the live ACP catalogue so a stale discovery
@@ -787,9 +811,9 @@ export function MultiProviderModelPicker({
                   try {
                     await useProviderHealth
                       .getState()
-                      .refresh("grok", { force: true });
+                      .refresh(next, { force: true });
                   } finally {
-                    await useProviderCapabilities.getState().refresh("grok");
+                    await useProviderCapabilities.getState().refresh(next);
                   }
                 })();
               }
@@ -831,6 +855,7 @@ export function MultiProviderModelPicker({
                         codexCaps,
                         cursorCaps,
                         grokCaps,
+                        antigravityCaps,
                         opencodeCaps,
                       )}
                       error={railError(railKey)}
@@ -845,6 +870,7 @@ export function MultiProviderModelPicker({
                         codexCaps,
                         cursorCaps,
                         grokCaps,
+                        antigravityCaps,
                         opencodeCaps,
                       )}
                       error={railError(railKey)}
@@ -1235,6 +1261,7 @@ function capsForRail(
   codexCaps: ProviderChatCapabilities | null,
   cursorCaps: ProviderChatCapabilities | null,
   grokCaps: ProviderChatCapabilities | null,
+  antigravityCaps: ProviderChatCapabilities | null,
   opencodeCaps: ProviderChatCapabilities | null,
 ): ProviderChatCapabilities | null {
   switch (rail) {
@@ -1246,6 +1273,8 @@ function capsForRail(
       return cursorCaps;
     case "grok":
       return grokCaps;
+    case "antigravity":
+      return antigravityCaps;
     case "opencode":
       return opencodeCaps;
     case "acp":
@@ -1541,6 +1570,46 @@ function ModelListEmptyState({
       );
     }
   }
+  if (railKey === "antigravity") {
+    const parsed = parseProviderError(error);
+    if (parsed?.kind === "not_installed") {
+      return (
+        <div className="px-4 py-6 text-center text-label text-muted-foreground">
+          <p className="font-medium text-foreground">
+            Antigravity not detected on your system
+          </p>
+          <p className="mt-1">
+            Install the Antigravity CLI and ensure{" "}
+            <code className="rounded-sm bg-muted px-1">agy</code> is on your PATH.
+          </p>
+        </div>
+      );
+    }
+    if (parsed?.kind === "not_authenticated") {
+      return (
+        <div className="px-4 py-6 text-center text-label text-muted-foreground">
+          <p className="font-medium text-foreground">
+            Antigravity is not signed in
+          </p>
+          <p className="mt-1">
+            Run{" "}
+            <code className="rounded-sm bg-muted px-1">agy acp --login</code>{" "}
+            to sign in with Google, then reopen this list.
+          </p>
+        </div>
+      );
+    }
+    if (parsed?.kind === "harvest_failed" || parsed?.kind === "unknown") {
+      return (
+        <div className="px-4 py-6 text-center text-label text-muted-foreground">
+          Antigravity model discovery failed:{" "}
+          <span className="text-foreground">
+            {parsed.detail ?? error ?? ""}
+          </span>
+        </div>
+      );
+    }
+  }
   if (caps && caps.models.length === 0) {
     return (
       <div className="px-4 py-6 text-center text-label text-muted-foreground">
@@ -1632,6 +1701,8 @@ function providerDisplayLabel(provider: AgentChatProviderKind): string {
       return "Hermes";
     case "grok":
       return "Grok";
+    case "antigravity":
+      return "Antigravity";
     case "opencode":
       return "OpenCode";
   }

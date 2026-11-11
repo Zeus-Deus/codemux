@@ -7,6 +7,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 // hands us a resolved path string — we render it via `<img>` so the
 // SVG is treated as a self-contained asset rather than inlined markup.
 import acpIcon from "@/assets/preset-icons/chat-agent.svg";
+import antigravityIcon from "@/assets/preset-icons/antigravity.svg";
 import claudeIcon from "@/assets/preset-icons/claude.svg";
 import codexIcon from "@/assets/preset-icons/codex.svg";
 import cursorIcon from "@/assets/preset-icons/cursor-agent.svg";
@@ -19,6 +20,7 @@ const PROVIDER_ICON_MAP: Record<AgentChatProviderKind, string> = {
   codex: codexIcon,
   cursor: cursorIcon,
   grok: grokIcon,
+  antigravity: antigravityIcon,
   hermes: hermesIcon,
   acp: acpIcon,
   opencode: opencodeIcon,
@@ -29,6 +31,7 @@ const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   codex: "Codex",
   cursor: "Cursor",
   grok: "Grok",
+  antigravity: "Antigravity",
   hermes: "Hermes",
   acp: "Custom agent",
   opencode: "OpenCode",

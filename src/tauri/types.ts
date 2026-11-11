@@ -1013,6 +1013,7 @@ export type AgentChatProviderKind =
   | "codex"
   | "cursor"
   | "grok"
+  | "antigravity"
   | "hermes"
   | "acp"
   | "opencode";

@@ -12,6 +12,8 @@ export function sessionProviderLabel(provider: string): string {
       return "Cursor";
     case "grok":
       return "Grok";
+    case "antigravity":
+      return "Antigravity";
     case "opencode":
       return "OpenCode";
     default:

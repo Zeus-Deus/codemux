@@ -59,6 +59,7 @@ impl ProviderInstanceId {
             ProviderKind::Codex => "codex",
             ProviderKind::Cursor => "cursor",
             ProviderKind::Grok => "grok",
+            ProviderKind::Antigravity => "antigravity",
             ProviderKind::Hermes => "hermes",
             ProviderKind::Acp => "acp",
             ProviderKind::OpenCode => "opencode",
@@ -88,6 +89,7 @@ mod tests {
             (ProviderKind::Codex, "codex"),
             (ProviderKind::Cursor, "cursor"),
             (ProviderKind::Grok, "grok"),
+            (ProviderKind::Antigravity, "antigravity"),
             (ProviderKind::OpenCode, "opencode"),
         ];
         for (driver, slug) in cases {

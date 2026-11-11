@@ -27,6 +27,7 @@ export const AGENT_NAME: Record<AgentChatProviderKind, string> = {
   codex: "Codex",
   cursor: "Cursor",
   grok: "Grok",
+  antigravity: "Antigravity",
   hermes: "Hermes",
   acp: "Custom agent",
   opencode: "OpenCode",

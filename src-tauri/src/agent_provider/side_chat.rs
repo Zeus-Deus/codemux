@@ -89,6 +89,7 @@ pub fn provider_label(provider: ProviderKind) -> &'static str {
         ProviderKind::Codex => "Codex",
         ProviderKind::Cursor => "Cursor",
         ProviderKind::Grok => "Grok",
+        ProviderKind::Antigravity => "Antigravity",
         ProviderKind::Hermes => "Hermes",
         ProviderKind::Acp => "custom agents",
         ProviderKind::OpenCode => "OpenCode",

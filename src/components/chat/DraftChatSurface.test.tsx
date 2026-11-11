@@ -273,7 +273,7 @@ function resetStores() {
       claude: emptyHealthSlot(),
       codex: emptyHealthSlot(),
       cursor: emptyHealthSlot(),
-      grok: emptyHealthSlot(),
+      grok: emptyHealthSlot(), antigravity: emptyHealthSlot(),
       hermes: emptyHealthSlot(),
       acp: emptyHealthSlot(),
       opencode: emptyHealthSlot(),

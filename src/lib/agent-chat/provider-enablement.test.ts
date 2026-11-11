@@ -32,7 +32,7 @@ describe("provider enablement", () => {
   });
 
   it("refuses to turn off the last provider a new chat can start on", () => {
-    for (const p of ["codex", "cursor", "grok", "opencode"] as const) expect(setProviderEnabled(p, false)).toBe(true);
+    for (const p of ["codex", "cursor", "grok", "antigravity", "opencode"] as const) expect(setProviderEnabled(p, false)).toBe(true);
     expect(isLastDefaultProvider("claude")).toBe(true);
     expect(setProviderEnabled("claude", false)).toBe(false);
     expect(isProviderEnabled("claude")).toBe(true);

@@ -663,6 +663,7 @@ fn native_mode(
             ProviderKind::Claude
             | ProviderKind::Codex
             | ProviderKind::Cursor
+            | ProviderKind::Antigravity
             | ProviderKind::OpenCode => Ok(Some("plan".into())),
             _ => Err("unsupported_operation: Provider has no reviewed Plan mode".into()),
         };
@@ -676,7 +677,7 @@ fn native_mode(
         return native_mode(provider, Some("approval-required"), interaction, None, None);
     };
     use ProviderKind::*;
-    let mode=match(provider,runtime){(Claude,"approval-required")=>"default",(Claude,"auto-accept-edits")=>"acceptEdits",(Claude,"full-access")=>"bypassPermissions",(Codex,"approval-required")=>"read-only",(Codex,"auto-accept-edits")=>"workspace-write",(Codex,"full-access")=>"danger-full-access",(Cursor|Grok,"approval-required")=>"ask",(Cursor|Grok,"full-access")=>"agent",(OpenCode|Hermes,"full-access")=>"default",_=>return Err("unsupported_operation: Runtime mode has no reviewed native policy mapping; select an advertised nativePermissionMode".into())};
+    let mode=match(provider,runtime){(Claude,"approval-required")=>"default",(Claude,"auto-accept-edits")=>"acceptEdits",(Claude,"full-access")=>"bypassPermissions",(Codex,"approval-required")=>"read-only",(Codex,"auto-accept-edits")=>"workspace-write",(Codex,"full-access")=>"danger-full-access",(Cursor|Grok|Antigravity,"approval-required")=>"ask",(Cursor|Grok|Antigravity,"full-access")=>"agent",(OpenCode|Hermes,"full-access")=>"default",_=>return Err("unsupported_operation: Runtime mode has no reviewed native policy mapping; select an advertised nativePermissionMode".into())};
     Ok(Some(mode.into()))
 }
 pub(crate) fn effect_identity(

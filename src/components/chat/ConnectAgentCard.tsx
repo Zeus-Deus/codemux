@@ -46,7 +46,7 @@ export function ConnectAgentCard({ agents }: { agents: FirstRunAgents }) {
           <Row
             logo={
               <span className="flex items-center -space-x-1.5" aria-hidden>
-                {(["cursor", "grok"] as const).map((p) => (
+                {(["cursor", "grok", "antigravity"] as const).map((p) => (
                   <span key={p} className="flex size-6 items-center justify-center rounded-md bg-surface-2 ring-2 ring-popover">
                     <ProviderLogo provider={p} className="size-3.5" />
                   </span>
@@ -54,7 +54,7 @@ export function ConnectAgentCard({ agents }: { agents: FirstRunAgents }) {
               </span>
             }
             name="More agents"
-            detail="Cursor, Grok, Hermes, or any ACP agent"
+            detail="Cursor, Grok, Antigravity, Hermes, or any ACP agent"
           >
             <Button variant="outline" size="sm" onClick={openProvidersSettings}>
               Browse agents

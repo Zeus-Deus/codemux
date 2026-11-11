@@ -47,6 +47,7 @@ pub(crate) fn binary_name(provider: ProviderKind) -> &'static str {
         ProviderKind::Codex => "codex",
         ProviderKind::Cursor => "cursor-agent",
         ProviderKind::Grok => "grok",
+        ProviderKind::Antigravity => "agy",
         ProviderKind::Hermes => "hermes",
         ProviderKind::Acp => "acp",
         ProviderKind::OpenCode => "opencode",

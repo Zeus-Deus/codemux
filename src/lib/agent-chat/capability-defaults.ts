@@ -30,6 +30,9 @@ const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string |
   // means "leave ACP on its provider-native default" until that catalogue
   // hydrates, so new Grok releases never require a Codemux update.
   grok: "default",
+  // Antigravity lists the account's models only in a signed-in session;
+  // `default` leaves the session on Antigravity's own choice until then.
+  antigravity: "default",
   hermes: "profile_default",
   acp: null,
   // Step 12 Stage 1 placeholder. OpenCode capabilities are harvested
@@ -78,6 +81,7 @@ const FALLBACK_DEFAULT_PERMISSION_MODE_BY_PROVIDER: Record<
   codex: "danger-full-access",
   cursor: "agent",
   grok: "agent",
+  antigravity: "agent",
   hermes: null,
   acp: null,
   opencode: null,
@@ -127,6 +131,7 @@ const REQUESTS_SURVIVE_SESSION_RESTART_BY_PROVIDER: Record<
   codex: false,
   cursor: false,
   grok: false,
+  antigravity: false,
   hermes: false,
   acp: false,
   opencode: true,

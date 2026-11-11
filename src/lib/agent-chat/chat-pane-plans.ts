@@ -186,7 +186,10 @@ export function planSubmit(input: PlanSubmitInput): SubmitPlan {
   return {
     text,
     effortOverride:
-      provider === "codex" || provider === "cursor" || provider === "grok"
+      provider === "codex" ||
+      provider === "cursor" ||
+      provider === "grok" ||
+      provider === "antigravity"
         ? effort
         : null,
   };

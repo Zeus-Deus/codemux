@@ -379,6 +379,21 @@ describe("ToolCallCard", () => {
     expect(onDecide).toHaveBeenCalledTimes(1);
   });
 
+  it("offers Antigravity only Allow and Deny, never a lasting allow", () => {
+    render(
+      <ChatProviderContext.Provider value="antigravity">
+        <ToolCallCard
+          item={makeTool({ approval_request_id: "req-agy" })}
+          approval={makePendingApproval({ request_id: "req-agy" })}
+          onDecide={vi.fn()}
+        />
+      </ChatProviderContext.Provider>,
+    );
+    expect(screen.getByRole("button", { name: "Allow" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Deny" })).toBeTruthy();
+    expect(screen.queryByText("Allow always")).toBeNull();
+  });
+
   it("Deny reveals the reason textarea and Confirm deny ships the reason", () => {
     const onDecide = vi.fn();
     render(
