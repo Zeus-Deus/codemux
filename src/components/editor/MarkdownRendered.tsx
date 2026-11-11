@@ -4,7 +4,7 @@ import rehypeRaw from "rehype-raw";
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 
-import { resolveAssetSrc } from "@/lib/asset-url";
+import { isAbsoluteFsPath, isRemoteOrDataUrl, resolveAssetSrc } from "@/lib/asset-url";
 import { openExternalUrl } from "@/lib/open-url";
 import { ImageLightbox } from "./image-lightbox";
 
@@ -108,7 +108,18 @@ function MarkdownRenderedImpl({
        * animated GIF keeps animating in both places.
        */
       img: ({ src, alt, ...rest }) => {
-        const resolved = resolveAssetSrc(src, filePath);
+        let imagePath = src;
+        if (src && !isRemoteOrDataUrl(src) && (filePath || isAbsoluteFsPath(src))) {
+          // Markdown destinations are URLs, but the asset protocol expects a
+          // filesystem path and encodes it again. Decode only the destination,
+          // leaving the base file's literal directory names intact.
+          try {
+            imagePath = decodeURIComponent(src);
+          } catch {
+            // Raw HTML can contain a literal '%' instead of a URL escape.
+          }
+        }
+        const resolved = resolveAssetSrc(imagePath, filePath);
         const label = alt ?? "";
         return (
           <img
