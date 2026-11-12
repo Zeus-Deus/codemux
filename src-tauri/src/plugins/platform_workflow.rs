@@ -1324,6 +1324,21 @@ mod platform_policy_tests {
         )
         .is_err());
         assert!(native_mode(ProviderKind::Grok, None, Some("plan"), None, None).is_err());
+        // Antigravity's Plan launch maps to its native mode and passes the
+        // same validation a launch runs, though its picker lists Ask/Full.
+        let antigravity = native_mode(ProviderKind::Antigravity, None, Some("plan"), None, None).unwrap();
+        assert_eq!(antigravity.as_deref(), Some("plan"));
+        let caps = crate::agent_provider::ProviderChatCapabilities {
+            supports_steering: false,
+            models: vec![],
+            effort_granularity: crate::agent_provider::EffortGranularity::PerTurn,
+            effort_label_map: Default::default(),
+            permission_modes: crate::agent_provider::antigravity::capabilities::antigravity_permission_modes(),
+            default_permission_mode: Some("agent".into()),
+            permission_granularity: crate::agent_provider::EffortGranularity::PerTurn,
+        };
+        assert!(crate::agent_control::service::validate_permission_mode(ProviderKind::Antigravity, antigravity.as_deref(), &caps).is_ok());
+        assert!(crate::agent_control::service::validate_permission_mode(ProviderKind::Grok, Some("plan"), &caps).is_err());
         assert!(native_mode(ProviderKind::Codex, Some("auto"), None, None, None).is_err());
         assert_eq!(
             native_mode(

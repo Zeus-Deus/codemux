@@ -1,4 +1,4 @@
-import { HermesPermissionOptions, isHermesPermission } from "./HermesPermissionOptions";
+import { HermesPermissionOptions, isExactOptionPermission } from "./HermesPermissionOptions";
 import { memo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -51,7 +51,7 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
     );
   }
 
-  if (isHermesPermission(item.payload)) return <HermesPermissionOptions payload={item.payload} onDecide={onDecide} />;
+  if (isExactOptionPermission(item.payload)) return <HermesPermissionOptions payload={item.payload} onDecide={onDecide} />;
 
   const toolName = readToolName(item.payload);
   const toolInput = readToolInput(item.payload);

@@ -1873,16 +1873,21 @@ impl AcpSession {
         // user's own settings. A generic allow (including "for this session")
         // therefore only ever selects "allow once"; a wider grant needs the
         // exact advertised option.
-        let response = match (&pending, &decision) {
+        let (response, decision) = match (&pending, &decision) {
             (
                 PendingRequest::Permission { options, .. },
                 ApprovalDecision::Allow { .. } | ApprovalDecision::AllowForSession,
-            ) if self.dialect.is_antigravity() => json!({
-                "outcome": select_permission_option(options, &["allow_once"])
-                    .map(|option_id| json!({ "outcome": "selected", "optionId": option_id }))
-                    .unwrap_or_else(|| json!({ "outcome": "cancelled" }))
-            }),
-            _ => pending_response(&pending, &decision),
+            ) if self.dialect.is_antigravity() => {
+                match select_permission_option(options, &["allow_once"]) {
+                    Some(option_id) => (
+                        json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
+                        ApprovalDecision::Allow { updated_input: None, updated_permissions: None },
+                    ),
+                    // Recorded as what went over the wire, not as an allow.
+                    None => (json!({ "outcome": { "outcome": "cancelled" } }), ApprovalDecision::Cancel),
+                }
+            }
+            _ => (pending_response(&pending, &decision), decision),
         };
         // The wire needs the exact opaque option ID. Native transcript/UI
         // consumers need its logical scope, not Hermes' ProviderOption event.
@@ -2353,12 +2358,18 @@ impl AcpSession {
             .get("toolCallId")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let mut payload = request.params;
+        // Without an "allow once" choice a generic Allow cannot be honoured,
+        // so the UI shows Antigravity's own options and sends the exact one.
+        if self.dialect.is_antigravity() && !antigravity_offers_allow_once(&payload) {
+            payload["_codemuxExactOptions"] = Value::Bool(true);
+        }
         let _ = self.event_tx.send(ProviderRuntimeEvent::RequestOpened {
             thread_id: self.thread_id.clone(),
             turn_id,
             request_id: request_id.clone(),
             request_kind: "tool_approval".into(),
-            payload: request.params,
+            payload,
             tool_use_id,
             subagent_id: None,
         });
@@ -3840,6 +3851,13 @@ fn xai_questions(params: &Value) -> (Vec<AcpQuestion>, Value) {
         }));
     }
     (questions, json!({ "questions": ui_questions }))
+}
+
+fn antigravity_offers_allow_once(params: &Value) -> bool {
+    params
+        .get("options")
+        .and_then(Value::as_array)
+        .is_some_and(|options| select_permission_option(options, &["allow_once"]).is_some())
 }
 
 /// An Antigravity question asked through `session/request_permission`: its

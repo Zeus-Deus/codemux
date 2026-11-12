@@ -565,8 +565,11 @@ async fn prepare_selection<R: Runtime>(
 }
 
 pub(crate) fn validate_permission_mode(provider: ProviderKind, mode: Option<&str>, caps: &ProviderChatCapabilities) -> Result<(), ControlError> {
-    // Plan is an app-owned collaboration mode, with an explicit read-only sandbox.
-    let plan = matches!(provider, ProviderKind::Claude | ProviderKind::Codex) && mode == Some("plan");
+    // Plan is an app-owned collaboration mode, with an explicit read-only
+    // sandbox, for Claude and Codex; Antigravity has a native `plan` session
+    // mode that its adapter holds for as long as the chat stays in Plan.
+    let plan = matches!(provider, ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Antigravity)
+        && mode == Some("plan");
     if plan || (caps.permission_modes.is_empty() && mode.is_none()) || caps.permission_modes.iter().any(|option| Some(option.value.as_str()) == mode) {
         Ok(())
     } else {

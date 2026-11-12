@@ -452,12 +452,19 @@ mod tests {
         let (opened, reply) = turn(&provider, &mut events, &thread, "need-approval", None).await;
         assert_eq!((opened, reply.as_str()), (None, "approval:once"));
 
-        // Without an allow-once choice the request goes to the user, and a
-        // plain Allow still never selects the lasting option.
+        // Without an allow-once choice the request goes to the user flagged
+        // for its exact options. A plain Allow never selects the lasting
+        // option and is recorded as the cancel it sent; the exact option
+        // is sent as chosen.
         let allow = ApprovalDecision::Allow { updated_input: None, updated_permissions: None };
-        let (opened, reply) =
-            turn(&provider, &mut events, &thread, "need-lasting-approval", Some(allow)).await;
-        assert_eq!((opened.as_deref(), reply.as_str()), (Some("tool_approval"), "approval:cancelled"));
+        let (flagged, recorded, reply) = lasting_turn(&provider, &mut events, &thread, allow).await;
+        assert!(flagged);
+        assert_eq!(reply, "approval:cancelled");
+        assert!(matches!(recorded, Some(ApprovalDecision::Cancel)), "{recorded:?}");
+        let exact = ApprovalDecision::ProviderOption { option_id: "always".into() };
+        let (_, recorded, reply) = lasting_turn(&provider, &mut events, &thread, exact).await;
+        assert_eq!(reply, "approval:always");
+        assert!(matches!(recorded, Some(ApprovalDecision::AllowForSession)), "{recorded:?}");
 
         let answer = ApprovalDecision::Allow {
             updated_input: Some(json!({ "answers": { "interaction_1": "SQLite" } })),
@@ -536,6 +543,38 @@ mod tests {
         let modes = std::fs::read_to_string(log.path()).unwrap();
         assert_eq!(modes.lines().last(), Some("plan"), "{modes}");
         provider.stop_session(thread).await.unwrap();
+    }
+
+    /// A `need-lasting-approval` turn answered with `decision`: whether the
+    /// request was flagged for exact options, the recorded decision, and
+    /// the fixture's reply.
+    async fn lasting_turn(
+        provider: &AntigravityAgentProvider,
+        events: &mut ProviderEventStream,
+        thread: &ThreadId,
+        decision: ApprovalDecision,
+    ) -> (bool, Option<ApprovalDecision>, String) {
+        provider.send_turn(send(thread, "need-lasting-approval")).await.unwrap();
+        let (mut flagged, mut recorded, mut reply) = (false, None, String::new());
+        let mut decision = Some(decision);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = events.next().await {
+                match event {
+                    ProviderRuntimeEvent::RequestOpened { request_id, payload, .. } => {
+                        flagged = payload["_codemuxExactOptions"] == json!(true);
+                        let decision = decision.take().expect("one request");
+                        provider.respond_to_request(thread.clone(), request_id, decision).await.unwrap();
+                    }
+                    ProviderRuntimeEvent::RequestResolved { decision, .. } => recorded = Some(decision),
+                    ProviderRuntimeEvent::ItemCompleted { item: CompletedItem::AssistantText { text }, .. } => reply = text,
+                    ProviderRuntimeEvent::TurnCompleted { .. } => return,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("turn timed out");
+        (flagged, recorded, reply)
     }
 
     async fn wait_for_turn(events: &mut ProviderEventStream) {
