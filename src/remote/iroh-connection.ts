@@ -17,6 +17,12 @@
  *   - a `wsFactory` that opens an {@link IrohWebSocket} to the cached grant's
  *     `node_id`, sending `{grant, browserNonce}` in the `hello-account` frame.
  *
+ * The transport abandons a ticket request that stalls and starts a new one, so
+ * mints can overlap. Only the newest, un-cancelled mint may replace the cached
+ * grant (an older one answering late would hand the next dial an expired
+ * credential, which the desktop rejects fatally), and each socket captures the
+ * grant it was created with, so a later mint can't change an in-flight dial.
+ *
  * A **fatal** handshake rejection (bad/expired grant, node mismatch) latches a
  * flag so the *next* ticket request returns `401` — breaking what would
  * otherwise be an unauthenticatable reconnect loop, and routing the user back to
@@ -58,8 +64,12 @@ export function createIrohConnection(
   let current: DeviceGrant | null = null;
   let currentNonce: string | null = null;
   let fatal = false;
+  let latestMint = 0;
 
-  const fetchImpl = (async (input: RequestInfo | URL): Promise<Response> => {
+  const fetchImpl = (async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> => {
     const url = String(input instanceof Request ? input.url : input);
     if (!url.includes("/api/ws-ticket")) {
       // The transport never calls anything else through this fetch, but be safe.
@@ -69,13 +79,19 @@ export function createIrohConnection(
       // A prior handshake fatally rejected — stop trying to reconnect.
       return new Response(null, { status: 401 });
     }
+    const signal = init?.signal ?? undefined;
+    const mint = ++latestMint;
+    const superseded = () => mint !== latestMint || signal?.aborted === true;
     const nonce = nonceFactory();
     try {
-      const grant = await opts.registry.connectDevice(opts.deviceId, nonce);
+      const grant = await opts.registry.connectDevice(opts.deviceId, nonce, signal);
+      if (superseded()) throw abandoned();
       current = grant;
       currentNonce = nonce;
       return new Response(JSON.stringify({ ticket: "iroh" }), { status: 200 });
     } catch (err) {
+      // Nobody is waiting on an abandoned mint; don't report its failure.
+      if (superseded()) throw abandoned();
       if (err instanceof DeviceRegistryError) {
         opts.onMintError?.(err);
         // Auth failures / removed device → give up (re-auth). Everything else is
@@ -87,18 +103,22 @@ export function createIrohConnection(
     }
   }) as typeof fetch;
 
-  const wsFactory = (_url: string): WebSocketLike =>
-    new IrohWebSocket({
+  const wsFactory = (_url: string): WebSocketLike => {
+    // The grant this socket was created for; a later mint must not swap it
+    // out between the dial and the handshake.
+    const grant = current;
+    const nonce = currentNonce;
+    return new IrohWebSocket({
       dialer: opts.dialer,
       target: () => {
-        if (!current) throw new Error("iroh: no grant minted before dial");
-        return { nodeId: current.nodeId, relayUrl: current.relayUrlHint };
+        if (!grant) throw new Error("iroh: no grant minted before dial");
+        return { nodeId: grant.nodeId, relayUrl: grant.relayUrlHint };
       },
       handshake: () => {
-        if (!current || !currentNonce) {
+        if (!grant || !nonce) {
           throw new Error("iroh: no grant minted before handshake");
         }
-        return { grant: current.grant, nonce: currentNonce };
+        return { grant: grant.grant, nonce };
       },
       onReject: (kind) => {
         if (kind === "fatal") fatal = true;
@@ -106,8 +126,13 @@ export function createIrohConnection(
       },
       onError: opts.onTransportError,
     });
+  };
 
   return { fetchImpl, wsFactory };
+}
+
+function abandoned(): DOMException {
+  return new DOMException("iroh: grant request abandoned", "AbortError");
 }
 
 /** A URL-safe random nonce (16 bytes, base64url, no padding). */

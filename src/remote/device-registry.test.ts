@@ -101,6 +101,24 @@ describe("DeviceRegistry.connectDevice", () => {
     });
   });
 
+  it("cancels the request through the caller's signal", async () => {
+    let sentSignal: AbortSignal | null | undefined;
+    const fetchImpl = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          sentSignal = init?.signal;
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError")),
+          );
+        }),
+    ) as unknown as typeof fetch;
+    const abort = new AbortController();
+    const pending = registry(fetchImpl).connectDevice("d1", "n", abort.signal);
+    abort.abort();
+    expect(sentSignal).toBe(abort.signal);
+    await expect(pending).rejects.toMatchObject({ kind: "network" });
+  });
+
   it("classifies an offline device (409) distinctly", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(409, { error: "device_offline" }),
