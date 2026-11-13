@@ -8,22 +8,25 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 /// `GIT_*`, SSH agents and credential helpers rely on git inheriting the
-/// app's environment: the marker is the only variable added (with the
-/// AppImage loader fixups, which are empty outside an AppImage).
+/// app's environment: the marker and `GIT_OPTIONAL_LOCKS=0` are the only
+/// variables added (with the AppImage loader fixups, which are empty outside
+/// an AppImage).
 #[test]
-fn git_command_adds_only_the_agent_marker() {
+fn git_command_adds_only_the_agent_marker_and_optional_locks_off() {
     let cmd = git_command();
     assert_eq!(cmd.get_program(), "git");
     let lossy = |value: &std::ffi::OsStr| value.to_string_lossy().into_owned();
     let mut envs: Vec<(String, Option<String>)> = cmd.get_envs().map(|(key, value)| (lossy(key), value.map(lossy))).collect();
     let mut expected = crate::execution::appimage_env_fixups();
     expected.push((AGENT_PROCESS_ENV.to_string(), Some(GIT_PROCESS_KIND.to_string())));
+    expected.push(("GIT_OPTIONAL_LOCKS".to_string(), Some("0".to_string())));
     envs.sort();
     expected.sort();
     assert_eq!(envs, expected);
 }
 
-/// `gh` and `glab` run git themselves, so they carry exactly git's marker.
+/// `gh` and `glab` run git themselves, so they carry exactly git's
+/// environment.
 #[test]
 fn source_control_clis_carry_the_git_marker() {
     for program in ["gh", "glab"] {

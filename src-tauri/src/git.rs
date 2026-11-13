@@ -119,13 +119,20 @@ pub(crate) const GIT_PROCESS_KIND: &str = "git-hook";
 /// Unlike setup scripts, git is not registered for ancestry (most callers wait
 /// on `output()`, which gives no pid), so the inherited marker is the signal.
 ///
-/// The marker is the only change to git's environment besides the AppImage
+/// Git also runs with `GIT_OPTIONAL_LOCKS=0`. Codemux reads status and
+/// diffs in the background while agents commit in the same checkout; an
+/// opportunistic index refresh takes `.git/index.lock`, and the agent's
+/// `git add` or `git commit` then fails because the lock exists. Commands
+/// that change the repository still take every lock they need.
+///
+/// Those two are the only changes to git's environment besides the AppImage
 /// loader fixups of [`crate::execution::host_command`], so `GIT_*`, SSH
 /// agents and credential helpers work as before. A caller that clears the
-/// environment must set the marker again.
+/// environment must set them again.
 pub(crate) fn git_command() -> Command {
     let mut cmd = crate::execution::host_command("git");
     cmd.env(crate::control_identity::AGENT_PROCESS_ENV, GIT_PROCESS_KIND);
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     cmd
 }
 
@@ -139,10 +146,12 @@ pub(crate) fn git_command_tokio() -> tokio::process::Command {
 /// --delete-branch` switches and deletes local branches), so they carry
 /// git's marker, and the repository hooks that git fires run as agents too.
 /// The same source-scan test keeps other `gh` and `glab` spawns out of
-/// production code.
+/// production code. The git they start skips optional locks for the same
+/// reason [`git_command`]'s does.
 pub(crate) fn source_control_cli_command(program: &str) -> Command {
     let mut cmd = crate::execution::host_command(program);
     cmd.env(crate::control_identity::AGENT_PROCESS_ENV, GIT_PROCESS_KIND);
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     cmd
 }
 
@@ -370,13 +379,37 @@ fn resolve_upstream_ref(repo_path: &Path) -> Option<String> {
     None
 }
 
+/// `git diff --numstat -z` between the index and the working tree. Plumbing,
+/// unlike porcelain `git diff`, never refreshes and rewrites the index, so a
+/// background read can't hold `.git/index.lock` while an agent commits.
+fn unstaged_numstat(repo_path: &Path) -> Result<String, String> {
+    run_git(repo_path, &["diff-files", "--numstat", "-z"])
+}
+
+/// `git diff --cached --numstat -z` in plumbing form (see
+/// [`unstaged_numstat`]). Porcelain diff detects renames by default, so
+/// `-M` keeps the counts the same. On an unborn branch there is no HEAD
+/// yet, and everything staged is new: compare against the empty tree, as
+/// porcelain does.
+fn staged_numstat(repo_path: &Path) -> Result<String, String> {
+    run_git(repo_path, &["diff-index", "--cached", "-M", "--numstat", "-z", "HEAD", "--"]).or_else(|head_error| {
+        if run_git(repo_path, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok() {
+            return Err(head_error);
+        }
+        // Without `-w` nothing is written; the id follows the repository's
+        // hash algorithm.
+        let empty_tree = run_git(repo_path, &["hash-object", "-t", "tree", "--stdin"])?;
+        run_git(repo_path, &["diff-index", "--cached", "-M", "--numstat", "-z", &empty_tree, "--"])
+    })
+}
+
 pub fn git_status(repo_path: &Path) -> Result<Vec<GitFileStatus>, String> {
     let output = run_git(repo_path, &["status", "--porcelain=v1", "-z"])?;
     let mut files = parse_porcelain_status(&output);
 
     // Merge per-file diff stats
-    let unstaged_stats = run_git_permissive(repo_path, &["diff", "--numstat", "-z"]);
-    let staged_stats = run_git_permissive(repo_path, &["diff", "--cached", "--numstat", "-z"]);
+    let unstaged_stats = unstaged_numstat(repo_path).unwrap_or_default();
+    let staged_stats = staged_numstat(repo_path).unwrap_or_default();
     let per_file = parse_numstat_per_file(&unstaged_stats, &staged_stats);
     for file in &mut files {
         if let Some(&(a, d)) = per_file.get(&file.path) {
@@ -396,10 +429,8 @@ pub fn git_diff(repo_path: &Path, file_path: &str, staged: bool) -> Result<Strin
 }
 
 pub fn git_diff_stat(repo_path: &Path) -> Result<GitDiffStat, String> {
-    let unstaged = run_git(repo_path, &["diff", "--numstat"])?;
-    let staged = run_git(repo_path, &["diff", "--cached", "--numstat"])?;
-    let (unstaged_additions, unstaged_deletions) = parse_numstat(&unstaged);
-    let (staged_additions, staged_deletions) = parse_numstat(&staged);
+    let (unstaged_additions, unstaged_deletions) = numstat_totals(&unstaged_numstat(repo_path)?);
+    let (staged_additions, staged_deletions) = numstat_totals(&staged_numstat(repo_path)?);
     Ok(GitDiffStat {
         staged_additions,
         staged_deletions,
@@ -1144,18 +1175,11 @@ fn parse_numstat_per_file(unstaged: &str, staged: &str) -> std::collections::Has
     map
 }
 
-fn parse_numstat(output: &str) -> (u32, u32) {
-    let mut total_add = 0u32;
-    let mut total_del = 0u32;
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 2 {
-            // Binary files show "-" for additions/deletions
-            total_add += parts[0].parse::<u32>().unwrap_or(0);
-            total_del += parts[1].parse::<u32>().unwrap_or(0);
-        }
-    }
-    (total_add, total_del)
+/// Total additions and deletions in `--numstat -z` output.
+fn numstat_totals(output: &str) -> (u32, u32) {
+    parse_numstat_per_file(output, "")
+        .values()
+        .fold((0, 0), |(adds, dels), (a, d)| (adds + a, dels + d))
 }
 
 /// Parse `git diff --name-status -z` (also used by `diff-tree`).
@@ -3608,23 +3632,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_numstat_sums_additions_and_deletions() {
-        let input = "\
-10\t5\tsrc/main.rs
-3\t0\tsrc/lib.rs
--\t-\tbinary-file.png
-0\t20\told-file.rs";
+    fn numstat_totals_sums_additions_and_deletions() {
+        let input = "10\t5\tsrc/main.rs\x003\t0\tsrc/lib.rs\0-\t-\tbinary-file.png\0\
+                     0\t20\told-file.rs\x004\t1\t\0src/old.rs\0src/new.rs\0";
 
-        let (adds, dels) = parse_numstat(input);
-        assert_eq!(adds, 13);
-        assert_eq!(dels, 25);
+        let (adds, dels) = numstat_totals(input);
+        assert_eq!(adds, 17);
+        assert_eq!(dels, 26);
     }
 
     #[test]
-    fn parse_numstat_handles_empty_output() {
-        let (adds, dels) = parse_numstat("");
-        assert_eq!(adds, 0);
-        assert_eq!(dels, 0);
+    fn numstat_totals_handles_empty_output() {
+        assert_eq!(numstat_totals(""), (0, 0));
     }
 
     #[test]
@@ -3729,6 +3748,82 @@ mod tests {
             assert_eq!((file.additions, file.deletions), (2, 0));
         }
         assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    /// The plumbing reads count what porcelain `git diff` counts (modified,
+    /// staged, renamed, binary and untracked files), and leave the index
+    /// file alone even when a file's stat data is stale.
+    #[test]
+    fn diff_stats_match_porcelain_and_never_rewrite_the_index() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        let lines = |n: usize| (1..=n).map(|i| format!("{i}\n")).collect::<String>();
+        std::fs::write(repo.join("mod.txt"), lines(100)).unwrap();
+        std::fs::write(repo.join("staged.txt"), lines(50)).unwrap();
+        std::fs::write(repo.join("rename-me.txt"), lines(200)).unwrap();
+        std::fs::write(repo.join("both.txt"), lines(30)).unwrap();
+        std::fs::write(repo.join("bin.dat"), b"\0\x01\x02bin").unwrap();
+        std::fs::write(repo.join("touched.txt"), "same\n").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        git_commit(&repo, "base").unwrap();
+
+        std::fs::write(repo.join("mod.txt"), lines(120).replace("\n5\n", "\nfive\n")).unwrap();
+        std::fs::write(repo.join("staged.txt"), lines(60)).unwrap();
+        run_git(&repo, &["add", "staged.txt"]).unwrap();
+        run_git(&repo, &["mv", "rename-me.txt", "renamed.txt"]).unwrap();
+        std::fs::write(repo.join("renamed.txt"), lines(201)).unwrap();
+        run_git(&repo, &["add", "renamed.txt"]).unwrap();
+        std::fs::write(repo.join("both.txt"), lines(35)).unwrap();
+        run_git(&repo, &["add", "both.txt"]).unwrap();
+        std::fs::write(repo.join("both.txt"), lines(40)).unwrap();
+        std::fs::write(repo.join("bin.dat"), b"\0\x01\x03bin2").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "new\n").unwrap();
+        // Same content, newer mtime: porcelain diff would refresh the index.
+        let touched = std::fs::File::options().write(true).open(repo.join("touched.txt")).unwrap();
+        touched.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
+        drop(touched);
+
+        let index = repo.join(".git").join("index");
+        let before = (std::fs::read(&index).unwrap(), std::fs::metadata(&index).unwrap().modified().unwrap());
+        let stat = git_diff_stat(&repo).unwrap();
+        let files = git_status(&repo).unwrap();
+        let after = (std::fs::read(&index).unwrap(), std::fs::metadata(&index).unwrap().modified().unwrap());
+        assert!(before == after, "a status read rewrote the index");
+
+        let porcelain = |args: &[&str]| numstat_totals(&run_git(&repo, args).unwrap());
+        assert_eq!((stat.unstaged_additions, stat.unstaged_deletions), porcelain(&["diff", "--numstat", "-z"]));
+        assert_eq!((stat.staged_additions, stat.staged_deletions), porcelain(&["diff", "--cached", "--numstat", "-z"]));
+        assert_eq!((stat.unstaged_additions, stat.unstaged_deletions), (26, 1));
+        assert_eq!((stat.staged_additions, stat.staged_deletions), (16, 0));
+        let counts = |path: &str| {
+            let file = files.iter().find(|file| file.path == path).unwrap_or_else(|| panic!("{path}: {files:?}"));
+            (file.additions, file.deletions)
+        };
+        assert_eq!(counts("mod.txt"), (21, 1));
+        assert_eq!(counts("both.txt"), (10, 0));
+        assert_eq!(counts("renamed.txt"), (1, 0));
+        assert_eq!(counts("bin.dat"), (0, 0));
+        assert_eq!(counts("untracked.txt"), (0, 0));
+        assert!(files.iter().all(|file| file.path != "touched.txt"), "{files:?}");
+    }
+
+    /// Before the first commit there is no HEAD: everything staged counts
+    /// as added, as porcelain `git diff --cached` reports it.
+    #[test]
+    fn diff_stats_count_staged_files_on_an_unborn_branch() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().to_path_buf();
+        run_git(&repo, &["init"]).unwrap();
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+        run_git(&repo, &["add", "a.txt"]).unwrap();
+        std::fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+        let stat = git_diff_stat(&repo).unwrap();
+        assert_eq!((stat.staged_additions, stat.staged_deletions), (2, 0));
+        assert_eq!((stat.unstaged_additions, stat.unstaged_deletions), (1, 0));
+        let files = git_status(&repo).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!((files[0].additions, files[0].deletions), (3, 0));
     }
 
     #[test]
