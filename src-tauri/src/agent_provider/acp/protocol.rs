@@ -8,6 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
+use crate::agent_provider::TaskStatus;
+
 /// ACP initialize payload shared by every Codemux ACP driver.
 ///
 /// `configOptions.boolean` lets newer agents advertise boolean selectors,
@@ -399,9 +401,43 @@ fn token(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
 }
 
+/// Whether a tool call `status` ends the call, and if so whether it ended in
+/// error. A cancelled call never resumes, so it settles as an error.
+pub fn tool_call_outcome(status: Option<&str>) -> Option<bool> {
+    match status? {
+        "completed" => Some(false),
+        "failed" | "cancelled" => Some(true),
+        _ => None,
+    }
+}
+
+/// Map a plan entry status. A cancelled step will not run, so it is settled
+/// rather than left pending.
+pub fn plan_entry_status(status: Option<&str>) -> TaskStatus {
+    match status {
+        Some("completed" | "cancelled") => TaskStatus::Completed,
+        Some("in_progress" | "inProgress") => TaskStatus::InProgress,
+        _ => TaskStatus::Pending,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_tool_calls_and_plan_steps_settle() {
+        assert_eq!(tool_call_outcome(Some("completed")), Some(false));
+        assert_eq!(tool_call_outcome(Some("failed")), Some(true));
+        assert_eq!(tool_call_outcome(Some("cancelled")), Some(true));
+        assert_eq!(tool_call_outcome(Some("in_progress")), None);
+        assert_eq!(tool_call_outcome(None), None);
+        assert_eq!(plan_entry_status(Some("cancelled")), TaskStatus::Completed);
+        assert_eq!(plan_entry_status(Some("completed")), TaskStatus::Completed);
+        assert_eq!(plan_entry_status(Some("inProgress")), TaskStatus::InProgress);
+        assert_eq!(plan_entry_status(Some("pending")), TaskStatus::Pending);
+        assert_eq!(plan_entry_status(None), TaskStatus::Pending);
+    }
 
     #[test]
     fn resolves_current_and_future_effort_values() {

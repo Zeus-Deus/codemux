@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::agent_provider::{
     pricing, ApprovalDecision, CompletedItem, ContentDelta, ContextUsageTracker, CostSource,
     ProviderError, ProviderKind, ProviderRuntimeEvent, ProviderSessionId, RequestId, SendOutcome,
-    SendTurnInput, SessionStatus, TaskSnapshotItem, TaskStatus, TasksSnapshot, ThreadId, TurnId,
+    SendTurnInput, SessionStatus, TaskSnapshotItem, TasksSnapshot, ThreadId, TurnId,
     TurnStatus, TurnUsage,
 };
 use crate::json_rpc_child::{
@@ -25,9 +25,9 @@ use crate::json_rpc_child::{
 use super::protocol::{
     config_id_for, config_options, current_model_id, grok_auth_method,
     grok_auth_reads_ambient_api_key, grok_model_effort_catalog, initialize_params,
-    local_xai_api_key_set, looks_unauthenticated, option_by_id, resolve_boolean_value,
-    resolve_effort_value, resolve_select_value, session_id, set_config_params, set_model_params,
-    ConfigKind, GrokModelEffortCatalog,
+    local_xai_api_key_set, looks_unauthenticated, option_by_id, plan_entry_status,
+    resolve_boolean_value, resolve_effort_value, resolve_select_value, session_id,
+    set_config_params, set_model_params, tool_call_outcome, ConfigKind, GrokModelEffortCatalog,
 };
 use super::slash_commands::{is_available_commands_update, AcpSlashCommandCache};
 
@@ -2527,16 +2527,13 @@ impl AcpSession {
                 });
             }
             "tool_call_update" => {
-                let terminal = update
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .is_some_and(|status| matches!(status, "completed" | "failed"));
-                if terminal {
+                if let Some(is_error) =
+                    tool_call_outcome(update.get("status").and_then(Value::as_str))
+                {
                     let id = update
                         .get("toolCallId")
                         .and_then(Value::as_str)
                         .unwrap_or("acp-tool");
-                    let is_error = update.get("status").and_then(Value::as_str) == Some("failed");
                     let content = update
                         .get("rawOutput")
                         .or_else(|| update.get("content"))
@@ -3747,11 +3744,7 @@ fn tasks_from_value(value: &Value) -> Option<TasksSnapshot> {
             if title.is_empty() {
                 return None;
             }
-            let status = match todo.get("status").and_then(Value::as_str) {
-                Some("completed") => TaskStatus::Completed,
-                Some("in_progress" | "inProgress") => TaskStatus::InProgress,
-                _ => TaskStatus::Pending,
-            };
+            let status = plan_entry_status(todo.get("status").and_then(Value::as_str));
             Some(TaskSnapshotItem {
                 task_id: todo
                     .get("id")

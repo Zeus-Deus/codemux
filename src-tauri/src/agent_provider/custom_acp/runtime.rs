@@ -3,6 +3,7 @@ use super::catalog::{
     Negotiation,
 };
 use super::{AcpBinding, AcpCatalog, AcpLaunchConfig};
+use crate::agent_provider::acp::protocol::{plan_entry_status, tool_call_outcome};
 use crate::agent_provider::*;
 use crate::json_rpc_child::{
     IncomingRequest, JsonRpcChild, SequencedNotification, RpcChildError, RpcError, SpawnConfig,
@@ -1475,7 +1476,7 @@ impl Session {
                         subagent_id: None,
                     });
                 }
-                if matches!(text(update, "status"), Some("completed" | "failed")) {
+                if let Some(is_error) = tool_call_outcome(text(update, "status")) {
                     self.flush_segments(&mut s, &turn);
                     self.emit(ProviderRuntimeEvent::ItemCompleted {
                         thread_id: self.thread.clone(),
@@ -1487,7 +1488,7 @@ impl Session {
                                 .or_else(|| update.get("content"))
                                 .cloned()
                                 .unwrap_or(Value::Null),
-                            is_error: text(update, "status") == Some("failed"),
+                            is_error,
                         },
                         subagent_id: None,
                     });
@@ -1505,11 +1506,7 @@ impl Session {
                                 Some(TaskSnapshotItem {
                                     task_id: format!("acp-plan-{index}"),
                                     title: text(entry, "content")?.into(),
-                                    status: match text(entry, "status") {
-                                        Some("completed") => TaskStatus::Completed,
-                                        Some("in_progress") => TaskStatus::InProgress,
-                                        _ => TaskStatus::Pending,
-                                    },
+                                    status: plan_entry_status(text(entry, "status")),
                                     detail: None,
                                     blocked_by: vec![],
                                 })
