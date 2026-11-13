@@ -30,10 +30,10 @@ use crate::mcp::registry::McpRegistry;
 
 use super::protocol::{
     AccountReadResponse, Capabilities, ClientInfo, CollaborationMode,
-    CollaborationModeSettings, DynamicToolCallParams, DynamicToolSpec,
+    CollaborationModeSettings, DynamicToolCallParams, DynamicToolSpec, ErrorParams,
     GetAccountRateLimitsResponse, InitializeParams, NotificationMessage, ServerRequestMessage,
     ThreadResumeParams, ThreadRollbackParams, ThreadStartParams, ThreadStartResponse,
-    TurnInputItem, TurnInterruptParams, TurnStartParams, TurnStartResponse,
+    TurnCompletedParams, TurnInputItem, TurnInterruptParams, TurnStartParams, TurnStartResponse,
     RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS,
 };
 use super::translate::{translate_notification_with, translate_server_request, CodexSubagentDemux};
@@ -2758,56 +2758,46 @@ fn spawn_notifications_task(
 ) -> JoinHandle<()> {
     let mut notifications = child.notifications();
     tokio::spawn(async move {
+        let mut retry_stall: Option<RetryStall> = None;
+        // The turn a stalled retry failed: its late `turn/completed` (from
+        // the interrupt) must not settle it a second time.
+        let mut stalled_turn: Option<(String, String)> = None;
         loop {
+            let stall_deadline = retry_stall.as_ref().map(|stall| stall.deadline);
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
+                _ = sleep_until_some(stall_deadline), if stall_deadline.is_some() => {
+                    let Some(stall) = retry_stall.take() else { continue };
+                    if let Some(failed) = fail_stalled_retry(&session, &stall).await {
+                        stalled_turn = Some((failed.thread_id.clone(), failed.turn_id.clone()));
+                        let msg = NotificationMessage::TurnCompleted(failed);
+                        route_notification(&session, &event_tx, msg).await;
+                    }
+                }
                 maybe_note = notifications.recv() => {
                     match maybe_note {
                         Ok(note) => {
                             let msg = NotificationMessage::from_raw(&note.method, note.params);
-                            // Update local state for a few special
-                            // notifications before broadcasting.
-                            update_state_from_notification(&session, &msg).await;
                             if let NotificationMessage::TurnCompleted(p) = &msg {
-                                session.settle_turn_approvals(&p.thread_id, &p.turn_id).await;
-                            }
-                            let mut demux=session.notification_demux.lock().await;
-                            // Codex never states a model on the usage
-                            // notification, so the ledger has to learn it
-                            // from session state. Refreshed only on the
-                            // usage notification itself — reading it on
-                            // every notification would take a mutex on the
-                            // per-token `item/updated` stream for nothing.
-                            if matches!(msg, NotificationMessage::ThreadTokenUsageUpdated(_)) {
-                                let model = session.state.lock().await.model.clone();
-                                demux.set_active_model(model);
-                            }
-                            let events =
-                                translate_notification_with(&mut demux, &session.thread_id, msg);
-                            drop(demux);
-                            for ev in events {
-                                if session.chatgpt_runtime.is_some() && matches!(ev,ProviderRuntimeEvent::PlanUsageUpdated{..}){continue}
-                                if event_tx.send(ev).is_err() {
-                                    // No subscribers — silently drop.
+                                if stalled_turn.as_ref().is_some_and(|(thread, turn)| {
+                                    *thread == p.thread_id && *turn == p.turn_id
+                                }) {
+                                    stalled_turn = None;
+                                    continue;
                                 }
                             }
-                            // Follow-up queue: a TurnCompleted notification
-                            // returns the session to idle (Ready), an
-                            // Error/child-exit tears it down. Drain the next
-                            // queued turn when idle; cancel the whole queue
-                            // when the session is gone. Runs after
-                            // `update_state_from_notification` released the
-                            // lock so `do_send` can re-acquire it.
-                            let status = {
-                                let state = session.state.lock().await;
-                                state.status.clone()
-                            };
-                            match status {
-                                SessionStatus::Closed | SessionStatus::Error { .. } => {
-                                    session.cancel_all_queued().await;
+                            match &msg {
+                                NotificationMessage::Error(e) if e.will_retry => {
+                                    if let Some(stall) = RetryStall::arm(&session, e).await {
+                                        retry_stall = Some(stall);
+                                    }
                                 }
-                                _ => {let session=session.clone();tokio::spawn(async move{session.drain_queue().await;});},
+                                _ if retry_stall.as_ref().is_some_and(|s| s.resumed_by(&msg)) => {
+                                    retry_stall = None;
+                                }
+                                _ => {}
                             }
+                            route_notification(&session, &event_tx, msg).await;
                         }
                         Err(broadcast::error::RecvError::Lagged(count)) => {
                             if session.managed.is_some() {
@@ -2825,6 +2815,157 @@ fn spawn_notifications_task(
                 }
             }
         }
+    })
+}
+
+/// Update state for one notification, translate it, broadcast the events,
+/// and advance the follow-up queue.
+async fn route_notification(
+    session: &Arc<CodexSession>,
+    event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
+    msg: NotificationMessage,
+) {
+    // Update local state for a few special
+    // notifications before broadcasting.
+    update_state_from_notification(session, &msg).await;
+    if let NotificationMessage::TurnCompleted(p) = &msg {
+        session.settle_turn_approvals(&p.thread_id, &p.turn_id).await;
+    }
+    let mut demux=session.notification_demux.lock().await;
+    // Codex never states a model on the usage
+    // notification, so the ledger has to learn it
+    // from session state. Refreshed only on the
+    // usage notification itself — reading it on
+    // every notification would take a mutex on the
+    // per-token `item/updated` stream for nothing.
+    if matches!(msg, NotificationMessage::ThreadTokenUsageUpdated(_)) {
+        let model = session.state.lock().await.model.clone();
+        demux.set_active_model(model);
+    }
+    let events =
+        translate_notification_with(&mut demux, &session.thread_id, msg);
+    drop(demux);
+    for ev in events {
+        if session.chatgpt_runtime.is_some() && matches!(ev,ProviderRuntimeEvent::PlanUsageUpdated{..}){continue}
+        if event_tx.send(ev).is_err() {
+            // No subscribers — silently drop.
+        }
+    }
+    // Follow-up queue: a TurnCompleted notification
+    // returns the session to idle (Ready), an
+    // Error/child-exit tears it down. Drain the next
+    // queued turn when idle; cancel the whole queue
+    // when the session is gone. Runs after
+    // `update_state_from_notification` released the
+    // lock so `do_send` can re-acquire it.
+    let status = {
+        let state = session.state.lock().await;
+        state.status.clone()
+    };
+    match status {
+        SessionStatus::Closed | SessionStatus::Error { .. } => {
+            session.cancel_all_queued().await;
+        }
+        _ => {let session=session.clone();tokio::spawn(async move{session.drain_queue().await;});},
+    }
+}
+
+/// How long a turn may sit in a provider retry with no further progress
+/// before it is failed. Codex can announce a retry and never resume, which
+/// would leave the turn running and the queue blocked forever.
+const RETRY_STALL_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(10 * 60)
+};
+const RETRY_STALL_MESSAGE: &str = "Codex stopped responding while retrying";
+
+/// A retry announced on the parent thread, and when to give up on it. Any
+/// later parent progress (including a turn ending or starting) clears it,
+/// so the turn still active at the deadline is the one that stalled.
+#[derive(Debug)]
+struct RetryStall {
+    codex_thread_id: String,
+    deadline: tokio::time::Instant,
+}
+
+impl RetryStall {
+    /// Arm (or re-arm) for a retry on the parent thread. Sub-agent retries
+    /// never stall the parent.
+    async fn arm(session: &CodexSession, error: &ErrorParams) -> Option<Self> {
+        let state = session.state.lock().await;
+        if error.thread_id.as_deref().is_some_and(|t| t != state.codex_thread_id) {
+            return None;
+        }
+        Some(Self {
+            codex_thread_id: state.codex_thread_id.clone(),
+            deadline: tokio::time::Instant::now() + RETRY_STALL_TIMEOUT,
+        })
+    }
+
+    /// Whether `msg` shows the parent thread made progress after the retry.
+    fn resumed_by(&self, msg: &NotificationMessage) -> bool {
+        use NotificationMessage::*;
+        let thread = match msg {
+            TurnStarted(p) => &p.thread_id,
+            TurnCompleted(p) => &p.thread_id,
+            ThreadTokenUsageUpdated(p) => &p.thread_id,
+            AgentMessageDelta(p)
+            | CommandExecutionOutputDelta(p)
+            | FileChangeOutputDelta(p)
+            | PlanDelta(p) => &p.thread_id,
+            TurnPlanUpdated(p) => &p.thread_id,
+            ReasoningTextDelta(p) => &p.thread_id,
+            ReasoningSummaryTextDelta(p) => &p.thread_id,
+            ReasoningSummaryPartAdded(p) => &p.thread_id,
+            TerminalInteraction(p) => &p.thread_id,
+            FileChangePatchUpdated(p) => &p.thread_id,
+            McpToolCallProgress(p) => &p.thread_id,
+            ItemStarted(env) | ItemCompleted(env) => &env.thread_id,
+            _ => return false,
+        };
+        *thread == self.codex_thread_id
+    }
+}
+
+async fn sleep_until_some(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Give up on a turn whose retry never resumed: ask Codex to interrupt it
+/// and return the failed `turn/completed` that settles it locally. `None`
+/// when no turn is running.
+async fn fail_stalled_retry(
+    session: &CodexSession,
+    stall: &RetryStall,
+) -> Option<TurnCompletedParams> {
+    let turn_id = {
+        let state = session.state.lock().await;
+        if state.codex_thread_id != stall.codex_thread_id {
+            return None;
+        }
+        state.active_turn.as_ref()?.0.clone()
+    };
+    let params = serde_json::to_value(TurnInterruptParams {
+        thread_id: stall.codex_thread_id.clone(),
+        turn_id: turn_id.clone(),
+    })
+    .unwrap_or(Value::Null);
+    let child = session.child().await;
+    // Best effort and detached: a stuck app-server may never answer.
+    tokio::spawn(async move {
+        let _ = child.request("turn/interrupt", params).await;
+    });
+    Some(TurnCompletedParams {
+        thread_id: stall.codex_thread_id.clone(),
+        turn_id,
+        status: "failed".into(),
+        error: Some(RETRY_STALL_MESSAGE.into()),
+        duration_ms: None,
+        error_info: None,
     })
 }
 
@@ -3337,6 +3478,32 @@ mod in_flight_send_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_stall_clears_only_on_parent_progress() {
+        let stall = RetryStall {
+            codex_thread_id: "parent".into(),
+            deadline: tokio::time::Instant::now(),
+        };
+        let note = |method: &str, params: Value| NotificationMessage::from_raw(method, params);
+        let delta = |thread: &str| {
+            note(
+                "item/agentMessage/delta",
+                json!({"threadId": thread, "turnId": "turn-1", "itemId": "i", "delta": "x"}),
+            )
+        };
+        assert!(stall.resumed_by(&delta("parent")));
+        assert!(!stall.resumed_by(&delta("child")), "a sub-agent's progress is not the parent's");
+        assert!(stall.resumed_by(&note(
+            "turn/completed",
+            json!({"threadId": "parent", "turn": {"id": "turn-1", "status": "completed"}}),
+        )));
+        assert!(!stall.resumed_by(&note(
+            "error",
+            json!({"message": "again", "willRetry": true, "threadId": "parent"}),
+        )));
+        assert!(!stall.resumed_by(&note("account/rateLimits/updated", json!({}))));
+    }
 
     #[test]
     fn managed_codex_configuration_requires_verified_isolation() {

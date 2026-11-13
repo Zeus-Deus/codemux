@@ -229,3 +229,97 @@ async fn approvals_resolve_on_answer_and_settle_when_their_turn_ends() {
     assert!(expired, "a sub-agent approval must not settle with the parent turn");
     let _ = session.shutdown().await;
 }
+
+/// Fake `codex app-server` whose turn announces a provider retry and then
+/// goes silent until it is interrupted.
+fn retry_fixture_binary(root: &std::path::Path) -> PathBuf {
+    let source = r#"#!/usr/bin/python3
+import sys,json
+from pathlib import Path
+root=Path(__ROOT__)
+if '--version' in sys.argv:
+ print('codex-cli 0.162.0');sys.exit(0)
+def output(v): print(json.dumps(v),flush=True)
+def record(v):
+ with (root/'wire.jsonl').open('a') as f: f.write(json.dumps(v)+'\n')
+for line in sys.stdin:
+ m=json.loads(line);method=m.get('method');record(m)
+ if 'id' not in m or method is None: continue
+ if method=='model/list': result={'data':[{'id':'fixture-model','isDefault':True,'displayName':'Fixture','inputModalities':['text'],'defaultReasoningEffort':'medium','supportedReasoningEfforts':[{'reasoningEffort':'medium','description':'Fixture'}]}]}
+ elif method=='account/read': result={'account':None,'requiresOpenaiAuth':False}
+ elif method in ['thread/start','thread/resume']: result={'thread':{'id':'fixture-thread','environments':[]},'approvalPolicy':'onRequest','sandbox':{'type':'readOnly'}}
+ elif method=='turn/start': result={'turn':{'id':'turn-1','status':'inProgress'}}
+ else: result={}
+ output({'id':m['id'],'result':result})
+ if method=='turn/start':
+  output({'method':'turn/started','params':{'threadId':'fixture-thread','turn':{'id':'turn-1','status':'inProgress'}}})
+  output({'method':'error','params':{'message':'stream disconnected','willRetry':True,'threadId':'fixture-thread'}})
+ if method=='turn/interrupt':
+  output({'method':'turn/completed','params':{'threadId':'fixture-thread','turn':{'id':'turn-1','status':'interrupted'}}})
+"#;
+    let source = source.replace(
+        "__ROOT__",
+        &serde_json::to_string(&root.to_string_lossy()).unwrap(),
+    );
+    let binary = root.join("codex-retry-fixture.py");
+    std::fs::write(&binary, source).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    binary
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_that_never_resumes_fails_the_turn_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = broadcast::channel(256);
+    let session = CodexSession::spawn_and_initialize(
+        ThreadId("t".into()),
+        dir.path().into(),
+        Some("fixture-model".into()),
+        None,
+        None,
+        "default".into(),
+        None,
+        None,
+        None,
+        CodexSpawnConfig {
+            codex_binary: retry_fixture_binary(dir.path()),
+            chatgpt_owner: None,
+            codex_home: None,
+            remote: None,
+            client_info: ClientInfo {
+                name: "codemux".into(),
+                title: "Codemux".into(),
+                version: "fixture".into(),
+            },
+            mcp_registry: None,
+        },
+        tx,
+        None,
+    )
+    .await
+    .unwrap();
+
+    session.enqueue_or_send(turn("first")).await.unwrap();
+    let status = next_matching(&mut rx, |event| match event {
+        ProviderRuntimeEvent::TurnCompleted { status, .. } => Some(status),
+        _ => None,
+    })
+    .await;
+    assert!(
+        matches!(&status, crate::agent_provider::TurnStatus::Error { message, .. } if message == RETRY_STALL_MESSAGE),
+        "unexpected turn status: {status:?}",
+    );
+    assert!(session.state.lock().await.active_turn.is_none());
+    // Codex is asked to stop the turn, and its own late completion does not
+    // settle the turn a second time.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let wire = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
+    assert!(wire.contains("\"turn/interrupt\""), "turn/interrupt was not sent: {wire}");
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(event, ProviderRuntimeEvent::TurnCompleted { .. }),
+            "the stalled turn completed twice",
+        );
+    }
+    let _ = session.shutdown().await;
+}
