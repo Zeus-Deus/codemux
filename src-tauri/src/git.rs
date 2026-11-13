@@ -35,6 +35,14 @@ pub struct BaseBranchDiff {
     pub merge_base_commit: String,
 }
 
+/// One file's diff for the diff pane. `truncated` means `diff` holds only
+/// the first lines, see [`MAX_FILE_DIFF_LINES`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDiff {
+    pub diff: String,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitDiffStat {
     pub staged_additions: u32,
@@ -119,13 +127,20 @@ pub(crate) const GIT_PROCESS_KIND: &str = "git-hook";
 /// Unlike setup scripts, git is not registered for ancestry (most callers wait
 /// on `output()`, which gives no pid), so the inherited marker is the signal.
 ///
-/// The marker is the only change to git's environment besides the AppImage
+/// Git also runs with `GIT_OPTIONAL_LOCKS=0`. Codemux reads status and
+/// diffs in the background while agents commit in the same checkout; an
+/// opportunistic index refresh takes `.git/index.lock`, and the agent's
+/// `git add` or `git commit` then fails because the lock exists. Commands
+/// that change the repository still take every lock they need.
+///
+/// Those two are the only changes to git's environment besides the AppImage
 /// loader fixups of [`crate::execution::host_command`], so `GIT_*`, SSH
 /// agents and credential helpers work as before. A caller that clears the
-/// environment must set the marker again.
+/// environment must set them again.
 pub(crate) fn git_command() -> Command {
     let mut cmd = crate::execution::host_command("git");
     cmd.env(crate::control_identity::AGENT_PROCESS_ENV, GIT_PROCESS_KIND);
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     cmd
 }
 
@@ -139,10 +154,12 @@ pub(crate) fn git_command_tokio() -> tokio::process::Command {
 /// --delete-branch` switches and deletes local branches), so they carry
 /// git's marker, and the repository hooks that git fires run as agents too.
 /// The same source-scan test keeps other `gh` and `glab` spawns out of
-/// production code.
+/// production code. The git they start skips optional locks for the same
+/// reason [`git_command`]'s does.
 pub(crate) fn source_control_cli_command(program: &str) -> Command {
     let mut cmd = crate::execution::host_command(program);
     cmd.env(crate::control_identity::AGENT_PROCESS_ENV, GIT_PROCESS_KIND);
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     cmd
 }
 
@@ -370,13 +387,44 @@ fn resolve_upstream_ref(repo_path: &Path) -> Option<String> {
     None
 }
 
+/// `git diff --numstat -z` between the index and the working tree. Plumbing,
+/// unlike porcelain `git diff`, never refreshes and rewrites the index, so a
+/// background read can't hold `.git/index.lock` while an agent commits.
+fn unstaged_numstat(repo_path: &Path) -> Result<String, String> {
+    run_git(repo_path, &["diff-files", "--numstat", "-z"])
+}
+
+/// `git diff --cached --numstat -z` in plumbing form (see
+/// [`unstaged_numstat`]). Porcelain diff detects renames by default, so
+/// `-M` keeps the counts the same. On an unborn branch there is no HEAD
+/// yet, and everything staged is new: compare against the empty tree, as
+/// porcelain does.
+fn staged_numstat(repo_path: &Path) -> Result<String, String> {
+    run_git(repo_path, &["diff-index", "--cached", "-M", "--numstat", "-z", "HEAD", "--"]).or_else(|head_error| {
+        if run_git(repo_path, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok() {
+            return Err(head_error);
+        }
+        // Without `-w` nothing is written; the id follows the repository's
+        // hash algorithm.
+        let empty_tree = run_git(repo_path, &["hash-object", "-t", "tree", "--stdin"])?;
+        run_git(repo_path, &["diff-index", "--cached", "-M", "--numstat", "-z", &empty_tree, "--"])
+    })
+}
+
+/// How many files `git status` lists, without the per-file line counts
+/// [`git_status`] adds. For callers that only show the count.
+pub fn git_changed_file_count(repo_path: &Path) -> Result<usize, String> {
+    let output = run_git(repo_path, &["status", "--porcelain=v1", "-z"])?;
+    Ok(parse_porcelain_status(&output).len())
+}
+
 pub fn git_status(repo_path: &Path) -> Result<Vec<GitFileStatus>, String> {
     let output = run_git(repo_path, &["status", "--porcelain=v1", "-z"])?;
     let mut files = parse_porcelain_status(&output);
 
     // Merge per-file diff stats
-    let unstaged_stats = run_git_permissive(repo_path, &["diff", "--numstat", "-z"]);
-    let staged_stats = run_git_permissive(repo_path, &["diff", "--cached", "--numstat", "-z"]);
+    let unstaged_stats = unstaged_numstat(repo_path).unwrap_or_default();
+    let staged_stats = staged_numstat(repo_path).unwrap_or_default();
     let per_file = parse_numstat_per_file(&unstaged_stats, &staged_stats);
     for file in &mut files {
         if let Some(&(a, d)) = per_file.get(&file.path) {
@@ -387,19 +435,109 @@ pub fn git_status(repo_path: &Path) -> Result<Vec<GitFileStatus>, String> {
     Ok(files)
 }
 
-pub fn git_diff(repo_path: &Path, file_path: &str, staged: bool) -> Result<String, String> {
+/// The diff pane renders every line it gets and re-reads the open file every
+/// few seconds, so a regenerated lockfile or a minified bundle would freeze
+/// it. A file's diff stops at whichever of these comes first, on a line
+/// boundary. The byte limit matches the per-file limit of turn diffs.
+const MAX_FILE_DIFF_LINES: usize = 5_000;
+const MAX_FILE_DIFF_BYTES: usize = 512 * 1024;
+/// How much of git's stderr a failed diff reports.
+const MAX_DIFF_STDERR_BYTES: u64 = 16 * 1024;
+
+/// Runs a single-file `git diff` and keeps at most [`MAX_FILE_DIFF_LINES`]
+/// lines and [`MAX_FILE_DIFF_BYTES`] bytes. Reading stops at the limit and
+/// git is stopped, so the rest is never held in memory.
+fn run_git_diff_capped(repo_path: &Path, args: &[&str]) -> Result<FileDiff, String> {
+    run_git_diff_capped_to(repo_path, args, MAX_FILE_DIFF_LINES, MAX_FILE_DIFF_BYTES)
+}
+
+fn run_git_diff_capped_to(
+    repo_path: &Path,
+    args: &[&str],
+    max_lines: usize,
+    max_bytes: usize,
+) -> Result<FileDiff, String> {
+    use std::io::Read;
+    let mut child = git_command()
+        .args(args)
+        .current_dir(repo_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    // Drained alongside stdout: an external diff or textconv driver that
+    // writes a lot to stderr would otherwise block on a full pipe before it
+    // closes stdout, and the read below would wait forever. Only the start
+    // is kept, for the error message.
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut head = Vec::new();
+        let _ = (&mut stderr).take(MAX_DIFF_STDERR_BYTES).read_to_end(&mut head);
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        head
+    });
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout is piped"));
+    let read = read_lines_capped(&mut stdout, max_lines, max_bytes);
+    drop(stdout);
+    // Anything but a complete read leaves git with output nobody will read.
+    if !matches!(read, Ok((_, false))) {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    let (kept, truncated) = read.map_err(|e| format!("Failed to read git diff: {e}"))?;
+    let status = status.map_err(|e| format!("Failed to run git: {e}"))?;
+    if !truncated && !status.success() {
+        // Git has exited, so its stderr is closed unless a helper it
+        // started still holds it.
+        let stderr = stderr_reader.join().unwrap_or_default();
+        let stderr = String::from_utf8_lossy(&stderr);
+        return Err(format!("git {} failed: {}", args.first().unwrap_or(&""), stderr.trim()));
+    }
+    // Otherwise the drain thread finishes on its own when the pipe closes.
+    Ok(FileDiff { diff: String::from_utf8_lossy(&kept).trim_end().to_string(), truncated })
+}
+
+/// Reads whole lines until EOF or until the next line would pass
+/// `max_lines` or `max_bytes`. Returns the lines and whether it stopped
+/// early.
+fn read_lines_capped(
+    reader: &mut impl std::io::BufRead,
+    max_lines: usize,
+    max_bytes: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::io::{BufRead, Read};
+    let mut kept = Vec::new();
+    let mut line = Vec::new();
+    let mut lines = 0;
+    loop {
+        line.clear();
+        // One byte past the budget is enough to tell that a line won't fit,
+        // without reading the whole of a minified one-line file.
+        let budget = (max_bytes - kept.len() + 1) as u64;
+        let read = reader.by_ref().take(budget).read_until(b'\n', &mut line)?;
+        if read == 0 {
+            return Ok((kept, false));
+        }
+        if lines == max_lines || kept.len() + read > max_bytes {
+            return Ok((kept, true));
+        }
+        kept.extend_from_slice(&line);
+        lines += 1;
+    }
+}
+
+pub fn git_diff(repo_path: &Path, file_path: &str, staged: bool) -> Result<FileDiff, String> {
     if staged {
-        run_git(repo_path, &["diff", "--cached", "--", file_path])
+        run_git_diff_capped(repo_path, &["diff", "--cached", "--", file_path])
     } else {
-        run_git(repo_path, &["diff", "--", file_path])
+        run_git_diff_capped(repo_path, &["diff", "--", file_path])
     }
 }
 
 pub fn git_diff_stat(repo_path: &Path) -> Result<GitDiffStat, String> {
-    let unstaged = run_git(repo_path, &["diff", "--numstat"])?;
-    let staged = run_git(repo_path, &["diff", "--cached", "--numstat"])?;
-    let (unstaged_additions, unstaged_deletions) = parse_numstat(&unstaged);
-    let (staged_additions, staged_deletions) = parse_numstat(&staged);
+    let (unstaged_additions, unstaged_deletions) = numstat_totals(&unstaged_numstat(repo_path)?);
+    let (staged_additions, staged_deletions) = numstat_totals(&staged_numstat(repo_path)?);
     Ok(GitDiffStat {
         staged_additions,
         staged_deletions,
@@ -1144,18 +1282,11 @@ fn parse_numstat_per_file(unstaged: &str, staged: &str) -> std::collections::Has
     map
 }
 
-fn parse_numstat(output: &str) -> (u32, u32) {
-    let mut total_add = 0u32;
-    let mut total_del = 0u32;
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 2 {
-            // Binary files show "-" for additions/deletions
-            total_add += parts[0].parse::<u32>().unwrap_or(0);
-            total_del += parts[1].parse::<u32>().unwrap_or(0);
-        }
-    }
-    (total_add, total_del)
+/// Total additions and deletions in `--numstat -z` output.
+fn numstat_totals(output: &str) -> (u32, u32) {
+    parse_numstat_per_file(output, "")
+        .values()
+        .fold((0, 0), |(adds, dels), (a, d)| (adds + a, dels + d))
 }
 
 /// Parse `git diff --name-status -z` (also used by `diff-tree`).
@@ -1233,14 +1364,14 @@ pub fn git_diff_base_branch(repo_path: &Path, base_branch: &str) -> Result<BaseB
     })
 }
 
-pub fn git_diff_base_branch_file(repo_path: &Path, base_branch: &str, file_path: &str) -> Result<String, String> {
+pub fn git_diff_base_branch_file(repo_path: &Path, base_branch: &str, file_path: &str) -> Result<FileDiff, String> {
     let base_ref = resolve_base_ref(repo_path, base_branch)?;
     let merge_base = run_git(repo_path, &["merge-base", "HEAD", &base_ref])?;
     if merge_base.is_empty() {
         return Err("No common ancestor found".to_string());
     }
     let range = format!("{}..HEAD", merge_base);
-    run_git(repo_path, &["diff", &range, "--", file_path])
+    run_git_diff_capped(repo_path, &["diff", &range, "--", file_path])
 }
 
 pub fn git_default_branch(repo_path: &Path) -> Result<String, String> {
@@ -3005,8 +3136,18 @@ pub fn git_create_worktree(
             run_git(repo_path, &["worktree", "add", &path_str, branch])?;
         }
     }
+    refresh_new_worktree_index(&worktree_path);
 
     Ok(path_str)
+}
+
+/// Refreshes a new worktree's index once. `git worktree add` writes the
+/// index in the same instant as the files, so git cannot trust their stat
+/// data and every status read re-hashes them; Codemux's background reads
+/// skip the refresh that would fix it (see [`git_command`]). Best effort:
+/// a failure only costs that hashing.
+pub(crate) fn refresh_new_worktree_index(worktree: &Path) {
+    let _ = run_git_full(worktree, &["update-index", "-q", "--refresh"]);
 }
 
 /// Dirty/unpushed guard shared by `git_remove_worktree` (its
@@ -3608,23 +3749,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_numstat_sums_additions_and_deletions() {
-        let input = "\
-10\t5\tsrc/main.rs
-3\t0\tsrc/lib.rs
--\t-\tbinary-file.png
-0\t20\told-file.rs";
+    fn numstat_totals_sums_additions_and_deletions() {
+        let input = "10\t5\tsrc/main.rs\x003\t0\tsrc/lib.rs\0-\t-\tbinary-file.png\0\
+                     0\t20\told-file.rs\x004\t1\t\0src/old.rs\0src/new.rs\0";
 
-        let (adds, dels) = parse_numstat(input);
-        assert_eq!(adds, 13);
-        assert_eq!(dels, 25);
+        let (adds, dels) = numstat_totals(input);
+        assert_eq!(adds, 17);
+        assert_eq!(dels, 26);
     }
 
     #[test]
-    fn parse_numstat_handles_empty_output() {
-        let (adds, dels) = parse_numstat("");
-        assert_eq!(adds, 0);
-        assert_eq!(dels, 0);
+    fn numstat_totals_handles_empty_output() {
+        assert_eq!(numstat_totals(""), (0, 0));
     }
 
     #[test]
@@ -3729,6 +3865,159 @@ mod tests {
             assert_eq!((file.additions, file.deletions), (2, 0));
         }
         assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    /// The plumbing reads count what porcelain `git diff` counts (modified,
+    /// staged, renamed, binary and untracked files), and leave the index
+    /// file alone even when a file's stat data is stale.
+    #[test]
+    fn diff_stats_match_porcelain_and_never_rewrite_the_index() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        let lines = |n: usize| (1..=n).map(|i| format!("{i}\n")).collect::<String>();
+        std::fs::write(repo.join("mod.txt"), lines(100)).unwrap();
+        std::fs::write(repo.join("staged.txt"), lines(50)).unwrap();
+        std::fs::write(repo.join("rename-me.txt"), lines(200)).unwrap();
+        std::fs::write(repo.join("both.txt"), lines(30)).unwrap();
+        std::fs::write(repo.join("bin.dat"), b"\0\x01\x02bin").unwrap();
+        std::fs::write(repo.join("touched.txt"), "same\n").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        git_commit(&repo, "base").unwrap();
+
+        std::fs::write(repo.join("mod.txt"), lines(120).replace("\n5\n", "\nfive\n")).unwrap();
+        std::fs::write(repo.join("staged.txt"), lines(60)).unwrap();
+        run_git(&repo, &["add", "staged.txt"]).unwrap();
+        run_git(&repo, &["mv", "rename-me.txt", "renamed.txt"]).unwrap();
+        std::fs::write(repo.join("renamed.txt"), lines(201)).unwrap();
+        run_git(&repo, &["add", "renamed.txt"]).unwrap();
+        std::fs::write(repo.join("both.txt"), lines(35)).unwrap();
+        run_git(&repo, &["add", "both.txt"]).unwrap();
+        std::fs::write(repo.join("both.txt"), lines(40)).unwrap();
+        std::fs::write(repo.join("bin.dat"), b"\0\x01\x03bin2").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "new\n").unwrap();
+        // Same content, newer mtime: porcelain diff would refresh the index.
+        let touched = std::fs::File::options().write(true).open(repo.join("touched.txt")).unwrap();
+        touched.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
+        drop(touched);
+
+        let index = repo.join(".git").join("index");
+        let before = (std::fs::read(&index).unwrap(), std::fs::metadata(&index).unwrap().modified().unwrap());
+        let stat = git_diff_stat(&repo).unwrap();
+        let files = git_status(&repo).unwrap();
+        assert_eq!(git_changed_file_count(&repo).unwrap(), files.len());
+        let after = (std::fs::read(&index).unwrap(), std::fs::metadata(&index).unwrap().modified().unwrap());
+        assert!(before == after, "a status read rewrote the index");
+
+        let porcelain = |args: &[&str]| numstat_totals(&run_git(&repo, args).unwrap());
+        assert_eq!((stat.unstaged_additions, stat.unstaged_deletions), porcelain(&["diff", "--numstat", "-z"]));
+        assert_eq!((stat.staged_additions, stat.staged_deletions), porcelain(&["diff", "--cached", "--numstat", "-z"]));
+        assert_eq!((stat.unstaged_additions, stat.unstaged_deletions), (26, 1));
+        assert_eq!((stat.staged_additions, stat.staged_deletions), (16, 0));
+        let counts = |path: &str| {
+            let file = files.iter().find(|file| file.path == path).unwrap_or_else(|| panic!("{path}: {files:?}"));
+            (file.additions, file.deletions)
+        };
+        assert_eq!(counts("mod.txt"), (21, 1));
+        assert_eq!(counts("both.txt"), (10, 0));
+        assert_eq!(counts("renamed.txt"), (1, 0));
+        assert_eq!(counts("bin.dat"), (0, 0));
+        assert_eq!(counts("untracked.txt"), (0, 0));
+        assert!(files.iter().all(|file| file.path != "touched.txt"), "{files:?}");
+    }
+
+    /// A file diff past the line or byte limit is cut on a line boundary
+    /// and says so; one inside both comes back whole.
+    #[test]
+    fn file_diff_is_capped_on_a_line_boundary() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        std::fs::write(repo.join("big.txt"), "").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        git_commit(&repo, "base").unwrap();
+        let body: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(repo.join("big.txt"), &body).unwrap();
+
+        let whole = git_diff(&repo, "big.txt", false).unwrap();
+        assert!(!whole.truncated);
+        assert!(whole.diff.ends_with("+line 50"), "{}", whole.diff);
+
+        let args = ["diff", "--", "big.txt"];
+        let by_lines = run_git_diff_capped_to(&repo, &args, 10, usize::MAX / 2).unwrap();
+        assert!(by_lines.truncated);
+        assert_eq!(by_lines.diff.lines().count(), 10);
+        assert!(whole.diff.starts_with(&by_lines.diff));
+
+        let by_bytes = run_git_diff_capped_to(&repo, &args, usize::MAX, 200).unwrap();
+        assert!(by_bytes.truncated);
+        assert!(by_bytes.diff.len() <= 200);
+        assert!(whole.diff.starts_with(&format!("{}\n", by_bytes.diff)), "cut mid-line: {:?}", by_bytes.diff);
+
+        // One line longer than the whole budget keeps nothing past it.
+        std::fs::write(repo.join("big.txt"), "x".repeat(1000)).unwrap();
+        let wide = run_git_diff_capped_to(&repo, &args, usize::MAX, 400).unwrap();
+        assert!(wide.truncated);
+        assert!(!wide.diff.contains("xxx"), "{}", wide.diff);
+
+        assert!(git_diff(&repo.join("missing"), "big.txt", false).is_err());
+    }
+
+    /// An external diff that floods stderr before writing its diff must not
+    /// stall the read, and a failing one reports a bounded error.
+    #[cfg(unix)]
+    #[test]
+    fn file_diff_survives_an_external_diff_that_floods_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, repo) = setup_test_repo();
+        git_config(&repo);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        git_commit(&repo, "base").unwrap();
+        std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+        let tool = |name: &str, exit: u8| {
+            let script = dir.path().join(name);
+            let body = format!(
+                "#!/bin/sh\nhead -c 300000 /dev/zero | tr '\\000' e >&2\necho \"external diff of $1\"\nexit {exit}\n"
+            );
+            std::fs::write(&script, body).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            script.to_string_lossy().into_owned()
+        };
+        let (noisy, failing) = (tool("noisy-diff", 0), tool("failing-diff", 1));
+
+        // Off the test thread, so a regression fails instead of hanging.
+        let read = |external: String| {
+            let repo = repo.clone();
+            let (sent, received) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                run_git(&repo, &["config", "diff.external", &external]).unwrap();
+                let _ = sent.send(git_diff(&repo, "a.txt", false));
+            });
+            received.recv_timeout(std::time::Duration::from_secs(30)).expect("the diff read hung")
+        };
+        let diff = read(noisy).unwrap();
+        assert!(!diff.truncated);
+        assert_eq!(diff.diff, "external diff of a.txt");
+        let error = read(failing).unwrap_err();
+        assert!(error.len() < 20 * 1024, "error is {} bytes", error.len());
+    }
+
+    /// Before the first commit there is no HEAD: everything staged counts
+    /// as added, as porcelain `git diff --cached` reports it.
+    #[test]
+    fn diff_stats_count_staged_files_on_an_unborn_branch() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().to_path_buf();
+        run_git(&repo, &["init"]).unwrap();
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+        run_git(&repo, &["add", "a.txt"]).unwrap();
+        std::fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+        let stat = git_diff_stat(&repo).unwrap();
+        assert_eq!((stat.staged_additions, stat.staged_deletions), (2, 0));
+        assert_eq!((stat.unstaged_additions, stat.unstaged_deletions), (1, 0));
+        let files = git_status(&repo).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!((files[0].additions, files[0].deletions), (3, 0));
     }
 
     #[test]

@@ -1659,7 +1659,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                   )}
                   {tunnelKind === "lost" && (
                     <span className="shrink-0 rounded-sm px-1 text-caption leading-[14px] text-danger bg-danger/15">
-                      Connection lost — re-push
+                      Connection lost — retrying
                     </span>
                   )}
 

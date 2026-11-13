@@ -622,8 +622,7 @@ mod tests {
         use futures_util::StreamExt;
         use std::{sync::Arc, time::Duration};
 
-        let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap()
-            .join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX));
+        let binary = crate::test_isolation::fixture_bin(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX));
         assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
         let provider = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(
             crate::agent_provider::cursor::CursorProviderConfig {

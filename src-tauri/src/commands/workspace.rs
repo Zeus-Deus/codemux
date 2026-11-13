@@ -57,7 +57,9 @@ pub(crate) fn gather_workspace_git_info(repo_path: &Path) -> WorkspaceGitInfo {
     let is_git = crate::config::workspace_config::find_git_root(repo_path).is_some();
     let branch_info = crate::git::git_branch_info(repo_path).ok();
     let diff_stat = crate::git::git_diff_stat(repo_path).ok();
-    let changed_files = crate::git::git_status(repo_path).map(|f| f.len() as u32).unwrap_or(0);
+    // Only the count: `git_status` would run the diffs above a second time
+    // for per-file line counts the sidebar never shows.
+    let changed_files = crate::git::git_changed_file_count(repo_path).map(|n| n as u32).unwrap_or(0);
 
     let branch = branch_info.as_ref().and_then(|i| i.branch.clone());
     let ahead = branch_info.as_ref().map(|i| i.ahead).unwrap_or(0);

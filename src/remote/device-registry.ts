@@ -131,10 +131,12 @@ export class DeviceRegistry {
     return raw.filter(isRegisteredDevice);
   }
 
-  /** Mint a fresh grant for `deviceId`, bound to `browserNonce`. */
+  /** Mint a fresh grant for `deviceId`, bound to `browserNonce`. `signal`
+   *  cancels the request when the connection attempt is abandoned. */
   async connectDevice(
     deviceId: string,
     browserNonce: string,
+    signal?: AbortSignal,
   ): Promise<DeviceGrant> {
     const res = await this.request(
       `/api/devices/${encodeURIComponent(deviceId)}/connect`,
@@ -142,6 +144,7 @@ export class DeviceRegistry {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ browserNonce }),
+        signal,
       },
     );
     if (!res.ok) {

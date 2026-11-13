@@ -652,6 +652,13 @@ export interface BaseBranchDiff {
   merge_base_commit: string;
 }
 
+/** One file's diff. `truncated` means the diff was too large to send whole:
+ *  `diff` holds its first lines. */
+export interface FileDiff {
+  diff: string;
+  truncated: boolean;
+}
+
 export interface GitDiffStat {
   staged_additions: number;
   staged_deletions: number;

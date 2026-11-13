@@ -571,6 +571,12 @@ pub fn run() {
                 tauri::async_runtime::block_on(
                     app.state::<commands::side_chat::SideChatStore>().shutdown_all(),
                 );
+                // Remote-workspace ssh tunnels otherwise outlive the app.
+                #[cfg(unix)]
+                let _ = tauri::async_runtime::block_on(tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    ssh::shutdown_all(),
+                ));
                 if let Err(error) = tauri::async_runtime::block_on(
                     app.state::<commands::workflows::WorkflowState>().shutdown(),
                 ) {
@@ -2139,22 +2145,30 @@ fn build_core_app<R: tauri::Runtime>(
 
                     futures_util::stream::iter(targets)
                         .for_each_concurrent(FETCH_CONCURRENCY, |cwd| async move {
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_secs(PER_FETCH_TIMEOUT_SECS),
-                                crate::git::git_command_tokio()
-                                    .args(["fetch", "--prune", "--quiet", "--no-tags"])
-                                    .current_dir(&cwd)
-                                    .env("GIT_TERMINAL_PROMPT", "0")
-                                    // Timing out drops the future, which must
-                                    // take the child with it — an unreachable
-                                    // network otherwise leaves a `git fetch`
-                                    // per repo per tick running forever.
-                                    .kill_on_drop(true)
-                                    .output(),
-                            )
-                            .await;
+                            let mut fetch = crate::git::git_command_tokio();
+                            fetch
+                                .args(jobs::BACKGROUND_FETCH_ARGS)
+                                .current_dir(&cwd)
+                                .env("GIT_TERMINAL_PROMPT", "0")
+                                .stdin(std::process::Stdio::null())
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                // A dropped future must take the child with
+                                // it, or an unreachable network leaves a
+                                // `git fetch` per repo per tick running.
+                                .kill_on_drop(true);
+                            // An unreachable remote is stopped at the limit,
+                            // politely first so git drops its ref locks.
                             // Result intentionally discarded — see comment
                             // on the parent loop.
+                            if let Ok(mut child) = fetch.spawn() {
+                                jobs::wait_or_stop(
+                                    &mut child,
+                                    std::time::Duration::from_secs(PER_FETCH_TIMEOUT_SECS),
+                                    std::time::Duration::from_secs(1),
+                                )
+                                .await;
+                            }
                         })
                         .await;
 

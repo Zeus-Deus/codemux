@@ -81,7 +81,7 @@ describe("createIrohConnection ticket minting", () => {
     });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ticket: "iroh" });
-    expect(connectDevice).toHaveBeenCalledWith("d1", "NONCE");
+    expect(connectDevice).toHaveBeenCalledWith("d1", "NONCE", undefined);
   });
 
   it("dials the minted node and sends grant + nonce in hello-account", async () => {
@@ -196,5 +196,125 @@ describe("createIrohConnection ticket minting", () => {
       method: "POST",
     });
     expect(res.status).toBe(200);
+  });
+});
+
+describe("createIrohConnection overlapping mints", () => {
+  /** A registry whose mints stay pending until the test settles them. */
+  function slowRegistry() {
+    const mints: Array<{
+      nonce: string;
+      signal?: AbortSignal;
+      resolve: (g: DeviceGrant) => void;
+    }> = [];
+    const connectDevice = vi.fn(
+      (_deviceId: string, nonce: string, signal?: AbortSignal) =>
+        new Promise<DeviceGrant>((resolve) => mints.push({ nonce, signal, resolve })),
+    );
+    return { registry: { connectDevice }, mints };
+  }
+
+  function nonces(): () => string {
+    let n = 0;
+    return () => `NONCE-${++n}`;
+  }
+
+  const ticket = (conn: ReturnType<typeof createIrohConnection>, signal?: AbortSignal) =>
+    conn.fetchImpl("https://app.local/api/ws-ticket", { method: "POST", signal });
+
+  it("keeps the newer grant when an abandoned mint answers late", async () => {
+    const { registry, mints } = slowRegistry();
+    const { dialer, targets, streams } = capturingDialer();
+    const conn = createIrohConnection({
+      registry,
+      deviceId: "d1",
+      dialer,
+      nonceFactory: nonces(),
+    });
+
+    const stale = new AbortController();
+    const first = ticket(conn, stale.signal);
+    first.catch(() => {});
+    stale.abort();
+    const second = ticket(conn, new AbortController().signal);
+    mints[1].resolve({ ...grant(), nodeId: "fresh-node", grant: "fresh-grant" });
+    expect((await second).status).toBe(200);
+
+    mints[0].resolve({ ...grant(), nodeId: "stale-node", grant: "stale-grant" });
+    await expect(first).rejects.toMatchObject({ name: "AbortError" });
+
+    conn.wsFactory("wss://ignored");
+    await tick();
+    expect(targets[0].nodeId).toBe("fresh-node");
+    expect(streams[0].firstFrame().json).toEqual({
+      t: "hello-account",
+      grant: "fresh-grant",
+      nonce: "NONCE-2",
+    });
+  });
+
+  it("drops an older mint that lands after a newer one, even uncancelled", async () => {
+    const { registry, mints } = slowRegistry();
+    const { dialer, streams } = capturingDialer();
+    const conn = createIrohConnection({ registry, deviceId: "d1", dialer, nonceFactory: nonces() });
+
+    const first = ticket(conn);
+    first.catch(() => {});
+    const second = ticket(conn);
+    mints[1].resolve({ ...grant(), grant: "fresh-grant" });
+    await second;
+    mints[0].resolve({ ...grant(), grant: "stale-grant" });
+    await expect(first).rejects.toMatchObject({ name: "AbortError" });
+
+    conn.wsFactory("wss://ignored");
+    await tick();
+    expect(streams[0].firstFrame().json).toMatchObject({ grant: "fresh-grant", nonce: "NONCE-2" });
+  });
+
+  it("passes the ticket request's cancellation through to the grant request", async () => {
+    const { registry, mints } = slowRegistry();
+    const onMintError = vi.fn();
+    const conn = createIrohConnection({
+      registry,
+      deviceId: "d1",
+      dialer: capturingDialer().dialer,
+      onMintError,
+    });
+    const abort = new AbortController();
+    void ticket(conn, abort.signal).catch(() => {});
+    expect(mints[0].signal).toBe(abort.signal);
+    abort.abort();
+    expect(mints[0].signal?.aborted).toBe(true);
+    expect(onMintError).not.toHaveBeenCalled();
+  });
+
+  it("keeps a socket's credentials when a newer mint lands mid-dial", async () => {
+    const { registry, mints } = slowRegistry();
+    const streams: FakeStream[] = [];
+    let finishDial: () => void = () => {};
+    const dialer: IrohDialer = {
+      dial: () =>
+        new Promise((resolve) => {
+          finishDial = () => {
+            const s = new FakeStream();
+            streams.push(s);
+            resolve(s);
+          };
+        }),
+    };
+    const conn = createIrohConnection({ registry, deviceId: "d1", dialer, nonceFactory: nonces() });
+
+    const first = ticket(conn);
+    mints[0].resolve({ ...grant(), grant: "grant-1" });
+    await first;
+    conn.wsFactory("wss://ignored");
+
+    const second = ticket(conn);
+    mints[1].resolve({ ...grant(), grant: "grant-2" });
+    await second;
+
+    finishDial();
+    await tick();
+    expect(streams[0].firstFrame().json).toMatchObject({ grant: "grant-1", nonce: "NONCE-1" });
   });
 });

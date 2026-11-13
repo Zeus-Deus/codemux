@@ -314,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn review600_async_questions_idle_answer_after_stop_resume_keeps_durable_generation() {
-        let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("fake_codex_app_server");
+        let binary = crate::test_isolation::fixture_bin("fake_codex_app_server");
         assert!(binary.exists(), "build the fake_codex_app_server test fixture first");
         for capture_diff in [false, true] {
             let app = tauri::test::mock_app();
@@ -369,7 +369,7 @@ mod tests {
     /// turn, and the same answer goes through once authorized.
     #[tokio::test]
     async fn steered_answer_is_authorized_before_turn_steer() {
-        let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("fake_codex_app_server");
+        let binary = crate::test_isolation::fixture_bin("fake_codex_app_server");
         assert!(binary.exists(), "build the fake_codex_app_server test fixture first");
         let root = tempfile::tempdir().unwrap();
         let trace = root.path().join("trace.jsonl");

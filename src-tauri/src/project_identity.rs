@@ -90,6 +90,39 @@ pub fn remote_host_path(remote: &str) -> Option<String> {
     Some(s.to_string())
 }
 
+/// Strip credentials from a git remote URL so it is safe to store, sync,
+/// or display, while staying usable as a clone URL.
+///
+/// - `http(s)://` drops the whole `user[:pass]@` userinfo plus any query
+///   and fragment (tokens such as `oauth2:glpat-…@` or `?private_token=`).
+/// - Other `scheme://` URLs (e.g. `ssh://`) keep the user — the SSH
+///   login name is not a secret — but drop any `:password`.
+/// - scp-style `git@host:owner/repo` has no password slot and is
+///   returned unchanged.
+pub fn redact_remote_url(remote: &str) -> String {
+    let s = remote.trim();
+    let Some((scheme, rest)) = s.split_once("://") else {
+        return s.to_string();
+    };
+    let is_http = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = match authority.rsplit_once('@') {
+        Some((_, host)) if is_http => host.to_string(),
+        Some((userinfo, host)) => {
+            let user = userinfo.split_once(':').map_or(userinfo, |(user, _)| user);
+            format!("{user}@{host}")
+        }
+        None => authority.to_string(),
+    };
+    let tail = if is_http {
+        tail.split(['?', '#']).next().unwrap_or("")
+    } else {
+        tail
+    };
+    format!("{scheme}://{authority}{tail}")
+}
+
 /// Compute the deterministic `project_uid` from the canonical key
 /// (`canonical_remote(...)` when available, otherwise the absolute
 /// project-root path).
@@ -180,6 +213,47 @@ mod tests {
         );
         assert_eq!(canonical_remote(""), None);
         assert_eq!(canonical_remote("   "), None);
+    }
+
+    #[test]
+    fn redact_remote_url_strips_http_credentials_query_and_fragment() {
+        assert_eq!(
+            redact_remote_url("https://oauth2:glpat-SECRET@gitlab.com/group/proj.git"),
+            "https://gitlab.com/group/proj.git"
+        );
+        assert_eq!(
+            redact_remote_url("https://x-access-token:ghs_SECRET@github.com/acme/app"),
+            "https://github.com/acme/app"
+        );
+        assert_eq!(
+            redact_remote_url("http://user@git.example.com:8080/a/b.git?private_token=SECRET#frag"),
+            "http://git.example.com:8080/a/b.git"
+        );
+        assert_eq!(
+            redact_remote_url("HTTPS://tok@host.example?token=SECRET"),
+            "HTTPS://host.example"
+        );
+        assert_eq!(
+            redact_remote_url("  https://github.com/acme/app.git\n"),
+            "https://github.com/acme/app.git"
+        );
+    }
+
+    #[test]
+    fn redact_remote_url_keeps_ssh_user_but_drops_password() {
+        assert_eq!(
+            redact_remote_url("ssh://git@github.com/acme/app.git"),
+            "ssh://git@github.com/acme/app.git"
+        );
+        assert_eq!(
+            redact_remote_url("ssh://deploy:SECRET@git.example.com:2222/a/b.git"),
+            "ssh://deploy@git.example.com:2222/a/b.git"
+        );
+        assert_eq!(
+            redact_remote_url("git@github.com:acme/app.git"),
+            "git@github.com:acme/app.git"
+        );
+        assert_eq!(redact_remote_url("/srv/git/app.git"), "/srv/git/app.git");
     }
 
     #[test]

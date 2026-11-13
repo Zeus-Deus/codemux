@@ -843,8 +843,17 @@ export const MessageList = memo(function MessageList({
       // anchor is mounted the built-in end pin is off and the advance effect
       // is the only thing moving the viewport, so cancelling on an ordinary
       // click would freeze the transcript for the rest of a live run.
-      const onPointerDown = (event: Event) => {
+      // `scrollbar-gutter: stable both-edges` also reserves an empty gutter
+      // on the left, and a press there targets the scroller too, so only a
+      // press within the scrollbar's reach of the right edge counts.
+      const onPointerDown = (event: PointerEvent) => {
         if (event.target !== viewport) return;
+        const scrollbarReach = Math.max(
+          16,
+          viewport.offsetWidth - viewport.clientWidth,
+        );
+        const { right } = viewport.getBoundingClientRect();
+        if (event.clientX < right - scrollbarReach) return;
         cancelFollowForUserNavigation();
       };
       // Keyboard scrolling is navigation too. Editable targets keep their

@@ -1,4 +1,4 @@
-use crate::git::{BaseBranchDiff, CommitFileEntry, ConflictCheckResult, GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, MergeIntoBaseResult, MergeState, ResolverBranchInfo, WorktreeInfo};
+use crate::git::{BaseBranchDiff, CommitFileEntry, ConflictCheckResult, FileDiff, GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, MergeIntoBaseResult, MergeState, ResolverBranchInfo, WorktreeInfo};
 use std::path::{Path, PathBuf};
 
 // Every command here shells out via `crate::git::*` → `git::git_command()`.
@@ -195,7 +195,7 @@ pub async fn get_git_status(path: String) -> Result<Vec<GitFileStatus>, String> 
 }
 
 #[tauri::command]
-pub async fn get_git_diff(path: String, file: String, staged: bool) -> Result<String, String> {
+pub async fn get_git_diff(path: String, file: String, staged: bool) -> Result<FileDiff, String> {
     tokio::task::spawn_blocking(move || crate::git::git_diff(Path::new(&path), &file, staged))
         .await
         .map_err(|e| format!("get_git_diff task join failed: {e}"))?
@@ -374,7 +374,7 @@ pub async fn get_base_branch_diff(path: String, base_branch: String) -> Result<B
 }
 
 #[tauri::command]
-pub async fn get_base_branch_file_diff(path: String, base_branch: String, file: String) -> Result<String, String> {
+pub async fn get_base_branch_file_diff(path: String, base_branch: String, file: String) -> Result<FileDiff, String> {
     tokio::task::spawn_blocking(move || {
         crate::git::git_diff_base_branch_file(Path::new(&path), &base_branch, &file)
     })

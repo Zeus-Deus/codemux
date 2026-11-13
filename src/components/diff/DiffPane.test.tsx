@@ -9,13 +9,13 @@ vi.mock("@/tauri/commands", () => ({
   getGitStatus: (...a: unknown[]) => mockGetGitStatus(...a),
   getGitDiff: (...a: unknown[]) => mockGetGitDiff(...a),
   getBaseBranchDiff: vi.fn().mockResolvedValue({ files: [], merge_base_commit: "" }),
-  getBaseBranchFileDiff: vi.fn().mockResolvedValue(""),
+  getBaseBranchFileDiff: vi.fn().mockResolvedValue({ diff: "", truncated: false }),
   closeTab: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { DiffPane } from "./DiffPane";
 import { useDiffStore } from "@/stores/diff-store";
-import type { GitFileStatus, WorkspaceSnapshot } from "@/tauri/types";
+import type { FileDiff, GitFileStatus, WorkspaceSnapshot } from "@/tauri/types";
 
 const TAB = "right-panel:ws-1:diff";
 const WORKSPACE = {
@@ -37,8 +37,8 @@ function status(path: string, additions: number, deletions = 0): GitFileStatus {
   };
 }
 
-function diffOf(path: string, added: string): string {
-  return [
+function diffOf(path: string, added: string, truncated = false): FileDiff {
+  const diff = [
     `diff --git a/${path} b/${path}`,
     `--- a/${path}`,
     `+++ b/${path}`,
@@ -47,6 +47,7 @@ function diffOf(path: string, added: string): string {
     "-const old = 1;",
     `+${added}`,
   ].join("\n");
+  return { diff, truncated };
 }
 
 function renderPane(props: Partial<Parameters<typeof DiffPane>[0]> = {}) {
@@ -201,9 +202,9 @@ describe("the embedded diff pane", () => {
 
   it("lets a read slower than the poll land instead of restarting it", async () => {
     vi.useFakeTimers();
-    let resolveRead: (raw: string) => void = () => {};
+    let resolveRead: (read: FileDiff) => void = () => {};
     mockGetGitDiff.mockImplementation(
-      () => new Promise<string>((resolve) => (resolveRead = resolve)),
+      () => new Promise<FileDiff>((resolve) => (resolveRead = resolve)),
     );
     renderPane();
     await act(() => vi.advanceTimersByTimeAsync(0));
@@ -248,6 +249,17 @@ describe("the embedded diff pane", () => {
     await waitFor(() => expect(pane).toHaveTextContent("2 files with changes"));
     fireEvent.keyDown(pane, { key: "K", shiftKey: true });
     expect(useDiffStore.getState().tabs[TAB].filePath).toBe("src/lib/b.ts");
+  });
+
+  it("says when a diff was too large to show whole", async () => {
+    mockGetGitDiff.mockImplementation((_cwd: string, path: string) =>
+      Promise.resolve(diffOf(path, "const first_part = 1;", true)),
+    );
+    renderPane();
+    await screen.findByText("const first_part = 1;");
+    expect(screen.getByTestId("diff-truncated")).toHaveTextContent(
+      "Diff too large — showing the first 4 lines",
+    );
   });
 
   it("hides a zero count in the header", async () => {

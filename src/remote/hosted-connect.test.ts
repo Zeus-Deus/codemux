@@ -88,14 +88,23 @@ describe("hosted connection startup", () => {
   });
 
   it("closes a stream whose desktop handshake never responds", async () => {
-    const stream = new ScriptedStream();
-    vi.mocked(loadIrohDialer).mockResolvedValue({ dial: async () => stream });
+    // The transport abandons and redials a socket that doesn't open in time,
+    // so startup may dial more than once before its own deadline.
+    const streams: ScriptedStream[] = [];
+    vi.mocked(loadIrohDialer).mockResolvedValue({
+      dial: async () => {
+        const stream = new ScriptedStream();
+        streams.push(stream);
+        return stream;
+      },
+    });
     let failure: unknown;
     const pending = connectOverIroh(args()).catch((error: unknown) => { failure = error; });
     await vi.advanceTimersByTimeAsync(30_000);
     expect((failure as Error).message).toMatch(/timed out/);
     await pending;
-    expect(stream.close).toHaveBeenCalledOnce();
+    expect(streams.length).toBeGreaterThan(0);
+    for (const stream of streams) expect(stream.close).toHaveBeenCalledOnce();
   });
 
   it("does not extend the approval deadline on each pending rejection", async () => {
@@ -269,8 +278,8 @@ describe("hosted connection startup", () => {
   });
 
   it("stops a stalled dial and closes a stream that arrives after the timeout", async () => {
-    let finishDial!: (stream: IrohByteStream) => void;
-    const dial = vi.fn(() => new Promise<IrohByteStream>((resolve) => (finishDial = resolve)));
+    const finishDials: Array<(stream: IrohByteStream) => void> = [];
+    const dial = vi.fn(() => new Promise<IrohByteStream>((resolve) => finishDials.push(resolve)));
     vi.mocked(loadIrohDialer).mockResolvedValue({ dial });
     const options = args();
     let failure: unknown;
@@ -279,13 +288,21 @@ describe("hosted connection startup", () => {
     expect(failure).toBeInstanceOf(Error);
     expect((failure as Error).message).toMatch(/timed out/i);
     await pending;
+    const dialsAtTimeout = dial.mock.calls.length;
 
-    const late = { read: vi.fn(), write: vi.fn(), close: vi.fn() };
-    finishDial(late);
+    // Every stalled dial (the transport may have redialed one that never
+    // opened) lands late and must be closed without a handshake.
+    const late = finishDials.map((finish) => {
+      const stream = { read: vi.fn(), write: vi.fn(), close: vi.fn() };
+      finish(stream);
+      return stream;
+    });
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(late.close).toHaveBeenCalledOnce();
-    expect(late.write).not.toHaveBeenCalled();
-    expect(dial).toHaveBeenCalledOnce();
+    for (const stream of late) {
+      expect(stream.close).toHaveBeenCalledOnce();
+      expect(stream.write).not.toHaveBeenCalled();
+    }
+    expect(dial).toHaveBeenCalledTimes(dialsAtTimeout);
     expect(options.onStatus).not.toHaveBeenCalled();
   });
 });

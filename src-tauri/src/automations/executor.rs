@@ -124,6 +124,7 @@ pub fn prepare_worktree(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    crate::git::refresh_new_worktree_index(worktree_dir);
     Ok(())
 }
 

@@ -7892,8 +7892,11 @@ const handlers: Record<string, Handler> = {
   // reachable when something is actually uncommitted.
   get_git_status: (a) =>
     String(a.path ?? "") === MOCK_CREATE_PR_PATH ? structuredClone(mockDirtyFiles) : [],
-  get_git_diff: (a) =>
-    String(a.path ?? "") === MOCK_CREATE_PR_PATH ? mockFileDiff(String(a.file ?? "")) : "",
+  get_git_diff: (a) => ({
+    diff: String(a.path ?? "") === MOCK_CREATE_PR_PATH ? mockFileDiff(String(a.file ?? "")) : "",
+    truncated: false,
+  }),
+  get_base_branch_file_diff: () => ({ diff: "", truncated: false }),
   git_stage_files: (a) => setMockStaged(a.path, a.files, true),
   git_unstage_files: (a) => setMockStaged(a.path, a.files, false),
   get_merge_state: () => null,
