@@ -403,6 +403,13 @@ fn staged_numstat(repo_path: &Path) -> Result<String, String> {
     })
 }
 
+/// How many files `git status` lists, without the per-file line counts
+/// [`git_status`] adds. For callers that only show the count.
+pub fn git_changed_file_count(repo_path: &Path) -> Result<usize, String> {
+    let output = run_git(repo_path, &["status", "--porcelain=v1", "-z"])?;
+    Ok(parse_porcelain_status(&output).len())
+}
+
 pub fn git_status(repo_path: &Path) -> Result<Vec<GitFileStatus>, String> {
     let output = run_git(repo_path, &["status", "--porcelain=v1", "-z"])?;
     let mut files = parse_porcelain_status(&output);
@@ -3787,6 +3794,7 @@ mod tests {
         let before = (std::fs::read(&index).unwrap(), std::fs::metadata(&index).unwrap().modified().unwrap());
         let stat = git_diff_stat(&repo).unwrap();
         let files = git_status(&repo).unwrap();
+        assert_eq!(git_changed_file_count(&repo).unwrap(), files.len());
         let after = (std::fs::read(&index).unwrap(), std::fs::metadata(&index).unwrap().modified().unwrap());
         assert!(before == after, "a status read rewrote the index");
 
