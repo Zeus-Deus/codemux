@@ -463,6 +463,109 @@ describe("liveness", () => {
   });
 });
 
+describe("connection attempt deadlines", () => {
+  /** A fetch whose ticket requests hang until the test answers them. */
+  function stallingFetch() {
+    const requests: Array<{ signal?: AbortSignal; answer: (ticket: string) => void }> = [];
+    const fetchImpl = vi.fn(
+      (_url: unknown, init?: RequestInit) =>
+        new Promise<Response>((resolve) => {
+          requests.push({
+            signal: init?.signal ?? undefined,
+            answer: (ticket) => resolve(new Response(JSON.stringify({ ticket }))),
+          });
+        }),
+    );
+    return { fetchImpl: fetchImpl as unknown as typeof fetch, requests };
+  }
+
+  it("retries a ticket request that never answers", async () => {
+    vi.useFakeTimers();
+    const { fetchImpl, requests } = stallingFetch();
+    const { transport } = newTransport({ fetchImpl });
+    const connected = transport.connect();
+
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(requests).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(requests[0].signal?.aborted).toBe(true);
+
+    // Normal 1s backoff, then a fresh request that does answer.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(requests).toHaveLength(2);
+    requests[1].answer("fresh");
+    await flushMicrotasks();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.instances[0].url).toContain("ticket=fresh");
+    FakeWebSocket.instances[0].open();
+    await connected;
+
+    // The abandoned request answering late opens nothing.
+    requests[0].answer("stale");
+    await flushMicrotasks();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it("abandons a socket that never opens", async () => {
+    vi.useFakeTimers();
+    const { transport, rec } = newTransport();
+    const connected = transport.connect();
+    await flushMicrotasks();
+    const stuck = FakeWebSocket.instances[0];
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(stuck.closeCalls).toBe(1);
+    expect(stuck.onopen).toBeNull();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    FakeWebSocket.instances[1].open();
+    await connected;
+    expect(rec.statuses).toEqual(["connected"]);
+  });
+
+  it("restarts a stale in-flight attempt when the network comes back", async () => {
+    vi.useFakeTimers();
+    const { fetchImpl, requests } = stallingFetch();
+    const { transport } = newTransport({ fetchImpl });
+    void transport.connect().catch(() => {});
+    await flushMicrotasks();
+
+    // A fresh attempt is left alone.
+    window.dispatchEvent(new Event("online"));
+    expect(requests).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(4_000);
+    window.dispatchEvent(new Event("online"));
+    expect(requests).toHaveLength(2);
+    expect(requests[0].signal?.aborted).toBe(true);
+
+    requests[0].answer("stale");
+    requests[1].answer("fresh");
+    await flushMicrotasks();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.instances[0].url).toContain("ticket=fresh");
+  });
+
+  it("restarts a socket stuck opening when the network comes back", async () => {
+    vi.useFakeTimers();
+    const { transport } = newTransport();
+    void transport.connect().catch(() => {});
+    await flushMicrotasks();
+    const stuck = FakeWebSocket.instances[0];
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    window.dispatchEvent(new Event("online"));
+    await flushMicrotasks();
+    expect(stuck.onopen).toBeNull();
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    // The abandoned socket's open deadline no longer fires.
+    await vi.advanceTimersByTimeAsync(11_000);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+});
+
 describe("compression negotiation", () => {
   it("offers compress=deflate alongside the encoded ticket", async () => {
     const { transport } = newTransport();

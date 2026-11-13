@@ -32,6 +32,13 @@ import { remoteClientId } from "./client-view";
  *     may be one large frame still downloading, which looks like silence,
  *     so the probe waits `BUSY_PROBE_TIMEOUT_MS` instead. Waking while a
  *     reconnect is backing off retries at once.
+ *   - Attempt deadlines: a ticket request or socket open sent into a dead
+ *     network (a phone switching networks mid-reconnect) can otherwise hang
+ *     until the OS gives up minutes later. Each phase has its own deadline
+ *     (`TICKET_TIMEOUT_MS`, `OPEN_TIMEOUT_MS`) that falls back into the
+ *     normal backoff, and a wake event restarts an attempt that has been in
+ *     flight for `STALE_ATTEMPT_MS`, since the network it started on may be
+ *     gone.
  *
  * This protocol contract MUST match the Rust server exactly.
  */
@@ -122,6 +129,13 @@ const PROBE_TIMEOUT_MS = 10_000;
 const BUSY_PROBE_TIMEOUT_MS = 120_000;
 /** Cadence of the idle/deadline check while a socket is open. */
 const LIVENESS_TICK_MS = 2_000;
+/** How long a ws-ticket request may take before the attempt is retried. */
+const TICKET_TIMEOUT_MS = 8_000;
+/** How long a new socket may take to open (over iroh: dial plus the
+ *  desktop's `welcome`) before it is abandoned and the attempt retried. */
+const OPEN_TIMEOUT_MS = 15_000;
+/** A wake event restarts a connection attempt in flight at least this long. */
+const STALE_ATTEMPT_MS = 3_000;
 
 /** Minimum length of a binary channel frame: tag(1) + cb(4) + idx(8). */
 const BINARY_HEADER_LEN = 13;
@@ -305,6 +319,13 @@ export class RemoteTransport {
   private reconnectDelay = BASE_RECONNECT_MS;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** When the in-flight connection attempt started; `null` when none is. */
+  private attemptStartedAt: number | null = null;
+  /** Aborts the in-flight ws-ticket request. */
+  private ticketAbort: AbortController | null = null;
+  /** Deadline for the current socket to open. */
+  private openTimer: ReturnType<typeof setTimeout> | null = null;
+
   /** When the open socket last delivered a frame (any frame). */
   private lastFrameAt = 0;
   /** Deadline of the outstanding liveness probe, if one is in flight. */
@@ -349,7 +370,7 @@ export class RemoteTransport {
     this.closed = true;
     this.listenForWake(false);
     this.stopLiveness();
-    this.generation += 1;
+    this.abandonAttempt();
     const error = new Error("web-remote: connection closed");
     this.firstConnectReject?.(error);
     this.firstConnectReject = this.firstConnectResolve = null;
@@ -361,16 +382,7 @@ export class RemoteTransport {
       this.reconnectTimer = null;
     }
     this.socketOpen = false;
-    const ws = this.ws;
-    this.ws = null;
-    if (ws) {
-      ws.onopen = ws.onclose = ws.onerror = ws.onmessage = ws.onactivity = null;
-      try {
-        ws.close();
-      } catch {
-        /* ignore */
-      }
-    }
+    this.detachSocket();
   }
 
   /** Send an invoke; reject immediately if the socket is down. */
@@ -418,6 +430,7 @@ export class RemoteTransport {
   private async attemptConnect(): Promise<void> {
     if (this.closed) return;
     const generation = this.generation;
+    this.attemptStartedAt = Date.now();
     let ticket: string;
     try {
       ticket = await this.fetchTicket();
@@ -457,9 +470,39 @@ export class RemoteTransport {
       /* an `onclose` always follows — reconnect is driven from there */
     };
     this.ws = ws;
+    this.openTimer = setTimeout(() => {
+      this.openTimer = null;
+      if (this.ws !== ws || this.socketOpen) return;
+      console.warn("[web-remote] connection attempt timed out; retrying");
+      this.replaceSocket();
+    }, OPEN_TIMEOUT_MS);
   }
 
+  /**
+   * Fetch a ws-ticket, giving up after `TICKET_TIMEOUT_MS`. The request is
+   * aborted, and also raced against the deadline, because an injected
+   * `fetchImpl` (the iroh grant minter) may not honour the signal.
+   */
   private async fetchTicket(): Promise<string> {
+    const abort = new AbortController();
+    this.ticketAbort = abort;
+    const timer = setTimeout(() => abort.abort(), TICKET_TIMEOUT_MS);
+    const aborted = new Promise<never>((_, reject) => {
+      abort.signal.addEventListener(
+        "abort",
+        () => reject(new Error("web-remote: ws-ticket request timed out")),
+        { once: true },
+      );
+    });
+    try {
+      return await Promise.race([this.requestTicket(abort.signal), aborted]);
+    } finally {
+      clearTimeout(timer);
+      if (this.ticketAbort === abort) this.ticketAbort = null;
+    }
+  }
+
+  private async requestTicket(signal: AbortSignal): Promise<string> {
     const token = this.getToken();
     const headers: Record<string, string> = {};
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -467,6 +510,7 @@ export class RemoteTransport {
       method: "POST",
       headers,
       credentials: "include",
+      signal,
     });
     // 401 → the session is gone (revoked / invalid). 403 → valid but not
     // yet approved: transient, keep polling until the desktop approves.
@@ -490,6 +534,8 @@ export class RemoteTransport {
 
   private handleOpen(): void {
     this.socketOpen = true;
+    this.clearOpenTimer();
+    this.attemptStartedAt = null;
     this.reconnectDelay = BASE_RECONNECT_MS;
     this.startLiveness();
     // Re-send every active subscription so the server re-registers its
@@ -508,6 +554,7 @@ export class RemoteTransport {
     const wasOpen = this.socketOpen;
     this.socketOpen = false;
     this.ws = null;
+    this.clearOpenTimer();
     this.stopLiveness();
     // Reject in-flight invokes — their responses will never arrive.
     if (this.pending.size > 0) {
@@ -584,20 +631,52 @@ export class RemoteTransport {
    * path directly: reject in-flight invokes, report `reconnecting`, reconnect.
    */
   private replaceDeadSocket(): void {
-    const ws = this.ws;
-    if (!ws) return;
+    if (!this.ws) return;
     console.warn("[web-remote] connection stopped responding; reconnecting");
+    this.replaceSocket();
+  }
+
+  /** Detach from the current socket and run the drop path, which schedules
+   *  the reconnect. Shared by the liveness and open-deadline checks. */
+  private replaceSocket(): void {
+    if (this.detachSocket()) this.handleClose();
+  }
+
+  /** Silence and close the current socket so none of its late callbacks
+   *  reach the transport. Returns whether there was one. */
+  private detachSocket(): boolean {
+    const ws = this.ws;
+    if (!ws) return false;
+    this.ws = null;
     ws.onopen = ws.onclose = ws.onerror = ws.onmessage = ws.onactivity = null;
     try {
       ws.close();
     } catch {
       /* already gone */
     }
-    this.handleClose();
+    return true;
   }
 
-  /** Page shown again or network back: check the socket now, or skip the
-   *  rest of a reconnect backoff. */
+  /** Cancel the in-flight connection attempt, if any. Bumping the generation
+   *  makes a late ticket from it a no-op; the caller decides what's next. */
+  private abandonAttempt(): void {
+    this.generation += 1;
+    this.attemptStartedAt = null;
+    this.ticketAbort?.abort();
+    this.ticketAbort = null;
+    this.clearOpenTimer();
+  }
+
+  private clearOpenTimer(): void {
+    if (this.openTimer !== null) {
+      clearTimeout(this.openTimer);
+      this.openTimer = null;
+    }
+  }
+
+  /** Page shown again or network back: check the socket now, skip the rest
+   *  of a reconnect backoff, or restart an attempt that may have started on
+   *  a network that's gone. */
   private readonly handleWake = (): void => {
     if (this.closed) return;
     if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
@@ -608,9 +687,17 @@ export class RemoteTransport {
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
-      this.reconnectDelay = BASE_RECONNECT_MS;
-      void this.attemptConnect();
+    } else if (
+      this.attemptStartedAt !== null &&
+      Date.now() - this.attemptStartedAt >= STALE_ATTEMPT_MS
+    ) {
+      this.abandonAttempt();
+      this.detachSocket();
+    } else {
+      return;
     }
+    this.reconnectDelay = BASE_RECONNECT_MS;
+    void this.attemptConnect();
   };
 
   private listenForWake(on: boolean): void {
@@ -626,6 +713,7 @@ export class RemoteTransport {
   }
 
   private scheduleReconnect(): void {
+    this.attemptStartedAt = null;
     if (this.closed || this.reconnectTimer !== null) return;
     const delay = this.reconnectDelay;
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_MS);
