@@ -172,7 +172,7 @@ describe("openEnvironmentConnection", () => {
     const connection = openEnvironmentConnection({ device, registry, dialer, onUpdate });
     await settle();
 
-    expect(registry.connectDevice).toHaveBeenCalledWith("7", expect.any(String));
+    expect(registry.connectDevice).toHaveBeenCalledWith("7", expect.any(String), expect.any(AbortSignal));
     expect(dialer.dial).toHaveBeenCalledWith({ nodeId: "node-ai-node", relayUrl: null });
     expect(machine.frames[0]).toMatchObject({ t: "hello-account", grant: "v1.grant" });
     for (const event of ["app-state-changed", "app-state-delta", "app-state-revision"]) {
