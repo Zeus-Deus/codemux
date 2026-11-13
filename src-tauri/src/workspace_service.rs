@@ -362,6 +362,24 @@ impl<R: Runtime> WorkspaceService<R> {
         })
     }
 
+    /// Archive a workspace: the close path without deleting anything, plus a
+    /// restorable entry. Returns its archive id.
+    pub(crate) async fn archive(&self, workspace_id: String) -> Result<String, String> {
+        let state = self.app.state::<AppStateStore>();
+        let db = self.app.state::<crate::database::DatabaseStore>();
+        crate::commands::workspace::archive_workspace_checked(self.app.clone(), &state, &db, workspace_id, &self.checkpoint)
+            .await
+    }
+
+    /// Restore an archive entry. Returns the restored workspace's id.
+    pub(crate) async fn unarchive(&self, archive_id: String, select: bool) -> Result<String, String> {
+        self.checkpoint.check()?;
+        let state = self.app.state::<AppStateStore>();
+        let db = self.app.state::<crate::database::DatabaseStore>();
+        crate::commands::workspace::unarchive_workspace_impl_with_selection(self.app.clone(), &state, &db, archive_id, select)
+            .await
+    }
+
     pub(crate) fn summaries(&self) -> Vec<WorkspaceSummary> {
         let snapshot = self.app.state::<AppStateStore>().snapshot();
         snapshot.workspaces.iter().map(WorkspaceSummary::of).collect()
@@ -411,7 +429,7 @@ pub(crate) fn default_base_name(repo: &Path) -> String {
 }
 
 /// How many of the most recent Recent projects count as known.
-const RECENT_PROJECT_LIMIT: u32 = 200;
+pub(crate) const RECENT_PROJECT_LIMIT: u32 = 200;
 
 /// Project roots this computer already works in: live and archived local
 /// workspaces' project roots and folders, plus Recent projects. Canonical and

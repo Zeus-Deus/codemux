@@ -5513,10 +5513,18 @@ pub async fn agent_chat_respond_to_request_guarded<R: Runtime>(
     decision: ApprovalDecision,
     control: Option<NativeControlGuard>,
 ) -> Result<(), String> {
+    // An answer to a user-input request (AskUserQuestion and its kin) grants
+    // no tool permission, so a supervised controller may send one.
+    let answers_question = control.is_some()
+        && matches!(decision, ApprovalDecision::Allow { updated_input: Some(_), .. })
+        && app.try_state::<NativeControlState>().is_some_and(|state| {
+            state.request_kind(&thread_id.0, &request_id.0).as_deref() == Some("user-input")
+        });
     if let Some(control) = &control {
         control.verify_target(provider, &thread_id.0)?;
         control.verify(&app)?;
         if control.caller.access != crate::agent_control::ControlAccess::FullAccess
+            && !answers_question
             && !matches!(
                 decision,
                 ApprovalDecision::Deny { .. } | ApprovalDecision::Cancel
@@ -5563,6 +5571,7 @@ pub async fn agent_chat_respond_to_request_guarded<R: Runtime>(
         }
     }
     let dispatch_decision = if control.is_some()
+        && !answers_question
         && matches!(provider, ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Antigravity)
     {
         app.state::<NativeControlState>().exact_acp_decision(&thread_id.0, &request_id.0, &decision)?
@@ -7071,23 +7080,46 @@ fn pane_tree_contains_id(root: &PaneNodeSnapshot, target: &str) -> bool {
 #[tauri::command]
 pub async fn agent_chat_open_search_result<R: Runtime>(
     app: AppHandle<R>,
-    state: State<'_, AppStateStore>,
-    observability: State<'_, ObservabilityStore>,
-    db: State<'_, DatabaseStore>,
     thread_id: String,
     select: Option<bool>,
 ) -> Result<OpenAgentChatSearchResult, String> {
-    feature_flag_on(&observability)?;
+    let opened = open_thread_pane(&app, &thread_id, select.unwrap_or(true)).await?;
+    Ok(OpenAgentChatSearchResult {
+        pane_id: opened.pane_id,
+        workspace_id: opened.workspace_id,
+    })
+}
+
+/// Where [`open_thread_pane`] put a thread.
+pub(crate) struct OpenedThreadPane {
+    pub pane_id: String,
+    pub workspace_id: String,
+    /// A new tab was bound; false when the thread already had a pane.
+    pub created: bool,
+}
+
+/// Binds `thread_id` to its existing pane, or to a new tab in its workspace.
+/// With `select` the pane's tab and pane become active and the workspace is
+/// selected; without it nothing moves, so an outside caller never takes the
+/// person's focus.
+pub(crate) async fn open_thread_pane<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+    select: bool,
+) -> Result<OpenedThreadPane, String> {
+    feature_flag_on(&app.state::<ObservabilityStore>())?;
+    let state = app.state::<AppStateStore>();
+    let db = app.state::<DatabaseStore>();
     // Binding a new pane holds the chat's dispatch lock from reading it
     // through the bind, so a history reopen can't merge it away in between
     // (`merge_reopened_chat`). A chat already open in a pane is never
     // merged, so focusing it doesn't wait behind a session that is starting.
-    let dispatch_guard = match state.agent_chat_pane_id_for_thread(&thread_id) {
+    let dispatch_guard = match state.agent_chat_pane_id_for_thread(thread_id) {
         Some(_) => None,
-        None => Some(native_thread_gate(&app, &thread_id).dispatch.clone().lock_owned().await),
+        None => Some(native_thread_gate(app, thread_id).dispatch.clone().lock_owned().await),
     };
     let record = db
-        .get_agent_chat_session(&thread_id)
+        .get_agent_chat_session(thread_id)
         .ok_or_else(|| format!("conversation_not_found: {thread_id}"))?;
     let provider = match record.provider.to_ascii_lowercase().as_str() {
         "claude" => ProviderKind::Claude,
@@ -7101,8 +7133,8 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
         other => return Err(format!("unsupported_provider: {other}")),
     };
 
-    let pane_id = if let Some(existing) = state.agent_chat_pane_id_for_thread(&thread_id) {
-        existing
+    let (pane_id, created) = if let Some(existing) = state.agent_chat_pane_id_for_thread(thread_id) {
+        (existing, false)
     } else {
         let pane_id = state
             .create_or_reuse_agent_chat_pane_with_selection(
@@ -7110,11 +7142,11 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
                 Some(provider),
                 record.cwd.clone(),
                 Some(crate::presets::LaunchMode::NewTab),
-                Some(thread_id.clone()),
-                select.unwrap_or(true),
+                Some(thread_id.to_string()),
+                select,
             )?
             .0;
-        pane_id.0
+        (pane_id.0, true)
     };
     drop(dispatch_guard);
 
@@ -7138,17 +7170,20 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     let Some((workspace_id, tab_id)) = location else {
         return Err(format!("conversation_pane_not_found: {pane_id}"));
     };
-    if let Some(tab_id) = tab_id {
-        state.activate_tab(&workspace_id, &tab_id)?;
+    if select {
+        if let Some(tab_id) = tab_id {
+            state.activate_tab(&workspace_id, &tab_id)?;
+        }
+        if !state.activate_pane_with_selection(&pane_id, true) {
+            return Err(format!("conversation_pane_not_found: {pane_id}"));
+        }
     }
-    if !state.activate_pane_with_selection(&pane_id, select.unwrap_or(true)) {
-        return Err(format!("conversation_pane_not_found: {pane_id}"));
-    }
-    crate::state::emit_app_state(&app);
+    crate::state::emit_app_state(app);
 
-    Ok(OpenAgentChatSearchResult {
+    Ok(OpenedThreadPane {
         pane_id,
         workspace_id,
+        created,
     })
 }
 

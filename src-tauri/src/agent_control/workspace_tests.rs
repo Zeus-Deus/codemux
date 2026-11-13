@@ -1928,3 +1928,333 @@ async fn answer_held_before_resume_starts_no_worker_once_the_grant_is_revoked() 
     assert!(matches!(resolution(), QuestionResolution::Failed { .. }), "the person can still answer it: {:?}", resolution());
     super::tests::connector_off(&app);
 }
+
+// ── thread lifecycle: open, rename, close, delete, search ────────────────
+
+fn thread_args(workspace: &str, thread: &str, key: &str) -> Value {
+    json!({"workspace_id": workspace, "thread_id": thread, "client_request_id": key})
+}
+
+fn pane_of(app: &App, thread: &str) -> Option<String> {
+    app.state::<AppStateStore>().agent_chat_pane_id_for_thread(thread)
+}
+
+fn active_tab(app: &App, workspace: &str) -> String {
+    app.state::<AppStateStore>().find_workspace(workspace).unwrap().active_tab_id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_open_rebinds_a_closed_thread_without_taking_focus() {
+    let (app, provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "open-launch", &workspace, "default").await;
+    let pane = pane_of(&app, &thread).unwrap();
+    app.state::<AppStateStore>().close_pane(&pane).unwrap();
+    // The person looks at another thread's tab meanwhile.
+    let watched = launched(&app, "open-watched", &workspace, "default").await;
+    let watched_tab = active_tab(&app, &workspace);
+    assert!(!watched_tab.is_empty() && pane_of(&app, &watched).is_some());
+    let bot = named(ControlAccess::Supervised);
+
+    let send = json!({"workspace_id": workspace, "thread_id": thread, "client_request_id": "open-send", "message": "Continue"});
+    let error = refused(call(&app, &bot, "thread_send", send.clone()).await, ErrorCode::ThreadNotBound);
+    assert!(error.message.contains("thread_open"), "the refusal names the way back: {error}");
+
+    let (focused, tab) = (active(&app), active_tab(&app, &workspace));
+    let starts = || provider.calls.snapshot().iter().filter(|call| matches!(call, MockCall::StartSession(_))).count();
+    let started = starts();
+    let args = thread_args(&workspace, &thread, "open-1");
+    let opened = call(&app, &bot, "thread_open", args.clone()).await.unwrap();
+    assert_eq!((opened["state"].clone(), opened["reopened"].clone()), (json!("succeeded"), json!(true)), "{opened}");
+    let rebound = pane_of(&app, &thread).expect("the thread is bound again");
+    assert_eq!(opened["pane_id"], rebound);
+    assert_eq!(opened["workspace_id"], workspace);
+    assert_eq!((active(&app), active_tab(&app, &workspace)), (focused, tab), "an open without select moves no focus");
+    assert_eq!(starts(), started, "opening starts no provider");
+
+    let retry = call(&app, &bot, "thread_open", args.clone()).await.unwrap();
+    assert_eq!((retry["operation_id"].clone(), retry["replayed"].clone()), (opened["operation_id"].clone(), json!(true)));
+    let mut changed = args;
+    changed["select"] = json!(true);
+    refused(call(&app, &bot, "thread_open", changed).await, ErrorCode::RequestKeyConflict);
+    let again = call(&app, &bot, "thread_open", thread_args(&workspace, &thread, "open-2")).await.unwrap();
+    assert_eq!((again["reopened"].clone(), again["pane_id"].clone()), (json!(false), json!(rebound)), "an open thread is returned as it is");
+
+    let sent = call(&app, &bot, "thread_send", send).await.unwrap();
+    assert_eq!(settle_once(&app, &bot, &sent).await["state"], "succeeded", "a reopened thread takes messages");
+
+    // Read-only callers cannot, and a thread above the caller's ceiling stays closed.
+    for reader in [named(ControlAccess::ReadOnly), connector(ControlAccess::ReadOnly)] {
+        refused(call(&app, &reader, "thread_open", thread_args(&workspace, &thread, "open-3")).await, ErrorCode::AccessDenied);
+    }
+    let full = launched(&app, "open-full-launch", &workspace, "bypassPermissions").await;
+    app.state::<AppStateStore>().close_pane(&pane_of(&app, &full).unwrap()).unwrap();
+    for supervised in [bot.clone(), connector(ControlAccess::Supervised)] {
+        refused(call(&app, &supervised, "thread_open", thread_args(&workspace, &full, "open-full")).await, ErrorCode::PermissionCeiling);
+        no_receipt(&app, &supervised, "open-full", "thread_open");
+    }
+    assert!(pane_of(&app, &full).is_none());
+    let network = call(&app, &connector(ControlAccess::FullAccess), "thread_open", thread_args(&workspace, &full, "open-full")).await.unwrap();
+    assert_eq!(network["reopened"], true, "{network}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_rename_and_close_keep_history_and_replay() {
+    use crate::agent_provider::AgentProvider;
+    let (app, provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "close-launch", &workspace, "default").await;
+    let bot = connector(ControlAccess::Supervised);
+    let db = app.state::<DatabaseStore>();
+
+    let mut rename = thread_args(&workspace, &thread, "rename-1");
+    rename["title"] = json!("Fix the login test");
+    refused(call(&app, &named(ControlAccess::ReadOnly), "thread_rename", rename.clone()).await, ErrorCode::AccessDenied);
+    let renamed = call(&app, &bot, "thread_rename", rename.clone()).await.unwrap();
+    assert_eq!(renamed["title"], "Fix the login test", "{renamed}");
+    assert_eq!(db.get_agent_chat_title(&thread).as_deref(), Some("Fix the login test"));
+    assert_eq!(call(&app, &bot, "thread_rename", rename.clone()).await.unwrap()["replayed"], true);
+    rename["title"] = json!("Another title");
+    refused(call(&app, &bot, "thread_rename", rename).await, ErrorCode::RequestKeyConflict);
+    let mut blank = thread_args(&workspace, &thread, "rename-2");
+    blank["title"] = json!(" padded ");
+    refused(call(&app, &bot, "thread_rename", blank).await, ErrorCode::InvalidArguments);
+
+    refused(call(&app, &named(ControlAccess::ReadOnly), "thread_close", thread_args(&workspace, &thread, "close-0")).await, ErrorCode::AccessDenied);
+    let args = thread_args(&workspace, &thread, "close-1");
+    let closed = call(&app, &bot, "thread_close", args.clone()).await.unwrap();
+    assert_eq!((closed["closed"].clone(), closed["state"].clone()), (json!(true), json!("succeeded")), "{closed}");
+    assert!(pane_of(&app, &thread).is_none(), "the pane is gone");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while provider.has_session(&ThreadId(thread.clone())).await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("closing stops the session");
+    assert!(db.get_agent_chat_session(&thread).is_some(), "the thread and its history stay");
+    let retry = call(&app, &bot, "thread_close", args).await.unwrap();
+    assert_eq!((retry["closed"].clone(), retry["replayed"].clone()), (json!(true), json!(true)));
+    let again = call(&app, &bot, "thread_close", thread_args(&workspace, &thread, "close-2")).await.unwrap();
+    assert_eq!(again["closed"], false, "a thread without a pane is already closed: {again}");
+
+    let reopened = call(&app, &bot, "thread_open", thread_args(&workspace, &thread, "close-open")).await.unwrap();
+    assert_eq!(reopened["reopened"], true, "a closed thread reopens: {reopened}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_delete_needs_full_access_and_stops_the_session_first() {
+    use crate::agent_provider::AgentProvider;
+    let (app, provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "delete-launch", &workspace, "default").await;
+    assert!(provider.has_session(&ThreadId(thread.clone())).await);
+    let args = thread_args(&workspace, &thread, "delete-1");
+    for caller in [named(ControlAccess::Supervised), connector(ControlAccess::Supervised), named(ControlAccess::ReadOnly)] {
+        refused(call(&app, &caller, "thread_delete", args.clone()).await, ErrorCode::AccessDenied);
+    }
+    assert!(app.state::<DatabaseStore>().get_agent_chat_session(&thread).is_some());
+
+    let owner = connector(ControlAccess::FullAccess);
+    let deleted = call(&app, &owner, "thread_delete", args.clone()).await.unwrap();
+    assert_eq!((deleted["deleted"].clone(), deleted["state"].clone()), (json!(true), json!("succeeded")), "{deleted}");
+    assert!(app.state::<DatabaseStore>().get_agent_chat_session(&thread).is_none());
+    assert!(pane_of(&app, &thread).is_none());
+    assert!(!provider.has_session(&ThreadId(thread.clone())).await, "the session stopped before the delete");
+    let retry = call(&app, &owner, "thread_delete", args).await.unwrap();
+    assert_eq!((retry["deleted"].clone(), retry["replayed"].clone()), (json!(true), json!(true)), "a retry replays, not thread_not_found");
+    refused(call(&app, &owner, "thread_delete", thread_args(&workspace, &thread, "delete-2")).await, ErrorCode::ThreadNotFound);
+}
+
+#[tokio::test]
+async fn outside_thread_search_spans_open_workspaces() {
+    let (app, provider, root, workspace) = fixture().await;
+    let other_folder = root.path().join("other");
+    std::fs::create_dir(&other_folder).unwrap();
+    let other = app.state::<AppStateStore>().create_empty_workspace_at_path(other_folder).0;
+    let db = app.state::<DatabaseStore>();
+    for (thread, ws) in [("search-a", &workspace), ("search-b", &other)] {
+        db.upsert_agent_chat_session(thread, ws, None, "claude").unwrap();
+        db.append_agent_chat_message(thread, &json!({"type": "user_message", "thread_id": thread, "text": "Where is the flaky login test?"}).to_string()).unwrap();
+    }
+    let reader = named(ControlAccess::ReadOnly);
+    let everywhere = call(&app, &reader, "thread_search", json!({"query": "flaky login"})).await.unwrap();
+    let mut found: Vec<&str> = everywhere["matches"].as_array().unwrap().iter().map(|hit| hit["thread_id"].as_str().unwrap()).collect();
+    found.sort();
+    assert_eq!(found, ["search-a", "search-b"], "{everywhere}");
+    let scoped = call(&app, &reader, "thread_search", json!({"query": "flaky login", "workspace_id": other, "limit": 5})).await.unwrap();
+    assert_eq!(scoped["matches"].as_array().unwrap().len(), 1, "{scoped}");
+    assert_eq!(scoped["matches"][0]["workspace_id"], other);
+    refused(call(&app, &reader, "thread_search", json!({"query": "x", "workspace_id": "no-such-workspace"})).await, ErrorCode::WorkspaceNotFound);
+    refused(call(&app, &reader, "thread_search", json!({"query": "   "})).await, ErrorCode::InvalidArguments);
+    assert!(provider.calls.snapshot().is_empty(), "searching starts no provider");
+}
+
+// ── thread_respond answers to user-input requests ────────────────────────
+
+fn user_input(app: &App, thread: &str, request: &str) {
+    app.state::<NativeControlState>().observe_event(&Event::RequestOpened {
+        thread_id: ThreadId(thread.into()), turn_id: TurnId("input-turn".into()),
+        request_id: RequestId(request.into()), request_kind: "user-input".into(),
+        payload: json!({"questions": [
+            {"question": "Which database?", "header": "Database", "multiSelect": false, "allowOther": false,
+             "options": [{"label": "staging", "description": "Shared"}, {"label": "prod"}]},
+            {"question": "Which checks?", "header": "Checks", "multiSelect": true, "options": [{"label": "lint"}, {"label": "tests"}]},
+        ]}),
+        tool_use_id: None, subagent_id: None,
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_respond_answers_user_input_requests_for_supervised_callers() {
+    let (app, provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "input-launch", &workspace, "default").await;
+    user_input(&app, &thread, "input-request");
+    let target = json!({"workspace_id": workspace, "thread_id": thread});
+    let status = call(&app, &ControlCaller::trusted(), "thread_status", target.clone()).await.unwrap();
+    let approval = &status["pending_approvals"][0];
+    assert_eq!(approval["request_kind"], "user-input");
+    assert_eq!(approval["questions"][0], json!({"question": "Which database?", "header": "Database", "options": ["staging", "prod"], "multi_select": false, "allow_other": false}));
+    assert_eq!(approval["questions"][1]["multi_select"], true);
+    let mut wait = target.clone();
+    wait["timeout_ms"] = json!(1);
+    let waited = call(&app, &ControlCaller::trusted(), "thread_wait", wait).await.unwrap();
+    assert_eq!(waited["pending"]["approvals"][0]["questions"], approval["questions"], "thread_wait shows what to answer: {waited}");
+
+    let request = approval["request_id"].clone();
+    let respond = |key: &str, answers: Value| json!({"workspace_id": workspace, "thread_id": thread, "client_request_id": key, "request_id": request, "answers": answers});
+    let bot = connector(ControlAccess::Supervised);
+    for (key, answers) in [
+        ("one-answer", json!(["staging"])),
+        ("not-an-option", json!(["dev", "lint"])),
+        ("two-for-one", json!([["staging", "prod"], "lint"])),
+        ("empty-choice", json!(["staging", [" "]])),
+    ] {
+        refused(call(&app, &bot, "thread_respond", respond(key, answers)).await, ErrorCode::InvalidArguments);
+        no_receipt(&app, &bot, key, "thread_respond");
+    }
+    let mut both = respond("both", json!(["staging", "lint"]));
+    both["decision"] = json!("deny");
+    refused(call(&app, &bot, "thread_respond", both).await, ErrorCode::InvalidArguments);
+    let mut allow = respond("allow", json!(null));
+    allow.as_object_mut().unwrap().remove("answers");
+    allow["decision"] = json!("allow_once");
+    refused(call(&app, &bot, "thread_respond", allow).await, ErrorCode::PermissionCeiling);
+    refused(call(&app, &named(ControlAccess::ReadOnly), "thread_respond", respond("reader", json!(["staging", "lint"]))).await, ErrorCode::AccessDenied);
+
+    let args = respond("answer-1", json!(["staging", ["lint", "tests"]]));
+    let receipt = call(&app, &bot, "thread_respond", args.clone()).await.unwrap();
+    assert_eq!(settle_once(&app, &bot, &receipt).await["state"], "succeeded");
+    let decisions = provider.decisions();
+    let Some(crate::agent_provider::ApprovalDecision::Allow { updated_input: Some(input), .. }) = decisions.last() else {
+        panic!("the answer reaches the worker as an allow with input: {decisions:?}");
+    };
+    assert_eq!(input["answers"], json!({"Which database?": "staging", "Which checks?": "lint, tests"}), "keyed as the question card keys them");
+    assert_eq!(input["questions"][0]["question"], "Which database?");
+    assert_eq!(call(&app, &bot, "thread_respond", args).await.unwrap()["operation_id"], receipt["operation_id"]);
+    let status = call(&app, &ControlCaller::trusted(), "thread_status", target).await.unwrap();
+    assert_eq!(status["pending_approvals"], json!([]), "{status}");
+
+    // Answers are for questions; a tool approval still takes a decision.
+    app.state::<NativeControlState>().observe_event(&Event::RequestOpened {
+        thread_id: ThreadId(thread.clone()), turn_id: TurnId("input-turn".into()),
+        request_id: RequestId("tool-request".into()), request_kind: "tool".into(),
+        payload: json!({}), tool_use_id: None, subagent_id: None,
+    });
+    let status = call(&app, &ControlCaller::trusted(), "thread_status", json!({"workspace_id": workspace, "thread_id": thread})).await.unwrap();
+    assert!(status["pending_approvals"][0].get("questions").is_none(), "{status}");
+    let tool = json!({"workspace_id": workspace, "thread_id": thread, "client_request_id": "tool-answer",
+        "request_id": status["pending_approvals"][0]["request_id"], "answers": ["yes"]});
+    refused(call(&app, &named(ControlAccess::FullAccess), "thread_respond", tool).await, ErrorCode::InvalidArguments);
+}
+
+// ── workspace archive and projects ───────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_archive_and_unarchive_replay_and_need_full_access() {
+    if isolated(&format!("{MODULE}workspace_archive_and_unarchive_replay_and_need_full_access")) {
+        return;
+    }
+    without_terminal_daemon();
+    let (app, _provider, root, _workspace) = fixture().await;
+    app.manage(crate::terminal::PtyState::default());
+    let state = app.state::<AppStateStore>();
+    let folder = root.path().join("archived");
+    std::fs::create_dir(&folder).unwrap();
+    let archived = state.create_empty_workspace_at_path(folder.clone()).0;
+
+    for caller in [named(ControlAccess::Supervised), connector(ControlAccess::Supervised)] {
+        refused(call(&app, &caller, "workspace_archive", json!({"workspace_id": archived})).await, ErrorCode::AccessDenied);
+        refused(call(&app, &caller, "workspace_unarchive", json!({"archive_id": "any"})).await, ErrorCode::AccessDenied);
+    }
+    let owner = connector(ControlAccess::FullAccess);
+    let args = json!({"workspace_id": archived, "client_request_id": "archive-1"});
+    let done = call(&app, &owner, "workspace_archive", args.clone()).await.unwrap();
+    assert_eq!((done["archived"].clone(), done["workspace_id"].clone()), (json!(true), json!(archived)), "{done}");
+    assert!(state.find_workspace(&archived).is_none());
+    assert!(folder.is_dir(), "archiving keeps the folder");
+    let archive_id = done["archive_id"].clone();
+    let retry = call(&app, &owner, "workspace_archive", args).await.unwrap();
+    assert_eq!((retry["archive_id"].clone(), retry["replayed"].clone()), (archive_id.clone(), json!(true)));
+
+    let listed = call(&app, &named(ControlAccess::ReadOnly), "workspace_archive_list", json!({})).await.unwrap();
+    assert!(listed["archived_workspaces"].as_array().unwrap().iter().any(|entry| entry["archive_id"] == archive_id), "{listed}");
+
+    let focused = active(&app);
+    refused(call(&app, &owner, "workspace_unarchive", json!({"archive_id": "no-such-archive"})).await, ErrorCode::ArchiveNotFound);
+    let restore = json!({"archive_id": archive_id, "client_request_id": "unarchive-1"});
+    let restored = call(&app, &owner, "workspace_unarchive", restore.clone()).await.unwrap();
+    assert_eq!(restored["restored"], true, "{restored}");
+    let restored_id = restored["workspace_id"].as_str().unwrap().to_string();
+    assert_eq!(state.find_workspace(&restored_id).unwrap().cwd, folder.display().to_string());
+    assert!(state.find_archived_workspace(archive_id.as_str().unwrap()).is_none(), "the entry is retired");
+    assert_eq!(active(&app), focused, "a restore without select takes no focus");
+    let retry = call(&app, &owner, "workspace_unarchive", restore).await.unwrap();
+    assert_eq!((retry["workspace_id"].clone(), retry["replayed"].clone()), (json!(restored_id), json!(true)), "a retry replays, not archive_not_found");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn project_list_and_clone_make_a_known_project() {
+    if isolated(&format!("{MODULE}project_list_and_clone_make_a_known_project")) {
+        return;
+    }
+    without_terminal_daemon();
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    let reader = connector(ControlAccess::ReadOnly);
+    let paths = |listed: &Value| listed["projects"].as_array().unwrap().iter().map(|p| p["path"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let listed = call(&app, &reader, "project_list", json!({})).await.unwrap();
+    assert!(paths(&listed).contains(&repo.canonicalize().unwrap().display().to_string()), "{listed}");
+
+    let sources = tempfile::tempdir().unwrap();
+    let origin = sources.path().join("tool.git");
+    git(sources.path(), &["clone", "--bare", &repo.display().to_string(), &origin.display().to_string()]);
+    let url = format!("file://{}", origin.display());
+    let parent = tempfile::tempdir().unwrap();
+    let clone = json!({"url": url, "parent": parent.path(), "client_request_id": "clone-1"});
+
+    refused(call(&app, &named(ControlAccess::Supervised), "project_clone", clone.clone()).await, ErrorCode::AccessDenied);
+    let network = connector(ControlAccess::FullAccess);
+    refused(call(&app, &network, "project_clone", clone.clone()).await, ErrorCode::InvalidArguments);
+    let unknown = json!({"url": "https://example.invalid/team/tool.git", "parent": parent.path(), "client_request_id": "clone-net"});
+    refused(call(&app, &network, "project_clone", unknown).await, ErrorCode::UnknownProjectRoot);
+    no_receipt(&app, &network, "clone-net", "project_clone");
+    let owner = named(ControlAccess::FullAccess);
+    for bad in [
+        json!({"url": "-uupload-pack=touch /tmp/x", "parent": parent.path()}),
+        json!({"url": "ext::sh -c touch% /tmp/x", "parent": parent.path()}),
+        json!({"url": url, "parent": parent.path(), "name": ".hidden"}),
+        json!({"url": url, "parent": "relative/folder"}),
+    ] {
+        refused(call(&app, &owner, "project_clone", bad).await, ErrorCode::InvalidArguments);
+    }
+
+    let cloned = call(&app, &owner, "project_clone", clone.clone()).await.unwrap();
+    assert_eq!((cloned["state"].clone(), cloned["created"].clone()), (json!("succeeded"), json!(true)), "{cloned}");
+    let path = parent.path().join("tool");
+    assert!(path.join(".git").exists(), "the repository was cloned into parent/<name>");
+    assert_eq!(cloned["path"], path.display().to_string());
+    let workspace = app.state::<AppStateStore>().find_workspace(cloned["workspace_id"].as_str().unwrap()).expect("it opened as a workspace");
+    assert_eq!(workspace.cwd, path.display().to_string());
+    assert!(app.state::<DatabaseStore>().get_recent_projects(10).iter().any(|p| p.path == path.display().to_string()), "it is a Recent project");
+    let listed = call(&app, &reader, "project_list", json!({})).await.unwrap();
+    assert!(paths(&listed).contains(&path.canonicalize().unwrap().display().to_string()), "{listed}");
+    let retry = call(&app, &owner, "project_clone", clone).await.unwrap();
+    assert_eq!((retry["workspace_id"].clone(), retry["replayed"].clone()), (cloned["workspace_id"].clone(), json!(true)));
+    let taken = json!({"url": url, "parent": parent.path(), "client_request_id": "clone-2"});
+    refused(call(&app, &owner, "project_clone", taken).await, ErrorCode::InvalidArguments);
+}

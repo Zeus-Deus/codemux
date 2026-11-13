@@ -87,6 +87,8 @@ pub struct MockAgentProvider {
     start_inputs: Arc<Mutex<Vec<StartSessionInput>>>,
     queue_next_send: std::sync::atomic::AtomicBool,
     queued_input: Mutex<Option<SendTurnInput>>,
+    /// Every decision `respond_to_request` received, in order.
+    decisions: Mutex<Vec<ApprovalDecision>>,
 }
 
 impl MockAgentProvider {
@@ -112,7 +114,14 @@ impl MockAgentProvider {
             start_inputs: Arc::new(Mutex::new(Vec::new())),
             queue_next_send: std::sync::atomic::AtomicBool::new(false),
             queued_input: Mutex::new(None),
+            decisions: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Snapshot of every decision `respond_to_request` received so far.
+    #[allow(dead_code)]
+    pub fn decisions(&self) -> Vec<ApprovalDecision> {
+        self.decisions.lock().unwrap().clone()
     }
 
     /// Queue without dispatching, as profile-serialized adapters do.
@@ -338,8 +347,9 @@ impl AgentProvider for MockAgentProvider {
         &self,
         thread_id: ThreadId,
         request_id: RequestId,
-        _decision: ApprovalDecision,
+        decision: ApprovalDecision,
     ) -> Result<(), ProviderError> {
+        self.decisions.lock().unwrap().push(decision);
         self.calls
             .push(MockCall::RespondToRequest(thread_id, request_id));
         Ok(())

@@ -94,6 +94,10 @@ codes! {
     WorktreeCreateFailed => "worktree_create_failed",
     WorkspaceCreateFailed => "workspace_create_failed",
     WorkspaceCloseRefused => "workspace_close_refused",
+    ArchiveNotFound => "archive_not_found",
+    WorkspaceArchiveFailed => "workspace_archive_failed",
+    WorkspaceUnarchiveFailed => "workspace_unarchive_failed",
+    ProjectCloneFailed => "project_clone_failed",
     // Worker questions answered from outside.
     QuestionNotFound => "question_not_found",
     QuestionClosed => "question_closed",

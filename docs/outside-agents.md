@@ -2,11 +2,12 @@
 
 Agents that Codemux didn't start can work with it through its MCP server: Claude Code or Codex in your own terminal, a Hermes chat bot, a script, or any other MCP client. They can:
 
-- open workspaces and create git worktrees;
+- list known projects, clone new ones, open workspaces and create git worktrees;
 - start Codemux threads with the provider, model and permission mode you pick;
 - send those threads messages, wait for the result and read it;
 - answer approvals and questions;
-- close workspaces and remove worktrees when they're done.
+- find, reopen, rename, close and delete threads;
+- close, archive and restore workspaces, and remove worktrees when they're done.
 
 There are two ways in:
 
@@ -16,7 +17,7 @@ There are two ways in:
 | Sign-in | None. It runs as you. | OAuth sign-in or a token, with an access level you choose |
 | Needs | Codemux open: the desktop app or `codemux serve` | **Over the network** turned on |
 
-Both reach the same tools. **Settings → Connections → Outside assistants** shows copy-ready setup commands for this computer. For the network door it shows the MCP URL, a Tailscale command and the tokens.
+`codemux mcp` serves the control tools in the [Tool reference](#tool-reference) and the older browser, git and terminal tools. The network door serves only the control tools. **Settings → Connections → Outside assistants** shows copy-ready setup commands for this computer. For the network door it shows the MCP URL, a Tailscale command and the tokens.
 
 ## On this computer
 
@@ -56,7 +57,7 @@ hermes mcp add codemux --command codemux --args mcp --client hermes --access sup
 ```
 
 1. Run it as the user Hermes runs as. Hermes can list the tools while Codemux is closed, but its tool calls need Codemux running.
-2. At **Enable all tools?**, press Enter. To give the bot only the control tools, answer `select` and keep the ones in the [Tool reference](#tool-reference). A supervised bot isn't offered `workspace_create`, `worktree_create` or `workspace_close`: they need full access.
+2. At **Enable all tools?**, press Enter. To give the bot only the control tools, answer `select` and keep the ones in the [Tool reference](#tool-reference). A supervised bot isn't offered the tools that need full access, such as `workspace_create`, `worktree_create`, `workspace_close` and `thread_delete`.
 3. Run `/reload-mcp` in open chats, or start a new one.
 4. `hermes mcp test codemux` should list `thread_launch`.
 
@@ -72,7 +73,7 @@ mcp_servers:
 
 `timeout` is how long Hermes waits for one tool call. Its default is 300 seconds. Keep it longer than the longest `thread_wait` you expect.
 
-**Why supervised.** A Hermes bot relays messages from other people, and anyone who can message it can try to steer it. Supervised lets it start threads in supervised permission modes, message them, deny approvals and answer questions. Approvals stay with you in Codemux. If you are the bot's only user and you want it to create worktrees and allow approvals, use full access instead:
+**Why supervised.** A Hermes bot relays messages from other people, and anyone who can message it can try to steer it. Supervised lets it start threads in supervised permission modes, message, reopen, rename and close them, deny approvals and answer questions. Approvals stay with you in Codemux. If you are the bot's only user and you want it to create worktrees and allow approvals, use full access instead:
 
 ```sh
 hermes mcp add codemux --command codemux --args mcp --client hermes --access full-access
@@ -261,6 +262,8 @@ mcp_servers:
     timeout: 660
 ```
 
+Over HTTP, Hermes gives up on a tool call after 300 seconds, whatever `timeout` says. Keep `thread_wait`'s `timeout_ms` well under 300000 there, such as 240000 or less.
+
 Codex reads the token from the `CODEMUX_TOKEN` environment variable, so set it wherever Codex runs:
 
 ```sh
@@ -288,7 +291,8 @@ codemux connector revoke --all
 #### What differs over the network
 
 - The network door serves the control tools in the [Tool reference](#tool-reference), not the older browser, git and terminal tools of `codemux mcp`.
-- `workspace_create` and `worktree_create` only open folders of projects already opened in Codemux (`unknown_project_root` otherwise).
+- `workspace_create` and `worktree_create` only open folders of projects already opened in Codemux (`unknown_project_root` otherwise). `project_list` lists them.
+- `project_clone` only clones into a folder that holds such a project, and only from https, http, ssh and git URLs.
 - `thread_respond` can allow a request once or deny it. `allow_always` is only available on this computer.
 - `workspace_close` can remove a clean worktree and its branch, never with `force_delete`.
 - `worktree_create` can't start a terminal preset (`agent_preset_id`). Without a preset, `initial_prompt` is ignored.
@@ -315,6 +319,15 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
    ```
 
    `workspace_create` returns the workspace already open in that folder (`created: false`), or opens one and runs the project's setup scripts. It needs full access. Workspace tools never take focus in Codemux unless you pass `"select": true`.
+
+   `project_list` lists the project folders Codemux already knows. `project_clone` clones a repository into a new folder under `parent` and opens it like `workspace_create`; the clone then counts as a known project:
+
+   ```text
+   project_list {}
+   → {"projects": [{"path": "/home/you/src/api", "name": "api", "last_opened_at": "…"}]}
+   project_clone {"url": "https://github.com/you/web.git", "parent": "/home/you/src", "client_request_id": "clone-web-1"}
+   → {"workspace_id": "workspace-8", "cwd": "/home/you/src/web", "path": "/home/you/src/web", "created": true, …}
+   ```
 
    Setup runs in the background, so a receipt from `workspace_create`, `worktree_create` or a `thread_launch` with `worktree` can report success while setup is still running. If revoking your access stops setup, that shows as a failed setup (Codemux's `workspace-setup-failed` event, with the reason in its stderr), not in the receipt.
 
@@ -408,7 +421,13 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
      thread_respond {"workspace_id": "workspace-9", "thread_id": "8a1f…", "client_request_id": "deny-1", "request_id": "<from pending.approvals>", "decision": "deny"}
      ```
 
-     A question that holds the run until it's answered, such as Claude's AskUserQuestion or Codex's `request_user_input`, is an approval with `request_kind` `"user-input"`, not a question. `thread_respond` can only allow it, with no answer, or deny it; `thread_answer` can't answer it. Only the person can answer it, in Codemux.
+     A question that holds the run until it's answered, such as Claude's AskUserQuestion or Codex's `request_user_input`, is an approval with `request_kind` `"user-input"`, not a question. Its `questions` list each question's text, options, and whether it takes several choices (`multi_select`) or its own text (`allow_other`). Answer it with `thread_respond` and `answers` instead of `decision`: one per question, in order, as text or, for a multi-select question, a list of choices. Supervised assistants can answer it.
+
+     ```text
+     thread_respond {"workspace_id": "workspace-9", "thread_id": "8a1f…", "client_request_id": "pick-db-1", "request_id": "<from pending.approvals>", "answers": ["staging", ["lint", "tests"]]}
+     ```
+
+     An answer that doesn't fit the questions fails with `invalid_arguments` and leaves the request open.
 
    - **Questions** (`pending.questions`): questions a Codex chat asks while it keeps working (`request_user_input_async`). Answer them with `thread_answer`, one answer per prompt, in order. It returns the `turn_id` of the run that continues; wait on that one.
 
@@ -430,6 +449,16 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
    - `thread_read` pages through the visible conversation with `cursor` (from `next_cursor`). It holds user messages and the assistant's replies, not hidden reasoning or raw tool output.
    - `thread_send` with the default `"delivery": "auto"` starts an idle thread, steers a busy one where that's safe, and otherwise queues. `queue`, `steer` and `interrupt` are explicit. Its receipt's `result.accepted_as` says which happened. Pass its `operation_id` to `thread_wait` to follow the run the message starts, queued or not.
    - `thread_interrupt` stops the current turn; pass `turn_id` so a newer run isn't cut short. `thread_stop` ends the provider session and its queue. The thread, its history and files stay.
+   - `thread_search` finds threads by their title or text, in every open workspace or in one `workspace_id`.
+   - A thread whose pane was closed fails other changes with `thread_not_bound`. `thread_open` binds it to a new tab again, without taking focus unless you pass `"select": true`:
+
+     ```text
+     thread_search {"query": "flaky login"}
+     thread_open {"workspace_id": "workspace-9", "thread_id": "8a1f…", "client_request_id": "reopen-1"}
+     → {"workspace_id": "workspace-9", "thread_id": "8a1f…", "pane_id": "pane-31", "reopened": true, …}
+     ```
+
+   - `thread_rename` renames a thread. `thread_close` closes its pane and stops its session, keeping its history, so `thread_open` can reopen it. `thread_delete` stops it and deletes it and its history for good; it needs full access.
 
 7. **Clean up.**
 
@@ -440,13 +469,21 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
 
    It stops the workspace's agents and terminals and runs its teardown. `delete_worktree` removes a worktree, never a project folder. It refuses one with uncommitted or unpushed work, including commits made on a detached HEAD that no branch holds (`workspace_close_refused`). `delete_branch` also deletes its branch, but only if a remote branch or the default branch holds all of its commits; another local branch doesn't count. Otherwise the close is refused. `force_delete` removes the worktree and branch anyway; only assistants on this computer can use it.
 
+   `workspace_archive` closes a workspace the same way but keeps its folder, worktree and branch, and returns an `archive_id`. `workspace_archive_list` lists the archived ones, and `workspace_unarchive` restores one. Both change the workspace's files and scripts, so they need full access.
+
+   ```text
+   workspace_archive {"workspace_id": "workspace-9", "client_request_id": "archive-9"}
+   → {"workspace_id": "workspace-9", "archive_id": "archive-3", "archived": true, …}
+   workspace_unarchive {"archive_id": "archive-3", "client_request_id": "restore-3"}
+   ```
+
    The teardown, or an agent before it stops, can still commit while the close runs. If that leaves a commit only the worktree's detached HEAD holds, the worktree and its branch stay: the result has `"worktree_removed": false`. If it leaves one only the branch holds, the worktree goes and the branch stays. Either way the workspace is closed, and `kept_because` says what stayed and why.
 
 **Errors.** A failed call is an MCP tool error (`isError: true`) whose text reads `code: message` and whose `structuredContent.error` holds `code`, `message` and `retryable`. An unknown tool is a JSON-RPC error.
 
 A call Codemux accepted and that then failed is final for its `client_request_id`. Retrying it with the same id returns its receipt as a normal result, not an error: `{"operation_id": …, "state": "failed", "error": {"code": …, "message": …, "retryable": …}, …}`. A retry while the first call still runs returns the same receipt with `state` `accepted` or `running`; poll `operation_status`. When `error.retryable` is `true`, try again with a new `client_request_id`. A call refused before Codemux accepted it, such as one with a wrong argument or too little access, leaves its id unused.
 
-If a client drops a `workspace_create`, `worktree_create`, `workspace_close` or `thread_answer` call (it disconnects, or a proxy times out), Codemux still finishes it. A retry with the same `client_request_id` returns the result, with `"replayed": true`.
+If a client drops a `workspace_create`, `worktree_create`, `workspace_close`, `workspace_archive`, `workspace_unarchive`, `project_clone`, `thread_answer`, `thread_open`, `thread_rename`, `thread_close` or `thread_delete` call (it disconnects, or a proxy times out), Codemux still finishes it. A retry with the same `client_request_id` returns the result, with `"replayed": true`.
 
 ## From the shell
 
@@ -491,13 +528,13 @@ Exit codes: `0` done, `1` failed or error, `2` needs input, `3` timed out, `64` 
 
 | | Read-only | Supervised | Full access |
 |---|---|---|---|
-| Read workspaces, threads, providers and models; wait for results | Yes, but only the model catalogs Codemux has already read | Yes | Yes |
-| Start threads, send messages, interrupt, stop, answer questions, run plugin actions | No | Yes, for threads in supervised permission modes | Yes |
+| Read workspaces, archived workspaces, projects, threads, providers and models; search threads; wait for results | Yes, but only the model catalogs Codemux has already read | Yes | Yes |
+| Start threads, send messages, interrupt, stop, reopen, rename and close threads, answer questions and user-input requests, run plugin actions | No | Yes, for threads in supervised permission modes | Yes |
 | Answer approvals | No | Deny only | Allow once or deny |
-| Open workspaces, create worktrees (also `thread_launch` with `worktree`), close, archive and remove them | No | No | Yes |
+| Open workspaces, clone projects, create worktrees (also `thread_launch` with `worktree`), close, archive, restore and remove them; delete threads | No | No | Yes |
 
 - Supervised permission modes are the ones that ask before acting, such as Claude's `default`, `acceptEdits` and `plan`, or Codex's `read-only`, `workspace-write` and `plan`. `agent_capabilities` lists the ones you may use as `allowed_permission_modes`.
-- Opening a workspace or creating a worktree runs the project's setup scripts. Closing or archiving a worktree workspace runs its teardown scripts, even when the worktree stays. That's why those need full access.
+- Opening a workspace, cloning a project or creating a worktree runs the project's setup scripts. Closing or archiving a worktree workspace runs its teardown scripts, even when the worktree stays. That's why those need full access. Deleting a thread can't be undone, so it needs full access too.
 - `allow_always`, `force_delete`, and `worktree_create` with a terminal preset (`agent_preset_id`) are only for assistants on this computer.
 - Assistants on this computer at full access also get the older administration tools of `codemux mcp`, such as `automation_create`, `terminal_write` and `preset_apply`. Network assistants never do.
 - Approving connections, Remote Access and pairing devices are never MCP tools. Use Settings or the `codemux` CLI.
@@ -547,7 +584,7 @@ A paired phone or browser can remove a clean worktree, for example with **Device
 
 - **The network door moved to its own port, 4378.** It used to share Remote Access's port 4377, and it no longer needs Remote Access. Point your proxy at port 4378. Assistants that used `http://127.0.0.1:4377/mcp` directly need the new URL and a new sign-in.
 - **Network sign-ins renew themselves**, and bots can use labelled tokens. A used refresh token that comes back more than 30 seconds later ends its sign-in, so don't copy a client's saved sign-in between machines. Hermes can now connect over HTTP.
-- **`codemux mcp` lists 76 tools at full access.** `workspace_list`, `workspace_info`, `workspace_create`, `worktree_create` and `workspace_close` are now control tools there. If your scripts called them before:
+- **`codemux mcp` lists 83 tools at full access.** `workspace_list`, `workspace_info`, `workspace_create`, `worktree_create` and `workspace_close` are now control tools there. If your scripts called them before:
   - All five refuse unknown arguments (`invalid_arguments`), return compact JSON with `structuredContent`, and report errors as `isError` results with a code.
   - `workspace_list` returns summaries; `"detail": "full"` returns the old snapshots. Rows add `worktree_path` and `parent_workspace_id`, and workspaces on other machines read `native_control_available: false`.
   - `workspace_info` takes an optional `workspace_id`. Without one, while no workspace is focused in Codemux, it is the error `no_active_workspace`, not a result with an `error` key.
@@ -556,11 +593,13 @@ A paired phone or browser can remove a clean worktree, for example with **Device
   - `workspace_close` needs full access, also when it keeps the worktree.
   - `workspace_create`, `worktree_create` and `workspace_close` take a `client_request_id`, so a retry returns the first call's result.
   - A `codemux mcp` that serves a Codemux agent keeps the older versions unchanged.
+- **`workspace_archive`, `workspace_unarchive` and `workspace_archive_list` are control tools too**, so the network door has them. As with the five above, they refuse unknown arguments, take a `client_request_id` and report errors with a code, and the older versions stay for Codemux agents. `workspace_unarchive` no longer switches to the restored workspace unless you pass `"select": true`. An unknown `archive_id` is `archive_not_found`.
+- **New control tools:** `project_list`, `project_clone`, `thread_search` (outside assistants can now use it too), `thread_open`, `thread_rename`, `thread_close` and `thread_delete`. `thread_not_bound` now points at `thread_open` instead of asking the person to reopen the thread.
 - **`--access` narrows `codemux mcp`.** A supervised or read-only client is offered fewer tools, and it refuses to work with an older Codemux that can't enforce its access level (`server_too_old`). `workspace_archive` needs full access, like `workspace_close`, because both run teardown scripts. So do the `archive_workspace` and `close_workspace` commands of `codemux json`.
 - **`thread_launch` needs `permission_mode`.** Without it, it fails with `invalid_arguments` (missing field `permission_mode`).
 - **`agent_capabilities` with `provider` reads that provider's catalog** if Codemux hasn't yet, for a Supervised or Full access caller. It used to list only catalogs Codemux had already read, so a provider no chat had used yet offered no models. A Read-only caller still gets only those.
 - **`thread_wait` returns `state`, `final_text`, `pending` and `wait_cursor`.** It waits up to 50 seconds by default and 10 minutes at most. With `operation_id` it follows the run a launch or send starts, also from the queue.
-- **Outside assistants can answer worker questions** in `pending.questions` with `thread_answer`. A question that arrives as a `"user-input"` approval, such as Claude's AskUserQuestion, can only be allowed or denied.
+- **Outside assistants can answer worker questions** in `pending.questions` with `thread_answer`, and a question that arrives as a `"user-input"` approval, such as Claude's AskUserQuestion, with `thread_respond` and `answers`. `thread_respond` no longer requires `decision`: pass `decision` or `answers`.
 - **New worktrees branch from the repository's default branch**, not always `main`.
 - **`codemux json` and the older `codemux` commands exit `1` when the reply is not ok.** That includes the refusals below. Check scripts that use `set -e`.
 - **Agents that Codemux started are refused administration commands**, through MCP and through the `codemux` CLI, also on devices that run `codemux serve`. That includes Claude Code typed in a Codemux terminal (see [In a Codemux terminal](#in-a-codemux-terminal)).
@@ -605,13 +644,18 @@ The codes an outside assistant meets most often. "Retry" means retrying the iden
 | `workspace_not_found` | No open workspace has that id | No |
 | `no_active_workspace` | `workspace_info` without an id, and no workspace is focused in Codemux | No |
 | `thread_not_found` | No thread has that id in that workspace | No |
+| `thread_not_bound` | The thread's pane was closed; reopen it with `thread_open` | No |
 | `invalid_target` | `thread_wait` can't follow that `turn_id` or `operation_id` in this thread | No |
 | `unsupported_remote_workspace` | The workspace is on another machine; thread tools can't target it | No |
-| `unknown_project_root` | Network assistants may only open folders of projects already open in Codemux | No |
+| `unknown_project_root` | Network assistants may only open folders of projects already open in Codemux, and clone only next to them | No |
 | `not_a_git_repository` | A worktree needs a git repository | No |
 | `worktree_conflict` | The branch or its checkout is already in use | No |
 | `worktree_base_unavailable` | The base branch can't be read, or origin can't be fetched when it must be | No |
 | `workspace_close_refused` | The worktree can't be removed safely; the message says why, such as uncommitted or unpushed work | No |
+| `archive_not_found` | No archived workspace has that `archive_id` | No |
+| `workspace_archive_failed` | The archive failed, for example in teardown; the message says why | No |
+| `workspace_unarchive_failed` | The restore failed, for example because nothing is left to restore; the message says why | No |
+| `project_clone_failed` | `git clone` failed; the message has git's reason | No |
 | `question_not_found` | No open question has that id | No |
 | `question_closed` | The question was answered or dismissed already | No |
 | `question_answer_failed` | The answer wasn't delivered or confirmed. Answer again, with a new id, only if the worker refused it; otherwise the person settles it in Codemux | No |
@@ -633,6 +677,11 @@ The codes an outside assistant meets most often. "Retry" means retrying the iden
 | `workspace_create` | Open a folder as a workspace, or return the one open there | Full access |
 | `worktree_create` | Create a git worktree and its workspace | Full access |
 | `workspace_close` | Close a workspace, optionally removing its worktree and branch | Full access |
+| `workspace_archive` | Close a workspace but keep its files, so it can be restored | Full access |
+| `workspace_unarchive` | Restore an archived workspace | Full access |
+| `workspace_archive_list` | List archived workspaces and their ids | Read-only |
+| `project_list` | List the project folders Codemux knows | Read-only |
+| `project_clone` | Clone a repository and open it as a workspace | Full access |
 | `agent_capabilities` | Providers, models, efforts and permission modes for a workspace | Read-only |
 | `thread_list` | Threads in a workspace | Read-only |
 | `thread_launch` | Start a thread, optionally in a new worktree | Supervised; full access with `worktree` |
@@ -642,8 +691,13 @@ The codes an outside assistant meets most often. "Retry" means retrying the iden
 | `thread_wait` | Wait for a run to finish or need input; returns state, final text and pending input | Read-only |
 | `thread_interrupt` | Interrupt the current turn | Supervised |
 | `thread_stop` | Stop the provider session and its queue | Supervised |
-| `thread_respond` | Answer an approval | Supervised (deny); full access to allow |
+| `thread_respond` | Answer an approval, or a user-input request with `answers` | Supervised (deny, answers); full access to allow |
 | `thread_answer` | Answer a worker's question | Supervised |
+| `thread_open` | Reopen a thread whose pane was closed | Supervised |
+| `thread_rename` | Rename a thread | Supervised |
+| `thread_close` | Close a thread's pane and stop its session, keeping its history | Supervised |
+| `thread_delete` | Delete a thread and its history | Full access |
+| `thread_search` | Find threads by title or text | Read-only |
 | `operation_status` | Read a change's receipt | Read-only |
 | `plugin_list` | Plugin actions exposed to agents | Read-only |
 | `plugin_invoke` | Run a plugin action | Supervised |

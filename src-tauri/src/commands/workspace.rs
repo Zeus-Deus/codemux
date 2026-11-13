@@ -2073,6 +2073,18 @@ pub(crate) async fn archive_workspace_impl<R: tauri::Runtime>(
     db: &crate::database::DatabaseStore,
     workspace_id: String,
 ) -> Result<String, String> {
+    archive_workspace_checked(app, state, db, workspace_id, &Checkpoint::default()).await
+}
+
+/// [`archive_workspace_impl`], asking `checkpoint` again at the close's
+/// points of no return, as [`close_workspace_checked`] does.
+pub(crate) async fn archive_workspace_checked<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    workspace_id: String,
+    checkpoint: &Checkpoint,
+) -> Result<String, String> {
     let ws = state
         .find_workspace(&workspace_id)
         .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
@@ -2086,14 +2098,17 @@ pub(crate) async fn archive_workspace_impl<R: tauri::Runtime>(
 
     // remove_worktree=false + force_delete=None: teardown scripts run
     // and their failure aborts the archive; files/branch are untouched.
-    close_workspace_with_worktree_impl(
+    close_workspace_tracked(
         app.clone(),
         state,
         db,
         workspace_id,
+        CloseRoute::Tracked,
         false,
         None,
         None,
+        CommitLoss::Allow,
+        checkpoint,
     )
     .await?;
 
@@ -2115,20 +2130,18 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
-    pty_state: &crate::terminal::PtyState,
-    presets: &crate::presets::PresetStoreState,
+    // Read from `app` by the worktree restore; kept for the callers' shape.
+    _pty_state: &crate::terminal::PtyState,
+    _presets: &crate::presets::PresetStoreState,
     archive_id: String,
 ) -> Result<String, String> {
-    unarchive_workspace_impl_with_selection(app, state, db, pty_state, presets, archive_id, true).await
+    unarchive_workspace_impl_with_selection(app, state, db, archive_id, true).await
 }
 
 pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
-    // Read from `app` by the worktree restore; kept for the callers' shape.
-    _pty_state: &crate::terminal::PtyState,
-    _presets: &crate::presets::PresetStoreState,
     archive_id: String,
     select: bool,
 ) -> Result<String, String> {
@@ -2425,12 +2438,10 @@ pub async fn unarchive_workspace<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
-    pty_state: State<'_, crate::terminal::PtyState>,
-    presets: State<'_, crate::presets::PresetStoreState>,
     archive_id: String,
     select: Option<bool>,
 ) -> Result<String, String> {
-    unarchive_workspace_impl_with_selection(app, &state, &db, &pty_state, &presets, archive_id, select.unwrap_or(true)).await
+    unarchive_workspace_impl_with_selection(app, &state, &db, archive_id, select.unwrap_or(true)).await
 }
 
 // `async fn` because deleting a worktree is a recursive filesystem
@@ -4355,10 +4366,8 @@ mod archive_guard_tests {
         app.manage(store);
         app.manage(crate::database::DatabaseStore::new_in_memory());
         app.manage(crate::terminal::PtyState::default());
-        let presets = crate::presets::PresetStoreState::new(&app.state::<crate::database::DatabaseStore>());
         let state = app.state::<AppStateStore>();
         let db = app.state::<crate::database::DatabaseStore>();
-        let pty = app.state::<crate::terminal::PtyState>();
 
         let mut archives = vec![];
         for child in &children {
@@ -4375,7 +4384,7 @@ mod archive_guard_tests {
         let mut restored = vec![];
         for (archive, title) in archives.into_iter().zip(["Child A", "Child B"]) {
             let id = unarchive_workspace_impl_with_selection(
-                app.handle().clone(), &state, &db, &pty, &presets, archive, false,
+                app.handle().clone(), &state, &db, archive, false,
             )
             .await
             .unwrap();
@@ -4605,14 +4614,12 @@ mod archive_guard_tests {
             .create_chat_child_workspace(&child, &parent, &dir.path().display().to_string(), "Review")
             .unwrap();
         let app = close_test_app(store);
-        let presets = crate::presets::PresetStoreState::new(&app.state::<crate::database::DatabaseStore>());
         let state = app.state::<AppStateStore>();
         let db = app.state::<crate::database::DatabaseStore>();
-        let pty = app.state::<crate::terminal::PtyState>();
         let archive = archive_workspace_impl(app.handle().clone(), &state, &db, child.0).await.unwrap();
         let restore = || {
             unarchive_workspace_impl_with_selection(
-                app.handle().clone(), &state, &db, &pty, &presets, archive.clone(), false,
+                app.handle().clone(), &state, &db, archive.clone(), false,
             )
         };
 
