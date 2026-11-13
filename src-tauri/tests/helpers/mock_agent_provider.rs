@@ -76,6 +76,8 @@ pub struct MockAgentProvider {
     send_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     accepted_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     start_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    stop_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    stop_error: Mutex<Option<ProviderError>>,
     /// Threads `turn_active` reports as running a turn. The mock never
     /// runs turns itself, so tests set this to stand in for one.
     active_turns: Mutex<HashSet<ThreadId>>,
@@ -87,6 +89,8 @@ pub struct MockAgentProvider {
     start_inputs: Arc<Mutex<Vec<StartSessionInput>>>,
     queue_next_send: std::sync::atomic::AtomicBool,
     queued_input: Mutex<Option<SendTurnInput>>,
+    /// Every decision `respond_to_request` received, in order.
+    decisions: Mutex<Vec<ApprovalDecision>>,
 }
 
 impl MockAgentProvider {
@@ -105,6 +109,8 @@ impl MockAgentProvider {
             start_error: Mutex::new(None),
             send_gate: Mutex::new(None),
             start_gate: Mutex::new(None),
+            stop_gate: Mutex::new(None),
+            stop_error: Mutex::new(None),
             accepted_gate: Mutex::new(None),
             active_turns: Mutex::new(HashSet::new()),
             send_error: Mutex::new(None),
@@ -112,7 +118,14 @@ impl MockAgentProvider {
             start_inputs: Arc::new(Mutex::new(Vec::new())),
             queue_next_send: std::sync::atomic::AtomicBool::new(false),
             queued_input: Mutex::new(None),
+            decisions: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Snapshot of every decision `respond_to_request` received so far.
+    #[allow(dead_code)]
+    pub fn decisions(&self) -> Vec<ApprovalDecision> {
+        self.decisions.lock().unwrap().clone()
     }
 
     /// Queue without dispatching, as profile-serialized adapters do.
@@ -155,6 +168,22 @@ impl MockAgentProvider {
         let release = Arc::new(tokio::sync::Notify::new());
         *self.start_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
         (entered, release)
+    }
+
+    /// Keep the next `stop_session` in flight until the returned release is
+    /// notified (a slow shutdown). The first notify fires on entry.
+    #[allow(dead_code)]
+    pub fn hold_next_stop(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.stop_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+        (entered, release)
+    }
+
+    /// Make the next `stop_session` fail with `error`, leaving the session up.
+    #[allow(dead_code)]
+    pub fn fail_next_stop(&self, error: ProviderError) {
+        *self.stop_error.lock().unwrap() = Some(error);
     }
 
     /// Barrier after the provider has accepted the request, before its ACK.
@@ -338,8 +367,9 @@ impl AgentProvider for MockAgentProvider {
         &self,
         thread_id: ThreadId,
         request_id: RequestId,
-        _decision: ApprovalDecision,
+        decision: ApprovalDecision,
     ) -> Result<(), ProviderError> {
+        self.decisions.lock().unwrap().push(decision);
         self.calls
             .push(MockCall::RespondToRequest(thread_id, request_id));
         Ok(())
@@ -394,6 +424,14 @@ impl AgentProvider for MockAgentProvider {
     }
 
     async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+        let gate = self.stop_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
+        }
+        if let Some(error) = self.stop_error.lock().unwrap().take() {
+            return Err(error);
+        }
         self.live.lock().unwrap().remove(&thread_id);
         self.calls.push(MockCall::StopSession(thread_id));
         Ok(())

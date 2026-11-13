@@ -51,6 +51,11 @@ pub struct PendingApproval {
     pub(crate) permission_options: Vec<(String, String)>,
     pub turn_id: String,
     pub request_kind: String,
+    /// A user-input request's `questions`, as its payload carries them, so
+    /// an outside answer can be checked against them and keyed like the
+    /// question card's.
+    #[serde(skip)]
+    pub(crate) questions: Option<Value>,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadRuntimeView {
@@ -376,6 +381,9 @@ impl NativeControlState {
                             }).collect(),
                         turn_id: turn_id.0.clone(),
                         request_kind: request_kind.clone(),
+                        questions: (request_kind == "user-input")
+                            .then(|| payload.get("questions").filter(|q| q.is_array()).cloned())
+                            .flatten(),
                     });
                 }
                 entry.view.phase = "waiting_approval".into();
@@ -514,6 +522,17 @@ impl NativeControlState {
         let option_id = kinds.iter().find_map(|kind| pending.permission_options.iter().find(|(k, _)| k == kind).map(|(_, id)| id.clone()))
             .ok_or_else(|| "unsupported_decision: exact requested scope was not advertised".to_string())?;
         Ok(ApprovalDecision::ProviderOption { option_id })
+    }
+    /// The open request an outside handle names.
+    pub(crate) fn pending_for_handle(&self, thread: &str, handle: &str) -> Option<PendingApproval> {
+        self.runtime.lock().unwrap().get(thread)?
+            .view.pending_approvals.iter().find(|p| p.outside_handle == handle).cloned()
+    }
+    /// The kind of a current request, by its provider id.
+    pub(crate) fn request_kind(&self, thread: &str, request: &str) -> Option<String> {
+        self.runtime.lock().unwrap().get(thread)?
+            .view.pending_approvals.iter().find(|p| p.request_id == request)
+            .map(|p| p.request_kind.clone())
     }
     pub(crate) fn provider_request_for_handle(&self, thread: &str, handle: &str) -> Option<String> {
         self.runtime.lock().unwrap().get(thread)?

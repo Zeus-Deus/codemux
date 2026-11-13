@@ -1,5 +1,6 @@
-//! Typed workspace and worktree tools for outside callers: list, info,
-//! open-or-create, worktree create and close.
+//! Typed workspace, worktree and project tools for outside callers: list,
+//! info, open-or-create, worktree create, close, archive and restore, and the
+//! projects this computer knows, listed or cloned.
 //!
 //! The registry's gate has already run (Read for list and info, Machine for the
 //! rest). These handlers add the rules that depend on the arguments and on
@@ -14,10 +15,11 @@ use crate::workspace_service::{
     self as workspaces, Checkpoint, CloseWorkspace, CommitLoss, InfoError, OpenWorkspace,
     WorkspaceService, WorkspaceTarget, WorktreeArgs,
 };
+use crate::state::AppStateStore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 
 #[derive(Deserialize, Default, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -225,6 +227,220 @@ pub(super) async fn close<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller
     .await
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ArchiveArgs {
+    workspace_id: String,
+    client_request_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UnarchiveArgs {
+    archive_id: String,
+    #[serde(default, deserialize_with = "service::null_as_default")]
+    select: bool,
+    client_request_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct NoArgs {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CloneArgs {
+    url: String,
+    parent: String,
+    name: Option<String>,
+    #[serde(default, deserialize_with = "service::null_as_default")]
+    select: bool,
+    client_request_id: Option<String>,
+}
+
+/// Archives a workspace: the close path, keeping every file, plus an entry
+/// `workspace_unarchive` restores.
+pub(super) async fn archive<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let args = without_nulls(args);
+    let ArchiveArgs { workspace_id, client_request_id } = service::parse(args.clone())?;
+    service::identifier(&workspace_id, "workspace_id", 256)?;
+    if let Some(key) = &client_request_id {
+        service::identifier(key, "client_request_id", 128)?;
+    }
+    // A retry after the archive replays it instead of finding no workspace.
+    if let Some(done) = service::recorded(app, caller, "workspace_archive", &args)? {
+        return Ok(done);
+    }
+    service::workspace(app, &workspace_id, false)?;
+    let receipt_workspace = workspace_id.clone();
+    let workspaces = WorkspaceService::new(app).checked(checkpoint(app, caller));
+    service::run_receipted(app, caller, "workspace_archive", &args, false, Some(&receipt_workspace), move |_| async move {
+        let archive_id = workspaces
+            .archive(workspace_id.clone())
+            .await
+            .map_err(|error| ControlError::from_text(error, ErrorCode::WorkspaceArchiveFailed))?;
+        Ok(json!({"workspace_id": workspace_id, "archive_id": archive_id, "archived": true}))
+    })
+    .await
+}
+
+/// Restores an archive entry, or returns the live workspace already in its
+/// folder.
+pub(super) async fn unarchive<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let args = without_nulls(args);
+    let UnarchiveArgs { archive_id, select, client_request_id } = service::parse(args.clone())?;
+    service::identifier(&archive_id, "archive_id", 256)?;
+    if let Some(key) = &client_request_id {
+        service::identifier(key, "client_request_id", 128)?;
+    }
+    // A restore retires its entry, so a retry replays before looking.
+    if let Some(done) = service::recorded(app, caller, "workspace_unarchive", &args)? {
+        return Ok(done);
+    }
+    if app.state::<AppStateStore>().find_archived_workspace(&archive_id).is_none() {
+        return Err(ControlError::new(ErrorCode::ArchiveNotFound, "No archived workspace has this archive_id; see workspace_archive_list"));
+    }
+    let workspaces = WorkspaceService::new(app).checked(checkpoint(app, caller));
+    service::run_receipted(app, caller, "workspace_unarchive", &args, false, None, move |_| async move {
+        let workspace_id = workspaces
+            .unarchive(archive_id.clone(), select)
+            .await
+            .map_err(|error| ControlError::from_text(error, ErrorCode::WorkspaceUnarchiveFailed))?;
+        Ok(json!({"archive_id": archive_id, "workspace_id": workspace_id, "restored": true}))
+    })
+    .await
+}
+
+pub(super) fn archive_list<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
+    let NoArgs {} = service::parse(args)?;
+    let entries = serde_json::to_value(app.state::<AppStateStore>().archived_workspaces_list()).map_err(serialization)?;
+    Ok(json!({"archived_workspaces": entries}))
+}
+
+/// The project roots connector clients may open: what `known_folder` checks.
+pub(super) async fn project_list<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
+    let NoArgs {} = service::parse(args)?;
+    let app = app.clone();
+    blocking(move || {
+        let recent: Vec<(PathBuf, crate::database::RecentProject)> = app
+            .state::<crate::database::DatabaseStore>()
+            .get_recent_projects(workspaces::RECENT_PROJECT_LIMIT)
+            .into_iter()
+            .filter_map(|project| Some((Path::new(&project.path).canonicalize().ok()?, project)))
+            .collect();
+        let projects: Vec<Value> = workspaces::known_project_roots(&app)
+            .into_iter()
+            .map(|root| {
+                let recent = recent.iter().find(|(path, _)| *path == root).map(|(_, project)| project);
+                let folder = root.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                json!({
+                    "path": root.display().to_string(),
+                    "name": recent.map_or(folder, |project| project.name.clone()),
+                    "last_opened_at": recent.map(|project| project.last_opened_at.clone()),
+                })
+            })
+            .collect();
+        Ok(json!({"projects": projects}))
+    })
+    .await
+}
+
+/// Clones a repository into a new folder, opens it as a workspace and
+/// records it as a Recent project, so it stays a known project.
+pub(super) async fn project_clone<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let args = without_nulls(args);
+    let CloneArgs { url, parent, name, select, client_request_id } = service::parse(args.clone())?;
+    if let Some(key) = &client_request_id {
+        service::identifier(key, "client_request_id", 128)?;
+    }
+    clone_url(&url, !caller.is_network())?;
+    let name = match name {
+        Some(name) => name,
+        None => repository_name(&url)?,
+    };
+    folder_name(&name)?;
+    // A retry replays even though the folder now exists.
+    if let Some(done) = service::recorded(app, caller, "project_clone", &args)? {
+        return Ok(done);
+    }
+    let parent = if caller.is_network() { known_parent(app, parent).await? } else { local_folder(&parent)? };
+    let target = Path::new(&parent).join(&name);
+    if target.exists() {
+        return Err(ControlError::new(ErrorCode::InvalidArguments, format!("{} already exists; pick another name", target.display())));
+    }
+    let owned = app.clone();
+    let workspaces = WorkspaceService::new(app).checked(checkpoint(app, caller));
+    let check = checkpoint(app, caller);
+    service::run_receipted(app, caller, "project_clone", &args, true, None, move |reserved| async move {
+        check.check().map_err(|error| ControlError::from_text(error, ErrorCode::ProjectCloneFailed))?;
+        let path = crate::commands::git::git_clone_repo(owned.clone(), url, target.display().to_string())
+            .await
+            .map_err(|error| ControlError::new(ErrorCode::ProjectCloneFailed, error))?;
+        let opened = workspaces
+            .open(OpenWorkspace { path: Some(path.clone()), select, reuse_open: true, reserved_id: reserved })
+            .await
+            .map_err(|error| ControlError::from_text(error, ErrorCode::WorkspaceCreateFailed))?;
+        owned.state::<crate::database::DatabaseStore>().add_recent_project(&path, &name)?;
+        Ok(json!({"workspace_id": opened.workspace_id, "cwd": opened.cwd, "path": path, "created": opened.created}))
+    })
+    .await
+}
+
+/// A repository URL git cannot read as an option or a command: https, http,
+/// ssh and git URLs, `user@host:path`, and for callers on this computer
+/// `file://` URLs. Transports such as `ext::` run commands.
+fn clone_url(url: &str, local: bool) -> Result<(), ControlError> {
+    let invalid = || ControlError::new(ErrorCode::InvalidArguments, "url must be an https, http, ssh or git URL, or user@host:path");
+    if url.starts_with('-') || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(invalid());
+    }
+    let schemes: &[&str] = if local { &["https://", "http://", "ssh://", "git://", "file://"] } else { &["https://", "http://", "ssh://", "git://"] };
+    // Compared as bytes: a URL with multibyte text has no char boundary where
+    // a scheme's length ends.
+    let scheme = schemes.iter().any(|scheme| {
+        url.len() > scheme.len() && url.as_bytes()[..scheme.len()].eq_ignore_ascii_case(scheme.as_bytes())
+    });
+    let scp_like = !url.contains("://")
+        && url.split_once(':').is_some_and(|(host, path)| host.contains('@') && !host.contains('/') && !path.is_empty());
+    if scheme || scp_like { Ok(()) } else { Err(invalid()) }
+}
+
+/// The folder name git itself would pick: the URL's last path segment
+/// without `.git`. A local path on Windows separates segments with `\` too.
+fn repository_name(url: &str) -> Result<String, ControlError> {
+    let path = url.trim_end_matches(['/', '\\']);
+    let last = path.rsplit(['/', ':', '\\']).next().unwrap_or_default();
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    if name.is_empty() {
+        return Err(ControlError::new(ErrorCode::InvalidArguments, "The URL names no repository; pass name"));
+    }
+    Ok(name.to_string())
+}
+
+/// One plain, visible folder name directly under the parent.
+fn folder_name(name: &str) -> Result<(), ControlError> {
+    if name.is_empty() || name.len() > 255 || name.starts_with('.') || name.contains(['/', '\\']) || name.chars().any(char::is_control) {
+        return Err(ControlError::new(ErrorCode::InvalidArguments, format!("\"{name}\" is not a usable folder name; pass name")));
+    }
+    Ok(())
+}
+
+/// A folder a connector client may clone into: one that already holds a
+/// project this computer works in. Returns the canonical path.
+async fn known_parent<R: Runtime>(app: &AppHandle<R>, path: String) -> Result<String, ControlError> {
+    let app = app.clone();
+    blocking(move || {
+        let folder = PathBuf::from(local_folder(&path)?);
+        let folder = folder.canonicalize().map_err(|error| ControlError::new(ErrorCode::InvalidArguments, format!("{path}: {error}")))?;
+        if workspaces::known_project_roots(&app).iter().any(|root| root.parent() == Some(folder.as_path())) {
+            Ok(folder.display().to_string())
+        } else {
+            Err(ControlError::new(ErrorCode::UnknownProjectRoot, format!("{path} holds no project already opened in Codemux")))
+        }
+    })
+    .await
+}
+
 /// The caller's authority, as the workspace lifecycle asks for it again after
 /// each wait: on the lifecycle lock, a fetch, a large checkout, a teardown
 /// command, stopping a closing workspace's agents. A grant revoked or a
@@ -315,4 +531,40 @@ pub(super) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T,
 
 fn serialization(error: serde_json::Error) -> ControlError {
     ControlError::new(ErrorCode::SerializationFailed, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clone_url;
+
+    /// Multibyte text where a scheme's length ends is refused or accepted on
+    /// its form, never a panic on a char boundary.
+    #[test]
+    fn clone_url_reads_multibyte_urls_without_panicking() {
+        for url in ["aaaaé@host:repo.git", "user@éxample:repo.git", "httpé://host/repo", "ééééééé"] {
+            for local in [true, false] {
+                let _ = clone_url(url, local);
+            }
+        }
+        assert!(clone_url("user@éxample:repo.git", false).is_ok(), "user@host:path with a Unicode host");
+        assert!(clone_url("https://éxample.com/repo.git", false).is_ok());
+        assert!(clone_url("HTTPS://example.com/repo.git", false).is_ok());
+        assert!(clone_url("ext::sh -c é", true).is_err());
+        assert!(clone_url("file:///tmp/é", false).is_err(), "a network caller clones no local files");
+    }
+
+    /// The folder git would pick, also from a Windows path with `\`.
+    #[test]
+    fn repository_name_is_the_last_segment_without_git() {
+        for (url, name) in [
+            ("https://example.com/team/tool.git", "tool"),
+            ("git@example.com:team/tool.git/", "tool"),
+            ("git@example.com:tool", "tool"),
+            ("file://C:\\Users\\me\\tool.git", "tool"),
+            ("file:///C:/Users/me/tool.git", "tool"),
+        ] {
+            assert_eq!(super::repository_name(url).unwrap(), name, "{url}");
+        }
+        assert!(super::repository_name("git@example.com:").is_err(), "names no repository");
+    }
 }
