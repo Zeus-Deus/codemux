@@ -406,10 +406,10 @@ fn clone_url(url: &str, local: bool) -> Result<(), ControlError> {
 }
 
 /// The folder name git itself would pick: the URL's last path segment
-/// without `.git`.
+/// without `.git`. A local path on Windows separates segments with `\` too.
 fn repository_name(url: &str) -> Result<String, ControlError> {
-    let path = url.trim_end_matches('/');
-    let last = path.rsplit(['/', ':']).next().unwrap_or_default();
+    let path = url.trim_end_matches(['/', '\\']);
+    let last = path.rsplit(['/', ':', '\\']).next().unwrap_or_default();
     let name = last.strip_suffix(".git").unwrap_or(last);
     if name.is_empty() {
         return Err(ControlError::new(ErrorCode::InvalidArguments, "The URL names no repository; pass name"));
@@ -551,5 +551,20 @@ mod tests {
         assert!(clone_url("HTTPS://example.com/repo.git", false).is_ok());
         assert!(clone_url("ext::sh -c é", true).is_err());
         assert!(clone_url("file:///tmp/é", false).is_err(), "a network caller clones no local files");
+    }
+
+    /// The folder git would pick, also from a Windows path with `\`.
+    #[test]
+    fn repository_name_is_the_last_segment_without_git() {
+        for (url, name) in [
+            ("https://example.com/team/tool.git", "tool"),
+            ("git@example.com:team/tool.git/", "tool"),
+            ("git@example.com:tool", "tool"),
+            ("file://C:\\Users\\me\\tool.git", "tool"),
+            ("file:///C:/Users/me/tool.git", "tool"),
+        ] {
+            assert_eq!(super::repository_name(url).unwrap(), name, "{url}");
+        }
+        assert!(super::repository_name("git@example.com:").is_err(), "names no repository");
     }
 }

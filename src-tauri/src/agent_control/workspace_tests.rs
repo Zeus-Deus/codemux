@@ -2647,7 +2647,9 @@ async fn project_list_and_clone_make_a_known_project() {
     let sources = tempfile::tempdir().unwrap();
     let origin = sources.path().join("tool.git");
     git(sources.path(), &["clone", "--bare", &repo.display().to_string(), &origin.display().to_string()]);
-    let url = format!("file://{}", origin.display());
+    // file:///C:/… on Windows, as git there reads it.
+    let origin_path = origin.display().to_string().replace('\\', "/");
+    let url = format!("file://{}{origin_path}", if origin_path.starts_with('/') { "" } else { "/" });
     let parent = tempfile::tempdir().unwrap();
     let clone = json!({"url": url, "parent": parent.path(), "client_request_id": "clone-1"});
 
