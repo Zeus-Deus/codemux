@@ -441,6 +441,8 @@ pub fn git_status(repo_path: &Path) -> Result<Vec<GitFileStatus>, String> {
 /// boundary. The byte limit matches the per-file limit of turn diffs.
 const MAX_FILE_DIFF_LINES: usize = 5_000;
 const MAX_FILE_DIFF_BYTES: usize = 512 * 1024;
+/// How much of git's stderr a failed diff reports.
+const MAX_DIFF_STDERR_BYTES: u64 = 16 * 1024;
 
 /// Runs a single-file `git diff` and keeps at most [`MAX_FILE_DIFF_LINES`]
 /// lines and [`MAX_FILE_DIFF_BYTES`] bytes. Reading stops at the limit and
@@ -455,7 +457,7 @@ fn run_git_diff_capped_to(
     max_lines: usize,
     max_bytes: usize,
 ) -> Result<FileDiff, String> {
-    use std::io::{BufRead, Read};
+    use std::io::Read;
     let mut child = git_command()
         .args(args)
         .current_dir(repo_path)
@@ -464,43 +466,65 @@ fn run_git_diff_capped_to(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to run git: {e}"))?;
-    let mut reader = std::io::BufReader::new(child.stdout.take().expect("stdout is piped"));
+    // Drained alongside stdout: an external diff or textconv driver that
+    // writes a lot to stderr would otherwise block on a full pipe before it
+    // closes stdout, and the read below would wait forever. Only the start
+    // is kept, for the error message.
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut head = Vec::new();
+        let _ = (&mut stderr).take(MAX_DIFF_STDERR_BYTES).read_to_end(&mut head);
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        head
+    });
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout is piped"));
+    let read = read_lines_capped(&mut stdout, max_lines, max_bytes);
+    drop(stdout);
+    // Anything but a complete read leaves git with output nobody will read.
+    if !matches!(read, Ok((_, false))) {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    let (kept, truncated) = read.map_err(|e| format!("Failed to read git diff: {e}"))?;
+    let status = status.map_err(|e| format!("Failed to run git: {e}"))?;
+    if !truncated && !status.success() {
+        // Git has exited, so its stderr is closed unless a helper it
+        // started still holds it.
+        let stderr = stderr_reader.join().unwrap_or_default();
+        let stderr = String::from_utf8_lossy(&stderr);
+        return Err(format!("git {} failed: {}", args.first().unwrap_or(&""), stderr.trim()));
+    }
+    // Otherwise the drain thread finishes on its own when the pipe closes.
+    Ok(FileDiff { diff: String::from_utf8_lossy(&kept).trim_end().to_string(), truncated })
+}
+
+/// Reads whole lines until EOF or until the next line would pass
+/// `max_lines` or `max_bytes`. Returns the lines and whether it stopped
+/// early.
+fn read_lines_capped(
+    reader: &mut impl std::io::BufRead,
+    max_lines: usize,
+    max_bytes: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::io::{BufRead, Read};
     let mut kept = Vec::new();
     let mut line = Vec::new();
     let mut lines = 0;
-    let mut truncated = false;
     loop {
         line.clear();
         // One byte past the budget is enough to tell that a line won't fit,
         // without reading the whole of a minified one-line file.
         let budget = (max_bytes - kept.len() + 1) as u64;
-        let read = (&mut reader)
-            .take(budget)
-            .read_until(b'\n', &mut line)
-            .map_err(|e| format!("Failed to read git diff: {e}"))?;
+        let read = reader.by_ref().take(budget).read_until(b'\n', &mut line)?;
         if read == 0 {
-            break;
+            return Ok((kept, false));
         }
         if lines == max_lines || kept.len() + read > max_bytes {
-            truncated = true;
-            break;
+            return Ok((kept, true));
         }
         kept.extend_from_slice(&line);
         lines += 1;
     }
-    drop(reader);
-    if truncated {
-        // The rest of the diff is not wanted.
-        let _ = child.kill();
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-    if !truncated && !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git {} failed: {}", args.first().unwrap_or(&""), stderr.trim()));
-    }
-    Ok(FileDiff { diff: String::from_utf8_lossy(&kept).trim_end().to_string(), truncated })
 }
 
 pub fn git_diff(repo_path: &Path, file_path: &str, staged: bool) -> Result<FileDiff, String> {
@@ -3935,6 +3959,46 @@ mod tests {
         assert!(!wide.diff.contains("xxx"), "{}", wide.diff);
 
         assert!(git_diff(&repo.join("missing"), "big.txt", false).is_err());
+    }
+
+    /// An external diff that floods stderr before writing its diff must not
+    /// stall the read, and a failing one reports a bounded error.
+    #[cfg(unix)]
+    #[test]
+    fn file_diff_survives_an_external_diff_that_floods_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, repo) = setup_test_repo();
+        git_config(&repo);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        git_commit(&repo, "base").unwrap();
+        std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+        let tool = |name: &str, exit: u8| {
+            let script = dir.path().join(name);
+            let body = format!(
+                "#!/bin/sh\nhead -c 300000 /dev/zero | tr '\\000' e >&2\necho \"external diff of $1\"\nexit {exit}\n"
+            );
+            std::fs::write(&script, body).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            script.to_string_lossy().into_owned()
+        };
+        let (noisy, failing) = (tool("noisy-diff", 0), tool("failing-diff", 1));
+
+        // Off the test thread, so a regression fails instead of hanging.
+        let read = |external: String| {
+            let repo = repo.clone();
+            let (sent, received) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                run_git(&repo, &["config", "diff.external", &external]).unwrap();
+                let _ = sent.send(git_diff(&repo, "a.txt", false));
+            });
+            received.recv_timeout(std::time::Duration::from_secs(30)).expect("the diff read hung")
+        };
+        let diff = read(noisy).unwrap();
+        assert!(!diff.truncated);
+        assert_eq!(diff.diff, "external diff of a.txt");
+        let error = read(failing).unwrap_err();
+        assert!(error.len() < 20 * 1024, "error is {} bytes", error.len());
     }
 
     /// Before the first commit there is no HEAD: everything staged counts
