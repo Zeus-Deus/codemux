@@ -175,15 +175,15 @@ pub(crate) struct RemoteEndpoint {
     /// Web origin implied by the remote, port included when the remote
     /// used http/https and named one.
     pub base_url: String,
-    /// The real host when `host` looks like a GitHub SSH config alias.
-    /// Applied by [`resolve_remote_endpoint`], after explicit host mappings
-    /// had their say.
-    ssh_alias_of: Option<&'static str>,
+    /// `host` came from an SSH remote and looks like a GitHub SSH config
+    /// alias. [`resolve_remote_endpoint`] asks ssh for its real `HostName`
+    /// after explicit host mappings had their say.
+    ssh_alias: bool,
 }
 
-/// [`parse_remote_endpoint`], then a GitHub SSH alias resolved to its real
-/// host unless the user mapped the alias itself (`custom_hosts` keys are
-/// lowercased hostnames).
+/// [`parse_remote_endpoint`], then a GitHub SSH alias resolved to the real
+/// host ssh connects to, unless the user mapped the alias itself
+/// (`custom_hosts` keys are lowercased hostnames).
 pub(crate) fn resolve_remote_endpoint(
     url: &str,
     custom_hosts: &HashMap<String, ProviderKind>,
@@ -197,14 +197,101 @@ pub(crate) fn resolve_remote_endpoint_with(
     url: &str,
     is_mapped: impl FnOnce(&str) -> bool,
 ) -> Option<RemoteEndpoint> {
+    resolve_with(url, is_mapped, ssh_config_hostname)
+}
+
+fn resolve_with(
+    url: &str,
+    is_mapped: impl FnOnce(&str) -> bool,
+    ssh_hostname: impl FnOnce(&str) -> Option<String>,
+) -> Option<RemoteEndpoint> {
     let mut endpoint = parse_remote_endpoint(url)?;
-    if let Some(real) = endpoint.ssh_alias_of.take() {
-        if !is_mapped(&endpoint.host) {
-            endpoint.host = real.to_string();
+    if std::mem::take(&mut endpoint.ssh_alias) && !is_mapped(&endpoint.host) {
+        // Only ssh's own answer redirects the remote: a dotless name may
+        // just as well be a real host reached through corporate DNS.
+        if let Some(real) = ssh_hostname(&endpoint.host).filter(|real| *real != endpoint.host) {
+            let real = if real == "ssh.github.com" { "github.com".to_string() } else { real };
             endpoint.base_url = format!("https://{real}");
+            endpoint.host = real;
         }
     }
     Some(endpoint)
+}
+
+/// How long one `ssh -G` answer is reused, so editing `~/.ssh/config`
+/// takes effect without restarting.
+#[cfg_attr(test, allow(dead_code))]
+const SSH_HOSTNAME_TTL: Duration = Duration::from_secs(300);
+#[cfg_attr(test, allow(dead_code))]
+const SSH_HOSTNAME_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg_attr(test, allow(dead_code))]
+static SSH_HOSTNAMES: LazyLock<Mutex<HashMap<String, (Instant, Option<String>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The `HostName` ssh would connect to for `alias`, from the user's ssh
+/// config (`ssh -G`). `None` when ssh is missing, fails, or times out.
+fn ssh_config_hostname(alias: &str) -> Option<String> {
+    #[cfg(test)]
+    return test_ssh_config::hostname(alias);
+    #[cfg(not(test))]
+    real_ssh_config_hostname(alias)
+}
+
+#[cfg(test)]
+pub(crate) mod test_ssh_config {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static HOSTNAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    }
+
+    /// Pretend `~/.ssh/config` maps each alias to a `HostName`, for this
+    /// test thread. Unlisted aliases have no `HostName`.
+    pub(crate) fn set(entries: &[(&str, &str)]) {
+        HOSTNAMES.with(|map| {
+            *map.borrow_mut() =
+                entries.iter().map(|(a, h)| (a.to_string(), h.to_string())).collect();
+        });
+    }
+
+    pub(super) fn hostname(alias: &str) -> Option<String> {
+        HOSTNAMES.with(|map| map.borrow().get(alias).cloned())
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn real_ssh_config_hostname(alias: &str) -> Option<String> {
+    // The alias comes from a remote URL: never let it read as an option.
+    if alias.starts_with('-')
+        || !alias.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    {
+        return None;
+    }
+    if let Some((at, cached)) = SSH_HOSTNAMES.lock().ok()?.get(alias) {
+        if at.elapsed() < SSH_HOSTNAME_TTL {
+            return cached.clone();
+        }
+    }
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.args(["-G", "--", alias]);
+    sanitize_gui_env_std(&mut cmd);
+    let answer = super::exec::run_timed(cmd, SSH_HOSTNAME_TIMEOUT)
+        .ok()
+        .filter(|output| output.success)
+        .and_then(|output| {
+            output.stdout.lines().find_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                key.eq_ignore_ascii_case("hostname")
+                    .then(|| value.trim().to_ascii_lowercase())
+                    .filter(|value| !value.is_empty())
+            })
+        });
+    if let Ok(mut cache) = SSH_HOSTNAMES.lock() {
+        cache.insert(alias.to_string(), (Instant::now(), answer.clone()));
+    }
+    answer
 }
 
 /// Split a remote URL into `(host, web origin)`.
@@ -254,9 +341,8 @@ pub(crate) fn parse_remote_endpoint(url: &str) -> Option<RemoteEndpoint> {
     if host.is_empty() {
         return None;
     }
-    let ssh_alias_of = matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git")
-        .then(|| github_ssh_alias_target(&host))
-        .flatten();
+    let ssh_alias = matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git")
+        && looks_like_github_ssh_alias(&host);
 
     // Only an http(s) remote names a *web* port. See `DetectedProvider`.
     let web_scheme = if scheme == "http" { "http" } else { "https" };
@@ -269,27 +355,27 @@ pub(crate) fn parse_remote_endpoint(url: &str) -> Option<RemoteEndpoint> {
     Some(RemoteEndpoint {
         host: host.to_ascii_lowercase(),
         base_url,
-        ssh_alias_of,
+        ssh_alias,
     })
 }
 
-/// The real host behind a GitHub SSH config alias, or `None`.
+/// Whether an SSH remote host may be a GitHub SSH config alias.
 ///
 /// Several GitHub accounts on one machine are usually configured as
 /// `Host github-work` → `HostName github.com` in `~/.ssh/config`, so the
-/// remote names the alias. gh, the API, and the web UI only know the real
-/// host, so a dotless host mentioning "github" (`github-work`) or a
-/// `github.com-<label>` / `github.com_<label>` host with a dotless label
-/// maps to `github.com`. Any other dotted name (`github.mycorp.com`,
-/// `github.com-work.corp.example`) is a real hostname and is left alone.
-fn github_ssh_alias_target(host: &str) -> Option<&'static str> {
+/// remote names the alias, while gh, the API and the web UI only know the
+/// real host. Candidates are a dotless host mentioning "github"
+/// (`github-work`) or `github.com-<label>` / `github.com_<label>` with a
+/// dotless label; only ssh's config decides where they really point. Any
+/// other dotted name (`github.mycorp.com`) is a real hostname.
+fn looks_like_github_ssh_alias(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     let dotless_alias = !host.contains('.') && host.contains("github");
     let suffixed_alias = host
         .strip_prefix("github.com")
         .and_then(|rest| rest.strip_prefix(['-', '_']))
         .is_some_and(|label| !label.is_empty() && !label.contains('.'));
-    (dotless_alias || suffixed_alias).then_some("github.com")
+    dotless_alias || suffixed_alias
 }
 
 /// Split `host[:port]`, tolerating a bracketed IPv6 literal.
@@ -695,6 +781,11 @@ mod tests {
 
     #[test]
     fn github_ssh_aliases_resolve_to_github_com() {
+        test_ssh_config::set(&[
+            ("github-work", "github.com"),
+            ("github.com-work", "github.com"),
+            ("github-personal", "ssh.github.com"),
+        ]);
         for url in [
             "git@github-work:a/b.git",
             "git@github.com-work:a/b.git",
@@ -721,7 +812,25 @@ mod tests {
     }
 
     #[test]
+    fn a_dotless_host_keeps_its_name_unless_ssh_config_redirects_it() {
+        // `github` / `github-enterprise` reached through corporate DNS: ssh
+        // has no HostName for them, so nothing points them at github.com.
+        test_ssh_config::set(&[("github-corp", "github.corp.example")]);
+        for host in ["github", "github-enterprise"] {
+            let endpoint =
+                resolve_remote_endpoint(&format!("git@{host}:a/b.git"), &no_custom()).unwrap();
+            assert_eq!(endpoint.host, host);
+            assert_eq!(endpoint.base_url, format!("https://{host}"));
+        }
+        // An alias for an enterprise instance resolves to that instance.
+        let endpoint = resolve_remote_endpoint("git@github-corp:a/b.git", &no_custom()).unwrap();
+        assert_eq!(endpoint.host, "github.corp.example");
+        assert_eq!(endpoint.base_url, "https://github.corp.example");
+    }
+
+    #[test]
     fn an_explicit_mapping_for_an_alias_wins_over_alias_inference() {
+        test_ssh_config::set(&[("github-work", "github.com")]);
         let custom = HashMap::from([("github-work".to_string(), ProviderKind::GitLab)]);
         let endpoint = resolve_remote_endpoint("git@github-work:a/b.git", &custom).unwrap();
         assert_eq!(endpoint.host, "github-work");

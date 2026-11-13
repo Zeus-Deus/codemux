@@ -3244,6 +3244,11 @@ mod tests {
             Some("github.example/a/b".into())
         );
         // SSH config aliases for extra accounts target github.com.
+        crate::git_provider::detect::test_ssh_config::set(&[
+            ("github-work", "github.com"),
+            ("github.com-work", "github.com"),
+            ("github-personal", "github.com"),
+        ]);
         for alias in [
             "git@github-work:a/b.git",
             "git@github.com-work:a/b.git",
