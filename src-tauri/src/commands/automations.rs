@@ -128,6 +128,8 @@ pub struct RepoAccessResult {
 /// Resolve a project's `origin` remote URL — the GitHub backbone a host
 /// without `project_path` clones from. `None` for a repo with no
 /// `origin` (such an automation can only run on "This machine").
+/// Credentials embedded in the URL are stripped: the value is uploaded to
+/// the cloud, synced to every device, and displayed.
 fn resolve_project_remote(project_path: &str) -> Option<String> {
     let output = crate::git::git_command()
         .arg("-C")
@@ -138,7 +140,7 @@ fn resolve_project_remote(project_path: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let url = crate::project_identity::redact_remote_url(&String::from_utf8_lossy(&output.stdout));
     if url.is_empty() {
         None
     } else {
@@ -168,10 +170,11 @@ fn clean_input(
         .filter(|p| !p.is_empty());
     // Resolve the project's git remote so a remote host can obtain the
     // repo. An explicit caller-supplied value (e.g. from MCP) wins;
-    // otherwise derive it from the chosen project.
+    // otherwise derive it from the chosen project. Either way it is stored
+    // without credentials.
     input.project_remote = input
         .project_remote
-        .map(|r| r.trim().to_string())
+        .map(|r| crate::project_identity::redact_remote_url(&r))
         .filter(|r| !r.is_empty())
         .or_else(|| {
             input
@@ -648,6 +651,18 @@ mod tests {
         let credentials = webhook_credentials_impl(&db, view.id).unwrap();
         assert_eq!(credentials.webhook_id, webhook.id);
         assert!(!json.contains(&credentials.token));
+    }
+
+    #[test]
+    fn explicit_project_remote_is_stored_without_credentials() {
+        let mut with_token = input(None);
+        with_token.project_remote =
+            Some(" https://oauth2:glpat-SECRET@gitlab.com/group/proj.git ".into());
+        let cleaned = clean_input(with_token, AutomationTrigger::Schedule).unwrap();
+        assert_eq!(
+            cleaned.project_remote.as_deref(),
+            Some("https://gitlab.com/group/proj.git")
+        );
     }
 
     #[test]
