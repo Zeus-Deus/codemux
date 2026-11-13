@@ -175,6 +175,36 @@ pub(crate) struct RemoteEndpoint {
     /// Web origin implied by the remote, port included when the remote
     /// used http/https and named one.
     pub base_url: String,
+    /// The real host when `host` looks like a GitHub SSH config alias.
+    /// Applied by [`resolve_remote_endpoint`], after explicit host mappings
+    /// had their say.
+    ssh_alias_of: Option<&'static str>,
+}
+
+/// [`parse_remote_endpoint`], then a GitHub SSH alias resolved to its real
+/// host unless the user mapped the alias itself (`custom_hosts` keys are
+/// lowercased hostnames).
+pub(crate) fn resolve_remote_endpoint(
+    url: &str,
+    custom_hosts: &HashMap<String, ProviderKind>,
+) -> Option<RemoteEndpoint> {
+    resolve_remote_endpoint_with(url, |host| custom_hosts.contains_key(host))
+}
+
+/// [`resolve_remote_endpoint`] with a lazy mapping lookup, for callers that
+/// only want to read settings when an alias is actually in play.
+pub(crate) fn resolve_remote_endpoint_with(
+    url: &str,
+    is_mapped: impl FnOnce(&str) -> bool,
+) -> Option<RemoteEndpoint> {
+    let mut endpoint = parse_remote_endpoint(url)?;
+    if let Some(real) = endpoint.ssh_alias_of.take() {
+        if !is_mapped(&endpoint.host) {
+            endpoint.host = real.to_string();
+            endpoint.base_url = format!("https://{real}");
+        }
+    }
+    Some(endpoint)
 }
 
 /// Split a remote URL into `(host, web origin)`.
@@ -224,11 +254,9 @@ pub(crate) fn parse_remote_endpoint(url: &str) -> Option<RemoteEndpoint> {
     if host.is_empty() {
         return None;
     }
-    let host = if matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git") {
-        github_ssh_alias_target(&host).map_or(host, str::to_string)
-    } else {
-        host
-    };
+    let ssh_alias_of = matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git")
+        .then(|| github_ssh_alias_target(&host))
+        .flatten();
 
     // Only an http(s) remote names a *web* port. See `DetectedProvider`.
     let web_scheme = if scheme == "http" { "http" } else { "https" };
@@ -241,6 +269,7 @@ pub(crate) fn parse_remote_endpoint(url: &str) -> Option<RemoteEndpoint> {
     Some(RemoteEndpoint {
         host: host.to_ascii_lowercase(),
         base_url,
+        ssh_alias_of,
     })
 }
 
@@ -250,15 +279,16 @@ pub(crate) fn parse_remote_endpoint(url: &str) -> Option<RemoteEndpoint> {
 /// `Host github-work` → `HostName github.com` in `~/.ssh/config`, so the
 /// remote names the alias. gh, the API, and the web UI only know the real
 /// host, so a dotless host mentioning "github" (`github-work`) or a
-/// `github.com-<suffix>` / `github.com_<suffix>` host maps to `github.com`.
-/// Dotted names like `github.mycorp.com` are real Enterprise hosts and
-/// are left alone.
+/// `github.com-<label>` / `github.com_<label>` host with a dotless label
+/// maps to `github.com`. Any other dotted name (`github.mycorp.com`,
+/// `github.com-work.corp.example`) is a real hostname and is left alone.
 fn github_ssh_alias_target(host: &str) -> Option<&'static str> {
     let host = host.to_ascii_lowercase();
     let dotless_alias = !host.contains('.') && host.contains("github");
     let suffixed_alias = host
         .strip_prefix("github.com")
-        .is_some_and(|rest| rest.starts_with(['-', '_']));
+        .and_then(|rest| rest.strip_prefix(['-', '_']))
+        .is_some_and(|label| !label.is_empty() && !label.contains('.'));
     (dotless_alias || suffixed_alias).then_some("github.com")
 }
 
@@ -362,7 +392,7 @@ pub(crate) fn select_remote<'a>(
     custom_hosts: &HashMap<String, ProviderKind>,
 ) -> Option<&'a Remote> {
     let classifiable = |remote: &Remote| {
-        parse_remote_endpoint(&remote.url)
+        resolve_remote_endpoint(&remote.url, custom_hosts)
             .map(|endpoint| classify_host(&endpoint.host, custom_hosts))
             .is_some_and(|kind| kind != ProviderKind::Unknown)
     };
@@ -392,7 +422,7 @@ pub(crate) fn detect_from_remotes(
     let Some(remote) = select_remote(remotes, upstream_remote, custom_hosts) else {
         return DetectedProvider::unknown();
     };
-    let Some(endpoint) = parse_remote_endpoint(&remote.url) else {
+    let Some(endpoint) = resolve_remote_endpoint(&remote.url, custom_hosts) else {
         // A filesystem remote is a real remote with no host to classify.
         return DetectedProvider {
             kind: ProviderKind::Unknown,
@@ -671,17 +701,38 @@ mod tests {
             "ssh://git@github-personal/a/b.git",
             "https://github.com/a/b",
         ] {
-            let endpoint = parse_remote_endpoint(url).unwrap_or_else(|| panic!("{url}"));
+            let endpoint =
+                resolve_remote_endpoint(url, &no_custom()).unwrap_or_else(|| panic!("{url}"));
             assert_eq!(endpoint.host, "github.com", "{url}");
             assert_eq!(endpoint.base_url, "https://github.com", "{url}");
         }
-        // A dotted Enterprise host is a real hostname, not an alias.
-        let enterprise = parse_remote_endpoint("git@github.mycorp.com:a/b.git").unwrap();
-        assert_eq!(enterprise.host, "github.mycorp.com");
+        // Dotted names are real hostnames, not aliases.
+        for host in ["github.mycorp.com", "github.company.com", "github.com-work.corp.example"] {
+            let url = format!("git@{host}:a/b.git");
+            let endpoint = resolve_remote_endpoint(&url, &no_custom()).unwrap();
+            assert_eq!(endpoint.host, host);
+            assert_eq!(endpoint.base_url, format!("https://{host}"));
+        }
+        // An alias over https is a real host name too.
         assert_eq!(
-            parse_remote_endpoint("git@github.company.com:a/b.git").unwrap().host,
-            "github.company.com"
+            resolve_remote_endpoint("https://github-work/a/b", &no_custom()).unwrap().host,
+            "github-work"
         );
+    }
+
+    #[test]
+    fn an_explicit_mapping_for_an_alias_wins_over_alias_inference() {
+        let custom = HashMap::from([("github-work".to_string(), ProviderKind::GitLab)]);
+        let endpoint = resolve_remote_endpoint("git@github-work:a/b.git", &custom).unwrap();
+        assert_eq!(endpoint.host, "github-work");
+        let remotes = vec![remote("origin", "git@github-work:a/b.git")];
+        let detected = detect_from_remotes(&remotes, None, &custom);
+        assert_eq!(detected.kind, ProviderKind::GitLab);
+        assert_eq!(detected.host.as_deref(), Some("github-work"));
+
+        let unmapped = detect_from_remotes(&remotes, None, &no_custom());
+        assert_eq!(unmapped.kind, ProviderKind::GitHub);
+        assert_eq!(unmapped.host.as_deref(), Some("github.com"));
     }
 
     #[test]

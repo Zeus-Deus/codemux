@@ -284,7 +284,11 @@ fn clean_host(host: &str) -> Option<String> {
 }
 
 fn remote_repository(url: &str) -> Option<String> {
-    let endpoint = crate::git_provider::detect::parse_remote_endpoint(url)?;
+    // Settings are read only when the host looks like an SSH alias, so an
+    // alias the user mapped explicitly is never redirected to github.com.
+    let endpoint = crate::git_provider::detect::resolve_remote_endpoint_with(url, |host| {
+        crate::git_provider::detect::custom_hosts_from_settings().contains_key(host)
+    })?;
     let (host, path) = if url.contains("://") {
         let parsed = url::Url::parse(url).ok()?;
         let host = if matches!(parsed.scheme(), "http" | "https") {
@@ -3248,10 +3252,13 @@ mod tests {
         ] {
             assert_eq!(remote_repository(alias), Some("github.com/a/b".into()), "{alias}");
         }
-        assert_eq!(
-            remote_repository("git@github.mycorp.com:a/b.git"),
-            Some("github.mycorp.com/a/b".into())
-        );
+        for real in ["github.mycorp.com", "github.com-work.corp.example"] {
+            assert_eq!(
+                remote_repository(&format!("git@{real}:a/b.git")),
+                Some(format!("{real}/a/b")),
+                "{real}"
+            );
+        }
         assert_eq!(retry_epoch("Retry-After: 120", 1000), Some(1120));
         assert_eq!(retry_epoch("x-ratelimit-reset: 2000", 1000), Some(2000));
         assert_eq!(retry_epoch("Retry after 2 seconds", 1000), Some(1060));
