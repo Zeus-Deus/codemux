@@ -2549,7 +2549,7 @@ async fn workspace_unarchive_revoked_while_queued_on_the_lifecycle_lock_restores
 
 /// A restore that adopts a worktree in place asks the caller's grant again
 /// after its git read: revoked during the read, it creates no workspace, so
-/// no terminal starts and no `.mcp.json` is written, and the entry stays.
+/// no terminal or setup starts, and the entry stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_unarchive_revoked_during_the_worktree_git_read_adopts_nothing() {
     if isolated(&format!("{MODULE}workspace_unarchive_revoked_during_the_worktree_git_read_adopts_nothing")) {
@@ -2582,7 +2582,6 @@ async fn workspace_unarchive_revoked_during_the_worktree_git_read_adopts_nothing
     refused(restoring.await.unwrap(), ErrorCode::GrantRevoked);
     failed_as_revoked(&settled(&app, &caller, &running["operation_id"]).await);
     assert_eq!(workspaces_at(&app, &checkout), 0, "no workspace, so no terminal and no setup script");
-    assert!(!checkout.join(".mcp.json").exists(), "no MCP config written");
     assert!(state.find_archived_workspace(&archive_id).is_some(), "the entry stays restorable");
     connector_off(&app);
 }

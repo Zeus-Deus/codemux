@@ -1162,7 +1162,7 @@ async fn import_worktree_workspace_checked<R: tauri::Runtime>(
     let wt_path_buf = PathBuf::from(&worktree_path);
     // Read before the workspace exists, so a requester whose authority was
     // withdrawn during the read leaves nothing behind: no workspace, no
-    // terminal, no `.mcp.json`.
+    // terminal, no setup.
     let git_info = {
         let path = wt_path_buf.clone();
         tokio::task::spawn_blocking(move || gather_workspace_git_info(&path))
