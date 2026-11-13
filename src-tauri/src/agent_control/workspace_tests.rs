@@ -2061,6 +2061,117 @@ async fn thread_delete_needs_full_access_and_stops_the_session_first() {
     refused(call(&app, &owner, "thread_delete", thread_args(&workspace, &thread, "delete-2")).await, ErrorCode::ThreadNotFound);
 }
 
+/// A close succeeds once the session stopped, not when the pane went: a
+/// reopen and send right after it are never stopped by the close's own
+/// cleanup. A stop the provider refused fails the close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_close_settles_only_once_the_session_stopped() {
+    use crate::agent_provider::AgentProvider;
+    let (app, provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "close-wait-launch", &workspace, "default").await;
+    let bot = connector(ControlAccess::Supervised);
+    let (entered, release) = provider.hold_next_stop();
+    let closing = spawn_call(&app, &bot, "thread_close", &thread_args(&workspace, &thread, "close-wait"));
+    tokio::time::timeout(Duration::from_secs(10), entered.notified()).await.expect("the close stops the session");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!closing.is_finished(), "the close waits for the stop");
+    release.notify_one();
+    let closed = closing.await.unwrap().unwrap();
+    assert_eq!((closed["state"].clone(), closed["closed"].clone()), (json!("succeeded"), json!(true)), "{closed}");
+    assert!(!provider.has_session(&ThreadId(thread.clone())).await, "the session stopped before the close succeeded");
+
+    // Right away: reopen. No stop of the close is still on its way to the
+    // reopened thread's next session.
+    let stops = || provider.calls.snapshot().iter().filter(|call| matches!(call, MockCall::StopSession(_))).count();
+    assert_eq!(stops(), 1);
+    call(&app, &bot, "thread_open", thread_args(&workspace, &thread, "close-wait-open")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(stops(), 1, "nothing of the close stops the reopened thread");
+
+    provider.fail_next_stop(crate::agent_provider::ProviderError::RpcError { message: "synthetic stop failure".into() });
+    let error = refused(call(&app, &bot, "thread_close", thread_args(&workspace, &thread, "close-fails")).await, ErrorCode::NativeControlFailed);
+    assert!(error.message.contains("did not stop"), "{error}");
+}
+
+/// A delete holds the thread from closing its pane through deleting it: an
+/// open that arrives while its session stops binds no pane, and finds the
+/// thread gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_delete_lets_no_open_in_while_the_session_stops() {
+    use crate::agent_provider::AgentProvider;
+    let (app, provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "delete-hold-launch", &workspace, "default").await;
+    let owner = connector(ControlAccess::FullAccess);
+    let (entered, release) = provider.hold_next_stop();
+    let deleting = spawn_call(&app, &owner, "thread_delete", &thread_args(&workspace, &thread, "delete-hold"));
+    tokio::time::timeout(Duration::from_secs(10), entered.notified()).await.expect("the delete stops the session");
+    assert!(pane_of(&app, &thread).is_none(), "the pane closed first");
+    let open = thread_args(&workspace, &thread, "delete-hold-open");
+    let opening = spawn_call(&app, &owner, "thread_open", &open);
+    admitted(&app, &owner, "thread_open", &open).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(pane_of(&app, &thread).is_none(), "no pane binds while the delete runs");
+    release.notify_one();
+
+    let deleted = deleting.await.unwrap().unwrap();
+    assert_eq!(deleted["deleted"], true, "{deleted}");
+    refused(opening.await.unwrap(), ErrorCode::ThreadNotFound);
+    assert!(pane_of(&app, &thread).is_none(), "no pane is left bound to a deleted thread");
+    assert!(app.state::<DatabaseStore>().get_agent_chat_session(&thread).is_none());
+    assert!(!provider.has_session(&ThreadId(thread.clone())).await);
+}
+
+/// An open that waited for the thread's dispatch lock is judged as things are
+/// once it holds it: a thread whose mode rose above the caller's ceiling
+/// meanwhile stays closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_open_checks_the_mode_again_after_waiting() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "open-wait-launch", &workspace, "default").await;
+    app.state::<AppStateStore>().close_pane(&pane_of(&app, &thread).unwrap()).unwrap();
+    let bot = connector(ControlAccess::Supervised);
+    let gate = app.state::<NativeControlState>().thread_gate(&thread);
+    let held = gate.dispatch.clone().lock_owned().await;
+    let open = thread_args(&workspace, &thread, "open-wait");
+    let opening = spawn_call(&app, &bot, "thread_open", &open);
+    admitted(&app, &bot, "thread_open", &open).await;
+    app.state::<DatabaseStore>().update_agent_chat_session_config(&thread, &crate::database::AgentChatSessionConfig {
+        permission_mode: Some(Some("bypassPermissions".into())),
+        ..Default::default()
+    }).unwrap();
+    drop((held, gate));
+    refused(opening.await.unwrap(), ErrorCode::PermissionCeiling);
+    assert!(pane_of(&app, &thread).is_none(), "the thread stays closed");
+}
+
+/// The lifecycle tools ask what the guarded thread tools ask: a supervised
+/// caller cannot rename, close or reopen a live full-access worker whose
+/// persisted mode only says supervised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_tools_see_through_a_persisted_mode_to_a_live_full_access_worker() {
+    use crate::agent_provider::AgentProvider;
+    let (app, provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "disguise-launch", &workspace, "bypassPermissions").await;
+    crate::commands::agent_chat::agent_chat_update_session_config(
+        app.handle().clone(), app.state(), thread.clone(),
+        crate::database::AgentChatSessionConfig { permission_mode: Some(Some("default".into())), ..Default::default() },
+    ).await.unwrap();
+    let bot = connector(ControlAccess::Supervised);
+    let mut rename = thread_args(&workspace, &thread, "disguise-rename");
+    rename["title"] = json!("Renamed");
+    refused(call(&app, &bot, "thread_rename", rename).await, ErrorCode::PermissionStateUnconfirmed);
+    no_receipt(&app, &bot, "disguise-rename", "thread_rename");
+    refused(call(&app, &bot, "thread_close", thread_args(&workspace, &thread, "disguise-close")).await, ErrorCode::PermissionStateUnconfirmed);
+    no_receipt(&app, &bot, "disguise-close", "thread_close");
+    assert!(pane_of(&app, &thread).is_some() && provider.has_session(&ThreadId(thread.clone())).await, "the worker keeps running");
+    // Closed in the app without stopping its worker: still not reopened.
+    app.state::<AppStateStore>().close_pane(&pane_of(&app, &thread).unwrap()).unwrap();
+    refused(call(&app, &bot, "thread_open", thread_args(&workspace, &thread, "disguise-open")).await, ErrorCode::PermissionStateUnconfirmed);
+    assert!(pane_of(&app, &thread).is_none());
+    let full = call(&app, &connector(ControlAccess::FullAccess), "thread_open", thread_args(&workspace, &thread, "disguise-open")).await.unwrap();
+    assert_eq!(full["reopened"], true, "a full-access caller may: {full}");
+}
+
 #[tokio::test]
 async fn outside_thread_search_spans_open_workspaces() {
     let (app, provider, root, workspace) = fixture().await;
@@ -2206,6 +2317,84 @@ async fn workspace_archive_and_unarchive_replay_and_need_full_access() {
     assert_eq!(active(&app), focused, "a restore without select takes no focus");
     let retry = call(&app, &owner, "workspace_unarchive", restore).await.unwrap();
     assert_eq!((retry["workspace_id"].clone(), retry["replayed"].clone()), (json!(restored_id), json!(true)), "a retry replays, not archive_not_found");
+}
+
+/// Archives a plain folder workspace; returns the folder and its archive id.
+async fn archived_folder(app: &App, root: &Path, name: &str) -> (PathBuf, String) {
+    let folder = root.join(name);
+    std::fs::create_dir(&folder).unwrap();
+    let workspace = app.state::<AppStateStore>().create_empty_workspace_at_path(folder.clone()).0;
+    let done = call(app, &connector(ControlAccess::FullAccess), "workspace_archive", json!({"workspace_id": workspace})).await.unwrap();
+    (folder, done["archive_id"].as_str().unwrap().to_string())
+}
+
+fn workspaces_at(app: &App, folder: &Path) -> usize {
+    let cwd = folder.display().to_string();
+    app.state::<AppStateStore>().snapshot().workspaces.iter().filter(|w| w.cwd == cwd).count()
+}
+
+/// Two restores of one entry under different keys, both waiting on the
+/// lifecycle lock: one workspace, so one terminal and one setup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simultaneous_restores_of_one_archive_make_one_workspace() {
+    if isolated(&format!("{MODULE}simultaneous_restores_of_one_archive_make_one_workspace")) {
+        return;
+    }
+    without_terminal_daemon();
+    let (app, _provider, root, _workspace) = fixture().await;
+    app.manage(crate::terminal::PtyState::default());
+    let (folder, archive_id) = archived_folder(&app, root.path(), "restored-twice").await;
+    let owner = connector(ControlAccess::FullAccess);
+
+    let removal = crate::worktree_cleanup::removal_guard().await;
+    let restores: Vec<_> = ["restore-a", "restore-b"].iter().map(|key| {
+        let args = json!({"archive_id": archive_id, "client_request_id": key});
+        (spawn_call(&app, &owner, "workspace_unarchive", &args), args)
+    }).collect();
+    for (_, args) in &restores {
+        admitted(&app, &owner, "workspace_unarchive", args).await;
+    }
+    reach_the_lock().await;
+    drop(removal);
+
+    let mut restored = vec![];
+    for (call, _) in restores {
+        if let Ok(done) = call.await.unwrap() {
+            restored.push(done["workspace_id"].clone());
+        }
+    }
+    assert_eq!(restored.len(), 1, "one restore makes the workspace: {restored:?}");
+    assert_eq!(workspaces_at(&app, &folder), 1, "no second workspace over the folder");
+    assert!(app.state::<AppStateStore>().find_archived_workspace(&archive_id).is_none());
+}
+
+/// A restore waiting on the lifecycle lock asks the caller's grant again
+/// once it holds it: revoked meanwhile, it creates nothing and keeps the
+/// entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_unarchive_revoked_while_queued_on_the_lifecycle_lock_restores_nothing() {
+    if isolated(&format!("{MODULE}workspace_unarchive_revoked_while_queued_on_the_lifecycle_lock_restores_nothing")) {
+        return;
+    }
+    without_terminal_daemon();
+    let (app, _provider, root, _workspace) = fixture().await;
+    app.manage(crate::terminal::PtyState::default());
+    let (folder, archive_id) = archived_folder(&app, root.path(), "restored-revoked").await;
+    let caller = connector_caller(&app, "queued-restore-client", "queued-restore-grant", ControlAccess::FullAccess).await;
+    let args = json!({"archive_id": archive_id, "client_request_id": "queued-restore"});
+
+    let removal = crate::worktree_cleanup::removal_guard().await;
+    let queued = spawn_call(&app, &caller, "workspace_unarchive", &args);
+    let running = admitted(&app, &caller, "workspace_unarchive", &args).await;
+    reach_the_lock().await;
+    crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "queued-restore-client".into()).unwrap();
+    drop(removal);
+
+    refused(queued.await.unwrap(), ErrorCode::GrantRevoked);
+    failed_as_revoked(&settled(&app, &caller, &running["operation_id"]).await);
+    assert_eq!(workspaces_at(&app, &folder), 0, "no workspace, so no terminal and no setup script");
+    assert!(app.state::<AppStateStore>().find_archived_workspace(&archive_id).is_some(), "the entry stays restorable");
+    connector_off(&app);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

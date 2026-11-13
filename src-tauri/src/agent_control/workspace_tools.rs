@@ -395,7 +395,11 @@ fn clone_url(url: &str, local: bool) -> Result<(), ControlError> {
         return Err(invalid());
     }
     let schemes: &[&str] = if local { &["https://", "http://", "ssh://", "git://", "file://"] } else { &["https://", "http://", "ssh://", "git://"] };
-    let scheme = schemes.iter().any(|scheme| url.len() > scheme.len() && url[..scheme.len()].eq_ignore_ascii_case(scheme));
+    // Compared as bytes: a URL with multibyte text has no char boundary where
+    // a scheme's length ends.
+    let scheme = schemes.iter().any(|scheme| {
+        url.len() > scheme.len() && url.as_bytes()[..scheme.len()].eq_ignore_ascii_case(scheme.as_bytes())
+    });
     let scp_like = !url.contains("://")
         && url.split_once(':').is_some_and(|(host, path)| host.contains('@') && !host.contains('/') && !path.is_empty());
     if scheme || scp_like { Ok(()) } else { Err(invalid()) }
@@ -527,4 +531,25 @@ pub(super) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T,
 
 fn serialization(error: serde_json::Error) -> ControlError {
     ControlError::new(ErrorCode::SerializationFailed, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clone_url;
+
+    /// Multibyte text where a scheme's length ends is refused or accepted on
+    /// its form, never a panic on a char boundary.
+    #[test]
+    fn clone_url_reads_multibyte_urls_without_panicking() {
+        for url in ["aaaaé@host:repo.git", "user@éxample:repo.git", "httpé://host/repo", "ééééééé"] {
+            for local in [true, false] {
+                let _ = clone_url(url, local);
+            }
+        }
+        assert!(clone_url("user@éxample:repo.git", false).is_ok(), "user@host:path with a Unicode host");
+        assert!(clone_url("https://éxample.com/repo.git", false).is_ok());
+        assert!(clone_url("HTTPS://example.com/repo.git", false).is_ok());
+        assert!(clone_url("ext::sh -c é", true).is_err());
+        assert!(clone_url("file:///tmp/é", false).is_err(), "a network caller clones no local files");
+    }
 }

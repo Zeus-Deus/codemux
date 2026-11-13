@@ -1582,6 +1582,45 @@ pub(super) struct OpenArgs {
     #[serde(default, deserialize_with = "null_as_default")] select: bool,
 }
 
+/// What the thread lifecycle tools check before admission and again under
+/// the thread's dispatch lock, where a guarded tool's
+/// [`NativeControlGuard::verify`] would: the caller's authority, the
+/// thread's workspace and provider, its permission mode against the caller's
+/// ceiling and, for a supervised caller, that a live worker runs in that
+/// mode (a DB-only mode change must not disguise a full-access worker).
+/// Unlike `verify`, the thread needs no pane: this returns it, if any.
+fn lifecycle_check<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, target: &Target, provider: ProviderKind) -> Result<Option<String>, ControlError> {
+    authorize(app, caller)?;
+    let (record, current) = thread_record(app, target, true)?;
+    if current != provider {
+        return Err(ControlError::new(ErrorCode::StaleThreadBinding, "The thread changed provider after admission"));
+    }
+    permission_ceiling(caller, provider, record.permission_mode.as_deref())?;
+    if caller.access == ControlAccess::Supervised {
+        if let Some(state) = app.try_state::<NativeControlState>() {
+            state.verify_worker_mode(&target.thread_id, provider, record.permission_mode.as_deref()).map_err(ControlError::from)?;
+        }
+    }
+    bound_pane(app, target, provider)
+}
+
+/// [`lifecycle_check`] in the string form the session owner's checked
+/// operations take; the code survives the round trip.
+fn lifecycle_witness<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, target: &Target, provider: ProviderKind) -> impl Fn() -> Result<Option<String>, String> {
+    let (app, caller, target) = (app.clone(), caller.clone(), target.clone());
+    move || lifecycle_check(&app, &caller, &target, provider).map_err(|error| error.to_string())
+}
+
+/// The thread a lifecycle tool targets and its provider, checked before
+/// admission so a refused call leaves no receipt.
+fn lifecycle_target<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, workspace_id: String, thread_id: String) -> Result<(Target, ProviderKind), ControlError> {
+    authorize(app, caller)?;
+    let target = Target { workspace_id, thread_id };
+    let (_, provider) = thread_record(app, &target, true)?;
+    lifecycle_check(app, caller, &target, provider)?;
+    Ok((target, provider))
+}
+
 /// Binds a thread whose pane was closed to a new tab, as reopening it from
 /// search does, so the thread tools can control it again. Opening a thread
 /// is as much control as sending it a message, so it takes the same ceiling.
@@ -1589,15 +1628,13 @@ pub(super) async fn thread_open<R: Runtime>(app: &AppHandle<R>, caller: &Control
     let input: OpenArgs = parse(args.clone())?;
     identifier(&input.client_request_id, "client_request_id", 128)?;
     if let Some(done) = recorded(app, caller, "thread_open", &args)? { return Ok(done); }
-    authorize(app, caller)?;
-    let target = Target { workspace_id: input.workspace_id, thread_id: input.thread_id };
-    let (record, provider) = thread_record(app, &target, true)?;
-    permission_ceiling(caller, provider, record.permission_mode.as_deref())?;
-    bound_pane(app, &target, provider)?;
-    let (owned, owner, select) = (app.clone(), caller.clone(), input.select);
+    let (target, provider) = lifecycle_target(app, caller, input.workspace_id, input.thread_id)?;
+    let witness = lifecycle_witness(app, caller, &target, provider);
+    let (owned, select) = (app.clone(), input.select);
     run_receipted(app, caller, "thread_open", &args, false, Some(&target.workspace_id.clone()), move |_| async move {
-        authorize(&owned, &owner)?;
-        let opened = agent_chat::open_thread_pane(&owned, &target.thread_id, select).await?;
+        // Checked again once the bind holds the thread's dispatch lock: the
+        // grant or the thread's mode may have changed while it waited.
+        let opened = agent_chat::open_thread_pane_checked(&owned, &target.thread_id, select, || witness().map(drop)).await?;
         Ok(json!({"workspace_id": opened.workspace_id, "thread_id": target.thread_id, "pane_id": opened.pane_id, "reopened": opened.created}))
     }).await
 }
@@ -1611,13 +1648,13 @@ pub(super) async fn thread_rename<R: Runtime>(app: &AppHandle<R>, caller: &Contr
     identifier(&input.client_request_id, "client_request_id", 128)?;
     identifier(&input.title, "title", 100)?;
     if let Some(done) = recorded(app, caller, "thread_rename", &args)? { return Ok(done); }
-    authorize(app, caller)?;
-    let target = Target { workspace_id: input.workspace_id, thread_id: input.thread_id };
-    let (record, provider) = thread_record(app, &target, true)?;
-    permission_ceiling(caller, provider, record.permission_mode.as_deref())?;
+    let (target, provider) = lifecycle_target(app, caller, input.workspace_id, input.thread_id)?;
     let (owned, owner, title) = (app.clone(), caller.clone(), input.title);
     run_receipted(app, caller, "thread_rename", &args, false, Some(&target.workspace_id.clone()), move |_| async move {
-        authorize(&owned, &owner)?;
+        // A mode change takes this lock, so the check holds through the rename.
+        let gate = owned.state::<NativeControlState>().thread_gate(&target.thread_id);
+        let _dispatch = gate.dispatch.clone().lock_owned().await;
+        lifecycle_check(&owned, &owner, &target, provider)?;
         agent_chat::agent_chat_rename_session(owned.clone(), owned.state(), target.thread_id.clone(), title.clone()).await?;
         Ok(json!({"workspace_id": target.workspace_id, "thread_id": target.thread_id, "title": title}))
     }).await
@@ -1629,52 +1666,34 @@ pub(super) struct LifecycleArgs { workspace_id: String, thread_id: String, clien
 
 /// Closes the thread's pane as the pane's close button does: the session
 /// stops, the thread and its history stay, and `thread_open` reopens it.
+/// Succeeds once the session stopped, so a reopen right after starts afresh.
 pub(super) async fn thread_close<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     let input: LifecycleArgs = parse(args.clone())?;
     identifier(&input.client_request_id, "client_request_id", 128)?;
     if let Some(done) = recorded(app, caller, "thread_close", &args)? { return Ok(done); }
-    authorize(app, caller)?;
-    let target = Target { workspace_id: input.workspace_id, thread_id: input.thread_id };
-    let (record, provider) = thread_record(app, &target, true)?;
-    permission_ceiling(caller, provider, record.permission_mode.as_deref())?;
-    bound_pane(app, &target, provider)?;
-    let (owned, owner) = (app.clone(), caller.clone());
+    let (target, provider) = lifecycle_target(app, caller, input.workspace_id, input.thread_id)?;
+    let witness = lifecycle_witness(app, caller, &target, provider);
+    let owned = app.clone();
     run_receipted(app, caller, "thread_close", &args, false, Some(&target.workspace_id.clone()), move |_| async move {
-        authorize(&owned, &owner)?;
-        let pane = bound_pane(&owned, &target, provider)?;
-        if let Some(pane) = &pane {
-            // Without select, closing moves no focus.
-            agent_chat::agent_chat_close_pane(owned.clone(), owned.state(), owned.state(), pane.clone(), Some(false))?;
-        }
+        // Without select, closing moves no focus.
+        let pane = agent_chat::close_thread_pane_checked(&owned, &target.thread_id, witness).await?;
         Ok(json!({"workspace_id": target.workspace_id, "thread_id": target.thread_id, "pane_id": pane, "closed": pane.is_some()}))
     }).await
 }
 
 /// Deletes a thread for good. Deleting a chat's history does not stop its
 /// session, so this closes its pane, ends its queued work and stops the
-/// session first, then deletes it as the history menu does.
+/// session first, then deletes it as the history menu does, all in one
+/// critical section on the thread, so nothing reopens or resumes it between.
 pub(super) async fn thread_delete<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     let input: LifecycleArgs = parse(args.clone())?;
     identifier(&input.client_request_id, "client_request_id", 128)?;
     if let Some(done) = recorded(app, caller, "thread_delete", &args)? { return Ok(done); }
-    authorize(app, caller)?;
-    let target = Target { workspace_id: input.workspace_id, thread_id: input.thread_id };
-    let (record, provider) = thread_record(app, &target, true)?;
-    permission_ceiling(caller, provider, record.permission_mode.as_deref())?;
-    bound_pane(app, &target, provider)?;
-    let (owned, owner) = (app.clone(), caller.clone());
+    let (target, provider) = lifecycle_target(app, caller, input.workspace_id, input.thread_id)?;
+    let witness = lifecycle_witness(app, caller, &target, provider);
+    let owned = app.clone();
     run_receipted(app, caller, "thread_delete", &args, false, Some(&target.workspace_id.clone()), move |_| async move {
-        authorize(&owned, &owner)?;
-        if let Some(pane) = bound_pane(&owned, &target, provider)? {
-            agent_chat::agent_chat_close_pane(owned.clone(), owned.state(), owned.state(), pane, Some(false))?;
-        }
-        owned.state::<DatabaseStore>().stop_message_deliveries(&target.thread_id)?;
-        // A provider no longer configured has no session to stop.
-        if owned.state::<ProviderRegistry>().get(provider).await.is_some() {
-            agent_chat::agent_chat_stop_session_guarded(owned.clone(), provider, ThreadId(target.thread_id.clone()), None).await?;
-        }
-        authorize(&owned, &owner)?;
-        agent_chat::agent_chat_delete_session(owned.clone(), owned.state(), target.thread_id.clone()).await?;
+        agent_chat::delete_thread_checked(&owned, provider, &target.thread_id, witness).await?;
         Ok(json!({"workspace_id": target.workspace_id, "thread_id": target.thread_id, "deleted": true}))
     }).await
 }

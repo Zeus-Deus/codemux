@@ -158,7 +158,7 @@ pub(crate) async fn populate_git_info_async(
 }
 
 /// Always creates a new workspace at `cwd` (the desktop's `create_workspace`
-/// command and unarchive). `state` and `db` are the app's own;
+/// command). `state` and `db` are the app's own;
 /// [`open_workspace_impl`] reads them from `app`.
 pub(crate) async fn create_workspace_impl_with_selection<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -1111,8 +1111,25 @@ pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
     layout: String,
     select: bool,
 ) -> Result<String, String> {
+    import_worktree_workspace_checked(app, state, db, worktree_path, branch, layout, select, &Checkpoint::default()).await
+}
+
+/// [`import_worktree_workspace_impl`], asking `checkpoint` again once the
+/// lifecycle lock is held; its setup asks the background checkpoint.
+#[allow(clippy::too_many_arguments)]
+async fn import_worktree_workspace_checked<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    worktree_path: String,
+    branch: String,
+    layout: String,
+    select: bool,
+    checkpoint: &Checkpoint,
+) -> Result<String, String> {
     // Cleanup must not delete a checkout while it is being opened.
     let _opening = crate::worktree_cleanup::opening_guard().await;
+    checkpoint.check()?;
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
         "pair" => WorkspacePresetLayout::Pair,
@@ -1147,7 +1164,7 @@ pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
         terminal::spawn_pty_for_session(app.clone(), session_id);
     }
 
-    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf, &Checkpoint::default());
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf, checkpoint);
 
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
@@ -2145,6 +2162,29 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
     archive_id: String,
     select: bool,
 ) -> Result<String, String> {
+    unarchive_workspace_checked(app, state, db, archive_id, select, &Checkpoint::default()).await
+}
+
+/// [`unarchive_workspace_impl_with_selection`], asking `checkpoint` again
+/// once no other restore runs and wherever the restore's create or adopt
+/// path asks it, its background setup included.
+///
+/// Restores run one at a time: each looks for a live workspace in its
+/// entry's folder and then creates one, and two restores of one entry (or of
+/// two entries for one folder) between those steps would both create one and
+/// run its setup twice. The later restore finds the entry retired, or the
+/// earlier one's workspace in the folder.
+pub(crate) async fn unarchive_workspace_checked<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    archive_id: String,
+    select: bool,
+    checkpoint: &Checkpoint,
+) -> Result<String, String> {
+    static RESTORE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _restore = RESTORE.lock().await;
+    checkpoint.check()?;
     let entry = state
         .find_archived_workspace(&archive_id)
         .ok_or_else(|| format!("No archived workspace found for {archive_id}"))?;
@@ -2262,7 +2302,7 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
                 .unwrap_or(false);
 
         let id = if adopt_in_place {
-            import_worktree_workspace_impl(
+            import_worktree_workspace_checked(
                 app.clone(),
                 state,
                 db,
@@ -2270,10 +2310,11 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
                 branch,
                 "single".to_string(),
                 select,
+                checkpoint,
             )
             .await?
         } else {
-            create_worktree_from_request(
+            create_worktree_checked(
                 app.clone(),
                 WorktreeRequest {
                     repo_path,
@@ -2287,6 +2328,7 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
                     initial_chat: None,
                     reserved_id: None,
                 },
+                checkpoint,
             )
             .await?
             .workspace_id
@@ -2306,7 +2348,13 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
                 entry.cwd
             ));
         }
-        let id = create_workspace_impl_with_selection(app.clone(), state, db, Some(entry.cwd.clone()), select).await?;
+        let id = open_workspace_impl(
+            app.clone(),
+            OpenWorkspace { path: Some(entry.cwd.clone()), select, reuse_open: false, reserved_id: None },
+            checkpoint,
+        )
+        .await?
+        .workspace_id;
         state.rename_workspace(&id, entry.title.clone());
         id
     };

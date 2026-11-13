@@ -373,10 +373,9 @@ impl<R: Runtime> WorkspaceService<R> {
 
     /// Restore an archive entry. Returns the restored workspace's id.
     pub(crate) async fn unarchive(&self, archive_id: String, select: bool) -> Result<String, String> {
-        self.checkpoint.check()?;
         let state = self.app.state::<AppStateStore>();
         let db = self.app.state::<crate::database::DatabaseStore>();
-        crate::commands::workspace::unarchive_workspace_impl_with_selection(self.app.clone(), &state, &db, archive_id, select)
+        crate::commands::workspace::unarchive_workspace_checked(self.app.clone(), &state, &db, archive_id, select, &self.checkpoint)
             .await
     }
 

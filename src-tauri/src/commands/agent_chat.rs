@@ -571,6 +571,20 @@ pub fn agent_chat_close_pane<R: Runtime>(
     select: Option<bool>,
 ) -> Result<(), String> {
     feature_flag_on(&observability)?;
+    close_agent_chat_pane(&app, &state, &pane_id, select.unwrap_or(true));
+    Ok(())
+}
+
+/// [`agent_chat_close_pane`]'s work, without the feature-flag gate. Returns
+/// the stop of the pane's session, which runs in the background; the close
+/// button never waits for it.
+fn close_agent_chat_pane<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppStateStore,
+    pane_id: &str,
+    select: bool,
+) -> crate::checkout_claims::Stops {
+    let pane_id = pane_id.to_string();
     // Capture the chat session bound to this pane *before* the tree
     // mutation so the cleanup path still has provider + thread_id to
     // hand to `stop_session`. Without this the JSON-RPC sidecar and
@@ -599,12 +613,83 @@ pub fn agent_chat_close_pane<R: Runtime>(
     }
     // close_pane errors when the pane id is unknown — treat that as a
     // no-op to keep the command idempotent.
-    let _ = state.close_pane_with_selection(&pane_id, select.unwrap_or(true));
-    if let Some(pair) = chat_thread {
-        shutdown_agent_chat_threads(&app, vec![pair]);
+    let _ = state.close_pane_with_selection(&pane_id, select);
+    let stops = chat_thread
+        .map(|pair| shutdown_agent_chat_threads(app, vec![pair]))
+        .unwrap_or_default();
+    crate::state::emit_app_state(app);
+    stops
+}
+
+/// Closes `thread_id`'s pane as its close button does, for a controller that
+/// must know the outcome. `check` runs under the thread's dispatch lock and
+/// returns the pane to close, so nothing it verified (the caller's authority,
+/// the thread's permission mode, its live worker's) changes before the pane
+/// closes. Returns that pane once its session stopped, or `None` when the
+/// thread had none; errs when the provider did not acknowledge the stop.
+pub(crate) async fn close_thread_pane_checked<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+    check: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    feature_flag_on(&app.state::<ObservabilityStore>())?;
+    let gate = native_thread_gate(app, thread_id);
+    // As the close button does: work still being admitted gives way to the
+    // close rather than holding it up. A thread without a pane closes nothing.
+    if app.state::<AppStateStore>().agent_chat_pane_id_for_thread(thread_id).is_some() {
+        gate.cancel();
     }
-    crate::state::emit_app_state(&app);
-    Ok(())
+    let (pane, stops) = {
+        let _native_guard = gate.dispatch.clone().lock_owned().await;
+        let Some(pane) = check()? else { return Ok(None) };
+        let stops = close_agent_chat_pane(app, &app.state(), &pane, false);
+        (pane, stops)
+    };
+    // The stop takes the dispatch lock itself, so it is awaited only once
+    // the lock is released. A reopen and send after this returns cannot be
+    // stopped by it.
+    crate::checkout_claims::wait_for(stops)
+        .await
+        .map_err(|error| format!("The session did not stop: {error}"))?;
+    Ok(Some(pane))
+}
+
+/// Deletes `thread_id` for good in one critical section: its pane closes,
+/// its queued work and session stop and its history goes, all under the
+/// thread's activity and dispatch locks, so no reopen, send or resume can
+/// bind a pane or start a session in between. `check` runs first under the
+/// locks and returns the pane to close, and again before the history goes,
+/// since stopping the session waited on the provider.
+pub(crate) async fn delete_thread_checked<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: &str,
+    check: impl Fn() -> Result<Option<String>, String>,
+) -> Result<(), String> {
+    feature_flag_on(&app.state::<ObservabilityStore>())?;
+    let gate = native_thread_gate(app, thread_id);
+    gate.cancel();
+    // Same lock order as `agent_chat_stop_session_guarded`.
+    let _activity_guard = super::usage_resume::activity_lock(thread_id).lock_owned().await;
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
+    let pane = check()?;
+    if let Some(pane) = pane {
+        // Its background stop waits for these locks, then finds the session
+        // this stops below already gone.
+        close_agent_chat_pane(app, &app.state(), &pane, false);
+    }
+    // What `agent_chat_stop_session_guarded` does before its locks.
+    crate::commands::secret_requests::stop_thread(app, thread_id);
+    crate::delegation::app::user_activity(app, thread_id, true)?;
+    super::delegation::on_thread_stopped(app, thread_id, super::delegation::StopKind::Restart);
+    super::usage_resume::cancel_for_stopped_thread(app, thread_id);
+    app.state::<DatabaseStore>().stop_message_deliveries(thread_id)?;
+    // A provider no longer configured has no session to stop.
+    if let Some(implementation) = app.state::<ProviderRegistry>().get(provider).await {
+        stop_session_locked(app, implementation.as_ref(), ThreadId(thread_id.to_string())).await?;
+    }
+    check()?;
+    delete_session_locked(app, &app.state(), thread_id).await
 }
 
 // ── Dev-only harness ──────────────────────────────────────────────────
@@ -6320,7 +6405,17 @@ pub async fn agent_chat_stop_session_guarded<R: Runtime>(
     if let Some(control) = &control {
         control.verify(&app)?;
     }
-    match impl_.stop_session(thread_id.clone()).await {
+    stop_session_locked(&app, impl_.as_ref(), thread_id).await
+}
+
+/// Stops the session; the caller holds the thread's activity and dispatch
+/// locks.
+async fn stop_session_locked<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: &dyn AgentProvider,
+    thread_id: ThreadId,
+) -> Result<(), String> {
+    match provider.stop_session(thread_id.clone()).await {
         Ok(()) | Err(ProviderError::SessionNotFound { .. }) => {
             if let Some(state) = app.try_state::<NativeControlState>() {
                 state.clear_worker(&thread_id.0);
@@ -7107,6 +7202,18 @@ pub(crate) async fn open_thread_pane<R: Runtime>(
     thread_id: &str,
     select: bool,
 ) -> Result<OpenedThreadPane, String> {
+    open_thread_pane_checked(app, thread_id, select, || Ok(())).await
+}
+
+/// [`open_thread_pane`], once `check` passes after any wait for the chat's
+/// dispatch lock, so a controller's authority and the thread's permission
+/// mode are judged as they are when the pane binds.
+pub(crate) async fn open_thread_pane_checked<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+    select: bool,
+    check: impl FnOnce() -> Result<(), String>,
+) -> Result<OpenedThreadPane, String> {
     feature_flag_on(&app.state::<ObservabilityStore>())?;
     let state = app.state::<AppStateStore>();
     let db = app.state::<DatabaseStore>();
@@ -7118,6 +7225,7 @@ pub(crate) async fn open_thread_pane<R: Runtime>(
         Some(_) => None,
         None => Some(native_thread_gate(app, thread_id).dispatch.clone().lock_owned().await),
     };
+    check()?;
     let record = db
         .get_agent_chat_session(thread_id)
         .ok_or_else(|| format!("conversation_not_found: {thread_id}"))?;
@@ -7275,6 +7383,17 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     let gate = native_thread_gate(&app, &thread_id);
     gate.cancel();
     let _native_guard = gate.dispatch.clone().lock_owned().await;
+    delete_session_locked(&app, &db, &thread_id).await
+}
+
+/// [`agent_chat_delete_session`]'s work; the caller holds the thread's
+/// dispatch lock.
+async fn delete_session_locked<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &DatabaseStore,
+    thread_id: &str,
+) -> Result<(), String> {
+    let thread_id = thread_id.to_string();
     if db.hermes_binding(&thread_id)?.is_some() {
         let registry: State<'_, ProviderRegistry> = app.state();
         if let Some(provider) = registry.get(ProviderKind::Hermes).await {
