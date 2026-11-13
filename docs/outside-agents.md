@@ -421,7 +421,7 @@ These are the tool calls, in order. Every tool takes explicit ids: an outside as
      thread_respond {"workspace_id": "workspace-9", "thread_id": "8a1f…", "client_request_id": "deny-1", "request_id": "<from pending.approvals>", "decision": "deny"}
      ```
 
-     A question that holds the run until it's answered, such as Claude's AskUserQuestion or Codex's `request_user_input`, is an approval with `request_kind` `"user-input"`, not a question. Its `questions` list each question's text, options, and whether it takes several choices (`multi_select`) or its own text (`allow_other`). Answer it with `thread_respond` and `answers` instead of `decision`: one per question, in order, as text or, for a multi-select question, a list of choices. Supervised assistants can answer it.
+     A question that holds the run until it's answered, such as Claude's AskUserQuestion or Codex's `request_user_input`, is an approval with `request_kind` `"user-input"`, not a question. Its `questions` list each question's text, options, and whether it takes several choices (`multi_select`) or its own text (`allow_other`). Answer it with `thread_respond` and `answers` instead of `decision`: one per question, in order, as text or, for a multi-select question, a list of choices. Providers other than OpenCode, Cursor and Grok get a multi-select's choices as one text joined with ", ", so choices that would blur there, such as one containing ", ", fail with `invalid_arguments`; answer those in Codemux. Supervised assistants can answer it.
 
      ```text
      thread_respond {"workspace_id": "workspace-9", "thread_id": "8a1f…", "client_request_id": "pick-db-1", "request_id": "<from pending.approvals>", "answers": ["staging", ["lint", "tests"]]}

@@ -1377,12 +1377,13 @@ fn approval_questions(questions: &Value) -> Value {
 
 /// The decision that answers a user-input request, as the question card
 /// builds it: the request's own `questions` and `answers` keyed by question
-/// text, a multi-select's choices joined with ", " (OpenCode takes them as a
-/// list). Answers are checked against the questions first: one per question,
+/// text, a multi-select's choices joined with ", " (OpenCode, Cursor and Grok
+/// take them as a list, each choice whole). Answers are checked against the questions first: one per question,
 /// one choice unless it is multi-select, and only listed options unless it
 /// allows its own text.
 fn user_input_answer(provider: ProviderKind, questions: &Value, answers: Vec<Answer>) -> Result<Value, ControlError> {
     let invalid = |message: String| ControlError::new(ErrorCode::InvalidArguments, message);
+    let takes_list = matches!(provider, ProviderKind::OpenCode | ProviderKind::Cursor | ProviderKind::Grok);
     let listed = questions.as_array().filter(|questions| !questions.is_empty())
         .ok_or_else(|| invalid("This request carries no questions to answer; answer it in CodeMux".into()))?;
     if answers.len() != listed.len() {
@@ -1404,11 +1405,10 @@ fn user_input_answer(provider: ProviderKind, questions: &Value, answers: Vec<Ans
             return Err(invalid(format!("answers/{index}: \"{text}\" takes one choice")));
         }
         let options: Vec<&str> = question["options"].as_array().into_iter().flatten().filter_map(|option| option["label"].as_str()).collect();
-        // Providers other than OpenCode take a multi-select's choices as one
-        // ", "-joined text and match a whole option label before splitting
-        // it, so a choice holding ", ", or choices whose join is itself a
-        // label, would reach the worker as a different selection.
-        if choices.len() > 1 && !(provider == ProviderKind::OpenCode && multi) {
+        // The others take a multi-select's choices as one ", "-joined text,
+        // so a choice holding ", ", or choices whose join is itself a label,
+        // would reach the worker as a different selection.
+        if choices.len() > 1 && !(takes_list && multi) {
             let joined = choices.join(", ");
             if choices.iter().any(|choice| choice.contains(", ")) || options.iter().any(|label| label.eq_ignore_ascii_case(&joined)) {
                 return Err(invalid(format!("answers/{index}: these choices cannot be told apart once joined with \", \"; answer \"{text}\" in CodeMux")));
@@ -1419,7 +1419,7 @@ fn user_input_answer(provider: ProviderKind, questions: &Value, answers: Vec<Ans
                 return Err(invalid(format!("answers/{index}: \"{unknown}\" is not an option; choose one of {}", options.join(", "))));
             }
         }
-        let value = if provider == ProviderKind::OpenCode && multi { json!(choices) } else { json!(choices.join(", ")) };
+        let value = if takes_list && multi { json!(choices) } else { json!(choices.join(", ")) };
         keyed.insert(text.to_string(), value);
     }
     Ok(json!({"questions": questions, "answers": keyed}))
@@ -1738,23 +1738,26 @@ mod answer_tests {
     }
 
     /// A multi-select whose choices a ", "-join would blur is refused rather
-    /// than delivered as another selection; OpenCode takes a list, so it may.
+    /// than delivered as another selection; OpenCode, Cursor and Grok take a
+    /// list, so their choices pass whole.
     #[test]
     fn multi_select_choices_that_blur_once_joined_are_refused() {
         let questions = json!([{"question": "Which?", "multiSelect": true,
             "options": [{"label": "A"}, {"label": "B"}, {"label": "A, B"}]}]);
         for (provider, answer) in [
-            (ProviderKind::Cursor, choices(&["A", "B"])),
-            (ProviderKind::Claude, choices(&["a", "b"])),
+            (ProviderKind::Claude, choices(&["A", "B"])),
+            (ProviderKind::Codex, choices(&["a", "b"])),
             (ProviderKind::Claude, choices(&["A, B", "A"])),
         ] {
             let error = user_input_answer(provider, &questions, vec![answer]).unwrap_err();
             assert!(error.to_string().contains("cannot be told apart"), "{error}");
         }
-        let combined = user_input_answer(ProviderKind::Cursor, &questions, vec![choices(&["A, B"])]).unwrap();
+        let combined = user_input_answer(ProviderKind::Claude, &questions, vec![choices(&["A, B"])]).unwrap();
         assert_eq!(combined["answers"]["Which?"], "A, B", "one choice is the label itself");
-        let listed = user_input_answer(ProviderKind::OpenCode, &questions, vec![choices(&["A", "B"])]).unwrap();
-        assert_eq!(listed["answers"]["Which?"], json!(["A", "B"]));
+        for provider in [ProviderKind::OpenCode, ProviderKind::Cursor, ProviderKind::Grok] {
+            let listed = user_input_answer(provider, &questions, vec![choices(&["A, B", "A"])]).unwrap();
+            assert_eq!(listed["answers"]["Which?"], json!(["A, B", "A"]), "{provider:?} takes each choice whole");
+        }
         let plain = json!([{"question": "Which?", "multiSelect": true, "options": [{"label": "lint"}, {"label": "tests"}]}]);
         let joined = user_input_answer(ProviderKind::Claude, &plain, vec![choices(&["lint", "tests"])]).unwrap();
         assert_eq!(joined["answers"]["Which?"], "lint, tests");
