@@ -37,6 +37,42 @@ describe("MarkdownRendered", () => {
     expect(img!.getAttribute("src")).toBe("mock-asset:/abs/x.png");
   });
 
+  it.each([
+    ["![diagram](./assets/my%20diagram.png)", "/repo/docs/assets/my diagram.png"],
+    ["![diagram](<./assets/my diagram.png>)", "/repo/docs/assets/my diagram.png"],
+    ['<img src="./assets/my%20diagram.png" alt="diagram">', "/repo/docs/assets/my diagram.png"],
+    ["![diagram](./assets/caf%C3%A9.png)", "/repo/docs/assets/café.png"],
+    ["![diagram](./assets/100%25.png)", "/repo/docs/assets/100%.png"],
+    ["![diagram](./assets/literal%2520.png)", "/repo/docs/assets/literal%20.png"],
+    ["![diagram](/assets/my%20diagram.png)", "/assets/my diagram.png"],
+    ['<img src="./assets/100%.png">', "/repo/docs/assets/100%.png"],
+  ])("resolves encoded image filenames in %s", (content, path) => {
+    const { container } = render(
+      <MarkdownRendered content={content} filePath="/repo/docs/guide.md" />,
+    );
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(
+      `mock-asset:${path}`,
+    );
+  });
+
+  it("keeps literal percent escapes in the base file's directory", () => {
+    const { container } = render(
+      <MarkdownRendered content="![](my%20diagram.png)" filePath="/repo/literal%20/guide.md" />,
+    );
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(
+      "mock-asset:/repo/literal%20/my diagram.png",
+    );
+  });
+
+  it.each([
+    ["![](https://example.com/my%20diagram.png)", "/repo/guide.md", "https://example.com/my%20diagram.png"],
+    ["![](./my%20diagram.png)", null, "./my%20diagram.png"],
+    ["![](/my%20diagram.png)", null, "mock-asset:/my diagram.png"],
+  ])("resolves %s with base %s", (content, filePath, expected) => {
+    const { container } = render(<MarkdownRendered content={content} filePath={filePath} />);
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(expected);
+  });
+
   it("leaves remote URLs alone", () => {
     const { container } = render(
       <MarkdownRendered
