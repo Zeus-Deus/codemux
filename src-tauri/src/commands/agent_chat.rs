@@ -651,12 +651,18 @@ pub(crate) async fn close_thread_pane_checked<R: Runtime>(
                 break (pane, stops);
             }
             if activity_guard.is_some() {
+                // Replaces the claim of a stop that failed, so a confirmed
+                // stop here frees the checkout for deletion again.
+                let (mut batch, _) = crate::checkout_claims::begin_stops(vec![stop_claim_of(app, thread_id)]);
                 // A provider no longer configured has no session to stop.
-                if let Some(implementation) = app.state::<ProviderRegistry>().get(provider).await {
-                    stop_session_locked(app, implementation.as_ref(), ThreadId(thread_id.to_string()))
-                        .await
-                        .map_err(|error| format!("The session did not stop: {error}"))?;
-                }
+                let stopped = match app.state::<ProviderRegistry>().get(provider).await {
+                    Some(implementation) => {
+                        stop_session_locked(app, implementation.as_ref(), ThreadId(thread_id.to_string())).await
+                    }
+                    None => Ok(()),
+                };
+                batch.settle(thread_id, stopped.clone());
+                stopped.map_err(|error| format!("The session did not stop: {error}"))?;
                 return Ok(None);
             }
             // The pane is gone, but the stop its close began may still be
@@ -6527,17 +6533,8 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
         return delegated;
     }
     // Claimed before the spawn so a worktree deletion that starts right
-    // after this call still finds the stop and waits for it. A session that
-    // runs on a device works in the device's folder, so it claims none here.
-    let db = app.try_state::<DatabaseStore>();
-    let sessions = threads
-        .iter()
-        .map(|(_, id, _)| {
-            let session = db.as_ref().and_then(|db| db.get_agent_chat_session(id));
-            let (workspace_id, cwd) = session.map_or((None, None), |s| (Some(s.workspace_id), s.cwd));
-            (id.clone(), workspace_id, cwd.filter(|_| !session_runs_on_device(id)))
-        })
-        .collect();
+    // after this call still finds the stop and waits for it.
+    let sessions = threads.iter().map(|(_, id, _)| stop_claim_of(app, id)).collect();
     let (batch, stops) = crate::checkout_claims::begin_stops(sessions);
     let mut handle = delegated;
     handle.extend(stops);
@@ -6546,6 +6543,15 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
         stop_agent_chat_threads(&app_handle, threads, batch).await;
     });
     handle
+}
+
+/// What a stop of `thread_id` claims, for [`crate::checkout_claims::begin_stops`]:
+/// its recorded workspace and folder. A session that runs on a device works
+/// in the device's folder, so it claims none here.
+fn stop_claim_of<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> (String, Option<String>, Option<String>) {
+    let session = app.try_state::<DatabaseStore>().and_then(|db| db.get_agent_chat_session(thread_id));
+    let (workspace_id, cwd) = session.map_or((None, None), |s| (Some(s.workspace_id), s.cwd));
+    (thread_id.to_string(), workspace_id, cwd.filter(|_| !session_runs_on_device(thread_id)))
 }
 
 /// [`shutdown_agent_chat_threads`], but resolves only once every session has

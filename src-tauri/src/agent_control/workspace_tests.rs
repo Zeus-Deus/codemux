@@ -2211,7 +2211,7 @@ async fn thread_delete_waits_for_an_open_binding_a_pane() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_close_without_a_pane_settles_once_the_session_stopped() {
     use crate::agent_provider::AgentProvider;
-    let (app, provider, _root, workspace) = fixture().await;
+    let (app, provider, root, workspace) = fixture().await;
     let thread = launched(&app, "close-race-launch", &workspace, "default").await;
     let bot = connector(ControlAccess::Supervised);
 
@@ -2239,9 +2239,13 @@ async fn thread_close_without_a_pane_settles_once_the_session_stopped() {
     provider.fail_next_stop(crate::agent_provider::ProviderError::RpcError { message: "synthetic stop failure".into() });
     refused(call(&app, &bot, "thread_close", thread_args(&workspace, &thread, "close-race-fails")).await, ErrorCode::NativeControlFailed);
     assert!(pane_of(&app, &thread).is_none() && provider.has_session(&ThreadId(thread.clone())).await, "the worker survived its failed stop");
+    let checkout = PathBuf::from(app.state::<DatabaseStore>().get_agent_chat_session(&thread).unwrap().cwd.unwrap());
+    assert!(checkout.starts_with(root.path()), "{checkout:?}");
+    assert!(crate::checkout_claims::refuse_failed_in(&checkout).is_err(), "its files stay while the worker may run");
     let retried = call(&app, &bot, "thread_close", thread_args(&workspace, &thread, "close-race-3")).await.unwrap();
     assert_eq!((retried["state"].clone(), retried["closed"].clone()), (json!("succeeded"), json!(false)), "{retried}");
     assert!(!provider.has_session(&ThreadId(thread.clone())).await, "the surviving worker stopped before the close succeeded");
+    assert_eq!(crate::checkout_claims::refuse_in(&checkout, None), Ok(()), "once it stopped, its checkout may go");
 }
 
 /// An open that waited for the thread's dispatch lock is judged as things are
