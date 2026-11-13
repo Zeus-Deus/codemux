@@ -639,7 +639,8 @@ pub(crate) async fn close_thread_pane_checked<R: Runtime>(
     let gate = native_thread_gate(app, thread_id);
     // As the close button does: work still being admitted gives way to the
     // close rather than holding it up. A thread without a pane closes nothing.
-    if app.state::<AppStateStore>().agent_chat_pane_id_for_thread(thread_id).is_some() {
+    // Checked first, so a close no longer allowed cancels nobody's work.
+    if check()?.is_some() {
         gate.cancel();
     }
     let (pane, stops) = {
@@ -666,10 +667,14 @@ pub(crate) async fn close_thread_pane_checked<R: Runtime>(
                 return Ok(None);
             }
             // The pane is gone, but the stop its close began may still be
-            // running, or may have failed and left the worker up. Stop the
-            // session here under that stop's locks, in its lock order, so
-            // this settles only once no worker runs.
+            // running, or may have failed and left the worker up. Join that
+            // stop first, without the locks it needs, so it cannot run after
+            // this settles and stop a session reopened since. Then stop the
+            // session here under its locks, in its lock order, so this
+            // settles only once no worker runs. A failed earlier stop is
+            // retried below, so its error is not this close's.
             drop(native_guard);
+            let _ = crate::checkout_claims::wait_for(crate::checkout_claims::pending_stop_of(thread_id)).await;
             activity_guard = Some(super::usage_resume::activity_lock(thread_id).lock_owned().await);
             native_guard = gate.dispatch.clone().lock_owned().await;
         }
@@ -697,6 +702,8 @@ pub(crate) async fn delete_thread_checked<R: Runtime>(
 ) -> Result<(), String> {
     feature_flag_on(&app.state::<ObservabilityStore>())?;
     let gate = native_thread_gate(app, thread_id);
+    // Checked first, so a delete no longer allowed cancels nobody's work.
+    check()?;
     gate.cancel();
     // Same lock order as `agent_chat_stop_session_guarded`.
     let _activity_guard = super::usage_resume::activity_lock(thread_id).lock_owned().await;

@@ -2271,6 +2271,52 @@ async fn thread_delete_after_a_failed_stop_frees_the_checkout() {
     assert_eq!(crate::checkout_claims::refuse_in(&checkout, None), Ok(()), "once it stopped, its checkout may go");
 }
 
+/// A close that finds no pane joins an earlier close's stop that has not run
+/// yet before it stops the session itself, so that stop cannot run after
+/// this close settled and stop a session reopened since.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_close_without_a_pane_joins_an_earlier_stop_not_yet_run() {
+    use crate::agent_provider::AgentProvider;
+    let (app, provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "join-stop-launch", &workspace, "default").await;
+    app.state::<AppStateStore>().close_pane(&pane_of(&app, &thread).unwrap()).unwrap();
+    // An earlier close's stop, claimed but not yet run.
+    let (mut earlier, _) = crate::checkout_claims::begin_stops(vec![(thread.clone(), Some(workspace.clone()), None)]);
+    let closing = spawn_call(&app, &connector(ControlAccess::Supervised), "thread_close", &thread_args(&workspace, &thread, "join-stop-close"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!closing.is_finished(), "the close waits for the earlier stop");
+    assert!(provider.has_session(&ThreadId(thread.clone())).await, "and stops nothing before it");
+    earlier.settle(&thread, Ok(()));
+    let closed = closing.await.unwrap().unwrap();
+    assert_eq!((closed["state"].clone(), closed["closed"].clone()), (json!("succeeded"), json!(false)), "{closed}");
+    assert!(!provider.has_session(&ThreadId(thread.clone())).await);
+}
+
+/// A close admitted before the thread's mode rose above the caller's ceiling
+/// checks again before it cancels the thread's work, so once refused it has
+/// cancelled nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_close_refused_after_admission_cancels_nothing() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "cancel-check-launch", &workspace, "default").await;
+    let bot = connector(ControlAccess::Supervised);
+    let barrier = Arc::new(tokio::sync::Semaphore::new(0));
+    *app.state::<NativeControlState>().fixture_operation_barrier.lock().unwrap() = Some(barrier.clone());
+    let args = thread_args(&workspace, &thread, "cancel-check-close");
+    let closing = spawn_call(&app, &bot, "thread_close", &args);
+    admitted(&app, &bot, "thread_close", &args).await;
+    app.state::<DatabaseStore>().update_agent_chat_session_config(&thread, &crate::database::AgentChatSessionConfig {
+        permission_mode: Some(Some("bypassPermissions".into())),
+        ..Default::default()
+    }).unwrap();
+    let gate = app.state::<NativeControlState>().thread_gate(&thread);
+    let generation = gate.generation();
+    barrier.add_permits(1);
+    refused(closing.await.unwrap(), ErrorCode::PermissionCeiling);
+    assert_eq!(gate.generation(), generation, "the refused close cancelled no work");
+    assert!(pane_of(&app, &thread).is_some(), "the thread stays open");
+}
+
 /// An open that waited for the thread's dispatch lock is judged as things are
 /// once it holds it: a thread whose mode rose above the caller's ceiling
 /// meanwhile stays closed.
