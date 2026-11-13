@@ -230,16 +230,22 @@ async fn approvals_resolve_on_answer_and_settle_when_their_turn_ends() {
     let _ = session.shutdown().await;
 }
 
-/// Fake `codex app-server` whose turn announces a provider retry and then
-/// goes silent until it is interrupted.
+/// Fake `codex app-server` whose turn keeps announcing provider retries,
+/// every 100ms and without any other progress, until it is interrupted.
 fn retry_fixture_binary(root: &std::path::Path) -> PathBuf {
     let source = r#"#!/usr/bin/python3
-import sys,json
+import sys,json,threading,time
 from pathlib import Path
 root=Path(__ROOT__)
 if '--version' in sys.argv:
  print('codex-cli 0.162.0');sys.exit(0)
-def output(v): print(json.dumps(v),flush=True)
+lock=threading.Lock()
+stopped=threading.Event()
+def output(v):
+ with lock: print(json.dumps(v),flush=True)
+def retry_forever():
+ while not stopped.wait(0.1):
+  output({'method':'error','params':{'message':'stream disconnected','willRetry':True,'threadId':'fixture-thread'}})
 def record(v):
  with (root/'wire.jsonl').open('a') as f: f.write(json.dumps(v)+'\n')
 for line in sys.stdin:
@@ -254,7 +260,9 @@ for line in sys.stdin:
  if method=='turn/start':
   output({'method':'turn/started','params':{'threadId':'fixture-thread','turn':{'id':'turn-1','status':'inProgress'}}})
   output({'method':'error','params':{'message':'stream disconnected','willRetry':True,'threadId':'fixture-thread'}})
+  threading.Thread(target=retry_forever,daemon=True).start()
  if method=='turn/interrupt':
+  stopped.set()
   output({'method':'turn/completed','params':{'threadId':'fixture-thread','turn':{'id':'turn-1','status':'interrupted'}}})
 "#;
     let source = source.replace(

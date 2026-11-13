@@ -2788,8 +2788,16 @@ fn spawn_notifications_task(
                             }
                             match &msg {
                                 NotificationMessage::Error(e) if e.will_retry => {
+                                    // A repeat retry keeps the first deadline:
+                                    // only real progress clears the stall, so a
+                                    // provider that retries forever still fails.
                                     if let Some(stall) = RetryStall::arm(&session, e).await {
-                                        retry_stall = Some(stall);
+                                        let same_thread = retry_stall.as_ref().is_some_and(|s| {
+                                            s.codex_thread_id == stall.codex_thread_id
+                                        });
+                                        if !same_thread {
+                                            retry_stall = Some(stall);
+                                        }
                                     }
                                 }
                                 _ if retry_stall.as_ref().is_some_and(|s| s.resumed_by(&msg)) => {
@@ -2890,7 +2898,7 @@ struct RetryStall {
 }
 
 impl RetryStall {
-    /// Arm (or re-arm) for a retry on the parent thread. Sub-agent retries
+    /// Arm for a retry on the parent thread. Sub-agent retries
     /// never stall the parent.
     async fn arm(session: &CodexSession, error: &ErrorParams) -> Option<Self> {
         let state = session.state.lock().await;
