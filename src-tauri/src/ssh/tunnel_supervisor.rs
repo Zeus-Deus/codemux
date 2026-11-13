@@ -185,6 +185,11 @@ async fn run_supervisor(
             argv.join(" ")
         );
 
+        // A dead ssh can leave its -L socket file behind. Readiness is
+        // "the socket exists", so clear it first or the next attempt
+        // reports Connected before ssh has even authenticated.
+        // (StreamLocalBindUnlink lets ssh rebind the path either way.)
+        remove_stale_socket(&local_socket);
         let spawn_res = cmd.spawn();
         let mut child = match spawn_res {
             Ok(c) => {
@@ -252,6 +257,19 @@ async fn run_supervisor(
         let _ = inner.status_tx.send_replace(status);
         if !sleep_or_shutdown(delay, &mut shutdown_rx).await {
             return;
+        }
+    }
+}
+
+fn remove_stale_socket(local_socket: &Path) {
+    match std::fs::remove_file(local_socket) {
+        Ok(()) => crate::trace_cloud_push!(
+            "[tunnel-supervisor] removed stale local socket {:?}",
+            local_socket
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            eprintln!("[tunnel-supervisor] failed to remove stale socket {local_socket:?}: {error}")
         }
     }
 }
@@ -505,6 +523,57 @@ mod tests {
             reaped,
             "failed SSH must be killed and reaped before reconnecting"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_local_socket_is_not_reported_as_connected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // An ssh that never binds the forward (e.g. stuck authenticating).
+        let fake_ssh = dir.path().join("ssh");
+        std::fs::write(&fake_ssh, "#!/bin/sh\nexec /bin/sleep 300\n").unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let local_socket = dir.path().join("tunnel.sock");
+        // Left behind by a previous ssh that died.
+        std::fs::write(&local_socket, b"").unwrap();
+
+        let (status_tx, mut status_rx) = watch::channel(TunnelStatus::Pending);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let inner = Arc::new(SupervisorInner {
+            local_socket: local_socket.clone(),
+            status_tx,
+            shutdown_tx,
+            current_child: Mutex::new(None),
+        });
+        let mut cmd = Command::new(&fake_ssh);
+        cmd.kill_on_drop(true);
+        let task = tokio::spawn(run_supervisor(
+            inner,
+            "unused-host".into(),
+            "/unused/remote.sock".into(),
+            local_socket.clone(),
+            "/unused/codemux-remote".into(),
+            shutdown_rx,
+            cmd,
+        ));
+        let connected = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(*status_rx.borrow_and_update(), TunnelStatus::Connected { .. }) {
+                    return;
+                }
+                status_rx.changed().await.unwrap();
+            }
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            connected.is_err(),
+            "a stale socket file must not make the tunnel report Connected"
+        );
+        assert!(!local_socket.exists(), "stale socket must be removed before spawning ssh");
     }
 
     #[tokio::test]
