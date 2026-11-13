@@ -336,7 +336,9 @@ fn diff_shows_modifications() {
     add_and_commit(&repo, "diff.txt", "line1\nline2\n", "add");
     write_file(&repo, "diff.txt", "line1\nchanged\nline3\n");
 
-    let diff = git_diff(&repo, "diff.txt", false).expect("diff");
+    let result = git_diff(&repo, "diff.txt", false).expect("diff");
+    assert!(!result.truncated);
+    let diff = result.diff;
     assert!(diff.contains("+changed") || diff.contains("+line3"), "diff should show additions: {}", diff);
     assert!(diff.contains("-line2"), "diff should show deletions: {}", diff);
 }
@@ -353,8 +355,8 @@ fn diff_staged_vs_unstaged() {
     // Make another unstaged change
     write_file(&repo, "sv.txt", "unstaged-change\n");
 
-    let staged_diff = git_diff(&repo, "sv.txt", true).expect("staged diff");
-    let unstaged_diff = git_diff(&repo, "sv.txt", false).expect("unstaged diff");
+    let staged_diff = git_diff(&repo, "sv.txt", true).expect("staged diff").diff;
+    let unstaged_diff = git_diff(&repo, "sv.txt", false).expect("unstaged diff").diff;
 
     assert!(staged_diff.contains("staged-change"), "staged diff: {}", staged_diff);
     assert!(unstaged_diff.contains("unstaged-change"), "unstaged diff: {}", unstaged_diff);
@@ -366,7 +368,9 @@ fn diff_unchanged_file_returns_empty() {
     let (_dir, repo) = create_test_repo();
     add_and_commit(&repo, "clean.txt", "content", "add");
 
-    let diff = git_diff(&repo, "clean.txt", false).expect("diff");
+    let result = git_diff(&repo, "clean.txt", false).expect("diff");
+    assert!(!result.truncated);
+    let diff = result.diff;
     assert!(diff.is_empty(), "unchanged file should have empty diff, got: {}", diff);
 }
 
@@ -1149,7 +1153,9 @@ fn base_branch_file_diff_returns_content() {
     run_git(&local, &["add", "init.txt"]);
     commit(&local, "modify file");
 
-    let diff = git_diff_base_branch_file(&local, &base, "init.txt").expect("file diff");
+    let result = git_diff_base_branch_file(&local, &base, "init.txt").expect("file diff");
+    assert!(!result.truncated);
+    let diff = result.diff;
     assert!(!diff.is_empty());
     assert!(diff.contains("changed content"));
 }
