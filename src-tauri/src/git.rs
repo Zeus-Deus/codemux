@@ -3036,8 +3036,18 @@ pub fn git_create_worktree(
             run_git(repo_path, &["worktree", "add", &path_str, branch])?;
         }
     }
+    refresh_new_worktree_index(&worktree_path);
 
     Ok(path_str)
+}
+
+/// Refreshes a new worktree's index once. `git worktree add` writes the
+/// index in the same instant as the files, so git cannot trust their stat
+/// data and every status read re-hashes them; Codemux's background reads
+/// skip the refresh that would fix it (see [`git_command`]). Best effort:
+/// a failure only costs that hashing.
+pub(crate) fn refresh_new_worktree_index(worktree: &Path) {
+    let _ = run_git_full(worktree, &["update-index", "-q", "--refresh"]);
 }
 
 /// Dirty/unpushed guard shared by `git_remove_worktree` (its

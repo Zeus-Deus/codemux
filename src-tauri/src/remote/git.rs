@@ -334,6 +334,7 @@ pub fn create_worktree(
     } else {
         run_git(&repo_root, &["worktree", "add", path_str.as_str(), branch])?;
     }
+    crate::git::refresh_new_worktree_index(&worktree_path);
 
     Ok(CreatedWorktree {
         worktree_path,
