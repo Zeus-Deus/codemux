@@ -713,10 +713,17 @@ pub(crate) async fn delete_thread_checked<R: Runtime>(
     super::delegation::on_thread_stopped(app, thread_id, super::delegation::StopKind::Restart);
     super::usage_resume::cancel_for_stopped_thread(app, thread_id);
     app.state::<DatabaseStore>().stop_message_deliveries(thread_id)?;
+    // Replaces the claim of the pane close's background stop, or of an
+    // earlier stop that failed, so a confirmed stop here frees the checkout
+    // for deletion; a failed one keeps it claimed.
+    let (mut batch, _) = crate::checkout_claims::begin_stops(vec![stop_claim_of(app, thread_id)]);
     // A provider no longer configured has no session to stop.
-    if let Some(implementation) = app.state::<ProviderRegistry>().get(provider).await {
-        stop_session_locked(app, implementation.as_ref(), ThreadId(thread_id.to_string())).await?;
-    }
+    let stopped = match app.state::<ProviderRegistry>().get(provider).await {
+        Some(implementation) => stop_session_locked(app, implementation.as_ref(), ThreadId(thread_id.to_string())).await,
+        None => Ok(()),
+    };
+    batch.settle(thread_id, stopped.clone());
+    stopped?;
     check()?;
     delete_session_locked(app, &app.state(), thread_id).await
 }

@@ -2248,6 +2248,29 @@ async fn thread_close_without_a_pane_settles_once_the_session_stopped() {
     assert_eq!(crate::checkout_claims::refuse_in(&checkout, None), Ok(()), "once it stopped, its checkout may go");
 }
 
+/// A delete after a close whose stop failed stops the surviving worker and
+/// frees its checkout, as a retried close does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_delete_after_a_failed_stop_frees_the_checkout() {
+    use crate::agent_provider::AgentProvider;
+    let (app, provider, root, workspace) = fixture().await;
+    let thread = launched(&app, "delete-fail-launch", &workspace, "default").await;
+    provider.fail_next_stop(crate::agent_provider::ProviderError::RpcError { message: "synthetic stop failure".into() });
+    refused(
+        call(&app, &connector(ControlAccess::Supervised), "thread_close", thread_args(&workspace, &thread, "delete-fail-close")).await,
+        ErrorCode::NativeControlFailed,
+    );
+    assert!(pane_of(&app, &thread).is_none() && provider.has_session(&ThreadId(thread.clone())).await, "the worker survived its failed stop");
+    let checkout = PathBuf::from(app.state::<DatabaseStore>().get_agent_chat_session(&thread).unwrap().cwd.unwrap());
+    assert!(checkout.starts_with(root.path()), "{checkout:?}");
+    assert!(crate::checkout_claims::refuse_failed_in(&checkout).is_err(), "its files stay while the worker may run");
+    let deleted = call(&app, &connector(ControlAccess::FullAccess), "thread_delete", thread_args(&workspace, &thread, "delete-fail-delete")).await.unwrap();
+    assert_eq!(deleted["deleted"], true, "{deleted}");
+    assert!(!provider.has_session(&ThreadId(thread.clone())).await, "the delete stopped the surviving worker");
+    assert!(app.state::<DatabaseStore>().get_agent_chat_session(&thread).is_none());
+    assert_eq!(crate::checkout_claims::refuse_in(&checkout, None), Ok(()), "once it stopped, its checkout may go");
+}
+
 /// An open that waited for the thread's dispatch lock is judged as things are
 /// once it holds it: a thread whose mode rose above the caller's ceiling
 /// meanwhile stays closed.
