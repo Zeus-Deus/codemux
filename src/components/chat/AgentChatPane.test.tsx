@@ -296,13 +296,13 @@ vi.mock("./Composer", async (importOriginal) => {
     onModeActivate: (mode: "plan" | "ask" | "debug") => void;
     onModelChange: (model: string) => void;
     onProviderModelChange: (
-      provider: "claude" | "codex" | "cursor" | "grok" | "opencode" | "hermes",
+      provider: "claude" | "codex" | "cursor" | "grok" | "antigravity" | "opencode" | "hermes",
       model: string,
     ) => void;
     onContextWindowChange: (contextWindow: string) => void;
     onServiceTierChange?: (serviceTier: string) => void;
     onPermissionModeChange: (mode: string) => void;
-    provider: "claude" | "codex" | "cursor" | "grok" | "opencode" | "hermes" | "acp";
+    provider: "claude" | "codex" | "cursor" | "grok" | "antigravity" | "opencode" | "hermes" | "acp";
     threadId?: string | null;
     providerCliInstalled?: boolean | null;
     providerAuthenticated?: boolean | null;

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::errors::ProviderError;
 use super::types::ProviderKind;
+use crate::agent_provider::antigravity;
 use crate::agent_provider::claude;
 use crate::agent_provider::codex;
 use crate::agent_provider::grok;
@@ -66,6 +67,7 @@ pub fn provider_login_command(provider: ProviderKind) -> Option<&'static str> {
         ProviderKind::Codex => Some("codex login"),
         ProviderKind::Cursor => Some("cursor-agent login"),
         ProviderKind::Grok => Some("grok login --device-auth"),
+        ProviderKind::Antigravity => Some("agy acp --login"),
         ProviderKind::OpenCode => Some("opencode auth login"),
         ProviderKind::Hermes | ProviderKind::Acp => None,
     }
@@ -85,7 +87,11 @@ pub fn provider_install_command(provider: ProviderKind) -> Option<&'static str> 
         ProviderKind::OpenCode => Some("npm install -g opencode-ai"),
         #[cfg(not(windows))]
         ProviderKind::OpenCode => Some("curl -fsSL https://opencode.ai/install | bash"),
-        ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Hermes | ProviderKind::Acp => None,
+        ProviderKind::Cursor
+        | ProviderKind::Grok
+        | ProviderKind::Antigravity
+        | ProviderKind::Hermes
+        | ProviderKind::Acp => None,
     }
 }
 
@@ -144,6 +150,7 @@ pub async fn check_provider_health(provider: ProviderKind) -> ProviderHealthRepo
         ProviderKind::Codex => check_codex_health().await,
         ProviderKind::Cursor => check_cursor_health().await,
         ProviderKind::Grok => check_grok_health().await,
+        ProviderKind::Antigravity => check_antigravity_health().await,
         ProviderKind::Hermes => ProviderHealthReport::warning(ProviderKind::Hermes, None, "Select an existing Hermes profile to probe its official ACP runtime. Configure credentials and ACP dependencies in Hermes.".into()),
         ProviderKind::Acp => ProviderHealthReport::warning(ProviderKind::Acp, None, "Select a custom ACP agent. Test its configured executable in Agent settings; there is no family-wide runtime to probe.".into()),
         ProviderKind::OpenCode => check_opencode_health().await,
@@ -459,6 +466,54 @@ fn grok_report_from_probe(
                 ),
             )
         }
+    }
+}
+
+// ── Antigravity ─────────────────────────────────────────────────────
+
+async fn check_antigravity_health() -> ProviderHealthReport {
+    let binary = match which::which("agy") {
+        Ok(path) => path,
+        Err(_) => {
+            return ProviderHealthReport::error(
+                ProviderKind::Antigravity,
+                false,
+                "Antigravity CLI (`agy`) is not installed or not on PATH.".into(),
+            )
+        }
+    };
+    antigravity_report_from_probe(antigravity::capabilities::probe_antigravity_health(&binary).await)
+}
+
+fn antigravity_report_from_probe(
+    result: Result<
+        antigravity::capabilities::AntigravityHealthProbe,
+        antigravity::capabilities::HarvestError,
+    >,
+) -> ProviderHealthReport {
+    use antigravity::capabilities::HarvestError;
+    let signed_out = |version| {
+        ProviderHealthReport::signed_out(
+            ProviderKind::Antigravity,
+            version,
+            "Antigravity is not signed in. Run `agy acp --login` to sign in with Google, then try again."
+                .into(),
+        )
+    };
+    match result {
+        Ok(probe) if probe.authenticated => {
+            ProviderHealthReport::ready(ProviderKind::Antigravity, probe.version)
+        }
+        Ok(probe) => signed_out(probe.version),
+        Err(HarvestError::NotAuthenticated { .. }) => signed_out(None),
+        Err(HarvestError::NotInstalled { hint }) => {
+            ProviderHealthReport::error(ProviderKind::Antigravity, false, hint)
+        }
+        Err(HarvestError::HarvestFailed { message }) => ProviderHealthReport::error(
+            ProviderKind::Antigravity,
+            true,
+            format!("Antigravity CLI is installed but `agy acp` failed to start. ({message})"),
+        ),
     }
 }
 

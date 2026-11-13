@@ -32,7 +32,7 @@ const SECTION_KEYWORDS: Partial<Record<Section, string>> = {
   notifications: "alerts sounds",
   shortcuts: "keyboard keybinds keybindings hotkeys bindings",
   workflows: "orchestration parallel agents subagents /workflow planner",
-  providers: "agents claude codex cursor grok opencode hermes acp accounts chatgpt sign in install",
+  providers: "agents claude codex cursor grok antigravity gemini opencode hermes acp accounts chatgpt sign in install",
   // Each section's former page name still finds it.
   agent: "agent ai models defaults behaviour",
   interface: "interface agent chat gui classic cli mode",

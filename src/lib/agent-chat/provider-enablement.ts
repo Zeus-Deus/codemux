@@ -14,7 +14,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 export const DISABLED_PROVIDERS_SETTING = "providers.disabled";
 
 const KNOWN: ReadonlySet<AgentChatProviderKind> = new Set<AgentChatProviderKind>([
-  "claude", "codex", "cursor", "grok", "hermes", "acp", "opencode",
+  "claude", "codex", "cursor", "grok", "antigravity", "hermes", "acp", "opencode",
 ]);
 
 export function parseDisabledProviders(raw: string | undefined): ReadonlySet<AgentChatProviderKind> {
@@ -38,7 +38,7 @@ export function isProviderEnabled(provider: AgentChatProviderKind): boolean {
  *  so there is always an enabled default to fall back to. Kept in step with
  *  `NEW_CHAT_DEFAULT_PROVIDERS`, which imports from here. */
 export const DEFAULT_CAPABLE_PROVIDERS: readonly AgentChatProviderKind[] = [
-  "claude", "codex", "cursor", "grok", "opencode",
+  "claude", "codex", "cursor", "grok", "antigravity", "opencode",
 ];
 
 /** Whether turning `provider` off would leave no provider a new chat can

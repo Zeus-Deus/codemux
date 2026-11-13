@@ -2,7 +2,7 @@ import { codemuxToolName, launchedChatId } from "@/lib/agent-chat/codemux-tool-p
 import { openDelegatedChat } from "./delegation-actions";
 import { isWorkspaceLaunchCall, workspaceLaunchFailed } from "@/lib/agent-chat/workspace-launch";
 import { Kbd } from "@/components/ui/kbd";
-import { HermesPermissionOptions, isHermesPermission, hermesPermissionAllowed } from "./HermesPermissionOptions";
+import { HermesPermissionOptions, isExactOptionPermission, hermesPermissionAllowed } from "./HermesPermissionOptions";
 import { memo, useEffect, useId, useMemo, useRef, useState, type ComponentType } from "react";
 import {
   Check,
@@ -275,7 +275,7 @@ export const ToolCallCard = memo(function ToolCallCard({
           stale text from a prior denial leaks into the next prompt. */}
       {isPendingApproval &&
         approval &&
-        (isHermesPermission(approval.payload) ? (
+        (isExactOptionPermission(approval.payload) ? (
           <HermesPermissionOptions
             key={approval.request_id}
             payload={approval.payload}
@@ -382,6 +382,10 @@ function ApprovalFooter({
   // they do support instead of rules that would silently do nothing.
   const provider = useChatProvider();
   const claudeRules = provider === null || provider === "claude";
+  // Antigravity's own "allow always" can outlive the chat, and Codemux
+  // answers a session-wide allow there as a single allow, so it only
+  // offers Allow and Deny.
+  const offersAllowAlways = provider !== "antigravity";
 
   // Take keyboard focus only when nothing else holds it. A focused
   // composer, even an empty one, is where the user is about to type, and
@@ -466,7 +470,7 @@ function ApprovalFooter({
     // the menu's own navigation and typeahead.
     if (menuOpen || denying || e.metaKey || e.ctrlKey || e.altKey) return;
     const key = e.key.toLowerCase();
-    if (key === "a") {
+    if (key === "a" && offersAllowAlways) {
       e.preventDefault();
       setMenuOpen(true);
     } else if (key === "d") {
@@ -506,6 +510,7 @@ function ApprovalFooter({
           >
             Allow
           </Button>
+          {offersAllowAlways && (
           <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
             <DropdownMenuTrigger asChild>
               <Button
@@ -549,6 +554,7 @@ function ApprovalFooter({
               )}
             </DropdownMenuContent>
           </DropdownMenu>
+          )}
           <Button
             type="button"
             variant="ghost"
@@ -562,7 +568,7 @@ function ApprovalFooter({
             data-testid="approval-key-hints"
             className="ml-auto hidden text-caption text-subtle-foreground group-focus-within/approval:inline"
           >
-            <Kbd>↵</Kbd> allow · <Kbd>A</Kbd> always · <Kbd>D</Kbd> deny
+            <Kbd>↵</Kbd> allow{offersAllowAlways && <> · <Kbd>A</Kbd> always</>} · <Kbd>D</Kbd> deny
           </span>
         </div>
       ) : (

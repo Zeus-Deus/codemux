@@ -40,6 +40,7 @@ import {
   selectProviderCapabilitiesLoaded,
   shouldRefreshCursorCapabilities,
   shouldRefreshGrokCapabilities,
+  shouldRefreshAntigravityCapabilities,
   useProviderCapabilities,
 } from "./provider-capabilities-store";
 import {
@@ -109,7 +110,7 @@ function resetStore() {
       claude: emptyHealthSlot(),
       codex: emptyHealthSlot(),
       cursor: emptyHealthSlot(),
-      grok: emptyHealthSlot(),
+      grok: emptyHealthSlot(), antigravity: emptyHealthSlot(),
       hermes: emptyHealthSlot(),
       acp: emptyHealthSlot(),
       opencode: emptyHealthSlot(),
@@ -231,6 +232,7 @@ describe("provider-capabilities-store", () => {
       codex: null,
       cursor: null,
       grok: null,
+      antigravity: null,
       opencode: null,
     });
   });
@@ -578,6 +580,23 @@ describe("grok capability polling", () => {
     expect(shouldRefreshGrokCapabilities(report(false))).toBe(false);
     expect(shouldRefreshGrokCapabilities(report(true))).toBe(true);
     expect(shouldRefreshGrokCapabilities(null)).toBe(true);
+  });
+});
+
+describe("antigravity capability polling", () => {
+  it("skips discovery while Antigravity is missing or signed out", () => {
+    const report = (installed: boolean, login_command: string | null = null) => ({
+      provider: "antigravity" as const,
+      status: installed && !login_command ? ("ready" as const) : ("error" as const),
+      installed,
+      message: null,
+      version: null,
+      login_command,
+    });
+    expect(shouldRefreshAntigravityCapabilities(report(false))).toBe(false);
+    expect(shouldRefreshAntigravityCapabilities(report(true, "agy acp --login"))).toBe(false);
+    expect(shouldRefreshAntigravityCapabilities(report(true))).toBe(true);
+    expect(shouldRefreshAntigravityCapabilities(null)).toBe(true);
   });
 });
 

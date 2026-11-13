@@ -34,13 +34,15 @@ function projectionProviderForChat(
     case "codex":
     case "opencode":
       return provider;
-    // Cursor and Grok have no native SKILL.md inventory. The backend feeds
-    // both the portable `.agents/skills` / Codex projection.
+    // Cursor, Grok and Antigravity get no native SKILL.md inventory from
+    // Codemux. The backend feeds them the portable `.agents/skills` / Codex
+    // projection.
     case "acp":
     case "hermes":
       return null;
     case "cursor":
     case "grok":
+    case "antigravity":
       return "codex";
   }
 }

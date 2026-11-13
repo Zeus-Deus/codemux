@@ -62,7 +62,7 @@ beforeEach(() => {
   useProviderHealth.setState({
     slots: {
       claude: emptyHealthSlot(), codex: emptyHealthSlot(), cursor: emptyHealthSlot(),
-      grok: emptyHealthSlot(), hermes: emptyHealthSlot(), acp: emptyHealthSlot(),
+      grok: emptyHealthSlot(), antigravity: emptyHealthSlot(), hermes: emptyHealthSlot(), acp: emptyHealthSlot(),
       opencode: emptyHealthSlot(),
     },
   });
@@ -546,7 +546,7 @@ describe("ChatHomeLanding", () => {
         claude: READY,
         codex: SIGNED_OUT("codex"),
         cursor: MISSING,
-        grok: MISSING,
+        grok: MISSING, antigravity: MISSING,
         opencode: READY,
       };
       mockProbe.mockImplementation(async (provider: AgentChatProviderKind) => ({
@@ -579,7 +579,7 @@ describe("ChatHomeLanding", () => {
 
     it("sums up what can run in one line once every probe has answered", async () => {
       await renderWithAgents("opencode");
-      expect(mockProbe).toHaveBeenCalledTimes(5);
+      expect(mockProbe).toHaveBeenCalledTimes(6);
       expect(mockProbe).not.toHaveBeenCalledWith("hermes");
       expect(screen.getByTestId("agent-status-line")).toHaveTextContent(
         "OpenCode and Claude Code are ready·Codex needs sign-in·Set up",
@@ -645,12 +645,12 @@ describe("ChatHomeLanding", () => {
         await claude;
       });
       expect(screen.getByTestId("agent-status-line")).toHaveTextContent(
-        "Codex and 3 more are ready",
+        "Codex and 4 more are ready",
       );
     });
 
     it("calls an agent it can't verify installed, and keeps the composer", async () => {
-      health = { claude: UNVERIFIED, codex: MISSING, cursor: MISSING, grok: MISSING, opencode: MISSING };
+      health = { claude: UNVERIFIED, codex: MISSING, cursor: MISSING, grok: MISSING, antigravity: MISSING, opencode: MISSING };
       await renderWithAgents();
       expect(screen.queryByTestId("connect-agent")).toBeNull();
       expect(screen.getByTestId("composer")).toBeInTheDocument();
@@ -659,7 +659,7 @@ describe("ChatHomeLanding", () => {
     });
 
     it("names only ready agents when some are ready and others unverified", async () => {
-      health = { claude: UNVERIFIED, codex: READY, cursor: MISSING, grok: MISSING, opencode: MISSING };
+      health = { claude: UNVERIFIED, codex: READY, cursor: MISSING, grok: MISSING, antigravity: MISSING, opencode: MISSING };
       await renderWithAgents();
       expect(screen.getByTestId("agent-status-line")).toHaveTextContent("Codex is ready·Set up");
     });
@@ -670,7 +670,7 @@ describe("ChatHomeLanding", () => {
           claude: SIGNED_OUT("claude"),
           codex: MISSING,
           cursor: MISSING,
-          grok: MISSING,
+          grok: MISSING, antigravity: MISSING,
           opencode: MISSING,
         };
       });
@@ -740,13 +740,13 @@ describe("ChatHomeLanding", () => {
         vi.useFakeTimers({ toFake: ["Date"] });
         await renderWithAgents();
         expect(screen.getByTestId("connect-agent")).toBeInTheDocument();
-        expect(mockProbe).toHaveBeenCalledTimes(5);
+        expect(mockProbe).toHaveBeenCalledTimes(6);
 
         // Too soon after the last answer: no CLI spawned.
         await act(async () => {
           window.dispatchEvent(new Event("focus"));
         });
-        expect(mockProbe).toHaveBeenCalledTimes(5);
+        expect(mockProbe).toHaveBeenCalledTimes(6);
 
         health = { ...health, claude: READY };
         vi.setSystemTime(Date.now() + 11_000);
@@ -754,7 +754,7 @@ describe("ChatHomeLanding", () => {
           window.dispatchEvent(new Event("focus"));
         });
         await flush();
-        expect(mockProbe).toHaveBeenCalledTimes(10);
+        expect(mockProbe).toHaveBeenCalledTimes(12);
         expect(screen.queryByTestId("connect-agent")).toBeNull();
         expect(screen.getByTestId("composer")).toBeInTheDocument();
         expect(screen.getByTestId("agent-status-line")).toHaveTextContent("Claude Code is ready");
@@ -762,11 +762,11 @@ describe("ChatHomeLanding", () => {
 
       it("re-checks straight away when opened again over a no-agent answer", async () => {
         const first = await renderWithAgents();
-        expect(mockProbe).toHaveBeenCalledTimes(5);
+        expect(mockProbe).toHaveBeenCalledTimes(6);
         first.unmount();
         health = { ...health, opencode: READY };
         await renderWithAgents();
-        expect(mockProbe).toHaveBeenCalledTimes(10);
+        expect(mockProbe).toHaveBeenCalledTimes(12);
         expect(screen.queryByTestId("connect-agent")).toBeNull();
       });
 

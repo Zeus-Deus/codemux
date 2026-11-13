@@ -714,6 +714,11 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(std::sync::Arc::new(
             crate::agent_provider::grok::capabilities::GrokCapabilityCache::new(),
         ))
+        // Antigravity lists the models a Google account may use only inside
+        // a signed-in ACP session; the cache holds the last discovery.
+        .manage(std::sync::Arc::new(
+            crate::agent_provider::antigravity::capabilities::AntigravityCapabilityCache::new(),
+        ))
         // ACP command catalogues arrive from a live session update, and from
         // initialize metadata on agents that publish it there. The command IPC
         // and every running ACP session share this cache so the composer sees
@@ -1508,6 +1513,19 @@ fn build_core_app<R: tauri::Runtime>(
                             );
                         registry
                             .set_grok(std::sync::Arc::new(grok) as _)
+                            .await;
+
+                        // Google Antigravity (`agy acp`), spawned the same way.
+                        let antigravity =
+                            agent_provider::antigravity::AntigravityAgentProvider::new_with_slash_command_cache(
+                                agent_provider::antigravity::AntigravityProviderConfig {
+                                    mcp_registry: Some(mcp_registry.clone()),
+                                    ..Default::default()
+                                },
+                                acp_slash_commands.inner().clone(),
+                            );
+                        registry
+                            .set_antigravity(std::sync::Arc::new(antigravity) as _)
                             .await;
 
                         let hermes = std::sync::Arc::new(agent_provider::hermes::HermesProvider::new_with_mcp_registry(

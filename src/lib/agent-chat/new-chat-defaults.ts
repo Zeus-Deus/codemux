@@ -35,6 +35,7 @@ export const AUTOMATIC_PROVIDER_ORDER: ReadonlyArray<AgentChatProviderKind> = [
   "opencode",
   "cursor",
   "grok",
+  "antigravity",
 ];
 
 /** Whether a probe found the CLI installed but signed out of its own

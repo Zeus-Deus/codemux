@@ -127,7 +127,7 @@ async fn harvest_initialize(
     cwd: &Path,
 ) -> Result<Option<Value>, String> {
     match dialect {
-        AcpDialect::Cursor => Ok(None),
+        AcpDialect::Cursor | AcpDialect::Antigravity => Ok(None),
         AcpDialect::Grok => crate::agent_provider::grok::capabilities::harvest_grok_initialize(
             binary_path,
             Some(cwd.to_path_buf()),

@@ -27,6 +27,10 @@ export const CURSOR_CAPABILITY_REFRESH_MS =
  *  cadence as Cursor's live ACP catalogue. */
 export const GROK_CAPABILITY_REFRESH_MS = CURSOR_CAPABILITY_REFRESH_MS;
 
+/** Antigravity lists the models a Google account may use only inside a
+ *  signed-in session, so the same bounded cadence applies. */
+export const ANTIGRAVITY_CAPABILITY_REFRESH_MS = CURSOR_CAPABILITY_REFRESH_MS;
+
 /** Whether a repeat Cursor re-harvest is worth issuing.
  *
  *  A machine without the CLI has no catalog to refresh, and the probe
@@ -47,6 +51,14 @@ export function shouldRefreshGrokCapabilities(
   return health?.installed !== false;
 }
 
+/** Antigravity's discovery also needs a Google sign-in, so a definite
+ *  "signed out" skips the spawn too until the user signs in. */
+export function shouldRefreshAntigravityCapabilities(
+  health: ProviderHealthReport | null,
+): boolean {
+  return health?.installed !== false && !health?.login_command;
+}
+
 /** Applies the installed-binary guard for the CLI-owned catalogs when a
  *  picker reopens past its re-harvest window. Providers whose catalogs are
  *  release-bundled have nothing to spawn, so they are always allowed. */
@@ -56,6 +68,9 @@ function shouldReharvestCapabilities(
   const health = useProviderHealth.getState().slots[provider]?.report ?? null;
   if (provider === "cursor") return shouldRefreshCursorCapabilities(health);
   if (provider === "grok") return shouldRefreshGrokCapabilities(health);
+  if (provider === "antigravity") {
+    return shouldRefreshAntigravityCapabilities(health);
+  }
   return true;
 }
 
@@ -64,6 +79,7 @@ interface ProviderCapabilitiesStore {
   codex: ProviderChatCapabilities | null;
   cursor: ProviderChatCapabilities | null;
   grok: ProviderChatCapabilities | null;
+  antigravity: ProviderChatCapabilities | null;
   /** Step 12 Stage 3 — slot for OpenCode's live model harvest. Stays
    *  `null` until `refresh("opencode")` resolves. Failure surfaces in
    *  `opencodeError`; the slot itself stays `null` so the picker can
@@ -73,6 +89,7 @@ interface ProviderCapabilitiesStore {
   codexError: string | null;
   cursorError: string | null;
   grokError: string | null;
+  antigravityError: string | null;
   opencodeError: string | null;
   /** Per-provider request lifecycle. `true` means the latest refresh settled,
    *  whether it returned models, an empty catalog, or an error. */
@@ -119,6 +136,7 @@ const INTENT_REHARVEST_INTERVAL_MS: Partial<
 > = {
   cursor: CURSOR_CAPABILITY_REFRESH_MS,
   grok: GROK_CAPABILITY_REFRESH_MS,
+  antigravity: ANTIGRAVITY_CAPABILITY_REFRESH_MS,
   hermes: Infinity,
 };
 export const PROVIDER_CAPABILITIES_STORAGE_KEY =
@@ -131,11 +149,13 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
       codex: null,
       cursor: null,
       grok: null,
+      antigravity: null,
       opencode: null,
       claudeError: null,
       codexError: null,
       cursorError: null,
       grokError: null,
+      antigravityError: null,
       opencodeError: null,
       loadedProviders: {},
       accountCatalogs: {},
@@ -225,6 +245,7 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
         codex: state.codex,
         cursor: state.cursor,
         grok: state.grok,
+        antigravity: state.antigravity,
         opencode: state.opencode,
       }),
     },
@@ -247,7 +268,7 @@ export function refreshProviderCapabilitiesForIntent(
   if (provider === "acp") return Promise.resolve(); // Explicit per-instance probe only.
   const healthRefresh = useProviderHealth.getState().refresh(provider).then(() => {});
   const lastRefresh = providerIntentRefreshedAt.get(provider);
-  // The Cursor and Grok catalogs are owned by their installed CLIs and used
+  // The Cursor, Grok and Antigravity catalogs are owned by their installed CLIs and used
   // to refresh on an app-level timer. Capability startup is now intent-driven,
   // so reopening a picker after that cadence becomes the bounded reharvest
   // trigger. Other providers retain their original once-per-renderer intent
@@ -308,11 +329,13 @@ export function resetProviderCapabilities(): void {
     codex: null,
     cursor: null,
     grok: null,
+    antigravity: null,
     opencode: null,
     claudeError: null,
     codexError: null,
     cursorError: null,
     grokError: null,
+    antigravityError: null,
     opencodeError: null,
     loadedProviders: {},
   });
@@ -351,6 +374,8 @@ export function selectCapabilities(
       return null; // Hermes catalogs are profile-scoped, never a singleton.
     case "grok":
       return state.grok;
+    case "antigravity":
+      return state.antigravity;
     case "opencode":
       return state.opencode;
   }
@@ -373,6 +398,8 @@ export function selectError(
       return null;
     case "grok":
       return state.grokError;
+    case "antigravity":
+      return state.antigravityError;
     case "opencode":
       return state.opencodeError;
   }
@@ -430,6 +457,8 @@ function storeOk(
       return { cursor: caps, cursorError: null };
     case "grok":
       return { grok: caps, grokError: null };
+    case "antigravity":
+      return { antigravity: caps, antigravityError: null };
     case "opencode":
       return { opencode: caps, opencodeError: null };
   }
@@ -452,6 +481,8 @@ function storeErr(
       return { cursorError: message };
     case "grok":
       return { grokError: message };
+    case "antigravity":
+      return { antigravityError: message };
     case "opencode":
       return { opencodeError: message };
   }

@@ -42,12 +42,21 @@ const PROMPT_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 /// terminal-update fallback still exists after this conservative delay.
 const XAI_TERMINAL_RESPONSE_GRACE: Duration = RPC_TIMEOUT;
 const DISPATCHING_TURN_SUFFIX: &str = "dispatching-turn";
+/// Antigravity's `oauth-personal` method opens the system browser when the
+/// machine is not signed in and only answers once Google redirects back, so
+/// the request has to outlive the usual RPC watchdog.
+const ANTIGRAVITY_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// The only Antigravity method that uses the account the user signed in to
+/// with `agy`; API-key and Vertex methods bill differently, so Codemux never
+/// switches to them on its own.
+pub(crate) const ANTIGRAVITY_AUTH_METHOD: &str = "oauth-personal";
 
 /// Provider-specific ACP behavior layered over the shared session engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AcpDialect {
     Cursor,
     Grok,
+    Antigravity,
 }
 
 impl AcpDialect {
@@ -55,6 +64,7 @@ impl AcpDialect {
         match self {
             Self::Cursor => ProviderKind::Cursor,
             Self::Grok => ProviderKind::Grok,
+            Self::Antigravity => ProviderKind::Antigravity,
         }
     }
 
@@ -62,6 +72,7 @@ impl AcpDialect {
         match self {
             Self::Cursor => "Cursor",
             Self::Grok => "Grok",
+            Self::Antigravity => "Antigravity",
         }
     }
 
@@ -69,12 +80,13 @@ impl AcpDialect {
         match self {
             Self::Cursor => "cursor",
             Self::Grok => "grok",
+            Self::Antigravity => "antigravity",
         }
     }
 
-    fn spawn_args(self) -> Vec<String> {
+    pub(crate) fn spawn_args(self) -> Vec<String> {
         match self {
-            Self::Cursor => vec!["acp".into()],
+            Self::Cursor | Self::Antigravity => vec!["acp".into()],
             // Disable the CLI's own background updater inside a managed GUI
             // process. The user's PATH-level package manager remains the
             // authority for upgrades and newly released models.
@@ -89,7 +101,7 @@ impl AcpDialect {
 
     fn default_permission_mode(self) -> &'static str {
         match self {
-            Self::Cursor | Self::Grok => "agent",
+            Self::Cursor | Self::Grok | Self::Antigravity => "agent",
         }
     }
 
@@ -97,11 +109,16 @@ impl AcpDialect {
         self == Self::Grok
     }
 
+    fn is_antigravity(self) -> bool {
+        self == Self::Antigravity
+    }
+
     /// Registry sources this agent already loads from its own config.
     fn native_mcp_sources(self) -> &'static [crate::mcp::McpConfigSource] {
         match self {
             Self::Cursor => super::mcp::CURSOR_NATIVE_SOURCES,
             Self::Grok => super::mcp::GROK_NATIVE_SOURCES,
+            Self::Antigravity => super::mcp::ANTIGRAVITY_NATIVE_SOURCES,
         }
     }
 }
@@ -225,6 +242,9 @@ struct AcpQuestionOption {
 enum UserInputDialect {
     Cursor,
     XAi,
+    /// A question Antigravity asks through `session/request_permission`;
+    /// the answer is the chosen permission option.
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -316,6 +336,12 @@ pub(crate) struct AcpSessionState {
     /// update. This can differ from the requested value after defaults or
     /// provider policy are applied.
     grok_effort: Option<String>,
+    /// Antigravity's own session mode as last reported or set; enforced
+    /// against `permission_mode` before every prompt.
+    antigravity_native_mode: Option<String>,
+    /// Bumped by every native mode report, so a mode Codemux set never
+    /// replaces a report that arrived while that request was in flight.
+    antigravity_native_revision: u64,
 }
 
 // Authority rejection is local to an undispatched input, not a provider failure.
@@ -416,6 +442,9 @@ pub(crate) struct AcpSession {
     interrupt_notify: Notify,
     xai_prompt_completion: Mutex<Option<XAiPromptCompletion>>,
     stopped: AtomicBool,
+    /// Serializes Antigravity session-mode changes, so a correction can
+    /// neither race the user's own mode change nor a prompt's dispatch.
+    mode_lock: Mutex<()>,
 }
 
 impl AcpSession {
@@ -563,14 +592,31 @@ impl AcpSession {
                         },
                     )?
                 }
+                AcpDialect::Antigravity => {
+                    if !advertises_auth_method(&initialized, ANTIGRAVITY_AUTH_METHOD) {
+                        return Err(ProviderError::NotAuthenticated {
+                            provider: ProviderKind::Antigravity,
+                            hint: auth_hint(dialect, device),
+                        });
+                    }
+                    ANTIGRAVITY_AUTH_METHOD.to_string()
+                }
             };
             let auth_params = if dialect.is_grok() {
                 json!({ "methodId": auth_method, "_meta": { "headless": true } })
             } else {
                 json!({ "methodId": auth_method })
             };
+            // A signed-out Antigravity opens Google sign-in in the browser
+            // and answers once it completes; a device has no browser and
+            // fails at once with the `agy acp --login` hint.
+            let auth_timeout = if dialect.is_antigravity() {
+                ANTIGRAVITY_SIGN_IN_TIMEOUT
+            } else {
+                RPC_TIMEOUT
+            };
             child
-                .request("authenticate", auth_params)
+                .request_with_timeout("authenticate", auth_params, auth_timeout)
                 .await
                 .map_err(|error| map_auth_error(error, dialect, device))?;
 
@@ -648,14 +694,26 @@ impl AcpSession {
             };
 
             let resume_id = resume_cursor.as_ref().and_then(resume_session_id);
+            // Antigravity restores a session without replaying its history
+            // through `session/resume`; `session/load` would stream the whole
+            // transcript back only for this session to drop it.
+            let restore_method = if dialect.is_antigravity()
+                && initialized
+                    .pointer("/agentCapabilities/sessionCapabilities/resume")
+                    .is_some_and(Value::is_object)
+            {
+                "session/resume"
+            } else {
+                "session/load"
+            };
             let (session_setup, provider_session_id) = if let Some(session_id) = resume_id {
                 let mut load_params = new_session_params();
                 load_params["sessionId"] = Value::String(session_id.clone());
                 match child
-                    .request("session/load", load_params)
+                    .request(restore_method, load_params)
                     .await
                 {
-                    // ACP's LoadSessionResponse deliberately omits sessionId:
+                    // ACP's Load/ResumeSessionResponse omit sessionId:
                     // the client already supplied it in the request. Keep the
                     // requested id instead of treating a standards-compliant
                     // response as a failed restart.
@@ -733,6 +791,11 @@ impl AcpSession {
                 },
                 grok_effort: grok_reasoning_effort(&setup)
                     .or_else(|| grok_reasoning_effort(&initialized)),
+                antigravity_native_mode: antigravity_mode_option(&config_options(&setup))
+                    .and_then(|option| option.get("currentValue"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                antigravity_native_revision: 0,
             }),
             cwd,
             on_device: remote.is_some(),
@@ -749,6 +812,7 @@ impl AcpSession {
             interrupt_notify: Notify::new(),
             xai_prompt_completion: Mutex::new(None),
             stopped: AtomicBool::new(false),
+            mode_lock: Mutex::new(()),
         });
         session
             .start_background_tasks(
@@ -1115,6 +1179,10 @@ impl AcpSession {
             }
             if let Some(mode) = input.permission_mode_override.clone() {
                 self.set_permission_mode(mode).await?;
+            }
+            if self.dialect.is_antigravity() {
+                // A prompt never runs in a native mode wider than the chat's.
+                self.enforce_antigravity_mode().await?;
             }
             Ok::<(), ProviderError>(())
         }
@@ -1801,7 +1869,26 @@ impl AcpSession {
             }
             state.pending.remove(&request_id).ok_or_else(|| ProviderError::RequestNotPending {request_id:request_id.clone()})?
         };
-        let response = pending_response(&pending, &decision);
+        // Antigravity's "allow always" can outlive the chat as a rule in the
+        // user's own settings. A generic allow (including "for this session")
+        // therefore only ever selects "allow once"; a wider grant needs the
+        // exact advertised option.
+        let (response, decision) = match (&pending, &decision) {
+            (
+                PendingRequest::Permission { options, .. },
+                ApprovalDecision::Allow { .. } | ApprovalDecision::AllowForSession,
+            ) if self.dialect.is_antigravity() => {
+                match select_permission_option(options, &["allow_once"]) {
+                    Some(option_id) => (
+                        json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
+                        ApprovalDecision::Allow { updated_input: None, updated_permissions: None },
+                    ),
+                    // Recorded as what went over the wire, not as an allow.
+                    None => (json!({ "outcome": { "outcome": "cancelled" } }), ApprovalDecision::Cancel),
+                }
+            }
+            _ => (pending_response(&pending, &decision), decision),
+        };
         // The wire needs the exact opaque option ID. Native transcript/UI
         // consumers need its logical scope, not Hermes' ProviderOption event.
         let event_decision = match (&pending, &decision) {
@@ -1910,14 +1997,128 @@ impl AcpSession {
             .mcp
             .as_ref()
             .map(|mcp| mcp.session.authority.policy_transition());
-        // `mode` is a stable ACP config option. Cursor's current values are
-        // Agent/Ask; resolve through the advertised options when available.
-        self.set_semantic_config(ConfigKind::Mode, &mode, true)
-            .await?;
+        // Held until the new policy is committed below, so an Antigravity
+        // correction never sees the new native mode with the old policy.
+        let _serial = match self.dialect {
+            AcpDialect::Antigravity => Some(self.mode_lock.lock().await),
+            _ => None,
+        };
+        if self.dialect.is_antigravity() {
+            self.set_antigravity_mode(antigravity_native_mode(&mode)).await?;
+        } else {
+            // `mode` is a stable ACP config option. Cursor's current values
+            // are Agent/Ask; resolve through the advertised options.
+            self.set_semantic_config(ConfigKind::Mode, &mode, true)
+                .await?;
+        }
         if let Some(mcp) = &self.mcp {
             mcp.session.set_mode(Some(mode.clone()));
         }
         self.state.lock().await.permission_mode = mode;
+        if self.dialect.is_antigravity() {
+            // A report that arrived during the switch was judged against the
+            // old policy; judge the newest native mode against the new one.
+            if let Err(error) = self.correct_antigravity_mode().await {
+                let _ = self.interrupt(None).await;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Follow a mode switch Antigravity made itself (its `/mode` command, or
+    /// finishing a plan). The chat's permission mode stays the user's choice
+    /// and is never rewritten from here; a native mode wider than it allows
+    /// is switched back right away, and checked again before every prompt.
+    async fn apply_antigravity_native_mode(self: &Arc<Self>, native: &str) {
+        let needs_correction = {
+            let mut state = self.state.lock().await;
+            state.antigravity_native_mode = Some(native.to_string());
+            state.antigravity_native_revision += 1;
+            antigravity_required_mode(native, &state.permission_mode).is_some()
+        };
+        if !needs_correction {
+            return;
+        }
+        // Not awaited here: this runs on the notification pump, which must
+        // keep draining while the RPC is in flight.
+        let session = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = session.enforce_antigravity_mode().await {
+                // The running turn must not continue unchecked. The next
+                // prompt enforces the mode again before it is sent.
+                session.warn(
+                    format!("Antigravity left the chat's permission mode and could not be switched back ({error}); stopping the turn."),
+                    None,
+                );
+                let _ = session.interrupt(None).await;
+            }
+        });
+    }
+
+    /// Put Antigravity back in the native mode the chat's permission mode
+    /// requires, judged against the newest state under `mode_lock`, so a
+    /// stale correction never undoes a later choice. A failure is returned
+    /// to the caller: a prompt is then not sent.
+    async fn enforce_antigravity_mode(&self) -> Result<(), ProviderError> {
+        let _serial = self.mode_lock.lock().await;
+        self.correct_antigravity_mode().await
+    }
+
+    /// The body of [`Self::enforce_antigravity_mode`], for callers that
+    /// already hold `mode_lock`.
+    async fn correct_antigravity_mode(&self) -> Result<(), ProviderError> {
+        let target = {
+            let state = self.state.lock().await;
+            state
+                .antigravity_native_mode
+                .as_deref()
+                .and_then(|native| antigravity_required_mode(native, &state.permission_mode))
+        };
+        match target {
+            Some(target) => self.set_antigravity_mode(target).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Switch Antigravity to one of its own session modes, through the mode
+    /// config option when the session advertises one and the standard
+    /// `session/set_mode` otherwise. A mode the agent does not offer is an
+    /// error rather than a silent no-op, so Ask first never runs wider.
+    async fn set_antigravity_mode(&self, native: &str) -> Result<(), ProviderError> {
+        let (option, revision) = {
+            let state = self.state.lock().await;
+            let option = antigravity_mode_option(&state.config_options).and_then(|option| {
+                let id = option.get("id")?.as_str()?.to_string();
+                Some((id, resolve_select_value(option, native)))
+            });
+            (option, state.antigravity_native_revision)
+        };
+        match option {
+            Some((id, Some(value))) => self.set_config(&id, Value::String(value)).await?,
+            Some((_, None)) => {
+                return Err(ProviderError::ValidationError {
+                    message: format!("Antigravity does not offer the `{native}` session mode"),
+                })
+            }
+            None => {
+                self.child
+                    .request(
+                        "session/set_mode",
+                        json!({ "sessionId": self.provider_session_id.0, "modeId": native }),
+                    )
+                    .await
+                    .map_err(|error| map_rpc_error(error, self.dialect))?;
+            }
+        }
+        #[cfg(test)]
+        antigravity_test_gate::hold_commit(self, revision).await;
+        // A report that arrived meanwhile is newer than this acknowledgement;
+        // keep it, so enforcement compares against what Antigravity runs in.
+        let mut state = self.state.lock().await;
+        if state.antigravity_native_revision == revision {
+            state.antigravity_native_mode = Some(native.to_string());
+        }
         Ok(())
     }
 
@@ -1951,6 +2152,25 @@ impl AcpSession {
     }
 
     async fn set_effort_config(&self, requested: &str) -> Result<(), ProviderError> {
+        if self.dialect.is_antigravity() {
+            // One session-wide thinking-level select; it has no on/off
+            // toggle, so the Cursor thinking handling below does not apply.
+            let resolved = {
+                let state = self.state.lock().await;
+                crate::agent_provider::antigravity::capabilities::effort_option(&state.config_options)
+                    .and_then(|option| {
+                        let id = option.get("id")?.as_str()?.to_string();
+                        Some((id, resolve_effort_value(option, requested)))
+                    })
+            };
+            return match resolved {
+                None => Ok(()),
+                Some((id, Some(value))) => self.set_config(&id, Value::String(value)).await,
+                Some((_, None)) => Err(ProviderError::ValidationError {
+                    message: format!("Antigravity does not offer thinking level `{requested}`"),
+                }),
+            };
+        }
         if self.dialect.is_grok() {
             let model = self.state.lock().await.model.clone().ok_or_else(|| {
                 ProviderError::ValidationError {
@@ -2070,6 +2290,14 @@ impl AcpSession {
     }
 
     async fn handle_permission_request(&self, request: IncomingRequest) {
+        // Antigravity sends its questions through the permission method.
+        // Their options are answers, not approvals, so Full access must not
+        // pick one for the user.
+        if self.dialect.is_antigravity() {
+            if let Some((questions, payload)) = antigravity_question(&request.params) {
+                return self.open_antigravity_question(request, questions, payload).await;
+            }
+        }
         let options = request
             .params
             .get("options")
@@ -2077,10 +2305,22 @@ impl AcpSession {
             .cloned()
             .unwrap_or_default();
         let full_access = self.state.lock().await.permission_mode == "agent";
-        if full_access {
-            let outcome = select_permission_option(&options, &["allow_always", "allow_once"])
+        // Antigravity's "allow always" can outlive this chat as a rule in the
+        // user's own Antigravity settings, so Full access only ever answers
+        // "allow once"; a request without one goes to the user instead.
+        let auto_answer = if !full_access {
+            None
+        } else if self.dialect.is_antigravity() {
+            select_permission_option(&options, &["allow_once"])
                 .map(|option_id| json!({ "outcome": "selected", "optionId": option_id }))
-                .unwrap_or_else(|| json!({ "outcome": "cancelled" }));
+        } else {
+            Some(
+                select_permission_option(&options, &["allow_always", "allow_once"])
+                    .map(|option_id| json!({ "outcome": "selected", "optionId": option_id }))
+                    .unwrap_or_else(|| json!({ "outcome": "cancelled" })),
+            )
+        };
+        if let Some(outcome) = auto_answer {
             let _ = self
                 .child
                 .respond(request.id, Ok(json!({ "outcome": outcome })))
@@ -2118,12 +2358,61 @@ impl AcpSession {
             .get("toolCallId")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let mut payload = request.params;
+        // Without an "allow once" choice a generic Allow cannot be honoured,
+        // so the UI shows Antigravity's own options and sends the exact one.
+        if self.dialect.is_antigravity() && !antigravity_offers_allow_once(&payload) {
+            payload["_codemuxExactOptions"] = Value::Bool(true);
+        }
         let _ = self.event_tx.send(ProviderRuntimeEvent::RequestOpened {
             thread_id: self.thread_id.clone(),
             turn_id,
             request_id: request_id.clone(),
             request_kind: "tool_approval".into(),
-            payload: request.params,
+            payload,
+            tool_use_id,
+            subagent_id: None,
+        });
+        let _ = self
+            .event_tx
+            .send(ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: self.thread_id.clone(),
+                status: SessionStatus::WaitingApproval { request_id },
+            });
+    }
+
+    async fn open_antigravity_question(
+        &self,
+        request: IncomingRequest,
+        questions: Vec<AcpQuestion>,
+        payload: Value,
+    ) {
+        let request_id = RequestId(self.opaque_id("question"));
+        let tool_use_id = questions.first().map(|question| question.id.clone());
+        let turn_id = {
+            let mut state = self.state.lock().await;
+            state.pending.insert(
+                request_id.clone(),
+                PendingRequest::UserInput {
+                    rpc_id: request.id,
+                    questions,
+                    dialect: UserInputDialect::Antigravity,
+                },
+            );
+            state.status = SessionStatus::WaitingApproval {
+                request_id: request_id.clone(),
+            };
+            state
+                .active_turn
+                .clone()
+                .unwrap_or_else(|| TurnId(format!("{}-turn-unknown", self.dialect.id_prefix())))
+        };
+        let _ = self.event_tx.send(ProviderRuntimeEvent::RequestOpened {
+            thread_id: self.thread_id.clone(),
+            turn_id,
+            request_id: request_id.clone(),
+            request_kind: "user-input".into(),
+            payload,
             tool_use_id,
             subagent_id: None,
         });
@@ -2352,7 +2641,7 @@ impl AcpSession {
             });
     }
 
-    async fn handle_notification(&self, notification: Notification) {
+    async fn handle_notification(self: &Arc<Self>, notification: Notification) {
         match notification.method.as_str() {
             "session/update" => self.handle_session_update(notification.params).await,
             "x.ai/session/prompt_complete" | "_x.ai/session/prompt_complete"
@@ -2423,7 +2712,7 @@ impl AcpSession {
         }
     }
 
-    async fn handle_session_update(&self, params: Value) {
+    async fn handle_session_update(self: &Arc<Self>, params: Value) {
         let update = params.get("update").unwrap_or(&params);
         let kind = update
             .get("sessionUpdate")
@@ -2455,6 +2744,12 @@ impl AcpSession {
                 .or_else(|| update.get("modeId"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            if self.dialect.is_antigravity() {
+                if let Some(native) = mode {
+                    self.apply_antigravity_native_mode(&native).await;
+                }
+                return;
+            }
             if let Some(mcp) = &self.mcp {
                 mcp.session.set_mode(mode.clone());
             }
@@ -2463,7 +2758,21 @@ impl AcpSession {
             }
             return;
         }
-        if kind == "config_option_update" {
+        if kind == "config_option_update" && self.dialect.is_antigravity() {
+            // The update carries the whole option set: a model switch can
+            // change the thinking levels on offer.
+            let options = config_options(update);
+            let native = antigravity_mode_option(&options)
+                .and_then(|option| option.get("currentValue"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if !options.is_empty() {
+                self.state.lock().await.config_options = options;
+            }
+            if let Some(native) = native {
+                self.apply_antigravity_native_mode(&native).await;
+            }
+        } else if kind == "config_option_update" {
             for option in config_options(update) {
                 if option.get("id").and_then(Value::as_str) == Some("mode")
                     || option.get("category").and_then(Value::as_str) == Some("mode")
@@ -3224,6 +3533,11 @@ fn pending_response(pending: &PendingRequest, decision: &ApprovalDecision) -> Va
             dialect: UserInputDialect::XAi,
             ..
         } => xai_question_response(questions, decision),
+        PendingRequest::UserInput {
+            questions,
+            dialect: UserInputDialect::Antigravity,
+            ..
+        } => antigravity_question_response(questions, decision),
         PendingRequest::Plan {
             dialect: PlanRequestDialect::Cursor,
             ..
@@ -3278,6 +3592,39 @@ fn new_session_setup(
 
 fn loaded_session_setup(response: Value, requested_session_id: String) -> (Value, String) {
     (response, requested_session_id)
+}
+
+/// Antigravity's session mode for a Codemux permission mode. Its ACP server
+/// offers `default`, `accept-edits`, `auto` and `plan` and has no mode that
+/// skips approval, so Full access keeps `default` and Codemux answers each
+/// permission request itself (see `handle_permission_request`).
+fn antigravity_native_mode(mode: &str) -> &'static str {
+    match mode {
+        "plan" => "plan",
+        _ => "default",
+    }
+}
+
+/// Antigravity's session-mode option. Matched exactly: a looser name match
+/// would also hit the `Model` option.
+fn antigravity_mode_option(options: &[Value]) -> Option<&Value> {
+    options.iter().find(|option| {
+        option.get("id").and_then(Value::as_str) == Some("mode")
+            || option.get("category").and_then(Value::as_str) == Some("mode")
+    })
+}
+
+/// The native mode Antigravity must be switched to for the chat's `mode`,
+/// or `None` when `native` already fits. Full access accepts any native mode.
+/// Ask first allows `default` and the narrower `plan`, never `accept-edits`
+/// or `auto`, which run edits (and some commands) without asking. Plan stays
+/// in `plan` until the user leaves it, as the Plan pill shows.
+fn antigravity_required_mode(native: &str, mode: &str) -> Option<&'static str> {
+    match mode {
+        "agent" => None,
+        "plan" => (native != "plan").then_some("plan"),
+        _ => (!matches!(native, "default" | "plan")).then_some("default"),
+    }
 }
 
 fn base_model_id(model: &str) -> &str {
@@ -3501,6 +3848,107 @@ fn xai_questions(params: &Value) -> (Vec<AcpQuestion>, Value) {
         }));
     }
     (questions, json!({ "questions": ui_questions }))
+}
+
+fn antigravity_offers_allow_once(params: &Value) -> bool {
+    params
+        .get("options")
+        .and_then(Value::as_array)
+        .is_some_and(|options| select_permission_option(options, &["allow_once"]).is_some())
+}
+
+/// An Antigravity question asked through `session/request_permission`: its
+/// tool call id starts with `interaction_` and each option is one answer.
+/// Malformed forms (no options, blank or duplicate ids) fall back to the
+/// ordinary approval path, which can only cancel them.
+fn antigravity_question(params: &Value) -> Option<(Vec<AcpQuestion>, Value)> {
+    let tool_call = params.get("toolCall")?;
+    let id = tool_call
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .filter(|id| id.starts_with("interaction_"))?;
+    let prompt = tool_call
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or("Choose an option.");
+    let mut options = Vec::new();
+    for option in params.get("options")?.as_array()? {
+        let option_id = option
+            .get("optionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())?;
+        if options.iter().any(|known: &AcpQuestionOption| known.id == option_id) {
+            return None;
+        }
+        let label = option
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(option_id);
+        options.push(AcpQuestionOption {
+            id: option_id.to_string(),
+            label: label.to_string(),
+        });
+    }
+    if options.is_empty() {
+        return None;
+    }
+    let payload = json!({ "questions": [{
+        "id": id,
+        "header": "Question",
+        "question": prompt,
+        "multiSelect": false,
+        // The answer must be one of the advertised option ids.
+        "allowOther": false,
+        "options": options.iter().map(|option| json!({
+            "label": option.label,
+            "description": ""
+        })).collect::<Vec<_>>(),
+    }]});
+    Some((
+        vec![AcpQuestion {
+            id: id.to_string(),
+            prompt: prompt.to_string(),
+            options,
+        }],
+        payload,
+    ))
+}
+
+fn antigravity_question_response(questions: &[AcpQuestion], decision: &ApprovalDecision) -> Value {
+    let cancelled = json!({ "outcome": { "outcome": "cancelled" } });
+    let (
+        Some(question),
+        ApprovalDecision::Allow {
+            updated_input: Some(input),
+            ..
+        },
+    ) = (questions.first(), decision)
+    else {
+        return cancelled;
+    };
+    let answer = input
+        .pointer("/answers")
+        .and_then(|answers| answers.get(&question.id).or_else(|| answers.get(&question.prompt)))
+        .and_then(Value::as_str)
+        .map(str::trim);
+    let option = answer.and_then(|answer| {
+        question
+            .options
+            .iter()
+            .find(|option| option.id == answer)
+            .or_else(|| {
+                let mut matches = question.options.iter().filter(|option| option.label == answer);
+                matches.next().filter(|_| matches.next().is_none())
+            })
+    });
+    match option {
+        Some(option) => json!({ "outcome": { "outcome": "selected", "optionId": option.id } }),
+        None => cancelled,
+    }
 }
 
 fn cursor_question_response(questions: &[AcpQuestion], decision: &ApprovalDecision) -> Value {
@@ -3779,6 +4227,7 @@ fn map_spawn_error(error: RpcChildError, dialect: AcpDialect) -> ProviderError {
                     AcpDialect::Grok => {
                         "Install the official Grok CLI and ensure `grok` is on PATH.".into()
                     }
+                    AcpDialect::Antigravity => ANTIGRAVITY_INSTALL_HINT.into(),
                 },
             }
         }
@@ -3802,7 +4251,30 @@ fn auth_hint(dialect: AcpDialect, device: Option<&str>) -> String {
         (AcpDialect::Grok, Some(device)) => format!(
             "Run `grok login --device-auth` on {device} (or set `XAI_API_KEY` there) and try again."
         ),
+        (AcpDialect::Antigravity, None) => ANTIGRAVITY_SIGN_IN_HINT.into(),
+        (AcpDialect::Antigravity, Some(device)) => {
+            format!("Run `agy acp --login` on {device} and try again.")
+        }
     }
+}
+
+/// Shown wherever Codemux finds no `agy` to launch.
+pub(crate) const ANTIGRAVITY_INSTALL_HINT: &str =
+    "Install the Antigravity CLI and ensure `agy` is on PATH.";
+/// Shown wherever Antigravity refuses to start a session for lack of a
+/// Google sign-in. `agy acp --login` stores the same credentials the ACP
+/// server reads; the interactive `agy` sign-in does too.
+pub(crate) const ANTIGRAVITY_SIGN_IN_HINT: &str =
+    "Run `agy acp --login` in a terminal to sign in with Google, then try again.";
+
+/// Whether `initialize` advertised `method_id` among its `authMethods`.
+pub(crate) fn advertises_auth_method(initialize: &Value, method_id: &str) -> bool {
+    initialize
+        .get("authMethods")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|method| method.get("id").and_then(Value::as_str) == Some(method_id))
 }
 
 /// How to install the agent CLI on a device.
@@ -3813,6 +4285,9 @@ fn device_install_hint(dialect: AcpDialect, device: &str) -> String {
             format!("Install Cursor Agent on {device} and run `cursor-agent login` there")
         }
         AcpDialect::Grok => format!("Install the Grok CLI on {device} and sign in there"),
+        AcpDialect::Antigravity => format!(
+            "Install the Antigravity CLI on {device} and run `agy acp --login` there"
+        ),
     }
 }
 
@@ -3822,7 +4297,12 @@ fn map_auth_error(
     device: Option<&str>,
 ) -> ProviderError {
     let message = error.to_string();
-    if looks_unauthenticated(&message) {
+    // Antigravity has no headless sign-in: every rejected or unfinished
+    // `authenticate` (no browser, cancelled, timed out) means "not signed
+    // in". Its own message names `agy acp --login` only for this computer.
+    let antigravity_sign_in = dialect.is_antigravity()
+        && matches!(error, RpcChildError::RpcError(_) | RpcChildError::Timeout { .. });
+    if antigravity_sign_in || looks_unauthenticated(&message) {
         ProviderError::NotAuthenticated {
             provider: dialect.provider(),
             hint: auth_hint(dialect, device),
@@ -3941,6 +4421,31 @@ async fn failed_drain_locked_test_schedule(thread: &ThreadId, drained: &[String]
         // Hold the already-existing state lock, allowing real Stop to queue
         // its FIFO acquisition. No post-drain cancellation point is added.
         barrier.release.acquire().await.unwrap().forget();
+    }
+}
+
+/// Holds a chosen session's Antigravity mode commit until a newer native
+/// report has been applied, to pin the interleaving a regression test needs.
+#[cfg(test)]
+pub(crate) mod antigravity_test_gate {
+    use super::*;
+
+    static HELD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    pub(crate) fn hold_mode_commits_for(thread: &str) {
+        *HELD.lock().unwrap() = Some(thread.to_string());
+    }
+
+    pub(super) async fn hold_commit(session: &AcpSession, revision: u64) {
+        if HELD.lock().unwrap().as_deref() != Some(session.thread_id.0.as_str()) {
+            return;
+        }
+        for _ in 0..400 {
+            if session.state.lock().await.antigravity_native_revision != revision {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 
@@ -4814,6 +5319,8 @@ mod tests {
             context: ContextUsageTracker::default(),
             grok_model_efforts: GrokModelEffortCatalog::default(),
             grok_effort: None,
+            antigravity_native_mode: None,
+            antigravity_native_revision: 0,
         }
     }
 
@@ -4888,6 +5395,100 @@ mod tests {
             }),
             json!({"outcome": {"outcome": "rejected", "reason": "Revise it"}})
         );
+    }
+
+    fn antigravity_question_request() -> Value {
+        json!({
+            "sessionId": "s1",
+            "toolCall": { "toolCallId": "interaction_7", "title": "Which database?" },
+            "options": [
+                { "optionId": "opt-pg", "name": "Postgres", "kind": "allow_once" },
+                { "optionId": "opt-sqlite", "name": "SQLite", "kind": "allow_once" }
+            ]
+        })
+    }
+
+    #[test]
+    fn antigravity_interaction_requests_become_single_choice_questions() {
+        let (questions, payload) = antigravity_question(&antigravity_question_request()).unwrap();
+        assert_eq!(questions[0].id, "interaction_7");
+        assert_eq!(payload["questions"][0]["question"], "Which database?");
+        assert_eq!(payload["questions"][0]["allowOther"], false);
+        assert_eq!(payload["questions"][0]["options"][1]["label"], "SQLite");
+
+        // Ordinary approvals and malformed forms stay approvals.
+        let mut approval = antigravity_question_request();
+        approval["toolCall"]["toolCallId"] = json!("call_1");
+        assert!(antigravity_question(&approval).is_none());
+        let mut duplicate = antigravity_question_request();
+        duplicate["options"][1]["optionId"] = json!("opt-pg");
+        assert!(antigravity_question(&duplicate).is_none());
+        let mut empty = antigravity_question_request();
+        empty["options"] = json!([]);
+        assert!(antigravity_question(&empty).is_none());
+    }
+
+    #[test]
+    fn antigravity_answers_select_the_exact_option_or_cancel() {
+        let (questions, _) = antigravity_question(&antigravity_question_request()).unwrap();
+        let answer = |value: &str| ApprovalDecision::Allow {
+            updated_input: Some(json!({ "answers": { "interaction_7": value } })),
+            updated_permissions: None,
+        };
+        assert_eq!(
+            antigravity_question_response(&questions, &answer("SQLite")),
+            json!({ "outcome": { "outcome": "selected", "optionId": "opt-sqlite" } })
+        );
+        assert_eq!(
+            antigravity_question_response(&questions, &answer("opt-pg")),
+            json!({ "outcome": { "outcome": "selected", "optionId": "opt-pg" } })
+        );
+        for decision in [answer("MySQL"), ApprovalDecision::Cancel, ApprovalDecision::AllowForSession] {
+            assert_eq!(
+                antigravity_question_response(&questions, &decision),
+                json!({ "outcome": { "outcome": "cancelled" } })
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_modes_never_widen_codemux_permissions() {
+        assert_eq!(antigravity_native_mode("agent"), "default");
+        assert_eq!(antigravity_native_mode("ask"), "default");
+        assert_eq!(antigravity_native_mode("plan"), "plan");
+        assert_eq!(antigravity_required_mode("auto", "agent"), None);
+        assert_eq!(antigravity_required_mode("default", "ask"), None);
+        assert_eq!(antigravity_required_mode("plan", "ask"), None);
+        // Wider native modes under Ask first go back; Plan stays planning.
+        assert_eq!(antigravity_required_mode("accept-edits", "ask"), Some("default"));
+        assert_eq!(antigravity_required_mode("auto", "ask"), Some("default"));
+        assert_eq!(antigravity_required_mode("default", "plan"), Some("plan"));
+        assert_eq!(antigravity_required_mode("accept-edits", "plan"), Some("plan"));
+        // A Model option listed first must not be taken for the mode option.
+        let options = [
+            json!({ "id": "model", "name": "Model", "category": "model", "type": "select" }),
+            json!({ "id": "mode", "name": "Mode", "category": "mode", "type": "select" }),
+        ];
+        assert_eq!(antigravity_mode_option(&options).unwrap()["id"], "mode");
+    }
+
+    #[test]
+    fn antigravity_sign_in_failures_ask_for_agy_login() {
+        let refused = RpcChildError::RpcError(RpcError {
+            code: -32603,
+            message: "No browser is available here".into(),
+            data: None,
+        });
+        match map_auth_error(refused, AcpDialect::Antigravity, Some("box")) {
+            ProviderError::NotAuthenticated { provider, hint } => {
+                assert_eq!(provider, ProviderKind::Antigravity);
+                assert!(hint.contains("agy acp --login") && hint.contains("box"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let initialize = json!({ "authMethods": [{ "id": "oauth-personal", "name": "Google" }] });
+        assert!(advertises_auth_method(&initialize, ANTIGRAVITY_AUTH_METHOD));
+        assert!(!advertises_auth_method(&initialize, "gemini-api-key"));
     }
 }
 

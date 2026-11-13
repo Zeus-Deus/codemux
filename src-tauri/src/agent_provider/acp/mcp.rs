@@ -28,6 +28,10 @@ pub const GROK_NATIVE_SOURCES: &[McpConfigSource] = &[
     McpConfigSource::CursorProject,
 ];
 
+/// Antigravity reads only its own `~/.gemini` MCP config, which is not a
+/// Codemux registry source, so the gateway delivers every registry server.
+pub const ANTIGRAVITY_NATIVE_SOURCES: &[McpConfigSource] = &[];
+
 /// Hosts an agent must reach directly: the gateway listens on loopback.
 const LOOPBACK_HOSTS: &str = "127.0.0.1,localhost,::1";
 
@@ -310,11 +314,12 @@ impl ChatMcp {
             gateway: Default::default(),
         }
     }
-    /// Cursor, Grok and custom ACP agents run one process per chat, so their
-    /// shell can carry this chat's credential for `codemux mcp-call`.
+    /// Cursor, Grok, Antigravity and custom ACP agents run one process per
+    /// chat, so their shell can carry this chat's credential for
+    /// `codemux mcp-call`.
     fn shell_fallback(&self) -> bool {
         use crate::agent_provider::ProviderKind::*;
-        matches!(self.session.caller().provider, Cursor | Grok | Acp)
+        matches!(self.session.caller().provider, Cursor | Grok | Antigravity | Acp)
     }
     /// Agents that never reached the gateway get a one-line hint toward the
     /// CLI fallback while collaboration is on. Slash commands stay untouched.

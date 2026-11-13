@@ -42,6 +42,7 @@ const PROVIDER_KINDS: readonly string[] = [
   "codex",
   "cursor",
   "grok",
+  "antigravity",
   "hermes",
   "opencode",
 ] satisfies AgentChatProviderKind[];

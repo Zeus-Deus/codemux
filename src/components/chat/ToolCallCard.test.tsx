@@ -379,6 +379,52 @@ describe("ToolCallCard", () => {
     expect(onDecide).toHaveBeenCalledTimes(1);
   });
 
+  it("offers Antigravity only Allow and Deny, never a lasting allow", () => {
+    render(
+      <ChatProviderContext.Provider value="antigravity">
+        <ToolCallCard
+          item={makeTool({ approval_request_id: "req-agy" })}
+          approval={makePendingApproval({ request_id: "req-agy" })}
+          onDecide={vi.fn()}
+        />
+      </ChatProviderContext.Provider>,
+    );
+    expect(screen.getByRole("button", { name: "Allow" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Deny" })).toBeTruthy();
+    expect(screen.queryByText("Allow always")).toBeNull();
+    // A has no menu to open, so it neither swallows D nor is advertised.
+    expect(screen.getByTestId("approval-key-hints").textContent).not.toContain("always");
+    fireEvent.keyDown(screen.getByText("Allow"), { key: "a" });
+    fireEvent.keyDown(screen.getByText("Allow"), { key: "d" });
+    expect(screen.getByPlaceholderText("Reason (optional)")).toBeTruthy();
+  });
+
+  it("shows Antigravity's own options when it offers no one-time approval", async () => {
+    const user = userEvent.setup();
+    const onDecide = vi.fn();
+    const payload = {
+      _codemuxExactOptions: true,
+      toolCall: { toolCallId: "call_2", title: "Fetch a URL" },
+      options: [
+        { optionId: "always", name: "Allow always", kind: "allow_always" },
+        { optionId: "reject", name: "Deny", kind: "reject_once" },
+      ],
+    };
+    render(
+      <ChatProviderContext.Provider value="antigravity">
+        <ToolCallCard
+          item={makeTool({ approval_request_id: "req-lasting" })}
+          approval={makePendingApproval({ request_id: "req-lasting", payload })}
+          onDecide={onDecide}
+        />
+      </ChatProviderContext.Provider>,
+    );
+    expect(screen.queryByRole("button", { name: "Allow" })).toBeNull();
+    expect(screen.getByText(/can be saved in the agent’s own settings/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Allow always" }));
+    expect(onDecide).toHaveBeenCalledWith({ decision: "provider_option", option_id: "always" });
+  });
+
   it("Deny reveals the reason textarea and Confirm deny ships the reason", () => {
     const onDecide = vi.fn();
     render(

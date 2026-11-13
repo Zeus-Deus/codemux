@@ -39,6 +39,7 @@ const BUILT_IN: readonly { id: AgentChatProviderKind; name: string }[] = [
   { id: "opencode", name: "OpenCode" },
   { id: "cursor", name: "Cursor" },
   { id: "grok", name: "Grok" },
+  { id: "antigravity", name: "Antigravity" },
 ];
 const PROBED: readonly AgentChatProviderKind[] = BUILT_IN.map((p) => p.id);
 
@@ -50,7 +51,8 @@ function toggleProvider(id: AgentChatProviderKind, on: boolean) {
   if (!on) useChatDraftStore.getState().applyNewChatDefaults(new Set([id]));
 }
 
-const LAST_PROVIDER_HINT = "New chats need at least one of Claude, Codex, OpenCode, Cursor or Grok.";
+const LAST_PROVIDER_HINT =
+  "New chats need at least one of Claude, Codex, OpenCode, Cursor, Grok or Antigravity.";
 
 /** Selection: a built-in provider, Hermes, a saved custom agent, or the
  *  editor for a new one. */

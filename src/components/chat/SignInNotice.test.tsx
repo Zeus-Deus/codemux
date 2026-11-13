@@ -43,6 +43,7 @@ function seedReadyClaude() {
         codex: emptyHealthSlot(),
         cursor: emptyHealthSlot(),
         grok: emptyHealthSlot(),
+        antigravity: emptyHealthSlot(),
         hermes: emptyHealthSlot(),
       acp: emptyHealthSlot(),
         opencode: emptyHealthSlot(),

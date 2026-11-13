@@ -34,7 +34,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 import type { ApprovalDecision } from "@/tauri/events";
 
 import type { StripAction, StripOccupant, StripRow } from "./ComposerStrip";
-import { isHermesPermission } from "./HermesPermissionOptions";
+import { isExactOptionPermission } from "./HermesPermissionOptions";
 import { isAccountProvider, useThreadAccount } from "./use-thread-account";
 
 /** How long the "just finished" row stays before it leaves the strip. */
@@ -645,7 +645,7 @@ export function approvalOccupant(
     const answerable =
       tool !== undefined &&
       request.request_kind !== "plan" &&
-      !isHermesPermission(request.payload);
+      !isExactOptionPermission(request.payload);
     const detail = workflow
       ? `Workflow · ${workflow.name ?? "run as a workflow"}`
       : request.request_kind === "plan"

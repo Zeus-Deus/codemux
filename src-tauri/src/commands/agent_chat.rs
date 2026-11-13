@@ -119,6 +119,7 @@ pub struct ProviderRegistry {
     codex: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     cursor: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     grok: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+    antigravity: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     hermes: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     acp: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     opencode: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
@@ -163,6 +164,11 @@ impl ProviderRegistry {
         *self.grok.write().await = Some(provider);
     }
 
+    /// Inject the Google Antigravity ACP provider.
+    pub async fn set_antigravity(&self, provider: Arc<dyn AgentProvider>) {
+        *self.antigravity.write().await = Some(provider);
+    }
+
     /// Inject the OpenCode provider. Reserved for a later stage; the
     /// Stage 1 scaffold never calls this so the slot stays `None`
     /// in production.
@@ -179,6 +185,7 @@ impl ProviderRegistry {
             ProviderKind::Codex => self.codex.read().await.clone(),
             ProviderKind::Cursor => self.cursor.read().await.clone(),
             ProviderKind::Grok => self.grok.read().await.clone(),
+            ProviderKind::Antigravity => self.antigravity.read().await.clone(),
             ProviderKind::Hermes => self.hermes.read().await.clone(),
             ProviderKind::Acp => self.acp.read().await.clone(),
             ProviderKind::OpenCode => self.opencode.read().await.clone(),
@@ -206,6 +213,9 @@ impl ProviderRegistry {
         }
         if let Some(p) = self.grok.read().await.clone() {
             out.push((ProviderKind::Grok, p));
+        }
+        if let Some(p) = self.antigravity.read().await.clone() {
+            out.push((ProviderKind::Antigravity, p));
         }
         if let Some(p) = self.opencode.read().await.clone() {
             out.push((ProviderKind::OpenCode, p));
@@ -810,9 +820,11 @@ fn ensure_provider_runs_on_devices(provider: ProviderKind) -> Result<(), String>
         ProviderKind::Acp => {
             return Err("Custom ACP agents run on this desktop's local workspaces. Connect to the target desktop to run an agent there.".into())
         }
-        ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Cursor | ProviderKind::Grok => {
-            return Ok(())
-        }
+        ProviderKind::Claude
+        | ProviderKind::Codex
+        | ProviderKind::Cursor
+        | ProviderKind::Grok
+        | ProviderKind::Antigravity => return Ok(()),
     };
     Err(format!(
         "unsupported: {name} can't run on another device yet"
@@ -1176,6 +1188,7 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
             ProviderKind::Codex => "codex",
             ProviderKind::Cursor => "cursor",
             ProviderKind::Grok => "grok",
+            ProviderKind::Antigravity => "antigravity",
             ProviderKind::Hermes => "hermes",
             ProviderKind::Acp => "acp",
             ProviderKind::OpenCode => "opencode",
@@ -1544,6 +1557,7 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
             ProviderKind::Codex => "codex",
             ProviderKind::Cursor => "cursor",
             ProviderKind::Grok => "grok",
+            ProviderKind::Antigravity => "antigravity",
             ProviderKind::Hermes => "hermes",
             ProviderKind::Acp => "acp",
             ProviderKind::OpenCode => "opencode",
@@ -2167,6 +2181,7 @@ fn stored_provider_kind(provider: &str) -> Result<ProviderKind, String> {
         "codex" => Ok(ProviderKind::Codex),
         "cursor" => Ok(ProviderKind::Cursor),
         "grok" => Ok(ProviderKind::Grok),
+        "antigravity" => Ok(ProviderKind::Antigravity),
         "hermes" => Ok(ProviderKind::Hermes),
         "acp" => Ok(ProviderKind::Acp),
         "opencode" => Ok(ProviderKind::OpenCode),
@@ -2880,6 +2895,7 @@ pub(crate) fn fallback_permission_mode(provider: ProviderKind) -> Option<&'stati
         ProviderKind::Codex => Some("danger-full-access"),
         ProviderKind::Cursor => Some("agent"),
         ProviderKind::Grok => Some("agent"),
+        ProviderKind::Antigravity => Some("agent"),
         ProviderKind::Hermes | ProviderKind::Acp => None,
         ProviderKind::OpenCode => None,
     }
@@ -2921,14 +2937,14 @@ pub(super) fn resolve_start_permission_mode(
         Some(mode) if provider == ProviderKind::Claude && mode == "danger-full-access" => {
             Some("bypassPermissions".to_string())
         }
-        // Cursor's adapter rejects an unknown mode outright, and that
-        // rejection aborts the whole start and tears the child down. A
+        // Cursor's adapter (and Antigravity's mode setter) rejects an unknown
+        // mode outright, and that rejection aborts the whole start. A
         // thread carried over from another provider (Claude's `default` /
         // `acceptEdits`, Codex's `read-only` / `workspace-write`) must
         // therefore be translated here: full-access strings become Cursor's
         // `agent`, and anything else degrades to its ask-first mode rather
         // than silently widening permissions.
-        Some(mode) if provider == ProviderKind::Cursor => Some(
+        Some(mode) if matches!(provider, ProviderKind::Cursor | ProviderKind::Antigravity) => Some(
             match mode.as_str() {
                 "bypassPermissions" | "danger-full-access" => "agent",
                 "agent" | "ask" | "plan" => mode.as_str(),
@@ -3354,8 +3370,8 @@ fn skill_provider_for(provider: ProviderKind) -> crate::skills::SkillProvider {
         // `.agents/skills` projection; selected bodies are inlined into the
         // ACP prompt exactly as they are for the other providers.
         ProviderKind::Cursor => crate::skills::SkillProvider::Codex,
-        // Grok also consumes the portable `.agents/skills` projection.
-        ProviderKind::Grok => crate::skills::SkillProvider::Codex,
+        // Grok and Antigravity also consume the portable projection.
+        ProviderKind::Grok | ProviderKind::Antigravity => crate::skills::SkillProvider::Codex,
         ProviderKind::Hermes | ProviderKind::Acp => crate::skills::SkillProvider::Codex,
         ProviderKind::OpenCode => crate::skills::SkillProvider::Opencode,
     }
@@ -3691,7 +3707,9 @@ async fn send_turn_internal<R: Runtime>(
     // ACP applies this option to the whole live session (including queued
     // turns), not a turn sandbox. The existing permission setter owns that
     // mutation and its live/persisted witness.
-    if input.permission_mode_override.is_some() && matches!(provider, ProviderKind::Cursor | ProviderKind::Grok) {
+    if input.permission_mode_override.is_some()
+        && matches!(provider, ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Antigravity)
+    {
         return Err("unsupported_permission_override: use the native session permission setter for ACP providers".into());
     }
     verify_native_control(
@@ -5544,7 +5562,9 @@ pub async fn agent_chat_respond_to_request_guarded<R: Runtime>(
             );
         }
     }
-    let dispatch_decision = if control.is_some() && matches!(provider, ProviderKind::Cursor | ProviderKind::Grok) {
+    let dispatch_decision = if control.is_some()
+        && matches!(provider, ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Antigravity)
+    {
         app.state::<NativeControlState>().exact_acp_decision(&thread_id.0, &request_id.0, &decision)?
     } else { decision.clone() };
     match impl_
@@ -5891,6 +5911,10 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
         '_,
         std::sync::Arc<crate::agent_provider::grok::capabilities::GrokCapabilityCache>,
     >,
+    antigravity_cache: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::antigravity::capabilities::AntigravityCapabilityCache>,
+    >,
     claude_cache: tauri::State<
         '_,
         std::sync::Arc<crate::agent_provider::claude::capabilities::ClaudeCapabilityCache>,
@@ -5980,6 +6004,21 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
                 .await
                 .map_err(|error| error.to_command_string())
         }
+        ProviderKind::Antigravity => {
+            let binary_path = which::which("agy").map_err(|_| {
+                crate::agent_provider::antigravity::capabilities::HarvestError::NotInstalled {
+                    hint: crate::agent_provider::acp::session::ANTIGRAVITY_INSTALL_HINT.into(),
+                }
+                .to_command_string()
+            })?;
+            if force.unwrap_or(false) {
+                antigravity_cache.invalidate().await;
+            }
+            antigravity_cache
+                .get_or_harvest(&binary_path)
+                .await
+                .map_err(|error| error.to_command_string())
+        }
         ProviderKind::Hermes => Err("Select a Hermes profile to discover its models".into()),
         ProviderKind::Acp => Err("Select a custom ACP instance to discover its models".into()),
         ProviderKind::OpenCode => {
@@ -6022,6 +6061,9 @@ pub(crate) async fn cached_chat_provider_capabilities<R: Runtime>(
             .and_then(|cache| cache.cached()),
         ProviderKind::Grok => app
             .try_state::<Arc<crate::agent_provider::grok::capabilities::GrokCapabilityCache>>()
+            .and_then(|cache| cache.cached()),
+        ProviderKind::Antigravity => app
+            .try_state::<Arc<crate::agent_provider::antigravity::capabilities::AntigravityCapabilityCache>>()
             .and_then(|cache| cache.cached()),
         ProviderKind::OpenCode => app
             .try_state::<Arc<crate::agent_provider::opencode::OpenCodeServerManager>>()
@@ -6129,7 +6171,7 @@ pub async fn list_chat_slash_commands(
             .to_string_lossy()
             .into_owned(),
     };
-    if matches!(provider, ProviderKind::Cursor | ProviderKind::Grok) {
+    if matches!(provider, ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Antigravity) {
         if let Some(thread_id) = thread_id {
             return lookup_provider(&registry, provider)
                 .await?
@@ -6183,6 +6225,13 @@ pub async fn list_chat_slash_commands(
         ProviderKind::Cursor => Ok(acp_slash_cache
             .cached(
                 crate::agent_provider::acp::session::AcpDialect::Cursor,
+                std::path::Path::new(&cwd),
+            )
+            .await),
+        // Antigravity also announces its catalogue only over a live session.
+        ProviderKind::Antigravity => Ok(acp_slash_cache
+            .cached(
+                crate::agent_provider::acp::session::AcpDialect::Antigravity,
                 std::path::Path::new(&cwd),
             )
             .await),
@@ -7045,6 +7094,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
         "codex" => ProviderKind::Codex,
         "cursor" => ProviderKind::Cursor,
         "grok" => ProviderKind::Grok,
+        "antigravity" => ProviderKind::Antigravity,
         "hermes" => ProviderKind::Hermes,
         "acp" => ProviderKind::Acp,
         "opencode" => ProviderKind::OpenCode,

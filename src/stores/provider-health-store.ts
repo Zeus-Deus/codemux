@@ -125,6 +125,7 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
     codex: emptyHealthSlot(),
     cursor: emptyHealthSlot(),
     grok: emptyHealthSlot(),
+    antigravity: emptyHealthSlot(),
     hermes: emptyHealthSlot(),
     acp: emptyHealthSlot(),
     opencode: emptyHealthSlot(),
