@@ -23,6 +23,7 @@ pub mod automations_sync;
 pub mod branch_name;
 pub mod json_rpc_child;
 pub mod local_session_import;
+pub mod mcp_cleanup;
 pub mod mcp_server;
 pub mod mcp_connector;
 pub mod agent_browser;
@@ -30,10 +31,12 @@ pub mod browser_viewport;
 pub mod cli;
 pub mod checkout_claims;
 pub mod claude_env;
+pub mod claude_plugin;
 pub mod commands;
 pub mod database;
 pub mod delegation;
 pub mod config;
+pub mod config_file;
 pub mod git;
 pub mod git_provider;
 pub mod github;
@@ -647,7 +650,6 @@ fn build_core_app<R: tauri::Runtime>(
         // never probed. The persisted facts (last seen, disk) live on
         // the `hosts` rows themselves, so nothing needs seeding here.
         .manage(hosts_status::HostStatusStore::default())
-        .manage(mcp_server::PendingMcpConfigRepairs::default())
         // Live plan-quota readings for Settings → Usage. In-memory only;
         // see `commands::usage::PlanQuotaStore`.
         .manage(commands::usage::PlanQuotaStore::default())
@@ -994,19 +996,9 @@ fn build_core_app<R: tauri::Runtime>(
             // the desktop app. Serving the current directory is both the
             // useful default and what a fresh headless box has to offer.
 
-            // Make the active checkout valid before restored agents start.
-            // Inactive unique checkouts are queued for the renderer's
-            // post-first-paint repair command so they do not extend boot.
-            if mcp_server::is_auto_mcp_enabled(&handle) {
-                let state: tauri::State<'_, state::AppStateStore> = handle.state();
-                let plan = mcp_server::plan_boot_mcp_reconciliation(&state.snapshot());
-                if let Some(active) = plan.active {
-                    mcp_server::reconcile_mcp_config_targets(&handle, std::slice::from_ref(&active));
-                }
-                let pending: tauri::State<'_, mcp_server::PendingMcpConfigRepairs> =
-                    handle.state();
-                pending.replace(plan.inactive);
-            }
+            // Remove the MCP entries older builds wrote into workspace
+            // folders and the home folder. Off the boot path; cheap to repeat.
+            mcp_cleanup::schedule(&handle);
 
             // Clean up orphan scrollback dirs and enforce disk limit
             {
@@ -1291,6 +1283,10 @@ fn build_core_app<R: tauri::Runtime>(
             hooks::register_gemini_hooks();
             tauri::async_runtime::spawn(hooks::register_opencode_plugin());
             hooks::register_pi_extension();
+
+            // Before any terminal starts, so each one gets Claude Code's
+            // Codemux plugin (see `claude_plugin`).
+            let _ = claude_plugin::local_plugin_dir();
 
             terminal::spawn_missing_ptys(handle);
 
@@ -2777,8 +2773,6 @@ fn build_core_app<R: tauri::Runtime>(
             commands::create_empty_workspace,
             commands::materialize_chat_workspace,
             commands::get_or_create_home_workspace,
-            commands::regenerate_mcp_config,
-            mcp_server::repair_inactive_mcp_configs,
             // MCP runtime registry commands. Frontend invokes these via
             // `src/tauri/commands.ts` and `src/hooks/use-mcp-runtime.ts`.
             // Defined in `commands/mcp.rs`; missing registration is what

@@ -39,7 +39,7 @@ import { useFeatureFlagsInit } from "@/stores/feature-flags";
 import { useEnsureDraftWhenEmpty } from "@/hooks/use-ensure-draft-when-empty";
 import { useReseedBootstrapDrafts } from "@/stores/chat-draft-store";
 import { useTranscriptSelectionHighlight } from "@/hooks/use-transcript-selection-highlight";
-import { getHomeDir, repairInactiveMcpConfigs } from "@/tauri/commands";
+import { getHomeDir } from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
 import { useRemotePathPickerStore } from "@/components/remote/remote-path-picker-store";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
@@ -115,17 +115,13 @@ function App() {
 
   // Verification runs on every invocation — the pending-verification retry
   // schedule and later session boundaries (a second account signing in after
-  // a sign-out) depend on it. The expensive startup one-shots — the deferred
-  // MCP config repair and the startup trace marks — fire once per process,
+  // a sign-out) depend on it. The startup trace marks fire once per process,
   // not once per retry tick.
   const handleShellFirstPaint = useCallback(() => {
     const firstRun = !postPaintStartupBegan.current;
     if (firstRun) {
       postPaintStartupBegan.current = true;
       markStartup("remote-session-start");
-      void repairInactiveMcpConfigs().catch((error) => {
-        console.warn("[startup] deferred MCP config repair failed:", error);
-      });
     }
     // A local ChatGPT connection is not a cloud session. Signed-out refresh
     // would replace the locally bootstrapped settings with cloud defaults.

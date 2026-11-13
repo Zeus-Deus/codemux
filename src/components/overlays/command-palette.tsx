@@ -94,7 +94,6 @@ import {
   getPresets,
   agentChatSearch,
   openInEditor,
-  regenerateMcpConfig,
   reloadInterface,
   setPresetBarVisible,
   type AgentChatSearchResult,
@@ -529,19 +528,6 @@ export const PALETTE_COMMANDS: PaletteCommand[] = [
     run: () => {
       if (isRemoteClient()) window.location.reload();
       else void reloadInterface().catch(reportFailure("Couldn't reload the interface"));
-    },
-  },
-  {
-    id: "regen-mcp",
-    label: "Regenerate MCP config",
-    icon: RefreshCw,
-    requiresWorkspace: true,
-    run: ({ workspace }) => {
-      if (!workspace) return;
-      // Nothing on screen changes when this works, so say that it did.
-      void regenerateMcpConfig(workspace.workspace_id)
-        .then(() => toast.success("MCP config regenerated"))
-        .catch(reportFailure("Couldn't regenerate the MCP config"));
     },
   },
 ];

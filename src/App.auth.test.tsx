@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { useAuthStore } from "@/stores/auth-store";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import App from "./App";
-import { getHomeDir, repairInactiveMcpConfigs } from "@/tauri/commands";
+import { getHomeDir } from "@/tauri/commands";
 vi.mock("@/hooks/use-app-state", () => ({ useAppStateInit: vi.fn() }));
 vi.mock("@/hooks/use-chatgpt-status", () => ({ useChatGptStatus: vi.fn() }));
 vi.mock("@/hooks/use-keyboard-shortcuts", () => ({ useKeyboardShortcuts: vi.fn() }));
@@ -33,11 +33,10 @@ vi.mock("@/components/pull-requests/pr-event-watcher", () => ({ PrEventWatcher: 
 vi.mock("@/components/update/update-toast", () => ({ UpdateToast: () => null }));
 vi.mock("@/components/remote/remote-connection-indicator", () => ({ RemoteConnectionBanner: () => null }));
 vi.mock("@/components/layout/app-shell", () => ({ AppShell: ({ onFirstPaint }: { onFirstPaint: () => void }) => <button onClick={onFirstPaint}>local workbench</button> }));
-vi.mock("@/tauri/commands", () => ({ getHomeDir: vi.fn().mockResolvedValue("/demo"), repairInactiveMcpConfigs: vi.fn().mockResolvedValue(0) }));
+vi.mock("@/tauri/commands", () => ({ getHomeDir: vi.fn().mockResolvedValue("/demo") }));
 vi.mock("@/lib/perf/interaction-trace", () => ({ markStartup: vi.fn() }));
 beforeEach(() => {
   vi.mocked(getHomeDir).mockResolvedValue("/demo");
-  vi.mocked(repairInactiveMcpConfigs).mockResolvedValue(0);
   useAuthStore.setState({ user: null, isAuthenticated: false, isLoading: false, sessionStatus: "signed-out" });
   useChatGptStore.setState({ localMode: true, ready: true, cloudLogin: true });
   vi.spyOn(useAuthStore.getState(), "bootstrapSession").mockResolvedValue(undefined);

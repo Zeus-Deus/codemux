@@ -93,22 +93,10 @@ fn ssh_push_pull_round_trip_against_real_host() {
         ".git/index.lock must be excluded"
     );
 
-    // R5 regression: the .mcp.json the push provisions must carry an
-    // ABSOLUTE command path. Agent CLIs spawn it directly — no shell
-    // (so `~` won't expand) and no systemd (`%h` won't expand). The old
-    // `%h` rewrite silently broke remote MCP auto-discovery.
-    let mcp_json = std::fs::read_to_string(remote.join(".mcp.json"))
-        .expect(".mcp.json must be provisioned by push");
-    let v: serde_json::Value = serde_json::from_str(&mcp_json).unwrap();
-    let cmd = v["mcpServers"]["codemux"]["command"].as_str().unwrap();
-    assert!(cmd.starts_with('/'), "mcp command must be absolute, got: {cmd}");
+    // Tools are delivered per session; a push must not provision agent config.
     assert!(
-        !cmd.contains('~') && !cmd.contains("%h"),
-        "mcp command must not contain a ~ or %h token: {cmd}"
-    );
-    assert!(
-        cmd.ends_with("/.local/bin/codemux-remote"),
-        "expected the resolved codemux-remote path, got: {cmd}"
+        !remote.join(".mcp.json").exists(),
+        "push must not write ambient MCP config"
     );
 
     // --delete mirror: remove a file locally, add another, re-push.
@@ -169,9 +157,8 @@ fn ssh_push_pull_round_trip_against_real_host() {
     );
 
     // R6 regression: a `~/`-relative remote path must be tilde-EXPANDED
-    // by the remote shell. push's mkdir AND provision's ssh_write_file
-    // both quote via the tilde-aware shell_escape; a naive single-quote
-    // would create a literal `~` directory and lose the files.
+    // by the remote shell. A naive single-quote in push's mkdir would
+    // create a literal `~` directory and lose the files.
     let home = std::env::var("HOME").unwrap();
     let tilde_rel = format!("cmx-e2e-tilde-{stamp}");
     let tilde_abs = std::path::PathBuf::from(&home).join(&tilde_rel);
@@ -193,8 +180,8 @@ fn ssh_push_pull_round_trip_against_real_host() {
         "~/ remote path must expand to $HOME (not a literal ~ dir)"
     );
     assert!(
-        tilde_abs.join(".mcp.json").exists(),
-        "tilde-aware ssh_write_file must drop .mcp.json under $HOME"
+        !tilde_abs.join(".mcp.json").exists(),
+        "tilde-relative push must not write ambient MCP config"
     );
     let _ = std::fs::remove_dir_all(&tilde_abs);
 

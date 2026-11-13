@@ -174,7 +174,6 @@ describe("settings single-store integration", () => {
       expect(SETTINGS_DEFAULTS["terminal.color_theme"]).toBe("app");
       expect(SETTINGS_DEFAULTS["terminal.font_family"]).toBeDefined();
       expect(SETTINGS_DEFAULTS["ai_commit_message_enabled"]).toBe("true");
-      expect(SETTINGS_DEFAULTS["auto_mcp_config"]).toBe("true");
     });
 
     it("DEFAULT_SETTINGS has all per-user fields", () => {

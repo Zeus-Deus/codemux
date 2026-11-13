@@ -16,6 +16,14 @@ pub use store::TaskStore;
 
 pub use crate::remote_task_protocol::*;
 
+/// This host's own `codemux-remote mcp` for the daemon state under `root`,
+/// given to each native Claude task for its session only. The task never
+/// gets the desktop's tools, and no config file other agents read is written.
+pub(crate) fn host_mcp_server(root: &Path) -> crate::agent_provider::claude::protocol::HostMcpServer {
+    let running = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("codemux-remote"));
+    crate::agent_provider::claude::protocol::HostMcpServer::codemux_remote(crate::mcp_server::install_path(&running), root)
+}
+
 /// Called by the single-threaded CLI before constructing Tokio. This pins a
 /// server-distributed Claude sidecar for the existing live capability cache.
 pub fn initialize_runtime() {
@@ -407,6 +415,7 @@ pub async fn run(root: &Path, id: &str) -> Result<(), String> {
                     claude_binary: Some(which::which("claude").map_err(|e| e.to_string())?),
                     event_channel_capacity: 65_536,
                     mcp_registry: None,
+                    host_mcp_server: Some(host_mcp_server(root)),
                 })
                 .await
                 .map_err(|e| e.to_string())?,

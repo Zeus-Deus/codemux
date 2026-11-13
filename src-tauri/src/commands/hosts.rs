@@ -459,7 +459,7 @@ pub async fn hosts_bootstrap_install<R: tauri::Runtime>(
                 // the scheduler this needs no auth token or server id —
                 // it's a per-host local control plane. After this
                 // returns successfully, an MCP-capable agent on the host
-                // can use `codemux-remote mcp` without any manual setup.
+                // that the user points at `codemux-remote mcp` can use it.
                 // Same best-effort contract: a failure logs and is
                 // surfaced in the result message, doesn't fail bootstrap.
                 let serve_note = match crate::ssh::bootstrap::provision_serve(
@@ -1175,13 +1175,6 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
         let result = result_opt.expect("at least one pull source candidate");
         let outcome = match result {
             crate::ssh::PullResult::Pulled { rsync_summary, .. } => {
-                // The pull just copied the host's `.mcp.json` over the
-                // local one, so its `codemux` entry names a path on the
-                // host. Point it back at this computer's `codemux mcp`
-                // (the upsert keeps the repo's other servers).
-                if crate::mcp_server::is_auto_mcp_enabled(&app) {
-                    crate::mcp_server::upsert_mcp_config(&local_worktree);
-                }
                 // Symmetric Claude JSONL sync (remote → local) BEFORE
                 // we kill the remote and respawn locally. Without this,
                 // any conversation continuation that happened on the

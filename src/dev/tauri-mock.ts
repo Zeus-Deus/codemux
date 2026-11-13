@@ -4938,7 +4938,6 @@ const handlers: Record<string, Handler> = {
     authMethod: "github",
     status: "verified",
   }),
-  repair_inactive_mcp_configs: () => 0,
   get_auth_token: () => "mock-token",
   get_sync_status: () => ({ syncAvailable: true, authMethod: "github" }),
   sign_out: () => undefined,

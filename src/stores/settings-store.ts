@@ -18,7 +18,6 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   ai_resolver_cli: "",
   ai_resolver_model: "",
   ai_resolver_strategy: "smart_merge",
-  auto_mcp_config: "true",
   // Legacy migration input only. AppShell maps an explicitly persisted
   // "warm" value to the synced Warm Stone theme; new writes use appearance.theme.
   "appearance.palette": "cool",

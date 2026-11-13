@@ -46,6 +46,17 @@ use tokio::sync::{broadcast, Mutex};
 #[cfg(unix)]
 static PID_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// The Claude Code plugin this daemon's shells get, set only by a remote
+/// host's `codemux-remote pty-daemon`: the desktop prepares its own plugin
+/// and sends it in each local spawn's env, and never sends a desktop path to
+/// a host (see `claude_plugin`).
+static HOST_CLAUDE_PLUGIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Gives every shell this daemon starts the host's own Claude Code plugin.
+pub fn set_host_claude_plugin(dir: PathBuf) {
+    let _ = HOST_CLAUDE_PLUGIN.set(dir);
+}
+
 /// `<socket>.pid` — the pidfile path for a given daemon socket. Pure so the
 /// host-side reconnect shell and tests agree on the location.
 #[cfg(unix)]
@@ -507,6 +518,7 @@ async fn handle_request(
             protocol_version: PROTOCOL_VERSION,
             daemon_pid: std::process::id(),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            host_claude_plugin: HOST_CLAUDE_PLUGIN.get().is_some(),
         },
         ClientRequest::Spawn {
             request_id,
@@ -800,6 +812,12 @@ async fn spawn_pty(
 
     for (k, v) in &env {
         cmd.env(k, v);
+    }
+    if let Some(dir) = HOST_CLAUDE_PLUGIN.get() {
+        use crate::claude_plugin::{plugin_dirs_value, PLUGIN_DIRS_ENV};
+        let requested = env.iter().find(|(key, _)| key == PLUGIN_DIRS_ENV).map(|(_, value)| std::ffi::OsString::from(value));
+        let inherited = requested.or_else(|| std::env::var_os(PLUGIN_DIRS_ENV));
+        cmd.env(PLUGIN_DIRS_ENV, plugin_dirs_value(dir, inherited.as_deref()));
     }
 
     // Belt-and-braces with the supervisor's own strip: a daemon adopted from

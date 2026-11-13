@@ -12,9 +12,10 @@
 //   writes to). `projects.<absolute-path>.mcpServers` is the per-user
 //   per-project local scope. The legacy `~/.claude/.mcp.json` path used
 //   in Stage 1 does NOT exist on real installs.
-// * `<project>/.mcp.json` — checked-in project scope. Codemux's own
-//   `upsert_mcp_config` writes here too, so the parser drops entries
-//   named `codemux` to avoid double-listing the always-on row.
+// * `<project>/.mcp.json` — checked-in project scope. Older Codemux
+//   builds wrote a `codemux` entry here, and users may add one, so the
+//   parser drops entries named `codemux` to avoid double-listing the
+//   always-on row.
 // * `~/.codemux/mcp.json` and `<project>/.codemux/mcp.json` — Codemux's
 //   own canonical paths (Stage 4 writes here when users add servers
 //   from the UI).

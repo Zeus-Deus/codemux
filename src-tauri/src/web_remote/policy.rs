@@ -135,7 +135,6 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "refresh_session"
             | "check_auth"
             | "get_sync_status"
-            | "repair_inactive_mcp_configs"
             | "apply_preset"
             | "agent_chat_open_search_result"
             | "activate_tab"

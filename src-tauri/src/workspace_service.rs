@@ -323,8 +323,8 @@ impl<R: Runtime> WorkspaceService<R> {
         Self { checkpoint, ..self }
     }
 
-    /// Create or open a workspace at a folder. Runs setup scripts and writes
-    /// `.mcp.json` only when it creates one.
+    /// Create or open a workspace at a folder. Runs setup scripts only when
+    /// it creates one.
     pub(crate) async fn open(&self, request: OpenWorkspace) -> Result<OpenedWorkspace, String> {
         crate::commands::workspace::open_workspace_impl(self.app.clone(), request, &self.checkpoint)
             .await

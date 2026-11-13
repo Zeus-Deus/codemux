@@ -73,7 +73,6 @@ vi.mock("@/stores/settings-store", () => {
   const defaults: Record<string, string> = {
     "terminal.color_theme": "app",
     "terminal.font_family": "'JetBrains Mono Variable', monospace",
-    auto_mcp_config: "true",
     "appearance.palette": "cool",
     "appearance.density": "comfortable",
     "sidebar.show_git_stats": "true",
@@ -1255,7 +1254,6 @@ describe("Settings rows", () => {
     requestedSection = "agent";
     render(<SettingsView />);
     for (const name of [
-      "Auto-configure MCP for workspaces",
       "Resume automatically after usage limits reset",
       "Auto-resume agents after restart",
     ]) {
@@ -1263,6 +1261,9 @@ describe("Settings rows", () => {
         /Only on this device/,
       );
     }
+    // Codemux no longer writes `.mcp.json` into workspaces, so there is
+    // nothing to turn off.
+    expect(screen.queryByRole("switch", { name: "Auto-configure MCP for workspaces" })).toBeNull();
     // Checkpoints sync with the account, so they carry no mark.
     expect(
       screen.getByRole("switch", { name: "Per-turn revert checkpoints" }),

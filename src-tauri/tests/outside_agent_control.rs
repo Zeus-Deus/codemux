@@ -44,8 +44,8 @@ const SETTLE: Duration = Duration::from_secs(30);
 const WAITS_PER_CLIENT: usize = 8;
 
 /// The 62 legacy stdio tools in-app agents see as `mcp__codemux__*`
-/// (`mcp_server::LEGACY_TOOL_NAMES`). Provider-origin and agent-marked
-/// `codemux mcp` must keep exactly these.
+/// (`mcp_server::LEGACY_TOOL_NAMES`). Agent-marked `codemux mcp` must keep
+/// exactly these.
 const LEGACY_TOOL_NAMES: [&str; 62] = [
     "delegation_targets", "delegate_remote_task", "task_status", "task_cancel",
     "browser_navigate", "browser_snapshot", "browser_accessibility_snapshot", "browser_click", "browser_fill",
@@ -908,9 +908,7 @@ fn stdio_door_drives_the_full_outside_flow() {
     let created = door.ok("worktree_create", json!({"repo_path": w.repo, "branch": branch, "client_request_id": format!("wt-{t}")}));
     let (workspace, cwd) = created_worktree(w, &created, &branch);
     cleanup.worktrees.push(workspace.clone());
-    // The per-workspace .mcp.json still marks in-app agents as provider-origin.
-    let mcp_json: Value = serde_json::from_str(&std::fs::read_to_string(cwd.join(".mcp.json")).unwrap()).unwrap();
-    assert!(mcp_json["mcpServers"]["codemux"]["env"].get("CODEMUX_MCP_PROVIDER_ORIGIN").is_some(), "{mcp_json}");
+    assert!(!cwd.join(".mcp.json").exists(), "workspace creation must not write ambient MCP config");
 
     let caps = door.ok("agent_capabilities", json!({"workspace_id": workspace, "provider": "cursor"}));
     let allowed = modes(&caps);
@@ -1788,10 +1786,10 @@ fn cli_worktree_verbs_replay_refuse_supervised_and_clean_up() {
 }
 
 #[test]
-fn provider_origin_stdio_keeps_in_app_tools_and_refuses_native_control() {
+fn agent_stdio_keeps_in_app_tools_and_refuses_native_control() {
     let w = world();
     let active = w.active_workspace().expect("a focused workspace");
-    let mut in_app = StdioDoor::spawn(&w.env, &["mcp"], &[("CODEMUX_MCP_PROVIDER_ORIGIN", "1")], "local");
+    let mut in_app = StdioDoor::spawn(&w.env, &["mcp"], &[("CODEMUX_AGENT_PROCESS", "terminal")], "local");
     let listed = names(&in_app.list());
     assert!(unique(&listed), "{listed:?}");
     assert_eq!(listed.into_iter().collect::<BTreeSet<_>>(), LEGACY_TOOL_NAMES.iter().map(|name| name.to_string()).collect());
@@ -1802,6 +1800,16 @@ fn provider_origin_stdio_keeps_in_app_tools_and_refuses_native_control() {
     let info = in_app.ok("workspace_info", json!({}));
     assert_eq!(id_text(&info["workspace_id"]), Some(active.clone()), "{info}");
     assert!(in_app.close().success());
+
+    // A stale written entry has no active agent marker and serves nothing.
+    let mut obsolete = StdioDoor::spawn(&w.env, &["mcp"], &[("CODEMUX_MCP_PROVIDER_ORIGIN", "1")], "local");
+    assert!(obsolete.list().is_empty());
+    for name in ["workspace_info", "thread_launch"] {
+        let refused = obsolete.call_raw(name, json!({}));
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert!(text(&refused["result"]["content"][0]["text"]).starts_with("obsolete_config:"), "{refused}");
+    }
+    assert!(obsolete.close().success());
 
     // The outside door serves the same name from the registry, and keeps its shape.
     let mut outside = StdioDoor::spawn(&w.env, &["mcp"], &[], "local");

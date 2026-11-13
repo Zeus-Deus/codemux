@@ -425,6 +425,9 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
                 workspace_env.push(("PATH".into(), prefixed));
                 workspace_env.push(("CODEMUX_CLI_SAFE_PATH".into(), current_exe));
             }
+            if let Some((key, value)) = super::claude_plugin_env() {
+                workspace_env.push((key.into(), value));
+            }
         }
         // One directory walk for the whole workspace: the per-session lookup
         // re-read and re-parsed every meta file on disk for each pane.
@@ -830,6 +833,11 @@ async fn spawn_prepared_session<R: Runtime>(
             "[trace:{session_id}] DECISION=fresh_spawn at t={}ms",
             entry_ts.elapsed().as_millis()
         );
+        // A Claude typed in this shell must not find an entry an older build
+        // wrote above its folder (see `mcp_cleanup::before_launch`).
+        if !is_remote {
+            crate::mcp_cleanup::before_launch(std::path::Path::new(&effective_cwd)).await;
+        }
         match client
             .spawn(
                 session_id.clone(),

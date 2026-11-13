@@ -386,12 +386,23 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
                 // semantics means a successful connect() doesn't
                 // prove the remote side is healthy.
                 let remaining = connect_deadline.saturating_duration_since(Instant::now());
-                match tokio::time::timeout(remaining, c.hello()).await {
-                    Ok(Ok((pid, version, _))) => {
+                match tokio::time::timeout(remaining, c.hello_with_host_plugin()).await {
+                    Ok(Ok(((pid, version, _), host_claude_plugin))) => {
                         eprintln!(
                             "[client_for_workspace:{workspace_id}] daemon reached: \
                              pid={pid} version={version}"
                         );
+                        // A daemon that kept running across an upgrade is
+                        // reused, so its new shells keep its old behaviour.
+                        if !host_claude_plugin {
+                            log::warn!(
+                                "[codemux::ssh] the host's terminal daemon (codemux-remote {version}, pid {pid}) \
+                                 has no Claude Code plugin (it predates per-terminal Codemux tools, or could not \
+                                 write the plugin): Claude Code in its new terminals gets no Codemux MCP server \
+                                 until that daemon restarts (the host reboots, or about an hour after its last \
+                                 Codemux terminal closes)"
+                            );
+                        }
                         break c;
                     }
                     Ok(Err(error)) => {

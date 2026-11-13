@@ -383,6 +383,12 @@ impl PtyDaemonClient {
     }
 
     pub async fn hello(&self) -> Result<(u32, String, u32), PtyDaemonError> {
+        self.hello_with_host_plugin().await.map(|(hello, _)| hello)
+    }
+
+    /// [`Self::hello`], plus whether the daemon gives its shells a remote
+    /// host's own Claude Code plugin (false for daemons older than that).
+    pub async fn hello_with_host_plugin(&self) -> Result<((u32, String, u32), bool), PtyDaemonError> {
         let id = self.next_id();
         match self
             .send_request(ClientRequest::Hello { request_id: id }, id)
@@ -392,8 +398,9 @@ impl PtyDaemonClient {
                 protocol_version,
                 daemon_pid,
                 daemon_version,
+                host_claude_plugin,
                 ..
-            } => Ok((daemon_pid, daemon_version, protocol_version)),
+            } => Ok(((daemon_pid, daemon_version, protocol_version), host_claude_plugin)),
             ServerResponse::Error { message, .. } => Err(PtyDaemonError::Daemon(message)),
             other => Err(PtyDaemonError::Daemon(format!(
                 "unexpected response to Hello: {other:?}"
