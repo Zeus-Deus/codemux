@@ -182,20 +182,37 @@ fn needs_runs_check(watch: &PrWatchRecord, view: &PrView, seen: &HashSet<String>
         && (watch.attempts > 0 || (watch.wake_on_green && !seen.contains(&green_key(&view.head_sha))))
 }
 
-/// Parse `GET repos/{owner}/{repo}/actions/runs?head_sha=…`: whether any run
-/// is unfinished. GitHub adds a run's check runs only once its jobs start,
-/// so a run queued behind a concurrency group, waiting on an environment,
-/// or just requested is missing from `statusCheckRollup` entirely.
-pub(crate) fn parse_runs_pending(json: &str) -> Result<bool, String> {
+/// Workflow runs per page of `actions/runs`; GitHub's maximum.
+const RUNS_PER_PAGE: usize = 100;
+/// Pages read before green is left unconfirmed (1,000 runs on one head).
+const MAX_RUNS_PAGES: u32 = 10;
+
+/// One page of `GET repos/{owner}/{repo}/actions/runs?head_sha=…`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RunsPage {
+    /// A run on this page is unfinished. GitHub adds a run's check runs only
+    /// once its jobs start, so a run queued behind a concurrency group,
+    /// waiting on an environment, or just requested is missing from
+    /// `statusCheckRollup` entirely.
+    pub pending: bool,
+    /// Runs on this page.
+    pub count: usize,
+    /// Runs on the head across all pages.
+    pub total: u64,
+}
+
+pub(crate) fn parse_runs_page(json: &str) -> Result<RunsPage, String> {
     let v: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("Failed to parse workflow runs JSON: {e}"))?;
     let runs = v["workflow_runs"].as_array().ok_or("Workflow runs JSON has no workflow_runs")?;
-    Ok(runs.iter().any(|run| {
+    let pending = runs.iter().any(|run| {
         matches!(
             run["status"].as_str(),
             Some("requested" | "queued" | "pending" | "waiting" | "in_progress")
         )
-    }))
+    });
+    let total = v["total_count"].as_u64().unwrap_or(runs.len() as u64);
+    Ok(RunsPage { pending, count: runs.len(), total })
 }
 
 /// Whether the workflow-runs read keeps the head from being green.
@@ -206,20 +223,36 @@ pub(crate) fn parse_runs_pending(json: &str) -> Result<bool, String> {
 /// checked again. A failure retrying cannot fix (no access, Actions
 /// unavailable, an unexpected body) falls back to the checks alone, so a
 /// watch is never stuck short of green.
-fn runs_hold_green(read: Result<String, String>, context: &str) -> bool {
-    let error = match read {
-        Ok(json) => match parse_runs_pending(&json) {
-            Ok(pending) => return pending,
+///
+/// Every page is read (`fetch_page` takes a 1-based page number), stopping
+/// at the first unfinished run; a head with more runs than
+/// [`MAX_RUNS_PAGES`] can hold stays unconfirmed.
+fn runs_hold_green(mut fetch_page: impl FnMut(u32) -> Result<String, String>, context: &str) -> bool {
+    let mut read = 0u64;
+    for page in 1..=MAX_RUNS_PAGES {
+        let error = match fetch_page(page) {
+            Ok(json) => match parse_runs_page(&json) {
+                Ok(runs) if runs.pending => return true,
+                Ok(runs) => {
+                    read += runs.count as u64;
+                    if runs.count < RUNS_PER_PAGE || read >= runs.total {
+                        return false;
+                    }
+                    continue;
+                }
+                Err(error) => error,
+            },
+            Err(error) if is_transient_read_error(&error) => {
+                eprintln!("[codemux::pr-watch] workflow runs for {context}, retrying next pass: {error}");
+                return true;
+            }
             Err(error) => error,
-        },
-        Err(error) if is_transient_read_error(&error) => {
-            eprintln!("[codemux::pr-watch] workflow runs for {context}, retrying next pass: {error}");
-            return true;
-        }
-        Err(error) => error,
-    };
-    eprintln!("[codemux::pr-watch] workflow runs for {context}, using checks alone: {error}");
-    false
+        };
+        eprintln!("[codemux::pr-watch] workflow runs for {context}, using checks alone: {error}");
+        return false;
+    }
+    eprintln!("[codemux::pr-watch] workflow runs for {context}: more than {read} runs, green stays unconfirmed");
+    true
 }
 
 /// A GitHub read failure that may succeed on retry. Access and "not
@@ -766,12 +799,14 @@ fn fetch_view(repo_path: &Path, pr: &PrRepo, watch: &PrWatchRecord, seen: &HashS
         view.remarks.extend(inline_remarks(inline, &viewer));
     }
     if needs_runs_check(watch, &view, seen) {
-        let endpoint = format!(
-            "repos/{}/actions/runs?head_sha={}&per_page=100",
-            pr.nwo, view.head_sha
-        );
-        let read = crate::github_budget::run(repo_path, &["api", &endpoint, "--hostname", &pr.host], GH_TIMEOUT);
-        view.runs_pending = runs_hold_green(read, &format!("{} @ {}", pr.selector(), view.head_sha));
+        let fetch_page = |page: u32| {
+            let endpoint = format!(
+                "repos/{}/actions/runs?head_sha={}&per_page={RUNS_PER_PAGE}&page={page}",
+                pr.nwo, view.head_sha
+            );
+            crate::github_budget::run(repo_path, &["api", &endpoint, "--hostname", &pr.host], GH_TIMEOUT)
+        };
+        view.runs_pending = runs_hold_green(fetch_page, &format!("{} @ {}", pr.selector(), view.head_sha));
     }
     Ok(view)
 }
@@ -1597,7 +1632,7 @@ mod tests {
 
         // Pass 1: the read times out. Not green, nothing refunded or marked.
         let failed = PrView {
-            runs_pending: runs_hold_green(Err("gh timed out after 15s".into()), "o/r @ h1"),
+            runs_pending: runs_hold_green(|_| Err("gh timed out after 15s".into()), "o/r @ h1"),
             ..passing.clone()
         };
         let eval = evaluate(&w, &failed, &seen, 1);
@@ -1610,7 +1645,7 @@ mod tests {
 
         // Pass 2: the read recovers and shows every run finished.
         let done = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
-        let recovered = PrView { runs_pending: runs_hold_green(Ok(done.into()), "o/r @ h1"), ..passing.clone() };
+        let recovered = PrView { runs_pending: runs_hold_green(|_| Ok(done.into()), "o/r @ h1"), ..passing.clone() };
         let eval = evaluate(&w, &recovered, &seen, 2);
         assert!(matches!(&eval.decision, Decision::Wake(report) if report.green));
         assert_eq!(eval.next.attempts, 0);
@@ -1626,17 +1661,73 @@ mod tests {
             "GitHub API rate limit: requests to github.com paused until 123",
             "error connecting to api.github.com",
         ] {
-            assert!(runs_hold_green(Err(transient.into()), "t"), "{transient}");
+            assert!(runs_hold_green(|_| Err(transient.into()), "t"), "{transient}");
         }
         for permanent in [
             "GitHub API read failed (HTTP 404): Not Found",
             "GitHub API read failed (HTTP 403): Resource not accessible by integration",
             "gh: Not Found (HTTP 404)",
         ] {
-            assert!(!runs_hold_green(Err(permanent.into()), "t"), "{permanent}");
+            assert!(!runs_hold_green(|_| Err(permanent.into()), "t"), "{permanent}");
         }
         // An unexpected body will not change on retry either.
-        assert!(!runs_hold_green(Ok(r#"{"message":"weird"}"#.into()), "t"));
+        assert!(!runs_hold_green(|_| Ok(r#"{"message":"weird"}"#.into()), "t"));
+    }
+
+    #[test]
+    fn an_unfinished_run_on_a_later_page_holds_green_back() {
+        let page = |statuses: Vec<&str>, total: usize| {
+            let runs: Vec<String> =
+                statuses.iter().map(|status| format!(r#"{{"status":"{status}"}}"#)).collect();
+            format!(r#"{{"total_count":{total},"workflow_runs":[{}]}}"#, runs.join(","))
+        };
+        let full_done = page(vec!["completed"; RUNS_PER_PAGE], 150);
+        let mut tail = vec!["completed"; 49];
+        tail.push("queued");
+        let tail_queued = page(tail, 150);
+        let tail_done = page(vec!["completed"; 50], 150);
+
+        // A queued run only on page 2 still holds green back.
+        let mut asked = Vec::new();
+        let pending = runs_hold_green(
+            |n| {
+                asked.push(n);
+                Ok(if n == 1 { full_done.clone() } else { tail_queued.clone() })
+            },
+            "t",
+        );
+        assert!(pending);
+        assert_eq!(asked, vec![1, 2]);
+
+        // Every page finished: green, and nothing past the last page is read.
+        let mut asked = Vec::new();
+        let pending = runs_hold_green(
+            |n| {
+                asked.push(n);
+                Ok(if n == 1 { full_done.clone() } else { tail_done.clone() })
+            },
+            "t",
+        );
+        assert!(!pending);
+        assert_eq!(asked, vec![1, 2]);
+
+        // A failure on a later page counts like a failure on the first.
+        assert!(runs_hold_green(
+            |n| if n == 1 { Ok(full_done.clone()) } else { Err("gh timed out after 15s".into()) },
+            "t",
+        ));
+
+        // More runs than the page limit covers: green stays unconfirmed.
+        let mut asked = 0;
+        let endless = page(vec!["completed"; RUNS_PER_PAGE], 5_000);
+        assert!(runs_hold_green(
+            |_| {
+                asked += 1;
+                Ok(endless.clone())
+            },
+            "t",
+        ));
+        assert_eq!(asked, MAX_RUNS_PAGES);
     }
 
     #[test]
@@ -1645,15 +1736,18 @@ mod tests {
             let json = format!(
                 r#"{{"total_count":2,"workflow_runs":[{{"status":"completed","conclusion":"success"}},{{"status":"{status}","conclusion":null}}]}}"#
             );
-            assert_eq!(parse_runs_pending(&json), Ok(true), "{status}");
+            assert_eq!(parse_runs_page(&json).map(|p| p.pending), Ok(true), "{status}");
         }
         let done = r#"{"total_count":2,"workflow_runs":[
             {"status":"completed","conclusion":"success"},
             {"status":"completed","conclusion":"skipped"}]}"#;
-        assert_eq!(parse_runs_pending(done), Ok(false));
-        assert_eq!(parse_runs_pending(r#"{"total_count":0,"workflow_runs":[]}"#), Ok(false));
-        assert!(parse_runs_pending(r#"{"message":"Not Found"}"#).is_err());
-        assert!(parse_runs_pending("not json").is_err());
+        assert_eq!(parse_runs_page(done).map(|p| p.pending), Ok(false));
+        assert_eq!(
+            parse_runs_page(r#"{"total_count":0,"workflow_runs":[]}"#),
+            Ok(RunsPage { pending: false, count: 0, total: 0 })
+        );
+        assert!(parse_runs_page(r#"{"message":"Not Found"}"#).is_err());
+        assert!(parse_runs_page("not json").is_err());
     }
 
     #[test]
