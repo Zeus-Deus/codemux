@@ -1736,6 +1736,18 @@ describe("MessageList new-turn scroll contract", () => {
     return document.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
   }
 
+  /** Press the scroller itself at `clientX`, laid out 600px wide with an
+   *  8px gutter reserved on each edge (`stable both-edges`). */
+  function pressScroller(clientX: number) {
+    const el = viewport();
+    vi.spyOn(el, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 0, 600, 400),
+    );
+    Object.defineProperty(el, "offsetWidth", { configurable: true, value: 600 });
+    Object.defineProperty(el, "clientWidth", { configurable: true, value: 584 });
+    fireEvent.pointerDown(el, { clientX });
+  }
+
   const anchor = (nonce: number) => ({ clientNonce: "nonce-send", nonce });
 
   it("reserves no end space until a send names a row", () => {
@@ -2057,7 +2069,7 @@ describe("MessageList new-turn scroll contract", () => {
     scrollToOffsetSpy.mockClear();
 
     act(() => {
-      fireEvent.pointerDown(viewport());
+      pressScroller(596);
     });
 
     listState.scroll = 84;
@@ -2071,6 +2083,47 @@ describe("MessageList new-turn scroll contract", () => {
     await flushFrames();
 
     expect(scrollToOffsetSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps following through a press in the empty left gutter", async () => {
+    // The gutter reserved on the left has no scrollbar, but a press there
+    // still targets the scroller itself.
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    settleGlide();
+    scrollToOffsetSpy.mockClear();
+
+    act(() => {
+      pressScroller(4);
+    });
+
+    listState.scroll = 84;
+    const grown: ChatViewItem[] = [userTurn, sentTurn];
+    for (let i = 0; i < 6; i++) {
+      grown.push({ ...answer, id: `am-${i}`, seq: 3 + i });
+    }
+    rerender(
+      <MessageList messages={grown} sendAnchor={anchor(1)} {...noopHandlers} />,
+    );
+    await flushFrames();
+
+    expect(scrollToOffsetSpy).toHaveBeenCalledWith({
+      offset: 316,
+      animated: false,
+    });
   });
 
   it("restores the built-in end pin when the anchor is dropped", () => {
