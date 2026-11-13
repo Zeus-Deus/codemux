@@ -571,6 +571,12 @@ pub fn run() {
                 tauri::async_runtime::block_on(
                     app.state::<commands::side_chat::SideChatStore>().shutdown_all(),
                 );
+                // Remote-workspace ssh tunnels otherwise outlive the app.
+                #[cfg(unix)]
+                let _ = tauri::async_runtime::block_on(tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    ssh::shutdown_all(),
+                ));
                 if let Err(error) = tauri::async_runtime::block_on(
                     app.state::<commands::workflows::WorkflowState>().shutdown(),
                 ) {

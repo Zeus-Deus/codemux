@@ -129,6 +129,20 @@ pub async fn shutdown_supervisor(workspace_id: &str) {
     }
 }
 
+/// Stop every supervisor and its ssh process. Called on app exit, where
+/// nothing else would end the tunnels: without it each remote workspace
+/// leaves an ssh (and a remote sshd session) running after quit.
+pub async fn shutdown_all() {
+    let supervisors: Vec<_> = match REGISTRY.get() {
+        Some(map) => map.lock().await.drain().map(|(_, s)| s).collect(),
+        None => return,
+    };
+    if let Some(clients) = WORKSPACE_CLIENTS.get() {
+        clients.lock().await.clear();
+    }
+    futures_util::future::join_all(supervisors.iter().map(|s| s.shutdown())).await;
+}
+
 /// Helper for the push flow: compose a stable local socket path
 /// from the workspace id. Putting all tunnels under a single dir
 /// keeps cleanup easy + avoids per-call temp-file allocation. The

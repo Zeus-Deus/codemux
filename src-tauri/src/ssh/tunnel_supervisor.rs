@@ -67,6 +67,9 @@ const STDERR_BYTE_LIMIT: u64 = 16 * 1024;
 /// supervisor's own task exits. Sharing the handle is fine.
 pub struct TunnelSupervisor {
     inner: Arc<SupervisorInner>,
+    /// Supervisor task, awaited by `shutdown` so an ssh that is still
+    /// connecting is killed before shutdown returns.
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 struct SupervisorInner {
@@ -96,19 +99,24 @@ impl TunnelSupervisor {
             current_child: Mutex::new(None),
         });
         let task_inner = inner.clone();
-        let _ = tokio::spawn(async move {
-            run_supervisor(
-                task_inner,
-                ssh_target,
-                remote_socket,
-                local_socket,
-                remote_binary,
-                shutdown_rx,
-                Command::new("ssh"),
-            )
-            .await;
-        });
-        Arc::new(Self { inner })
+        let mut cmd = Command::new("ssh");
+        // The remote side ends in a long `exec sleep`, so an ssh that
+        // outlives its owner would hold the tunnel and an sshd session
+        // open indefinitely.
+        cmd.kill_on_drop(true);
+        let task = tokio::spawn(run_supervisor(
+            task_inner,
+            ssh_target,
+            remote_socket,
+            local_socket,
+            remote_binary,
+            shutdown_rx,
+            cmd,
+        ));
+        Arc::new(Self {
+            inner,
+            task: std::sync::Mutex::new(Some(task)),
+        })
     }
 
     /// Local socket path the `PtyDaemonClient` should dial. Stable
@@ -127,9 +135,13 @@ impl TunnelSupervisor {
     /// local socket. Idempotent.
     pub async fn shutdown(&self) {
         let _ = self.inner.shutdown_tx.send(true);
-        let mut guard = self.inner.current_child.lock().await;
-        if let Some(mut child) = guard.take() {
+        if let Some(mut child) = self.inner.current_child.lock().await.take() {
             let _ = child.kill().await;
+        }
+        // Wait for the task too: it owns any ssh still connecting.
+        let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(task) = task {
+            let _ = task.await;
         }
         let _ = std::fs::remove_file(&self.inner.local_socket);
     }
@@ -212,7 +224,14 @@ async fn run_supervisor(
         };
 
         // Wait for the socket to appear (or SSH to die before it does).
-        let socket_ready = wait_for_socket(&local_socket, &mut child, SPAWN_TIMEOUT).await;
+        let socket_ready = tokio::select! {
+            ready = wait_for_socket(&local_socket, &mut child, SPAWN_TIMEOUT) => Some(ready),
+            _ = shutdown_rx.wait_for(|stop| *stop) => None,
+        };
+        let Some(socket_ready) = socket_ready else {
+            let _ = child.kill().await;
+            return;
+        };
         match socket_ready {
             Ok(()) => {
                 let ssh_pid = child.id().unwrap_or(0);
@@ -230,7 +249,11 @@ async fn run_supervisor(
                 // Watchdog: wait for SSH to exit or shutdown signal.
                 let exited = watch_child_until_exit(&inner, &mut shutdown_rx).await;
                 if !exited {
-                    // Shutdown signalled — drop everything.
+                    // Shutdown signalled. `shutdown` may have checked the
+                    // slot before this child was stored, so kill it here.
+                    if let Some(mut child) = inner.current_child.lock().await.take() {
+                        let _ = child.kill().await;
+                    }
                     return;
                 }
                 eprintln!("[tunnel-supervisor] ssh exited; will reconnect");
@@ -474,6 +497,7 @@ mod tests {
         });
         let supervisor = TunnelSupervisor {
             inner: inner.clone(),
+            task: std::sync::Mutex::new(None),
         };
         let mut cmd = Command::new(&fake_ssh);
         // Keep a failing regression test from leaving its fake SSH alive
@@ -523,6 +547,65 @@ mod tests {
             reaped,
             "failed SSH must be killed and reaped before reconnecting"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_kills_ssh_that_is_still_connecting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_ssh = dir.path().join("ssh");
+        std::fs::write(
+            &fake_ssh,
+            "#!/bin/sh\necho $$ > \"$0.pid\"\nexec /bin/sleep 300\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (status_tx, _status_rx) = watch::channel(TunnelStatus::Pending);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let local_socket = dir.path().join("tunnel.sock");
+        let inner = Arc::new(SupervisorInner {
+            local_socket: local_socket.clone(),
+            status_tx,
+            shutdown_tx,
+            current_child: Mutex::new(None),
+        });
+        let mut cmd = Command::new(&fake_ssh);
+        cmd.kill_on_drop(true);
+        let task = tokio::spawn(run_supervisor(
+            inner.clone(),
+            "unused-host".into(),
+            "/unused/remote.sock".into(),
+            local_socket,
+            "/unused/codemux-remote".into(),
+            shutdown_rx,
+            cmd,
+        ));
+        let supervisor = TunnelSupervisor {
+            inner,
+            task: std::sync::Mutex::new(Some(task)),
+        };
+        let pid_file = dir.path().join("ssh.pid");
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fake ssh must start");
+
+        tokio::time::timeout(Duration::from_secs(2), supervisor.shutdown())
+            .await
+            .expect("shutdown must not wait for the connect timeout");
+        let reaped = unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        assert!(reaped, "shutdown must kill and reap an ssh that is still connecting");
     }
 
     #[tokio::test]
