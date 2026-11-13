@@ -126,6 +126,62 @@ test("Stop the CLI never acknowledges ends the CLI process instead of hanging", 
   await session.close();
 });
 
+test("an unacknowledged Stop never ends a query that replaced the stopped one", async () => {
+  const methods: string[] = [];
+  const session = new ClaudeSession(
+    { ...input(), resume: "stale-xyz" },
+    { notification: (method) => methods.push(method) },
+  );
+  setInterruptAckTimeoutForTests(50);
+  await session.sendTurn({ text: "first" });
+  const fake = fakes[0] as FakeQuery;
+  fake.interrupt = () => new Promise<void>(() => {});
+  const stopping = session.interrupt();
+  // A stale-resume self-heal swaps in a new query before the deadline.
+  fake.emit({
+    type: "result",
+    subtype: "error_during_execution",
+    errors: ["No conversation found with session ID: stale-xyz"],
+  } as unknown as SDKMessage);
+  await settle();
+  expect(fakes).toHaveLength(2);
+  await stopping;
+  const replacement = fakes[1] as FakeQuery;
+  expect(replacement.closed).toBe(false);
+  expect(replacement.capturedOptions?.abortController?.signal.aborted).toBe(false);
+  expect(methods).not.toContain("turn-interrupted");
+  await session.close();
+});
+
+test("concurrent Stops share one stop, and a send waits for it", async () => {
+  const methods: string[] = [];
+  const session = new ClaudeSession(input(), {
+    notification: (method) => methods.push(method),
+  });
+  setInterruptAckTimeoutForTests(20);
+  await session.sendTurn({ text: "first" });
+  const fake = fakes[0] as FakeQuery;
+  let interruptCalls = 0;
+  fake.interrupt = () => {
+    interruptCalls += 1;
+    return new Promise<void>(() => {});
+  };
+  await Promise.all([
+    session.interrupt(),
+    session.interrupt(),
+    session.sendTurn({ text: "next" }),
+  ]);
+  expect(interruptCalls).toBe(1);
+  expect(methods.filter((m) => m === "turn-interrupted")).toHaveLength(1);
+  // The send landed on a fresh query, never on the one the Stop ended.
+  await settle();
+  expect(fake.closed).toBe(true);
+  expect(fakes).toHaveLength(2);
+  expect(fake.capturedPrompts.map((p) => p.message.content)).not.toContain("next");
+  expect(fakes[1]?.capturedPrompts[0]?.message.content).toBe("next");
+  await session.close();
+});
+
 test("steer-turn RPC validates params and forwards to the session", async () => {
   const methods = buildMethods(emit);
   await methods["start-session"]?.({

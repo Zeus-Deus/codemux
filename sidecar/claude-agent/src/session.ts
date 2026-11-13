@@ -417,6 +417,10 @@ export class ClaudeSession {
    *  an iterator exit is expected and stays silent instead of firing
    *  `session-ended`. */
   private interrupting = false;
+  /** The Stop in flight, shared by concurrent `interrupt()` calls and
+   *  awaited by `sendTurn` so a new turn never lands on a query the Stop
+   *  is about to end. */
+  private stopTask: Promise<void> | null = null;
   /** True once an interrupt has killed the SDK query. The next
    *  `sendTurn` rebuilds a resumed query via `ensureLiveQuery`. */
   private queryDead = false;
@@ -818,6 +822,8 @@ export class ClaudeSession {
   /** Enqueue a user turn on the prompt queue. Rejects if the session
    *  has already been closed. */
   async sendTurn(input: SendTurnInput): Promise<void> {
+    // A failed Stop is reported to its own caller; the turn still goes.
+    if (this.stopTask) await this.stopTask.catch(() => undefined);
     if (this.closed) {
       throw new Error("session is closed");
     }
@@ -901,12 +907,14 @@ export class ClaudeSession {
    *  rebuilds a resumed query, as after any interrupt that killed it. */
   private async retireForStop(): Promise<void> {
     this.interrupting = true;
-    this.retiredQueries.add(this.query);
+    const query = this.query;
+    const iterationTask = this.iterationTask;
+    this.retiredQueries.add(query);
     this.pendingSteers.clear();
     try {
       try {
         this.queryAbort.abort();
-        this.query.close();
+        query.close();
       } catch (err) {
         logger.warn("query.close during stop threw", {
           threadId: this.threadId,
@@ -915,14 +923,14 @@ export class ClaudeSession {
       }
       let timer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
-        this.iterationTask,
+        iterationTask,
         new Promise<void>((resolve) => {
           timer = setTimeout(resolve, interruptExitTimeoutMs);
         }),
       ]);
       if (timer !== undefined) clearTimeout(timer);
       // The process is gone either way; never reuse its query.
-      this.queryDead = true;
+      if (this.query === query) this.queryDead = true;
       if (!this.closed) {
         this.emitter.notification("turn-interrupted", {
           threadId: this.threadId,
@@ -997,20 +1005,37 @@ export class ClaudeSession {
    *  notification (not `session-ended`) tells the host the turn is
    *  over but the session lives. */
   async interrupt(): Promise<void> {
+    // Concurrent Stops share the one in flight.
+    if (this.stopTask) return this.stopTask;
     if (this.closed || this.queryDead) return;
     this.acceptsSteers = false;
     this.pluginBridgeGuard.clearTickets();
-    if (this.pendingSteers.size > 0) return this.retireForStop();
+    const stop =
+      this.pendingSteers.size > 0 ? this.retireForStop() : this.softInterrupt();
+    this.stopTask = stop;
+    try {
+      await stop;
+    } finally {
+      if (this.stopTask === stop) this.stopTask = null;
+    }
+  }
+
+  /** Every step targets the query that was running when Stop began. A
+   *  stale-resume self-heal can replace it mid-Stop, and the replacement
+   *  must never be ended by this Stop's timers. */
+  private async softInterrupt(): Promise<void> {
+    const query = this.query;
+    const iterationTask = this.iterationTask;
     this.interrupting = true;
     try {
       let ackTimer: ReturnType<typeof setTimeout> | undefined;
       const acked = await Promise.race([
-        this.query.interrupt().then(() => true),
+        query.interrupt().then(() => true),
         new Promise<boolean>((resolve) => {
           ackTimer = setTimeout(() => resolve(false), interruptAckTimeoutMs);
         }),
       ]).finally(() => clearTimeout(ackTimer));
-      if (!acked) {
+      if (!acked && this.query === query && !this.queryDead && !this.closed) {
         // The CLI never answered; end its process so Stop still wins.
         logger.warn("interrupt not acknowledged; ending the CLI", {
           threadId: this.threadId,
@@ -1022,13 +1047,13 @@ export class ClaudeSession {
       // treated the interrupt as soft and kept iterating.
       let timer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
-        this.iterationTask,
+        iterationTask,
         new Promise<void>((resolve) => {
           timer = setTimeout(resolve, interruptExitTimeoutMs);
         }),
       ]);
       if (timer !== undefined) clearTimeout(timer);
-      if (this.queryDead && !this.closed) {
+      if (this.query === query && this.queryDead && !this.closed) {
         this.emitter.notification("turn-interrupted", {
           threadId: this.threadId,
         });
