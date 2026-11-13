@@ -168,6 +168,13 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
             eprintln!("[codemux::opencode] shutdown incomplete: {error}");
         }
     }
+    // Remote-workspace ssh tunnels live in a global registry, so dropping
+    // `app` would not stop them.
+    #[cfg(unix)]
+    let _ = tauri::async_runtime::block_on(tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        crate::ssh::shutdown_all(),
+    ));
     if let Err(error) = crate::active_workspace_persistence::flush_latest(app.handle()) {
         eprintln!("[codemux::selection] headless shutdown flush failed: {error}");
     }
