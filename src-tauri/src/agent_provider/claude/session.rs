@@ -2681,7 +2681,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn review600_mid_turn_permission_change_allows_new_mcp_callbacks() {
-        let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("fake_claude_sidecar");
+        let binary = crate::test_isolation::fixture_bin("fake_claude_sidecar");
         assert!(binary.exists(), "build the fake_claude_sidecar test fixture first");
         for mode in ["bypassPermissions", "plan"] {
             let thread = ThreadId(format!("review600-mode-{mode}"));

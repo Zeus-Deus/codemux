@@ -935,7 +935,7 @@ async fn review_s3_guarded_acp_scope_is_exact_and_unsupported_callback_stays_pen
 async fn review_s5_native_cursor_override_cannot_mutate_session_mode_behind_witness() {
     let binary = std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE")
         .map(std::path::PathBuf::from).unwrap_or_else(|| {
-            std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX))
+            crate::test_isolation::fixture_bin(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX))
         });
     assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
     let provider = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(
@@ -959,7 +959,7 @@ async fn review_s5_native_cursor_override_cannot_mutate_session_mode_behind_witn
 async fn review_s2_actual_acp_queue_drain_revalidates_native_worker_ceiling() {
     use futures_util::StreamExt;
     let binary = std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
+        .unwrap_or_else(|| crate::test_isolation::fixture_bin(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
     assert!(binary.is_file(), "build fake_cursor_acp first");
     let provider = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(
         crate::agent_provider::cursor::CursorProviderConfig { binary,event_channel_capacity:128, mcp_registry: None },
@@ -1051,7 +1051,7 @@ async fn review_acp_fixture(thread: &str) -> (
     std::fs::create_dir_all(&rig).unwrap();
     // A compiled, direct owned child on every platform; no interpreter or shell.
     let binary = std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
+        .unwrap_or_else(|| crate::test_isolation::fixture_bin(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
     assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
     let provider = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(
         crate::agent_provider::cursor::CursorProviderConfig { binary, event_channel_capacity: 256, mcp_registry: None },

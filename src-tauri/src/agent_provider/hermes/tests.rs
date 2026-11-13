@@ -13,7 +13,7 @@ async fn review_l3_native_stop_wakes_cold_hermes_profile_operation_wait() {
     use crate::commands::agent_chat::{self, ProviderRegistry};
     use tauri::Manager;
     let binary = std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
+        .unwrap_or_else(|| crate::test_isolation::fixture_bin(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
     assert!(binary.is_file(), "synthetic ACP fixture required, never a real Hermes CLI");
     let placeholder = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(
         crate::agent_provider::cursor::CursorProviderConfig {binary:binary.clone(), event_channel_capacity:128, mcp_registry: None },
@@ -95,7 +95,7 @@ async fn review_pump_fixture_with_binary(binary: Option<std::path::PathBuf>) -> 
     let root = tempfile::tempdir().unwrap();
     // Launch only the compiled synthetic ACP peer, never the official Hermes CLI.
     let binary = binary.or_else(||std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from))
-        .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
+        .unwrap_or_else(|| crate::test_isolation::fixture_bin(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
     assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
     std::fs::write(root.path().join("config.yaml"), "model: {provider: custom}\n").unwrap();
     let profile = profile::resolve(&binary, root.path(), "default").unwrap();

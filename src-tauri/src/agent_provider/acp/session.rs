@@ -4948,8 +4948,7 @@ mod mcp_delivery_tests {
     /// injected server, never on slash commands, and Stop reloads nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cursor_shell_fallback_is_env_only_and_survives_stop() {
-        let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap()
-            .join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX));
+        let binary = crate::test_isolation::fixture_bin(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX));
         assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
         let registry = crate::mcp::registry::McpRegistry::new();
         registry.set_host_tools(Arc::new(Collaboration));

@@ -2,6 +2,20 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// A test fixture binary (`fake_cursor_acp`, …) built next to the crate's
+/// own binaries. Unit-test executables used to sit one level below them in
+/// `target/<profile>/deps`; newer Cargo puts them deeper in the build
+/// directory, so look for the fixture in each ancestor directory. Falls
+/// back to the old location, so a missing fixture still names a path.
+pub(crate) fn fixture_bin(name: impl AsRef<Path>) -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    exe.ancestors()
+        .skip(1)
+        .map(|dir| dir.join(name.as_ref()))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| exe.parent().unwrap().parent().unwrap().join(name.as_ref()))
+}
+
 /// Set only in the child process [`isolated`] starts: its private root.
 const ROOT_ENV: &str = "CODEMUX_TEST_ISOLATED_ROOT";
 

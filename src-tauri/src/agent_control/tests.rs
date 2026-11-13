@@ -178,8 +178,7 @@ async fn review_r3_grok_terminal_survives_interrupt_during_standard_response_gra
     use futures_util::StreamExt;
     use std::time::Duration;
 
-    let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap()
-        .join(format!("fake_grok_acp{}", std::env::consts::EXE_SUFFIX));
+    let binary = crate::test_isolation::fixture_bin(format!("fake_grok_acp{}", std::env::consts::EXE_SUFFIX));
     assert!(binary.is_file(), "build the fake_grok_acp test fixture first");
     let provider = crate::agent_provider::grok::GrokAgentProvider::new(
         crate::agent_provider::grok::GrokProviderConfig { binary, event_channel_capacity: 128, mcp_registry: None },
