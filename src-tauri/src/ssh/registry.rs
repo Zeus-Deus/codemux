@@ -312,9 +312,11 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
                 break;
             }
             TunnelStatus::CircuitOpen { recent_failures } => {
+                // The supervisor keeps retrying in the background; a later
+                // call succeeds once it reports Connected again.
                 return Err(PtyDaemonError::Daemon(format!(
-                    "tunnel circuit breaker open ({recent_failures} recent \
-                     failures); push the workspace again to retry"
+                    "tunnel to the host is down ({recent_failures} recent \
+                     failures); retrying automatically every minute"
                 )));
             }
             _ => {}

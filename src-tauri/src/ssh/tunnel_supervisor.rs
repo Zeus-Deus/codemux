@@ -7,10 +7,10 @@
 //!
 //! - Exponential backoff from 1 s to 30 s
 //! - Watchdog detects SSH death within ~2 s
-//! - Crash circuit: 5 reconnect failures in 5 min opens the breaker
-//!   and stops trying. The user has to explicitly re-push the
-//!   workspace to recover (matches our local pty-daemon circuit
-//!   pattern — recurring failures are environmental, not transient).
+//! - Crash circuit: 5 reconnect failures in 5 min opens the breaker.
+//!   The supervisor then retries at a slow fixed interval so a longer
+//!   outage (no network, host rebooting) heals on its own once the
+//!   host is reachable again, without hammering it meanwhile.
 //!
 //! API: `TunnelSupervisor::spawn` returns a supervisor handle that
 //! exposes the current local socket path (which stays stable across
@@ -40,8 +40,8 @@ pub enum TunnelStatus {
     Connected { ssh_pid: u32 },
     /// SSH died; supervisor is waiting `delay_ms` before next attempt.
     Reconnecting { attempt: u32, delay_ms: u64 },
-    /// Crash circuit tripped. The supervisor is now passive — the
-    /// user must take action (re-push the workspace, fix the host).
+    /// Crash circuit tripped. The supervisor keeps retrying every
+    /// `CIRCUIT_RETRY_INTERVAL` and returns to `Connected` on success.
     CircuitOpen { recent_failures: u32 },
 }
 
@@ -52,6 +52,9 @@ const BACKOFF_FLOOR_MS: u64 = 1_000;
 const BACKOFF_CEIL_MS: u64 = 30_000;
 const MAX_FAILURES: u32 = 5;
 const CIRCUIT_WINDOW: Duration = Duration::from_secs(300);
+/// Retry cadence while the circuit is open: slow enough not to hammer
+/// a dead host, fast enough to recover soon after the network returns.
+const CIRCUIT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// How long we wait for the tunnel socket to appear after spawning
 /// SSH. The first connect can be slow (DNS, key handshake); later
 /// reconnects are usually instant.
@@ -146,11 +149,7 @@ async fn run_supervisor(
          local_socket={local_socket:?} remote_socket={remote_socket} \
          remote_binary={remote_binary}"
     );
-    // Failure timestamps form a sliding window; we count failures in
-    // the last `CIRCUIT_WINDOW` and trip the breaker when we exceed
-    // the cap.
-    let mut failures: Vec<Instant> = Vec::new();
-    let mut attempt: u32 = 0;
+    let mut retry = RetryState::default();
     let opts = TunnelOptions {
         ssh_target: &ssh_target,
         remote_socket: &remote_socket,
@@ -174,11 +173,15 @@ async fn run_supervisor(
         // lazily from client_for_workspace). With plain `send`, a
         // Connected status published before the consumer subscribes
         // is silently dropped, so the consumer sees Pending forever.
-        let _ = inner.status_tx.send_replace(TunnelStatus::Pending);
+        // While the circuit is open, keep showing CircuitOpen through
+        // each slow retry so the UI doesn't flicker.
+        if !retry.circuit_open {
+            let _ = inner.status_tx.send_replace(TunnelStatus::Pending);
+        }
 
         crate::trace_cloud_push!(
             "[tunnel-supervisor] attempt {} argv: ssh {}",
-            attempt + 1,
+            retry.attempt + 1,
             argv.join(" ")
         );
 
@@ -193,19 +196,8 @@ async fn run_supervisor(
             }
             Err(error) => {
                 eprintln!("[tunnel-supervisor] spawn failed: {error}");
-                record_failure(&mut failures);
-                if circuit_open(&failures) {
-                    let _ = inner.status_tx.send_replace(TunnelStatus::CircuitOpen {
-                        recent_failures: failures.len() as u32,
-                    });
-                    return;
-                }
-                attempt += 1;
-                let delay = backoff_delay(attempt);
-                let _ = inner.status_tx.send_replace(TunnelStatus::Reconnecting {
-                    attempt,
-                    delay_ms: delay.as_millis() as u64,
-                });
+                let (status, delay) = retry.on_failure();
+                let _ = inner.status_tx.send_replace(status);
                 // Wait the delay but bail early on shutdown.
                 if !sleep_or_shutdown(delay, &mut shutdown_rx).await {
                     return;
@@ -228,7 +220,7 @@ async fn run_supervisor(
                      (ssh_pid={ssh_pid}, receivers={}, prev={prev:?})",
                     inner.status_tx.receiver_count(),
                 );
-                attempt = 0; // success resets the attempt counter
+                retry.on_connected();
 
                 // Watchdog: wait for SSH to exit or shutdown signal.
                 let exited = watch_child_until_exit(&inner, &mut shutdown_rx).await;
@@ -237,7 +229,6 @@ async fn run_supervisor(
                     return;
                 }
                 eprintln!("[tunnel-supervisor] ssh exited; will reconnect");
-                record_failure(&mut failures);
             }
             Err(reason) => {
                 // A live SSH won't close stderr. Kill and reap it before
@@ -254,22 +245,11 @@ async fn run_supervisor(
                      [tunnel-supervisor] ssh stderr: {}",
                     stderr_dump.trim()
                 );
-                record_failure(&mut failures);
             }
         }
 
-        if circuit_open(&failures) {
-            let _ = inner.status_tx.send_replace(TunnelStatus::CircuitOpen {
-                recent_failures: failures.len() as u32,
-            });
-            return;
-        }
-        attempt += 1;
-        let delay = backoff_delay(attempt);
-        let _ = inner.status_tx.send_replace(TunnelStatus::Reconnecting {
-            attempt,
-            delay_ms: delay.as_millis() as u64,
-        });
+        let (status, delay) = retry.on_failure();
+        let _ = inner.status_tx.send_replace(status);
         if !sleep_or_shutdown(delay, &mut shutdown_rx).await {
             return;
         }
@@ -385,6 +365,50 @@ async fn watch_child_until_exit(
                     return false;
                 }
             }
+        }
+    }
+}
+
+/// Reconnect bookkeeping: failure timestamps form a sliding window;
+/// `MAX_FAILURES` within `CIRCUIT_WINDOW` opens the circuit.
+#[derive(Default)]
+struct RetryState {
+    failures: Vec<Instant>,
+    attempt: u32,
+    /// Sticky until a connect succeeds, so the slow retries don't fall
+    /// back to fast backoff as old failures age out of the window.
+    circuit_open: bool,
+}
+
+impl RetryState {
+    /// Record a failed attempt; returns the status to publish and how
+    /// long to wait before the next attempt.
+    fn on_failure(&mut self) -> (TunnelStatus, Duration) {
+        record_failure(&mut self.failures);
+        self.circuit_open |= circuit_open(&self.failures);
+        if self.circuit_open {
+            let status = TunnelStatus::CircuitOpen {
+                recent_failures: self.failures.len() as u32,
+            };
+            return (status, CIRCUIT_RETRY_INTERVAL);
+        }
+        self.attempt += 1;
+        let delay = backoff_delay(self.attempt);
+        let status = TunnelStatus::Reconnecting {
+            attempt: self.attempt,
+            delay_ms: delay.as_millis() as u64,
+        };
+        (status, delay)
+    }
+
+    /// A connect succeeded. A recovered circuit starts from a clean
+    /// slate; otherwise failures stay in the window so a tunnel that
+    /// keeps connecting and dying still trips the breaker.
+    fn on_connected(&mut self) {
+        self.attempt = 0;
+        if self.circuit_open {
+            self.circuit_open = false;
+            self.failures.clear();
         }
     }
 }
@@ -612,6 +636,55 @@ mod tests {
             "plain send drops the update when no receivers are alive — \
              this is exactly the bug we fixed by switching to send_replace"
         );
+    }
+
+    #[test]
+    fn open_circuit_keeps_retrying_slowly_until_connected() {
+        let mut retry = RetryState::default();
+        for attempt in 1..MAX_FAILURES {
+            let (status, delay) = retry.on_failure();
+            assert!(matches!(status, TunnelStatus::Reconnecting { attempt: a, .. } if a == attempt));
+            assert_eq!(delay, backoff_delay(attempt));
+        }
+        let (status, delay) = retry.on_failure();
+        assert_eq!(
+            status,
+            TunnelStatus::CircuitOpen {
+                recent_failures: MAX_FAILURES
+            }
+        );
+        assert_eq!(delay, CIRCUIT_RETRY_INTERVAL);
+
+        // Failures aging out of the window must not drop back to fast
+        // backoff while the host is still unreachable.
+        retry.failures.clear();
+        let (status, delay) = retry.on_failure();
+        assert!(matches!(status, TunnelStatus::CircuitOpen { .. }));
+        assert_eq!(delay, CIRCUIT_RETRY_INTERVAL);
+
+        // A successful reconnect closes the circuit and resets counters.
+        retry.on_connected();
+        let (status, delay) = retry.on_failure();
+        assert_eq!(
+            status,
+            TunnelStatus::Reconnecting {
+                attempt: 1,
+                delay_ms: backoff_delay(1).as_millis() as u64
+            }
+        );
+        assert_eq!(delay, backoff_delay(1));
+    }
+
+    #[test]
+    fn connected_without_open_circuit_keeps_failure_window() {
+        let mut retry = RetryState::default();
+        for _ in 0..(MAX_FAILURES - 1) {
+            retry.on_failure();
+            retry.on_connected();
+        }
+        // A tunnel that keeps connecting and dying still trips.
+        let (status, _) = retry.on_failure();
+        assert!(matches!(status, TunnelStatus::CircuitOpen { .. }));
     }
 
     #[test]

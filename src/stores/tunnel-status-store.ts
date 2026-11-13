@@ -8,8 +8,8 @@ import type { TunnelStatus } from "@/tauri/events";
  *
  * The UI reads this to render a compact status pill on remote workspaces
  * — "Reconnecting…" on a sleep/wake or WiFi flap, "Connection lost" once
- * the supervisor's circuit breaker trips. Without it the workspace just
- * appears frozen and the user is never told they must re-push.
+ * the supervisor's circuit breaker trips (it keeps retrying slowly). Without
+ * it the workspace just appears frozen.
  *
  * `connected` / `pending` deliberately resolve to "no pill" (see
  * `tunnelStatusKind`): a healthy tunnel needs no chrome.

@@ -801,7 +801,7 @@ export const onAgentChatTurnCheckpointsInvalidated = (
 // Mirror of src-tauri/src/ssh/tunnel_supervisor.rs:TunnelStatus
 // (serde tag = "kind", snake_case) and the registry's
 // TunnelStatusEvent. Lets the overview/sidebar render a
-// "Reconnecting…" / "Connection lost — re-push" pill on remote
+// "Reconnecting…" / "Connection lost — retrying" pill on remote
 // workspaces instead of a silent freeze.
 export type TunnelStatus =
   | { kind: "pending" }
