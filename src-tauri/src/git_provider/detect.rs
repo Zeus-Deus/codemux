@@ -224,6 +224,11 @@ pub(crate) fn parse_remote_endpoint(url: &str) -> Option<RemoteEndpoint> {
     if host.is_empty() {
         return None;
     }
+    let host = if matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git") {
+        github_ssh_alias_target(&host).map_or(host, str::to_string)
+    } else {
+        host
+    };
 
     // Only an http(s) remote names a *web* port. See `DetectedProvider`.
     let web_scheme = if scheme == "http" { "http" } else { "https" };
@@ -237,6 +242,24 @@ pub(crate) fn parse_remote_endpoint(url: &str) -> Option<RemoteEndpoint> {
         host: host.to_ascii_lowercase(),
         base_url,
     })
+}
+
+/// The real host behind a GitHub SSH config alias, or `None`.
+///
+/// Several GitHub accounts on one machine are usually configured as
+/// `Host github-work` → `HostName github.com` in `~/.ssh/config`, so the
+/// remote names the alias. gh, the API, and the web UI only know the real
+/// host, so a dotless host mentioning "github" (`github-work`) or a
+/// `github.com-<suffix>` / `github.com_<suffix>` host maps to `github.com`.
+/// Dotted names like `github.mycorp.com` are real Enterprise hosts and
+/// are left alone.
+fn github_ssh_alias_target(host: &str) -> Option<&'static str> {
+    let host = host.to_ascii_lowercase();
+    let dotless_alias = !host.contains('.') && host.contains("github");
+    let suffixed_alias = host
+        .strip_prefix("github.com")
+        .is_some_and(|rest| rest.starts_with(['-', '_']));
+    (dotless_alias || suffixed_alias).then_some("github.com")
 }
 
 /// Split `host[:port]`, tolerating a bracketed IPv6 literal.
@@ -638,6 +661,27 @@ mod tests {
             let endpoint = parse_remote_endpoint(url).unwrap_or_else(|| panic!("{url}"));
             assert_eq!(endpoint.host, "github.com", "{url}");
         }
+    }
+
+    #[test]
+    fn github_ssh_aliases_resolve_to_github_com() {
+        for url in [
+            "git@github-work:a/b.git",
+            "git@github.com-work:a/b.git",
+            "ssh://git@github-personal/a/b.git",
+            "https://github.com/a/b",
+        ] {
+            let endpoint = parse_remote_endpoint(url).unwrap_or_else(|| panic!("{url}"));
+            assert_eq!(endpoint.host, "github.com", "{url}");
+            assert_eq!(endpoint.base_url, "https://github.com", "{url}");
+        }
+        // A dotted Enterprise host is a real hostname, not an alias.
+        let enterprise = parse_remote_endpoint("git@github.mycorp.com:a/b.git").unwrap();
+        assert_eq!(enterprise.host, "github.mycorp.com");
+        assert_eq!(
+            parse_remote_endpoint("git@github.company.com:a/b.git").unwrap().host,
+            "github.company.com"
+        );
     }
 
     #[test]

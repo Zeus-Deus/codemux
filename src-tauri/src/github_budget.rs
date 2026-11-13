@@ -3239,6 +3239,19 @@ mod tests {
             remote_repository("git@github.example:a/b.git"),
             Some("github.example/a/b".into())
         );
+        // SSH config aliases for extra accounts target github.com.
+        for alias in [
+            "git@github-work:a/b.git",
+            "git@github.com-work:a/b.git",
+            "ssh://git@github-personal/a/b.git",
+            "https://github.com/a/b",
+        ] {
+            assert_eq!(remote_repository(alias), Some("github.com/a/b".into()), "{alias}");
+        }
+        assert_eq!(
+            remote_repository("git@github.mycorp.com:a/b.git"),
+            Some("github.mycorp.com/a/b".into())
+        );
         assert_eq!(retry_epoch("Retry-After: 120", 1000), Some(1120));
         assert_eq!(retry_epoch("x-ratelimit-reset: 2000", 1000), Some(2000));
         assert_eq!(retry_epoch("Retry after 2 seconds", 1000), Some(1060));
