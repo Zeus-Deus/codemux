@@ -45,6 +45,8 @@ interface LoadedDiff {
   path: string;
   raw: string;
   lines: DiffLine[];
+  /** The diff was too large to read whole; `lines` are its start. */
+  truncated: boolean;
 }
 
 /** How often the open file's status and diff are read again. */
@@ -195,14 +197,14 @@ export function DiffPane({
         ? getBaseBranchFileDiff(cwd, tab.baseBranch, path)
         : getGitDiff(cwd, path, tab.staged);
     fetchDiff
-      .then((raw) => {
+      .then(({ diff: raw, truncated }) => {
         if (read.cancelled) return;
         setError(null);
         // An unchanged re-read keeps the same object, so nothing renders.
         setDiff((prev) =>
-          prev?.source === source && prev.raw === raw
+          prev?.source === source && prev.raw === raw && prev.truncated === truncated
             ? prev
-            : { source, path, raw, lines: parseDiff(raw) },
+            : { source, path, raw, lines: parseDiff(raw), truncated },
         );
       })
       .catch((err: unknown) => {
@@ -390,7 +392,7 @@ export function DiffPane({
         <p className="text-label">Loading diff…</p>
       </div>
     );
-  } else if (current && diff.lines.length === 0) {
+  } else if (current && diff.lines.length === 0 && !diff.truncated) {
     body = (
       <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
         <GitCompare className="size-6 opacity-30" />
@@ -409,6 +411,17 @@ export function DiffPane({
           !current && "opacity-50",
         )}
       >
+        {/* Every line is rendered, so a lockfile or bundle diff arrives
+            cut short rather than freezing the pane. */}
+        {diff.truncated && (
+          <p
+            data-testid="diff-truncated"
+            className="shrink-0 border-b border-hairline px-3 py-1 text-caption text-muted-foreground"
+          >
+            Diff too large — showing the first {diff.lines.length.toLocaleString()}{" "}
+            {diff.lines.length === 1 ? "line" : "lines"}
+          </p>
+        )}
         {tab.layout === "split" ? (
           <DiffSplitView ref={viewRef} lines={diff.lines} />
         ) : (

@@ -35,6 +35,14 @@ pub struct BaseBranchDiff {
     pub merge_base_commit: String,
 }
 
+/// One file's diff for the diff pane. `truncated` means `diff` holds only
+/// the first lines, see [`MAX_FILE_DIFF_LINES`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDiff {
+    pub diff: String,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitDiffStat {
     pub staged_additions: u32,
@@ -427,11 +435,79 @@ pub fn git_status(repo_path: &Path) -> Result<Vec<GitFileStatus>, String> {
     Ok(files)
 }
 
-pub fn git_diff(repo_path: &Path, file_path: &str, staged: bool) -> Result<String, String> {
+/// The diff pane renders every line it gets and re-reads the open file every
+/// few seconds, so a regenerated lockfile or a minified bundle would freeze
+/// it. A file's diff stops at whichever of these comes first, on a line
+/// boundary. The byte limit matches the per-file limit of turn diffs.
+const MAX_FILE_DIFF_LINES: usize = 5_000;
+const MAX_FILE_DIFF_BYTES: usize = 512 * 1024;
+
+/// Runs a single-file `git diff` and keeps at most [`MAX_FILE_DIFF_LINES`]
+/// lines and [`MAX_FILE_DIFF_BYTES`] bytes. Reading stops at the limit and
+/// git is stopped, so the rest is never held in memory.
+fn run_git_diff_capped(repo_path: &Path, args: &[&str]) -> Result<FileDiff, String> {
+    run_git_diff_capped_to(repo_path, args, MAX_FILE_DIFF_LINES, MAX_FILE_DIFF_BYTES)
+}
+
+fn run_git_diff_capped_to(
+    repo_path: &Path,
+    args: &[&str],
+    max_lines: usize,
+    max_bytes: usize,
+) -> Result<FileDiff, String> {
+    use std::io::{BufRead, Read};
+    let mut child = git_command()
+        .args(args)
+        .current_dir(repo_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    let mut reader = std::io::BufReader::new(child.stdout.take().expect("stdout is piped"));
+    let mut kept = Vec::new();
+    let mut line = Vec::new();
+    let mut lines = 0;
+    let mut truncated = false;
+    loop {
+        line.clear();
+        // One byte past the budget is enough to tell that a line won't fit,
+        // without reading the whole of a minified one-line file.
+        let budget = (max_bytes - kept.len() + 1) as u64;
+        let read = (&mut reader)
+            .take(budget)
+            .read_until(b'\n', &mut line)
+            .map_err(|e| format!("Failed to read git diff: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        if lines == max_lines || kept.len() + read > max_bytes {
+            truncated = true;
+            break;
+        }
+        kept.extend_from_slice(&line);
+        lines += 1;
+    }
+    drop(reader);
+    if truncated {
+        // The rest of the diff is not wanted.
+        let _ = child.kill();
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    if !truncated && !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git {} failed: {}", args.first().unwrap_or(&""), stderr.trim()));
+    }
+    Ok(FileDiff { diff: String::from_utf8_lossy(&kept).trim_end().to_string(), truncated })
+}
+
+pub fn git_diff(repo_path: &Path, file_path: &str, staged: bool) -> Result<FileDiff, String> {
     if staged {
-        run_git(repo_path, &["diff", "--cached", "--", file_path])
+        run_git_diff_capped(repo_path, &["diff", "--cached", "--", file_path])
     } else {
-        run_git(repo_path, &["diff", "--", file_path])
+        run_git_diff_capped(repo_path, &["diff", "--", file_path])
     }
 }
 
@@ -1264,14 +1340,14 @@ pub fn git_diff_base_branch(repo_path: &Path, base_branch: &str) -> Result<BaseB
     })
 }
 
-pub fn git_diff_base_branch_file(repo_path: &Path, base_branch: &str, file_path: &str) -> Result<String, String> {
+pub fn git_diff_base_branch_file(repo_path: &Path, base_branch: &str, file_path: &str) -> Result<FileDiff, String> {
     let base_ref = resolve_base_ref(repo_path, base_branch)?;
     let merge_base = run_git(repo_path, &["merge-base", "HEAD", &base_ref])?;
     if merge_base.is_empty() {
         return Err("No common ancestor found".to_string());
     }
     let range = format!("{}..HEAD", merge_base);
-    run_git(repo_path, &["diff", &range, "--", file_path])
+    run_git_diff_capped(repo_path, &["diff", &range, "--", file_path])
 }
 
 pub fn git_default_branch(repo_path: &Path) -> Result<String, String> {
@@ -3823,6 +3899,42 @@ mod tests {
         assert_eq!(counts("bin.dat"), (0, 0));
         assert_eq!(counts("untracked.txt"), (0, 0));
         assert!(files.iter().all(|file| file.path != "touched.txt"), "{files:?}");
+    }
+
+    /// A file diff past the line or byte limit is cut on a line boundary
+    /// and says so; one inside both comes back whole.
+    #[test]
+    fn file_diff_is_capped_on_a_line_boundary() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        std::fs::write(repo.join("big.txt"), "").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        git_commit(&repo, "base").unwrap();
+        let body: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(repo.join("big.txt"), &body).unwrap();
+
+        let whole = git_diff(&repo, "big.txt", false).unwrap();
+        assert!(!whole.truncated);
+        assert!(whole.diff.ends_with("+line 50"), "{}", whole.diff);
+
+        let args = ["diff", "--", "big.txt"];
+        let by_lines = run_git_diff_capped_to(&repo, &args, 10, usize::MAX / 2).unwrap();
+        assert!(by_lines.truncated);
+        assert_eq!(by_lines.diff.lines().count(), 10);
+        assert!(whole.diff.starts_with(&by_lines.diff));
+
+        let by_bytes = run_git_diff_capped_to(&repo, &args, usize::MAX, 200).unwrap();
+        assert!(by_bytes.truncated);
+        assert!(by_bytes.diff.len() <= 200);
+        assert!(whole.diff.starts_with(&format!("{}\n", by_bytes.diff)), "cut mid-line: {:?}", by_bytes.diff);
+
+        // One line longer than the whole budget keeps nothing past it.
+        std::fs::write(repo.join("big.txt"), "x".repeat(1000)).unwrap();
+        let wide = run_git_diff_capped_to(&repo, &args, usize::MAX, 400).unwrap();
+        assert!(wide.truncated);
+        assert!(!wide.diff.contains("xxx"), "{}", wide.diff);
+
+        assert!(git_diff(&repo.join("missing"), "big.txt", false).is_err());
     }
 
     /// Before the first commit there is no HEAD: everything staged counts

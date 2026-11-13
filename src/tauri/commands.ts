@@ -39,6 +39,7 @@ import type {
   CheckInfo,
   EditorInfo,
   FileAttachmentInfo,
+  FileDiff,
   FileEntry,
   FileMatch,
   FolderAttachmentInfo,
@@ -1124,7 +1125,7 @@ export const getGitStatus = (path: string) =>
   invoke<GitFileStatus[]>("get_git_status", { path });
 
 export const getGitDiff = (path: string, file: string, staged: boolean) =>
-  invoke<string>("get_git_diff", { path, file, staged });
+  invoke<FileDiff>("get_git_diff", { path, file, staged });
 
 export const getGitDiffStat = (path: string) =>
   invoke<GitDiffStat>("get_git_diff_stat", { path });
@@ -1133,7 +1134,7 @@ export const getBaseBranchDiff = (path: string, baseBranch: string) =>
   invoke<BaseBranchDiff>("get_base_branch_diff", { path, baseBranch });
 
 export const getBaseBranchFileDiff = (path: string, baseBranch: string, file: string) =>
-  invoke<string>("get_base_branch_file_diff", { path, baseBranch, file });
+  invoke<FileDiff>("get_base_branch_file_diff", { path, baseBranch, file });
 
 export const getDefaultBranch = (path: string) =>
   invoke<string>("get_default_branch", { path });
