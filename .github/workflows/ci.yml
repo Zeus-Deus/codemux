@@ -538,14 +538,15 @@ jobs:
         # Windows loader honors the side-by-side manifest file whenever the
         # exe has no embedded manifest — exactly the situation Rust test
         # binaries are in — and creates the v6 activation context before
-        # resolving static imports. Copying to every exe in deps/ is
-        # deliberate overkill: it is harmless for exes that don't import
+        # resolving static imports. Copying to every exe under target/debug
+        # is deliberate overkill: it is harmless for exes that don't import
         # comctl32 and future-proof for whichever test binary picks up the
-        # import next.
+        # import next. The search is recursive because Cargo has moved test
+        # executables from deps/ into build/<pkg>/<hash>/out/.
         shell: pwsh
         run: |
           $manifest = (Resolve-Path "src-tauri/test-common-controls-v6.manifest").Path
-          Get-ChildItem "src-tauri/target/debug/deps" -Filter "*.exe" | ForEach-Object {
+          Get-ChildItem "src-tauri/target/debug" -Recurse -Filter "*.exe" | ForEach-Object {
             Copy-Item $manifest "$($_.FullName).manifest" -Force
           }
 
