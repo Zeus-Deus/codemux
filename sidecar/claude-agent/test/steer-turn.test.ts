@@ -6,8 +6,10 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import {
   ClaudeSession,
+  resetInterruptAckTimeoutForTests,
   resetInterruptExitTimeoutForTests,
   resetQueryFactoryForTests,
+  setInterruptAckTimeoutForTests,
   setInterruptExitTimeoutForTests,
   setQueryFactoryForTests,
   type EventEmitter,
@@ -41,6 +43,7 @@ beforeEach(() => {
 afterEach(() => {
   resetQueryFactoryForTests();
   resetInterruptExitTimeoutForTests();
+  resetInterruptAckTimeoutForTests();
   _resetSessionsForTests();
 });
 
@@ -97,6 +100,29 @@ test("steerTurn is rejected while an interrupt is still ending the turn", async 
   );
   release();
   await stopping;
+  await session.close();
+});
+
+test("Stop the CLI never acknowledges ends the CLI process instead of hanging", async () => {
+  const methods: string[] = [];
+  const session = new ClaudeSession(input(), {
+    notification: (method) => methods.push(method),
+  });
+  setInterruptAckTimeoutForTests(20);
+  await session.sendTurn({ text: "first" });
+  const fake = fakes[0] as FakeQuery;
+  fake.interrupt = () => new Promise<void>(() => {});
+  await session.interrupt();
+  expect(fake.closed).toBe(true);
+  expect(methods).toContain("turn-interrupted");
+  // The stop finished, so the next turn may steer again on a fresh query.
+  await session.sendTurn({ text: "next" });
+  await session.steerTurn({ text: "guidance", uuid: "steer-ack" });
+  await settle();
+  expect(fakes).toHaveLength(2);
+  expect(fakes[1]?.capturedPrompts.map((p) => p.uuid as string | undefined)).toContain(
+    "steer-ack",
+  );
   await session.close();
 });
 

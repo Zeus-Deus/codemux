@@ -174,6 +174,20 @@ export function resetInterruptExitTimeoutForTests(): void {
   interruptExitTimeoutMs = 2000;
 }
 
+/** How long `interrupt()` waits for the CLI to acknowledge the interrupt
+ *  control request. A wedged CLI never replies, and the SDK waits forever.
+ *  Must stay below the host's 20s RPC timeout so Stop falls back to ending
+ *  the CLI process instead of failing. */
+let interruptAckTimeoutMs = 10_000;
+
+export function setInterruptAckTimeoutForTests(ms: number): void {
+  interruptAckTimeoutMs = ms;
+}
+
+export function resetInterruptAckTimeoutForTests(): void {
+  interruptAckTimeoutMs = 10_000;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -989,7 +1003,20 @@ export class ClaudeSession {
     if (this.pendingSteers.size > 0) return this.retireForStop();
     this.interrupting = true;
     try {
-      await this.query.interrupt();
+      let ackTimer: ReturnType<typeof setTimeout> | undefined;
+      const acked = await Promise.race([
+        this.query.interrupt().then(() => true),
+        new Promise<boolean>((resolve) => {
+          ackTimer = setTimeout(() => resolve(false), interruptAckTimeoutMs);
+        }),
+      ]).finally(() => clearTimeout(ackTimer));
+      if (!acked) {
+        // The CLI never answered; end its process so Stop still wins.
+        logger.warn("interrupt not acknowledged; ending the CLI", {
+          threadId: this.threadId,
+        });
+        return await this.retireForStop();
+      }
       // Wait for `consumeMessages` to observe the iterator exit (which
       // flips `queryDead`), bounded by a timeout in case the SDK
       // treated the interrupt as soft and kept iterating.
