@@ -250,19 +250,29 @@ pub(crate) async fn open_workspace_impl<R: tauri::Runtime>(
 }
 
 /// Lines concurrent opens of one folder up just before the step that makes
-/// the workspace, so a test can run them through it together.
+/// the workspace, so a test can run them through it together, or holds one
+/// open there, its git read done, until the test releases it.
 #[cfg(test)]
 pub(crate) mod open_pause {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Notify};
 
     static LINE_UP: Mutex<Option<(PathBuf, Arc<Barrier>)>> = Mutex::new(None);
+    static HOLD: Mutex<Option<(PathBuf, Arc<Notify>, Arc<Notify>)>> = Mutex::new(None);
 
     /// The next `parties` opens of `path` wait there for each other.
     pub(crate) fn line_up(path: &Path, parties: usize) {
         *LINE_UP.lock().unwrap() = Some((path.to_path_buf(), Arc::new(Barrier::new(parties))));
+    }
+
+    /// The next open of `path` waits there for the returned release; the
+    /// first notify fires once it arrived.
+    pub(crate) fn hold(path: &Path) -> (Arc<Notify>, Arc<Notify>) {
+        let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        *HOLD.lock().unwrap() = Some((path.to_path_buf(), entered.clone(), release.clone()));
+        (entered, release)
     }
 
     pub(crate) async fn reached(path: &Path) {
@@ -270,6 +280,14 @@ pub(crate) mod open_pause {
         if let Some(barrier) = barrier {
             // Bounded, so a broken test fails on its assertions, not a hang.
             let _ = tokio::time::timeout(Duration::from_secs(10), barrier.wait()).await;
+        }
+        let held = {
+            let mut hold = HOLD.lock().unwrap();
+            if hold.as_ref().is_some_and(|(at, _, _)| at == path) { hold.take() } else { None }
+        };
+        if let Some((_, entered, release)) = held {
+            entered.notify_one();
+            let _ = tokio::time::timeout(Duration::from_secs(10), release.notified()).await;
         }
     }
 }
@@ -1076,7 +1094,7 @@ pub(crate) async fn create_worktree_checked<R: tauri::Runtime>(
     })
 }
 
-// `async fn` so `populate_git_info_async`'s 5-8 git subprocesses run on the
+// `async fn` so the git-info gather's 5-8 git subprocesses run on the
 // blocking pool. The function itself adopts an already-on-disk worktree
 // (state ops are cheap), so the git-info gather is the only slow step.
 #[tauri::command]
@@ -1115,7 +1133,8 @@ pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
 }
 
 /// [`import_worktree_workspace_impl`], asking `checkpoint` again once the
-/// lifecycle lock is held; its setup asks the background checkpoint.
+/// lifecycle lock is held and after the git read, before the workspace is
+/// created; its setup asks the background checkpoint.
 #[allow(clippy::too_many_arguments)]
 async fn import_worktree_workspace_checked<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -1141,6 +1160,18 @@ async fn import_worktree_workspace_checked<R: tauri::Runtime>(
     };
 
     let wt_path_buf = PathBuf::from(&worktree_path);
+    // Read before the workspace exists, so a requester whose authority was
+    // withdrawn during the read leaves nothing behind: no workspace, no
+    // terminal, no `.mcp.json`.
+    let git_info = {
+        let path = wt_path_buf.clone();
+        tokio::task::spawn_blocking(move || gather_workspace_git_info(&path))
+            .await
+            .unwrap_or_default()
+    };
+    #[cfg(test)]
+    open_pause::reached(&wt_path_buf).await;
+    checkpoint.check()?;
     let workspace_id = state.create_workspace_with_layout_with_selection(wt_path_buf.clone(), layout, select);
 
     state.set_workspace_worktree(&workspace_id.0, worktree_path.clone(), branch);
@@ -1149,8 +1180,7 @@ async fn import_worktree_workspace_checked<R: tauri::Runtime>(
     if let Some(root) = crate::config::workspace_config::find_git_root(&wt_path_buf) {
         state.set_workspace_project_root(&workspace_id.0, root.display().to_string());
     }
-
-    populate_git_info_async(&state, &workspace_id.0, wt_path_buf.clone()).await;
+    apply_workspace_git_info(state, &workspace_id.0, git_info);
 
     let snapshot = state.snapshot();
     let session_ids = snapshot

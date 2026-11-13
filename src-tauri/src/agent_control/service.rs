@@ -1676,7 +1676,7 @@ pub(super) async fn thread_close<R: Runtime>(app: &AppHandle<R>, caller: &Contro
     let owned = app.clone();
     run_receipted(app, caller, "thread_close", &args, false, Some(&target.workspace_id.clone()), move |_| async move {
         // Without select, closing moves no focus.
-        let pane = agent_chat::close_thread_pane_checked(&owned, &target.thread_id, witness).await?;
+        let pane = agent_chat::close_thread_pane_checked(&owned, provider, &target.thread_id, witness).await?;
         Ok(json!({"workspace_id": target.workspace_id, "thread_id": target.thread_id, "pane_id": pane, "closed": pane.is_some()}))
     }).await
 }

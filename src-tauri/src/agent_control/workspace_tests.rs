@@ -2121,6 +2121,129 @@ async fn thread_delete_lets_no_open_in_while_the_session_stops() {
     assert!(!provider.has_session(&ThreadId(thread.clone())).await);
 }
 
+/// A check for `open_thread_pane_checked` that, the first time it is asked,
+/// reports that the open got there and waits for the test to let it go on.
+/// It blocks only its own worker: `block_in_place` hands the rest of the
+/// runtime's work to the other.
+fn first_check_waits() -> (impl Fn() -> Result<(), String> + Send + 'static, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (reached, arrived) = std::sync::mpsc::channel();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let first = Mutex::new(Some((reached, wait)));
+    let check = move || {
+        if let Some((reached, wait)) = first.lock().unwrap().take() {
+            reached.send(()).unwrap();
+            tokio::task::block_in_place(|| wait.recv_timeout(Duration::from_secs(10))).expect("the test lets the open go on");
+        }
+        Ok(())
+    };
+    (check, arrived, go)
+}
+
+async fn arrives(arrived: std::sync::mpsc::Receiver<()>) {
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("the open reaches its check");
+}
+
+/// An open that found the thread's pane before a delete closed it binds no
+/// new pane while the delete still runs: it takes the lock the delete holds
+/// and then finds the thread gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_open_that_saw_the_pane_before_a_delete_binds_none_after_it() {
+    use crate::agent_provider::AgentProvider;
+    let (app, provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "delete-race-launch", &workspace, "default").await;
+    assert!(pane_of(&app, &thread).is_some());
+    let (check, arrived, go) = first_check_waits();
+    let opening = {
+        let (handle, thread) = (app.handle().clone(), thread.clone());
+        tokio::spawn(async move { crate::commands::agent_chat::open_thread_pane_checked(&handle, &thread, false, check).await.map(|opened| opened.pane_id) })
+    };
+    arrives(arrived).await;
+
+    let (entered, release) = provider.hold_next_stop();
+    let deleting = spawn_call(&app, &connector(ControlAccess::FullAccess), "thread_delete", &thread_args(&workspace, &thread, "delete-race"));
+    tokio::time::timeout(Duration::from_secs(10), entered.notified()).await.expect("the delete stops the session");
+    assert!(pane_of(&app, &thread).is_none(), "the delete closed the pane");
+    go.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(pane_of(&app, &thread).is_none(), "no pane binds while the delete runs");
+    release.notify_one();
+
+    assert_eq!(deleting.await.unwrap().unwrap()["deleted"], true);
+    let error = opening.await.unwrap().expect_err("the thread is gone");
+    assert!(error.starts_with("conversation_not_found"), "{error}");
+    assert!(pane_of(&app, &thread).is_none(), "no pane is left bound to a deleted thread");
+    assert!(!provider.has_session(&ThreadId(thread.clone())).await);
+}
+
+/// An open binding a new pane keeps the thread's gate, not only its lock: a
+/// delete that arrives meanwhile finds that gate and waits, rather than a
+/// fresh one whose lock is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_delete_waits_for_an_open_binding_a_pane() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "bind-race-launch", &workspace, "default").await;
+    app.state::<AppStateStore>().close_pane(&pane_of(&app, &thread).unwrap()).unwrap();
+    let (check, arrived, go) = first_check_waits();
+    let opening = {
+        let (handle, thread) = (app.handle().clone(), thread.clone());
+        tokio::spawn(async move { crate::commands::agent_chat::open_thread_pane_checked(&handle, &thread, false, check).await.map(|opened| opened.pane_id) })
+    };
+    arrives(arrived).await;
+
+    let deleting = spawn_call(&app, &connector(ControlAccess::FullAccess), "thread_delete", &thread_args(&workspace, &thread, "bind-race"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!deleting.is_finished(), "the delete waits for the open's bind");
+    assert!(app.state::<DatabaseStore>().get_agent_chat_session(&thread).is_some());
+    go.send(()).unwrap();
+
+    opening.await.unwrap().expect("the open binds before the delete");
+    assert_eq!(deleting.await.unwrap().unwrap()["deleted"], true);
+    assert!(pane_of(&app, &thread).is_none(), "the delete closed the pane the open bound");
+    assert!(app.state::<DatabaseStore>().get_agent_chat_session(&thread).is_none());
+}
+
+/// A close that finds the pane already gone still settles only once no
+/// worker runs: it joins a stop still pending, and stops a worker an earlier
+/// close failed to stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_close_without_a_pane_settles_once_the_session_stopped() {
+    use crate::agent_provider::AgentProvider;
+    let (app, provider, _root, workspace) = fixture().await;
+    let thread = launched(&app, "close-race-launch", &workspace, "default").await;
+    let bot = connector(ControlAccess::Supervised);
+
+    // The first close's stop cannot start while the thread's activity lock is held.
+    let activity = crate::commands::agent_chat::delegation_activity_lock(&thread).lock_owned().await;
+    let first = spawn_call(&app, &bot, "thread_close", &thread_args(&workspace, &thread, "close-race-1"));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pane_of(&app, &thread).is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the first close closes the pane");
+    let second = spawn_call(&app, &bot, "thread_close", &thread_args(&workspace, &thread, "close-race-2"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!second.is_finished(), "a close without a pane waits for the pending stop");
+    assert!(provider.has_session(&ThreadId(thread.clone())).await);
+    drop(activity);
+    assert_eq!(first.await.unwrap().unwrap()["closed"], true);
+    assert_eq!(second.await.unwrap().unwrap()["closed"], false);
+    assert!(!provider.has_session(&ThreadId(thread.clone())).await, "the session stopped before either close succeeded");
+
+    // A close whose stop failed leaves the worker running and no pane; the
+    // next close stops it.
+    let thread = launched(&app, "close-fail-launch", &workspace, "default").await;
+    assert!(provider.has_session(&ThreadId(thread.clone())).await);
+    provider.fail_next_stop(crate::agent_provider::ProviderError::RpcError { message: "synthetic stop failure".into() });
+    refused(call(&app, &bot, "thread_close", thread_args(&workspace, &thread, "close-race-fails")).await, ErrorCode::NativeControlFailed);
+    assert!(pane_of(&app, &thread).is_none() && provider.has_session(&ThreadId(thread.clone())).await, "the worker survived its failed stop");
+    let retried = call(&app, &bot, "thread_close", thread_args(&workspace, &thread, "close-race-3")).await.unwrap();
+    assert_eq!((retried["state"].clone(), retried["closed"].clone()), (json!("succeeded"), json!(false)), "{retried}");
+    assert!(!provider.has_session(&ThreadId(thread.clone())).await, "the surviving worker stopped before the close succeeded");
+}
+
 /// An open that waited for the thread's dispatch lock is judged as things are
 /// once it holds it: a thread whose mode rose above the caller's ceiling
 /// meanwhile stays closed.
@@ -2394,6 +2517,46 @@ async fn workspace_unarchive_revoked_while_queued_on_the_lifecycle_lock_restores
     failed_as_revoked(&settled(&app, &caller, &running["operation_id"]).await);
     assert_eq!(workspaces_at(&app, &folder), 0, "no workspace, so no terminal and no setup script");
     assert!(app.state::<AppStateStore>().find_archived_workspace(&archive_id).is_some(), "the entry stays restorable");
+    connector_off(&app);
+}
+
+/// A restore that adopts a worktree in place asks the caller's grant again
+/// after its git read: revoked during the read, it creates no workspace, so
+/// no terminal starts and no `.mcp.json` is written, and the entry stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_unarchive_revoked_during_the_worktree_git_read_adopts_nothing() {
+    if isolated(&format!("{MODULE}workspace_unarchive_revoked_during_the_worktree_git_read_adopts_nothing")) {
+        return;
+    }
+    without_terminal_daemon();
+    let (app, _provider, _root, _workspace, repo) = git_fixture().await;
+    let parent = tempfile::tempdir().unwrap();
+    let checkout = parent.path().join("adopted");
+    git(&repo, &["worktree", "add", "-b", "adopted", checkout.to_str().unwrap()]);
+    let state = app.state::<AppStateStore>();
+    let imported = state.create_empty_workspace_at_path(checkout.clone()).0;
+    state.set_workspace_worktree(&imported, checkout.display().to_string(), "adopted".into());
+    state.set_workspace_project_root(&imported, repo.display().to_string());
+    // An archive records the branch the workspace shows.
+    crate::commands::workspace::populate_git_info(&state, &imported, &checkout);
+    let archived = call(&app, &connector(ControlAccess::FullAccess), "workspace_archive", json!({"workspace_id": imported})).await.unwrap();
+    let archive_id = archived["archive_id"].as_str().unwrap().to_string();
+    assert_eq!(workspaces_at(&app, &checkout), 0);
+    let caller = connector_caller(&app, "adopt-restore-client", "adopt-restore-grant", ControlAccess::FullAccess).await;
+    let args = json!({"archive_id": archive_id, "client_request_id": "adopt-restore"});
+
+    let (entered, release) = crate::commands::workspace::open_pause::hold(&checkout);
+    let restoring = spawn_call(&app, &caller, "workspace_unarchive", &args);
+    let running = admitted(&app, &caller, "workspace_unarchive", &args).await;
+    tokio::time::timeout(Duration::from_secs(10), entered.notified()).await.expect("the restore reads the worktree's git state");
+    crate::mcp_connector::agent_connector_revoke(app.handle().clone(), "adopt-restore-client".into()).unwrap();
+    release.notify_one();
+
+    refused(restoring.await.unwrap(), ErrorCode::GrantRevoked);
+    failed_as_revoked(&settled(&app, &caller, &running["operation_id"]).await);
+    assert_eq!(workspaces_at(&app, &checkout), 0, "no workspace, so no terminal and no setup script");
+    assert!(!checkout.join(".mcp.json").exists(), "no MCP config written");
+    assert!(state.find_archived_workspace(&archive_id).is_some(), "the entry stays restorable");
     connector_off(&app);
 }
 

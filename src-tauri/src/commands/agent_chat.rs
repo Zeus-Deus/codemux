@@ -626,11 +626,14 @@ fn close_agent_chat_pane<R: Runtime>(
 /// returns the pane to close, so nothing it verified (the caller's authority,
 /// the thread's permission mode, its live worker's) changes before the pane
 /// closes. Returns that pane once its session stopped, or `None` when the
-/// thread had none; errs when the provider did not acknowledge the stop.
+/// thread had none (its session is still stopped, should an earlier close's
+/// stop be pending or have failed); errs when the provider did not
+/// acknowledge the stop.
 pub(crate) async fn close_thread_pane_checked<R: Runtime>(
     app: &AppHandle<R>,
+    provider: ProviderKind,
     thread_id: &str,
-    check: impl FnOnce() -> Result<Option<String>, String>,
+    check: impl Fn() -> Result<Option<String>, String>,
 ) -> Result<Option<String>, String> {
     feature_flag_on(&app.state::<ObservabilityStore>())?;
     let gate = native_thread_gate(app, thread_id);
@@ -640,10 +643,30 @@ pub(crate) async fn close_thread_pane_checked<R: Runtime>(
         gate.cancel();
     }
     let (pane, stops) = {
-        let _native_guard = gate.dispatch.clone().lock_owned().await;
-        let Some(pane) = check()? else { return Ok(None) };
-        let stops = close_agent_chat_pane(app, &app.state(), &pane, false);
-        (pane, stops)
+        let mut native_guard = gate.dispatch.clone().lock_owned().await;
+        let mut activity_guard = None;
+        loop {
+            if let Some(pane) = check()? {
+                let stops = close_agent_chat_pane(app, &app.state(), &pane, false);
+                break (pane, stops);
+            }
+            if activity_guard.is_some() {
+                // A provider no longer configured has no session to stop.
+                if let Some(implementation) = app.state::<ProviderRegistry>().get(provider).await {
+                    stop_session_locked(app, implementation.as_ref(), ThreadId(thread_id.to_string()))
+                        .await
+                        .map_err(|error| format!("The session did not stop: {error}"))?;
+                }
+                return Ok(None);
+            }
+            // The pane is gone, but the stop its close began may still be
+            // running, or may have failed and left the worker up. Stop the
+            // session here under that stop's locks, in its lock order, so
+            // this settles only once no worker runs.
+            drop(native_guard);
+            activity_guard = Some(super::usage_resume::activity_lock(thread_id).lock_owned().await);
+            native_guard = gate.dispatch.clone().lock_owned().await;
+        }
     };
     // The stop takes the dispatch lock itself, so it is awaited only once
     // the lock is released. A reopen and send after this returns cannot be
@@ -7212,38 +7235,50 @@ pub(crate) async fn open_thread_pane_checked<R: Runtime>(
     app: &AppHandle<R>,
     thread_id: &str,
     select: bool,
-    check: impl FnOnce() -> Result<(), String>,
+    check: impl Fn() -> Result<(), String>,
 ) -> Result<OpenedThreadPane, String> {
     feature_flag_on(&app.state::<ObservabilityStore>())?;
     let state = app.state::<AppStateStore>();
     let db = app.state::<DatabaseStore>();
     // Binding a new pane holds the chat's dispatch lock from reading it
     // through the bind, so a history reopen can't merge it away in between
-    // (`merge_reopened_chat`). A chat already open in a pane is never
-    // merged, so focusing it doesn't wait behind a session that is starting.
-    let dispatch_guard = match state.agent_chat_pane_id_for_thread(thread_id) {
+    // (`merge_reopened_chat`) and a delete can't close it and then find a
+    // new pane bound to the history it removes. A chat already open in a
+    // pane is never merged, so focusing it doesn't wait behind a session
+    // that is starting. The gate is held as long as its lock: the registry
+    // keeps gates only while someone does, and another caller must find
+    // this one, not a fresh gate with a free lock.
+    let gate = native_thread_gate(app, thread_id);
+    let mut dispatch_guard = match state.agent_chat_pane_id_for_thread(thread_id) {
         Some(_) => None,
-        None => Some(native_thread_gate(app, thread_id).dispatch.clone().lock_owned().await),
+        None => Some(gate.dispatch.clone().lock_owned().await),
     };
-    check()?;
-    let record = db
-        .get_agent_chat_session(thread_id)
-        .ok_or_else(|| format!("conversation_not_found: {thread_id}"))?;
-    let provider = match record.provider.to_ascii_lowercase().as_str() {
-        "claude" => ProviderKind::Claude,
-        "codex" => ProviderKind::Codex,
-        "cursor" => ProviderKind::Cursor,
-        "grok" => ProviderKind::Grok,
-        "antigravity" => ProviderKind::Antigravity,
-        "hermes" => ProviderKind::Hermes,
-        "acp" => ProviderKind::Acp,
-        "opencode" => ProviderKind::OpenCode,
-        other => return Err(format!("unsupported_provider: {other}")),
-    };
-
-    let (pane_id, created) = if let Some(existing) = state.agent_chat_pane_id_for_thread(thread_id) {
-        (existing, false)
-    } else {
+    let (pane_id, created) = loop {
+        check()?;
+        let record = db
+            .get_agent_chat_session(thread_id)
+            .ok_or_else(|| format!("conversation_not_found: {thread_id}"))?;
+        let provider = match record.provider.to_ascii_lowercase().as_str() {
+            "claude" => ProviderKind::Claude,
+            "codex" => ProviderKind::Codex,
+            "cursor" => ProviderKind::Cursor,
+            "grok" => ProviderKind::Grok,
+            "antigravity" => ProviderKind::Antigravity,
+            "hermes" => ProviderKind::Hermes,
+            "acp" => ProviderKind::Acp,
+            "opencode" => ProviderKind::OpenCode,
+            other => return Err(format!("unsupported_provider: {other}")),
+        };
+        if let Some(existing) = state.agent_chat_pane_id_for_thread(thread_id) {
+            break (existing, false);
+        }
+        if dispatch_guard.is_none() {
+            // The pane seen without the lock closed since, perhaps by a
+            // delete still holding it: bind only under the lock, once the
+            // thread is checked again there.
+            dispatch_guard = Some(gate.dispatch.clone().lock_owned().await);
+            continue;
+        }
         let pane_id = state
             .create_or_reuse_agent_chat_pane_with_selection(
                 &record.workspace_id,
@@ -7254,7 +7289,7 @@ pub(crate) async fn open_thread_pane_checked<R: Runtime>(
                 select,
             )?
             .0;
-        (pane_id.0, true)
+        break (pane_id.0, true);
     };
     drop(dispatch_guard);
 
