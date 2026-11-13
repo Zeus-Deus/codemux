@@ -50,17 +50,39 @@ pub async fn serve<R: Runtime>(
             // may request a large image/media file.
             let stream = tokio_util::io::ReaderStream::new(asset.file);
             let body = axum::body::Body::from_stream(stream);
-            axum::response::Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, asset.mime)
-                .header(header::CONTENT_LENGTH, asset.len)
-                .body(body)
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "asset build failed").into_response()
-                })
+            asset_response(asset.mime, asset.len, body)
         }
         Err(AssetError::NotFound) => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
+}
+
+/// CSP applied when a scriptable asset is opened as a top-level document.
+/// `sandbox` gives the document an opaque origin, so script inside a repo's
+/// SVG/HTML cannot use the session cookie to reach the authenticated API
+/// (e.g. mint a WebSocket ticket). It has no effect on `<img src>` rendering.
+const SCRIPTABLE_DOCUMENT_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+
+/// Whether a served MIME type can execute script when navigated to directly.
+fn is_scriptable_mime(mime: &str) -> bool {
+    let essence = mime.split(';').next().unwrap_or("").trim();
+    essence == "text/html" || essence.ends_with("+xml") || essence.ends_with("/xml")
+}
+
+/// Build the 200 response for an asset. Always disables MIME sniffing so a
+/// file served as text or a download is never upgraded to HTML, and
+/// sandboxes scriptable document types.
+fn asset_response(mime: &'static str, len: u64, body: axum::body::Body) -> Response {
+    let mut builder = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_LENGTH, len)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    if is_scriptable_mime(mime) {
+        builder = builder.header(header::CONTENT_SECURITY_POLICY, SCRIPTABLE_DOCUMENT_CSP);
+    }
+    builder.body(body).unwrap_or_else(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "asset build failed").into_response()
+    })
 }
 
 /// An openable regular file plus the metadata needed to serve it.
@@ -179,6 +201,29 @@ mod tests {
             open_asset(Path::new("/no/such/file/should/exist/xyz.png")).await,
             Err(AssetError::NotFound)
         ));
+    }
+
+    #[test]
+    fn every_asset_disables_sniffing_and_scriptable_types_are_sandboxed() {
+        for name in ["logo.svg", "page.html", "page.htm", "feed.xml"] {
+            let mime = guess_mime(Path::new(name));
+            let resp = asset_response(mime, 0, axum::body::Body::empty());
+            assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{name}");
+            assert_eq!(
+                resp.headers()[header::CONTENT_SECURITY_POLICY],
+                SCRIPTABLE_DOCUMENT_CSP,
+                "{name}"
+            );
+        }
+        for name in ["shot.png", "notes.md", "app.js", "doc.pdf", "blob.bin"] {
+            let mime = guess_mime(Path::new(name));
+            let resp = asset_response(mime, 0, axum::body::Body::empty());
+            assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{name}");
+            assert!(
+                resp.headers().get(header::CONTENT_SECURITY_POLICY).is_none(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
