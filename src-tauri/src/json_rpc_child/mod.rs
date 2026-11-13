@@ -79,6 +79,10 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// promptly — the bound only matters when a grandchild process inherited
 /// the stdout fd and is holding the pipe open.
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long pending requests wait after stdout EOF for the process exit to
+/// be observed before they fail anyway. A child that closes stdout but keeps
+/// running would otherwise strand them until their own timeout.
+const STDOUT_EOF_EXIT_GRACE: Duration = Duration::from_secs(1);
 /// Depth of the incoming-request mpsc queue. Higher values absorb bursty
 /// providers at the cost of more memory; the value is a conservative ceiling
 /// well above what any current CLI uses.
@@ -614,6 +618,7 @@ impl JsonRpcChild {
             let failure_tx_reader = failure_tx.clone();
             let incoming_tx_reader = incoming_tx.clone();
             let alive_reader = Arc::clone(&alive);
+            let exit_info_reader = Arc::clone(&exit_info);
             #[cfg(test)]
             let reader_gate_reader = reader_gate.clone();
             tokio::spawn(async move {
@@ -666,6 +671,27 @@ impl JsonRpcChild {
                     }
                 }
                 alive_reader.store(false, Ordering::SeqCst);
+                // Nothing can answer a pending request once stdout is gone,
+                // but the process may outlive its stdout indefinitely and the
+                // watchdog only fails requests after the exit. Fail them here
+                // unless the exit lands within a short grace; the watchdog
+                // then owns the drain and its more informative error.
+                tokio::spawn(async move {
+                    tokio::time::sleep(STDOUT_EOF_EXIT_GRACE).await;
+                    let stranded = {
+                        let Ok(exit) = exit_info_reader.lock() else { return };
+                        if exit.is_some() {
+                            return;
+                        }
+                        pending_reader.lock().map(|mut m| m.drain()).unwrap_or_default()
+                    };
+                    for tx in stranded {
+                        let _ = tx.send(Err(RpcChildError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "child closed its stdout",
+                        ))));
+                    }
+                });
                 // Dropping `incoming_tx_reader` (the only remaining sender
                 // besides the watchdog-held clone) will eventually close the
                 // channel once watchdog drops its clone too.
@@ -1845,6 +1871,24 @@ mod safety_tests {
         child.shutdown().await.unwrap();
         TEST_WRITE_GATES.lock().unwrap().remove(&key);
         assert!(matches!(denied, Err(RpcChildError::AlreadyShutdown)), "queued writer appended to a quarantined stream: {denied:?}");
+    }
+
+    #[tokio::test]
+    async fn pending_request_fails_when_stdout_closes_before_exit() {
+        // Reads the request, closes stdout, and keeps running.
+        let child = JsonRpcChild::spawn(SpawnConfig {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "read line; exec 1>&-; sleep 30".into()],
+            env: HashMap::new(), cwd: None, default_timeout: Duration::from_secs(30),
+        }).await.unwrap();
+        let started = std::time::Instant::now();
+        let result = child.request("stranded", serde_json::json!({})).await;
+        assert!(
+            matches!(&result, Err(RpcChildError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "expected stdout EOF failure, got {result:?}",
+        );
+        assert!(started.elapsed() < Duration::from_secs(10), "request waited for its own timeout");
+        child.shutdown().await.unwrap();
     }
 
     #[tokio::test]
