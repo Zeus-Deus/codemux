@@ -656,9 +656,66 @@ pub fn startup_jitter(max: Duration) -> Duration {
     Duration::from_millis(rand::thread_rng().gen_range(0..=max_ms))
 }
 
+/// The background fetch's arguments. It runs while the user or an agent
+/// may be using the same repository, so it leaves FETCH_HEAD alone (git
+/// writes it without a lock, and a concurrent `git pull` reads it) and never
+/// starts auto gc or maintenance, which a fetch per repo per minute would
+/// otherwise keep triggering.
+pub const BACKGROUND_FETCH_ARGS: [&str; 6] =
+    ["fetch", "--prune", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-auto-gc"];
+
+/// Waits for `child` up to `limit`, then stops it. On Unix it gets SIGTERM
+/// first and `grace` to exit, so git removes the ref lock files it holds;
+/// a kill would leave them behind and break the next fetch or push.
+pub async fn wait_or_stop(child: &mut tokio::process::Child, limit: Duration, grace: Duration) {
+    if tokio::time::timeout(limit, child.wait()).await.is_ok() {
+        return;
+    }
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: kill(2) has no memory effects. `id()` is `Some` only
+        // while the child is unreaped, so the pid is still ours.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if tokio::time::timeout(grace, child.wait()).await.is_ok() {
+            return;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = grace;
+    let _ = child.kill().await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child past its limit is asked to stop before it is killed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_or_stop_sends_sigterm_before_killing() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("term");
+        let script = format!("trap 'echo term > \"{}\"; exit 0' TERM; while :; do sleep 0.05; done", seen.display());
+        let mut child = tokio::process::Command::new("sh").args(["-c", &script]).kill_on_drop(true).spawn().unwrap();
+        wait_or_stop(&mut child, Duration::from_millis(200), Duration::from_secs(5)).await;
+        assert!(child.try_wait().unwrap().is_some_and(|status| status.success()), "exited from its TERM trap");
+        assert!(seen.exists(), "the trap ran");
+    }
+
+    /// A child that ignores SIGTERM is killed once the grace runs out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_or_stop_kills_a_child_that_ignores_sigterm() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 0.05; done"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        wait_or_stop(&mut child, Duration::from_millis(100), Duration::from_millis(200)).await;
+        assert!(child.try_wait().unwrap().is_some(), "still running");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     fn ws(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
