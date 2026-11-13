@@ -368,8 +368,10 @@ mod tests {
     use std::time::Duration;
 
     fn fixture() -> PathBuf {
-        let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap()
-            .join(format!("fake_antigravity_acp{}", std::env::consts::EXE_SUFFIX));
+        let binary = crate::test_isolation::fixture_bin(format!(
+            "fake_antigravity_acp{}",
+            std::env::consts::EXE_SUFFIX
+        ));
         assert!(binary.is_file(), "build the fake_antigravity_acp test fixture first");
         binary
     }
