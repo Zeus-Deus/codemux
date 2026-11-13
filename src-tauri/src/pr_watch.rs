@@ -161,9 +161,10 @@ pub(crate) struct PrView {
     pub review_keys: Vec<String>,
     /// Read in the same query as `head_sha`, so they always belong to it.
     pub checks: Vec<PrCheck>,
-    /// A workflow run on the head has not finished. Its jobs may not show in
-    /// `checks` yet: see [`parse_runs_pending`]. Only looked up when the
-    /// checks alone would read as green.
+    /// A workflow run on the head has not finished, or that could not be
+    /// ruled out this pass. Its jobs may not show in `checks` yet: see
+    /// [`runs_hold_green`]. Only looked up when the checks alone would read
+    /// as green.
     pub runs_pending: bool,
 }
 
@@ -195,6 +196,43 @@ pub(crate) fn parse_runs_pending(json: &str) -> Result<bool, String> {
             Some("requested" | "queued" | "pending" | "waiting" | "in_progress")
         )
     }))
+}
+
+/// Whether the workflow-runs read keeps the head from being green.
+///
+/// A failure retrying can fix (timeout, 5xx, rate limit, paused budget)
+/// holds green back for this pass: an unconfirmed green would wake the
+/// agent, refill its budget, and mark the head told, so it would never be
+/// checked again. A failure retrying cannot fix (no access, Actions
+/// unavailable, an unexpected body) falls back to the checks alone, so a
+/// watch is never stuck short of green.
+fn runs_hold_green(read: Result<String, String>, context: &str) -> bool {
+    let error = match read {
+        Ok(json) => match parse_runs_pending(&json) {
+            Ok(pending) => return pending,
+            Err(error) => error,
+        },
+        Err(error) if is_transient_read_error(&error) => {
+            eprintln!("[codemux::pr-watch] workflow runs for {context}, retrying next pass: {error}");
+            return true;
+        }
+        Err(error) => error,
+    };
+    eprintln!("[codemux::pr-watch] workflow runs for {context}, using checks alone: {error}");
+    false
+}
+
+/// A GitHub read failure that may succeed on retry. Access and "not
+/// found" refusals are permanent unless they are rate limiting in disguise
+/// (GitHub reports secondary limits as HTTP 403).
+fn is_transient_read_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    if error.contains("rate limit") || error.contains("http 429") {
+        return true;
+    }
+    !["http 401", "http 403", "http 404", "http 410", "http 422", "not found", "resource not accessible"]
+        .iter()
+        .any(|marker| error.contains(marker))
 }
 
 fn is_own(author: &str, viewer: &str) -> bool {
@@ -732,18 +770,8 @@ fn fetch_view(repo_path: &Path, pr: &PrRepo, watch: &PrWatchRecord, seen: &HashS
             "repos/{}/actions/runs?head_sha={}&per_page=100",
             pr.nwo, view.head_sha
         );
-        match crate::github_budget::run(repo_path, &["api", &endpoint, "--hostname", &pr.host], GH_TIMEOUT)
-            .and_then(|json| parse_runs_pending(&json))
-        {
-            Ok(pending) => view.runs_pending = pending,
-            // Never hold green back forever on a failed read; the checks
-            // alone decide, as they did before this lookup existed.
-            Err(error) => eprintln!(
-                "[codemux::pr-watch] workflow runs for {} @ {}: {error}",
-                pr.selector(),
-                view.head_sha
-            ),
-        }
+        let read = crate::github_budget::run(repo_path, &["api", &endpoint, "--hostname", &pr.host], GH_TIMEOUT);
+        view.runs_pending = runs_hold_green(read, &format!("{} @ {}", pr.selector(), view.head_sha));
     }
     Ok(view)
 }
@@ -1559,6 +1587,56 @@ mod tests {
         let eval = evaluate(&w, &passing("h1"), &seen, 2);
         assert!(matches!(&eval.decision, Decision::Wake(report) if report.green));
         assert_eq!(eval.next.attempts, 0);
+    }
+
+    #[test]
+    fn a_failed_runs_read_holds_green_until_a_retry_succeeds() {
+        let passing = PrView { runs_pending: false, ..view("h1", vec![], vec![check("ci", CheckState::Success, 1)]) };
+        let w = PrWatchRecord { wake_on_green: true, head_sha: Some("h1".into()), attempts: 2, ..watch() };
+        let mut seen = HashSet::new();
+
+        // Pass 1: the read times out. Not green, nothing refunded or marked.
+        let failed = PrView {
+            runs_pending: runs_hold_green(Err("gh timed out after 15s".into()), "o/r @ h1"),
+            ..passing.clone()
+        };
+        let eval = evaluate(&w, &failed, &seen, 1);
+        assert!(matches!(eval.decision, Decision::Quiet), "{:?}", eval.decision);
+        assert_eq!(eval.next.attempts, 2);
+        let w = commit(&eval, &mut seen);
+        assert!(!seen.contains(&green_key("h1")));
+        // So the next pass asks again.
+        assert!(needs_runs_check(&w, &passing, &seen));
+
+        // Pass 2: the read recovers and shows every run finished.
+        let done = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+        let recovered = PrView { runs_pending: runs_hold_green(Ok(done.into()), "o/r @ h1"), ..passing.clone() };
+        let eval = evaluate(&w, &recovered, &seen, 2);
+        assert!(matches!(&eval.decision, Decision::Wake(report) if report.green));
+        assert_eq!(eval.next.attempts, 0);
+    }
+
+    #[test]
+    fn runs_read_failures_split_into_retry_and_checks_only() {
+        for transient in [
+            "gh timed out after 15s",
+            "GitHub API read failed (HTTP 502): Bad Gateway",
+            "GitHub API read failed (HTTP 429): slow down; rate limit exceeded",
+            "GitHub API read failed (HTTP 403): You have exceeded a secondary rate limit",
+            "GitHub API rate limit: requests to github.com paused until 123",
+            "error connecting to api.github.com",
+        ] {
+            assert!(runs_hold_green(Err(transient.into()), "t"), "{transient}");
+        }
+        for permanent in [
+            "GitHub API read failed (HTTP 404): Not Found",
+            "GitHub API read failed (HTTP 403): Resource not accessible by integration",
+            "gh: Not Found (HTTP 404)",
+        ] {
+            assert!(!runs_hold_green(Err(permanent.into()), "t"), "{permanent}");
+        }
+        // An unexpected body will not change on retry either.
+        assert!(!runs_hold_green(Ok(r#"{"message":"weird"}"#.into()), "t"));
     }
 
     #[test]
