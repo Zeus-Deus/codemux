@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -12,6 +12,7 @@ import type {
   PaneNodeSnapshot,
   WorkspaceSnapshot,
 } from "@/tauri/types";
+import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import {
   DEFAULT_RIGHT_PANEL_PANES,
@@ -22,7 +23,10 @@ import {
 // ── Mocks ──
 // Sub-panels are irrelevant to deck wiring — stub them out.
 vi.mock("@/components/workspace/file-tree-panel", () => ({
-  FileTreePanel: () => <div data-testid="file-tree-panel" />,
+  FileTreePanel: () => {
+    mocks.fileTreeRenders += 1;
+    return <div data-testid="file-tree-panel" />;
+  },
 }));
 vi.mock("@/components/workspace/changes-panel", () => ({
   ChangesPanel: () => <div data-testid="changes-panel" />,
@@ -63,6 +67,7 @@ const mocks = vi.hoisted(() => ({
   dock: vi.fn().mockResolvedValue(undefined),
   undock: vi.fn().mockResolvedValue(undefined),
   createTab: vi.fn().mockResolvedValue("tab-1"),
+  fileTreeRenders: 0,
 }));
 vi.mock("@/components/workflow/use-workspace-workflow", () => ({
   useWorkspaceWorkflow: () => mocks.workflow,
@@ -890,3 +895,43 @@ describe("RightPanel browser pane", () => {
   });
 });
 
+
+describe("RightPanel while the chat streams", () => {
+  afterEach(() => {
+    useAgentChatStore.setState({ threads: {} });
+  });
+
+  function streamReply(text: string) {
+    useAgentChatStore.getState().ensureThread("thread-1");
+    useAgentChatStore.setState((s) => ({
+      threads: {
+        ...s.threads,
+        "thread-1": {
+          ...s.threads["thread-1"],
+          messages: [
+            {
+              kind: "assistant_message",
+              id: "a-1",
+              seq: 1,
+              turn_id: "turn-1",
+              text,
+              streaming: true,
+            },
+          ],
+        },
+      },
+    }) as never);
+  }
+
+  it("does not redraw the open pane for each streamed batch", () => {
+    renderDeck({ activeTab: "files" });
+    expect(screen.getByTestId("file-tree-panel")).toBeInTheDocument();
+    const rendersBefore = mocks.fileTreeRenders;
+
+    for (const text of ["H", "He", "Hel", "Hell", "Hello"]) {
+      act(() => streamReply(text));
+    }
+
+    expect(mocks.fileTreeRenders).toBe(rendersBefore);
+  });
+});

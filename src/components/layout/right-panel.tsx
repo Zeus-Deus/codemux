@@ -61,6 +61,7 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useShallow } from "zustand/react/shallow";
 
 import { TasksPanel, TasksPaneActions } from "@/components/chat/TasksPanel";
 import { DiffPane } from "@/components/diff/DiffPane";
@@ -92,7 +93,10 @@ import {
   useSideChatStore,
 } from "@/lib/agent-chat/side-chat";
 import { sessionProviderLabel } from "@/lib/agent-chat/session-mentions";
-import { subagentDeckSummary } from "@/lib/agent-chat/subagents";
+import {
+  subagentDeckSummary,
+  type SubagentDeckSummary,
+} from "@/lib/agent-chat/subagents";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { isImageExtension, isVideoExtension } from "@/lib/editor-languages";
 import {
@@ -159,6 +163,48 @@ interface Props {
 }
 
 const EMPTY_MESSAGES: ChatViewItem[] = [];
+
+type ChatStoreState = ReturnType<typeof useAgentChatStore.getState>;
+
+function selectThreadMessages(
+  state: ChatStoreState,
+  threadId: string | null,
+): ChatViewItem[] {
+  return threadId
+    ? (state.threads[threadId]?.messages ?? EMPTY_MESSAGES)
+    : EMPTY_MESSAGES;
+}
+
+/**
+ * Selector for the deck's subagent counts. The thread's messages array is
+ * replaced on every streamed batch, so the deck must not subscribe to it
+ * directly: that re-rendered the whole panel, and the open pane, once per
+ * frame. The summary is recomputed only when the array changes, and paired
+ * with `useShallow` the deck re-renders only when a count does.
+ */
+function makeSubagentSummarySelector(
+  threadId: string | null,
+  dismissed: readonly string[],
+): (state: ChatStoreState) => SubagentDeckSummary {
+  const dismissedSet = new Set(dismissed);
+  let lastMessages: ChatViewItem[] | null = null;
+  let lastSummary: SubagentDeckSummary | null = null;
+  return (state) => {
+    const messages = selectThreadMessages(state, threadId);
+    if (messages !== lastMessages || lastSummary === null) {
+      lastMessages = messages;
+      lastSummary = subagentDeckSummary(messages, dismissedSet);
+    }
+    return lastSummary;
+  };
+}
+
+/** The Subagents pane reads the live transcript, so it subscribes itself
+ *  rather than through the deck (see `makeSubagentSummarySelector`). */
+function ThreadSubagentsPane({ threadId }: { threadId: string | null }) {
+  const messages = useAgentChatStore((s) => selectThreadMessages(s, threadId));
+  return <SubagentsPane threadId={threadId} messages={messages} />;
+}
 
 type ChecksRollup = "pending" | "success" | "failure" | "none";
 
@@ -287,11 +333,6 @@ export const RightPanel = memo(function RightPanel({
     activeChatTasks && activeChatTasks.tasks.length > 0
       ? activeChatTasks
       : null;
-  const messages = useAgentChatStore((s) =>
-    threadId
-      ? (s.threads[threadId]?.messages ?? EMPTY_MESSAGES)
-      : EMPTY_MESSAGES,
-  );
   const contextUsage = useAgentChatStore((s) =>
     threadId ? (s.threads[threadId]?.contextUsage ?? null) : null,
   );
@@ -314,9 +355,14 @@ export const RightPanel = memo(function RightPanel({
   );
   const subagentsHistoryOpen = useUIStore((s) => s.subagentsHistoryOpen);
   const setSubagentsHistoryOpen = useUIStore((s) => s.setSubagentsHistoryOpen);
-  const subagentSummary = useMemo(
-    () => subagentDeckSummary(messages, new Set(dismissedSubagentAttention)),
-    [messages, dismissedSubagentAttention],
+  const subagentSummary = useAgentChatStore(
+    useShallow(
+      useMemo(
+        () =>
+          makeSubagentSummarySelector(threadId, dismissedSubagentAttention),
+        [threadId, dismissedSubagentAttention],
+      ),
+    ),
   );
 
   // The `/btw` side chat for this workspace's deck, if one is open.
@@ -607,6 +653,16 @@ export const RightPanel = memo(function RightPanel({
       }
     },
     [dropPane, setRightPanelTab, workspaceId, activePane],
+  );
+
+  // Stable so the memoized tab strip doesn't re-render with the deck.
+  const handleSelect = useCallback(
+    (id: RightPanelTab) => setRightPanelTab(workspaceId, id),
+    [setRightPanelTab, workspaceId],
+  );
+  const handleReorder = useCallback(
+    (ids: RightPanelTab[]) => reorderRightPanelPanes(workspaceId, ids),
+    [reorderRightPanelPanes, workspaceId],
   );
 
   const handleOpenTerminal = useCallback(() => {
@@ -1000,10 +1056,10 @@ export const RightPanel = memo(function RightPanel({
         inTitlebar={titlebarOverlay}
         tabs={tabs}
         activeTab={activePane}
-        onSelect={(id) => setRightPanelTab(workspaceId, id)}
+        onSelect={handleSelect}
         onClose={handleClose}
         onCloseMany={handleCloseMany}
-        onReorder={(ids) => reorderRightPanelPanes(workspaceId, ids)}
+        onReorder={handleReorder}
         actions={actions}
         surfaces={surfaces}
         onOpenFile={handleOpenFile}
@@ -1081,7 +1137,7 @@ export const RightPanel = memo(function RightPanel({
             threadId={workflowThreadId}
           />
         ) : activePane === "subagents" ? (
-          <SubagentsPane threadId={threadId} messages={messages} />
+          <ThreadSubagentsPane threadId={threadId} />
         ) : activePane === "side-chat" ? (
           <SideChatPane
             key={sideChat?.sideId ?? "none"}
