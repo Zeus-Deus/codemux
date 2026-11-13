@@ -161,6 +161,40 @@ pub(crate) struct PrView {
     pub review_keys: Vec<String>,
     /// Read in the same query as `head_sha`, so they always belong to it.
     pub checks: Vec<PrCheck>,
+    /// A workflow run on the head has not finished. Its jobs may not show in
+    /// `checks` yet: see [`parse_runs_pending`]. Only looked up when the
+    /// checks alone would read as green.
+    pub runs_pending: bool,
+}
+
+/// Whether the checks and mergeability alone read as green.
+fn checks_look_green(view: &PrView) -> bool {
+    view.checks.iter().all(|c| matches!(c.state, CheckState::Success | CheckState::Neutral))
+        && view.checks.iter().any(|c| c.state == CheckState::Success)
+        && view.mergeable == "MERGEABLE"
+}
+
+/// Whether green on this head would change anything (a wake to send or an
+/// attempt budget to refill), so the extra workflow-runs read is worth it.
+fn needs_runs_check(watch: &PrWatchRecord, view: &PrView, seen: &HashSet<String>) -> bool {
+    checks_look_green(view)
+        && (watch.attempts > 0 || (watch.wake_on_green && !seen.contains(&green_key(&view.head_sha))))
+}
+
+/// Parse `GET repos/{owner}/{repo}/actions/runs?head_sha=…`: whether any run
+/// is unfinished. GitHub adds a run's check runs only once its jobs start,
+/// so a run queued behind a concurrency group, waiting on an environment,
+/// or just requested is missing from `statusCheckRollup` entirely.
+pub(crate) fn parse_runs_pending(json: &str) -> Result<bool, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("Failed to parse workflow runs JSON: {e}"))?;
+    let runs = v["workflow_runs"].as_array().ok_or("Workflow runs JSON has no workflow_runs")?;
+    Ok(runs.iter().any(|run| {
+        matches!(
+            run["status"].as_str(),
+            Some("requested" | "queued" | "pending" | "waiting" | "in_progress")
+        )
+    }))
 }
 
 fn is_own(author: &str, viewer: &str) -> bool {
@@ -264,6 +298,7 @@ pub(crate) fn parse_pr_view(json: &str, viewer: &str) -> Result<PrView, String> 
         remarks,
         review_keys,
         checks,
+        runs_pending: false,
     })
 }
 
@@ -382,16 +417,13 @@ pub(crate) fn evaluate(
 
     let mut failed = Vec::new();
     let mut more_failed = 0;
-    let pending = view.checks.iter().any(|c| c.state == CheckState::Pending);
+    let pending = view.runs_pending || view.checks.iter().any(|c| c.state == CheckState::Pending);
     // Green checks prove the fix worked only once GitHub also reports the
     // branch as mergeable: an agent pushing green heads that still conflict
     // would otherwise get a fresh budget for every conflict wake. A
     // mergeability still being computed waits for the next pass. Cancelled
     // runs prove nothing and leave the budget alone.
-    let green = !pending
-        && view.checks.iter().all(|c| matches!(c.state, CheckState::Success | CheckState::Neutral))
-        && view.checks.iter().any(|c| c.state == CheckState::Success)
-        && view.mergeable == "MERGEABLE";
+    let green = !pending && checks_look_green(view);
     if green {
         next.attempts = 0;
     }
@@ -694,6 +726,24 @@ fn fetch_view(repo_path: &Path, pr: &PrRepo, watch: &PrWatchRecord, seen: &HashS
     if view.review_keys.iter().any(|key| !seen.contains(key)) {
         let inline = crate::github::get_pr_inline_comments_fresh(repo_path, &pr.host, &pr.nwo, watch.pr_number)?;
         view.remarks.extend(inline_remarks(inline, &viewer));
+    }
+    if needs_runs_check(watch, &view, seen) {
+        let endpoint = format!(
+            "repos/{}/actions/runs?head_sha={}&per_page=100",
+            pr.nwo, view.head_sha
+        );
+        match crate::github_budget::run(repo_path, &["api", &endpoint, "--hostname", &pr.host], GH_TIMEOUT)
+            .and_then(|json| parse_runs_pending(&json))
+        {
+            Ok(pending) => view.runs_pending = pending,
+            // Never hold green back forever on a failed read; the checks
+            // alone decide, as they did before this lookup existed.
+            Err(error) => eprintln!(
+                "[codemux::pr-watch] workflow runs for {} @ {}: {error}",
+                pr.selector(),
+                view.head_sha
+            ),
+        }
     }
     Ok(view)
 }
@@ -1050,6 +1100,7 @@ mod tests {
             remarks,
             review_keys: vec![],
             checks,
+            runs_pending: false,
         }
     }
 
@@ -1476,6 +1527,55 @@ mod tests {
         let eval = evaluate(&w, &passing("h2"), &seen, 5);
         assert!(matches!(&eval.decision, Decision::Wake(report) if report.green));
         assert_eq!(eval.next.comment_streak, COMMENT_WAKE_LIMIT);
+    }
+
+    #[test]
+    fn unfinished_workflow_runs_hold_green_back() {
+        let passing = |head: &str| view(head, vec![], vec![check("ci", CheckState::Success, 1)]);
+        let w = PrWatchRecord { wake_on_green: true, head_sha: Some("h1".into()), attempts: 2, ..watch() };
+        let mut seen = HashSet::new();
+
+        // Only a head that would otherwise be green and newsworthy pays for
+        // the workflow-runs read.
+        assert!(needs_runs_check(&w, &passing("h1"), &seen));
+        assert!(needs_runs_check(&PrWatchRecord { wake_on_green: false, ..w.clone() }, &passing("h1"), &seen));
+        let quiet = PrWatchRecord { wake_on_green: false, attempts: 0, ..w.clone() };
+        assert!(!needs_runs_check(&quiet, &passing("h1"), &seen));
+        let failing = view("h1", vec![], vec![check("ci", CheckState::Failure, 1)]);
+        assert!(!needs_runs_check(&w, &failing, &seen));
+        let conflicting = PrView { mergeable: "CONFLICTING".into(), ..passing("h1") };
+        assert!(!needs_runs_check(&w, &conflicting, &seen));
+        seen.insert(green_key("h1"));
+        assert!(!needs_runs_check(&PrWatchRecord { attempts: 0, ..w.clone() }, &passing("h1"), &seen));
+        seen.clear();
+
+        // A run still queued keeps the head pending: no wake, no refund.
+        let queued = PrView { runs_pending: true, ..passing("h1") };
+        let eval = evaluate(&w, &queued, &seen, 1);
+        assert!(matches!(eval.decision, Decision::Quiet), "{:?}", eval.decision);
+        assert_eq!(eval.next.attempts, 2);
+        assert!(!eval.mark_seen.contains(&green_key("h1")));
+        // Once it finishes, green arrives.
+        let eval = evaluate(&w, &passing("h1"), &seen, 2);
+        assert!(matches!(&eval.decision, Decision::Wake(report) if report.green));
+        assert_eq!(eval.next.attempts, 0);
+    }
+
+    #[test]
+    fn workflow_run_statuses_classify_as_pending_or_done() {
+        for status in ["requested", "queued", "pending", "waiting", "in_progress"] {
+            let json = format!(
+                r#"{{"total_count":2,"workflow_runs":[{{"status":"completed","conclusion":"success"}},{{"status":"{status}","conclusion":null}}]}}"#
+            );
+            assert_eq!(parse_runs_pending(&json), Ok(true), "{status}");
+        }
+        let done = r#"{"total_count":2,"workflow_runs":[
+            {"status":"completed","conclusion":"success"},
+            {"status":"completed","conclusion":"skipped"}]}"#;
+        assert_eq!(parse_runs_pending(done), Ok(false));
+        assert_eq!(parse_runs_pending(r#"{"total_count":0,"workflow_runs":[]}"#), Ok(false));
+        assert!(parse_runs_pending(r#"{"message":"Not Found"}"#).is_err());
+        assert!(parse_runs_pending("not json").is_err());
     }
 
     #[test]
