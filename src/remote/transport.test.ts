@@ -494,8 +494,8 @@ describe("connection attempt deadlines", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     expect(requests).toHaveLength(2);
     requests[1].answer("fresh");
-    await flushMicrotasks();
-    expect(FakeWebSocket.instances).toHaveLength(1);
+    // Reading the ticket body can take more than a few microtask turns.
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
     expect(FakeWebSocket.instances[0].url).toContain("ticket=fresh");
     FakeWebSocket.instances[0].open();
     await connected;
@@ -542,6 +542,7 @@ describe("connection attempt deadlines", () => {
 
     requests[0].answer("stale");
     requests[1].answer("fresh");
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
     await flushMicrotasks();
     expect(FakeWebSocket.instances).toHaveLength(1);
     expect(FakeWebSocket.instances[0].url).toContain("ticket=fresh");
