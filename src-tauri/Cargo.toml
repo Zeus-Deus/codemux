@@ -240,6 +240,7 @@ windows-sys = { version = "0.59", features = [
 test-fixtures = []
 
 [dev-dependencies]
+tokio = { version = "1.0", features = ["test-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 mockito = "1"
 serial_test = "3"

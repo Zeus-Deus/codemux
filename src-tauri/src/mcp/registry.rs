@@ -1233,23 +1233,8 @@ impl McpRegistry {
             return Err("provider_control_denied: native controller tools are not available through provider MCP relays".into());
         }
         let params = tool_call_params(&raw_name, arguments, is_codemux_self, workspace_id);
-        let call = async {
-            if let Some(child) = child {
-                child
-                    .request("tools/call", params)
-                    .await
-                    .map_err(|e| format!("tools/call failed: {e}"))
-            } else if let Some(remote) = remote {
-                tokio::time::timeout(
-                    super::runtime::DEFAULT_REQUEST_TIMEOUT,
-                    remote.request("tools/call", params),
-                )
-                .await
-                .map_err(|_| "tools/call timed out".to_string())?
-            } else {
-                Err("MCP transport disappeared before tools/call".into())
-            }
-        };
+        let budget = super::runtime::tool_call_timeout(is_codemux_self, &raw_name);
+        let call = super::runtime::relay_tool_call(child.as_deref(), remote.as_deref(), params, budget);
         let cancellation = async {
             match cancelled.as_mut() {
                 Some(rx) => {

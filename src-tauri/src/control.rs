@@ -707,12 +707,92 @@ async fn send_control_request_to(
     connection.exchange(&ControlEnvelope { request, client: client.cloned() }).await
 }
 
+/// MCP callers need a finite exchange even when the endpoint accepts but
+/// stops responding. CLI callers retain their existing wait behavior.
+pub(crate) async fn send_mcp_control_request(request: ControlRequest) -> Result<ControlResponse, McpControlError> {
+    let budget = mcp_control_budget(&request);
+    send_mcp_control_request_to(
+        &control_socket_candidates(), request, ControlClient::current().as_ref(),
+        std::time::Duration::from_secs(2), budget,
+    ).await
+}
+
+fn mcp_control_budget(request: &ControlRequest) -> std::time::Duration {
+    // Direct stdio clients have no outer relay timeout. This ceiling only
+    // prevents an endless wait; lifecycle, network and plugin work can be slow.
+    let ordinary = std::time::Duration::from_secs(300);
+    if request.command == "browser_automation" {
+        // A fresh daemon can spend 30 s applying the viewport, then 60 s
+        // opening the page. Leave overhead inside the 120 s browser relay.
+        return std::time::Duration::from_secs(105);
+    }
+    let wait_args = match request.command.as_str() {
+        "tool_call" if request.params["name"] == "thread_wait" => Some(&request.params["arguments"]),
+        // Older apps expose only the bare socket alias.
+        "thread_wait" => Some(&request.params),
+        _ => None,
+    };
+    if let Some(arguments) = wait_args {
+        let wait = arguments["timeout_ms"].as_u64()
+            .unwrap_or(crate::agent_control::wait::DEFAULT_WAIT_MS)
+            .min(crate::agent_control::wait::MAX_OUTSIDE_WAIT_MS);
+        return ordinary.max(std::time::Duration::from_millis(wait) + std::time::Duration::from_secs(15));
+    }
+    ordinary
+}
+
+#[derive(Debug)]
+pub(crate) struct McpControlError {
+    message: String,
+    pub(crate) outcome_unknown: bool,
+    // Present only for an admitted mutation whose deadline expired. False
+    // means its original connection acknowledged completion or closed.
+    pub(crate) pending_mutation: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+impl std::fmt::Display for McpControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.outcome_unknown {
+            // ControlError::from_text uses this prefix to preserve the non-retryable code.
+            write!(f, "outcome_unknown: {}; the request outcome is unknown. Do not automatically retry a mutation", self.message)
+        } else {
+            f.write_str(&self.message)
+        }
+    }
+}
+
+impl std::error::Error for McpControlError {}
+
+pub(crate) async fn send_mcp_control_request_to(
+    candidates: &[PathBuf],
+    request: ControlRequest,
+    client: Option<&ControlClient>,
+    connect_budget: std::time::Duration,
+    total_budget: std::time::Duration,
+) -> Result<ControlResponse, McpControlError> {
+    let deadline = tokio::time::Instant::now() + total_budget;
+    // One budget covers all fallback sockets, including Windows pipe retries.
+    let connection = mcp_connect(Connection::open(candidates), connect_budget, deadline).await?;
+    connection.mcp_exchange(request, client, deadline).await
+}
+
+async fn mcp_connect<T>(
+    connect: impl std::future::Future<Output = Result<T, String>>,
+    budget: std::time::Duration,
+    deadline: tokio::time::Instant,
+) -> Result<T, McpControlError> {
+    tokio::time::timeout_at(deadline.min(tokio::time::Instant::now() + budget), connect).await
+        .map_err(|_| "Timed out connecting to Codemux control endpoint".to_string())
+        .and_then(|result| result)
+        .map_err(|message| McpControlError { message, outcome_unknown: false, pending_mutation: None })
+}
+
 /// An older app ignores `client`, so a narrowed client would silently run
 /// with full access. Ask the server's protocol version first, on the
 /// connection the request then uses, and refuse. Nothing is remembered: a
 /// long-lived `codemux mcp` may outlive its app, and the next connection may
 /// reach an older build on the same socket.
-async fn ensure_server_enforces_access(connection: &mut Connection) -> Result<(), String> {
+async fn ensure_server_enforces_access<S: AsyncRead + AsyncWrite + Unpin>(connection: &mut Connection<S>) -> Result<(), String> {
     let probe = ControlEnvelope {
         request: ControlRequest { command: "status".into(), params: serde_json::json!({}) },
         client: None,
@@ -731,9 +811,9 @@ async fn ensure_server_enforces_access(connection: &mut Connection) -> Result<()
 /// A client's connection to the control endpoint. Every server version
 /// answers any number of request lines on one connection, in order, so the
 /// access probe and the request share it.
-struct Connection {
-    lines: tokio::io::Lines<BufReader<tokio::io::ReadHalf<transport::ClientStream>>>,
-    writer: tokio::io::WriteHalf<transport::ClientStream>,
+struct Connection<S = transport::ClientStream> {
+    lines: tokio::io::Lines<BufReader<tokio::io::ReadHalf<S>>>,
+    writer: tokio::io::WriteHalf<S>,
 }
 
 impl Connection {
@@ -745,13 +825,18 @@ impl Connection {
     /// No existence check comes first: on Windows, opening a pipe name to
     /// look at it is itself a connection the server accepts.
     async fn open(candidates: &[PathBuf]) -> Result<Self, String> {
+        Self::open_with(candidates, |path| async move { transport::connect(&path).await }).await
+    }
+
+    async fn open_with<F, Fut>(candidates: &[PathBuf], mut connect: F) -> Result<Self, String>
+    where
+        F: FnMut(PathBuf) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<transport::ClientStream>>,
+    {
         let mut last_error = None;
         for path in candidates {
-            match transport::connect(path).await {
-                Ok(stream) => {
-                    let (reader, writer) = tokio::io::split(stream);
-                    return Ok(Self { lines: BufReader::new(reader).lines(), writer });
-                }
+            match connect(path.clone()).await {
+                Ok(stream) => return Ok(Self::from_stream(stream)),
                 Err(error) => {
                     let try_next = matches!(
                         error.kind(),
@@ -769,12 +854,81 @@ impl Connection {
             None => "Control socket path unavailable".to_string(),
         })
     }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
+    fn from_stream(stream: S) -> Self {
+        let (reader, writer) = tokio::io::split(stream);
+        Self { lines: BufReader::new(reader).lines(), writer }
+    }
+
+    async fn mcp_exchange(
+        mut self, request: ControlRequest, client: Option<&ControlClient>, deadline: tokio::time::Instant,
+    ) -> Result<ControlResponse, McpControlError>
+    where
+        S: Send + 'static,
+    {
+        let mutates = crate::control_identity::command_access(&request.command, &request.params)
+            != crate::agent_control::Access::Read;
+        let mut admitted = false;
+        // Retain partial write progress so recovery can finish the line even
+        // on transports, such as Windows pipes, without write-half shutdown.
+        let mut pending_write = std::io::Cursor::new(Vec::new());
+        let result = tokio::time::timeout_at(deadline, async {
+            if client.is_some_and(ControlClient::narrows) {
+                ensure_server_enforces_access(&mut self).await?;
+            }
+            self.exchange_admitted(&ControlEnvelope { request, client: client.cloned() }, &mut admitted, &mut pending_write).await
+        }).await;
+        match result {
+            Ok(Ok(response)) => Ok(response),
+            // A closed or invalid reply has no app-side work left to await.
+            Ok(Err(message)) => Err(McpControlError { message, outcome_unknown: admitted, pending_mutation: None }),
+            Err(_) => {
+                let pending_mutation = if admitted && mutates {
+                    let (completed, pending) = tokio::sync::watch::channel(true);
+                    tokio::spawn(async move {
+                        // Finish a partial line, then send EOF so the app
+                        // resolves it. Read concurrently: a stalled write or
+                        // shutdown must not hide a late reply or disconnect.
+                        tokio::select! {
+                            _ = async {
+                                let _ = self.writer.write_all_buf(&mut pending_write).await;
+                                let _ = self.writer.shutdown().await;
+                            } => { let _ = self.lines.next_line().await; }
+                            _ = self.lines.next_line() => {}
+                        }
+                        completed.send_replace(false);
+                    });
+                    Some(pending)
+                } else {
+                    None
+                };
+                Err(McpControlError {
+                    message: "Timed out waiting for Codemux control exchange".into(),
+                    outcome_unknown: admitted,
+                    pending_mutation,
+                })
+            }
+        }
+    }
 
     /// One request line, one response line.
     async fn exchange(&mut self, envelope: &ControlEnvelope) -> Result<ControlResponse, String> {
+        self.exchange_admitted(envelope, &mut false, &mut std::io::Cursor::new(Vec::new())).await
+    }
+
+    async fn exchange_admitted(
+        &mut self, envelope: &ControlEnvelope, admitted: &mut bool, pending_write: &mut std::io::Cursor<Vec<u8>>,
+    ) -> Result<ControlResponse, String> {
         let payload = serde_json::to_string(envelope).map_err(|error| error.to_string())?;
+        *pending_write = std::io::Cursor::new(format!("{payload}\n").into_bytes());
+        // The server also parses an unterminated final line at EOF. A
+        // partial write may therefore be admitted when this socket closes;
+        // conservatively track uncertainty as soon as writing starts.
+        *admitted = true;
         self.writer
-            .write_all(format!("{payload}\n").as_bytes())
+            .write_all_buf(pending_write)
             .await
             .map_err(|error| format!("Failed to send request: {error}"))?;
 
@@ -2951,6 +3105,238 @@ mod tests {
         let error = send_control_request_to(&[], request("status", serde_json::json!({})), None).await.unwrap_err();
         assert_eq!(error, "Control socket path unavailable");
         server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_deadline_accept_and_hang_has_unknown_outcome() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hang.sock");
+        let listener = transport::bind(&path).unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            sent.send(lines.next_line().await.unwrap().unwrap()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let error = tokio::time::timeout(Duration::from_secs(1), send_mcp_control_request_to(
+            &[path], request("notify", serde_json::json!({})), None,
+            Duration::from_millis(20), Duration::from_millis(40),
+        )).await.unwrap().unwrap_err();
+        assert!(received.await.unwrap().contains("notify"));
+        assert!(error.outcome_unknown, "{error}");
+        assert!(error.to_string().contains("outcome is unknown"));
+        server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_deadline_bounds_a_stalled_write() {
+        use std::time::Duration;
+        let (stream, _unread_peer) = tokio::io::duplex(64);
+        let connection = Connection::from_stream(stream);
+        let error = tokio::time::timeout(Duration::from_secs(1), connection.mcp_exchange(
+            request("notify", serde_json::json!({"message":"x".repeat(256 * 1024)})), None,
+            tokio::time::Instant::now() + Duration::from_millis(30),
+        )).await.unwrap().unwrap_err();
+        assert!(error.outcome_unknown, "a partial write may be admitted on EOF: {error}");
+        assert!(error.to_string().contains("Timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_deadline_partial_write_recovers_without_duplicating_bytes() {
+        use std::time::Duration;
+        let envelope = ControlEnvelope { request: request("notify", serde_json::json!({})), client: None };
+        // Fit all the JSON, but not the newline, before the writer stalls.
+        let capacity = serde_json::to_vec(&envelope).unwrap().len();
+        let (stream, peer) = tokio::io::duplex(capacity);
+        let connection = Connection::from_stream(stream);
+        let error = connection.mcp_exchange(envelope.request, None,
+            tokio::time::Instant::now() + Duration::from_millis(20)).await.unwrap_err();
+        assert!(error.outcome_unknown);
+        let mut pending = error.pending_mutation.unwrap();
+        assert!(*pending.borrow(), "the incomplete write is still unresolved");
+        // Recovery finishes the line without duplicating any partial write,
+        // and retains the connection until the app acknowledges completion.
+        let (reader, mut writer) = tokio::io::split(peer);
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines.next_line().await.unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<ControlEnvelope>(&line).unwrap().request.command, "notify");
+        assert!(*pending.borrow());
+        writer.write_all(b"{\"ok\":true,\"data\":null}\n").await.unwrap();
+        pending.wait_for(|pending| !pending).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_deadline_bounds_the_access_probe_without_admitting_the_request() {
+        use std::time::Duration;
+        let (stream, peer) = tokio::io::duplex(4096);
+        let connection = Connection::from_stream(stream);
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(peer).lines();
+            sent.send(lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert!(lines.next_line().await.unwrap().is_none(), "the mutation must not follow a hung probe");
+        });
+        let client = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly), agent: None };
+        let error = tokio::time::timeout(Duration::from_secs(1), connection.mcp_exchange(
+            request("notify", serde_json::json!({})), Some(&client),
+            tokio::time::Instant::now() + Duration::from_millis(30),
+        )).await.unwrap().unwrap_err();
+        assert_eq!(serde_json::from_str::<Value>(&received.await.unwrap()).unwrap()["command"], "status");
+        assert!(!error.outcome_unknown, "{error}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_deadline_access_probe_and_request_share_one_budget() {
+        use std::time::Duration;
+        let (stream, peer) = tokio::io::duplex(4096);
+        let connection = Connection::from_stream(stream);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(peer);
+            let mut lines = BufReader::new(reader).lines();
+            for _ in 0..2 {
+                lines.next_line().await.unwrap().unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let reply = b"{\"ok\":true,\"protocol_version\":2,\"data\":null,\"error\":null}\n";
+                let _ = writer.write_all(reply).await;
+            }
+        });
+        let client = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly), agent: None };
+        let error = connection.mcp_exchange(request("notify", serde_json::json!({})), Some(&client),
+            tokio::time::Instant::now() + Duration::from_millis(80)).await.unwrap_err();
+        assert!(error.outcome_unknown, "the probe succeeded but the mutation did not finish: {error}");
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_deadline_fallback_sockets_reach_the_live_endpoint() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.sock");
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        let live = dir.path().join("live.sock");
+        let (server, seen) = spawn_line_server(&live, CONTROL_PROTOCOL_VERSION);
+        let reply = send_mcp_control_request_to(&[missing, stale, live], request("status", serde_json::json!({})), None,
+            Duration::from_millis(100), Duration::from_millis(200)).await.unwrap();
+        assert!(reply.ok);
+        assert_eq!(*seen.lock().unwrap(), vec![(0, "status".to_owned())]);
+        server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_deadline_connect_budget_is_total_across_fallbacks() {
+        use std::time::Duration;
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let candidates: Vec<_> = (0..5).map(|i| PathBuf::from(i.to_string())).collect();
+        let open = Connection::open_with(&candidates, |_| async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        let error = tokio::time::timeout(Duration::from_secs(1), mcp_connect(open, Duration::from_millis(60),
+            tokio::time::Instant::now() + Duration::from_secs(1))).await.unwrap().err().unwrap();
+        assert!(!error.outcome_unknown);
+        assert!(error.to_string().contains("Timed out connecting"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2, "the budget is not renewed for each socket");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_deadline_closed_or_invalid_exchanges_do_not_quarantine() {
+        for reply in [None, Some("not json\n")] {
+            let (stream, peer) = tokio::io::duplex(4096);
+            let backend = tokio::spawn(async move {
+                let (reader, mut writer) = tokio::io::split(peer);
+                BufReader::new(reader).lines().next_line().await.unwrap().unwrap();
+                if let Some(reply) = reply {
+                    writer.write_all(reply.as_bytes()).await.unwrap();
+                }
+            });
+            let error = Connection::from_stream(stream).mcp_exchange(request("notify", serde_json::json!({})), None,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1)).await.unwrap_err();
+            assert!(error.outcome_unknown);
+            assert!(error.pending_mutation.is_none(), "a completed exchange has nothing left to await: {error}");
+            backend.await.unwrap();
+        }
+        let (stream, peer) = tokio::io::duplex(4096);
+        drop(peer);
+        let error = Connection::from_stream(stream).mcp_exchange(request("notify", serde_json::json!({})), None,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1)).await.unwrap_err();
+        assert!(error.to_string().contains("Failed to send request"));
+        assert!(error.pending_mutation.is_none(), "write errors must not quarantine");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_deadline_read_timeouts_do_not_quarantine() {
+        for (command, params) in [
+            ("status", serde_json::json!({})),
+            ("get_app_state", serde_json::json!({})),
+            ("read_terminal", serde_json::json!({})),
+            ("port_list", serde_json::json!({})),
+            ("browser_automation", serde_json::json!({"action":{"kind":"snapshot"}})),
+            ("browser_automation", serde_json::json!({"action":{"kind":"screenshot"}})),
+            ("browser_automation", serde_json::json!({"action":{"kind":"console"}})),
+        ] {
+            let (stream, _peer) = tokio::io::duplex(4096);
+            let error = Connection::from_stream(stream).mcp_exchange(request(command, params), None,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(10)).await.unwrap_err();
+            assert!(error.outcome_unknown, "the read was admitted: {command}");
+            assert!(error.pending_mutation.is_none(), "reads must not pause mutations: {command}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_deadline_allows_slow_direct_commands_to_finish() {
+        use std::time::Duration;
+        for (command, params) in [
+            ("create_worktree_workspace", serde_json::json!({})),
+            ("close_workspace", serde_json::json!({})),
+            ("archive_workspace", serde_json::json!({})),
+            ("list_github_issues", serde_json::json!({})),
+            ("tool_call", serde_json::json!({"name":"thread_launch","arguments":{}})),
+            ("tool_call", serde_json::json!({"name":"plugin_invoke","arguments":{}})),
+        ] {
+            let (stream, peer) = tokio::io::duplex(4096);
+            let backend = tokio::spawn(async move {
+                let (reader, mut writer) = tokio::io::split(peer);
+                BufReader::new(reader).lines().next_line().await.unwrap().unwrap();
+                tokio::time::sleep(Duration::from_secs(40)).await;
+                writer.write_all(b"{\"ok\":true,\"protocol_version\":2,\"data\":null,\"error\":null}\n").await.unwrap();
+            });
+            let request = request(command, params);
+            let started = tokio::time::Instant::now();
+            let deadline = started + mcp_control_budget(&request);
+            let response = Connection::from_stream(stream).mcp_exchange(request, None, deadline).await.unwrap();
+            assert!(response.ok, "{command}");
+            assert!(started.elapsed() > Duration::from_secs(25), "legitimate work outlives the old cutoff");
+            backend.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn mcp_deadline_preserves_explicit_controller_wait_budgets() {
+        use std::time::Duration;
+        for params in [serde_json::json!({}), serde_json::json!({"timeout_ms":50_000}),
+            serde_json::json!({"timeout_ms":600_000}), serde_json::json!({"timeout_ms":u64::MAX})] {
+            let alias = mcp_control_budget(&request("thread_wait", params.clone()));
+            let registry = mcp_control_budget(&request("tool_call", serde_json::json!({"name":"thread_wait","arguments":params})));
+            assert_eq!(alias, registry, "old-app aliases retain the same wait budget");
+            assert!(alias >= Duration::from_secs(300));
+        }
+        let wait = request("tool_call", serde_json::json!({"name":"thread_wait","arguments":{"timeout_ms":600_000}}));
+        assert_eq!(mcp_control_budget(&wait), Duration::from_secs(615));
+        for command in ["status", "create_workspace", "create_worktree_workspace", "close_workspace", "archive_workspace",
+            "unarchive_workspace", "apply_preset", "list_github_issues", "get_github_issue", "link_workspace_issue", "tool_call"] {
+            assert_eq!(mcp_control_budget(&request(command, serde_json::json!({}))), Duration::from_secs(300), "{command}");
+        }
+        let browser = mcp_control_budget(&request("browser_automation", serde_json::json!({})));
+        assert_eq!(browser, Duration::from_secs(105));
+        assert!(browser > Duration::from_secs(30 + 60), "viewport plus open need startup overhead");
+        assert!(browser < crate::mcp::runtime::BROWSER_RELAY_TIMEOUT);
     }
 
     #[cfg(unix)]
