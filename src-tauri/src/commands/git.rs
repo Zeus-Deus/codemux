@@ -756,7 +756,8 @@ pub async fn git_clone_repo<R: tauri::Runtime>(
     let existed_before = Path::new(&target_dir).exists();
 
     let mut child = crate::git::git_command_tokio()
-        .args(["clone", "--progress", &url, &target_dir])
+        // `--` keeps a URL that starts with `-` from reading as an option.
+        .args(["clone", "--progress", "--", &url, &target_dir])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .stdin(Stdio::null())

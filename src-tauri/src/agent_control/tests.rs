@@ -3389,11 +3389,14 @@ async fn named_client_messages_are_attributed_to_the_client() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dispatch_refuses_tools_off_their_route() {
     let (app, _provider, _root, workspace, thread, _authority, actor) = native_caller_fixture("default").await;
-    for name in ["create_threads", "orchestrator_capabilities", "thread_search", "nope"] {
+    for name in ["create_threads", "orchestrator_capabilities", "nope"] {
         let error = execute(app.handle(), &ControlCaller::trusted(), name, json!({"workspace_id":workspace})).await.unwrap_err();
         assert_eq!(error.code, "unknown_tool", "{name}: {error}");
         assert_eq!(error.message, format!("Unknown tool: {name}"));
     }
+    // thread_search serves both routes, each with its own arguments.
+    let error = execute(app.handle(), &ControlCaller::trusted(), "thread_search", json!({"workspace_id":workspace})).await.unwrap_err();
+    assert_eq!(error.code, "invalid_arguments", "{error}");
     // Chats have no thread_status: the name falls through to the legacy relay,
     // which refuses it below full access.
     let error = native::call(app.handle().clone(), actor, "thread_status".into(), json!({"thread_id":thread})).await.unwrap_err();

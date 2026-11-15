@@ -30,8 +30,10 @@ macro_rules! tool_ids {
 
 tool_ids! {
     WorkspaceList, WorkspaceInfo, WorkspaceCreate, WorktreeCreate, WorkspaceClose,
+    WorkspaceArchive, WorkspaceUnarchive, WorkspaceArchiveList, ProjectList, ProjectClone,
     AgentCapabilities, ThreadList, ThreadLaunch, ThreadSend, ThreadRead, ThreadStatus, ThreadWait,
-    ThreadInterrupt, ThreadStop, ThreadRespond, ThreadAnswer, OperationStatus,
+    ThreadInterrupt, ThreadStop, ThreadRespond, ThreadAnswer, ThreadOpen, ThreadRename, ThreadClose,
+    ThreadDelete, OperationStatus,
     OrchestratorCapabilities, CreateThreads, ThreadSearch, PluginList, PluginInvoke,
 }
 
@@ -373,10 +375,16 @@ async fn run<R: Runtime>(id: ToolId, call: Call<'_, R>) -> Result<Value, Control
         (WorkspaceCreate, _) => workspace_tools::create(app, caller, args).await,
         (WorktreeCreate, _) => workspace_tools::create_worktree(app, caller, args).await,
         (WorkspaceClose, _) => workspace_tools::close(app, caller, args).await,
+        (WorkspaceArchive, _) => workspace_tools::archive(app, caller, args).await,
+        (WorkspaceUnarchive, _) => workspace_tools::unarchive(app, caller, args).await,
+        (WorkspaceArchiveList, _) => workspace_tools::archive_list(app, args),
+        (ProjectList, _) => workspace_tools::project_list(app, args).await,
+        (ProjectClone, _) => workspace_tools::project_clone(app, caller, args).await,
         (AgentCapabilities, _) => service::agent_capabilities(app, caller, args).await,
         (ThreadList, Route::Outside) => service::thread_list(app, args),
         (ThreadList, Route::InApp { .. }) => native::in_app_inventory(app, actor()?, "thread_list", args),
-        (ThreadSearch, _) => native::in_app_inventory(app, actor()?, "thread_search", args),
+        (ThreadSearch, Route::Outside) => service::thread_search(app, args),
+        (ThreadSearch, Route::InApp { .. }) => native::in_app_inventory(app, actor()?, "thread_search", args),
         (OrchestratorCapabilities, _) => native::in_app_capabilities(app, caller, actor()?, args).await,
         (ThreadLaunch, Route::Outside) => service::launch(app, caller, args).await,
         (ThreadLaunch, Route::InApp { .. }) => native::in_app_launch(app, caller, actor()?, args).await,
@@ -390,6 +398,10 @@ async fn run<R: Runtime>(id: ToolId, call: Call<'_, R>) -> Result<Value, Control
         (ThreadStop, _) => service::thread_stop(app, caller, args).await,
         (ThreadRespond, _) => service::thread_respond(app, caller, args).await,
         (ThreadAnswer, _) => service::thread_answer(app, caller, args).await,
+        (ThreadOpen, _) => service::thread_open(app, caller, args).await,
+        (ThreadRename, _) => service::thread_rename(app, caller, args).await,
+        (ThreadClose, _) => service::thread_close(app, caller, args).await,
+        (ThreadDelete, _) => service::thread_delete(app, caller, args).await,
         (OperationStatus, _) => service::operation_status(app, caller, args),
         (PluginList | PluginInvoke, _) => crate::plugins::platform_transport::agent_request(app, caller.clone(), id.spec().name, args)
             .await
@@ -522,16 +534,21 @@ mod tests {
             }
         }
         assert_eq!(names(&CallerView::outside(ReadOnly)), [
-            "workspace_list", "workspace_info", "agent_capabilities", "thread_list", "thread_read", "thread_status",
-            "thread_wait", "operation_status", "plugin_list",
+            "workspace_list", "workspace_info", "workspace_archive_list", "project_list", "agent_capabilities",
+            "thread_list", "thread_read", "thread_status", "thread_wait", "operation_status", "thread_search", "plugin_list",
         ], "a read-only connection is not offered tools that change anything");
         let supervised = names(&CallerView::outside(Supervised));
-        assert_eq!(supervised.len(), 16);
-        for machine in ["workspace_create", "worktree_create", "workspace_close"] {
+        assert_eq!(supervised.len(), 22);
+        for machine in [
+            "workspace_create", "worktree_create", "workspace_close", "workspace_archive", "workspace_unarchive",
+            "project_clone", "thread_delete",
+        ] {
             assert!(!supervised.contains(&machine), "{machine} changes this machine; supervised connections are not offered it");
             assert!(names(&CallerView::outside(FullAccess)).contains(&machine), "{machine}");
         }
-        assert!(supervised.contains(&"thread_answer"), "answering a worker's question is a thread write");
+        for write in ["thread_answer", "thread_open", "thread_rename", "thread_close"] {
+            assert!(supervised.contains(&write), "{write} is a thread write");
+        }
         assert!(names(&CallerView::in_app(ProviderKind::Claude, Some("default"), false)).is_empty(),
             "with Agent collaboration off, chats are offered nothing: the plugin layer refuses their plugin calls too");
     }
@@ -561,7 +578,10 @@ mod tests {
         }
         let destructive: Vec<&str> = list(&CallerView::outside(FullAccess)).into_iter()
             .filter(|tool| tool.definition.annotations["destructiveHint"] == true).map(|tool| tool.spec.name).collect();
-        assert_eq!(destructive, ["workspace_close", "thread_interrupt", "thread_stop", "thread_respond", "plugin_invoke"]);
+        assert_eq!(destructive, [
+            "workspace_close", "workspace_archive", "thread_interrupt", "thread_stop", "thread_respond", "thread_close",
+            "thread_delete", "plugin_invoke",
+        ]);
         assert!(list(&CallerView::outside(FullAccess)).iter().all(|tool| tool.definition.annotations["idempotentHint"] != false),
             "every outside mutation is keyed, so a retry is safe");
     }
@@ -629,6 +649,10 @@ mod tests {
             "workspace_create" => typed::<workspace_tools::CreateArgs>,
             "worktree_create" => typed::<crate::workspace_service::WorktreeArgs>,
             "workspace_close" => typed::<workspace_tools::CloseArgs>,
+            "workspace_archive" => typed::<workspace_tools::ArchiveArgs>,
+            "workspace_unarchive" => typed::<workspace_tools::UnarchiveArgs>,
+            "workspace_archive_list" | "project_list" => typed::<workspace_tools::NoArgs>,
+            "project_clone" => typed::<workspace_tools::CloneArgs>,
             "agent_capabilities" => typed::<service::CapabilitiesArgs>,
             "thread_list" => typed::<service::ThreadListArgs>,
             "thread_launch" => typed::<service::Launch>,
@@ -640,6 +664,10 @@ mod tests {
             "thread_stop" => typed::<service::StopArgs>,
             "thread_respond" => typed::<service::RespondArgs>,
             "thread_answer" => typed::<service::AnswerArgs>,
+            "thread_open" => typed::<service::OpenArgs>,
+            "thread_rename" => typed::<service::RenameArgs>,
+            "thread_close" | "thread_delete" => typed::<service::LifecycleArgs>,
+            "thread_search" => typed::<service::SearchArgs>,
             "operation_status" => typed::<service::OperationStatusArgs>,
             _ => return None,
         })
@@ -671,7 +699,11 @@ mod tests {
     /// is one the typed arguments cannot do without.
     #[test]
     fn workspace_tool_schemas_match_typed_args() {
-        for name in ["workspace_list", "workspace_info", "workspace_create", "worktree_create", "workspace_close", "thread_answer", "thread_wait"] {
+        for name in [
+            "workspace_list", "workspace_info", "workspace_create", "worktree_create", "workspace_close", "workspace_archive",
+            "workspace_unarchive", "workspace_archive_list", "project_list", "project_clone", "thread_answer", "thread_wait",
+            "thread_open", "thread_rename", "thread_close", "thread_delete", "thread_search", "thread_respond",
+        ] {
             let definition = list(&CallerView::outside(FullAccess)).into_iter().find(|tool| tool.spec.name == name)
                 .unwrap_or_else(|| panic!("{name} is an outside tool")).definition;
             let (schema, parse) = (&definition.input_schema, typed_parser(name).unwrap());

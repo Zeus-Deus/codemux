@@ -3990,26 +3990,38 @@ fn xai_question_response(questions: &[AcpQuestion], decision: &ApprovalDecision)
         let Some(answer) = raw_answers
             .get(&question.id)
             .or_else(|| raw_answers.get(&question.prompt))
-            .and_then(Value::as_str)
         else {
             continue;
         };
         let mut labels = Vec::new();
         let mut notes = Vec::new();
-        let exact = question.options.iter().find(|option| {
-            option.id.eq_ignore_ascii_case(answer.trim())
-                || option.label.eq_ignore_ascii_case(answer.trim())
-        });
-        let values = exact.map_or_else(
-            || {
-                answer
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .collect::<Vec<_>>()
-            },
-            |_| vec![answer.trim()],
-        );
+        let values = if let Some(choices) = answer.as_array() {
+            // Choices given one by one are taken whole, never split, so a
+            // label holding a comma stays one choice.
+            choices
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        } else if let Some(answer) = answer.as_str() {
+            let exact = question.options.iter().find(|option| {
+                option.id.eq_ignore_ascii_case(answer.trim())
+                    || option.label.eq_ignore_ascii_case(answer.trim())
+            });
+            exact.map_or_else(
+                || {
+                    answer
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .collect::<Vec<_>>()
+                },
+                |_| vec![answer.trim()],
+            )
+        } else {
+            continue;
+        };
         for value in values {
             if let Some(option) = question.options.iter().find(|option| {
                 option.id.eq_ignore_ascii_case(value) || option.label.eq_ignore_ascii_case(value)
@@ -4058,8 +4070,27 @@ fn cursor_question_answers(questions: &[AcpQuestion], decision: &ApprovalDecisio
         .filter_map(|question| {
             let answer = answers
                 .get(&question.id)
-                .or_else(|| answers.get(&question.prompt))
-                .and_then(Value::as_str)?;
+                .or_else(|| answers.get(&question.prompt))?;
+            if let Some(choices) = answer.as_array() {
+                // Choices given one by one are matched whole, never split,
+                // so a label holding ", " stays one choice.
+                let selected_option_ids = choices
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(|choice| {
+                        question.options.iter().find(|option| {
+                            option.id.eq_ignore_ascii_case(choice.trim())
+                                || option.label.eq_ignore_ascii_case(choice.trim())
+                        })
+                    })
+                    .map(|option| option.id.clone())
+                    .collect::<Vec<_>>();
+                return Some(json!({
+                    "questionId": question.id,
+                    "selectedOptionIds": selected_option_ids
+                }));
+            }
+            let answer = answer.as_str()?;
             let exact = question.options.iter().find(|option| {
                 option.id.eq_ignore_ascii_case(answer) || option.label.eq_ignore_ascii_case(answer)
             });
@@ -4631,6 +4662,30 @@ mod tests {
                 "questionId": "stack",
                 "selectedOptionIds": ["ts-react"]
             })]
+        );
+    }
+
+    /// Multi-select choices given as a list reach the worker whole: a label
+    /// holding a comma is one selection, not split into others.
+    #[test]
+    fn listed_choices_keep_labels_that_hold_commas() {
+        let option = |id: &str, label: &str| AcpQuestionOption { id: id.into(), label: label.into() };
+        let questions = vec![AcpQuestion {
+            id: "pick".into(),
+            prompt: "Which?".into(),
+            options: vec![option("ab", "A,B"), option("a", "A"), option("b", "B"), option("c", "C")],
+        }];
+        let decision = ApprovalDecision::Allow {
+            updated_input: Some(json!({ "answers": {"Which?": ["A,B", "C"]} })),
+            updated_permissions: None,
+        };
+        assert_eq!(
+            xai_question_response(&questions, &decision),
+            json!({ "outcome": "accepted", "answers": {"Which?": ["A,B", "C"]} })
+        );
+        assert_eq!(
+            cursor_question_answers(&questions, &decision),
+            vec![json!({ "questionId": "pick", "selectedOptionIds": ["ab", "c"] })]
         );
     }
 

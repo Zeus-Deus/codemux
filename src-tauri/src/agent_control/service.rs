@@ -781,6 +781,18 @@ pub(super) fn thread_read<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller
 pub(crate) struct Target { pub workspace_id: String, pub thread_id: String }
 
 pub(crate) fn resolve_thread<R: Runtime>(app: &AppHandle<R>, target: &Target, mutation: bool) -> Result<(crate::database::AgentChatSessionRecord, ProviderKind), ControlError> {
+    let (record, provider) = thread_record(app, target, mutation)?;
+    if mutation {
+        bound_pane(app, target, provider)?.ok_or_else(|| ControlError::new(ErrorCode::ThreadNotBound, "This thread has no pane in CodeMux; reopen it with thread_open"))?;
+    }
+    Ok((record, provider))
+}
+
+/// The thread `target` names, with its provider. A mutation also needs a
+/// live local workspace and a thread that is not an imported snapshot, but
+/// not a pane: [`resolve_thread`] adds that, and the lifecycle tools that
+/// reopen, close or delete a thread check it themselves.
+fn thread_record<R: Runtime>(app: &AppHandle<R>, target: &Target, mutation: bool) -> Result<(crate::database::AgentChatSessionRecord, ProviderKind), ControlError> {
     workspace(app, &target.workspace_id, mutation)?;
     identifier(&target.thread_id, "thread_id", 256)?;
     let record = app.state::<DatabaseStore>().get_agent_chat_session(&target.thread_id)
@@ -788,17 +800,22 @@ pub(crate) fn resolve_thread<R: Runtime>(app: &AppHandle<R>, target: &Target, mu
     if record.workspace_id != target.workspace_id { return Err(ControlError::new(ErrorCode::ThreadOutsideWorkspace, "This thread does not belong to the selected workspace")); }
     let provider: ProviderKind = serde_json::from_value(json!(record.provider))
         .map_err(|_| ControlError::new(ErrorCode::UnsupportedProvider, "This persisted thread has an unsupported provider"))?;
-    if mutation {
-        if record.imported_from.is_some() { return Err(ControlError::new(ErrorCode::ImportedSnapshotReadOnly, "Imported threads are read-only snapshots")); }
-        let state = app.state::<AppStateStore>();
-        let pane = state.agent_chat_pane_id_for_thread(&record.thread_id)
-            .ok_or_else(|| ControlError::new(ErrorCode::ThreadNotBound, "Reopen this thread in CodeMux before controlling it"))?;
-        if state.workspace_id_for_pane(&pane).as_deref() != Some(target.workspace_id.as_str())
-            || state.agent_chat_pane_thread(&pane) != Some((provider,target.thread_id.clone())) {
-            return Err(ControlError::new(ErrorCode::StaleThreadBinding, "The pane no longer belongs to this workspace/provider/thread"));
-        }
+    if mutation && record.imported_from.is_some() {
+        return Err(ControlError::new(ErrorCode::ImportedSnapshotReadOnly, "Imported threads are read-only snapshots"));
     }
     Ok((record, provider))
+}
+
+/// The pane the thread is bound to, if any. A pane that is bound to it but
+/// sits in another workspace or runs another provider is a stale binding.
+fn bound_pane<R: Runtime>(app: &AppHandle<R>, target: &Target, provider: ProviderKind) -> Result<Option<String>, ControlError> {
+    let state = app.state::<AppStateStore>();
+    let Some(pane) = state.agent_chat_pane_id_for_thread(&target.thread_id) else { return Ok(None) };
+    if state.workspace_id_for_pane(&pane).as_deref() != Some(target.workspace_id.as_str())
+        || state.agent_chat_pane_thread(&pane) != Some((provider, target.thread_id.clone())) {
+        return Err(ControlError::new(ErrorCode::StaleThreadBinding, "The pane no longer belongs to this workspace/provider/thread"));
+    }
+    Ok(Some(pane))
 }
 
 pub(super) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
@@ -813,9 +830,11 @@ pub(super) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -
     // The database resolves matching completion within the latest logical run.
     let terminal = latest.as_ref().filter(|event| event["type"] == "turn_completed");
     let observed = app.state::<NativeControlState>().thread_runtime(&target.thread_id);
-    let pending: Vec<_> = observed.as_ref().map(|view|view.pending_approvals.iter().map(|request|
-        json!({"request_id":request.outside_handle,"turn_id":request.turn_id,"request_kind":request.request_kind})
-    ).collect()).unwrap_or_default();
+    let pending: Vec<_> = observed.as_ref().map(|view|view.pending_approvals.iter().map(|request| {
+        let mut approval = json!({"request_id":request.outside_handle,"turn_id":request.turn_id,"request_kind":request.request_kind});
+        if let Some(questions) = &request.questions { approval["questions"] = approval_questions(questions); }
+        approval
+    }).collect()).unwrap_or_default();
     let inactive = app.state::<DatabaseStore>().inactive_delivery_queue_ids(&target.thread_id)?;
     let queued: Vec<_> = observed.as_ref().map(|view|view.queued_ids.clone()).unwrap_or_default().into_iter().filter(|id| !inactive.contains(id)).collect();
     let uncertain_queued = app.state::<DatabaseStore>().control_unresolved_queued_ids(&target.thread_id)?
@@ -1330,17 +1349,92 @@ pub(super) async fn thread_stop<R: Runtime>(app: &AppHandle<R>, caller: &Control
 #[serde(rename_all = "snake_case")]
 pub(super) enum Decision { AllowOnce, AllowAlways, Deny }
 
+/// One answer to a user-input question: text, or a multi-select's choices.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum Answer { Text(String), Choices(Vec<String>) }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RespondArgs { workspace_id: String, thread_id: String, client_request_id: String, request_id: String, decision: Decision }
+pub(super) struct RespondArgs {
+    workspace_id: String, thread_id: String, client_request_id: String, request_id: String,
+    decision: Option<Decision>, answers: Option<Vec<Answer>>,
+}
+
+/// What `thread_status` shows of a user-input request's questions: what an
+/// outside caller needs to answer them, in the order `answers` follows.
+fn approval_questions(questions: &Value) -> Value {
+    let rows: Vec<Value> = questions.as_array().into_iter().flatten().take(20).map(|question| json!({
+        "question": question["question"].as_str().unwrap_or_default(),
+        "header": question["header"].as_str().unwrap_or_default(),
+        "options": question["options"].as_array().into_iter().flatten().take(50)
+            .filter_map(|option| option["label"].as_str()).collect::<Vec<_>>(),
+        "multi_select": question["multiSelect"] == true,
+        "allow_other": question["allowOther"] != false,
+    })).collect();
+    json!(rows)
+}
+
+/// The decision that answers a user-input request, as the question card
+/// builds it: the request's own `questions` and `answers` keyed by question
+/// text, a multi-select's choices joined with ", " (OpenCode, Cursor and Grok
+/// take them as a list, each choice whole). Answers are checked against the questions first: one per question,
+/// one choice unless it is multi-select, and only listed options unless it
+/// allows its own text.
+fn user_input_answer(provider: ProviderKind, questions: &Value, answers: Vec<Answer>) -> Result<Value, ControlError> {
+    let invalid = |message: String| ControlError::new(ErrorCode::InvalidArguments, message);
+    let takes_list = matches!(provider, ProviderKind::OpenCode | ProviderKind::Cursor | ProviderKind::Grok);
+    let listed = questions.as_array().filter(|questions| !questions.is_empty())
+        .ok_or_else(|| invalid("This request carries no questions to answer; answer it in CodeMux".into()))?;
+    if answers.len() != listed.len() {
+        return Err(invalid(format!("Pass one answer per question: the request has {}, answers has {}", listed.len(), answers.len())));
+    }
+    let mut keyed = serde_json::Map::new();
+    for (index, (question, answer)) in listed.iter().zip(answers).enumerate() {
+        let text = question["question"].as_str().filter(|text| !text.is_empty())
+            .ok_or_else(|| invalid(format!("Question {} has no text; answer it in CodeMux", index + 1)))?;
+        if keyed.contains_key(text) {
+            return Err(invalid("Two questions have the same text, so their answers cannot be told apart; answer them in CodeMux".into()));
+        }
+        let choices = match answer { Answer::Text(text) => vec![text], Answer::Choices(choices) => choices };
+        if choices.is_empty() || choices.iter().any(|choice| choice.trim().is_empty()) {
+            return Err(invalid(format!("answers/{index} is empty")));
+        }
+        let multi = question["multiSelect"] == true;
+        if !multi && choices.len() > 1 {
+            return Err(invalid(format!("answers/{index}: \"{text}\" takes one choice")));
+        }
+        let options: Vec<&str> = question["options"].as_array().into_iter().flatten().filter_map(|option| option["label"].as_str()).collect();
+        // The others take a multi-select's choices as one ", "-joined text,
+        // so a choice holding ", ", or choices whose join is itself a label,
+        // would reach the worker as a different selection.
+        if choices.len() > 1 && !(takes_list && multi) {
+            let joined = choices.join(", ");
+            if choices.iter().any(|choice| choice.contains(", ")) || options.iter().any(|label| label.eq_ignore_ascii_case(&joined)) {
+                return Err(invalid(format!("answers/{index}: these choices cannot be told apart once joined with \", \"; answer \"{text}\" in CodeMux")));
+            }
+        }
+        if question["allowOther"] == false {
+            if let Some(unknown) = choices.iter().find(|choice| !options.contains(&choice.as_str())) {
+                return Err(invalid(format!("answers/{index}: \"{unknown}\" is not an option; choose one of {}", options.join(", "))));
+            }
+        }
+        let value = if takes_list && multi { json!(choices) } else { json!(choices.join(", ")) };
+        keyed.insert(text.to_string(), value);
+    }
+    Ok(json!({"questions": questions, "answers": keyed}))
+}
 
 pub(super) async fn thread_respond<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     if caller.thread_id().is_some() { return Err(ControlError::new(ErrorCode::PermissionDenied,"Agents cannot grant permission approvals")); }
     let input: RespondArgs = parse(args.clone())?;
     // "Always" outlives the run a connector client is watching, so only the
     // person on this computer grants it.
-    if caller.kind() == CallerKind::Client && matches!(input.decision, Decision::AllowAlways) {
+    if caller.kind() == CallerKind::Client && matches!(input.decision, Some(Decision::AllowAlways)) {
         return Err(ControlError::new(ErrorCode::PermissionDenied, "Connector clients can allow a request once or deny it; allow_always is only available on this computer"));
+    }
+    if input.decision.is_some() == input.answers.is_some() {
+        return Err(ControlError::new(ErrorCode::InvalidArguments, "Pass decision for an approval or answers for a user-input request, not both"));
     }
     identifier(&input.client_request_id,"client_request_id",128)?;
     identifier(&input.request_id,"request_id",256)?;
@@ -1348,13 +1442,29 @@ pub(super) async fn thread_respond<R: Runtime>(app: &AppHandle<R>, caller: &Cont
     let target = Target { workspace_id:input.workspace_id,thread_id:input.thread_id };
     let (record,provider) = resolve_thread(app,&target,true)?;
     permission_ceiling(caller,provider,record.permission_mode.as_deref())?;
-    if caller.access != ControlAccess::FullAccess && !matches!(input.decision,Decision::Deny) {
-        return Err(ControlError::new(ErrorCode::PermissionCeiling,"Supervised clients cannot approve worker requests"));
-    }
-    let decision = match input.decision {
-        Decision::AllowOnce => crate::agent_provider::ApprovalDecision::Allow { updated_input:None,updated_permissions:None },
-        Decision::AllowAlways => crate::agent_provider::ApprovalDecision::AllowForSession,
-        Decision::Deny => crate::agent_provider::ApprovalDecision::Deny { message:"Denied by the outside assistant".into() },
+    let decision = match (input.decision, input.answers) {
+        (Some(decision), _) => {
+            if caller.access != ControlAccess::FullAccess && !matches!(decision,Decision::Deny) {
+                return Err(ControlError::new(ErrorCode::PermissionCeiling,"Supervised clients cannot approve worker requests"));
+            }
+            match decision {
+                Decision::AllowOnce => crate::agent_provider::ApprovalDecision::Allow { updated_input:None,updated_permissions:None },
+                Decision::AllowAlways => crate::agent_provider::ApprovalDecision::AllowForSession,
+                Decision::Deny => crate::agent_provider::ApprovalDecision::Deny { message:"Denied by the outside assistant".into() },
+            }
+        }
+        // Answering a question grants no tool permission, so supervised
+        // callers may. The answers are checked against the live request.
+        (None, answers) => {
+            let request = app.state::<NativeControlState>().pending_for_handle(&target.thread_id, &input.request_id)
+                .ok_or_else(|| ControlError::new(ErrorCode::StaleProviderCallback, "No current-process callback matches this outside handle"))?;
+            if request.request_kind != "user-input" {
+                return Err(ControlError::new(ErrorCode::InvalidArguments, format!("answers only answer user-input requests; this one is {}: pass decision", request.request_kind)));
+            }
+            let questions = request.questions.unwrap_or(Value::Null);
+            let updated = user_input_answer(provider, &questions, answers.unwrap_or_default())?;
+            crate::agent_provider::ApprovalDecision::Allow { updated_input: Some(updated), updated_permissions: None }
+        }
     };
     let admission = admit_mutation(app,caller,"thread_respond",&args,&target)?;
     let receipt = serde_json::to_value(&admission.receipt).map_err(|e|ControlError::new(ErrorCode::SerializationFailed,e.to_string()))?;
@@ -1473,6 +1583,185 @@ pub(super) fn authority_refusal<R: Runtime>(app: &AppHandle<R>, control: &Native
 /// worker twice.
 fn answer_unsettled() -> ControlError {
     ControlError::new(ErrorCode::QuestionAnswerFailed, "An answer to this question is being delivered or awaits confirmation; the person settles it in CodeMux")
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OpenArgs {
+    workspace_id: String, thread_id: String, client_request_id: String,
+    #[serde(default, deserialize_with = "null_as_default")] select: bool,
+}
+
+/// What the thread lifecycle tools check before admission and again under
+/// the thread's dispatch lock, where a guarded tool's
+/// [`NativeControlGuard::verify`] would: the caller's authority, the
+/// thread's workspace and provider, its permission mode against the caller's
+/// ceiling and, for a supervised caller, that a live worker runs in that
+/// mode (a DB-only mode change must not disguise a full-access worker).
+/// Unlike `verify`, the thread needs no pane: this returns it, if any.
+fn lifecycle_check<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, target: &Target, provider: ProviderKind) -> Result<Option<String>, ControlError> {
+    authorize(app, caller)?;
+    let (record, current) = thread_record(app, target, true)?;
+    if current != provider {
+        return Err(ControlError::new(ErrorCode::StaleThreadBinding, "The thread changed provider after admission"));
+    }
+    permission_ceiling(caller, provider, record.permission_mode.as_deref())?;
+    if caller.access == ControlAccess::Supervised {
+        if let Some(state) = app.try_state::<NativeControlState>() {
+            state.verify_worker_mode(&target.thread_id, provider, record.permission_mode.as_deref()).map_err(ControlError::from)?;
+        }
+    }
+    bound_pane(app, target, provider)
+}
+
+/// [`lifecycle_check`] in the string form the session owner's checked
+/// operations take; the code survives the round trip.
+fn lifecycle_witness<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, target: &Target, provider: ProviderKind) -> impl Fn() -> Result<Option<String>, String> {
+    let (app, caller, target) = (app.clone(), caller.clone(), target.clone());
+    move || lifecycle_check(&app, &caller, &target, provider).map_err(|error| error.to_string())
+}
+
+/// The thread a lifecycle tool targets and its provider, checked before
+/// admission so a refused call leaves no receipt.
+fn lifecycle_target<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, workspace_id: String, thread_id: String) -> Result<(Target, ProviderKind), ControlError> {
+    authorize(app, caller)?;
+    let target = Target { workspace_id, thread_id };
+    let (_, provider) = thread_record(app, &target, true)?;
+    lifecycle_check(app, caller, &target, provider)?;
+    Ok((target, provider))
+}
+
+/// Binds a thread whose pane was closed to a new tab, as reopening it from
+/// search does, so the thread tools can control it again. Opening a thread
+/// is as much control as sending it a message, so it takes the same ceiling.
+pub(super) async fn thread_open<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let input: OpenArgs = parse(args.clone())?;
+    identifier(&input.client_request_id, "client_request_id", 128)?;
+    if let Some(done) = recorded(app, caller, "thread_open", &args)? { return Ok(done); }
+    let (target, provider) = lifecycle_target(app, caller, input.workspace_id, input.thread_id)?;
+    let witness = lifecycle_witness(app, caller, &target, provider);
+    let (owned, select) = (app.clone(), input.select);
+    run_receipted(app, caller, "thread_open", &args, false, Some(&target.workspace_id.clone()), move |_| async move {
+        // Checked again once the bind holds the thread's dispatch lock: the
+        // grant or the thread's mode may have changed while it waited.
+        let opened = agent_chat::open_thread_pane_checked(&owned, &target.thread_id, select, || witness().map(drop)).await?;
+        Ok(json!({"workspace_id": opened.workspace_id, "thread_id": target.thread_id, "pane_id": opened.pane_id, "reopened": opened.created}))
+    }).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RenameArgs { workspace_id: String, thread_id: String, client_request_id: String, title: String }
+
+pub(super) async fn thread_rename<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let input: RenameArgs = parse(args.clone())?;
+    identifier(&input.client_request_id, "client_request_id", 128)?;
+    identifier(&input.title, "title", 100)?;
+    if let Some(done) = recorded(app, caller, "thread_rename", &args)? { return Ok(done); }
+    let (target, provider) = lifecycle_target(app, caller, input.workspace_id, input.thread_id)?;
+    let (owned, owner, title) = (app.clone(), caller.clone(), input.title);
+    run_receipted(app, caller, "thread_rename", &args, false, Some(&target.workspace_id.clone()), move |_| async move {
+        // A mode change takes this lock, so the check holds through the rename.
+        let gate = owned.state::<NativeControlState>().thread_gate(&target.thread_id);
+        let _dispatch = gate.dispatch.clone().lock_owned().await;
+        lifecycle_check(&owned, &owner, &target, provider)?;
+        agent_chat::agent_chat_rename_session(owned.clone(), owned.state(), target.thread_id.clone(), title.clone()).await?;
+        Ok(json!({"workspace_id": target.workspace_id, "thread_id": target.thread_id, "title": title}))
+    }).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LifecycleArgs { workspace_id: String, thread_id: String, client_request_id: String }
+
+/// Closes the thread's pane as the pane's close button does: the session
+/// stops, the thread and its history stay, and `thread_open` reopens it.
+/// Succeeds once the session stopped, so a reopen right after starts afresh.
+pub(super) async fn thread_close<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let input: LifecycleArgs = parse(args.clone())?;
+    identifier(&input.client_request_id, "client_request_id", 128)?;
+    if let Some(done) = recorded(app, caller, "thread_close", &args)? { return Ok(done); }
+    let (target, provider) = lifecycle_target(app, caller, input.workspace_id, input.thread_id)?;
+    let witness = lifecycle_witness(app, caller, &target, provider);
+    let owned = app.clone();
+    run_receipted(app, caller, "thread_close", &args, false, Some(&target.workspace_id.clone()), move |_| async move {
+        // Without select, closing moves no focus.
+        let pane = agent_chat::close_thread_pane_checked(&owned, provider, &target.thread_id, witness).await?;
+        Ok(json!({"workspace_id": target.workspace_id, "thread_id": target.thread_id, "pane_id": pane, "closed": pane.is_some()}))
+    }).await
+}
+
+/// Deletes a thread for good. Deleting a chat's history does not stop its
+/// session, so this closes its pane, ends its queued work and stops the
+/// session first, then deletes it as the history menu does, all in one
+/// critical section on the thread, so nothing reopens or resumes it between.
+pub(super) async fn thread_delete<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
+    let input: LifecycleArgs = parse(args.clone())?;
+    identifier(&input.client_request_id, "client_request_id", 128)?;
+    if let Some(done) = recorded(app, caller, "thread_delete", &args)? { return Ok(done); }
+    let (target, provider) = lifecycle_target(app, caller, input.workspace_id, input.thread_id)?;
+    let witness = lifecycle_witness(app, caller, &target, provider);
+    let owned = app.clone();
+    run_receipted(app, caller, "thread_delete", &args, false, Some(&target.workspace_id.clone()), move |_| async move {
+        agent_chat::delete_thread_checked(&owned, provider, &target.thread_id, witness).await?;
+        Ok(json!({"workspace_id": target.workspace_id, "thread_id": target.thread_id, "deleted": true}))
+    }).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SearchArgs { query: String, workspace_id: Option<String>, limit: Option<u32> }
+
+/// Searches every open workspace's threads, or one workspace's.
+pub(super) fn thread_search<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
+    let input: SearchArgs = parse(args)?;
+    if input.query.trim().is_empty() || input.query.len() > 1000 {
+        return Err(ControlError::new(ErrorCode::InvalidArguments, "query must contain text and fit in 1000 bytes"));
+    }
+    let limit = input.limit.unwrap_or(20);
+    if !(1..=50).contains(&limit) { return Err(ControlError::new(ErrorCode::InvalidArguments, "limit must be between 1 and 50")); }
+    let workspaces: Vec<String> = match &input.workspace_id {
+        Some(id) => vec![workspace(app, id, false)?.workspace_id.0],
+        None => app.state::<AppStateStore>().snapshot().workspaces.into_iter().map(|w| w.workspace_id.0).collect(),
+    };
+    Ok(json!({"matches": app.state::<DatabaseStore>().search_agent_chat(&input.query, &workspaces, limit)?}))
+}
+
+#[cfg(test)]
+mod answer_tests {
+    use super::{user_input_answer, Answer};
+    use crate::agent_provider::ProviderKind;
+    use serde_json::json;
+
+    fn choices(values: &[&str]) -> Answer {
+        Answer::Choices(values.iter().map(|value| value.to_string()).collect())
+    }
+
+    /// A multi-select whose choices a ", "-join would blur is refused rather
+    /// than delivered as another selection; OpenCode, Cursor and Grok take a
+    /// list, so their choices pass whole.
+    #[test]
+    fn multi_select_choices_that_blur_once_joined_are_refused() {
+        let questions = json!([{"question": "Which?", "multiSelect": true,
+            "options": [{"label": "A"}, {"label": "B"}, {"label": "A, B"}]}]);
+        for (provider, answer) in [
+            (ProviderKind::Claude, choices(&["A", "B"])),
+            (ProviderKind::Codex, choices(&["a", "b"])),
+            (ProviderKind::Claude, choices(&["A, B", "A"])),
+        ] {
+            let error = user_input_answer(provider, &questions, vec![answer]).unwrap_err();
+            assert!(error.to_string().contains("cannot be told apart"), "{error}");
+        }
+        let combined = user_input_answer(ProviderKind::Claude, &questions, vec![choices(&["A, B"])]).unwrap();
+        assert_eq!(combined["answers"]["Which?"], "A, B", "one choice is the label itself");
+        for provider in [ProviderKind::OpenCode, ProviderKind::Cursor, ProviderKind::Grok] {
+            let listed = user_input_answer(provider, &questions, vec![choices(&["A, B", "A"])]).unwrap();
+            assert_eq!(listed["answers"]["Which?"], json!(["A, B", "A"]), "{provider:?} takes each choice whole");
+        }
+        let plain = json!([{"question": "Which?", "multiSelect": true, "options": [{"label": "lint"}, {"label": "tests"}]}]);
+        let joined = user_input_answer(ProviderKind::Claude, &plain, vec![choices(&["lint", "tests"])]).unwrap();
+        assert_eq!(joined["answers"]["Which?"], "lint, tests");
+    }
 }
 
 #[cfg(test)]

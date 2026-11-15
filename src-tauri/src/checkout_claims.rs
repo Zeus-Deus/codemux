@@ -201,6 +201,19 @@ pub(crate) fn stops_of_workspace(workspace_id: &str) -> Stops {
     )
 }
 
+/// The stop of `thread_id` still in flight, if any, for a close that must not
+/// settle while an earlier close's stop can still run.
+pub(crate) fn pending_stop_of(thread_id: &str) -> Stops {
+    Stops(
+        claims()
+            .get(&Key::Stop(thread_id.to_string()))
+            .filter(|claim| claim.result.borrow().is_none())
+            .map(|claim| claim.result.clone())
+            .into_iter()
+            .collect(),
+    )
+}
+
 /// Claims on folders inside `root`, except the deleting workspace's own,
 /// for a deletion to wait on before its final check.
 pub(crate) fn claims_in(root: &Path, own: Option<&CloseClaim>) -> Stops {

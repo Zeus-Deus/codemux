@@ -571,6 +571,20 @@ pub fn agent_chat_close_pane<R: Runtime>(
     select: Option<bool>,
 ) -> Result<(), String> {
     feature_flag_on(&observability)?;
+    close_agent_chat_pane(&app, &state, &pane_id, select.unwrap_or(true));
+    Ok(())
+}
+
+/// [`agent_chat_close_pane`]'s work, without the feature-flag gate. Returns
+/// the stop of the pane's session, which runs in the background; the close
+/// button never waits for it.
+fn close_agent_chat_pane<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppStateStore,
+    pane_id: &str,
+    select: bool,
+) -> crate::checkout_claims::Stops {
+    let pane_id = pane_id.to_string();
     // Capture the chat session bound to this pane *before* the tree
     // mutation so the cleanup path still has provider + thread_id to
     // hand to `stop_session`. Without this the JSON-RPC sidecar and
@@ -599,12 +613,126 @@ pub fn agent_chat_close_pane<R: Runtime>(
     }
     // close_pane errors when the pane id is unknown — treat that as a
     // no-op to keep the command idempotent.
-    let _ = state.close_pane_with_selection(&pane_id, select.unwrap_or(true));
-    if let Some(pair) = chat_thread {
-        shutdown_agent_chat_threads(&app, vec![pair]);
+    let _ = state.close_pane_with_selection(&pane_id, select);
+    let stops = chat_thread
+        .map(|pair| shutdown_agent_chat_threads(app, vec![pair]))
+        .unwrap_or_default();
+    crate::state::emit_app_state(app);
+    stops
+}
+
+/// Closes `thread_id`'s pane as its close button does, for a controller that
+/// must know the outcome. `check` runs under the thread's dispatch lock and
+/// returns the pane to close, so nothing it verified (the caller's authority,
+/// the thread's permission mode, its live worker's) changes before the pane
+/// closes. Returns that pane once its session stopped, or `None` when the
+/// thread had none (its session is still stopped, should an earlier close's
+/// stop be pending or have failed); errs when the provider did not
+/// acknowledge the stop.
+pub(crate) async fn close_thread_pane_checked<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: &str,
+    check: impl Fn() -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    feature_flag_on(&app.state::<ObservabilityStore>())?;
+    let gate = native_thread_gate(app, thread_id);
+    // As the close button does: work still being admitted gives way to the
+    // close rather than holding it up. A thread without a pane closes nothing.
+    // Checked first, so a close no longer allowed cancels nobody's work.
+    if check()?.is_some() {
+        gate.cancel();
     }
-    crate::state::emit_app_state(&app);
-    Ok(())
+    let (pane, stops) = {
+        let mut native_guard = gate.dispatch.clone().lock_owned().await;
+        let mut activity_guard = None;
+        loop {
+            if let Some(pane) = check()? {
+                let stops = close_agent_chat_pane(app, &app.state(), &pane, false);
+                break (pane, stops);
+            }
+            if activity_guard.is_some() {
+                // Replaces the claim of a stop that failed, so a confirmed
+                // stop here frees the checkout for deletion again.
+                let (mut batch, _) = crate::checkout_claims::begin_stops(vec![stop_claim_of(app, thread_id)]);
+                // A provider no longer configured has no session to stop.
+                let stopped = match app.state::<ProviderRegistry>().get(provider).await {
+                    Some(implementation) => {
+                        stop_session_locked(app, implementation.as_ref(), ThreadId(thread_id.to_string())).await
+                    }
+                    None => Ok(()),
+                };
+                batch.settle(thread_id, stopped.clone());
+                stopped.map_err(|error| format!("The session did not stop: {error}"))?;
+                return Ok(None);
+            }
+            // The pane is gone, but the stop its close began may still be
+            // running, or may have failed and left the worker up. Join that
+            // stop first, without the locks it needs, so it cannot run after
+            // this settles and stop a session reopened since. Then stop the
+            // session here under its locks, in its lock order, so this
+            // settles only once no worker runs. A failed earlier stop is
+            // retried below, so its error is not this close's.
+            drop(native_guard);
+            let _ = crate::checkout_claims::wait_for(crate::checkout_claims::pending_stop_of(thread_id)).await;
+            activity_guard = Some(super::usage_resume::activity_lock(thread_id).lock_owned().await);
+            native_guard = gate.dispatch.clone().lock_owned().await;
+        }
+    };
+    // The stop takes the dispatch lock itself, so it is awaited only once
+    // the lock is released. A reopen and send after this returns cannot be
+    // stopped by it.
+    crate::checkout_claims::wait_for(stops)
+        .await
+        .map_err(|error| format!("The session did not stop: {error}"))?;
+    Ok(Some(pane))
+}
+
+/// Deletes `thread_id` for good in one critical section: its pane closes,
+/// its queued work and session stop and its history goes, all under the
+/// thread's activity and dispatch locks, so no reopen, send or resume can
+/// bind a pane or start a session in between. `check` runs first under the
+/// locks and returns the pane to close, and again before the history goes,
+/// since stopping the session waited on the provider.
+pub(crate) async fn delete_thread_checked<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: &str,
+    check: impl Fn() -> Result<Option<String>, String>,
+) -> Result<(), String> {
+    feature_flag_on(&app.state::<ObservabilityStore>())?;
+    let gate = native_thread_gate(app, thread_id);
+    // Checked first, so a delete no longer allowed cancels nobody's work.
+    check()?;
+    gate.cancel();
+    // Same lock order as `agent_chat_stop_session_guarded`.
+    let _activity_guard = super::usage_resume::activity_lock(thread_id).lock_owned().await;
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
+    let pane = check()?;
+    if let Some(pane) = pane {
+        // Its background stop waits for these locks, then finds the session
+        // this stops below already gone.
+        close_agent_chat_pane(app, &app.state(), &pane, false);
+    }
+    // What `agent_chat_stop_session_guarded` does before its locks.
+    crate::commands::secret_requests::stop_thread(app, thread_id);
+    crate::delegation::app::user_activity(app, thread_id, true)?;
+    super::delegation::on_thread_stopped(app, thread_id, super::delegation::StopKind::Restart);
+    super::usage_resume::cancel_for_stopped_thread(app, thread_id);
+    app.state::<DatabaseStore>().stop_message_deliveries(thread_id)?;
+    // Replaces the claim of the pane close's background stop, or of an
+    // earlier stop that failed, so a confirmed stop here frees the checkout
+    // for deletion; a failed one keeps it claimed.
+    let (mut batch, _) = crate::checkout_claims::begin_stops(vec![stop_claim_of(app, thread_id)]);
+    // A provider no longer configured has no session to stop.
+    let stopped = match app.state::<ProviderRegistry>().get(provider).await {
+        Some(implementation) => stop_session_locked(app, implementation.as_ref(), ThreadId(thread_id.to_string())).await,
+        None => Ok(()),
+    };
+    batch.settle(thread_id, stopped.clone());
+    stopped?;
+    check()?;
+    delete_session_locked(app, &app.state(), thread_id).await
 }
 
 // ── Dev-only harness ──────────────────────────────────────────────────
@@ -5513,10 +5641,18 @@ pub async fn agent_chat_respond_to_request_guarded<R: Runtime>(
     decision: ApprovalDecision,
     control: Option<NativeControlGuard>,
 ) -> Result<(), String> {
+    // An answer to a user-input request (AskUserQuestion and its kin) grants
+    // no tool permission, so a supervised controller may send one.
+    let answers_question = control.is_some()
+        && matches!(decision, ApprovalDecision::Allow { updated_input: Some(_), .. })
+        && app.try_state::<NativeControlState>().is_some_and(|state| {
+            state.request_kind(&thread_id.0, &request_id.0).as_deref() == Some("user-input")
+        });
     if let Some(control) = &control {
         control.verify_target(provider, &thread_id.0)?;
         control.verify(&app)?;
         if control.caller.access != crate::agent_control::ControlAccess::FullAccess
+            && !answers_question
             && !matches!(
                 decision,
                 ApprovalDecision::Deny { .. } | ApprovalDecision::Cancel
@@ -5563,6 +5699,7 @@ pub async fn agent_chat_respond_to_request_guarded<R: Runtime>(
         }
     }
     let dispatch_decision = if control.is_some()
+        && !answers_question
         && matches!(provider, ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Antigravity)
     {
         app.state::<NativeControlState>().exact_acp_decision(&thread_id.0, &request_id.0, &decision)?
@@ -6311,7 +6448,17 @@ pub async fn agent_chat_stop_session_guarded<R: Runtime>(
     if let Some(control) = &control {
         control.verify(&app)?;
     }
-    match impl_.stop_session(thread_id.clone()).await {
+    stop_session_locked(&app, impl_.as_ref(), thread_id).await
+}
+
+/// Stops the session; the caller holds the thread's activity and dispatch
+/// locks.
+async fn stop_session_locked<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: &dyn AgentProvider,
+    thread_id: ThreadId,
+) -> Result<(), String> {
+    match provider.stop_session(thread_id.clone()).await {
         Ok(()) | Err(ProviderError::SessionNotFound { .. }) => {
             if let Some(state) = app.try_state::<NativeControlState>() {
                 state.clear_worker(&thread_id.0);
@@ -6400,17 +6547,8 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
         return delegated;
     }
     // Claimed before the spawn so a worktree deletion that starts right
-    // after this call still finds the stop and waits for it. A session that
-    // runs on a device works in the device's folder, so it claims none here.
-    let db = app.try_state::<DatabaseStore>();
-    let sessions = threads
-        .iter()
-        .map(|(_, id, _)| {
-            let session = db.as_ref().and_then(|db| db.get_agent_chat_session(id));
-            let (workspace_id, cwd) = session.map_or((None, None), |s| (Some(s.workspace_id), s.cwd));
-            (id.clone(), workspace_id, cwd.filter(|_| !session_runs_on_device(id)))
-        })
-        .collect();
+    // after this call still finds the stop and waits for it.
+    let sessions = threads.iter().map(|(_, id, _)| stop_claim_of(app, id)).collect();
     let (batch, stops) = crate::checkout_claims::begin_stops(sessions);
     let mut handle = delegated;
     handle.extend(stops);
@@ -6419,6 +6557,15 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
         stop_agent_chat_threads(&app_handle, threads, batch).await;
     });
     handle
+}
+
+/// What a stop of `thread_id` claims, for [`crate::checkout_claims::begin_stops`]:
+/// its recorded workspace and folder. A session that runs on a device works
+/// in the device's folder, so it claims none here.
+fn stop_claim_of<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> (String, Option<String>, Option<String>) {
+    let session = app.try_state::<DatabaseStore>().and_then(|db| db.get_agent_chat_session(thread_id));
+    let (workspace_id, cwd) = session.map_or((None, None), |s| (Some(s.workspace_id), s.cwd));
+    (thread_id.to_string(), workspace_id, cwd.filter(|_| !session_runs_on_device(thread_id)))
 }
 
 /// [`shutdown_agent_chat_threads`], but resolves only once every session has
@@ -7071,50 +7218,98 @@ fn pane_tree_contains_id(root: &PaneNodeSnapshot, target: &str) -> bool {
 #[tauri::command]
 pub async fn agent_chat_open_search_result<R: Runtime>(
     app: AppHandle<R>,
-    state: State<'_, AppStateStore>,
-    observability: State<'_, ObservabilityStore>,
-    db: State<'_, DatabaseStore>,
     thread_id: String,
     select: Option<bool>,
 ) -> Result<OpenAgentChatSearchResult, String> {
-    feature_flag_on(&observability)?;
+    let opened = open_thread_pane(&app, &thread_id, select.unwrap_or(true)).await?;
+    Ok(OpenAgentChatSearchResult {
+        pane_id: opened.pane_id,
+        workspace_id: opened.workspace_id,
+    })
+}
+
+/// Where [`open_thread_pane`] put a thread.
+pub(crate) struct OpenedThreadPane {
+    pub pane_id: String,
+    pub workspace_id: String,
+    /// A new tab was bound; false when the thread already had a pane.
+    pub created: bool,
+}
+
+/// Binds `thread_id` to its existing pane, or to a new tab in its workspace.
+/// With `select` the pane's tab and pane become active and the workspace is
+/// selected; without it nothing moves, so an outside caller never takes the
+/// person's focus.
+pub(crate) async fn open_thread_pane<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+    select: bool,
+) -> Result<OpenedThreadPane, String> {
+    open_thread_pane_checked(app, thread_id, select, || Ok(())).await
+}
+
+/// [`open_thread_pane`], once `check` passes after any wait for the chat's
+/// dispatch lock, so a controller's authority and the thread's permission
+/// mode are judged as they are when the pane binds.
+pub(crate) async fn open_thread_pane_checked<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+    select: bool,
+    check: impl Fn() -> Result<(), String>,
+) -> Result<OpenedThreadPane, String> {
+    feature_flag_on(&app.state::<ObservabilityStore>())?;
+    let state = app.state::<AppStateStore>();
+    let db = app.state::<DatabaseStore>();
     // Binding a new pane holds the chat's dispatch lock from reading it
     // through the bind, so a history reopen can't merge it away in between
-    // (`merge_reopened_chat`). A chat already open in a pane is never
-    // merged, so focusing it doesn't wait behind a session that is starting.
-    let dispatch_guard = match state.agent_chat_pane_id_for_thread(&thread_id) {
+    // (`merge_reopened_chat`) and a delete can't close it and then find a
+    // new pane bound to the history it removes. A chat already open in a
+    // pane is never merged, so focusing it doesn't wait behind a session
+    // that is starting. The gate is held as long as its lock: the registry
+    // keeps gates only while someone does, and another caller must find
+    // this one, not a fresh gate with a free lock.
+    let gate = native_thread_gate(app, thread_id);
+    let mut dispatch_guard = match state.agent_chat_pane_id_for_thread(thread_id) {
         Some(_) => None,
-        None => Some(native_thread_gate(&app, &thread_id).dispatch.clone().lock_owned().await),
+        None => Some(gate.dispatch.clone().lock_owned().await),
     };
-    let record = db
-        .get_agent_chat_session(&thread_id)
-        .ok_or_else(|| format!("conversation_not_found: {thread_id}"))?;
-    let provider = match record.provider.to_ascii_lowercase().as_str() {
-        "claude" => ProviderKind::Claude,
-        "codex" => ProviderKind::Codex,
-        "cursor" => ProviderKind::Cursor,
-        "grok" => ProviderKind::Grok,
-        "antigravity" => ProviderKind::Antigravity,
-        "hermes" => ProviderKind::Hermes,
-        "acp" => ProviderKind::Acp,
-        "opencode" => ProviderKind::OpenCode,
-        other => return Err(format!("unsupported_provider: {other}")),
-    };
-
-    let pane_id = if let Some(existing) = state.agent_chat_pane_id_for_thread(&thread_id) {
-        existing
-    } else {
+    let (pane_id, created) = loop {
+        check()?;
+        let record = db
+            .get_agent_chat_session(thread_id)
+            .ok_or_else(|| format!("conversation_not_found: {thread_id}"))?;
+        let provider = match record.provider.to_ascii_lowercase().as_str() {
+            "claude" => ProviderKind::Claude,
+            "codex" => ProviderKind::Codex,
+            "cursor" => ProviderKind::Cursor,
+            "grok" => ProviderKind::Grok,
+            "antigravity" => ProviderKind::Antigravity,
+            "hermes" => ProviderKind::Hermes,
+            "acp" => ProviderKind::Acp,
+            "opencode" => ProviderKind::OpenCode,
+            other => return Err(format!("unsupported_provider: {other}")),
+        };
+        if let Some(existing) = state.agent_chat_pane_id_for_thread(thread_id) {
+            break (existing, false);
+        }
+        if dispatch_guard.is_none() {
+            // The pane seen without the lock closed since, perhaps by a
+            // delete still holding it: bind only under the lock, once the
+            // thread is checked again there.
+            dispatch_guard = Some(gate.dispatch.clone().lock_owned().await);
+            continue;
+        }
         let pane_id = state
             .create_or_reuse_agent_chat_pane_with_selection(
                 &record.workspace_id,
                 Some(provider),
                 record.cwd.clone(),
                 Some(crate::presets::LaunchMode::NewTab),
-                Some(thread_id.clone()),
-                select.unwrap_or(true),
+                Some(thread_id.to_string()),
+                select,
             )?
             .0;
-        pane_id.0
+        break (pane_id.0, true);
     };
     drop(dispatch_guard);
 
@@ -7138,17 +7333,20 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     let Some((workspace_id, tab_id)) = location else {
         return Err(format!("conversation_pane_not_found: {pane_id}"));
     };
-    if let Some(tab_id) = tab_id {
-        state.activate_tab(&workspace_id, &tab_id)?;
+    if select {
+        if let Some(tab_id) = tab_id {
+            state.activate_tab(&workspace_id, &tab_id)?;
+        }
+        if !state.activate_pane_with_selection(&pane_id, true) {
+            return Err(format!("conversation_pane_not_found: {pane_id}"));
+        }
     }
-    if !state.activate_pane_with_selection(&pane_id, select.unwrap_or(true)) {
-        return Err(format!("conversation_pane_not_found: {pane_id}"));
-    }
-    crate::state::emit_app_state(&app);
+    crate::state::emit_app_state(app);
 
-    Ok(OpenAgentChatSearchResult {
+    Ok(OpenedThreadPane {
         pane_id,
         workspace_id,
+        created,
     })
 }
 
@@ -7240,6 +7438,17 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     let gate = native_thread_gate(&app, &thread_id);
     gate.cancel();
     let _native_guard = gate.dispatch.clone().lock_owned().await;
+    delete_session_locked(&app, &db, &thread_id).await
+}
+
+/// [`agent_chat_delete_session`]'s work; the caller holds the thread's
+/// dispatch lock.
+async fn delete_session_locked<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &DatabaseStore,
+    thread_id: &str,
+) -> Result<(), String> {
+    let thread_id = thread_id.to_string();
     if db.hermes_binding(&thread_id)?.is_some() {
         let registry: State<'_, ProviderRegistry> = app.state();
         if let Some(provider) = registry.get(ProviderKind::Hermes).await {

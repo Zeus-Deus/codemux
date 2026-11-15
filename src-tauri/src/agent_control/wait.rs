@@ -172,6 +172,9 @@ struct PendingApproval {
     request_id: String,
     turn_id: String,
     request_kind: String,
+    /// A user-input request's questions, which `thread_respond` answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    questions: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -204,6 +207,7 @@ impl Pending {
                 request_id: text(&approval["request_id"]),
                 turn_id: text(&approval["turn_id"]),
                 request_kind: text(&approval["request_kind"]),
+                questions: approval.get("questions").filter(|questions| questions.is_array()).cloned(),
             })
             .collect();
         // Questions omit the provider route (`target`) and source item.
