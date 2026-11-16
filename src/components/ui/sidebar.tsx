@@ -304,8 +304,20 @@ function SidebarRail({ className, ...props }: React.ComponentProps<"div">) {
       const handle = e.currentTarget as HTMLElement
       handle.dataset.dragging = "true"
 
-      // Find the sidebar wrapper to update CSS variable directly during drag
       const wrapper = handle.closest("[data-slot='sidebar-wrapper']") as HTMLElement | null
+      // Size only the two boxes that read `--sidebar-width` while dragging.
+      // Changing the variable on the wrapper restyles every element in the
+      // sidebar and the main column (tens of ms a frame); an inline width on
+      // these two is a layout-only change.
+      // `collapsible="none"` renders the sidebar as a single box.
+      const sidebar = handle.closest<HTMLElement>("[data-slot='sidebar']")
+      const gap = sidebar?.querySelector<HTMLElement>("[data-slot='sidebar-gap']")
+      const boxes = gap
+        ? [gap, sidebar?.querySelector<HTMLElement>("[data-slot='sidebar-container']")]
+            .filter((box): box is HTMLElement => box != null)
+        : sidebar
+          ? [sidebar]
+          : []
       let lastWidth = 0
 
       // Disable width transitions during drag so the sidebar tracks the cursor 1:1
@@ -314,12 +326,13 @@ function SidebarRail({ className, ...props }: React.ComponentProps<"div">) {
       const onMove = (ev: PointerEvent) => {
         const clamped = Math.max(SIDEBAR_WIDTH_MIN, Math.min(SIDEBAR_WIDTH_MAX, ev.clientX))
         lastWidth = clamped
-        // Update CSS variable directly — no React re-render during drag
+        // Write the DOM directly — no React re-render during drag
         cancelAnimationFrame(rafId.current)
         rafId.current = requestAnimationFrame(() => {
-          if (wrapper) {
-            wrapper.style.setProperty("--sidebar-width", `${clamped}px`)
-          }
+          // A collapsed sidebar keeps its rail (or offcanvas) width; an
+          // inline width would override those classes and stretch it.
+          const width = sidebar?.dataset.state === "collapsed" ? "" : `${clamped}px`
+          for (const box of boxes) box.style.width = width
         })
       }
 
@@ -330,6 +343,14 @@ function SidebarRail({ className, ...props }: React.ComponentProps<"div">) {
         cancelAnimationFrame(rafId.current)
         window.removeEventListener("pointermove", onMove)
         window.removeEventListener("pointerup", onUp)
+        window.removeEventListener("pointercancel", onUp)
+        window.removeEventListener("blur", onUp)
+        // Hand the width back to the variable in the same task as the
+        // inline widths are cleared, so no frame paints the old width.
+        if (lastWidth > 0 && wrapper) {
+          wrapper.style.setProperty("--sidebar-width", `${lastWidth}px`)
+        }
+        for (const box of boxes) box.style.width = ""
         // Commit the final width to React state (single re-render)
         if (lastWidth > 0) {
           setSidebarWidth(lastWidth)
@@ -338,6 +359,9 @@ function SidebarRail({ className, ...props }: React.ComponentProps<"div">) {
 
       window.addEventListener("pointermove", onMove)
       window.addEventListener("pointerup", onUp)
+      // A lost pointerup would otherwise leave the inline widths pinned.
+      window.addEventListener("pointercancel", onUp)
+      window.addEventListener("blur", onUp)
     },
     [setSidebarWidth],
   )
