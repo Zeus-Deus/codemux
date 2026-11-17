@@ -206,10 +206,11 @@ pub async fn pull(
         )?;
     }
 
-    // Server-side deletion sweep.
+    // Server-side deletion sweep. A row with unpushed changes is left to
+    // its push, which settles a row the server dropped (see `push_update`).
     for row in &local {
         if let Some(sid) = &row.server_id {
-            if !server_ids.contains(sid) && row.deleted_at.is_none() {
+            if !server_ids.contains(sid) && row.deleted_at.is_none() && !row.dirty {
                 eprintln!(
                     "[automations-sync] server no longer has {sid}; tombstoning locally"
                 );
@@ -340,11 +341,61 @@ async fn push_update(
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
+    if resp.status().as_u16() == 404 && server_lacks_automation(client, base, token, server_id).await {
+        // Deleted on another device before this edit reached the account.
+        // The pull leaves dirty rows alone, so settle it here: the
+        // removal wins, as it does for a clean row.
+        eprintln!("[automations-sync] server no longer has {server_id}; dropping the local edit");
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        db.mark_automation_synced(row.id, None)?;
+        return db.upsert_automation_from_server(
+            server_id,
+            &row.name,
+            &row.prompt,
+            &row.agent,
+            &row.schedule,
+            &row.timezone,
+            row.host_id,
+            row.project_path.as_deref(),
+            row.project_remote.as_deref(),
+            row.enabled,
+            row.retention_limit,
+            &row.created_at,
+            &now,
+            Some(&now),
+        );
+    }
     if !resp.status().is_success() {
         return Err(format!("API error: {}", resp.status()));
     }
     db.mark_automation_synced(row.id, None)?;
     Ok(())
+}
+
+/// Whether the account's automation list is readable and has no row
+/// `server_id`. A server without the automations API answers 404 to
+/// everything, so a 404 alone does not say the row is gone.
+async fn server_lacks_automation(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    server_id: &str,
+) -> bool {
+    let Ok(resp) = client
+        .get(format!("{base}/api/automations"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    match resp.json::<ListAutomationsResponse>().await {
+        Ok(body) => !body.automations.iter().any(|a| a.id == server_id),
+        Err(_) => false,
+    }
 }
 
 async fn push_delete(
@@ -560,6 +611,62 @@ mod tests {
         let row = db.get_automation(created.id).unwrap();
         assert!(!row.dirty);
         assert!(row.server_id.is_none());
+        std::env::remove_var("CODEMUX_API_URL");
+    }
+
+    fn server_copy(id: &str, name: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","name":"{name}","prompt":"p","agent":"claude",
+            "schedule":"DTSTART:20260101T090000Z\nRRULE:FREQ=DAILY",
+            "timezone":"UTC","hostServerId":null,"projectPath":"/r",
+            "enabled":true,"retentionLimit":10,
+            "createdAt":"2026-01-01T00:00:00Z",
+            "updatedAt":"2026-01-01T00:00:00Z","deletedAt":null}}"#
+        )
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn pull_keeps_unpushed_edits_pauses_and_deletes() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        // The account still has the old, enabled copy of all three.
+        let _list = server
+            .mock("GET", "/api/automations")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"automations":[{},{},{}]}}"#,
+                server_copy("srv-1", "Paused"),
+                server_copy("srv-2", "Deleted"),
+                server_copy("srv-3", "Untouched")
+            ))
+            .create_async()
+            .await;
+
+        let db = init_test_database();
+        let mut ids = Vec::new();
+        for (name, sid) in [("Paused", "srv-1"), ("Deleted", "srv-2"), ("Old name", "srv-3")] {
+            let row = db
+                .insert_automation(&AutomationInput { name: name.into(), ..sample_input() })
+                .unwrap();
+            db.mark_automation_synced(row.id, Some(sid)).unwrap();
+            ids.push(row.id);
+        }
+        db.set_automation_enabled(ids[0], false).unwrap();
+        db.delete_automation(ids[1]).unwrap();
+
+        pull("token", &db, None).await.unwrap();
+
+        let rows = db.list_automations_for_sync();
+        let row = |id: i64| rows.iter().find(|r| r.id == id).unwrap();
+        assert!(!row(ids[0]).enabled && row(ids[0]).dirty, "a pause is not reverted");
+        assert!(
+            row(ids[1]).deleted_at.is_some() && row(ids[1]).dirty,
+            "a deleted automation is not resurrected"
+        );
+        assert_eq!(row(ids[2]).name, "Untouched", "a clean row still takes the server copy");
+        assert_eq!(rows.len(), 3, "no duplicate rows");
         std::env::remove_var("CODEMUX_API_URL");
     }
 }

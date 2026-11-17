@@ -213,10 +213,11 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
     // Server-side deletion sweep: if a local row has a server_id the
     // server no longer returns, it was deleted elsewhere. Tombstone
     // it locally — dirty stays 0 (server-sourced changes are always
-    // clean).
+    // clean). A row with unpushed changes is left to its push, which
+    // settles a row the server dropped (see `push_update`).
     for local_row in &local {
         if let Some(sid) = &local_row.server_id {
-            if !server_ids.contains(sid) && local_row.deleted_at.is_none() {
+            if !server_ids.contains(sid) && local_row.deleted_at.is_none() && !local_row.dirty {
                 eprintln!(
                     "[workspaces-sync] server no longer has {sid}; tombstoning locally"
                 );
@@ -421,11 +422,59 @@ async fn push_update(
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
+    if resp.status().as_u16() == 404 && server_lacks_workspace(client, base, token, server_id).await {
+        // Deleted on another device before this edit reached the account.
+        // The pull leaves dirty rows alone, so settle it here: the
+        // removal wins, as it does for a clean row.
+        eprintln!("[workspaces-sync] server no longer has {server_id}; dropping the local edit");
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        db.mark_workspace_sync_synced(row.id, None)?;
+        return db.upsert_workspace_sync_from_server(
+            server_id,
+            &row.title,
+            row.host_server_id.as_deref(),
+            row.project_path.as_deref(),
+            row.project_remote.as_deref(),
+            row.git_branch.as_deref(),
+            row.git_head_sha.as_deref(),
+            &row.created_at,
+            &now,
+            Some(&now),
+            row.project_uid.as_deref(),
+            row.workspace_kind.as_deref(),
+        );
+    }
     if !resp.status().is_success() {
         return Err(format!("API error: {}", resp.status()));
     }
     db.mark_workspace_sync_synced(row.id, None)?;
     Ok(())
+}
+
+/// Whether the account's workspace list is readable and has no row
+/// `server_id`. A server without the workspaces API answers 404 to
+/// everything, so a 404 alone does not say the row is gone.
+async fn server_lacks_workspace(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    server_id: &str,
+) -> bool {
+    let Ok(resp) = client
+        .get(format!("{base}/api/workspaces"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    match resp.json::<ListWorkspacesResponse>().await {
+        Ok(body) => !body.workspaces.iter().any(|w| w.id == server_id),
+        Err(_) => false,
+    }
 }
 
 async fn push_delete(
@@ -767,6 +816,48 @@ mod tests {
         db.mark_workspace_sync_synced(all[0].id, None).unwrap();
         db.purge_acknowledged_workspace_sync_deletes().unwrap();
         assert_eq!(db.list_workspaces_sync_for_sync().len(), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn upsert_from_server_keeps_unpushed_edits_and_deletes() {
+        let db = fresh_db();
+        let server_copy = |id: &str, title: &str| {
+            db.upsert_workspace_sync_from_server(
+                id, title, None, None, None, Some("main"), None,
+                "2026-01-01 00:00:00", "2026-01-01 00:00:00", None, None, None,
+            )
+            .unwrap();
+        };
+        for (workspace, sid) in [("workspace-1", "1"), ("workspace-2", "2"), ("workspace-3", "3")] {
+            let row = db
+                .insert_workspace_sync(workspace, "old", None, None, None, Some("main"), None, None, None)
+                .unwrap();
+            db.mark_workspace_sync_synced(row.id, Some(sid)).unwrap();
+        }
+        db.update_workspace_sync_by_workspace_id(
+            "workspace-1", "renamed", None, None, None, Some("feature"), None, None, None,
+        )
+        .unwrap();
+        db.soft_delete_workspace_sync_by_workspace_id("workspace-2").unwrap();
+
+        // The server still has the old copy of each.
+        for sid in ["1", "2", "3"] {
+            server_copy(sid, "server title");
+        }
+
+        let rows = db.list_workspaces_sync_for_sync();
+        assert_eq!(rows.len(), 3, "no duplicate rows");
+        let row = |sid: &str| rows.iter().find(|r| r.server_id.as_deref() == Some(sid)).unwrap();
+        assert_eq!(row("1").title, "renamed", "a rename is not reverted");
+        assert_eq!(row("1").git_branch.as_deref(), Some("feature"));
+        assert!(row("1").dirty, "and still goes up with the push");
+        assert!(
+            row("2").deleted_at.is_some() && row("2").dirty,
+            "a closed workspace is not resurrected"
+        );
+        assert_eq!(row("3").title, "server title", "a clean row still takes the server copy");
+        assert!(!row("3").dirty);
     }
 
     #[test]
