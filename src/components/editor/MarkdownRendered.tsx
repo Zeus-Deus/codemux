@@ -25,6 +25,8 @@ function safeUrlTransform(url: string): string {
   return DANGEROUS_URL.test(url) ? "" : url;
 }
 
+const ID_PREFIX = defaultSchema.clobberPrefix ?? "";
+
 const DRIVE_LETTERS = [..."abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"];
 
 /**
@@ -52,6 +54,34 @@ const LOCAL_FILE_SCHEMA: SanitizeSchema = {
     ],
   },
 };
+
+/**
+ * Scroll to the target of an in-page link, within the same rendered
+ * document. The sanitizer's prefix is tried first: a raw
+ * `<a name="setup">` renders as `user-content-setup`, and a footnote,
+ * which is generated already prefixed, ends up prefixed twice.
+ */
+function scrollToFragment(link: Element, fragment: string): void {
+  let name = fragment;
+  try {
+    name = decodeURIComponent(fragment);
+  } catch {
+    // A literal '%' rather than a URL escape.
+  }
+  if (!name) return;
+  const root = link.closest(".markdown-rendered");
+  if (!root) return;
+  const anchors = Array.from(root.querySelectorAll("[id], [name]"));
+  for (const candidate of [`${ID_PREFIX}${name}`, name]) {
+    const target = anchors.find(
+      (el) => el.id === candidate || el.getAttribute("name") === candidate,
+    );
+    if (target) {
+      target.scrollIntoView();
+      return;
+    }
+  }
+}
 
 interface Props {
   content: string;
@@ -191,6 +221,14 @@ function MarkdownRenderedImpl({
           href={href}
           rel="noopener noreferrer"
           onClick={(event) => {
+            if (href?.startsWith("#")) {
+              // Sanitizing prefixes every `id` and `name` so a document
+              // cannot shadow the app's own, which leaves an in-page link
+              // pointing at the unprefixed one. Resolve it here.
+              event.preventDefault();
+              scrollToFragment(event.currentTarget, href.slice(1));
+              return;
+            }
             if (!href || !/^https?:\/\//i.test(href)) return;
             event.preventDefault();
             void openExternalUrl(href, { event });
