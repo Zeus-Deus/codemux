@@ -1804,33 +1804,46 @@ pub struct MergeIntoBaseResult {
     pub conflicted_files: Vec<ConflictFile>,
 }
 
-/// After `update-ref`, the worktree where `base_branch` is checked out still has
-/// stale files on disk.  Find that worktree via `git worktree list --porcelain`
-/// and run `reset --hard HEAD` to sync its working tree.
-/// Failures are silently ignored — the ref update already succeeded and stale
-/// files are annoying but not data-loss.
-fn refresh_base_worktree(repo_path: &Path, base_branch: &str) {
-    let output = match run_git(repo_path, &["worktree", "list", "--porcelain"]) {
-        Ok(o) => o,
-        Err(_) => return,
-    };
-
-    let target_ref = format!("refs/heads/{}", base_branch);
+/// The worktree where `branch` is checked out, if any and still on disk.
+fn branch_worktree(repo_path: &Path, branch: &str) -> Option<PathBuf> {
+    let output = run_git(repo_path, &["worktree", "list", "--porcelain"]).ok()?;
+    let target_ref = format!("refs/heads/{branch}");
     let mut current_path: Option<&str> = None;
 
     for line in output.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
             current_path = Some(path);
-        } else if let Some(branch) = line.strip_prefix("branch ") {
-            if branch == target_ref {
-                if let Some(path) = current_path {
-                    let _ = run_git(Path::new(path), &["reset", "--hard", "HEAD"]);
-                    return;
-                }
-            }
+        } else if line.strip_prefix("branch ") == Some(target_ref.as_str()) {
+            return current_path.map(PathBuf::from).filter(|path| path.is_dir());
         } else if line.is_empty() {
             current_path = None;
         }
+    }
+    None
+}
+
+/// Fast-forward `base_branch` to `commit`.
+///
+/// Where the base branch is checked out, the fast-forward runs inside that
+/// checkout, so its files follow the ref and git refuses when uncommitted
+/// work there would be overwritten — moving the ref and resetting the
+/// checkout would silently discard that work. A base branch checked out
+/// nowhere has no files to protect, so only its ref moves.
+fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Result<(), String> {
+    match branch_worktree(repo_path, base_branch) {
+        Some(checkout) => run_git(&checkout, &["merge", "--ff-only", commit])
+            .map(|_| ())
+            .map_err(|e| {
+                format!(
+                    "Cannot update {base_branch}: its checkout at {} has uncommitted changes the merge would overwrite. Commit or stash them there first. ({e})",
+                    checkout.display()
+                )
+            }),
+        None => run_git(
+            repo_path,
+            &["update-ref", &format!("refs/heads/{base_branch}"), commit],
+        )
+        .map(|_| ()),
     }
 }
 
@@ -1912,8 +1925,11 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch
             return Err("Cannot fast-forward base branch — history has diverged".to_string());
         }
         let temp_commit = run_git(repo_path, &["rev-parse", &temp_branch])?;
-        run_git(repo_path, &["update-ref", &format!("refs/heads/{}", base_branch), temp_commit.trim()])?;
-        refresh_base_worktree(repo_path, base_branch);
+        if let Err(e) = advance_base_branch(repo_path, base_branch, temp_commit.trim()) {
+            run_git(repo_path, &["checkout", &source_branch])?;
+            let _ = run_git(repo_path, &["branch", "-D", &temp_branch]);
+            return Err(e);
+        }
 
         if delete_source_branch {
             // Delete source while still on temp (can't delete a checked-out branch)
@@ -1995,8 +2011,7 @@ pub fn complete_merge_into_base(
         return Err("Cannot fast-forward base branch — history has diverged".to_string());
     }
     let temp_commit = run_git(repo_path, &["rev-parse", temp_branch])?;
-    run_git(repo_path, &["update-ref", &format!("refs/heads/{}", base_branch), temp_commit.trim()])?;
-    refresh_base_worktree(repo_path, base_branch);
+    advance_base_branch(repo_path, base_branch, temp_commit.trim())?;
 
     if delete_source_branch {
         // Delete source while still on temp (can't delete a checked-out branch)
@@ -6491,6 +6506,63 @@ mod tests {
         // Main worktree files on disk must reflect the merged content (not stale)
         let on_disk = std::fs::read_to_string(repo.join("feature.txt")).unwrap();
         assert_eq!(on_disk, "worktree work", "main worktree file must match merged content");
+    }
+
+    #[test]
+    fn test_merge_into_base_keeps_uncommitted_work_in_base_checkout() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+
+        std::fs::write(repo.join("shared.txt"), "original").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "add shared"]).unwrap();
+        let main_before = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        run_git(&wt, &["merge", main]).unwrap();
+        std::fs::write(wt.join("shared.txt"), "from feature").unwrap();
+        run_git(&wt, &["commit", "-am", "feature edit"]).unwrap();
+
+        // Uncommitted work in the main checkout, on the file the merge changes.
+        std::fs::write(repo.join("shared.txt"), "unsaved local work").unwrap();
+
+        let err = merge_into_base(&wt, main, false).unwrap_err();
+        assert!(err.contains("uncommitted changes"), "unexpected error: {err}");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("shared.txt")).unwrap(),
+            "unsaved local work",
+            "the base checkout's uncommitted work must survive",
+        );
+        assert_eq!(run_git(&repo, &["rev-parse", "HEAD"]).unwrap(), main_before);
+        assert_eq!(run_git(&wt, &["branch", "--show-current"]).unwrap(), "feature");
+        let leftovers = run_git(&wt, &["branch", "--list", "merge/*"]).unwrap();
+        assert!(leftovers.is_empty(), "temp branch left behind: {leftovers}");
+    }
+
+    #[test]
+    fn test_merge_into_base_keeps_unrelated_work_in_base_checkout() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+
+        std::fs::write(repo.join("notes.txt"), "committed").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "add notes"]).unwrap();
+
+        run_git(&wt, &["merge", main]).unwrap();
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        // Uncommitted work the merge does not touch.
+        std::fs::write(repo.join("notes.txt"), "unsaved local work").unwrap();
+
+        let result = merge_into_base(&wt, main, false).unwrap();
+        assert_eq!(result.status, "merged");
+        assert_eq!(std::fs::read_to_string(repo.join("feature.txt")).unwrap(), "worktree work");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("notes.txt")).unwrap(),
+            "unsaved local work",
+        );
     }
 
     #[test]
