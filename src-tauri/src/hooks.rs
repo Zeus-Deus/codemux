@@ -71,8 +71,10 @@ pub fn start_hook_server<R: Runtime>(app: AppHandle<R>) -> u16 {
                 }
 
                 // Always store the agent session ID — it reflects the CURRENT
-                // session running in this pane.
-                if !agent_session_id.is_empty() {
+                // session running in this pane. Anything on this machine can
+                // reach this port, and the id later lands in a resume command
+                // typed into the pane's shell, so only a plain token is kept.
+                if crate::session_adapters::is_safe_capture(agent_session_id) {
                     let state: tauri::State<'_, AppStateStore> = app.state();
                     // `handle_lifecycle_event` below emits, but only for event
                     // types it recognises — an unrecognised one returns early,
