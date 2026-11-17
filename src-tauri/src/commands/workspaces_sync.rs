@@ -101,6 +101,14 @@ fn adopt_root_landing(project_uid: Option<&str>, project_name: &str) -> String {
         .to_string()
 }
 
+/// What a clone-adopt does with its project landing dir: `(reuse, created)`.
+/// An existing clone is reused instead of cloned again, and only a path that
+/// did not exist beforehand counts as created by the adopt — the one case its
+/// failure rollback may delete.
+fn adopt_clone_plan(project_path: &std::path::Path) -> (bool, bool) {
+    (project_path.join(".git").exists(), !project_path.exists())
+}
+
 /// Absolute local landing dir for an adopted WORKTREE
 /// (`~/.codemux/worktrees/<basename>-<short-uid>/<branch>`), with the basename
 /// read-fallback.
@@ -1170,6 +1178,8 @@ async fn adopt_worktree_via_repo_rsync<R: tauri::Runtime>(
     {
         // ── 2. rsync the parent repo (incl .git) unless already present ──
         let already_local = local_project_path.join(".git").exists();
+        // Only a directory this call creates is this call's to remove.
+        let created_here = !local_project_path.exists();
         if !already_local {
             if let Err(e) = std::fs::create_dir_all(&local_project_path) {
                 return Err(format!(
@@ -1185,7 +1195,9 @@ async fn adopt_worktree_via_repo_rsync<R: tauri::Runtime>(
             match crate::ssh::pull_workspace_back(opts).await {
                 crate::ssh::PullResult::Pulled { .. } => {}
                 crate::ssh::PullResult::RemoteNotFound { path } => {
-                    let _ = std::fs::remove_dir_all(&local_project_path);
+                    if created_here {
+                        let _ = std::fs::remove_dir_all(&local_project_path);
+                    }
                     return Err(format!(
                         "Remote repo not found at {path}. The host may have been \
                          wiped or the project moved."
@@ -1445,12 +1457,22 @@ pub async fn workspaces_adopt_via_clone<R: tauri::Runtime>(
     let project_path_clone = project_path.clone();
     // Phase 1: clone the bare-ish project (no checkout — worktree-add
     // picks the right branch).
+    //
+    // The landing dir is the same for every workspace of a project, so a
+    // second adopt finds the first one's clone already there. Reuse it —
+    // and never let the rollback below remove a directory that was here
+    // before this call, since it backs live worktrees.
     let clone_project_path = project_path.clone();
-    let cloned = tokio::task::spawn_blocking(move || {
-        crate::git::git_clone(&project_remote, &clone_project_path)
-    })
-    .await
-    .map_err(|e| format!("git_clone join failed: {e}"))?;
+    let (reuse_clone, created_here) = adopt_clone_plan(&project_path);
+    let cloned = if reuse_clone {
+        Ok(project_path_str.clone())
+    } else {
+        tokio::task::spawn_blocking(move || {
+            crate::git::git_clone(&project_remote, &clone_project_path)
+        })
+        .await
+        .map_err(|e| format!("git_clone join failed: {e}"))?
+    };
     // The new worktree can land on a path an old archive entry still
     // names, so keep worktree cleanup off it until it is registered.
     let opening = crate::worktree_cleanup::opening_guard().await;
@@ -1473,9 +1495,11 @@ pub async fn workspaces_adopt_via_clone<R: tauri::Runtime>(
     };
 
     let worktree_actual_path = clone_result.map_err(|e| {
-        // Roll back the cloned project dir on failure so a retry
-        // starts clean.
-        let _ = std::fs::remove_dir_all(&project_path);
+        // Roll back the project dir this call cloned so a retry starts
+        // clean.
+        if created_here {
+            let _ = std::fs::remove_dir_all(&project_path);
+        }
         e
     })?;
 
@@ -2057,10 +2081,29 @@ mod landing_tests {
     //! `none_uid_reproduces_legacy_basename_layout` tests, one layer up: at
     //! the adoption layer where the basename read-fallback decision lives.
     use super::{
-        adopt_root_landing, adopt_worktree_landing, adopt_worktree_landing_via_repo,
-        choose_landing,
+        adopt_clone_plan, adopt_root_landing, adopt_worktree_landing,
+        adopt_worktree_landing_via_repo, choose_landing,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn clone_adopt_only_owns_a_landing_dir_it_creates() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Nothing there yet: clone it, and a failed adopt may remove it.
+        assert_eq!(adopt_clone_plan(&tmp.path().join("fresh")), (false, true));
+
+        // A sibling workspace's clone: reuse it, never remove it.
+        let cloned = tmp.path().join("cloned");
+        std::fs::create_dir_all(cloned.join(".git")).unwrap();
+        assert_eq!(adopt_clone_plan(&cloned), (true, false));
+
+        // Somebody's plain directory: the clone will refuse it, and the
+        // rollback must leave it alone.
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(adopt_clone_plan(&plain), (false, false));
+    }
 
     // ── choose_landing: the basename read-fallback decision ──
 
