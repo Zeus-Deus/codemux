@@ -247,6 +247,37 @@ describe("MarkdownRendered", () => {
     expect(link!.getAttribute("href") ?? "").not.toContain("javascript:");
   });
 
+  it("never lets a local file's raw HTML run script or restyle the app", () => {
+    const { container } = render(
+      <MarkdownRendered
+        content={[
+          `<iframe srcdoc="<script>parent.x()</script>"></iframe>`,
+          `<script>window.x()</script>`,
+          `<style>body{display:none}</style>`,
+          `<img src="x.png" onerror="window.x()">`,
+          ``,
+          `still here`,
+        ].join("\n")}
+        filePath="/repo/README.md"
+      />,
+    );
+    expect(container.querySelector("iframe, script, style")).toBeNull();
+    expect(container.querySelector("img")?.hasAttribute("onerror")).toBe(false);
+    expect(container.textContent).toContain("still here");
+  });
+
+  it("keeps Windows drive paths and data images in a local file", () => {
+    const { container } = render(
+      <MarkdownRendered
+        content={`<img src="C:\\repo\\logo.png">\n\n<img src="data:image/png;base64,AAAA">`}
+        filePath={"C:\\repo\\README.md"}
+      />,
+    );
+    const imgs = container.querySelectorAll("img");
+    expect(imgs[0].getAttribute("src")).toBe("mock-asset:C:\\repo\\logo.png");
+    expect(imgs[1].getAttribute("src")).toBe("data:image/png;base64,AAAA");
+  });
+
   it("still re-renders when content actually changes", () => {
     const { rerender, container } = render(
       <MarkdownRendered content={`# A`} filePath="/r/d.md" />,

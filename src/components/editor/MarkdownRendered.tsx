@@ -1,8 +1,9 @@
 import { memo, useCallback, useMemo, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeRaw from "rehype-raw";
-import rehypeSanitize from "rehype-sanitize";
+import rehypeSanitize, { defaultSchema, type Options as SanitizeSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
+import type { PluggableList } from "unified";
 
 import { isAbsoluteFsPath, isRemoteOrDataUrl, resolveAssetSrc } from "@/lib/asset-url";
 import { openExternalUrl } from "@/lib/open-url";
@@ -24,6 +25,34 @@ function safeUrlTransform(url: string): string {
   return DANGEROUS_URL.test(url) ? "" : url;
 }
 
+const DRIVE_LETTERS = [..."abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"];
+
+/**
+ * The allowlist for a document from the user's own disk. It is GitHub's
+ * allowlist plus the image sources a local file legitimately uses:
+ * `data:` and `blob:` images, already-converted asset URLs, and Windows
+ * drive paths (`C:\x.png`), which the sanitizer would otherwise read as
+ * an unknown `c:` scheme and drop.
+ *
+ * A local file is still not trusted to run code: a cloned repository's
+ * README is somebody else's HTML, and the webview it renders into can
+ * call every backend command.
+ */
+const LOCAL_FILE_SCHEMA: SanitizeSchema = {
+  ...defaultSchema,
+  protocols: {
+    ...defaultSchema.protocols,
+    src: [
+      ...(defaultSchema.protocols?.src ?? []),
+      "data",
+      "blob",
+      "asset",
+      "tauri",
+      ...DRIVE_LETTERS,
+    ],
+  },
+};
+
 interface Props {
   content: string;
   /**
@@ -42,10 +71,12 @@ interface Props {
    */
   inline?: boolean;
   /**
-   * The content was written by someone else — a review comment anyone
-   * on the pull request can post. Raw HTML still renders (bots lean on
-   * `<details>` and `<img>`), but through GitHub's own allowlist, so a
-   * `<style>`, `<iframe>` or `<base>` cannot reach the app's DOM.
+   * The content came from the forge rather than the local disk — a pull
+   * request description or a review comment anyone can post. Raw HTML
+   * is always sanitized (bots lean on `<details>` and `<img>`, so it
+   * still renders, but a `<style>`, `<iframe>` or `<base>` cannot reach
+   * the app's DOM); this additionally drops the local-only image
+   * sources a remote author has no business using.
    */
   untrusted?: boolean;
 }
@@ -88,10 +119,11 @@ function MarkdownRenderedImpl({
   // (e.g. a README's `<div align="center">` wrapper and `<img>` logo) so
   // it renders as real elements instead of escaped text. Raw `<img>`
   // tags become proper `img` nodes, so the `img` override below still
-  // routes their `src` through `resolveAssetSrc`. Someone else's HTML is
-  // sanitized after it is parsed, never before.
-  const rehypePlugins = useMemo(
-    () => (untrusted ? [rehypeRaw, rehypeSanitize] : [rehypeRaw]),
+  // routes their `src` through `resolveAssetSrc`. The HTML is sanitized
+  // after it is parsed, never before, and on every surface: an
+  // `<iframe srcdoc>` that survived would run script in this webview.
+  const rehypePlugins = useMemo<PluggableList>(
+    () => [rehypeRaw, untrusted ? rehypeSanitize : [rehypeSanitize, LOCAL_FILE_SCHEMA]],
     [untrusted],
   );
 
