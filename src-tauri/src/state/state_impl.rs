@@ -6793,24 +6793,28 @@ fn recovery_pending_at(path: &Path) -> bool {
 }
 
 /// Preserve the layout at `path` as `aside`, never replacing anything
-/// already there. A hard link keeps the very entry (a link stays a link)
-/// and fails if `aside` exists; then the original name is dropped. Where
-/// hard links are unavailable, the bytes are copied into a newly created
-/// file instead.
+/// already there, and durably — see [`move_no_clobber_durably`]. Where the
+/// entry cannot be moved, its bytes are copied into a new file instead.
 fn set_aside(path: &Path, aside: &Path) -> bool {
-    if fs::hard_link(path, aside).is_ok() {
-        // Even if this fails, `aside` holds the layout: a later save
-        // replaces `layout.json`'s entry, not the file both names share.
-        let _ = fs::remove_file(path);
+    if move_no_clobber_durably(path, aside).is_ok() {
         return true;
     }
+    // Where the entry cannot be moved, copy its bytes into a new file and
+    // move that into place the same way.
+    let Some(dir) = aside.parent() else {
+        return false;
+    };
     let Ok(mut source) = fs::File::open(path) else {
         return false;
     };
-    let Ok(mut copy) = fs::OpenOptions::new().write(true).create_new(true).open(aside) else {
+    let Ok(mut copy) = tempfile::NamedTempFile::new_in(dir) else {
         return false;
     };
-    std::io::copy(&mut source, &mut copy).is_ok() && copy.sync_all().is_ok()
+    if std::io::copy(&mut source, &mut copy).is_err() || copy.as_file().sync_all().is_err() {
+        return false;
+    }
+    let copy = copy.into_temp_path();
+    move_no_clobber_durably(&copy, aside).is_ok()
 }
 
 /// Whether `name` is a set-aside name for `file_name` exactly as
@@ -6850,8 +6854,9 @@ fn add_to_recovery_marker(path: &Path, aside_name: &str) -> std::io::Result<()> 
     let mut replacement = tempfile::NamedTempFile::new_in(dir)?;
     replacement.write_all(listed.as_bytes())?;
     replacement.as_file().sync_all()?;
-    replacement.persist(&marker).map_err(|e| e.error)?;
-    Ok(())
+    // Durable before the layout is touched: a crash must not leave a set-aside
+    // copy that no marker remembers.
+    publish_durably(replacement, &marker).map_err(std::io::Error::other)
 }
 
 /// Read the layout at `path`. An unreadable one is preserved before
@@ -7675,36 +7680,14 @@ fn persistable_snapshot(snapshot: &AppStateSnapshot) -> AppStateSnapshot {
     snapshot
 }
 
-fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
-    let path = persisted_layout_path().ok_or("No config directory for layout persistence")?;
-    save_layout_to(&path, snapshot)
-}
-
-fn save_layout_to(path: &Path, snapshot: &AppStateSnapshot) -> Result<(), String> {
-    use std::io::Write;
-    if layout_saves_blocked() {
-        return Err("Layout saving is paused: the unreadable layout could not be set aside".into());
-    }
-    let path = path.to_path_buf();
-    let parent = path
-        .parent()
-        .ok_or("No parent directory for layout persistence")?;
-    fs::create_dir_all(parent).map_err(|error| format!("Failed to create config dir: {error}"))?;
-
-    let snapshot = persistable_snapshot(snapshot);
-    let json = serde_json::to_string_pretty(&snapshot)
-        .map_err(|error| format!("Failed to serialize layout state: {error}"))?;
-    // Same-directory temporary file keeps replacement atomic. A short write or
-    // failed file sync leaves the previous layout untouched and the journal pending.
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| format!("Failed to create layout temporary file: {error}"))?;
-    temporary
-        .write_all(json.as_bytes())
-        .and_then(|()| temporary.as_file().sync_all())
-        .map_err(|error| format!("Failed to write/sync layout state: {error}"))?;
+/// Move a fully written and synced `temporary` file over `path`, and make
+/// the replacement durable before returning: the directory entry is synced
+/// on Unix, and on Windows the move is written through.
+fn publish_durably(temporary: tempfile::NamedTempFile, path: &Path) -> Result<(), String> {
+    let parent = path.parent().ok_or("No parent directory for a durable replace")?;
     #[cfg(not(windows))]
     temporary
-        .persist(&path)
+        .persist(path)
         .map_err(|error| format!("Failed to replace layout state: {error}"))?;
     // Commit the directory entry before SQLite may mark the layout complete.
     // After a rename, a sync failure still leaves a whole valid layout, but the
@@ -7770,6 +7753,66 @@ fn save_layout_to(path: &Path, snapshot: &AppStateSnapshot) -> Result<(), String
             ));
         }
     }
+    Ok(())
+}
+
+/// Move `from` to `to` without replacing anything already at `to`, and make
+/// it durable before returning. The entry itself moves, so a link stays a
+/// link.
+fn move_no_clobber_durably(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // A hard link fails if `to` exists; then the old name is dropped.
+        // Should that fail, `to` still holds the same file.
+        fs::hard_link(from, to)?;
+        let _ = fs::remove_file(from);
+        let dir = to.parent().ok_or_else(|| std::io::Error::other("no folder"))?;
+        fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+        let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
+        let (source, destination) = (wide(from), wide(to));
+        // Without MOVEFILE_REPLACE_EXISTING the move fails if `to` exists;
+        // WRITE_THROUGH returns only once it is on disk.
+        // SAFETY: both buffers are owned, NUL-terminated UTF-16 paths.
+        if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
+    let path = persisted_layout_path().ok_or("No config directory for layout persistence")?;
+    save_layout_to(&path, snapshot)
+}
+
+fn save_layout_to(path: &Path, snapshot: &AppStateSnapshot) -> Result<(), String> {
+    use std::io::Write;
+    if layout_saves_blocked() {
+        return Err("Layout saving is paused: the unreadable layout could not be set aside".into());
+    }
+    let path = path.to_path_buf();
+    let parent = path
+        .parent()
+        .ok_or("No parent directory for layout persistence")?;
+    fs::create_dir_all(parent).map_err(|error| format!("Failed to create config dir: {error}"))?;
+
+    let snapshot = persistable_snapshot(snapshot);
+    let json = serde_json::to_string_pretty(&snapshot)
+        .map_err(|error| format!("Failed to serialize layout state: {error}"))?;
+    // Same-directory temporary file keeps replacement atomic. A short write or
+    // failed file sync leaves the previous layout untouched and the journal pending.
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("Failed to create layout temporary file: {error}"))?;
+    temporary
+        .write_all(json.as_bytes())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| format!("Failed to write/sync layout state: {error}"))?;
+    publish_durably(temporary, &path)?;
     Ok(())
 }
 
@@ -11142,11 +11185,12 @@ mod tests {
         // Windows runtime test: FlushFileBuffers requires GENERIC_WRITE and
         // opening a directory for write is not a supported substitute.
         let source = include_str!("state_impl.rs");
+        // The layout writer's durable replace lives in `publish_durably`.
         let writer = source
-            .split("fn save_persisted_state(")
+            .split("fn publish_durably(")
             .nth(1)
             .unwrap()
-            .split("fn find_workspace_id_for_session(")
+            .split("fn move_no_clobber_durably(")
             .next()
             .unwrap();
         let windows = writer.split("#[cfg(windows)]").nth(1).unwrap();

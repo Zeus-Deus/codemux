@@ -558,9 +558,28 @@ pub fn record_closed(db: &DatabaseStore, workspace_id: &str) -> Result<(), Strin
     db.soft_delete_workspace_sync_by_workspace_id(workspace_id)
 }
 
+/// Orders reconciles by when their snapshot was taken: a ticket is drawn on
+/// entry, straight after the caller's `snapshot()` and before the slow Git
+/// reads, and under the lock a pass older than one already applied is
+/// stale and skipped — it would otherwise infer closes from a past state.
+static NEXT_TICKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn take_ticket() -> u64 {
+    NEXT_TICKET.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
 pub fn reconcile_from_snapshot(
     db: &DatabaseStore,
     snapshot: &AppStateSnapshot,
+) -> Result<(), String> {
+    reconcile_with_ticket(db, snapshot, take_ticket())
+}
+
+fn reconcile_with_ticket(
+    db: &DatabaseStore,
+    snapshot: &AppStateSnapshot,
+    ticket: u64,
 ) -> Result<(), String> {
     // Git first, outside the lock: a slow repository must not hold up a
     // close being recorded.
@@ -582,6 +601,10 @@ pub fn reconcile_from_snapshot(
         .collect();
 
     let _serialised = lock(&RECONCILE_LOCK);
+    if ticket < LAST_APPLIED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
+    LAST_APPLIED.store(ticket, std::sync::atomic::Ordering::SeqCst);
     let recovering = crate::state::layout_recovery_pending();
     let closed = if recovering {
         persist_unsaved_closes(db);
@@ -1289,6 +1312,22 @@ mod tests {
         crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
         super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
         assert!(db.ui_state_keys_with_prefix(super::CLOSED_DURING_RECOVERY).unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_reconcile_from_an_older_snapshot_never_undoes_a_newer_one() {
+        let db = fresh_db();
+        // The old pass took its snapshot (with no new workspace) and then
+        // stalled in Git while a newer pass published a new workspace.
+        let stale_ticket = super::take_ticket();
+        super::reconcile_from_snapshot(&db, &make_snapshot(vec![make_ws("ws-after-stale", "new")])).unwrap();
+        super::reconcile_with_ticket(&db, &make_snapshot(Vec::new()), stale_ticket).unwrap();
+
+        assert!(
+            db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some("ws-after-stale")),
+            "the stale pass must not delete what the newer one published"
+        );
     }
 
     #[test]
