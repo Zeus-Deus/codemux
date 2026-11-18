@@ -558,23 +558,25 @@ pub fn record_closed(db: &DatabaseStore, workspace_id: &str) -> Result<(), Strin
     db.soft_delete_workspace_sync_by_workspace_id(workspace_id)
 }
 
-/// Mirror `snapshot` into the sync table. Only the workspaces in the
-/// snapshot count as present, so a row is deleted when its workspace is
-/// missing from it. Production code calls [`reconcile_from_state`], which
-/// also checks current state before deleting.
+/// Mirror `snapshot` into the sync table, taking it as current state.
+/// Production code calls [`reconcile_from_state`], which checks the state
+/// as it is now as well.
 pub fn reconcile_from_snapshot(
     db: &DatabaseStore,
     snapshot: &AppStateSnapshot,
 ) -> Result<(), String> {
-    reconcile_inner(db, snapshot, &|| HashSet::new())
+    let ids: HashSet<String> = snapshot.workspaces.iter().map(|w| w.workspace_id.0.clone()).collect();
+    reconcile_inner(db, snapshot, &|| ids.clone())
 }
 
 /// Take a snapshot of `state` and mirror it. A pass can be delayed anywhere —
-/// after taking its snapshot, or in the Git reads — while a newer pass
-/// publishes a workspace opened meanwhile; so before deleting anything,
-/// under the lock, it also reads which workspaces exist now, and deletes a
-/// row only when its workspace is in neither. A stale pass can at worst
-/// write a workspace's older details, which the next one corrects.
+/// after taking its snapshot, or in the Git reads — while workspaces open
+/// and close. So before writing anything, under the lock, it also reads
+/// which workspaces exist now: it writes rows only for workspaces in both
+/// its snapshot and current state (so it never republishes one closed
+/// meanwhile), and deletes a row only when its workspace is in neither (so
+/// it never deletes one opened meanwhile). A stale pass can at worst write
+/// a workspace's older details, which the next one corrects.
 pub fn reconcile_from_state(
     db: &DatabaseStore,
     state: &crate::state::AppStateStore,
@@ -608,6 +610,7 @@ fn reconcile_inner(
         .collect();
 
     let _serialised = lock(&RECONCILE_LOCK);
+    let present_now = current_ids();
     let recovering = crate::state::layout_recovery_pending();
     let closed = if recovering {
         persist_unsaved_closes(db);
@@ -667,9 +670,9 @@ fn reconcile_inner(
         }
 
         let wid = ws.workspace_id.0.clone();
-        // Closed during recovery: a snapshot that still lists it is older
-        // than the close.
-        if closed.contains(&wid) {
+        // Closed since this snapshot was taken, or during recovery: a
+        // snapshot that still lists it is older than the close.
+        if closed.contains(&wid) || !present_now.contains(&wid) {
             continue;
         }
         live_wids.insert(wid.clone());
@@ -761,7 +764,6 @@ fn reconcile_inner(
         }
         return Ok(());
     }
-    let present_now = current_ids();
     for row in &sync_rows {
         if let Some(wid) = &row.workspace_id {
             if !live_wids.contains(wid) && !present_now.contains(wid) {
@@ -1331,6 +1333,23 @@ mod tests {
         assert!(
             db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some("ws-after-stale")),
             "the stale pass must not delete a workspace that exists now"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_reconcile_from_an_older_snapshot_never_republishes_a_closed_workspace() {
+        let db = fresh_db();
+        // The old pass captured the workspace; it was closed before the pass
+        // wrote its first row; then the pass resumes.
+        let before_close = make_snapshot(vec![make_ws("ws-closed-race", "closed")]);
+        super::reconcile_inner(&db, &before_close, &|| std::collections::HashSet::new()).unwrap();
+
+        assert!(
+            db.list_workspaces_sync_for_sync()
+                .iter()
+                .all(|r| r.workspace_id.as_deref() != Some("ws-closed-race")),
+            "no row may be left to publish for a workspace closed meanwhile"
         );
     }
 
