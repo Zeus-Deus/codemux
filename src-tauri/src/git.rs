@@ -1821,7 +1821,7 @@ fn branch_worktree(repo_path: &Path, branch: &str) -> Result<Option<PathBuf>, St
         } else if field.strip_prefix("branch ") == Some(target_ref.as_str()) {
             let Some(path) = current_path else { continue };
             let path = PathBuf::from(path);
-            return if is_checkout_of(&path, &target_ref) {
+            return if is_checkout_of(&path, repo_path, &target_ref) {
                 Ok(Some(path))
             } else {
                 Err(format!(
@@ -1836,23 +1836,43 @@ fn branch_worktree(repo_path: &Path, branch: &str) -> Result<Option<PathBuf>, St
     Ok(None)
 }
 
-/// Whether `path` is itself a checkout with `branch_ref` checked out. A
-/// directory left where a moved worktree used to be is not: git would find
-/// whatever repository encloses it, and a merge run there would move that
-/// repository's branch instead.
-fn is_checkout_of(path: &Path, branch_ref: &str) -> bool {
+/// Whether `path` is a checkout of `repo_path`'s repository, in its own
+/// right, with `branch_ref` checked out. A directory left where a moved
+/// worktree used to be fails this: git would find whatever repository
+/// encloses it, or another clone placed there, and a merge run there would
+/// move that repository's branch instead.
+fn is_checkout_of(path: &Path, repo_path: &Path, branch_ref: &str) -> bool {
     if !path.is_dir() {
         return false;
     }
-    let Ok(top) = run_git(path, &["rev-parse", "--show-toplevel"]) else {
+    let (Some((here_common, here_top)), Some((repo_common, _))) =
+        (checkout_dirs(path), checkout_dirs(repo_path))
+    else {
         return false;
     };
-    let same_dir = match (std::fs::canonicalize(path), std::fs::canonicalize(top.trim())) {
+    let same = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     };
-    same_dir
+    same(path, &here_top)
+        && same(&here_common, &repo_common)
         && run_git(path, &["symbolic-ref", "--quiet", "HEAD"]).is_ok_and(|head| head.trim() == branch_ref)
+}
+
+/// `(common git dir, top level)` of the checkout at `dir`, read without
+/// trimming so a path that ends in whitespace survives.
+fn checkout_dirs(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let output = git_command()
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut lines = text.split_terminator('\n');
+    let common = PathBuf::from(lines.next()?);
+    let top = PathBuf::from(lines.next()?);
+    Some((common, top))
 }
 
 /// Fast-forward `base_branch` to `commit`.
@@ -6701,6 +6721,46 @@ mod tests {
         assert_eq!(run_git(&repo, &["rev-parse", &main]).unwrap(), main_before, "main must not move");
         assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
         assert!(!repo.join("feature.txt").exists(), "main's files must not change");
+    }
+
+    #[test]
+    fn test_merge_into_base_never_moves_another_clone_at_a_stale_checkout_path() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let stale = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", "release", stale.to_str().unwrap()]).unwrap();
+        std::fs::rename(&stale, dir.path().join("moved-release")).unwrap();
+        // A separate clone that shares objects now sits at the old path,
+        // on its own `release`.
+        run_git(dir.path(), &["clone", "--shared", repo.to_str().unwrap(), stale.to_str().unwrap()]).unwrap();
+        run_git(&stale, &["checkout", "release"]).unwrap();
+        let clone_before = run_git(&stale, &["rev-parse", "HEAD"]).unwrap();
+        let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        let err = merge_into_base(&wt, "release", true).unwrap_err();
+        assert!(err.contains("cannot be reached"), "unexpected error: {err}");
+        assert_eq!(run_git(&stale, &["rev-parse", "HEAD"]).unwrap(), clone_before, "the clone must not move");
+        assert!(!stale.join("feature.txt").exists());
+        assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_into_base_advances_a_base_whose_path_ends_in_a_space() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let spaced = dir.path().join("release wt ");
+        run_git(&repo, &["worktree", "add", "-b", "release", spaced.to_str().unwrap()]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        let result = merge_into_base(&wt, "release", false).unwrap();
+        assert_eq!(result.status, "merged");
+        assert_eq!(std::fs::read_to_string(spaced.join("feature.txt")).unwrap(), "worktree work");
     }
 
     #[test]
