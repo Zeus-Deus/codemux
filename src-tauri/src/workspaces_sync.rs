@@ -574,8 +574,9 @@ pub fn reconcile_from_snapshot(
 /// and close. So before writing anything, under the lock, it also reads
 /// which workspaces exist now: it writes rows only for workspaces in both
 /// its snapshot and current state (so it never republishes one closed
-/// meanwhile), and deletes a row only when its workspace is in neither (so
-/// it never deletes one opened meanwhile). A stale pass can at worst write
+/// meanwhile), and deletes a row only when its workspace is in neither —
+/// reading current state once more just before, after the rows (so it
+/// never deletes one opened or adopted meanwhile). A stale pass can at worst write
 /// a workspace's older details, which the next one corrects.
 pub fn reconcile_from_state(
     db: &DatabaseStore,
@@ -764,9 +765,12 @@ fn reconcile_inner(
         }
         return Ok(());
     }
+    // Read membership again: a workspace adopted after the first read may
+    // have linked one of `sync_rows` since.
+    let present_late = current_ids();
     for row in &sync_rows {
         if let Some(wid) = &row.workspace_id {
-            if !live_wids.contains(wid) && !present_now.contains(wid) {
+            if !live_wids.contains(wid) && !present_now.contains(wid) && !present_late.contains(wid) {
                 if let Err(error) =
                     db.soft_delete_workspace_sync_by_workspace_id(wid)
                 {
@@ -1351,6 +1355,52 @@ mod tests {
                 .all(|r| r.workspace_id.as_deref() != Some("ws-closed-race")),
             "no row may be left to publish for a workspace closed meanwhile"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn a_row_adopted_during_a_reconcile_is_not_deleted() {
+        let db = fresh_db();
+        // The adoption links an existing row to a new workspace after the
+        // pass's first look at current state.
+        let row = db
+            .insert_workspace_sync("ws-adopted-midway", "adopted", None, None, None, None, None, None, None)
+            .unwrap();
+        db.mark_workspace_sync_synced(row.id, Some("srv-adopted")).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let current = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                std::collections::HashSet::new()
+            } else {
+                ["ws-adopted-midway".to_string()].into()
+            }
+        };
+        super::reconcile_inner(&db, &make_snapshot(Vec::new()), &current).unwrap();
+
+        assert!(
+            db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some("ws-adopted-midway")),
+            "a workspace adopted meanwhile must keep its row"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn during_recovery_only_the_closed_copy_is_deleted() {
+        let db = fresh_db();
+        for wid in ["ws-copy-closed", "ws-copy-missing"] {
+            db.insert_workspace_sync(wid, "copy", None, None, None, None, None, None, None).unwrap();
+        }
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+        // What closing a standalone copy now does after removing it.
+        super::record_closed(&db, "ws-copy-closed").unwrap();
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+
+        let live = |wid: &str| db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some(wid));
+        assert!(!live("ws-copy-closed"), "the closed copy is deleted");
+        assert!(live("ws-copy-missing"), "an unrelated missing workspace is not");
+        let _ = db.delete_ui_state_with_prefix(super::CLOSED_DURING_RECOVERY);
     }
 
     #[test]

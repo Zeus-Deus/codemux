@@ -1694,6 +1694,12 @@ pub async fn workspaces_reconcile_copy<R: tauri::Runtime>(
     {
         let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
         let close_result = app_state.close_workspace(&workspace_id)?;
+        // An explicit close, recorded as such: while a layout recovery is
+        // pending, reconcile infers no closes on its own.
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        if let Err(error) = crate::workspaces_sync::record_closed(db.inner(), &workspace_id) {
+            eprintln!("[workspaces-sync] recording the copy's close failed: {error}");
+        }
         crate::commands::workspace::reap_agent_browser_sessions(
             &app,
             close_result.removed_agent_browser_sessions,
