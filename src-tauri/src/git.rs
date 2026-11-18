@@ -1913,6 +1913,30 @@ fn git_line(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Child-process variable holding the empty value that clears the base's
+/// merge defaults; see [`fast_forward_checkout`].
+const CLEAR_MERGE_OPTIONS_ENV: &str = "CODEMUX_CLEAR_MERGE_OPTIONS";
+
+/// `git merge --ff-only <commit>` in `checkout`, with the defaults that
+/// would bend it overridden (see [`advance_base_branch`]). The branch's
+/// `mergeOptions` key is cleared through `--config-env`, which splits at
+/// the last `=` — a branch name may contain `=`, an environment variable
+/// name may not, so `-c` cannot name such a branch's key.
+fn fast_forward_checkout(checkout: &Path, base_branch: &str, commit: &str) -> Result<(), String> {
+    let output = git_command()
+        .arg(format!("--config-env=branch.{base_branch}.mergeOptions={CLEAR_MERGE_OPTIONS_ENV}"))
+        .args(["merge", "--ff-only", "--no-squash", "--no-overwrite-ignore", "--no-autostash", commit])
+        .env(CLEAR_MERGE_OPTIONS_ENV, "")
+        .current_dir(checkout)
+        .output()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!("git merge failed: {}", String::from_utf8_lossy(&output.stderr).trim()))
+    }
+}
+
 /// Fast-forward `base_branch` to `commit`.
 ///
 /// Where the base branch is checked out, the fast-forward runs inside that
@@ -1927,7 +1951,8 @@ fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Res
     let base_ref = format!("refs/heads/{base_branch}");
     match branch_worktree(repo_path, base_branch)? {
         // Defaults that would bend the fast-forward are overridden:
-        // - `branch.<base>.mergeOptions` is cleared: git applies it before
+        // - `branch.<base>.mergeOptions` is cleared (whatever the branch is
+        //   called, `=` included): git applies it before
         //   the command line, and some of it (`--strategy=ours`) still wins
         //   over `--ff-only`, recording a merge that drops the changes;
         // - `--no-squash`: a `branch.<base>.mergeOptions=--squash` default
@@ -1937,20 +1962,7 @@ fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Res
         // - `--no-autostash`: `merge.autoStash` would stash local edits and
         //   re-apply them after the move, leaving conflicts git still
         //   reports as success.
-        Some(checkout) => run_git(
-            &checkout,
-            &[
-                "-c",
-                &format!("branch.{base_branch}.mergeOptions="),
-                "merge",
-                "--ff-only",
-                "--no-squash",
-                "--no-overwrite-ignore",
-                "--no-autostash",
-                commit,
-            ],
-        )
-            .map(|_| ())
+        Some(checkout) => fast_forward_checkout(&checkout, base_branch, commit)
             .map_err(|e| {
                 format!(
                     "Cannot update {base_branch}: its checkout at {} has uncommitted changes the merge would overwrite. Commit or stash them there first. ({e})",
@@ -6709,6 +6721,23 @@ mod tests {
             run_git_full(&repo, &["merge-base", "--is-ancestor", &feature_tip, "HEAD"]).unwrap();
         assert!(contains);
         assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_fast_forwards_a_strategy_ours_base_named_with_an_equals_sign() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let branch = "release=stable";
+        let checkout = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", branch, checkout.to_str().unwrap()]).unwrap();
+        // `git config` takes the key and value apart, so the name is safe here.
+        run_git(&repo, &["config", &format!("branch.{branch}.mergeOptions"), "--strategy=ours"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        assert_eq!(merge_into_base(&wt, branch, false).unwrap().status, "merged");
+        assert_eq!(std::fs::read_to_string(checkout.join("feature.txt")).unwrap(), "worktree work");
     }
 
     #[test]
