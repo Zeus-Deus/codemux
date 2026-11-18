@@ -1821,7 +1821,7 @@ fn branch_worktree(repo_path: &Path, branch: &str) -> Result<Option<PathBuf>, St
         } else if field.strip_prefix("branch ") == Some(target_ref.as_str()) {
             let Some(path) = current_path else { continue };
             let path = PathBuf::from(path);
-            return if path.is_dir() {
+            return if is_checkout_of(&path, &target_ref) {
                 Ok(Some(path))
             } else {
                 Err(format!(
@@ -1834,6 +1834,25 @@ fn branch_worktree(repo_path: &Path, branch: &str) -> Result<Option<PathBuf>, St
         }
     }
     Ok(None)
+}
+
+/// Whether `path` is itself a checkout with `branch_ref` checked out. A
+/// directory left where a moved worktree used to be is not: git would find
+/// whatever repository encloses it, and a merge run there would move that
+/// repository's branch instead.
+fn is_checkout_of(path: &Path, branch_ref: &str) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let Ok(top) = run_git(path, &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    let same_dir = match (std::fs::canonicalize(path), std::fs::canonicalize(top.trim())) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    same_dir
+        && run_git(path, &["symbolic-ref", "--quiet", "HEAD"]).is_ok_and(|head| head.trim() == branch_ref)
 }
 
 /// Fast-forward `base_branch` to `commit`.
@@ -6657,6 +6676,31 @@ mod tests {
         assert!(err.contains("cannot be reached"), "unexpected error: {err}");
         assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
         assert_eq!(run_git(&wt, &["branch", "--show-current"]).unwrap(), "feature");
+    }
+
+    #[test]
+    fn test_merge_into_base_never_moves_the_repository_enclosing_a_stale_checkout() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo).to_string();
+        // `release` lives in a worktree nested inside the main checkout,
+        // which was moved without telling git; an empty directory is left
+        // at the registered path.
+        let nested = repo.join("nested-release");
+        run_git(&repo, &["worktree", "add", "-b", "release", nested.to_str().unwrap()]).unwrap();
+        std::fs::rename(&nested, dir.path().join("moved-release")).unwrap();
+        std::fs::create_dir(&nested).unwrap();
+        let main_before = run_git(&repo, &["rev-parse", &main]).unwrap();
+        let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        let err = merge_into_base(&wt, "release", true).unwrap_err();
+        assert!(err.contains("cannot be reached"), "unexpected error: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", &main]).unwrap(), main_before, "main must not move");
+        assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+        assert!(!repo.join("feature.txt").exists(), "main's files must not change");
     }
 
     #[test]
