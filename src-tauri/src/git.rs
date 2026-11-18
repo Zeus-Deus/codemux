@@ -1898,6 +1898,9 @@ fn git_path(dir: &Path, flag: &str) -> Option<PathBuf> {
     let mut bytes = output.stdout;
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
+        // A Unix path may itself end in `\r`; elsewhere no path can, so a
+        // CR there can only be part of a CRLF terminator.
+        #[cfg(not(unix))]
         if bytes.last() == Some(&b'\r') {
             bytes.pop();
         }
@@ -6783,6 +6786,23 @@ mod tests {
         let (dir, repo, wt) = setup_worktree_merge_scenario();
         let odd = dir.path().join("release\nwt");
         run_git(&repo, &["worktree", "add", "-b", "release", odd.to_str().unwrap()]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        assert_eq!(merge_into_base(&wt, "release", false).unwrap().status, "merged");
+        assert_eq!(std::fs::read_to_string(odd.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_into_base_advances_a_base_whose_path_ends_in_a_carriage_return() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let plain = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", "release", plain.to_str().unwrap()]).unwrap();
+        let odd = dir.path().join("release-wt\r");
+        run_git(&repo, &["worktree", "move", plain.to_str().unwrap(), odd.to_str().unwrap()]).unwrap();
 
         std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
         run_git(&wt, &["add", "."]).unwrap();
