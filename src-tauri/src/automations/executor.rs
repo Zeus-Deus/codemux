@@ -16,6 +16,7 @@
 //! tested; `prepare_worktree` is covered against a real temp repo.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -184,8 +185,8 @@ fn repo_dir_name(remote_url: &str) -> String {
 /// existing clone of, `project_remote` into `~/.codemux/
 /// automation-repos/`, and branch off the freshly-fetched
 /// `origin/<default>`.
-fn resolve_repo(automation: &AutomationRecord) -> Result<ResolvedRepo, String> {
-    if let Some(path) = &automation.project_path {
+fn resolve_repo(project_path: Option<&str>, project_remote: Option<&str>) -> Result<ResolvedRepo, String> {
+    if let Some(path) = project_path {
         let candidate = Path::new(path);
         if candidate.join(".git").exists() {
             return Ok(ResolvedRepo {
@@ -194,7 +195,7 @@ fn resolve_repo(automation: &AutomationRecord) -> Result<ResolvedRepo, String> {
             });
         }
     }
-    let remote = automation.project_remote.as_deref().ok_or_else(|| {
+    let remote = project_remote.ok_or_else(|| {
         "This automation has no project repo on this machine and no git \
          remote to clone from. Pick a project that has a git remote."
             .to_string()
@@ -374,6 +375,32 @@ fn resolve_clone(remote: &str, repos_dir: &Path, clone_cwd: &Path) -> Result<Pat
 /// Git authenticates with the host's own credentials — Codemux injects
 /// no token (matching Superset's clone behaviour).
 fn ensure_clone(source: &CloneSource<'_>, clone_dir: &Path) -> Result<(), String> {
+    let parent = clone_dir.parent().ok_or("Automation checkout has no parent directory")?;
+    let name = clone_dir.file_name().ok_or("Automation checkout has no directory name")?;
+    let locks = parent.join(".locks");
+    std::fs::create_dir_all(&locks)
+        .map_err(|error| format!("Failed to create automation checkout lock directory: {error}"))?;
+    let lock_path = locks.join(name);
+    // Keep the lock file in place so concurrent runs always lock the same
+    // file. A nonempty lock file records a clone with an unconfirmed outcome.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(&lock_path)
+        .map_err(|error| format!("Failed to open automation checkout lock: {error}"))?;
+    lock.lock().map_err(|error| format!("Failed to lock automation checkout: {error}"))?;
+    if lock.metadata().map_err(|error| format!("Failed to read automation checkout lock: {error}"))?.len() != 0 {
+        return Err(format!(
+            "Git did not report completion for the interrupted automation clone at {}. Its incomplete marker is {}",
+            clone_dir.display(),
+            lock_path.display(),
+        ));
+    }
+
     if clone_dir.join(".git").exists() {
         if !clone_has_origin(clone_dir, source) {
             return Err("Automation checkout does not match the requested Git remote".into());
@@ -392,33 +419,56 @@ fn ensure_clone(source: &CloneSource<'_>, clone_dir: &Path) -> Result<(), String
         }
         return Ok(());
     }
-    let parent = clone_dir.parent().ok_or("Automation checkout has no parent directory")?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("Failed to create clone directory: {error}"))?;
-    // Publish only a complete clone, so a retry or a concurrent run never
-    // mistakes a partially cloned directory for a usable Git checkout.
-    let staging = tempfile::tempdir_in(parent)
-        .map_err(|error| format!("Failed to create temporary clone directory: {error}"))?;
-    let staging_clone = staging.path().join("repo");
-    let output = crate::git::git_command()
+    match std::fs::symlink_metadata(clone_dir) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || clone_dir.read_dir()
+                .map_err(|error| format!("Failed to inspect automation checkout: {error}"))?
+                .next().is_some()
+            {
+                return Err(format!("Automation checkout path is already occupied: {}", clone_dir.display()));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Failed to inspect automation checkout: {error}")),
+    }
+    lock.set_len(1).and_then(|_| lock.sync_data())
+        .map_err(|error| format!("Failed to mark automation checkout incomplete: {error}"))?;
+    // Initialize .git at its final location so clone and fetch see the same
+    // destination-scoped Git config.
+    let child = crate::git::git_command()
         .current_dir(source.cwd)
         .args(["clone", "--"])
         .arg(source.clone_argument())
-        .arg(&staging_clone)
-        .output()
-        .map_err(|error| format!("Failed to run git clone: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git clone failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    if let Err(error) = std::fs::rename(&staging_clone, clone_dir) {
-        if !clone_has_origin(clone_dir, source) {
-            return Err(format!("Failed to move automation clone into place: {error}"));
+        .arg(clone_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let result = match child {
+        Ok(child) => {
+            // A failed wait can leave Git running. Keep the marker in that
+            // case so a later run preserves the checkout.
+            let output = child.wait_with_output()
+                .map_err(|error| format!("Failed to wait for git clone: {error}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                let message = format!("git clone failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+                // Git removes its own failed clone. Only remove an empty
+                // directory here, and retain the marker if files remain.
+                if let Err(error) = std::fs::remove_dir(clone_dir) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(format!("{message}\nThe checkout remains incomplete at {}: {error}", clone_dir.display()));
+                    }
+                }
+                Err(message)
+            }
         }
-    }
-    Ok(())
+        Err(error) => Err(format!("Failed to run git clone: {error}")),
+    };
+    lock.set_len(0).and_then(|_| lock.sync_data())
+        .map_err(|error| format!("Failed to clear the automation checkout's incomplete marker: {error}"))?;
+    result
 }
 
 /// `origin/<default-branch>` for a clone, resolved via `origin/HEAD`.
@@ -590,7 +640,14 @@ async fn run_inner(
 ) -> Result<(String, Option<String>), (Option<String>, String)> {
     // Resolve the project to a repo on *this* machine — the local path
     // if it is here, otherwise a clone of the git remote.
-    let repo = resolve_repo(automation).map_err(|error| (None, error))?;
+    let project_path = automation.project_path.clone();
+    let project_remote = automation.project_remote.clone();
+    let repo = tokio::task::spawn_blocking(move || {
+        resolve_repo(project_path.as_deref(), project_remote.as_deref())
+    })
+        .await
+        .map_err(|error| (None, format!("Automation repo resolution failed: {error}")))?
+        .map_err(|error| (None, error))?;
 
     let worktree_dir =
         worktree_destination(&repo.path, branch).map_err(|error| (None, error))?;
@@ -783,37 +840,6 @@ mod tests {
         );
     }
 
-    fn automation_with(
-        project_path: Option<&str>,
-        project_remote: Option<&str>,
-    ) -> AutomationRecord {
-        AutomationRecord {
-            id: 1,
-            server_id: None,
-            name: "Test".to_string(),
-            prompt: "do the thing".to_string(),
-            agent: "claude".to_string(),
-            schedule: "DTSTART:20260101T090000Z\nRRULE:FREQ=DAILY".to_string(),
-            timezone: "UTC".to_string(),
-            host_id: None,
-            project_path: project_path.map(str::to_string),
-            project_remote: project_remote.map(str::to_string),
-            enabled: true,
-            retention_limit: 10,
-            last_run_at: None,
-            next_run_at: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-            deleted_at: None,
-            dirty: false,
-            trigger_type: Default::default(),
-            webhook_id: None,
-            webhook_token: None,
-            webhook_signature: None,
-            webhook_secret_ref: None,
-        }
-    }
-
     #[test]
     fn repo_dir_name_takes_the_final_segment() {
         assert_eq!(repo_dir_name("git@github.com:me/whatsapp-rag.git"), "whatsapp-rag");
@@ -857,6 +883,58 @@ mod tests {
             base.as_deref().map(|b| b.starts_with("origin/")).unwrap_or(false),
             "expected origin/<branch>, got {base:?}"
         );
+    }
+
+    #[test]
+    fn resolve_clone_retries_after_git_reports_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("source");
+        let remote = source_dir.join("repo.git");
+        let remote = remote.to_str().unwrap();
+        let cache = root.path().join("cache");
+        let error = resolve_clone(remote, &cache, root.path()).unwrap_err();
+        assert!(error.starts_with("git clone failed:"), "{error}");
+
+        create_bare_remote_with_marker(&source_dir, "retry.txt");
+        let checkout = resolve_clone(remote, &cache, root.path()).unwrap();
+        assert!(checkout.join("retry.txt").is_file());
+    }
+
+    #[test]
+    fn ensure_clone_preserves_a_checkout_when_completion_is_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let source = temp_repo();
+        let source = CloneSource::new(source.path().to_str().unwrap(), root.path());
+        let checkout = root.path().join("checkout");
+        ensure_clone(&source, &checkout).unwrap();
+        std::fs::write(root.path().join(".locks/checkout"), [1]).unwrap();
+
+        let error = ensure_clone(&source, &checkout).unwrap_err();
+        assert!(error.contains("Git did not report completion"), "{error}");
+        assert!(checkout.join(".git").is_dir());
+    }
+
+    #[test]
+    fn resolve_clone_serializes_concurrent_requests_for_the_same_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("source");
+        create_bare_remote_with_marker(&source_dir, "shared.txt");
+        let remote = source_dir.join("repo.git");
+        let remote = remote.to_str().unwrap();
+        let cache = root.path().join("cache");
+        let start = std::sync::Barrier::new(2);
+        let resolve = || {
+            start.wait();
+            resolve_clone(remote, &cache, root.path()).unwrap()
+        };
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(&resolve);
+            let second = resolve();
+            (first.join().unwrap(), second)
+        });
+        assert_eq!(first, second);
+        assert!(first.join("shared.txt").is_file());
     }
 
     #[test]
@@ -907,6 +985,58 @@ mod tests {
             assert_eq!(resolve_clone(remote, &cache, &shadow).unwrap(), literal);
             assert_eq!(resolve_clone(remote, &cache, root.path()).unwrap(), aliased);
         }
+    }
+
+    #[test]
+    fn resolve_clone_uses_destination_git_config_for_clone_and_fetch() {
+        if crate::test_isolation::isolated(
+            "automations::executor::tests::resolve_clone_uses_destination_git_config_for_clone_and_fetch",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let fallback = root.path().join("fallback");
+        std::fs::create_dir(&fallback).unwrap();
+        create_bare_remote_with_marker(&fallback.join("project"), "fallback.txt");
+        let scoped = root.path().join("scoped");
+        create_bare_remote_with_marker(&scoped, "scoped.txt");
+
+        let remote = "company:project/repo.git";
+        let cache = root.path().join("cache");
+        let checkout_name = format!("repo-{:x}", Sha256::digest(remote.as_bytes()));
+        let fallback_url = url::Url::from_directory_path(&fallback).unwrap();
+        git(root.path(), &[
+            "config", "--global", &format!("url.{fallback_url}.insteadOf"), "company:",
+        ]);
+        let scoped_config = root.path().join("scoped.gitconfig");
+        let scoped_url = url::Url::from_directory_path(&scoped).unwrap();
+        git(root.path(), &[
+            "config", "--file", scoped_config.to_str().unwrap(),
+            &format!("url.{scoped_url}.insteadOf"), "company:project/",
+        ]);
+        git(root.path(), &[
+            "config", "--global", &format!("includeIf.gitdir:**/cache/{checkout_name}/.git.path"),
+            scoped_config.to_str().unwrap(),
+        ]);
+
+        let checkout = resolve_clone(remote, &cache, root.path()).unwrap();
+        assert_eq!(checkout, cache.join(&checkout_name));
+        assert!(checkout.join("scoped.txt").is_file());
+        assert!(!checkout.join("fallback.txt").exists());
+
+        let publisher = root.path().join("publisher");
+        git(root.path(), &[
+            "clone", "-q", "--", scoped.join("repo.git").to_str().unwrap(),
+            publisher.to_str().unwrap(),
+        ]);
+        std::fs::write(publisher.join("fetched.txt"), "new scoped commit").unwrap();
+        git(&publisher, &["add", "fetched.txt"]);
+        git(&publisher, &["commit", "-qm", "Advance scoped remote"]);
+        git(&publisher, &["push", "-q", "origin", "HEAD"]);
+
+        assert_eq!(resolve_clone(remote, &cache, root.path()).unwrap(), checkout);
+        let branch = default_remote_branch(&checkout).unwrap();
+        git(&checkout, &["cat-file", "-e", &format!("{branch}:fetched.txt")]);
     }
 
     #[cfg(windows)]
@@ -1047,7 +1177,7 @@ mod tests {
     fn resolve_repo_uses_a_local_project_path_when_present() {
         let repo = temp_repo();
         let path = repo.path().to_string_lossy().to_string();
-        let resolved = resolve_repo(&automation_with(Some(&path), None)).unwrap();
+        let resolved = resolve_repo(Some(&path), None).unwrap();
         assert_eq!(resolved.path, repo.path());
         // A local repo branches off its own HEAD.
         assert!(resolved.base.is_none());
@@ -1056,7 +1186,7 @@ mod tests {
     #[test]
     fn resolve_repo_errors_without_a_path_or_remote() {
         // No project_path on this machine and no remote to clone.
-        let result = resolve_repo(&automation_with(Some("/nonexistent/x"), None));
+        let result = resolve_repo(Some("/nonexistent/x"), None);
         assert!(result.is_err());
     }
 
