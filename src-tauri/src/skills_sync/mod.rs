@@ -818,8 +818,8 @@ mod confined {
     /// - a leftover temporary file is deleted by handle, the link itself and
     ///   never its target, and the new one is created exclusively relative
     ///   to the folder;
-    /// - the content is written through that handle, and the rename into
-    ///   `SKILL.md` is made relative to the folder handle.
+    /// - the content is written through that handle, and the file is
+    ///   renamed to `SKILL.md` in place, within the folder it was created in.
     #[cfg(windows)]
     pub(super) fn write(root: &Path, name: &OsStr, content: &[u8]) -> Result<(), String> {
         use std::fs::File;
@@ -829,16 +829,17 @@ mod confined {
         use std::os::windows::io::{AsRawHandle, FromRawHandle};
         use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
         use windows_sys::Wdk::Storage::FileSystem::{
-            NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-            FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+            FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE,
+            FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
+            FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0,
+            FILE_SYNCHRONOUS_IO_NONALERT,
         };
         use windows_sys::Win32::Foundation::{HANDLE, STATUS_OBJECT_NAME_NOT_FOUND, UNICODE_STRING};
         use windows_sys::Win32::Storage::FileSystem::{
-            FileDispositionInfo, FileRenameInfo, SetFileInformationByHandle, DELETE,
-            FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO,
-            FILE_RENAME_INFO_0, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-            SYNCHRONIZE,
+            FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
         };
         use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, IO_STATUS_BLOCK_0};
 
@@ -952,29 +953,38 @@ mod confined {
             return Err(format!("write the temporary file ({e})"));
         }
 
-        // FILE_RENAME_INFO ends in a variable-length name; build it in an
-        // 8-byte-aligned buffer large enough for the struct plus the name.
+        // Rename in place: with no root directory and a bare name, the
+        // native rename keeps the file in the directory it is already in —
+        // the held folder — so no path is resolved. FILE_RENAME_INFORMATION
+        // ends in a variable-length name; build it in an 8-byte-aligned
+        // buffer large enough for the struct plus the name.
         let wide: Vec<u16> = OsStr::new(FILE).encode_wide().collect();
-        let size = std::mem::size_of::<FILE_RENAME_INFO>() + wide.len() * 2;
+        let size = std::mem::size_of::<FILE_RENAME_INFORMATION>() + wide.len() * 2;
         let mut buf = vec![0u64; size.div_ceil(8)];
-        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let mut status_block = IO_STATUS_BLOCK { Anonymous: IO_STATUS_BLOCK_0 { Status: 0 }, Information: 0 };
         // SAFETY: `buf` is zeroed, aligned and large enough for the struct and
         // the name written after its first element.
-        let renamed = unsafe {
-            (*info).Anonymous = FILE_RENAME_INFO_0 { ReplaceIfExists: 1 };
-            (*info).RootDirectory = dir.as_raw_handle();
+        let status = unsafe {
+            (*info).Anonymous = FILE_RENAME_INFORMATION_0 { ReplaceIfExists: 1 };
+            (*info).RootDirectory = std::ptr::null_mut();
             (*info).FileNameLength = (wide.len() * 2) as u32;
             std::ptr::copy_nonoverlapping(
                 wide.as_ptr(),
                 std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
                 wide.len(),
             );
-            SetFileInformationByHandle(tmp.as_raw_handle(), FileRenameInfo, info.cast(), size as u32)
+            NtSetInformationFile(
+                tmp.as_raw_handle(),
+                &mut status_block,
+                info.cast(),
+                size as u32,
+                FileRenameInformation,
+            )
         };
-        if renamed == 0 {
-            let error = std::io::Error::last_os_error();
+        if status < 0 {
             discard(&tmp);
-            return Err(format!("rename the skill file ({error})"));
+            return Err(format!("rename the skill file (NTSTATUS {status:#010x})"));
         }
         drop(tmp);
         drop(dir);
@@ -1362,7 +1372,8 @@ mod tests {
     fn a_new_skill_is_never_written_through_a_junction() {
         let home = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
-        let skills_root = home.path().join(".codemux/skills");
+        // Built per component: `cmd` would read a `/` as a switch.
+        let skills_root = home.path().join(".codemux").join("skills");
         fs::create_dir_all(&skills_root).unwrap();
         let link = skills_root.join("linked");
         let made = std::process::Command::new("cmd")
