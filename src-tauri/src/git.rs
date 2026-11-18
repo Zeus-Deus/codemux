@@ -1829,22 +1829,33 @@ fn branch_worktree(repo_path: &Path, branch: &str) -> Option<PathBuf> {
 /// work there would be overwritten — moving the ref and resetting the
 /// checkout would silently discard that work. A base branch checked out
 /// nowhere has no files to protect, so only its ref moves.
+///
+/// Either way the ref is read back afterwards: callers go on to delete the
+/// merged branch, which is only safe once the base really holds `commit`.
 fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Result<(), String> {
+    let base_ref = format!("refs/heads/{base_branch}");
     match branch_worktree(repo_path, base_branch) {
-        Some(checkout) => run_git(&checkout, &["merge", "--ff-only", commit])
+        // `--no-squash`: a `branch.<base>.mergeOptions=--squash` default
+        // would otherwise stage the changes, leave HEAD where it was, and
+        // still exit 0.
+        Some(checkout) => run_git(&checkout, &["merge", "--ff-only", "--no-squash", commit])
             .map(|_| ())
             .map_err(|e| {
                 format!(
                     "Cannot update {base_branch}: its checkout at {} has uncommitted changes the merge would overwrite. Commit or stash them there first. ({e})",
                     checkout.display()
                 )
-            }),
-        None => run_git(
-            repo_path,
-            &["update-ref", &format!("refs/heads/{base_branch}"), commit],
-        )
-        .map(|_| ()),
+            })?,
+        None => run_git(repo_path, &["update-ref", &base_ref, commit]).map(|_| ())?,
     }
+    let now = run_git(repo_path, &["rev-parse", "--verify", &base_ref])?;
+    if now.trim() != commit {
+        return Err(format!(
+            "Cannot update {base_branch}: it is at {} instead of the merged commit {commit}.",
+            now.trim()
+        ));
+    }
+    Ok(())
 }
 
 /// Safely merge the current branch into a base branch using a temporary resolver branch.
@@ -6537,6 +6548,29 @@ mod tests {
         assert_eq!(run_git(&wt, &["branch", "--show-current"]).unwrap(), "feature");
         let leftovers = run_git(&wt, &["branch", "--list", "merge/*"]).unwrap();
         assert!(leftovers.is_empty(), "temp branch left behind: {leftovers}");
+    }
+
+    #[test]
+    fn test_merge_into_base_advances_a_base_that_defaults_to_squash() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        run_git(&repo, &["config", &format!("branch.{main}.mergeOptions"), "--squash"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+        let feature_tip = run_git(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+        let result = merge_into_base(&wt, main, true).unwrap();
+        assert_eq!(result.status, "merged");
+        let (_, _, contains) = run_git_full(
+            &repo,
+            &["merge-base", "--is-ancestor", &feature_tip, "HEAD"],
+        )
+        .unwrap();
+        assert!(contains, "the base's HEAD must hold the feature commit");
+        assert!(git_status(&repo).unwrap().is_empty(), "and its checkout must be clean");
+        assert_eq!(std::fs::read_to_string(repo.join("feature.txt")).unwrap(), "worktree work");
     }
 
     #[test]
