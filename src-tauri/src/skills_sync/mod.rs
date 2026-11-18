@@ -676,49 +676,36 @@ fn collect_local_skill_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// Write `content` to `dest` atomically. With `confine_to`, the skill's
-/// folder must resolve inside that root — a folder that is a link to
-/// somewhere else is refused rather than written through.
+/// Write `content` to `dest` atomically.
+///
+/// With `confine_to`, `dest` must be `<root>/<name>/SKILL.md`, and the write
+/// is confined to that folder on disk: a folder that is, or becomes, a link
+/// to somewhere else is refused, never written through (see
+/// [`confined::write`]).
 fn write_skill_to_disk(dest: &Path, content: &str, confine_to: Option<&Path>) -> Result<(), String> {
-    use std::io::Write;
+    let Some(root) = confine_to else {
+        return write_unconfined(dest, content);
+    };
     let parent = dest
         .parent()
         .ok_or_else(|| format!("skill path has no folder: {}", dest.display()))?;
-    match confine_to {
-        // Only the skill's own folder is created, directly inside the root,
-        // so nothing is ever created through a link that leads elsewhere.
-        Some(root) => {
-            if parent.parent() != Some(root) {
-                return Err(format!("{} is not a skill folder under {}", dest.display(), root.display()));
-            }
-            fs::create_dir_all(root).map_err(|e| format!("create skills root: {e}"))?;
-            match fs::symlink_metadata(parent) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    fs::create_dir(parent).map_err(|e| format!("create skill dir: {e}"))?
-                }
-                Err(e) => return Err(format!("inspect skill dir: {e}")),
-            }
-        }
-        None => fs::create_dir_all(parent).map_err(|e| format!("create skill dir: {e}"))?,
+    let (Some(name), Some(file)) = (parent.file_name(), dest.file_name()) else {
+        return Err(format!("{} is not a skill file", dest.display()));
+    };
+    if parent.parent() != Some(root) || file != "SKILL.md" {
+        return Err(format!("{} is not a skill folder under {}", dest.display(), root.display()));
     }
-    if let Some(root) = confine_to {
-        let inside = match (fs::canonicalize(parent), fs::canonicalize(root)) {
-            (Ok(parent), Ok(root)) => parent.starts_with(&root),
-            _ => false,
-        };
-        if !inside {
-            return Err(format!(
-                "refusing to write {}: its folder resolves outside {}",
-                dest.display(),
-                root.display()
-            ));
-        }
+    fs::create_dir_all(root).map_err(|e| format!("create skills root: {e}"))?;
+    confined::write(root, name, content.as_bytes())
+        .map_err(|e| format!("refusing to write {}: {e}", dest.display()))
+}
+
+/// The plain atomic write, for callers that do not need confinement.
+fn write_unconfined(dest: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create skill dir: {e}"))?;
     }
-    // Atomic-write via tmp+rename to avoid leaving a partial file
-    // on disk if we crash mid-write. The temporary file is created fresh
-    // (a leftover is removed first, never followed), so a link planted at
-    // its name cannot redirect the write.
     let tmp = dest.with_extension("md.tmp");
     match fs::remove_file(&tmp) {
         Ok(()) => {}
@@ -730,11 +717,154 @@ fn write_skill_to_disk(dest: &Path, content: &str, confine_to: Option<&Path>) ->
         .create_new(true)
         .open(&tmp)
         .map_err(|e| format!("write tmp skill: {e}"))?;
-    file.write_all(content.as_bytes())
-        .map_err(|e| format!("write tmp skill: {e}"))?;
+    file.write_all(content.as_bytes()).map_err(|e| format!("write tmp skill: {e}"))?;
     drop(file);
     fs::rename(&tmp, dest).map_err(|e| format!("rename skill: {e}"))?;
     Ok(())
+}
+
+/// Writing `<root>/<name>/SKILL.md` so that the folder checked is the
+/// folder written, even if something swaps it for a link mid-write.
+mod confined {
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    const FILE: &str = "SKILL.md";
+    const TMP: &str = "SKILL.md.tmp";
+
+    /// Unix: every step after opening the root goes through file
+    /// descriptors. The skill folder is opened with `O_NOFOLLOW` relative
+    /// to the root, and the temporary file is created, written and renamed
+    /// relative to that folder, so no path is resolved again. std has no
+    /// `*at` calls, hence the libc FFI.
+    #[cfg(unix)]
+    pub(super) fn write(root: &Path, name: &OsStr, content: &[u8]) -> Result<(), String> {
+        use std::ffi::CString;
+        use std::io::{Error, ErrorKind, Write};
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let c = |bytes: &[u8]| CString::new(bytes).map_err(|_| "a name contains NUL".to_string());
+        let fd = |raw: libc::c_int, what: &str| -> Result<OwnedFd, String> {
+            if raw < 0 {
+                Err(format!("{what} ({})", Error::last_os_error()))
+            } else {
+                // SAFETY: `raw` is a descriptor the call just returned, owned
+                // by nothing else.
+                Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+            }
+        };
+        let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+
+        let root_c = c(root.as_os_str().as_bytes())?;
+        // The root itself may be a link (a dotfiles checkout, say); it is the
+        // trusted location.
+        // SAFETY: a valid NUL-terminated path and plain flags.
+        let root_fd = fd(unsafe { libc::open(root_c.as_ptr(), dir_flags) }, "open the skills root")?;
+
+        let name_c = c(name.as_bytes())?;
+        // SAFETY: a live descriptor and a NUL-terminated name.
+        if unsafe { libc::mkdirat(root_fd.as_raw_fd(), name_c.as_ptr(), 0o755) } != 0 {
+            let error = Error::last_os_error();
+            if error.kind() != ErrorKind::AlreadyExists {
+                return Err(format!("create the skill folder ({error})"));
+            }
+        }
+        // SAFETY: as above; `O_NOFOLLOW` refuses a link in place of the folder.
+        let dir_fd = fd(
+            unsafe { libc::openat(root_fd.as_raw_fd(), name_c.as_ptr(), dir_flags | libc::O_NOFOLLOW) },
+            "the skill folder is a link or not a folder",
+        )?;
+
+        let tmp_c = c(TMP.as_bytes())?;
+        let file_c = c(FILE.as_bytes())?;
+        // A leftover temporary file is removed, never followed.
+        // SAFETY: a live descriptor and a NUL-terminated name.
+        if unsafe { libc::unlinkat(dir_fd.as_raw_fd(), tmp_c.as_ptr(), 0) } != 0 {
+            let error = Error::last_os_error();
+            if error.kind() != ErrorKind::NotFound {
+                return Err(format!("clear the temporary file ({error})"));
+            }
+        }
+        // SAFETY: as above; `O_EXCL | O_NOFOLLOW` only ever creates a new
+        // regular file.
+        let tmp_fd = fd(
+            unsafe {
+                libc::openat(
+                    dir_fd.as_raw_fd(),
+                    tmp_c.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0o644 as libc::c_uint,
+                )
+            },
+            "create the temporary file",
+        )?;
+        let mut tmp = std::fs::File::from(tmp_fd);
+        tmp.write_all(content).map_err(|e| format!("write the temporary file ({e})"))?;
+        drop(tmp);
+        // SAFETY: both names are relative to the same live descriptor.
+        if unsafe { libc::renameat(dir_fd.as_raw_fd(), tmp_c.as_ptr(), dir_fd.as_raw_fd(), file_c.as_ptr()) } != 0 {
+            return Err(format!("rename the skill file ({})", Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Windows: the skill folder is held open, refusing a reparse point (a
+    /// link or junction) and without sharing delete access, so for as long
+    /// as the write takes it cannot be renamed, removed or replaced. The
+    /// paths used inside it therefore keep naming the folder that was
+    /// checked.
+    #[cfg(windows)]
+    pub(super) fn write(root: &Path, name: &OsStr, content: &[u8]) -> Result<(), String> {
+        use std::fs;
+        use std::io::{ErrorKind, Write};
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let dir = root.join(name);
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("create the skill folder ({e})")),
+        }
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&dir)
+            .map_err(|e| format!("open the skill folder ({e})"))?;
+        let meta = held.metadata().map_err(|e| format!("inspect the skill folder ({e})"))?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !meta.is_dir() {
+            return Err("the skill folder is a link or not a folder".into());
+        }
+        let inside = match (fs::canonicalize(&dir), fs::canonicalize(root)) {
+            (Ok(dir), Ok(root)) => dir.parent() == Some(root.as_path()),
+            _ => false,
+        };
+        if !inside {
+            return Err("the skill folder is not inside the skills root".into());
+        }
+
+        let tmp = dir.join(TMP);
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("clear the temporary file ({e})")),
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| format!("create the temporary file ({e})"))?;
+        file.write_all(content).map_err(|e| format!("write the temporary file ({e})"))?;
+        drop(file);
+        fs::rename(&tmp, dir.join(FILE)).map_err(|e| format!("rename the skill file ({e})"))?;
+        drop(held);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1090,6 +1220,33 @@ mod tests {
         let dest = skills_root.join("demo/SKILL.md");
         assert!(write_skill_to_disk(&dest, "pwned", Some(&skills_root)).is_err());
         assert!(!gone.exists(), "no folder is created through the link");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_confined_write_never_follows_a_link_at_the_temporary_name() {
+        let home = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("victim");
+        fs::write(&target, "original").unwrap();
+        let skills_root = home.path().join(".codemux/skills");
+        let dest = skills_root.join("demo/SKILL.md");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, dest.with_extension("md.tmp")).unwrap();
+
+        write_skill_to_disk(&dest, "new body", Some(&skills_root)).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new body");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert!(!dest.with_extension("md.tmp").exists());
+    }
+
+    #[test]
+    fn a_confined_write_refuses_a_path_that_is_not_a_skill_file_under_its_root() {
+        let home = TempDir::new().unwrap();
+        let root = home.path().join(".codemux/skills");
+        for dest in [root.join("demo/other.md"), root.join("a/b/SKILL.md"), root.join("SKILL.md")] {
+            assert!(write_skill_to_disk(&dest, "x", Some(&root)).is_err(), "{}", dest.display());
+        }
     }
 
     #[cfg(unix)]
