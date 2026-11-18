@@ -269,6 +269,45 @@ describe("useAppStateInit — lifecycle boundaries", () => {
     expect(useAppStore.getState().appState).toBeNull();
   });
 
+  it("loads the workspace after transient startup failures without waiting for another snapshot event", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      getAppStateMock
+        .mockRejectedValueOnce(new Error("connection interrupted"))
+        .mockRejectedValueOnce(new Error("reconnecting"))
+        .mockResolvedValueOnce(makeAppState("ws-B"));
+      renderHook(() => useAppStateInit());
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(2);
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(2);
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-B");
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(3);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it.each(["snapshot", "sign-out"] as const)("stops retrying the initial fetch after %s", async (boundary) => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      getAppStateMock.mockRejectedValue(new Error("connection interrupted"));
+      const { rerender } = renderHook(({ skip }) => useAppStateInit(skip), { initialProps: { skip: false } });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      if (boundary === "snapshot") {
+        act(() => deliverSnapshot!(makeAppState("ws-A")));
+      } else {
+        rerender({ skip: true });
+      }
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(1);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it("abandons an in-flight resync when unmounted without applying its late snapshot", async () => {
     let resolve!: (snapshot: AppStateSnapshot) => void;
     const { unmount } = renderHook(() => useAppStateInit());

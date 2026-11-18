@@ -75,19 +75,30 @@ export function useAppStateInit(skip = false) {
     commit?.();
   }, []);
 
-  // Fetch initial state on mount (skip if not authenticated yet)
+  // Deltas and heartbeats require a baseline. Keep trying after a transient
+  // startup failure until the fetch or a pushed snapshot supplies one.
   useEffect(() => {
     if (skip) return;
     let cancelled = false;
-    getAppState()
-      .then((snapshot) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const fetchInitial = async (retryDelay: number) => {
+      try {
+        const snapshot = await getAppState();
         if (cancelled) return;
         setAppState(snapshot);
         markStartup("initial-snapshot-ready", tracedPayloadMeta(snapshot));
-      })
-      .catch((err) => console.error("Failed to fetch app state:", err));
+      } catch (err) {
+        if (cancelled || useAppStore.getState().appState) return;
+        console.error("Failed to fetch app state:", err);
+        timer = setTimeout(() => {
+          if (!useAppStore.getState().appState) void fetchInitial(Math.min(retryDelay * 2, 30_000));
+        }, retryDelay);
+      }
+    };
+    void fetchInitial(1_000);
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
   }, [setAppState, skip]);
 
