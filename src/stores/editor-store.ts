@@ -21,6 +21,8 @@ export interface EditorTabState {
   /** Unsaved buffer of an unmounted editor. Kept in memory only. */
   suspendedDraft?: string;
   pendingSave?: PendingSave;
+  /** Shared by close requests once the backend close is committed. */
+  closing?: Promise<unknown>;
   /** Transient request from a source reference. Omitted from persistence.
    *  `endColumn` (exclusive) selects the range from `column`, e.g. a search hit. */
   revealRequest?: { line: number; column?: number; endColumn?: number; nonce: number };
@@ -42,6 +44,7 @@ interface EditorStore {
   suspendDraft: (tabId: string, filePath: string, content: string) => void;
   beginSave: (tabId: string, draft: string) => EditorSave;
   awaitPendingSaves: (tabId: string) => Promise<EditorTabState | undefined>;
+  closeTab: (tabId: string, closeOnBackend: () => Promise<unknown>) => Promise<unknown>;
   requestReveal: (tabId: string, line: number, column?: number, endColumn?: number) => void;
   clearReveal: (tabId: string, nonce: number) => void;
   removeTab: (tabId: string) => void;
@@ -148,6 +151,35 @@ export const useEditorStore = create<EditorStore>()(
         } while (tail !== pending.done);
         // The closer verifies this snapshot still belongs to the live tab.
         return saved?.isDirty ? undefined : saved;
+      },
+
+      closeTab: async (tabId, closeOnBackend) => {
+        const tab = get().tabs[tabId];
+        if (!tab) return closeOnBackend();
+        const saved = tab.pendingSave ? await get().awaitPendingSaves(tabId) : tab;
+        const current = get().tabs[tabId];
+        if (current?.closing) return current.closing;
+        if (!saved || current !== saved) {
+          throw new Error("Review the file and save any unsaved changes before closing the tab.");
+        }
+
+        // Mark the editor read-only before dispatching the IPC in the next
+        // microtask. Its completion belongs only to this instance of the tab.
+        const closing: Promise<unknown> = Promise.resolve().then(() => {
+          if (get().tabs[tabId]?.closing === closing) return closeOnBackend();
+        });
+        set((s) => ({ tabs: { ...s.tabs, [tabId]: { ...current, closing } } }));
+        try {
+          const result = await closing;
+          if (get().tabs[tabId]?.closing === closing) get().removeTab(tabId);
+          return result;
+        } catch (err) {
+          const current = get().tabs[tabId];
+          if (current?.closing === closing) {
+            set((s) => ({ tabs: { ...s.tabs, [tabId]: { ...current, closing: undefined } } }));
+          }
+          throw err;
+        }
       },
 
       requestReveal: (tabId, line, column, endColumn) =>

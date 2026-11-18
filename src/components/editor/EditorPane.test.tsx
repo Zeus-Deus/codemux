@@ -321,6 +321,46 @@ describe("EditorPane disk sync", () => {
     expect(useEditorStore.getState().getTab(TAB)?.suspendedDraft).toBe("const a = 1;\n// mine\n");
   });
 
+  it.each(["success", "failure"] as const)("blocks edits and Save while the close reply is pending (%s)", async (outcome) => {
+    const view = await openEditor();
+    type(view, "// existing draft\n");
+    const draft = view.state.doc.toString();
+    let finishClose!: () => void;
+    mockIPC((command) => {
+      if (command === "close_tab") return new Promise<void>((resolve, reject) => {
+        finishClose = () => outcome === "success" ? resolve() : reject(new Error("Close failed"));
+      });
+    });
+    try {
+      let closing!: ReturnType<typeof closeTab>;
+      act(() => {
+        closing = closeTab("workspace", TAB);
+        // The close and the edit happen before React can render the new state.
+        undo(view);
+        type(view, "// same tick\n");
+        save(view);
+      });
+      type(view, "// still closing\n");
+      save(view);
+      await act(async () => {});
+      expect.soft(view.state.doc.toString()).toBe(draft);
+      expect.soft(writeFile).not.toHaveBeenCalled();
+      if (outcome === "failure") {
+        const failed = expect(closing).rejects.toThrow("Close failed");
+        await act(async () => { finishClose(); await failed; });
+        expect(useEditorStore.getState().getTab(TAB)?.isDirty).toBe(true);
+        type(view, "// recovered\n");
+        save(view);
+        await waitFor(() => expect(disk.content).toBe(`${draft}// recovered\n`));
+      } else {
+        await act(async () => { finishClose(); await closing; });
+        expect(useEditorStore.getState().getTab(TAB)).toBeUndefined();
+      }
+    } finally {
+      clearMocks();
+    }
+  });
+
   it("reloads a clean buffer in place when the file changes on disk", async () => {
     const view = await openEditor();
     act(() => view.dispatch({ selection: { anchor: 3 } }));

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, highlightSpecialChars } from "@codemirror/view";
-import { EditorState, Compartment, Transaction } from "@codemirror/state";
+import { Annotation, EditorState, Compartment, Transaction } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { bracketMatching, indentOnInput } from "@codemirror/language";
 import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
@@ -57,6 +57,8 @@ export const DISK_POLL_MS = 2000;
 const NOTICE_MS = 1500;
 /** Matches the `duration-150` surface fade on the notice. */
 const NOTICE_FADE_MS = 150;
+const bufferSync = Annotation.define<boolean>();
+const readOnly = [EditorState.readOnly.of(true), EditorView.editable.of(false)];
 
 /** Swap the document for `next` by replacing only the span that differs, so
  *  the cursor, selection and scroll position outside an agent's edit stay
@@ -78,7 +80,7 @@ function replaceDocument(view: EditorView, next: string, addToHistory: boolean) 
   }
   view.dispatch({
     changes: { from: start, to: prevEnd, insert: next.slice(start, nextEnd) },
-    annotations: Transaction.addToHistory.of(addToHistory),
+    annotations: [Transaction.addToHistory.of(addToHistory), bufferSync.of(true)],
   });
 }
 
@@ -94,6 +96,7 @@ export function EditorPane({
   const themeCompartment = useRef(new Compartment());
   const languageCompartment = useRef(new Compartment());
   const wrapCompartment = useRef(new Compartment());
+  const editability = useRef(new Compartment());
   const isLoadingRef = useRef(false);
 
   const theme = useSyntaxThemeColors();
@@ -106,6 +109,7 @@ export function EditorPane({
 
   const filePath = tab?.filePath ?? null;
   const isDirty = tab?.isDirty ?? false;
+  const isClosing = Boolean(tab?.closing);
   const baselineContent = tab?.baselineContent ?? "";
   const revealRequest = tab?.revealRequest;
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -262,7 +266,7 @@ export function EditorPane({
     const editor = useEditorStore.getState();
     const tab = editor.getTab(tabId);
     const path = tab?.filePath;
-    if (!view || !path || isLoadingRef.current) return;
+    if (!view || !path || tab.closing || isLoadingRef.current) return;
 
     // A pending conflict means disk holds a version the user has not
     // chosen to replace yet; Reload or Keep mine decides, not Ctrl+S.
@@ -310,15 +314,17 @@ export function EditorPane({
   }, [tabId, setDiskConflict, flashNotice]);
 
   const reloadFromDisk = useCallback(() => {
-    if (diskConflict == null) return;
+    const tab = useEditorStore.getState().getTab(tabId);
+    if (diskConflict == null || !tab || tab.closing) return;
     adoptDiskContent(diskConflict, true);
     flashNotice("reloaded");
-  }, [diskConflict, adoptDiskContent, flashNotice]);
+  }, [diskConflict, tabId, adoptDiskContent, flashNotice]);
 
   /** Keep the unsaved edits and treat the newer disk version as the base,
    *  so the next save deliberately replaces it. */
   const keepMine = useCallback(() => {
-    if (diskConflict == null) return;
+    const tab = useEditorStore.getState().getTab(tabId);
+    if (diskConflict == null || !tab || tab.closing) return;
     const view = viewRef.current;
     setBaselineContent(tabId, diskConflict);
     setDirty(tabId, view != null && view.state.doc.toString() !== diskConflict);
@@ -376,10 +382,22 @@ export function EditorPane({
         langExt,
         updateListener,
         wrapCompartment.current.of(wrap ? EditorView.lineWrapping : []),
+        editability.current.of(isClosing ? readOnly : []),
       ],
     });
 
-    const view = new EditorView({ state, parent: containerRef.current });
+    const view = new EditorView({
+      state,
+      parent: containerRef.current,
+      dispatchTransactions(transactions, editor) {
+        // Close takes effect before React refreshes the read-only facets.
+        // Undo and redo bypass ordinary CodeMirror transaction filters.
+        const tab = useEditorStore.getState().getTab(tabId);
+        if (!tab) return;
+        if (tab.closing && transactions.some((tr) => tr.docChanged && !tr.annotation(bufferSync))) return;
+        editor.update(transactions);
+      },
+    });
     viewRef.current = view;
 
     return () => {
@@ -388,6 +406,13 @@ export function EditorPane({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (view && view.state.readOnly !== isClosing) {
+      view.dispatch({ effects: editability.current.reconfigure(isClosing ? readOnly : []) });
+    }
+  }, [isClosing, tabId]);
 
   // Wrap is a compartment so the deck's pane-bar toggle can flip it
   // without tearing the editor down and reloading the file.
@@ -460,11 +485,11 @@ export function EditorPane({
     } else {
       void readFile(filePath)
         .then((c) => {
-          if (cancelled) return;
+          if (cancelled || useEditorStore.getState().getTab(tabId)?.filePath !== filePath) return;
           // Out of the undo history: Ctrl+Z must not empty a freshly opened file.
           view.dispatch({
             changes: { from: 0, to: view.state.doc.length, insert: c },
-            annotations: Transaction.addToHistory.of(false),
+            annotations: [Transaction.addToHistory.of(false), bufferSync.of(true)],
           });
           setBaselineContent(tabId, c);
           setContent(c);
@@ -681,13 +706,14 @@ export function EditorPane({
           <span className="min-w-0 flex-1 text-label text-foreground">
             Changed on disk. Your edits are unsaved.
           </span>
-          <Button size="xs" variant="outline" className="shrink-0" onClick={reloadFromDisk}>
+          <Button size="xs" variant="outline" className="shrink-0" disabled={isClosing} onClick={reloadFromDisk}>
             Reload
           </Button>
           <Button
             size="xs"
             variant="ghost"
             className="shrink-0"
+            disabled={isClosing}
             onClick={keepMine}
             title="Keep your edits. Saving will replace the version on disk."
           >

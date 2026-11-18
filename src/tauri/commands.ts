@@ -595,18 +595,8 @@ async function refreshRemoteWorkspaceView(workspaceId: string, tabId: string | u
   useAppStore.setState(s => s.appState ? { appState: projectRemotePanes(s.appState) } : {});
 }
 
-export const closeTab = async (workspaceId: string, tabId: string) => {
-  const editor = useEditorStore.getState();
-  if (editor.getTab(tabId)?.pendingSave) {
-    const saved = await editor.awaitPendingSaves(tabId);
-    if (!saved || editor.getTab(tabId) !== saved) {
-      throw new Error("Review the file and save any unsaved changes before closing the tab.");
-    }
-  }
-  const result = await invoke("close_tab", { workspaceId, tabId });
-  if (editor.getTab(tabId)) editor.removeTab(tabId);
-  return result;
-};
+export const closeTab = (workspaceId: string, tabId: string) =>
+  useEditorStore.getState().closeTab(tabId, () => invoke("close_tab", { workspaceId, tabId }));
 
 export const activateTab = async (workspaceId: string, tabId: string) => {
   const sequence = beginRemoteNavigation();

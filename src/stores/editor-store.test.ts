@@ -38,6 +38,26 @@ describe("closing during a save", () => {
   });
 });
 
+it("shares a pending backend close and leaves a reopened tab alone when it completes", async () => {
+  const editor = useEditorStore.getState();
+  const filePath = "/repo/notes.md";
+  editor.initTab(TAB, { filePath });
+  let finish!: () => void;
+  const backend = vi.fn(() => new Promise<void>((done) => { finish = done; }));
+  const first = editor.closeTab(TAB, backend);
+  const second = editor.closeTab(TAB, backend);
+  await Promise.resolve();
+  expect(backend).toHaveBeenCalledOnce();
+
+  editor.removeTab(TAB);
+  editor.initTab(TAB, { filePath });
+  const reopened = editor.getTab(TAB);
+  finish();
+  await Promise.all([first, second]);
+  expect(editor.getTab(TAB)).toBe(reopened);
+  expect(reopened?.closing).toBeUndefined();
+});
+
 describe("editor store dirty flags", () => {
   afterEach(() => {
     vi.restoreAllMocks();
