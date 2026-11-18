@@ -765,7 +765,7 @@ mod stdout_drain {
             // does not start either.
             let (stopping, stopped) = std::sync::mpsc::channel::<()>();
             let (cancel_stop, cancel_done) = (stop.clone(), done.clone());
-            std::thread::Builder::new()
+            let canceller = std::thread::Builder::new()
                 .name("opencode-stdout-cancel".into())
                 .spawn(move || {
                     use std::os::windows::io::AsRawHandle;
@@ -789,40 +789,61 @@ mod stdout_drain {
                 .try_with(|probe| {
                     let mut probe = probe.lock().unwrap();
                     probe.done = Some(done.clone());
-                    probe.pause_before_drain_read.take()
+                    (probe.pause_before_drain_read.take(), probe.fail_reader_spawn)
                 })
-                .ok()
-                .flatten();
+                .ok();
+            #[cfg(test)]
+            let (pause, fail_reader_spawn) = match pause {
+                Some((pause, fail)) => (pause, fail),
+                None => (None, false),
+            };
             let (banner_tx, banner_rx) = tokio::sync::oneshot::channel();
             let (thread_stop, thread_done) = (stop.clone(), done.clone());
-            std::thread::Builder::new()
-                .name("opencode-stdout".into())
-                .spawn(move || {
-                    let mut reader = std::io::BufReader::new(reader);
-                    // The banner first; its buffers live only inside the scan.
-                    let result = scan_banner(&mut reader, &thread_stop);
-                    let found = result.is_ok();
-                    let _ = banner_tx.send(result);
-                    if !found {
-                        thread_done.store(true, Ordering::SeqCst);
-                        return;
-                    }
-                    // Then everything after it.
-                    let mut buf = [0u8; 8192];
-                    while !thread_stop.load(Ordering::SeqCst) {
-                        #[cfg(test)]
-                        if let Some((arrived, release)) = pause.as_ref() {
-                            arrived.wait();
-                            release.wait();
-                        }
-                        match reader.read(&mut buf) {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {}
-                        }
-                    }
+            let reader_thread = move || {
+                let mut reader = std::io::BufReader::new(reader);
+                // The banner first; its buffers live only inside the scan.
+                let result = scan_banner(&mut reader, &thread_stop);
+                let found = result.is_ok();
+                let _ = banner_tx.send(result);
+                if !found {
                     thread_done.store(true, Ordering::SeqCst);
-                })
-                .map_err(|e| e.to_string())?;
+                    return;
+                }
+                // Then everything after it.
+                let mut buf = [0u8; 8192];
+                while !thread_stop.load(Ordering::SeqCst) {
+                    #[cfg(test)]
+                    if let Some((arrived, release)) = pause.as_ref() {
+                        arrived.wait();
+                        release.wait();
+                    }
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                thread_done.store(true, Ordering::SeqCst);
+            };
+            let reader_builder = std::thread::Builder::new().name("opencode-stdout".into());
+            #[cfg(test)]
+            let spawned = if fail_reader_spawn {
+                drop(reader_thread);
+                Err(std::io::Error::other("simulated reader spawn failure"))
+            } else {
+                reader_builder.spawn(reader_thread)
+            };
+            #[cfg(not(test))]
+            let spawned = reader_builder.spawn(reader_thread);
+            if let Err(e) = spawned {
+                // No reader will ever set `done`: set it here, wake the cancel
+                // thread so it sees that and exits, and wait for it, so a
+                // failed start leaves no thread or pipe handle behind.
+                done.store(true, Ordering::SeqCst);
+                drop(stopping);
+                let _ = canceller.join();
+                return Err(e.to_string());
+            }
+
             Ok((Self { stop, done, stopping }, banner_rx))
         }
 
@@ -850,6 +871,8 @@ mod stdout_drain {
 pub(crate) struct DrainProbe {
     pub(crate) done: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) pause_before_drain_read: Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>,
+    /// Make the reader thread's spawn fail, after the cancel thread started.
+    pub(crate) fail_reader_spawn: bool,
 }
 
 #[cfg(all(test, windows))]
@@ -1338,8 +1361,8 @@ mod tests {
         let arrived = std::sync::Arc::new(std::sync::Barrier::new(2));
         let release = std::sync::Arc::new(std::sync::Barrier::new(2));
         let probe = std::sync::Arc::new(std::sync::Mutex::new(DrainProbe {
-            done: None,
             pause_before_drain_read: Some((arrived.clone(), release.clone())),
+            ..DrainProbe::default()
         }));
 
         let mut server = DRAIN_PROBE
@@ -1398,6 +1421,33 @@ mod tests {
         assert!(err.starts_with("ready_banner_missing"), "{err}");
         assert!(err.contains("some log line"));
         assert!(err.len() < 9_000, "the diagnostic is capped: {} bytes", err.len());
+    }
+
+    // Windows: if the reader thread cannot start after the cancel thread
+    // has, starting fails without leaving the cancel thread (and its pipe
+    // handle) behind. `start` joins it, so this returning at all shows it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_reader_that_cannot_start_leaves_no_cancel_thread_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-opencode.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\necho opencode server listening on http://127.0.0.1:1\r\nping -n 60 127.0.0.1 >nul\r\n",
+        )
+        .unwrap();
+        let probe = std::sync::Arc::new(std::sync::Mutex::new(DrainProbe {
+            fail_reader_spawn: true,
+            ..DrainProbe::default()
+        }));
+        let started = tokio::time::timeout(
+            Duration::from_secs(10),
+            DRAIN_PROBE.scope(probe, OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(10))),
+        )
+        .await
+        .expect("a failed reader start must not hang on its cancel thread");
+        let err = started.err().expect("startup fails when the reader cannot start");
+        assert!(err.contains("read stdout"), "unexpected error: {err}");
     }
 
     /// Tests in this module that rely on the live `opencode` binary
