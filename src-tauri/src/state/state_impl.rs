@@ -6786,6 +6786,27 @@ fn recovery_pending_at(path: &Path) -> bool {
     true
 }
 
+/// Preserve the layout at `path` as `aside`, never replacing anything
+/// already there. A hard link keeps the very entry (a link stays a link)
+/// and fails if `aside` exists; then the original name is dropped. Where
+/// hard links are unavailable, the bytes are copied into a newly created
+/// file instead.
+fn set_aside(path: &Path, aside: &Path) -> bool {
+    if fs::hard_link(path, aside).is_ok() {
+        // Even if this fails, `aside` holds the layout: a later save
+        // replaces `layout.json`'s entry, not the file both names share.
+        let _ = fs::remove_file(path);
+        return true;
+    }
+    let Ok(mut source) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(mut copy) = fs::OpenOptions::new().write(true).create_new(true).open(aside) else {
+        return false;
+    };
+    std::io::copy(&mut source, &mut copy).is_ok() && copy.sync_all().is_ok()
+}
+
 /// Add `aside_name` to the recovery marker beside `path`, keeping every
 /// copy already listed.
 fn add_to_recovery_marker(path: &Path, aside_name: &str) -> std::io::Result<()> {
@@ -6797,13 +6818,22 @@ fn add_to_recovery_marker(path: &Path, aside_name: &str) -> std::io::Result<()> 
 
 /// Read the layout at `path`. An unreadable one is preserved before
 /// anything can save over it, so it can still be recovered by hand:
-/// renamed (or, failing that, copied) to `<name>.unreadable-<unix millis>`,
+/// moved (or, failing that, copied), never over anything, to
+/// `<name>.unreadable-<unix millis>-<random>`,
 /// with a marker beside it so later launches stay in recovery mode too.
 /// `preserved: false` means neither worked and `layout.json` must not be
 /// replaced this run.
 fn load_layout_from(path: &Path) -> PersistedLayout {
     let error = match fs::read_to_string(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return PersistedLayout::Missing,
+        // Only an absent entry is a first launch: a `layout.json` link whose
+        // target is unavailable reads as "not found" too, but is someone's
+        // layout.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return PersistedLayout::Missing
+        }
         Err(error) => error.to_string(),
         Ok(contents) => match serde_json::from_str(&contents) {
             Ok(snapshot) => return PersistedLayout::Loaded(Box::new(snapshot)),
@@ -6815,15 +6845,14 @@ fn load_layout_from(path: &Path) -> PersistedLayout {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let mut aside = path.as_os_str().to_owned();
-    aside.push(format!(".unreadable-{stamp}"));
+    aside.push(format!(".unreadable-{stamp}-{:08x}", rand::random::<u32>()));
     let aside = PathBuf::from(aside);
     let aside_name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     // The marker goes first: if it cannot be written, nothing else is
     // trusted to remember the copy, and `layout.json` stays as it is. Copies
     // set aside earlier stay listed.
     let marked = add_to_recovery_marker(path, &aside_name).is_ok();
-    let kept = marked
-        && (fs::rename(path, &aside).is_ok() || fs::copy(path, &aside).is_ok());
+    let kept = marked && set_aside(path, &aside);
     if kept {
         log::error!(
             "Could not read the saved layout ({error}); kept it as {} and started without it. \
@@ -14071,8 +14100,8 @@ mod persisted_layout_tests {
         };
         fs::write(&path, "first broken layout").unwrap();
         assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        // The fallback layout later turns unreadable too.
+        // The fallback layout later turns unreadable too — in the same
+        // millisecond, even: the names still differ.
         fs::write(&path, "second broken layout").unwrap();
         assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
         let both = asides(dir.path());
@@ -14082,6 +14111,44 @@ mod persisted_layout_tests {
         assert!(recovery_pending_at(&path), "the first copy still waits");
         fs::remove_file(&both[0]).unwrap();
         assert!(!recovery_pending_at(&path));
+    }
+
+    #[test]
+    fn setting_aside_never_replaces_an_earlier_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let aside = dir.path().join("layout.json.unreadable-taken");
+        fs::write(&path, "newer broken layout").unwrap();
+        fs::write(&aside, "earlier copy").unwrap();
+
+        assert!(!set_aside(&path, &aside), "a taken name is refused");
+        assert_eq!(fs::read_to_string(&aside).unwrap(), "earlier copy");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "newer broken layout");
+    }
+
+    // Unix only: a symlink needs no privilege there.
+    #[cfg(unix)]
+    #[test]
+    fn a_layout_link_whose_target_is_gone_is_kept_not_treated_as_a_first_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let target = dir.path().join("dotfiles-layout.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
+        assert!(recovery_pending_at(&path), "so cleanup stays off");
+        let kept: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("layout.json.unreadable-"))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read_link(&kept[0]).unwrap(), target, "the link itself is what was kept");
+
+        // A later save writes a fresh layout.json; the kept link is untouched.
+        save_layout_to(&path, &default_app_state()).unwrap();
+        assert_eq!(fs::read_link(&kept[0]).unwrap(), target);
+        assert!(recovery_pending_at(&path));
     }
 
     #[test]

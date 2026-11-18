@@ -507,10 +507,47 @@ fn read_git_head_sha(path: &str) -> Option<String> {
 ///
 /// Returns Ok even on partial failure: individual row failures are
 /// logged so a corrupt row doesn't strand the whole tick.
-/// Mark the sync row of a workspace the user just closed as deleted. The
-/// close says so explicitly, so this holds even while a layout recovery
-/// keeps [`reconcile_from_snapshot`] from inferring closes.
+/// Serialises recording a close with reconciling, so a reconcile working
+/// from a snapshot taken before a close cannot slip a row in after it.
+static RECONCILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `ui_state` key holding the workspaces closed while a layout recovery is
+/// pending, as a JSON array of ids.
+const CLOSED_DURING_RECOVERY: &str = "workspaces_sync.closed_during_recovery";
+
+/// Closes this run could not persist, kept so they are still honoured.
+static CLOSED_UNPERSISTED: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Every workspace closed while the current layout recovery is pending.
+fn closed_during_recovery(db: &DatabaseStore) -> HashSet<String> {
+    let mut closed: HashSet<String> = db
+        .get_ui_state(CLOSED_DURING_RECOVERY)
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    closed.extend(lock(&CLOSED_UNPERSISTED).iter().cloned());
+    closed
+}
+
+/// The user closed `workspace_id`: mark its sync row deleted. While a
+/// layout recovery is pending, reconcile infers no closes, so the close is
+/// also remembered — across restarts — and reconcile keeps applying it:
+/// it never re-adds that workspace and retries the deletion every tick,
+/// covering a failed write here and a row a stale reconcile added.
 pub fn record_closed(db: &DatabaseStore, workspace_id: &str) -> Result<(), String> {
+    let _serialised = lock(&RECONCILE_LOCK);
+    if crate::state::layout_recovery_pending() {
+        let mut closed = closed_during_recovery(db);
+        closed.insert(workspace_id.to_string());
+        let json = serde_json::to_string(&closed).unwrap_or_else(|_| "[]".into());
+        if db.set_ui_state(CLOSED_DURING_RECOVERY, &json).is_err() {
+            lock(&CLOSED_UNPERSISTED).insert(workspace_id.to_string());
+        }
+    }
     db.soft_delete_workspace_sync_by_workspace_id(workspace_id)
 }
 
@@ -518,6 +555,16 @@ pub fn reconcile_from_snapshot(
     db: &DatabaseStore,
     snapshot: &AppStateSnapshot,
 ) -> Result<(), String> {
+    let _serialised = lock(&RECONCILE_LOCK);
+    let recovering = crate::state::layout_recovery_pending();
+    let closed = if recovering {
+        closed_during_recovery(db)
+    } else {
+        // Recovery over: closes are inferred again, so the list is done.
+        let _ = db.delete_ui_state(CLOSED_DURING_RECOVERY);
+        lock(&CLOSED_UNPERSISTED).clear();
+        HashSet::new()
+    };
     // Build local host_id → server_id map for translating
     // WorkspaceSnapshot.host_id (i64) into host_server_id (TEXT).
     let host_id_to_server: HashMap<i64, String> = db
@@ -559,6 +606,11 @@ pub fn reconcile_from_snapshot(
         }
 
         let wid = ws.workspace_id.0.clone();
+        // Closed during recovery: a snapshot that still lists it is older
+        // than the close.
+        if closed.contains(&wid) {
+            continue;
+        }
         live_wids.insert(wid.clone());
 
         let host_server_id = ws
@@ -644,7 +696,13 @@ pub fn reconcile_from_snapshot(
     // from it is missing, not closed: deleting its row would remove it from
     // every other device too. Nothing is inferred then; a workspace really
     // closed has its row deleted by the close itself (`record_closed`).
-    if crate::state::layout_recovery_pending() {
+    if recovering {
+        for wid in &closed {
+            // Idempotent; retries a close whose own write failed.
+            if let Err(error) = db.soft_delete_workspace_sync_by_workspace_id(wid) {
+                eprintln!("[workspaces-sync] soft-delete failed for {wid}: {error}");
+            }
+        }
         return Ok(());
     }
     for row in &sync_rows {
@@ -1171,6 +1229,36 @@ mod tests {
         let live = |wid: &str| db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some(wid));
         assert!(!live("ws-recovery-closed"), "a workspace really closed is deleted");
         assert!(live("ws-recovery-missing"), "a missing one is not");
+    }
+
+    #[test]
+    #[serial]
+    fn a_close_during_recovery_holds_against_a_stale_reconcile_and_a_restart() {
+        let db = fresh_db();
+        let stale = make_snapshot(vec![make_ws("ws-close-stale", "closed")]);
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+        let live = |db: &DatabaseStore| {
+            db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some("ws-close-stale"))
+        };
+
+        // Closed before it ever had a row; then a reconcile from a snapshot
+        // taken before the close.
+        super::record_closed(&db, "ws-close-stale").unwrap();
+        super::reconcile_from_snapshot(&db, &stale).unwrap();
+        assert!(!live(&db), "a stale snapshot does not re-add a closed workspace");
+
+        // A row that slipped in anyway (or whose deletion failed) is deleted
+        // on the next tick — also after a restart, from the persisted list.
+        super::lock(&super::CLOSED_UNPERSISTED).clear();
+        db.insert_workspace_sync("ws-close-stale", "closed", None, None, None, None, None, None, None)
+            .unwrap();
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        assert!(!live(&db), "the close is retried");
+
+        // Once recovery is over the list is cleared.
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        assert!(db.get_ui_state(super::CLOSED_DURING_RECOVERY).is_none());
     }
 
     #[test]
