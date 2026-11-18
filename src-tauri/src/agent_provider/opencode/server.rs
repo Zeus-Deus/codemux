@@ -392,11 +392,23 @@ impl OpenCodeServer {
             .stdout
             .take()
             .ok_or_else(|| "spawn_failed: child stdout pipe missing".to_string())?;
+        // Nothing reads the server's stderr, but it must still be drained:
+        // once the pipe's buffer fills, the server's next log write blocks,
+        // and with it every OpenCode chat this one server runs.
+        if let Some(stderr) = child.0.stderr.take() {
+            tokio::spawn(drain(stderr));
+        }
 
         let url_result = tokio::time::timeout(ready_budget, await_ready_url(stdout)).await;
 
         let (base_url, api) = match url_result {
-            Ok(Ok(url)) => url,
+            Ok(Ok((base_url, api, rest))) => {
+                // Keep reading stdout after the banner too: dropping the
+                // reader closes the pipe, and the server's next write to
+                // stdout would fail instead.
+                tokio::spawn(drain(rest));
+                (base_url, api)
+            }
             Ok(Err(message)) => {
                 // Probe drained stdout before exiting — kill the
                 // child and surface the failure verbatim.
@@ -561,12 +573,19 @@ async fn leader_exited(_pid: u32) {
     std::future::pending::<()>().await
 }
 
+/// Read and discard a child's output until it closes, so the child never
+/// blocks on a full pipe.
+async fn drain(mut output: impl tokio::io::AsyncRead + Unpin) {
+    let _ = tokio::io::copy(&mut output, &mut tokio::io::sink()).await;
+}
+
 /// Read lines from the child's stdout until the ready banner shows
 /// up or the stream closes. Only the *banner* triggers `Ok`; anything
-/// else is forwarded as part of the diagnostic on failure.
+/// else is forwarded as part of the diagnostic on failure. On success the
+/// rest of the stream is handed back so the caller keeps draining it.
 async fn await_ready_url(
     stdout: tokio::process::ChildStdout,
-) -> Result<(String, OpenCodeApi), String> {
+) -> Result<(String, OpenCodeApi, BufReader<tokio::process::ChildStdout>), String> {
     let mut reader = BufReader::new(stdout).lines();
     let mut buffered = String::new();
     while let Some(line) = reader
@@ -580,7 +599,7 @@ async fn await_ready_url(
         buffered.push_str(&line);
         if let Some(url) = parse_ready_url(&line) {
             if let Some(api) = OpenCodeApi::from_ready_banner(&line) {
-                return Ok((url, api));
+                return Ok((url, api, reader.into_inner()));
             }
         }
     }
@@ -859,6 +878,41 @@ mod tests {
             err.starts_with("ready_banner_missing") || err.starts_with("ready_timeout_after_"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chatty_server_is_never_blocked_on_its_own_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let done = dir.path().join("done");
+        let script = dir.path().join("fake-opencode");
+        // Far more than a pipe buffer on both streams, after the banner.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 echo 'opencode server listening on http://127.0.0.1:1'\n\
+                 head -c 1048576 /dev/zero >&2\n\
+                 head -c 1048576 /dev/zero\n\
+                 touch '{}'\n\
+                 sleep 30\n",
+                done.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut server = OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(5))
+            .await
+            .expect("the banner is enough to start");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let finished = done.exists();
+        server.shutdown().await.unwrap();
+        assert!(finished, "the server blocked writing its own output");
     }
 
     /// Tests in this module that rely on the live `opencode` binary
