@@ -37,3 +37,20 @@ it("persists mock editor writes for subsequent reads and changes the disk signat
   expect(await invoke("read_file", { path })).toBe("export const audited = true;\n");
   expect(await invoke("file_signature", { path })).not.toBe(signature);
 });
+
+it("leaves the editor open when the save it is waiting for fails", async () => {
+  const snapshot = await invoke("get_app_state") as AppStateSnapshot;
+  const workspace = snapshot.workspaces.find((candidate) => candidate.workspace_id === "ws-codemux-chat")!;
+  const tabId = await openEditorTab(workspace.workspace_id, workspace.tabs, `${workspace.cwd}/notes.md`);
+  const editor = useEditorStore.getState();
+  const save = editor.beginSave(tabId, "unsaved edit");
+  const closing = closeTab(workspace.workspace_id, tabId);
+  save.finish();
+
+  await expect(closing).rejects.toThrow(/unsaved changes/i);
+  const after = await invoke("get_app_state") as AppStateSnapshot;
+  const remaining = after.workspaces.find((ws) => ws.workspace_id === workspace.workspace_id)!.tabs;
+  expect(remaining.map((tab) => tab.tab_id)).toContain(tabId);
+  expect(editor.getTab(tabId)).toMatchObject({ suspendedDraft: "unsaved edit", isDirty: true });
+  await closeTab(workspace.workspace_id, tabId);
+});

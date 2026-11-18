@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { EditorView } from "@codemirror/view";
 import { undo } from "@codemirror/commands";
+import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 
 // A one-file fake disk: `signature` moves with every write, like size+mtime.
 const disk = { content: "", version: 0 };
@@ -28,7 +29,7 @@ vi.mock("@/lib/editor-languages", async () => ({
 
 import { EditorPane } from "./EditorPane";
 import { useEditorStore } from "@/stores/editor-store";
-import { fileSignature, readFile } from "@/tauri/commands";
+import { closeTab, fileSignature, readFile } from "@/tauri/commands";
 
 // CodeMirror measures selection rectangles; jsdom has no layout for ranges.
 Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
@@ -277,6 +278,47 @@ describe("EditorPane disk sync", () => {
     await checkDisk();
     expect(await screen.findByRole("alert")).toHaveTextContent(/changed on disk/i);
     expect(current.state.doc.toString()).toBe(`${baseline}// replacement tab\n`);
+  });
+
+  it("writes the newest requested save before closing the editor tab", async () => {
+    const view = await openEditor();
+    const contentsAtClose: string[] = [];
+    mockIPC((command) => {
+      if (command === "close_tab") contentsAtClose.push(disk.content);
+    });
+    try {
+      const finishWrite = delayNextWrite();
+      type(view, "// first\n");
+      save(view);
+      await waitFor(() => expect(writeFile).toHaveBeenCalledOnce());
+      type(view, "// second\n");
+      const latest = view.state.doc.toString();
+      save(view);
+      await act(async () => {
+        const closing = closeTab("workspace", TAB);
+        finishWrite();
+        await closing;
+      });
+      expect(contentsAtClose).toEqual([latest]);
+      expect(disk.content).toBe(latest);
+      expect(useEditorStore.getState().getTab(TAB)).toBeUndefined();
+    } finally {
+      clearMocks();
+    }
+  });
+
+  it("keeps a closing tab open when its pending save finds a conflicting disk edit", async () => {
+    const view = await openEditor();
+    type(view, "// mine\n");
+    let finishStat!: (signature: string) => void;
+    vi.mocked(fileSignature).mockImplementationOnce(() => new Promise((done) => { finishStat = done; }));
+    save(view);
+    const blocked = expect(closeTab("workspace", TAB)).rejects.toThrow(/unsaved changes/i);
+    agentWrites("// theirs\n");
+    await act(async () => { finishStat(`v${disk.version}`); await blocked; });
+    expect(screen.getByRole("alert")).toHaveTextContent(/changed on disk/i);
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(useEditorStore.getState().getTab(TAB)?.suspendedDraft).toBe("const a = 1;\n// mine\n");
   });
 
   it("reloads a clean buffer in place when the file changes on disk", async () => {

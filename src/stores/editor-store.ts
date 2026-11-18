@@ -4,11 +4,12 @@ import { persist } from "zustand/middleware";
 interface PendingSave {
   /** Live buffer while the captured version is being saved. */
   draft: string;
-  done: Promise<void>;
+  /** The tab after a successful write, or undefined if the write failed or the tab was replaced. */
+  done: Promise<EditorTabState | undefined>;
 }
 
 interface EditorSave {
-  previous?: Promise<void>;
+  previous?: PendingSave["done"];
   ownsTab: () => boolean;
   finish: (written?: string) => void;
 }
@@ -40,6 +41,7 @@ interface EditorStore {
   setDirty: (tabId: string, dirty: boolean) => void;
   suspendDraft: (tabId: string, filePath: string, content: string) => void;
   beginSave: (tabId: string, draft: string) => EditorSave;
+  awaitPendingSaves: (tabId: string) => Promise<EditorTabState | undefined>;
   requestReveal: (tabId: string, line: number, column?: number, endColumn?: number) => void;
   clearReveal: (tabId: string, nonce: number) => void;
   removeTab: (tabId: string) => void;
@@ -98,8 +100,8 @@ export const useEditorStore = create<EditorStore>()(
       beginSave: (tabId, draft) => {
         const tab = get().tabs[tabId];
         const previous = tab.pendingSave?.done;
-        let resolve!: () => void;
-        const done = new Promise<void>((release) => { resolve = release; });
+        let resolve!: (savedTab?: EditorTabState) => void;
+        const done = new Promise<EditorTabState | undefined>((release) => { resolve = release; });
         // All saves for this open file share its current buffer. Each write
         // waits for its predecessor before checking the disk version.
         const pending = tab.pendingSave ?? { draft, done };
@@ -125,10 +127,27 @@ export const useEditorStore = create<EditorStore>()(
                 pendingSave: pending.done === done ? undefined : pending,
               };
               set((s) => ({ tabs: { ...s.tabs, [tabId]: updated } }));
+              resolve(written === undefined ? undefined : updated);
+            } else {
+              resolve();
             }
-            resolve();
           },
         };
+      },
+
+      awaitPendingSaves: async (tabId) => {
+        const tab = get().tabs[tabId];
+        const pending = tab?.pendingSave;
+        if (!pending) return tab;
+        // Another Ctrl+S may extend the queue while a close waits on disk.
+        let tail: PendingSave["done"];
+        let saved: EditorTabState | undefined;
+        do {
+          tail = pending.done;
+          saved = await tail;
+        } while (tail !== pending.done);
+        // The closer verifies this snapshot still belongs to the live tab.
+        return saved?.isDirty ? undefined : saved;
       },
 
       requestReveal: (tabId, line, column, endColumn) =>

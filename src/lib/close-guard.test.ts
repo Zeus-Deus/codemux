@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   undoable: vi.fn(),
   dismiss: vi.fn(),
   error: vi.fn(),
+  failure: vi.fn(),
 }));
 
 vi.mock("@/tauri/commands", () => ({
@@ -23,7 +24,7 @@ vi.mock("@/lib/agent-chat/launch-pane", () => ({
   launchAgentChatPane: mocks.launchAgentChatPane,
 }));
 vi.mock("@/lib/toast", () => ({
-  toast: { undoable: mocks.undoable, dismiss: mocks.dismiss, error: mocks.error },
+  toast: { undoable: mocks.undoable, dismiss: mocks.dismiss, error: mocks.error, failure: mocks.failure },
 }));
 
 import {
@@ -99,6 +100,13 @@ beforeEach(() => {
 });
 
 describe("requestCloseTab", () => {
+  it("shows the reason an editor close was blocked", async () => {
+    const reason = new Error("The editor has unsaved changes.");
+    mocks.closeTab.mockRejectedValueOnce(reason);
+    await requestCloseTab("ws-1", "c");
+    expect(mocks.failure).toHaveBeenCalledWith("Couldn't close Notes", reason);
+  });
+
   it("closes an idle shell at once", async () => {
     await requestCloseTab("ws-1", "a");
     expect(mocks.terminalForegroundJobs).toHaveBeenCalledWith(["sess-term"]);

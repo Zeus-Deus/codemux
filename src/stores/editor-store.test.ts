@@ -12,6 +12,32 @@ beforeEach(() => {
   useEditorStore.setState({ tabs: {} });
 });
 
+describe("closing during a save", () => {
+  it("waits for saves appended after the close was requested", async () => {
+    const editor = useEditorStore.getState();
+    editor.initTab(TAB, { filePath: "/repo/notes.md" });
+    const first = editor.beginSave(TAB, "first");
+    const closing = editor.awaitPendingSaves(TAB);
+    const pending = editor.getTab(TAB)!.pendingSave!;
+    pending.draft = "second";
+    const second = editor.beginSave(TAB, pending.draft);
+    first.finish("first");
+    await second.previous;
+    second.finish("second");
+    expect(await closing).toBe(editor.getTab(TAB));
+  });
+
+  it("keeps the tab open if a save failed even when the buffer matches the old baseline", async () => {
+    const editor = useEditorStore.getState();
+    editor.initTab(TAB, { filePath: "/repo/notes.md" });
+    const save = editor.beginSave(TAB, "");
+    const closing = editor.awaitPendingSaves(TAB);
+    save.finish();
+    expect(editor.getTab(TAB)?.isDirty).toBe(false);
+    expect(await closing).toBeUndefined();
+  });
+});
+
 describe("editor store dirty flags", () => {
   afterEach(() => {
     vi.restoreAllMocks();
