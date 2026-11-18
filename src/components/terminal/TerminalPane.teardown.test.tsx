@@ -36,6 +36,7 @@ const h = vi.hoisted(() => ({
   },
   sessionState: "ready",
   sessionRemoved: false,
+  restartToken: "original-shell" as string | undefined,
   sessionCols: 80,
   sessionRows: 24,
   parse: null as (() => void) | null,
@@ -195,7 +196,9 @@ vi.mock("./webgl-renderer-probe", () => ({
 
 vi.mock("./terminal-write-pump", () => ({
   createWritePump: () => ({
-    enqueue: () => {},
+    enqueue: (data: Uint8Array) => {
+      if (new TextDecoder().decode(data).includes("shell restarted")) h.log.push("restart-marker");
+    },
     enqueueString: () => {
       const terminal = h.terminals[h.terminals.length - 1]!;
       h.log.push(`restore:${terminal.cols}x${terminal.rows}`);
@@ -230,6 +233,7 @@ vi.mock("@/tauri/commands", () => ({
   resumePtyOutput: vi.fn(async () => {}),
   getTerminalStatus: vi.fn(async (session_id: string) => ({
     session_id,
+    restart_token: h.restartToken,
     ...h.status,
   })),
   restartTerminalSession: vi.fn(async () => {
@@ -697,6 +701,7 @@ describe("TerminalPane exited shell", () => {
     h.status = { state: "ready", message: null, exit_code: null };
     h.sessionState = "ready";
     h.sessionRemoved = false;
+    h.restartToken = "original-shell";
     vi.unstubAllGlobals();
   });
 
@@ -707,6 +712,7 @@ describe("TerminalPane exited shell", () => {
     vi.stubGlobal("__TAURI_INTERNALS__", { unregisterCallback });
     h.status = { state: "exited", message: "Shell exited with code 2", exit_code: 2 };
     h.sessionState = "exited";
+    h.restartToken = undefined;
     const view = renderPane("sess-a");
     await act(async () => {});
 
@@ -721,6 +727,7 @@ describe("TerminalPane exited shell", () => {
     });
 
     expect(h.log).toContain("restart");
+    expect(restartTerminalSession).toHaveBeenCalledExactlyOnceWith("sess-a", undefined);
     // The respawned runtime has no subscribers, so the pane attaches again.
     expect(attachPtyOutput).toHaveBeenCalledTimes(2);
     const second = vi.mocked(attachPtyOutput).mock.calls[1][1].id;
@@ -835,7 +842,7 @@ describe("TerminalPane exited shell", () => {
 
     await act(async () => finishAttach(1));
     expect(detachPtyOutput).toHaveBeenCalledExactlyOnceWith("sess-a", 1);
-    expect(restartTerminalSession).toHaveBeenCalledExactlyOnceWith("sess-a");
+    expect(restartTerminalSession).toHaveBeenCalledExactlyOnceWith("sess-a", "original-shell");
     expect(h.log.indexOf("detach")).toBeLessThan(h.log.indexOf("restart"));
     expect(attachPtyOutput).toHaveBeenCalledOnce();
 
@@ -844,6 +851,29 @@ describe("TerminalPane exited shell", () => {
     const replacement = vi.mocked(attachPtyOutput).mock.calls[1][1];
     remounted.unmount();
     expect(unregisterCallback.mock.calls).toEqual([[original.id], [replacement.id]]);
+  });
+
+  it("attaches to a shell another client restarted while the request was queued", async () => {
+    schedulerHarness();
+    h.status = { state: "exited", message: null, exit_code: 0 };
+    h.sessionState = "exited";
+    let finishAttach!: (generation: number) => void;
+    vi.mocked(attachPtyOutput).mockReturnValueOnce(new Promise(resolve => { finishAttach = resolve; }));
+    vi.mocked(restartTerminalSession).mockImplementationOnce(async (_sessionId, token) => (
+      token === h.restartToken
+    ));
+    const view = renderPane("sess-a");
+    await act(async () => {});
+    fireEvent.click(view.getByRole("button", { name: "Restart shell" }));
+
+    h.restartToken = "replacement-shell";
+    h.status = { state: "ready", message: null, exit_code: null };
+    h.sessionState = "ready";
+    await act(async () => finishAttach(1));
+
+    expect(restartTerminalSession).toHaveBeenCalledExactlyOnceWith("sess-a", "original-shell");
+    expect(h.log).not.toContain("restart-marker");
+    expect(attachPtyOutput).toHaveBeenCalledTimes(2);
   });
 
   it.each(["session closes", "host changes"])(
@@ -892,6 +922,9 @@ describe("TerminalPane exited shell", () => {
     expect(attachPtyOutput).toHaveBeenCalledOnce();
 
     await act(async () => fireEvent.click(view.getByRole("button", { name: "Retry" })));
+    expect(vi.mocked(restartTerminalSession).mock.calls).toEqual([
+      ["sess-a", "original-shell"], ["sess-a", "original-shell"],
+    ]);
     expect(attachPtyOutput).toHaveBeenCalledTimes(2);
   });
 

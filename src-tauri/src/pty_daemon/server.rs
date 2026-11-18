@@ -972,6 +972,7 @@ async fn spawn_pty(
     // the rt handle so we can hop back into the tokio world to drop the
     // session under the same `Mutex` everyone else uses.
     let wait_session_id = session_id.clone();
+    let wait_session = Arc::downgrade(&session);
     let wait_state = state.clone();
     let wait_tx = tx;
     let wait_exit_code = exit_code;
@@ -992,17 +993,20 @@ async fn spawn_pty(
                 -1
             }
         };
-        // Record the exit code so late-attachers see it.
+        // Remove only this incarnation before telling a client it can restart.
+        // Close may have already removed it and a same-id spawn may own the slot.
         rt_handle.block_on(async {
+            let mut guard = wait_state.lock().await;
+            if guard.sessions.get(&wait_session_id).is_some_and(|session| {
+                std::ptr::eq(Arc::as_ptr(session), wait_session.as_ptr())
+            }) {
+                guard.sessions.remove(&wait_session_id);
+            }
+            drop(guard);
+            // Record the code for subscriptions that already obtained the session.
             let mut exit_code = wait_exit_code.lock().await;
             *exit_code = Some(code);
             let _ = wait_tx.send(SessionFrame::Exited(code));
-        });
-        // Evict from the daemon's session map so subsequent
-        // Write/Resize/Attach for this id error with "unknown session".
-        rt_handle.block_on(async {
-            let mut guard = wait_state.lock().await;
-            guard.sessions.remove(&wait_session_id);
         });
     });
 

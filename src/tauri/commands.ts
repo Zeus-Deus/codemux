@@ -350,8 +350,8 @@ export const activateTerminalSession = async (sessionId: string) => {
 export const closeTerminalSession = (sessionId: string) =>
   invoke<string>("close_terminal_session", { sessionId });
 
-export const restartTerminalSession = (sessionId: string) =>
-  invoke("restart_terminal_session", { sessionId });
+export const restartTerminalSession = (sessionId: string, expectedRestartToken?: string) =>
+  invoke<boolean | null | void>("restart_terminal_session", { sessionId, expectedRestartToken });
 
 export const createWorkspace = (cwd: string | null = null) =>
   invoke<string>("create_workspace", { cwd });

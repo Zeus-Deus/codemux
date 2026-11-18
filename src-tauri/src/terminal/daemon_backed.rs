@@ -337,10 +337,12 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
     let hydration_started = std::time::Instant::now();
     let terminal_state: State<'_, PtyState> = app.state();
     let sessions = terminal_state.sessions.clone();
-    let pending: Vec<PtyHydrationSession> = plan
+    let pending: Vec<_> = plan
         .sessions
         .into_iter()
-        .filter(|session| !super::is_session_spawn_active(&sessions, &session.session_id))
+        .filter_map(|session| {
+            super::idle_restart_token(&sessions, &session.session_id).map(|token| (session, token))
+        })
         .collect();
     if pending.is_empty() {
         crate::diagnostics::record_perf_timing(
@@ -353,8 +355,8 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
     let workspace = Arc::new(plan.workspace);
     let is_remote = workspace.host_id.is_some();
     if is_remote {
-        for session in &pending {
-            emit_terminal_status(
+        for (session, token) in &pending {
+            super::emit_terminal_status_if_current(
                 &app,
                 &sessions,
                 TerminalStatusPayload {
@@ -366,6 +368,7 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
                     ),
                     exit_code: None,
                 },
+                Some(*token),
             );
         }
     }
@@ -413,7 +416,7 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
     // env derivation stay off the async worker. One preparation task serves
     // every pane in the workspace.
     let prep_workspace = workspace.clone();
-    let prep_sessions = pending.clone();
+    let prep_sessions: Vec<_> = pending.iter().map(|(session, _)| session.clone()).collect();
     let prep_device_dir = device_dir.clone();
     let prepared = tokio::task::spawn_blocking(move || {
         let mut workspace_env =
@@ -469,7 +472,7 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
     let (workspace_env, mut disk_meta, shell, session_restore_enabled) = prepared;
 
     let mut work = Vec::with_capacity(pending.len());
-    for session in pending {
+    for (session, token) in pending {
         let prior = existing.remove(&session.session_id);
         let meta = disk_meta.remove(&session.session_id);
         let session_id = session.session_id.clone();
@@ -491,6 +494,7 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
                 device_dir,
                 shell,
                 session_restore_enabled,
+                token,
             )
             .await;
             (session_id, result)
@@ -527,6 +531,7 @@ async fn spawn_prepared_session<R: Runtime>(
     device_dir: Option<String>,
     shell: String,
     session_restore_enabled: bool,
+    expected_restart_token: uuid::Uuid,
 ) -> Result<(), DaemonHydrationFailure> {
     let session_id = session.session_id.clone();
     let entry_ts = std::time::Instant::now();
@@ -535,13 +540,18 @@ async fn spawn_prepared_session<R: Runtime>(
     let app_state: State<'_, AppStateStore> = app.state();
     let sessions = terminal_state.sessions.clone();
 
-    let Some(mut reservation) = SessionSpawnReservation::try_new(&sessions, &session_id) else {
+    let Some(mut reservation) = SessionSpawnReservation::try_new(
+        &sessions,
+        &session_id,
+        Some(expected_restart_token),
+    ) else {
         crate::trace_cloud_push!(
             "[trace:{session_id}] try_reserve FAILED at t={}ms",
             entry_ts.elapsed().as_millis()
         );
         return Err(DaemonHydrationFailure::AlreadyReserved);
     };
+    let restart_token = reservation.restart_token;
     let workspace_id = workspace.workspace_id.clone();
     let host_id = workspace.host_id;
     let is_remote = host_id.is_some();
@@ -1058,6 +1068,7 @@ async fn spawn_prepared_session<R: Runtime>(
             &read_sessions,
             &read_session_id,
             &read_client,
+            restart_token,
             "Shell ended",
         );
     });

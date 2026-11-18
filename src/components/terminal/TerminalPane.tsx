@@ -101,7 +101,7 @@ const OVERLAY_FADE_MS = 150;
 const LINK_HINT = "Ctrl+click to open";
 
 // A shell restart belongs to the session even when its pane is remounted.
-const pendingRestarts = new Map<string, Promise<boolean>>();
+const pendingRestarts = new Map<string, Promise<boolean | null>>();
 
 const EXIT_CHIP_CLASS =
   "status-meta inline-flex items-center rounded-sm px-1.5 py-0.5 text-label font-mono";
@@ -266,7 +266,11 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   // static slots. The Tailwind classes on the slots define the look;
   // `describeTerminalStatus` decides which are visible.
   const updateStatusOverlay = useCallback((status: TerminalStatusPayload) => {
-    statusRef.current = status;
+    const previous = statusRef.current;
+    // Local overlays can change the message without observing a new shell.
+    statusRef.current = status.restart_token === undefined && previous.session_id === status.session_id
+      ? { ...status, restart_token: previous.restart_token }
+      : status;
     if (status.state === "ready") {
       const target = getSessionWorkspaceId(status.session_id) ?? undefined;
       markPaneReady("terminal", { target });
@@ -1048,10 +1052,22 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       return attaching;
     };
 
+    const showTerminalStatus = (status: TerminalStatusPayload) => {
+      const session = useAppStore.getState().appState?.terminal_sessions.find(
+        (session) => session.session_id === sid,
+      );
+      updateStatusOverlay(reconcileMountedStatus(status, session));
+    };
+
     restartRef.current = async () => {
       if (cancelled || restarting || pendingRestarts.has(restartKey)) return;
+      const observedStatus = statusRef.current;
+      if (observedStatus.session_id !== sid || (observedStatus.state !== "exited" && observedStatus.state !== "failed")) {
+        return;
+      }
       restarting = true;
       const epoch = ++outputEpoch;
+      const restartToken = observedStatus.restart_token;
       releaseOutputChannel();
       const generation = attachedGenerationRef.current;
       attachedSessionRef.current = null;
@@ -1068,23 +1084,41 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         exit_code: null,
       });
       const restart = (async () => {
+        // Retry can be offered after a local read or attach failure, before
+        // this pane has observed a shell token.
+        const statusAtClick = restartToken === undefined ? getTerminalStatus(sid).catch(() => null) : null;
         // Finish any issued startup resize or attach before replacing the
         // PTY. A late detach could otherwise hit a reused generation.
         if (pendingOutputIpc) await pendingOutputIpc;
-        if (remoteViewHost() !== host) return false;
+        if (remoteViewHost() !== host) return null;
         if (generation != null) await detachPtyOutput(sid, generation).catch(console.error);
+        if (remoteViewHost() !== host) return null;
+
+        let expectedToken = restartToken;
+        if (statusAtClick) {
+          const status = await statusAtClick;
+          if (!status) throw new Error("Could not read terminal status");
+          if (remoteViewHost() !== host) return null;
+          if (status.state !== "exited" && status.state !== "failed") return false;
+          expectedToken = status.restart_token;
+          if (expectedToken === undefined) {
+            // Older hosts lack a token. Recheck the live state just before
+            // making their unguarded restart call.
+            const current = await getTerminalStatus(sid);
+            if (remoteViewHost() !== host) return null;
+            if (current.state !== "exited" && current.state !== "failed") return false;
+          }
+        }
         const { appState } = useAppStore.getState();
         // A closed session may disappear while its pane's IPC drains.
-        const sessionClosed = appState && !appState.terminal_sessions.some(
-          (session) => session.session_id === sid,
-        );
-        if (remoteViewHost() !== host || sessionClosed) return false;
-        await restartTerminalSession(sid);
-        return true;
+        if (appState && !appState.terminal_sessions.some((session) => session.session_id === sid)) {
+          return null;
+        }
+        return (await restartTerminalSession(sid, expectedToken)) !== false;
       })();
       pendingRestarts.set(restartKey, restart);
       try {
-        let restarted: boolean;
+        let restarted: boolean | null;
         try {
           restarted = await restart;
         } catch (err) {
@@ -1099,10 +1133,16 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         } finally {
           pendingRestarts.delete(restartKey);
         }
-        if (!restarted || !ownsOutput(epoch)) return;
-        pump.enqueue(
-          new TextEncoder().encode("\r\n\x1b[2m── shell restarted ──\x1b[0m\r\n\r\n"),
-        );
+        if (restarted === null || !ownsOutput(epoch) || remoteViewHost() !== host) return;
+        if (restarted) {
+          pump.enqueue(
+            new TextEncoder().encode("\r\n\x1b[2m── shell restarted ──\x1b[0m\r\n\r\n"),
+          );
+        } else {
+          const status = await getTerminalStatus(sid).catch(() => null);
+          if (!ownsOutput(epoch) || remoteViewHost() !== host) return;
+          if (status) showTerminalStatus(status);
+        }
         if (await attachOutput(epoch) && ownsOutput(epoch)) term.focus();
       } finally {
         restarting = false;
@@ -1165,10 +1205,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
       // Update overlay from whichever result we got.
       if (statusResult.status === "fulfilled") {
-        const session = useAppStore
-          .getState()
-          .appState?.terminal_sessions.find((s) => s.session_id === sid);
-        updateStatusOverlay(reconcileMountedStatus(statusResult.value, session));
+        showTerminalStatus(statusResult.value);
       } else {
         updateStatusOverlay({
           session_id: sid,
