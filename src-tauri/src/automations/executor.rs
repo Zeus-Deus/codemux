@@ -371,6 +371,14 @@ fn resolve_clone(remote: &str, repos_dir: &Path, clone_cwd: &Path) -> Result<Pat
     Ok(clone_dir)
 }
 
+// Store clone progress in the length of the per-checkout lock file.
+const CLONE_IN_PROGRESS: u64 = 1;
+const CLONE_FAILED: u64 = 2;
+
+fn record_clone_state(lock: &std::fs::File, state: u64) -> std::io::Result<()> {
+    lock.set_len(state).and_then(|_| lock.sync_data())
+}
+
 /// Clone `remote` into `clone_dir` if absent; otherwise `git fetch` it.
 /// Git authenticates with the host's own credentials — Codemux injects
 /// no token (matching Superset's clone behaviour).
@@ -381,8 +389,7 @@ fn ensure_clone(source: &CloneSource<'_>, clone_dir: &Path) -> Result<(), String
     std::fs::create_dir_all(&locks)
         .map_err(|error| format!("Failed to create automation checkout lock directory: {error}"))?;
     let lock_path = locks.join(name);
-    // Keep the lock file in place so concurrent runs always lock the same
-    // file. A nonempty lock file records a clone with an unconfirmed outcome.
+    // Keep the lock file in place so concurrent runs always lock the same file.
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -393,12 +400,22 @@ fn ensure_clone(source: &CloneSource<'_>, clone_dir: &Path) -> Result<(), String
     let lock = options.open(&lock_path)
         .map_err(|error| format!("Failed to open automation checkout lock: {error}"))?;
     lock.lock().map_err(|error| format!("Failed to lock automation checkout: {error}"))?;
-    if lock.metadata().map_err(|error| format!("Failed to read automation checkout lock: {error}"))?.len() != 0 {
-        return Err(format!(
-            "Git did not report completion for the interrupted automation clone at {}. Its incomplete marker is {}",
-            clone_dir.display(),
-            lock_path.display(),
-        ));
+    let state = lock.metadata().map_err(|error| format!("Failed to read automation checkout lock: {error}"))?.len();
+    match state {
+        0 => {}
+        CLONE_FAILED => {
+            preserve_failed_clone(clone_dir, &locks)
+                .map_err(|error| format!("Failed to preserve the incomplete checkout at {}: {error}", clone_dir.display()))?;
+            record_clone_state(&lock, 0)
+                .map_err(|error| format!("Failed to clear the automation checkout's incomplete marker: {error}"))?;
+        }
+        _ => {
+            return Err(format!(
+                "Git did not report completion for the interrupted automation clone at {}. Its incomplete marker is {}",
+                clone_dir.display(),
+                lock_path.display(),
+            ));
+        }
     }
 
     if clone_dir.join(".git").exists() {
@@ -431,7 +448,7 @@ fn ensure_clone(source: &CloneSource<'_>, clone_dir: &Path) -> Result<(), String
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("Failed to inspect automation checkout: {error}")),
     }
-    lock.set_len(1).and_then(|_| lock.sync_data())
+    record_clone_state(&lock, CLONE_IN_PROGRESS)
         .map_err(|error| format!("Failed to mark automation checkout incomplete: {error}"))?;
     // Initialize .git at its final location so clone and fetch see the same
     // destination-scoped Git config.
@@ -453,22 +470,45 @@ fn ensure_clone(source: &CloneSource<'_>, clone_dir: &Path) -> Result<(), String
             if output.status.success() {
                 Ok(())
             } else {
-                let message = format!("git clone failed: {}", String::from_utf8_lossy(&output.stderr).trim());
-                // Git removes its own failed clone. Only remove an empty
-                // directory here, and retain the marker if files remain.
-                if let Err(error) = std::fs::remove_dir(clone_dir) {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        return Err(format!("{message}\nThe checkout remains incomplete at {}: {error}", clone_dir.display()));
-                    }
+                let mut message = format!("git clone failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+                record_clone_state(&lock, CLONE_FAILED)
+                    .map_err(|error| format!("{message}\nFailed to record the clone failure: {error}"))?;
+                match preserve_failed_clone(clone_dir, &locks) {
+                    Ok(Some(saved)) => message.push_str(&format!(
+                        "\nThe incomplete checkout was moved to {}.",
+                        saved.display(),
+                    )),
+                    Ok(None) => {}
+                    Err(error) => return Err(format!(
+                        "{message}\nThe checkout remains incomplete at {}: {error}",
+                        clone_dir.display(),
+                    )),
                 }
                 Err(message)
             }
         }
         Err(error) => Err(format!("Failed to run git clone: {error}")),
     };
-    lock.set_len(0).and_then(|_| lock.sync_data())
+    record_clone_state(&lock, 0)
         .map_err(|error| format!("Failed to clear the automation checkout's incomplete marker: {error}"))?;
     result
+}
+
+/// Called under the checkout lock after Git has reported failure. Preserve
+/// files left by a failed checkout so the original path can be retried.
+fn preserve_failed_clone(clone_dir: &Path, locks: &Path) -> std::io::Result<Option<PathBuf>> {
+    match std::fs::remove_dir(clone_dir) {
+        Ok(()) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            let recovery = tempfile::Builder::new().prefix("failed-clone-").tempdir_in(locks)?;
+            let saved = recovery.path().join("checkout");
+            std::fs::rename(clone_dir, &saved)?;
+            let _ = recovery.keep();
+            Ok(Some(saved))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// `origin/<default-branch>` for a clone, resolved via `origin/HEAD`.
@@ -900,6 +940,80 @@ mod tests {
         assert!(checkout.join("retry.txt").is_file());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resolve_clone_retries_and_preserves_files_after_checkout_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::test_isolation::isolated(
+            "automations::executor::tests::resolve_clone_retries_and_preserves_files_after_checkout_failure",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        create_bare_remote_with_marker(&source, "tracked.txt");
+        let hooks = root.path().join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let hook = hooks.join("post-checkout");
+        std::fs::write(&hook, r#"#!/bin/sh
+if [ ! -f "$0.ran" ]; then
+    : > "$0.ran"
+    printf '%s' 'first checkout data' > first-attempt.txt
+    printf '%s\n' 'fixture checkout hook failed' >&2
+    exit 1
+fi
+"#).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(root.path(), &["config", "--global", "core.hooksPath", hooks.to_str().unwrap()]);
+
+        let remote = source.join("repo.git");
+        let remote = remote.to_str().unwrap();
+        let cache = root.path().join("cache");
+        let error = resolve_clone(remote, &cache, root.path()).unwrap_err();
+        assert!(error.contains("fixture checkout hook failed"), "{error}");
+
+        let checkout = resolve_clone(remote, &cache, root.path()).unwrap();
+        assert!(checkout.join("tracked.txt").is_file());
+        assert!(!checkout.join("first-attempt.txt").exists());
+
+        let mut preserved = std::fs::read_dir(cache.join(".locks")).unwrap()
+            .map(|entry| entry.unwrap().path().join("checkout"))
+            .filter(|path| path.is_dir());
+        let failed_checkout = preserved.next().expect("the failed checkout was preserved");
+        assert!(preserved.next().is_none());
+        assert!(failed_checkout.join(".git").is_dir());
+        assert!(failed_checkout.join("tracked.txt").is_file());
+        assert_eq!(
+            std::fs::read_to_string(failed_checkout.join("first-attempt.txt")).unwrap(),
+            "first checkout data",
+        );
+    }
+
+    #[test]
+    fn ensure_clone_recovers_a_recorded_failure_on_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let source = temp_repo();
+        let source = CloneSource::new(source.path().to_str().unwrap(), root.path());
+        let checkout = root.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        std::fs::write(checkout.join("leftover.txt"), "failed clone file").unwrap();
+        let locks = root.path().join(".locks");
+        std::fs::create_dir(&locks).unwrap();
+        let marker = std::fs::File::create(locks.join("checkout")).unwrap();
+        record_clone_state(&marker, CLONE_FAILED).unwrap();
+        drop(marker);
+
+        ensure_clone(&source, &checkout).unwrap();
+        assert!(checkout.join(".git").is_dir());
+        assert!(!checkout.join("leftover.txt").exists());
+        let saved = locks.read_dir().unwrap()
+            .map(|entry| entry.unwrap().path().join("checkout/leftover.txt"))
+            .find(|path| path.is_file())
+            .expect("the failed checkout was preserved");
+        assert_eq!(std::fs::read_to_string(saved).unwrap(), "failed clone file");
+    }
+
     #[test]
     fn ensure_clone_preserves_a_checkout_when_completion_is_unknown() {
         let root = tempfile::tempdir().unwrap();
@@ -907,7 +1021,9 @@ mod tests {
         let source = CloneSource::new(source.path().to_str().unwrap(), root.path());
         let checkout = root.path().join("checkout");
         ensure_clone(&source, &checkout).unwrap();
-        std::fs::write(root.path().join(".locks/checkout"), [1]).unwrap();
+        let marker = std::fs::File::create(root.path().join(".locks/checkout")).unwrap();
+        record_clone_state(&marker, CLONE_IN_PROGRESS).unwrap();
+        drop(marker);
 
         let error = ensure_clone(&source, &checkout).unwrap_err();
         assert!(error.contains("Git did not report completion"), "{error}");
