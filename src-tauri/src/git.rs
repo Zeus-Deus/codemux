@@ -2031,7 +2031,12 @@ fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Res
                     checkout.display()
                 )
             })?,
-        None => run_git(repo_path, &["update-ref", &base_ref, commit]).map(|_| ())?,
+        // Checked out nowhere, so only the ref moves. `branch -f` rather than
+        // `update-ref`: git refuses it for a branch any worktree has in use
+        // without it being HEAD — mid-rebase or mid-bisect — which the
+        // lookups above cannot see. The move was checked to be a
+        // fast-forward before this point.
+        None => run_git(repo_path, &["branch", "-f", "--end-of-options", base_branch, commit]).map(|_| ())?,
     }
     let now = run_git(repo_path, &["rev-parse", "--verify", &base_ref])?;
     if now.trim() != commit {
@@ -7096,6 +7101,36 @@ mod tests {
         let result = merge_into_base(&wt, "release", false).unwrap();
         assert_eq!(result.status, "merged");
         assert_eq!(std::fs::read_to_string(spaced.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[test]
+    fn test_merge_into_base_never_moves_a_base_being_rebased_elsewhere() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        // `release` is mid-rebase in its own worktree: HEAD is detached
+        // there, and the branch is only named by the rebase state.
+        let rel = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", "release", rel.to_str().unwrap()]).unwrap();
+        git_config(&rel);
+        std::fs::write(rel.join("r.txt"), "release work").unwrap();
+        run_git(&rel, &["add", "."]).unwrap();
+        run_git(&rel, &["commit", "-m", "release commit"]).unwrap();
+        let _ = run_git(&rel, &["rebase", "--exec", "false", "HEAD~1"]);
+        let rebasing = |p: &Path| {
+            let dir = run_git(p, &["rev-parse", "--git-path", "rebase-merge"]).unwrap();
+            p.join(dir).is_dir()
+        };
+        assert!(rebasing(&rel), "precondition: the rebase is paused");
+        let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+
+        run_git(&wt, &["merge", "release"]).unwrap();
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        assert!(merge_into_base(&wt, "release", true).is_err());
+        assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+        assert!(rebasing(&rel), "the rebase is left as it was");
+        assert_eq!(run_git(&wt, &["branch", "--show-current"]).unwrap(), "feature");
     }
 
     #[test]
