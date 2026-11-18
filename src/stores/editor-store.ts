@@ -1,12 +1,25 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
+interface PendingSave {
+  /** Live buffer while the captured version is being saved. */
+  draft: string;
+  done: Promise<void>;
+}
+
+interface EditorSave {
+  previous?: Promise<void>;
+  ownsTab: () => boolean;
+  finish: (written?: string) => void;
+}
+
 export interface EditorTabState {
   filePath: string | null;
   baselineContent: string;
   isDirty: boolean;
   /** Unsaved buffer of an unmounted editor. Kept in memory only. */
   suspendedDraft?: string;
+  pendingSave?: PendingSave;
   /** Transient request from a source reference. Omitted from persistence.
    *  `endColumn` (exclusive) selects the range from `column`, e.g. a search hit. */
   revealRequest?: { line: number; column?: number; endColumn?: number; nonce: number };
@@ -26,6 +39,7 @@ interface EditorStore {
   setBaselineContent: (tabId: string, content: string) => void;
   setDirty: (tabId: string, dirty: boolean) => void;
   suspendDraft: (tabId: string, filePath: string, content: string) => void;
+  beginSave: (tabId: string, draft: string) => EditorSave;
   requestReveal: (tabId: string, line: number, column?: number, endColumn?: number) => void;
   clearReveal: (tabId: string, nonce: number) => void;
   removeTab: (tabId: string) => void;
@@ -79,6 +93,42 @@ export const useEditorStore = create<EditorStore>()(
         const tab = get().tabs[tabId];
         if (!tab?.isDirty || tab.filePath !== filePath) return;
         set((s) => ({ tabs: { ...s.tabs, [tabId]: { ...tab, suspendedDraft: content } } }));
+      },
+
+      beginSave: (tabId, draft) => {
+        const tab = get().tabs[tabId];
+        const previous = tab.pendingSave?.done;
+        let resolve!: () => void;
+        const done = new Promise<void>((release) => { resolve = release; });
+        // All saves for this open file share its current buffer. Each write
+        // waits for its predecessor before checking the disk version.
+        const pending = tab.pendingSave ?? { draft, done };
+        pending.done = done;
+        if (!tab.pendingSave) {
+          set((s) => ({ tabs: { ...s.tabs, [tabId]: { ...tab, pendingSave: pending } } }));
+        }
+        const ownsTab = () => get().tabs[tabId]?.pendingSave === pending;
+        return {
+          previous,
+          ownsTab,
+          finish(written) {
+            const tab = get().tabs[tabId];
+            // Closing the tab or changing files detaches the old save.
+            if (tab?.pendingSave === pending) {
+              const baselineContent = written ?? tab.baselineContent;
+              const isDirty = pending.draft !== baselineContent;
+              const updated = {
+                ...tab,
+                baselineContent,
+                isDirty,
+                suspendedDraft: isDirty ? pending.draft : undefined,
+                pendingSave: pending.done === done ? undefined : pending,
+              };
+              set((s) => ({ tabs: { ...s.tabs, [tabId]: updated } }));
+            }
+            resolve();
+          },
+        };
       },
 
       requestReveal: (tabId, line, column, endColumn) =>

@@ -233,8 +233,9 @@ export function EditorPane({
   );
 
   const checkDisk = useCallback(async () => {
-    const path = useEditorStore.getState().getTab(tabId)?.filePath;
-    if (!path || checkingDiskRef.current) return;
+    const tab = useEditorStore.getState().getTab(tabId);
+    const path = tab?.filePath;
+    if (!path || tab.pendingSave || checkingDiskRef.current) return;
     checkingDiskRef.current = true;
     const epoch = diskEpochRef.current;
     try {
@@ -258,54 +259,55 @@ export function EditorPane({
   // Save handler
   const handleSave = useCallback(async () => {
     const view = viewRef.current;
-    const path = useEditorStore.getState().getTab(tabId)?.filePath;
-    if (!view || !path) return;
+    const editor = useEditorStore.getState();
+    const tab = editor.getTab(tabId);
+    const path = tab?.filePath;
+    if (!view || !path || isLoadingRef.current) return;
 
     // A pending conflict means disk holds a version the user has not
     // chosen to replace yet; Reload or Keep mine decides, not Ctrl+S.
     if (diskConflictRef.current != null) return;
 
-    const c = view.state.doc.toString();
+    const submitted = view.state.doc.toString();
+    const knownSignature = tab.pendingSave ? null : diskSignatureRef.current;
+    const save = editor.beginSave(tabId, submitted);
+    let written: string | undefined;
+    diskEpochRef.current++;
     try {
+      if (save.previous) {
+        await save.previous;
+        if (!save.ownsTab() || (viewRef.current === view && diskConflictRef.current != null)) return;
+      }
       // Refuse to silently overwrite a version written since this buffer
       // last synced with disk (an agent edit, typically).
       const signature = await fileSignature(path).catch(() => null);
-      if (viewRef.current !== view || useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
-      if (signature !== null && signature !== diskSignatureRef.current) {
+      if (!save.ownsTab()) return;
+      if (signature !== null && signature !== knownSignature) {
         const disk = await readFile(path);
-        if (viewRef.current !== view || useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
-        diskSignatureRef.current = signature;
-        const baseline = useEditorStore.getState().getTab(tabId)?.baselineContent;
-        if (disk !== baseline && disk !== c) {
-          setDiskConflict(disk);
+        if (!save.ownsTab()) return;
+        if (viewRef.current === view) diskSignatureRef.current = signature;
+        const baseline = editor.getTab(tabId)?.baselineContent;
+        if (disk !== baseline && disk !== submitted) {
+          if (viewRef.current === view) setDiskConflict(disk);
           return;
         }
       }
-      diskEpochRef.current++;
-      await writeFile(path, c);
-      // Again after the write: a check that started while it was in flight
-      // may have read the old (or half-written) file.
-      diskEpochRef.current++;
-      // The tab may have moved files or remounted while the write awaited
-      // disk. Its current pane owns the baseline and unsaved edits now.
-      if (viewRef.current !== view || useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
+      await writeFile(path, submitted);
+      written = submitted;
+      if (!save.ownsTab() || viewRef.current !== view) return;
       // Unknown until the next check re-reads it, which also confirms the
       // write landed as this buffer.
       diskSignatureRef.current = null;
-      setBaselineContent(tabId, c);
-      // The write saves the captured buffer; edits made while it awaited
-      // disk still belong to the current buffer and must remain unsaved.
-      const current = view.state.doc.toString();
-      setDirty(tabId, current !== c);
-      setContent(current);
       setDiskConflict(null);
       flashNotice("saved");
     } catch (err) {
       toast.error(`Couldn't save ${path.split("/").pop() ?? path}`, {
         description: String(err),
       });
+    } finally {
+      save.finish(written);
     }
-  }, [tabId, setBaselineContent, setDirty, setDiskConflict, flashNotice]);
+  }, [tabId, setDiskConflict, flashNotice]);
 
   const reloadFromDisk = useCallback(() => {
     if (diskConflict == null) return;
@@ -337,7 +339,9 @@ export function EditorPane({
     const updateListener = EditorView.updateListener.of((update) => {
       if (update.docChanged && !isLoadingRef.current) {
         const c = update.state.doc.toString();
-        const baseline = useEditorStore.getState().getTab(tabId)?.baselineContent ?? "";
+        const tab = useEditorStore.getState().getTab(tabId);
+        if (tab?.pendingSave) tab.pendingSave.draft = c;
+        const baseline = tab?.baselineContent ?? "";
         setDirty(tabId, c !== baseline);
         setContent(c);
       }
@@ -440,14 +444,19 @@ export function EditorPane({
     const langPromise = loadLanguage(filePath);
 
     const tab = useEditorStore.getState().getTab(tabId);
-    if (tab?.isDirty && tab.suspendedDraft !== undefined) {
-      replaceDocument(view, tab.suspendedDraft, false);
-      setContent(tab.suspendedDraft);
+    const draft = tab?.pendingSave?.draft ?? (tab?.isDirty ? tab.suspendedDraft : undefined);
+    if (draft !== undefined) {
+      replaceDocument(view, draft, false);
+      setContent(draft);
       setLoadedFilePath(filePath);
       isLoadingRef.current = false;
       // Compare disk with the original baseline, just as if the pane had
       // stayed open. A changed or unreadable file must not replace the draft.
-      void checkDisk();
+      if (tab?.pendingSave) {
+        void tab.pendingSave.done.then(() => { if (!cancelled) void checkDisk(); });
+      } else {
+        void checkDisk();
+      }
     } else {
       void readFile(filePath)
         .then((c) => {
@@ -561,22 +570,10 @@ export function EditorPane({
     viewMode,
   ]);
 
-  // When switching back to raw, sync content from store in case it changed
+  // Rendered mode only hides CodeMirror; its document stays current.
   useEffect(() => {
-    if (viewMode === "raw" && viewRef.current && isMd) {
-      const view = viewRef.current;
-      const current = view.state.doc.toString();
-      if (current !== content && content) {
-        isLoadingRef.current = true;
-        view.dispatch({
-          changes: { from: 0, to: view.state.doc.length, insert: content },
-        });
-        isLoadingRef.current = false;
-      }
-      // Focus the editor when switching to raw
-      view.focus();
-    }
-  }, [viewMode, isMd, content]);
+    if (viewMode === "raw" && isMd) viewRef.current?.focus();
+  }, [viewMode, isMd, tabId]);
 
   if (!filePath) {
     return (
