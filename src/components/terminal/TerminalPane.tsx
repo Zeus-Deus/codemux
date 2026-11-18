@@ -71,6 +71,7 @@ import { createWritePump } from "./terminal-write-pump";
 import { createIdleScrollbackSerializer } from "./scrollback-idle-serializer";
 import { parkTeardown, flushTeardown } from "./deferred-teardown";
 import { useAppStore, getSessionWorkspaceId } from "@/stores/app-store";
+import { releaseRemoteChannel } from "@/remote/channel";
 import { useRemoteReconnectEpoch } from "@/remote/remote-connection-store";
 import {
   useTerminalCwdStore,
@@ -880,6 +881,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // Net: 3 sequential round-trips → 1 parallel pair + 1 = effectively
     // 2 round-trips per terminal on switch.
     let cancelled = false;
+    let outputChannel: Channel<unknown> | null = null;
     const attachStarted = performance.now();
 
     // ── Throttled write pump + PTY producer back-pressure ──
@@ -988,6 +990,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         scanKittyProtocol(bytes);
         pump.enqueue(bytes);
       });
+      outputChannel = channel;
 
       try {
         const generation = (await attachPtyOutput(sid, channel)) ?? null;
@@ -1014,6 +1017,10 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
           });
         }
       } catch (err) {
+        if (outputChannel === channel) {
+          releaseRemoteChannel(channel.id);
+          outputChannel = null;
+        }
         if (cancelled) return false;
         updateStatusOverlay({
           session_id: sid,
@@ -1056,6 +1063,10 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         return;
       }
       if (cancelled) return;
+      if (outputChannel) {
+        releaseRemoteChannel(outputChannel.id);
+        outputChannel = null;
+      }
       pump.enqueue(
         new TextEncoder().encode("\r\n\x1b[2m── shell restarted ──\x1b[0m\r\n\r\n"),
       );
@@ -1169,6 +1180,10 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // ── Cleanup ──
     return () => {
       cancelled = true;
+      if (outputChannel) {
+        releaseRemoteChannel(outputChannel.id);
+        outputChannel = null;
+      }
 
       const attachedGeneration = attachedGenerationRef.current;
       if (attachedSessionRef.current && attachedGeneration != null) {

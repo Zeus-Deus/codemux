@@ -24,6 +24,7 @@ const h = vi.hoisted(() => ({
   webgls: [] as { index: number; disposed: number }[],
   serializeCalls: 0,
   serializeAddons: 0,
+  nextChannelId: 0,
   mobile: false,
   tabCount: 1,
   split: false,
@@ -243,6 +244,7 @@ vi.mock("@/tauri/commands", () => ({
     h.log.push("uncache");
   }),
   Channel: class {
+    id = h.nextChannelId++;
     constructor(_onmessage: (payload: unknown) => void) {}
   },
 }));
@@ -685,10 +687,14 @@ describe("TerminalPane exited shell", () => {
     setTeardownScheduler(null);
     h.status = { state: "ready", message: null, exit_code: null };
     h.sessionState = "ready";
+    vi.unstubAllGlobals();
   });
 
   it("says the process exited and restarts the shell in place", async () => {
     schedulerHarness();
+    const unregisterCallback = vi.fn();
+    vi.stubGlobal("__CODEMUX_REMOTE__", true);
+    vi.stubGlobal("__TAURI_INTERNALS__", { unregisterCallback });
     h.status = { state: "exited", message: "Shell exited with code 2", exit_code: 2 };
     h.sessionState = "exited";
     const view = renderPane("sess-a");
@@ -698,6 +704,7 @@ describe("TerminalPane exited shell", () => {
     expect(view.getByText("Exit code 2")).toBeTruthy();
     expect(view.queryByText("Terminal starting")).toBeNull();
     expect(attachPtyOutput).toHaveBeenCalledTimes(1);
+    const first = vi.mocked(attachPtyOutput).mock.calls[0][1].id;
 
     await act(async () => {
       fireEvent.click(view.getByRole("button", { name: "Restart shell" }));
@@ -706,8 +713,12 @@ describe("TerminalPane exited shell", () => {
     expect(h.log).toContain("restart");
     // The respawned runtime has no subscribers, so the pane attaches again.
     expect(attachPtyOutput).toHaveBeenCalledTimes(2);
+    const second = vi.mocked(attachPtyOutput).mock.calls[1][1].id;
+    expect(unregisterCallback.mock.calls).toEqual([[first]]);
     // Still the same xterm: the old output stays above the restart marker.
     expect(h.terminals).toHaveLength(1);
+    view.unmount();
+    expect(unregisterCallback.mock.calls).toEqual([[first], [second]]);
   });
 
   it("hands focus to Restart from the terminal but not from the find bar", async () => {

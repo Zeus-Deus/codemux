@@ -219,10 +219,7 @@ export function installShim(options: InstallShimOptions): ShimHandle {
       } catch (err) {
         console.error(`[web-remote] listener for "${event}" threw:`, err);
       }
-      if (cb.once) {
-        callbacks.delete(callbackId);
-        removeListener(event, eventId);
-      }
+      if (cb.once) removeListener(event, eventId);
     }
   }
 
@@ -246,7 +243,9 @@ export function installShim(options: InstallShimOptions): ShimHandle {
    *  refcount only once. */
   function removeListener(event: string, eventId: number): void {
     const map = eventListeners.get(event);
-    if (!map || !map.has(eventId)) return;
+    const callbackId = map?.get(eventId);
+    if (!map || callbackId === undefined) return;
+    callbacks.delete(callbackId);
     map.delete(eventId);
     if (map.size === 0) eventListeners.delete(event);
     const next = (eventRefcount.get(event) ?? 1) - 1;
