@@ -53,7 +53,6 @@ fn fixture_command(program: &str, root: &Path) -> Command {
         .env("CODEMUX_API_URL", "http://127.0.0.1:1")
         .env("CODEMUX_DISABLE_PTY_DAEMON", "1")
         .env("CODEMUX_GDK_BACKEND", "x11")
-        .env("CODEMUX_WEBKIT_COMPAT", "1")
         .env("GIO_USE_VFS", "local")
         .env("NO_AT_BRIDGE", "1")
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -94,7 +93,7 @@ fn xdotool(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 #[test]
-#[ignore = "requires xvfb-run, dbus-run-session, openbox, xdotool, and xmessage"]
+#[ignore = "requires xvfb-run, dbus-run-session, openbox, xdotool, xmessage, and WebKitGTK 2.40+"]
 fn duplicate_desktop_launch_focuses_the_layout_owner() {
     if std::env::var_os(ISOLATED_DISPLAY).is_none() {
         let session = tempfile::tempdir().unwrap();
@@ -160,6 +159,7 @@ fn duplicate_desktop_launch_focuses_the_layout_owner() {
     let log = std::fs::File::create(&primary_log).unwrap();
     let mut primary = Process::spawn(
         fixture_command(CODEMUX, root)
+            .env("CODEMUX_WEBKIT_COMPAT", "1")
             .stdout(log.try_clone().unwrap())
             .stderr(log),
     );
@@ -234,6 +234,16 @@ fn duplicate_desktop_launch_focuses_the_layout_owner() {
         (xdotool(root, &["getactivewindow"]).as_deref() == Some(other.as_str())).then_some(())
     });
 
+    let sentinel = root
+        .join("data")
+        .join(codemux_lib::APP_DIR_NAME)
+        .join("webview-renderer.sentinel");
+    assert!(
+        !sentinel.try_exists().unwrap(),
+        "the compatibility-forced primary armed the crash sentinel"
+    );
+    // Only the primary requested compatibility. This launch would use the
+    // accelerated renderer if it were creating a window of its own.
     let mut duplicate = Process::spawn(&mut fixture_command(CODEMUX, root));
     let status = eventually("duplicate launched its own desktop", || {
         duplicate.0.try_wait().unwrap()
@@ -242,6 +252,11 @@ fn duplicate_desktop_launch_focuses_the_layout_owner() {
     eventually("duplicate did not focus the existing desktop", || {
         (xdotool(root, &["getactivewindow"]).as_deref() == Some(main.as_str())).then_some(())
     });
+    assert!(
+        !sentinel.try_exists().unwrap(),
+        "the forwarded launch armed the crash sentinel: {:?}",
+        std::fs::read_to_string(&sentinel)
+    );
     assert!(primary.0.try_wait().unwrap().is_none());
     let contender = std::fs::OpenOptions::new()
         .read(true)

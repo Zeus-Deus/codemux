@@ -488,10 +488,10 @@ pub fn run() {
     // GDK_BACKEND: forces Wayland-native when available, preventing XWayland fallback
     // (which triggers unintended Hyprland window rules on AppImage builds).
     #[cfg(target_os = "linux")]
-    {
+    let track_renderer_startup = {
         webview_tuning::configure_gdk_backend_env();
-        webview_tuning::configure_renderer_env();
-    }
+        webview_tuning::configure_renderer_env()
+    };
 
     #[cfg(debug_assertions)]
     {
@@ -527,12 +527,6 @@ pub fn run() {
                     cwd
                 ));
             }
-            // A duplicate launch bumps the renderer crash sentinel in a
-            // process that exits before it ever builds a window. This
-            // instance is demonstrably healthy, so clear that increment
-            // rather than let repeated duplicate launches look like repeated
-            // renderer crashes.
-            crate::webview_tuning::mark_startup_successful();
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -540,14 +534,20 @@ pub fn run() {
         },
     ));
 
-    build_core_app(builder, AppMode::Gui, None)
+    let app = build_core_app(builder, AppMode::Gui, None)
         .build(app_context())
         .unwrap_or_else(|error| {
-            webview_tuning::mark_clean_exit();
             diagnostics::stderr_line(&format!("[codemux] Desktop startup failed: {error}"));
             std::process::exit(1);
-        })
-        .run(|app, event| {
+        });
+    // Build finishes duplicate routing and validates ownership. The first
+    // webview is created on the Ready event after the run loop starts.
+    #[cfg(target_os = "linux")]
+    if track_renderer_startup {
+        webview_tuning::arm_renderer_startup();
+    }
+    app.run(
+        |app, event| {
             if let tauri::RunEvent::Exit = event {
                 // Stop taking outside-assistant connections first.
                 mcp_connector::listener::stop(app);
@@ -614,7 +614,8 @@ pub fn run() {
                 // Tauri can launch a replacement process after this callback.
                 drop(app.state::<StartupLayout>().ownership.lock().unwrap().take());
             }
-        });
+        },
+    );
 }
 
 /// Run the headless `codemux serve` web-remote server on the main thread.
@@ -876,8 +877,8 @@ fn build_core_app<R: tauri::Runtime>(
         //
         // A finished load on the main window is also the app's first proof
         // that the webview came up, which clears the renderer crash sentinel
-        // armed before GTK init. `mode` is `Copy`, so the setup closure below
-        // still captures it too.
+        // armed just before the run loop. `mode` is `Copy`, so the setup
+        // closure below still captures it too.
         .on_page_load(move |webview, payload| {
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
                 // A new document is replacing the main page, so the old
