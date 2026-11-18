@@ -1804,22 +1804,36 @@ pub struct MergeIntoBaseResult {
     pub conflicted_files: Vec<ConflictFile>,
 }
 
-/// The worktree where `branch` is checked out, if any and still on disk.
-fn branch_worktree(repo_path: &Path, branch: &str) -> Option<PathBuf> {
-    let output = run_git(repo_path, &["worktree", "list", "--porcelain"]).ok()?;
+/// The worktree where `branch` is checked out, if any.
+///
+/// A checkout git still has registered but that cannot be reached (a
+/// removed or unmounted directory) is an error, not "checked out nowhere":
+/// moving the ref under it would leave its files and index describing the
+/// old commit. Records are read NUL-delimited, so any path parses.
+fn branch_worktree(repo_path: &Path, branch: &str) -> Result<Option<PathBuf>, String> {
+    let output = run_git(repo_path, &["worktree", "list", "--porcelain", "-z"])?;
     let target_ref = format!("refs/heads/{branch}");
     let mut current_path: Option<&str> = None;
 
-    for line in output.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
+    for field in output.split('\0') {
+        if let Some(path) = field.strip_prefix("worktree ") {
             current_path = Some(path);
-        } else if line.strip_prefix("branch ") == Some(target_ref.as_str()) {
-            return current_path.map(PathBuf::from).filter(|path| path.is_dir());
-        } else if line.is_empty() {
+        } else if field.strip_prefix("branch ") == Some(target_ref.as_str()) {
+            let Some(path) = current_path else { continue };
+            let path = PathBuf::from(path);
+            return if path.is_dir() {
+                Ok(Some(path))
+            } else {
+                Err(format!(
+                    "Cannot update {branch}: it is checked out at {}, which cannot be reached. Reconnect or remove that worktree first.",
+                    path.display()
+                ))
+            };
+        } else if field.is_empty() {
             current_path = None;
         }
     }
-    None
+    Ok(None)
 }
 
 /// Fast-forward `base_branch` to `commit`.
@@ -1834,7 +1848,7 @@ fn branch_worktree(repo_path: &Path, branch: &str) -> Option<PathBuf> {
 /// merged branch, which is only safe once the base really holds `commit`.
 fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Result<(), String> {
     let base_ref = format!("refs/heads/{base_branch}");
-    match branch_worktree(repo_path, base_branch) {
+    match branch_worktree(repo_path, base_branch)? {
         // Defaults that would bend the fast-forward are overridden:
         // - `--no-squash`: a `branch.<base>.mergeOptions=--squash` default
         //   stages the changes, leaves HEAD where it was, and exits 0;
@@ -6623,6 +6637,26 @@ mod tests {
             run_git(&repo, &["stash", "list"]).unwrap().is_empty(),
             "nothing may be left in a stash"
         );
+    }
+
+    #[test]
+    fn test_merge_into_base_refuses_a_base_checked_out_somewhere_unreachable() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        // `release` is checked out in a worktree whose directory is gone
+        // (an unmounted drive, say) while git still has it registered.
+        let release_wt = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", "release", release_wt.to_str().unwrap()]).unwrap();
+        let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+        std::fs::rename(&release_wt, dir.path().join("unplugged")).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        let err = merge_into_base(&wt, "release", true).unwrap_err();
+        assert!(err.contains("cannot be reached"), "unexpected error: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+        assert_eq!(run_git(&wt, &["branch", "--show-current"]).unwrap(), "feature");
     }
 
     #[test]
