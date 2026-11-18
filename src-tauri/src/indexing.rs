@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 #[cfg(any(unix, windows))]
@@ -126,30 +126,95 @@ pub struct IndexSearchResult {
     pub matched_symbols: Vec<String>,
 }
 
+#[cfg(unix)]
+type DirectoryId = (u64, u64);
+#[cfg(windows)]
+type DirectoryId = (u64, u128);
+
+fn directory_id(dir: &Dir) -> io::Result<DirectoryId> {
+    #[cfg(unix)]
+    {
+        let metadata = dir.dir_metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        crate::windows_file_id::file_id(&dir.try_clone()?.into_std_file())
+    }
+}
+
+struct ProjectRoot {
+    path: PathBuf,
+    id: Option<DirectoryId>,
+}
+
+impl ProjectRoot {
+    fn new(path: &Path, dir: &Dir) -> Self {
+        Self {
+            path: path.to_owned(),
+            id: directory_id(dir).ok(),
+        }
+    }
+
+    fn same_directory(&self, other: &Self) -> bool {
+        self.id.is_some() && self.id == other.id && self.path == other.path
+    }
+}
+
+struct ActiveIndex {
+    snapshot: Arc<ProjectIndexSnapshot>,
+    // The allocation identifies one watch registration, even if a user
+    // switches away and back to exactly the same directory.
+    binding: Option<Arc<ProjectRoot>>,
+    watcher: Option<RecommendedWatcher>,
+}
+
+impl ActiveIndex {
+    fn is_bound_to(&self, binding: &Arc<ProjectRoot>) -> bool {
+        self.binding
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, binding))
+    }
+
+    fn watches(&self, project: &ProjectRoot) -> bool {
+        self.watcher.is_some()
+            && self
+                .binding
+                .as_ref()
+                .is_some_and(|active| active.same_directory(project))
+    }
+}
+
+struct IndexState {
+    active: Mutex<ActiveIndex>,
+    // Serialize scans and changes of selection without blocking search readers.
+    writer: Mutex<()>,
+}
+
 pub struct ProjectIndexStore {
-    inner: Arc<Mutex<Arc<ProjectIndexSnapshot>>>,
+    inner: Arc<IndexState>,
 }
 
 impl Default for ProjectIndexStore {
     fn default() -> Self {
-        // Start with an empty index. The actual project root is set later in
-        // setup() once the active workspace is known, avoiding the old bug
-        // where env::current_dir() (often $HOME) was scanned.
         Self {
-            inner: Arc::new(Mutex::new(Arc::new(default_index(PathBuf::new())))),
+            inner: Arc::new(IndexState {
+                active: Mutex::new(ActiveIndex {
+                    snapshot: Arc::new(default_index(PathBuf::new())),
+                    binding: None,
+                    watcher: None,
+                }),
+                writer: Mutex::new(()),
+            }),
         }
     }
 }
 
 impl ProjectIndexStore {
-    /// Load the cached index and keep the same root open for watcher rebuilds.
     pub fn initialize_for_project(&self, project_root: PathBuf) {
-        let opened = project_root.canonicalize().and_then(|path| {
-            let dir = open_project_dir(&path)?;
-            Ok((path, dir))
-        });
-        let (watch_root, dir) = match opened {
-            Ok(opened) => opened,
+        let _writer = self.inner.writer.lock().unwrap();
+        let dir = match open_project_dir(&project_root) {
+            Ok(dir) => dir,
             Err(error) => {
                 eprintln!(
                     "[codemux::index] Failed to open {}: {error}",
@@ -159,46 +224,83 @@ impl ProjectIndexStore {
                 return;
             }
         };
+        let binding = Arc::new(ProjectRoot::new(&project_root, &dir));
+        if self.inner.active.lock().unwrap().watches(&binding) {
+            return;
+        }
         let cache = IndexCache::for_project(&project_root, &dir);
-        let pending = self.restore_cached_index(&project_root, &dir, &cache);
-        spawn_index_watcher(
-            self.inner.clone(),
-            project_root,
-            watch_root,
-            dir,
-            cache,
-            pending,
-        );
+        let cached = cache.load(&project_root, &dir);
+        let pending = self.restore_cached_index(binding.clone(), cached);
+        let weak = Arc::downgrade(&self.inner);
+        std::thread::spawn(move || {
+            let witness = match retain_for_watching(&dir) {
+                Ok(witness) => witness,
+                Err(error) => {
+                    eprintln!("[codemux::index] Failed to retain watched directory: {error}");
+                    if let (Some(state), Some(expected)) = (weak.upgrade(), pending.as_ref()) {
+                        refresh_index(&state, &binding, || Ok(dir), &cache, Some(expected));
+                    }
+                    return;
+                }
+            };
+            let registered = watch_project(&binding, &dir);
+            drop(dir);
+            let events = {
+                let Some(state) = weak.upgrade() else { return };
+                let mut active = state.active.lock().unwrap();
+                if !active.is_bound_to(&binding) {
+                    return;
+                }
+                registered.map(|(watcher, events)| {
+                    active.watcher = Some(watcher);
+                    events
+                })
+            };
+            if let (Some(state), Some(expected)) = (weak.upgrade(), pending.as_ref()) {
+                refresh_index(
+                    &state,
+                    &binding,
+                    || open_for_watched_scan(&witness),
+                    &cache,
+                    Some(expected),
+                );
+            }
+            if let Some(events) = events {
+                watch_changes(&weak, &binding, &cache, witness, events);
+            }
+        });
     }
 
-    /// A cache miss installs a placeholder that the first background scan can replace.
     fn restore_cached_index(
         &self,
-        project: &Path,
-        dir: &Dir,
-        cache: &IndexCache,
+        binding: Arc<ProjectRoot>,
+        cached: Option<ProjectIndexSnapshot>,
     ) -> Option<Arc<ProjectIndexSnapshot>> {
-        match cache.load(project, dir) {
-            Some(cached) => {
-                self.replace_snapshot(cached);
-                None
-            }
-            None => {
-                let empty = Arc::new(default_index(project.to_owned()));
-                *self.inner.lock().unwrap() = empty.clone();
-                Some(empty)
-            }
-        }
+        let missing = cached.is_none();
+        let snapshot = Arc::new(cached.unwrap_or_else(|| default_index(binding.path.clone())));
+        self.select(ActiveIndex {
+            snapshot: snapshot.clone(),
+            binding: Some(binding),
+            watcher: None,
+        });
+        missing.then_some(snapshot)
     }
 
-    /// Readers retain an immutable generation without cloning its file contents
-    /// or holding the store lock while searching.
+    fn select(&self, active: ActiveIndex) {
+        let previous = std::mem::replace(&mut *self.inner.active.lock().unwrap(), active);
+        drop(previous);
+    }
+
     pub fn snapshot(&self) -> Arc<ProjectIndexSnapshot> {
-        self.inner.lock().unwrap().clone()
+        self.inner.active.lock().unwrap().snapshot.clone()
     }
 
     fn replace_snapshot(&self, snapshot: ProjectIndexSnapshot) {
-        *self.inner.lock().unwrap() = Arc::new(snapshot);
+        self.select(ActiveIndex {
+            snapshot: Arc::new(snapshot),
+            binding: None,
+            watcher: None,
+        });
     }
 
     pub fn status(&self) -> ProjectIndexStatus {
@@ -218,6 +320,7 @@ pub fn rebuild_index(
     store: &ProjectIndexStore,
     project_root: Option<String>,
 ) -> Result<Arc<ProjectIndexSnapshot>, String> {
+    let _writer = store.inner.writer.lock().unwrap();
     let root = resolve_project_root(project_root)?;
     let dir = open_project_dir(&root).map_err(|error| {
         format!(
@@ -226,7 +329,39 @@ pub fn rebuild_index(
         )
     })?;
     let cache = IndexCache::for_project(&root, &dir);
-    rebuild_for_root(store, &root, &dir, &cache)
+    let binding = Arc::new(ProjectRoot::new(&root, &dir));
+    let reuse = store.inner.active.lock().unwrap().watches(&binding);
+    // A fresh registration buffers concurrent edits until its snapshot is published.
+    let registration = if reuse {
+        None
+    } else {
+        match retain_for_watching(&dir) {
+            Ok(witness) => {
+                watch_project(&binding, &dir).map(|(watcher, events)| (watcher, (witness, events)))
+            }
+            Err(error) => {
+                eprintln!("[codemux::index] Failed to retain watched directory: {error}");
+                None
+            }
+        }
+    };
+    let rebuild = prepare_rebuild(&root, &dir, &cache)?;
+    drop(dir);
+    let (watcher, events) = registration.unzip();
+    let publication = if reuse {
+        Publication::Manual
+    } else {
+        Publication::Select {
+            binding: binding.clone(),
+            watcher,
+        }
+    };
+    let snapshot = rebuild.publish(&store.inner, publication);
+    if let Some((witness, events)) = events {
+        let weak = Arc::downgrade(&store.inner);
+        std::thread::spawn(move || watch_changes(&weak, &binding, &cache, witness, events));
+    }
+    Ok(snapshot)
 }
 
 pub fn search_index(
@@ -298,71 +433,75 @@ fn register_index_watcher(
     Ok((watcher, events))
 }
 
-fn spawn_index_watcher(
-    store: Arc<Mutex<Arc<ProjectIndexSnapshot>>>,
-    project_root: PathBuf,
-    watch_root: PathBuf,
-    dir: Dir,
-    cache: IndexCache,
-    pending: Option<Arc<ProjectIndexSnapshot>>,
-) {
-    eprintln!(
-        "[codemux::index] Watching project root: {}",
-        project_root.display()
-    );
-    std::thread::spawn(move || {
-        // Register first so project changes during a cold scan are queued for the worker.
-        let registered = match register_index_watcher(&watch_root) {
-            Ok(registered) => Some(registered),
-            Err(error) => {
-                eprintln!(
-                    "[codemux::index] Failed to watch {}: {error}",
-                    project_root.display()
-                );
-                None
-            }
-        };
-        refresh_index_on_changes(
-            &store,
-            &project_root,
-            &watch_root,
-            dir,
-            &cache,
-            pending,
-            registered.as_ref().map(|(_, rx)| rx),
-        );
-    });
+fn retain_for_watching(dir: &Dir) -> io::Result<fs::File> {
+    let handle = dir.try_clone()?.into_std_file();
+    #[cfg(windows)]
+    {
+        reopen_watched_dir(&handle, true)
+    }
+    #[cfg(unix)]
+    {
+        Ok(handle)
+    }
 }
 
-fn refresh_index_on_changes(
-    store: &Mutex<Arc<ProjectIndexSnapshot>>,
-    project_root: &Path,
-    watch_root: &Path,
-    dir: Dir,
-    cache: &IndexCache,
-    pending: Option<Arc<ProjectIndexSnapshot>>,
-    events: Option<&Receiver<notify::Result<notify::Event>>>,
-) {
-    if let Some(expected) = pending {
-        refresh_index(store, project_root, &dir, cache, &expected);
-    }
-    let Some(rx) = events else { return };
-    // Keep the identity of the watched directory without locking its name
-    // between rebuilds.
+fn open_for_watched_scan(witness: &fs::File) -> io::Result<Dir> {
     #[cfg(windows)]
-    let watched = match reopen_watched_dir(&dir.into_std_file(), true) {
-        Ok(file) => file,
-        Err(error) => {
-            eprintln!("[codemux::index] Failed to retain watched directory: {error}");
+    let handle = reopen_watched_dir(witness, false)?;
+    #[cfg(unix)]
+    let handle = witness.try_clone()?;
+    Ok(Dir::from_std_file(handle))
+}
+
+struct ProjectEvents {
+    root: PathBuf,
+    rx: Receiver<notify::Result<notify::Event>>,
+}
+
+fn watch_project(project: &ProjectRoot, _dir: &Dir) -> Option<(RecommendedWatcher, ProjectEvents)> {
+    let register = || -> notify::Result<_> {
+        // Keep the selected directory pinned until the OS watcher has opened it.
+        #[cfg(windows)]
+        let root = pinned_windows_path(_dir)?;
+        #[cfg(unix)]
+        let root = project.path.canonicalize()?;
+        let (watcher, rx) = register_index_watcher(&root)?;
+        if let Some(id) = project.id {
+            if directory_id(&open_project_dir(&root)?)? != id {
+                return Err(notify::Error::generic(
+                    "Watched directory changed during registration",
+                ));
+            }
+        }
+        Ok((watcher, ProjectEvents { root, rx }))
+    };
+    register()
+        .map_err(|error| {
+            eprintln!(
+                "[codemux::index] Failed to watch {}: {error}",
+                project.path.display()
+            );
+        })
+        .ok()
+}
+
+fn watch_changes(
+    store: &Weak<IndexState>,
+    binding: &Arc<ProjectRoot>,
+    cache: &IndexCache,
+    witness: fs::File,
+    events: ProjectEvents,
+) {
+    let rx = &events.rx;
+    let is_current = || {
+        store
+            .upgrade()
+            .is_some_and(|state| state.active.lock().unwrap().is_bound_to(binding))
+    };
+    while let Ok(event) = rx.recv() {
+        if !is_current() {
             return;
         }
-    };
-
-    loop {
-        let event = match rx.recv() {
-            Ok(ev) => ev,
-            Err(_) => break,
-        };
         let event = match event {
             Ok(ev) => ev,
             Err(error) => {
@@ -379,7 +518,7 @@ fn refresh_index_on_changes(
         ) {
             continue;
         }
-        if !event_has_relevant_paths(&event, watch_root, cache) {
+        if !event_has_relevant_paths(&event, &events.root, cache) {
             continue;
         }
 
@@ -393,12 +532,15 @@ fn refresh_index_on_changes(
             }
             match rx.recv_timeout(remaining) {
                 Ok(Ok(ev)) => {
+                    if !is_current() {
+                        return;
+                    }
                     if !ev.paths.is_empty()
                         && matches!(
                             ev.kind,
                             EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
                         )
-                        && event_has_relevant_paths(&ev, watch_root, cache)
+                        && event_has_relevant_paths(&ev, &events.root, cache)
                     {
                         deadline = Instant::now() + INDEX_REBUILD_DEBOUNCE;
                     }
@@ -409,36 +551,52 @@ fn refresh_index_on_changes(
             }
         }
 
-        #[cfg(windows)]
-        let dir = match reopen_watched_dir(&watched, false) {
-            Ok(pinned) => Dir::from_std_file(pinned),
-            Err(error) => {
-                eprintln!(
-                    "[codemux::index] Failed to open watched directory for indexing: {error}"
-                );
-                continue;
-            }
-        };
-        let expected = store.lock().unwrap().clone();
-        refresh_index(store, project_root, &dir, cache, &expected);
+        let Some(state) = store.upgrade() else { return };
+        refresh_index(
+            &state,
+            binding,
+            || open_for_watched_scan(&witness),
+            cache,
+            None,
+        );
     }
 }
 
 fn refresh_index(
-    store: &Mutex<Arc<ProjectIndexSnapshot>>,
-    project_root: &Path,
-    dir: &Dir,
+    store: &IndexState,
+    binding: &Arc<ProjectRoot>,
+    open: impl FnOnce() -> io::Result<Dir>,
     cache: &IndexCache,
-    expected: &Arc<ProjectIndexSnapshot>,
+    expected: Option<&Arc<ProjectIndexSnapshot>>,
 ) {
-    if expected.project_root != project_root.to_string_lossy()
-        || !Arc::ptr_eq(&store.lock().unwrap(), expected)
-    {
-        return;
-    }
-    match prepare_rebuild(project_root, dir, cache) {
+    let _writer = store.writer.lock().unwrap();
+    let baseline = {
+        let active = store.active.lock().unwrap();
+        if !active.is_bound_to(binding)
+            || expected.is_some_and(|snapshot| !Arc::ptr_eq(&active.snapshot, snapshot))
+        {
+            return;
+        }
+        active.snapshot.clone()
+    };
+    let dir = match open() {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("[codemux::index] Failed to reopen watched directory: {error}");
+            return;
+        }
+    };
+    let rebuild = prepare_rebuild(&binding.path, &dir, cache);
+    drop(dir);
+    match rebuild {
         Ok(rebuild) => {
-            rebuild.publish(store, Some(expected));
+            rebuild.publish(
+                store,
+                Publication::Watch {
+                    binding,
+                    expected: &baseline,
+                },
+            );
         }
         Err(error) => eprintln!("[codemux::index] Failed to refresh index: {error}"),
     }
@@ -460,19 +618,9 @@ fn index_cache_dir() -> io::Result<PathBuf> {
 
 fn index_cache_path(cache_dir: &Path, root_path: &Path, root: &Dir) -> io::Result<PathBuf> {
     let mut hash = Sha256::new();
-    #[cfg(unix)]
-    {
-        let metadata = root.dir_metadata()?;
-        hash.update(metadata.dev().to_le_bytes());
-        hash.update(metadata.ino().to_le_bytes());
-    }
-    #[cfg(windows)]
-    {
-        let (volume, directory) =
-            crate::windows_file_id::file_id(&root.try_clone()?.into_std_file())?;
-        hash.update(volume.to_le_bytes());
-        hash.update(directory.to_le_bytes());
-    }
+    let (volume, directory) = directory_id(root)?;
+    hash.update(volume.to_le_bytes());
+    hash.update(directory.to_le_bytes());
     // The selected path distinguishes aliases. The handle distinguishes a worktree
     // replaced at the same path while an old watcher is publishing its last scan.
     hash.update(root_path.as_os_str().as_encoded_bytes());
@@ -582,6 +730,7 @@ fn load_cached_index(
     .then_some(cached.snapshot)
 }
 
+#[cfg(test)]
 fn rebuild_for_root(
     store: &ProjectIndexStore,
     project_root: &Path,
@@ -589,7 +738,25 @@ fn rebuild_for_root(
     cache: &IndexCache,
 ) -> Result<Arc<ProjectIndexSnapshot>, String> {
     let rebuild = prepare_rebuild(project_root, root, cache)?;
-    Ok(rebuild.publish(&store.inner, None))
+    Ok(rebuild.publish(
+        &store.inner,
+        Publication::Select {
+            binding: Arc::new(ProjectRoot::new(project_root, root)),
+            watcher: None,
+        },
+    ))
+}
+
+enum Publication<'a> {
+    Manual,
+    Select {
+        binding: Arc<ProjectRoot>,
+        watcher: Option<RecommendedWatcher>,
+    },
+    Watch {
+        binding: &'a Arc<ProjectRoot>,
+        expected: &'a Arc<ProjectIndexSnapshot>,
+    },
 }
 
 struct PreparedIndex<'a> {
@@ -600,21 +767,32 @@ struct PreparedIndex<'a> {
 impl PreparedIndex<'_> {
     fn publish(
         self,
-        store: &Mutex<Arc<ProjectIndexSnapshot>>,
-        expected: Option<&Arc<ProjectIndexSnapshot>>,
+        store: &IndexState,
+        publication: Publication<'_>,
     ) -> Arc<ProjectIndexSnapshot> {
-        let mut current = store.lock().unwrap();
-        if expected.is_some_and(|expected| !Arc::ptr_eq(&current, expected)) {
-            return current.clone();
-        }
+        let mut active = store.active.lock().unwrap();
+        let retired = match publication {
+            Publication::Watch { binding, expected } => {
+                if !active.is_bound_to(binding) || !Arc::ptr_eq(&active.snapshot, expected) {
+                    return active.snapshot.clone();
+                }
+                None
+            }
+            Publication::Select { binding, watcher } => {
+                active.binding = Some(binding);
+                std::mem::replace(&mut active.watcher, watcher)
+            }
+            Publication::Manual => None,
+        };
         if let Some((file, path)) = self.cache {
             if let Err(error) = file.persist(path) {
                 eprintln!("[codemux::index] Failed to save disk cache: {error}");
             }
         }
         let snapshot = Arc::new(self.snapshot);
-        let previous = std::mem::replace(&mut *current, snapshot.clone());
-        drop(current);
+        let previous = std::mem::replace(&mut active.snapshot, snapshot.clone());
+        drop(active);
+        drop(retired);
         drop(previous);
         snapshot
     }
@@ -1040,14 +1218,29 @@ fn current_time_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn wait_for_indexed_text(store: &ProjectIndexStore, query: &str) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while search_index(store, query, None).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "index did not refresh for {query}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     #[test]
     fn startup_rebuilds_an_old_cache_without_a_file_change() {
+        if crate::test_isolation::isolated(
+            "indexing::tests::startup_rebuilds_an_old_cache_without_a_file_change",
+        ) {
+            return;
+        }
         let project = tempfile::tempdir().unwrap();
-        let base = tempfile::tempdir().unwrap();
         let root = project.path().canonicalize().unwrap();
         fs::write(root.join("main.rs"), "fn searchable() {}").unwrap();
         let dir = open_project_dir(&root).unwrap();
-        let cache = IndexCache::at(base.path(), &root, &dir).unwrap();
+        let cache = IndexCache::for_project(&root, &dir);
         let IndexCache::File(path) = &cache else {
             panic!("expected a private cache path")
         };
@@ -1059,27 +1252,22 @@ mod tests {
             .unwrap();
 
         let store = ProjectIndexStore::default();
-        let pending = store.restore_cached_index(&root, &dir, &cache);
-        assert!(pending.is_some());
-        assert!(search_index(&store, "searchable", None).is_empty());
-        // No events are available to trigger a refresh.
-        let (sender, events) = channel();
-        drop(sender);
-        refresh_index_on_changes(
-            &store.inner,
-            &root,
-            &root,
-            dir.try_clone().unwrap(),
-            &cache,
-            pending,
-            Some(&events),
-        );
+        assert!(cache.load(&root, &dir).is_none());
+        store.initialize_for_project(root.clone());
+        wait_for_indexed_text(&store, "searchable");
         let hits = search_index(&store, "searchable", None);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].file_path, "main.rs");
+        let cached = cache.load(&root, &dir).unwrap();
+        drop(store);
         let restored = ProjectIndexStore::default();
-        assert!(restored.restore_cached_index(&root, &dir, &cache).is_none());
+        let binding = Arc::new(ProjectRoot::new(&root, &dir));
+        assert!(restored
+            .restore_cached_index(binding, Some(cached))
+            .is_none());
         assert_eq!(search_index(&restored, "searchable", None).len(), 1);
+        drop(dir);
+        project.close().unwrap();
     }
 
     #[test]
@@ -1096,12 +1284,19 @@ mod tests {
         let dir = open_project_dir(root).unwrap();
         let cache = IndexCache::for_project(root, &dir);
         let store = ProjectIndexStore::default();
-        let expected = store.restore_cached_index(root, &dir, &cache).unwrap();
+        let binding = Arc::new(ProjectRoot::new(root, &dir));
+        let expected = store.restore_cached_index(binding.clone(), None).unwrap();
         let late = prepare_rebuild(root, &dir, &cache).unwrap();
 
         fs::write(source, "fn newer() {}").unwrap();
         let published = rebuild_index(&store, Some(root.display().to_string())).unwrap();
-        late.publish(&store.inner, Some(&expected));
+        late.publish(
+            &store.inner,
+            Publication::Watch {
+                binding: &binding,
+                expected: &expected,
+            },
+        );
         assert!(Arc::ptr_eq(&published, &store.snapshot()));
         assert_eq!(search_index(&store, "newer", None).len(), 1);
         assert_eq!(
@@ -1112,40 +1307,83 @@ mod tests {
 
     #[test]
     fn editing_a_watched_file_refreshes_the_searchable_index() {
+        if crate::test_isolation::isolated(
+            "indexing::tests::editing_a_watched_file_refreshes_the_searchable_index",
+        ) {
+            return;
+        }
         let project = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
         let root = project.path().canonicalize().unwrap();
         let source = root.join("main.rs");
         fs::write(&source, "fn original() {}").unwrap();
-        let dir = open_project_dir(&root).unwrap();
-        let (watcher, events) = register_index_watcher(&root).unwrap();
         let store = ProjectIndexStore::default();
-        let disk_cache = IndexCache::at(cache.path(), &root, &dir).unwrap();
-        rebuild_for_root(&store, &root, &dir, &disk_cache).unwrap();
-        assert_eq!(search_index(&store, "original", None).len(), 1);
-
-        let (stopped, stop_ack) = channel();
-        let shared = store.inner.clone();
-        let worker = std::thread::spawn(move || {
-            refresh_index_on_changes(&shared, &root, &root, dir, &disk_cache, None, Some(&events));
-            stopped.send(()).unwrap();
-        });
+        store.initialize_for_project(root);
+        wait_for_indexed_text(&store, "original");
         fs::write(&source, "fn updated() {}").unwrap();
-
-        let timeout = Duration::from_secs(15);
-        let deadline = Instant::now() + timeout;
-        while search_index(&store, "updated", None).is_empty() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        drop(watcher);
-        stop_ack
-            .recv_timeout(timeout)
-            .expect("index watcher did not stop");
-        worker.join().unwrap();
+        wait_for_indexed_text(&store, "updated");
         assert!(search_index(&store, "original", None).is_empty());
         let hits = search_index(&store, "updated", None);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].file_path, "main.rs");
+        drop(store);
+        project.close().unwrap();
+    }
+
+    #[test]
+    fn replacing_a_watched_checkout_retires_queued_events_and_watches_the_replacement() {
+        if crate::test_isolation::isolated(
+            "indexing::tests::replacing_a_watched_checkout_retires_queued_events_and_watches_the_replacement",
+        ) {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let base = project.path().canonicalize().unwrap();
+        let selected = base.join("selected");
+        let moved = base.join("moved");
+        fs::create_dir(&selected).unwrap();
+        let source = selected.join("main.rs");
+        fs::write(&source, "fn former() {}").unwrap();
+        let store = ProjectIndexStore::default();
+        let path = selected.display().to_string();
+        rebuild_index(&store, Some(path.clone())).unwrap();
+        let old_binding = {
+            let active = store.inner.active.lock().unwrap();
+            assert!(active.watcher.is_some());
+            active.binding.clone().unwrap()
+        };
+        let old_dir = open_project_dir(&selected).unwrap();
+        let old_cache = IndexCache::for_project(&selected, &old_dir);
+        let old_watch = retain_for_watching(&old_dir).unwrap();
+        drop(old_dir);
+
+        fs::rename(&selected, &moved).unwrap();
+        fs::create_dir(&selected).unwrap();
+        fs::write(&source, "fn replacement() {}").unwrap();
+        let rebuilt = rebuild_index(&store, Some(path)).unwrap();
+        assert_eq!(search_index(&store, "replacement", None).len(), 1);
+
+        // Deliver the old worker's queued refresh only after the new snapshot is current.
+        let mut opened = false;
+        refresh_index(
+            &store.inner,
+            &old_binding,
+            || {
+                opened = true;
+                open_for_watched_scan(&old_watch)
+            },
+            &old_cache,
+            None,
+        );
+        assert!(!opened, "retired watcher attempted to reopen its root");
+        assert!(Arc::ptr_eq(&rebuilt, &store.snapshot()));
+        assert!(search_index(&store, "former", None).is_empty());
+        drop(old_watch);
+
+        fs::write(&source, "fn edited() {}").unwrap();
+        wait_for_indexed_text(&store, "edited");
+        assert!(search_index(&store, "replacement", None).is_empty());
+        drop(store);
+        project.close().unwrap();
     }
 
     #[test]
