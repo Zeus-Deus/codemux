@@ -81,6 +81,27 @@ describe("FrameDecoder", () => {
     dec.push(partial.subarray(2));
     const second = dec.next()!;
     expect(Array.from(second.payload)).toEqual([9, 9, 9]);
+    expect(new TextDecoder().decode(first.payload)).toBe("aa");
+  });
+
+  it("keeps a fragmented frame intact when the reader reuses its chunk buffer", () => {
+    const payload = new Uint8Array(256 * 1024).fill(42);
+    const framed = encodeFrame(KIND_BINARY, payload);
+    const readBuffer = new Uint8Array(16 * 1024);
+    const dec = new FrameDecoder();
+
+    for (let offset = 0; offset < framed.length; offset += readBuffer.length) {
+      const chunk = framed.subarray(offset, offset + readBuffer.length);
+      readBuffer.set(chunk);
+      dec.push(readBuffer.subarray(0, chunk.length));
+      readBuffer.fill(0);
+      if (offset + chunk.length < framed.length) expect(dec.next()).toBeNull();
+    }
+
+    const decoded = dec.next()?.payload;
+    expect(decoded?.length).toBe(payload.length);
+    expect(decoded?.every((byte, index) => byte === payload[index])).toBe(true);
+    expect(dec.buffered).toBe(0);
   });
 
   it("throws on an unknown kind byte", () => {
