@@ -47,6 +47,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use rand::distributions::{Alphanumeric, DistString};
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -394,31 +395,9 @@ impl OpenCodeServer {
             .stdout
             .take()
             .ok_or_else(|| "spawn_failed: child stdout pipe missing".to_string())?;
-        // On Windows a banner read runs on a blocking thread that outlives
-        // a timed-out future; keep a way to cancel it.
-        #[cfg(windows)]
-        let banner_reads = stdout_drain::Canceller::for_handle(&stdout);
-
-        let url_result = tokio::time::timeout(ready_budget, await_ready_url(stdout)).await;
-        #[cfg(windows)]
-        if !matches!(url_result, Ok(Ok(_))) {
-            if let Some(reads) = banner_reads {
-                reads.cancel_until(None);
-            }
-        }
-
+        let url_result = Self::read_banner(&mut child, stdout, ready_budget).await;
         let (base_url, api) = match url_result {
-            Ok(Ok((base_url, api, rest))) => {
-                // Keep reading stdout after the banner too: dropping the
-                // reader closes the pipe, and the server's next write to
-                // stdout would fail instead. The drain is owned by the
-                // process, so it stops with it.
-                child.1 = Some(
-                    stdout_drain::Drain::start(rest)
-                        .map_err(|e| format!("spawn_failed: drain stdout ({e})"))?,
-                );
-                (base_url, api)
-            }
+            Ok(Ok(found)) => found,
             Ok(Err(message)) => {
                 // Probe drained stdout before exiting — kill the
                 // child and surface the failure verbatim.
@@ -440,6 +419,49 @@ impl OpenCodeServer {
             api,
             server_password,
         })
+    }
+
+    /// Wait up to `budget` for the ready banner on `stdout`, and leave the
+    /// rest of stdout draining, owned by `child` so it stops with the
+    /// process however startup ends — even if this future is dropped.
+    #[cfg(unix)]
+    async fn read_banner(
+        child: &mut ServerProcess,
+        stdout: tokio::process::ChildStdout,
+        budget: Duration,
+    ) -> Result<Result<(String, OpenCodeApi), String>, tokio::time::error::Elapsed> {
+        tokio::time::timeout(budget, async {
+            let (base_url, api, rest) = await_ready_url(stdout).await?;
+            // Keep reading stdout after the banner too: dropping the reader
+            // closes the pipe, and the server's next write to stdout would
+            // fail instead.
+            child.1 = Some(stdout_drain::Drain::start(rest));
+            Ok((base_url, api))
+        })
+        .await
+    }
+
+    /// Windows: the pipe is read on a thread of its own from the start —
+    /// banner and drain alike — because tokio's pipe reads run on a
+    /// blocking thread nothing can cancel. The drain is owned by `child`
+    /// before the first await.
+    #[cfg(windows)]
+    async fn read_banner(
+        child: &mut ServerProcess,
+        stdout: tokio::process::ChildStdout,
+        budget: Duration,
+    ) -> Result<Result<(String, OpenCodeApi), String>, tokio::time::error::Elapsed> {
+        let (drain, banner) = match stdout_drain::Drain::start(stdout) {
+            Ok(started) => started,
+            Err(e) => return Ok(Err(format!("spawn_failed: read stdout ({e})"))),
+        };
+        child.1 = Some(drain);
+        tokio::time::timeout(budget, async {
+            banner
+                .await
+                .unwrap_or_else(|_| Err("ready_banner_missing; child stdout closed".to_string()))
+        })
+        .await
     }
 
     /// Stable HTTP URL the server is listening on, e.g.
@@ -607,9 +629,6 @@ async fn leader_exited(_pid: u32) {
 /// server never blocks or fails on a full or closed pipe, and stops with the
 /// server even if a descendant still holds the pipe's write end.
 mod stdout_drain {
-    use tokio::io::BufReader;
-    use tokio::process::ChildStdout;
-
     /// Unix: an async task, which aborting stops outright.
     #[cfg(unix)]
     #[derive(Debug)]
@@ -617,13 +636,13 @@ mod stdout_drain {
 
     #[cfg(unix)]
     impl Drain {
-        pub(super) fn start(mut rest: BufReader<ChildStdout>) -> Result<Self, String> {
-            Ok(Self(
+        pub(super) fn start(mut rest: tokio::io::BufReader<tokio::process::ChildStdout>) -> Self {
+            Self(
                 tokio::spawn(async move {
                     let _ = tokio::io::copy(&mut rest, &mut tokio::io::sink()).await;
                 })
                 .abort_handle(),
-            ))
+            )
         }
 
         pub(super) fn stop(self) {
@@ -638,36 +657,75 @@ mod stdout_drain {
         }
     }
 
-    /// Windows: tokio reads child pipes on a blocking thread, which aborting
-    /// a task does not release. The pipe is read on a thread of its own
-    /// instead, and a pending read is cancelled with `CancelIoEx`.
+    /// The banner the reader thread found, or why it found none.
+    #[cfg(windows)]
+    pub(super) type Banner = tokio::sync::oneshot::Receiver<Result<(String, super::OpenCodeApi), String>>;
+
+    /// Windows: the pipe is read on a thread of its own — the banner, then
+    /// everything after it. Stopping sets a flag that keeps the thread from
+    /// starting another read, then cancels the read in progress with
+    /// `CancelIoEx` until the thread is seen to exit.
     #[cfg(windows)]
     #[derive(Debug)]
     pub(super) struct Drain {
-        reads: Canceller,
+        pipe: std::fs::File,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[cfg(windows)]
     impl Drain {
-        pub(super) fn start(rest: BufReader<ChildStdout>) -> Result<Self, String> {
-            use std::io::Read;
+        pub(super) fn start(stdout: tokio::process::ChildStdout) -> Result<(Self, Banner), String> {
+            use std::io::{BufRead, Read};
             use std::sync::atomic::{AtomicBool, Ordering};
             use std::sync::Arc;
 
-            let handle = rest.into_inner().into_owned_handle().map_err(|e| e.to_string())?;
-            let mut pipe = std::fs::File::from(handle);
-            let reads = Canceller(pipe.try_clone().map_err(|e| e.to_string())?);
+            let handle = stdout.into_owned_handle().map_err(|e| e.to_string())?;
+            let reader = std::fs::File::from(handle);
+            let pipe = reader.try_clone().map_err(|e| e.to_string())?;
             let stop = Arc::new(AtomicBool::new(false));
             let done = Arc::new(AtomicBool::new(false));
+            #[cfg(test)]
+            let _ = super::DRAIN_PROBE.try_with(|probe| *probe.lock().unwrap() = Some(done.clone()));
+            let (banner_tx, banner_rx) = tokio::sync::oneshot::channel();
             let (thread_stop, thread_done) = (stop.clone(), done.clone());
             std::thread::Builder::new()
-                .name("opencode-stdout-drain".into())
+                .name("opencode-stdout".into())
                 .spawn(move || {
+                    let mut reader = std::io::BufReader::new(reader);
+                    let mut banner_tx = Some(banner_tx);
+                    let mut captured = String::new();
+                    let mut line = String::new();
+                    // The banner, line by line.
+                    while banner_tx.is_some() && !thread_stop.load(Ordering::SeqCst) {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let text = line.trim_end_matches(['\r', '\n']);
+                                if let Some(found) = super::parse_ready_url(text).and_then(|url| {
+                                    super::OpenCodeApi::from_ready_banner(text).map(|api| (url, api))
+                                }) {
+                                    let _ = banner_tx.take().map(|tx| tx.send(Ok(found)));
+                                } else {
+                                    if !captured.is_empty() {
+                                        captured.push('\n');
+                                    }
+                                    captured.push_str(text);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(tx) = banner_tx.take() {
+                        let _ = tx.send(Err(format!(
+                            "ready_banner_missing; child stdout closed. captured:\n{}",
+                            captured.trim()
+                        )));
+                    }
+                    // Then everything after it.
                     let mut buf = [0u8; 8192];
                     while !thread_stop.load(Ordering::SeqCst) {
-                        match pipe.read(&mut buf) {
+                        match reader.read(&mut buf) {
                             Ok(0) | Err(_) => break,
                             Ok(_) => {}
                         }
@@ -675,62 +733,52 @@ mod stdout_drain {
                     thread_done.store(true, Ordering::SeqCst);
                 })
                 .map_err(|e| e.to_string())?;
-            Ok(Self { reads, stop, done })
+            Ok((Self { pipe, stop, done }, banner_rx))
         }
 
         pub(super) fn stop(self) {
-            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-            self.reads.cancel_until(Some(self.done));
+            use std::os::windows::io::AsRawHandle;
+            use std::sync::atomic::Ordering;
+            self.stop.store(true, Ordering::SeqCst);
+            let Self { pipe, done, .. } = self;
+            // Off the caller's thread, so Drop never blocks. The flag keeps
+            // the reader from starting a new read; a read it had already
+            // started is cancelled, again if it began just after a cancel,
+            // until the thread is seen to exit.
+            let _ = std::thread::Builder::new()
+                .name("opencode-stdout-cancel".into())
+                .spawn(move || {
+                    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !done.load(Ordering::SeqCst) && std::time::Instant::now() < give_up {
+                        // SAFETY: a live handle owned by `pipe`; a null
+                        // OVERLAPPED cancels every read pending on it.
+                        unsafe { windows_sys::Win32::System::IO::CancelIoEx(pipe.as_raw_handle(), std::ptr::null()) };
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                });
         }
 
-        /// Whether the drain thread has exited.
+        /// Whether the reader thread has exited.
         #[cfg(test)]
         pub(super) fn finished(&self) -> impl Fn() -> bool {
             let done = self.done.clone();
             move || done.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
+}
 
-    /// A second handle to a pipe, for cancelling reads pending on it.
-    #[cfg(windows)]
-    #[derive(Debug)]
-    pub(super) struct Canceller(std::fs::File);
-
-    #[cfg(windows)]
-    impl Canceller {
-        pub(super) fn for_handle(reader: &impl std::os::windows::io::AsRawHandle) -> Option<Self> {
-            // SAFETY: the handle is live for this call; it is duplicated, not
-            // taken over.
-            let borrowed = unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(reader.as_raw_handle()) };
-            borrowed.try_clone_to_owned().ok().map(|owned| Self(std::fs::File::from(owned)))
-        }
-
-        /// Cancel reads pending on the pipe, off the caller's thread, until
-        /// `done` is set (or for a short while without one). A read issued
-        /// just after one cancel is caught by the next.
-        pub(super) fn cancel_until(self, done: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
-            use std::os::windows::io::AsRawHandle;
-            let _ = std::thread::Builder::new()
-                .name("opencode-stdout-cancel".into())
-                .spawn(move || {
-                    for _ in 0..400 {
-                        if done.as_ref().is_some_and(|d| d.load(std::sync::atomic::Ordering::SeqCst)) {
-                            break;
-                        }
-                        // SAFETY: a live handle owned by `self`; a null
-                        // OVERLAPPED cancels every read pending on it.
-                        unsafe { windows_sys::Win32::System::IO::CancelIoEx(self.0.as_raw_handle(), std::ptr::null()) };
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                });
-        }
-    }
+#[cfg(all(test, windows))]
+tokio::task_local! {
+    /// Test hook: receives the reader thread's "exited" flag, so a test can
+    /// watch it after startup itself has been dropped.
+    pub(crate) static DRAIN_PROBE: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>>;
 }
 
 /// Read lines from the child's stdout until the ready banner shows
 /// up or the stream closes. Only the *banner* triggers `Ok`; anything
 /// else is forwarded as part of the diagnostic on failure. On success the
 /// rest of the stream is handed back so the caller keeps draining it.
+#[cfg(unix)]
 async fn await_ready_url(
     stdout: tokio::process::ChildStdout,
 ) -> Result<(String, OpenCodeApi, BufReader<tokio::process::ChildStdout>), String> {
@@ -1158,6 +1206,37 @@ mod tests {
         let released = drain();
         server.shutdown().await.unwrap();
         assert!(released, "the pending read kept the drain thread alive");
+    }
+
+    // Windows: startup dropped while waiting for the banner, with another
+    // process still holding the pipe's write end, must release the read.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn dropping_startup_before_the_banner_releases_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-opencode.cmd");
+        // No banner; a `start /b` child inherits stdout and outlives the
+        // script, so the pipe stays open after the server process is gone.
+        std::fs::write(
+            &script,
+            "@echo off\r\nstart \"\" /b ping -n 20 127.0.0.1\r\nping -n 60 127.0.0.1 >nul\r\n",
+        )
+        .unwrap();
+
+        let probe = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let startup = DRAIN_PROBE.scope(
+            probe.clone(),
+            OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(60)),
+        );
+        // Drop startup mid-wait.
+        assert!(tokio::time::timeout(Duration::from_secs(2), startup).await.is_err());
+
+        let done = probe.lock().unwrap().clone().expect("the reader started");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst), "the read outlived the dropped startup");
     }
 
     /// Tests in this module that rely on the live `opencode` binary
