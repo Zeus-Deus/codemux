@@ -809,58 +809,89 @@ mod confined {
         Ok(())
     }
 
-    /// Windows: the skill folder is held open, refusing a reparse point (a
-    /// link or junction) and without sharing delete access, so it cannot be
-    /// renamed, removed or replaced while the write runs. Nothing after that
-    /// resolves the root's path again:
-    /// - the temporary file is created under the held folder's own resolved
-    ///   path, and its handle is checked to really sit in that folder;
-    /// - the content is written through that handle;
-    /// - the rename into `SKILL.md` is made relative to the held folder's
-    ///   handle (`FILE_RENAME_INFO.RootDirectory`), not to a path.
+    /// Windows: the root is opened once (following a linked root, as on
+    /// Unix), and every step after that is relative to a handle, through
+    /// `NtCreateFile` with `RootDirectory` — no path is resolved again:
+    /// - the skill folder is opened or created relative to the root,
+    ///   refusing a reparse point (a link or junction), and held without
+    ///   sharing delete access so it cannot be renamed or removed meanwhile;
+    /// - a leftover temporary file is deleted by handle, the link itself and
+    ///   never its target, and the new one is created exclusively relative
+    ///   to the folder;
+    /// - the content is written through that handle, and the rename into
+    ///   `SKILL.md` is made relative to the folder handle.
     #[cfg(windows)]
     pub(super) fn write(root: &Path, name: &OsStr, content: &[u8]) -> Result<(), String> {
-        use std::ffi::OsString;
-        use std::fs;
-        use std::io::{Error, ErrorKind, Write};
-        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use std::fs::File;
+        use std::io::Write;
+        use std::os::windows::ffi::OsStrExt;
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-        use std::os::windows::io::AsRawHandle;
-        use std::path::PathBuf;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FileDispositionInfo, FileRenameInfo, GetFinalPathNameByHandleW, SetFileInformationByHandle,
-            DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED,
-            FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-            VOLUME_NAME_DOS,
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+            FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
         };
+        use windows_sys::Win32::Foundation::{HANDLE, STATUS_OBJECT_NAME_NOT_FOUND, UNICODE_STRING};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, FileRenameInfo, SetFileInformationByHandle, DELETE,
+            FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO,
+            FILE_RENAME_INFO_0, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+            SYNCHRONIZE,
+        };
+        use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, IO_STATUS_BLOCK_0};
 
-        /// Where an open file really is, links and junctions resolved.
-        fn final_path(file: &fs::File) -> Result<PathBuf, String> {
-            let mut buf = vec![0u16; 512];
-            loop {
-                // SAFETY: a live handle and a buffer of the stated length.
-                let len = unsafe {
-                    GetFinalPathNameByHandleW(
-                        file.as_raw_handle(),
-                        buf.as_mut_ptr(),
-                        buf.len() as u32,
-                        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
-                    )
-                } as usize;
-                if len == 0 {
-                    return Err(format!("resolve a path ({})", Error::last_os_error()));
-                }
-                if len < buf.len() {
-                    buf.truncate(len);
-                    return Ok(PathBuf::from(OsString::from_wide(&buf)));
-                }
-                buf.resize(len + 1, 0);
+        const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+
+        /// Open or create `name` relative to the directory `parent`.
+        fn open_relative(
+            parent: &File,
+            name: &OsStr,
+            access: u32,
+            share: u32,
+            disposition: u32,
+            options: u32,
+        ) -> Result<File, i32> {
+            let mut wide: Vec<u16> = name.encode_wide().collect();
+            let bytes = (wide.len() * 2) as u16;
+            let unicode = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+            let attributes = OBJECT_ATTRIBUTES {
+                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+                RootDirectory: parent.as_raw_handle(),
+                ObjectName: &unicode,
+                Attributes: OBJ_CASE_INSENSITIVE,
+                SecurityDescriptor: std::ptr::null(),
+                SecurityQualityOfService: std::ptr::null(),
+            };
+            let mut status_block = IO_STATUS_BLOCK { Anonymous: IO_STATUS_BLOCK_0 { Status: 0 }, Information: 0 };
+            let mut handle: HANDLE = std::ptr::null_mut();
+            // SAFETY: every pointer refers to a live local of the right type;
+            // `wide` outlives the call.
+            let status = unsafe {
+                NtCreateFile(
+                    &mut handle,
+                    access | SYNCHRONIZE,
+                    &attributes,
+                    &mut status_block,
+                    std::ptr::null(),
+                    FILE_ATTRIBUTE_NORMAL,
+                    share,
+                    disposition,
+                    options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                    std::ptr::null(),
+                    0,
+                )
+            };
+            if status < 0 {
+                return Err(status);
             }
+            // SAFETY: a handle NtCreateFile just opened, owned by nothing else.
+            Ok(unsafe { File::from_raw_handle(handle) })
         }
 
         /// Delete a file through its own handle.
-        fn discard(file: &fs::File) {
+        fn discard(file: &File) -> bool {
             let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
             // SAFETY: a live handle opened with DELETE access, and a struct of
             // the stated size.
@@ -870,52 +901,52 @@ mod confined {
                     FileDispositionInfo,
                     std::ptr::addr_of!(info).cast(),
                     std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-                );
+                ) != 0
             }
         }
 
-        let dir = root.join(name);
-        match fs::create_dir(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(format!("create the skill folder ({e})")),
-        }
-        let held = fs::OpenOptions::new()
+        // The root may be a link (a dotfiles checkout, say); it is the trusted
+        // location, resolved this once.
+        let root = std::fs::OpenOptions::new()
             .read(true)
             .access_mode(FILE_GENERIC_READ | FILE_TRAVERSE)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&dir)
-            .map_err(|e| format!("open the skill folder ({e})"))?;
-        let meta = held.metadata().map_err(|e| format!("inspect the skill folder ({e})"))?;
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(root)
+            .map_err(|e| format!("open the skills root ({e})"))?;
+
+        let dir = open_relative(
+            &root,
+            name,
+            FILE_GENERIC_READ | FILE_TRAVERSE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN_IF,
+            FILE_DIRECTORY_FILE,
+        )
+        .map_err(|status| format!("open the skill folder (NTSTATUS {status:#010x})"))?;
+        let meta = dir.metadata().map_err(|e| format!("inspect the skill folder ({e})"))?;
         if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !meta.is_dir() {
             return Err("the skill folder is a link or not a folder".into());
         }
-        let held_path = final_path(&held)?;
-        let root_path = fs::canonicalize(root).map_err(|e| format!("resolve the skills root ({e})"))?;
-        if held_path.parent() != Some(root_path.as_path()) {
-            return Err("the skill folder is not inside the skills root".into());
-        }
 
-        let tmp_path = held_path.join(TMP);
-        match fs::remove_file(&tmp_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("clear the temporary file ({e})")),
+        match open_relative(&dir, OsStr::new(TMP), DELETE, 0, FILE_OPEN, FILE_NON_DIRECTORY_FILE) {
+            Ok(leftover) => {
+                if !discard(&leftover) {
+                    return Err("clear the temporary file".into());
+                }
+            }
+            Err(STATUS_OBJECT_NAME_NOT_FOUND) => {}
+            Err(status) => return Err(format!("clear the temporary file (NTSTATUS {status:#010x})")),
         }
-        let mut tmp = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .access_mode(FILE_GENERIC_WRITE | DELETE)
-            .share_mode(0)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&tmp_path)
-            .map_err(|e| format!("create the temporary file ({e})"))?;
-        let landed = final_path(&tmp);
-        if landed.as_ref().ok().and_then(|p| p.parent()) != Some(held_path.as_path()) {
-            discard(&tmp);
-            return Err("the temporary file did not land in the skill folder".into());
-        }
+        let mut tmp = open_relative(
+            &dir,
+            OsStr::new(TMP),
+            FILE_GENERIC_WRITE | DELETE,
+            0,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE,
+        )
+        .map_err(|status| format!("create the temporary file (NTSTATUS {status:#010x})"))?;
         if let Err(e) = tmp.write_all(content).and_then(|()| tmp.flush()) {
             discard(&tmp);
             return Err(format!("write the temporary file ({e})"));
@@ -931,7 +962,7 @@ mod confined {
         // the name written after its first element.
         let renamed = unsafe {
             (*info).Anonymous = FILE_RENAME_INFO_0 { ReplaceIfExists: 1 };
-            (*info).RootDirectory = held.as_raw_handle();
+            (*info).RootDirectory = dir.as_raw_handle();
             (*info).FileNameLength = (wide.len() * 2) as u32;
             std::ptr::copy_nonoverlapping(
                 wide.as_ptr(),
@@ -941,12 +972,13 @@ mod confined {
             SetFileInformationByHandle(tmp.as_raw_handle(), FileRenameInfo, info.cast(), size as u32)
         };
         if renamed == 0 {
-            let error = Error::last_os_error();
+            let error = std::io::Error::last_os_error();
             discard(&tmp);
             return Err(format!("rename the skill file ({error})"));
         }
         drop(tmp);
-        drop(held);
+        drop(dir);
+        drop(root);
         Ok(())
     }
 }
