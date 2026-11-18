@@ -881,7 +881,16 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // Net: 3 sequential round-trips → 1 parallel pair + 1 = effectively
     // 2 round-trips per terminal on switch.
     let cancelled = false;
+    let outputEpoch = 0;
+    const mountOutputEpoch = outputEpoch;
+    let restarting = false;
     let outputChannel: Channel<unknown> | null = null;
+    let pendingAttach: Promise<boolean> | undefined;
+    const ownsOutput = (epoch: number) => !cancelled && epoch === outputEpoch;
+    const releaseOutputChannel = () => {
+      if (outputChannel) releaseRemoteChannel(outputChannel.id);
+      outputChannel = null;
+    };
     const attachStarted = performance.now();
 
     // ── Throttled write pump + PTY producer back-pressure ──
@@ -936,16 +945,50 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       },
     });
 
+    const installOutputChannel = async (channel: Channel<unknown>, epoch: number): Promise<boolean> => {
+      try {
+        const generation = (await attachPtyOutput(sid, channel)) ?? null;
+        if (!ownsOutput(epoch)) {
+          // Teardown already released the callback, but could not detach
+          // without the generation. Finish before restart replaces the PTY.
+          if (generation != null) await detachPtyOutput(sid, generation).catch(console.error);
+          return false;
+        }
+        attachedSessionRef.current = sid;
+        attachedGenerationRef.current = generation;
+        // Apply a pause that crossed the high watermark before the attach
+        // reply supplied a generation.
+        if (flowPaused && generation != null) {
+          pausePtyOutput(sid, generation).catch((err) => {
+            flowPaused = false;
+            console.error(`[codemux] flow-control pause failed for ${sid}:`, err);
+          });
+        }
+      } catch (err) {
+        if (!ownsOutput(epoch)) return false;
+        releaseOutputChannel();
+        updateStatusOverlay({
+          session_id: sid,
+          state: "failed",
+          message: `Failed to attach terminal output: ${String(err)}`,
+          exit_code: null,
+        });
+        return false;
+      }
+
+      return true;
+    };
+
     // Finish parsing restored output at its recorded geometry before fitting
     // the pane and subscribing to live output. Shared with shell restart.
-    const attachOutput = async (): Promise<boolean> => {
+    const attachOutput = async (epoch: number): Promise<boolean> => {
       // The pump may still have history split across macrotasks; xterm then
       // parses each write asynchronously. Wait for BOTH queues before fit can
       // change the coordinates of a saved prompt or absolute cursor sequence.
       await pump.flush();
-      if (cancelled) return false;
+      if (!ownsOutput(epoch)) return false;
       await new Promise<void>(resolve => term.write("", resolve));
-      if (cancelled) return false;
+      if (!ownsOutput(epoch)) return false;
       // Size both ends before subscribing: attach can synchronously replay
       // output, including ConPTY's absolute cursor positions. A spawning PTY
       // may not have its master yet; retain the subscription in that case so
@@ -961,7 +1004,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
             await resizePty(sid, term.cols, term.rows).catch(console.error);
           }
         }
-        if (cancelled) return false;
+        if (!ownsOutput(epoch)) return false;
         // A resize may have arrived while this IPC was pending. Refit the
         // latest geometry before exposing output; never issue concurrent
         // startup resizes or require another event to recover the new size.
@@ -972,7 +1015,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       // reads kittyLevel on every keystroke, so it can't wait behind the
       // throttled pump) then enqueues the bytes for the shared drain.
       const channel = new Channel<unknown>((payload) => {
-        if (cancelled) return;
+        if (!ownsOutput(epoch)) return;
         const bytes = extractBytes(payload);
         if (!bytes) return;
         // First live byte on a migrating pane means the replacement PTY is
@@ -991,52 +1034,16 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         pump.enqueue(bytes);
       });
       outputChannel = channel;
-
-      try {
-        const generation = (await attachPtyOutput(sid, channel)) ?? null;
-        if (cancelled) {
-          // Unmounted during the attach round-trip: the cleanup below ran
-          // before we recorded the generation, so tear down the subscriber we
-          // just installed here — otherwise it lingers in the backend fan-out
-          // set (dropping bytes via the `cancelled` guard) until the session
-          // closes.
-          if (generation != null) {
-            detachPtyOutput(sid, generation).catch(console.error);
-          }
-          return false;
-        }
-        attachedSessionRef.current = sid;
-        attachedGenerationRef.current = generation;
-        // Reconcile a pause that crossed the HIGH watermark during the
-        // pre-attach scrollback restore, when we had no generation to attribute
-        // it to. Now that we're a subscriber, apply it.
-        if (flowPaused && generation != null) {
-          pausePtyOutput(sid, generation).catch((err) => {
-            flowPaused = false;
-            console.error(`[codemux] flow-control pause failed for ${sid}:`, err);
-          });
-        }
-      } catch (err) {
-        if (outputChannel === channel) {
-          releaseRemoteChannel(channel.id);
-          outputChannel = null;
-        }
-        if (cancelled) return false;
-        updateStatusOverlay({
-          session_id: sid,
-          state: "failed",
-          message: `Failed to attach terminal output: ${String(err)}`,
-          exit_code: null,
-        });
-        return false;
-      }
-
-      return true;
+      pendingAttach = installOutputChannel(channel, epoch);
+      return pendingAttach;
     };
 
     restartRef.current = async () => {
-      // The old runtime, and this pane's subscription with it, is gone once
-      // the backend respawns, so drop the stale generation and protocol state.
+      if (cancelled || restarting) return;
+      restarting = true;
+      const epoch = ++outputEpoch;
+      releaseOutputChannel();
+      const generation = attachedGenerationRef.current;
       attachedSessionRef.current = null;
       attachedGenerationRef.current = null;
       replayReadyRef.current = false;
@@ -1051,26 +1058,31 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         exit_code: null,
       });
       try {
-        await restartTerminalSession(sid);
-      } catch (err) {
-        if (cancelled) return;
-        updateStatusOverlay({
-          session_id: sid,
-          state: "failed",
-          message: `Failed to restart shell: ${String(err)}`,
-          exit_code: null,
-        });
-        return;
+        // A replacement PTY can reuse its predecessor's generation tokens.
+        // Finish detaching here so a late detach cannot target that PTY.
+        if (pendingAttach) await pendingAttach;
+        if (generation != null) await detachPtyOutput(sid, generation).catch(console.error);
+        if (!ownsOutput(epoch)) return;
+        try {
+          await restartTerminalSession(sid);
+        } catch (err) {
+          if (!ownsOutput(epoch)) return;
+          updateStatusOverlay({
+            session_id: sid,
+            state: "failed",
+            message: `Failed to restart shell: ${String(err)}`,
+            exit_code: null,
+          });
+          return;
+        }
+        if (!ownsOutput(epoch)) return;
+        pump.enqueue(
+          new TextEncoder().encode("\r\n\x1b[2m── shell restarted ──\x1b[0m\r\n\r\n"),
+        );
+        if (await attachOutput(epoch)) term.focus();
+      } finally {
+        restarting = false;
       }
-      if (cancelled) return;
-      if (outputChannel) {
-        releaseRemoteChannel(outputChannel.id);
-        outputChannel = null;
-      }
-      pump.enqueue(
-        new TextEncoder().encode("\r\n\x1b[2m── shell restarted ──\x1b[0m\r\n\r\n"),
-      );
-      if (await attachOutput()) term.focus();
     };
 
     (async () => {
@@ -1090,7 +1102,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
           : Promise.resolve(null),
         getTerminalStatus(sid),
       ]);
-      if (cancelled) return;
+      if (!ownsOutput(mountOutputEpoch)) return;
 
       // Enqueue scrollback first so historical bytes drain before any live
       // channel byte (FIFO order on the shared pump preserves the parser's
@@ -1135,7 +1147,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         });
       }
 
-      if (!(await attachOutput())) return;
+      if (!(await attachOutput(mountOutputEpoch))) return;
 
       // Timing log gated to slow mounts so steady-state stays quiet.
       // The user can grep stderr for `[codemux::terminal-mount]` while
@@ -1180,10 +1192,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // ── Cleanup ──
     return () => {
       cancelled = true;
-      if (outputChannel) {
-        releaseRemoteChannel(outputChannel.id);
-        outputChannel = null;
-      }
+      releaseOutputChannel();
 
       const attachedGeneration = attachedGenerationRef.current;
       if (attachedSessionRef.current && attachedGeneration != null) {
