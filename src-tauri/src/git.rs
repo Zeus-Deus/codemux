@@ -1809,18 +1809,28 @@ pub struct MergeIntoBaseResult {
 /// A checkout git still has registered but that cannot be reached (a
 /// removed or unmounted directory) is an error, not "checked out nowhere":
 /// moving the ref under it would leave its files and index describing the
-/// old commit. Records are read NUL-delimited, so any path parses.
+/// old commit. Records are read NUL-delimited and as raw bytes, so any
+/// path parses.
 fn branch_worktree(repo_path: &Path, branch: &str) -> Result<Option<PathBuf>, String> {
-    let output = run_git(repo_path, &["worktree", "list", "--porcelain", "-z"])?;
+    let output = git_command()
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git worktree failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
     let target_ref = format!("refs/heads/{branch}");
-    let mut current_path: Option<&str> = None;
+    let mut current_path: Option<PathBuf> = None;
 
-    for field in output.split('\0') {
-        if let Some(path) = field.strip_prefix("worktree ") {
-            current_path = Some(path);
-        } else if field.strip_prefix("branch ") == Some(target_ref.as_str()) {
-            let Some(path) = current_path else { continue };
-            let path = PathBuf::from(path);
+    for field in output.stdout.split(|&b| b == 0) {
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            current_path = path_from_git_bytes(path.to_vec());
+        } else if field.strip_prefix(b"branch ") == Some(target_ref.as_bytes()) {
+            let Some(path) = current_path.take() else { continue };
             return if is_checkout_of(&path, repo_path, &target_ref) {
                 Ok(Some(path))
             } else {
@@ -1836,6 +1846,19 @@ fn branch_worktree(repo_path: &Path, branch: &str) -> Result<Option<PathBuf>, St
     Ok(None)
 }
 
+/// A path git printed, kept byte for byte where the platform allows it.
+fn path_from_git_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes).ok().map(PathBuf::from)
+    }
+}
+
 /// Whether `path` is a checkout of `repo_path`'s repository, in its own
 /// right, with `branch_ref` checked out. A directory left where a moved
 /// worktree used to be fails this: git would find whatever repository
@@ -1845,9 +1868,12 @@ fn is_checkout_of(path: &Path, repo_path: &Path, branch_ref: &str) -> bool {
     if !path.is_dir() {
         return false;
     }
-    let (Some((here_common, here_top)), Some((repo_common, _))) =
-        (checkout_dirs(path), checkout_dirs(repo_path))
-    else {
+    let paths = (
+        git_path(path, "--show-toplevel"),
+        git_path(path, "--git-common-dir"),
+        git_path(repo_path, "--git-common-dir"),
+    );
+    let (Some(here_top), Some(here_common), Some(repo_common)) = paths else {
         return false;
     };
     let same = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
@@ -1859,20 +1885,24 @@ fn is_checkout_of(path: &Path, repo_path: &Path, branch_ref: &str) -> bool {
         && run_git(path, &["symbolic-ref", "--quiet", "HEAD"]).is_ok_and(|head| head.trim() == branch_ref)
 }
 
-/// `(common git dir, top level)` of the checkout at `dir`, read without
-/// trimming so a path that ends in whitespace survives.
-fn checkout_dirs(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+/// One absolute path from `git rev-parse <flag>` in `dir`. Only the final
+/// line terminator is removed, so whitespace, newlines and (on Unix)
+/// non-UTF-8 bytes in the path survive.
+fn git_path(dir: &Path, flag: &str) -> Option<PathBuf> {
     let output = git_command()
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"])
+        .args(["rev-parse", "--path-format=absolute", flag])
         .current_dir(dir)
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    let text = String::from_utf8(output.stdout).ok()?;
-    let mut lines = text.split_terminator('\n');
-    let common = PathBuf::from(lines.next()?);
-    let top = PathBuf::from(lines.next()?);
-    Some((common, top))
+    let mut bytes = output.stdout;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    path_from_git_bytes(bytes)
 }
 
 /// Fast-forward `base_branch` to `commit`.
@@ -6745,6 +6775,45 @@ mod tests {
         assert_eq!(run_git(&stale, &["rev-parse", "HEAD"]).unwrap(), clone_before, "the clone must not move");
         assert!(!stale.join("feature.txt").exists());
         assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_into_base_advances_a_base_whose_path_has_a_newline() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let odd = dir.path().join("release\nwt");
+        run_git(&repo, &["worktree", "add", "-b", "release", odd.to_str().unwrap()]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        assert_eq!(merge_into_base(&wt, "release", false).unwrap().status, "merged");
+        assert_eq!(std::fs::read_to_string(odd.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    // Linux only: macOS file systems refuse names that are not UTF-8.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_advances_a_base_whose_path_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let odd = dir.path().join(std::ffi::OsStr::from_bytes(b"release-\xff"));
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "-b", "release"])
+            .arg(&odd)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        assert_eq!(merge_into_base(&wt, "release", false).unwrap().status, "merged");
+        assert_eq!(std::fs::read_to_string(odd.join("feature.txt")).unwrap(), "worktree work");
     }
 
     #[cfg(unix)]
