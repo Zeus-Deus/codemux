@@ -1334,7 +1334,6 @@ fn build_core_app<R: tauri::Runtime>(
                 if let Some((_, cwd)) = app_state.active_workspace_cwd() {
                     index_store.initialize_for_project(std::path::PathBuf::from(cwd));
                 }
-                indexing::spawn_index_watcher(index_store);
             }
 
             control::spawn_control_server(app.handle().clone());

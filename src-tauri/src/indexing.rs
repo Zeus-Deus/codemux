@@ -1,4 +1,5 @@
-use crate::git::ensure_git_exclude;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::Dir;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -9,11 +10,13 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+#[cfg(any(unix, windows))]
+use cap_std::fs::MetadataExt;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
 // Older snapshots can contain content reached through links outside the project.
-const INDEX_SCHEMA_VERSION: u32 = 2;
+const INDEX_SCHEMA_VERSION: u32 = 3;
 const MAX_FILE_SIZE_BYTES: u64 = 512 * 1024;
 const CHUNK_LINE_COUNT: usize = 40;
 const DEFAULT_SEARCH_LIMIT: usize = 12;
@@ -131,10 +134,27 @@ impl Default for ProjectIndexStore {
 }
 
 impl ProjectIndexStore {
-    /// Load (or build) the index for a specific project directory.
+    /// Load the cached index and keep the same root open for watcher rebuilds.
     pub fn initialize_for_project(&self, project_root: PathBuf) {
-        let snapshot = load_index(&project_root).unwrap_or_else(|| default_index(project_root));
+        let opened = project_root.canonicalize().and_then(|path| {
+            let dir = open_project_dir(&path)?;
+            Ok((path, dir))
+        });
+        let (watch_root, dir) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                eprintln!(
+                    "[codemux::index] Failed to open {}: {error}",
+                    project_root.display()
+                );
+                self.replace_snapshot(default_index(project_root));
+                return;
+            }
+        };
+        let snapshot =
+            load_index(&project_root, &dir).unwrap_or_else(|| default_index(project_root.clone()));
         self.replace_snapshot(snapshot);
+        spawn_index_watcher(self.inner.clone(), project_root, watch_root, dir);
     }
 
     /// Readers retain an immutable generation without cloning its file contents
@@ -162,8 +182,14 @@ impl ProjectIndexStore {
 
 pub fn rebuild_index(project_root: Option<String>) -> Result<ProjectIndexSnapshot, String> {
     let root = resolve_project_root(project_root)?;
-    let snapshot = build_index_for_root(&root)?;
-    save_index(&root, &snapshot)?;
+    let dir = open_project_dir(&root).map_err(|error| {
+        format!(
+            "Failed to open project directory {}: {error}",
+            root.display()
+        )
+    })?;
+    let snapshot = build_index_for_root(&root, &dir)?;
+    save_index(&dir, &snapshot)?;
     Ok(snapshot)
 }
 
@@ -176,32 +202,46 @@ pub fn search_index(
     search_snapshot(&snapshot, query, limit.unwrap_or(DEFAULT_SEARCH_LIMIT))
 }
 
-pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
-    let project_root = PathBuf::from(&store.snapshot().project_root);
-    if project_root.as_os_str().is_empty() || !project_root.is_dir() {
-        eprintln!("[codemux::index] No valid project root — skipping index watcher");
-        return;
+fn open_project_dir(path: &Path) -> io::Result<Dir> {
+    Dir::open_ambient_dir(path, cap_std::ambient_authority())
+}
+
+#[cfg(windows)]
+fn pinned_windows_path(dir: &Dir) -> io::Result<PathBuf> {
+    // Retain the verbatim prefix, including for UNC shares. cap-std opens directories
+    // without delete sharing, pinning them while path-based Windows APIs run.
+    winx::file::get_file_path(&dir.try_clone()?.into_std_file())
+}
+
+#[cfg(windows)]
+fn reopen_watched_dir(dir: &Dir, allow_rename: bool) -> io::Result<Dir> {
+    use std::os::windows::io::AsHandle;
+    use winx::file::{reopen_file, AccessMode, Flags, ShareMode};
+    let mut share = ShareMode::FILE_SHARE_READ | ShareMode::FILE_SHARE_WRITE;
+    if allow_rename {
+        share |= ShareMode::FILE_SHARE_DELETE;
     }
+    reopen_file(
+        dir.as_handle(),
+        AccessMode::GENERIC_READ,
+        share,
+        Flags::FILE_FLAG_BACKUP_SEMANTICS,
+    )
+    .map(Dir::from_std_file)
+}
+
+fn spawn_index_watcher(
+    store: Arc<Mutex<Arc<ProjectIndexSnapshot>>>,
+    project_root: PathBuf,
+    watch_root: PathBuf,
+    dir: Dir,
+) {
     eprintln!(
         "[codemux::index] Watching project root: {}",
         project_root.display()
     );
-    let store = store.inner.clone();
-
     std::thread::spawn(move || {
         let (tx, rx) = channel();
-        // The selected project may itself be a directory alias. Watch its target
-        // while excluding links below it, just as the index scan does.
-        let watch_root = match project_root.canonicalize() {
-            Ok(root) => root,
-            Err(error) => {
-                eprintln!(
-                    "[codemux::index] Failed to resolve {}: {error}",
-                    project_root.display()
-                );
-                return;
-            }
-        };
         let mut watcher =
             match RecommendedWatcher::new(tx, Config::default().with_follow_symlinks(false)) {
                 Ok(watcher) => watcher,
@@ -218,6 +258,21 @@ pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
             );
             return;
         }
+
+        // Keep the identity of the watched directory without locking its name
+        // between rebuilds. ReOpenFile operates on the original directory handle.
+        #[cfg(windows)]
+        let dir = {
+            let watched = reopen_watched_dir(&dir, true);
+            drop(dir);
+            match watched {
+                Ok(dir) => dir,
+                Err(error) => {
+                    eprintln!("[codemux::index] Failed to retain watched directory: {error}");
+                    return;
+                }
+            }
+        };
 
         loop {
             let event = match rx.recv() {
@@ -270,9 +325,19 @@ pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
                 }
             }
 
-            match build_index_for_root(&project_root) {
+            #[cfg(windows)]
+            let dir = match reopen_watched_dir(&dir, false) {
+                Ok(pinned) => pinned,
+                Err(error) => {
+                    eprintln!(
+                        "[codemux::index] Failed to open watched directory for indexing: {error}"
+                    );
+                    continue;
+                }
+            };
+            match build_index_for_root(&project_root, &dir) {
                 Ok(snapshot) => {
-                    let _ = save_index(&project_root, &snapshot);
+                    let _ = save_index(&dir, &snapshot);
                     *store.lock().unwrap() = Arc::new(snapshot);
                 }
                 Err(error) => {
@@ -283,24 +348,27 @@ pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
     });
 }
 
-fn load_index(root: &Path) -> Option<ProjectIndexSnapshot> {
-    let path = index_path(root).ok()?;
+const INDEX_FILE_NAME: &str = "index.json";
+
+fn load_index(root_path: &Path, root: &Dir) -> Option<ProjectIndexSnapshot> {
+    let dir = open_child_dir(root, Path::new(".codemux")).ok()?;
     let mut contents = Vec::new();
-    let (mut file, _) = open_regular_file(&path).ok()?;
+    let (mut file, _) = open_regular_file(&dir, Path::new(INDEX_FILE_NAME)).ok()?;
     file.read_to_end(&mut contents).ok()?;
     let snapshot: ProjectIndexSnapshot = serde_json::from_slice(&contents).ok()?;
-    (snapshot.schema_version == INDEX_SCHEMA_VERSION && Path::new(&snapshot.project_root) == root)
+    (snapshot.schema_version == INDEX_SCHEMA_VERSION
+        && Path::new(&snapshot.project_root) == root_path)
         .then_some(snapshot)
 }
 
-fn build_index_for_root(project_root: &Path) -> Result<ProjectIndexSnapshot, String> {
+fn build_index_for_root(project_root: &Path, root: &Dir) -> Result<ProjectIndexSnapshot, String> {
     let mut files = Vec::new();
     let mut chunks = Vec::new();
     let mut seen_dirs = HashSet::new();
     let mut total_bytes: usize = 0;
     scan_directory(
-        project_root,
-        project_root,
+        root,
+        Path::new(""),
         &mut files,
         &mut chunks,
         &mut seen_dirs,
@@ -330,8 +398,8 @@ fn build_index_for_root(project_root: &Path) -> Result<ProjectIndexSnapshot, Str
 }
 
 fn scan_directory(
-    project_root: &Path,
-    dir: &Path,
+    dir: &Dir,
+    relative_dir: &Path,
     files: &mut Vec<IndexedFile>,
     chunks: &mut Vec<IndexedChunk>,
     seen_dirs: &mut HashSet<(u64, u64)>,
@@ -341,11 +409,14 @@ fn scan_directory(
     // Also terminate walks across repeated bind mounts.
     #[cfg(unix)]
     {
-        if let Ok(meta) = fs::metadata(dir) {
-            let key = (meta.dev(), meta.ino());
-            if !seen_dirs.insert(key) {
-                return Ok(());
-            }
+        let meta = dir.dir_metadata().map_err(|error| {
+            format!(
+                "Failed to identify directory {}: {error}",
+                relative_dir.display()
+            )
+        })?;
+        if !seen_dirs.insert((meta.dev(), meta.ino())) {
+            return Ok(());
         }
     }
 
@@ -353,21 +424,44 @@ fn scan_directory(
         return Ok(());
     }
 
-    let entries = fs::read_dir(dir)
-        .map_err(|error| format!("Failed to read directory {}: {error}", dir.display()))?;
+    #[cfg(not(windows))]
+    let entries = dir.entries();
+    #[cfg(windows)]
+    let entries = pinned_windows_path(dir).and_then(fs::read_dir);
+    let entries = entries.map_err(|error| {
+        format!(
+            "Failed to read directory {}: {error}",
+            relative_dir.display()
+        )
+    })?;
 
     for entry in entries {
         if *total_bytes >= MAX_TOTAL_INDEX_BYTES {
             break;
         }
         let entry = entry.map_err(|error| format!("Failed to read directory entry: {error}"))?;
-        let path = entry.path();
+        let name = entry.file_name();
+        let name = Path::new(&name);
+        let path = relative_dir.join(name);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let metadata = entry.metadata().map_err(|error| {
+                format!("Failed to read attributes for {}: {error}", path.display())
+            })?;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                continue;
+            }
+        }
         let kind = entry
             .file_type()
             .map_err(|error| format!("Failed to read file type for {}: {error}", path.display()))?;
         if kind.is_dir() {
-            if !IGNORED_DIRS.contains(&entry.file_name().to_string_lossy().as_ref()) {
-                scan_directory(project_root, &path, files, chunks, seen_dirs, total_bytes)?;
+            if !IGNORED_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                let child = open_child_dir(dir, name).map_err(|error| {
+                    format!("Failed to open directory {}: {error}", path.display())
+                })?;
+                scan_directory(&child, &path, files, chunks, seen_dirs, total_bytes)?;
             }
             continue;
         }
@@ -375,7 +469,7 @@ fn scan_directory(
             continue;
         }
 
-        if let Some((file, file_chunks)) = index_file(project_root, &path)? {
+        if let Some((file, file_chunks)) = index_file(dir, name, &path)? {
             *total_bytes += file.size_bytes as usize;
             files.push(file);
             chunks.extend(file_chunks);
@@ -386,10 +480,11 @@ fn scan_directory(
 }
 
 fn index_file(
-    project_root: &Path,
+    dir: &Dir,
+    name: &Path,
     path: &Path,
 ) -> Result<Option<(IndexedFile, Vec<IndexedChunk>)>, String> {
-    let (file, metadata) = open_regular_file(path)
+    let (file, metadata) = open_regular_file(dir, name)
         .map_err(|error| format!("Failed to open file {}: {error}", path.display()))?;
 
     if metadata.len() > MAX_FILE_SIZE_BYTES {
@@ -407,11 +502,7 @@ fn index_file(
     let content = String::from_utf8(bytes)
         .map_err(|error| format!("Failed to decode file {} as UTF-8: {error}", path.display()))?;
 
-    let relative = path
-        .strip_prefix(project_root)
-        .unwrap_or(path)
-        .display()
-        .to_string();
+    let relative = path.display().to_string();
     let modified_at_ms = metadata
         .modified()
         .ok()
@@ -554,31 +645,62 @@ fn search_snapshot(
     results
 }
 
-fn save_index(root: &Path, snapshot: &ProjectIndexSnapshot) -> Result<(), String> {
-    let path = index_path(root).map_err(|e| format!("Invalid project index cache: {e}"))?;
-    let dir = root.join(".codemux");
-    fs::create_dir_all(&dir).map_err(|error| {
-        format!(
-            "Failed to create index directory {}: {error}",
-            dir.display()
-        )
-    })?;
-    ensure_git_exclude(root, ".codemux");
-    let mut staged = tempfile::NamedTempFile::new_in(&dir)
-        .map_err(|error| format!("Failed to create index file in {}: {error}", dir.display()))?;
-    let mut writer = BufWriter::new(staged.as_file_mut());
-    serde_json::to_writer_pretty(&mut writer, snapshot)
-        .map_err(|error| format!("Failed to serialize project index: {error}"))?;
-    writer
-        .flush()
-        .map_err(|error| format!("Failed to flush project index: {error}"))?;
-    drop(writer);
-    staged.persist(&path).map(|_| ()).map_err(|error| {
-        format!(
-            "Failed to write project index file {}: {error}",
-            path.display()
-        )
-    })
+fn save_index(root: &Dir, snapshot: &ProjectIndexSnapshot) -> Result<(), String> {
+    #[cfg(windows)]
+    let created = pinned_windows_path(root).and_then(|path| fs::create_dir(path.join(".codemux")));
+    #[cfg(not(windows))]
+    let created = root.create_dir(".codemux");
+    if let Err(error) = created {
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(format!("Failed to create index directory: {error}"));
+        }
+    }
+    let dir = open_child_dir(root, Path::new(".codemux"))
+        .map_err(|error| format!("Failed to open index directory: {error}"))?;
+    persist_index(&dir, snapshot).map_err(|error| format!("Failed to write project index: {error}"))
+}
+
+fn persist_index(dir: &Dir, snapshot: &ProjectIndexSnapshot) -> io::Result<()> {
+    if let Err(error) = open_regular_file(dir, Path::new(INDEX_FILE_NAME)) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    let staging_name = format!("index-{}.tmp", uuid::Uuid::new_v4());
+    #[cfg(windows)]
+    let (staging_path, index_path) = {
+        let path = pinned_windows_path(dir)?;
+        (path.join(&staging_name), path.join(INDEX_FILE_NAME))
+    };
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = dir.open_with(&staging_name, &options)?;
+    let result = (|| {
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, snapshot)?;
+        writer.flush()?;
+        drop(writer);
+        #[cfg(windows)]
+        {
+            fs::rename(&staging_path, index_path)
+        }
+        #[cfg(not(windows))]
+        {
+            dir.rename(&staging_name, dir, INDEX_FILE_NAME)
+        }
+    })();
+    if result.is_err() {
+        #[cfg(windows)]
+        let _ = fs::remove_file(staging_path);
+        #[cfg(not(windows))]
+        let _ = dir.remove_file(&staging_name);
+    }
+    result
 }
 
 fn default_index(project_root: PathBuf) -> ProjectIndexSnapshot {
@@ -604,35 +726,32 @@ fn resolve_project_root(project_root: Option<String>) -> Result<PathBuf, String>
     }
 }
 
-fn index_path(project_root: &Path) -> io::Result<PathBuf> {
-    let dir = project_root.join(".codemux");
-    let path = dir.join("index.json");
-    for (entry, directory) in [(&dir, true), (&path, false)] {
-        match fs::symlink_metadata(entry) {
-            Ok(m) if (directory && m.is_dir()) || (!directory && m.is_file()) => {}
-            Ok(_) => {
-                return Err(io::Error::other(format!(
-                    "Unexpected cache entry at {}",
-                    entry.display()
-                )))
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+fn open_child_dir(parent: &Dir, name: &Path) -> io::Result<Dir> {
+    let child = parent.open_dir_nofollow(name)?;
+    #[cfg(windows)]
+    if child.dir_metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::other("Unexpected reparse point"));
     }
-    Ok(path)
+    Ok(child)
 }
 
-fn open_regular_file(path: &Path) -> io::Result<(fs::File, fs::Metadata)> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
+fn open_regular_file(dir: &Dir, name: &Path) -> io::Result<(fs::File, fs::Metadata)> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
     }
-    let file = options.open(path)?;
+    let file = dir.open_with(name, &options)?.into_std();
     let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::other("Unexpected reparse point"));
+        }
+    }
     if !metadata.is_file() {
         return Err(io::Error::other("Expected a regular file"));
     }
@@ -665,23 +784,79 @@ mod tests {
     fn cache_is_used_only_for_its_selected_root_and_schema() {
         let project = tempfile::tempdir().unwrap();
         let root = project.path();
-        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        let dir = open_project_dir(root).unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
         let mut snapshot = rebuild_index(Some(root.display().to_string())).unwrap();
-        let store = ProjectIndexStore::default();
-        store.initialize_for_project(root.to_owned());
-        assert_eq!(store.status().file_count, 1);
+        assert_eq!(load_index(root, &dir).unwrap().file_count, 1);
 
-        snapshot.schema_version = 1;
-        save_index(root, &snapshot).unwrap();
-        store.initialize_for_project(root.to_owned());
-        assert_eq!(store.status().file_count, 0);
+        snapshot.schema_version = INDEX_SCHEMA_VERSION - 1;
+        save_index(&dir, &snapshot).unwrap();
+        assert!(load_index(root, &dir).is_none());
 
         snapshot.schema_version = INDEX_SCHEMA_VERSION;
         snapshot.project_root = root.join("previous-location").display().to_string();
-        save_index(root, &snapshot).unwrap();
-        store.initialize_for_project(root.to_owned());
-        assert_eq!(store.status().project_root, root.display().to_string());
-        assert_eq!(store.status().file_count, 0);
+        save_index(&dir, &snapshot).unwrap();
+        assert!(load_index(root, &dir).is_none());
+    }
+
+    #[test]
+    fn rebuilding_an_index_preserves_git_excludes() {
+        let project = tempfile::tempdir().unwrap();
+        let info = project.path().join(".git/info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("exclude"), b"*.local\n").unwrap();
+        rebuild_index(Some(project.path().display().to_string())).unwrap();
+        assert_eq!(fs::read(info.join("exclude")).unwrap(), b"*.local\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_and_cache_keep_using_open_directories_after_a_rename() {
+        let project = tempfile::tempdir().unwrap();
+        let selected = project.path().join("selected");
+        let moved = project.path().join("moved");
+        fs::create_dir_all(selected.join("src")).unwrap();
+        fs::write(selected.join("src/original.rs"), "fn original() {}").unwrap();
+        let parent = open_project_dir(project.path()).unwrap();
+        let root = open_child_dir(&parent, Path::new("selected")).unwrap();
+        fs::rename(&selected, &moved).unwrap();
+        fs::create_dir(&selected).unwrap();
+
+        let snapshot = build_index_for_root(&selected, &root).unwrap();
+        assert_eq!(snapshot.file_count, 1);
+        assert_eq!(snapshot.files[0].file_path, "src/original.rs");
+        save_index(&root, &snapshot).unwrap();
+        assert!(load_index(&selected, &root).is_some());
+        assert!(!selected.join(".codemux").exists());
+
+        let cache = open_child_dir(&root, Path::new(".codemux")).unwrap();
+        fs::rename(moved.join(".codemux"), moved.join("saved")).unwrap();
+        fs::create_dir(moved.join(".codemux")).unwrap();
+        let empty = default_index(selected);
+        persist_index(&cache, &empty).unwrap();
+        let saved: ProjectIndexSnapshot =
+            serde_json::from_slice(&fs::read(moved.join("saved/index.json")).unwrap()).unwrap();
+        assert_eq!(saved.file_count, 0);
+        assert!(!moved.join(".codemux/index.json").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn watched_directory_can_be_renamed_between_scans() {
+        let project = tempfile::tempdir().unwrap();
+        let selected = project.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("original.rs"), "fn original() {}").unwrap();
+        let watched = reopen_watched_dir(&open_project_dir(&selected).unwrap(), true).unwrap();
+        fs::rename(&selected, project.path().join("moved")).unwrap();
+        fs::create_dir(&selected).unwrap();
+        let pinned = reopen_watched_dir(&watched, false).unwrap();
+        let snapshot = build_index_for_root(&selected, &pinned).unwrap();
+        assert_eq!(snapshot.file_count, 1);
+        assert_eq!(snapshot.files[0].file_path, "original.rs");
+        save_index(&pinned, &snapshot).unwrap();
+        assert!(!selected.join(".codemux").exists());
     }
 
     #[cfg(unix)]
@@ -705,7 +880,7 @@ mod tests {
         let snapshot = rebuild_index(Some(root.display().to_string())).unwrap();
         assert_eq!(snapshot.file_count, 1);
         assert_eq!(snapshot.files[0].file_path, "src/main.rs");
-        assert!(load_index(&root).is_some());
+        assert!(load_index(&root, &open_project_dir(&root).unwrap()).is_some());
     }
 
     #[cfg(unix)]
@@ -715,6 +890,7 @@ mod tests {
 
         let project = tempfile::tempdir().unwrap();
         let root = project.path();
+        let handle = open_project_dir(root).unwrap();
         let other = tempfile::tempdir().unwrap();
         let snapshot = default_index(root.to_owned());
         let sentinel = serde_json::to_vec(&snapshot).unwrap();
@@ -722,14 +898,14 @@ mod tests {
         fs::write(&other_file, &sentinel).unwrap();
         let dir = root.join(".codemux");
         symlink(other.path(), &dir).unwrap();
-        assert!(load_index(root).is_none());
-        assert!(save_index(root, &snapshot).is_err());
+        assert!(load_index(root, &handle).is_none());
+        assert!(save_index(&handle, &snapshot).is_err());
 
         fs::remove_file(&dir).unwrap();
         fs::create_dir(&dir).unwrap();
         symlink(&other_file, dir.join("index.json")).unwrap();
-        assert!(load_index(root).is_none());
-        assert!(save_index(root, &snapshot).is_err());
+        assert!(load_index(root, &handle).is_none());
+        assert!(save_index(&handle, &snapshot).is_err());
         assert_eq!(fs::read(other_file).unwrap(), sentinel);
     }
 
