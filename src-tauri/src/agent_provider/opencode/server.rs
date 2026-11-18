@@ -657,12 +657,75 @@ mod stdout_drain {
         }
     }
 
-    /// The longest startup line read at once, and the most startup output
-    /// kept for an error message.
-    #[cfg(windows)]
-    const MAX_LINE: u64 = 4096;
-    #[cfg(windows)]
+    /// The longest startup line parsed for the banner, and the most startup
+    /// output kept for an error message.
+    #[cfg(any(windows, test))]
+    const MAX_LINE: usize = 4096;
+    #[cfg(any(windows, test))]
     const MAX_CAPTURED: usize = 8192;
+
+    /// Read startup output line by line until the ready banner. Lines are
+    /// scanned as bytes: a line longer than [`MAX_LINE`] is skipped to its
+    /// end without being parsed, and the rest are decoded leniently, so a
+    /// multibyte character cut by a buffer boundary never ends startup.
+    /// Memory stays bounded however chatty the output is.
+    #[cfg(any(windows, test))]
+    pub(super) fn scan_banner(
+        reader: &mut impl std::io::BufRead,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<(String, super::OpenCodeApi), String> {
+        let mut captured = String::new();
+        let mut line: Vec<u8> = Vec::with_capacity(256);
+        let mut overlong = false;
+        loop {
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("ready_banner_missing; stopped".to_string());
+            }
+            let chunk = match reader.fill_buf() {
+                Ok([]) | Err(_) => {
+                    return Err(format!(
+                        "ready_banner_missing; child stdout closed. captured:\n{}",
+                        captured.trim()
+                    ))
+                }
+                Ok(chunk) => chunk,
+            };
+            let (part, ends_line) = match chunk.iter().position(|&b| b == b'\n') {
+                Some(i) => (&chunk[..=i], true),
+                None => (chunk, false),
+            };
+            let used = part.len();
+            if !overlong {
+                if line.len() + used > MAX_LINE + 1 {
+                    // Too long to be the banner; skip to the end of the line.
+                    overlong = true;
+                    line.clear();
+                } else {
+                    line.extend_from_slice(part);
+                }
+            }
+            reader.consume(used);
+            if !ends_line {
+                continue;
+            }
+            if !std::mem::take(&mut overlong) {
+                let text = String::from_utf8_lossy(&line);
+                let text = text.trim_end_matches(['\r', '\n']);
+                if let Some(found) = super::parse_ready_url(text)
+                    .and_then(|url| super::OpenCodeApi::from_ready_banner(text).map(|api| (url, api)))
+                {
+                    return Ok(found);
+                }
+                if captured.len() < MAX_CAPTURED {
+                    if !captured.is_empty() {
+                        captured.push('\n');
+                    }
+                    captured.push_str(text);
+                }
+            }
+            line.clear();
+        }
+    }
 
     /// The banner the reader thread found, or why it found none.
     #[cfg(windows)]
@@ -675,15 +738,16 @@ mod stdout_drain {
     #[cfg(windows)]
     #[derive(Debug)]
     pub(super) struct Drain {
-        pipe: std::fs::File,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Wakes the cancel thread; dropping it does too.
+        stopping: std::sync::mpsc::Sender<()>,
     }
 
     #[cfg(windows)]
     impl Drain {
         pub(super) fn start(stdout: tokio::process::ChildStdout) -> Result<(Self, Banner), String> {
-            use std::io::{BufRead, Read};
+            use std::io::Read;
             use std::sync::atomic::{AtomicBool, Ordering};
             use std::sync::Arc;
 
@@ -692,6 +756,34 @@ mod stdout_drain {
             let pipe = reader.try_clone().map_err(|e| e.to_string())?;
             let stop = Arc::new(AtomicBool::new(false));
             let done = Arc::new(AtomicBool::new(false));
+
+            // Cancellation is in place before the first read: a thread that
+            // waits for the stop, then keeps cancelling any pending read until
+            // the reader is seen to exit. A read begun just after one cancel
+            // is caught by the next; there is no deadline, because the reader
+            // always exits once its read fails. If it cannot start, the drain
+            // does not start either.
+            let (stopping, stopped) = std::sync::mpsc::channel::<()>();
+            let (cancel_stop, cancel_done) = (stop.clone(), done.clone());
+            std::thread::Builder::new()
+                .name("opencode-stdout-cancel".into())
+                .spawn(move || {
+                    use std::os::windows::io::AsRawHandle;
+                    // A stop, or the drain being dropped without one.
+                    let _ = stopped.recv();
+                    cancel_stop.store(true, Ordering::SeqCst);
+                    let mut wait = std::time::Duration::from_millis(5);
+                    while !cancel_done.load(Ordering::SeqCst) {
+                        // SAFETY: a live handle owned by `pipe`; a null
+                        // OVERLAPPED cancels every read pending on it.
+                        unsafe {
+                            windows_sys::Win32::System::IO::CancelIoEx(pipe.as_raw_handle(), std::ptr::null())
+                        };
+                        std::thread::sleep(wait);
+                        wait = (wait * 2).min(std::time::Duration::from_millis(250));
+                    }
+                })
+                .map_err(|e| e.to_string())?;
             #[cfg(test)]
             let pause = super::DRAIN_PROBE
                 .try_with(|probe| {
@@ -707,45 +799,13 @@ mod stdout_drain {
                 .name("opencode-stdout".into())
                 .spawn(move || {
                     let mut reader = std::io::BufReader::new(reader);
-                    // The banner, line by line. Its buffers live only in this
-                    // block and are capped, so a chatty startup costs nothing
-                    // once the banner is found.
-                    {
-                        let mut captured = String::new();
-                        let mut line = String::new();
-                        let result = loop {
-                            if thread_stop.load(Ordering::SeqCst) {
-                                break Err("ready_banner_missing; stopped".to_string());
-                            }
-                            line.clear();
-                            match (&mut reader).take(MAX_LINE).read_line(&mut line) {
-                                Ok(0) | Err(_) => {
-                                    break Err(format!(
-                                        "ready_banner_missing; child stdout closed. captured:\n{}",
-                                        captured.trim()
-                                    ))
-                                }
-                                Ok(_) => {}
-                            }
-                            let text = line.trim_end_matches(['\r', '\n']);
-                            if let Some(found) = super::parse_ready_url(text)
-                                .and_then(|url| super::OpenCodeApi::from_ready_banner(text).map(|api| (url, api)))
-                            {
-                                break Ok(found);
-                            }
-                            if captured.len() < MAX_CAPTURED {
-                                if !captured.is_empty() {
-                                    captured.push('\n');
-                                }
-                                captured.push_str(text);
-                            }
-                        };
-                        let found = result.is_ok();
-                        let _ = banner_tx.send(result);
-                        if !found {
-                            thread_done.store(true, Ordering::SeqCst);
-                            return;
-                        }
+                    // The banner first; its buffers live only inside the scan.
+                    let result = scan_banner(&mut reader, &thread_stop);
+                    let found = result.is_ok();
+                    let _ = banner_tx.send(result);
+                    if !found {
+                        thread_done.store(true, Ordering::SeqCst);
+                        return;
                     }
                     // Then everything after it.
                     let mut buf = [0u8; 8192];
@@ -763,40 +823,14 @@ mod stdout_drain {
                     thread_done.store(true, Ordering::SeqCst);
                 })
                 .map_err(|e| e.to_string())?;
-            Ok((Self { pipe, stop, done }, banner_rx))
+            Ok((Self { stop, done, stopping }, banner_rx))
         }
 
         pub(super) fn stop(self) {
-            use std::os::windows::io::AsRawHandle;
-            use std::sync::atomic::Ordering;
-            self.stop.store(true, Ordering::SeqCst);
-            let Self { pipe, done, .. } = self;
-            let pipe = std::sync::Arc::new(pipe);
-            let cancel = move || {
-                // SAFETY: a live handle owned by `pipe`; a null OVERLAPPED
-                // cancels every read pending on it.
-                unsafe { windows_sys::Win32::System::IO::CancelIoEx(pipe.as_raw_handle(), std::ptr::null()) };
-            };
-            // The flag keeps the reader from starting another read once it
-            // next checks it; a read already begun — even one begun just
-            // after a cancel — is cancelled, and cancelled again, until the
-            // thread is seen to exit. No deadline: the reader always exits
-            // once its read fails. Off the caller's thread, so Drop never
-            // blocks; if that thread cannot even start, cancel once here.
-            let fallback = cancel.clone();
-            let spawned = std::thread::Builder::new()
-                .name("opencode-stdout-cancel".into())
-                .spawn(move || {
-                    let mut wait = std::time::Duration::from_millis(5);
-                    while !done.load(Ordering::SeqCst) {
-                        cancel();
-                        std::thread::sleep(wait);
-                        wait = (wait * 2).min(std::time::Duration::from_millis(250));
-                    }
-                });
-            if spawned.is_err() {
-                fallback();
-            }
+            // The flag keeps the reader from starting another read; the
+            // cancel thread, already running, releases the one in progress.
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.stopping.send(());
         }
 
         /// Whether the reader thread has exited.
@@ -1334,6 +1368,36 @@ mod tests {
         let released = done.load(std::sync::atomic::Ordering::SeqCst);
         server.shutdown().await.unwrap();
         assert!(released, "a read issued after the stop kept the reader alive");
+    }
+
+    #[test]
+    fn the_banner_is_found_after_long_and_multibyte_startup_lines() {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        // A line whose multibyte characters cross every 4 KiB boundary, one
+        // far longer than any banner, invalid UTF-8, then the banner.
+        let mut input = "é".repeat(3000).into_bytes();
+        input.push(b'\n');
+        input.extend("x".repeat(100_000).into_bytes());
+        input.push(b'\n');
+        input.extend(b"\xff\xfe not utf-8\r\n");
+        input.extend(b"opencode server listening on http://127.0.0.1:4096\n");
+        input.extend(b"after the banner\n");
+        // A tiny buffer, so every line spans many reads.
+        let mut reader = std::io::BufReader::with_capacity(7, std::io::Cursor::new(input));
+
+        let (url, _api) = stdout_drain::scan_banner(&mut reader, &stop).expect("the banner");
+        assert_eq!(url, "http://127.0.0.1:4096");
+    }
+
+    #[test]
+    fn no_banner_reports_what_startup_printed_within_a_cap() {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let input = "some log line\n".repeat(10_000);
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+        let err = stdout_drain::scan_banner(&mut reader, &stop).unwrap_err();
+        assert!(err.starts_with("ready_banner_missing"), "{err}");
+        assert!(err.contains("some log line"));
+        assert!(err.len() < 9_000, "the diagnostic is capped: {} bytes", err.len());
     }
 
     /// Tests in this module that rely on the live `opencode` binary
