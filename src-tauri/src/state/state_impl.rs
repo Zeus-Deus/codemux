@@ -6684,9 +6684,74 @@ fn emit_debouncer() -> &'static EmitDebouncer {
 }
 
 pub fn load_persisted_state() -> Option<AppStateSnapshot> {
-    let path = persisted_layout_path()?;
-    let contents = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    match load_persisted_layout() {
+        PersistedLayout::Loaded(snapshot) => Some(*snapshot),
+        PersistedLayout::Missing | PersistedLayout::Unreadable => None,
+    }
+}
+
+/// What startup found where the layout is saved.
+pub enum PersistedLayout {
+    /// No layout yet: a first launch.
+    Missing,
+    Loaded(Box<AppStateSnapshot>),
+    /// A layout exists but could not be read — a newer build's format after
+    /// a downgrade, a hand edit, disk damage. The file has been moved aside;
+    /// see [`layout_was_unreadable`].
+    Unreadable,
+}
+
+static LAYOUT_UNREADABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this run started without the user's saved layout because it
+/// could not be read. Startup then shows no workspaces, which must not be
+/// mistaken for the user having closed them all: nothing tied to the old
+/// workspaces (their scrollback, their synced rows) may be cleaned up.
+pub fn layout_was_unreadable() -> bool {
+    LAYOUT_UNREADABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn load_persisted_layout() -> PersistedLayout {
+    let Some(path) = persisted_layout_path() else {
+        return PersistedLayout::Missing;
+    };
+    let layout = load_layout_from(&path);
+    if matches!(layout, PersistedLayout::Unreadable) {
+        LAYOUT_UNREADABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    layout
+}
+
+/// Read the layout at `path`. An unreadable one is renamed to
+/// `<name>.unreadable-<unix seconds>` before anything can save over it, so
+/// it can still be recovered by hand.
+fn load_layout_from(path: &Path) -> PersistedLayout {
+    let error = match fs::read_to_string(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return PersistedLayout::Missing,
+        Err(error) => error.to_string(),
+        Ok(contents) => match serde_json::from_str(&contents) {
+            Ok(snapshot) => return PersistedLayout::Loaded(Box::new(snapshot)),
+            Err(error) => error.to_string(),
+        },
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".unreadable-{stamp}"));
+    let aside = PathBuf::from(aside);
+    match fs::rename(path, &aside) {
+        Ok(()) => log::error!(
+            "Could not read the saved layout ({error}); kept it as {} and started without it",
+            aside.display()
+        ),
+        Err(rename_error) => log::error!(
+            "Could not read the saved layout at {} ({error}), nor set it aside ({rename_error})",
+            path.display()
+        ),
+    }
+    PersistedLayout::Unreadable
 }
 
 /// Remove all browser panes and browser sessions from a snapshot.
@@ -13839,5 +13904,46 @@ mod reserved_workspace_id_tests {
         );
         assert_eq!(store.snapshot().workspaces.len(), count);
         assert!(store.find_workspace(&unused.0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod persisted_layout_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_layout_is_a_first_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(load_layout_from(&dir.path().join("layout.json")), PersistedLayout::Missing));
+    }
+
+    #[test]
+    fn an_unreadable_layout_is_kept_aside_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        // A layout this build cannot parse, e.g. one a newer build wrote.
+        fs::write(&path, r#"{"workspaces":[{"tabs":[{"kind":"from-the-future"}]}]}"#).unwrap();
+
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable));
+        assert!(!path.exists(), "nothing may save over it now");
+        let kept: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].starts_with("layout.json.unreadable-"), "{kept:?}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join(&kept[0])).unwrap(),
+            r#"{"workspaces":[{"tabs":[{"kind":"from-the-future"}]}]}"#
+        );
+    }
+
+    #[test]
+    fn a_saved_layout_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        fs::write(&path, serde_json::to_string(&default_app_state()).unwrap()).unwrap();
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Loaded(_)));
+        assert!(path.exists());
     }
 }

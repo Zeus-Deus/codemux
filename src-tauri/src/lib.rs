@@ -941,7 +941,9 @@ fn build_core_app<R: tauri::Runtime>(
             // a force-close cascade. See `scrollback::should_run_orphan_cleanup`
             // for the full failure-mode write-up.
             let mut layout_loaded = false;
-            if let Some(snapshot) = state::load_persisted_state() {
+            let persisted_layout = state::load_persisted_layout();
+            if let state::PersistedLayout::Loaded(snapshot) = persisted_layout {
+                let snapshot = *snapshot;
                 let mut stripped = state::strip_removed_workspaces_from_snapshot(snapshot);
                 // The coalesced SQLite stream is authoritative for selection;
                 // layout.json remains authoritative for the pane/layout body.
@@ -1025,7 +1027,11 @@ fn build_core_app<R: tauri::Runtime>(
                 // historical behavior verbatim. See
                 // `scrollback::should_run_orphan_cleanup` for the full
                 // failure-mode rationale.
-                if scrollback::should_run_orphan_cleanup(layout_loaded) {
+                // An unreadable layout is not "no workspaces": their
+                // scrollback must survive until the layout is recovered.
+                if scrollback::should_run_orphan_cleanup(layout_loaded)
+                    && !state::layout_was_unreadable()
+                {
                     let removed = scrollback::cleanup_orphan_scrollbacks(&ws_ids);
                     if !removed.is_empty() {
                         eprintln!(

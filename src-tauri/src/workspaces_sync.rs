@@ -632,6 +632,13 @@ pub fn reconcile_from_snapshot(
     // Soft-delete sync rows whose workspace_id is no longer in
     // app_state. Rows with no workspace_id (pulled-only) are skipped
     // by construction (the filter_map above excludes them).
+    //
+    // Not after a startup that could not read the saved layout: its
+    // workspaces are missing, not closed, and deleting their rows would
+    // remove them from every other device too.
+    if crate::state::layout_was_unreadable() {
+        return Ok(());
+    }
     for row in &sync_rows {
         if let Some(wid) = &row.workspace_id {
             if !live_wids.contains(wid) {
