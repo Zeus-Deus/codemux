@@ -1440,8 +1440,8 @@ mod tests {
     // on a worker thread, so a stuck join would trip the deadline instead of
     // hanging the test.
     #[cfg(windows)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_reader_that_cannot_start_leaves_no_cancel_thread_behind() {
+    #[test]
+    fn a_reader_that_cannot_start_leaves_no_cancel_thread_behind() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("fake-opencode.cmd");
         std::fs::write(
@@ -1455,18 +1455,28 @@ mod tests {
             canceller_exited: Some(exited.clone()),
             ..DrainProbe::default()
         }));
-        // The path moves into the task (`tokio::spawn` needs `'static`); the
-        // temp dir outlives it, as the task is awaited below.
-        let startup = tokio::spawn(DRAIN_PROBE.scope(probe, async move {
-            OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(10)).await
-        }));
-        let started = tokio::time::timeout(Duration::from_secs(10), startup)
-            .await
-            .expect("a failed reader start must not hang on its cancel thread")
+        // An owned runtime, shut down with a deadline before asserting, so a
+        // stuck join fails the test instead of hanging it at teardown.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
             .unwrap();
+        let outcome = runtime.block_on(async move {
+            // The path moves into the task (`tokio::spawn` needs `'static`);
+            // the temp dir outlives it.
+            let startup = tokio::spawn(DRAIN_PROBE.scope(probe, async move {
+                OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(10)).await
+            }));
+            tokio::time::timeout(Duration::from_secs(10), startup).await
+        });
+        runtime.shutdown_timeout(Duration::from_secs(1));
+
+        let started = outcome.expect("a failed reader start must not hang on its cancel thread").unwrap();
         let err = started.err().expect("startup fails when the reader cannot start");
         assert!(err.contains("read stdout"), "unexpected error: {err}");
         assert!(exited.load(std::sync::atomic::Ordering::SeqCst), "the cancel thread has exited");
+        drop(dir);
     }
 
     /// Tests in this module that rely on the live `opencode` binary
