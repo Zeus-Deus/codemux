@@ -82,19 +82,20 @@ export function useAppStateInit(skip = false) {
     let cancelled = false;
     // Sign-out pauses the listener but leaves its last workspace state in memory.
     const startingCount = useAppStore.getState().fullSnapshotCount;
-    const needsSnapshot = () => !cancelled && useAppStore.getState().fullSnapshotCount === startingCount;
+    const receivedSnapshot = () => useAppStore.getState().fullSnapshotCount !== startingCount;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const fetchInitial = async (retryDelay: number) => {
       try {
         const snapshot = await getAppState();
-        if (cancelled) return;
+        // An unrevisioned reply cannot be ordered against a snapshot already received.
+        if (cancelled || (!snapshot.snapshot_revision && receivedSnapshot())) return;
         setAppState(snapshot);
         markStartup("initial-snapshot-ready", tracedPayloadMeta(snapshot));
       } catch (err) {
-        if (!needsSnapshot()) return;
+        if (cancelled || receivedSnapshot()) return;
         console.error("Failed to fetch app state:", err);
         timer = setTimeout(() => {
-          if (needsSnapshot()) void fetchInitial(Math.min(retryDelay * 2, 30_000));
+          if (!receivedSnapshot()) void fetchInitial(Math.min(retryDelay * 2, 30_000));
         }, retryDelay);
       }
     };

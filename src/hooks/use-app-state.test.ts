@@ -333,6 +333,35 @@ describe("useAppStateInit — lifecycle boundaries", () => {
     }
   });
 
+  it.each([
+    { revision: undefined, expectedWorkspace: "ws-B" },
+    { revision: 0, expectedWorkspace: "ws-B" },
+    { revision: 4, expectedWorkspace: "ws-B" },
+    { revision: 6, expectedWorkspace: "ws-A" },
+  ])("keeps $expectedWorkspace when a retry with revision $revision arrives after a pushed snapshot", async ({ revision, expectedWorkspace }) => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let resolveRetry!: (snapshot: AppStateSnapshot) => void;
+      getAppStateMock
+        .mockRejectedValueOnce(new Error("reconnecting"))
+        .mockReturnValueOnce(new Promise((resolve) => { resolveRetry = resolve; }));
+      renderHook(() => useAppStateInit());
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(2);
+
+      act(() => {
+        deliverSnapshot!({ ...makeAppState("ws-B"), snapshot_revision: 5 });
+        vi.advanceTimersByTime(16);
+      });
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-B");
+
+      await act(async () => { resolveRetry({ ...makeAppState("ws-A"), snapshot_revision: revision }); });
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe(expectedWorkspace);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it("continues retrying after a delta and an out-of-date full snapshot", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
