@@ -885,7 +885,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     const mountOutputEpoch = outputEpoch;
     let restarting = false;
     let outputChannel: Channel<unknown> | null = null;
-    let pendingAttach: Promise<boolean> | undefined;
+    let pendingOutputIpc: Promise<unknown> | undefined;
     const ownsOutput = (epoch: number) => !cancelled && epoch === outputEpoch;
     const releaseOutputChannel = () => {
       if (outputChannel) releaseRemoteChannel(outputChannel.id);
@@ -1001,7 +1001,8 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         } else if (visibleRef.current) {
           fitAddon.fit();
           if (term.cols > 0 && term.rows > 0) {
-            await resizePty(sid, term.cols, term.rows).catch(console.error);
+            pendingOutputIpc = resizePty(sid, term.cols, term.rows).catch(console.error);
+            await pendingOutputIpc;
           }
         }
         if (!ownsOutput(epoch)) return false;
@@ -1034,8 +1035,9 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         pump.enqueue(bytes);
       });
       outputChannel = channel;
-      pendingAttach = installOutputChannel(channel, epoch);
-      return pendingAttach;
+      const attaching = installOutputChannel(channel, epoch);
+      pendingOutputIpc = attaching;
+      return attaching;
     };
 
     restartRef.current = async () => {
@@ -1058,9 +1060,9 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         exit_code: null,
       });
       try {
-        // A replacement PTY can reuse its predecessor's generation tokens.
-        // Finish detaching here so a late detach cannot target that PTY.
-        if (pendingAttach) await pendingAttach;
+        // Finish any issued startup resize or attach before replacing the
+        // PTY. A late detach could otherwise hit a reused generation.
+        if (pendingOutputIpc) await pendingOutputIpc;
         if (generation != null) await detachPtyOutput(sid, generation).catch(console.error);
         if (!ownsOutput(epoch)) return;
         try {
@@ -1079,7 +1081,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         pump.enqueue(
           new TextEncoder().encode("\r\n\x1b[2m── shell restarted ──\x1b[0m\r\n\r\n"),
         );
-        if (await attachOutput(epoch)) term.focus();
+        if (await attachOutput(epoch) && ownsOutput(epoch)) term.focus();
       } finally {
         restarting = false;
       }

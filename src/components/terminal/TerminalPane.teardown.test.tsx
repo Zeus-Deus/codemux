@@ -680,8 +680,11 @@ describe("TerminalPane exited shell", () => {
     h.mobile = false;
     h.holdParse = false;
     h.parse = null;
+    h.fitCols = 80;
+    h.fitRows = 24;
     detachPtyOutput.mockClear();
     vi.mocked(attachPtyOutput).mockClear();
+    vi.mocked(resizePty).mockReset().mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -773,6 +776,30 @@ describe("TerminalPane exited shell", () => {
     view.unmount();
     expect(unregisterCallback.mock.calls).toEqual([[mountChannel.id], [replacement.id]]);
     expect(detachPtyOutput.mock.calls).toEqual([["sess-a", 1], ["sess-a", 1]]);
+  });
+
+  it("waits for an issued mount resize before sizing the restarted PTY", async () => {
+    schedulerHarness();
+    h.status = { state: "exited", message: null, exit_code: 0 };
+    h.sessionState = "exited";
+    let finishResize!: () => void;
+    vi.mocked(resizePty).mockReturnValueOnce(new Promise<void>(resolve => { finishResize = resolve; }));
+    const view = renderPane("sess-a");
+    await act(async () => {});
+    expect(resizePty).toHaveBeenCalledExactlyOnceWith("sess-a", 80, 24);
+
+    h.fitCols = 100;
+    h.fitRows = 40;
+    await act(async () => fireEvent.click(view.getByRole("button", { name: "Restart shell" })));
+    expect(h.log).not.toContain("restart");
+    expect(attachPtyOutput).not.toHaveBeenCalled();
+
+    await act(async () => finishResize());
+    expect(h.log).toContain("restart");
+    expect(vi.mocked(resizePty).mock.calls).toEqual([
+      ["sess-a", 80, 24], ["sess-a", 100, 40],
+    ]);
+    expect(attachPtyOutput).toHaveBeenCalledOnce();
   });
 
   it("can retry a rejected restart after releasing the old subscription", async () => {
