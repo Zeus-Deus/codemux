@@ -1455,10 +1455,11 @@ mod tests {
             canceller_exited: Some(exited.clone()),
             ..DrainProbe::default()
         }));
-        let startup = tokio::spawn(DRAIN_PROBE.scope(
-            probe,
-            OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(10)),
-        ));
+        // The path moves into the task (`tokio::spawn` needs `'static`); the
+        // temp dir outlives it, as the task is awaited below.
+        let startup = tokio::spawn(DRAIN_PROBE.scope(probe, async move {
+            OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(10)).await
+        }));
         let started = tokio::time::timeout(Duration::from_secs(10), startup)
             .await
             .expect("a failed reader start must not hang on its cancel thread")
