@@ -99,16 +99,9 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     //    or serve instance (they would fight over the control socket, the DB,
     //    the PTY daemon, and the web-remote port).
     //
-    //    Both directions of the guard key off the SAME fact — who holds the
-    //    control endpoint — so it only works if `serve` actually takes it: the
-    //    check below stops a second `serve` (or a `serve` next to a GUI), and
-    //    `main.rs` runs the identical check before building the GUI. The
-    //    control server is spawned from the Tauri `setup` hook, which is why
-    //    `build_headless_app` has to run that hook (see step 2). While setup
-    //    was skipped, `serve` never took the endpoint: the GUI happily booted
-    //    beside it, a second `serve` got as far as failing on the web-remote
-    //    port with an Address-in-use error instead of this clear message, and
-    //    `codemux remote pair` / `connect status` reported nothing running.
+    //    The socket catches a running backend that may predate the layout
+    //    lock. Desktop performs the same probe after native launch routing.
+    //    The lock also covers startup before the socket is listening.
     if crate::control::control_server_is_running() {
         return Err(
             "Codemux is already running on this machine (GUI or serve) — stop it first, \
@@ -245,7 +238,7 @@ fn flush_shutdown_state<R: Runtime>(app: &AppHandle<R>, drain_result: Result<(),
     // A timed-out operation can still be running. Save the current snapshot
     // and report the timeout so the caller knows the drain was incomplete.
     let layout_result =
-        crate::state::finish_layout_persistence(&app.state::<crate::state::AppStateStore>(), false);
+        crate::state::finish_layout_persistence(&app.state::<crate::state::AppStateStore>());
     let selection_result = crate::active_workspace_persistence::finish_persistence(app)
         .map_err(|error| format!("Failed to save the active workspace: {error}"));
     drain_result.and(layout_result).and(selection_result)

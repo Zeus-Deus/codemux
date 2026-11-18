@@ -167,10 +167,7 @@ pub fn flush_persisted_state(store: &AppStateStore) -> Result<(), String> {
 }
 
 /// Seal layout persistence before handing ownership to a new process.
-pub(crate) fn finish_layout_persistence(
-    store: &AppStateStore,
-    verify_existing_layout: bool,
-) -> Result<(), String> {
+pub(crate) fn finish_layout_persistence(store: &AppStateStore) -> Result<(), String> {
     let debouncer = persist_debouncer();
     {
         let mut pending = debouncer.last_snapshot.lock().unwrap();
@@ -181,9 +178,6 @@ pub(crate) fn finish_layout_persistence(
     // A writer that already took its snapshot owns this gate until its
     // save finishes. Wait for it before saving the final state.
     let _write_guard = debouncer.write_lock.lock().unwrap();
-    if verify_existing_layout {
-        load_persisted_state_checked()?;
-    }
     save_persisted_state(&store.snapshot())
 }
 
@@ -11022,7 +11016,7 @@ mod tests {
             let release = release_tx;
             let store = &store;
             let finish = scope.spawn(move || {
-                let result = finish_layout_persistence(store, false);
+                let result = finish_layout_persistence(store);
                 drop(owner);
                 result
             });
@@ -11070,24 +11064,6 @@ mod tests {
             "Layout persistence is closed",
         );
         assert_eq!(fs::read(path).unwrap(), successor_bytes);
-    }
-
-    #[test]
-    fn layout_handoff_preserves_a_still_unreadable_layout() {
-        if crate::test_isolation::isolated(
-            "state::state_impl::tests::layout_handoff_preserves_a_still_unreadable_layout",
-        ) {
-            return;
-        }
-        let path = persisted_layout_path().unwrap();
-        let _owner = acquire_layout_lock().unwrap();
-        let original = b"{\"workspaces\":[";
-        fs::write(&path, original).unwrap();
-        let store = AppStateStore::default();
-
-        let error = finish_layout_persistence(&store, true).unwrap_err();
-        assert!(error.contains("Failed to decode workspace layout"), "{error}");
-        assert_eq!(fs::read(path).unwrap(), original);
     }
 
     #[test]
