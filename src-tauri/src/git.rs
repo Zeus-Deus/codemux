@@ -224,6 +224,9 @@ pub fn git_clone(remote_url: &str, target_dir: &Path) -> Result<String, String> 
     if remote_url.trim().is_empty() {
         return Err("git_clone: remote_url cannot be empty".into());
     }
+    if remote_url.trim_start().starts_with('-') {
+        return Err("git_clone: remote_url cannot start with '-'".into());
+    }
     if target_dir.exists() {
         // Don't clobber — caller should have picked a fresh path.
         return Err(format!(
@@ -254,7 +257,7 @@ pub fn git_clone(remote_url: &str, target_dir: &Path) -> Result<String, String> 
     // the right branch — clone's default checkout of the remote's
     // HEAD branch is wasted work for our flow.
     let output = git_command()
-        .args(["clone", "--no-checkout", remote_url, &target_str])
+        .args(["clone", "--no-checkout", "--", remote_url, &target_str])
         .current_dir(parent)
         .output()
         .map_err(|e| format!("git_clone: failed to spawn git: {e}"))?;
@@ -282,6 +285,14 @@ mod git_clone_input_validation {
         let _ = std::fs::remove_dir_all(&dir);
         let err = git_clone("", &dir).unwrap_err();
         assert!(err.contains("cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_an_option_shaped_remote_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = git_clone("--upload-pack=touch /tmp/x", &tmp.path().join("t")).unwrap_err();
+        assert!(err.contains("cannot start with '-'"), "{err}");
+        assert!(!tmp.path().join("t").exists());
     }
 
     #[test]
@@ -3001,6 +3012,14 @@ pub fn git_create_worktree(
     base: Option<&str>,
     pr_number: Option<u32>,
 ) -> Result<String, String> {
+    // Both names reach git's argv (`fetch origin <b>:<b>`, `worktree add`),
+    // and some callers take them from synced or remote data. A value
+    // starting with `-` would be read as an option — `--upload-pack=<cmd>`
+    // runs a command — so the shared plain-text rules apply to every caller.
+    crate::workspace_service::check_ref_text("branch", branch)?;
+    if let Some(base) = base {
+        crate::workspace_service::check_ref_text("base", base)?;
+    }
     let worktree_path = conventional_worktree_path(repo_path, branch)
         .ok_or_else(|| format!("Not a git repository: {}", repo_path.display()))?;
 
@@ -4481,6 +4500,27 @@ mod tests {
         let head = run_git(Path::new(&wt_path), &["rev-parse", "HEAD"]).unwrap();
         git_remove_worktree(Path::new(&wt_path), Some("from-origin-commit"), true).expect("cleanup");
         assert_eq!(head, remote_tip);
+    }
+
+    #[test]
+    fn option_shaped_branch_or_base_never_reaches_git() {
+        let (dir, local, _tip) = setup_stale_clone_with_remote("inject");
+        let marker = dir.path().join("pwned");
+        let payload = format!("--upload-pack=touch {};#", marker.display());
+
+        for (branch, base) in [
+            (payload.as_str(), None),
+            ("ok-branch", Some(payload.as_str())),
+            ("", None),
+            ("bad\nname", None),
+        ] {
+            for new_branch in [false, true] {
+                let err = git_create_worktree(&local, branch, new_branch, base, None)
+                    .expect_err("an option-shaped name must be refused");
+                assert!(err.starts_with("invalid_input:"), "{branch:?}/{base:?}: {err}");
+            }
+        }
+        assert!(!marker.exists(), "git must never have run the payload");
     }
 
     #[test]
