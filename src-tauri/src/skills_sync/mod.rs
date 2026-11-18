@@ -842,7 +842,9 @@ mod confined {
             FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0,
             FILE_SYNCHRONOUS_IO_NONALERT,
         };
-        use windows_sys::Win32::Foundation::{HANDLE, UNICODE_STRING};
+        use windows_sys::Win32::Foundation::{
+            HANDLE, STATUS_ACCESS_DENIED, STATUS_SHARING_VIOLATION, UNICODE_STRING,
+        };
         use windows_sys::Win32::Storage::FileSystem::{
             FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_NORMAL,
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
@@ -962,10 +964,9 @@ mod confined {
         let size = std::mem::size_of::<FILE_RENAME_INFORMATION>() + wide.len() * 2;
         let mut buf = vec![0u64; size.div_ceil(8)];
         let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-        let mut status_block = IO_STATUS_BLOCK { Anonymous: IO_STATUS_BLOCK_0 { Status: 0 }, Information: 0 };
         // SAFETY: `buf` is zeroed, aligned and large enough for the struct and
         // the name written after its first element.
-        let status = unsafe {
+        unsafe {
             (*info).Anonymous = FILE_RENAME_INFORMATION_0 { ReplaceIfExists: 1 };
             (*info).RootDirectory = std::ptr::null_mut();
             (*info).FileNameLength = (wide.len() * 2) as u32;
@@ -974,13 +975,29 @@ mod confined {
                 std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
                 wide.len(),
             );
-            NtSetInformationFile(
-                tmp.as_raw_handle(),
-                &mut status_block,
-                info.cast(),
-                size as u32,
-                FileRenameInformation,
-            )
+        }
+        // Replacing `SKILL.md` fails for a moment while another write is
+        // replacing it, or while a reader that does not share delete access
+        // (a scanner, an indexer) has it open; retry briefly.
+        let mut attempts = 0;
+        let status = loop {
+            let mut status_block = IO_STATUS_BLOCK { Anonymous: IO_STATUS_BLOCK_0 { Status: 0 }, Information: 0 };
+            // SAFETY: a live handle opened with DELETE access, and the buffer
+            // filled in above.
+            let status = unsafe {
+                NtSetInformationFile(
+                    tmp.as_raw_handle(),
+                    &mut status_block,
+                    info.cast(),
+                    size as u32,
+                    FileRenameInformation,
+                )
+            };
+            attempts += 1;
+            if status >= 0 || !matches!(status, STATUS_ACCESS_DENIED | STATUS_SHARING_VIOLATION) || attempts == 50 {
+                break status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         };
         if status < 0 {
             discard(&tmp);
