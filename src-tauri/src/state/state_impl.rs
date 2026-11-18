@@ -6682,9 +6682,26 @@ fn emit_debouncer() -> &'static EmitDebouncer {
 }
 
 pub fn load_persisted_state() -> Option<AppStateSnapshot> {
-    let path = persisted_layout_path()?;
-    let contents = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    load_persisted_state_checked().ok().flatten()
+}
+
+/// A missing layout is normal on first launch. Other load errors mean the
+/// existing layout cannot be safely replaced by a fresh workspace snapshot.
+pub(crate) fn load_persisted_state_checked() -> Result<Option<AppStateSnapshot>, String> {
+    let path = persisted_layout_path().ok_or("No config directory for workspace layout")?;
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            && fs::symlink_metadata(&path).is_err_and(|metadata_error| {
+                metadata_error.kind() == std::io::ErrorKind::NotFound
+            }) => return Ok(None),
+        Err(error) => {
+            return Err(format!("Failed to read workspace layout at {}: {error}", path.display()));
+        }
+    };
+    serde_json::from_str(&contents).map(Some).map_err(|error| {
+        format!("Failed to decode workspace layout at {}: {error}", path.display())
+    })
 }
 
 /// Remove all browser panes and browser sessions from a snapshot.

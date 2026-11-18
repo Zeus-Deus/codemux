@@ -537,7 +537,7 @@ pub fn run() {
         },
     ));
 
-    build_core_app(builder, AppMode::Gui)
+    build_core_app(builder, AppMode::Gui, state::load_persisted_state)
         .build(app_context())
         .expect("error while building tauri application")
         .run(|app, event| {
@@ -632,6 +632,7 @@ fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
 fn build_core_app<R: tauri::Runtime>(
     builder: tauri::Builder<R>,
     mode: AppMode,
+    load_layout: impl FnOnce() -> Option<state::AppStateSnapshot> + Send + 'static,
 ) -> tauri::Builder<R> {
     let builder = if mode == AppMode::ServeHeadless {
         builder.manage(web_remote::serve::ShutdownAdmission::default())
@@ -949,7 +950,7 @@ fn build_core_app<R: tauri::Runtime>(
             // a force-close cascade. See `scrollback::should_run_orphan_cleanup`
             // for the full failure-mode write-up.
             let mut layout_loaded = false;
-            if let Some(snapshot) = state::load_persisted_state() {
+            if let Some(snapshot) = load_layout() {
                 let mut stripped = state::strip_removed_workspaces_from_snapshot(snapshot);
                 // The coalesced SQLite stream is authoritative for selection;
                 // layout.json remains authoritative for the pane/layout body.
@@ -3357,9 +3358,13 @@ fn build_core_app<R: tauri::Runtime>(
 /// busy-loops); a single call to run setup on a runtime we own is exactly what
 /// it still does correctly.
 pub fn build_headless_app() -> tauri::Result<tauri::App<tauri::test::MockRuntime>> {
+    // Reject an unreadable layout before setup can publish fallback state or
+    // recover an import. Either operation can schedule or write a new layout.
+    let layout = state::load_persisted_state_checked().map_err(std::io::Error::other)?;
     let mut app = build_core_app(
         tauri::Builder::<tauri::test::MockRuntime>::new(),
         AppMode::ServeHeadless,
+        move || layout,
     )
     .build(app_context())?;
 

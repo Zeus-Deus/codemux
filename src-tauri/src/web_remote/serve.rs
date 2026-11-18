@@ -19,6 +19,7 @@
 //! path (in `main.rs`) refuses to start when a `serve` instance does.
 
 use crate::web_remote::{self, BIND_SCOPE_ALL};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -116,6 +117,11 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
         );
     }
 
+    // Install the listeners before setup starts the control server. Signals
+    // received during startup remain pending until the shutdown wait begins.
+    let shutdown_signal = tauri::async_runtime::block_on(async { register_shutdown_signal() })
+        .map_err(|error| format!("Failed to register shutdown signals: {error}"))?;
+
     // 2. Boot the full app headless (DB, state, control server, PTY warmup,
     //    web_remote restore_on_boot, every background loop) on MockRuntime.
     //    `build_headless_app` runs the Tauri `setup` hook explicitly — Tauri
@@ -188,7 +194,7 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
         //    system to drive, and this process's "event loop" is the signal
         //    wait below. (`build_headless_app` runs the one thing `run()` would
         //    otherwise have been needed for: the `setup` hook.)
-        wait_for_shutdown_signal().await;
+        shutdown_signal.await;
         eprintln!("\n[codemux serve] shutting down…");
         Ok::<(), String>(())
     });
@@ -410,31 +416,26 @@ fn print_footer(relay_only: bool, connector_enabled: bool) {
     println!("Press Ctrl-C (or send SIGTERM) to stop the server.");
 }
 
-/// Block until the process receives SIGINT or SIGTERM. On non-Unix, waits on
-/// Ctrl-C only (SIGTERM has no portable equivalent).
+/// Register the signal listeners and return the future that waits for them.
 #[cfg(unix)]
-async fn wait_for_shutdown_signal() {
+fn register_shutdown_signal() -> std::io::Result<impl Future<Output = ()>> {
     use tokio::signal::unix::{signal, SignalKind};
-    // If a handler can't be installed, fall back to Ctrl-C so we never busy-spin.
-    match (
-        signal(SignalKind::interrupt()),
-        signal(SignalKind::terminate()),
-    ) {
-        (Ok(mut sigint), Ok(mut sigterm)) => {
-            tokio::select! {
-                _ = sigint.recv() => {}
-                _ = sigterm.recv() => {}
-            }
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
         }
-        _ => {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-    }
+    })
 }
 
-#[cfg(not(unix))]
-async fn wait_for_shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+#[cfg(windows)]
+fn register_shutdown_signal() -> std::io::Result<impl Future<Output = ()>> {
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+    Ok(async move {
+        let _ = ctrl_c.recv().await;
+    })
 }
 
 /// Dev-only: does the source-tree `dist/` (the debug asset fallback the

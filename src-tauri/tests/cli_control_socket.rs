@@ -88,10 +88,12 @@ struct Serve {
 
 impl Serve {
     fn start() -> Self {
-        Self::start_in(tempfile::tempdir().unwrap())
+        let mut serve = Self::spawn_in(tempfile::tempdir().unwrap());
+        serve.wait_ready();
+        serve
     }
 
-    fn start_in(root: tempfile::TempDir) -> Self {
+    fn spawn_in(root: tempfile::TempDir) -> Self {
         let bin = root.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         // Codemux finds Cursor as `cursor-agent` on PATH. A symlink, not a
@@ -113,9 +115,7 @@ impl Serve {
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log);
-        let mut serve = Self { child: cmd.spawn().unwrap(), root };
-        serve.wait_ready();
-        serve
+        Self { child: cmd.spawn().unwrap(), root }
     }
 
     fn log(&self) -> String {
@@ -128,11 +128,13 @@ impl Serve {
             if let Some(status) = self.child.try_wait().unwrap() {
                 panic!("codemux serve exited early ({status}):\n{}", self.log());
             }
-            let output = self.cli(&["json", "status"]);
-            if output.status.success() {
+            // The footer follows registration of the shutdown signal handlers.
+            if self.log().contains("Press Ctrl-C (or send SIGTERM) to stop the server.")
+                && self.cli(&["json", "status"]).status.success()
+            {
                 return;
             }
-            assert!(Instant::now() < deadline, "codemux serve never answered on its socket:\n{}", self.log());
+            assert!(Instant::now() < deadline, "codemux serve never became ready:\n{}", self.log());
             std::thread::sleep(Duration::from_millis(200));
         }
     }
@@ -673,6 +675,40 @@ fn serve_sigterm_saves_workspace_layout_and_exits_successfully() {
     }));
 }
 
+#[test]
+fn serve_rejects_a_corrupt_layout_without_overwriting_it() {
+    let root = tempfile::tempdir().unwrap();
+    let layout = layout_path(root.path());
+    let corrupt = b"{\"workspaces\":[";
+    std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
+    std::fs::write(&layout, corrupt).unwrap();
+
+    let mut serve = Serve::spawn_in(root);
+    let status = serve.wait_for_exit().expect("serve should reject a corrupt layout");
+    let log = serve.log();
+    assert_eq!(status.code(), Some(1), "serve exited with {status}:\n{log}");
+    assert!(log.lines().any(|line| {
+        line.starts_with("[codemux serve]") && line.contains("Failed to decode workspace layout")
+    }), "serve did not report the layout decode error:\n{log}");
+    assert_eq!(std::fs::read(layout).unwrap(), corrupt);
+}
+
+#[test]
+fn serve_preserves_an_unreadable_layout_link() {
+    let root = tempfile::tempdir().unwrap();
+    let layout = layout_path(root.path());
+    let target = root.path().join("missing-layout.json");
+    std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &layout).unwrap();
+
+    let mut serve = Serve::spawn_in(root);
+    let status = serve.wait_for_exit().expect("serve should reject an unreadable layout");
+    let log = serve.log();
+    assert_eq!(status.code(), Some(1), "serve exited with {status}:\n{log}");
+    assert!(log.contains("Failed to read workspace layout"), "{log}");
+    assert_eq!(std::fs::read_link(layout).unwrap(), target);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn serve_sigterm_drains_an_admitted_workspace_creation_before_saving() {
@@ -712,21 +748,9 @@ exec /usr/bin/git "$@"
         let release = ReleaseGit(root.join("workspace-git-release"));
         let creating = scope.spawn(|| cli_in(&root, &["json", "create_workspace", &params]));
 
-        // The control socket can answer status before serve installs its
-        // signal handler. Wait for actual registration before sending SIGTERM.
-        let process_status = PathBuf::from(format!("/proc/{pid}/status"));
-        let sigterm_mask = 1_u64 << (libc::SIGTERM - 1);
-        let signal_ready = || {
-            std::fs::read_to_string(&process_status).is_ok_and(|status| {
-                status.lines()
-                    .find_map(|line| line.strip_prefix("SigCgt:"))
-                    .and_then(|caught| u64::from_str_radix(caught.trim(), 16).ok())
-                    .is_some_and(|caught| caught & sigterm_mask != 0)
-            })
-        };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !entered.is_file() || !signal_ready() {
-            assert!(Instant::now() < deadline, "workspace creation or signal handler never became ready:\n{}", serve.log());
+        while !entered.is_file() {
+            assert!(Instant::now() < deadline, "workspace creation never reached Git:\n{}", serve.log());
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
@@ -764,11 +788,14 @@ exec /usr/bin/git "$@"
 
 #[test]
 fn serve_sigterm_reports_layout_save_failure() {
-    let root = tempfile::tempdir().unwrap();
+    let mut serve = Serve::start();
+    let layout = layout_path(serve.root.path());
+    if layout.is_file() {
+        std::fs::rename(&layout, layout.with_extension("startup.json")).unwrap();
+    }
     // A directory at the destination blocks the final atomic file replacement
     // even when the test process has permission to write to the parent.
-    std::fs::create_dir_all(layout_path(root.path())).unwrap();
-    let mut serve = Serve::start_in(root);
+    std::fs::create_dir_all(layout).unwrap();
     serve.workspace("fail-layout-save");
 
     let status = serve.shutdown().expect("serve should stop after SIGTERM");
