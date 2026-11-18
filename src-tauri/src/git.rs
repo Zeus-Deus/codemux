@@ -1812,15 +1812,22 @@ pub struct MergeIntoBaseResult {
 /// old commit. Records are read NUL-delimited and as raw bytes where git
 /// supports it, so any path parses.
 fn branch_worktree(repo_path: &Path, branch: &str) -> Result<Option<PathBuf>, String> {
-    let (listing, separator) = worktree_listing(repo_path)?;
     let target_ref = format!("refs/heads/{branch}");
+    // Whether the branch is checked out anywhere, asked of git directly
+    // rather than read off the listing, which older git prints ambiguously.
+    let occupied = git_line(repo_path, &["for-each-ref", "--format=%(worktreepath)", &target_ref])
+        .ok_or_else(|| format!("Cannot update {branch}: could not tell where it is checked out."))?;
+    let (listing, separator) = worktree_listing(repo_path)?;
     let unreachable = |shown: &dyn std::fmt::Display| {
         Err(format!(
             "Cannot update {branch}: it is checked out at {shown}, which cannot be reached. Reconnect or remove that worktree first."
         ))
     };
     match registered_checkout(&listing, separator, &target_ref) {
-        Registered::Nowhere => Ok(None),
+        Registered::Nowhere if occupied.is_empty() => Ok(None),
+        // Checked out, but the listing could not say where: refuse rather
+        // than move the ref under a checkout that would not follow.
+        Registered::Nowhere => unreachable(&"a path git could not list unambiguously"),
         Registered::At(Some(path)) if is_checkout_of(&path, repo_path, &target_ref) => Ok(Some(path)),
         Registered::At(Some(path)) => unreachable(&path.display()),
         Registered::At(None) => unreachable(&"a path this platform cannot represent"),
@@ -6930,6 +6937,31 @@ mod tests {
         }
         assert_eq!(merge_into_base(&wt, "release", false).unwrap().status, "merged");
         assert_eq!(std::fs::read_to_string(odd.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_into_base_never_moves_a_base_whose_listing_is_ambiguous() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        // Two newlines in a row read as the end of a record in the listing
+        // older git prints.
+        let odd = dir.path().join("release\n\nwt");
+        run_git(&repo, &["worktree", "add", "-b", "release", odd.to_str().unwrap()]).unwrap();
+        let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        if run_git(&repo, &["worktree", "list", "--porcelain", "-z"]).is_ok() {
+            assert_eq!(merge_into_base(&wt, "release", false).unwrap().status, "merged");
+            assert_eq!(std::fs::read_to_string(odd.join("feature.txt")).unwrap(), "worktree work");
+            return;
+        }
+        let err = merge_into_base(&wt, "release", false).unwrap_err();
+        assert!(err.contains("cannot be reached"), "unexpected error: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+        assert!(!odd.join("feature.txt").exists(), "the checkout's files must not change");
     }
 
     #[cfg(unix)]
