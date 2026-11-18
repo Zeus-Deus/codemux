@@ -33,6 +33,7 @@ pub(crate) struct ShutdownAdmission {
 }
 
 pub(crate) type ShutdownLease = OwnedRwLockReadGuard<()>;
+const SHUTTING_DOWN: &str = "Codemux is shutting down";
 
 impl ShutdownAdmission {
     pub(crate) fn admit<R: Runtime>(
@@ -41,17 +42,26 @@ impl ShutdownAdmission {
         app.try_state::<Self>().map(|admission| admission.try_admit()).transpose()
     }
 
+    pub(super) fn check_open<R: Runtime>(app: &AppHandle<R>) -> Result<(), &'static str> {
+        app.try_state::<Self>().map_or(Ok(()), |admission| admission.ensure_open())
+    }
+
+    fn ensure_open(&self) -> Result<(), &'static str> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SHUTTING_DOWN);
+        }
+        Ok(())
+    }
+
     fn try_admit(&self) -> Result<ShutdownLease, &'static str> {
         let permit = Arc::clone(&self.in_flight)
             .try_read_owned()
-            .map_err(|_| "Codemux is shutting down")?;
-        if self.closed.load(Ordering::Acquire) {
-            return Err("Codemux is shutting down");
-        }
+            .map_err(|_| SHUTTING_DOWN)?;
+        self.ensure_open()?;
         Ok(permit)
     }
 
-    async fn close_and_drain(&self) -> Result<(), String> {
+    pub(super) async fn close_and_drain(&self) -> Result<(), String> {
         self.closed.store(true, Ordering::Release);
         // Repository setup or teardown can wait indefinitely on an external
         // command. Keep admission closed if the drain is cancelled.
@@ -218,15 +228,19 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
         let _ = tokio::time::timeout(Duration::from_secs(3), crate::ssh::shutdown_all()).await;
         (drain_result, coordinator_result)
     });
-    let persistence_result = drain_result.and_then(|_| {
-        let layout_result = crate::state::flush_persisted_state(&app.state::<crate::state::AppStateStore>());
-        let selection_result = crate::active_workspace_persistence::flush_latest(app.handle())
-            .map_err(|error| format!("Failed to save the active workspace: {error}"));
-        layout_result.and(selection_result)
-    });
+    let persistence_result = flush_shutdown_state(app.handle(), drain_result);
     crate::agent_browser::kill_stream_daemons();
     drop(app);
     result.and(coordinator_result).and(persistence_result)
+}
+
+fn flush_shutdown_state<R: Runtime>(app: &AppHandle<R>, drain_result: Result<(), String>) -> Result<(), String> {
+    // A timed-out operation can still be running. Save the current snapshot
+    // and report the timeout so the caller knows the drain was incomplete.
+    let layout_result = crate::state::flush_persisted_state(&app.state::<crate::state::AppStateStore>());
+    let selection_result = crate::active_workspace_persistence::flush_latest(app)
+        .map_err(|error| format!("Failed to save the active workspace: {error}"));
+    drain_result.and(layout_result).and(selection_result)
 }
 
 /// Which bind scope a `codemux serve` startup should request, given the
@@ -445,6 +459,28 @@ mod tests {
         assert!(admission.close_and_drain().await.is_err());
         drop(in_flight);
         assert!(admission.try_admit().is_err());
+    }
+
+    #[test]
+    fn shutdown_saves_the_current_layout_even_when_the_drain_times_out() {
+        if crate::test_isolation::isolated(
+            "web_remote::serve::tests::shutdown_saves_the_current_layout_even_when_the_drain_times_out",
+        ) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let app = tauri::test::mock_app();
+        let state = crate::state::AppStateStore::default();
+        let workspace = state.create_workspace_at_path(root.clone());
+        app.manage(state);
+
+        let error = "fixture drain timeout";
+        assert_eq!(flush_shutdown_state(app.handle(), Err(error.into())).unwrap_err(), error);
+        let layout = std::fs::read(root.join("layout.json")).unwrap();
+        let layout: serde_json::Value = serde_json::from_slice(&layout).unwrap();
+        assert!(layout["workspaces"].as_array().unwrap().iter().any(|entry| {
+            entry["workspace_id"].as_str() == Some(workspace.0.as_str())
+        }));
     }
 
     #[test]

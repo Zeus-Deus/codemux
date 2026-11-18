@@ -72,7 +72,12 @@ fn free_loopback_port() -> u16 {
 }
 
 fn layout_path(root: &Path) -> PathBuf {
-    root.join("config").join(codemux_lib::APP_DIR_NAME).join("layout.json")
+    // Match the config directory dirs::config_dir resolves in the child.
+    #[cfg(target_os = "macos")]
+    let config = root.join("Library/Application Support");
+    #[cfg(not(target_os = "macos"))]
+    let config = root.join("config");
+    config.join(codemux_lib::APP_DIR_NAME).join("layout.json")
 }
 
 /// A `codemux serve` child, stopped (SIGTERM, then kill) when dropped.

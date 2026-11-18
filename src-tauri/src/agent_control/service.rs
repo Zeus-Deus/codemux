@@ -15,13 +15,17 @@ use tauri::{AppHandle, Manager, Runtime};
 type ShutdownLease = Arc<crate::web_remote::serve::ShutdownLease>;
 
 tokio::task_local! {
-    static SHUTDOWN_LEASE: ShutdownLease;
+    static SHUTDOWN_LEASE: Option<ShutdownLease>;
+}
+
+fn current_shutdown_lease() -> Option<ShutdownLease> {
+    SHUTDOWN_LEASE.try_with(Clone::clone).ok().flatten()
 }
 
 // Carry the registry's admission into detached work without making another
 // admission decision after shutdown has closed the gate.
 fn admit_shutdown<R: Runtime>(app: &AppHandle<R>) -> Result<Option<ShutdownLease>, ControlError> {
-    if let Ok(lease) = SHUTDOWN_LEASE.try_with(Arc::clone) {
+    if let Some(lease) = current_shutdown_lease() {
         return Ok(Some(lease));
     }
     crate::web_remote::serve::ShutdownAdmission::admit(app)
@@ -33,11 +37,8 @@ pub(crate) async fn with_shutdown_admission<R: Runtime, T>(
     app: &AppHandle<R>,
     work: impl std::future::Future<Output = T>,
 ) -> Result<T, ControlError> {
-    let output = match admit_shutdown(app)? {
-        Some(lease) => SHUTDOWN_LEASE.scope(lease, work).await,
-        None => work.await,
-    };
-    Ok(output)
+    let lease = admit_shutdown(app)?;
+    Ok(SHUTDOWN_LEASE.scope(lease, work).await)
 }
 
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ControlError> {
@@ -1197,7 +1198,7 @@ fn spawn_operation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, recei
     let epoch = app.state::<NativeControlState>().epoch.clone();
     #[cfg(test)]
     let barrier = app.state::<NativeControlState>().fixture_operation_barrier.lock().unwrap().take();
-    let shutdown_lease = SHUTDOWN_LEASE.try_with(Arc::clone).ok();
+    let shutdown_lease = current_shutdown_lease();
     tauri::async_runtime::spawn(async move {
         let _shutdown_lease = shutdown_lease;
         #[cfg(test)]

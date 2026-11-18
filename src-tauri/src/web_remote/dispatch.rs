@@ -244,7 +244,12 @@ pub async fn dispatch_invoke<R: Runtime>(
     cmd: String,
     mut args: Value,
 ) {
-    let admission = match super::serve::ShutdownAdmission::admit(app) {
+    let admission = if super::policy::affects_workspace_layout(&cmd) {
+        super::serve::ShutdownAdmission::admit(app)
+    } else {
+        super::serve::ShutdownAdmission::check_open(app).map(|()| None)
+    };
+    let admission = match admission {
         Ok(admission) => admission,
         Err(error) => {
             let _ = out.send(err_text(id, error));
@@ -485,12 +490,77 @@ fn err_text(id: u64, message: &str) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     fn drain_text(rx: &mut crate::web_remote::server::OutboundRx) -> Value {
         match rx.try_recv().expect("a frame was sent") {
             Message::Text(s) => serde_json::from_str(&s).unwrap(),
             other => panic!("expected text frame, got {other:?}"),
         }
+    }
+
+    #[derive(Default)]
+    struct SlowFetch {
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[tauri::command]
+    async fn git_fetch_changes(path: String, fetch: tauri::State<'_, SlowFetch>) -> Result<String, String> {
+        let released = fetch.release.notified();
+        fetch.entered.notify_one();
+        released.await;
+        Ok(path)
+    }
+
+    #[tokio::test]
+    async fn slow_web_git_fetch_does_not_delay_layout_shutdown() {
+        use crate::web_remote::serve::ShutdownAdmission;
+
+        let app = tauri::test::mock_builder()
+            .manage(ShutdownAdmission::default())
+            .manage(SlowFetch::default())
+            .invoke_handler(tauri::generate_handler![git_fetch_changes])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let _webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let router = Arc::new(ChannelRouter::default());
+        let (out, mut frames) = crate::web_remote::server::test_outbound();
+        let fetch = app.state::<SlowFetch>();
+        let timeout = Duration::from_secs(5);
+        let invoke = dispatch_invoke(
+            app.handle(), &router, 7, &out, 1, "git_fetch_changes".into(),
+            json!({"path": "/fixture/slow-fetch"}),
+        );
+        tokio::pin!(invoke);
+        tokio::time::timeout(timeout, async {
+            tokio::select! {
+                _ = fetch.entered.notified() => {},
+                _ = &mut invoke => panic!("fetch returned before entering the fixture: {}", drain_text(&mut frames)),
+            }
+        }).await.expect("web fetch never reached the fixture");
+
+        let admission = app.state::<ShutdownAdmission>();
+        let drained = tokio::time::timeout(timeout, admission.close_and_drain()).await;
+        if !matches!(&drained, Ok(Ok(()))) {
+            fetch.release.notify_waiters();
+        }
+        drained.expect("layout drain waited for the unrelated web fetch").unwrap();
+        assert!(frames.try_recv().is_err(), "fetch responded before release");
+
+        let denied = tokio::time::timeout(timeout, dispatch_invoke(
+            app.handle(), &router, 7, &out, 2, "git_fetch_changes".into(),
+            json!({"path": "/fixture/late-fetch"}),
+        )).await;
+        fetch.release.notify_waiters();
+        denied.expect("late web fetch was admitted during shutdown");
+        assert_eq!(drain_text(&mut frames), json!({"t":"err", "id":2, "error":"Codemux is shutting down"}));
+
+        tokio::time::timeout(timeout, invoke).await.expect("released fetch should respond");
+        assert_eq!(drain_text(&mut frames), json!({"t":"ok", "id":1, "data":"/fixture/slow-fetch"}));
     }
 
     /// Register one route the way the dispatcher does and hand back the
