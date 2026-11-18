@@ -114,8 +114,9 @@ fi
 
 # The desktop build prepares both bundled Bun sidecars before starting Vite.
 if command -v bun &>/dev/null; then
-    bun_ver=$(bun --version)
-    if [ "$bun_ver" = "1.3.12" ]; then
+    if ! bun_ver=$(bun --version 2>/dev/null); then
+        fail "could not run bun --version (need 1.3.12 for the desktop sidecars)"
+    elif [ "$bun_ver" = "1.3.12" ]; then
         pass "bun $bun_ver"
     else
         fail "bun $bun_ver (need exactly 1.3.12 for the desktop sidecars)"
