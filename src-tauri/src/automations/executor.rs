@@ -199,7 +199,9 @@ fn resolve_repo(automation: &AutomationRecord) -> Result<ResolvedRepo, String> {
          remote to clone from. Pick a project that has a git remote."
             .to_string()
     })?;
-    let clone_dir = resolve_clone(remote, &automation_repos_dir()?)?;
+    let clone_cwd = std::env::current_dir()
+        .map_err(|error| format!("Failed to determine the Git clone directory: {error}"))?;
+    let clone_dir = resolve_clone(remote, &automation_repos_dir()?, &clone_cwd)?;
     let base = default_remote_branch(&clone_dir)
         .unwrap_or_else(|| "origin/HEAD".to_string());
     Ok(ResolvedRepo {
@@ -208,8 +210,8 @@ fn resolve_repo(automation: &AutomationRecord) -> Result<ResolvedRepo, String> {
     })
 }
 
-fn clone_has_origin(clone_dir: &Path, remote: &str) -> bool {
-    if !clone_dir.join(".git").is_dir() {
+fn clone_has_origin(clone_dir: &Path, remote: &str, clone_cwd: &Path) -> bool {
+    if remote.is_empty() || !clone_dir.join(".git").is_dir() {
         return false;
     }
     let Ok(output) = crate::git::git_command()
@@ -232,34 +234,74 @@ fn clone_has_origin(clone_dir: &Path, remote: &str) -> bool {
     if origin == remote {
         return true;
     }
-    // Git may normalize absolute paths when cloning from a local directory.
-    let (origin, remote) = (Path::new(origin), Path::new(remote));
-    origin.is_absolute()
-        && origin
-            .canonicalize()
-            .is_ok_and(|origin| remote.canonicalize().is_ok_and(|remote| origin == remote))
+    let origin_path = Path::new(origin);
+    let remote_path = Path::new(remote);
+    let has_prefix = matches!(remote_path.components().next(), Some(std::path::Component::Prefix(_)));
+    // Git treats a colon before the first path separator as a remote spec.
+    // Drive prefixes are local paths on Windows.
+    let is_remote_spec = !remote_path.has_root() && !has_prefix
+        && remote.split_once(':').is_some_and(|(prefix, _)| {
+            !prefix.contains('/') && !(cfg!(windows) && prefix.contains('\\'))
+        });
+    if !origin_path.is_absolute() || is_remote_spec {
+        return false;
+    }
+    if !remote_path.is_absolute() && (remote_path.has_root() || has_prefix) {
+        return same_existing_path(origin_path, remote_path);
+    }
+    let absolute_remote = clone_cwd.join(remote_path);
+    // Git saves the absolute spelling of a local argument even when the
+    // repository was found by appending .git. Keep trailing separators and
+    // parent components intact, since they affect the repository Git tries.
+    if origin_path.as_os_str() == absolute_remote.as_os_str() {
+        return true;
+    }
+    #[cfg(windows)]
+    let (origin_with_slashes, remote_with_slashes) = (origin.replace('\\', "/"), remote.replace('\\', "/"));
+    #[cfg(windows)]
+    let (origin, remote) = (origin_with_slashes.as_str(), remote_with_slashes.as_str());
+    #[cfg(windows)]
+    if absolute_remote.to_str().is_some_and(|path| origin == path.replace('\\', "/")) {
+        return true;
+    }
+    // Git can use PWD's alias for the working directory. Resolve only the
+    // prefix in that case, since the source spelling may have no inode.
+    if !remote_path.is_absolute() {
+        if let Some(directory) = origin.strip_suffix(remote).filter(|path| path.ends_with('/')) {
+            if same_existing_path(Path::new(directory), clone_cwd) {
+                return true;
+            }
+        }
+    }
+    same_existing_path(origin_path, &absolute_remote)
 }
 
-fn resolve_clone(remote: &str, repos_dir: &Path) -> Result<PathBuf, String> {
+fn same_existing_path(first: &Path, second: &Path) -> bool {
+    first.canonicalize().is_ok_and(|first| {
+        second.canonicalize().is_ok_and(|second| first == second)
+    })
+}
+
+fn resolve_clone(remote: &str, repos_dir: &Path, clone_cwd: &Path) -> Result<PathBuf, String> {
     let name = repo_dir_name(remote);
     let legacy = repos_dir.join(&name);
     // Keep existing clones and their worktrees usable when their origin matches.
-    let clone_dir = if clone_has_origin(&legacy, remote) {
+    let clone_dir = if clone_has_origin(&legacy, remote, clone_cwd) {
         legacy
     } else {
         let digest = Sha256::digest(remote.as_bytes());
         repos_dir.join(format!("{:.40}-{digest:x}", name))
     };
-    ensure_clone(remote, &clone_dir)?;
+    ensure_clone(remote, &clone_dir, clone_cwd)?;
     Ok(clone_dir)
 }
 
 /// Clone `remote` into `clone_dir` if absent; otherwise `git fetch` it.
 /// Git authenticates with the host's own credentials — Codemux injects
 /// no token (matching Superset's clone behaviour).
-fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
+fn ensure_clone(remote: &str, clone_dir: &Path, clone_cwd: &Path) -> Result<(), String> {
     if clone_dir.join(".git").exists() {
-        if !clone_has_origin(clone_dir, remote) {
+        if !clone_has_origin(clone_dir, remote, clone_cwd) {
             return Err("Automation checkout does not match the requested Git remote".into());
         }
         let output = crate::git::git_command()
@@ -285,6 +327,7 @@ fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("Failed to create temporary clone directory: {error}"))?;
     let staging_clone = staging.path().join("repo");
     let output = crate::git::git_command()
+        .current_dir(clone_cwd)
         .args(["clone", "--", remote])
         .arg(&staging_clone)
         .output()
@@ -296,7 +339,7 @@ fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
         ));
     }
     if let Err(error) = std::fs::rename(&staging_clone, clone_dir) {
-        if !clone_has_origin(clone_dir, remote) {
+        if !clone_has_origin(clone_dir, remote, clone_cwd) {
             return Err(format!("Failed to move automation clone into place: {error}"));
         }
     }
@@ -714,10 +757,10 @@ mod tests {
         let remote_str = remote.to_string_lossy().to_string();
 
         // First call clones.
-        ensure_clone(&remote_str, &clone_dir).unwrap();
+        ensure_clone(&remote_str, &clone_dir, remote_dir.path()).unwrap();
         assert!(clone_dir.join(".git").is_dir());
         // Second call fetches an existing clone — must not error.
-        ensure_clone(&remote_str, &clone_dir).unwrap();
+        ensure_clone(&remote_str, &clone_dir, remote_dir.path()).unwrap();
 
         // The clone exposes a default remote branch.
         let base = default_remote_branch(&clone_dir);
@@ -725,6 +768,22 @@ mod tests {
             base.as_deref().map(|b| b.starts_with("origin/")).unwrap_or(false),
             "expected origin/<branch>, got {base:?}"
         );
+    }
+
+    #[test]
+    fn resolve_clone_reuses_a_relative_bare_remote_without_the_git_suffix() {
+        let source = temp_repo();
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &[
+            "clone", "--bare", "-q", source.path().to_str().unwrap(), "project.git",
+        ]);
+        assert!(!root.path().join("project").exists());
+        let cache = root.path().join("cache");
+
+        let checkout = resolve_clone("project", &cache, root.path()).unwrap();
+        assert_eq!(resolve_clone("project", &cache, root.path()).unwrap(), checkout);
+        assert!(!clone_has_origin(&checkout, "project", &cache));
+        assert!(!clone_has_origin(&checkout, "project/", root.path()));
     }
 
     #[test]
@@ -745,13 +804,13 @@ mod tests {
         let second = second.to_str().unwrap();
         let cache = root.path().join("cache");
         let legacy = cache.join("repo");
-        ensure_clone(first, &legacy).unwrap();
+        ensure_clone(first, &legacy, root.path()).unwrap();
 
-        let second_clone = resolve_clone(second, &cache).unwrap();
+        let second_clone = resolve_clone(second, &cache, root.path()).unwrap();
         assert_ne!(second_clone, legacy);
         assert!(second_clone.join("second.txt").is_file());
-        assert_eq!(resolve_clone(second, &cache).unwrap(), second_clone);
-        assert_eq!(resolve_clone(first, &cache).unwrap(), legacy);
+        assert_eq!(resolve_clone(second, &cache, root.path()).unwrap(), second_clone);
+        assert_eq!(resolve_clone(first, &cache, root.path()).unwrap(), legacy);
         assert!(legacy.join("first.txt").is_file());
     }
 
