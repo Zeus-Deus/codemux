@@ -14160,12 +14160,16 @@ mod persisted_layout_tests {
         assert!(recovery_pending_at(&path));
         fs::remove_dir(recovery_marker(&path)).unwrap();
 
-        // A listed copy whose existence cannot be checked (a path component
-        // is a file, which is not "not found").
-        fs::write(&path, "{}").unwrap();
-        fs::write(recovery_marker(&path), "layout.json/copy\n").unwrap();
-        assert!(recovery_pending_at(&path));
-        assert!(recovery_marker(&path).exists(), "and the marker is left alone");
+        // A listed copy whose existence cannot be checked. Unix only: a path
+        // through a file is "not a directory" there, while Windows reports
+        // it as "path not found".
+        #[cfg(unix)]
+        {
+            fs::write(&path, "{}").unwrap();
+            fs::write(recovery_marker(&path), "layout.json/copy\n").unwrap();
+            assert!(recovery_pending_at(&path));
+            assert!(recovery_marker(&path).exists(), "and the marker is left alone");
+        }
     }
 
     // Unix only: a read-only directory is how this test makes setting the
