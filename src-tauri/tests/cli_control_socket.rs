@@ -71,6 +71,10 @@ fn free_loopback_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+fn layout_path(root: &Path) -> PathBuf {
+    root.join("config").join(codemux_lib::APP_DIR_NAME).join("layout.json")
+}
+
 /// A `codemux serve` child, stopped (SIGTERM, then kill) when dropped.
 struct Serve {
     child: Child,
@@ -79,7 +83,10 @@ struct Serve {
 
 impl Serve {
     fn start() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        Self::start_in(tempfile::tempdir().unwrap())
+    }
+
+    fn start_in(root: tempfile::TempDir) -> Self {
         let bin = root.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         // Codemux finds Cursor as `cursor-agent` on PATH. A symlink, not a
@@ -150,6 +157,10 @@ impl Serve {
             return Some(status);
         }
         unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        self.wait_for_exit()
+    }
+
+    fn wait_for_exit(&mut self) -> Option<ExitStatus> {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if let Ok(Some(status)) = self.child.try_wait() {
@@ -651,11 +662,116 @@ fn serve_sigterm_saves_workspace_layout_and_exits_successfully() {
     let status = serve.shutdown().expect("serve should stop after SIGTERM");
     assert!(status.success(), "serve exited with {status}:\n{}", serve.log());
 
-    let layout_path = serve.root.path().join("config").join(codemux_lib::APP_DIR_NAME).join("layout.json");
-    let layout: Value = serde_json::from_slice(&std::fs::read(layout_path).unwrap()).unwrap();
+    let layout: Value = serde_json::from_slice(&std::fs::read(layout_path(serve.root.path())).unwrap()).unwrap();
     assert!(layout["workspaces"].as_array().unwrap().iter().any(|workspace| {
         workspace["workspace_id"].as_str() == Some(workspace_id.as_str())
     }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn serve_sigterm_drains_an_admitted_workspace_creation_before_saving() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The wrapper blocks only the new project's Git read, before the
+    // admitted create command can insert the workspace into app state.
+    let mut serve = Serve::start();
+    let root = serve.root.path().to_path_buf();
+    let folder = root.join("shutdown-workspace");
+    std::fs::create_dir_all(&folder).unwrap();
+    let git = root.join("bin/git");
+    std::fs::write(&git, r#"#!/bin/sh
+if [ "$PWD" = "$HOME/shutdown-workspace" ] && [ "$1" = branch ] && [ "$2" = --show-current ]; then
+    : > "$HOME/workspace-git-entered"
+    remaining=3000
+    while [ ! -f "$HOME/workspace-git-release" ] && [ "$remaining" -gt 0 ]; do
+        remaining=$((remaining - 1))
+        sleep 0.01
+    done
+    [ -f "$HOME/workspace-git-release" ] || exit 124
+fi
+exec /usr/bin/git "$@"
+"#).unwrap();
+    std::fs::set_permissions(git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let params = json!({"path": folder}).to_string();
+    let pid = serve.child.id();
+    let entered = root.join("workspace-git-entered");
+
+    let output = std::thread::scope(|scope| {
+        struct ReleaseGit(PathBuf);
+        impl Drop for ReleaseGit {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, b"");
+            }
+        }
+        let release = ReleaseGit(root.join("workspace-git-release"));
+        let creating = scope.spawn(|| cli_in(&root, &["json", "create_workspace", &params]));
+
+        // The control socket can answer status before serve installs its
+        // signal handler. Wait for actual registration before sending SIGTERM.
+        let process_status = PathBuf::from(format!("/proc/{pid}/status"));
+        let sigterm_mask = 1_u64 << (libc::SIGTERM - 1);
+        let signal_ready = || {
+            std::fs::read_to_string(&process_status).is_ok_and(|status| {
+                status.lines()
+                    .find_map(|line| line.strip_prefix("SigCgt:"))
+                    .and_then(|caught| u64::from_str_radix(caught.trim(), 16).ok())
+                    .is_some_and(|caught| caught & sigterm_mask != 0)
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !entered.is_file() || !signal_ready() {
+            assert!(Instant::now() < deadline, "workspace creation or signal handler never became ready:\n{}", serve.log());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = serve.cli(&["json", "status"]);
+            if !status.status.success()
+                && [&status.stdout, &status.stderr].iter().any(|bytes| {
+                    String::from_utf8_lossy(bytes).contains("Codemux is shutting down")
+                })
+            {
+                break;
+            }
+            assert!(serve.child.try_wait().unwrap().is_none(), "serve exited during the workspace mutation:\n{}", serve.log());
+            assert!(Instant::now() < deadline, "serve never closed admission:\n{}", serve.log());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(release);
+        creating.join().unwrap()
+    });
+    assert!(output.status.success(), "admitted workspace creation failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stderr), serve.log());
+    let created = stdout_json(&output);
+    let workspace_id = created["data"]["workspace_id"].as_str().expect("a workspace id");
+
+    let status = serve.wait_for_exit().expect("serve should stop after draining the workspace creation");
+    assert!(status.success(), "serve exited with {status}:\n{}", serve.log());
+    let layout: Value = serde_json::from_slice(&std::fs::read(layout_path(&root)).unwrap()).unwrap();
+    assert!(layout["workspaces"].as_array().unwrap().iter().any(|workspace| {
+        workspace["workspace_id"].as_str() == Some(workspace_id)
+    }), "admitted workspace {workspace_id} was missing from the shutdown layout");
+}
+
+#[test]
+fn serve_sigterm_reports_layout_save_failure() {
+    let root = tempfile::tempdir().unwrap();
+    // A directory at the destination blocks the final atomic file replacement
+    // even when the test process has permission to write to the parent.
+    std::fs::create_dir_all(layout_path(root.path())).unwrap();
+    let mut serve = Serve::start_in(root);
+    serve.workspace("fail-layout-save");
+
+    let status = serve.shutdown().expect("serve should stop after SIGTERM");
+    let log = serve.log();
+    assert_eq!(status.code(), Some(1), "serve exited with {status}:\n{log}");
+    assert!(log.lines().any(|line| {
+        line.starts_with("[codemux serve]") && line.contains("Failed to replace layout state")
+    }), "serve did not report the shutdown layout error:\n{log}");
 }
 
 #[test]

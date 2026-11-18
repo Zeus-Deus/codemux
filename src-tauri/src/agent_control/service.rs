@@ -9,7 +9,36 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tauri::{AppHandle, Manager, Runtime};
+
+type ShutdownLease = Arc<crate::web_remote::serve::ShutdownLease>;
+
+tokio::task_local! {
+    static SHUTDOWN_LEASE: ShutdownLease;
+}
+
+// Carry the registry's admission into detached work without making another
+// admission decision after shutdown has closed the gate.
+fn admit_shutdown<R: Runtime>(app: &AppHandle<R>) -> Result<Option<ShutdownLease>, ControlError> {
+    if let Ok(lease) = SHUTDOWN_LEASE.try_with(Arc::clone) {
+        return Ok(Some(lease));
+    }
+    crate::web_remote::serve::ShutdownAdmission::admit(app)
+        .map(|lease| lease.map(Arc::new))
+        .map_err(|error| ControlError::new(ErrorCode::AppUnavailable, error))
+}
+
+pub(crate) async fn with_shutdown_admission<R: Runtime, T>(
+    app: &AppHandle<R>,
+    work: impl std::future::Future<Output = T>,
+) -> Result<T, ControlError> {
+    let output = match admit_shutdown(app)? {
+        Some(lease) => SHUTDOWN_LEASE.scope(lease, work).await,
+        None => work.await,
+    };
+    Ok(output)
+}
 
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ControlError> {
     if !value.is_object() { return Err(ControlError::new(ErrorCode::InvalidArguments, "Arguments must be an object")); }
@@ -301,6 +330,7 @@ pub(crate) async fn launch_placed<R: Runtime>(app: &AppHandle<R>, caller: &Contr
     let epoch = app.state::<NativeControlState>().epoch.clone();
     let fingerprint = fingerprint(&args)?;
     let thread = uuid::Uuid::new_v4().to_string();
+    let shutdown_lease = admit_shutdown(app)?;
     // Named before admission so the receipt and any retry point at it.
     let target = if child_workspace || worktree.is_some() { AppStateStore::reserve_workspace_id().0 } else { workspace.workspace_id.0.clone() };
     let admitted = caller.admit(||app.state::<DatabaseStore>().admit_control_operation_for_thread(
@@ -330,6 +360,7 @@ pub(crate) async fn launch_placed<R: Runtime>(app: &AppHandle<R>, caller: &Contr
     let operation = admitted.receipt.operation_id;
     if caller.thread_id().is_some(){caller.admitted=Some(super::AdmittedAuthority::Operation{operation_id:operation.clone()});}
     tauri::async_runtime::spawn(async move {
+        let _shutdown_lease = shutdown_lease;
         let db = app.state::<DatabaseStore>();
         if db.update_control_operation(&caller.principal, &operation, &epoch, "running", None, None, None, None).is_err() { return; }
         let selection = input.resolved.as_ref().map(|s| json!({"selection":s}));
@@ -1058,8 +1089,9 @@ where
     F: FnOnce(Option<WorkspaceId>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<Value, ControlError>> + Send + 'static,
 {
+    let shutdown_lease = admit_shutdown(app)?;
     if !keyed(args) {
-        return detached(work(None)).await;
+        return detached(shutdown_lease, work(None)).await;
     }
     if let Some(receipt) = retry_receipt(app, caller, tool, args)? {
         return replay(receipt);
@@ -1086,7 +1118,7 @@ where
     let (owned, principal, id) = (app.clone(), caller.principal.clone(), operation.clone());
     #[cfg(test)]
     let barrier = app.state::<NativeControlState>().fixture_operation_barrier.lock().unwrap().take();
-    let mut value = detached(async move {
+    let mut value = detached(shutdown_lease, async move {
         #[cfg(test)]
         if let Some(barrier) = barrier {
             barrier.acquire().await.unwrap().forget();
@@ -1118,11 +1150,14 @@ where
 
 /// Runs `work` in a task of its own: dropping the caller's future leaves it
 /// running to the end.
-async fn detached<Fut>(work: Fut) -> Result<Value, ControlError>
+async fn detached<Fut>(shutdown_lease: Option<ShutdownLease>, work: Fut) -> Result<Value, ControlError>
 where
     Fut: std::future::Future<Output = Result<Value, ControlError>> + Send + 'static,
 {
-    tauri::async_runtime::spawn(work)
+    tauri::async_runtime::spawn(async move {
+        let _shutdown_lease = shutdown_lease;
+        work.await
+    })
         .await
         .map_err(|error| ControlError::new(ErrorCode::NativeControlFailed, format!("Worker failed: {error}")))?
 }
@@ -1162,7 +1197,9 @@ fn spawn_operation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, recei
     let epoch = app.state::<NativeControlState>().epoch.clone();
     #[cfg(test)]
     let barrier = app.state::<NativeControlState>().fixture_operation_barrier.lock().unwrap().take();
+    let shutdown_lease = SHUTDOWN_LEASE.try_with(Arc::clone).ok();
     tauri::async_runtime::spawn(async move {
+        let _shutdown_lease = shutdown_lease;
         #[cfg(test)]
         if let Some(barrier) = barrier { barrier.acquire().await.unwrap().forget(); }
         let db = app.state::<DatabaseStore>();

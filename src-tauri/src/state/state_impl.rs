@@ -145,14 +145,12 @@ fn persist_debouncer() -> &'static PersistDebouncer {
 
 /// Synchronously persist the current app state. Called on app close to
 /// ensure the debounced write completes before the process exits.
-pub fn flush_persisted_state(store: &AppStateStore) {
+pub fn flush_persisted_state(store: &AppStateStore) -> Result<(), String> {
     let debouncer = persist_debouncer();
     let _write_guard = debouncer.write_lock.lock().unwrap();
     debouncer.last_snapshot.lock().unwrap().take();
     let snapshot = store.snapshot();
-    if let Err(e) = save_persisted_state(&snapshot) {
-        eprintln!("[codemux::state] Failed to persist layout state on close: {e}");
-    }
+    save_persisted_state(&snapshot)
 }
 
 use crate::project::current_project_root;
@@ -10989,7 +10987,7 @@ mod tests {
                 0
             );
             store.create_empty_workspace_at_path(path.parent().unwrap().join("ordinary-close"));
-            flush_persisted_state(&store);
+            flush_persisted_state(&store).unwrap();
             assert_eq!(load_persisted_state().unwrap().workspaces.len(), 2);
             let app = tauri::test::mock_app();
             app.manage(store);

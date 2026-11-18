@@ -244,6 +244,13 @@ pub async fn dispatch_invoke<R: Runtime>(
     cmd: String,
     mut args: Value,
 ) {
+    let admission = match super::serve::ShutdownAdmission::admit(app) {
+        Ok(admission) => admission,
+        Err(error) => {
+            let _ = out.send(err_text(id, error));
+            return;
+        }
+    };
     if cmd == "plugins_platform_request" {
         let shared = app.state::<super::WebRemoteState>().shared();
         let result = match shared.connections.session_for_connection(conn_id) {
@@ -371,7 +378,7 @@ pub async fn dispatch_invoke<R: Runtime>(
         invoke_key: app.invoke_key().to_string(),
     };
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<InvokeResponse>();
+    let (tx, rx) = tokio::sync::oneshot::channel();
     // Drive on_message off the async workers: a synchronous command runs
     // inline on this blocking thread, an async command is handed to
     // Tauri's runtime and resolves the responder later. Either way the
@@ -380,15 +387,21 @@ pub async fn dispatch_invoke<R: Runtime>(
         webview.on_message(
             request,
             Box::new(move |_webview, _cmd, response, _callback, _error| {
-                let _ = tx.send(response);
+                let _ = tx.send((response, admission));
             }),
         );
     });
 
-    let frame = match rx.await {
-        Ok(InvokeResponse::Ok(body)) => ok_frame(id, remote_mcp_response(&cmd, body)),
-        Ok(InvokeResponse::Err(err)) => err_value(id, err.0),
-        Err(_) => err_text(id, "web-remote: command dropped without responding"),
+    let (response, _admission) = match rx.await {
+        Ok(response) => response,
+        Err(_) => {
+            let _ = out.send(err_text(id, "web-remote: command dropped without responding"));
+            return;
+        }
+    };
+    let frame = match response {
+        InvokeResponse::Ok(body) => ok_frame(id, remote_mcp_response(&cmd, body)),
+        InvokeResponse::Err(err) => err_value(id, err.0),
     };
     let _ = out.send(frame);
 }

@@ -633,6 +633,11 @@ fn build_core_app<R: tauri::Runtime>(
     builder: tauri::Builder<R>,
     mode: AppMode,
 ) -> tauri::Builder<R> {
+    let builder = if mode == AppMode::ServeHeadless {
+        builder.manage(web_remote::serve::ShutdownAdmission::default())
+    } else {
+        builder
+    };
     // Web-remote state must exist before the builder so the channel
     // interceptor (registered below) and the WS dispatcher share one
     // channel routing table. The interceptor reroutes a synthesized
@@ -1232,7 +1237,9 @@ fn build_core_app<R: tauri::Runtime>(
                                     scrollback::refresh_stale_scrollback_metadata(&app_state);
 
                                     // Flush layout state
-                                    state::flush_persisted_state(&app_state);
+                                    if let Err(error) = state::flush_persisted_state(&app_state) {
+                                        eprintln!("[codemux::state] Failed to persist layout state on close: {error}");
+                                    }
                                     if let Err(error) = active_workspace_persistence::flush_latest(&async_handle) {
                                         eprintln!("[codemux::selection] close flush failed: {error}");
                                     }
@@ -1250,7 +1257,9 @@ fn build_core_app<R: tauri::Runtime>(
                                 // Session restore disabled — close immediately
                                 let app_state: tauri::State<'_, state::AppStateStore> = close_handle.state();
                                 scrollback::refresh_stale_scrollback_metadata(&app_state);
-                                state::flush_persisted_state(&app_state);
+                                if let Err(error) = state::flush_persisted_state(&app_state) {
+                                    eprintln!("[codemux::state] Failed to persist layout state on close: {error}");
+                                }
                                 if let Err(error) = active_workspace_persistence::flush_latest(&close_handle) {
                                     eprintln!("[codemux::selection] close flush failed: {error}");
                                 }

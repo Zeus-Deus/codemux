@@ -19,8 +19,48 @@
 //! path (in `main.rs`) refuses to start when a `serve` instance does.
 
 use crate::web_remote::{self, BIND_SCOPE_ALL};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tauri::Manager;
+use tauri::{AppHandle, Manager, Runtime};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+
+/// Tracks admitted headless requests until they finish changing state.
+#[derive(Default)]
+pub(crate) struct ShutdownAdmission {
+    closed: AtomicBool,
+    in_flight: Arc<RwLock<()>>,
+}
+
+pub(crate) type ShutdownLease = OwnedRwLockReadGuard<()>;
+
+impl ShutdownAdmission {
+    pub(crate) fn admit<R: Runtime>(
+        app: &AppHandle<R>,
+    ) -> Result<Option<ShutdownLease>, &'static str> {
+        app.try_state::<Self>().map(|admission| admission.try_admit()).transpose()
+    }
+
+    fn try_admit(&self) -> Result<ShutdownLease, &'static str> {
+        let permit = Arc::clone(&self.in_flight)
+            .try_read_owned()
+            .map_err(|_| "Codemux is shutting down")?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err("Codemux is shutting down");
+        }
+        Ok(permit)
+    }
+
+    async fn close_and_drain(&self) -> Result<(), String> {
+        self.closed.store(true, Ordering::Release);
+        // Repository setup or teardown can wait indefinitely on an external
+        // command. Keep admission closed if the drain is cancelled.
+        tokio::time::timeout(Duration::from_secs(20), self.in_flight.write())
+            .await
+            .map(|_| ())
+            .map_err(|_| "Timed out waiting for headless requests to finish during shutdown".into())
+    }
+}
 
 /// Options parsed from `codemux serve [--scope …] [--port N] [--relay]`.
 /// Flag semantics mirror `codemux remote enable` exactly.
@@ -146,12 +186,14 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     // Mirror the GUI's `RunEvent::Exit` cleanup, then let `app` drop normally
     // so managed provider/server state gets its destructors. A success-path
     // `process::exit` would skip those destructors and leak child processes.
-    // Stop taking outside-assistant connections first, so no network client
-    // starts work against managers that are shutting down.
-    crate::mcp_connector::listener::stop(app.handle());
     // Tokio timers must be constructed inside the runtime. Keep running
     // the remaining cleanup if a delegation owner failed to shut down.
-    let coordinator_result = tauri::async_runtime::block_on(async {
+    let (drain_result, coordinator_result) = tauri::async_runtime::block_on(async {
+        let drain_result = app.state::<ShutdownAdmission>().close_and_drain().await;
+        crate::mcp_connector::listener::stop(app.handle());
+        let remote = app.state::<web_remote::WebRemoteState>().shared();
+        web_remote::stop_lan(&remote);
+        web_remote::stop_relay(&remote);
         if let Some(platform) =
             app.try_state::<crate::plugins::platform_transport::PluginPlatformState>()
         {
@@ -174,15 +216,17 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
         // Remote-workspace SSH tunnels live in a global registry.
         #[cfg(unix)]
         let _ = tokio::time::timeout(Duration::from_secs(3), crate::ssh::shutdown_all()).await;
-        coordinator_result
+        (drain_result, coordinator_result)
     });
-    crate::state::flush_persisted_state(&app.state::<crate::state::AppStateStore>());
-    if let Err(error) = crate::active_workspace_persistence::flush_latest(app.handle()) {
-        eprintln!("[codemux::selection] headless shutdown flush failed: {error}");
-    }
+    let persistence_result = drain_result.and_then(|_| {
+        let layout_result = crate::state::flush_persisted_state(&app.state::<crate::state::AppStateStore>());
+        let selection_result = crate::active_workspace_persistence::flush_latest(app.handle())
+            .map_err(|error| format!("Failed to save the active workspace: {error}"));
+        layout_result.and(selection_result)
+    });
     crate::agent_browser::kill_stream_daemons();
     drop(app);
-    result.and(coordinator_result)
+    result.and(coordinator_result).and(persistence_result)
 }
 
 /// Which bind scope a `codemux serve` startup should request, given the
@@ -393,6 +437,15 @@ fn dev_dist_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_shutdown_keeps_requests_closed() {
+        let admission = ShutdownAdmission::default();
+        let in_flight = admission.try_admit().unwrap();
+        assert!(admission.close_and_drain().await.is_err());
+        drop(in_flight);
+        assert!(admission.try_admit().is_err());
+    }
 
     #[test]
     fn explicit_scope_flag_wins_over_persisted_config() {
