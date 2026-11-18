@@ -146,14 +146,18 @@ pub fn is_skill_dir_name(name: &str) -> bool {
     matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
-/// `CON`, `nul.txt`, `COM1` and the like, which Windows reserves whatever
-/// the extension or case.
+/// `CON`, `nul.txt`, `COM1`, `LPT²` and the like, which Windows reserves
+/// whatever the extension or case.
 fn is_windows_device_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name).trim_end().to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.len() == 4
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let Some(digit) = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT")) else {
+        return false;
+    };
+    let mut chars = digit.chars();
+    matches!((chars.next(), chars.next()), (Some('1'..='9' | '¹' | '²' | '³'), None))
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -431,7 +435,7 @@ mod tests {
 
     #[test]
     fn only_a_single_ordinary_component_names_a_skill_dir() {
-        for ok in ["my-skill", "My_Skill", "skill v2", "a.b", "..hidden-ish", "console", "com10", "lpt0"] {
+        for ok in ["my-skill", "My_Skill", "skill v2", "a.b", "..hidden-ish", "console", "com10", "lpt0", "com⁴"] {
             assert!(is_skill_dir_name(ok), "{ok:?}");
         }
         for bad in [
@@ -439,6 +443,7 @@ mod tests {
             "a/b", "a\\b", "C:\\x", "C:", "x\0", "./x",
             "what?", "a*b", "a<b", "a>b", "a|b", "say \"hi\"", "tab\there",
             "trailing.", "trailing ", "CON", "nul", "Com1", "lpt9.txt", "aux.md",
+            "COM¹", "lpt².txt", "com³",
         ] {
             assert!(!is_skill_dir_name(bad), "{bad:?}");
         }
