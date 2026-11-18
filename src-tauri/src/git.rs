@@ -1882,15 +1882,22 @@ fn is_checkout_of(path: &Path, repo_path: &Path, branch_ref: &str) -> bool {
     };
     same(path, &here_top)
         && same(&here_common, &repo_common)
-        && run_git(path, &["symbolic-ref", "--quiet", "HEAD"]).is_ok_and(|head| head.trim() == branch_ref)
+        && git_line(path, &["symbolic-ref", "--quiet", "HEAD"]).as_deref() == Some(branch_ref.as_bytes())
 }
 
-/// One absolute path from `git rev-parse <flag>` in `dir`. Only the final
-/// line terminator is removed, so whitespace, newlines and (on Unix)
-/// non-UTF-8 bytes in the path survive.
+/// One absolute path from `git rev-parse <flag>` in `dir`, byte for byte
+/// (see [`git_line`]).
 fn git_path(dir: &Path, flag: &str) -> Option<PathBuf> {
+    path_from_git_bytes(git_line(dir, &["rev-parse", "--path-format=absolute", flag])?)
+}
+
+/// The single line a successful git command printed, as raw bytes. Only
+/// the final line terminator is removed — on Unix just the LF, since a path
+/// there may end in a CR — so whitespace, newlines and non-UTF-8 bytes in
+/// a path or ref name survive.
+fn git_line(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let output = git_command()
-        .args(["rev-parse", "--path-format=absolute", flag])
+        .args(args)
         .current_dir(dir)
         .output()
         .ok()
@@ -1898,14 +1905,12 @@ fn git_path(dir: &Path, flag: &str) -> Option<PathBuf> {
     let mut bytes = output.stdout;
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
-        // A Unix path may itself end in `\r`; elsewhere no path can, so a
-        // CR there can only be part of a CRLF terminator.
         #[cfg(not(unix))]
         if bytes.last() == Some(&b'\r') {
             bytes.pop();
         }
     }
-    path_from_git_bytes(bytes)
+    Some(bytes)
 }
 
 /// Fast-forward `base_branch` to `commit`.
@@ -6810,6 +6815,21 @@ mod tests {
 
         assert_eq!(merge_into_base(&wt, "release", false).unwrap().status, "merged");
         assert_eq!(std::fs::read_to_string(odd.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[test]
+    fn test_merge_into_base_advances_a_base_whose_name_ends_in_unicode_whitespace() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let branch = "release\u{a0}";
+        let checkout = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", branch, checkout.to_str().unwrap()]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        assert_eq!(merge_into_base(&wt, branch, false).unwrap().status, "merged");
+        assert_eq!(std::fs::read_to_string(checkout.join("feature.txt")).unwrap(), "worktree work");
     }
 
     // Linux only: macOS file systems refuse names that are not UTF-8.
