@@ -43,11 +43,15 @@ use axum::{
     },
     http::{header, HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
+    Extension,
 };
 use futures_util::{SinkExt, StreamExt};
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
+
+use super::{ListenerLife, WebRemoteState};
 
 /// Lowest agent-browser stream port. Sourced from the public constant so the
 /// proxy range tracks the allocator's floor automatically.
@@ -76,19 +80,39 @@ fn has_control_char(s: &str) -> bool {
 // ── WebSocket proxy ─────────────────────────────────────────────────
 
 /// `GET /proxy/browser/:port/ws` — upgrade and bridge to the daemon socket.
-pub async fn ws_proxy<R: Runtime>(
+pub(super) async fn ws_proxy<R: Runtime>(
     State(app): State<AppHandle<R>>,
+    life: Option<Extension<ListenerLife>>,
     Path(port): Path<u16>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if let Err(resp) = super::server::require_session(&app, &headers) {
-        return resp;
-    }
+    let session = match super::server::require_session(&app, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let Some(Extension(mut life)) = life.filter(|Extension(life)| life.live()) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     if !port_in_range(port) {
         return (StatusCode::BAD_REQUEST, "port out of range").into_response();
     }
-    ws.on_upgrade(move |socket| bridge_ws(socket, port))
+    ws.on_upgrade(move |socket| async move {
+        let shared = app.state::<WebRemoteState>().shared();
+        let (close, mut closed) = watch::channel(false);
+        let connection = shared.connections.register_browser_proxy(&session.id, close);
+        // Register before checking again so a revocation during the upgrade
+        // is either visible here or can signal this bridge to close.
+        if super::server::session_active(&app, &session.id) {
+            tokio::select! {
+                biased;
+                _ = closed.changed() => {}
+                _ = life.stopped() => {}
+                _ = bridge_ws(socket, port) => {}
+            }
+        }
+        shared.connections.unregister(connection);
+    })
 }
 
 /// Bidirectionally pipe an upgraded client socket to the loopback daemon at
@@ -449,6 +473,19 @@ fn dechunk(mut data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn listener_shutdown_before_upgrade_is_still_observed() {
+        let (shutdown, receiver) = watch::channel(false);
+        let mut life = ListenerLife(receiver);
+        assert!(life.live());
+
+        shutdown.send(true).unwrap();
+        assert!(!life.live());
+        tokio::time::timeout(Duration::from_secs(1), life.stopped())
+            .await
+            .expect("an upgrade on the old listener must observe its shutdown");
+    }
 
     #[test]
     fn port_range_accepts_in_range_and_rejects_out() {
