@@ -272,6 +272,8 @@ pub struct SessionRuntime {
     pub is_spawning: bool,
     /// Rotated under the sessions lock whenever a spawn claims this id.
     restart_token: Uuid,
+    /// The daemon may still own the shell after its connection dropped.
+    needs_daemon_reconciliation: bool,
     /// Set when this session is owned by the `codemux pty-daemon` process
     /// instead of the in-process portable-pty path. The PID stored in
     /// `child_pid` belongs to a process the daemon spawned — NOT a direct
@@ -325,6 +327,7 @@ impl SessionRuntime {
             resume_command: None,
             is_spawning: false,
             restart_token: Uuid::nil(),
+            needs_daemon_reconciliation: false,
             persistent: false,
             #[cfg(unix)]
             daemon_client: None,
@@ -428,6 +431,9 @@ fn try_reserve_session_spawn(
     let runtime = guard
         .entry(session_id.to_string())
         .or_insert_with(|| SessionRuntime::new(session_id));
+    if runtime.needs_daemon_reconciliation {
+        return None;
+    }
     runtime.reserve_spawn()
 }
 
@@ -506,6 +512,13 @@ impl SessionSpawnReservation {
         self.committed = true;
     }
 
+    #[cfg(unix)]
+    fn is_current(&self) -> bool {
+        with_existing_session_runtime(&self.sessions, &self.session_id, |runtime| {
+            runtime.restart_token == self.restart_token
+        }).unwrap_or(false)
+    }
+
     /// Compare the observed shell and take its runtime in one lock. The
     /// replacement reserves the id through the old shell's teardown.
     fn for_restart(
@@ -554,6 +567,21 @@ impl SessionSpawnReservation {
         });
         self.commit();
         released.unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn retain_for_daemon_reconciliation(&mut self) -> bool {
+        let retained = with_existing_session_runtime(&self.sessions, &self.session_id, |runtime| {
+            if runtime.restart_token != self.restart_token {
+                return false;
+            }
+            runtime.needs_daemon_reconciliation = true;
+            true
+        }).unwrap_or(false);
+        if retained {
+            self.remove_on_drop = false;
+        }
+        retained
     }
 
     #[cfg(unix)]
@@ -896,57 +924,72 @@ fn queue_or_send_output(
     session_id: &str,
     chunk: Vec<u8>,
 ) {
-    let subscribers_to_send = with_session_runtime(
-        sessions,
-        session_id,
-        || SessionRuntime::new(session_id),
-        |runtime| {
-            // Maintain `pending_output_bytes` in lockstep with the deque so
-            // the eviction loop below can cap by total bytes without an O(n)
-            // re-sum. `saturating_add` defends against the pathological case
-            // of cumulative bytes wrapping `usize::MAX` — at the production
-            // 256 MiB cap this is theoretical, but it's free insurance.
-            runtime.pending_output_bytes = runtime.pending_output_bytes.saturating_add(chunk.len());
-            runtime.pending_output.push_back(chunk.clone());
-            while runtime.pending_output_bytes > OUTPUT_BUFFER_BYTE_LIMIT {
-                let Some(evicted) = runtime.pending_output.pop_front() else {
-                    // Defensive: the byte counter and the deque got out of
-                    // sync somehow (would indicate a bug in this function or
-                    // a future caller mutating the deque directly). Clamp to
-                    // zero to break the loop instead of spinning, and let
-                    // the next push restart accounting from a clean slate.
-                    runtime.pending_output_bytes = 0;
-                    break;
-                };
-                runtime.pending_output_bytes =
-                    runtime.pending_output_bytes.saturating_sub(evicted.len());
-                if runtime.output_subscribers.is_empty() {
-                    let dropped = runtime.dropped_chunks.saturating_add(1);
-                    runtime.dropped_chunks = dropped;
-                    // Log on the first drop and then on each power-of-two boundary
-                    // so a chatty regression doesn't spam stderr but is still
-                    // discoverable. A single line is enough — the count is the
-                    // signal; the rest is in the bug.
-                    if dropped == 1 || dropped.is_power_of_two() {
-                        eprintln!(
-                            "[codemux::terminal] session={session_id} dropped pending_output \
-                             chunk (cumulative={dropped}). Indicates no consumer was \
-                             attached when the buffer overflowed."
-                        );
-                    }
+    queue_or_send_output_if_current(sessions, session_id, chunk, None);
+}
+
+fn queue_or_send_output_if_current(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    chunk: Vec<u8>,
+    expected: Option<Uuid>,
+) {
+    let queue = |runtime: &mut SessionRuntime| {
+        // Maintain `pending_output_bytes` in lockstep with the deque so
+        // the eviction loop below can cap by total bytes without an O(n)
+        // re-sum. `saturating_add` defends against the pathological case
+        // of cumulative bytes wrapping `usize::MAX` — at the production
+        // 256 MiB cap this is theoretical, but it's free insurance.
+        runtime.pending_output_bytes = runtime.pending_output_bytes.saturating_add(chunk.len());
+        runtime.pending_output.push_back(chunk.clone());
+        while runtime.pending_output_bytes > OUTPUT_BUFFER_BYTE_LIMIT {
+            let Some(evicted) = runtime.pending_output.pop_front() else {
+                // Defensive: the byte counter and the deque got out of
+                // sync somehow (would indicate a bug in this function or
+                // a future caller mutating the deque directly). Clamp to
+                // zero to break the loop instead of spinning, and let
+                // the next push restart accounting from a clean slate.
+                runtime.pending_output_bytes = 0;
+                break;
+            };
+            runtime.pending_output_bytes =
+                runtime.pending_output_bytes.saturating_sub(evicted.len());
+            if runtime.output_subscribers.is_empty() {
+                let dropped = runtime.dropped_chunks.saturating_add(1);
+                runtime.dropped_chunks = dropped;
+                // Log on the first drop and then on each power-of-two boundary
+                // so a chatty regression doesn't spam stderr but is still
+                // discoverable. A single line is enough — the count is the
+                // signal; the rest is in the bug.
+                if dropped == 1 || dropped.is_power_of_two() {
+                    eprintln!(
+                        "[codemux::terminal] session={session_id} dropped pending_output \
+                         chunk (cumulative={dropped}). Indicates no consumer was \
+                         attached when the buffer overflowed."
+                    );
                 }
             }
+        }
 
-            // Snapshot (generation, channel) for every subscriber so the sends
-            // happen OUTSIDE the lock. Cloning a `Channel` is cheap (it's
-            // internally ref-counted).
-            runtime
-                .output_subscribers
-                .iter()
-                .map(|s| (s.generation, s.channel.clone()))
-                .collect::<Vec<_>>()
-        },
-    );
+        // Snapshot (generation, channel) for every subscriber so the sends
+        // happen OUTSIDE the lock. Cloning a `Channel` is cheap (it's
+        // internally ref-counted).
+        runtime
+            .output_subscribers
+            .iter()
+            .map(|s| (s.generation, s.channel.clone()))
+            .collect::<Vec<_>>()
+    };
+    let subscribers_to_send = if let Some(token) = expected {
+        let subscribers = with_existing_session_runtime(sessions, session_id, |runtime| {
+            (runtime.restart_token == token).then(|| queue(runtime))
+        });
+        let Some(subscribers) = subscribers.flatten() else {
+            return;
+        };
+        subscribers
+    } else {
+        with_session_runtime(sessions, session_id, || SessionRuntime::new(session_id), queue)
+    };
 
     if subscribers_to_send.is_empty() {
         return;
@@ -1841,18 +1884,29 @@ async fn handle_daemon_spawn_failure<R: Runtime>(
     if error.is_already_reserved() {
         return;
     }
-    {
-        let pty_state: State<'_, PtyState> = app.state();
-        if is_session_spawn_active(&pty_state.sessions, &session_id) {
-            // Hydration inventories are snapshots. If another activation/pane
-            // creation won the race after this one failed, its healthy runtime
-            // is authoritative and must not be overwritten by a stale Failed
-            // status or local fallback spawn.
-            return;
-        }
+    let pty_state: State<'_, PtyState> = app.state();
+    let (spawn_active, reconciliation_token) =
+        with_existing_session_runtime(&pty_state.sessions, &session_id, |runtime| {
+            (
+                runtime.spawn_active(),
+                runtime.needs_daemon_reconciliation.then_some(runtime.restart_token),
+            )
+        }).unwrap_or_default();
+    // A healthy runtime from a concurrent activation takes precedence over
+    // an older hydration failure.
+    if spawn_active {
+        return;
+    }
+    if let Some(token) = reconciliation_token {
+        emit_terminal_status_if_current(
+            &app,
+            &pty_state.sessions,
+            daemon_spawn_failure_status(session_id, error, is_remote),
+            Some(token),
+        );
+        return;
     }
     if is_remote || !error.allows_local_fallback() {
-        let pty_state: State<'_, PtyState> = app.state();
         // Keep a status-only runtime so a pane that mounts after this event can
         // replay Failed via `get_terminal_status`. It owns no PTY handles and
         // `is_spawning` is false, so an explicit retry can reserve the same id
@@ -1873,26 +1927,10 @@ async fn handle_daemon_spawn_failure<R: Runtime>(
                 runtime.daemon_client = None;
             },
         );
-        let message = if is_remote {
-            format!(
-                "Couldn't reach the remote host: {error}. Try Test Connection in \
-                 Settings → Connections → Devices, or right-click → Pull back."
-            )
-        } else {
-            format!(
-                "Persistent shell outcome is uncertain: {error}. Retry to reattach \
-                 without starting a duplicate shell."
-            )
-        };
         emit_terminal_status(
             &app,
             &pty_state.sessions,
-            TerminalStatusPayload {
-                session_id: session_id.clone(),
-                state: TerminalLifecycleState::Failed,
-                message: Some(message),
-                exit_code: None,
-            },
+            daemon_spawn_failure_status(session_id, error, is_remote),
         );
         return;
     }
@@ -1902,6 +1940,31 @@ async fn handle_daemon_spawn_failure<R: Runtime>(
         spawn_pty_for_session_in_process(app, session_id);
     })
     .await;
+}
+
+#[cfg(unix)]
+fn daemon_spawn_failure_status(
+    session_id: String,
+    error: daemon_backed::DaemonHydrationFailure,
+    is_remote: bool,
+) -> TerminalStatusPayload {
+    let message = if is_remote {
+        format!(
+            "Couldn't reach the remote host: {error}. Try Test Connection in \
+             Settings → Connections → Devices, or right-click → Pull back."
+        )
+    } else {
+        format!(
+            "Persistent shell outcome is uncertain: {error}. Retry to reattach \
+             without starting a duplicate shell."
+        )
+    };
+    TerminalStatusPayload {
+        session_id,
+        state: TerminalLifecycleState::Failed,
+        message: Some(message),
+        exit_code: None,
+    }
 }
 
 fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: String) {
@@ -2423,7 +2486,7 @@ pub fn spawn_missing_ptys_for_workspace<R: Runtime>(app: AppHandle<R>, workspace
         tauri::async_runtime::spawn(async move {
             use futures_util::StreamExt as _;
             let failures =
-                match daemon_backed::hydrate_workspace_via_daemon(app.clone(), plan).await {
+                match daemon_backed::hydrate_workspace_via_daemon(app.clone(), plan, None).await {
                     Ok(failures) => failures,
                     // The workspace-level error arrives pre-classified: a
                     // List timeout against a stalled-but-alive daemon stays
@@ -2801,41 +2864,70 @@ pub async fn restart_terminal_session<R: Runtime>(
     let Some((reservation, old)) = SessionSpawnReservation::for_restart(&terminal_state.sessions, &session_id, expected) else {
         return Ok(false);
     };
+    #[cfg(unix)]
+    let mut reconcile_daemon = false;
     if let Some(runtime) = old {
         #[cfg(unix)]
         if runtime.persistent {
-            let close = async {
-                let client = match &runtime.daemon_client {
-                    Some(client) => client.clone(),
-                    None => crate::pty_daemon::ensure_daemon().await?,
-                };
-                client.close(session_id.clone()).await?;
-                Ok::<_, crate::pty_daemon::PtyDaemonError>(client)
-            }.await;
-            let client = match close {
-                Ok(client) => client,
-                Err(error) => {
-                    reservation.restore_after_failed_close(runtime);
-                    return Err(error.to_string());
+            // Only the original connection can retire the shell we observed.
+            // On disconnect, reconcile through the workspace's daemon inventory.
+            reconcile_daemon = true;
+            if let Some(client) = runtime.daemon_client.clone() {
+                match client.close(session_id.clone()).await {
+                    Ok(()) => match client.detach(session_id.clone()).await {
+                        // Flush the old subscription before attaching again
+                        // on this socket with the same session id.
+                        Ok(()) => reconcile_daemon = false,
+                        Err(_) if client.is_closed() => {}
+                        Err(error) => return Err(error.to_string()),
+                    },
+                    Err(_) if client.is_closed() => {}
+                    Err(error) => {
+                        reservation.restore_after_failed_close(runtime);
+                        return Err(error.to_string());
+                    }
                 }
-            };
-            drop(runtime);
-            // Drain the old subscription before reusing the daemon's session
-            // id. Its Exited frame must not detach the replacement reader.
-            client.detach(session_id.clone()).await.map_err(|error| error.to_string())?;
+            }
         } else {
+            reconcile_daemon = runtime.needs_daemon_reconciliation;
             terminate_removed_session(runtime, &session_id);
         }
         #[cfg(not(unix))]
         terminate_removed_session(runtime, &session_id);
     }
-    if app.state::<AppStateStore>().pty_hydration_plan_for_session(&session_id).is_some()
-        && reservation.release_for_spawn()
-    {
-        spawn_pty_for_session(app, session_id);
-        return Ok(true);
+    let Some(plan) = app.state::<AppStateStore>().pty_hydration_plan_for_session(&session_id) else {
+        return Ok(false);
+    };
+    #[cfg(unix)]
+    if reconcile_daemon {
+        let mut reservation = reservation;
+        if !reservation.retain_for_daemon_reconciliation() {
+            return Ok(false);
+        }
+        let token = reservation.restart_token;
+        let is_remote = plan.workspace.host_id.is_some();
+        let result = daemon_backed::hydrate_workspace_via_daemon(app.clone(), plan, Some(reservation)).await;
+        let error = match result {
+            Ok(failures) => failures.into_iter().next().map(|(_, error)| error),
+            Err(error) => Some(error),
+        };
+        if let Some(error) = error.filter(|error| !error.is_already_reserved()) {
+            emit_terminal_status_if_current(
+                &app,
+                &terminal_state.sessions,
+                daemon_spawn_failure_status(session_id, error, is_remote),
+                Some(token),
+            );
+        }
+        // A surviving shell is reattached without a restart marker.
+        return Ok(false);
     }
-    Ok(false)
+    let _ = plan;
+    if !reservation.release_for_spawn() {
+        return Ok(false);
+    }
+    spawn_pty_for_session(app, session_id);
+    Ok(true)
 }
 
 #[tauri::command]
@@ -6145,6 +6237,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn restart_guard_keeps_reconciliation_daemon_only() {
+        let sessions = make_spawn_sessions();
+        let id = "disconnected-daemon";
+        let (mut restart, _) = SessionSpawnReservation::for_restart(&sessions, id, None).unwrap();
+        assert!(restart.retain_for_daemon_reconciliation());
+        drop(restart);
+        assert!(try_reserve_session_spawn(&sessions, id).is_none());
+        {
+            let _attempt = SessionSpawnReservation::try_new(&sessions, id, None).unwrap();
+        }
+        assert!(try_reserve_session_spawn(&sessions, id).is_none());
+        assert!(SessionSpawnReservation::try_new(&sessions, id, None).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn restart_guard_preserves_daemon_shell_ownership_on_close_failure() {
         let sessions = make_spawn_sessions();
         let id = "daemon-close-failure";
@@ -6159,6 +6267,152 @@ mod tests {
         restart.restore_after_failed_close(old.unwrap());
         let (_, original) = SessionSpawnReservation::for_restart(&sessions, id, Some(token)).unwrap();
         assert!(original.unwrap().persistent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_guard_reconnects_to_a_surviving_daemon_shell() {
+        const TEST: &str = "terminal::tests::restart_guard_reconnects_to_a_surviving_daemon_shell";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        assert_daemon_reconnect(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_guard_respects_a_pane_close_during_daemon_attach() {
+        const TEST: &str = "terminal::tests::restart_guard_respects_a_pane_close_during_daemon_attach";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        assert_daemon_reconnect(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_daemon_reconnect(close_during_attach: bool) {
+        let root = crate::test_isolation::isolated_root().unwrap();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
+                    use crate::pty_daemon::protocol::{
+                        ClientRequest, DaemonSessionInfo, Frame, ServerResponse, PROTOCOL_VERSION,
+                    };
+                    use crate::pty_daemon::PtyDaemonClient;
+                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                    use tokio::net::{UnixListener, UnixStream};
+
+                    let app = tauri::test::mock_app();
+                    app.manage(PtyState::default());
+                    app.manage(AppStateStore::default());
+                    app.manage(crate::database::DatabaseStore::new_in_memory());
+                    let layout_state = app.state::<AppStateStore>();
+                    let id = layout_state.active_terminal_session_id().unwrap().0;
+                    let workspace_id = layout_state.snapshot().active_workspace_id.0;
+
+                    let (old_stream, old_peer) = UnixStream::pair().unwrap();
+                    let old = PtyDaemonClient::from_test_stream(old_stream, Duration::from_secs(1));
+                    drop(old_peer);
+                    while !old.is_closed() {
+                        tokio::task::yield_now().await;
+                    }
+                    let pty_state = app.state::<PtyState>();
+                    let old_token = try_reserve_session_spawn(&pty_state.sessions, &id).unwrap();
+                    with_existing_session_runtime(&pty_state.sessions, &id, |runtime| {
+                        runtime.is_spawning = false;
+                        runtime.persistent = true;
+                        runtime.writer = Some(Box::new(std::io::sink()));
+                        runtime.daemon_client = Some(old);
+                        runtime.last_status.state = TerminalLifecycleState::Exited;
+                    });
+
+                    let daemon_pid = std::process::id();
+                    let shell_pid = 4242;
+                    let socket_path = root.join("daemon.sock");
+                    let listener = UnixListener::bind(&socket_path).unwrap();
+                    let version = env!("CARGO_PKG_VERSION").to_string();
+                    write_manifest(&DaemonManifest {
+                        pid: daemon_pid,
+                        socket_path,
+                        daemon_version: version.clone(),
+                        protocol_version: PROTOCOL_VERSION,
+                        started_at: 0,
+                    }).unwrap();
+
+                    let surviving_id = id.clone();
+                    let sessions = pty_state.sessions.clone();
+                    let (finish, finished) = tokio::sync::oneshot::channel();
+                    let daemon = tokio::spawn(async move {
+                        let (socket, _) = listener.accept().await.unwrap();
+                        let (read, mut write) = socket.into_split();
+                        let mut lines = BufReader::new(read).lines();
+                        for step in ["hello", "list", "attach"] {
+                            let line = lines.next_line().await.unwrap().unwrap();
+                            let request: ClientRequest = serde_json::from_str(&line).unwrap();
+                            let response = match (step, request) {
+                                ("hello", ClientRequest::Hello { request_id }) => ServerResponse::Hello {
+                                    request_id,
+                                    protocol_version: PROTOCOL_VERSION,
+                                    daemon_pid,
+                                    daemon_version: version.clone(),
+                                    host_claude_plugin: false,
+                                },
+                                ("list", ClientRequest::List { request_id }) => ServerResponse::Listed {
+                                    request_id,
+                                    sessions: vec![DaemonSessionInfo {
+                                        session_id: surviving_id.clone(),
+                                        workspace_id: workspace_id.clone(),
+                                        pid: shell_pid,
+                                        argv: vec!["sh".into()],
+                                        cwd: "/".into(),
+                                        rows: 24,
+                                        cols: 80,
+                                        created_at: 0,
+                                    }],
+                                },
+                                ("attach", ClientRequest::Attach { request_id, session_id }) => {
+                                    assert_eq!(session_id, surviving_id);
+                                    if close_during_attach {
+                                        terminate_pty_session(&sessions, &session_id);
+                                    }
+                                    ServerResponse::Attached { request_id, session_id }
+                                }
+                                (step, request) => panic!("expected {step}, received {request:?}"),
+                            };
+                            let mut frame = serde_json::to_vec(&Frame::Response(response)).unwrap();
+                            frame.push(b'\n');
+                            write.write_all(&frame).await.unwrap();
+                        }
+                        tokio::select! {
+                            biased;
+                            request = lines.next_line() => panic!("unexpected daemon request: {request:?}"),
+                            _ = finished => {}
+                        }
+                    });
+
+                    let restarted = restart_terminal_session(
+                        app.handle().clone(),
+                        app.state::<PtyState>(),
+                        id.clone(),
+                        Some(old_token.to_string()),
+                    ).await.unwrap();
+                    assert!(!restarted, "reattaching must not report a restarted shell");
+                    let runtime_exists = with_existing_session_runtime(&pty_state.sessions, &id, |runtime| {
+                        assert_eq!(runtime.child_pid, Some(shell_pid));
+                        assert!(matches!(runtime.last_status.state, TerminalLifecycleState::Ready));
+                        assert_ne!(runtime.restart_token, old_token);
+                        assert!(!runtime.daemon_client.as_ref().unwrap().is_closed());
+                    }).is_some();
+                    assert_eq!(runtime_exists, !close_during_attach);
+                    finish.send(()).unwrap();
+                    daemon.await.unwrap();
+                }).await.expect("daemon reconnection should finish within the test deadline");
+            });
     }
 
     #[test]

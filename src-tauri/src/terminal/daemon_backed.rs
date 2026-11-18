@@ -15,8 +15,8 @@
 //!     socket → daemon → master fd → acknowledgement.
 
 use super::{
-    emit_terminal_status, hydration_workspace_pty_env, queue_or_send_output, with_session_runtime,
-    PtyState, SessionRuntime, SessionSpawnReservation, TerminalLifecycleState,
+    emit_terminal_status_if_current, hydration_workspace_pty_env, queue_or_send_output_if_current,
+    with_existing_session_runtime, PtyState, SessionSpawnReservation, TerminalLifecycleState,
     TerminalStatusPayload, DEFAULT_COLS, DEFAULT_ROWS,
 };
 use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
@@ -25,6 +25,12 @@ use futures_util::stream::StreamExt as _;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, Runtime, State};
+use uuid::Uuid;
+
+enum DaemonSpawnClaim {
+    Hydrate(Uuid),
+    Restart(SessionSpawnReservation),
+}
 
 /// Should `spawn_pty_for_session_via_daemon` synthesize a "relaunch this
 /// agent" command from the in-memory `original_command`?
@@ -311,7 +317,7 @@ pub(crate) async fn spawn_pty_for_session_via_daemon<R: Runtime>(
                 "terminal session has no owning workspace".to_string(),
             )
         })?;
-    let failures = hydrate_workspace_via_daemon(app, plan).await?;
+    let failures = hydrate_workspace_via_daemon(app, plan, None).await?;
     failures
         .into_iter()
         .next()
@@ -330,20 +336,34 @@ pub(crate) async fn spawn_pty_for_session_via_daemon<R: Runtime>(
 /// errors proving the daemon is absent allow a local fallback, while List
 /// failures (including timeouts) are always retry-only because the daemon
 /// may still own every listed shell.
-pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
+pub(super) async fn hydrate_workspace_via_daemon<R: Runtime>(
     app: AppHandle<R>,
     plan: PtyHydrationPlan,
+    restart: Option<SessionSpawnReservation>,
 ) -> Result<Vec<(String, DaemonHydrationFailure)>, DaemonHydrationFailure> {
     let hydration_started = std::time::Instant::now();
     let terminal_state: State<'_, PtyState> = app.state();
     let sessions = terminal_state.sessions.clone();
-    let pending: Vec<_> = plan
-        .sessions
-        .into_iter()
-        .filter_map(|session| {
-            super::idle_restart_token(&sessions, &session.session_id).map(|token| (session, token))
-        })
-        .collect();
+    let pending: Vec<_> = match restart {
+        // Reconnect already owns this session. Keep that reservation while
+        // acquiring the daemon and reading its inventory.
+        Some(reservation) => plan
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == reservation.session_id)
+            .filter(|_| reservation.is_current())
+            .map(|session| (session, DaemonSpawnClaim::Restart(reservation)))
+            .into_iter()
+            .collect(),
+        None => plan
+            .sessions
+            .into_iter()
+            .filter_map(|session| {
+                let token = super::idle_restart_token(&sessions, &session.session_id)?;
+                Some((session, DaemonSpawnClaim::Hydrate(token)))
+            })
+            .collect(),
+    };
     if pending.is_empty() {
         crate::diagnostics::record_perf_timing(
             "pty.workspace-hydration",
@@ -355,8 +375,12 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
     let workspace = Arc::new(plan.workspace);
     let is_remote = workspace.host_id.is_some();
     if is_remote {
-        for (session, token) in &pending {
-            super::emit_terminal_status_if_current(
+        for (session, claim) in &pending {
+            let token = match claim {
+                DaemonSpawnClaim::Hydrate(token) => *token,
+                DaemonSpawnClaim::Restart(reservation) => reservation.restart_token,
+            };
+            emit_terminal_status_if_current(
                 &app,
                 &sessions,
                 TerminalStatusPayload {
@@ -368,7 +392,7 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
                     ),
                     exit_code: None,
                 },
-                Some(*token),
+                Some(token),
             );
         }
     }
@@ -472,7 +496,7 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
     let (workspace_env, mut disk_meta, shell, session_restore_enabled) = prepared;
 
     let mut work = Vec::with_capacity(pending.len());
-    for (session, token) in pending {
+    for (session, claim) in pending {
         let prior = existing.remove(&session.session_id);
         let meta = disk_meta.remove(&session.session_id);
         let session_id = session.session_id.clone();
@@ -494,7 +518,7 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
                 device_dir,
                 shell,
                 session_restore_enabled,
-                token,
+                claim,
             )
             .await;
             (session_id, result)
@@ -531,7 +555,7 @@ async fn spawn_prepared_session<R: Runtime>(
     device_dir: Option<String>,
     shell: String,
     session_restore_enabled: bool,
-    expected_restart_token: uuid::Uuid,
+    claim: DaemonSpawnClaim,
 ) -> Result<(), DaemonHydrationFailure> {
     let session_id = session.session_id.clone();
     let entry_ts = std::time::Instant::now();
@@ -540,11 +564,13 @@ async fn spawn_prepared_session<R: Runtime>(
     let app_state: State<'_, AppStateStore> = app.state();
     let sessions = terminal_state.sessions.clone();
 
-    let Some(mut reservation) = SessionSpawnReservation::try_new(
-        &sessions,
-        &session_id,
-        Some(expected_restart_token),
-    ) else {
+    let reservation = match claim {
+        DaemonSpawnClaim::Hydrate(token) => {
+            SessionSpawnReservation::try_new(&sessions, &session_id, Some(token))
+        }
+        DaemonSpawnClaim::Restart(reservation) => reservation.is_current().then_some(reservation),
+    };
+    let Some(mut reservation) = reservation else {
         crate::trace_cloud_push!(
             "[trace:{session_id}] try_reserve FAILED at t={}ms",
             entry_ts.elapsed().as_millis()
@@ -814,7 +840,7 @@ async fn spawn_prepared_session<R: Runtime>(
     if let Some(port) = crate::hooks::hook_port() {
         env.push(("CODEMUX_HOOK_PORT".into(), port.to_string()));
     }
-    emit_terminal_status(
+    emit_terminal_status_if_current(
         &app,
         &sessions,
         TerminalStatusPayload {
@@ -823,6 +849,7 @@ async fn spawn_prepared_session<R: Runtime>(
             message: Some(format!("Starting persistent shell: {shell}")),
             exit_code: None,
         },
+        Some(restart_token),
     );
 
     // Idempotent reattach decision comes from the workspace-level List. The
@@ -848,6 +875,9 @@ async fn spawn_prepared_session<R: Runtime>(
         if !is_remote {
             crate::mcp_cleanup::before_launch(std::path::Path::new(&effective_cwd)).await;
         }
+        if !reservation.is_current() {
+            return Err(DaemonHydrationFailure::AlreadyReserved);
+        }
         match client
             .spawn(
                 session_id.clone(),
@@ -867,6 +897,9 @@ async fn spawn_prepared_session<R: Runtime>(
         }
     };
 
+    if !reservation.is_current() {
+        return Err(DaemonHydrationFailure::AlreadyReserved);
+    }
     let mut rx = match client.attach(session_id.clone()).await {
         Ok(rx) => rx,
         Err(error) => {
@@ -895,27 +928,31 @@ async fn spawn_prepared_session<R: Runtime>(
         auto_resume_command.clone()
     };
     let client_for_runtime = client.clone();
-    with_session_runtime(
-        &sessions,
-        &session_id,
-        || SessionRuntime::new(&session_id),
-        |runtime| {
-            runtime.daemon_writer = Some(writer.clone());
-            runtime.writer = Some(Box::new(writer));
-            runtime.master = None;
-            runtime.child_pid = Some(pid);
-            runtime.persistent = true;
-            runtime.is_spawning = false;
-            // On reattach, skip_preset_launch must ALSO be true so the
-            // preset launcher (separate from auto-write) doesn't fire
-            // a preset write into the live agent.
-            runtime.skip_preset_launch = reattached || auto_resume_clone.is_some();
-            runtime.resume_command = auto_resume_clone.clone();
-            // Same as the agent path — capture the client so resize/close
-            // route to the daemon that actually owns this session id.
-            runtime.daemon_client = Some(client_for_runtime);
-        },
-    );
+    let installed = with_existing_session_runtime(&sessions, &session_id, |runtime| {
+        if runtime.restart_token != restart_token {
+            return false;
+        }
+        runtime.daemon_writer = Some(writer.clone());
+        runtime.writer = Some(Box::new(writer));
+        runtime.master = None;
+        runtime.child_pid = Some(pid);
+        runtime.persistent = true;
+        runtime.is_spawning = false;
+        runtime.needs_daemon_reconciliation = false;
+        // On reattach, skip_preset_launch must ALSO be true so the
+        // preset launcher (separate from auto-write) doesn't fire
+        // a preset write into the live agent.
+        runtime.skip_preset_launch = reattached || auto_resume_clone.is_some();
+        runtime.resume_command = auto_resume_clone.clone();
+        // Same as the agent path — capture the client so resize/close
+        // route to the daemon that actually owns this session id.
+        runtime.daemon_client = Some(client_for_runtime);
+        true
+    })
+    .unwrap_or(false);
+    if !installed {
+        return Err(DaemonHydrationFailure::AlreadyReserved);
+    }
     reservation.commit();
 
     // Preflight: for remote workspaces, verify the agent binary
@@ -958,7 +995,7 @@ async fn spawn_prepared_session<R: Runtime>(
                                      Failed status instead of writing doomed command",
                                     host.name
                                 );
-                                emit_terminal_status(
+                                emit_terminal_status_if_current(
                                     &app,
                                     &sessions,
                                     TerminalStatusPayload {
@@ -972,6 +1009,7 @@ async fn spawn_prepared_session<R: Runtime>(
                                         )),
                                         exit_code: None,
                                     },
+                                    Some(restart_token),
                                 );
                                 // Don't write the command — let the bare bash
                                 // prompt remain on the pane as a fallback.
@@ -1006,7 +1044,7 @@ async fn spawn_prepared_session<R: Runtime>(
         );
     }
 
-    emit_terminal_status(
+    emit_terminal_status_if_current(
         &app,
         &sessions,
         TerminalStatusPayload {
@@ -1017,6 +1055,7 @@ async fn spawn_prepared_session<R: Runtime>(
             )),
             exit_code: None,
         },
+        Some(restart_token),
     );
 
     // ── Reader task: drain the daemon's mpsc into queue_or_send_output AND
@@ -1056,7 +1095,7 @@ async fn spawn_prepared_session<R: Runtime>(
                     }
                 }
             }
-            queue_or_send_output(&read_sessions, &read_session_id, chunk);
+            queue_or_send_output_if_current(&read_sessions, &read_session_id, chunk, Some(restart_token));
         }
         crate::trace_cloud_push!(
             "[codemux::terminal::daemon_backed] shell read loop ended for {read_session_id}"
