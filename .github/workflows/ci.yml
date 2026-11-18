@@ -123,7 +123,7 @@ jobs:
           # @v5 (Node 24 runtime) so it won't trip GitHub's Node-20-actions
           # deprecation that takes effect 2026-06-02.
           # See: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
-          node-version: 22
+          node-version: "^22.22.2" # Minimum Node 22 version supported by npm 12.2.2.
           cache: npm
 
       - name: Install npm dependencies
@@ -170,6 +170,10 @@ jobs:
         run: |
           npm run check:plugin-sdk
           npm run test:plugin-sdk
+
+      - name: Test the SDK package with npm 12
+        if: matrix.os == 'ubuntu-latest'
+        run: npx --yes npm@12.2.2 --prefix packages/plugin-sdk test
 
       - name: Hermes managed library boundary tests
         if: matrix.os == 'ubuntu-latest'
