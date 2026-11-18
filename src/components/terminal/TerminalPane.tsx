@@ -72,6 +72,7 @@ import { createIdleScrollbackSerializer } from "./scrollback-idle-serializer";
 import { parkTeardown, flushTeardown } from "./deferred-teardown";
 import { useAppStore, getSessionWorkspaceId } from "@/stores/app-store";
 import { releaseRemoteChannel } from "@/remote/channel";
+import { remoteViewHost } from "@/remote/client-view";
 import { useRemoteReconnectEpoch } from "@/remote/remote-connection-store";
 import {
   useTerminalCwdStore,
@@ -98,6 +99,9 @@ interface Props {
 const OVERLAY_FADE_MS = 150;
 
 const LINK_HINT = "Ctrl+click to open";
+
+// A shell restart belongs to the session even when its pane is remounted.
+const pendingRestarts = new Map<string, Promise<boolean>>();
 
 const EXIT_CHIP_CLASS =
   "status-meta inline-flex items-center rounded-sm px-1.5 py-0.5 text-label font-mono";
@@ -351,6 +355,8 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   // ── Main mount/teardown effect ──
   useEffect(() => {
     const sid = sessionId;
+    const host = remoteViewHost();
+    const restartKey = JSON.stringify([host, sid]);
 
     // Switching back to a session whose teardown is still parked (A → B → A):
     // finish it NOW, before this mount builds a second Terminal for the same
@@ -951,7 +957,9 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         if (!ownsOutput(epoch)) {
           // Teardown already released the callback, but could not detach
           // without the generation. Finish before restart replaces the PTY.
-          if (generation != null) await detachPtyOutput(sid, generation).catch(console.error);
+          if (generation != null && remoteViewHost() === host) {
+            await detachPtyOutput(sid, generation).catch(console.error);
+          }
           return false;
         }
         attachedSessionRef.current = sid;
@@ -1041,7 +1049,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     };
 
     restartRef.current = async () => {
-      if (cancelled || restarting) return;
+      if (cancelled || restarting || pendingRestarts.has(restartKey)) return;
       restarting = true;
       const epoch = ++outputEpoch;
       releaseOutputChannel();
@@ -1059,14 +1067,26 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         message: "Restarting shell…",
         exit_code: null,
       });
-      try {
+      const restart = (async () => {
         // Finish any issued startup resize or attach before replacing the
         // PTY. A late detach could otherwise hit a reused generation.
         if (pendingOutputIpc) await pendingOutputIpc;
+        if (remoteViewHost() !== host) return false;
         if (generation != null) await detachPtyOutput(sid, generation).catch(console.error);
-        if (!ownsOutput(epoch)) return;
+        const { appState } = useAppStore.getState();
+        // A closed session may disappear while its pane's IPC drains.
+        const sessionClosed = appState && !appState.terminal_sessions.some(
+          (session) => session.session_id === sid,
+        );
+        if (remoteViewHost() !== host || sessionClosed) return false;
+        await restartTerminalSession(sid);
+        return true;
+      })();
+      pendingRestarts.set(restartKey, restart);
+      try {
+        let restarted: boolean;
         try {
-          await restartTerminalSession(sid);
+          restarted = await restart;
         } catch (err) {
           if (!ownsOutput(epoch)) return;
           updateStatusOverlay({
@@ -1076,8 +1096,10 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
             exit_code: null,
           });
           return;
+        } finally {
+          pendingRestarts.delete(restartKey);
         }
-        if (!ownsOutput(epoch)) return;
+        if (!restarted || !ownsOutput(epoch)) return;
         pump.enqueue(
           new TextEncoder().encode("\r\n\x1b[2m── shell restarted ──\x1b[0m\r\n\r\n"),
         );
@@ -1088,6 +1110,13 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     };
 
     (async () => {
+      // A remount must attach to the replacement PTY, not the one that is
+      // about to be torn down. Read the status after the restart settles.
+      const restart = pendingRestarts.get(restartKey);
+      if (restart) {
+        await restart.catch(() => {});
+        if (!ownsOutput(mountOutputEpoch)) return;
+      }
       // O(1) reverse-index lookup; see `buildSessionWorkspaceIndex`.
       const workspaceId = getSessionWorkspaceId(sid);
       const restoreEnabled = useSyncedSettingsStore.getState().settings.session_restore.enabled;
