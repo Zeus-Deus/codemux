@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{unix::OwnedWriteHalf, UnixStream};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+use uuid::Uuid;
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -62,7 +63,37 @@ impl From<serde_json::Error> for PtyDaemonError {
 }
 
 type PendingMap = Arc<StdMutex<HashMap<u64, oneshot::Sender<ServerResponse>>>>;
-type AttachMap = Arc<StdMutex<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>>;
+type AttachMap = Arc<StdMutex<HashMap<String, Vec<AttachedOutput>>>>;
+
+struct AttachedOutput {
+    request_id: u64,
+    tagged: bool,
+    sender: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl AttachedOutput {
+    fn accepts(&self, attachment_id: Option<u64>) -> bool {
+        self.tagged.then_some(self.request_id) == attachment_id
+    }
+}
+
+fn retain_attachments(
+    attached: &AttachMap,
+    session_id: &str,
+    retain: impl FnMut(&AttachedOutput) -> bool,
+) {
+    let mut guard = attached.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entries) = guard.get_mut(session_id) {
+        entries.retain(retain);
+        if entries.is_empty() {
+            guard.remove(session_id);
+        }
+    }
+}
+
+fn remove_attachment(attached: &AttachMap, session_id: &str, request_id: u64) {
+    retain_attachments(attached, session_id, |entry| entry.request_id != request_id);
+}
 
 /// Removes a request sender even when the request future is cancelled. A
 /// synchronous mutex keeps Drop deterministic; the map is held only for a
@@ -113,6 +144,7 @@ impl Drop for WriteInFlightGuard {
 struct AttachReservation {
     attached: AttachMap,
     session_id: String,
+    request_id: u64,
     committed: bool,
 }
 
@@ -125,10 +157,7 @@ impl AttachReservation {
 impl Drop for AttachReservation {
     fn drop(&mut self) {
         if !self.committed {
-            self.attached
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.session_id);
+            remove_attachment(&self.attached, &self.session_id, self.request_id);
         }
     }
 }
@@ -145,6 +174,7 @@ pub struct PtyDaemonClient {
     /// terminal socket error). Supervisors use this to evict a cached client
     /// instead of returning the same permanently-dead connection forever.
     closed: Arc<AtomicBool>,
+    guarded_shells: AtomicBool,
     rpc_timeout: Duration,
 }
 
@@ -175,6 +205,7 @@ impl PtyDaemonClient {
             pending,
             attached,
             closed: Arc::new(AtomicBool::new(false)),
+            guarded_shells: AtomicBool::new(false),
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
         })
     }
@@ -197,6 +228,7 @@ impl PtyDaemonClient {
             pending: pending.clone(),
             attached: attached.clone(),
             closed: closed.clone(),
+            guarded_shells: AtomicBool::new(false),
             rpc_timeout,
         });
 
@@ -245,6 +277,7 @@ impl PtyDaemonClient {
                     }
                     Frame::Event(ServerEvent::Output {
                         session_id,
+                        attachment_id,
                         data_b64,
                     }) => {
                         let bytes =
@@ -259,7 +292,9 @@ impl PtyDaemonClient {
                             };
                         let sender = {
                             let guard = bg_attached.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.get(&session_id).cloned()
+                            guard.get(&session_id)
+                                .and_then(|entries| entries.iter().find(|entry| entry.accepts(attachment_id)))
+                                .map(|entry| entry.sender.clone())
                         };
                         if let Some(sender) = sender {
                             let _ = sender.send(bytes);
@@ -267,10 +302,12 @@ impl PtyDaemonClient {
                     }
                     Frame::Event(ServerEvent::Exited {
                         session_id,
+                        attachment_id,
                         exit_code: _,
                     }) => {
-                        let mut guard = bg_attached.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.remove(&session_id);
+                        retain_attachments(&bg_attached, &session_id, |entry| {
+                            !entry.accepts(attachment_id)
+                        });
                     }
                 }
             }
@@ -399,12 +436,28 @@ impl PtyDaemonClient {
                 daemon_pid,
                 daemon_version,
                 host_claude_plugin,
+                guarded_shells,
                 ..
-            } => Ok(((daemon_pid, daemon_version, protocol_version), host_claude_plugin)),
+            } => {
+                self.guarded_shells.store(guarded_shells, Ordering::Release);
+                Ok(((daemon_pid, daemon_version, protocol_version), host_claude_plugin))
+            }
             ServerResponse::Error { message, .. } => Err(PtyDaemonError::Daemon(message)),
             other => Err(PtyDaemonError::Daemon(format!(
                 "unexpected response to Hello: {other:?}"
             ))),
+        }
+    }
+
+    pub fn supports_guarded_shells(&self) -> bool {
+        self.guarded_shells.load(Ordering::Acquire)
+    }
+
+    fn require_guarded_shells(&self) -> Result<(), PtyDaemonError> {
+        if self.supports_guarded_shells() {
+            Ok(())
+        } else {
+            Err(PtyDaemonError::Daemon("daemon does not support guarded shell operations".into()))
         }
     }
 
@@ -418,6 +471,23 @@ impl PtyDaemonClient {
         rows: u16,
         cols: u16,
     ) -> Result<u32, PtyDaemonError> {
+        self.spawn_with_shell_id(session_id, None, workspace_id, argv, cwd, env, rows, cols).await
+    }
+
+    pub async fn spawn_with_shell_id(
+        &self,
+        session_id: String,
+        shell_id: Option<Uuid>,
+        workspace_id: String,
+        argv: Vec<String>,
+        cwd: String,
+        env: Vec<(String, String)>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<u32, PtyDaemonError> {
+        if shell_id.is_some() {
+            self.require_guarded_shells()?;
+        }
         let id = self.next_id();
         match self
             .send_request(
@@ -425,6 +495,7 @@ impl PtyDaemonClient {
                     request_id: id,
                     session_id,
                     workspace_id,
+                    shell_id,
                     argv,
                     cwd,
                     env,
@@ -450,28 +521,59 @@ impl PtyDaemonClient {
         &self,
         session_id: String,
     ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>, PtyDaemonError> {
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        self.attach_inner(session_id, None).await
+    }
+
+    pub async fn attach_owned(
+        &self,
+        session_id: String,
+        shell_id: Uuid,
+    ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>, PtyDaemonError> {
+        self.require_guarded_shells()?;
+        self.attach_inner(session_id, Some(shell_id)).await
+    }
+
+    async fn attach_inner(
+        &self,
+        session_id: String,
+        shell_id: Option<Uuid>,
+    ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>, PtyDaemonError> {
+        let id = self.next_id();
+        let (sender, rx) = mpsc::unbounded_channel::<Vec<u8>>();
         {
             let mut guard = self.attached.lock().unwrap_or_else(|e| e.into_inner());
-            guard.insert(session_id.clone(), tx);
+            let entries = guard.entry(session_id.clone()).or_default();
+            // A guarded request may fail after a different shell has attached.
+            // Keep the existing sender until the daemon acknowledges replacement.
+            if shell_id.is_none() {
+                entries.retain(|entry| entry.tagged);
+            }
+            entries.push(AttachedOutput {
+                request_id: id,
+                tagged: shell_id.is_some(),
+                sender,
+            });
         }
         let mut reservation = AttachReservation {
             attached: self.attached.clone(),
             session_id: session_id.clone(),
+            request_id: id,
             committed: false,
         };
-        let id = self.next_id();
-        match self
-            .send_request(
-                ClientRequest::Attach {
-                    request_id: id,
-                    session_id: session_id.clone(),
-                },
-                id,
-            )
-            .await?
-        {
+        let request = match shell_id {
+            Some(shell_id) => ClientRequest::AttachOwned {
+                request_id: id,
+                session_id: session_id.clone(),
+                shell_id,
+            },
+            None => ClientRequest::Attach {
+                request_id: id,
+                session_id: session_id.clone(),
+            },
+        };
+        match self.send_request(request, id).await? {
             ServerResponse::Attached { .. } => {
+                retain_attachments(&self.attached, &session_id, |entry| entry.request_id >= id);
                 reservation.commit();
                 Ok(rx)
             }
@@ -571,6 +673,30 @@ impl PtyDaemonClient {
             ServerResponse::Error { message, .. } => Err(PtyDaemonError::Daemon(message)),
             other => Err(PtyDaemonError::Daemon(format!(
                 "unexpected response to Close: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn close_owned(&self, session_id: String, shell_id: Uuid) -> Result<(), PtyDaemonError> {
+        self.require_guarded_shells()?;
+        let id = self.next_id();
+        match self.send_request(
+            ClientRequest::CloseOwned {
+                request_id: id,
+                session_id: session_id.clone(),
+                shell_id,
+            },
+            id,
+        ).await? {
+            ServerResponse::Closed { attachment_id, .. } => {
+                if let Some(attachment_id) = attachment_id {
+                    remove_attachment(&self.attached, &session_id, attachment_id);
+                }
+                Ok(())
+            }
+            ServerResponse::Error { message, .. } => Err(PtyDaemonError::Daemon(message)),
+            other => Err(PtyDaemonError::Daemon(format!(
+                "unexpected response to CloseOwned: {other:?}"
             ))),
         }
     }
@@ -831,7 +957,7 @@ fn response_request_id(resp: &ServerResponse) -> u64 {
         | ServerResponse::Detached { request_id, .. }
         | ServerResponse::Written { request_id }
         | ServerResponse::Resized { request_id }
-        | ServerResponse::Closed { request_id }
+        | ServerResponse::Closed { request_id, .. }
         | ServerResponse::Listed { request_id, .. }
         | ServerResponse::ShuttingDown { request_id }
         | ServerResponse::FlowPaused { request_id }

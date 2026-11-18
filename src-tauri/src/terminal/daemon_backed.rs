@@ -351,7 +351,7 @@ pub(super) async fn hydrate_workspace_via_daemon<R: Runtime>(
             .sessions
             .into_iter()
             .find(|session| session.session_id == reservation.session_id)
-            .filter(|_| reservation.is_current())
+            .filter(|_| reservation.is_current() || reservation.pane_closed())
             .map(|session| (session, DaemonSpawnClaim::Restart(reservation)))
             .into_iter()
             .collect(),
@@ -568,7 +568,7 @@ async fn spawn_prepared_session<R: Runtime>(
         DaemonSpawnClaim::Hydrate(token) => {
             SessionSpawnReservation::try_new(&sessions, &session_id, Some(token))
         }
-        DaemonSpawnClaim::Restart(reservation) => reservation.is_current().then_some(reservation),
+        DaemonSpawnClaim::Restart(reservation) => Some(reservation),
     };
     let Some(mut reservation) = reservation else {
         crate::trace_cloud_push!(
@@ -578,6 +578,30 @@ async fn spawn_prepared_session<R: Runtime>(
         return Err(DaemonHydrationFailure::AlreadyReserved);
     };
     let restart_token = reservation.restart_token;
+    let reconciling = reservation.reconciliation.is_some();
+    let reattached = existing.is_some();
+    let shell_id = if !reconciling || !client.supports_guarded_shells() {
+        None
+    } else if let Some(existing) = &existing {
+        existing.shell_id
+    } else {
+        // Choose the identity before Spawn so cleanup can target it even
+        // when the daemon accepted the request but its reply was lost.
+        Some(Uuid::new_v4())
+    };
+    let close_if_requested = || async {
+        if reservation.pane_closed() {
+            if let Some(shell_id) = shell_id {
+                close_recovered_daemon_shell(&app, &workspace, &client, &session_id, shell_id).await;
+            }
+        }
+    };
+    if !reservation.is_current() {
+        if reattached {
+            close_if_requested().await;
+        }
+        return Err(DaemonHydrationFailure::AlreadyReserved);
+    }
     let workspace_id = workspace.workspace_id.clone();
     let host_id = workspace.host_id;
     let is_remote = host_id.is_some();
@@ -855,17 +879,14 @@ async fn spawn_prepared_session<R: Runtime>(
     // Idempotent reattach decision comes from the workspace-level List. The
     // caller performs exactly one List and maps it before any pane tasks fan
     // out, so an eight-pane activation never sends eight identical RPCs.
-    let reattached;
-    let pid = if let Some(existing) = existing {
-        reattached = true;
+    let spawn_result = if let Some(existing) = existing {
         crate::trace_cloud_push!(
             "[trace:{session_id}] DECISION=reattach pid={} at t={}ms",
             existing.pid,
             entry_ts.elapsed().as_millis()
         );
-        existing.pid
+        Ok(existing.pid)
     } else {
-        reattached = false;
         crate::trace_cloud_push!(
             "[trace:{session_id}] DECISION=fresh_spawn at t={}ms",
             entry_ts.elapsed().as_millis()
@@ -878,9 +899,10 @@ async fn spawn_prepared_session<R: Runtime>(
         if !reservation.is_current() {
             return Err(DaemonHydrationFailure::AlreadyReserved);
         }
-        match client
-            .spawn(
+        client
+            .spawn_with_shell_id(
                 session_id.clone(),
+                shell_id,
                 workspace_id,
                 vec![shell.clone()],
                 effective_cwd,
@@ -889,20 +911,21 @@ async fn spawn_prepared_session<R: Runtime>(
                 DEFAULT_COLS,
             )
             .await
-        {
-            Ok(pid) => pid,
-            Err(error) => {
-                return Err(classify_spawn_rpc_failure(error));
-            }
-        }
     };
 
     if !reservation.is_current() {
+        close_if_requested().await;
         return Err(DaemonHydrationFailure::AlreadyReserved);
     }
-    let mut rx = match client.attach(session_id.clone()).await {
+    let pid = spawn_result.map_err(classify_spawn_rpc_failure)?;
+    let attachment = match shell_id {
+        Some(shell_id) => client.attach_owned(session_id.clone(), shell_id).await,
+        None => client.attach(session_id.clone()).await,
+    };
+    let mut rx = match attachment {
         Ok(rx) => rx,
         Err(error) => {
+            close_if_requested().await;
             // Keep a successfully spawned daemon session alive. The reservation
             // guard clears the local `is_spawning` marker on return, and a retry
             // will discover this session through List and reattach idempotently.
@@ -930,7 +953,7 @@ async fn spawn_prepared_session<R: Runtime>(
     let client_for_runtime = client.clone();
     let installed = with_existing_session_runtime(&sessions, &session_id, |runtime| {
         if runtime.restart_token != restart_token {
-            return false;
+            return None;
         }
         runtime.daemon_writer = Some(writer.clone());
         runtime.writer = Some(Box::new(writer));
@@ -938,7 +961,8 @@ async fn spawn_prepared_session<R: Runtime>(
         runtime.child_pid = Some(pid);
         runtime.persistent = true;
         runtime.is_spawning = false;
-        runtime.needs_daemon_reconciliation = false;
+        runtime.daemon_reconciliation = None;
+        runtime.daemon_shell_id = shell_id;
         // On reattach, skip_preset_launch must ALSO be true so the
         // preset launcher (separate from auto-write) doesn't fire
         // a preset write into the live agent.
@@ -947,13 +971,16 @@ async fn spawn_prepared_session<R: Runtime>(
         // Same as the agent path — capture the client so resize/close
         // route to the daemon that actually owns this session id.
         runtime.daemon_client = Some(client_for_runtime);
-        true
-    })
-    .unwrap_or(false);
-    if !installed {
+        Some(super::recompute_flow_paused(runtime))
+    }).flatten();
+    let Some(flow_paused) = installed else {
+        close_if_requested().await;
         return Err(DaemonHydrationFailure::AlreadyReserved);
-    }
+    };
     reservation.commit();
+    if flow_paused {
+        super::forward_flow_control_to_daemon(&sessions, &session_id);
+    }
 
     // Preflight: for remote workspaces, verify the agent binary
     // we're about to write actually exists on the remote host. If
@@ -1079,7 +1106,8 @@ async fn spawn_prepared_session<R: Runtime>(
     let read_client = client.clone();
     tauri::async_runtime::spawn(async move {
         let mut line_buf: Vec<u8> = Vec::new();
-        while let Some(chunk) = rx.recv().await {
+        let mut reset_before_replay = reconciling && reattached;
+        while let Some(mut chunk) = rx.recv().await {
             // Adapter scanner (cheap when has_scanner=false).
             if has_scanner {
                 if let Some(ref adapter) = adapter_clone {
@@ -1094,6 +1122,11 @@ async fn spawn_prepared_session<R: Runtime>(
                         }
                     }
                 }
+            }
+            if std::mem::take(&mut reset_before_replay) {
+                // Mounted viewers already rendered the old stream. Reset
+                // before replaying the daemon's snapshot into those viewers.
+                chunk = [crate::pty_daemon::server::RESYNC_PREFIX, &chunk].concat();
             }
             queue_or_send_output_if_current(&read_sessions, &read_session_id, chunk, Some(restart_token));
         }
@@ -1113,6 +1146,30 @@ async fn spawn_prepared_session<R: Runtime>(
     });
 
     Ok(())
+}
+
+async fn close_recovered_daemon_shell<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace: &PtyHydrationWorkspace,
+    client: &PtyDaemonClient,
+    session_id: &str,
+    shell_id: Uuid,
+) {
+    let mut result = client.close_owned(session_id.to_owned(), shell_id).await;
+    if result.is_err() && client.is_closed() {
+        // An interrupted Spawn may still have reached the daemon. The UUID
+        // also makes cleanup safe on the replacement socket.
+        result = match crate::ssh::client_for_workspace(app, &workspace.workspace_id, workspace.host_id).await {
+            Ok(client) if client.supports_guarded_shells() => {
+                client.close_owned(session_id.to_owned(), shell_id).await
+            }
+            Ok(_) => return,
+            Err(error) => Err(error),
+        };
+    }
+    if let Err(error) = result {
+        eprintln!("[codemux::terminal] cleanup of closed pane {session_id} failed: {error}");
+    }
 }
 
 /// Acknowledgement for one queued input write. Internal callers await it after
@@ -1567,6 +1624,7 @@ mod tests {
             let sessions = (0..8)
                 .map(|index| DaemonSessionInfo {
                     session_id: format!("session-{index}"),
+                    shell_id: None,
                     workspace_id: "workspace".into(),
                     pid: 1000 + index,
                     argv: vec!["bash".into()],

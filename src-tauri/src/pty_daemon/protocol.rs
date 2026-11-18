@@ -19,6 +19,7 @@
 //! demuxes by `request_id` and `session_id`.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Daemon wire-protocol version. Bumped when the message shape changes in a
 /// backwards-incompatible way. Adoption on startup compares this against the
@@ -47,6 +48,9 @@ pub enum ClientRequest {
         request_id: u64,
         session_id: String,
         workspace_id: String,
+        /// Known before the Spawn acknowledgment so its exact shell can be retired.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell_id: Option<Uuid>,
         argv: Vec<String>,
         /// Working directory for the child. Must exist on the daemon's
         /// filesystem (daemon and Tauri share `$HOME`).
@@ -63,6 +67,13 @@ pub enum ClientRequest {
     Attach {
         request_id: u64,
         session_id: String,
+    },
+
+    /// Attach only while the requested shell owns the session id.
+    AttachOwned {
+        request_id: u64,
+        session_id: String,
+        shell_id: Uuid,
     },
 
     /// Stop receiving output frames for this session. Does NOT kill the
@@ -95,6 +106,13 @@ pub enum ClientRequest {
     Close {
         request_id: u64,
         session_id: String,
+    },
+
+    /// Retire only this incarnation, leaving other shells with the same session id alone.
+    CloseOwned {
+        request_id: u64,
+        session_id: String,
+        shell_id: Uuid,
     },
 
     /// Enumerate all live sessions in the daemon. Used by the Tauri app
@@ -139,6 +157,9 @@ pub enum ServerResponse {
         /// Code plugin. Daemons older than that feature omit it.
         #[serde(default)]
         host_claude_plugin: bool,
+        /// Supports guarded Spawn, AttachOwned, CloseOwned and tagged output.
+        #[serde(default)]
+        guarded_shells: bool,
     },
     Spawned {
         request_id: u64,
@@ -161,6 +182,9 @@ pub enum ServerResponse {
     },
     Closed {
         request_id: u64,
+        /// Exact subscription removed from this connection by CloseOwned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment_id: Option<u64>,
     },
     Listed {
         request_id: u64,
@@ -192,6 +216,8 @@ pub enum ServerEvent {
     /// straight to its xterm channel.
     Output {
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment_id: Option<u64>,
         data_b64: String,
     },
     /// Child process exited. After this event, the daemon removes the
@@ -199,6 +225,8 @@ pub enum ServerEvent {
     /// targeting this id will error.
     Exited {
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment_id: Option<u64>,
         exit_code: i32,
     },
 }
@@ -208,6 +236,8 @@ pub enum ServerEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonSessionInfo {
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_id: Option<Uuid>,
     pub workspace_id: String,
     pub pid: u32,
     pub argv: Vec<String>,
@@ -240,7 +270,8 @@ mod tests {
     fn hello_from_an_older_daemon_reads_as_no_host_plugin() {
         let old = r#"{"type":"hello","request_id":1,"protocol_version":2,"daemon_pid":7,"daemon_version":"0.26.2"}"#;
         match serde_json::from_str::<ServerResponse>(old).unwrap() {
-            ServerResponse::Hello { host_claude_plugin, daemon_version, .. } => {
+            ServerResponse::Hello { host_claude_plugin, guarded_shells, daemon_version, .. } => {
+                assert!(!guarded_shells);
                 assert!(!host_claude_plugin);
                 assert_eq!(daemon_version, "0.26.2");
             }
