@@ -1030,7 +1030,7 @@ fn build_core_app<R: tauri::Runtime>(
                 // An unreadable layout is not "no workspaces": their
                 // scrollback must survive until the layout is recovered.
                 if scrollback::should_run_orphan_cleanup(layout_loaded)
-                    && !state::layout_was_unreadable()
+                    && !state::layout_recovery_pending()
                 {
                     let removed = scrollback::cleanup_orphan_scrollbacks(&ws_ids);
                     if !removed.is_empty() {

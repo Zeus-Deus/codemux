@@ -507,6 +507,10 @@ fn read_git_head_sha(path: &str) -> Option<String> {
 ///
 /// Returns Ok even on partial failure: individual row failures are
 /// logged so a corrupt row doesn't strand the whole tick.
+/// Every workspace id reconcile has seen live in this run.
+static SEEN_LIVE: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
 pub fn reconcile_from_snapshot(
     db: &DatabaseStore,
     snapshot: &AppStateSnapshot,
@@ -633,15 +637,19 @@ pub fn reconcile_from_snapshot(
     // app_state. Rows with no workspace_id (pulled-only) are skipped
     // by construction (the filter_map above excludes them).
     //
-    // Not after a startup that could not read the saved layout: its
-    // workspaces are missing, not closed, and deleting their rows would
-    // remove them from every other device too.
-    if crate::state::layout_was_unreadable() {
-        return Ok(());
-    }
+    // While an unreadable saved layout awaits recovery, a workspace missing
+    // from it is missing, not closed: deleting its row would remove it from
+    // every other device too. Only workspaces seen live in this run and
+    // gone since — really closed — are deleted then.
+    let recovering = crate::state::layout_recovery_pending();
+    let seen = {
+        let mut seen = SEEN_LIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        seen.extend(live_wids.iter().cloned());
+        seen.clone()
+    };
     for row in &sync_rows {
         if let Some(wid) = &row.workspace_id {
-            if !live_wids.contains(wid) {
+            if !live_wids.contains(wid) && (!recovering || seen.contains(wid)) {
                 if let Err(error) =
                     db.soft_delete_workspace_sync_by_workspace_id(wid)
                 {
@@ -1140,6 +1148,31 @@ mod tests {
             !db.list_workspaces_sync()[0].dirty,
             "unchanged identity must not re-mark the row dirty"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn during_layout_recovery_only_workspaces_really_closed_are_deleted() {
+        let db = fresh_db();
+        // A row from before the unreadable layout: missing now, not closed.
+        db.insert_workspace_sync("ws-recovery-missing", "old", None, None, None, None, None, None, None)
+            .unwrap();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        let live = |db: &DatabaseStore, wid: &str| {
+            db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some(wid))
+        };
+        assert!(live(&db, "ws-recovery-missing"), "a missing workspace is not deleted");
+
+        // Opened and explicitly closed during the recovery session.
+        super::reconcile_from_snapshot(&db, &make_snapshot(vec![make_ws("ws-recovery-session", "new")]))
+            .unwrap();
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+
+        assert!(!live(&db, "ws-recovery-session"), "a workspace closed this run is deleted");
+        assert!(live(&db, "ws-recovery-missing"), "and the missing one still is not");
     }
 
     #[test]

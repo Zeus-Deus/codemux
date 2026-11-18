@@ -6686,7 +6686,7 @@ fn emit_debouncer() -> &'static EmitDebouncer {
 pub fn load_persisted_state() -> Option<AppStateSnapshot> {
     match load_persisted_layout() {
         PersistedLayout::Loaded(snapshot) => Some(*snapshot),
-        PersistedLayout::Missing | PersistedLayout::Unreadable => None,
+        PersistedLayout::Missing | PersistedLayout::Unreadable { .. } => None,
     }
 }
 
@@ -6696,19 +6696,45 @@ pub enum PersistedLayout {
     Missing,
     Loaded(Box<AppStateSnapshot>),
     /// A layout exists but could not be read — a newer build's format after
-    /// a downgrade, a hand edit, disk damage. The file has been moved aside;
-    /// see [`layout_was_unreadable`].
-    Unreadable,
+    /// a downgrade, a hand edit, disk damage. See [`load_layout_from`] for
+    /// how it is preserved, and [`layout_recovery_pending`].
+    Unreadable {
+        /// Whether a copy was set aside where no save can replace it.
+        preserved: bool,
+    },
 }
 
-static LAYOUT_UNREADABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAYOUT_RECOVERY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAYOUT_SAVES_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether this run started without the user's saved layout because it
-/// could not be read. Startup then shows no workspaces, which must not be
-/// mistaken for the user having closed them all: nothing tied to the old
-/// workspaces (their scrollback, their synced rows) may be cleaned up.
-pub fn layout_was_unreadable() -> bool {
-    LAYOUT_UNREADABLE.load(std::sync::atomic::Ordering::Relaxed)
+#[cfg(test)]
+thread_local! {
+    /// Test overrides for the two process-wide flags, per test thread.
+    pub(crate) static TEST_RECOVERY_PENDING: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_SAVES_BLOCKED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a saved layout that could not be read is still waiting to be
+/// restored or discarded — on this launch or any later one, even after a
+/// close saved the empty fallback layout over `layout.json`. Until then,
+/// workspaces missing from the layout are missing, not closed: nothing tied
+/// to them (their scrollback, their synced rows) may be cleaned up.
+pub fn layout_recovery_pending() -> bool {
+    #[cfg(test)]
+    if let Some(pending) = TEST_RECOVERY_PENDING.with(std::cell::Cell::get) {
+        return pending;
+    }
+    LAYOUT_RECOVERY_PENDING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether saving the layout is paused, because an unreadable layout could
+/// not be set aside and `layout.json` still holds its only copy.
+fn layout_saves_blocked() -> bool {
+    #[cfg(test)]
+    if let Some(blocked) = TEST_SAVES_BLOCKED.with(std::cell::Cell::get) {
+        return blocked;
+    }
+    LAYOUT_SAVES_BLOCKED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn load_persisted_layout() -> PersistedLayout {
@@ -6716,15 +6742,45 @@ pub fn load_persisted_layout() -> PersistedLayout {
         return PersistedLayout::Missing;
     };
     let layout = load_layout_from(&path);
-    if matches!(layout, PersistedLayout::Unreadable) {
-        LAYOUT_UNREADABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let PersistedLayout::Unreadable { preserved: false } = layout {
+        LAYOUT_SAVES_BLOCKED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    let pending = matches!(layout, PersistedLayout::Unreadable { .. }) || recovery_pending_at(&path);
+    LAYOUT_RECOVERY_PENDING.store(pending, std::sync::atomic::Ordering::Relaxed);
     layout
 }
 
-/// Read the layout at `path`. An unreadable one is renamed to
-/// `<name>.unreadable-<unix seconds>` before anything can save over it, so
-/// it can still be recovered by hand.
+/// The marker recording that the layout at `path` was set aside.
+fn recovery_marker(path: &Path) -> PathBuf {
+    let mut marker = path.as_os_str().to_owned();
+    marker.push(".recovery-pending");
+    PathBuf::from(marker)
+}
+
+/// Whether the layout at `path` has a set-aside copy still waiting. The
+/// marker names that copy; once the copy is gone — renamed back over
+/// `layout.json` to restore it, or deleted to discard it — the recovery is
+/// over and the marker is removed.
+fn recovery_pending_at(path: &Path) -> bool {
+    let marker = recovery_marker(path);
+    let Ok(aside_name) = fs::read_to_string(&marker) else {
+        return false;
+    };
+    let aside_name = aside_name.trim();
+    let aside = path.parent().map(|dir| dir.join(aside_name));
+    if !aside_name.is_empty() && aside.is_some_and(|aside| aside.exists()) {
+        return true;
+    }
+    let _ = fs::remove_file(&marker);
+    false
+}
+
+/// Read the layout at `path`. An unreadable one is preserved before
+/// anything can save over it, so it can still be recovered by hand:
+/// renamed (or, failing that, copied) to `<name>.unreadable-<unix seconds>`,
+/// with a marker beside it so later launches stay in recovery mode too.
+/// `preserved: false` means neither worked and `layout.json` must not be
+/// replaced this run.
 fn load_layout_from(path: &Path) -> PersistedLayout {
     let error = match fs::read_to_string(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return PersistedLayout::Missing,
@@ -6741,17 +6797,30 @@ fn load_layout_from(path: &Path) -> PersistedLayout {
     let mut aside = path.as_os_str().to_owned();
     aside.push(format!(".unreadable-{stamp}"));
     let aside = PathBuf::from(aside);
-    match fs::rename(path, &aside) {
-        Ok(()) => log::error!(
-            "Could not read the saved layout ({error}); kept it as {} and started without it",
-            aside.display()
-        ),
-        Err(rename_error) => log::error!(
-            "Could not read the saved layout at {} ({error}), nor set it aside ({rename_error})",
+    let aside_name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // The marker goes first: if it cannot be written, nothing else is
+    // trusted to remember the copy, and `layout.json` stays as it is.
+    let marked = fs::write(recovery_marker(path), &aside_name).is_ok();
+    let kept = marked
+        && (fs::rename(path, &aside).is_ok() || fs::copy(path, &aside).is_ok());
+    if kept {
+        log::error!(
+            "Could not read the saved layout ({error}); kept it as {} and started without it. \
+             Rename it back to {} to restore it, or delete it to discard it.",
+            aside.display(),
             path.display()
-        ),
+        );
+    } else {
+        if marked {
+            let _ = fs::remove_file(recovery_marker(path));
+        }
+        log::error!(
+            "Could not read the saved layout at {} ({error}), nor set it aside; \
+             layout saving is paused for this run so it is not overwritten",
+            path.display()
+        );
     }
-    PersistedLayout::Unreadable
+    PersistedLayout::Unreadable { preserved: kept }
 }
 
 /// Remove all browser panes and browser sessions from a snapshot.
@@ -7522,8 +7591,16 @@ fn persistable_snapshot(snapshot: &AppStateSnapshot) -> AppStateSnapshot {
 }
 
 fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
-    use std::io::Write;
     let path = persisted_layout_path().ok_or("No config directory for layout persistence")?;
+    save_layout_to(&path, snapshot)
+}
+
+fn save_layout_to(path: &Path, snapshot: &AppStateSnapshot) -> Result<(), String> {
+    use std::io::Write;
+    if layout_saves_blocked() {
+        return Err("Layout saving is paused: the unreadable layout could not be set aside".into());
+    }
+    let path = path.to_path_buf();
     let parent = path
         .parent()
         .ok_or("No parent directory for layout persistence")?;
@@ -13922,20 +13999,65 @@ mod persisted_layout_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("layout.json");
         // A layout this build cannot parse, e.g. one a newer build wrote.
-        fs::write(&path, r#"{"workspaces":[{"tabs":[{"kind":"from-the-future"}]}]}"#).unwrap();
+        let original = r#"{"workspaces":[{"tabs":[{"kind":"from-the-future"}]}]}"#;
+        fs::write(&path, original).unwrap();
 
-        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable));
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
         assert!(!path.exists(), "nothing may save over it now");
-        let kept: Vec<_> = fs::read_dir(dir.path())
+        let aside: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("layout.json.unreadable-"))
             .collect();
-        assert_eq!(kept.len(), 1);
-        assert!(kept[0].starts_with("layout.json.unreadable-"), "{kept:?}");
-        assert_eq!(
-            fs::read_to_string(dir.path().join(&kept[0])).unwrap(),
-            r#"{"workspaces":[{"tabs":[{"kind":"from-the-future"}]}]}"#
-        );
+        assert_eq!(aside.len(), 1);
+        assert_eq!(fs::read_to_string(dir.path().join(&aside[0])).unwrap(), original);
+        assert!(recovery_pending_at(&path));
+    }
+
+    #[test]
+    fn recovery_outlives_a_restart_after_the_fallback_layout_was_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        fs::write(&path, "not json").unwrap();
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
+
+        // A normal close saves the empty fallback layout; the next launch
+        // reads it fine — and is still in recovery.
+        save_layout_to(&path, &default_app_state()).unwrap();
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Loaded(_)));
+        assert!(recovery_pending_at(&path), "a parsable fallback must not end the recovery");
+
+        // Discarding (or restoring) the set-aside copy ends it.
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with("layout.json.unreadable-") {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        assert!(!recovery_pending_at(&path));
+        assert!(!recovery_marker(&path).exists());
+    }
+
+    // Unix only: a read-only directory is how this test makes setting the
+    // layout aside fail.
+    #[cfg(unix)]
+    #[test]
+    fn a_layout_that_cannot_be_set_aside_is_never_saved_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        fs::write(&path, "not json").unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let layout = load_layout_from(&path);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(layout, PersistedLayout::Unreadable { preserved: false }));
+
+        // Writes work again, but saving stays paused for this run.
+        TEST_SAVES_BLOCKED.with(|b| b.set(Some(true)));
+        let saved = save_layout_to(&path, &default_app_state());
+        TEST_SAVES_BLOCKED.with(|b| b.set(None));
+        assert!(saved.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not json", "the only copy is intact");
     }
 
     #[test]
