@@ -765,6 +765,11 @@ mod stdout_drain {
             // does not start either.
             let (stopping, stopped) = std::sync::mpsc::channel::<()>();
             let (cancel_stop, cancel_done) = (stop.clone(), done.clone());
+            #[cfg(test)]
+            let canceller_exited = super::DRAIN_PROBE
+                .try_with(|probe| probe.lock().unwrap().canceller_exited.clone())
+                .ok()
+                .flatten();
             let canceller = std::thread::Builder::new()
                 .name("opencode-stdout-cancel".into())
                 .spawn(move || {
@@ -781,6 +786,10 @@ mod stdout_drain {
                         };
                         std::thread::sleep(wait);
                         wait = (wait * 2).min(std::time::Duration::from_millis(250));
+                    }
+                    #[cfg(test)]
+                    if let Some(exited) = canceller_exited {
+                        exited.store(true, Ordering::SeqCst);
                     }
                 })
                 .map_err(|e| e.to_string())?;
@@ -873,6 +882,8 @@ pub(crate) struct DrainProbe {
     pub(crate) pause_before_drain_read: Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>,
     /// Make the reader thread's spawn fail, after the cancel thread started.
     pub(crate) fail_reader_spawn: bool,
+    /// Set by the cancel thread as it exits.
+    pub(crate) canceller_exited: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[cfg(all(test, windows))]
@@ -1424,10 +1435,12 @@ mod tests {
     }
 
     // Windows: if the reader thread cannot start after the cancel thread
-    // has, starting fails without leaving the cancel thread (and its pipe
-    // handle) behind. `start` joins it, so this returning at all shows it.
+    // has, starting fails and the cancel thread (with its pipe handle) has
+    // exited — observed directly, not inferred from the error. Startup runs
+    // on a worker thread, so a stuck join would trip the deadline instead of
+    // hanging the test.
     #[cfg(windows)]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reader_that_cannot_start_leaves_no_cancel_thread_behind() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("fake-opencode.cmd");
@@ -1436,18 +1449,23 @@ mod tests {
             "@echo off\r\necho opencode server listening on http://127.0.0.1:1\r\nping -n 60 127.0.0.1 >nul\r\n",
         )
         .unwrap();
+        let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let probe = std::sync::Arc::new(std::sync::Mutex::new(DrainProbe {
             fail_reader_spawn: true,
+            canceller_exited: Some(exited.clone()),
             ..DrainProbe::default()
         }));
-        let started = tokio::time::timeout(
-            Duration::from_secs(10),
-            DRAIN_PROBE.scope(probe, OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(10))),
-        )
-        .await
-        .expect("a failed reader start must not hang on its cancel thread");
+        let startup = tokio::spawn(DRAIN_PROBE.scope(
+            probe,
+            OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(10)),
+        ));
+        let started = tokio::time::timeout(Duration::from_secs(10), startup)
+            .await
+            .expect("a failed reader start must not hang on its cancel thread")
+            .unwrap();
         let err = started.err().expect("startup fails when the reader cannot start");
         assert!(err.contains("read stdout"), "unexpected error: {err}");
+        assert!(exited.load(std::sync::atomic::Ordering::SeqCst), "the cancel thread has exited");
     }
 
     /// Tests in this module that rely on the live `opencode` binary
