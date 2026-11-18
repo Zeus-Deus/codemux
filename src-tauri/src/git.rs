@@ -1953,6 +1953,49 @@ fn git_line(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Whether any worktree of `repo_path`'s repository is paused mid-rebase
+/// or mid-bisect on `branch`. Read from each worktree's own git directory
+/// (the common one for the main checkout, `worktrees/*` for linked ones),
+/// so it works on any git version and does not depend on the listing.
+/// Unreadable state is an error, not "no".
+fn branch_held_by_rebase_or_bisect(repo_path: &Path, branch: &str) -> Result<bool, String> {
+    let common = git_path(repo_path, "--git-common-dir")
+        .ok_or_else(|| format!("Cannot update {branch}: could not find the repository's git directory."))?;
+    let mut git_dirs = vec![common.clone()];
+    match std::fs::read_dir(common.join("worktrees")) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("Cannot update {branch}: could not read worktrees ({e})."))?;
+                git_dirs.push(entry.path());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("Cannot update {branch}: could not read worktrees ({e}).")),
+    }
+    let full_ref = format!("refs/heads/{branch}");
+    let names = |file: &Path| -> Result<Option<String>, String> {
+        match std::fs::read(file) {
+            Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).trim_end_matches(['\n', '\r']).to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("Cannot update {branch}: could not read {} ({e}).", file.display())),
+        }
+    };
+    for dir in git_dirs {
+        for rebase in ["rebase-merge", "rebase-apply"] {
+            if names(&dir.join(rebase).join("head-name"))?.as_deref() == Some(full_ref.as_str()) {
+                return Ok(true);
+            }
+        }
+        // `BISECT_START` names the branch bisect returns to, short form.
+        if let Some(start) = names(&dir.join("BISECT_START"))? {
+            if start == branch || start == full_ref {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Child-process variable holding the empty value that clears the base's
 /// merge defaults; see [`fast_forward_checkout`].
 const CLEAR_MERGE_OPTIONS_ENV: &str = "CODEMUX_CLEAR_MERGE_OPTIONS";
@@ -2036,7 +2079,16 @@ fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Res
         // without it being HEAD — mid-rebase or mid-bisect — which the
         // lookups above cannot see. The move was checked to be a
         // fast-forward before this point.
-        None => run_git(repo_path, &["branch", "-f", "--end-of-options", base_branch, commit]).map(|_| ())?,
+        None => {
+            // Git only refuses this itself from 2.35 on, so the rebase and
+            // bisect state of every worktree is read directly first.
+            if branch_held_by_rebase_or_bisect(repo_path, base_branch)? {
+                return Err(format!(
+                    "Cannot update {base_branch}: another worktree is in the middle of rebasing or bisecting it. Finish or abort that first."
+                ));
+            }
+            run_git(repo_path, &["branch", "-f", "--end-of-options", base_branch, commit]).map(|_| ())?
+        }
     }
     let now = run_git(repo_path, &["rev-parse", "--verify", &base_ref])?;
     if now.trim() != commit {
@@ -7127,10 +7179,31 @@ mod tests {
         run_git(&wt, &["add", "."]).unwrap();
         run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
 
-        assert!(merge_into_base(&wt, "release", true).is_err());
+        // Refused by Codemux's own check, which does not depend on the git
+        // version: `branch -f` only refuses this itself from git 2.35 on.
+        let err = merge_into_base(&wt, "release", true).unwrap_err();
+        assert!(err.contains("rebasing or bisecting"), "unexpected error: {err}");
         assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
         assert!(rebasing(&rel), "the rebase is left as it was");
         assert_eq!(run_git(&wt, &["branch", "--show-current"]).unwrap(), "feature");
+    }
+
+    #[test]
+    fn test_merge_into_base_never_moves_a_base_being_bisected_elsewhere() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let rel = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", "release", rel.to_str().unwrap()]).unwrap();
+        run_git(&rel, &["bisect", "start"]).unwrap();
+        run_git(&rel, &["checkout", "--detach"]).unwrap();
+        let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        let err = merge_into_base(&wt, "release", false).unwrap_err();
+        assert!(err.contains("rebasing or bisecting"), "unexpected error: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
     }
 
     #[test]
