@@ -1960,11 +1960,7 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                     state.active_workspace_cwd().map(|(_, cwd)| cwd)
                 });
             let store: State<'_, indexing::ProjectIndexStore> = app.state();
-            indexing::rebuild_index(project_root)
-                .map(|snapshot| {
-                    store.replace_snapshot(snapshot.clone());
-                    snapshot
-                })
+            indexing::rebuild_index(&store, project_root)
                 .and_then(|snapshot| serde_json::to_value(snapshot).map_err(|error| error.to_string()))
         }
         "index_status" => {
