@@ -356,6 +356,21 @@ impl SyncEngine {
         // Existing entries keep their previously-recorded path so
         // a user who manually moved or renamed a synced skill
         // doesn't get a duplicate written elsewhere.
+        // A recorded destination is only used while it is still a user
+        // skill location sync may write — one saved by an older build
+        // could point anywhere. Such a mapping is dropped, its target left
+        // untouched; the next pull treats the row as new.
+        if let Some(e) = &existing {
+            if !detect_skill_path(&e.local_path, home).is_some_and(|info| info.is_syncable) {
+                eprintln!(
+                    "[skills_sync] dropping the mapping for remote skill {}: {} is not a skill location sync writes",
+                    wire.remote_id,
+                    e.local_path.display()
+                );
+                mapping.remove_by_remote_id(&wire.remote_id);
+                return Ok(false);
+            }
+        }
         let dest = match &existing {
             Some(e) => e.local_path.clone(),
             None => destination_path_after_pull(&name_plain, home),
@@ -373,7 +388,10 @@ impl SyncEngine {
         };
 
         if should_write {
-            write_skill_to_disk(&dest, &content_plain)?;
+            // A new skill lands in its own folder under the skills root;
+            // that folder may already exist as a link to somewhere else.
+            let confine_to = existing.is_none().then_some(skills_root);
+            write_skill_to_disk(&dest, &content_plain, confine_to)?;
         }
 
         // Record/refresh the mapping. `last_synced_at_millis` is
@@ -449,6 +467,15 @@ impl SyncEngine {
             .map_err(|e| format!("read {}: {e}", local.display()))?;
         let name = skill_name_from_path(local)
             .ok_or_else(|| format!("could not derive skill name from {}", local.display()))?;
+        // Every other device would refuse this name on pull, so it is not
+        // uploaded as if it would sync.
+        if !is_skill_dir_name(&name) {
+            eprintln!(
+                "[skills_sync] not syncing {}: other devices cannot use the name {name:?}",
+                local.display()
+            );
+            return Ok(PushOutcome::Skipped);
+        }
 
         // Use the mapping's recorded provider when available so
         // origin survives across receiving-device edits (where the
@@ -514,6 +541,7 @@ impl Default for SyncEngine {
     }
 }
 
+#[derive(Debug)]
 enum PushOutcome {
     Pushed,
     Skipped,
@@ -641,14 +669,46 @@ fn collect_local_skill_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-fn write_skill_to_disk(dest: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create skill dir: {e}"))?;
+/// Write `content` to `dest` atomically. With `confine_to`, the skill's
+/// folder must resolve inside that root — a folder that is a link to
+/// somewhere else is refused rather than written through.
+fn write_skill_to_disk(dest: &Path, content: &str, confine_to: Option<&Path>) -> Result<(), String> {
+    use std::io::Write;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| format!("skill path has no folder: {}", dest.display()))?;
+    fs::create_dir_all(parent).map_err(|e| format!("create skill dir: {e}"))?;
+    if let Some(root) = confine_to {
+        let inside = match (fs::canonicalize(parent), fs::canonicalize(root)) {
+            (Ok(parent), Ok(root)) => parent.starts_with(&root),
+            _ => false,
+        };
+        if !inside {
+            return Err(format!(
+                "refusing to write {}: its folder resolves outside {}",
+                dest.display(),
+                root.display()
+            ));
+        }
     }
     // Atomic-write via tmp+rename to avoid leaving a partial file
-    // on disk if we crash mid-write.
+    // on disk if we crash mid-write. The temporary file is created fresh
+    // (a leftover is removed first, never followed), so a link planted at
+    // its name cannot redirect the write.
     let tmp = dest.with_extension("md.tmp");
-    fs::write(&tmp, content).map_err(|e| format!("write tmp skill: {e}"))?;
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("clear tmp skill: {e}")),
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| format!("write tmp skill: {e}"))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("write tmp skill: {e}"))?;
+    drop(file);
     fs::rename(&tmp, dest).map_err(|e| format!("rename skill: {e}"))?;
     Ok(())
 }
@@ -875,6 +935,102 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_mapping_outside_the_skill_locations_is_dropped_not_written() {
+        let home = TempDir::new().unwrap();
+        let engine = SyncEngine::with_home(home.path());
+        // Recorded by an older build from an escaping name.
+        let escaped = home.path().join(".codemux/skills/../../escaped/SKILL.md");
+        let mut mapping = SkillMapping::default();
+        mapping.upsert(MappingEntry {
+            local_path: escaped,
+            remote_id: "1".into(),
+            name: "x".into(),
+            provider: "codemux".into(),
+            scope: "user".into(),
+            last_synced_at_millis: 0,
+            server_updated_at_millis: 0,
+        });
+
+        // A newer, valid row for the same remote id.
+        let wire = plain_wire("fine", "body", "codemux", "user", "1", "2026-04-29T20:00:00Z");
+        let applied = engine
+            .apply_remote_skill(
+                &wire,
+                &mut mapping,
+                &mut LocalSkills::default(),
+                home.path(),
+                &home.path().join(".codemux/skills"),
+            )
+            .unwrap();
+        assert!(!applied);
+        assert!(mapping.skills.is_empty(), "the unsafe mapping is dropped");
+        assert!(!home.path().parent().unwrap().join("escaped").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_skill_is_never_written_through_a_linked_folder() {
+        let home = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let engine = SyncEngine::with_home(home.path());
+        let skills_root = home.path().join(".codemux/skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        std::os::unix::fs::symlink(outside.path(), skills_root.join("linked")).unwrap();
+
+        let wire = plain_wire("linked", "pwned", "codemux", "user", "1", "2026-04-29T20:00:00Z");
+        let result = engine.apply_remote_skill(
+            &wire,
+            &mut SkillMapping::default(),
+            &mut LocalSkills::default(),
+            home.path(),
+            &skills_root,
+        );
+        assert!(result.is_err(), "the write must be refused");
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none(), "nothing lands outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_temporary_file_is_never_followed() {
+        let home = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("victim");
+        fs::write(&target, "original").unwrap();
+        let dest = destination_path_after_pull("demo", home.path());
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, dest.with_extension("md.tmp")).unwrap();
+
+        write_skill_to_disk(&dest, "new body", None).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new body");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_name_other_devices_cannot_use_is_not_uploaded() {
+        // Any request would reach this server, which expects none.
+        let mut server = mockito::Server::new_async().await;
+        let no_calls = server.mock("POST", "/api/skills").expect(0).create_async().await;
+        let prev_url = std::env::var("CODEMUX_API_URL").ok();
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let home = TempDir::new().unwrap();
+        let engine = SyncEngine::with_home(home.path());
+        let local = home.path().join(".codemux/skills/a:b/SKILL.md");
+        fs::create_dir_all(local.parent().unwrap()).unwrap();
+        fs::write(&local, "body").unwrap();
+
+        let outcome = engine
+            .push_one(&local, &mut SkillMapping::default(), "no-token", home.path())
+            .await;
+        match prev_url {
+            Some(v) => std::env::set_var("CODEMUX_API_URL", v),
+            None => std::env::remove_var("CODEMUX_API_URL"),
+        }
+        assert!(matches!(outcome, Ok(PushOutcome::Skipped)), "{outcome:?}");
+        no_calls.assert_async().await;
+    }
+
+    #[test]
     fn apply_remote_skill_writes_when_server_newer_than_recorded() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
@@ -882,7 +1038,7 @@ mod tests {
         // Seed an existing mapping pointing at a real on-disk
         // file with old content.
         let dest = destination_path_after_pull("demo", home.path());
-        write_skill_to_disk(&dest, "old body").unwrap();
+        write_skill_to_disk(&dest, "old body", None).unwrap();
         let mut mapping = SkillMapping::default();
         mapping.upsert(MappingEntry {
             local_path: dest.clone(),
@@ -945,7 +1101,7 @@ mod tests {
 
     fn write_local_skill(home: &Path, root: &str, name: &str, content: &str) -> PathBuf {
         let path = home.join(root).join(name).join("SKILL.md");
-        write_skill_to_disk(&path, content).unwrap();
+        write_skill_to_disk(&path, content, None).unwrap();
         path
     }
 
@@ -1037,7 +1193,7 @@ mod tests {
     fn write_skill_creates_parent_dirs_and_consumes_tmp() {
         let dir = TempDir::new().unwrap();
         let dest = dir.path().join("nested/deeper/SKILL.md");
-        write_skill_to_disk(&dest, "hello").unwrap();
+        write_skill_to_disk(&dest, "hello", None).unwrap();
         assert_eq!(fs::read_to_string(&dest).unwrap(), "hello");
         assert!(!dest.with_extension("md.tmp").exists());
     }
