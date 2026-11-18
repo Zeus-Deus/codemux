@@ -2017,7 +2017,11 @@ fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Res
                 // Advice only for the failure it fits: git also refuses for
                 // other reasons (an unsigned commit under
                 // `merge.verifySignatures`, say), and its own message says why.
-                let advice = if e.contains("would be overwritten") {
+                let advice = if e.contains("untracked working tree files would be overwritten") {
+                    // Often an ignored private file (a local config): a stash
+                    // leaves it in place, and committing it would publish it.
+                    " It has untracked or ignored files where the merge adds tracked ones; move them somewhere safe, then retry."
+                } else if e.contains("would be overwritten") {
                     " It has uncommitted changes the merge would overwrite; commit or stash them there first."
                 } else {
                     ""
@@ -6873,7 +6877,8 @@ mod tests {
         run_git(&wt, &["commit", "-m", "track local.env"]).unwrap();
 
         let err = merge_into_base(&wt, main, false).unwrap_err();
-        assert!(err.contains("commit or stash"), "a collision gets the advice: {err}");
+        assert!(err.contains("move them somewhere safe"), "an ignored file gets safe advice: {err}");
+        assert!(!err.contains("commit or stash"), "never advise committing a private file: {err}");
         assert_eq!(std::fs::read_to_string(repo.join("local.env")).unwrap(), "my secrets");
         assert_eq!(run_git(&repo, &["rev-parse", "HEAD"]).unwrap(), main_before);
     }
