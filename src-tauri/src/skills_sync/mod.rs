@@ -684,7 +684,24 @@ fn write_skill_to_disk(dest: &Path, content: &str, confine_to: Option<&Path>) ->
     let parent = dest
         .parent()
         .ok_or_else(|| format!("skill path has no folder: {}", dest.display()))?;
-    fs::create_dir_all(parent).map_err(|e| format!("create skill dir: {e}"))?;
+    match confine_to {
+        // Only the skill's own folder is created, directly inside the root,
+        // so nothing is ever created through a link that leads elsewhere.
+        Some(root) => {
+            if parent.parent() != Some(root) {
+                return Err(format!("{} is not a skill folder under {}", dest.display(), root.display()));
+            }
+            fs::create_dir_all(root).map_err(|e| format!("create skills root: {e}"))?;
+            match fs::symlink_metadata(parent) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(parent).map_err(|e| format!("create skill dir: {e}"))?
+                }
+                Err(e) => return Err(format!("inspect skill dir: {e}")),
+            }
+        }
+        None => fs::create_dir_all(parent).map_err(|e| format!("create skill dir: {e}"))?,
+    }
     if let Some(root) = confine_to {
         let inside = match (fs::canonicalize(parent), fs::canonicalize(root)) {
             (Ok(parent), Ok(root)) => parent.starts_with(&root),
@@ -1058,6 +1075,21 @@ mod tests {
             .unwrap();
         assert!(applied);
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_in_place_of_a_skill_folder_creates_nothing() {
+        let home = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let skills_root = home.path().join(".codemux/skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        let gone = outside.path().join("not-yet");
+        std::os::unix::fs::symlink(&gone, skills_root.join("demo")).unwrap();
+
+        let dest = skills_root.join("demo/SKILL.md");
+        assert!(write_skill_to_disk(&dest, "pwned", Some(&skills_root)).is_err());
+        assert!(!gone.exists(), "no folder is created through the link");
     }
 
     #[cfg(unix)]

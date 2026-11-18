@@ -127,16 +127,33 @@ pub fn user_skill_root_for(path: &Path, home: &Path) -> Option<PathBuf> {
 /// Whether `name` can name a skill's own directory: exactly one ordinary
 /// path component, so it can never climb out of, or replace, the skills
 /// root. Names otherwise stay as free-form as the directories they come
-/// from (other tools allow capitals, `_`, spaces). `:` is refused on every
-/// platform: Windows reads `C:` as a drive, and no platform's skill names
-/// need it.
+/// from (other tools allow capitals, `_`, spaces), within what every
+/// platform's file system accepts.
 pub fn is_skill_dir_name(name: &str) -> bool {
     use std::path::Component;
-    if name.is_empty() || name.len() > 255 || name.contains(['/', '\\', ':', '\0']) {
+    // The name must work as a folder on every device the account syncs to,
+    // so Windows' rules apply everywhere: none of `<>:"/\\|?*` or control
+    // characters, no trailing dot or space, no reserved device name.
+    if name.is_empty()
+        || name.len() > 255
+        || name.chars().any(|c| c.is_control() || r#"<>:"/\|?*"#.contains(c))
+        || name.ends_with(['.', ' '])
+        || is_windows_device_name(name)
+    {
         return false;
     }
     let mut components = Path::new(name).components();
     matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+/// `CON`, `nul.txt`, `COM1` and the like, which Windows reserves whatever
+/// the extension or case.
+fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end().to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -414,12 +431,14 @@ mod tests {
 
     #[test]
     fn only_a_single_ordinary_component_names_a_skill_dir() {
-        for ok in ["my-skill", "My_Skill", "skill v2", "a.b", "..hidden-ish"] {
+        for ok in ["my-skill", "My_Skill", "skill v2", "a.b", "..hidden-ish", "console", "com10", "lpt0"] {
             assert!(is_skill_dir_name(ok), "{ok:?}");
         }
         for bad in [
             "", ".", "..", "../x", "../../projects/repo/.claude/skills/x", "/etc",
             "a/b", "a\\b", "C:\\x", "C:", "x\0", "./x",
+            "what?", "a*b", "a<b", "a>b", "a|b", "say \"hi\"", "tab\there",
+            "trailing.", "trailing ", "CON", "nul", "Com1", "lpt9.txt", "aux.md",
         ] {
             assert!(!is_skill_dir_name(bad), "{bad:?}");
         }
