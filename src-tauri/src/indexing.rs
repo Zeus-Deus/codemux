@@ -208,26 +208,49 @@ fn open_project_dir(path: &Path) -> io::Result<Dir> {
 
 #[cfg(windows)]
 fn pinned_windows_path(dir: &Dir) -> io::Result<PathBuf> {
-    // Retain the verbatim prefix, including for UNC shares. cap-std opens directories
-    // without delete sharing, pinning them while path-based Windows APIs run.
+    // Preserve the verbatim path, including the UNC prefix on network shares.
     winx::file::get_file_path(&dir.try_clone()?.into_std_file())
 }
 
 #[cfg(windows)]
-fn reopen_watched_dir(dir: &Dir, allow_rename: bool) -> io::Result<Dir> {
-    use std::os::windows::io::AsHandle;
-    use winx::file::{reopen_file, AccessMode, Flags, ShareMode};
-    let mut share = ShareMode::FILE_SHARE_READ | ShareMode::FILE_SHARE_WRITE;
+fn reopen_watched_dir(dir: &fs::File, allow_rename: bool) -> io::Result<fs::File> {
+    open_watched_dir_at(dir, &winx::file::get_file_path(dir)?, allow_rename)
+}
+
+#[cfg(windows)]
+fn open_watched_dir_at(dir: &fs::File, path: &Path, allow_rename: bool) -> io::Result<fs::File> {
+    use crate::windows_file_id::file_id;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let mut options = fs::OpenOptions::new();
     if allow_rename {
-        share |= ShareMode::FILE_SHARE_DELETE;
+        // Idle watchers need only identity and the current name. The default
+        // share mode permits reads, writes, and renames by other processes.
+        options.access_mode(FILE_READ_ATTRIBUTES);
+    } else {
+        options
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
     }
-    reopen_file(
-        dir.as_handle(),
-        AccessMode::GENERIC_READ,
-        share,
-        Flags::FILE_FLAG_BACKUP_SEMANTICS,
-    )
-    .map(Dir::from_std_file)
+    let file = options
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    // The name can be reassigned between looking it up and opening it.
+    // Keep both handles alive until their filesystem identities match.
+    if !metadata.is_dir()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || file_id(&file)? != file_id(dir)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Watched directory was replaced",
+        ));
+    }
+    Ok(file)
 }
 
 fn spawn_index_watcher(
@@ -260,17 +283,13 @@ fn spawn_index_watcher(
         }
 
         // Keep the identity of the watched directory without locking its name
-        // between rebuilds. ReOpenFile operates on the original directory handle.
+        // between rebuilds.
         #[cfg(windows)]
-        let dir = {
-            let watched = reopen_watched_dir(&dir, true);
-            drop(dir);
-            match watched {
-                Ok(dir) => dir,
-                Err(error) => {
-                    eprintln!("[codemux::index] Failed to retain watched directory: {error}");
-                    return;
-                }
+        let watched = match reopen_watched_dir(&dir.into_std_file(), true) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("[codemux::index] Failed to retain watched directory: {error}");
+                return;
             }
         };
 
@@ -326,8 +345,8 @@ fn spawn_index_watcher(
             }
 
             #[cfg(windows)]
-            let dir = match reopen_watched_dir(&dir, false) {
-                Ok(pinned) => pinned,
+            let dir = match reopen_watched_dir(&watched, false) {
+                Ok(pinned) => Dir::from_std_file(pinned),
                 Err(error) => {
                     eprintln!(
                         "[codemux::index] Failed to open watched directory for indexing: {error}"
@@ -848,10 +867,18 @@ mod tests {
         let selected = project.path().join("selected");
         fs::create_dir(&selected).unwrap();
         fs::write(selected.join("original.rs"), "fn original() {}").unwrap();
-        let watched = reopen_watched_dir(&open_project_dir(&selected).unwrap(), true).unwrap();
+        let watched =
+            reopen_watched_dir(&open_project_dir(&selected).unwrap().into_std_file(), true)
+                .unwrap();
         fs::rename(&selected, project.path().join("moved")).unwrap();
         fs::create_dir(&selected).unwrap();
-        let pinned = reopen_watched_dir(&watched, false).unwrap();
+        assert_eq!(
+            open_watched_dir_at(&watched, &selected, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let pinned = Dir::from_std_file(reopen_watched_dir(&watched, false).unwrap());
         let snapshot = build_index_for_root(&selected, &pinned).unwrap();
         assert_eq!(snapshot.file_count, 1);
         assert_eq!(snapshot.files[0].file_path, "original.rs");

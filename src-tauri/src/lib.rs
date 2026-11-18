@@ -93,6 +93,8 @@ pub mod fs_size;
 pub mod hosts_upgrade;
 pub mod hosts_inventory;
 pub mod workspace_paths;
+#[cfg(windows)]
+mod windows_file_id;
 pub mod workspace_service;
 pub mod project_identity;
 pub mod workspaces_sync;
