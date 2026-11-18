@@ -290,19 +290,65 @@ describe("useAppStateInit — lifecycle boundaries", () => {
     }
   });
 
-  it.each(["snapshot", "sign-out"] as const)("stops retrying the initial fetch after %s", async (boundary) => {
+  it.each(["snapshot", "unchanged snapshot", "sign-out"] as const)("stops retrying the initial fetch after %s", async (boundary) => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
+      if (boundary === "unchanged snapshot") useAppStore.getState().setAppState(makeAppState("ws-A"));
       getAppStateMock.mockRejectedValue(new Error("connection interrupted"));
       const { rerender } = renderHook(({ skip }) => useAppStateInit(skip), { initialProps: { skip: false } });
       await act(() => vi.advanceTimersByTimeAsync(0));
-      if (boundary === "snapshot") {
+      if (boundary !== "sign-out") {
         act(() => deliverSnapshot!(makeAppState("ws-A")));
       } else {
         rerender({ skip: true });
       }
       await act(() => vi.advanceTimersByTimeAsync(60_000));
       expect(getAppStateMock).toHaveBeenCalledTimes(1);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("retries a failed sign-in fetch even when the previous workspace snapshot is still in memory", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      getAppStateMock
+        .mockResolvedValueOnce(makeAppState("ws-A"))
+        .mockRejectedValueOnce(new Error("reconnecting"))
+        .mockResolvedValueOnce(makeAppState("ws-B"));
+      const { rerender } = renderHook(({ skip }) => useAppStateInit(skip), { initialProps: { skip: false } });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      rerender({ skip: true });
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-A");
+
+      rerender({ skip: false });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(getAppStateMock).toHaveBeenCalledTimes(2);
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-A");
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-B");
+      expect(getAppStateMock).toHaveBeenCalledTimes(3);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("continues retrying after a delta and an out-of-date full snapshot", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      useAppStore.getState().setAppState({ ...makeAppState("ws-A"), snapshot_revision: 4 });
+      getAppStateMock
+        .mockRejectedValueOnce(new Error("reconnecting"))
+        .mockResolvedValueOnce({ ...makeAppState("ws-B"), snapshot_revision: 6 });
+      renderHook(() => useAppStateInit());
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      act(() => {
+        deliverDelta!({ revision: 5, delta: { domain: "pane_status", pane_id: "p", status: "working" } });
+        deliverSnapshot!({ ...makeAppState("ws-A"), snapshot_revision: 4 });
+      });
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(2);
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-B");
     } finally {
       error.mockRestore();
     }

@@ -17,6 +17,8 @@ import type { HostView } from "@/tauri/commands";
 
 interface AppStore {
   appState: AppStateSnapshot | null;
+  /** Counts accepted full snapshots, including those from unrevisioned backends. */
+  fullSnapshotCount: number;
   remoteActiveWorkspaceId: string | null;
   setRemoteActiveWorkspace: (workspaceId: string) => void;
   /** Cached `$HOME` string from the `get_home_dir` Tauri call. Null
@@ -472,6 +474,7 @@ function reconcileRemoteSelection(
 
 export const useAppStore = create<AppStore>((set) => ({
   appState: null,
+  fullSnapshotCount: 0,
   remoteActiveWorkspaceId: null,
   setRemoteActiveWorkspace: (workspaceId) => set((state) => {
     // A close can land between touch's response and the local commit.
@@ -545,6 +548,7 @@ export const useAppStore = create<AppStore>((set) => ({
       return {
         ...reconcileRemoteSelection(state, drained.appState),
         appState: projectRemotePanes(drained.appState),
+        fullSnapshotCount: state.fullSnapshotCount + 1,
         lastSeenRevision: drained.lastSeenRevision,
         deltaBuffer: drained.buffer,
         // Adopt whatever instance stamped this snapshot. Only a stamped

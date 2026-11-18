@@ -80,6 +80,9 @@ export function useAppStateInit(skip = false) {
   useEffect(() => {
     if (skip) return;
     let cancelled = false;
+    // Sign-out pauses the listener but leaves its last workspace state in memory.
+    const startingCount = useAppStore.getState().fullSnapshotCount;
+    const needsSnapshot = () => !cancelled && useAppStore.getState().fullSnapshotCount === startingCount;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const fetchInitial = async (retryDelay: number) => {
       try {
@@ -88,10 +91,10 @@ export function useAppStateInit(skip = false) {
         setAppState(snapshot);
         markStartup("initial-snapshot-ready", tracedPayloadMeta(snapshot));
       } catch (err) {
-        if (cancelled || useAppStore.getState().appState) return;
+        if (!needsSnapshot()) return;
         console.error("Failed to fetch app state:", err);
         timer = setTimeout(() => {
-          if (!useAppStore.getState().appState) void fetchInitial(Math.min(retryDelay * 2, 30_000));
+          if (needsSnapshot()) void fetchInitial(Math.min(retryDelay * 2, 30_000));
         }, retryDelay);
       }
     };
