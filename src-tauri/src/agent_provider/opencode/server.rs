@@ -372,7 +372,9 @@ impl OpenCodeServer {
         cmd.env(crate::control_identity::AGENT_PROCESS_ENV, "opencode");
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        // Nothing reads stderr, and an unread pipe would block the server
+        // once full — and every OpenCode chat with it.
+        cmd.stderr(Stdio::null());
         cmd.kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
@@ -380,7 +382,7 @@ impl OpenCodeServer {
 
         let mut child = cmd
             .spawn()
-            .map(ServerProcess)
+            .map(ServerProcess::new)
             .map_err(|err| format!("spawn_failed: {} ({err})", binary_path.display()))?;
         if let Some(pid) = child.0.id() {
             #[cfg(target_os = "linux")]
@@ -392,12 +394,6 @@ impl OpenCodeServer {
             .stdout
             .take()
             .ok_or_else(|| "spawn_failed: child stdout pipe missing".to_string())?;
-        // Nothing reads the server's stderr, but it must still be drained:
-        // once the pipe's buffer fills, the server's next log write blocks,
-        // and with it every OpenCode chat this one server runs.
-        if let Some(stderr) = child.0.stderr.take() {
-            tokio::spawn(drain(stderr));
-        }
 
         let url_result = tokio::time::timeout(ready_budget, await_ready_url(stdout)).await;
 
@@ -405,8 +401,9 @@ impl OpenCodeServer {
             Ok(Ok((base_url, api, rest))) => {
                 // Keep reading stdout after the banner too: dropping the
                 // reader closes the pipe, and the server's next write to
-                // stdout would fail instead.
-                tokio::spawn(drain(rest));
+                // stdout would fail instead. The drain is owned by the
+                // process, so it stops with it.
+                child.1 = Some(tokio::spawn(drain(rest)).abort_handle());
                 (base_url, api)
             }
             Ok(Err(message)) => {
@@ -497,9 +494,23 @@ impl Drop for OpenCodeServer {
 /// unreaped (`Child::id` is `Some`), so its PID — the group ID — cannot have
 /// been recycled for an unrelated group.
 #[derive(Debug)]
-struct ServerProcess(Child);
+/// The server child, plus the task draining its stdout after the ready
+/// banner. The drain lives and dies with the process: it is stopped on
+/// terminate and on drop, so a descendant still holding the pipe open
+/// cannot keep the task (and the pipe) alive past the server.
+struct ServerProcess(Child, Option<tokio::task::AbortHandle>);
 
 impl ServerProcess {
+    fn new(child: Child) -> Self {
+        Self(child, None)
+    }
+
+    fn stop_drain(&mut self) {
+        if let Some(drain) = self.1.take() {
+            drain.abort();
+        }
+    }
+
     /// TERM the group, wait up to [`TERMINATE_GRACE`] for the leader, KILL
     /// the group (descendants may ignore TERM or outlive the leader), reap.
     async fn terminate(&mut self) -> std::io::Result<()> {
@@ -526,12 +537,15 @@ impl ServerProcess {
             })
             .await;
         }
-        self.0.kill().await
+        let result = self.0.kill().await;
+        self.stop_drain();
+        result
     }
 }
 
 impl Drop for ServerProcess {
     fn drop(&mut self) {
+        self.stop_drain();
         // Runs before the inner Child drops, so the leader is still
         // unreaped; `kill_on_drop` then kills and reaps the leader.
         #[cfg(unix)]
@@ -838,7 +852,7 @@ mod tests {
             .spawn()
             .unwrap();
         let mut server = OpenCodeServer {
-            child: ServerProcess(child),
+            child: ServerProcess::new(child),
             base_url: "http://127.0.0.1:1".into(),
             api: super::super::api::OpenCodeApi::Legacy,
             server_password: "synthetic".into(),
@@ -887,11 +901,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let done = dir.path().join("done");
         let script = dir.path().join("fake-opencode");
-        // Far more than a pipe buffer on both streams, after the banner.
+        // Far more than a pipe buffer on both streams, after the banner;
+        // `set -e` makes a failed write (a closed pipe) skip the marker.
         std::fs::write(
             &script,
             format!(
                 "#!/bin/sh\n\
+                 set -e\n\
                  echo 'opencode server listening on http://127.0.0.1:1'\n\
                  head -c 1048576 /dev/zero >&2\n\
                  head -c 1048576 /dev/zero\n\
@@ -913,6 +929,69 @@ mod tests {
         let finished = done.exists();
         server.shutdown().await.unwrap();
         assert!(finished, "the server blocked writing its own output");
+    }
+
+    // Linux only: `setsid` puts a descendant outside the server's process
+    // group, where the group kill on shutdown does not reach it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_stdout_drain_stops_with_the_server_even_if_a_descendant_keeps_the_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("stray.pid");
+        let script = dir.path().join("fake-opencode");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 echo 'opencode server listening on http://127.0.0.1:1'\n\
+                 setsid sleep 60 &\n\
+                 echo $! > '{}'\n\
+                 exec sleep 60\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut server = OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(5))
+            .await
+            .expect("the banner is enough to start");
+        let drain = server.child.1.clone().expect("the drain is owned by the process");
+        // Shut down only once the descendant has left the server's session
+        // (and so its process group) while holding the pipe.
+        let escaped = |pid_file: &Path| -> bool {
+            let Some(pid) = std::fs::read_to_string(pid_file).ok().and_then(|p| p.trim().parse::<u32>().ok())
+            else {
+                return false;
+            };
+            // Field 6 of /proc/<pid>/stat is the session id; the command
+            // name before it is parenthesised and may contain spaces.
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(3))
+                    .is_some_and(|sid| sid == pid.to_string())
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !escaped(&pid_file) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(escaped(&pid_file), "precondition: the descendant left the session");
+        server.shutdown().await.unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !drain.is_finished() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let stopped = drain.is_finished();
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = pid.trim().parse::<i32>() {
+                // SAFETY: plain kill(2) on the stray child this test started.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        assert!(stopped, "the drain outlived the server");
     }
 
     /// Tests in this module that rely on the live `opencode` binary
