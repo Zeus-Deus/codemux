@@ -6772,8 +6772,14 @@ fn recovery_pending_at(path: &Path) -> bool {
     let Some(dir) = path.parent() else {
         return true;
     };
+    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut waiting = Vec::new();
     for name in listed.lines().map(str::trim).filter(|n| !n.is_empty()) {
+        // A line that is not a name this code writes — a torn write, say —
+        // cannot vouch that its copy is gone.
+        if !is_aside_name(&file_name, name) {
+            return true;
+        }
         match fs::symlink_metadata(dir.join(name)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             _ => waiting.push(name),
@@ -6807,13 +6813,45 @@ fn set_aside(path: &Path, aside: &Path) -> bool {
     std::io::copy(&mut source, &mut copy).is_ok() && copy.sync_all().is_ok()
 }
 
+/// Whether `name` is a set-aside name for `file_name` exactly as
+/// [`load_layout_from`] makes them: `<file>.unreadable-<millis>-<8 hex>`.
+fn is_aside_name(file_name: &str, name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(file_name).and_then(|r| r.strip_prefix(".unreadable-")) else {
+        return false;
+    };
+    let Some((millis, suffix)) = rest.split_once('-') else {
+        return false;
+    };
+    !millis.is_empty()
+        && millis.bytes().all(|b| b.is_ascii_digit())
+        && suffix.len() == 8
+        && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Add `aside_name` to the recovery marker beside `path`, keeping every
-/// copy already listed.
+/// copy already listed. The whole marker is rewritten in a temporary file
+/// beside it and moved into place, so it is never left half-written.
 fn add_to_recovery_marker(path: &Path, aside_name: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let mut marker = fs::OpenOptions::new().create(true).append(true).open(recovery_marker(path))?;
-    writeln!(marker, "{aside_name}")?;
-    marker.sync_all()
+    let marker = recovery_marker(path);
+    let mut listed = match fs::read_to_string(&marker) {
+        Ok(listed) => listed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    // Whatever an earlier write left — even a torn last line — stays on a
+    // line of its own.
+    if !listed.is_empty() && !listed.ends_with('\n') {
+        listed.push('\n');
+    }
+    listed.push_str(aside_name);
+    listed.push('\n');
+    let dir = marker.parent().ok_or_else(|| std::io::Error::other("no folder for the recovery marker"))?;
+    let mut replacement = tempfile::NamedTempFile::new_in(dir)?;
+    replacement.write_all(listed.as_bytes())?;
+    replacement.as_file().sync_all()?;
+    replacement.persist(&marker).map_err(|e| e.error)?;
+    Ok(())
 }
 
 /// Read the layout at `path`. An unreadable one is preserved before
@@ -14111,6 +14149,46 @@ mod persisted_layout_tests {
         assert!(recovery_pending_at(&path), "the first copy still waits");
         fs::remove_file(&both[0]).unwrap();
         assert!(!recovery_pending_at(&path));
+    }
+
+    #[test]
+    fn a_torn_marker_entry_keeps_recovery_pending_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        // An earlier copy, whose marker entry was torn mid-write.
+        fs::write(dir.path().join("layout.json.unreadable-1700000000000-0123abcd"), "earliest").unwrap();
+        fs::write(recovery_marker(&path), "layout.json.unreadable-17000").unwrap();
+
+        // Another unreadable layout is set aside, then the fallback saved.
+        fs::write(&path, "not json").unwrap();
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
+        let marker = fs::read_to_string(recovery_marker(&path)).unwrap();
+        assert!(marker.starts_with("layout.json.unreadable-17000\n"), "the torn line stays on its own: {marker:?}");
+        save_layout_to(&path, &default_app_state()).unwrap();
+
+        // Even with the newer copy discarded, the torn entry cannot vouch.
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("layout.json.unreadable-") && !name.contains("1700000000000") {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        assert!(recovery_pending_at(&path));
+    }
+
+    #[test]
+    fn aside_names_are_recognised_exactly() {
+        assert!(is_aside_name("layout.json", "layout.json.unreadable-1700000000000-0123abcd"));
+        for bad in [
+            "layout.json.unreadable-17000",
+            "layout.json.unreadable-1700000000000-0123",
+            "layout.json.unreadable-x-0123abcd",
+            "other.json.unreadable-1-0123abcd",
+            "layout.json/copy",
+        ] {
+            assert!(!is_aside_name("layout.json", bad), "{bad}");
+        }
     }
 
     #[test]

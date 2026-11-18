@@ -511,11 +511,12 @@ fn read_git_head_sha(path: &str) -> Option<String> {
 /// from a snapshot taken before a close cannot slip a row in after it.
 static RECONCILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// `ui_state` key holding the workspaces closed while a layout recovery is
-/// pending, as a JSON array of ids.
-const CLOSED_DURING_RECOVERY: &str = "workspaces_sync.closed_during_recovery";
+/// `ui_state` key prefix: one row per workspace closed while a layout
+/// recovery is pending (`<prefix><workspace id>`), so recording one close
+/// never rewrites, or loses, another.
+const CLOSED_DURING_RECOVERY: &str = "workspaces_sync.closed_during_recovery:";
 
-/// Closes this run could not persist, kept so they are still honoured.
+/// Closes not yet saved; retried every reconcile until they are.
 static CLOSED_UNPERSISTED: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(Default::default);
 
@@ -523,30 +524,36 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Every workspace closed while the current layout recovery is pending.
-fn closed_during_recovery(db: &DatabaseStore) -> HashSet<String> {
+/// Save every close still held only in memory; each is forgotten from
+/// memory only once its row is written.
+fn persist_unsaved_closes(db: &DatabaseStore) {
+    let mut unsaved = lock(&CLOSED_UNPERSISTED);
+    unsaved.retain(|wid| db.set_ui_state(&format!("{CLOSED_DURING_RECOVERY}{wid}"), "1").is_err());
+}
+
+/// Every workspace closed while the current layout recovery is pending, or
+/// an error if the saved ones cannot be read.
+fn closed_during_recovery(db: &DatabaseStore) -> Result<HashSet<String>, String> {
     let mut closed: HashSet<String> = db
-        .get_ui_state(CLOSED_DURING_RECOVERY)
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default();
+        .ui_state_keys_with_prefix(CLOSED_DURING_RECOVERY)?
+        .into_iter()
+        .filter_map(|key| key.strip_prefix(CLOSED_DURING_RECOVERY).map(str::to_string))
+        .collect();
     closed.extend(lock(&CLOSED_UNPERSISTED).iter().cloned());
-    closed
+    Ok(closed)
 }
 
 /// The user closed `workspace_id`: mark its sync row deleted. While a
 /// layout recovery is pending, reconcile infers no closes, so the close is
-/// also remembered — across restarts — and reconcile keeps applying it:
-/// it never re-adds that workspace and retries the deletion every tick,
-/// covering a failed write here and a row a stale reconcile added.
+/// also remembered — saved so it survives a restart, and kept in memory
+/// and retried until that save works — and reconcile keeps applying it: it
+/// never re-adds that workspace and retries the deletion every tick.
 pub fn record_closed(db: &DatabaseStore, workspace_id: &str) -> Result<(), String> {
     let _serialised = lock(&RECONCILE_LOCK);
-    if crate::state::layout_recovery_pending() {
-        let mut closed = closed_during_recovery(db);
-        closed.insert(workspace_id.to_string());
-        let json = serde_json::to_string(&closed).unwrap_or_else(|_| "[]".into());
-        if db.set_ui_state(CLOSED_DURING_RECOVERY, &json).is_err() {
-            lock(&CLOSED_UNPERSISTED).insert(workspace_id.to_string());
-        }
+    if crate::state::layout_recovery_pending()
+        && db.set_ui_state(&format!("{CLOSED_DURING_RECOVERY}{workspace_id}"), "1").is_err()
+    {
+        lock(&CLOSED_UNPERSISTED).insert(workspace_id.to_string());
     }
     db.soft_delete_workspace_sync_by_workspace_id(workspace_id)
 }
@@ -555,13 +562,41 @@ pub fn reconcile_from_snapshot(
     db: &DatabaseStore,
     snapshot: &AppStateSnapshot,
 ) -> Result<(), String> {
+    // Git first, outside the lock: a slow repository must not hold up a
+    // close being recorded.
+    let heads: HashMap<String, Option<String>> = snapshot
+        .workspaces
+        .iter()
+        // Only the workspaces the loop below mirrors.
+        .filter(|ws| {
+            !ws.attach_only
+                && !matches!(
+                    ws.workspace_type,
+                    crate::state::WorkspaceType::Removed | crate::state::WorkspaceType::Home
+                )
+        })
+        .map(|ws| {
+            let path = ws.worktree_path.as_deref().unwrap_or(ws.cwd.as_str());
+            (ws.workspace_id.0.clone(), read_git_head_sha(path))
+        })
+        .collect();
+
     let _serialised = lock(&RECONCILE_LOCK);
     let recovering = crate::state::layout_recovery_pending();
     let closed = if recovering {
-        closed_during_recovery(db)
+        persist_unsaved_closes(db);
+        match closed_during_recovery(db) {
+            Ok(closed) => closed,
+            Err(error) => {
+                // Without the list, any write here could re-add a closed
+                // workspace; try again next tick.
+                eprintln!("[workspaces-sync] cannot read recovery-time closes ({error}); skipping this reconcile");
+                return Ok(());
+            }
+        }
     } else {
         // Recovery over: closes are inferred again, so the list is done.
-        let _ = db.delete_ui_state(CLOSED_DURING_RECOVERY);
+        let _ = db.delete_ui_state_with_prefix(CLOSED_DURING_RECOVERY);
         lock(&CLOSED_UNPERSISTED).clear();
         HashSet::new()
     };
@@ -632,17 +667,12 @@ pub fn reconcile_from_snapshot(
         let project_uid = ws.project_uid.as_deref();
         let workspace_kind = ws.workspace_kind.as_deref();
 
-        // Read the workspace's git HEAD sha so Phase-4 divergence
-        // detection can compare across devices. Best-effort: if
-        // git isn't installed, the workspace isn't a git repo, or
-        // it has no commits, we leave it as None. Use the
-        // worktree_path when set, else fall back to cwd.
-        let head_path = ws
-            .worktree_path
-            .as_deref()
-            .or(Some(ws.cwd.as_str()))
-            .unwrap_or("");
-        let git_head_sha: Option<String> = read_git_head_sha(head_path);
+        // The workspace's git HEAD sha (read above, outside the lock) so
+        // Phase-4 divergence detection can compare across devices.
+        // Best-effort: None if git isn't installed, the workspace isn't a
+        // git repo, or it has no commits. From the worktree_path when set,
+        // else the cwd.
+        let git_head_sha: Option<String> = heads.get(&wid).cloned().flatten();
         let git_head_sha_ref = git_head_sha.as_deref();
 
         if let Some(existing) = sync_by_wid.get(wid.as_str()) {
@@ -1258,7 +1288,34 @@ mod tests {
         // Once recovery is over the list is cleared.
         crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
         super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
-        assert!(db.get_ui_state(super::CLOSED_DURING_RECOVERY).is_none());
+        assert!(db.ui_state_keys_with_prefix(super::CLOSED_DURING_RECOVERY).unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_close_whose_save_failed_is_saved_on_a_later_tick_and_survives_a_restart() {
+        let db = fresh_db();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+        // The close's own save failed: it is held only in memory.
+        super::lock(&super::CLOSED_UNPERSISTED).insert("ws-close-unsaved".to_string());
+
+        // A later tick saves it and forgets it from memory.
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        assert!(super::lock(&super::CLOSED_UNPERSISTED).is_empty());
+        assert_eq!(
+            db.ui_state_keys_with_prefix(super::CLOSED_DURING_RECOVERY).unwrap(),
+            [format!("{}ws-close-unsaved", super::CLOSED_DURING_RECOVERY)]
+        );
+
+        // After a restart, a snapshot from before the close does not
+        // re-add it.
+        super::reconcile_from_snapshot(&db, &make_snapshot(vec![make_ws("ws-close-unsaved", "x")])).unwrap();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+        assert!(!db
+            .list_workspaces_sync()
+            .iter()
+            .any(|r| r.workspace_id.as_deref() == Some("ws-close-unsaved")));
+        let _ = db.delete_ui_state_with_prefix(super::CLOSED_DURING_RECOVERY);
     }
 
     #[test]

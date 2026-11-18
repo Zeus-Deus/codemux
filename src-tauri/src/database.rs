@@ -1612,6 +1612,35 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Every `ui_state` key that starts with `prefix`. Unlike
+    /// [`Self::get_ui_state`], a failed read is an error, not "none".
+    pub fn ui_state_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT key FROM ui_state
+                 WHERE user_id = 'local' AND substr(key, 1, length(?1)) = ?1",
+            )
+            .map_err(|e| format!("Failed to list ui_state: {e}"))?;
+        let keys = stmt
+            .query_map(params![prefix], |row| row.get(0))
+            .map_err(|e| format!("Failed to list ui_state: {e}"))?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| format!("Failed to list ui_state: {e}"));
+        keys
+    }
+
+    /// Delete every `ui_state` key that starts with `prefix`.
+    pub fn delete_ui_state_with_prefix(&self, prefix: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM ui_state WHERE user_id = 'local' AND substr(key, 1, length(?1)) = ?1",
+            params![prefix],
+        )
+        .map_err(|e| format!("Failed to delete ui_state: {e}"))?;
+        Ok(())
+    }
+
     pub fn delete_ui_state(&self, key: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
