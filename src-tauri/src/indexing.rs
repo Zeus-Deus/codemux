@@ -392,8 +392,9 @@ fn index_file(
         return Ok(None);
     }
 
-    let content = String::from_utf8(bytes)
-        .map_err(|error| format!("Failed to decode file {} as UTF-8: {error}", path.display()))?;
+    let Ok(content) = String::from_utf8(bytes) else {
+        return Ok(None);
+    };
 
     let relative = path
         .strip_prefix(project_root)
@@ -670,5 +671,19 @@ mod tests {
         assert_eq!(first.chunks[0].text, "original needle");
         assert_eq!(store.status().project_root, "/second");
         assert!(search_index(&store, "needle", None).is_empty());
+    }
+
+    #[test]
+    fn rebuild_skips_non_utf8_content_and_keeps_other_files_searchable() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        fs::write(root.join("notes.txt"), b"caf\xe9").unwrap();
+        fs::write(root.join("main.rs"), "fn search_me() {}").unwrap();
+
+        let snapshot = rebuild_index(Some(root.display().to_string())).unwrap();
+        assert_eq!(snapshot.file_count, 1);
+        let results = search_snapshot(&snapshot, "search_me", 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_path, "main.rs");
     }
 }
