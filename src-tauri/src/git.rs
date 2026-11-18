@@ -1927,6 +1927,9 @@ fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Res
     let base_ref = format!("refs/heads/{base_branch}");
     match branch_worktree(repo_path, base_branch)? {
         // Defaults that would bend the fast-forward are overridden:
+        // - `branch.<base>.mergeOptions` is cleared: git applies it before
+        //   the command line, and some of it (`--strategy=ours`) still wins
+        //   over `--ff-only`, recording a merge that drops the changes;
         // - `--no-squash`: a `branch.<base>.mergeOptions=--squash` default
         //   stages the changes, leaves HEAD where it was, and exits 0;
         // - `--no-overwrite-ignore`: by default an ignored local file (a
@@ -1936,7 +1939,16 @@ fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Res
         //   reports as success.
         Some(checkout) => run_git(
             &checkout,
-            &["merge", "--ff-only", "--no-squash", "--no-overwrite-ignore", "--no-autostash", commit],
+            &[
+                "-c",
+                &format!("branch.{base_branch}.mergeOptions="),
+                "merge",
+                "--ff-only",
+                "--no-squash",
+                "--no-overwrite-ignore",
+                "--no-autostash",
+                commit,
+            ],
         )
             .map(|_| ())
             .map_err(|e| {
@@ -6670,6 +6682,33 @@ mod tests {
         assert!(contains, "the base's HEAD must hold the feature commit");
         assert!(git_status(&repo).unwrap().is_empty(), "and its checkout must be clean");
         assert_eq!(std::fs::read_to_string(repo.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[test]
+    fn test_merge_into_base_fast_forwards_a_base_that_defaults_to_strategy_ours() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo).to_string();
+        run_git(&repo, &["config", &format!("branch.{main}.mergeOptions"), "--strategy=ours"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+        let feature_tip = run_git(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+        let result = merge_into_base(&wt, &main, false).unwrap();
+        assert_eq!(result.status, "merged");
+        // A real fast-forward: the base's tree holds the feature's file, and
+        // no `ours` merge commit sits on top.
+        assert_eq!(std::fs::read_to_string(repo.join("feature.txt")).unwrap(), "worktree work");
+        let parents = run_git(&repo, &["rev-list", "--parents", "-n", "1", "HEAD"]).unwrap();
+        assert!(
+            parents.split_whitespace().count() <= 3,
+            "HEAD must be the resolver commit, not an extra merge on top: {parents}"
+        );
+        let (_, _, contains) =
+            run_git_full(&repo, &["merge-base", "--is-ancestor", &feature_tip, "HEAD"]).unwrap();
+        assert!(contains);
+        assert!(git_status(&repo).unwrap().is_empty());
     }
 
     #[test]
