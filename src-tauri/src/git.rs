@@ -1965,7 +1965,17 @@ const CLEAR_MERGE_OPTIONS_ENV: &str = "CODEMUX_CLEAR_MERGE_OPTIONS";
 fn fast_forward_checkout(checkout: &Path, base_branch: &str, commit: &str) -> Result<(), String> {
     let output = git_command()
         .arg(format!("--config-env=branch.{base_branch}.mergeOptions={CLEAR_MERGE_OPTIONS_ENV}"))
-        .args(["merge", "--ff-only", "--no-squash", "--no-overwrite-ignore", "--no-autostash", commit])
+        .args([
+            "merge",
+            "--ff-only",
+            // Named, so no config (`pull.twohead=ours`) can pick a strategy
+            // that records a merge instead of fast-forwarding.
+            "--strategy=ort",
+            "--no-squash",
+            "--no-overwrite-ignore",
+            "--no-autostash",
+            commit,
+        ])
         .env(CLEAR_MERGE_OPTIONS_ENV, "")
         .current_dir(checkout)
         .output()
@@ -6760,6 +6770,24 @@ mod tests {
         let (_, _, contains) =
             run_git_full(&repo, &["merge-base", "--is-ancestor", &feature_tip, "HEAD"]).unwrap();
         assert!(contains);
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_fast_forwards_a_base_checkout_whose_pull_twohead_is_ours() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo).to_string();
+        // Scoped to the base checkout only, so the resolver merge in the
+        // source worktree does not see it.
+        run_git(&repo, &["config", "extensions.worktreeConfig", "true"]).unwrap();
+        run_git(&repo, &["config", "--worktree", "pull.twohead", "ours"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        assert_eq!(merge_into_base(&wt, &main, false).unwrap().status, "merged");
+        assert_eq!(std::fs::read_to_string(repo.join("feature.txt")).unwrap(), "worktree work");
         assert!(git_status(&repo).unwrap().is_empty());
     }
 
