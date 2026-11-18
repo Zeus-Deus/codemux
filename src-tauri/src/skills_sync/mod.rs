@@ -55,7 +55,7 @@ use serde::Serialize;
 
 use api_client::{SkillUpload, SkillWire};
 use mapping::{account_mapping_path, load_mapping, save_mapping, MappingEntry, SkillMapping};
-use path_detection::{destination_path_after_pull, detect_skill_path};
+use path_detection::{destination_path_after_pull, detect_skill_path, is_skill_dir_name};
 
 /// Sync result reported back to the frontend after a `sync_now`.
 /// Caller logs it; nothing here is load-bearing for correctness.
@@ -286,6 +286,17 @@ impl SyncEngine {
         // the server returns them with an empty name. They get
         // rewritten in place the next time the owning device pushes.
         if wire.name.is_empty() {
+            return Ok(false);
+        }
+        // The name becomes a directory under the skills root. Another
+        // device, an imported export file or the server itself could send
+        // `../x` or an absolute path; such a row is not this device's to
+        // write.
+        if !is_skill_dir_name(&wire.name) {
+            eprintln!(
+                "[skills_sync] skipping remote skill {} with an unusable name {:?}",
+                wire.remote_id, wire.name
+            );
             return Ok(false);
         }
 
@@ -793,6 +804,31 @@ mod tests {
         assert_eq!(mapping.skills[0].remote_id, "1");
         assert_eq!(mapping.skills[0].name, "demo");
         assert_eq!(mapping.skills[0].local_path, dest);
+    }
+
+    #[test]
+    fn apply_remote_skill_never_writes_outside_the_skills_root() {
+        let home = TempDir::new().unwrap();
+        let engine = SyncEngine::with_home(home.path());
+        let mut mapping = SkillMapping::default();
+
+        for (id, name) in [("1", "../../escaped"), ("2", "/tmp/escaped-abs"), ("3", "..")] {
+            let wire = plain_wire(name, "pwned", "codemux", "user", id, "2026-04-29T20:00:00Z");
+            let applied = engine
+                .apply_remote_skill(
+                    &wire,
+                    &mut mapping,
+                    &mut LocalSkills::default(),
+                    home.path(),
+                    &home.path().join(".codemux/skills"),
+                )
+                .unwrap();
+            assert!(!applied, "{name:?} must not be written");
+        }
+        assert!(mapping.skills.is_empty());
+        assert!(!home.path().join("escaped").exists());
+        assert!(!home.path().join(".codemux/escaped").exists());
+        assert!(!std::path::Path::new("/tmp/escaped-abs/SKILL.md").exists());
     }
 
     #[test]

@@ -105,8 +105,27 @@ pub fn detect_with_project_root(
 /// provider's path the skill originated from. The pull pipeline
 /// uses this to write decrypted skills; the file watcher's
 /// "currently-writing" guard uses it to avoid an echo loop.
+///
+/// Callers check [`is_skill_dir_name`] first: the name comes from the
+/// server, and joining a `../x` or an absolute path here would write
+/// outside the skills root.
 pub fn destination_path_after_pull(name: &str, home: &Path) -> PathBuf {
     home.join(".codemux/skills").join(name).join("SKILL.md")
+}
+
+/// Whether `name` can name a skill's own directory: exactly one ordinary
+/// path component, so it can never climb out of, or replace, the skills
+/// root. Names otherwise stay as free-form as the directories they come
+/// from (other tools allow capitals, `_`, spaces). `:` is refused on every
+/// platform: Windows reads `C:` as a drive, and no platform's skill names
+/// need it.
+pub fn is_skill_dir_name(name: &str) -> bool {
+    use std::path::Component;
+    if name.is_empty() || name.len() > 255 || name.contains(['/', '\\', ':', '\0']) {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -380,6 +399,19 @@ mod tests {
         let home = fake_home();
         let dest = destination_path_after_pull("my-skill", &home);
         assert_eq!(dest, home.join(".codemux/skills/my-skill/SKILL.md"));
+    }
+
+    #[test]
+    fn only_a_single_ordinary_component_names_a_skill_dir() {
+        for ok in ["my-skill", "My_Skill", "skill v2", "a.b", "..hidden-ish"] {
+            assert!(is_skill_dir_name(ok), "{ok:?}");
+        }
+        for bad in [
+            "", ".", "..", "../x", "../../projects/repo/.claude/skills/x", "/etc",
+            "a/b", "a\\b", "C:\\x", "C:", "x\0", "./x",
+        ] {
+            assert!(!is_skill_dir_name(bad), "{bad:?}");
+        }
     }
 
     #[test]
