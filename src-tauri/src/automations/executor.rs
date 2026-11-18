@@ -218,8 +218,11 @@ fn absolute_local_remote(remote: &str, clone_cwd: &Path) -> Option<PathBuf> {
     }
     let path = Path::new(remote);
     let has_prefix = matches!(path.components().next(), Some(std::path::Component::Prefix(_)));
-    if !path.has_root() && !has_prefix
-        && remote.split_once(':').is_some_and(|(prefix, _)| !prefix.contains('/'))
+    // A one-letter remote helper can look like a Windows drive prefix.
+    if !path.has_root()
+        && remote.split_once(':').is_some_and(|(prefix, address)| {
+            !prefix.contains('/') && (!has_prefix || address.starts_with(':'))
+        })
     {
         return None;
     }
@@ -840,6 +843,12 @@ mod tests {
         assert!(!second.join("first.txt").exists());
         assert_eq!(resolve_clone("first/repo", &cache, root.path()).unwrap(), legacy);
         assert_eq!(resolve_clone("second/repo", &cache, root.path()).unwrap(), second);
+    }
+
+    #[test]
+    fn absolute_local_remote_preserves_remote_helper_syntax() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(absolute_local_remote("x::repository", &cwd), None);
     }
 
     #[test]
