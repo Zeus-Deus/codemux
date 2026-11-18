@@ -1995,38 +1995,154 @@ fn branch_held_by_rebase_or_bisect(repo_path: &Path, branch: &str) -> Result<boo
     Ok(false)
 }
 
-/// Child-process variable holding the empty value that clears the base's
-/// merge defaults; see [`fast_forward_checkout`].
-const CLEAR_MERGE_OPTIONS_ENV: &str = "CODEMUX_CLEAR_MERGE_OPTIONS";
+/// Fast-forward the branch checked out in `checkout`, `base_branch`, to
+/// `commit`, moving its index and files with it.
+///
+/// Built from plumbing rather than `git merge`, so that nothing can change
+/// underneath it and no configuration can bend it:
+/// - the checkout's `HEAD.lock` is held throughout, so git refuses any
+///   branch switch there, and HEAD is re-read under it — the branch that
+///   moves is the one that was checked;
+/// - the files move with a two-way `read-tree -u -m`, which refuses to
+///   overwrite uncommitted changes, and ignored files the commit would add
+///   are refused here first (read-tree overwrites those);
+/// - the ref moves by compare-and-swap from the old tip, and the files are
+///   put back if that fails;
+/// - no merge strategy, squash or autostash setting applies, and a
+///   signature requirement (`merge.verifySignatures`, or
+///   `--verify-signatures` in the branch's merge options) is checked.
+fn fast_forward_checkout(
+    repo_path: &Path,
+    checkout: &Path,
+    base_branch: &str,
+    commit: &str,
+) -> Result<(), String> {
+    let base_ref = format!("refs/heads/{base_branch}");
+    let head = git_line(checkout, &["rev-parse", "--path-format=absolute", "--git-path", "HEAD"])
+        .and_then(path_from_git_bytes)
+        .ok_or_else(|| "could not find the checkout's HEAD".to_string())?;
+    let _lock = HeadLock::acquire(&head)?;
 
-/// `git merge --ff-only <commit>` in `checkout`, with the defaults that
-/// would bend it overridden (see [`advance_base_branch`]). The branch's
-/// `mergeOptions` key is cleared through `--config-env`, which splits at
-/// the last `=` — a branch name may contain `=`, an environment variable
-/// name may not, so `-c` cannot name such a branch's key.
-fn fast_forward_checkout(checkout: &Path, base_branch: &str, commit: &str) -> Result<(), String> {
-    let output = git_command()
-        .arg(format!("--config-env=branch.{base_branch}.mergeOptions={CLEAR_MERGE_OPTIONS_ENV}"))
-        .args([
-            "merge",
-            "--ff-only",
-            // Named, so no config (`pull.twohead=ours`) can pick a strategy
-            // that records a merge instead of fast-forwarding.
-            "--strategy=ort",
-            "--no-squash",
-            "--no-overwrite-ignore",
-            "--no-autostash",
-            commit,
-        ])
-        .env(CLEAR_MERGE_OPTIONS_ENV, "")
-        .current_dir(checkout)
-        .output()
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!("git merge failed: {}", String::from_utf8_lossy(&output.stderr).trim()))
+    let expected = format!("ref: {base_ref}");
+    let now = std::fs::read(&head).map_err(|e| format!("could not read the checkout's HEAD ({e})"))?;
+    if now.strip_suffix(b"\n").unwrap_or(&now) != expected.as_bytes() {
+        return Err(format!("the checkout no longer has {base_branch} checked out"));
     }
+    let old = run_git(checkout, &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")])?;
+    let old = old.trim();
+    let (_, _, is_ff) = run_git_full(checkout, &["merge-base", "--is-ancestor", old, commit])?;
+    if !is_ff {
+        return Err(format!("{base_branch} moved while merging and is no longer behind the merged commit"));
+    }
+
+    if requires_signed_merges(checkout, base_branch) {
+        run_git(checkout, &["verify-commit", commit]).map_err(|e| {
+            format!("it only takes signed commits, and {commit} has no valid signature ({e})")
+        })?;
+    }
+    if let Some(path) = untracked_file_in_the_way(checkout, old, commit)? {
+        return Err(format!(
+            "Untracked working tree file '{}' would be overwritten by merge.",
+            path.display()
+        ));
+    }
+    run_git(checkout, &["read-tree", "-u", "-m", old, commit])?;
+
+    // Run from the source worktree: updating the ref a checkout's HEAD
+    // names from inside that checkout would also take its `HEAD.lock`.
+    let message = format!("merge into {base_branch}: fast-forward");
+    if let Err(e) = run_git(repo_path, &["update-ref", "-m", &message, &base_ref, commit, old]) {
+        let _ = run_git(checkout, &["read-tree", "-u", "-m", commit, old]);
+        return Err(format!("{base_branch} moved while merging ({e})"));
+    }
+    Ok(())
+}
+
+/// A checkout's `HEAD.lock`, held for the life of the value. While it
+/// exists git refuses to change that checkout's HEAD.
+struct HeadLock(PathBuf);
+
+impl HeadLock {
+    fn acquire(head: &Path) -> Result<Self, String> {
+        let mut lock = head.as_os_str().to_owned();
+        lock.push(".lock");
+        let lock = PathBuf::from(lock);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    "another git command is changing that checkout right now; try again".to_string()
+                } else {
+                    format!("could not lock the checkout's HEAD ({e})")
+                }
+            })?;
+        Ok(Self(lock))
+    }
+}
+
+impl Drop for HeadLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Whether merges into `base_branch` in `checkout` must be signed, as
+/// `git merge` would enforce.
+fn requires_signed_merges(checkout: &Path, base_branch: &str) -> bool {
+    let configured = git_line(checkout, &["config", "--type=bool", "--get", "merge.verifySignatures"])
+        .is_some_and(|v| v == b"true");
+    let branch_options = git_line(
+        checkout,
+        &["config", "--get", &format!("branch.{base_branch}.mergeOptions")],
+    )
+    .map(|v| String::from_utf8_lossy(&v).into_owned())
+    .unwrap_or_default();
+    let mut required = configured;
+    for option in branch_options.split_whitespace() {
+        match option {
+            "--verify-signatures" => required = true,
+            "--no-verify-signatures" => required = false,
+            _ => {}
+        }
+    }
+    required
+}
+
+/// The first path `old..new` changes that `checkout` does not track but
+/// has on disk — an ignored or untracked file the fast-forward would
+/// replace.
+fn untracked_file_in_the_way(checkout: &Path, old: &str, new: &str) -> Result<Option<PathBuf>, String> {
+    let raw = |args: &[&str]| -> Result<Vec<u8>, String> {
+        let output = git_command()
+            .args(args)
+            .current_dir(checkout)
+            .output()
+            .map_err(|e| format!("Failed to run git: {e}"))?;
+        if output.status.success() {
+            Ok(output.stdout)
+        } else {
+            Err(format!("git {} failed: {}", args[0], String::from_utf8_lossy(&output.stderr).trim()))
+        }
+    };
+    let changed = raw(&["diff", "--name-only", "--no-renames", "-z", old, new, "--"])?;
+    let tracked = raw(&["ls-files", "-z"])?;
+    let tracked: std::collections::HashSet<&[u8]> =
+        tracked.split(|&b| b == 0).filter(|p| !p.is_empty()).collect();
+    for path in changed.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+        if tracked.contains(path) {
+            continue;
+        }
+        let Some(rel) = path_from_git_bytes(path.to_vec()) else { continue };
+        match std::fs::symlink_metadata(checkout.join(&rel)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Anything else — the file exists, or a parent is a file — is in
+            // the way.
+            _ => return Ok(Some(rel)),
+        }
+    }
+    Ok(None)
 }
 
 /// Fast-forward `base_branch` to `commit`.
@@ -2042,28 +2158,19 @@ fn fast_forward_checkout(checkout: &Path, base_branch: &str, commit: &str) -> Re
 fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Result<(), String> {
     let base_ref = format!("refs/heads/{base_branch}");
     match branch_worktree(repo_path, base_branch)? {
-        // Defaults that would bend the fast-forward are overridden:
-        // - `branch.<base>.mergeOptions` is cleared (whatever the branch is
-        //   called, `=` included): git applies it before
-        //   the command line, and some of it (`--strategy=ours`) still wins
-        //   over `--ff-only`, recording a merge that drops the changes;
-        // - `--no-squash`: a `branch.<base>.mergeOptions=--squash` default
-        //   stages the changes, leaves HEAD where it was, and exits 0;
-        // - `--no-overwrite-ignore`: by default an ignored local file (a
-        //   private config) is replaced when the merge tracks that path;
-        // - `--no-autostash`: `merge.autoStash` would stash local edits and
-        //   re-apply them after the move, leaving conflicts git still
-        //   reports as success.
-        Some(checkout) => fast_forward_checkout(&checkout, base_branch, commit)
+        // A guarded fast-forward: see `fast_forward_checkout` for why it is
+        // not `git merge`.
+        Some(checkout) => fast_forward_checkout(repo_path, &checkout, base_branch, commit)
             .map_err(|e| {
-                // Advice only for the failure it fits: git also refuses for
-                // other reasons (an unsigned commit under
-                // `merge.verifySignatures`, say), and its own message says why.
-                let advice = if e.contains("untracked working tree files would be overwritten") {
+                // Advice only for the failure it fits: the fast-forward is
+                // also refused for other reasons (an unsigned commit, a
+                // branch switch), and the message says why.
+                let lower = e.to_lowercase();
+                let advice = if lower.contains("untracked working tree file") {
                     // Often an ignored private file (a local config): a stash
                     // leaves it in place, and committing it would publish it.
                     " It has untracked or ignored files where the merge adds tracked ones; move them somewhere safe, then retry."
-                } else if e.contains("would be overwritten") {
+                } else if lower.contains("not uptodate") || lower.contains("would be overwritten") {
                     " It has uncommitted changes the merge would overwrite; commit or stash them there first."
                 } else {
                     ""
@@ -7203,6 +7310,42 @@ mod tests {
         let err = merge_into_base(&wt, "release", false).unwrap_err();
         assert!(err.contains("rebasing or bisecting"), "unexpected error: {err}");
         assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+    }
+
+    #[test]
+    fn fast_forward_refuses_a_checkout_switched_to_another_branch_after_validation() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo).to_string();
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+        let commit = run_git(&wt, &["rev-parse", "HEAD"]).unwrap();
+        let main_before = run_git(&repo, &["rev-parse", &main]).unwrap();
+
+        // Validation saw `main`; then the checkout switched to a sibling
+        // branch at the same tip.
+        run_git(&repo, &["switch", "-c", "side"]).unwrap();
+
+        let err = fast_forward_checkout(&wt, &repo, &main, &commit).unwrap_err();
+        assert!(err.contains("no longer has"), "unexpected error: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", &main]).unwrap(), main_before);
+        assert_eq!(run_git(&repo, &["rev-parse", "side"]).unwrap(), main_before, "the sibling must not move");
+        assert!(!repo.join("feature.txt").exists(), "the checkout's files must not change");
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_branch_switch_gets_in_while_the_checkout_is_locked() {
+        let (_dir, repo, _wt) = setup_worktree_merge_scenario();
+        let head = git_line(&repo, &["rev-parse", "--path-format=absolute", "--git-path", "HEAD"])
+            .and_then(path_from_git_bytes)
+            .unwrap();
+        run_git(&repo, &["branch", "side"]).unwrap();
+        let lock = HeadLock::acquire(&head).unwrap();
+        assert!(run_git(&repo, &["switch", "side"]).is_err(), "git must refuse the switch");
+        assert!(HeadLock::acquire(&head).is_err(), "and so must a second lock");
+        drop(lock);
+        run_git(&repo, &["switch", "side"]).expect("the lock is released on drop");
     }
 
     #[test]
