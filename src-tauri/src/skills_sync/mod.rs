@@ -810,19 +810,69 @@ mod confined {
     }
 
     /// Windows: the skill folder is held open, refusing a reparse point (a
-    /// link or junction) and without sharing delete access, so for as long
-    /// as the write takes it cannot be renamed, removed or replaced. The
-    /// paths used inside it therefore keep naming the folder that was
-    /// checked.
+    /// link or junction) and without sharing delete access, so it cannot be
+    /// renamed, removed or replaced while the write runs. Nothing after that
+    /// resolves the root's path again:
+    /// - the temporary file is created under the held folder's own resolved
+    ///   path, and its handle is checked to really sit in that folder;
+    /// - the content is written through that handle;
+    /// - the rename into `SKILL.md` is made relative to the held folder's
+    ///   handle (`FILE_RENAME_INFO.RootDirectory`), not to a path.
     #[cfg(windows)]
     pub(super) fn write(root: &Path, name: &OsStr, content: &[u8]) -> Result<(), String> {
+        use std::ffi::OsString;
         use std::fs;
-        use std::io::{ErrorKind, Write};
+        use std::io::{Error, ErrorKind, Write};
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
+        use std::path::PathBuf;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FileDispositionInfo, FileRenameInfo, GetFinalPathNameByHandleW, SetFileInformationByHandle,
+            DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED,
+            FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+            VOLUME_NAME_DOS,
         };
+
+        /// Where an open file really is, links and junctions resolved.
+        fn final_path(file: &fs::File) -> Result<PathBuf, String> {
+            let mut buf = vec![0u16; 512];
+            loop {
+                // SAFETY: a live handle and a buffer of the stated length.
+                let len = unsafe {
+                    GetFinalPathNameByHandleW(
+                        file.as_raw_handle(),
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+                    )
+                } as usize;
+                if len == 0 {
+                    return Err(format!("resolve a path ({})", Error::last_os_error()));
+                }
+                if len < buf.len() {
+                    buf.truncate(len);
+                    return Ok(PathBuf::from(OsString::from_wide(&buf)));
+                }
+                buf.resize(len + 1, 0);
+            }
+        }
+
+        /// Delete a file through its own handle.
+        fn discard(file: &fs::File) {
+            let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+            // SAFETY: a live handle opened with DELETE access, and a struct of
+            // the stated size.
+            unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    FileDispositionInfo,
+                    std::ptr::addr_of!(info).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                );
+            }
+        }
 
         let dir = root.join(name);
         match fs::create_dir(&dir) {
@@ -832,6 +882,7 @@ mod confined {
         }
         let held = fs::OpenOptions::new()
             .read(true)
+            .access_mode(FILE_GENERIC_READ | FILE_TRAVERSE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&dir)
@@ -840,28 +891,61 @@ mod confined {
         if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !meta.is_dir() {
             return Err("the skill folder is a link or not a folder".into());
         }
-        let inside = match (fs::canonicalize(&dir), fs::canonicalize(root)) {
-            (Ok(dir), Ok(root)) => dir.parent() == Some(root.as_path()),
-            _ => false,
-        };
-        if !inside {
+        let held_path = final_path(&held)?;
+        let root_path = fs::canonicalize(root).map_err(|e| format!("resolve the skills root ({e})"))?;
+        if held_path.parent() != Some(root_path.as_path()) {
             return Err("the skill folder is not inside the skills root".into());
         }
 
-        let tmp = dir.join(TMP);
-        match fs::remove_file(&tmp) {
+        let tmp_path = held_path.join(TMP);
+        match fs::remove_file(&tmp_path) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(format!("clear the temporary file ({e})")),
         }
-        let mut file = fs::OpenOptions::new()
+        let mut tmp = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&tmp)
+            .access_mode(FILE_GENERIC_WRITE | DELETE)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&tmp_path)
             .map_err(|e| format!("create the temporary file ({e})"))?;
-        file.write_all(content).map_err(|e| format!("write the temporary file ({e})"))?;
-        drop(file);
-        fs::rename(&tmp, dir.join(FILE)).map_err(|e| format!("rename the skill file ({e})"))?;
+        let landed = final_path(&tmp);
+        if landed.as_ref().ok().and_then(|p| p.parent()) != Some(held_path.as_path()) {
+            discard(&tmp);
+            return Err("the temporary file did not land in the skill folder".into());
+        }
+        if let Err(e) = tmp.write_all(content).and_then(|()| tmp.flush()) {
+            discard(&tmp);
+            return Err(format!("write the temporary file ({e})"));
+        }
+
+        // FILE_RENAME_INFO ends in a variable-length name; build it in an
+        // 8-byte-aligned buffer large enough for the struct plus the name.
+        let wide: Vec<u16> = OsStr::new(FILE).encode_wide().collect();
+        let size = std::mem::size_of::<FILE_RENAME_INFO>() + wide.len() * 2;
+        let mut buf = vec![0u64; size.div_ceil(8)];
+        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: `buf` is zeroed, aligned and large enough for the struct and
+        // the name written after its first element.
+        let renamed = unsafe {
+            (*info).Anonymous = FILE_RENAME_INFO_0 { ReplaceIfExists: 1 };
+            (*info).RootDirectory = held.as_raw_handle();
+            (*info).FileNameLength = (wide.len() * 2) as u32;
+            std::ptr::copy_nonoverlapping(
+                wide.as_ptr(),
+                std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+                wide.len(),
+            );
+            SetFileInformationByHandle(tmp.as_raw_handle(), FileRenameInfo, info.cast(), size as u32)
+        };
+        if renamed == 0 {
+            let error = Error::last_os_error();
+            discard(&tmp);
+            return Err(format!("rename the skill file ({error})"));
+        }
+        drop(tmp);
         drop(held);
         Ok(())
     }
@@ -1237,6 +1321,39 @@ mod tests {
         write_skill_to_disk(&dest, "new body", Some(&skills_root)).unwrap();
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new body");
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert!(!dest.with_extension("md.tmp").exists());
+    }
+
+    // Windows: a junction needs no special privilege, unlike a symlink.
+    #[cfg(windows)]
+    #[test]
+    fn a_new_skill_is_never_written_through_a_junction() {
+        let home = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let skills_root = home.path().join(".codemux/skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        let link = skills_root.join("linked");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(outside.path())
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+
+        let dest = link.join("SKILL.md");
+        assert!(write_skill_to_disk(&dest, "pwned", Some(&skills_root)).is_err());
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none(), "nothing lands outside");
+    }
+
+    #[test]
+    fn a_confined_write_replaces_an_existing_skill_file() {
+        let home = TempDir::new().unwrap();
+        let root = home.path().join(".codemux/skills");
+        let dest = root.join("demo/SKILL.md");
+        write_skill_to_disk(&dest, "first", Some(&root)).unwrap();
+        write_skill_to_disk(&dest, "second", Some(&root)).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "second");
         assert!(!dest.with_extension("md.tmp").exists());
     }
 
