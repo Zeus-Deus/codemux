@@ -2138,8 +2138,7 @@ async fn get_workspace_cwd(workspace_id: &str) -> Result<String, String> {
 
 async fn run_git(args: &[&str], workspace_id: &str) -> Result<Value, String> {
     let cwd = get_workspace_cwd(workspace_id).await?;
-    let output = crate::git::git_command_tokio()
-        .args(args)
+    let output = tokio::process::Command::from(crate::git::git_command_with_args(args))
         .current_dir(&cwd)
         .output()
         .await

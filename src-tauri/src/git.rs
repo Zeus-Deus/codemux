@@ -144,6 +144,16 @@ pub(crate) fn git_command() -> Command {
     cmd
 }
 
+pub(crate) fn git_command_with_args(args: &[&str]) -> Command {
+    let mut cmd = git_command();
+    if args.starts_with(&["--literal-pathspecs"]) {
+        // Git rejects both of these inherited pathspec modes in literal mode.
+        cmd.env_remove("GIT_GLOB_PATHSPECS").env_remove("GIT_ICASE_PATHSPECS");
+    }
+    cmd.args(args);
+    cmd
+}
+
 /// Tokio form of [`git_command`].
 pub(crate) fn git_command_tokio() -> tokio::process::Command {
     git_command().into()
@@ -168,8 +178,7 @@ pub(crate) fn source_control_cli_command(program: &str) -> Command {
 mod command_tests;
 
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = git_command()
-        .args(args)
+    let output = git_command_with_args(args)
         .current_dir(repo_path)
         .output()
         .map_err(|e| format!("Failed to run git: {e}"))?;
@@ -458,8 +467,7 @@ fn run_git_diff_capped_to(
     max_bytes: usize,
 ) -> Result<FileDiff, String> {
     use std::io::Read;
-    let mut child = git_command()
-        .arg("--literal-pathspecs")
+    let mut child = git_command_with_args(&["--literal-pathspecs"])
         .args(args)
         .current_dir(repo_path)
         .stdin(std::process::Stdio::null())
@@ -3822,6 +3830,29 @@ mod tests {
         run_git(&path, &["init"]).expect("git init");
         run_git(&path, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "initial"]).expect("initial commit");
         (dir, path)
+    }
+
+    #[test]
+    fn selected_file_actions_with_inherited_pathspec_modes() {
+        // Each child runs the real file operations with a private environment.
+        let test = "git::tests::selected_file_actions_preserve_edits_in_matching_sibling_names";
+        for mode in ["GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env_remove("GIT_GLOB_PATHSPECS")
+                .env_remove("GIT_ICASE_PATHSPECS")
+                .env_remove("GIT_LITERAL_PATHSPECS")
+                .env_remove("GIT_NOGLOB_PATHSPECS")
+                .env(mode, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{mode}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
