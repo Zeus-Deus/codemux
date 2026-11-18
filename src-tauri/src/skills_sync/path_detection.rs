@@ -113,6 +113,17 @@ pub fn destination_path_after_pull(name: &str, home: &Path) -> PathBuf {
     home.join(".codemux/skills").join(name).join("SKILL.md")
 }
 
+/// The user-scope skill root (`~/.claude/skills`, `~/.codemux/skills`, …)
+/// that `path` is a `<name>/SKILL.md` under, if any. Remote writes are
+/// confined to it.
+pub fn user_skill_root_for(path: &Path, home: &Path) -> Option<PathBuf> {
+    USER_SCOPE_PROVIDERS.iter().find_map(|(subdir, _)| {
+        let root = home.join(subdir);
+        let rel = path.strip_prefix(&root).ok()?;
+        is_skill_md_layout(rel).then_some(root)
+    })
+}
+
 /// Whether `name` can name a skill's own directory: exactly one ordinary
 /// path component, so it can never climb out of, or replace, the skills
 /// root. Names otherwise stay as free-form as the directories they come

@@ -55,7 +55,9 @@ use serde::Serialize;
 
 use api_client::{SkillUpload, SkillWire};
 use mapping::{account_mapping_path, load_mapping, save_mapping, MappingEntry, SkillMapping};
-use path_detection::{destination_path_after_pull, detect_skill_path, is_skill_dir_name};
+use path_detection::{
+    destination_path_after_pull, detect_skill_path, is_skill_dir_name, user_skill_root_for,
+};
 
 /// Sync result reported back to the frontend after a `sync_now`.
 /// Caller logs it; nothing here is load-bearing for correctness.
@@ -360,8 +362,15 @@ impl SyncEngine {
         // skill location sync may write — one saved by an older build
         // could point anywhere. Such a mapping is dropped, its target left
         // untouched; the next pull treats the row as new.
+        //
+        // Every remote write is also confined, on disk, to the skill root
+        // its path is under: a recorded skill whose folder has since become
+        // a link to somewhere else is refused rather than written through.
+        let saved_root = existing.as_ref().and_then(|e| user_skill_root_for(&e.local_path, home));
         if let Some(e) = &existing {
-            if !detect_skill_path(&e.local_path, home).is_some_and(|info| info.is_syncable) {
+            if saved_root.is_none()
+                || !detect_skill_path(&e.local_path, home).is_some_and(|info| info.is_syncable)
+            {
                 eprintln!(
                     "[skills_sync] dropping the mapping for remote skill {}: {} is not a skill location sync writes",
                     wire.remote_id,
@@ -388,10 +397,8 @@ impl SyncEngine {
         };
 
         if should_write {
-            // A new skill lands in its own folder under the skills root;
-            // that folder may already exist as a link to somewhere else.
-            let confine_to = existing.is_none().then_some(skills_root);
-            write_skill_to_disk(&dest, &content_plain, confine_to)?;
+            let confine_to = saved_root.as_deref().unwrap_or(skills_root);
+            write_skill_to_disk(&dest, &content_plain, Some(confine_to))?;
         }
 
         // Record/refresh the mapping. `last_synced_at_millis` is
@@ -991,6 +998,70 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn an_update_is_never_written_through_a_saved_skill_folder_that_became_a_link() {
+        let home = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let engine = SyncEngine::with_home(home.path());
+        let claude_root = home.path().join(".claude/skills");
+        fs::create_dir_all(&claude_root).unwrap();
+        std::os::unix::fs::symlink(outside.path(), claude_root.join("demo")).unwrap();
+        let mut mapping = SkillMapping::default();
+        mapping.upsert(MappingEntry {
+            local_path: claude_root.join("demo/SKILL.md"),
+            remote_id: "1".into(),
+            name: "demo".into(),
+            provider: "claude".into(),
+            scope: "user".into(),
+            last_synced_at_millis: 0,
+            server_updated_at_millis: 0,
+        });
+
+        let wire = plain_wire("demo", "pwned", "claude", "user", "1", "2026-04-29T20:00:00Z");
+        let result = engine.apply_remote_skill(
+            &wire,
+            &mut mapping,
+            &mut LocalSkills::default(),
+            home.path(),
+            &home.path().join(".codemux/skills"),
+        );
+        assert!(result.is_err(), "the write must be refused");
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none(), "nothing lands outside");
+    }
+
+    #[test]
+    fn an_update_to_another_providers_saved_skill_still_lands() {
+        let home = TempDir::new().unwrap();
+        let engine = SyncEngine::with_home(home.path());
+        let path = home.path().join(".claude/skills/demo/SKILL.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "old").unwrap();
+        let mut mapping = SkillMapping::default();
+        mapping.upsert(MappingEntry {
+            local_path: path.clone(),
+            remote_id: "1".into(),
+            name: "demo".into(),
+            provider: "claude".into(),
+            scope: "user".into(),
+            last_synced_at_millis: 0,
+            server_updated_at_millis: 0,
+        });
+
+        let wire = plain_wire("demo", "new", "claude", "user", "1", "2026-04-29T20:00:00Z");
+        let applied = engine
+            .apply_remote_skill(
+                &wire,
+                &mut mapping,
+                &mut LocalSkills::default(),
+                home.path(),
+                &home.path().join(".codemux/skills"),
+            )
+            .unwrap();
+        assert!(applied);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_temporary_file_is_never_followed() {
         let home = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
@@ -1005,6 +1076,9 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
     }
 
+    // Unix only: Windows cannot create a folder named `a:b` at all; the
+    // shared name rule's colon case is covered by the path tests.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
     async fn a_name_other_devices_cannot_use_is_not_uploaded() {
