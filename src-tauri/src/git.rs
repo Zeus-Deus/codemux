@@ -2014,8 +2014,16 @@ fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Res
         //   reports as success.
         Some(checkout) => fast_forward_checkout(&checkout, base_branch, commit)
             .map_err(|e| {
+                // Advice only for the failure it fits: git also refuses for
+                // other reasons (an unsigned commit under
+                // `merge.verifySignatures`, say), and its own message says why.
+                let advice = if e.contains("would be overwritten") {
+                    " It has uncommitted changes the merge would overwrite; commit or stash them there first."
+                } else {
+                    ""
+                };
                 format!(
-                    "Cannot update {base_branch}: its checkout at {} has uncommitted changes the merge would overwrite. Commit or stash them there first. ({e})",
+                    "Cannot fast-forward {base_branch} in its checkout at {}.{advice} ({e})",
                     checkout.display()
                 )
             })?,
@@ -6831,6 +6839,26 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_into_base_reports_why_git_refused_without_blaming_local_changes() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo).to_string();
+        // A clean base checkout that only accepts signed commits.
+        run_git(&repo, &["config", "extensions.worktreeConfig", "true"]).unwrap();
+        run_git(&repo, &["config", "--worktree", "merge.verifySignatures", "true"]).unwrap();
+        let main_before = run_git(&repo, &["rev-parse", &main]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        let err = merge_into_base(&wt, &main, false).unwrap_err();
+        assert!(err.contains("Cannot fast-forward"), "unexpected error: {err}");
+        assert!(!err.contains("uncommitted"), "the checkout is clean: {err}");
+        assert!(err.contains("signature"), "git's own reason is kept: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", &main]).unwrap(), main_before);
+    }
+
+    #[test]
     fn test_merge_into_base_keeps_an_ignored_file_the_merge_would_track() {
         let (_dir, repo, wt) = setup_worktree_merge_scenario();
         let main = main_branch(&repo);
@@ -6844,7 +6872,8 @@ mod tests {
         run_git(&wt, &["add", "-f", "local.env"]).unwrap();
         run_git(&wt, &["commit", "-m", "track local.env"]).unwrap();
 
-        assert!(merge_into_base(&wt, main, false).is_err());
+        let err = merge_into_base(&wt, main, false).unwrap_err();
+        assert!(err.contains("commit or stash"), "a collision gets the advice: {err}");
         assert_eq!(std::fs::read_to_string(repo.join("local.env")).unwrap(), "my secrets");
         assert_eq!(run_git(&repo, &["rev-parse", "HEAD"]).unwrap(), main_before);
     }
