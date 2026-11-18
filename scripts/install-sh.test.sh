@@ -458,11 +458,21 @@ is "runnable configured deb completes handover" "$?" "0"
 contains "verified the packaged version" "$(cat "$TMPROOT/handover.log")" "codemux 9.9.9 at $PACKAGE_BIN"
 is "successful handover retires the fallback files" "$(test ! -e "$launcher" && test ! -e "$LIB_DIR" && test ! -e "$desktop" && echo yes)" "yes"
 
+make_fallback
+new_bin="$TMPROOT/new-install-dir"
+PATH="$BIN_DIR:${PACKAGE_BIN%/*}:$PATH" BIN_DIR="$new_bin" run_package_handover
+is "handover with an AppImage in another prefix succeeds" "$?" "0"
+contains "warns which AppImage still runs" "$(cat "$TMPROOT/handover.log")" "PATH still selects the AppImage launcher at $launcher"
+contains "names the native command to use" "$(cat "$TMPROOT/handover.log")" "Use $PACKAGE_BIN"
+is "keeps the other prefix's launcher" "$("$launcher" 2>/dev/null)" "fallback"
+PATH="${PACKAGE_BIN%/*}:$BIN_DIR:$PATH" BIN_DIR="$new_bin" run_package_handover
+not_contains "no shadowing warning when the package is first" "$(cat "$TMPROOT/handover.log")" "PATH still selects"
+
 # A former CODEMUX_INSTALL_DIR may name the package's own prefix, even if
 # this invocation chooses a different one. Block the manager before unpack.
 PACKAGE_BIN="$launcher"
 make_fallback
-BIN_DIR="$TMPROOT/new-install-dir"
+BIN_DIR="$new_bin"
 for method in deb rpm; do
     manager_rc=1
     rm -f "$TMPROOT/manager-ran"

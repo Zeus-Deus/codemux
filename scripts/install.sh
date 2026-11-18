@@ -648,6 +648,13 @@ install_native_package() {
     verify_install "$PACKAGE_BIN"
     remove_fallback_install
     ok "installed from $(basename "$2")"
+    if [ "$DRY_RUN" != "1" ]; then
+        _path_launcher=$(command -v codemux 2>/dev/null || true)
+        if [ "$_path_launcher" != "$PACKAGE_BIN" ] && is_fallback_launcher "$_path_launcher"; then
+            warn "Your PATH still selects the AppImage launcher at ${_path_launcher}."
+            note "Use ${PACKAGE_BIN} for the commands below, or change your PATH order."
+        fi
+    fi
 }
 
 # The AppImage is a squashfs AppDir. `--appimage-extract` unpacks it without
