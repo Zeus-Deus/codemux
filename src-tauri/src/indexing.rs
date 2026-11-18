@@ -3,6 +3,7 @@ use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
@@ -11,7 +12,8 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-const INDEX_SCHEMA_VERSION: u32 = 1;
+// Older snapshots can contain content reached through links outside the project.
+const INDEX_SCHEMA_VERSION: u32 = 2;
 const MAX_FILE_SIZE_BYTES: u64 = 512 * 1024;
 const CHUNK_LINE_COUNT: usize = 40;
 const DEFAULT_SEARCH_LIMIT: usize = 12;
@@ -55,7 +57,10 @@ fn path_should_skip_for_index(path: &Path, project_root: &Path) -> bool {
 
 /// True if the event contains at least one path that should trigger an index rebuild.
 fn event_has_relevant_paths(event: &notify::Event, project_root: &Path) -> bool {
-    event.paths.iter().any(|p| !path_should_skip_for_index(p, project_root))
+    event
+        .paths
+        .iter()
+        .any(|p| !path_should_skip_for_index(p, project_root))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,8 +133,7 @@ impl Default for ProjectIndexStore {
 impl ProjectIndexStore {
     /// Load (or build) the index for a specific project directory.
     pub fn initialize_for_project(&self, project_root: PathBuf) {
-        let snapshot = load_or_default_index(Some(project_root.display().to_string()))
-            .unwrap_or_else(|_| default_index(project_root));
+        let snapshot = load_index(&project_root).unwrap_or_else(|| default_index(project_root));
         self.replace_snapshot(snapshot);
     }
 
@@ -159,7 +163,7 @@ impl ProjectIndexStore {
 pub fn rebuild_index(project_root: Option<String>) -> Result<ProjectIndexSnapshot, String> {
     let root = resolve_project_root(project_root)?;
     let snapshot = build_index_for_root(&root)?;
-    save_index(&snapshot)?;
+    save_index(&root, &snapshot)?;
     Ok(snapshot)
 }
 
@@ -186,15 +190,28 @@ pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
 
     std::thread::spawn(move || {
         let (tx, rx) = channel();
-        let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {
-            Ok(watcher) => watcher,
+        // The selected project may itself be a directory alias. Watch its target
+        // while excluding links below it, just as the index scan does.
+        let watch_root = match project_root.canonicalize() {
+            Ok(root) => root,
             Err(error) => {
-                eprintln!("[codemux::index] Failed to create watcher: {error}");
+                eprintln!(
+                    "[codemux::index] Failed to resolve {}: {error}",
+                    project_root.display()
+                );
                 return;
             }
         };
+        let mut watcher =
+            match RecommendedWatcher::new(tx, Config::default().with_follow_symlinks(false)) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    eprintln!("[codemux::index] Failed to create watcher: {error}");
+                    return;
+                }
+            };
 
-        if let Err(error) = watcher.watch(&project_root, RecursiveMode::Recursive) {
+        if let Err(error) = watcher.watch(&watch_root, RecursiveMode::Recursive) {
             eprintln!(
                 "[codemux::index] Failed to watch {}: {error}",
                 project_root.display()
@@ -223,7 +240,7 @@ pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
             ) {
                 continue;
             }
-            if !event_has_relevant_paths(&event, &project_root) {
+            if !event_has_relevant_paths(&event, &watch_root) {
                 continue;
             }
 
@@ -242,7 +259,7 @@ pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
                                 ev.kind,
                                 EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
                             )
-                            && event_has_relevant_paths(&ev, &project_root)
+                            && event_has_relevant_paths(&ev, &watch_root)
                         {
                             deadline = Instant::now() + INDEX_REBUILD_DEBOUNCE;
                         }
@@ -253,10 +270,9 @@ pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
                 }
             }
 
-            let current_root = project_root.clone();
-            match build_index_for_root(&current_root) {
+            match build_index_for_root(&project_root) {
                 Ok(snapshot) => {
-                    let _ = save_index(&snapshot);
+                    let _ = save_index(&project_root, &snapshot);
                     *store.lock().unwrap() = Arc::new(snapshot);
                 }
                 Err(error) => {
@@ -267,17 +283,14 @@ pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
     });
 }
 
-fn load_or_default_index(project_root: Option<String>) -> Result<ProjectIndexSnapshot, String> {
-    let root = resolve_project_root(project_root)?;
-    let path = index_path(&root);
-    if !path.exists() {
-        return Ok(default_index(root));
-    }
-
-    let contents = fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read index file {}: {error}", path.display()))?;
-    serde_json::from_str(&contents)
-        .map_err(|error| format!("Failed to parse index file {}: {error}", path.display()))
+fn load_index(root: &Path) -> Option<ProjectIndexSnapshot> {
+    let path = index_path(root).ok()?;
+    let mut contents = Vec::new();
+    let (mut file, _) = open_regular_file(&path).ok()?;
+    file.read_to_end(&mut contents).ok()?;
+    let snapshot: ProjectIndexSnapshot = serde_json::from_slice(&contents).ok()?;
+    (snapshot.schema_version == INDEX_SCHEMA_VERSION && Path::new(&snapshot.project_root) == root)
+        .then_some(snapshot)
 }
 
 fn build_index_for_root(project_root: &Path) -> Result<ProjectIndexSnapshot, String> {
@@ -325,7 +338,7 @@ fn scan_directory(
     total_bytes: &mut usize,
 ) -> Result<(), String> {
     // Cycle detection: track visited directories by (device, inode) identity.
-    // This prevents infinite recursion when symlinks create cycles.
+    // Also terminate walks across repeated bind mounts.
     #[cfg(unix)]
     {
         if let Ok(meta) = fs::metadata(dir) {
@@ -344,24 +357,21 @@ fn scan_directory(
         .map_err(|error| format!("Failed to read directory {}: {error}", dir.display()))?;
 
     for entry in entries {
+        if *total_bytes >= MAX_TOTAL_INDEX_BYTES {
+            break;
+        }
         let entry = entry.map_err(|error| format!("Failed to read directory entry: {error}"))?;
         let path = entry.path();
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-
-        if path.is_dir() {
-            if IGNORED_DIRS.iter().any(|ignored| *ignored == file_name) {
-                continue;
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("Failed to read file type for {}: {error}", path.display()))?;
+        if kind.is_dir() {
+            if !IGNORED_DIRS.contains(&entry.file_name().to_string_lossy().as_ref()) {
+                scan_directory(project_root, &path, files, chunks, seen_dirs, total_bytes)?;
             }
-            scan_directory(project_root, &path, files, chunks, seen_dirs, total_bytes)?;
             continue;
         }
-
-        if *total_bytes >= MAX_TOTAL_INDEX_BYTES {
-            return Ok(());
-        }
-
-        if !is_indexable_file(&path) {
+        if !kind.is_file() || !is_indexable_file(&path) {
             continue;
         }
 
@@ -379,16 +389,18 @@ fn index_file(
     project_root: &Path,
     path: &Path,
 ) -> Result<Option<(IndexedFile, Vec<IndexedChunk>)>, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("Failed to read metadata for {}: {error}", path.display()))?;
+    let (file, metadata) = open_regular_file(path)
+        .map_err(|error| format!("Failed to open file {}: {error}", path.display()))?;
 
     if metadata.len() > MAX_FILE_SIZE_BYTES {
         return Ok(None);
     }
 
-    let bytes = fs::read(path)
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_SIZE_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("Failed to read file {}: {error}", path.display()))?;
-    if bytes.iter().any(|byte| *byte == 0) {
+    if bytes.len() as u64 > MAX_FILE_SIZE_BYTES || bytes.contains(&0) {
         return Ok(None);
     }
 
@@ -416,7 +428,7 @@ fn index_file(
         IndexedFile {
             file_path: relative,
             language,
-            size_bytes: metadata.len(),
+            size_bytes: content.len() as u64,
             modified_at_ms,
             symbol_names,
         },
@@ -542,8 +554,8 @@ fn search_snapshot(
     results
 }
 
-fn save_index(snapshot: &ProjectIndexSnapshot) -> Result<(), String> {
-    let root = PathBuf::from(&snapshot.project_root);
+fn save_index(root: &Path, snapshot: &ProjectIndexSnapshot) -> Result<(), String> {
+    let path = index_path(root).map_err(|e| format!("Invalid project index cache: {e}"))?;
     let dir = root.join(".codemux");
     fs::create_dir_all(&dir).map_err(|error| {
         format!(
@@ -551,11 +563,17 @@ fn save_index(snapshot: &ProjectIndexSnapshot) -> Result<(), String> {
             dir.display()
         )
     })?;
-    ensure_git_exclude(&root, ".codemux");
-    let path = index_path(&root);
-    let json = serde_json::to_string_pretty(snapshot)
+    ensure_git_exclude(root, ".codemux");
+    let mut staged = tempfile::NamedTempFile::new_in(&dir)
+        .map_err(|error| format!("Failed to create index file in {}: {error}", dir.display()))?;
+    let mut writer = BufWriter::new(staged.as_file_mut());
+    serde_json::to_writer_pretty(&mut writer, snapshot)
         .map_err(|error| format!("Failed to serialize project index: {error}"))?;
-    fs::write(&path, json).map_err(|error| {
+    writer
+        .flush()
+        .map_err(|error| format!("Failed to flush project index: {error}"))?;
+    drop(writer);
+    staged.persist(&path).map(|_| ()).map_err(|error| {
         format!(
             "Failed to write project index file {}: {error}",
             path.display()
@@ -586,8 +604,39 @@ fn resolve_project_root(project_root: Option<String>) -> Result<PathBuf, String>
     }
 }
 
-fn index_path(project_root: &Path) -> PathBuf {
-    project_root.join(".codemux").join("index.json")
+fn index_path(project_root: &Path) -> io::Result<PathBuf> {
+    let dir = project_root.join(".codemux");
+    let path = dir.join("index.json");
+    for (entry, directory) in [(&dir, true), (&path, false)] {
+        match fs::symlink_metadata(entry) {
+            Ok(m) if (directory && m.is_dir()) || (!directory && m.is_file()) => {}
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "Unexpected cache entry at {}",
+                    entry.display()
+                )))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(path)
+}
+
+fn open_regular_file(path: &Path) -> io::Result<(fs::File, fs::Metadata)> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("Expected a regular file"));
+    }
+    Ok((file, metadata))
 }
 
 fn is_indexable_file(path: &Path) -> bool {
@@ -611,6 +660,78 @@ fn current_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_is_used_only_for_its_selected_root_and_schema() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        let mut snapshot = rebuild_index(Some(root.display().to_string())).unwrap();
+        let store = ProjectIndexStore::default();
+        store.initialize_for_project(root.to_owned());
+        assert_eq!(store.status().file_count, 1);
+
+        snapshot.schema_version = 1;
+        save_index(root, &snapshot).unwrap();
+        store.initialize_for_project(root.to_owned());
+        assert_eq!(store.status().file_count, 0);
+
+        snapshot.schema_version = INDEX_SCHEMA_VERSION;
+        snapshot.project_root = root.join("previous-location").display().to_string();
+        save_index(root, &snapshot).unwrap();
+        store.initialize_for_project(root.to_owned());
+        assert_eq!(store.status().project_root, root.display().to_string());
+        assert_eq!(store.status().file_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_root_can_be_an_alias_but_its_children_must_be_regular_files_or_directories() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+
+        let temp = tempfile::tempdir().unwrap();
+        let actual = temp.path().join("actual");
+        let root = temp.path().join("selected");
+        let sibling = temp.path().join("sibling");
+        fs::create_dir_all(actual.join("src")).unwrap();
+        fs::create_dir(&sibling).unwrap();
+        symlink(&actual, &root).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(sibling.join("notes.md"), "notes").unwrap();
+        symlink(sibling.join("notes.md"), root.join("file-link.md")).unwrap();
+        symlink(&sibling, root.join("dir-link")).unwrap();
+        let _socket = UnixListener::bind(root.join("socket.txt")).unwrap();
+
+        let snapshot = rebuild_index(Some(root.display().to_string())).unwrap();
+        assert_eq!(snapshot.file_count, 1);
+        assert_eq!(snapshot.files[0].file_path, "src/main.rs");
+        assert!(load_index(&root).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_requires_a_local_directory_and_regular_file() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let other = tempfile::tempdir().unwrap();
+        let snapshot = default_index(root.to_owned());
+        let sentinel = serde_json::to_vec(&snapshot).unwrap();
+        let other_file = other.path().join("index.json");
+        fs::write(&other_file, &sentinel).unwrap();
+        let dir = root.join(".codemux");
+        symlink(other.path(), &dir).unwrap();
+        assert!(load_index(root).is_none());
+        assert!(save_index(root, &snapshot).is_err());
+
+        fs::remove_file(&dir).unwrap();
+        fs::create_dir(&dir).unwrap();
+        symlink(&other_file, dir.join("index.json")).unwrap();
+        assert!(load_index(root).is_none());
+        assert!(save_index(root, &snapshot).is_err());
+        assert_eq!(fs::read(other_file).unwrap(), sentinel);
+    }
 
     #[test]
     fn search_snapshot_returns_ranked_matches() {
@@ -663,7 +784,10 @@ mod tests {
         let second = store.snapshot();
         assert_eq!(first.chunks.as_ptr(), second.chunks.as_ptr());
         assert_eq!(store.status().chunk_count, 1);
-        assert_eq!(search_index(&store, "needle", None)[0].file_path, "first.rs");
+        assert_eq!(
+            search_index(&store, "needle", None)[0].file_path,
+            "first.rs"
+        );
 
         store.replace_snapshot(default_index(PathBuf::from("/second")));
         assert_eq!(first.project_root, "/first");
