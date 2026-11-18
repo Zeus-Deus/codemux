@@ -244,8 +244,9 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
 fn flush_shutdown_state<R: Runtime>(app: &AppHandle<R>, drain_result: Result<(), String>) -> Result<(), String> {
     // A timed-out operation can still be running. Save the current snapshot
     // and report the timeout so the caller knows the drain was incomplete.
-    let layout_result = crate::state::flush_persisted_state(&app.state::<crate::state::AppStateStore>());
-    let selection_result = crate::active_workspace_persistence::flush_latest(app)
+    let layout_result =
+        crate::state::finish_layout_persistence(&app.state::<crate::state::AppStateStore>(), false);
+    let selection_result = crate::active_workspace_persistence::finish_persistence(app)
         .map_err(|error| format!("Failed to save the active workspace: {error}"));
     drain_result.and(layout_result).and(selection_result)
 }

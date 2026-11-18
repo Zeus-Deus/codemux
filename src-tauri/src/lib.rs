@@ -544,7 +544,10 @@ pub fn run() {
         },
     ));
 
-    build_core_app(builder, AppMode::Gui, state::load_persisted_state)
+    let layout = state::load_persisted_state_checked();
+    let verify_existing_layout = layout.is_err();
+    let layout = layout.ok().flatten();
+    build_core_app(builder, AppMode::Gui, layout)
         .build(app_context())
         .expect("error while building tauri application")
         .run(move |app, event| {
@@ -595,7 +598,13 @@ pub fn run() {
                 ) {
                     eprintln!("[codemux::workflows] shutdown incomplete: {error}");
                 }
-                if let Err(error) = active_workspace_persistence::flush_latest(app) {
+                if let Err(error) = state::finish_layout_persistence(
+                    &app.state::<state::AppStateStore>(),
+                    verify_existing_layout,
+                ) {
+                    eprintln!("[codemux::state] Failed to persist layout state on exit: {error}");
+                }
+                if let Err(error) = active_workspace_persistence::finish_persistence(app) {
                     eprintln!("[codemux::selection] shutdown flush failed: {error}");
                 }
                 // A graceful run-loop exit is not a renderer crash: disarm the
@@ -641,7 +650,7 @@ fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
 fn build_core_app<R: tauri::Runtime>(
     builder: tauri::Builder<R>,
     mode: AppMode,
-    load_layout: impl FnOnce() -> Option<state::AppStateSnapshot> + Send + 'static,
+    startup_layout: Option<state::AppStateSnapshot>,
 ) -> tauri::Builder<R> {
     let builder = if mode == AppMode::ServeHeadless {
         builder.manage(web_remote::serve::ShutdownAdmission::default())
@@ -959,7 +968,7 @@ fn build_core_app<R: tauri::Runtime>(
             // a force-close cascade. See `scrollback::should_run_orphan_cleanup`
             // for the full failure-mode write-up.
             let mut layout_loaded = false;
-            if let Some(snapshot) = load_layout() {
+            if let Some(snapshot) = startup_layout {
                 let mut stripped = state::strip_removed_workspaces_from_snapshot(snapshot);
                 // The coalesced SQLite stream is authoritative for selection;
                 // layout.json remains authoritative for the pane/layout body.
@@ -3373,7 +3382,7 @@ pub fn build_headless_app() -> tauri::Result<tauri::App<tauri::test::MockRuntime
     let mut app = build_core_app(
         tauri::Builder::<tauri::test::MockRuntime>::new(),
         AppMode::ServeHeadless,
-        move || layout,
+        layout,
     )
     .build(app_context())?;
 
