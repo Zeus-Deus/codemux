@@ -1535,7 +1535,7 @@ fn detach_workspace<R: tauri::Runtime>(
     if let Err(error) = crate::workspaces_sync::record_closed(db, workspace_id) {
         eprintln!("[workspaces-sync] recording the close failed (reconcile will retry): {error}");
     }
-    if let Err(error) = crate::workspaces_sync::reconcile_from_snapshot(db, &state.snapshot()) {
+    if let Err(error) = crate::workspaces_sync::reconcile_from_state(db, state) {
         eprintln!(
             "[workspaces-sync] reconcile after close failed (will \
              retry on next background tick): {error}"

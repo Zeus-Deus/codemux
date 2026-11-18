@@ -268,11 +268,7 @@ pub async fn workspaces_sync_now<R: tauri::Runtime>(
         let db_state: tauri::State<'_, DatabaseStore> = app.state();
         let app_state: tauri::State<'_, crate::state::AppStateStore> =
             app.state();
-        let snapshot = app_state.snapshot();
-        crate::workspaces_sync::reconcile_from_snapshot(
-            db_state.inner(),
-            &snapshot,
-        )?;
+        crate::workspaces_sync::reconcile_from_state(db_state.inner(), app_state.inner())?;
     }
     crate::workspaces_sync::try_sync_with_app(&app).await
 }

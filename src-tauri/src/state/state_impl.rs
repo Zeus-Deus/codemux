@@ -4585,6 +4585,13 @@ impl AppStateStore {
         self.inner.lock().unwrap().archived_workspaces.clone()
     }
 
+    /// The ids of every workspace in state right now, without cloning the
+    /// rest of it.
+    pub fn workspace_ids(&self) -> std::collections::HashSet<String> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot.workspaces.iter().map(|w| w.workspace_id.0.clone()).collect()
+    }
+
     /// Clone of the live workspace with `workspace_id`, if any — the
     /// narrow sibling of `snapshot()` for single-workspace lookups.
     pub fn find_workspace(&self, workspace_id: &str) -> Option<WorkspaceSnapshot> {
@@ -7756,18 +7763,37 @@ fn publish_durably(temporary: tempfile::NamedTempFile, path: &Path) -> Result<()
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: make the next directory sync on this thread fail.
+    static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Commit a directory's entries to disk (Unix).
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DIR_SYNC.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
+    fs::File::open(dir)?.sync_all()
+}
+
 /// Move `from` to `to` without replacing anything already at `to`, and make
 /// it durable before returning. The entry itself moves, so a link stays a
 /// link.
 fn move_no_clobber_durably(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        // A hard link fails if `to` exists; then the old name is dropped.
-        // Should that fail, `to` still holds the same file.
+        // A hard link fails if `to` exists. It is made durable before the old
+        // name is dropped, so a crash or a failed sync never leaves the file
+        // with neither name; should dropping it fail, `to` still holds the
+        // same file.
         fs::hard_link(from, to)?;
-        let _ = fs::remove_file(from);
         let dir = to.parent().ok_or_else(|| std::io::Error::other("no folder"))?;
-        fs::File::open(dir)?.sync_all()
+        sync_dir(dir)?;
+        let _ = fs::remove_file(from);
+        sync_dir(dir)
     }
     #[cfg(windows)]
     {
@@ -14233,6 +14259,20 @@ mod persisted_layout_tests {
         ] {
             assert!(!is_aside_name("layout.json", bad), "{bad}");
         }
+    }
+
+    // Unix only: the directory sync is a Unix step.
+    #[cfg(unix)]
+    #[test]
+    fn the_layout_keeps_its_name_until_its_copy_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let aside = dir.path().join("layout.json.unreadable-1-0123abcd");
+        fs::write(&path, "broken layout").unwrap();
+
+        FAIL_DIR_SYNC.with(|fail| fail.set(true));
+        assert!(move_no_clobber_durably(&path, &aside).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "broken layout", "the original is still in place");
     }
 
     #[test]

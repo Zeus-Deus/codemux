@@ -558,28 +558,35 @@ pub fn record_closed(db: &DatabaseStore, workspace_id: &str) -> Result<(), Strin
     db.soft_delete_workspace_sync_by_workspace_id(workspace_id)
 }
 
-/// Orders reconciles by when their snapshot was taken: a ticket is drawn on
-/// entry, straight after the caller's `snapshot()` and before the slow Git
-/// reads, and under the lock a pass older than one already applied is
-/// stale and skipped — it would otherwise infer closes from a past state.
-static NEXT_TICKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static LAST_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn take_ticket() -> u64 {
-    NEXT_TICKET.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
-}
-
+/// Mirror `snapshot` into the sync table. Only the workspaces in the
+/// snapshot count as present, so a row is deleted when its workspace is
+/// missing from it. Production code calls [`reconcile_from_state`], which
+/// also checks current state before deleting.
 pub fn reconcile_from_snapshot(
     db: &DatabaseStore,
     snapshot: &AppStateSnapshot,
 ) -> Result<(), String> {
-    reconcile_with_ticket(db, snapshot, take_ticket())
+    reconcile_inner(db, snapshot, &|| HashSet::new())
 }
 
-fn reconcile_with_ticket(
+/// Take a snapshot of `state` and mirror it. A pass can be delayed anywhere —
+/// after taking its snapshot, or in the Git reads — while a newer pass
+/// publishes a workspace opened meanwhile; so before deleting anything,
+/// under the lock, it also reads which workspaces exist now, and deletes a
+/// row only when its workspace is in neither. A stale pass can at worst
+/// write a workspace's older details, which the next one corrects.
+pub fn reconcile_from_state(
+    db: &DatabaseStore,
+    state: &crate::state::AppStateStore,
+) -> Result<(), String> {
+    let snapshot = state.snapshot();
+    reconcile_inner(db, &snapshot, &|| state.workspace_ids())
+}
+
+fn reconcile_inner(
     db: &DatabaseStore,
     snapshot: &AppStateSnapshot,
-    ticket: u64,
+    current_ids: &dyn Fn() -> HashSet<String>,
 ) -> Result<(), String> {
     // Git first, outside the lock: a slow repository must not hold up a
     // close being recorded.
@@ -601,10 +608,6 @@ fn reconcile_with_ticket(
         .collect();
 
     let _serialised = lock(&RECONCILE_LOCK);
-    if ticket < LAST_APPLIED.load(std::sync::atomic::Ordering::SeqCst) {
-        return Ok(());
-    }
-    LAST_APPLIED.store(ticket, std::sync::atomic::Ordering::SeqCst);
     let recovering = crate::state::layout_recovery_pending();
     let closed = if recovering {
         persist_unsaved_closes(db);
@@ -758,9 +761,10 @@ fn reconcile_with_ticket(
         }
         return Ok(());
     }
+    let present_now = current_ids();
     for row in &sync_rows {
         if let Some(wid) = &row.workspace_id {
-            if !live_wids.contains(wid) {
+            if !live_wids.contains(wid) && !present_now.contains(wid) {
                 if let Err(error) =
                     db.soft_delete_workspace_sync_by_workspace_id(wid)
                 {
@@ -1318,15 +1322,15 @@ mod tests {
     #[serial]
     fn a_reconcile_from_an_older_snapshot_never_undoes_a_newer_one() {
         let db = fresh_db();
-        // The old pass took its snapshot (with no new workspace) and then
-        // stalled in Git while a newer pass published a new workspace.
-        let stale_ticket = super::take_ticket();
+        // A newer pass published a workspace opened after the old pass took
+        // its snapshot; the old pass, delayed anywhere since, then runs.
         super::reconcile_from_snapshot(&db, &make_snapshot(vec![make_ws("ws-after-stale", "new")])).unwrap();
-        super::reconcile_with_ticket(&db, &make_snapshot(Vec::new()), stale_ticket).unwrap();
+        let now: std::collections::HashSet<String> = ["ws-after-stale".to_string()].into();
+        super::reconcile_inner(&db, &make_snapshot(Vec::new()), &|| now.clone()).unwrap();
 
         assert!(
             db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some("ws-after-stale")),
-            "the stale pass must not delete what the newer one published"
+            "the stale pass must not delete a workspace that exists now"
         );
     }
 

@@ -2637,10 +2637,9 @@ fn build_core_app<R: tauri::Runtime>(
                         sync_handle.state();
                     let db: tauri::State<'_, database::DatabaseStore> =
                         sync_handle.state();
-                    let snapshot = app_state.snapshot();
-                    if let Err(error) = workspaces_sync::reconcile_from_snapshot(
+                    if let Err(error) = workspaces_sync::reconcile_from_state(
                         db.inner(),
-                        &snapshot,
+                        app_state.inner(),
                     ) {
                         eprintln!(
                             "[codemux::workspaces-sync] reconcile failed: {error}"
