@@ -25,6 +25,7 @@ npm run tauri:dev
 
 - **Rust 1.75+** via [rustup](https://rustup.rs): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - **Node.js 20+** with npm
+- **Bun 1.3.12** for building the desktop sidecars. The build checks this exact version.
 - **Tauri CLI** installed automatically as an npm devDependency (`@tauri-apps/cli`)
 
 ### System Libraries

@@ -82,6 +82,9 @@ From another device, run the same `codemux mcp` over SSH, or turn on **Settings 
 git clone https://github.com/Zeus-Deus/codemux.git
 cd codemux
 
+# Check build prerequisites
+bash scripts/check-deps.sh
+
 # Install dependencies
 npm install
 
@@ -92,7 +95,7 @@ npm run tauri:dev
 npm run tauri:build
 ```
 
-**System dependencies:** Rust, Node.js, and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your distro.
+**System dependencies:** Rust, Node.js, Bun 1.3.12 for the desktop sidecars, and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your distro.
 
 ## License
 

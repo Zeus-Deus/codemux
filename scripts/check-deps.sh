@@ -112,6 +112,18 @@ else
     fail "npm not found"
 fi
 
+# The desktop build prepares both bundled Bun sidecars before starting Vite.
+if command -v bun &>/dev/null; then
+    bun_ver=$(bun --version)
+    if [ "$bun_ver" = "1.3.12" ]; then
+        pass "bun $bun_ver"
+    else
+        fail "bun $bun_ver (need exactly 1.3.12 for the desktop sidecars)"
+    fi
+else
+    fail "bun not found (need 1.3.12 for the desktop sidecars)"
+fi
+
 # git
 if command -v git &>/dev/null; then
     pass "git $(git --version | awk '{print $3}')"
