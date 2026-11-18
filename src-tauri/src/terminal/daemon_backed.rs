@@ -215,6 +215,7 @@ const HYDRATION_CONCURRENCY: usize = 4;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DaemonHydrationFailure {
     AlreadyReserved,
+    RequiresGuardedRecovery,
     SafeToFallback(String),
     Ambiguous(String),
 }
@@ -233,6 +234,9 @@ impl std::fmt::Display for DaemonHydrationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AlreadyReserved => f.write_str("session already reserved by another spawn"),
+            Self::RequiresGuardedRecovery => {
+                f.write_str("update the terminal daemon on its host before retrying this shell")
+            }
             Self::SafeToFallback(message) | Self::Ambiguous(message) => f.write_str(message),
         }
     }
@@ -421,6 +425,15 @@ pub(super) async fn hydrate_workspace_via_daemon<R: Runtime>(
         }
     };
 
+    if let [(session, DaemonSpawnClaim::Restart(reservation))] = pending.as_slice() {
+        if reservation.pane_closed() {
+            if let Some(shell_id) = reservation.closed_pane_shell_id() {
+                close_recovered_daemon_shell(&app, &workspace, &client, &session.session_id, shell_id).await;
+            }
+            return Ok(Vec::new());
+        }
+    }
+
     let list_started = std::time::Instant::now();
     let listed = list_daemon_session_map(&client).await;
     crate::diagnostics::record_perf_timing("pty.daemon-list", list_started.elapsed());
@@ -579,16 +592,24 @@ async fn spawn_prepared_session<R: Runtime>(
     };
     let restart_token = reservation.restart_token;
     let reconciling = reservation.reconciliation.is_some();
+    if !reservation.is_current() {
+        if let Some(shell_id) = reservation.closed_pane_shell_id() {
+            close_recovered_daemon_shell(&app, &workspace, &client, &session_id, shell_id).await;
+        }
+        return Err(DaemonHydrationFailure::AlreadyReserved);
+    }
     let reattached = existing.is_some();
-    let shell_id = if !reconciling || !client.supports_guarded_shells() {
-        None
-    } else if let Some(existing) = &existing {
-        existing.shell_id
-    } else {
-        // Choose the identity before Spawn so cleanup can target it even
-        // when the daemon accepted the request but its reply was lost.
-        Some(Uuid::new_v4())
+    let shell_id = match (&existing, client.supports_guarded_shells()) {
+        (Some(existing), true) => existing.shell_id,
+        // Know the shell identity before Spawn, even if its reply is lost.
+        (None, true) => Some(Uuid::new_v4()),
+        (_, false) => None,
     };
+    if reconciling && shell_id.is_none() {
+        // Recovery can outlive the pane. Require an identity that lets us
+        // retire this exact shell if the pane closes while an RPC is pending.
+        return Err(DaemonHydrationFailure::RequiresGuardedRecovery);
+    }
     let close_if_requested = || async {
         if reservation.pane_closed() {
             if let Some(shell_id) = shell_id {
@@ -596,12 +617,6 @@ async fn spawn_prepared_session<R: Runtime>(
             }
         }
     };
-    if !reservation.is_current() {
-        if reattached {
-            close_if_requested().await;
-        }
-        return Err(DaemonHydrationFailure::AlreadyReserved);
-    }
     let workspace_id = workspace.workspace_id.clone();
     let host_id = workspace.host_id;
     let is_remote = host_id.is_some();

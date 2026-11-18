@@ -712,7 +712,6 @@ describe("TerminalPane exited shell", () => {
     vi.stubGlobal("__TAURI_INTERNALS__", { unregisterCallback });
     h.status = { state: "exited", message: "Shell exited with code 2", exit_code: 2 };
     h.sessionState = "exited";
-    h.restartToken = undefined;
     const view = renderPane("sess-a");
     await act(async () => {});
 
@@ -727,7 +726,7 @@ describe("TerminalPane exited shell", () => {
     });
 
     expect(h.log).toContain("restart");
-    expect(restartTerminalSession).toHaveBeenCalledExactlyOnceWith("sess-a", undefined);
+    expect(restartTerminalSession).toHaveBeenCalledExactlyOnceWith("sess-a", "original-shell");
     // The respawned runtime has no subscribers, so the pane attaches again.
     expect(attachPtyOutput).toHaveBeenCalledTimes(2);
     const second = vi.mocked(attachPtyOutput).mock.calls[1][1].id;
@@ -736,6 +735,24 @@ describe("TerminalPane exited shell", () => {
     expect(h.terminals).toHaveLength(1);
     view.unmount();
     expect(unregisterCallback.mock.calls).toEqual([[first], [second]]);
+  });
+
+  it("requires a host lifecycle token for a deferred restart", async () => {
+    schedulerHarness();
+    h.status = { state: "exited", message: null, exit_code: 0 };
+    h.sessionState = "exited";
+    h.restartToken = undefined;
+    let finishAttach!: (generation: number) => void;
+    vi.mocked(attachPtyOutput).mockReturnValueOnce(new Promise(resolve => { finishAttach = resolve; }));
+    const view = renderPane("sess-a");
+    await act(async () => {});
+
+    fireEvent.click(view.getByRole("button", { name: "Restart shell" }));
+    expect(restartTerminalSession).not.toHaveBeenCalled();
+    await act(async () => finishAttach(1));
+
+    expect(restartTerminalSession).not.toHaveBeenCalled();
+    expect(view.getByText(/Update Codemux on the host to restart this shell safely/)).toBeTruthy();
   });
 
   it("supersedes the mount attach while its scrollback is still parsing", async () => {

@@ -1101,13 +1101,9 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
           if (remoteViewHost() !== host) return null;
           if (status.state !== "exited" && status.state !== "failed") return false;
           expectedToken = status.restart_token;
-          if (expectedToken === undefined) {
-            // Older hosts lack a token. Recheck the live state just before
-            // making their unguarded restart call.
-            const current = await getTerminalStatus(sid);
-            if (remoteViewHost() !== host) return null;
-            if (current.state !== "exited" && current.state !== "failed") return false;
-          }
+        }
+        if (!expectedToken) {
+          throw new Error("Update Codemux on the host to restart this shell safely.");
         }
         const { appState } = useAppStore.getState();
         // A closed session may disappear while its pane's IPC drains.

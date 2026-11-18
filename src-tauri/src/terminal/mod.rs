@@ -272,9 +272,8 @@ pub struct SessionRuntime {
     pub is_spawning: bool,
     /// Rotated under the sessions lock whenever a spawn claims this id.
     restart_token: Uuid,
-    /// A disconnected daemon may still own the shell. A pane close sets this
-    /// flag under the sessions lock so the in-flight recovery can retire it.
-    daemon_reconciliation: Option<Arc<AtomicBool>>,
+    /// Shared with the restart attempt before it starts daemon RPCs.
+    daemon_reconciliation: Option<Arc<DaemonReconciliation>>,
     /// Set when this session is owned by the `codemux pty-daemon` process
     /// instead of the in-process portable-pty path. The PID stored in
     /// `child_pid` belongs to a process the daemon spawned — NOT a direct
@@ -305,6 +304,12 @@ pub struct SessionRuntime {
     pub daemon_client: Option<Arc<crate::pty_daemon::PtyDaemonClient>>,
     #[cfg(unix)]
     daemon_shell_id: Option<Uuid>,
+}
+
+struct DaemonReconciliation {
+    pane_closed: AtomicBool,
+    #[cfg(unix)]
+    original_shell_id: Option<Uuid>,
 }
 
 impl SessionRuntime {
@@ -412,8 +417,8 @@ fn remove_session_runtime(
     let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
     let removed = guard.remove(session_id)?;
     if close_pane {
-        if let Some(close_requested) = &removed.daemon_reconciliation {
-            close_requested.store(true, Ordering::Release);
+        if let Some(reconciliation) = &removed.daemon_reconciliation {
+            reconciliation.pane_closed.store(true, Ordering::Release);
         }
     }
     Some(removed)
@@ -488,7 +493,7 @@ struct SessionSpawnReservation {
     session_id: String,
     restart_token: Uuid,
     #[cfg(unix)]
-    reconciliation: Option<Arc<AtomicBool>>,
+    reconciliation: Option<Arc<DaemonReconciliation>>,
     remove_on_drop: bool,
     committed: bool,
 }
@@ -561,7 +566,20 @@ impl SessionSpawnReservation {
                 return None;
             }
         }
+        #[cfg(unix)]
+        let reconciliation = current.and_then(|runtime| {
+            runtime.daemon_reconciliation.clone().or_else(|| {
+                runtime.persistent.then(|| Arc::new(DaemonReconciliation {
+                    pane_closed: AtomicBool::new(false),
+                    original_shell_id: runtime.daemon_shell_id,
+                }))
+            })
+        });
         let mut replacement = SessionRuntime::new(session_id);
+        #[cfg(unix)]
+        {
+            replacement.daemon_reconciliation = reconciliation.clone();
+        }
         let restart_token = replacement.reserve_spawn().expect("fresh runtime is idle");
         if let Some(runtime) = guard.get_mut(session_id) {
             // Viewers own their subscriptions across shell lifetimes. Move
@@ -576,7 +594,7 @@ impl SessionSpawnReservation {
             session_id: session_id.to_string(),
             restart_token,
             #[cfg(unix)]
-            reconciliation: None,
+            reconciliation,
             remove_on_drop: true,
             committed: false,
         }, old))
@@ -588,6 +606,7 @@ impl SessionSpawnReservation {
                 return false;
             }
             runtime.is_spawning = false;
+            runtime.daemon_reconciliation = None;
             true
         });
         self.commit();
@@ -596,39 +615,37 @@ impl SessionSpawnReservation {
 
     #[cfg(unix)]
     fn pane_closed(&self) -> bool {
-        self.reconciliation.as_ref().is_some_and(|close_requested| {
-            close_requested.load(Ordering::Acquire)
+        self.reconciliation.as_ref().is_some_and(|reconciliation| {
+            reconciliation.pane_closed.load(Ordering::Acquire)
         })
     }
 
     #[cfg(unix)]
-    fn retain_for_daemon_reconciliation(&mut self) -> bool {
-        let close_requested = Arc::new(AtomicBool::new(false));
-        let retained = with_existing_session_runtime(&self.sessions, &self.session_id, |runtime| {
-            if runtime.restart_token != self.restart_token {
-                return false;
-            }
-            runtime.daemon_reconciliation = Some(close_requested.clone());
-            true
-        }).unwrap_or(false);
-        if retained {
-            self.reconciliation = Some(close_requested);
-            self.remove_on_drop = false;
-        }
-        retained
+    fn closed_pane_shell_id(&self) -> Option<Uuid> {
+        self.reconciliation.as_ref().and_then(|reconciliation| {
+            reconciliation.pane_closed.load(Ordering::Acquire)
+                .then_some(reconciliation.original_shell_id)
+                .flatten()
+        })
     }
 
     #[cfg(unix)]
-    fn restore_after_failed_close(mut self, mut old: SessionRuntime) {
-        with_existing_session_runtime(&self.sessions, &self.session_id, |runtime| {
-            if runtime.restart_token == self.restart_token {
-                old.output_subscribers.append(&mut runtime.output_subscribers);
-                recompute_flow_paused(&old);
-                *runtime = old;
+    fn restore_after_failed_close(&mut self, mut old: SessionRuntime) -> bool {
+        let restored = with_existing_session_runtime(&self.sessions, &self.session_id, |runtime| {
+            if runtime.restart_token != self.restart_token {
+                return false;
             }
-        });
-        self.commit();
+            old.output_subscribers.append(&mut runtime.output_subscribers);
+            recompute_flow_paused(&old);
+            *runtime = old;
+            true
+        }).unwrap_or(false);
+        if restored {
+            self.commit();
+        }
+        restored
     }
+
 }
 
 impl Drop for SessionSpawnReservation {
@@ -1983,7 +2000,9 @@ fn daemon_spawn_failure_status(
     error: daemon_backed::DaemonHydrationFailure,
     is_remote: bool,
 ) -> TerminalStatusPayload {
-    let message = if is_remote {
+    let message = if matches!(error, daemon_backed::DaemonHydrationFailure::RequiresGuardedRecovery) {
+        error.to_string()
+    } else if is_remote {
         format!(
             "Couldn't reach the remote host: {error}. Try Test Connection in \
              Settings → Connections → Devices, or right-click → Pull back."
@@ -2905,10 +2924,12 @@ pub async fn restart_terminal_session<R: Runtime>(
 ) -> Result<bool, String> {
     let expected = expected_restart_token.as_deref().map(Uuid::parse_str).transpose()
         .map_err(|_| "Invalid terminal restart token".to_string())?;
-    if expected.is_some() && app.state::<AppStateStore>().pty_hydration_plan_for_session(&session_id).is_none() {
+    // Keep the daemon route even if closing the pane removes its layout entry
+    // while the old connection is still handling Close.
+    let Some(plan) = app.state::<AppStateStore>().pty_hydration_plan_for_session(&session_id) else {
         return Ok(false);
-    }
-    let Some((reservation, old)) = SessionSpawnReservation::for_restart(&terminal_state.sessions, &session_id, expected) else {
+    };
+    let Some((mut reservation, old)) = SessionSpawnReservation::for_restart(&terminal_state.sessions, &session_id, expected) else {
         return Ok(false);
     };
     #[cfg(unix)]
@@ -2936,9 +2957,10 @@ pub async fn restart_terminal_session<R: Runtime>(
                     },
                     Err(_) if client.is_closed() => {}
                     Err(error) => {
-                        reservation.restore_after_failed_close(runtime);
-                        forward_flow_control_to_daemon(&terminal_state.sessions, &session_id);
-                        return Err(error.to_string());
+                        if reservation.restore_after_failed_close(runtime) {
+                            forward_flow_control_to_daemon(&terminal_state.sessions, &session_id);
+                            return Err(error.to_string());
+                        }
                     }
                 }
             }
@@ -2949,15 +2971,12 @@ pub async fn restart_terminal_session<R: Runtime>(
         #[cfg(not(unix))]
         terminate_removed_session(runtime, &session_id);
     }
-    let Some(plan) = app.state::<AppStateStore>().pty_hydration_plan_for_session(&session_id) else {
-        return Ok(false);
-    };
     #[cfg(unix)]
     if reconcile_daemon {
-        let mut reservation = reservation;
-        if !reservation.retain_for_daemon_reconciliation() {
+        if !reservation.is_current() && !reservation.pane_closed() {
             return Ok(false);
         }
+        reservation.remove_on_drop = false;
         let token = reservation.restart_token;
         let is_remote = plan.workspace.host_id.is_some();
         let result = daemon_backed::hydrate_workspace_via_daemon(app.clone(), plan, Some(reservation)).await;
@@ -2977,7 +2996,9 @@ pub async fn restart_terminal_session<R: Runtime>(
         return Ok(false);
     }
     let _ = plan;
-    if !reservation.release_for_spawn() {
+    if app.state::<AppStateStore>().pty_hydration_plan_for_session(&session_id).is_none()
+        || !reservation.release_for_spawn()
+    {
         return Ok(false);
     }
     spawn_pty_for_session(app, session_id);
@@ -6294,8 +6315,11 @@ mod tests {
     fn restart_guard_keeps_reconciliation_daemon_only() {
         let sessions = make_spawn_sessions();
         let id = "disconnected-daemon";
+        with_session_runtime(&sessions, id, || SessionRuntime::new(id), |runtime| {
+            runtime.persistent = true;
+        });
         let (mut restart, _) = SessionSpawnReservation::for_restart(&sessions, id, None).unwrap();
-        assert!(restart.retain_for_daemon_reconciliation());
+        restart.remove_on_drop = false;
         drop(restart);
         assert!(try_reserve_session_spawn(&sessions, id).is_none());
         {
@@ -6322,7 +6346,7 @@ mod tests {
         set_pty_flow_paused(&sessions, id, Some(leaving), true);
         set_pty_flow_paused(&sessions, id, Some(staying), true);
 
-        let (restart, old) = SessionSpawnReservation::for_restart(&sessions, id, Some(token)).unwrap();
+        let (mut restart, old) = SessionSpawnReservation::for_restart(&sessions, id, Some(token)).unwrap();
         let old = old.unwrap();
         assert!(old.output_subscribers.is_empty());
         with_existing_session_runtime(&sessions, id, |runtime| {
@@ -6332,7 +6356,7 @@ mod tests {
 
         detach_subscriber(&sessions, id, leaving);
         let joining = attach_subscriber(&sessions, id, Channel::new(|_| Ok(())));
-        restart.restore_after_failed_close(old);
+        assert!(restart.restore_after_failed_close(old));
         with_existing_session_runtime(&sessions, id, |runtime| {
             let subscribers: Vec<_> = runtime.output_subscribers.iter()
                 .map(|subscriber| (subscriber.generation, subscriber.flow_paused))
@@ -6352,7 +6376,7 @@ mod tests {
         if crate::test_isolation::isolated(TEST) {
             return;
         }
-        assert_daemon_reconnect(None);
+        assert_daemon_reconnect(ReconnectCase::Resume);
     }
 
     #[cfg(unix)]
@@ -6362,7 +6386,7 @@ mod tests {
         if crate::test_isolation::isolated(TEST) {
             return;
         }
-        assert_daemon_reconnect(Some(ReconnectClose::Attach));
+        assert_daemon_reconnect(ReconnectCase::CloseOnAttach);
     }
 
     #[cfg(unix)]
@@ -6372,18 +6396,52 @@ mod tests {
         if crate::test_isolation::isolated(TEST) {
             return;
         }
-        assert_daemon_reconnect(Some(ReconnectClose::Spawn));
+        assert_daemon_reconnect(ReconnectCase::CloseOnSpawn);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_guard_closes_the_original_shell_after_the_first_close_disconnects() {
+        const TEST: &str = "terminal::tests::restart_guard_closes_the_original_shell_after_the_first_close_disconnects";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        assert_daemon_reconnect(ReconnectCase::CloseOnOldConnection);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_guard_sends_no_legacy_attach_when_the_pane_closes() {
+        const TEST: &str = "terminal::tests::restart_guard_sends_no_legacy_attach_when_the_pane_closes";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        assert_daemon_reconnect(ReconnectCase::LegacyClose);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_guard_surfaces_the_upgrade_required_for_a_legacy_daemon() {
+        const TEST: &str = "terminal::tests::restart_guard_surfaces_the_upgrade_required_for_a_legacy_daemon";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        assert_daemon_reconnect(ReconnectCase::LegacyOpen);
     }
 
     #[cfg(unix)]
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum ReconnectClose {
-        Attach,
-        Spawn,
+    enum ReconnectCase {
+        Resume,
+        CloseOnAttach,
+        CloseOnSpawn,
+        CloseOnOldConnection,
+        LegacyClose,
+        LegacyOpen,
     }
 
     #[cfg(unix)]
-    fn assert_daemon_reconnect(close_at: Option<ReconnectClose>) {
+    fn assert_daemon_reconnect(case: ReconnectCase) {
         let root = crate::test_isolation::isolated_root().unwrap();
 
         tokio::runtime::Builder::new_current_thread()
@@ -6409,18 +6467,68 @@ mod tests {
                     let layout_state = app.state::<AppStateStore>();
                     let id = layout_state.active_terminal_session_id().unwrap().0;
                     let workspace_id = layout_state.snapshot().active_workspace_id.0;
-                    if close_at.is_some() {
+                    let closes = !matches!(case, ReconnectCase::Resume | ReconnectCase::LegacyOpen);
+                    let legacy = matches!(case, ReconnectCase::LegacyClose | ReconnectCase::LegacyOpen);
+                    if closes {
                         let plan = layout_state.pty_hydration_plan_for_session(&id).unwrap();
                         let pane_id = plan.sessions[0].pane_id.as_deref().unwrap();
                         layout_state.split_pane(pane_id, state::SplitDirection::Horizontal).unwrap();
                     }
 
+                    let daemon_pid = std::process::id();
+                    let version = env!("CARGO_PKG_VERSION").to_string();
+                    let survivor_shell_id = Uuid::new_v4();
+                    let close_app = app.handle().clone();
+                    let close_pane = move |session_id: String| {
+                        close_terminal_session(
+                            close_app.clone(), close_app.state(), close_app.state(), session_id, None,
+                        ).unwrap();
+                    };
                     let (old_stream, old_peer) = UnixStream::pair().unwrap();
                     let old = PtyDaemonClient::from_test_stream(old_stream, Duration::from_secs(1));
-                    drop(old_peer);
-                    while !old.is_closed() {
-                        tokio::task::yield_now().await;
-                    }
+                    let old_daemon = if case == ReconnectCase::CloseOnOldConnection {
+                        let close_pane = close_pane.clone();
+                        let version = version.clone();
+                        let old_id = id.clone();
+                        let task = tokio::spawn(async move {
+                            let (read, mut write) = old_peer.into_split();
+                            let mut lines = BufReader::new(read).lines();
+                            let hello = lines.next_line().await.unwrap().unwrap();
+                            let ClientRequest::Hello { request_id } = serde_json::from_str(&hello).unwrap() else {
+                                panic!("expected the original daemon handshake");
+                            };
+                            let hello = ServerResponse::Hello {
+                                request_id,
+                                protocol_version: PROTOCOL_VERSION,
+                                daemon_pid,
+                                daemon_version: version,
+                                host_claude_plugin: false,
+                                guarded_shells: true,
+                            };
+                            let mut frame = serde_json::to_vec(&Frame::Response(hello)).unwrap();
+                            frame.push(b'\n');
+                            write.write_all(&frame).await.unwrap();
+
+                            let request = lines.next_line().await.unwrap().unwrap();
+                            let ClientRequest::CloseOwned { session_id, shell_id, .. } =
+                                serde_json::from_str(&request).unwrap()
+                            else {
+                                panic!("expected CloseOwned on the original connection");
+                            };
+                            assert_eq!(session_id, old_id);
+                            assert_eq!(shell_id, survivor_shell_id);
+                            close_pane(session_id);
+                            // Drop the old connection before acting on Close.
+                        });
+                        old.hello().await.unwrap();
+                        Some(task)
+                    } else {
+                        drop(old_peer);
+                        while !old.is_closed() {
+                            tokio::task::yield_now().await;
+                        }
+                        None
+                    };
                     let pty_state = app.state::<PtyState>();
                     let old_token = try_reserve_session_spawn(&pty_state.sessions, &id).unwrap();
                     with_existing_session_runtime(&pty_state.sessions, &id, |runtime| {
@@ -6428,11 +6536,12 @@ mod tests {
                         runtime.persistent = true;
                         runtime.writer = Some(Box::new(std::io::sink()));
                         runtime.daemon_client = Some(old);
+                        runtime.daemon_shell_id = (!legacy).then_some(survivor_shell_id);
                         runtime.last_status.state = TerminalLifecycleState::Exited;
                     });
 
                     let mut viewers = Vec::new();
-                    if close_at.is_none() {
+                    if case == ReconnectCase::Resume {
                         for _ in 0..2 {
                             let (output, receive) = tokio::sync::mpsc::unbounded_channel();
                             let channel = Channel::new(move |body| {
@@ -6444,12 +6553,9 @@ mod tests {
                         }
                     }
 
-                    let daemon_pid = std::process::id();
                     let shell_pid = 4242;
-                    let survivor_shell_id = Uuid::new_v4();
                     let socket_path = root.join("daemon.sock");
                     let listener = UnixListener::bind(&socket_path).unwrap();
-                    let version = env!("CARGO_PKG_VERSION").to_string();
                     write_manifest(&DaemonManifest {
                         pid: daemon_pid,
                         socket_path,
@@ -6459,21 +6565,17 @@ mod tests {
                     }).unwrap();
 
                     let surviving_id = id.clone();
-                    let close_app = app.handle().clone();
                     let (finish, finished) = tokio::sync::oneshot::channel();
                     let daemon = tokio::spawn(async move {
                         let (socket, _) = listener.accept().await.unwrap();
                         let (read, mut write) = socket.into_split();
                         let mut lines = BufReader::new(read).lines();
-                        let steps: &[&str] = match close_at {
-                            None => &["hello", "list", "attach"],
-                            Some(ReconnectClose::Attach) => &["hello", "list", "attach", "close"],
-                            Some(ReconnectClose::Spawn) => &["hello", "list", "spawn", "close"],
-                        };
-                        let close_pane = |session_id: String| {
-                            close_terminal_session(
-                                close_app.clone(), close_app.state(), close_app.state(), session_id, None,
-                            ).unwrap();
+                        let steps: &[&str] = match case {
+                            ReconnectCase::Resume => &["hello", "list", "attach"],
+                            ReconnectCase::CloseOnAttach => &["hello", "list", "attach", "close"],
+                            ReconnectCase::CloseOnSpawn => &["hello", "list", "spawn", "close"],
+                            ReconnectCase::CloseOnOldConnection => &["hello", "close"],
+                            ReconnectCase::LegacyClose | ReconnectCase::LegacyOpen => &["hello", "list"],
                         };
                         let mut owned_shell_id = survivor_shell_id;
                         let mut attachment_id = None;
@@ -6487,13 +6589,15 @@ mod tests {
                                     daemon_pid,
                                     daemon_version: version.clone(),
                                     host_claude_plugin: false,
-                                    guarded_shells: true,
+                                    guarded_shells: !legacy,
                                 },
-                                ("list", ClientRequest::List { request_id }) => ServerResponse::Listed {
-                                    request_id,
-                                    sessions: (close_at != Some(ReconnectClose::Spawn)).then(|| DaemonSessionInfo {
+                                ("list", ClientRequest::List { request_id }) => {
+                                    if case == ReconnectCase::LegacyClose {
+                                        close_pane(surviving_id.clone());
+                                    }
+                                    let sessions = (case != ReconnectCase::CloseOnSpawn).then(|| DaemonSessionInfo {
                                         session_id: surviving_id.clone(),
-                                        shell_id: Some(survivor_shell_id),
+                                        shell_id: (!legacy).then_some(survivor_shell_id),
                                         workspace_id: workspace_id.clone(),
                                         pid: shell_pid,
                                         argv: vec!["sh".into()],
@@ -6501,13 +6605,14 @@ mod tests {
                                         rows: 24,
                                         cols: 80,
                                         created_at: 0,
-                                    }).into_iter().collect(),
+                                    }).into_iter().collect();
+                                    ServerResponse::Listed { request_id, sessions }
                                 },
                                 ("attach", ClientRequest::AttachOwned { request_id, session_id, shell_id }) => {
                                     assert_eq!(session_id, surviving_id);
                                     assert_eq!(shell_id, owned_shell_id);
                                     attachment_id = Some(request_id);
-                                    if close_at == Some(ReconnectClose::Attach) {
+                                    if case == ReconnectCase::CloseOnAttach {
                                         close_pane(session_id.clone());
                                     }
                                     ServerResponse::Attached { request_id, session_id }
@@ -6529,7 +6634,7 @@ mod tests {
                             frame.push(b'\n');
                             write.write_all(&frame).await.unwrap();
                         }
-                        if close_at.is_none() {
+                        if case == ReconnectCase::Resume {
                             let update = Frame::Event(ServerEvent::Output {
                                 session_id: surviving_id,
                                 attachment_id,
@@ -6554,6 +6659,12 @@ mod tests {
                     ).await.unwrap();
                     assert!(!restarted, "reattaching must not report a restarted shell");
                     let runtime_exists = with_existing_session_runtime(&pty_state.sessions, &id, |runtime| {
+                        if case == ReconnectCase::LegacyOpen {
+                            assert!(matches!(runtime.last_status.state, TerminalLifecycleState::Failed));
+                            assert_eq!(runtime.last_status.message.as_deref(), Some("update the terminal daemon on its host before retrying this shell"));
+                            assert!(runtime.daemon_client.is_none());
+                            return;
+                        }
                         assert_eq!(runtime.child_pid, Some(shell_pid));
                         assert!(matches!(runtime.last_status.state, TerminalLifecycleState::Ready));
                         assert_ne!(runtime.restart_token, old_token);
@@ -6562,7 +6673,10 @@ mod tests {
                         assert_eq!(runtime.output_subscribers.iter().map(|viewer| viewer.generation).collect::<Vec<_>>(),
                             viewers.iter().map(|(generation, _)| *generation).collect::<Vec<_>>());
                     }).is_some();
-                    assert_eq!(runtime_exists, close_at.is_none());
+                    assert_eq!(runtime_exists, !closes);
+                    if let Some(old_daemon) = old_daemon {
+                        old_daemon.await.unwrap();
+                    }
                     for (_, mut receive) in viewers {
                         assert_eq!(receive.recv().await.unwrap(), b"\x18\x1bcrecovered output");
                     }
