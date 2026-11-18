@@ -199,6 +199,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   // Track props for closures
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
+  const previousVisibilityRef = useRef(visible);
 
   // ── Kitty protocol scanning ──
   const scanKittyProtocol = useCallback((data: Uint8Array | string) => {
@@ -1432,12 +1433,12 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
   useEffect(() => { void syncTerminalSize(); }, [phoneControl, mirrorSize?.cols, mirrorSize?.rows, syncTerminalSize]);
 
-  // Resizes are skipped while the pane is hidden, so a split or a panel change
-  // made then leaves the shell at its old width. Re-sync on the first frame
-  // the pane is shown again, before the next keystroke can wrap at the stale
-  // width.
+  // Startup sizes the PTY before attaching. Re-sync on a later reveal because
+  // splits or panel changes while the pane was hidden can leave a stale size.
   useEffect(() => {
-    if (!visible) return;
+    const becameVisible = visible && !previousVisibilityRef.current;
+    previousVisibilityRef.current = visible;
+    if (!becameVisible) return;
     const frame = requestAnimationFrame(() => {
       void syncTerminalSize();
     });

@@ -808,6 +808,13 @@ describe("TerminalPane exited shell", () => {
 
   it("waits for an issued mount resize before sizing the restarted PTY", async () => {
     schedulerHarness();
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.set(++nextFrame, callback);
+      return nextFrame;
+    });
+    vi.stubGlobal("cancelAnimationFrame", (frame: number) => frames.delete(frame));
     h.status = { state: "exited", message: null, exit_code: 0 };
     h.sessionState = "exited";
     let finishResize!: () => void;
@@ -823,11 +830,20 @@ describe("TerminalPane exited shell", () => {
     expect(attachPtyOutput).not.toHaveBeenCalled();
 
     await act(async () => finishResize());
+    // A busy renderer can paint its first frame after the replacement attaches.
+    await act(async () => {
+      const pending = [...frames.values()];
+      frames.clear();
+      for (const callback of pending) callback(performance.now());
+    });
     expect(h.log).toContain("restart");
     expect(vi.mocked(resizePty).mock.calls).toEqual([
       ["sess-a", 80, 24], ["sess-a", 100, 40],
     ]);
     expect(attachPtyOutput).toHaveBeenCalledOnce();
+    const replacementResize = vi.mocked(resizePty).mock.invocationCallOrder[1];
+    expect(vi.mocked(restartTerminalSession).mock.invocationCallOrder[0]).toBeLessThan(replacementResize);
+    expect(replacementResize).toBeLessThan(vi.mocked(attachPtyOutput).mock.invocationCallOrder[0]);
   });
 
   it("finishes a requested restart if the pane unmounts during attach", async () => {
