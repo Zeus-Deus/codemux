@@ -18,6 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 
 use crate::database::{AutomationRecord, AutomationRunRecord, DatabaseStore};
@@ -157,7 +158,7 @@ fn automation_repos_dir() -> Result<PathBuf, String> {
 fn repo_dir_name(remote_url: &str) -> String {
     let trimmed = remote_url.trim_end_matches('/');
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-    let segment = trimmed.rsplit(['/', ':']).next().unwrap_or("project");
+    let segment = trimmed.rsplit(['/', '\\', ':']).next().unwrap_or("project");
     let slug: String = segment
         .chars()
         .map(|c| {
@@ -198,8 +199,7 @@ fn resolve_repo(automation: &AutomationRecord) -> Result<ResolvedRepo, String> {
          remote to clone from. Pick a project that has a git remote."
             .to_string()
     })?;
-    let clone_dir = automation_repos_dir()?.join(repo_dir_name(remote));
-    ensure_clone(remote, &clone_dir)?;
+    let clone_dir = resolve_clone(remote, &automation_repos_dir()?)?;
     let base = default_remote_branch(&clone_dir)
         .unwrap_or_else(|| "origin/HEAD".to_string());
     Ok(ResolvedRepo {
@@ -208,11 +208,60 @@ fn resolve_repo(automation: &AutomationRecord) -> Result<ResolvedRepo, String> {
     })
 }
 
+fn clone_has_origin(clone_dir: &Path, remote: &str) -> bool {
+    if !clone_dir.join(".git").is_dir() {
+        return false;
+    }
+    let Ok(output) = crate::git::git_command()
+        .arg("-C")
+        .arg(clone_dir)
+        .args(["config", "--null", "--get-all", "remote.origin.url"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(origin) = std::str::from_utf8(&output.stdout) else {
+        return false;
+    };
+    let Some(origin) = origin.strip_suffix('\0').filter(|origin| !origin.contains('\0')) else {
+        return false;
+    };
+    if origin == remote {
+        return true;
+    }
+    // Git may normalize absolute paths when cloning from a local directory.
+    let (origin, remote) = (Path::new(origin), Path::new(remote));
+    origin.is_absolute()
+        && origin
+            .canonicalize()
+            .is_ok_and(|origin| remote.canonicalize().is_ok_and(|remote| origin == remote))
+}
+
+fn resolve_clone(remote: &str, repos_dir: &Path) -> Result<PathBuf, String> {
+    let name = repo_dir_name(remote);
+    let legacy = repos_dir.join(&name);
+    // Keep existing clones and their worktrees usable when their origin matches.
+    let clone_dir = if clone_has_origin(&legacy, remote) {
+        legacy
+    } else {
+        let digest = Sha256::digest(remote.as_bytes());
+        repos_dir.join(format!("{:.40}-{digest:x}", name))
+    };
+    ensure_clone(remote, &clone_dir)?;
+    Ok(clone_dir)
+}
+
 /// Clone `remote` into `clone_dir` if absent; otherwise `git fetch` it.
 /// Git authenticates with the host's own credentials — Codemux injects
 /// no token (matching Superset's clone behaviour).
 fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
     if clone_dir.join(".git").exists() {
+        if !clone_has_origin(clone_dir, remote) {
+            return Err("Automation checkout does not match the requested Git remote".into());
+        }
         let output = crate::git::git_command()
             .arg("-C")
             .arg(clone_dir)
@@ -227,13 +276,17 @@ fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
         }
         return Ok(());
     }
-    if let Some(parent) = clone_dir.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("Failed to create clone directory: {error}"))?;
-    }
+    let parent = clone_dir.parent().ok_or("Automation checkout has no parent directory")?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create clone directory: {error}"))?;
+    // Publish only a complete clone, so a retry or a concurrent run never
+    // mistakes a partially cloned directory for a usable Git checkout.
+    let staging = tempfile::tempdir_in(parent)
+        .map_err(|error| format!("Failed to create temporary clone directory: {error}"))?;
+    let staging_clone = staging.path().join("repo");
     let output = crate::git::git_command()
-        .args(["clone", remote])
-        .arg(clone_dir)
+        .args(["clone", "--", remote])
+        .arg(&staging_clone)
         .output()
         .map_err(|error| format!("Failed to run git clone: {error}"))?;
     if !output.status.success() {
@@ -241,6 +294,11 @@ fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
             "git clone failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
+    }
+    if let Err(error) = std::fs::rename(&staging_clone, clone_dir) {
+        if !clone_has_origin(clone_dir, remote) {
+            return Err(format!("Failed to move automation clone into place: {error}"));
+        }
     }
     Ok(())
 }
@@ -667,6 +725,34 @@ mod tests {
             base.as_deref().map(|b| b.starts_with("origin/")).unwrap_or(false),
             "expected origin/<branch>, got {base:?}"
         );
+    }
+
+    #[test]
+    fn remote_automations_keep_same_named_repositories_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first/repo");
+        let second = root.path().join("second/repo");
+        for (path, marker) in [(&first, "first.txt"), (&second, "second.txt")] {
+            std::fs::create_dir_all(path).unwrap();
+            git(path, &["init", "-q"]);
+            git(path, &["config", "user.email", "t@example.com"]);
+            git(path, &["config", "user.name", "Test"]);
+            std::fs::write(path.join(marker), marker).unwrap();
+            git(path, &["add", marker]);
+            git(path, &["commit", "-qm", "Add marker"]);
+        }
+        let first = first.to_str().unwrap();
+        let second = second.to_str().unwrap();
+        let cache = root.path().join("cache");
+        let legacy = cache.join("repo");
+        ensure_clone(first, &legacy).unwrap();
+
+        let second_clone = resolve_clone(second, &cache).unwrap();
+        assert_ne!(second_clone, legacy);
+        assert!(second_clone.join("second.txt").is_file());
+        assert_eq!(resolve_clone(second, &cache).unwrap(), second_clone);
+        assert_eq!(resolve_clone(first, &cache).unwrap(), legacy);
+        assert!(legacy.join("first.txt").is_file());
     }
 
     #[test]
