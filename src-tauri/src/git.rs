@@ -1986,11 +1986,10 @@ fn branch_held_by_rebase_or_bisect(repo_path: &Path, branch: &str) -> Result<boo
                 return Ok(true);
             }
         }
-        // `BISECT_START` names the branch bisect returns to, short form.
-        if let Some(start) = names(&dir.join("BISECT_START"))? {
-            if start == branch || start == full_ref {
-                return Ok(true);
-            }
+        // `BISECT_START` names the branch bisect returns to, in short form
+        // (git strips `refs/heads/`), so only the short name can match.
+        if names(&dir.join("BISECT_START"))?.as_deref() == Some(branch) {
+            return Ok(true);
         }
     }
     Ok(false)
