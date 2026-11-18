@@ -16,7 +16,8 @@
 
 use super::{
     emit_terminal_status_if_current, hydration_workspace_pty_env, queue_or_send_output_if_current,
-    with_existing_session_runtime, PtyState, SessionSpawnReservation, TerminalLifecycleState,
+    with_existing_session_runtime, DaemonReconciliation, PtyState, SessionSpawnReservation,
+    TerminalLifecycleState,
     TerminalStatusPayload, DEFAULT_COLS, DEFAULT_ROWS,
 };
 use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
@@ -24,6 +25,7 @@ use crate::state::{AppStateStore, PtyHydrationPlan, PtyHydrationSession, PtyHydr
 use futures_util::stream::StreamExt as _;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::{AppHandle, Manager, Runtime, State};
 use uuid::Uuid;
 
@@ -355,7 +357,7 @@ pub(super) async fn hydrate_workspace_via_daemon<R: Runtime>(
             .sessions
             .into_iter()
             .find(|session| session.session_id == reservation.session_id)
-            .filter(|_| reservation.is_current() || reservation.pane_closed())
+            .filter(|_| reservation.is_current())
             .map(|session| (session, DaemonSpawnClaim::Restart(reservation)))
             .into_iter()
             .collect(),
@@ -424,15 +426,6 @@ pub(super) async fn hydrate_workspace_via_daemon<R: Runtime>(
             return Err(classify_client_acquisition_failure(error));
         }
     };
-
-    if let [(session, DaemonSpawnClaim::Restart(reservation))] = pending.as_slice() {
-        if reservation.pane_closed() {
-            if let Some(shell_id) = reservation.closed_pane_shell_id() {
-                close_recovered_daemon_shell(&app, &workspace, &client, &session.session_id, shell_id).await;
-            }
-            return Ok(Vec::new());
-        }
-    }
 
     let list_started = std::time::Instant::now();
     let listed = list_daemon_session_map(&client).await;
@@ -593,9 +586,6 @@ async fn spawn_prepared_session<R: Runtime>(
     let restart_token = reservation.restart_token;
     let reconciling = reservation.reconciliation.is_some();
     if !reservation.is_current() {
-        if let Some(shell_id) = reservation.closed_pane_shell_id() {
-            close_recovered_daemon_shell(&app, &workspace, &client, &session_id, shell_id).await;
-        }
         return Err(DaemonHydrationFailure::AlreadyReserved);
     }
     let reattached = existing.is_some();
@@ -610,13 +600,6 @@ async fn spawn_prepared_session<R: Runtime>(
         // retire this exact shell if the pane closes while an RPC is pending.
         return Err(DaemonHydrationFailure::RequiresGuardedRecovery);
     }
-    let close_if_requested = || async {
-        if reservation.pane_closed() {
-            if let Some(shell_id) = shell_id {
-                close_recovered_daemon_shell(&app, &workspace, &client, &session_id, shell_id).await;
-            }
-        }
-    };
     let workspace_id = workspace.workspace_id.clone();
     let host_id = workspace.host_id;
     let is_remote = host_id.is_some();
@@ -891,6 +874,27 @@ async fn spawn_prepared_session<R: Runtime>(
         Some(restart_token),
     );
 
+    // A Claude typed in this shell must not find an entry an older build
+    // wrote above its folder (see `mcp_cleanup::before_launch`).
+    if !reattached && !is_remote {
+        crate::mcp_cleanup::before_launch(std::path::Path::new(&effective_cwd)).await;
+    }
+
+    // Publish the exact cleanup target before sending an effectful RPC.
+    // Closing the pane starts a separate worker that waits for this lock.
+    // Keeping it until install or failure orders cleanup after Spawn/Attach.
+    let cleanup_target = if let Some(recovery) = &reservation.reconciliation {
+        let mut target = recovery.target.lock().await;
+        if !reservation.is_current() {
+            return Err(DaemonHydrationFailure::AlreadyReserved);
+        }
+        target.shell_id = shell_id;
+        target.client = Some(client.clone());
+        Some(target)
+    } else {
+        None
+    };
+
     // Idempotent reattach decision comes from the workspace-level List. The
     // caller performs exactly one List and maps it before any pane tasks fan
     // out, so an eight-pane activation never sends eight identical RPCs.
@@ -906,11 +910,6 @@ async fn spawn_prepared_session<R: Runtime>(
             "[trace:{session_id}] DECISION=fresh_spawn at t={}ms",
             entry_ts.elapsed().as_millis()
         );
-        // A Claude typed in this shell must not find an entry an older build
-        // wrote above its folder (see `mcp_cleanup::before_launch`).
-        if !is_remote {
-            crate::mcp_cleanup::before_launch(std::path::Path::new(&effective_cwd)).await;
-        }
         if !reservation.is_current() {
             return Err(DaemonHydrationFailure::AlreadyReserved);
         }
@@ -929,7 +928,6 @@ async fn spawn_prepared_session<R: Runtime>(
     };
 
     if !reservation.is_current() {
-        close_if_requested().await;
         return Err(DaemonHydrationFailure::AlreadyReserved);
     }
     let pid = spawn_result.map_err(classify_spawn_rpc_failure)?;
@@ -940,12 +938,8 @@ async fn spawn_prepared_session<R: Runtime>(
     let mut rx = match attachment {
         Ok(rx) => rx,
         Err(error) => {
-            close_if_requested().await;
-            // Keep a successfully spawned daemon session alive. The reservation
-            // guard clears the local `is_spawning` marker on return, and a retry
-            // will discover this session through List and reattach idempotently.
-            // Sending a background Close here races that retry and can kill the
-            // shell immediately after the second attach succeeds.
+            // Keep a successfully spawned daemon session available for retry.
+            // The cleanup target survives the failure for an explicit close.
             return Err(classify_attach_rpc_failure(error));
         }
     };
@@ -989,9 +983,9 @@ async fn spawn_prepared_session<R: Runtime>(
         Some(super::recompute_flow_paused(runtime))
     }).flatten();
     let Some(flow_paused) = installed else {
-        close_if_requested().await;
         return Err(DaemonHydrationFailure::AlreadyReserved);
     };
+    drop(cleanup_target);
     reservation.commit();
     if flow_paused {
         super::forward_flow_control_to_daemon(&sessions, &session_id);
@@ -1163,28 +1157,67 @@ async fn spawn_prepared_session<R: Runtime>(
     Ok(())
 }
 
-async fn close_recovered_daemon_shell<R: Runtime>(
-    app: &AppHandle<R>,
-    workspace: &PtyHydrationWorkspace,
-    client: &PtyDaemonClient,
-    session_id: &str,
-    shell_id: Uuid,
+/// Retire the exact shell of an explicitly closed pane, even if hydration
+/// failed or was waiting for its workspace's daemon to reconnect.
+pub(super) fn queue_closed_pane_cleanup<R: Runtime>(
+    app: AppHandle<R>,
+    session_id: String,
+    recovery: Arc<DaemonReconciliation>,
 ) {
-    let mut result = client.close_owned(session_id.to_owned(), shell_id).await;
-    if result.is_err() && client.is_closed() {
-        // An interrupted Spawn may still have reached the daemon. The UUID
-        // also makes cleanup safe on the replacement socket.
-        result = match crate::ssh::client_for_workspace(app, &workspace.workspace_id, workspace.host_id).await {
-            Ok(client) if client.supports_guarded_shells() => {
-                client.close_owned(session_id.to_owned(), shell_id).await
-            }
-            Ok(_) => return,
-            Err(error) => Err(error),
+    tauri::async_runtime::spawn(async move {
+        let (shell_id, mut captured_client) = {
+            let target = recovery.target.lock().await;
+            (target.shell_id, target.client.clone())
         };
-    }
-    if let Err(error) = result {
-        eprintln!("[codemux::terminal] cleanup of closed pane {session_id} failed: {error}");
-    }
+        let Some(shell_id) = shell_id else { return };
+
+        let mut reacquired_client = false;
+        let mut delay = Duration::from_millis(250);
+        let result = tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let acquired = match captured_client.take().filter(|client| !client.is_closed()) {
+                    Some(client) => Ok(client),
+                    None => {
+                        reacquired_client = true;
+                        crate::ssh::client_for_workspace(
+                            &app, &recovery.workspace_id, recovery.host_id,
+                        ).await
+                    }
+                };
+                match acquired {
+                    Ok(client) if client.supports_guarded_shells() => {
+                        if client.close_owned(session_id.clone(), shell_id).await.is_ok() {
+                            return Ok(());
+                        }
+                        if !client.is_closed() {
+                            captured_client = Some(client);
+                        }
+                    }
+                    Ok(_) => return Err("the daemon does not support closing an exact shell"),
+                    Err(_) => {}
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+        }).await;
+        // A full workspace close can shut down its supervisor before this
+        // worker reconnects. Release any tunnel opened for cleanup alone.
+        if reacquired_client && recovery.host_id.is_some()
+            && app.state::<AppStateStore>().pty_hydration_plan_for_workspace(&recovery.workspace_id).is_none()
+        {
+            crate::ssh::forget_workspace_client(&recovery.workspace_id).await;
+            crate::ssh::shutdown_supervisor(&recovery.workspace_id).await;
+        }
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!(
+                "[codemux::terminal] cleanup of closed pane {session_id} failed: {error}"
+            ),
+            Err(_) => eprintln!(
+                "[codemux::terminal] cleanup of closed pane {session_id} timed out"
+            ),
+        }
+    });
 }
 
 /// Acknowledgement for one queued input write. Internal callers await it after

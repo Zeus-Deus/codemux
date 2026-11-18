@@ -1550,7 +1550,7 @@ fn detach_workspace<R: tauri::Runtime>(
     // no-op) so per-session errors cannot bubble.
     if let Some(terminal_state) = app.try_state::<crate::terminal::PtyState>() {
         for session_id in result.removed_sessions {
-            crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
+            crate::terminal::terminate_pty_session(app, &terminal_state.sessions, &session_id.0);
         }
     }
 
@@ -2885,7 +2885,7 @@ pub(crate) fn close_pane_impl_with_selection<R: tauri::Runtime>(
         // helper instead of back through `close_terminal_session` (which
         // would try to re-remove from the store and fail).
         let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
-        crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
+        crate::terminal::terminate_pty_session(&app, &terminal_state.sessions, &session_id.0);
     }
 
     if let Some(browser_id) = removed_browser_id {
@@ -3112,7 +3112,7 @@ pub fn close_tab<R: tauri::Runtime>(
     // the store, so we go straight to the PTY helper.
     let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
     for session_id in result.removed_sessions {
-        crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
+        crate::terminal::terminate_pty_session(&app, &terminal_state.sessions, &session_id.0);
     }
 
     for browser_id in &result.removed_browser_ids {
