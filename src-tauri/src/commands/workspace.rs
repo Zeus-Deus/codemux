@@ -1530,6 +1530,11 @@ fn detach_workspace<R: tauri::Runtime>(
     // up to ~30 s, until the background reconcile loop catches up.
     // Errors here are non-fatal: the close itself already succeeded,
     // and the background tick will retry the reconcile + push.
+    // The close is recorded explicitly first, by id: while a layout
+    // recovery is pending, reconcile infers no closes at all.
+    if let Err(error) = crate::workspaces_sync::record_closed(db, workspace_id) {
+        eprintln!("[workspaces-sync] recording the close failed (reconcile will retry): {error}");
+    }
     if let Err(error) = crate::workspaces_sync::reconcile_from_snapshot(db, &state.snapshot()) {
         eprintln!(
             "[workspaces-sync] reconcile after close failed (will \

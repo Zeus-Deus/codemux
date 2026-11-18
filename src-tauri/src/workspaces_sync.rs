@@ -507,9 +507,12 @@ fn read_git_head_sha(path: &str) -> Option<String> {
 ///
 /// Returns Ok even on partial failure: individual row failures are
 /// logged so a corrupt row doesn't strand the whole tick.
-/// Every workspace id reconcile has seen live in this run.
-static SEEN_LIVE: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
-    std::sync::LazyLock::new(Default::default);
+/// Mark the sync row of a workspace the user just closed as deleted. The
+/// close says so explicitly, so this holds even while a layout recovery
+/// keeps [`reconcile_from_snapshot`] from inferring closes.
+pub fn record_closed(db: &DatabaseStore, workspace_id: &str) -> Result<(), String> {
+    db.soft_delete_workspace_sync_by_workspace_id(workspace_id)
+}
 
 pub fn reconcile_from_snapshot(
     db: &DatabaseStore,
@@ -639,17 +642,14 @@ pub fn reconcile_from_snapshot(
     //
     // While an unreadable saved layout awaits recovery, a workspace missing
     // from it is missing, not closed: deleting its row would remove it from
-    // every other device too. Only workspaces seen live in this run and
-    // gone since — really closed — are deleted then.
-    let recovering = crate::state::layout_recovery_pending();
-    let seen = {
-        let mut seen = SEEN_LIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        seen.extend(live_wids.iter().cloned());
-        seen.clone()
-    };
+    // every other device too. Nothing is inferred then; a workspace really
+    // closed has its row deleted by the close itself (`record_closed`).
+    if crate::state::layout_recovery_pending() {
+        return Ok(());
+    }
     for row in &sync_rows {
         if let Some(wid) = &row.workspace_id {
-            if !live_wids.contains(wid) && (!recovering || seen.contains(wid)) {
+            if !live_wids.contains(wid) {
                 if let Err(error) =
                     db.soft_delete_workspace_sync_by_workspace_id(wid)
                 {
@@ -1154,25 +1154,23 @@ mod tests {
     #[serial]
     fn during_layout_recovery_only_workspaces_really_closed_are_deleted() {
         let db = fresh_db();
-        // A row from before the unreadable layout: missing now, not closed.
-        db.insert_workspace_sync("ws-recovery-missing", "old", None, None, None, None, None, None, None)
-            .unwrap();
+        // Rows synced before the unreadable layout. One is missing from the
+        // fallback; the other is restored and then closed, before any
+        // background reconcile has run.
+        for wid in ["ws-recovery-missing", "ws-recovery-closed"] {
+            db.insert_workspace_sync(wid, "old", None, None, None, None, None, None, None).unwrap();
+        }
         crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
 
-        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
-        let live = |db: &DatabaseStore, wid: &str| {
-            db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some(wid))
-        };
-        assert!(live(&db, "ws-recovery-missing"), "a missing workspace is not deleted");
-
-        // Opened and explicitly closed during the recovery session.
-        super::reconcile_from_snapshot(&db, &make_snapshot(vec![make_ws("ws-recovery-session", "new")]))
-            .unwrap();
+        // The close: an explicit record, then the reconcile the close path
+        // runs with the post-close snapshot.
+        super::record_closed(&db, "ws-recovery-closed").unwrap();
         super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
         crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
 
-        assert!(!live(&db, "ws-recovery-session"), "a workspace closed this run is deleted");
-        assert!(live(&db, "ws-recovery-missing"), "and the missing one still is not");
+        let live = |wid: &str| db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some(wid));
+        assert!(!live("ws-recovery-closed"), "a workspace really closed is deleted");
+        assert!(live("ws-recovery-missing"), "a missing one is not");
     }
 
     #[test]

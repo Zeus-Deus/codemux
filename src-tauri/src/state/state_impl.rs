@@ -6758,26 +6758,46 @@ fn recovery_marker(path: &Path) -> PathBuf {
 }
 
 /// Whether the layout at `path` has a set-aside copy still waiting. The
-/// marker names that copy; once the copy is gone — renamed back over
-/// `layout.json` to restore it, or deleted to discard it — the recovery is
-/// over and the marker is removed.
+/// marker lists every copy set aside, one name per line; recovery is over
+/// only once all of them are gone — renamed back over `layout.json` to
+/// restore one, or deleted to discard it. Anything that cannot be checked
+/// counts as still waiting: only "not found" means gone.
 fn recovery_pending_at(path: &Path) -> bool {
     let marker = recovery_marker(path);
-    let Ok(aside_name) = fs::read_to_string(&marker) else {
-        return false;
+    let listed = match fs::read_to_string(&marker) {
+        Ok(listed) => listed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
     };
-    let aside_name = aside_name.trim();
-    let aside = path.parent().map(|dir| dir.join(aside_name));
-    if !aside_name.is_empty() && aside.is_some_and(|aside| aside.exists()) {
+    let Some(dir) = path.parent() else {
         return true;
+    };
+    let mut waiting = Vec::new();
+    for name in listed.lines().map(str::trim).filter(|n| !n.is_empty()) {
+        match fs::symlink_metadata(dir.join(name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => waiting.push(name),
+        }
     }
-    let _ = fs::remove_file(&marker);
-    false
+    if waiting.is_empty() {
+        let _ = fs::remove_file(&marker);
+        return false;
+    }
+    true
+}
+
+/// Add `aside_name` to the recovery marker beside `path`, keeping every
+/// copy already listed.
+fn add_to_recovery_marker(path: &Path, aside_name: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut marker = fs::OpenOptions::new().create(true).append(true).open(recovery_marker(path))?;
+    writeln!(marker, "{aside_name}")?;
+    marker.sync_all()
 }
 
 /// Read the layout at `path`. An unreadable one is preserved before
 /// anything can save over it, so it can still be recovered by hand:
-/// renamed (or, failing that, copied) to `<name>.unreadable-<unix seconds>`,
+/// renamed (or, failing that, copied) to `<name>.unreadable-<unix millis>`,
 /// with a marker beside it so later launches stay in recovery mode too.
 /// `preserved: false` means neither worked and `layout.json` must not be
 /// replaced this run.
@@ -6792,15 +6812,16 @@ fn load_layout_from(path: &Path) -> PersistedLayout {
     };
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
     let mut aside = path.as_os_str().to_owned();
     aside.push(format!(".unreadable-{stamp}"));
     let aside = PathBuf::from(aside);
     let aside_name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     // The marker goes first: if it cannot be written, nothing else is
-    // trusted to remember the copy, and `layout.json` stays as it is.
-    let marked = fs::write(recovery_marker(path), &aside_name).is_ok();
+    // trusted to remember the copy, and `layout.json` stays as it is. Copies
+    // set aside earlier stay listed.
+    let marked = add_to_recovery_marker(path, &aside_name).is_ok();
     let kept = marked
         && (fs::rename(path, &aside).is_ok() || fs::copy(path, &aside).is_ok());
     if kept {
@@ -6811,9 +6832,6 @@ fn load_layout_from(path: &Path) -> PersistedLayout {
             path.display()
         );
     } else {
-        if marked {
-            let _ = fs::remove_file(recovery_marker(path));
-        }
         log::error!(
             "Could not read the saved layout at {} ({error}), nor set it aside; \
              layout saving is paused for this run so it is not overwritten",
@@ -14036,6 +14054,51 @@ mod persisted_layout_tests {
         }
         assert!(!recovery_pending_at(&path));
         assert!(!recovery_marker(&path).exists());
+    }
+
+    #[test]
+    fn recovery_waits_for_every_copy_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let asides = |dir: &Path| -> Vec<PathBuf> {
+            let mut found: Vec<_> = fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("layout.json.unreadable-"))
+                .collect();
+            found.sort();
+            found
+        };
+        fs::write(&path, "first broken layout").unwrap();
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // The fallback layout later turns unreadable too.
+        fs::write(&path, "second broken layout").unwrap();
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
+        let both = asides(dir.path());
+        assert_eq!(both.len(), 2);
+
+        fs::remove_file(&both[1]).unwrap();
+        assert!(recovery_pending_at(&path), "the first copy still waits");
+        fs::remove_file(&both[0]).unwrap();
+        assert!(!recovery_pending_at(&path));
+    }
+
+    #[test]
+    fn recovery_state_that_cannot_be_read_still_counts_as_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        // A marker that cannot be read as a file.
+        fs::create_dir(recovery_marker(&path)).unwrap();
+        assert!(recovery_pending_at(&path));
+        fs::remove_dir(recovery_marker(&path)).unwrap();
+
+        // A listed copy whose existence cannot be checked (a path component
+        // is a file, which is not "not found").
+        fs::write(&path, "{}").unwrap();
+        fs::write(recovery_marker(&path), "layout.json/copy\n").unwrap();
+        assert!(recovery_pending_at(&path));
+        assert!(recovery_marker(&path).exists(), "and the marker is left alone");
     }
 
     // Unix only: a read-only directory is how this test makes setting the
