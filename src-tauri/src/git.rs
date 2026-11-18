@@ -1809,41 +1809,74 @@ pub struct MergeIntoBaseResult {
 /// A checkout git still has registered but that cannot be reached (a
 /// removed or unmounted directory) is an error, not "checked out nowhere":
 /// moving the ref under it would leave its files and index describing the
-/// old commit. Records are read NUL-delimited and as raw bytes, so any
-/// path parses.
+/// old commit. Records are read NUL-delimited and as raw bytes where git
+/// supports it, so any path parses.
 fn branch_worktree(repo_path: &Path, branch: &str) -> Result<Option<PathBuf>, String> {
-    let output = git_command()
-        .args(["worktree", "list", "--porcelain", "-z"])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git worktree failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
+    let (listing, separator) = worktree_listing(repo_path)?;
     let target_ref = format!("refs/heads/{branch}");
-    let mut current_path: Option<PathBuf> = None;
+    let unreachable = |shown: &dyn std::fmt::Display| {
+        Err(format!(
+            "Cannot update {branch}: it is checked out at {shown}, which cannot be reached. Reconnect or remove that worktree first."
+        ))
+    };
+    match registered_checkout(&listing, separator, &target_ref) {
+        Registered::Nowhere => Ok(None),
+        Registered::At(Some(path)) if is_checkout_of(&path, repo_path, &target_ref) => Ok(Some(path)),
+        Registered::At(Some(path)) => unreachable(&path.display()),
+        Registered::At(None) => unreachable(&"a path this platform cannot represent"),
+    }
+}
 
-    for field in output.stdout.split(|&b| b == 0) {
+/// `git worktree list --porcelain`, NUL-delimited where git supports it
+/// (2.36+), newline-delimited on older git such as Ubuntu 22.04's. Returns
+/// the listing and its record separator. On older git a path containing a
+/// newline cannot be read back; such a checkout then fails
+/// [`is_checkout_of`] and the merge is refused rather than misdirected.
+fn worktree_listing(repo_path: &Path) -> Result<(Vec<u8>, u8), String> {
+    let run = |args: &[&str]| {
+        git_command()
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .map_err(|e| format!("Failed to run git: {e}"))
+    };
+    let output = run(&["worktree", "list", "--porcelain", "-z"])?;
+    if output.status.success() {
+        return Ok((output.stdout, 0));
+    }
+    let output = run(&["worktree", "list", "--porcelain"])?;
+    if output.status.success() {
+        return Ok((output.stdout, b'\n'));
+    }
+    Err(format!(
+        "git worktree failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+/// Where a porcelain worktree listing has a branch checked out.
+#[derive(Debug, PartialEq)]
+enum Registered {
+    Nowhere,
+    /// Checked out at this path — `None` when the path's bytes cannot be
+    /// represented here, which still counts as checked out.
+    At(Option<PathBuf>),
+}
+
+fn registered_checkout(listing: &[u8], separator: u8, target_ref: &str) -> Registered {
+    let mut current_path: Option<Option<PathBuf>> = None;
+    for field in listing.split(|&b| b == separator) {
         if let Some(path) = field.strip_prefix(b"worktree ") {
-            current_path = path_from_git_bytes(path.to_vec());
+            current_path = Some(path_from_git_bytes(path.to_vec()));
         } else if field.strip_prefix(b"branch ") == Some(target_ref.as_bytes()) {
-            let Some(path) = current_path.take() else { continue };
-            return if is_checkout_of(&path, repo_path, &target_ref) {
-                Ok(Some(path))
-            } else {
-                Err(format!(
-                    "Cannot update {branch}: it is checked out at {}, which cannot be reached. Reconnect or remove that worktree first.",
-                    path.display()
-                ))
-            };
+            if let Some(path) = current_path.take() {
+                return Registered::At(path);
+            }
         } else if field.is_empty() {
             current_path = None;
         }
     }
-    Ok(None)
+    Registered::Nowhere
 }
 
 /// A path git printed, kept byte for byte where the platform allows it.
@@ -6741,6 +6774,28 @@ mod tests {
     }
 
     #[test]
+    fn registered_checkout_reads_both_listing_formats() {
+        let target = "refs/heads/release";
+        for (listing, sep) in [
+            (&b"worktree /r\0HEAD 1\0branch refs/heads/main\0\0worktree /w/rel\0HEAD 2\0branch refs/heads/release\0\0"[..], 0u8),
+            (&b"worktree /r\nHEAD 1\nbranch refs/heads/main\n\nworktree /w/rel\nHEAD 2\nbranch refs/heads/release\n\n"[..], b'\n'),
+        ] {
+            assert_eq!(
+                registered_checkout(listing, sep, target),
+                Registered::At(Some(PathBuf::from("/w/rel")))
+            );
+            assert_eq!(registered_checkout(listing, sep, "refs/heads/other"), Registered::Nowhere);
+        }
+        // A detached checkout between records does not lend its path to the
+        // next record's branch.
+        let listing = b"worktree /d\nHEAD 3\ndetached\n\nworktree /w/rel\nHEAD 2\nbranch refs/heads/release\n\n";
+        assert_eq!(
+            registered_checkout(listing, b'\n', target),
+            Registered::At(Some(PathBuf::from("/w/rel")))
+        );
+    }
+
+    #[test]
     fn test_merge_into_base_keeps_an_ignored_file_the_merge_would_track() {
         let (_dir, repo, wt) = setup_worktree_merge_scenario();
         let main = main_branch(&repo);
@@ -6864,6 +6919,15 @@ mod tests {
         run_git(&wt, &["add", "."]).unwrap();
         run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
 
+        if run_git(&repo, &["worktree", "list", "--porcelain", "-z"]).is_err() {
+            // Git before 2.36 cannot list such a path unambiguously: the
+            // merge must refuse rather than guess.
+            let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+            let err = merge_into_base(&wt, "release", false).unwrap_err();
+            assert!(err.contains("cannot be reached"), "unexpected error: {err}");
+            assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+            return;
+        }
         assert_eq!(merge_into_base(&wt, "release", false).unwrap().status, "merged");
         assert_eq!(std::fs::read_to_string(odd.join("feature.txt")).unwrap(), "worktree work");
     }
