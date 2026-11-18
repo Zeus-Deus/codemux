@@ -60,6 +60,26 @@ pub enum ClientRequest {
         cols: u16,
     },
 
+    /// Reserve one shell incarnation before sending its delayed SpawnOwned.
+    PrepareOwnedSpawn {
+        request_id: u64,
+        session_id: String,
+        shell_id: Uuid,
+    },
+
+    /// Spawn only if the exact preparation still exists and has not expired.
+    SpawnOwned {
+        request_id: u64,
+        session_id: String,
+        shell_id: Uuid,
+        workspace_id: String,
+        argv: Vec<String>,
+        cwd: String,
+        env: Vec<(String, String)>,
+        rows: u16,
+        cols: u16,
+    },
+
     /// Attach this connection to the named session's output stream.
     /// The daemon will push `ServerEvent::Output` frames until `Detach`.
     /// If the session has buffered output (collected while no client was
@@ -160,6 +180,12 @@ pub enum ServerResponse {
         /// Supports guarded Spawn, AttachOwned, CloseOwned and tagged output.
         #[serde(default)]
         guarded_shells: bool,
+        /// Supports single-use PrepareOwnedSpawn and SpawnOwned.
+        #[serde(default)]
+        prepared_spawn: bool,
+    },
+    SpawnPrepared {
+        request_id: u64,
     },
     Spawned {
         request_id: u64,
@@ -270,8 +296,9 @@ mod tests {
     fn hello_from_an_older_daemon_reads_as_no_host_plugin() {
         let old = r#"{"type":"hello","request_id":1,"protocol_version":2,"daemon_pid":7,"daemon_version":"0.26.2"}"#;
         match serde_json::from_str::<ServerResponse>(old).unwrap() {
-            ServerResponse::Hello { host_claude_plugin, guarded_shells, daemon_version, .. } => {
+            ServerResponse::Hello { host_claude_plugin, guarded_shells, prepared_spawn, daemon_version, .. } => {
                 assert!(!guarded_shells);
+                assert!(!prepared_spawn);
                 assert!(!host_claude_plugin);
                 assert_eq!(daemon_version, "0.26.2");
             }

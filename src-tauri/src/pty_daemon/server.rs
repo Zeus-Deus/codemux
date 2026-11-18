@@ -208,10 +208,38 @@ async fn subscribe(session: &Arc<DaemonSession>, prefix: &[u8]) -> Subscription 
     }
 }
 
+const SPAWN_PREPARATION_TTL: Duration = Duration::from_secs(30);
+
+struct PreparedSpawn {
+    shell_id: Uuid,
+    expires_at: Instant,
+}
+
 #[derive(Default)]
 struct DaemonState {
     sessions: HashMap<String, Arc<DaemonSession>>,
+    prepared_spawns: HashMap<String, PreparedSpawn>,
     spawning: HashMap<String, Uuid>,
+}
+
+impl DaemonState {
+    fn prune_spawn_preparations(&mut self, now: Instant) {
+        self.prepared_spawns.retain(|_, permit| permit.expires_at > now);
+    }
+
+    fn is_idle(&mut self) -> bool {
+        self.prune_spawn_preparations(Instant::now());
+        self.sessions.is_empty() && self.prepared_spawns.is_empty() && self.spawning.is_empty()
+    }
+
+    fn has_shell_or_active_spawn(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id) || self.spawning.contains_key(session_id)
+    }
+}
+
+enum SpawnClaim {
+    Immediate(Option<Uuid>),
+    Prepared(Uuid),
 }
 
 type SharedState = Arc<Mutex<DaemonState>>;
@@ -310,7 +338,7 @@ pub async fn run(socket_path: PathBuf) -> Result<(), String> {
                 Some(tokio::time::Instant::now());
             loop {
                 tokio::time::sleep(CHECK_INTERVAL).await;
-                if !reaper_state.lock().await.sessions.is_empty() {
+                if !reaper_state.lock().await.is_idle() {
                     idle_since = None;
                     continue;
                 }
@@ -321,7 +349,7 @@ pub async fn run(socket_path: PathBuf) -> Result<(), String> {
                 }
                 // Re-check under the lock right before exit — never reap a
                 // daemon that just gained a session between the poll and now.
-                if !reaper_state.lock().await.sessions.is_empty() {
+                if !reaper_state.lock().await.is_idle() {
                     idle_since = None;
                     continue;
                 }
@@ -532,7 +560,24 @@ async fn handle_request(
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             host_claude_plugin: HOST_CLAUDE_PLUGIN.get().is_some(),
             guarded_shells: true,
+            prepared_spawn: true,
         },
+        ClientRequest::PrepareOwnedSpawn { request_id, session_id, shell_id } => {
+            let mut guard = state.lock().await;
+            let now = Instant::now();
+            guard.prune_spawn_preparations(now);
+            if guard.has_shell_or_active_spawn(&session_id) {
+                return ServerResponse::Error {
+                    request_id,
+                    message: format!("session {session_id} already exists in daemon"),
+                };
+            }
+            guard.prepared_spawns.insert(session_id, PreparedSpawn {
+                shell_id,
+                expires_at: now + SPAWN_PREPARATION_TTL,
+            });
+            ServerResponse::SpawnPrepared { request_id }
+        }
         ClientRequest::Spawn {
             request_id,
             session_id,
@@ -543,20 +588,30 @@ async fn handle_request(
             env,
             rows,
             cols,
-        } => match spawn_pty(
-            &state, session_id.clone(), shell_id, workspace_id, argv, cwd, env, rows, cols,
-        ).await
-        {
-            Ok(pid) => ServerResponse::Spawned {
-                request_id,
-                session_id,
-                pid,
-            },
-            Err(error) => ServerResponse::Error {
-                request_id,
-                message: error,
-            },
-        },
+        } => {
+            let result = spawn_pty(
+                &state, session_id.clone(), SpawnClaim::Immediate(shell_id),
+                workspace_id, argv, cwd, env, rows, cols,
+            ).await;
+            spawn_response(request_id, session_id, result)
+        }
+        ClientRequest::SpawnOwned {
+            request_id,
+            session_id,
+            shell_id,
+            workspace_id,
+            argv,
+            cwd,
+            env,
+            rows,
+            cols,
+        } => {
+            let result = spawn_pty(
+                &state, session_id.clone(), SpawnClaim::Prepared(shell_id),
+                workspace_id, argv, cwd, env, rows, cols,
+            ).await;
+            spawn_response(request_id, session_id, result)
+        }
         ClientRequest::Attach {
             request_id,
             session_id,
@@ -686,6 +741,11 @@ async fn handle_request(
                 if guard.spawning.get(&session_id) == Some(&shell_id) {
                     guard.spawning.remove(&session_id);
                 }
+                if guard.prepared_spawns.get(&session_id)
+                    .is_some_and(|permit| permit.shell_id == shell_id)
+                {
+                    guard.prepared_spawns.remove(&session_id);
+                }
                 let attachment_id = if attached.get(&session_id)
                     .is_some_and(|subscription| subscription.session.shell_id == shell_id)
                 {
@@ -801,10 +861,21 @@ fn terminate_session(session: &DaemonSession) {
     kill_session_pid(session.pid);
 }
 
+fn spawn_response(
+    request_id: u64,
+    session_id: String,
+    result: Result<u32, String>,
+) -> ServerResponse {
+    match result {
+        Ok(pid) => ServerResponse::Spawned { request_id, session_id, pid },
+        Err(message) => ServerResponse::Error { request_id, message },
+    }
+}
+
 async fn spawn_pty(
     state: &SharedState,
     session_id: String,
-    shell_id: Option<Uuid>,
+    claim: SpawnClaim,
     workspace_id: String,
     argv: Vec<String>,
     cwd: String,
@@ -816,14 +887,29 @@ async fn spawn_pty(
         return Err("argv is empty".into());
     }
 
-    let shell_id = shell_id.unwrap_or_else(Uuid::new_v4);
-    {
+    let shell_id = {
         let mut guard = state.lock().await;
-        if guard.sessions.contains_key(&session_id) || guard.spawning.contains_key(&session_id) {
+        if guard.has_shell_or_active_spawn(&session_id) {
             return Err(format!("session {session_id} already exists in daemon"));
         }
+        let shell_id = match claim {
+            SpawnClaim::Immediate(shell_id) => shell_id.unwrap_or_else(Uuid::new_v4),
+            SpawnClaim::Prepared(shell_id) => {
+                let available = guard.prepared_spawns.get(&session_id).is_some_and(|permit| {
+                    permit.shell_id == shell_id && permit.expires_at > Instant::now()
+                });
+                if !available {
+                    return Err(format!("no active spawn preparation for session {session_id}"));
+                }
+                shell_id
+            }
+        };
+        // Claim the slot and consume its permit atomically. A normal Spawn
+        // also supersedes an unused preparation for the same session.
+        guard.prepared_spawns.remove(&session_id);
         guard.spawning.insert(session_id.clone(), shell_id);
-    }
+        shell_id
+    };
 
     let result = spawn_reserved_pty(
         state, session_id.clone(), shell_id, workspace_id, argv, cwd, env, rows, cols,
@@ -1185,6 +1271,58 @@ mod tests {
         let _ = session
             .frame_tx
             .send(super::SessionFrame::Output(bytes.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn guarded_close_cancels_delayed_spawn_without_touching_replacement() {
+        use super::*;
+
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let (spawner, spawn_task) = output_test_client(state.clone());
+        let (closer, close_task) = output_test_client(state.clone());
+        spawner.hello().await.unwrap();
+        closer.hello().await.unwrap();
+        assert!(spawner.supports_prepared_spawn());
+
+        let id = "delayed-spawn";
+        let cancelled = Uuid::new_v4();
+        spawner.prepare_owned_spawn(id.into(), cancelled).await.unwrap();
+        closer.close_owned(id.into(), cancelled).await.unwrap();
+
+        // An unused permit can expire or be superseded without affecting
+        // another shell's identity.
+        let expired = Uuid::new_v4();
+        spawner.prepare_owned_spawn(id.into(), expired).await.unwrap();
+        state.lock().await.prepared_spawns.get_mut(id).unwrap().expires_at = Instant::now();
+        let spawn = |shell_id| {
+            spawner.spawn_prepared(
+                id.into(), shell_id, "workspace".into(),
+                vec!["/bin/sleep".into(), "15".into()],
+                "/".into(), vec![], 24, 80,
+            )
+        };
+        assert!(spawn(expired).await.unwrap_err().to_string().contains("no active spawn preparation"));
+
+        let superseded = Uuid::new_v4();
+        spawner.prepare_owned_spawn(id.into(), superseded).await.unwrap();
+        let replacement = Uuid::new_v4();
+        spawner.prepare_owned_spawn(id.into(), replacement).await.unwrap();
+        closer.close_owned(id.into(), cancelled).await.unwrap();
+        for stale in [cancelled, superseded] {
+            assert!(spawn(stale).await.unwrap_err().to_string().contains("no active spawn preparation"));
+        }
+        assert!(closer.list().await.unwrap().is_empty());
+
+        let pid = spawn(replacement).await.unwrap();
+        let sessions = closer.list().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].shell_id, Some(replacement));
+        assert_eq!(sessions[0].pid, pid);
+
+        closer.close_owned(id.into(), replacement).await.unwrap();
+        assert!(closer.list().await.unwrap().is_empty());
+        spawn_task.abort();
+        close_task.abort();
     }
 
     #[tokio::test]

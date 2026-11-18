@@ -73,6 +73,7 @@ pub struct TunnelSupervisor {
 }
 
 struct SupervisorInner {
+    ssh_target: String,
     local_socket: PathBuf,
     status_tx: watch::Sender<TunnelStatus>,
     shutdown_tx: watch::Sender<bool>,
@@ -93,6 +94,7 @@ impl TunnelSupervisor {
         let (status_tx, _status_rx) = watch::channel(TunnelStatus::Pending);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let inner = Arc::new(SupervisorInner {
+            ssh_target,
             local_socket: local_socket.clone(),
             status_tx,
             shutdown_tx,
@@ -106,7 +108,6 @@ impl TunnelSupervisor {
         cmd.kill_on_drop(true);
         let task = tokio::spawn(run_supervisor(
             task_inner,
-            ssh_target,
             remote_socket,
             local_socket,
             remote_binary,
@@ -117,6 +118,10 @@ impl TunnelSupervisor {
             inner,
             task: std::sync::Mutex::new(Some(task)),
         })
+    }
+
+    pub(crate) fn ssh_target(&self) -> &str {
+        &self.inner.ssh_target
     }
 
     /// Local socket path the `PtyDaemonClient` should dial. Stable
@@ -149,13 +154,13 @@ impl TunnelSupervisor {
 
 async fn run_supervisor(
     inner: Arc<SupervisorInner>,
-    ssh_target: String,
     remote_socket: String,
     local_socket: PathBuf,
     remote_binary: String,
     mut shutdown_rx: watch::Receiver<bool>,
     mut cmd: Command,
 ) {
+    let ssh_target = &inner.ssh_target;
     eprintln!(
         "[tunnel-supervisor] start: ssh_target={ssh_target} \
          local_socket={local_socket:?} remote_socket={remote_socket} \
@@ -163,7 +168,7 @@ async fn run_supervisor(
     );
     let mut retry = RetryState::default();
     let opts = TunnelOptions {
-        ssh_target: &ssh_target,
+        ssh_target,
         remote_socket: &remote_socket,
         local_socket: &local_socket,
         remote_binary: &remote_binary,
@@ -490,6 +495,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let local_socket = dir.path().join("tunnel.sock");
         let inner = Arc::new(SupervisorInner {
+            ssh_target: "unused-host".into(),
             local_socket: local_socket.clone(),
             status_tx,
             shutdown_tx,
@@ -505,7 +511,6 @@ mod tests {
         cmd.kill_on_drop(true);
         let mut task = tokio::spawn(run_supervisor(
             inner,
-            "unused-host".into(),
             "/unused/remote.sock".into(),
             local_socket,
             "/unused/codemux-remote".into(),
@@ -565,6 +570,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let local_socket = dir.path().join("tunnel.sock");
         let inner = Arc::new(SupervisorInner {
+            ssh_target: "unused-host".into(),
             local_socket: local_socket.clone(),
             status_tx,
             shutdown_tx,
@@ -574,7 +580,6 @@ mod tests {
         cmd.kill_on_drop(true);
         let task = tokio::spawn(run_supervisor(
             inner.clone(),
-            "unused-host".into(),
             "/unused/remote.sock".into(),
             local_socket,
             "/unused/codemux-remote".into(),
@@ -624,6 +629,7 @@ mod tests {
         let (status_tx, mut status_rx) = watch::channel(TunnelStatus::Pending);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let inner = Arc::new(SupervisorInner {
+            ssh_target: "unused-host".into(),
             local_socket: local_socket.clone(),
             status_tx,
             shutdown_tx,
@@ -633,7 +639,6 @@ mod tests {
         cmd.kill_on_drop(true);
         let task = tokio::spawn(run_supervisor(
             inner,
-            "unused-host".into(),
             "/unused/remote.sock".into(),
             local_socket.clone(),
             "/unused/codemux-remote".into(),

@@ -16,15 +16,17 @@
 
 use super::{
     emit_terminal_status_if_current, hydration_workspace_pty_env, queue_or_send_output_if_current,
-    with_existing_session_runtime, DaemonReconciliation, PtyState, SessionSpawnReservation,
+    with_existing_session_runtime, DaemonReconciliation, DaemonWorkspaceRoute, PtyState,
+    SessionSpawnReservation,
     TerminalLifecycleState,
     TerminalStatusPayload, DEFAULT_COLS, DEFAULT_ROWS,
 };
 use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
 use crate::state::{AppStateStore, PtyHydrationPlan, PtyHydrationSession, PtyHydrationWorkspace};
 use futures_util::stream::StreamExt as _;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, Runtime, State};
 use uuid::Uuid;
@@ -585,6 +587,13 @@ async fn spawn_prepared_session<R: Runtime>(
     };
     let restart_token = reservation.restart_token;
     let reconciling = reservation.reconciliation.is_some();
+    if reservation.reconciliation.as_ref().is_some_and(|recovery| {
+        recovery.route.ssh_target.as_deref() != client.ssh_target()
+    }) {
+        return Err(DaemonHydrationFailure::Ambiguous(
+            "the workspace daemon destination changed while recovering this shell".into(),
+        ));
+    }
     if !reservation.is_current() {
         return Err(DaemonHydrationFailure::AlreadyReserved);
     }
@@ -595,9 +604,9 @@ async fn spawn_prepared_session<R: Runtime>(
         (None, true) => Some(Uuid::new_v4()),
         (_, false) => None,
     };
-    if reconciling && shell_id.is_none() {
-        // Recovery can outlive the pane. Require an identity that lets us
-        // retire this exact shell if the pane closes while an RPC is pending.
+    if reconciling && (shell_id.is_none() || (!reattached && !client.supports_prepared_spawn())) {
+        // Recovery can outlive the pane. A new shell also needs a permit the
+        // daemon can revoke before an already-sent Spawn reaches it.
         return Err(DaemonHydrationFailure::RequiresGuardedRecovery);
     }
     let workspace_id = workspace.workspace_id.clone();
@@ -913,18 +922,23 @@ async fn spawn_prepared_session<R: Runtime>(
         if !reservation.is_current() {
             return Err(DaemonHydrationFailure::AlreadyReserved);
         }
-        client
-            .spawn_with_shell_id(
-                session_id.clone(),
-                shell_id,
-                workspace_id,
-                vec![shell.clone()],
-                effective_cwd,
-                env,
-                DEFAULT_ROWS,
-                DEFAULT_COLS,
-            )
-            .await
+        let argv = vec![shell.clone()];
+        if let Some(shell_id) = shell_id.filter(|_| reconciling) {
+            client.prepare_owned_spawn(session_id.clone(), shell_id)
+                .await.map_err(classify_spawn_rpc_failure)?;
+            if !reservation.is_current() {
+                return Err(DaemonHydrationFailure::AlreadyReserved);
+            }
+            client.spawn_prepared(
+                session_id.clone(), shell_id, workspace_id, argv, effective_cwd, env,
+                DEFAULT_ROWS, DEFAULT_COLS,
+            ).await
+        } else {
+            client.spawn_with_shell_id(
+                session_id.clone(), shell_id, workspace_id, argv, effective_cwd, env,
+                DEFAULT_ROWS, DEFAULT_COLS,
+            ).await
+        }
     };
 
     if !reservation.is_current() {
@@ -1157,67 +1171,107 @@ async fn spawn_prepared_session<R: Runtime>(
     Ok(())
 }
 
-/// Retire the exact shell of an explicitly closed pane, even if hydration
-/// failed or was waiting for its workspace's daemon to reconnect.
+struct PendingDaemonClose {
+    session_id: String,
+    recovery: Arc<DaemonReconciliation>,
+}
+
+/// One queue and worker per workspace daemon route. A closed pane's cleanup
+/// is owned here until the daemon acknowledges it, even after a long outage.
+#[derive(Default)]
+pub(super) struct PendingDaemonCloses {
+    routes: Mutex<HashMap<DaemonWorkspaceRoute, VecDeque<PendingDaemonClose>>>,
+}
+
 pub(super) fn queue_closed_pane_cleanup<R: Runtime>(
     app: AppHandle<R>,
     session_id: String,
     recovery: Arc<DaemonReconciliation>,
 ) {
-    tauri::async_runtime::spawn(async move {
-        let (shell_id, mut captured_client) = {
-            let target = recovery.target.lock().await;
-            (target.shell_id, target.client.clone())
-        };
-        let Some(shell_id) = shell_id else { return };
+    let pending = app.state::<PtyState>().pending_daemon_closes.clone();
+    let route = recovery.route.clone();
+    let request = PendingDaemonClose { session_id, recovery };
+    {
+        let mut queues = pending.routes.lock().unwrap_or_else(|error| error.into_inner());
+        match queues.entry(route.clone()) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().push_back(request);
+                return;
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(VecDeque::from([request]));
+            }
+        }
+    }
+    tauri::async_runtime::spawn(drain_pending_daemon_closes(pending, route));
+}
 
-        let mut reacquired_client = false;
-        let mut delay = Duration::from_millis(250);
-        let result = tokio::time::timeout(Duration::from_secs(120), async {
-            loop {
-                let acquired = match captured_client.take().filter(|client| !client.is_closed()) {
-                    Some(client) => Ok(client),
+async fn drain_pending_daemon_closes(
+    pending: Arc<PendingDaemonCloses>,
+    route: DaemonWorkspaceRoute,
+) {
+    let mut cleanup_tunnel = tokio::sync::Mutex::new(None);
+    loop {
+        let request = pending.routes.lock().unwrap_or_else(|error| error.into_inner())
+            .get_mut(&route).and_then(VecDeque::pop_front);
+        if let Some(request) = request {
+            let (shell_id, captured_client) = {
+                let target = request.recovery.target.lock().await;
+                (target.shell_id, target.client.clone())
+            };
+            let Some(shell_id) = shell_id else { continue };
+            retry_guarded_close(|| async {
+                let acquired = match captured_client.as_ref().filter(|client| !client.is_closed()) {
+                    Some(client) => Ok(client.clone()),
                     None => {
-                        reacquired_client = true;
-                        crate::ssh::client_for_workspace(
-                            &app, &recovery.workspace_id, recovery.host_id,
-                        ).await
+                        if let Some(ssh_target) = &route.ssh_target {
+                            let mut tunnel = cleanup_tunnel.lock().await;
+                            if tunnel.is_none() {
+                                *tunnel = Some(crate::ssh::registry::CleanupDaemonTunnel::start(
+                                    &route.workspace_id, ssh_target,
+                                ).await);
+                            }
+                            tunnel.as_mut().expect("cleanup tunnel initialized")
+                                .client(&route.workspace_id).await
+                        } else if route.host_id.is_none() {
+                            crate::pty_daemon::ensure_daemon().await
+                        } else {
+                            return false;
+                        }
                     }
                 };
-                match acquired {
-                    Ok(client) if client.supports_guarded_shells() => {
-                        if client.close_owned(session_id.clone(), shell_id).await.is_ok() {
-                            return Ok(());
-                        }
-                        if !client.is_closed() {
-                            captured_client = Some(client);
-                        }
-                    }
-                    Ok(_) => return Err("the daemon does not support closing an exact shell"),
-                    Err(_) => {}
-                }
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(5));
-            }
-        }).await;
-        // A full workspace close can shut down its supervisor before this
-        // worker reconnects. Release any tunnel opened for cleanup alone.
-        if reacquired_client && recovery.host_id.is_some()
-            && app.state::<AppStateStore>().pty_hydration_plan_for_workspace(&recovery.workspace_id).is_none()
-        {
-            crate::ssh::forget_workspace_client(&recovery.workspace_id).await;
-            crate::ssh::shutdown_supervisor(&recovery.workspace_id).await;
+                let Ok(client) = acquired else { return false };
+                client.supports_guarded_shells()
+                    && client.close_owned(request.session_id.clone(), shell_id).await.is_ok()
+            }).await;
+            continue;
         }
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => eprintln!(
-                "[codemux::terminal] cleanup of closed pane {session_id} failed: {error}"
-            ),
-            Err(_) => eprintln!(
-                "[codemux::terminal] cleanup of closed pane {session_id} timed out"
-            ),
+
+        // Release only the worker's tunnel. The workspace may have moved
+        // to another host and installed a different active connection.
+        if let Some(tunnel) = cleanup_tunnel.get_mut().take() {
+            tunnel.shutdown().await;
         }
-    });
+        let mut queues = pending.routes.lock().unwrap_or_else(|error| error.into_inner());
+        if queues.get(&route).is_some_and(VecDeque::is_empty) {
+            queues.remove(&route);
+            return;
+        }
+    }
+}
+
+async fn retry_guarded_close<F>(mut attempt: impl FnMut() -> F + Send)
+where
+    F: Future<Output = bool> + Send,
+{
+    let mut delay = Duration::from_millis(250);
+    loop {
+        if tokio::time::timeout(Duration::from_secs(35), attempt()).await.unwrap_or(false) {
+            return;
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(30));
+    }
 }
 
 /// Acknowledgement for one queued input write. Internal callers await it after
@@ -1370,6 +1424,72 @@ mod tests {
         let mut bytes = serde_json::to_vec(&Frame::Response(response)).unwrap();
         bytes.push(b'\n');
         write.write_all(&bytes).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guarded_close_retries_past_two_minutes_for_the_original_shell() {
+        let session_id = "closed-pane";
+        let shell_id = uuid::Uuid::new_v4();
+        let unavailable_until = tokio::time::Instant::now() + Duration::from_secs(125);
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let unavailable_attempts = AtomicUsize::new(0);
+        let close_acknowledged = AtomicBool::new(false);
+
+        let cleanup = super::retry_guarded_close(|| async {
+            if tokio::time::Instant::now() < unavailable_until {
+                unavailable_attempts.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+
+            // The outage and backoff use virtual time. Run the recovered
+            // socket exchange on real time so readiness cannot race a
+            // paused Tokio timer automatically advancing to its deadline.
+            tokio::time::resume();
+            let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+            let client = PtyDaemonClient::from_test_stream(client_stream, Duration::from_secs(2));
+            let daemon = tokio::spawn(async move {
+                let (read, mut write) = server_stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                let hello = lines.next_line().await.unwrap().unwrap();
+                let ClientRequest::Hello { request_id } = serde_json::from_str(&hello).unwrap() else {
+                    panic!("expected the recovered daemon handshake");
+                };
+                send_test_response(&mut write, ServerResponse::Hello {
+                    request_id,
+                    protocol_version: crate::pty_daemon::protocol::PROTOCOL_VERSION,
+                    daemon_pid: std::process::id(),
+                    daemon_version: env!("CARGO_PKG_VERSION").into(),
+                    host_claude_plugin: false,
+                    guarded_shells: true,
+                    prepared_spawn: true,
+                }).await;
+
+                let close = lines.next_line().await.unwrap().unwrap();
+                let ClientRequest::CloseOwned {
+                    request_id, session_id: requested_session, shell_id: requested_shell,
+                } = serde_json::from_str(&close).unwrap() else {
+                    panic!("expected a guarded close on the recovered connection");
+                };
+                assert_eq!(requested_session, session_id);
+                assert_eq!(requested_shell, shell_id);
+                send_test_response(&mut write, ServerResponse::Closed {
+                    request_id,
+                    attachment_id: None,
+                }).await;
+            });
+
+            client.hello().await.unwrap();
+            client.close_owned(session_id.into(), shell_id).await.unwrap();
+            daemon.await.unwrap();
+            close_acknowledged.store(true, Ordering::Relaxed);
+            true
+        });
+
+        tokio::time::timeout(Duration::from_secs(160), cleanup)
+            .await
+            .expect("the pending close should finish when the daemon comes back");
+        assert!(unavailable_attempts.load(Ordering::Relaxed) > 1);
+        assert!(close_acknowledged.load(Ordering::Relaxed), "the cleanup returned before closing the shell");
     }
 
     #[tokio::test]

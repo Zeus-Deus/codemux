@@ -308,9 +308,16 @@ pub struct SessionRuntime {
 }
 
 #[cfg(unix)]
-struct DaemonReconciliation {
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct DaemonWorkspaceRoute {
     workspace_id: String,
     host_id: Option<i64>,
+    ssh_target: Option<String>,
+}
+
+#[cfg(unix)]
+struct DaemonReconciliation {
+    route: DaemonWorkspaceRoute,
     /// Serializes daemon RPCs that can change shell ownership with pane cleanup.
     target: tokio::sync::Mutex<DaemonReconciliationTarget>,
 }
@@ -406,6 +413,8 @@ impl Drop for SessionRuntime {
 #[derive(Default)]
 pub struct PtyState {
     pub sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    #[cfg(unix)]
+    pending_daemon_closes: Arc<daemon_backed::PendingDaemonCloses>,
 }
 
 impl PtyState {
@@ -549,7 +558,7 @@ impl SessionSpawnReservation {
         sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
         session_id: &str,
         expected: Option<Uuid>,
-        workspace: Option<&state::PtyHydrationWorkspace>,
+        workspace: Option<(&state::PtyHydrationWorkspace, Option<String>)>,
     ) -> Option<(Self, Option<SessionRuntime>)> {
         let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
         let current = guard.get(session_id);
@@ -573,10 +582,20 @@ impl SessionSpawnReservation {
         #[cfg(unix)]
         let reconciliation = current.and_then(|runtime| {
             runtime.daemon_reconciliation.clone().or_else(|| {
-                let workspace = workspace.filter(|_| runtime.persistent)?;
+                let (workspace, configured_target) = workspace.filter(|_| runtime.persistent)?;
+                let (host_id, ssh_target) = match runtime.daemon_client.as_ref() {
+                    Some(client) => {
+                        let target = client.ssh_target().map(str::to_owned);
+                        (workspace.host_id.filter(|_| target.is_some()), target)
+                    }
+                    None => (workspace.host_id, configured_target),
+                };
                 Some(Arc::new(DaemonReconciliation {
-                    workspace_id: workspace.workspace_id.clone(),
-                    host_id: workspace.host_id,
+                    route: DaemonWorkspaceRoute {
+                        workspace_id: workspace.workspace_id.clone(),
+                        host_id,
+                        ssh_target,
+                    },
                     target: tokio::sync::Mutex::new(DaemonReconciliationTarget {
                         shell_id: runtime.daemon_shell_id,
                         client: runtime.daemon_client.clone(),
@@ -2934,8 +2953,15 @@ pub async fn restart_terminal_session<R: Runtime>(
     let Some(plan) = app.state::<AppStateStore>().pty_hydration_plan_for_session(&session_id) else {
         return Ok(false);
     };
+    #[cfg(unix)]
+    let configured_target = plan.workspace.host_id.and_then(|host_id| {
+        app.try_state::<crate::database::DatabaseStore>()?.list_hosts()
+            .into_iter().find(|host| host.id == host_id).map(|host| host.ssh_target)
+    });
+    #[cfg(not(unix))]
+    let configured_target = None;
     let Some((reservation, old)) = SessionSpawnReservation::for_restart(
-        &terminal_state.sessions, &session_id, expected, Some(&plan.workspace),
+        &terminal_state.sessions, &session_id, expected, Some((&plan.workspace, configured_target)),
     ) else {
         return Ok(false);
     };
@@ -5550,7 +5576,7 @@ mod tests {
         .expect("runtime exists");
         assert!(!flag.load(Ordering::Relaxed), "the dead subscriber blocks parking");
 
-        let state = PtyState { sessions: sessions.clone() };
+        let state = PtyState { sessions: sessions.clone(), ..PtyState::default() };
         assert_eq!(retain_output_subscribers(&state, |id| id == remote_id), 2);
 
         let left = |session: &str| {
@@ -6342,7 +6368,7 @@ mod tests {
         with_session_runtime(&sessions, id, || SessionRuntime::new(id), |runtime| {
             runtime.persistent = true;
         });
-        let (mut restart, _) = SessionSpawnReservation::for_restart(&sessions, id, None, Some(&plan.workspace)).unwrap();
+        let (mut restart, _) = SessionSpawnReservation::for_restart(&sessions, id, None, Some((&plan.workspace, None))).unwrap();
         restart.remove_on_drop = false;
         drop(restart);
         assert!(try_reserve_session_spawn(&sessions, id).is_none());
@@ -6351,6 +6377,29 @@ mod tests {
         }
         assert!(try_reserve_session_spawn(&sessions, id).is_none());
         assert!(SessionSpawnReservation::try_new(&sessions, id, None).is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_guard_keeps_the_original_ssh_destination_for_cleanup() {
+        let sessions = make_spawn_sessions();
+        let state = AppStateStore::default();
+        let id = state.active_terminal_session_id().unwrap().0;
+        let mut plan = state.pty_hydration_plan_for_session(&id).unwrap();
+        plan.workspace.host_id = Some(42);
+        let client = crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        client.set_ssh_target("original.example");
+        with_session_runtime(&sessions, &id, || SessionRuntime::new(&id), |runtime| {
+            runtime.persistent = true;
+            runtime.daemon_client = Some(client);
+        });
+
+        let (restart, _) = SessionSpawnReservation::for_restart(
+            &sessions, &id, None, Some((&plan.workspace, Some("updated.example".into()))),
+        ).unwrap();
+        let route = &restart.reconciliation.as_ref().unwrap().route;
+        assert_eq!(route.workspace_id, plan.workspace.workspace_id);
+        assert_eq!(route.ssh_target.as_deref(), Some("original.example"));
     }
 
     #[cfg(unix)]
@@ -6550,6 +6599,7 @@ mod tests {
                                 daemon_version: version,
                                 host_claude_plugin: false,
                                 guarded_shells: true,
+                                prepared_spawn: true,
                             };
                             let mut frame = serde_json::to_vec(&Frame::Response(hello)).unwrap();
                             frame.push(b'\n');
@@ -6625,13 +6675,13 @@ mod tests {
                         let steps: &[&str] = match case {
                             ReconnectCase::Resume => &["hello", "list", "attach"],
                             ReconnectCase::CloseOnAttach => &["hello", "list", "attach", "close"],
-                            ReconnectCase::CloseOnSpawn => &["hello", "list", "spawn", "close"],
+                            ReconnectCase::CloseOnSpawn => &["hello", "list", "prepare", "spawn", "close"],
                             ReconnectCase::CloseOnOldConnection => &["hello", "close"],
                             ReconnectCase::CloseOnListDisconnect => {
                                 &["hello", "list_disconnect", "reconnect", "hello", "close"]
                             }
                             ReconnectCase::CloseAfterAttachDisconnect => {
-                                &["hello", "list", "spawn", "attach_disconnect", "reconnect", "hello", "close"]
+                                &["hello", "list", "prepare", "spawn", "attach_disconnect", "reconnect", "hello", "close"]
                             }
                             ReconnectCase::LegacyClose | ReconnectCase::LegacyOpen => &["hello", "list"],
                         };
@@ -6658,6 +6708,7 @@ mod tests {
                                     daemon_version: version.clone(),
                                     host_claude_plugin: false,
                                     guarded_shells: !legacy,
+                                    prepared_spawn: !legacy,
                                 },
                                 ("list", ClientRequest::List { request_id }) => {
                                     if case == ReconnectCase::LegacyClose {
@@ -6698,10 +6749,15 @@ mod tests {
                                     // The daemon may have attached before the response was lost.
                                     continue;
                                 }
-                                ("spawn", ClientRequest::Spawn { request_id, session_id, shell_id: Some(shell_id), .. }) => {
+                                ("prepare", ClientRequest::PrepareOwnedSpawn { request_id, session_id, shell_id }) => {
                                     assert_eq!(session_id, surviving_id);
                                     assert_ne!(shell_id, survivor_shell_id);
                                     owned_shell_id = shell_id;
+                                    ServerResponse::SpawnPrepared { request_id }
+                                }
+                                ("spawn", ClientRequest::SpawnOwned { request_id, session_id, shell_id, .. }) => {
+                                    assert_eq!(session_id, surviving_id);
+                                    assert_eq!(shell_id, owned_shell_id);
                                     if case == ReconnectCase::CloseOnSpawn {
                                         daemon_close_pane(session_id.clone());
                                     }
