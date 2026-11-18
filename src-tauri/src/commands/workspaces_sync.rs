@@ -101,6 +101,109 @@ fn adopt_root_landing(project_uid: Option<&str>, project_name: &str) -> String {
         .to_string()
 }
 
+/// Serializes the adopts that create, reuse or roll back a project landing
+/// dir. Every workspace of a project lands in the same dir, so without this
+/// one adopt's rollback could remove a clone another adopt had just reused.
+/// Adopts are rare and user-driven, so one lock for all landings is enough.
+static ADOPT_LANDING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn adopt_landing_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    ADOPT_LANDING.lock().await
+}
+
+/// Held from a clone-adopt's first look at its landing dir until the new
+/// workspace is registered: the landing lock, plus the guard that keeps
+/// worktree cleanup off the new checkout.
+struct AdoptLanding {
+    _opening: tokio::sync::RwLockReadGuard<'static, ()>,
+    _landing: tokio::sync::MutexGuard<'static, ()>,
+}
+
+/// Clone `project_remote` into `project_path` — or reuse the clone already
+/// there — and add a worktree for `branch`. Returns the worktree's path.
+///
+/// A failure removes the landing dir only when this call created it.
+async fn clone_adopt_worktree(
+    project_remote: String,
+    project_path: std::path::PathBuf,
+    branch: String,
+) -> Result<(String, AdoptLanding), String> {
+    let landing = adopt_landing_guard().await;
+    // The landing dir is the same for every workspace of a project, so a
+    // second adopt finds the first one's clone already there.
+    let (reuse_clone, created_here) = adopt_clone_plan(&project_path);
+
+    // Phase 1: clone the bare-ish project (no checkout — worktree-add
+    // picks the right branch), or bring a reused clone up to date.
+    let (path, fetch_branch) = (project_path.clone(), branch.clone());
+    let prepared = tokio::task::spawn_blocking(move || {
+        if reuse_clone {
+            refresh_reused_clone(&path, &project_remote, &fetch_branch)
+        } else {
+            crate::git::git_clone(&project_remote, &path).map(|_| ())
+        }
+    })
+    .await
+    .map_err(|e| format!("git_clone join failed: {e}"))?;
+
+    // The new worktree can land on a path an old archive entry still
+    // names, so keep worktree cleanup off it until it is registered.
+    let opening = crate::worktree_cleanup::opening_guard().await;
+    let result = match prepared {
+        Err(e) => Err(e),
+        // Phase 2: add the worktree at the requested branch.
+        Ok(()) => {
+            let path = project_path.clone();
+            tokio::task::spawn_blocking(move || {
+                // `new_branch=false` — we want the existing branch from
+                // the remote, not a new one.
+                crate::git::git_create_worktree(&path, &branch, false, None, None)
+            })
+            .await
+            .map_err(|e| format!("git worktree add join failed: {e}"))?
+        }
+    };
+
+    match result {
+        Ok(worktree) => Ok((worktree, AdoptLanding { _opening: opening, _landing: landing })),
+        Err(e) => {
+            // Roll back the project dir this call cloned so a retry starts
+            // clean. Still under the landing lock, so no other adopt has
+            // started using it.
+            if created_here {
+                let _ = std::fs::remove_dir_all(&project_path);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Make an existing clone fit to take another workspace of its project:
+/// check it is a clone of `project_remote`, then fetch `branch` so the new
+/// worktree starts at the remote's current tip rather than wherever the
+/// first adopt left `origin/<branch>`.
+fn refresh_reused_clone(
+    project_path: &std::path::Path,
+    project_remote: &str,
+    branch: &str,
+) -> Result<(), String> {
+    let existing = crate::project_identity::git_canonical_remote(project_path);
+    if existing.is_none() || existing != crate::project_identity::canonical_remote(project_remote) {
+        return Err(format!(
+            "path_in_use: {} already holds a different repository ({}).",
+            project_path.display(),
+            existing.as_deref().unwrap_or("no origin remote"),
+        ));
+    }
+    if !crate::git::fetch_origin_branch(project_path, branch) {
+        return Err(format!(
+            "Could not fetch '{branch}' from origin into the existing clone at {}.",
+            project_path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// What a clone-adopt does with its project landing dir: `(reuse, created)`.
 /// An existing clone is reused instead of cloned again, and only a path that
 /// did not exist beforehand counts as created by the adopt — the one case its
@@ -1177,6 +1280,9 @@ async fn adopt_worktree_via_repo_rsync<R: tauri::Runtime>(
     #[cfg(unix)]
     {
         // ── 2. rsync the parent repo (incl .git) unless already present ──
+        // One adopt at a time per landing, so the existence checks below
+        // still hold when the rollback acts on them.
+        let landing = adopt_landing_guard().await;
         let already_local = local_project_path.join(".git").exists();
         // Only a directory this call creates is this call's to remove.
         let created_here = !local_project_path.exists();
@@ -1277,6 +1383,7 @@ async fn adopt_worktree_via_repo_rsync<R: tauri::Runtime>(
         drop(app_state);
         drop(db);
         drop(opening);
+        drop(landing);
 
         if let Err(e) = crate::workspaces_sync::try_sync_with_app(&app).await {
             eprintln!(
@@ -1453,55 +1560,8 @@ pub async fn workspaces_adopt_via_clone<R: tauri::Runtime>(
     // thread via spawn_blocking — git operations can take seconds.
     let project_path_str = project_path.to_string_lossy().to_string();
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
-    let branch_clone = branch.clone();
-    let project_path_clone = project_path.clone();
-    // Phase 1: clone the bare-ish project (no checkout — worktree-add
-    // picks the right branch).
-    //
-    // The landing dir is the same for every workspace of a project, so a
-    // second adopt finds the first one's clone already there. Reuse it —
-    // and never let the rollback below remove a directory that was here
-    // before this call, since it backs live worktrees.
-    let clone_project_path = project_path.clone();
-    let (reuse_clone, created_here) = adopt_clone_plan(&project_path);
-    let cloned = if reuse_clone {
-        Ok(project_path_str.clone())
-    } else {
-        tokio::task::spawn_blocking(move || {
-            crate::git::git_clone(&project_remote, &clone_project_path)
-        })
-        .await
-        .map_err(|e| format!("git_clone join failed: {e}"))?
-    };
-    // The new worktree can land on a path an old archive entry still
-    // names, so keep worktree cleanup off it until it is registered.
-    let opening = crate::worktree_cleanup::opening_guard().await;
-    let clone_result = match cloned {
-        Err(e) => Err(e),
-        // Phase 2: add the worktree at the requested branch.
-        Ok(_) => tokio::task::spawn_blocking(move || {
-            crate::git::git_create_worktree(
-                project_path_clone.as_path(),
-                &branch_clone,
-                // `new_branch=false` — we want the existing branch from
-                // the remote, not a new one.
-                false,
-                None,
-                None,
-            )
-        })
-        .await
-        .map_err(|e| format!("git worktree add join failed: {e}"))?,
-    };
-
-    let worktree_actual_path = clone_result.map_err(|e| {
-        // Roll back the project dir this call cloned so a retry starts
-        // clean.
-        if created_here {
-            let _ = std::fs::remove_dir_all(&project_path);
-        }
-        e
-    })?;
+    let (worktree_actual_path, landing) =
+        clone_adopt_worktree(project_remote, project_path.clone(), branch.clone()).await?;
 
     // Step 7: register a brand-new local workspace pointing at the
     // freshly-cloned worktree. Crucially we do NOT link to the
@@ -1532,7 +1592,7 @@ pub async fn workspaces_adopt_via_clone<R: tauri::Runtime>(
     // (and being re-adopted as a duplicate). Recomputing from the local
     // checkout mirrors every other create path.
     app_state.set_workspace_project_root(&workspace_id.0, project_path_str.clone());
-    drop(opening);
+    drop(landing);
 
     // Nothing else on this path emits, so without this the brand-new workspace
     // stays invisible in the sidebar and the overview until some unrelated
@@ -2084,7 +2144,116 @@ mod landing_tests {
         adopt_clone_plan, adopt_root_landing, adopt_worktree_landing,
         adopt_worktree_landing_via_repo, choose_landing,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@test.com"])
+            .args(args)
+            .output()
+            .expect("git spawn");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A bare "origin" with `main`, `feature` and `other`, plus a clone to
+    /// push from.
+    fn origin_with_feature(root: &Path) -> (PathBuf, PathBuf) {
+        let publisher = root.join("publisher");
+        std::fs::create_dir_all(&publisher).unwrap();
+        git(&publisher, &["init", "--initial-branch=main"]);
+        git(&publisher, &["commit", "--allow-empty", "-m", "initial"]);
+        git(&publisher, &["branch", "feature"]);
+        git(&publisher, &["branch", "other"]);
+        let origin = root.join("origin.git");
+        git(root, &["clone", "--bare", publisher.to_str().unwrap(), origin.to_str().unwrap()]);
+        git(&publisher, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        (origin, publisher)
+    }
+
+    fn remove_worktree(worktree: &str) {
+        let _ = crate::git::git_remove_worktree(Path::new(worktree), None, true);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_clone_adopt_never_removes_a_clone_its_sibling_uses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (origin, _publisher) = origin_with_feature(tmp.path());
+        let remote = origin.to_string_lossy().to_string();
+        let landing = tmp.path().join(format!("adopt-race-{}", std::process::id()));
+
+        // Two workspaces of one project pulled at once: one branch exists
+        // on the remote, the other does not.
+        // Each adopt releases its guards as it finishes, as registering
+        // the workspace does in the command.
+        let adopt = |branch: &str| {
+            let (remote, landing, branch) = (remote.clone(), landing.clone(), branch.to_string());
+            async move {
+                super::clone_adopt_worktree(remote, landing, branch).await.map(|(path, _)| path)
+            }
+        };
+        let (good, bad) = tokio::join!(adopt("feature"), adopt("no-such-branch"));
+
+        assert!(bad.is_err(), "a branch the remote lacks cannot be adopted");
+        let worktree = good.expect("the sibling adopt succeeds");
+        assert!(landing.join(".git").exists(), "its clone survives the other's rollback");
+        assert_eq!(git(Path::new(&worktree), &["branch", "--show-current"]), "feature");
+        remove_worktree(&worktree);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_reused_clone_is_fetched_before_its_second_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (origin, publisher) = origin_with_feature(tmp.path());
+        let remote = origin.to_string_lossy().to_string();
+        let landing = tmp.path().join(format!("adopt-fresh-{}", std::process::id()));
+
+        let (first, guards) =
+            super::clone_adopt_worktree(remote.clone(), landing.clone(), "other".into())
+                .await
+                .unwrap();
+        drop(guards);
+
+        // `feature` advances on the remote after the first adopt cloned it.
+        git(&publisher, &["checkout", "feature"]);
+        git(&publisher, &["commit", "--allow-empty", "-m", "later"]);
+        git(&publisher, &["push", "origin", "feature"]);
+        let tip = git(&publisher, &["rev-parse", "HEAD"]);
+
+        let (second, guards) =
+            super::clone_adopt_worktree(remote, landing.clone(), "feature".into()).await.unwrap();
+        drop(guards);
+        assert_eq!(git(Path::new(&second), &["rev-parse", "HEAD"]), tip);
+        remove_worktree(&second);
+        remove_worktree(&first);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_landing_holding_another_repository_is_refused_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (origin, _publisher) = origin_with_feature(tmp.path());
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let (other_origin, _) = origin_with_feature(&other);
+        let landing = tmp.path().join(format!("adopt-other-{}", std::process::id()));
+        git(tmp.path(), &["clone", other_origin.to_str().unwrap(), landing.to_str().unwrap()]);
+
+        let err = super::clone_adopt_worktree(
+            origin.to_string_lossy().to_string(),
+            landing.clone(),
+            "feature".into(),
+        )
+        .await
+        .err()
+        .expect("another project's clone is not reused");
+        assert!(err.starts_with("path_in_use:"), "unexpected error: {err}");
+        assert!(landing.join(".git").exists(), "and it is left as it was");
+    }
 
     #[test]
     fn clone_adopt_only_owns_a_landing_dir_it_creates() {
