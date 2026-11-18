@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,6 +85,9 @@ impl Serve {
         // Codemux finds Cursor as `cursor-agent` on PATH. A symlink, not a
         // copy: copy-then-exec races ETXTBSY.
         std::os::unix::fs::symlink(FAKE_CURSOR, bin.join("cursor-agent")).unwrap();
+        // Keep startup and shutdown browser cleanup inside this fixture.
+        std::os::unix::fs::symlink("/bin/true", bin.join("pkill")).unwrap();
+        std::os::unix::fs::symlink("/bin/true", bin.join("fuser")).unwrap();
         let log = std::fs::File::create(root.path().join("serve.log")).unwrap();
         let mut cmd = Command::new(CODEMUX);
         isolate(&mut cmd, root.path());
@@ -141,21 +144,29 @@ impl Serve {
         let created = self.ok(&["json", "create_workspace", &json!({"path": folder}).to_string()]);
         (created["data"]["workspace_id"].as_str().expect("a workspace id").to_owned(), folder)
     }
+
+    fn shutdown(&mut self) -> Option<ExitStatus> {
+        if let Ok(Some(status)) = self.child.try_wait() {
+            return Some(status);
+        }
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
 }
 
 impl Drop for Serve {
     fn drop(&mut self) {
-        // This test started the serve; stop it by its pid.
-        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if self.child.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        if self.shutdown().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -631,6 +642,20 @@ fn workspace_create_list_info_close_round_trip() {
     let listed = serve.ok(&["workspace", "list", "--json"]);
     let ids: Vec<&str> = listed["result"]["workspaces"].as_array().unwrap().iter().filter_map(|w| w["workspace_id"].as_str()).collect();
     assert!(!ids.contains(&workspace.as_str()), "{ids:?}");
+}
+
+#[test]
+fn serve_sigterm_saves_workspace_layout_and_exits_successfully() {
+    let mut serve = Serve::start();
+    let (workspace_id, _) = serve.workspace("persist-on-shutdown");
+    let status = serve.shutdown().expect("serve should stop after SIGTERM");
+    assert!(status.success(), "serve exited with {status}:\n{}", serve.log());
+
+    let layout_path = serve.root.path().join("config").join(codemux_lib::APP_DIR_NAME).join("layout.json");
+    let layout: Value = serde_json::from_slice(&std::fs::read(layout_path).unwrap()).unwrap();
+    assert!(layout["workspaces"].as_array().unwrap().iter().any(|workspace| {
+        workspace["workspace_id"].as_str() == Some(workspace_id.as_str())
+    }));
 }
 
 #[test]

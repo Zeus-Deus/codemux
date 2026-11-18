@@ -19,6 +19,8 @@
 //! path (in `main.rs`) refuses to start when a `serve` instance does.
 
 use crate::web_remote::{self, BIND_SCOPE_ALL};
+use std::time::Duration;
+use tauri::Manager;
 
 /// Options parsed from `codemux serve [--scope …] [--port N] [--relay]`.
 /// Flag semantics mirror `codemux remote enable` exactly.
@@ -78,9 +80,8 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     };
     let handle = app.handle().clone();
 
-    // Everything from here is async: run it — and the signal wait — inside one
-    // `block_on`. `app` stays owned in this scope so the backend lives for the
-    // whole session; dropping it would tear the runtime down.
+    // Run startup and the signal wait inside the async runtime. Keep `app`
+    // alive through teardown.
     let result = tauri::async_runtime::block_on(async move {
         // 6. Debug-asset caveat: dev builds embed no frontend (devUrl), so the
         //    served UI only works when the source-tree `dist/` fallback exists.
@@ -148,39 +149,40 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     // Stop taking outside-assistant connections first, so no network client
     // starts work against managers that are shutting down.
     crate::mcp_connector::listener::stop(app.handle());
-    if let Some(platform) =
-        tauri::Manager::try_state::<crate::plugins::platform_transport::PluginPlatformState>(&app)
-    {
-        let _ = tauri::async_runtime::block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            platform.shutdown(),
-        ));
-    }
-    if let Some(coordinator) = tauri::Manager::try_state::<crate::delegation::coordinator::Coordinator>(&app) {
-        tauri::async_runtime::block_on(coordinator.shutdown())?;
-    }
-    // Managed state need not drop on exit; stop OpenCode explicitly.
-    if let Some(manager) = tauri::Manager::try_state::<
-        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
-    >(&app)
-    {
-        if let Err(error) = tauri::async_runtime::block_on(manager.shutdown()) {
-            eprintln!("[codemux::opencode] shutdown incomplete: {error}");
+    // Tokio timers must be constructed inside the runtime. Keep running
+    // the remaining cleanup if a delegation owner failed to shut down.
+    let coordinator_result = tauri::async_runtime::block_on(async {
+        if let Some(platform) =
+            app.try_state::<crate::plugins::platform_transport::PluginPlatformState>()
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(3), platform.shutdown()).await;
         }
-    }
-    // Remote-workspace ssh tunnels live in a global registry, so dropping
-    // `app` would not stop them.
-    #[cfg(unix)]
-    let _ = tauri::async_runtime::block_on(tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        crate::ssh::shutdown_all(),
-    ));
+        let coordinator_result =
+            if let Some(coordinator) = app.try_state::<crate::delegation::coordinator::Coordinator>() {
+                coordinator.shutdown().await
+            } else {
+                Ok(())
+            };
+        // Managed state need not drop on exit. Stop OpenCode explicitly.
+        if let Some(manager) = app.try_state::<
+            std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
+        >() {
+            if let Err(error) = manager.shutdown().await {
+                eprintln!("[codemux::opencode] shutdown incomplete: {error}");
+            }
+        }
+        // Remote-workspace SSH tunnels live in a global registry.
+        #[cfg(unix)]
+        let _ = tokio::time::timeout(Duration::from_secs(3), crate::ssh::shutdown_all()).await;
+        coordinator_result
+    });
+    crate::state::flush_persisted_state(&app.state::<crate::state::AppStateStore>());
     if let Err(error) = crate::active_workspace_persistence::flush_latest(app.handle()) {
         eprintln!("[codemux::selection] headless shutdown flush failed: {error}");
     }
     crate::agent_browser::kill_stream_daemons();
     drop(app);
-    result
+    result.and(coordinator_result)
 }
 
 /// Which bind scope a `codemux serve` startup should request, given the

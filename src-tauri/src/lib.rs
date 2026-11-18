@@ -544,10 +544,13 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 // Stop taking outside-assistant connections first.
                 mcp_connector::listener::stop(app);
-                let _ = tauri::async_runtime::block_on(tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    app.state::<plugins::platform_transport::PluginPlatformState>().shutdown(),
-                ));
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        app.state::<plugins::platform_transport::PluginPlatformState>().shutdown(),
+                    )
+                    .await
+                });
                 tauri::async_runtime::block_on(
                     app.state::<plugins::host::PluginHostState>().shutdown(),
                 );
@@ -576,10 +579,10 @@ pub fn run() {
                 );
                 // Remote-workspace ssh tunnels otherwise outlive the app.
                 #[cfg(unix)]
-                let _ = tauri::async_runtime::block_on(tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    ssh::shutdown_all(),
-                ));
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(3), ssh::shutdown_all())
+                        .await
+                });
                 if let Err(error) = tauri::async_runtime::block_on(
                     app.state::<commands::workflows::WorkflowState>().shutdown(),
                 ) {
