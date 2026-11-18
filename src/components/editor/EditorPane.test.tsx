@@ -49,12 +49,12 @@ async function checkDisk() {
   });
 }
 
-async function openEditor(embedded = false) {
+async function openEditor(embedded = false, expectedContent = disk.content) {
   const { container } = render(<EditorPane tabId={TAB} embedded={embedded} />);
   await waitFor(() => {
     const el = container.querySelector(".cm-editor");
     expect(el && EditorView.findFromDOM(el as HTMLElement)?.state.doc.toString()).toBe(
-      disk.content,
+      expectedContent,
     );
   });
   return EditorView.findFromDOM(container.querySelector(".cm-editor") as HTMLElement)!;
@@ -83,6 +83,35 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("EditorPane disk sync", () => {
+  it("restores unsaved edits after switching away and lets the user save them", async () => {
+    const before = await openEditor();
+    type(before, "// unfinished\n");
+    const draft = before.state.doc.toString();
+    cleanup();
+
+    const restored = await openEditor(false, draft);
+    expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(true);
+    expect(localStorage.getItem("codemux-editor")).not.toContain("unfinished");
+    save(restored);
+    await waitFor(() => expect(disk.content).toBe(draft));
+    expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(false);
+  });
+
+  it("restores an empty draft and detects an outside edit made while the pane was hidden", async () => {
+    const before = await openEditor();
+    act(() => before.dispatch({ changes: { from: 0, to: before.state.doc.length } }));
+    cleanup();
+    agentWrites("// agent edit\n");
+
+    const restored = await openEditor(false, "");
+    expect(await screen.findByRole("alert")).toHaveTextContent(/changed on disk/i);
+    save(restored);
+    await act(async () => {});
+    expect(writeFile).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+    expect(restored.state.doc.toString()).toBe("// agent edit\n");
+  });
+
   it("ignores an earlier file read after another file has loaded", async () => {
     let finishOldRead!: (value: string) => void;
     vi.mocked(readFile).mockImplementationOnce(() => new Promise((done) => { finishOldRead = done; }));
@@ -146,12 +175,12 @@ describe("EditorPane disk sync", () => {
     save(original);
     await waitFor(() => expect(writeFile).toHaveBeenCalledWith(PATH, saving));
     cleanup();
-    const current = await openEditor();
-    const baseline = current.state.doc.toString();
+    const baseline = disk.content;
+    const current = await openEditor(false, saving);
     type(current, "// new pane edit\n");
     await act(async () => { finishWrite(); });
     expect(disk.content).toBe(saving);
-    expect(current.state.doc.toString()).toBe(`${baseline}// new pane edit\n`);
+    expect(current.state.doc.toString()).toBe(`${saving}// new pane edit\n`);
     expect(useEditorStore.getState().tabs[TAB].baselineContent).toBe(baseline);
     expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(true);
   });

@@ -437,27 +437,37 @@ export function EditorPane({
     // resolved, which on a workspace switch with an editor tab open
     // doubled the wall clock (IPC round-trip + module load + parse)
     // for no reason \u2014 neither call needs the other's result.
-    const readPromise = readFile(filePath);
     const langPromise = loadLanguage(filePath);
 
-    readPromise
-      .then((c) => {
-        if (cancelled) return;
-        // Out of the undo history: Ctrl+Z must not empty a freshly opened file.
-        view.dispatch({
-          changes: { from: 0, to: view.state.doc.length, insert: c },
-          annotations: Transaction.addToHistory.of(false),
+    const tab = useEditorStore.getState().getTab(tabId);
+    if (tab?.isDirty && tab.suspendedDraft !== undefined) {
+      replaceDocument(view, tab.suspendedDraft, false);
+      setContent(tab.suspendedDraft);
+      setLoadedFilePath(filePath);
+      isLoadingRef.current = false;
+      // Compare disk with the original baseline, just as if the pane had
+      // stayed open. A changed or unreadable file must not replace the draft.
+      void checkDisk();
+    } else {
+      void readFile(filePath)
+        .then((c) => {
+          if (cancelled) return;
+          // Out of the undo history: Ctrl+Z must not empty a freshly opened file.
+          view.dispatch({
+            changes: { from: 0, to: view.state.doc.length, insert: c },
+            annotations: Transaction.addToHistory.of(false),
+          });
+          setBaselineContent(tabId, c);
+          setContent(c);
+          setLoadedFilePath(filePath);
+        })
+        .catch((err) => {
+          if (!cancelled) setErrorMsg(String(err));
+        })
+        .finally(() => {
+          if (!cancelled) isLoadingRef.current = false;
         });
-        setBaselineContent(tabId, c);
-        setContent(c);
-        setLoadedFilePath(filePath);
-      })
-      .catch((err) => {
-        if (!cancelled) setErrorMsg(String(err));
-      })
-      .finally(() => {
-        if (!cancelled) isLoadingRef.current = false;
-      });
+    }
 
     // Apply the language as soon as it's ready, independently of the
     // text content being in the document. CodeMirror's language
@@ -477,8 +487,12 @@ export function EditorPane({
       cancelled = true;
       isLoadingRef.current = false;
       diskEpochRef.current++;
+      const editor = useEditorStore.getState();
+      if (editor.getTab(tabId)?.isDirty) {
+        editor.suspendDraft(tabId, filePath, view.state.doc.toString());
+      }
     };
-  }, [filePath, tabId, setBaselineContent, setDiskConflict]);
+  }, [filePath, tabId, setBaselineContent, setDiskConflict, checkDisk]);
 
   // Watch the open text file for edits made outside the editor. Polling a
   // stat matches how the diff and changes panels refresh; checks also run

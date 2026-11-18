@@ -14,6 +14,7 @@ import type {
 } from "@/tauri/types";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
+import { useEditorStore } from "@/stores/editor-store";
 import {
   DEFAULT_RIGHT_PANEL_PANES,
   RIGHT_PANEL_EMPTY,
@@ -93,7 +94,7 @@ vi.mock("@/tauri/commands", async (importOriginal) => ({
 }));
 
 import { RightPanel } from "./right-panel";
-import { docPaneId } from "./right-panel/pane-registry";
+import { docEditorTabId, docPaneId } from "./right-panel/pane-registry";
 
 function chatPane(threadId: string | null): PaneNodeSnapshot {
   return {
@@ -441,6 +442,19 @@ describe("RightPanel deck", () => {
     await user.click(screen.getByTestId("right-panel-add-pane"));
     await user.click(await screen.findByRole("menuitem", { name: "Changes" }));
     expect(screen.getByTestId("changes-tab")).toBeInTheDocument();
+  });
+
+  it("drops the editor buffer when the user closes a document in the deck", async () => {
+    const filePath = "/p/example.txt";
+    const tabId = docEditorTabId("ws-1", filePath);
+    useEditorStore.getState().initTab(tabId, { filePath });
+    useUIStore.setState({
+      rightPanelPanes: { "ws-1": [...DEFAULT_RIGHT_PANEL_PANES, docPaneId(filePath)] },
+    });
+    renderDeck();
+
+    await userEvent.setup().click(screen.getByRole("button", { name: "Close example.txt" }));
+    expect(useEditorStore.getState().getTab(tabId)).toBeUndefined();
   });
 
   // Closing the pane you're looking at must land somewhere, not on a blank

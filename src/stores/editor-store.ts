@@ -5,6 +5,8 @@ export interface EditorTabState {
   filePath: string | null;
   baselineContent: string;
   isDirty: boolean;
+  /** Unsaved buffer of an unmounted editor. Kept in memory only. */
+  suspendedDraft?: string;
   /** Transient request from a source reference. Omitted from persistence.
    *  `endColumn` (exclusive) selects the range from `column`, e.g. a search hit. */
   revealRequest?: { line: number; column?: number; endColumn?: number; nonce: number };
@@ -23,6 +25,7 @@ interface EditorStore {
   setFilePath: (tabId: string, filePath: string) => void;
   setBaselineContent: (tabId: string, content: string) => void;
   setDirty: (tabId: string, dirty: boolean) => void;
+  suspendDraft: (tabId: string, filePath: string, content: string) => void;
   requestReveal: (tabId: string, line: number, column?: number, endColumn?: number) => void;
   clearReveal: (tabId: string, nonce: number) => void;
   removeTab: (tabId: string) => void;
@@ -36,24 +39,17 @@ export const useEditorStore = create<EditorStore>()(
       getTab: (tabId) => get().tabs[tabId],
 
       initTab: (tabId, opts) =>
-        set((s) => ({
-          tabs: {
-            ...s.tabs,
-            [tabId]: {
-              ...DEFAULT_TAB,
-              ...s.tabs[tabId],
-              ...(opts?.filePath != null ? { filePath: opts.filePath } : {}),
-            },
-          },
-        })),
+        set((s) => {
+          const current = s.tabs[tabId] ?? DEFAULT_TAB;
+          const filePath = opts?.filePath ?? current.filePath;
+          const tab = filePath === current.filePath
+            ? current
+            : { ...DEFAULT_TAB, filePath, revealRequest: current.revealRequest };
+          return { tabs: { ...s.tabs, [tabId]: tab } };
+        }),
 
       setFilePath: (tabId, filePath) =>
-        set((s) => ({
-          tabs: {
-            ...s.tabs,
-            [tabId]: { ...(s.tabs[tabId] ?? DEFAULT_TAB), filePath },
-          },
-        })),
+        get().initTab(tabId, { filePath }),
 
       setBaselineContent: (tabId, content) =>
         set((s) => ({
@@ -63,6 +59,7 @@ export const useEditorStore = create<EditorStore>()(
               ...(s.tabs[tabId] ?? DEFAULT_TAB),
               baselineContent: content,
               isDirty: false,
+              suspendedDraft: undefined,
             },
           },
         })),
@@ -76,6 +73,12 @@ export const useEditorStore = create<EditorStore>()(
             [tabId]: { ...(s.tabs[tabId] ?? DEFAULT_TAB), isDirty: dirty },
           },
         }));
+      },
+
+      suspendDraft: (tabId, filePath, content) => {
+        const tab = get().tabs[tabId];
+        if (!tab?.isDirty || tab.filePath !== filePath) return;
+        set((s) => ({ tabs: { ...s.tabs, [tabId]: { ...tab, suspendedDraft: content } } }));
       },
 
       requestReveal: (tabId, line, column, endColumn) =>

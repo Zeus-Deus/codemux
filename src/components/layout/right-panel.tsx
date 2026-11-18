@@ -612,6 +612,8 @@ export const RightPanel = memo(function RightPanel({
   const dropPane = useCallback(
     (id: RightPanelTab) => {
       closeRightPanelPane(workspaceId, id);
+      const filePath = docPanePath(id);
+      if (filePath) useEditorStore.getState().removeTab(docEditorTabId(workspaceId, filePath));
       if (id === "side-chat") {
         // Closing the pane is the end of the side chat: reap its fork.
         const open = useSideChatStore.getState().activeByWorkspace[workspaceId];
