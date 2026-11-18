@@ -2396,7 +2396,9 @@ pub fn fetch_origin_branch(repo_path: &Path, branch: &str) -> bool {
         None if branch.starts_with("refs/") => return false,
         None => branch,
     };
-    if branch.is_empty() {
+    // Checked after normalising: `origin/-x` passes a check on the input
+    // but leaves an option-shaped `-x` behind.
+    if crate::workspace_service::check_ref_text("branch", branch).is_err() {
         return false;
     }
     // Cheap local check first: `git fetch origin` on a repo with no
@@ -2407,7 +2409,7 @@ pub fn fetch_origin_branch(repo_path: &Path, branch: &str) -> bool {
         return false;
     }
     let Ok(mut child) = git_command()
-        .args(["fetch", "--quiet", "--no-tags", "origin", branch])
+        .args(["fetch", "--quiet", "--no-tags", "--", "origin", branch])
         .current_dir(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
@@ -4536,6 +4538,20 @@ mod tests {
     fn fetch_origin_branch_is_noop_without_origin_remote() {
         let (_dir, repo) = setup_test_repo();
         assert!(!fetch_origin_branch(&repo, "main"), "no origin remote → no fetch");
+    }
+
+    #[test]
+    fn fetch_origin_branch_never_passes_an_option_shaped_name_after_normalising() {
+        let (dir, local, _tip) = setup_stale_clone_with_remote("fetch-inject");
+        let marker = dir.path().join("pwned");
+        let payload = format!("origin/--upload-pack=touch {};#", marker.display());
+
+        assert!(!fetch_origin_branch(&local, &payload));
+        assert!(!marker.exists(), "git must never have run the payload");
+
+        // The same name as a worktree base: refused or harmless, never run.
+        let _ = git_create_worktree(&local, "inject-base", true, Some(&payload), None);
+        assert!(!marker.exists(), "git must never have run the payload");
     }
 
     #[test]
