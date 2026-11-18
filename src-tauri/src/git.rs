@@ -1835,10 +1835,18 @@ fn branch_worktree(repo_path: &Path, branch: &str) -> Option<PathBuf> {
 fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Result<(), String> {
     let base_ref = format!("refs/heads/{base_branch}");
     match branch_worktree(repo_path, base_branch) {
-        // `--no-squash`: a `branch.<base>.mergeOptions=--squash` default
-        // would otherwise stage the changes, leave HEAD where it was, and
-        // still exit 0.
-        Some(checkout) => run_git(&checkout, &["merge", "--ff-only", "--no-squash", commit])
+        // Defaults that would bend the fast-forward are overridden:
+        // - `--no-squash`: a `branch.<base>.mergeOptions=--squash` default
+        //   stages the changes, leaves HEAD where it was, and exits 0;
+        // - `--no-overwrite-ignore`: by default an ignored local file (a
+        //   private config) is replaced when the merge tracks that path;
+        // - `--no-autostash`: `merge.autoStash` would stash local edits and
+        //   re-apply them after the move, leaving conflicts git still
+        //   reports as success.
+        Some(checkout) => run_git(
+            &checkout,
+            &["merge", "--ff-only", "--no-squash", "--no-overwrite-ignore", "--no-autostash", commit],
+        )
             .map(|_| ())
             .map_err(|e| {
                 format!(
@@ -6571,6 +6579,50 @@ mod tests {
         assert!(contains, "the base's HEAD must hold the feature commit");
         assert!(git_status(&repo).unwrap().is_empty(), "and its checkout must be clean");
         assert_eq!(std::fs::read_to_string(repo.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[test]
+    fn test_merge_into_base_keeps_an_ignored_file_the_merge_would_track() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        // A private, ignored file in the base checkout only.
+        std::fs::write(repo.join(".git/info/exclude"), "local.env\n").unwrap();
+        std::fs::write(repo.join("local.env"), "my secrets").unwrap();
+        let main_before = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        // The feature branch starts tracking the same path.
+        std::fs::write(wt.join("local.env"), "template").unwrap();
+        run_git(&wt, &["add", "-f", "local.env"]).unwrap();
+        run_git(&wt, &["commit", "-m", "track local.env"]).unwrap();
+
+        assert!(merge_into_base(&wt, main, false).is_err());
+        assert_eq!(std::fs::read_to_string(repo.join("local.env")).unwrap(), "my secrets");
+        assert_eq!(run_git(&repo, &["rev-parse", "HEAD"]).unwrap(), main_before);
+    }
+
+    #[test]
+    fn test_merge_into_base_refuses_instead_of_autostashing() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        run_git(&repo, &["config", "merge.autoStash", "true"]).unwrap();
+
+        std::fs::write(repo.join("shared.txt"), "original").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "add shared"]).unwrap();
+        let main_before = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        run_git(&wt, &["merge", main]).unwrap();
+        std::fs::write(wt.join("shared.txt"), "from feature").unwrap();
+        run_git(&wt, &["commit", "-am", "feature edit"]).unwrap();
+        std::fs::write(repo.join("shared.txt"), "unsaved local work").unwrap();
+
+        assert!(merge_into_base(&wt, main, false).is_err());
+        assert_eq!(std::fs::read_to_string(repo.join("shared.txt")).unwrap(), "unsaved local work");
+        assert_eq!(run_git(&repo, &["rev-parse", "HEAD"]).unwrap(), main_before);
+        assert!(
+            run_git(&repo, &["stash", "list"]).unwrap().is_empty(),
+            "nothing may be left in a stash"
+        );
     }
 
     #[test]
