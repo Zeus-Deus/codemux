@@ -730,12 +730,18 @@ mod confined {
     use std::path::Path;
 
     const FILE: &str = "SKILL.md";
-    const TMP: &str = "SKILL.md.tmp";
+
+    /// A temporary name of this write's own: syncs can overlap, and each
+    /// must only ever rename or remove the file it created.
+    fn tmp_name() -> String {
+        format!("SKILL.md.{:016x}.tmp", rand::random::<u64>())
+    }
 
     /// Unix: every step after opening the root goes through file
     /// descriptors. The skill folder is opened with `O_NOFOLLOW` relative
     /// to the root, and the temporary file is created, written and renamed
-    /// relative to that folder, so no path is resolved again. std has no
+    /// relative to that folder, so no path is resolved again. Each write
+    /// uses a temporary name of its own (see [`tmp_name`]). std has no
     /// `*at` calls, hence the libc FFI.
     #[cfg(unix)]
     pub(super) fn write(root: &Path, name: &OsStr, content: &[u8]) -> Result<(), String> {
@@ -776,16 +782,8 @@ mod confined {
             "the skill folder is a link or not a folder",
         )?;
 
-        let tmp_c = c(TMP.as_bytes())?;
+        let tmp_c = c(tmp_name().as_bytes())?;
         let file_c = c(FILE.as_bytes())?;
-        // A leftover temporary file is removed, never followed.
-        // SAFETY: a live descriptor and a NUL-terminated name.
-        if unsafe { libc::unlinkat(dir_fd.as_raw_fd(), tmp_c.as_ptr(), 0) } != 0 {
-            let error = Error::last_os_error();
-            if error.kind() != ErrorKind::NotFound {
-                return Err(format!("clear the temporary file ({error})"));
-            }
-        }
         // SAFETY: as above; `O_EXCL | O_NOFOLLOW` only ever creates a new
         // regular file.
         let tmp_fd = fd(
@@ -799,12 +797,23 @@ mod confined {
             },
             "create the temporary file",
         )?;
+        // Removes this write's own temporary file, relative to the folder.
+        let discard = || {
+            // SAFETY: a live descriptor and a NUL-terminated name.
+            unsafe { libc::unlinkat(dir_fd.as_raw_fd(), tmp_c.as_ptr(), 0) };
+        };
         let mut tmp = std::fs::File::from(tmp_fd);
-        tmp.write_all(content).map_err(|e| format!("write the temporary file ({e})"))?;
+        if let Err(e) = tmp.write_all(content) {
+            drop(tmp);
+            discard();
+            return Err(format!("write the temporary file ({e})"));
+        }
         drop(tmp);
         // SAFETY: both names are relative to the same live descriptor.
         if unsafe { libc::renameat(dir_fd.as_raw_fd(), tmp_c.as_ptr(), dir_fd.as_raw_fd(), file_c.as_ptr()) } != 0 {
-            return Err(format!("rename the skill file ({})", Error::last_os_error()));
+            let error = Error::last_os_error();
+            discard();
+            return Err(format!("rename the skill file ({error})"));
         }
         Ok(())
     }
@@ -815,9 +824,8 @@ mod confined {
     /// - the skill folder is opened or created relative to the root,
     ///   refusing a reparse point (a link or junction), and held without
     ///   sharing delete access so it cannot be renamed or removed meanwhile;
-    /// - a leftover temporary file is deleted by handle, the link itself and
-    ///   never its target, and the new one is created exclusively relative
-    ///   to the folder;
+    /// - this write's own temporary file is created exclusively relative to
+    ///   the folder, and deleted by its handle if anything fails;
     /// - the content is written through that handle, and the file is
     ///   renamed to `SKILL.md` in place, within the folder it was created in.
     #[cfg(windows)]
@@ -830,11 +838,11 @@ mod confined {
         use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
         use windows_sys::Wdk::Storage::FileSystem::{
             FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE,
-            FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
+            FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_IF,
             FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0,
             FILE_SYNCHRONOUS_IO_NONALERT,
         };
-        use windows_sys::Win32::Foundation::{HANDLE, STATUS_OBJECT_NAME_NOT_FOUND, UNICODE_STRING};
+        use windows_sys::Win32::Foundation::{HANDLE, UNICODE_STRING};
         use windows_sys::Win32::Storage::FileSystem::{
             FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_NORMAL,
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
@@ -930,18 +938,10 @@ mod confined {
             return Err("the skill folder is a link or not a folder".into());
         }
 
-        match open_relative(&dir, OsStr::new(TMP), DELETE, 0, FILE_OPEN, FILE_NON_DIRECTORY_FILE) {
-            Ok(leftover) => {
-                if !discard(&leftover) {
-                    return Err("clear the temporary file".into());
-                }
-            }
-            Err(STATUS_OBJECT_NAME_NOT_FOUND) => {}
-            Err(status) => return Err(format!("clear the temporary file (NTSTATUS {status:#010x})")),
-        }
+        let tmp_name = tmp_name();
         let mut tmp = open_relative(
             &dir,
-            OsStr::new(TMP),
+            OsStr::new(&tmp_name),
             FILE_GENERIC_WRITE | DELETE,
             0,
             FILE_CREATE,
@@ -1218,8 +1218,12 @@ mod tests {
     fn a_saved_mapping_outside_the_skill_locations_is_dropped_not_written() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
-        // Recorded by an older build from an escaping name.
+        // Recorded by an older build from an escaping name; it resolves to
+        // `<home>/escaped/SKILL.md`, outside every skill root.
         let escaped = home.path().join(".codemux/skills/../../escaped/SKILL.md");
+        let real_target = home.path().join("escaped").join("SKILL.md");
+        fs::create_dir_all(real_target.parent().unwrap()).unwrap();
+        fs::write(&real_target, "sentinel").unwrap();
         let mut mapping = SkillMapping::default();
         mapping.upsert(MappingEntry {
             local_path: escaped,
@@ -1244,7 +1248,7 @@ mod tests {
             .unwrap();
         assert!(!applied);
         assert!(mapping.skills.is_empty(), "the unsafe mapping is dropped");
-        assert!(!home.path().parent().unwrap().join("escaped").exists());
+        assert_eq!(fs::read_to_string(&real_target).unwrap(), "sentinel", "its target is untouched");
     }
 
     #[cfg(unix)]
@@ -1363,7 +1367,38 @@ mod tests {
         write_skill_to_disk(&dest, "new body", Some(&skills_root)).unwrap();
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new body");
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
-        assert!(!dest.with_extension("md.tmp").exists());
+        // The planted link is never used, so it is all that remains.
+        assert_eq!(leftover_temps(dest.parent().unwrap()), ["SKILL.md.tmp"]);
+    }
+
+    /// Temporary files a confined write left in a skill folder.
+    fn leftover_temps(dir: &std::path::Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("SKILL.md.") && n.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn overlapping_writes_to_one_skill_never_mix_or_strand_files() {
+        let home = TempDir::new().unwrap();
+        let root = home.path().join(".codemux").join("skills");
+        let dest = root.join("demo").join("SKILL.md");
+        let bodies: Vec<String> = (0..8).map(|i| format!("body {i} ").repeat(4096)).collect();
+        std::thread::scope(|scope| {
+            for body in &bodies {
+                let (dest, root) = (&dest, &root);
+                scope.spawn(move || {
+                    for _ in 0..10 {
+                        write_skill_to_disk(dest, body, Some(root)).unwrap();
+                    }
+                });
+            }
+        });
+        let written = fs::read_to_string(&dest).unwrap();
+        assert!(bodies.contains(&written), "the file holds exactly one write's content");
+        assert!(leftover_temps(dest.parent().unwrap()).is_empty());
     }
 
     // Windows: a junction needs no special privilege, unlike a symlink.
@@ -1397,7 +1432,7 @@ mod tests {
         write_skill_to_disk(&dest, "first", Some(&root)).unwrap();
         write_skill_to_disk(&dest, "second", Some(&root)).unwrap();
         assert_eq!(fs::read_to_string(&dest).unwrap(), "second");
-        assert!(!dest.with_extension("md.tmp").exists());
+        assert!(leftover_temps(dest.parent().unwrap()).is_empty());
     }
 
     #[test]
