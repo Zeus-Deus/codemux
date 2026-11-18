@@ -216,6 +216,25 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_still_delivers_after_the_hub_lock_is_poisoned() {
+        let (tx, mut rx) = crate::web_remote::server::test_outbound();
+        let inner: Arc<Mutex<HashMap<String, EventEntry>>> = Arc::new(Mutex::new(HashMap::from([(
+            "app-state".to_string(),
+            EventEntry { handler_id: 0, subscribers: HashMap::from([(1u64, tx)]) },
+        )])));
+        let poisoner = inner.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the hub lock");
+        })
+        .join();
+        assert!(inner.is_poisoned());
+
+        fan_out(&inner, "app-state", "{}");
+        assert!(matches!(rx.try_recv(), Ok(Message::Text(_))), "the subscriber still gets the event");
+    }
+
+    #[test]
     fn fan_out_unknown_event_is_a_noop() {
         let inner: Arc<Mutex<HashMap<String, EventEntry>>> = Arc::new(Mutex::new(HashMap::new()));
         // Must not panic when no one is listening.
