@@ -80,6 +80,19 @@ fn layout_path(root: &Path) -> PathBuf {
     config.join(codemux_lib::APP_DIR_NAME).join("layout.json")
 }
 
+fn serve_command(root: &Path, port: u16) -> Command {
+    let mut cmd = Command::new(CODEMUX);
+    isolate(&mut cmd, root);
+    // In-process terminals, no reachable account API, and a shell with nothing to say.
+    cmd.env("CODEMUX_DISABLE_PTY_DAEMON", "1")
+        .env("CODEMUX_API_URL", "http://127.0.0.1:1")
+        .env("SHELL", "/bin/true")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["serve", "--scope", "loopback", "--port", &port.to_string()])
+        .stdin(Stdio::null());
+    cmd
+}
+
 /// A `codemux serve` child, stopped (SIGTERM, then kill) when dropped.
 struct Serve {
     child: Child,
@@ -102,19 +115,13 @@ impl Serve {
         // Keep startup and shutdown browser cleanup inside this fixture.
         std::os::unix::fs::symlink("/bin/true", bin.join("pkill")).unwrap();
         std::os::unix::fs::symlink("/bin/true", bin.join("fuser")).unwrap();
+        let cmd = serve_command(root.path(), free_loopback_port());
+        Self::spawn(root, cmd)
+    }
+
+    fn spawn(root: tempfile::TempDir, mut cmd: Command) -> Self {
         let log = std::fs::File::create(root.path().join("serve.log")).unwrap();
-        let mut cmd = Command::new(CODEMUX);
-        isolate(&mut cmd, root.path());
-        // In-process terminals (no detached daemon outlives the test), no
-        // reachable account API, and a shell with nothing to say.
-        cmd.env("CODEMUX_DISABLE_PTY_DAEMON", "1")
-            .env("CODEMUX_API_URL", "http://127.0.0.1:1")
-            .env("SHELL", "/bin/true")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .args(["serve", "--scope", "loopback", "--port", &free_loopback_port().to_string()])
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().unwrap())
-            .stderr(log);
+        cmd.stdout(log.try_clone().unwrap()).stderr(log);
         Self { child: cmd.spawn().unwrap(), root }
     }
 
@@ -691,6 +698,54 @@ fn serve_rejects_a_corrupt_layout_without_overwriting_it() {
         line.starts_with("[codemux serve]") && line.contains("Failed to decode workspace layout")
     }), "serve did not report the layout decode error:\n{log}");
     assert_eq!(std::fs::read(layout).unwrap(), corrupt);
+}
+
+#[test]
+fn serve_refuses_to_share_a_layout_with_another_instance() {
+    use std::os::unix::fs::MetadataExt;
+
+    let owner = Serve::start();
+    let port = owner.ok(&["json", "web_remote_status"])["data"]["port"]
+        .as_u64().unwrap().try_into().unwrap();
+    let (workspace_id, _) = owner.workspace("retained-by-layout-owner");
+    let layout = layout_path(owner.root.path());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let saved = loop {
+        if let Ok(bytes) = std::fs::read(&layout) {
+            let snapshot: Value = serde_json::from_slice(&bytes).unwrap();
+            let workspace_saved = snapshot["workspaces"].as_array().unwrap().iter().any(|workspace| {
+                workspace["workspace_id"].as_str() == Some(workspace_id.as_str())
+            });
+            // Wait for both fixture shells to finish updating their layout metadata.
+            let shells_settled = snapshot["terminal_sessions"].as_array().unwrap().iter().all(|session| {
+                matches!(session["state"].as_str(), Some("exited" | "failed"))
+            });
+            if workspace_saved && shells_settled {
+                break bytes;
+            }
+        }
+        assert!(Instant::now() < deadline, "owner did not persist its workspace:\n{}", owner.log());
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let layout_inode = std::fs::metadata(&layout).unwrap().ino();
+
+    // A different runtime directory bypasses the control-socket liveness probe,
+    // but both children still use the same config, data, and browser stubs.
+    let contender_root = tempfile::tempdir().unwrap();
+    let mut cmd = serve_command(owner.root.path(), port);
+    cmd.env("XDG_RUNTIME_DIR", contender_root.path());
+    let mut contender = Serve::spawn(contender_root, cmd);
+    let status = contender.wait_for_exit().unwrap_or_else(|| {
+        panic!("second serve did not exit:\n{}", contender.log());
+    });
+    let log = contender.log();
+    assert_eq!(status.code(), Some(1), "second serve exited with {status}:\n{log}");
+    assert!(log.contains("Codemux is already running with the workspace layout"), "second serve did not report layout ownership:\n{log}");
+    assert_eq!(std::fs::read(&layout).unwrap(), saved);
+    assert_eq!(std::fs::metadata(&layout).unwrap().ino(), layout_inode, "second serve replaced the layout");
+
+    let live = owner.ok(&["json", "status"]);
+    assert_eq!(live["data"]["active_workspace_id"].as_str(), Some(workspace_id.as_str()));
 }
 
 #[test]

@@ -462,6 +462,13 @@ pub fn run() {
     // can start a thread or a child (pinned by a test in control_identity).
     control_identity::scrub_inherited_agent_identity();
     diagnostics::record_startup_milestone("startup.run-enter");
+    let mut layout_lock = match state::acquire_layout_lock() {
+        Ok(lock) => Some(lock),
+        Err(error) => {
+            diagnostics::stderr_line(&format!("[codemux] {error}"));
+            return;
+        }
+    };
     // Set WebKitGTK env vars before any GTK/Tauri initialization.
     //
     // Renderer transport: `webview_tuning::configure_renderer_env` sets
@@ -540,7 +547,7 @@ pub fn run() {
     build_core_app(builder, AppMode::Gui, state::load_persisted_state)
         .build(app_context())
         .expect("error while building tauri application")
-        .run(|app, event| {
+        .run(move |app, event| {
             if let tauri::RunEvent::Exit = event {
                 // Stop taking outside-assistant connections first.
                 mcp_connector::listener::stop(app);
@@ -599,6 +606,8 @@ pub fn run() {
                 webview_tuning::mark_clean_exit();
                 // Kill agent-browser daemons so they don't persist across restarts.
                 agent_browser::kill_stream_daemons();
+                // Tauri can launch a replacement process after this callback.
+                drop(layout_lock.take());
             }
         });
 }

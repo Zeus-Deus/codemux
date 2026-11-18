@@ -116,6 +116,7 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
                 .to_string(),
         );
     }
+    let _layout_lock = crate::state::acquire_layout_lock()?;
 
     // Install the listeners before setup starts the control server. Signals
     // received during startup remain pending until the shutdown wait begins.

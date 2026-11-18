@@ -7403,6 +7403,38 @@ fn persisted_layout_path() -> Option<PathBuf> {
     Some(base.join(crate::APP_DIR_NAME).join("layout.json"))
 }
 
+/// Hold ownership of the saved layout from startup through the final write.
+/// Socket paths can differ between processes that share this layout.
+pub(crate) fn acquire_layout_lock() -> Result<fs::File, String> {
+    let layout = persisted_layout_path().ok_or("No config directory for workspace layout")?;
+    let parent = layout.parent().ok_or("Workspace layout has no parent directory")?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create the layout directory at {}: {error}", parent.display()))?;
+
+    let lock_path = layout.with_extension("lock");
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(&lock_path)
+        .map_err(|error| format!("Failed to open the layout lock at {}: {error}", lock_path.display()))?;
+    // Keep the lock file in place so contenders always open the same file.
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(fs::TryLockError::WouldBlock) => Err(format!(
+            "Codemux is already running with the workspace layout at {}.",
+            layout.display(),
+        )),
+        Err(fs::TryLockError::Error(error)) => Err(format!(
+            "Failed to acquire the layout lock at {}: {error}",
+            lock_path.display(),
+        )),
+    }
+}
+
 /// Drop the pane statuses that mean nothing after a restart, keeping the ones
 /// that do.
 ///
