@@ -657,6 +657,13 @@ mod stdout_drain {
         }
     }
 
+    /// The longest startup line read at once, and the most startup output
+    /// kept for an error message.
+    #[cfg(windows)]
+    const MAX_LINE: u64 = 4096;
+    #[cfg(windows)]
+    const MAX_CAPTURED: usize = 8192;
+
     /// The banner the reader thread found, or why it found none.
     #[cfg(windows)]
     pub(super) type Banner = tokio::sync::oneshot::Receiver<Result<(String, super::OpenCodeApi), String>>;
@@ -686,45 +693,68 @@ mod stdout_drain {
             let stop = Arc::new(AtomicBool::new(false));
             let done = Arc::new(AtomicBool::new(false));
             #[cfg(test)]
-            let _ = super::DRAIN_PROBE.try_with(|probe| *probe.lock().unwrap() = Some(done.clone()));
+            let pause = super::DRAIN_PROBE
+                .try_with(|probe| {
+                    let mut probe = probe.lock().unwrap();
+                    probe.done = Some(done.clone());
+                    probe.pause_before_drain_read.take()
+                })
+                .ok()
+                .flatten();
             let (banner_tx, banner_rx) = tokio::sync::oneshot::channel();
             let (thread_stop, thread_done) = (stop.clone(), done.clone());
             std::thread::Builder::new()
                 .name("opencode-stdout".into())
                 .spawn(move || {
                     let mut reader = std::io::BufReader::new(reader);
-                    let mut banner_tx = Some(banner_tx);
-                    let mut captured = String::new();
-                    let mut line = String::new();
-                    // The banner, line by line.
-                    while banner_tx.is_some() && !thread_stop.load(Ordering::SeqCst) {
-                        line.clear();
-                        match reader.read_line(&mut line) {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {
-                                let text = line.trim_end_matches(['\r', '\n']);
-                                if let Some(found) = super::parse_ready_url(text).and_then(|url| {
-                                    super::OpenCodeApi::from_ready_banner(text).map(|api| (url, api))
-                                }) {
-                                    let _ = banner_tx.take().map(|tx| tx.send(Ok(found)));
-                                } else {
-                                    if !captured.is_empty() {
-                                        captured.push('\n');
-                                    }
-                                    captured.push_str(text);
-                                }
+                    // The banner, line by line. Its buffers live only in this
+                    // block and are capped, so a chatty startup costs nothing
+                    // once the banner is found.
+                    {
+                        let mut captured = String::new();
+                        let mut line = String::new();
+                        let result = loop {
+                            if thread_stop.load(Ordering::SeqCst) {
+                                break Err("ready_banner_missing; stopped".to_string());
                             }
+                            line.clear();
+                            match (&mut reader).take(MAX_LINE).read_line(&mut line) {
+                                Ok(0) | Err(_) => {
+                                    break Err(format!(
+                                        "ready_banner_missing; child stdout closed. captured:\n{}",
+                                        captured.trim()
+                                    ))
+                                }
+                                Ok(_) => {}
+                            }
+                            let text = line.trim_end_matches(['\r', '\n']);
+                            if let Some(found) = super::parse_ready_url(text)
+                                .and_then(|url| super::OpenCodeApi::from_ready_banner(text).map(|api| (url, api)))
+                            {
+                                break Ok(found);
+                            }
+                            if captured.len() < MAX_CAPTURED {
+                                if !captured.is_empty() {
+                                    captured.push('\n');
+                                }
+                                captured.push_str(text);
+                            }
+                        };
+                        let found = result.is_ok();
+                        let _ = banner_tx.send(result);
+                        if !found {
+                            thread_done.store(true, Ordering::SeqCst);
+                            return;
                         }
-                    }
-                    if let Some(tx) = banner_tx.take() {
-                        let _ = tx.send(Err(format!(
-                            "ready_banner_missing; child stdout closed. captured:\n{}",
-                            captured.trim()
-                        )));
                     }
                     // Then everything after it.
                     let mut buf = [0u8; 8192];
                     while !thread_stop.load(Ordering::SeqCst) {
+                        #[cfg(test)]
+                        if let Some((arrived, release)) = pause.as_ref() {
+                            arrived.wait();
+                            release.wait();
+                        }
                         match reader.read(&mut buf) {
                             Ok(0) | Err(_) => break,
                             Ok(_) => {}
@@ -741,21 +771,32 @@ mod stdout_drain {
             use std::sync::atomic::Ordering;
             self.stop.store(true, Ordering::SeqCst);
             let Self { pipe, done, .. } = self;
-            // Off the caller's thread, so Drop never blocks. The flag keeps
-            // the reader from starting a new read; a read it had already
-            // started is cancelled, again if it began just after a cancel,
-            // until the thread is seen to exit.
-            let _ = std::thread::Builder::new()
+            let pipe = std::sync::Arc::new(pipe);
+            let cancel = move || {
+                // SAFETY: a live handle owned by `pipe`; a null OVERLAPPED
+                // cancels every read pending on it.
+                unsafe { windows_sys::Win32::System::IO::CancelIoEx(pipe.as_raw_handle(), std::ptr::null()) };
+            };
+            // The flag keeps the reader from starting another read once it
+            // next checks it; a read already begun — even one begun just
+            // after a cancel — is cancelled, and cancelled again, until the
+            // thread is seen to exit. No deadline: the reader always exits
+            // once its read fails. Off the caller's thread, so Drop never
+            // blocks; if that thread cannot even start, cancel once here.
+            let fallback = cancel.clone();
+            let spawned = std::thread::Builder::new()
                 .name("opencode-stdout-cancel".into())
                 .spawn(move || {
-                    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                    while !done.load(Ordering::SeqCst) && std::time::Instant::now() < give_up {
-                        // SAFETY: a live handle owned by `pipe`; a null
-                        // OVERLAPPED cancels every read pending on it.
-                        unsafe { windows_sys::Win32::System::IO::CancelIoEx(pipe.as_raw_handle(), std::ptr::null()) };
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    let mut wait = std::time::Duration::from_millis(5);
+                    while !done.load(Ordering::SeqCst) {
+                        cancel();
+                        std::thread::sleep(wait);
+                        wait = (wait * 2).min(std::time::Duration::from_millis(250));
                     }
                 });
+            if spawned.is_err() {
+                fallback();
+            }
         }
 
         /// Whether the reader thread has exited.
@@ -767,11 +808,19 @@ mod stdout_drain {
     }
 }
 
+/// Test hook for the Windows reader thread: it hands over the thread's
+/// "exited" flag, so a test can watch it after startup itself has been
+/// dropped, and can pause the thread just before its first drain read.
+#[cfg(all(test, windows))]
+#[derive(Default)]
+pub(crate) struct DrainProbe {
+    pub(crate) done: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) pause_before_drain_read: Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>,
+}
+
 #[cfg(all(test, windows))]
 tokio::task_local! {
-    /// Test hook: receives the reader thread's "exited" flag, so a test can
-    /// watch it after startup itself has been dropped.
-    pub(crate) static DRAIN_PROBE: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>>;
+    pub(crate) static DRAIN_PROBE: std::sync::Arc<std::sync::Mutex<DrainProbe>>;
 }
 
 /// Read lines from the child's stdout until the ready banner shows
@@ -1223,7 +1272,7 @@ mod tests {
         )
         .unwrap();
 
-        let probe = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let probe = std::sync::Arc::new(std::sync::Mutex::new(DrainProbe::default()));
         let startup = DRAIN_PROBE.scope(
             probe.clone(),
             OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(60)),
@@ -1231,12 +1280,60 @@ mod tests {
         // Drop startup mid-wait.
         assert!(tokio::time::timeout(Duration::from_secs(2), startup).await.is_err());
 
-        let done = probe.lock().unwrap().clone().expect("the reader started");
+        let done = probe.lock().unwrap().done.clone().expect("the reader started");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !done.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(done.load(std::sync::atomic::Ordering::SeqCst), "the read outlived the dropped startup");
+    }
+
+    // Windows: the reader passed its stop check and is about to read when
+    // the drain is stopped; the read it then issues must still be released
+    // while the writer stays open.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_read_issued_after_the_stop_is_still_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-opencode.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\necho opencode server listening on http://127.0.0.1:1\r\nping -n 60 127.0.0.1 >nul\r\n",
+        )
+        .unwrap();
+        let arrived = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let probe = std::sync::Arc::new(std::sync::Mutex::new(DrainProbe {
+            done: None,
+            pause_before_drain_read: Some((arrived.clone(), release.clone())),
+        }));
+
+        let mut server = DRAIN_PROBE
+            .scope(probe.clone(), OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(10)))
+            .await
+            .expect("the banner is enough to start");
+        let done = probe.lock().unwrap().done.clone().unwrap();
+
+        // The reader is past its stop check, just before reading.
+        tokio::task::spawn_blocking({
+            let arrived = arrived.clone();
+            move || arrived.wait()
+        })
+        .await
+        .unwrap();
+        server.child.stop_drain();
+        // Let the cancel loop run with nothing pending, then let the reader
+        // issue its read.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::task::spawn_blocking(move || release.wait()).await.unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let released = done.load(std::sync::atomic::Ordering::SeqCst);
+        server.shutdown().await.unwrap();
+        assert!(released, "a read issued after the stop kept the reader alive");
     }
 
     /// Tests in this module that rely on the live `opencode` binary
