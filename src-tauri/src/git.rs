@@ -146,6 +146,16 @@ pub(crate) fn git_command() -> Command {
     cmd
 }
 
+pub(crate) fn git_command_with_args(args: &[&str]) -> Command {
+    let mut cmd = git_command();
+    if args.starts_with(&["--literal-pathspecs"]) {
+        // Git rejects both of these inherited pathspec modes in literal mode.
+        cmd.env_remove("GIT_GLOB_PATHSPECS").env_remove("GIT_ICASE_PATHSPECS");
+    }
+    cmd.args(args);
+    cmd
+}
+
 /// Tokio form of [`git_command`].
 pub(crate) fn git_command_tokio() -> tokio::process::Command {
     git_command().into()
@@ -170,8 +180,7 @@ pub(crate) fn source_control_cli_command(program: &str) -> Command {
 mod command_tests;
 
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = git_command()
-        .args(args)
+    let output = git_command_with_args(args)
         .current_dir(repo_path)
         .output()
         .map_err(|e| format!("Failed to run git: {e}"))?;
@@ -180,7 +189,7 @@ fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "git {} failed: {}",
-            args.first().unwrap_or(&""),
+            args.strip_prefix(&["--literal-pathspecs"]).unwrap_or(args).first().unwrap_or(&""),
             stderr.trim()
         ));
     }
@@ -471,7 +480,7 @@ fn run_git_diff_capped_to(
     max_bytes: usize,
 ) -> Result<FileDiff, String> {
     use std::io::Read;
-    let mut child = git_command()
+    let mut child = git_command_with_args(&["--literal-pathspecs"])
         .args(args)
         .current_dir(repo_path)
         .stdin(std::process::Stdio::null())
@@ -563,7 +572,9 @@ pub fn git_stage(repo_path: &Path, files: &[String]) -> Result<(), String> {
     if files.is_empty() {
         return Ok(());
     }
-    let mut args: Vec<&str> = vec!["add", "--"];
+    // These are names from git status. Without literal pathspecs, selecting
+    // a route like [id].tsx can also stage edits in i.tsx and d.tsx.
+    let mut args: Vec<&str> = vec!["--literal-pathspecs", "add", "--"];
     args.extend(files.iter().map(|f| f.as_str()));
     run_git(repo_path, &args)?;
     Ok(())
@@ -573,11 +584,11 @@ pub fn git_unstage(repo_path: &Path, files: &[String]) -> Result<(), String> {
     if files.is_empty() {
         return Ok(());
     }
-    let mut args: Vec<&str> = vec!["restore", "--staged", "--"];
+    let mut args: Vec<&str> = vec!["--literal-pathspecs", "restore", "--staged", "--"];
     args.extend(files.iter().map(|f| f.as_str()));
     if run_git(repo_path, &args).is_err() {
         // Fallback for newly added files on older git versions
-        let mut rm_args: Vec<&str> = vec!["rm", "--cached", "--"];
+        let mut rm_args: Vec<&str> = vec!["--literal-pathspecs", "rm", "--cached", "--"];
         rm_args.extend(files.iter().map(|f| f.as_str()));
         run_git(repo_path, &rm_args)?;
     }
@@ -1030,12 +1041,12 @@ pub fn git_checkpoint_prune(
 
 pub fn git_discard_file(repo_path: &Path, file: &str) -> Result<(), String> {
     // Try git restore first (works for tracked files)
-    let restore = run_git(repo_path, &["restore", "--", file]);
+    let restore = run_git(repo_path, &["--literal-pathspecs", "restore", "--", file]);
     if restore.is_ok() {
         return Ok(());
     }
     // For untracked files, try clean
-    run_git(repo_path, &["clean", "-f", "--", file])?;
+    run_git(repo_path, &["--literal-pathspecs", "clean", "-f", "--", file])?;
     Ok(())
 }
 
@@ -1549,19 +1560,19 @@ pub fn check_merge_conflicts(
 }
 
 pub fn resolve_conflict_ours(repo_path: &Path, file: &str) -> Result<(), String> {
-    run_git(repo_path, &["checkout", "--ours", "--", file])?;
-    run_git(repo_path, &["add", "--", file])?;
+    run_git(repo_path, &["--literal-pathspecs", "checkout", "--ours", "--", file])?;
+    run_git(repo_path, &["--literal-pathspecs", "add", "--", file])?;
     Ok(())
 }
 
 pub fn resolve_conflict_theirs(repo_path: &Path, file: &str) -> Result<(), String> {
-    run_git(repo_path, &["checkout", "--theirs", "--", file])?;
-    run_git(repo_path, &["add", "--", file])?;
+    run_git(repo_path, &["--literal-pathspecs", "checkout", "--theirs", "--", file])?;
+    run_git(repo_path, &["--literal-pathspecs", "add", "--", file])?;
     Ok(())
 }
 
 pub fn mark_conflict_resolved(repo_path: &Path, file: &str) -> Result<(), String> {
-    run_git(repo_path, &["add", "--", file])?;
+    run_git(repo_path, &["--literal-pathspecs", "add", "--", file])?;
     Ok(())
 }
 
@@ -4267,6 +4278,59 @@ mod tests {
         run_git(&path, &["init"]).expect("git init");
         run_git(&path, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "initial"]).expect("initial commit");
         (dir, path)
+    }
+
+    #[test]
+    fn selected_file_actions_with_inherited_pathspec_modes() {
+        // Each child runs the real file operations with a private environment.
+        let test = "git::tests::selected_file_actions_preserve_edits_in_matching_sibling_names";
+        for mode in ["GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env_remove("GIT_GLOB_PATHSPECS")
+                .env_remove("GIT_ICASE_PATHSPECS")
+                .env_remove("GIT_LITERAL_PATHSPECS")
+                .env_remove("GIT_NOGLOB_PATHSPECS")
+                .env(mode, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{mode}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn selected_file_actions_preserve_edits_in_matching_sibling_names() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        let route = "[id].tsx";
+        let sibling = "i.tsx";
+        for name in [route, sibling] {
+            std::fs::write(repo.join(name), "original\n").unwrap();
+        }
+        run_git(&repo, &["add", "."]).unwrap();
+        git_commit(&repo, "add routes").unwrap();
+        std::fs::write(repo.join(route), "route change\n").unwrap();
+        std::fs::write(repo.join(sibling), "sibling change\n").unwrap();
+
+        let selected = [route.to_owned()];
+        let diff = git_diff(&repo, route, false).unwrap().diff;
+        assert!(diff.contains("+route change"));
+        assert!(!diff.contains("+sibling change"));
+        git_stage(&repo, &selected).unwrap();
+        assert_eq!(run_git(&repo, &["diff", "--cached", "--name-only"]).unwrap(), route);
+
+        run_git(&repo, &["add", "."]).unwrap();
+        git_unstage(&repo, &selected).unwrap();
+        assert_eq!(run_git(&repo, &["diff", "--cached", "--name-only"]).unwrap(), sibling);
+        git_unstage(&repo, &[sibling.to_owned()]).unwrap();
+        git_discard_file(&repo, route).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join(route)).unwrap(), "original\n");
+        assert_eq!(std::fs::read_to_string(repo.join(sibling)).unwrap(), "sibling change\n");
     }
 
     #[cfg(unix)]

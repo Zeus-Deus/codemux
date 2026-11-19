@@ -1759,13 +1759,13 @@ async fn handle_tool_call(call: CallToolParams) -> Value {
         "git_diff" => {
             let file = arguments.get("file").and_then(Value::as_str);
             match file {
-                Some(f) => run_git(&["diff", "--", f], &workspace_id).await,
+                Some(f) => run_git(&["--literal-pathspecs", "diff", "--", f], &workspace_id).await,
                 None => run_git(&["diff"], &workspace_id).await,
             }
         }
         "git_stage" => {
             let file = arguments.get("file").and_then(Value::as_str).unwrap_or(".");
-            run_git(&["add", "--", file], &workspace_id).await
+            run_git(&["--literal-pathspecs", "add", "--", file], &workspace_id).await
         }
         "git_commit" => {
             let message = arguments.get("message").and_then(Value::as_str).unwrap_or_default();
@@ -2141,8 +2141,7 @@ async fn get_workspace_cwd(workspace_id: &str) -> Result<String, String> {
 
 async fn run_git(args: &[&str], workspace_id: &str) -> Result<Value, String> {
     let cwd = get_workspace_cwd(workspace_id).await?;
-    let output = crate::git::git_command_tokio()
-        .args(args)
+    let output = tokio::process::Command::from(crate::git::git_command_with_args(args))
         .current_dir(&cwd)
         .output()
         .await
