@@ -1300,6 +1300,47 @@ mod tests {
         assert!(ok_is_clean(&db), "the waiting row goes first next time and is sent");
     }
 
+    #[test]
+    #[serial]
+    fn a_retry_answered_with_an_already_mirrored_id_leaves_one_linked_row() {
+        let db = fresh_db();
+        // The local workspace's first upload lost its answer, and a pull
+        // then mirrored the server's copy as an unadopted row.
+        let original = db
+            .insert_workspace_sync("ws-retried", "title", None, None, None, Some("main"), None, None, None)
+            .unwrap();
+        db.upsert_workspace_sync_from_server(
+            "srv-same", "title", None, None, None, Some("main"), None,
+            "2026-01-01 00:00:00", "2026-01-01 00:00:00", None, None, None,
+        )
+        .unwrap();
+
+        // The retry's answer names that same server row.
+        db.mark_workspace_sync_pushed(&original, Some("srv-same")).unwrap();
+
+        let rows = db.list_workspaces_sync_for_sync();
+        assert_eq!(rows.len(), 1, "one row: {rows:?}");
+        assert_eq!(rows[0].server_id.as_deref(), Some("srv-same"));
+        assert_eq!(rows[0].workspace_id.as_deref(), Some("ws-retried"), "the local workspace stays linked");
+        assert!(!rows[0].dirty);
+    }
+
+    #[test]
+    #[serial]
+    fn an_adopted_row_holding_the_id_is_never_dropped() {
+        let db = fresh_db();
+        let adopted = db
+            .insert_workspace_sync("ws-adopted-holder", "a", None, None, None, None, None, None, None)
+            .unwrap();
+        db.mark_workspace_sync_synced(adopted.id, Some("srv-held")).unwrap();
+        let other = db
+            .insert_workspace_sync("ws-other", "b", None, None, None, None, None, None, None)
+            .unwrap();
+
+        assert!(db.mark_workspace_sync_pushed(&other, Some("srv-held")).is_err());
+        assert_eq!(db.list_workspaces_sync_for_sync().len(), 2, "nothing is dropped");
+    }
+
     #[tokio::test]
     #[serial]
     async fn a_pass_past_its_deadline_starts_no_request() {
