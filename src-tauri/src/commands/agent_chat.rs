@@ -7311,7 +7311,6 @@ pub(crate) async fn open_thread_pane_checked<R: Runtime>(
             .0;
         break (pane_id.0, true);
     };
-    drop(dispatch_guard);
 
     // Pane activation selects the workspace/surface, while tab activation is
     // a separate state field. Resolve both from one immutable snapshot and
@@ -7341,6 +7340,8 @@ pub(crate) async fn open_thread_pane_checked<R: Runtime>(
             return Err(format!("conversation_pane_not_found: {pane_id}"));
         }
     }
+    // A queued delete may remove the newly bound pane as soon as we unlock.
+    drop(dispatch_guard);
     crate::state::emit_app_state(app);
 
     Ok(OpenedThreadPane {
