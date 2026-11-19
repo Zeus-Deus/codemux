@@ -8,6 +8,7 @@ use crate::workspace_service::Checkpoint;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -320,30 +321,38 @@ fn read_shell_records(
 
 fn begin_authorized_close<'a>(
     conn: &'a Connection,
+    primary: &'a Mutex<Connection>,
     checkpoint: &Checkpoint,
-) -> Result<Transaction<'a>, TerminalCloseError> {
+) -> Result<(MutexGuard<'a, Connection>, Transaction<'a>), TerminalCloseError> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let version: i64 = conn.pragma_query_value(None, "data_version", |row| row.get(0))
             .map_err(|error| error.to_string())?;
         checkpoint.check().map_err(TerminalCloseError::Authorization)?;
-        match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
-            Ok(tx) => {
-                let current = tx.pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
-                    .map_err(|error| error.to_string())?;
-                // A durable grant may have changed between the checkpoint
-                // and writer admission. Reauthorize against the newer data.
-                if current == version {
-                    return Ok(tx);
+        // The primary connection may have a read snapshot it still needs
+        // to promote to a write. Share its mutex for the journal commit.
+        // The journal connection tries the writer with a zero busy timeout.
+        match primary.try_lock() {
+            Ok(primary) => match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+                Ok(tx) => {
+                    let current = tx.pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
+                        .map_err(|error| error.to_string())?;
+                    // A durable grant may have changed between the checkpoint
+                    // and writer admission. Reauthorize against the newer data.
+                    if current == version {
+                        return Ok((primary, tx));
+                    }
                 }
-            }
-            Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) => {
-                #[cfg(all(test, unix))]
-                if let Some(notify) = CLOSE_JOURNAL_CONTENTION.lock().unwrap().take() {
-                    let _ = notify.send(());
+                Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) => {
+                    #[cfg(all(test, unix))]
+                    if let Some(notify) = CLOSE_JOURNAL_CONTENTION.lock().unwrap().take() {
+                        let _ = notify.send(());
+                    }
                 }
-            }
-            Err(error) => return Err(error.to_string().into()),
+                Err(error) => return Err(error.to_string().into()),
+            },
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(_)) => return Err("Database connection lock is poisoned".to_owned().into()),
         }
         if Instant::now() >= deadline {
             return Err("Timed out waiting for terminal close journal".to_owned().into());
@@ -471,7 +480,7 @@ impl DatabaseStore {
             // without the SQLite writer lock, then only take that lock if
             // it is available immediately and the database is still current.
             conn.busy_timeout(Duration::ZERO).map_err(|error| error.to_string())?;
-            let tx = begin_authorized_close(&conn, checkpoint)?;
+            let (_primary, tx) = begin_authorized_close(&conn, &self.conn, checkpoint)?;
             return write_layout_close(
                 tx, intent, payload.as_deref(), workspace_id, closed_sessions, daemon_closes, checkpoint.connector_grant_id(),
             );
@@ -968,6 +977,54 @@ impl DatabaseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_close_waits_for_primary_read_to_finish_its_write() {
+        use std::sync::mpsc;
+
+        let root = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::test_file(&root.path().join("checked-close.sqlite"));
+        let (checked, checks) = mpsc::channel();
+        let (release, first_check) = mpsc::channel();
+        let first_check = Mutex::new(Some(first_check));
+        let checkpoint = Checkpoint::new(move || {
+            checked.send(()).unwrap();
+            if let Some(first_check) = first_check.lock().unwrap().take() {
+                first_check.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            Ok(())
+        });
+        let intent = LayoutCloseIntent::Workspace("checked-workspace".into());
+
+        std::thread::scope(|scope| {
+            let close = scope.spawn(|| {
+                db.record_layout_close_with_shell_ownership(&intent, None, &[], &[], &checkpoint)
+            });
+            checks.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut primary = db.conn.lock().unwrap();
+            let peer = primary.transaction().unwrap();
+            let before: i64 = peer.query_row(
+                "SELECT COUNT(*) FROM pending_layout_closes", [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(before, 0);
+            release.send(()).unwrap();
+            // The peer holds only a read snapshot. The checked close must
+            // rerun authorization while waiting for the primary connection.
+            checks.recv_timeout(Duration::from_secs(5)).unwrap();
+            peer.execute(
+                "INSERT INTO pending_layout_closes (scope, workspace_id, target_id)
+                 VALUES ('workspace', 'peer-workspace', '')",
+                [],
+            ).unwrap();
+            peer.commit().unwrap();
+            drop(primary);
+            assert!(close.join().unwrap().unwrap().is_empty());
+        });
+
+        let closes = db.pending_layout_closes().unwrap();
+        assert!(closes.contains(&intent));
+        assert!(closes.contains(&LayoutCloseIntent::Workspace("peer-workspace".into())));
+    }
 
     #[test]
     fn memory_database_cannot_record_guarded_shell_ownership() {

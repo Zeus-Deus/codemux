@@ -184,7 +184,10 @@ impl DatabaseStore {
     /// Neither this journal nor historical IDs restore runtime authority.
     pub(crate) fn control_append_user_message(&self, thread: &str, payload: &str, turn: &str, steered: bool) -> Result<Option<i64>, String> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(|e|e.to_string())?;
+        // Reserve the WAL writer before inspecting the transcript so an
+        // independent workspace close cannot invalidate the read snapshot.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
         let identity: Value = serde_json::from_str(payload).map_err(|e|e.to_string())?;
         let existing: Option<i64> = tx.query_row("SELECT id FROM agent_chat_messages WHERE thread_id=?1 AND message_id=?2",
             params![thread,identity["message_id"].as_str()],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
@@ -1397,52 +1400,101 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn keyed_admission_waits_for_an_independent_layout_close_writer() {
-        use std::sync::{mpsc, Mutex};
+    fn with_independent_layout_close_writer<T: Send>(
+        db: &DatabaseStore,
+        path: &std::path::Path,
+        write: impl FnOnce() -> Result<T, String> + Send,
+    ) -> T {
+        use std::cell::RefCell;
+        use std::sync::mpsc;
         use std::time::Duration;
 
-        static WAITING_FOR_WRITER: Mutex<Option<mpsc::Sender<()>>> = Mutex::new(None);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("admission.sqlite");
-        let db = DatabaseStore::test_file(&path);
+        thread_local! {
+            static WAITING_FOR_WRITER: RefCell<Option<mpsc::Sender<()>>> = const { RefCell::new(None) };
+        }
         let (notify, waiting) = mpsc::channel();
-        *WAITING_FOR_WRITER.lock().unwrap() = Some(notify);
         db.test_busy_handler(|attempt| {
-            if let Some(notify) = WAITING_FOR_WRITER.lock().unwrap().take() {
+            if let Some(notify) = WAITING_FOR_WRITER.with(|writer| writer.borrow_mut().take()) {
                 let _ = notify.send(());
             }
             std::thread::sleep(Duration::from_millis(5));
             attempt < 1_000
         });
 
-        let mut separate = rusqlite::Connection::open(&path).unwrap();
+        let mut separate = rusqlite::Connection::open(path).unwrap();
         let close = separate.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
         close.execute(
             "INSERT INTO pending_layout_closes (scope, workspace_id, target_id)
              VALUES ('workspace', 'closing-workspace', '')",
             [],
         ).unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                WAITING_FOR_WRITER.with(|writer| *writer.borrow_mut() = Some(notify));
+                write()
+            });
+            let blocked = waiting.recv_timeout(Duration::from_secs(5));
+            close.commit().unwrap();
+            let result = worker.join().unwrap();
+            assert!(
+                blocked.is_ok(),
+                "operation never waited for the other writer: {:?}",
+                result.as_ref().err(),
+            );
+            result.unwrap()
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keyed_admission_waits_for_an_independent_layout_close_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admission.sqlite");
+        let db = DatabaseStore::test_file(&path);
         let admit = || db.admit_control_operation(
             "client-a", "req-a", "thread_launch", "hash-a", "boot-a",
             Some("ws-a"), Some("thread-a"),
         );
-        let first = std::thread::scope(|scope| {
-            let admission = scope.spawn(&admit);
-            let blocked = waiting.recv_timeout(Duration::from_secs(5));
-            close.commit().unwrap();
-            let result = admission.join().unwrap();
-            assert!(
-                blocked.is_ok(),
-                "admission never waited for the other writer: {:?}",
-                result.as_ref().err(),
-            );
-            result.unwrap()
-        });
+        let first = with_independent_layout_close_writer(&db, &path, &admit);
         let retry = admit().unwrap();
         assert!(first.newly_admitted);
         assert!(!retry.newly_admitted);
         assert_eq!(first.receipt.operation_id, retry.receipt.operation_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_message_and_run_correlation_wait_for_an_independent_layout_close_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.sqlite");
+        let db = DatabaseStore::test_file(&path);
+        db.upsert_agent_chat_session("thread-a", "chat-workspace", None, "codex").unwrap();
+        let envelope = serde_json::json!({
+            "type": "user_message",
+            "thread_id": "thread-a",
+            "message_id": "message-a",
+            "text": "A saved user message",
+        }).to_string();
+
+        let row = with_independent_layout_close_writer(&db, &path, || {
+            db.control_append_user_message("thread-a", &envelope, "run-a", false)
+        }).unwrap();
+        drop(db);
+
+        let reopened = DatabaseStore::test_file(&path);
+        let rows = reopened.list_agent_chat_messages("thread-a");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], envelope);
+        assert_eq!(
+            serde_json::from_str::<Value>(&rows[1]).unwrap(),
+            serde_json::json!({
+                "type": "native_user_control",
+                "thread_id": "thread-a",
+                "user_message_id": row,
+                "turn_id": "run-a",
+                "steered": false,
+            }),
+        );
     }
 
     #[test]
