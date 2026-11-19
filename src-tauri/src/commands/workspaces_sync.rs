@@ -1674,36 +1674,20 @@ pub async fn workspaces_reconcile_copy<R: tauri::Runtime>(
     };
 
     // Off-thread git checks: must be a divergent copy and safe to detach.
-    let blocker = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let p = std::path::Path::new(&path);
         if !crate::git::is_divergent_copy(p) {
             return Err(
                 "This workspace isn't a standalone copy — nothing to reconcile.".to_string(),
             );
         }
-        Ok(crate::git::reconcile_copy_blocker(p))
+        if let Some(reason) = crate::git::reconcile_copy_blocker(p) {
+            return Err(format!("Can't reconcile yet: {reason}."));
+        }
+        super::workspace::detach_reconciled_copy(&app, &workspace_id)
     })
     .await
-    .map_err(|e| format!("git check join failed: {e}"))??;
-
-    if let Some(reason) = blocker {
-        return Err(format!("Can't reconcile yet: {reason}."));
-    }
-
-    // Safe: detach the copy's workspace card. close_workspace (state-level)
-    // removes the workspace from app_state WITHOUT deleting the directory —
-    // the files (and any local-only history) stay on disk. The copy's
-    // agent-browser daemon (if any) IS reaped, though — the workspace card
-    // is gone, so nothing could drive that browser anymore (issue #126).
-    {
-        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
-        let close_result = app_state.close_workspace(&workspace_id)?;
-        crate::commands::workspace::reap_agent_browser_sessions(
-            &app,
-            close_result.removed_agent_browser_sessions,
-        );
-    }
-    crate::state::emit_app_state(&app);
+    .map_err(|e| format!("reconcile copy task failed: {e}"))??;
 
     Ok("Closed the standalone copy (files kept on disk). Use \"Pull project\" \
         to materialize a proper repo root."
@@ -1715,6 +1699,107 @@ mod tests {
     use super::*;
     use crate::database::DatabaseStore;
     use serial_test::serial;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_copy_closes_guarded_terminal_and_keeps_checkout() {
+        use crate::database::daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose};
+        use crate::pty_daemon::{self, manifest::read_manifest};
+        use crate::state::{AppStateStore, WorkspacePresetLayout};
+        use crate::terminal::PtyState;
+        use std::time::Duration;
+
+        const TEST: &str = "commands::workspaces_sync::tests::reconcile_copy_closes_guarded_terminal_and_keeps_checkout";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let copy = dirs::home_dir().unwrap().join(".codemux/worktrees/copy/main");
+        std::fs::create_dir_all(copy.join(".codemux")).unwrap();
+        std::fs::write(copy.join("README.md"), "keep this file\n").unwrap();
+        std::fs::write(
+            copy.join(".codemux/config.json"),
+            r#"{"teardown":["touch teardown-ran"]}"#,
+        ).unwrap();
+        let commands: &[&[&str]] = &[
+            &["init", "--quiet"],
+            &["add", "."],
+            &["commit", "--quiet", "-m", "fixture"],
+        ];
+        for &args in commands {
+            let output = std::process::Command::new("git")
+                .current_dir(&copy)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        assert_eq!(crate::scripts::teardown_commands(&copy, None), ["touch teardown-ran"]);
+
+        let layout = AppStateStore::default();
+        let workspace_id = layout
+            .create_workspace_with_layout(copy.clone(), WorkspacePresetLayout::Single).0;
+        let copy_path = copy.to_str().unwrap().to_owned();
+        layout.set_workspace_worktree(&workspace_id, copy_path.clone(), "Standalone copy".into());
+        let plan = layout.pty_hydration_plan_for_workspace(&workspace_id).unwrap();
+        let session_id = plan.sessions[0].session_id.clone();
+        let shell_id = uuid::Uuid::new_v4();
+        // Model a shell that survived the last attachment. The database is
+        // the only place the app knows its daemon identity.
+        let ownership = PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: workspace_id.clone(),
+                host_id: None,
+                ssh_target: None,
+            },
+            session_id: session_id.clone(),
+            shell_id,
+        };
+        let db = DatabaseStore::test_file(&root.join("reconcile-copy.sqlite"));
+        db.remember_daemon_shell(&ownership).unwrap();
+        let app = tauri::test::mock_app();
+        app.manage(layout);
+        app.manage(PtyState::default());
+        app.manage(db);
+
+        let socket = root.join("reconcile-copy.sock");
+        let daemon = tokio::spawn(pty_daemon::server::run(socket.clone()));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !read_manifest().is_some_and(|manifest| manifest.socket_path == socket) {
+                assert!(!daemon.is_finished(), "fixture daemon exited before publishing its socket");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let client = pty_daemon::ensure_daemon().await.unwrap();
+            client.prepare_owned_spawn(session_id.clone(), shell_id).await.unwrap();
+            client.spawn_prepared(
+                session_id,
+                shell_id,
+                workspace_id.clone(),
+                vec!["/bin/sleep".into(), "30".into()],
+                copy_path,
+                vec![],
+                24,
+                80,
+            ).await.unwrap();
+            let shells = client.list().await.unwrap();
+            assert_eq!(shells.len(), 1);
+            assert_eq!(shells[0].shell_id, Some(shell_id));
+
+            workspaces_reconcile_copy(app.handle().clone(), workspace_id.clone()).await.unwrap();
+            assert!(app.state::<AppStateStore>().find_workspace(&workspace_id).is_none());
+            assert!(copy.join(".git").is_dir());
+            assert_eq!(std::fs::read_to_string(copy.join("README.md")).unwrap(), "keep this file\n");
+            assert!(!copy.join("teardown-ran").exists());
+
+            let db = app.state::<DatabaseStore>();
+            assert!(db.daemon_shell_ownership().unwrap().is_empty());
+            while !client.list().await.unwrap().is_empty() || !db.pending_daemon_closes().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("Reconcile Copy should close the guarded shell without a relaunch");
+        daemon.abort();
+    }
 
     // ── resolve_open_on_host_cwd ───────────────────────────────
     //
