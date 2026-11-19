@@ -157,8 +157,33 @@ pub(crate) enum LayoutCloseIntent {
     Session { workspace_id: String, session_id: String },
     Tab { workspace_id: String, tab_id: String },
     Workspace(String),
-    Archive(Box<ArchivedWorkspaceSnapshot>),
+    Archive(Box<PendingArchive>),
     ConsumedArchive { workspace_id: String, archive_id: String },
+}
+
+/// Older archive journal payloads are the flattened entry alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingArchive {
+    #[serde(flatten)]
+    pub(crate) entry: ArchivedWorkspaceSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restored_workspace_id: Option<String>,
+}
+
+impl LayoutCloseIntent {
+    pub(crate) fn archive(entry: ArchivedWorkspaceSnapshot) -> Self {
+        Self::Archive(Box::new(PendingArchive { entry, restored_workspace_id: None }))
+    }
+
+    pub(crate) fn closed_workspace_id(&self) -> Option<&str> {
+        match self {
+            Self::Workspace(id) | Self::ConsumedArchive { workspace_id: id, .. } => Some(id),
+            Self::Archive(archive) if archive.restored_workspace_id.as_deref() != Some(&archive.entry.workspace_id) => {
+                Some(&archive.entry.workspace_id)
+            }
+            _ => None,
+        }
+    }
 }
 
 fn persist_debouncer() -> &'static PersistDebouncer {
@@ -4708,8 +4733,8 @@ impl AppStateStore {
                 let sessions = collect_terminal_sessions(&workspace.surfaces).into_iter().map(SessionId).collect();
                 (workspace, sessions, Some(None))
             }
-            LayoutCloseIntent::Archive(entry) => {
-                let workspace = workspace(&entry.workspace_id)?;
+            LayoutCloseIntent::Archive(archive) => {
+                let workspace = workspace(&archive.entry.workspace_id)?;
                 let sessions = collect_terminal_sessions(&workspace.surfaces).into_iter().map(SessionId).collect();
                 (workspace, sessions, Some(None))
             }
@@ -7155,7 +7180,14 @@ fn open_layout(path: &Path) -> Result<(Option<AppStateSnapshot>, Option<String>)
     let base = recovery_base(&names, primary_source.as_ref())
         .map_err(|e| format!("Could not identify the primary layout {}: {e}", path.display()))?;
     match read_layout::<RecoverySnapshot<AppStateSnapshot>>(&session) {
-        Ok(Some((saved, _))) if saved.recovery_base == base => {
+        Ok(Some((mut saved, _))) if saved.recovery_base == base || primary_source.is_none() => {
+            if pending && saved.recovery_base != base {
+                // Quarantining another primary (including on the previous boot)
+                // left this session as the only readable layout. Bind it to the
+                // absent primary before any reader or writer uses the new base.
+                saved.recovery_base.clone_from(&base);
+                write_layout_to(&session, &saved)?;
+            }
             if !pending {
                 // Discarding the last backup adopts the session. Keep the
                 // marker until its snapshot is durable, including on retry.
@@ -7172,8 +7204,14 @@ fn open_layout(path: &Path) -> Result<(Option<AppStateSnapshot>, Option<String>)
     if pending {
         Ok((snapshot, Some(base)))
     } else {
+        // The selected primary is durable. Retire the session first so a
+        // crash cannot leave it unmarked for an unrelated future recovery.
+        match fs::remove_file(session) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Could not retire layout recovery session: {e}")),
+        }
         fs::remove_file(marker).map_err(|e| format!("Could not retire layout recovery marker: {e}"))?;
-        let _ = fs::remove_file(session);
         Ok((snapshot, None))
     }
 }
@@ -7593,8 +7631,25 @@ impl LayoutCloseIntent {
             Self::ConsumedArchive { workspace_id, archive_id } =>
                 snapshot.workspaces.iter().any(|ws| ws.workspace_id.0 == *workspace_id)
                     || snapshot.archived_workspaces.iter().any(|entry| entry.archive_id == *archive_id),
-            Self::Archive(entry) => snapshot.workspaces.iter().any(|workspace| workspace.workspace_id.0 == entry.workspace_id)
-                || !archive_installed_or_superseded(snapshot, entry),
+            Self::Archive(archive) => {
+                self.closed_workspace_id().is_some_and(|id| snapshot.workspaces.iter().any(|ws| ws.workspace_id.0 == id))
+                    || archive.change_for(snapshot).is_some()
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+enum ArchiveChange { Install, Remove }
+
+#[cfg(unix)]
+impl PendingArchive {
+    fn change_for(&self, snapshot: &AppStateSnapshot) -> Option<ArchiveChange> {
+        if self.restored_workspace_id.as_ref().is_some_and(|id| snapshot.workspaces.iter().any(|ws| &ws.workspace_id.0 == id)) {
+            snapshot.archived_workspaces.iter().any(|e| e.archive_id == self.entry.archive_id)
+                .then_some(ArchiveChange::Remove)
+        } else {
+            (!archive_installed_or_superseded(snapshot, &self.entry)).then_some(ArchiveChange::Install)
         }
     }
 }
@@ -7710,17 +7765,17 @@ pub(crate) fn restore_pending_layout_closes(
                     store.remove_archived_workspace(archive_id)?;
                 }
             }
-            LayoutCloseIntent::Archive(entry) => {
-                let (workspace_open, archived) = {
-                    let snapshot = store.inner.lock().unwrap();
-                    (snapshot.workspaces.iter().any(|workspace| workspace.workspace_id.0 == entry.workspace_id),
-                     archive_installed_or_superseded(&snapshot, entry))
-                };
-                if workspace_open {
-                    store.close_workspace(&entry.workspace_id)?;
+            LayoutCloseIntent::Archive(archive) => {
+                if let Some(id) = close.closed_workspace_id() {
+                    if store.find_workspace(id).is_some() {
+                        store.close_workspace(id)?;
+                    }
                 }
-                if !archived {
-                    store.add_archived_workspace((**entry).clone());
+                let change = archive.change_for(&store.inner.lock().unwrap());
+                match change {
+                    Some(ArchiveChange::Install) => store.add_archived_workspace(archive.entry.clone()),
+                    Some(ArchiveChange::Remove) => { store.remove_archived_workspace(&archive.entry.archive_id)?; }
+                    None => {}
                 }
             }
         }
@@ -8364,7 +8419,7 @@ fn move_no_clobber_durably(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
+pub(crate) fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
     let path = persisted_layout_path().ok_or("No config directory for layout persistence")?;
     let base = RECOVERY_SAVE_BASE.lock().unwrap().clone();
     if let Some(recovery_base) = base {
@@ -10347,7 +10402,7 @@ mod tests {
         later.archived_at = earlier.archived_at;
         later.workspace_id = next_id("workspace");
         store.add_archived_workspace(later.clone());
-        restore_pending_layout_closes(&store, &[LayoutCloseIntent::Archive(Box::new(earlier.clone()))]).unwrap();
+        restore_pending_layout_closes(&store, &[LayoutCloseIntent::archive(earlier.clone())]).unwrap();
         assert_eq!(store.archived_workspaces_list(), [later.clone()]);
 
         earlier.archive_id = uuid::Uuid::new_v4().to_string();
@@ -10355,7 +10410,7 @@ mod tests {
         later.archive_id = uuid::Uuid::new_v4().to_string();
         later.workspace_id = "workspace-10".into();
         store.add_archived_workspace(later.clone());
-        restore_pending_layout_closes(&store, &[LayoutCloseIntent::Archive(Box::new(earlier))]).unwrap();
+        restore_pending_layout_closes(&store, &[LayoutCloseIntent::archive(earlier)]).unwrap();
         assert_eq!(store.archived_workspaces_list(), [later]);
     }
 
@@ -10374,7 +10429,7 @@ mod tests {
             let workspace_id = store.snapshot().active_workspace_id.0;
             let entry = build_archive_entry(&store.find_workspace(&workspace_id).unwrap());
             store.close_workspace(&workspace_id).unwrap();
-            let intent = LayoutCloseIntent::Archive(Box::new(entry.clone()));
+            let intent = LayoutCloseIntent::archive(entry.clone());
             DatabaseStore::test_file(&db_path).record_layout_close(&intent, &[]).unwrap();
             // An existing debounce may save the removal before the live
             // archive entry is published after teardown completes.
@@ -10384,7 +10439,7 @@ mod tests {
 
         let db = DatabaseStore::test_file(&db_path);
         let intents = db.pending_layout_closes().unwrap();
-        assert_eq!(intents, [LayoutCloseIntent::Archive(Box::new(entry.clone()))]);
+        assert_eq!(intents, [LayoutCloseIntent::archive(entry.clone())]);
         let store = AppStateStore::default();
         store.replace_snapshot(load_persisted_state().unwrap());
         assert!(store.find_workspace(&entry.workspace_id).is_none());
@@ -15161,6 +15216,51 @@ mod persisted_layout_tests {
         assert_eq!(fs::read(&path).unwrap(), repaired);
         assert_eq!(open_layout(&path).unwrap().0.unwrap().active_workspace_id,
             serde_json::from_slice::<AppStateSnapshot>(&repaired).unwrap().active_workspace_id);
+    }
+
+    #[test]
+    fn recovery_session_survives_a_second_unreadable_primary_and_shutdown() {
+        const TEST: &str = "state::state_impl::persisted_layout_tests::recovery_session_survives_a_second_unreadable_primary_and_shutdown";
+        if crate::test_isolation::isolated(TEST) { return; }
+        let path = persisted_layout_path().unwrap();
+        fs::write(&path, b"first corrupt layout").unwrap();
+        assert!(load_persisted_state_checked().unwrap().is_none());
+        // Older versions wrote a usable fallback at the primary path.
+        save_layout_to(&path, &default_app_state()).unwrap();
+        let store = AppStateStore::default();
+        store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+        let added = store.create_empty_workspace_at_path(path.parent().unwrap().to_owned());
+        flush_persisted_state(&store).unwrap();
+        let session = recovery_session_path(&path);
+        let before_quarantine = fs::read(&session).unwrap();
+        fs::write(&path, b"second corrupt layout").unwrap();
+
+        for boot in 0..2 {
+            if boot == 1 {
+                // Crash boundary: the primary was set aside but the session
+                // still has the base from before quarantine.
+                fs::write(&session, &before_quarantine).unwrap();
+            }
+            let loaded = load_persisted_state_checked().unwrap().expect("valid recovery session");
+            store.replace_snapshot(loaded);
+            assert!(store.find_workspace(&added.0).is_some());
+            assert!(load_persisted_state().unwrap().workspaces.iter().any(|ws| ws.workspace_id == added));
+            assert!(layout_recovery_pending());
+        }
+        finish_layout_persistence(&store).unwrap();
+        assert!(!path.exists());
+        let listed = fs::read_to_string(recovery_marker(&path)).unwrap();
+        let copies: Vec<_> = listed.lines().map(|name| path.with_file_name(name)).collect();
+        assert_eq!(copies.len(), 2);
+        for (copy, original) in copies.iter().zip(["first corrupt layout", "second corrupt layout"]) {
+            assert_eq!(fs::read_to_string(copy).unwrap(), original);
+            fs::remove_file(copy).unwrap();
+        }
+        for _ in 0..2 {
+            let (loaded, base) = open_layout(&path).unwrap();
+            assert!(base.is_none());
+            assert!(loaded.unwrap().workspaces.iter().any(|ws| ws.workspace_id == added));
+        }
     }
 
     #[test]

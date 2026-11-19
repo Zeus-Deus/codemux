@@ -2,7 +2,7 @@
 
 use super::DatabaseStore;
 use crate::agent_control::{ControlError, ErrorCode};
-use crate::state::{ArchivedWorkspaceSnapshot, LayoutCloseIntent, SessionId};
+use crate::state::{ArchivedWorkspaceSnapshot, LayoutCloseIntent, PendingArchive, SessionId};
 use crate::terminal::TerminalCloseError;
 use crate::workspace_service::Checkpoint;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -59,6 +59,16 @@ fn replacement_session_id(replacement_id: Uuid) -> String {
     format!("session-{}", replacement_id.simple())
 }
 
+impl PendingArchive {
+    fn from_payload(payload: &str, workspace_id: &str, archive_id: &str) -> Result<Self, String> {
+        let archive: Self = serde_json::from_str(payload).map_err(|e| e.to_string())?;
+        if archive.entry.workspace_id != workspace_id || archive.entry.archive_id != archive_id {
+            return Err("Archive close payload has a different identity".into());
+        }
+        Ok(archive)
+    }
+}
+
 impl LayoutCloseIntent {
     fn row_key(&self) -> (&str, &str, &str) {
         match self {
@@ -75,7 +85,7 @@ impl LayoutCloseIntent {
             // Older workspace closes have an empty target. A consumed archive
             // closes the same workspace and also removes this exact entry.
             Self::ConsumedArchive { workspace_id, archive_id } => ("workspace", workspace_id, archive_id),
-            Self::Archive(entry) => ("archive", &entry.workspace_id, &entry.archive_id),
+            Self::Archive(archive) => ("archive", &archive.entry.workspace_id, &archive.entry.archive_id),
         }
     }
 }
@@ -380,6 +390,15 @@ fn write_layout_close(
         params![scope, intent_workspace_id, target_id, payload],
     )
     .map_err(|error| error.to_string())?;
+    if let Some(id) = intent.closed_workspace_id() {
+        // Once the user closes or rearchives the replacement, its absence
+        // from a later snapshot must not bring the original archive back.
+        tx.execute(
+            "UPDATE OR REPLACE pending_layout_closes SET scope = 'workspace', payload = NULL
+             WHERE scope = 'archive' AND json_extract(payload, '$.restored_workspace_id') = ?1",
+            [id],
+        ).map_err(|error| error.to_string())?;
+    }
     let mut closes = daemon_closes.to_vec();
     if let Some(workspace_id) = workspace_id {
         for id in closed_sessions {
@@ -901,16 +920,11 @@ impl DatabaseStore {
                 "workspace" if target_id.is_empty() => Ok(LayoutCloseIntent::Workspace(workspace_id)),
                 "workspace" => Ok(LayoutCloseIntent::ConsumedArchive { workspace_id, archive_id: target_id }),
                 "archive" => {
-                    let entry: ArchivedWorkspaceSnapshot = serde_json::from_str(
-                        payload
-                            .as_deref()
-                            .ok_or("Archive close payload is missing")?,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    if entry.workspace_id != workspace_id || entry.archive_id != target_id {
-                        return Err("Archive close payload has a different identity".into());
-                    }
-                    Ok(LayoutCloseIntent::Archive(Box::new(entry)))
+                    let archive = PendingArchive::from_payload(
+                        payload.as_deref().ok_or("Archive close payload is missing")?,
+                        &workspace_id, &target_id,
+                    )?;
+                    Ok(LayoutCloseIntent::Archive(Box::new(archive)))
                 }
                 _ => Err(format!("Unknown layout close scope {scope}")),
             }
@@ -934,51 +948,60 @@ impl DatabaseStore {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    /// The archive entry is durable and can now be consumed. The recovery
-    /// copy may still contain the workspace it closed.
-    pub(crate) fn consume_recovery_archive(&self, entry: &ArchivedWorkspaceSnapshot) -> Result<(), String> {
+    /// A deletion is unconditional. An unarchive consumes the entry only in
+    /// layouts that contain the exact workspace that replaced it.
+    pub(crate) fn consume_recovery_archive(
+        &self,
+        entry: &ArchivedWorkspaceSnapshot,
+        restored_workspace_id: Option<&str>,
+    ) -> Result<(), String> {
         if !crate::state::layout_recovery_pending() {
             return Ok(());
         }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
-        // The entry can also come from a saved layout with no pending archive
-        // insertion. Record its consumption in either case, including retries.
-        tx.execute(
-            "INSERT INTO pending_layout_closes (scope, workspace_id, target_id)
-             VALUES ('workspace', ?1, ?2) ON CONFLICT DO NOTHING",
-            params![entry.workspace_id, entry.archive_id],
-        ).map_err(|error| error.to_string())?;
-        // Older retained archives for this checkout were displaced when this
-        // entry was installed. Once it is gone they must not be reinstalled.
+        // Older retained archives displaced by this entry stay consumed.
         for intent in Self::read_layout_closes(&tx)? {
             if let LayoutCloseIntent::Archive(prior) = intent {
-                if entry.supersedes_or_matches(&prior) {
+                if entry.supersedes_or_matches(&prior.entry)
+                    && (restored_workspace_id.is_none() || prior.entry.archive_id != entry.archive_id)
+                {
                     tx.execute(
                         "UPDATE OR REPLACE pending_layout_closes SET scope = 'workspace', payload = NULL
                          WHERE scope = 'archive' AND workspace_id = ?1 AND target_id = ?2",
-                        params![prior.workspace_id, prior.archive_id],
+                        params![prior.entry.workspace_id, prior.entry.archive_id],
                     ).map_err(|error| error.to_string())?;
                 }
             }
         }
+        if let Some(id) = restored_workspace_id {
+            let archive = PendingArchive { entry: entry.clone(), restored_workspace_id: Some(id.to_owned()) };
+            let payload = serde_json::to_string(&archive).map_err(|error| error.to_string())?;
+            // An explicit delete wins over a concurrent restore or a retry.
+            tx.execute(
+                "INSERT INTO pending_layout_closes (scope, workspace_id, target_id, payload)
+                 SELECT 'archive', ?1, ?2, ?3 WHERE NOT EXISTS (
+                    SELECT 1 FROM pending_layout_closes WHERE scope = 'workspace' AND workspace_id = ?1 AND target_id = ?2
+                 ) ON CONFLICT(scope, workspace_id, target_id) DO UPDATE SET payload = excluded.payload",
+                params![entry.workspace_id, entry.archive_id, payload],
+            ).map_err(|error| error.to_string())?;
+        } else {
+            // The archive may have come from a layout with no journal row.
+            tx.execute(
+                "INSERT INTO pending_layout_closes (scope, workspace_id, target_id)
+                 VALUES ('workspace', ?1, ?2) ON CONFLICT DO NOTHING",
+                params![entry.workspace_id, entry.archive_id],
+            ).map_err(|error| error.to_string())?;
+        }
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub(crate) fn has_pending_layout_close(
-        &self,
-        intent: &LayoutCloseIntent,
-    ) -> Result<bool, String> {
-        self.conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pending_layout_closes
-             WHERE scope = ?1 AND workspace_id = ?2 AND target_id = ?3)",
-                intent.row_key(),
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())
+    pub(crate) fn pending_archive(&self, entry: &ArchivedWorkspaceSnapshot) -> Result<Option<PendingArchive>, String> {
+        let payload = self.conn.lock().unwrap().query_row(
+            "SELECT payload FROM pending_layout_closes WHERE scope = 'archive' AND workspace_id = ?1 AND target_id = ?2",
+            params![entry.workspace_id, entry.archive_id], |row| row.get::<_, String>(0),
+        ).optional().map_err(|error| error.to_string())?;
+        payload.map(|p| PendingArchive::from_payload(&p, &entry.workspace_id, &entry.archive_id)).transpose()
     }
 
     pub(crate) fn pending_daemon_closes(&self) -> Result<Vec<PendingDaemonClose>, String> {

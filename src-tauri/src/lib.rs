@@ -1090,13 +1090,9 @@ fn build_core_app<R: tauri::Runtime>(
                 // mirror. Replay explicit closes even if the layout already
                 // reflects them, before any journal retirement or sync tick.
                 for close in &pending_layout_closes {
-                    let id = match close {
-                        state::LayoutCloseIntent::Workspace(id)
-                        | state::LayoutCloseIntent::ConsumedArchive { workspace_id: id, .. } => id,
-                        state::LayoutCloseIntent::Archive(entry) => &entry.workspace_id,
-                        _ => continue,
-                    };
-                    workspaces_sync::record_closed(&db, id).map_err(std::io::Error::other)?;
+                    if let Some(id) = close.closed_workspace_id() {
+                        workspaces_sync::record_closed(&db, id).map_err(std::io::Error::other)?;
+                    }
                 }
                 if let Err(error) = state::persist_terminal_replacements(&store, &db, &terminal_replacements) {
                     log::warn!("Could not save replayed terminal replacements: {error}");
