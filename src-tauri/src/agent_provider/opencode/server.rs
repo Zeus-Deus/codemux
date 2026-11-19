@@ -660,7 +660,7 @@ mod stdout_drain {
     /// The longest startup line parsed for the banner, and the most startup
     /// output kept for an error message.
     #[cfg(any(windows, test))]
-    const MAX_LINE: usize = 4096;
+    pub(super) const MAX_LINE: usize = 4096;
     #[cfg(any(windows, test))]
     const MAX_CAPTURED: usize = 8192;
 
@@ -681,22 +681,15 @@ mod stdout_drain {
             if stop.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err("ready_banner_missing; stopped".to_string());
             }
-            let chunk = match reader.fill_buf() {
-                Ok([]) | Err(_) => {
-                    return Err(format!(
-                        "ready_banner_missing; child stdout closed. captured:\n{}",
-                        captured.trim()
-                    ))
-                }
-                Ok(chunk) => chunk,
-            };
-            let (part, ends_line) = match chunk.iter().position(|&b| b == b'\n') {
-                Some(i) => (&chunk[..=i], true),
-                None => (chunk, false),
-            };
-            let used = part.len();
+            let chunk = reader
+                .fill_buf()
+                .map_err(|err| format!("stdout_read_error: {err}"))?;
+            let eof = chunk.is_empty();
+            let newline = chunk.iter().position(|&b| b == b'\n');
+            let part = &chunk[..newline.unwrap_or(chunk.len())];
+            let used = part.len() + usize::from(newline.is_some());
             if !overlong {
-                if line.len() + used > MAX_LINE + 1 {
+                if part.len() > MAX_LINE - line.len() {
                     // Too long to be the banner; skip to the end of the line.
                     overlong = true;
                     line.clear();
@@ -705,12 +698,12 @@ mod stdout_drain {
                 }
             }
             reader.consume(used);
-            if !ends_line {
+            if !eof && newline.is_none() {
                 continue;
             }
             if !std::mem::take(&mut overlong) {
                 let text = String::from_utf8_lossy(&line);
-                let text = text.trim_end_matches(['\r', '\n']);
+                let text = text.trim_end_matches('\r');
                 if let Some(found) = super::parse_ready_url(text)
                     .and_then(|url| super::OpenCodeApi::from_ready_banner(text).map(|api| (url, api)))
                 {
@@ -722,6 +715,12 @@ mod stdout_drain {
                     }
                     captured.push_str(text);
                 }
+            }
+            if eof {
+                return Err(format!(
+                    "ready_banner_missing; child stdout closed. captured:\n{}",
+                    captured.trim()
+                ));
             }
             line.clear();
         }
@@ -802,7 +801,7 @@ mod stdout_drain {
                 })
                 .ok();
             #[cfg(test)]
-            let (pause, fail_reader_spawn) = match pause {
+            let (mut pause, fail_reader_spawn) = match pause {
                 Some((pause, fail)) => (pause, fail),
                 None => (None, false),
             };
@@ -822,9 +821,12 @@ mod stdout_drain {
                 let mut buf = [0u8; 8192];
                 while !thread_stop.load(Ordering::SeqCst) {
                     #[cfg(test)]
-                    if let Some((arrived, release)) = pause.as_ref() {
-                        arrived.wait();
-                        release.wait();
+                    if let Some((arrived, release)) = pause.take() {
+                        if arrived.send(()).is_err()
+                            || release.recv_timeout(std::time::Duration::from_secs(10)).is_err()
+                        {
+                            break;
+                        }
                     }
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
@@ -879,7 +881,8 @@ mod stdout_drain {
 #[derive(Default)]
 pub(crate) struct DrainProbe {
     pub(crate) done: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    pub(crate) pause_before_drain_read: Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>,
+    pub(crate) pause_before_drain_read:
+        Option<(tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     /// Make the reader thread's spawn fail, after the cancel thread started.
     pub(crate) fail_reader_spawn: bool,
     /// Set by the cancel thread as it exits.
@@ -1369,10 +1372,10 @@ mod tests {
             "@echo off\r\necho opencode server listening on http://127.0.0.1:1\r\nping -n 60 127.0.0.1 >nul\r\n",
         )
         .unwrap();
-        let arrived = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let probe = std::sync::Arc::new(std::sync::Mutex::new(DrainProbe {
-            pause_before_drain_read: Some((arrived.clone(), release.clone())),
+            pause_before_drain_read: Some((arrived_tx, release_rx)),
             ..DrainProbe::default()
         }));
 
@@ -1383,17 +1386,15 @@ mod tests {
         let done = probe.lock().unwrap().done.clone().unwrap();
 
         // The reader is past its stop check, just before reading.
-        tokio::task::spawn_blocking({
-            let arrived = arrived.clone();
-            move || arrived.wait()
-        })
-        .await
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("timed out waiting for the reader")
+            .expect("reader exited before its first drain read");
         server.child.stop_drain();
         // Let the cancel loop run with nothing pending, then let the reader
         // issue its read.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        tokio::task::spawn_blocking(move || release.wait()).await.unwrap();
+        release_tx.send(()).expect("reader exited before release");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !done.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < deadline {
@@ -1421,6 +1422,45 @@ mod tests {
 
         let (url, _api) = stdout_drain::scan_banner(&mut reader, &stop).expect("the banner");
         assert_eq!(url, "http://127.0.0.1:4096");
+    }
+
+    #[test]
+    fn banner_length_limit_is_the_same_at_newline_and_eof() {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let banner = "opencode server listening on http://127.0.0.1:4096";
+        let padding = " ".repeat(stdout_drain::MAX_LINE - banner.len());
+        for ending in ["", "\n"] {
+            let input = format!("{padding}{banner}{ending}");
+            let mut reader = std::io::BufReader::with_capacity(7, input.as_bytes());
+            let (url, _) = stdout_drain::scan_banner(&mut reader, &stop).unwrap();
+            assert_eq!(url, "http://127.0.0.1:4096");
+
+            let overlong = format!(" {input}");
+            let mut reader = std::io::BufReader::with_capacity(7, overlong.as_bytes());
+            let err = stdout_drain::scan_banner(&mut reader, &stop).unwrap_err();
+            assert!(err.starts_with("ready_banner_missing"), "{err}");
+            assert!(!err.contains(banner), "{err}");
+        }
+    }
+
+    #[test]
+    fn read_error_does_not_complete_a_partial_banner() {
+        use std::io::{self, Read};
+
+        struct FailedRead;
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("pipe read failed"))
+            }
+        }
+
+        let input = b"opencode server listening on http://127.0.0.1:4096"
+            .as_slice()
+            .chain(FailedRead);
+        let mut reader = io::BufReader::new(input);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let err = stdout_drain::scan_banner(&mut reader, &stop).unwrap_err();
+        assert_eq!(err, "stdout_read_error: pipe read failed");
     }
 
     #[test]
