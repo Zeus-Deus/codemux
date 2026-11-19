@@ -2303,6 +2303,11 @@ impl DatabaseStore {
     /// Idempotent upsert from a server pull. Always sets `dirty = 0`.
     /// Does NOT clobber the local `workspace_id` if one is already
     /// stamped — adoption is sticky.
+    ///
+    /// A local row with unpushed changes (`dirty = 1`) is left alone:
+    /// the server copy predates the local edit or delete, and the next
+    /// push sends it. Checked here, under the connection lock, so an
+    /// edit that lands mid-pull is covered too.
     pub fn upsert_workspace_sync_from_server(
         &self,
         server_id: &str,
@@ -2335,7 +2340,7 @@ impl DatabaseStore {
                      project_uid = COALESCE(?11, project_uid),
                      workspace_kind = COALESCE(?12, workspace_kind),
                      dirty = 0
-                 WHERE user_id = 'local' AND server_id = ?10",
+                 WHERE user_id = 'local' AND server_id = ?10 AND dirty = 0",
                 params![
                     title,
                     host_server_id,
@@ -2352,7 +2357,16 @@ impl DatabaseStore {
                 ],
             )
             .map_err(|e| format!("Failed to update workspace sync from server: {e}"))?;
-        if updated == 0 {
+        // Nothing updated: either the row is new to this install, or it
+        // exists with local changes pending. Only the former is inserted.
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces_sync WHERE user_id = 'local' AND server_id = ?1)",
+                params![server_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to look up workspace sync from server: {e}"))?;
+        if updated == 0 && !exists {
             conn.execute(
                 "INSERT INTO workspaces_sync
                     (user_id, server_id, workspace_id, title, host_server_id,
@@ -3234,6 +3248,10 @@ impl DatabaseStore {
     /// Always written `dirty = 0` (server rows are authoritative).
     /// `next_run_at` / `last_run_at` are derived per-device and are not
     /// carried over the wire, so a server upsert leaves them untouched.
+    ///
+    /// A local row with unpushed changes (`dirty = 1`) is left alone:
+    /// the server copy predates the user's edit, pause or delete, and
+    /// the next push sends it.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_automation_from_server(
         &self,
@@ -3261,7 +3279,7 @@ impl DatabaseStore {
                      project_remote = ?8, enabled = ?9, retention_limit = ?10,
                      created_at = ?11, updated_at = ?12, deleted_at = ?13,
                      dirty = 0
-                 WHERE user_id = 'local' AND server_id = ?14",
+                 WHERE user_id = 'local' AND server_id = ?14 AND dirty = 0",
                 params![
                     name,
                     prompt,
@@ -3280,7 +3298,16 @@ impl DatabaseStore {
                 ],
             )
             .map_err(|e| format!("Failed to update automation from server: {e}"))?;
-        if updated == 0 {
+        // Nothing updated: either the row is new to this install, or it
+        // exists with local changes pending. Only the former is inserted.
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automations WHERE user_id = 'local' AND server_id = ?1)",
+                params![server_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to look up automation from server: {e}"))?;
+        if updated == 0 && !exists {
             conn.execute(
                 "INSERT INTO automations
                     (user_id, server_id, name, prompt, agent, schedule,
