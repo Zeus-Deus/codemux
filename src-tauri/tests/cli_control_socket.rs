@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -71,6 +71,28 @@ fn free_loopback_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+fn layout_path(root: &Path) -> PathBuf {
+    // Match the config directory dirs::config_dir resolves in the child.
+    #[cfg(target_os = "macos")]
+    let config = root.join("Library/Application Support");
+    #[cfg(not(target_os = "macos"))]
+    let config = root.join("config");
+    config.join(codemux_lib::APP_DIR_NAME).join("layout.json")
+}
+
+fn serve_command(root: &Path, port: u16) -> Command {
+    let mut cmd = Command::new(CODEMUX);
+    isolate(&mut cmd, root);
+    // In-process terminals, no reachable account API, and a shell with nothing to say.
+    cmd.env("CODEMUX_DISABLE_PTY_DAEMON", "1")
+        .env("CODEMUX_API_URL", "http://127.0.0.1:1")
+        .env("SHELL", "/bin/true")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["serve", "--scope", "loopback", "--port", &port.to_string()])
+        .stdin(Stdio::null());
+    cmd
+}
+
 /// A `codemux serve` child, stopped (SIGTERM, then kill) when dropped.
 struct Serve {
     child: Child,
@@ -79,28 +101,28 @@ struct Serve {
 
 impl Serve {
     fn start() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let mut serve = Self::spawn_in(tempfile::tempdir().unwrap());
+        serve.wait_ready();
+        serve
+    }
+
+    fn spawn_in(root: tempfile::TempDir) -> Self {
         let bin = root.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         // Codemux finds Cursor as `cursor-agent` on PATH. A symlink, not a
         // copy: copy-then-exec races ETXTBSY.
         std::os::unix::fs::symlink(FAKE_CURSOR, bin.join("cursor-agent")).unwrap();
+        // Keep startup and shutdown browser cleanup inside this fixture.
+        std::os::unix::fs::symlink("/bin/true", bin.join("pkill")).unwrap();
+        std::os::unix::fs::symlink("/bin/true", bin.join("fuser")).unwrap();
+        let cmd = serve_command(root.path(), free_loopback_port());
+        Self::spawn(root, cmd)
+    }
+
+    fn spawn(root: tempfile::TempDir, mut cmd: Command) -> Self {
         let log = std::fs::File::create(root.path().join("serve.log")).unwrap();
-        let mut cmd = Command::new(CODEMUX);
-        isolate(&mut cmd, root.path());
-        // In-process terminals (no detached daemon outlives the test), no
-        // reachable account API, and a shell with nothing to say.
-        cmd.env("CODEMUX_DISABLE_PTY_DAEMON", "1")
-            .env("CODEMUX_API_URL", "http://127.0.0.1:1")
-            .env("SHELL", "/bin/true")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .args(["serve", "--scope", "loopback", "--port", &free_loopback_port().to_string()])
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().unwrap())
-            .stderr(log);
-        let mut serve = Self { child: cmd.spawn().unwrap(), root };
-        serve.wait_ready();
-        serve
+        cmd.stdout(log.try_clone().unwrap()).stderr(log);
+        Self { child: cmd.spawn().unwrap(), root }
     }
 
     fn log(&self) -> String {
@@ -113,11 +135,13 @@ impl Serve {
             if let Some(status) = self.child.try_wait().unwrap() {
                 panic!("codemux serve exited early ({status}):\n{}", self.log());
             }
-            let output = self.cli(&["json", "status"]);
-            if output.status.success() {
+            // The footer follows registration of the shutdown signal handlers.
+            if self.log().contains("Press Ctrl-C (or send SIGTERM) to stop the server.")
+                && self.cli(&["json", "status"]).status.success()
+            {
                 return;
             }
-            assert!(Instant::now() < deadline, "codemux serve never answered on its socket:\n{}", self.log());
+            assert!(Instant::now() < deadline, "codemux serve never became ready:\n{}", self.log());
             std::thread::sleep(Duration::from_millis(200));
         }
     }
@@ -141,21 +165,33 @@ impl Serve {
         let created = self.ok(&["json", "create_workspace", &json!({"path": folder}).to_string()]);
         (created["data"]["workspace_id"].as_str().expect("a workspace id").to_owned(), folder)
     }
+
+    fn shutdown(&mut self) -> Option<ExitStatus> {
+        if let Ok(Some(status)) = self.child.try_wait() {
+            return Some(status);
+        }
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        self.wait_for_exit()
+    }
+
+    fn wait_for_exit(&mut self) -> Option<ExitStatus> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
 }
 
 impl Drop for Serve {
     fn drop(&mut self) {
-        // This test started the serve; stop it by its pid.
-        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if self.child.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        if self.shutdown().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -631,6 +667,212 @@ fn workspace_create_list_info_close_round_trip() {
     let listed = serve.ok(&["workspace", "list", "--json"]);
     let ids: Vec<&str> = listed["result"]["workspaces"].as_array().unwrap().iter().filter_map(|w| w["workspace_id"].as_str()).collect();
     assert!(!ids.contains(&workspace.as_str()), "{ids:?}");
+}
+
+#[test]
+fn serve_sigterm_saves_workspace_layout_and_exits_successfully() {
+    let mut serve = Serve::start();
+    let (workspace_id, _) = serve.workspace("persist-on-shutdown");
+    let status = serve.shutdown().expect("serve should stop after SIGTERM");
+    assert!(status.success(), "serve exited with {status}:\n{}", serve.log());
+
+    let layout: Value = serde_json::from_slice(&std::fs::read(layout_path(serve.root.path())).unwrap()).unwrap();
+    assert!(layout["workspaces"].as_array().unwrap().iter().any(|workspace| {
+        workspace["workspace_id"].as_str() == Some(workspace_id.as_str())
+    }));
+}
+
+#[test]
+fn serve_saves_its_layout_without_overwriting_the_recovery_copy() {
+    let root = tempfile::tempdir().unwrap();
+    let layout = layout_path(root.path());
+    let corrupt = b"{\"workspaces\":[";
+    std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
+    std::fs::write(&layout, corrupt).unwrap();
+
+    #[cfg(target_os = "macos")]
+    let data_dir = root.path().join("Library/Application Support");
+    #[cfg(not(target_os = "macos"))]
+    let data_dir = root.path().join("data");
+    let orphan = data_dir.join(codemux_lib::APP_DIR_NAME).join("scrollback/missing-workspace");
+    std::fs::create_dir_all(&orphan).unwrap();
+    let scrollback = orphan.join("pane.dat");
+    std::fs::write(&scrollback, b"terminal history").unwrap();
+
+    let mut serve = Serve::spawn_in(root);
+    serve.wait_ready();
+    let (workspace_id, _) = serve.workspace("during-recovery");
+    let status = serve.shutdown().expect("serve should stop after SIGTERM");
+    assert!(status.success(), "serve exited with {status}:\n{}", serve.log());
+
+    let saved: Value = serde_json::from_slice(&std::fs::read(&layout).unwrap()).unwrap();
+    assert!(saved["workspaces"].as_array().unwrap().iter().any(|workspace| {
+        workspace["workspace_id"].as_str() == Some(workspace_id.as_str())
+    }));
+    let backup = std::fs::read_to_string(layout.with_extension("json.recovery-pending")).unwrap();
+    assert_eq!(std::fs::read(layout.with_file_name(backup.trim())).unwrap(), corrupt);
+    assert_eq!(std::fs::read(scrollback).unwrap(), b"terminal history");
+}
+
+#[test]
+fn serve_refuses_to_share_a_layout_with_another_instance() {
+    use std::os::unix::fs::MetadataExt;
+
+    let owner = Serve::start();
+    let port = owner.ok(&["json", "web_remote_status"])["data"]["port"]
+        .as_u64().unwrap().try_into().unwrap();
+    let (workspace_id, _) = owner.workspace("retained-by-layout-owner");
+    let layout = layout_path(owner.root.path());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let saved = loop {
+        if let Ok(bytes) = std::fs::read(&layout) {
+            let snapshot: Value = serde_json::from_slice(&bytes).unwrap();
+            let workspace_saved = snapshot["workspaces"].as_array().unwrap().iter().any(|workspace| {
+                workspace["workspace_id"].as_str() == Some(workspace_id.as_str())
+            });
+            // Wait for both fixture shells to finish updating their layout metadata.
+            let shells_settled = snapshot["terminal_sessions"].as_array().unwrap().iter().all(|session| {
+                matches!(session["state"].as_str(), Some("exited" | "failed"))
+            });
+            if workspace_saved && shells_settled {
+                break bytes;
+            }
+        }
+        assert!(Instant::now() < deadline, "owner did not persist its workspace:\n{}", owner.log());
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let layout_inode = std::fs::metadata(&layout).unwrap().ino();
+
+    // A different runtime directory bypasses the control-socket liveness probe,
+    // but both children still use the same config, data, and browser stubs.
+    let contender_root = tempfile::tempdir().unwrap();
+    let mut cmd = serve_command(owner.root.path(), port);
+    cmd.env("XDG_RUNTIME_DIR", contender_root.path());
+    let mut contender = Serve::spawn(contender_root, cmd);
+    let status = contender.wait_for_exit().unwrap_or_else(|| {
+        panic!("second serve did not exit:\n{}", contender.log());
+    });
+    let log = contender.log();
+    assert_eq!(status.code(), Some(1), "second serve exited with {status}:\n{log}");
+    assert!(log.contains("Codemux is already running with the workspace layout"), "second serve did not report layout ownership:\n{log}");
+    assert_eq!(std::fs::read(&layout).unwrap(), saved);
+    assert_eq!(std::fs::metadata(&layout).unwrap().ino(), layout_inode, "second serve replaced the layout");
+
+    let live = owner.ok(&["json", "status"]);
+    assert_eq!(live["data"]["active_workspace_id"].as_str(), Some(workspace_id.as_str()));
+}
+
+#[test]
+fn serve_preserves_an_unreadable_layout_link() {
+    let root = tempfile::tempdir().unwrap();
+    let layout = layout_path(root.path());
+    let target = root.path().join("missing-layout.json");
+    std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &layout).unwrap();
+
+    let mut serve = Serve::spawn_in(root);
+    serve.wait_ready();
+    let status = serve.shutdown().expect("serve should stop after SIGTERM");
+    assert!(status.success(), "serve exited with {status}:\n{}", serve.log());
+    let backup = std::fs::read_to_string(layout.with_extension("json.recovery-pending")).unwrap();
+    assert_eq!(std::fs::read_link(layout.with_file_name(backup.trim())).unwrap(), target);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn serve_sigterm_drains_an_admitted_workspace_creation_before_saving() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The wrapper blocks only the new project's Git read, before the
+    // admitted create command can insert the workspace into app state.
+    let mut serve = Serve::start();
+    let root = serve.root.path().to_path_buf();
+    let folder = root.join("shutdown-workspace");
+    std::fs::create_dir_all(&folder).unwrap();
+    let git = root.join("bin/git");
+    std::fs::write(&git, r#"#!/bin/sh
+if [ "$PWD" = "$HOME/shutdown-workspace" ] && [ "$1" = branch ] && [ "$2" = --show-current ]; then
+    : > "$HOME/workspace-git-entered"
+    remaining=3000
+    while [ ! -f "$HOME/workspace-git-release" ] && [ "$remaining" -gt 0 ]; do
+        remaining=$((remaining - 1))
+        sleep 0.01
+    done
+    [ -f "$HOME/workspace-git-release" ] || exit 124
+fi
+exec /usr/bin/git "$@"
+"#).unwrap();
+    std::fs::set_permissions(git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let params = json!({"path": folder}).to_string();
+    let pid = serve.child.id();
+    let entered = root.join("workspace-git-entered");
+
+    let output = std::thread::scope(|scope| {
+        struct ReleaseGit(PathBuf);
+        impl Drop for ReleaseGit {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, b"");
+            }
+        }
+        let release = ReleaseGit(root.join("workspace-git-release"));
+        let creating = scope.spawn(|| cli_in(&root, &["json", "create_workspace", &params]));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !entered.is_file() {
+            assert!(Instant::now() < deadline, "workspace creation never reached Git:\n{}", serve.log());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = serve.cli(&["json", "status"]);
+            if !status.status.success()
+                && [&status.stdout, &status.stderr].iter().any(|bytes| {
+                    String::from_utf8_lossy(bytes).contains("Codemux is shutting down")
+                })
+            {
+                break;
+            }
+            assert!(serve.child.try_wait().unwrap().is_none(), "serve exited during the workspace mutation:\n{}", serve.log());
+            assert!(Instant::now() < deadline, "serve never closed admission:\n{}", serve.log());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(release);
+        creating.join().unwrap()
+    });
+    assert!(output.status.success(), "admitted workspace creation failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stderr), serve.log());
+    let created = stdout_json(&output);
+    let workspace_id = created["data"]["workspace_id"].as_str().expect("a workspace id");
+
+    let status = serve.wait_for_exit().expect("serve should stop after draining the workspace creation");
+    assert!(status.success(), "serve exited with {status}:\n{}", serve.log());
+    let layout: Value = serde_json::from_slice(&std::fs::read(layout_path(&root)).unwrap()).unwrap();
+    assert!(layout["workspaces"].as_array().unwrap().iter().any(|workspace| {
+        workspace["workspace_id"].as_str() == Some(workspace_id)
+    }), "admitted workspace {workspace_id} was missing from the shutdown layout");
+}
+
+#[test]
+fn serve_sigterm_reports_layout_save_failure() {
+    let mut serve = Serve::start();
+    let layout = layout_path(serve.root.path());
+    if layout.is_file() {
+        std::fs::rename(&layout, layout.with_extension("startup.json")).unwrap();
+    }
+    // A directory at the destination blocks the final atomic file replacement
+    // even when the test process has permission to write to the parent.
+    std::fs::create_dir_all(layout).unwrap();
+    serve.workspace("fail-layout-save");
+
+    let status = serve.shutdown().expect("serve should stop after SIGTERM");
+    let log = serve.log();
+    assert_eq!(status.code(), Some(1), "serve exited with {status}:\n{log}");
+    assert!(log.lines().any(|line| {
+        line.starts_with("[codemux serve]") && line.contains("Failed to replace layout state")
+    }), "serve did not report the shutdown layout error:\n{log}");
 }
 
 #[test]

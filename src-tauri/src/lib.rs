@@ -2,6 +2,9 @@ use tauri::{Emitter, Listener, Manager};
 #[cfg(test)]
 extern crate self as codemux_lib;
 
+#[cfg(test)]
+mod desktop_layout_tests;
+
 /// Subdirectory name used under XDG config/data dirs for all Codemux state
 /// (sqlite db, auth tokens, scrollback, presets, etc.). Debug builds use a
 /// distinct name so a locally-running dev build keeps its sessions, auth,
@@ -94,6 +97,8 @@ pub mod fs_size;
 pub mod hosts_upgrade;
 pub mod hosts_inventory;
 pub mod workspace_paths;
+#[cfg(windows)]
+mod windows_file_id;
 pub mod workspace_service;
 pub mod project_identity;
 pub mod workspaces_sync;
@@ -486,10 +491,10 @@ pub fn run() {
     // GDK_BACKEND: forces Wayland-native when available, preventing XWayland fallback
     // (which triggers unintended Hyprland window rules on AppImage builds).
     #[cfg(target_os = "linux")]
-    {
+    let track_renderer_startup = {
         webview_tuning::configure_gdk_backend_env();
-        webview_tuning::configure_renderer_env();
-    }
+        webview_tuning::configure_renderer_env()
+    };
 
     #[cfg(debug_assertions)]
     {
@@ -525,12 +530,6 @@ pub fn run() {
                     cwd
                 ));
             }
-            // A duplicate launch bumps the renderer crash sentinel in a
-            // process that exits before it ever builds a window. This
-            // instance is demonstrably healthy, so clear that increment
-            // rather than let repeated duplicate launches look like repeated
-            // renderer crashes.
-            crate::webview_tuning::mark_startup_successful();
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -538,17 +537,30 @@ pub fn run() {
         },
     ));
 
-    build_core_app(builder, AppMode::Gui)
+    let app = build_core_app(builder, AppMode::Gui, None)
         .build(app_context())
-        .expect("error while building tauri application")
-        .run(|app, event| {
+        .unwrap_or_else(|error| {
+            diagnostics::stderr_line(&format!("[codemux] Desktop startup failed: {error}"));
+            std::process::exit(1);
+        });
+    // Build finishes duplicate routing and validates ownership. The first
+    // webview is created on the Ready event after the run loop starts.
+    #[cfg(target_os = "linux")]
+    if track_renderer_startup {
+        webview_tuning::arm_renderer_startup();
+    }
+    app.run(
+        |app, event| {
             if let tauri::RunEvent::Exit = event {
                 // Stop taking outside-assistant connections first.
                 mcp_connector::listener::stop(app);
-                let _ = tauri::async_runtime::block_on(tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    app.state::<plugins::platform_transport::PluginPlatformState>().shutdown(),
-                ));
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        app.state::<plugins::platform_transport::PluginPlatformState>().shutdown(),
+                    )
+                    .await
+                });
                 tauri::async_runtime::block_on(
                     app.state::<plugins::host::PluginHostState>().shutdown(),
                 );
@@ -577,16 +589,21 @@ pub fn run() {
                 );
                 // Remote-workspace ssh tunnels otherwise outlive the app.
                 #[cfg(unix)]
-                let _ = tauri::async_runtime::block_on(tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    ssh::shutdown_all(),
-                ));
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(3), ssh::shutdown_all())
+                        .await
+                });
                 if let Err(error) = tauri::async_runtime::block_on(
                     app.state::<commands::workflows::WorkflowState>().shutdown(),
                 ) {
                     eprintln!("[codemux::workflows] shutdown incomplete: {error}");
                 }
-                if let Err(error) = active_workspace_persistence::flush_latest(app) {
+                if let Err(error) =
+                    state::finish_layout_persistence(&app.state::<state::AppStateStore>())
+                {
+                    eprintln!("[codemux::state] Failed to persist layout state on exit: {error}");
+                }
+                if let Err(error) = active_workspace_persistence::finish_persistence(app) {
                     eprintln!("[codemux::selection] shutdown flush failed: {error}");
                 }
                 // A graceful run-loop exit is not a renderer crash: disarm the
@@ -597,8 +614,11 @@ pub fn run() {
                 webview_tuning::mark_clean_exit();
                 // Kill agent-browser daemons so they don't persist across restarts.
                 agent_browser::kill_stream_daemons();
+                // Tauri can launch a replacement process after this callback.
+                drop(app.state::<StartupLayout>().ownership.lock().unwrap().take());
             }
-        });
+        },
+    );
 }
 
 /// Run the headless `codemux serve` web-remote server on the main thread.
@@ -620,6 +640,53 @@ fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
     tauri::tauri_build_context!()
 }
 
+struct StartupLayout {
+    snapshot: std::sync::Mutex<Option<state::AppStateSnapshot>>,
+    ownership: std::sync::Mutex<Option<std::fs::File>>,
+}
+
+fn core_startup_plugin<R: tauri::Runtime>(
+    mode: AppMode,
+    headless_layout: Option<state::AppStateSnapshot>,
+) -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("core-startup")
+        .setup(move |app, _| {
+            // A duplicate desktop launch has already been forwarded by the
+            // first plugin. Ownership and layout validation precede window
+            // creation, import recovery, and initialization of these stores.
+            let (ownership, snapshot) = match mode {
+                AppMode::Gui => {
+                    let lock = state::acquire_layout_lock().map_err(std::io::Error::other)?;
+                    // Also exclude a running backend that predates the layout lock.
+                    if control::control_server_is_running() {
+                        return Err(std::io::Error::other(
+                            "Another Codemux backend is already using the control endpoint.",
+                        )
+                        .into());
+                    }
+                    let snapshot =
+                        state::load_persisted_state_checked().map_err(std::io::Error::other)?;
+                    (Some(lock), snapshot)
+                }
+                AppMode::ServeHeadless => (None, headless_layout),
+            };
+            app.manage(StartupLayout {
+                snapshot: std::sync::Mutex::new(snapshot),
+                ownership: std::sync::Mutex::new(ownership),
+            });
+            app.manage(database::init_database().unwrap_or_else(|error| {
+                eprintln!("[codemux] WARNING: Database init failed: {error}. Using in-memory fallback.");
+                database::DatabaseStore::new_in_memory()
+            }));
+            app.manage(commands::workflows::WorkflowState::open_default());
+            app.manage(observability::load_observability_store());
+            app.manage(session_adapters::AdapterState::new());
+            app.manage(agent_browser::AgentBrowserManager::new_with_cleanup());
+            Ok(())
+        })
+        .build()
+}
+
 /// Wire the full command surface — managed state, channel interceptor,
 /// plugins, setup closure, and invoke handler — onto `builder`. Shared
 /// verbatim by the GUI desktop app (`run`, on Wry) and the headless serve
@@ -630,7 +697,13 @@ fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
 fn build_core_app<R: tauri::Runtime>(
     builder: tauri::Builder<R>,
     mode: AppMode,
+    headless_layout: Option<state::AppStateSnapshot>,
 ) -> tauri::Builder<R> {
+    let builder = if mode == AppMode::ServeHeadless {
+        builder.manage(web_remote::serve::ShutdownAdmission::default())
+    } else {
+        builder
+    };
     // Web-remote state must exist before the builder so the channel
     // interceptor (registered below) and the WS dispatcher share one
     // channel routing table. The interceptor reroutes a synthesized
@@ -640,6 +713,7 @@ fn build_core_app<R: tauri::Runtime>(
     let web_remote_channel_router = web_remote_state.channel_router();
 
     let builder = builder
+        .plugin(core_startup_plugin(mode, headless_layout))
         // Mode is managed state so commands and the setup closure can gate
         // display-coupled behavior on it.
         .manage(mode)
@@ -656,18 +730,14 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(commands::usage::PlanQuotaStore::default())
         // Ephemeral `/btw` side chats; each owns its provider process.
         .manage(commands::side_chat::SideChatStore::default())
-        .manage(agent_browser::AgentBrowserManager::new_with_cleanup())
         .manage(indexing::ProjectIndexStore::default())
-        .manage(observability::load_observability_store())
         .manage(terminal::PtyState::default())
         .manage(resource_metrics::ResourceMonitorState::default())
-        .manage(session_adapters::AdapterState::new())
         .manage(scrollback::ScrollbackCache::default())
         .manage(auth::AuthState::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
         .manage(agent_control::NativeControlState::default())
-        .manage(commands::workflows::WorkflowState::open_default())
         // Per-thread live event channels for the chat pane: each
         // mounted pane attaches a tauri::ipc::Channel keyed by
         // thread_id; forward_event routes that thread's runtime
@@ -753,10 +823,6 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(plugins::host::PluginHostState::default())
         .manage(skills::watcher::SkillsWatcherState::new())
         .manage(skills::inventory::SkillInventoryService::new())
-        .manage(database::init_database().unwrap_or_else(|e| {
-            eprintln!("[codemux] WARNING: Database init failed: {e}. Using in-memory fallback.");
-            database::DatabaseStore::new_in_memory()
-        }))
         .manage(web_remote_state)
         .manage(std::sync::Arc::new(environments::EnvironmentStreams::default()))
         .manage(mcp_connector::McpConnectorState::default())
@@ -814,8 +880,8 @@ fn build_core_app<R: tauri::Runtime>(
         //
         // A finished load on the main window is also the app's first proof
         // that the webview came up, which clears the renderer crash sentinel
-        // armed before GTK init. `mode` is `Copy`, so the setup closure below
-        // still captures it too.
+        // armed just before the run loop. `mode` is `Copy`, so the setup
+        // closure below still captures it too.
         .on_page_load(move |webview, payload| {
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
                 // A new document is replacing the main page, so the old
@@ -942,9 +1008,8 @@ fn build_core_app<R: tauri::Runtime>(
             // a force-close cascade. See `scrollback::should_run_orphan_cleanup`
             // for the full failure-mode write-up.
             let mut layout_loaded = false;
-            let persisted_layout = state::load_persisted_layout();
-            if let state::PersistedLayout::Loaded(snapshot) = persisted_layout {
-                let snapshot = *snapshot;
+            let startup_layout = app.state::<StartupLayout>().snapshot.lock().unwrap().take();
+            if let Some(snapshot) = startup_layout {
                 let mut stripped = state::strip_removed_workspaces_from_snapshot(snapshot);
                 // The coalesced SQLite stream is authoritative for selection;
                 // layout.json remains authoritative for the pane/layout body.
@@ -978,9 +1043,8 @@ fn build_core_app<R: tauri::Runtime>(
                 layout_loaded = true;
                 diagnostics::record_startup_milestone("startup.layout-restored");
             } else if mode == AppMode::Gui {
-                // First launch — no persisted layout exists. Replace the
-                // default_app_state (which creates a CWD workspace) with an
-                // empty state so the user sees the splash screen instead.
+                // First launch or recovery: show the splash screen instead
+                // of the CWD workspace created by default_app_state.
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.clear_workspaces();
             }
@@ -1207,7 +1271,9 @@ fn build_core_app<R: tauri::Runtime>(
                                     scrollback::refresh_stale_scrollback_metadata(&app_state);
 
                                     // Flush layout state
-                                    state::flush_persisted_state(&app_state);
+                                    if let Err(error) = state::flush_persisted_state(&app_state) {
+                                        eprintln!("[codemux::state] Failed to persist layout state on close: {error}");
+                                    }
                                     if let Err(error) = active_workspace_persistence::flush_latest(&async_handle) {
                                         eprintln!("[codemux::selection] close flush failed: {error}");
                                     }
@@ -1225,7 +1291,9 @@ fn build_core_app<R: tauri::Runtime>(
                                 // Session restore disabled — close immediately
                                 let app_state: tauri::State<'_, state::AppStateStore> = close_handle.state();
                                 scrollback::refresh_stale_scrollback_metadata(&app_state);
-                                state::flush_persisted_state(&app_state);
+                                if let Err(error) = state::flush_persisted_state(&app_state) {
+                                    eprintln!("[codemux::state] Failed to persist layout state on close: {error}");
+                                }
                                 if let Err(error) = active_workspace_persistence::flush_latest(&close_handle) {
                                     eprintln!("[codemux::selection] close flush failed: {error}");
                                 }
@@ -1312,7 +1380,6 @@ fn build_core_app<R: tauri::Runtime>(
                 if let Some((_, cwd)) = app_state.active_workspace_cwd() {
                     index_store.initialize_for_project(std::path::PathBuf::from(cwd));
                 }
-                indexing::spawn_index_watcher(index_store);
             }
 
             control::spawn_control_server(app.handle().clone());
@@ -3322,9 +3389,13 @@ fn build_core_app<R: tauri::Runtime>(
 /// busy-loops); a single call to run setup on a runtime we own is exactly what
 /// it still does correctly.
 pub fn build_headless_app() -> tauri::Result<tauri::App<tauri::test::MockRuntime>> {
+    // Preserve any unreadable layout before setup can publish fallback
+    // state or recover an import. Both can write a new layout.
+    let layout = state::load_persisted_state_checked().map_err(std::io::Error::other)?;
     let mut app = build_core_app(
         tauri::Builder::<tauri::test::MockRuntime>::new(),
         AppMode::ServeHeadless,
+        layout,
     )
     .build(app_context())?;
 

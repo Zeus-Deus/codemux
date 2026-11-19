@@ -481,7 +481,7 @@ pub async fn complete_merge_into_base(
     temp_branch: String,
     source_branch: String,
     delete_source_branch: bool,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     run_blocking_with_timeout(
         std::time::Duration::from_secs(60),
         "complete_merge_into_base",

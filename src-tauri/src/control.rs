@@ -1041,6 +1041,22 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
         }
         return control_response(Err(error.to_string()));
     }
+    // Registry tools use their own access class for admission. Legacy writes
+    // need a lease across their handler, including async worktree setup.
+    let _shutdown_lease = if request.command != "tool_call"
+        && !crate::agent_control::registry::is_socket_alias(&request.command)
+    {
+        match crate::web_remote::serve::ShutdownAdmission::admit(app) {
+            Ok(lease) if required != crate::agent_control::Access::Read => lease,
+            Ok(_) => None,
+            Err(error) => return control_response(Err(crate::agent_control::ControlError::new(
+                crate::agent_control::ErrorCode::AppUnavailable,
+                error,
+            ).to_string())),
+        }
+    } else {
+        None
+    };
     let result = match request.command.as_str() {
         "delegation_local_context" => match request.params.get("threadId").or_else(||request.params.get("thread_id")).and_then(Value::as_str) {
             Some(thread)=>crate::commands::delegation::delegation_local_context(app.clone(),thread.into()).await,
@@ -1960,11 +1976,7 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                     state.active_workspace_cwd().map(|(_, cwd)| cwd)
                 });
             let store: State<'_, indexing::ProjectIndexStore> = app.state();
-            indexing::rebuild_index(project_root)
-                .map(|snapshot| {
-                    store.replace_snapshot(snapshot.clone());
-                    snapshot
-                })
+            indexing::rebuild_index(&store, project_root)
                 .and_then(|snapshot| serde_json::to_value(snapshot).map_err(|error| error.to_string()))
         }
         "index_status" => {

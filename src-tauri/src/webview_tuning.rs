@@ -384,8 +384,11 @@ fn enable_compatibility_renderer() {
 /// machines do not alternate between a working and a crashing renderer on
 /// every other launch; deleting the sentinel file re-arms the accelerated
 /// path.
+///
+/// Returns whether this renderer should be tracked when the process owns
+/// the desktop instance and is about to create its first webview.
 #[cfg(target_os = "linux")]
-pub fn configure_renderer_env() {
+pub fn configure_renderer_env() -> bool {
     // Unambiguous opt-in to the legacy renderer. Checked first and never
     // scrubbed: only a human sets this.
     if std::env::var(COMPAT_MODE_ENV).as_deref() == Ok("1") {
@@ -395,7 +398,7 @@ pub fn configure_renderer_env() {
              scrolling)."
         ));
         enable_compatibility_renderer();
-        return;
+        return false;
     }
 
     // Renderer vars inherited from a parent Codemux are not user intent.
@@ -413,7 +416,7 @@ pub fn configure_renderer_env() {
         let non_composited = env_value_disables(std::env::var_os(DISABLE_DMABUF_ENV).as_deref())
             || env_value_disables(std::env::var_os(DISABLE_COMPOSITING_ENV).as_deref());
         COMPAT_MODE.store(non_composited, Ordering::Release);
-        return;
+        return false;
     }
 
     // Old WebKitGTK has no DMA-BUF renderer: `FORCE_SHM` is unrecognized
@@ -430,7 +433,7 @@ pub fn configure_renderer_env() {
             FORCE_SHM_MIN_WEBKIT.0, FORCE_SHM_MIN_WEBKIT.1,
         ));
         enable_compatibility_renderer();
-        return;
+        return false;
     }
 
     let sentinel = normalize_sentinel(read_sentinel());
@@ -447,15 +450,25 @@ pub fn configure_renderer_env() {
                 .unwrap_or_else(|| SENTINEL_FILE.to_string()),
         ));
         enable_compatibility_renderer();
-        return;
+        return false;
     }
 
+    unsafe { std::env::set_var(FORCE_SHM_ENV, "1") };
+    true
+}
+
+/// Record the accelerated renderer attempt after duplicate routing and
+/// layout ownership checks, immediately before starting the webview.
+#[cfg(target_os = "linux")]
+pub(crate) fn arm_renderer_startup() {
+    // The previous owner may have cleared its count since we chose the
+    // renderer environment. Use the count visible under our ownership.
+    let sentinel = normalize_sentinel(read_sentinel());
     write_sentinel(RendererSentinel {
-        consecutive_failures: sentinel.consecutive_failures + 1,
+        consecutive_failures: sentinel.consecutive_failures.saturating_add(1),
         policy_revision: RENDERER_POLICY_REVISION,
     });
     SENTINEL_OWNED.store(true, Ordering::Release);
-    unsafe { std::env::set_var(FORCE_SHM_ENV, "1") };
 }
 
 /// What the on-disk sentinel should become when this process disarms it.
@@ -478,9 +491,7 @@ fn disarm_owned_sentinel() {
 
 /// Clear the crash sentinel: this process reached a state that proves the
 /// renderer it picked works. Called from the page-load hook for the main
-/// window, and from the duplicate-launch handler — a duplicate launch
-/// increments the counter in a process that exits before it ever builds a
-/// window, so the healthy instance it hands off to clears that increment.
+/// window.
 ///
 /// No-op unless this process armed the sentinel, which keeps the sticky
 /// compatibility fallback sticky.

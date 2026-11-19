@@ -1,3 +1,5 @@
+mod checkout;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -224,6 +226,9 @@ pub fn git_clone(remote_url: &str, target_dir: &Path) -> Result<String, String> 
     if remote_url.trim().is_empty() {
         return Err("git_clone: remote_url cannot be empty".into());
     }
+    if remote_url.trim_start().starts_with('-') {
+        return Err("git_clone: remote_url cannot start with '-'".into());
+    }
     if target_dir.exists() {
         // Don't clobber — caller should have picked a fresh path.
         return Err(format!(
@@ -254,7 +259,7 @@ pub fn git_clone(remote_url: &str, target_dir: &Path) -> Result<String, String> 
     // the right branch — clone's default checkout of the remote's
     // HEAD branch is wasted work for our flow.
     let output = git_command()
-        .args(["clone", "--no-checkout", remote_url, &target_str])
+        .args(["clone", "--no-checkout", "--", remote_url, &target_str])
         .current_dir(parent)
         .output()
         .map_err(|e| format!("git_clone: failed to spawn git: {e}"))?;
@@ -282,6 +287,14 @@ mod git_clone_input_validation {
         let _ = std::fs::remove_dir_all(&dir);
         let err = git_clone("", &dir).unwrap_err();
         assert!(err.contains("cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_an_option_shaped_remote_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = git_clone("--upload-pack=touch /tmp/x", &tmp.path().join("t")).unwrap_err();
+        assert!(err.contains("cannot start with '-'"), "{err}");
+        assert!(!tmp.path().join("t").exists());
     }
 
     #[test]
@@ -1421,13 +1434,7 @@ pub struct ConflictCheckResult {
 
 /// Get the actual git directory (handles worktrees where .git is a file).
 fn resolve_git_dir(repo_path: &Path) -> Result<PathBuf, String> {
-    let output = run_git(repo_path, &["rev-parse", "--git-dir"])?;
-    let git_dir = PathBuf::from(output.trim());
-    if git_dir.is_absolute() {
-        Ok(git_dir)
-    } else {
-        Ok(repo_path.join(git_dir))
-    }
+    git_path(repo_path, "--git-dir").ok_or_else(|| "could not locate checkout git directory".to_string())
 }
 
 pub fn get_merge_state(repo_path: &Path) -> Result<MergeState, String> {
@@ -1802,36 +1809,464 @@ pub struct MergeIntoBaseResult {
     pub temp_branch: Option<String>,
     pub source_branch: String,
     pub conflicted_files: Vec<ConflictFile>,
+    /// Directory of outgoing files that may still have open writers.
+    /// Relative paths start at the directory printed by `git rev-parse --git-common-dir`.
+    pub recovery_dir: Option<String>,
 }
 
-/// After `update-ref`, the worktree where `base_branch` is checked out still has
-/// stale files on disk.  Find that worktree via `git worktree list --porcelain`
-/// and run `reset --hard HEAD` to sync its working tree.
-/// Failures are silently ignored — the ref update already succeeded and stale
-/// files are annoying but not data-loss.
-fn refresh_base_worktree(repo_path: &Path, base_branch: &str) {
-    let output = match run_git(repo_path, &["worktree", "list", "--porcelain"]) {
-        Ok(o) => o,
-        Err(_) => return,
+/// The worktree where `branch` is checked out, if any.
+///
+/// A checkout git still has registered but that cannot be reached (a
+/// removed or unmounted directory) is an error, not "checked out nowhere":
+/// moving the ref under it would leave its files and index describing the
+/// old commit. Records are read NUL-delimited and as raw bytes where git
+/// supports it, so any path parses.
+fn branch_worktree(repo_path: &Path, branch: &str) -> Result<Option<PathBuf>, String> {
+    let target_ref = format!("refs/heads/{branch}");
+    // Whether the branch is checked out anywhere, asked of git directly
+    // rather than read off the listing, which older git prints ambiguously.
+    let occupied = git_line(repo_path, &["for-each-ref", "--format=%(worktreepath)", &target_ref])
+        .ok_or_else(|| format!("Cannot update {branch}: could not tell where it is checked out."))?;
+    let (listing, separator) = worktree_listing(repo_path)?;
+    let unreachable = |shown: &dyn std::fmt::Display| {
+        Err(format!(
+            "Cannot update {branch}: it is checked out at {shown}, which cannot be reached. Reconnect or remove that worktree first."
+        ))
     };
+    match registered_checkout(&listing, separator, &target_ref) {
+        Registered::Nowhere if occupied.is_empty() => Ok(None),
+        // Checked out, but the listing could not say where: refuse rather
+        // than move the ref under a checkout that would not follow.
+        Registered::Nowhere => unreachable(&"a path git could not list unambiguously"),
+        Registered::At(Some(path)) if is_checkout_of(&path, repo_path, &target_ref) => Ok(Some(path)),
+        Registered::At(Some(path)) => unreachable(&path.display()),
+        Registered::At(None) => unreachable(&"a path this platform cannot represent"),
+    }
+}
 
-    let target_ref = format!("refs/heads/{}", base_branch);
-    let mut current_path: Option<&str> = None;
+/// `git worktree list --porcelain`, NUL-delimited where git supports it
+/// (2.36+), newline-delimited on older git such as Ubuntu 22.04's. Returns
+/// the listing and its record separator. On older git a path containing a
+/// newline cannot be read back; such a checkout then fails
+/// [`is_checkout_of`] and the merge is refused rather than misdirected.
+fn worktree_listing(repo_path: &Path) -> Result<(Vec<u8>, u8), String> {
+    let run = |args: &[&str]| {
+        git_command()
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .map_err(|e| format!("Failed to run git: {e}"))
+    };
+    let output = run(&["worktree", "list", "--porcelain", "-z"])?;
+    if output.status.success() {
+        return Ok((output.stdout, 0));
+    }
+    let output = run(&["worktree", "list", "--porcelain"])?;
+    if output.status.success() {
+        return Ok((output.stdout, b'\n'));
+    }
+    Err(format!(
+        "git worktree failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
 
-    for line in output.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            current_path = Some(path);
-        } else if let Some(branch) = line.strip_prefix("branch ") {
-            if branch == target_ref {
-                if let Some(path) = current_path {
-                    let _ = run_git(Path::new(path), &["reset", "--hard", "HEAD"]);
-                    return;
-                }
+/// Where a porcelain worktree listing has a branch checked out.
+#[derive(Debug, PartialEq)]
+enum Registered {
+    Nowhere,
+    /// Checked out at this path — `None` when the path's bytes cannot be
+    /// represented here, which still counts as checked out.
+    At(Option<PathBuf>),
+}
+
+fn registered_checkout(listing: &[u8], separator: u8, target_ref: &str) -> Registered {
+    let mut current_path: Option<Option<PathBuf>> = None;
+    for field in listing.split(|&b| b == separator) {
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            current_path = Some(path_from_git_bytes(path.to_vec()));
+        } else if field.strip_prefix(b"branch ") == Some(target_ref.as_bytes()) {
+            if let Some(path) = current_path.take() {
+                return Registered::At(path);
             }
-        } else if line.is_empty() {
+        } else if field.is_empty() {
             current_path = None;
         }
     }
+    Registered::Nowhere
+}
+
+/// A path git printed, kept byte for byte where the platform allows it.
+fn path_from_git_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes).ok().map(PathBuf::from)
+    }
+}
+
+/// Whether `path` is a checkout of `repo_path`'s repository, in its own
+/// right, with `branch_ref` checked out. A directory left where a moved
+/// worktree used to be fails this: git would find whatever repository
+/// encloses it, or another clone placed there, and a merge run there would
+/// move that repository's branch instead.
+fn is_checkout_of(path: &Path, repo_path: &Path, branch_ref: &str) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let paths = (
+        git_path(path, "--show-toplevel"),
+        git_path(path, "--git-common-dir"),
+        git_path(repo_path, "--git-common-dir"),
+    );
+    let (Some(here_top), Some(here_common), Some(repo_common)) = paths else {
+        return false;
+    };
+    let same = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    same(path, &here_top)
+        && same(&here_common, &repo_common)
+        && git_line(path, &["symbolic-ref", "--quiet", "HEAD"]).as_deref() == Some(branch_ref.as_bytes())
+}
+
+/// One absolute path from `git rev-parse <flag>` in `dir`, byte for byte
+/// (see [`git_line`]).
+fn git_path(dir: &Path, flag: &str) -> Option<PathBuf> {
+    path_from_git_bytes(git_line(dir, &["rev-parse", "--path-format=absolute", flag])?)
+}
+
+/// The single line a successful git command printed, as raw bytes. Only
+/// the final line terminator is removed — on Unix just the LF, since a path
+/// there may end in a CR — so whitespace, newlines and non-UTF-8 bytes in
+/// a path or ref name survive.
+fn git_line(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = git_command()
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let mut bytes = output.stdout;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        #[cfg(not(unix))]
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    Some(bytes)
+}
+
+/// Whether any worktree of `repo_path`'s repository is paused mid-rebase
+/// or mid-bisect on `branch`. Read from each worktree's own git directory
+/// (the common one for the main checkout, `worktrees/*` for linked ones),
+/// so it works on any git version and does not depend on the listing.
+/// Unreadable state is an error, not "no".
+fn branch_held_by_rebase_or_bisect(repo_path: &Path, branch: &str) -> Result<bool, String> {
+    let common = git_path(repo_path, "--git-common-dir")
+        .ok_or_else(|| format!("Cannot update {branch}: could not find the repository's git directory."))?;
+    let mut git_dirs = vec![common.clone()];
+    match std::fs::read_dir(common.join("worktrees")) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("Cannot update {branch}: could not read worktrees ({e})."))?;
+                git_dirs.push(entry.path());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("Cannot update {branch}: could not read worktrees ({e}).")),
+    }
+    let full_ref = format!("refs/heads/{branch}");
+    let names = |file: &Path| -> Result<Option<String>, String> {
+        match std::fs::read(file) {
+            Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).trim_end_matches(['\n', '\r']).to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("Cannot update {branch}: could not read {} ({e}).", file.display())),
+        }
+    };
+    for dir in git_dirs {
+        for rebase in ["rebase-merge", "rebase-apply"] {
+            if names(&dir.join(rebase).join("head-name"))?.as_deref() == Some(full_ref.as_str()) {
+                return Ok(true);
+            }
+        }
+        // `BISECT_START` names the branch bisect returns to, in short form
+        // (git strips `refs/heads/`), so only the short name can match.
+        if names(&dir.join("BISECT_START"))?.as_deref() == Some(branch) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// Keep Git's index.lock from validation through publishing the replacement
+// index. A switch must take this lock before it can write checkout files.
+fn lock_checkout_index(checkout: &Path) -> Result<(PathBuf, tempfile::TempPath), String> {
+    let index = git_line(checkout, &["rev-parse", "--path-format=absolute", "--git-path", "index"])
+        .and_then(path_from_git_bytes)
+        .ok_or_else(|| "could not locate the checkout index".to_string())?;
+    let mut name = index.as_os_str().to_owned();
+    name.push(".lock");
+    let path = PathBuf::from(name);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| format!("could not lock the checkout index ({e})"))?;
+    let lock = tempfile::TempPath::try_from_path(path).map_err(|e| e.to_string())?;
+    std::fs::copy(&index, &lock).map_err(|e| format!("could not copy the checkout index ({e})"))?;
+    // Git uses the index timestamp to detect racily clean entries.
+    if !copy_mtime(&index, &lock) {
+        return Err("could not preserve the checkout index timestamp".into());
+    }
+    Ok((index, lock))
+}
+
+// A prepared update to HEAD locks both the symbolic ref and its referent
+// using the repository's ref backend. Inspect the symbolic name under that
+// lock. Closing stdin without 'commit' aborts the transaction.
+fn advance_checkout_head(
+    checkout: &Path, base_ref: &str, old: &str, new: &str, apply: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Read, Seek, Write};
+    use std::process::Stdio;
+
+    // A reference-transaction hook may produce more diagnostics than a pipe
+    // can hold before Git acknowledges 'prepare'.
+    let mut diagnostics = tempfile::tempfile().map_err(|e| e.to_string())?;
+    let stderr = diagnostics.try_clone().map_err(|e| e.to_string())?;
+
+    let mut git = git_command()
+        .current_dir(checkout)
+        .args(["update-ref", "-m", "merge into base: fast-forward", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(stderr)
+        .spawn()
+        .map_err(|e| format!("could not start git update-ref ({e})"))?;
+    let mut input = git.stdin.take().unwrap();
+    let mut output = BufReader::new(git.stdout.take().unwrap());
+    let transaction = (|| {
+        writeln!(input, "start\nupdate HEAD {new} {old}\nprepare").map_err(|e| e.to_string())?;
+        for expected in ["start: ok", "prepare: ok"] {
+            let mut reply = String::new();
+            output.read_line(&mut reply).map_err(|e| e.to_string())?;
+            if reply.trim_end() != expected {
+                return Err("git could not reserve the checkout's HEAD".into());
+            }
+        }
+        if git_line(checkout, &["symbolic-ref", "--quiet", "HEAD"]).as_deref() != Some(base_ref.as_bytes()) {
+            return Err(format!("the checkout no longer has {base_ref} checked out"));
+        }
+        apply()?;
+        writeln!(input, "commit").map_err(|e| e.to_string())
+    })();
+    drop(input);
+    if !git.wait().map_err(|e| e.to_string())?.success() {
+        let mut bytes = Vec::new();
+        diagnostics.rewind().and_then(|()| diagnostics.read_to_end(&mut bytes)).map_err(|e| e.to_string())?;
+        return Err(format!("git update-ref failed: {}", String::from_utf8_lossy(&bytes).trim()));
+    }
+    transaction
+}
+
+fn describe_recovery_dir(path: &str) -> String {
+    if Path::new(path).is_relative() {
+        format!("{path} (relative to the directory printed by `git rev-parse --git-common-dir`)")
+    } else {
+        path.to_owned()
+    }
+}
+
+// Once files have been retained, report their location even if a later step fails.
+fn report_checkout_recovery(result: Result<(), String>, recovery_dir: Option<String>) -> Result<Option<String>, String> {
+    match (result, recovery_dir) {
+        (Err(error), Some(path)) => Err(format!("{error}. Checkout recovery files remain at {}", describe_recovery_dir(&path))),
+        (result, path) => result.map(|()| path),
+    }
+}
+
+fn fast_forward_checkout(checkout: &Path, base_branch: &str, commit: &str) -> Result<Option<String>, String> {
+    let (index, lock) = lock_checkout_index(checkout)?;
+    let base_ref = format!("refs/heads/{base_branch}");
+    let old = run_git(checkout, &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")])?;
+    let (_, _, is_ff) = run_git_full(checkout, &["merge-base", "--is-ancestor", &old, commit])?;
+    if !is_ff {
+        return Err(format!("{base_branch} moved while merging and is no longer behind the merged commit"));
+    }
+    ensure_checkout_idle(checkout)?;
+    verify_checkout_merge_policy(checkout, base_branch, commit)?;
+    run_git_with_index(checkout, &lock, &["read-tree", "-n", "-u", "-m", &old, commit])?;
+    let mut files = checkout::PreparedCheckout::new(checkout, &lock, &old, commit)?;
+    let update = advance_checkout_head(checkout, &base_ref, &old, commit, || {
+        // Recheck the live files after filters and the prepared ref hook ran.
+        run_git_with_index(checkout, &lock, &["read-tree", "-n", "-u", "-m", &old, commit])?;
+        files.install(checkout, &lock).map_err(|e| files.rollback(e))
+    });
+    if let Err(e) = update {
+        return Err(files.rollback(e));
+    }
+    let recovery_dir = files.keep_originals();
+    let installed = lock.persist(&index).map_err(|err| {
+        // The ref and files now describe the new tree. Keep the corresponding
+        // index available for recovery if the atomic rename itself fails.
+        let cause = err.error;
+        let mut path = err.path;
+        path.disable_cleanup(true);
+        let location = path.to_str().unwrap_or("the checkout index lock (append `.lock` to the path printed by `git rev-parse --git-path index`)");
+        format!("advanced {base_ref}, but could not install the new index ({cause}); it is at {location}")
+    });
+    report_checkout_recovery(installed, recovery_dir)
+}
+
+fn ensure_checkout_idle(checkout: &Path) -> Result<(), String> {
+    let git_dir = git_path(checkout, "--git-dir").ok_or("could not locate the checkout's Git directory")?;
+    for state in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+        "BISECT_START",
+    ] {
+        if git_dir.join(state).try_exists().map_err(|e| format!("could not inspect {state} ({e})"))? {
+            return Err(format!("finish or abort the operation in this checkout first ({state})"));
+        }
+    }
+
+    // Reftable stores these refs in its tables instead of loose files.
+    for state in ["CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+        let out = git_command()
+            .current_dir(checkout)
+            .args(["show-ref", "--verify", "--quiet", state])
+            .output()
+            .map_err(|e| e.to_string())?;
+        match out.status.code() {
+            Some(1) if out.stderr.is_empty() => {}
+            Some(0) => return Err(format!("finish or abort the operation in this checkout first ({state})")),
+            _ => return Err(format!("could not inspect {state}: {}", String::from_utf8_lossy(&out.stderr).trim())),
+        }
+    }
+    Ok(())
+}
+
+fn checkout_config(checkout: &Path, key: &str, boolean: bool) -> Result<Option<String>, String> {
+    let mut cmd = git_command();
+    cmd.current_dir(checkout).arg("config");
+    if boolean {
+        cmd.arg("--type=bool");
+    }
+    let out = cmd.args(["--get", key]).output().map_err(|e| e.to_string())?;
+    match out.status.code() {
+        Some(0) => String::from_utf8(out.stdout).map(Some).map_err(|e| format!("invalid {key}: {e}")),
+        Some(1) if out.stderr.is_empty() => Ok(None),
+        _ => Err(format!("could not read {key}: {}", String::from_utf8_lossy(&out.stderr).trim())),
+    }
+}
+
+fn verify_checkout_merge_policy(checkout: &Path, base: &str, commit: &str) -> Result<(), String> {
+    let mut required =
+        checkout_config(checkout, "merge.verifySignatures", true)?.is_some_and(|v| v.trim_end() == "true");
+    if let Some(options) = checkout_config(checkout, &format!("branch.{base}.mergeOptions"), false)? {
+        // Only accept self-contained defaults we understand. A value-taking
+        // option may consume the next token, including --no-verify-signatures.
+        for word in options.split_ascii_whitespace() {
+            let option = word
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| word.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(word);
+            match option {
+                "--verify-signatures" => required = true,
+                "--no-verify-signatures" => required = false,
+                "--ff" | "--no-ff" | "--ff-only" | "--squash" | "--no-squash" | "--autostash"
+                | "--no-autostash" => {}
+                s if s.strip_prefix("--strategy=").is_some_and(|name| {
+                    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                }) => {}
+                _ => return Err(format!("cannot safely interpret branch.{base}.mergeOptions: {word}")),
+            }
+        }
+    }
+    if required {
+        let policy = checkout_config(checkout, "gpg.minTrustLevel", false)?;
+        let mut args = Vec::new();
+        if policy.is_none() {
+            args.extend(["-c", "gpg.minTrustLevel=marginal"]);
+        }
+        args.extend(["verify-commit", commit]);
+        run_git(checkout, &args).map_err(|e| format!("{commit} has no trusted merge signature ({e})"))?;
+    }
+    Ok(())
+}
+
+/// Fast-forward `base_branch` to `commit`.
+///
+/// Where the base branch is checked out, the fast-forward runs inside that
+/// checkout, so its files follow the ref and git refuses when uncommitted
+/// work there would be overwritten — moving the ref and resetting the
+/// checkout would silently discard that work. A base branch checked out
+/// nowhere has no files to protect, so only its ref moves.
+///
+/// Either way the ref is read back afterwards: callers go on to delete the
+/// merged branch, which is only safe once the base really holds `commit`.
+fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Result<Option<String>, String> {
+    let base_ref = format!("refs/heads/{base_branch}");
+    let recovery_dir = match branch_worktree(repo_path, base_branch)? {
+        // A guarded fast-forward: see `fast_forward_checkout` for why it is
+        // not `git merge`.
+        Some(checkout) => fast_forward_checkout(&checkout, base_branch, commit)
+            .map_err(|e| {
+                // Advice only for the failure it fits: the fast-forward is
+                // also refused for other reasons (an unsigned commit, a
+                // branch switch), and the message says why.
+                let lower = e.to_lowercase();
+                let advice = if lower.contains("untracked working tree file") {
+                    // Often an ignored private file (a local config): a stash
+                    // leaves it in place, and committing it would publish it.
+                    " It has untracked or ignored files where the merge adds tracked ones; move them somewhere safe, then retry."
+                } else if lower.contains("not uptodate") || lower.contains("would be overwritten") {
+                    " It has uncommitted changes the merge would overwrite; commit or stash them there first."
+                } else {
+                    ""
+                };
+                format!(
+                    "Cannot fast-forward {base_branch} in its checkout at {}.{advice} ({e})",
+                    checkout.display()
+                )
+            })?,
+        // Checked out nowhere, so only the ref moves. `branch -f` rather than
+        // `update-ref`: git refuses it for a branch any worktree has in use
+        // without it being HEAD — mid-rebase or mid-bisect — which the
+        // lookups above cannot see. The move was checked to be a
+        // fast-forward before this point.
+        None => {
+            // Git only refuses this itself from 2.35 on, so the rebase and
+            // bisect state of every worktree is read directly first.
+            if branch_held_by_rebase_or_bisect(repo_path, base_branch)? {
+                return Err(format!(
+                    "Cannot update {base_branch}: another worktree is in the middle of rebasing or bisecting it. Finish or abort that first."
+                ));
+            }
+            run_git(repo_path, &["branch", "-f", "--end-of-options", base_branch, commit])?;
+            None
+        }
+    };
+    let verified = run_git(repo_path, &["rev-parse", "--verify", &base_ref]).and_then(|now| {
+        if now.trim() == commit {
+            Ok(())
+        } else {
+            Err(format!("Cannot update {base_branch}: it is at {} instead of the merged commit {commit}.", now.trim()))
+        }
+    });
+    report_checkout_recovery(verified, recovery_dir)
 }
 
 /// Safely merge the current branch into a base branch using a temporary resolver branch.
@@ -1860,6 +2295,7 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch
     if source_head.trim() == merge_base.trim() {
         return Ok(MergeIntoBaseResult {
             status: "already_up_to_date".to_string(),
+            recovery_dir: None,
             temp_branch: None,
             source_branch,
             conflicted_files: Vec::new(),
@@ -1874,6 +2310,7 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch
     if is_ancestor {
         return Ok(MergeIntoBaseResult {
             status: "already_up_to_date".to_string(),
+            recovery_dir: None,
             temp_branch: None,
             source_branch,
             conflicted_files: Vec::new(),
@@ -1912,25 +2349,19 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch
             return Err("Cannot fast-forward base branch — history has diverged".to_string());
         }
         let temp_commit = run_git(repo_path, &["rev-parse", &temp_branch])?;
-        run_git(repo_path, &["update-ref", &format!("refs/heads/{}", base_branch), temp_commit.trim()])?;
-        refresh_base_worktree(repo_path, base_branch);
-
-        if delete_source_branch {
-            // Delete source while still on temp (can't delete a checked-out branch)
-            let _ = run_git(repo_path, &["branch", "-d", &source_branch]);
-            // Land on base if possible, otherwise detach (worktree scenario)
-            if run_git(repo_path, &["checkout", base_branch]).is_err() {
-                run_git(repo_path, &["checkout", "--detach"])?;
+        let recovery_dir = match advance_base_branch(repo_path, base_branch, temp_commit.trim()) {
+            Ok(path) => path,
+            Err(e) => {
+                run_git(repo_path, &["checkout", &source_branch])
+                    .map_err(|restore| format!("{e}. Could not return to {source_branch} ({restore})"))?;
+                let _ = run_git(repo_path, &["branch", "-D", &temp_branch]);
+                return Err(e);
             }
-        } else {
-            run_git(repo_path, &["checkout", &source_branch])?;
-        }
-        // Force-delete temp: -d would fail because temp isn't merged into HEAD (source),
-        // but its content is safely in base via branch -f above
-        let _ = run_git(repo_path, &["branch", "-D", &temp_branch]);
-
+        };
+        let finished = finish_resolver_branch(repo_path, base_branch, &temp_branch, &source_branch, delete_source_branch);
         return Ok(MergeIntoBaseResult {
             status: "merged".to_string(),
+            recovery_dir: report_checkout_recovery(finished, recovery_dir)?,
             temp_branch: None,
             source_branch,
             conflicted_files: Vec::new(),
@@ -1958,6 +2389,7 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch
 
     Ok(MergeIntoBaseResult {
         status: "conflicts".to_string(),
+        recovery_dir: None,
         temp_branch: Some(temp_branch),
         source_branch,
         conflicted_files,
@@ -1965,13 +2397,14 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch
 }
 
 /// Complete the merge-into-base flow after conflict resolution.
+/// Returns the recovery directory as in [`MergeIntoBaseResult::recovery_dir`].
 pub fn complete_merge_into_base(
     repo_path: &Path,
     base_branch: &str,
     temp_branch: &str,
     source_branch: &str,
     delete_source_branch: bool,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     // Verify all conflicts are resolved
     let status = git_status(repo_path)?;
     let unresolved: Vec<_> = status.iter().filter(|f| f.status == FileStatus::Conflicted).collect();
@@ -1995,9 +2428,14 @@ pub fn complete_merge_into_base(
         return Err("Cannot fast-forward base branch — history has diverged".to_string());
     }
     let temp_commit = run_git(repo_path, &["rev-parse", temp_branch])?;
-    run_git(repo_path, &["update-ref", &format!("refs/heads/{}", base_branch), temp_commit.trim()])?;
-    refresh_base_worktree(repo_path, base_branch);
+    let recovery_dir = advance_base_branch(repo_path, base_branch, temp_commit.trim())?;
+    let finished = finish_resolver_branch(repo_path, base_branch, temp_branch, source_branch, delete_source_branch);
+    report_checkout_recovery(finished, recovery_dir)
+}
 
+fn finish_resolver_branch(
+    repo_path: &Path, base_branch: &str, temp_branch: &str, source_branch: &str, delete_source_branch: bool,
+) -> Result<(), String> {
     if delete_source_branch {
         // Delete source while still on temp (can't delete a checked-out branch)
         let _ = run_git(repo_path, &["branch", "-d", source_branch]);
@@ -2385,7 +2823,9 @@ pub fn fetch_origin_branch(repo_path: &Path, branch: &str) -> bool {
         None if branch.starts_with("refs/") => return false,
         None => branch,
     };
-    if branch.is_empty() {
+    // Checked after normalising: `origin/-x` passes a check on the input
+    // but leaves an option-shaped `-x` behind.
+    if crate::workspace_service::check_ref_text("branch", branch).is_err() {
         return false;
     }
     // Cheap local check first: `git fetch origin` on a repo with no
@@ -2396,7 +2836,7 @@ pub fn fetch_origin_branch(repo_path: &Path, branch: &str) -> bool {
         return false;
     }
     let Ok(mut child) = git_command()
-        .args(["fetch", "--quiet", "--no-tags", "origin", branch])
+        .args(["fetch", "--quiet", "--no-tags", "--", "origin", branch])
         .current_dir(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
@@ -3001,6 +3441,14 @@ pub fn git_create_worktree(
     base: Option<&str>,
     pr_number: Option<u32>,
 ) -> Result<String, String> {
+    // Both names reach git's argv (`fetch origin <b>:<b>`, `worktree add`),
+    // and some callers take them from synced or remote data. A value
+    // starting with `-` would be read as an option — `--upload-pack=<cmd>`
+    // runs a command — so the shared plain-text rules apply to every caller.
+    crate::workspace_service::check_ref_text("branch", branch)?;
+    if let Some(base) = base {
+        crate::workspace_service::check_ref_text("base", base)?;
+    }
     let worktree_path = conventional_worktree_path(repo_path, branch)
         .ok_or_else(|| format!("Not a git repository: {}", repo_path.display()))?;
 
@@ -4484,6 +4932,27 @@ mod tests {
     }
 
     #[test]
+    fn option_shaped_branch_or_base_never_reaches_git() {
+        let (dir, local, _tip) = setup_stale_clone_with_remote("inject");
+        let marker = dir.path().join("pwned");
+        let payload = format!("--upload-pack=touch {};#", marker.display());
+
+        for (branch, base) in [
+            (payload.as_str(), None),
+            ("ok-branch", Some(payload.as_str())),
+            ("", None),
+            ("bad\nname", None),
+        ] {
+            for new_branch in [false, true] {
+                let err = git_create_worktree(&local, branch, new_branch, base, None)
+                    .expect_err("an option-shaped name must be refused");
+                assert!(err.starts_with("invalid_input:"), "{branch:?}/{base:?}: {err}");
+            }
+        }
+        assert!(!marker.exists(), "git must never have run the payload");
+    }
+
+    #[test]
     fn fetch_origin_branch_updates_remote_tracking_ref() {
         let (_dir, local, remote_tip) = setup_stale_clone_with_remote("fetch");
         // `origin/<b>` input is normalised to `<b>` before fetching.
@@ -4496,6 +4965,20 @@ mod tests {
     fn fetch_origin_branch_is_noop_without_origin_remote() {
         let (_dir, repo) = setup_test_repo();
         assert!(!fetch_origin_branch(&repo, "main"), "no origin remote → no fetch");
+    }
+
+    #[test]
+    fn fetch_origin_branch_never_passes_an_option_shaped_name_after_normalising() {
+        let (dir, local, _tip) = setup_stale_clone_with_remote("fetch-inject");
+        let marker = dir.path().join("pwned");
+        let payload = format!("origin/--upload-pack=touch {};#", marker.display());
+
+        assert!(!fetch_origin_branch(&local, &payload));
+        assert!(!marker.exists(), "git must never have run the payload");
+
+        // The same name as a worktree base: refused or harmless, never run.
+        let _ = git_create_worktree(&local, "inject-base", true, Some(&payload), None);
+        assert!(!marker.exists(), "git must never have run the payload");
     }
 
     #[test]
@@ -6475,6 +6958,7 @@ mod tests {
         let result = merge_into_base(&wt, main, false).unwrap();
         assert_eq!(result.status, "merged");
         assert!(result.temp_branch.is_none(), "temp branch should be cleaned up");
+        assert!(result.recovery_dir.is_none(), "additions moved no originals");
 
         // User stays on feature in the worktree
         let current = run_git(&wt, &["branch", "--show-current"]).unwrap();
@@ -6491,6 +6975,1250 @@ mod tests {
         // Main worktree files on disk must reflect the merged content (not stale)
         let on_disk = std::fs::read_to_string(repo.join("feature.txt")).unwrap();
         assert_eq!(on_disk, "worktree work", "main worktree file must match merged content");
+    }
+
+    #[test]
+    fn test_merge_into_base_keeps_uncommitted_work_in_base_checkout() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+
+        std::fs::write(repo.join("shared.txt"), "original").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "add shared"]).unwrap();
+        let main_before = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        run_git(&wt, &["merge", main]).unwrap();
+        std::fs::write(wt.join("shared.txt"), "from feature").unwrap();
+        run_git(&wt, &["commit", "-am", "feature edit"]).unwrap();
+
+        // Uncommitted work in the main checkout, on the file the merge changes.
+        std::fs::write(repo.join("shared.txt"), "unsaved local work").unwrap();
+
+        let err = merge_into_base(&wt, main, false).unwrap_err();
+        assert!(err.contains("uncommitted changes"), "unexpected error: {err}");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("shared.txt")).unwrap(),
+            "unsaved local work",
+            "the base checkout's uncommitted work must survive",
+        );
+        assert_eq!(run_git(&repo, &["rev-parse", "HEAD"]).unwrap(), main_before);
+        assert_eq!(run_git(&wt, &["branch", "--show-current"]).unwrap(), "feature");
+        let leftovers = run_git(&wt, &["branch", "--list", "merge/*"]).unwrap();
+        assert!(leftovers.is_empty(), "temp branch left behind: {leftovers}");
+    }
+
+    #[test]
+    fn test_merge_into_base_advances_a_base_that_defaults_to_squash() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        run_git(&repo, &["config", &format!("branch.{main}.mergeOptions"), "--squash"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+        let feature_tip = run_git(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+        let result = merge_into_base(&wt, main, true).unwrap();
+        assert_eq!(result.status, "merged");
+        let (_, _, contains) = run_git_full(
+            &repo,
+            &["merge-base", "--is-ancestor", &feature_tip, "HEAD"],
+        )
+        .unwrap();
+        assert!(contains, "the base's HEAD must hold the feature commit");
+        assert!(git_status(&repo).unwrap().is_empty(), "and its checkout must be clean");
+        assert_eq!(std::fs::read_to_string(repo.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[test]
+    fn test_merge_into_base_fast_forwards_a_base_that_defaults_to_strategy_ours() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo).to_string();
+        run_git(&repo, &["config", &format!("branch.{main}.mergeOptions"), "--strategy=ours"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+        let feature_tip = run_git(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+        let result = merge_into_base(&wt, &main, false).unwrap();
+        assert_eq!(result.status, "merged");
+        // A real fast-forward: the base's tree holds the feature's file, and
+        // no `ours` merge commit sits on top.
+        assert_eq!(std::fs::read_to_string(repo.join("feature.txt")).unwrap(), "worktree work");
+        let parents = run_git(&repo, &["rev-list", "--parents", "-n", "1", "HEAD"]).unwrap();
+        assert!(
+            parents.split_whitespace().count() <= 3,
+            "HEAD must be the resolver commit, not an extra merge on top: {parents}"
+        );
+        let (_, _, contains) =
+            run_git_full(&repo, &["merge-base", "--is-ancestor", &feature_tip, "HEAD"]).unwrap();
+        assert!(contains);
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_fast_forwards_a_base_checkout_whose_pull_twohead_is_ours() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo).to_string();
+        // Scoped to the base checkout only, so the resolver merge in the
+        // source worktree does not see it.
+        run_git(&repo, &["config", "extensions.worktreeConfig", "true"]).unwrap();
+        run_git(&repo, &["config", "--worktree", "pull.twohead", "ours"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        assert_eq!(merge_into_base(&wt, &main, false).unwrap().status, "merged");
+        assert_eq!(std::fs::read_to_string(repo.join("feature.txt")).unwrap(), "worktree work");
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_fast_forwards_a_strategy_ours_base_named_with_an_equals_sign() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let branch = "release=stable";
+        let checkout = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", branch, checkout.to_str().unwrap()]).unwrap();
+        // `git config` takes the key and value apart, so the name is safe here.
+        run_git(&repo, &["config", &format!("branch.{branch}.mergeOptions"), "--strategy=ours"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        assert_eq!(merge_into_base(&wt, branch, false).unwrap().status, "merged");
+        assert_eq!(std::fs::read_to_string(checkout.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[test]
+    fn registered_checkout_reads_both_listing_formats() {
+        let target = "refs/heads/release";
+        for (listing, sep) in [
+            (&b"worktree /r\0HEAD 1\0branch refs/heads/main\0\0worktree /w/rel\0HEAD 2\0branch refs/heads/release\0\0"[..], 0u8),
+            (&b"worktree /r\nHEAD 1\nbranch refs/heads/main\n\nworktree /w/rel\nHEAD 2\nbranch refs/heads/release\n\n"[..], b'\n'),
+        ] {
+            assert_eq!(
+                registered_checkout(listing, sep, target),
+                Registered::At(Some(PathBuf::from("/w/rel")))
+            );
+            assert_eq!(registered_checkout(listing, sep, "refs/heads/other"), Registered::Nowhere);
+        }
+        // A detached checkout between records does not lend its path to the
+        // next record's branch.
+        let listing = b"worktree /d\nHEAD 3\ndetached\n\nworktree /w/rel\nHEAD 2\nbranch refs/heads/release\n\n";
+        assert_eq!(
+            registered_checkout(listing, b'\n', target),
+            Registered::At(Some(PathBuf::from("/w/rel")))
+        );
+    }
+
+    #[test]
+    fn test_merge_into_base_reports_why_git_refused_without_blaming_local_changes() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo).to_string();
+        // A clean base checkout that only accepts signed commits.
+        run_git(&repo, &["config", "extensions.worktreeConfig", "true"]).unwrap();
+        run_git(&repo, &["config", "--worktree", "merge.verifySignatures", "true"]).unwrap();
+        let main_before = run_git(&repo, &["rev-parse", &main]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        let err = merge_into_base(&wt, &main, false).unwrap_err();
+        assert!(err.contains("Cannot fast-forward"), "unexpected error: {err}");
+        assert!(!err.contains("uncommitted"), "the checkout is clean: {err}");
+        assert!(err.contains("signature"), "git's own reason is kept: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", &main]).unwrap(), main_before);
+    }
+
+    #[test]
+    fn test_merge_into_base_keeps_an_ignored_file_the_merge_would_track() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        // A private, ignored file in the base checkout only.
+        std::fs::write(repo.join(".git/info/exclude"), "local.env\n").unwrap();
+        std::fs::write(repo.join("local.env"), "my secrets").unwrap();
+        let main_before = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        // The feature branch starts tracking the same path.
+        std::fs::write(wt.join("local.env"), "template").unwrap();
+        run_git(&wt, &["add", "-f", "local.env"]).unwrap();
+        run_git(&wt, &["commit", "-m", "track local.env"]).unwrap();
+
+        let err = merge_into_base(&wt, main, false).unwrap_err();
+        assert!(err.contains("move them somewhere safe"), "an ignored file gets safe advice: {err}");
+        assert!(!err.contains("commit or stash"), "never advise committing a private file: {err}");
+        assert_eq!(std::fs::read_to_string(repo.join("local.env")).unwrap(), "my secrets");
+        assert_eq!(run_git(&repo, &["rev-parse", "HEAD"]).unwrap(), main_before);
+    }
+
+    #[test]
+    fn test_merge_into_base_refuses_instead_of_autostashing() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        run_git(&repo, &["config", "merge.autoStash", "true"]).unwrap();
+
+        std::fs::write(repo.join("shared.txt"), "original").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "add shared"]).unwrap();
+        let main_before = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        run_git(&wt, &["merge", main]).unwrap();
+        std::fs::write(wt.join("shared.txt"), "from feature").unwrap();
+        run_git(&wt, &["commit", "-am", "feature edit"]).unwrap();
+        std::fs::write(repo.join("shared.txt"), "unsaved local work").unwrap();
+
+        assert!(merge_into_base(&wt, main, false).is_err());
+        assert_eq!(std::fs::read_to_string(repo.join("shared.txt")).unwrap(), "unsaved local work");
+        assert_eq!(run_git(&repo, &["rev-parse", "HEAD"]).unwrap(), main_before);
+        assert!(
+            run_git(&repo, &["stash", "list"]).unwrap().is_empty(),
+            "nothing may be left in a stash"
+        );
+    }
+
+    #[test]
+    fn test_merge_into_base_refuses_a_base_checked_out_somewhere_unreachable() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        // `release` is checked out in a worktree whose directory is gone
+        // (an unmounted drive, say) while git still has it registered.
+        let release_wt = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", "release", release_wt.to_str().unwrap()]).unwrap();
+        let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+        std::fs::rename(&release_wt, dir.path().join("unplugged")).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        let err = merge_into_base(&wt, "release", true).unwrap_err();
+        assert!(err.contains("cannot be reached"), "unexpected error: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+        assert_eq!(run_git(&wt, &["branch", "--show-current"]).unwrap(), "feature");
+    }
+
+    #[test]
+    fn test_merge_into_base_never_moves_the_repository_enclosing_a_stale_checkout() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo).to_string();
+        // `release` lives in a worktree nested inside the main checkout,
+        // which was moved without telling git; an empty directory is left
+        // at the registered path.
+        let nested = repo.join("nested-release");
+        run_git(&repo, &["worktree", "add", "-b", "release", nested.to_str().unwrap()]).unwrap();
+        std::fs::rename(&nested, dir.path().join("moved-release")).unwrap();
+        std::fs::create_dir(&nested).unwrap();
+        let main_before = run_git(&repo, &["rev-parse", &main]).unwrap();
+        let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        let err = merge_into_base(&wt, "release", true).unwrap_err();
+        assert!(err.contains("cannot be reached"), "unexpected error: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", &main]).unwrap(), main_before, "main must not move");
+        assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+        assert!(!repo.join("feature.txt").exists(), "main's files must not change");
+    }
+
+    #[test]
+    fn test_merge_into_base_never_moves_another_clone_at_a_stale_checkout_path() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let stale = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", "release", stale.to_str().unwrap()]).unwrap();
+        std::fs::rename(&stale, dir.path().join("moved-release")).unwrap();
+        // A separate clone that shares objects now sits at the old path,
+        // on its own `release`.
+        run_git(dir.path(), &["clone", "--shared", repo.to_str().unwrap(), stale.to_str().unwrap()]).unwrap();
+        run_git(&stale, &["checkout", "release"]).unwrap();
+        let clone_before = run_git(&stale, &["rev-parse", "HEAD"]).unwrap();
+        let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        let err = merge_into_base(&wt, "release", true).unwrap_err();
+        assert!(err.contains("cannot be reached"), "unexpected error: {err}");
+        assert_eq!(run_git(&stale, &["rev-parse", "HEAD"]).unwrap(), clone_before, "the clone must not move");
+        assert!(!stale.join("feature.txt").exists());
+        assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_into_base_advances_a_base_whose_path_has_a_newline() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let odd = dir.path().join("release\nwt");
+        run_git(&repo, &["worktree", "add", "-b", "release", odd.to_str().unwrap()]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        if run_git(&repo, &["worktree", "list", "--porcelain", "-z"]).is_err() {
+            // Git before 2.36 cannot list such a path unambiguously: the
+            // merge must refuse rather than guess.
+            let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+            let err = merge_into_base(&wt, "release", false).unwrap_err();
+            assert!(err.contains("cannot be reached"), "unexpected error: {err}");
+            assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+            return;
+        }
+        assert_eq!(merge_into_base(&wt, "release", false).unwrap().status, "merged");
+        assert_eq!(std::fs::read_to_string(odd.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_into_base_never_moves_a_base_whose_listing_is_ambiguous() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        // Two newlines in a row read as the end of a record in the listing
+        // older git prints.
+        let odd = dir.path().join("release\n\nwt");
+        run_git(&repo, &["worktree", "add", "-b", "release", odd.to_str().unwrap()]).unwrap();
+        let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        if run_git(&repo, &["worktree", "list", "--porcelain", "-z"]).is_ok() {
+            assert_eq!(merge_into_base(&wt, "release", false).unwrap().status, "merged");
+            assert_eq!(std::fs::read_to_string(odd.join("feature.txt")).unwrap(), "worktree work");
+            return;
+        }
+        let err = merge_into_base(&wt, "release", false).unwrap_err();
+        assert!(err.contains("cannot be reached"), "unexpected error: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+        assert!(!odd.join("feature.txt").exists(), "the checkout's files must not change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_into_base_advances_a_base_whose_path_ends_in_a_carriage_return() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let plain = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", "release", plain.to_str().unwrap()]).unwrap();
+        let odd = dir.path().join("release-wt\r");
+        run_git(&repo, &["worktree", "move", plain.to_str().unwrap(), odd.to_str().unwrap()]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        assert_eq!(merge_into_base(&wt, "release", false).unwrap().status, "merged");
+        assert_eq!(std::fs::read_to_string(odd.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[test]
+    fn test_merge_into_base_advances_a_base_whose_name_ends_in_unicode_whitespace() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let branch = "release\u{a0}";
+        let checkout = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", branch, checkout.to_str().unwrap()]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        assert_eq!(merge_into_base(&wt, branch, false).unwrap().status, "merged");
+        assert_eq!(std::fs::read_to_string(checkout.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    // Linux only: macOS file systems refuse names that are not UTF-8.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_advances_a_base_whose_path_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let odd = dir.path().join(std::ffi::OsStr::from_bytes(b"release-\xff"));
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "-b", "release"])
+            .arg(&odd)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        assert_eq!(merge_into_base(&wt, "release", false).unwrap().status, "merged");
+        assert_eq!(std::fs::read_to_string(odd.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn non_utf8_main_repo() -> (TempDir, PathBuf, PathBuf) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join(std::ffi::OsStr::from_bytes(b"main-\xff"));
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-b", "main"]).unwrap();
+        git_config(&repo);
+        run_git(&repo, &["commit", "--allow-empty", "-m", "initial"]).unwrap();
+        let wt = dir.path().join("feature");
+        run_git(&repo, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]).unwrap();
+        (dir, repo, wt)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_non_utf8_main_repo_reports_moved_originals() {
+        use std::io::Write;
+
+        let (_dir, repo, wt) = non_utf8_main_repo();
+        std::fs::write(wt.join("tracked"), b"original").unwrap();
+        run_git(&wt, &["add", "tracked"]).unwrap();
+        run_git(&wt, &["commit", "-m", "add file"]).unwrap();
+        let added = merge_into_base(&wt, "main", false).unwrap();
+        assert_eq!(added.status, "merged");
+        assert!(added.recovery_dir.is_none());
+        assert_eq!(std::fs::read(repo.join("tracked")).unwrap(), b"original");
+
+        let mut editor = std::fs::File::options().append(true).open(repo.join("tracked")).unwrap();
+        std::fs::write(wt.join("tracked"), b"replacement").unwrap();
+        run_git(&wt, &["commit", "-am", "replace file"]).unwrap();
+        let replaced = merge_into_base(&wt, "main", false).unwrap();
+        assert_eq!(replaced.status, "merged");
+        assert_eq!(std::fs::read(repo.join("tracked")).unwrap(), b"replacement");
+        let reported = PathBuf::from(replaced.recovery_dir.unwrap());
+        assert!(reported.is_relative());
+        editor.write_all(b"\0late save").unwrap();
+        let common = git_path(&wt, "--git-common-dir").unwrap();
+        assert_eq!(std::fs::read(common.join(reported).join("tracked")).unwrap(), b"original\0late save");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_non_utf8_main_repo_completes_resolved_conflict() {
+        let (_dir, repo, wt) = non_utf8_main_repo();
+        for (checkout, contents) in [(&repo, "base"), (&wt, "feature")] {
+            std::fs::write(checkout.join("tracked"), contents).unwrap();
+            run_git(checkout, &["add", "tracked"]).unwrap();
+            run_git(checkout, &["commit", "-m", contents]).unwrap();
+        }
+
+        let merge = merge_into_base(&wt, "main", false).unwrap();
+        assert_eq!(merge.status, "conflicts");
+        std::fs::write(wt.join("tracked"), b"resolved").unwrap();
+        mark_conflict_resolved(&wt, "tracked").unwrap();
+        let recovery = complete_merge_into_base(&wt, "main", &merge.temp_branch.unwrap(), "feature", false)
+            .unwrap().expect("location of the original base file");
+        assert_eq!(std::fs::read(repo.join("tracked")).unwrap(), b"resolved");
+        assert!(Path::new(&recovery).is_relative());
+        let common = git_path(&wt, "--git-common-dir").unwrap();
+        assert_eq!(std::fs::read(common.join(recovery).join("tracked")).unwrap(), b"base");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_into_base_advances_a_base_whose_path_ends_in_a_space() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let spaced = dir.path().join("release wt ");
+        run_git(&repo, &["worktree", "add", "-b", "release", spaced.to_str().unwrap()]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        let result = merge_into_base(&wt, "release", false).unwrap();
+        assert_eq!(result.status, "merged");
+        assert_eq!(std::fs::read_to_string(spaced.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[test]
+    fn test_merge_into_base_never_moves_a_base_being_rebased_elsewhere() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        // `release` is mid-rebase in its own worktree: HEAD is detached
+        // there, and the branch is only named by the rebase state.
+        let rel = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", "release", rel.to_str().unwrap()]).unwrap();
+        git_config(&rel);
+        std::fs::write(rel.join("r.txt"), "release work").unwrap();
+        run_git(&rel, &["add", "."]).unwrap();
+        run_git(&rel, &["commit", "-m", "release commit"]).unwrap();
+        let _ = run_git(&rel, &["rebase", "--exec", "false", "HEAD~1"]);
+        let rebasing = |p: &Path| {
+            let dir = run_git(p, &["rev-parse", "--git-path", "rebase-merge"]).unwrap();
+            p.join(dir).is_dir()
+        };
+        assert!(rebasing(&rel), "precondition: the rebase is paused");
+        let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+
+        run_git(&wt, &["merge", "release"]).unwrap();
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        // Refused by Codemux's own check, which does not depend on the git
+        // version: `branch -f` only refuses this itself from git 2.35 on.
+        let err = merge_into_base(&wt, "release", true).unwrap_err();
+        assert!(err.contains("rebasing or bisecting"), "unexpected error: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+        assert!(rebasing(&rel), "the rebase is left as it was");
+        assert_eq!(run_git(&wt, &["branch", "--show-current"]).unwrap(), "feature");
+    }
+
+    #[test]
+    fn test_merge_into_base_never_moves_a_base_being_bisected_elsewhere() {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let rel = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", "release", rel.to_str().unwrap()]).unwrap();
+        run_git(&rel, &["bisect", "start"]).unwrap();
+        run_git(&rel, &["checkout", "--detach"]).unwrap();
+        let release_before = run_git(&repo, &["rev-parse", "release"]).unwrap();
+
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        let err = merge_into_base(&wt, "release", false).unwrap_err();
+        assert!(err.contains("rebasing or bisecting"), "unexpected error: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", "release"]).unwrap(), release_before);
+    }
+
+    #[test]
+    fn test_merge_into_base_refuses_a_checkout_switched_to_another_branch_after_validation() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo).to_string();
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+        let commit = run_git(&wt, &["rev-parse", "HEAD"]).unwrap();
+        let main_before = run_git(&repo, &["rev-parse", &main]).unwrap();
+
+        // Validation saw `main`; then the checkout switched to a sibling
+        // branch at the same tip.
+        run_git(&repo, &["switch", "-c", "side"]).unwrap();
+
+        let err = fast_forward_checkout(&repo, &main, &commit).unwrap_err();
+        assert!(err.contains("no longer has"), "unexpected error: {err}");
+        assert_eq!(run_git(&repo, &["rev-parse", &main]).unwrap(), main_before);
+        assert_eq!(run_git(&repo, &["rev-parse", "side"]).unwrap(), main_before, "the sibling must not move");
+        assert!(!repo.join("feature.txt").exists(), "the checkout's files must not change");
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_index_lock_excludes_a_switch_to_a_different_tree() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        run_git(&repo, &["switch", "-c", "side"]).unwrap();
+        std::fs::write(repo.join("side.txt"), "side tree").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "side tree"]).unwrap();
+        let side = head_hash(&repo);
+        run_git(&repo, &["switch", main]).unwrap();
+        std::fs::write(wt.join("incoming.txt"), "incoming").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "incoming"]).unwrap();
+        let new = head_hash(&wt);
+        // Try the switch from Git's prepared transaction hook, after the
+        // preflight has succeeded but before the base ref is committed.
+        let hooks = repo.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        run_git(&repo, &["config", "core.hooksPath", hooks.to_str().unwrap()]).unwrap();
+        let hook = hooks.join("reference-transaction");
+        std::fs::write(&hook, r#"#!/bin/sh
+if test "$1" = prepared && ! test -f .git/switch-attempt; then
+    git switch side >.git/switch-attempt 2>&1 && exit 1
+    test ! -e side.txt && git diff --cached --quiet || exit 1
+fi
+exit 0
+"#).unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fast_forward_checkout(&repo, main, &new).unwrap();
+        let attempt = std::fs::read_to_string(repo.join(".git/switch-attempt")).unwrap();
+        assert!(attempt.contains("index.lock"), "switch must fail before writing its tree: {attempt}");
+        assert_eq!(run_git(&repo, &["symbolic-ref", "--short", "HEAD"]).unwrap(), main);
+        assert_eq!(head_hash(&repo), new);
+        assert_eq!(run_git(&repo, &["rev-parse", "side"]).unwrap(), side);
+        assert!(!repo.join("side.txt").exists());
+        assert_eq!(std::fs::read(repo.join("incoming.txt")).unwrap(), b"incoming");
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_ref_failure_keeps_matching_staged_entry_byte_for_byte() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        let old = head_hash(&repo);
+        for path in [&repo, &wt] {
+            std::fs::write(path.join("shared.txt"), b"matching staged contents\n").unwrap();
+            run_git(path, &["add", "shared.txt"]).unwrap();
+        }
+        run_git(&wt, &["commit", "-m", "incoming"]).unwrap();
+        let index = repo.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        // Reserve the branch ref so the update will fail, even though the
+        // two-tree merge accepts the user's staged contents.
+        std::fs::write(repo.join(format!(".git/refs/heads/{main}.lock")), "").unwrap();
+        let err = fast_forward_checkout(&repo, main, &head_hash(&wt)).unwrap_err();
+        assert!(err.contains("update-ref"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+        assert_eq!(std::fs::read(repo.join("shared.txt")).unwrap(), b"matching staged contents\n");
+        assert!(!repo.join(".git/index.lock").exists());
+    }
+
+    #[test]
+    fn test_merge_into_base_advances_reftable_checkout() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        let (_, stderr, ok) = run_git_full(dir.path(), &["init", "--ref-format=reftable", "-b", "main", "repo"]).unwrap();
+        if !ok && stderr.contains("unknown option") {
+            return; // Git before 2.45 has no reftable backend.
+        }
+        assert!(ok, "{stderr}");
+        git_config(&repo);
+        run_git(&repo, &["commit", "--allow-empty", "-m", "initial"]).unwrap();
+        let wt = dir.path().join("feature");
+        run_git(&repo, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]).unwrap();
+        std::fs::write(wt.join("incoming"), "feature").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature"]).unwrap();
+        let old = head_hash(&repo);
+        let new = head_hash(&wt);
+        run_git(&repo, &["update-ref", "CHERRY_PICK_HEAD", &new]).unwrap();
+        let err = fast_forward_checkout(&repo, "main", &new).unwrap_err();
+        assert!(err.contains("CHERRY_PICK_HEAD"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert!(!repo.join("incoming").exists());
+        run_git(&repo, &["update-ref", "-d", "CHERRY_PICK_HEAD"]).unwrap();
+        assert_eq!(merge_into_base(&wt, "main", false).unwrap().status, "merged");
+        assert_eq!(std::fs::read(repo.join("incoming")).unwrap(), b"feature");
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_preserves_an_ignored_file_created_by_the_ref_hook() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        let old = head_hash(&repo);
+        std::fs::write(wt.join("local.env"), "template").unwrap();
+        run_git(&wt, &["add", "local.env"]).unwrap();
+        run_git(&wt, &["commit", "-m", "track local.env"]).unwrap();
+        std::fs::write(repo.join(".git/info/exclude"), "local.env\n").unwrap();
+        let hooks = repo.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        run_git(&repo, &["config", "core.hooksPath", hooks.to_str().unwrap()]).unwrap();
+        let hook = hooks.join("reference-transaction");
+        std::fs::write(&hook, "#!/bin/sh\nif test \"$1\" = prepared; then printf private >local.env; fi\n").unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let index = repo.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        let err = fast_forward_checkout(&repo, main, &head_hash(&wt)).unwrap_err();
+        assert!(err.to_lowercase().contains("untracked"), "{err}");
+        assert_eq!(std::fs::read(repo.join("local.env")).unwrap(), b"private");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+    }
+
+    #[test]
+    fn test_merge_into_base_preserves_late_materialization_outside_sparse_patterns() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        for dir in ["included", "outside"] {
+            std::fs::create_dir(repo.join(dir)).unwrap();
+            std::fs::write(repo.join(dir).join("tracked"), b"original").unwrap();
+        }
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "both directories"]).unwrap();
+        let old = head_hash(&repo);
+        run_git(&wt, &["merge", "--ff-only", main]).unwrap();
+        std::fs::write(wt.join("included/tracked"), b"incoming").unwrap();
+        run_git(&wt, &["commit", "-am", "only update the included path"]).unwrap();
+        run_git(&repo, &["sparse-checkout", "set", "--cone", "included"]).unwrap();
+        let edited = repo.join("outside/tracked");
+        assert!(!edited.exists());
+        std::fs::create_dir_all(edited.parent().unwrap()).unwrap();
+        std::fs::write(&edited, b"private\x00edit").unwrap();
+        let index = repo.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+
+        let result = fast_forward_checkout(&repo, main, &head_hash(&wt));
+        assert_eq!(std::fs::read(edited).unwrap(), b"private\x00edit");
+        let err = result.unwrap_err();
+        assert!(err.contains("sparse"), "{err}");
+        assert_eq!(std::fs::read(repo.join("included/tracked")).unwrap(), b"original");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+    }
+
+    fn setup_incoming_tracked_update() -> (TempDir, PathBuf, PathBuf) {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        let tracked = repo.join("tracked");
+        std::fs::write(&tracked, b"old\x00data").unwrap();
+        run_git(&repo, &["add", "tracked"]).unwrap();
+        run_git(&repo, &["commit", "-m", "old file"]).unwrap();
+        run_git(&wt, &["merge", "--ff-only", main]).unwrap();
+        std::fs::write(wt.join("tracked"), b"incoming").unwrap();
+        run_git(&wt, &["commit", "-am", "replace tracked file"]).unwrap();
+        (dir, repo, wt)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_into_base_preserves_writes_through_an_outgoing_file_descriptor() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, repo, wt) = setup_incoming_tracked_update();
+        let base = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", "release", base.to_str().unwrap()]).unwrap();
+        let tracked = base.join("tracked");
+        let mut editor = std::fs::OpenOptions::new().append(true).open(&tracked).unwrap();
+        let result = merge_into_base(&wt, "release", false).unwrap();
+        assert_eq!(result.status, "merged");
+        assert_eq!(std::fs::read(&tracked).unwrap(), b"incoming");
+        assert!(git_status(&base).unwrap().is_empty());
+
+        let recovery = PathBuf::from(result.recovery_dir.expect("reported location of the outgoing file"));
+        let private = recovery.parent().unwrap();
+        assert!(private.starts_with(dunce::canonicalize(repo.join(".git")).unwrap()));
+        assert_eq!(std::fs::metadata(private).unwrap().permissions().mode() & 0o077, 0);
+        run_git(&repo, &["worktree", "remove", base.to_str().unwrap()]).unwrap();
+        assert!(!base.exists());
+        editor.write_all(b"\0late save").unwrap();
+        drop(editor);
+        assert_eq!(std::fs::read(recovery.join("tracked")).unwrap(), b"old\0data\0late save");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_test_acl(path: &Path, entries: &str) -> bool {
+        let result = Command::new("setfacl").env("LC_ALL", "C").args(["-m", entries]).arg(path).output();
+        let out = match result {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            result => result.unwrap(),
+        };
+        let error = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() && error.contains("Operation not supported") {
+            return false;
+        }
+        assert!(out.status.success(), "{error}");
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_acl(path: &Path) -> String {
+        let out = Command::new("getfacl").env("LC_ALL", "C").args(["-cn"]).arg(path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_acl_after_directory_rollback() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let parent = repo.join("obsolete");
+        std::fs::create_dir(&parent).unwrap();
+        if !set_test_acl(&parent, "u:65534:r-x,d:u::rwx,d:u:65534:r-x,d:g::---,d:o::---") {
+            return;
+        }
+        let acl = test_acl(&parent);
+        std::fs::write(parent.join("tracked"), b"original").unwrap();
+        run_git(&repo, &["add", "obsolete"]).unwrap();
+        run_git(&repo, &["commit", "-m", "track original"]).unwrap();
+        let old = head_hash(&repo);
+        run_git(&wt, &["merge", "--ff-only", &old]).unwrap();
+        run_git(&wt, &["rm", "-r", "obsolete"]).unwrap();
+        std::fs::write(wt.join("collision.env"), b"incoming").unwrap();
+        run_git(&wt, &["add", "collision.env"]).unwrap();
+        run_git(&wt, &["commit", "-m", "replace obsolete directory"]).unwrap();
+        std::fs::write(repo.join(".git/info/exclude"), "*.env\n").unwrap();
+        std::fs::write(repo.join("collision.env"), b"private").unwrap();
+
+        let index = repo.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        let err = fast_forward_checkout(&repo, main_branch(&repo), &head_hash(&wt)).unwrap_err();
+        assert!(err.contains("collision.env"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+        assert_eq!(std::fs::read(repo.join("collision.env")).unwrap(), b"private");
+        assert_eq!(std::fs::read(parent.join("tracked")).unwrap(), b"original");
+        assert_eq!(test_acl(&parent), acl);
+
+        // A different parent appearing during rollback owns its name. Keep
+        // both the displaced directory and the tracked file in recovery.
+        let (_, lock) = lock_checkout_index(&repo).unwrap();
+        let mut files = checkout::PreparedCheckout::new(&repo, &lock, &old, &head_hash(&wt)).unwrap();
+        let collision = files.install(&repo, &lock).unwrap_err();
+        assert!(collision.contains("collision.env"), "{collision}");
+        let other = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(other.path(), &parent).unwrap();
+        let err = files.rollback(collision);
+        let (_, recovery) = err.split_once("checkout recovery files remain at ").expect(&err);
+        assert_eq!(std::fs::read_link(&parent).unwrap(), other.path());
+        assert!(!other.path().join("tracked").exists());
+        assert_eq!(std::fs::read(Path::new(recovery).join("original/obsolete/tracked")).unwrap(), b"original");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_refuses_a_stale_index_for_a_write_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let worktrees = TempDir::new().unwrap();
+        let native = worktrees.path().join("native");
+        run_git(&repo, &["worktree", "add", "--detach", native.to_str().unwrap()]).unwrap();
+        let path = "nested/incoming";
+        for root in [&repo, &native, &wt] {
+            std::fs::create_dir(root.join("nested")).unwrap();
+        }
+        for root in [&repo, &native] {
+            if !set_test_acl(&root.join("nested"), "d:u::-w-,d:g::---,d:o::---") {
+                return;
+            }
+        }
+        std::fs::write(wt.join(path), b"filtered bytes").unwrap();
+        run_git(&wt, &["add", path]).unwrap();
+        run_git(&wt, &["commit", "-m", "add file"]).unwrap();
+        let new = head_hash(&wt);
+        run_git(&native, &["merge", "--ff-only", &new]).unwrap();
+        let native_path = native.join(path);
+        assert_eq!(std::fs::metadata(&native_path).unwrap().permissions().mode() & 0o777, 0o200);
+        // A privileged runner can bypass the read restriction.
+        match std::fs::File::open(&native_path) {
+            Ok(_) => return,
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+        }
+
+        let dest = repo.join(path);
+        // Validate both the held inode's bytes and its identity at the name.
+        for replace in [false, true] {
+            let (_, lock) = lock_checkout_index(&repo).unwrap();
+            let mut files = checkout::PreparedCheckout::new(&repo, &lock, &head_hash(&repo), &new).unwrap();
+            let refusal = files.install(&repo, &lock).unwrap_err();
+            assert!(refusal.contains("cannot refresh the checkout index"), "{refusal}");
+            if replace {
+                std::fs::rename(&dest, worktrees.path().join("moved")).unwrap();
+            }
+            std::fs::write(&dest, b"local edit").unwrap();
+            let err = files.rollback(refusal);
+            assert!(err.contains("changed during checkout"), "{err}");
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), b"local edit");
+            std::fs::rename(&dest, worktrees.path().join(if replace { "replacement" } else { "edit" })).unwrap();
+        }
+        let old = head_hash(&repo);
+        let index = repo.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        let err = fast_forward_checkout(&repo, main_branch(&repo), &new).unwrap_err();
+        assert!(err.contains("cannot refresh the checkout index") && err.contains(path), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+        assert!(!dest.exists());
+        // Git may re-read even a matching entry if its mtime is in the same
+        // second as the index. Isolate the stat cache from that racy-Git check.
+        let native_index = git_path(&native, "--git-dir").unwrap().join("index");
+        let mtime = std::fs::metadata(&native_path).unwrap().modified().unwrap();
+        std::fs::File::open(native_index).unwrap().set_modified(mtime + std::time::Duration::from_secs(2)).unwrap();
+        let native_status = run_git(&native, &["status", "--porcelain"]).unwrap();
+        assert_eq!(native_status, "");
+        assert_eq!(run_git(&repo, &["status", "--porcelain"]).unwrap(), native_status);
+        let (_, recovery) = err.split_once("Checkout recovery files remain at ").expect(&err);
+        let retained = Path::new(recovery).join(path);
+        assert_eq!(test_acl(&retained), test_acl(&native_path));
+        for file in [&retained, &native_path] {
+            assert_eq!(std::fs::File::open(file).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(std::fs::read(retained).unwrap(), std::fs::read(native_path).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_inherits_nested_default_acl_like_git() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        let worktrees = TempDir::new().unwrap();
+        let native = worktrees.path().join("native");
+        let wt = worktrees.path().join("feature");
+        run_git(&repo, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]).unwrap();
+        run_git(&repo, &["worktree", "add", "--detach", native.to_str().unwrap()]).unwrap();
+        for root in [&repo, &native] {
+            let nested = root.join("nested");
+            std::fs::create_dir(&nested).unwrap();
+            if !set_test_acl(&nested, "d:u::rwx,d:u:65534:r-x,d:g::---,d:m::r-x,d:o::---") {
+                return;
+            }
+        }
+
+        std::fs::create_dir_all(wt.join("nested/new-dir")).unwrap();
+        let paths = ["nested/plain", "nested/new-dir/executable"];
+        for path in paths {
+            std::fs::write(wt.join(path), b"incoming").unwrap();
+        }
+        run_git(&wt, &["add", "nested"]).unwrap();
+        run_git(&wt, &["update-index", "--chmod=+x", paths[1]]).unwrap();
+        run_git(&wt, &["commit", "-m", "add regular and executable files"]).unwrap();
+        let new = head_hash(&wt);
+        run_git(&native, &["merge", "--ff-only", &new]).unwrap();
+        // A ref refusal after installation must still recognize the installed
+        // files, whose permissions now differ from the original scratch files.
+        {
+            let (_, lock) = lock_checkout_index(&repo).unwrap();
+            let mut files = checkout::PreparedCheckout::new(&repo, &lock, &head_hash(&repo), &new).unwrap();
+            files.install(&repo, &lock).unwrap();
+            let error = files.rollback("simulated ref refusal".into());
+            assert!(!error.contains("Could not restore"), "{error}");
+            for path in paths {
+                assert!(!repo.join(path).exists(), "{path} remained after rollback");
+            }
+        }
+        fast_forward_checkout(&repo, main_branch(&repo), &new).unwrap();
+
+        for path in paths {
+            let expected = test_acl(&native.join(path));
+            assert!(expected.contains("user:65534:r-x") && expected.contains("other::---"), "{expected}");
+            assert_eq!(test_acl(&repo.join(path)), expected, "{path}");
+            assert_eq!(std::fs::metadata(repo.join(path)).unwrap().permissions().mode(),
+                       std::fs::metadata(native.join(path)).unwrap().permissions().mode(), "{path}");
+            assert_eq!(std::fs::read(repo.join(path)).unwrap(), b"incoming");
+        }
+    }
+
+    // /dev/shm normally gives Linux CI a second writable filesystem without mounts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_refuses_cross_device_recovery_before_install() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let (_dir, repo, wt) = setup_incoming_tracked_update();
+        let Ok(other_volume) = TempDir::new_in("/dev/shm") else { return };
+        if std::fs::metadata(other_volume.path()).unwrap().dev() == std::fs::metadata(&repo).unwrap().dev() {
+            return;
+        }
+
+        let base = other_volume.path().join("base");
+        run_git(&repo, &["worktree", "add", "-b", "release", base.to_str().unwrap()]).unwrap();
+        let index = git_path(&base, "--git-dir").unwrap().join("index");
+        let before = std::fs::read(&index).unwrap();
+        let old = head_hash(&base);
+        let tracked = base.join("tracked");
+        let inode = std::fs::metadata(&tracked).unwrap().ino();
+
+        let hooks = repo.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        run_git(&repo, &["config", "core.hooksPath", hooks.to_str().unwrap()]).unwrap();
+        let hook = hooks.join("reference-transaction");
+        std::fs::write(&hook, "#!/bin/sh\ntouch ref-hook-ran\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = fast_forward_checkout(&base, "release", &head_hash(&wt)).unwrap_err();
+        assert!(err.contains("recovery"), "{err}");
+        assert!(!base.join("ref-hook-ran").exists());
+        assert_eq!(head_hash(&base), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+        assert_eq!(std::fs::metadata(&tracked).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(tracked).unwrap(), b"old\0data");
+    }
+
+    #[test]
+    fn test_merge_into_base_preserves_late_save_to_a_tracked_file() {
+        let (_dir, repo, wt) = setup_incoming_tracked_update();
+        let (old, new) = (head_hash(&repo), head_hash(&wt));
+        let main = main_branch(&repo);
+        let tracked = repo.join("tracked");
+        let (index, lock) = lock_checkout_index(&repo).unwrap();
+        let before = std::fs::read(&index).unwrap();
+        let mut files = checkout::PreparedCheckout::new(&repo, &lock, &old, &new).unwrap();
+
+        let update = advance_checkout_head(&repo, &format!("refs/heads/{main}"), &old, &new, || {
+            run_git_with_index(&repo, &lock, &["read-tree", "-n", "-u", "-m", &old, &new])?;
+            // Same inode, size and mtime. The saved bytes distinguish the edit.
+            let file = std::fs::File::options().write(true).open(&tracked).unwrap();
+            let modified = file.metadata().unwrap().modified().unwrap();
+            std::fs::write(&tracked, b"new\x00edit").unwrap();
+            file.set_modified(modified).unwrap();
+            files.install(&repo, &lock).map_err(|e| files.rollback(e))
+        });
+        assert_eq!(std::fs::read(&tracked).unwrap(), b"new\x00edit");
+        let err = update.unwrap_err();
+        assert!(err.contains("tracked"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+    }
+
+    #[test]
+    fn test_merge_into_base_preserves_an_edit_to_an_installed_file_during_rollback() {
+        let (_dir, repo, wt) = setup_incoming_tracked_update();
+        let (old, new) = (head_hash(&repo), head_hash(&wt));
+        let main = main_branch(&repo);
+        let tracked = repo.join("tracked");
+        let (index, lock) = lock_checkout_index(&repo).unwrap();
+        let before = std::fs::read(&index).unwrap();
+        let mut files = checkout::PreparedCheckout::new(&repo, &lock, &old, &new).unwrap();
+
+        let update = advance_checkout_head(&repo, &format!("refs/heads/{main}"), &old, &new, || {
+            run_git_with_index(&repo, &lock, &["read-tree", "-n", "-u", "-m", &old, &new])?;
+            files.install(&repo, &lock)?;
+            assert_eq!(std::fs::read(&tracked).unwrap(), b"incoming");
+            std::fs::write(&tracked, b"saved after install").unwrap();
+            Err("simulated refusal".into())
+        });
+        let err = files.rollback(update.unwrap_err());
+        drop(files);
+        assert_eq!(std::fs::read(&tracked).unwrap(), b"saved after install");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+        let (_, recovery) = err.split_once("checkout recovery files remain at ").expect(&err);
+        assert!(Path::new(recovery).starts_with(dunce::canonicalize(repo.join(".git")).unwrap()));
+        assert_eq!(std::fs::read(Path::new(recovery).join("original/tracked")).unwrap(), b"old\x00data");
+    }
+
+    #[test]
+    fn test_merge_into_base_recovers_partial_install_without_rebuilding_the_index() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        std::fs::write(repo.join("obsolete"), b"original\x00bytes").unwrap();
+        run_git(&repo, &["add", "obsolete"]).unwrap();
+        run_git(&repo, &["commit", "-m", "old file"]).unwrap();
+        let old = head_hash(&repo);
+        run_git(&wt, &["merge", "--ff-only", main]).unwrap();
+        run_git(&wt, &["rm", "obsolete"]).unwrap();
+        for path in ["a-first", "z-last.env"] {
+            std::fs::write(wt.join(path), "incoming").unwrap();
+        }
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "replace old file"]).unwrap();
+        let new = head_hash(&wt);
+        std::fs::write(repo.join("notes"), "staged").unwrap();
+        run_git(&repo, &["add", "notes"]).unwrap();
+        std::fs::write(repo.join("notes"), "unstaged").unwrap();
+        std::fs::write(repo.join(".git/info/exclude"), "*.env\n").unwrap();
+        let (index, lock) = lock_checkout_index(&repo).unwrap();
+        let before = std::fs::read(&index).unwrap();
+        let mut files = checkout::PreparedCheckout::new(&repo, &lock, &old, &new).unwrap();
+        let update = advance_checkout_head(&repo, &format!("refs/heads/{main}"), &old, &new, || {
+            run_git_with_index(&repo, &lock, &["read-tree", "-n", "-u", "-m", &old, &new])?;
+            // Arrives after Git has finished checking the live tree.
+            std::fs::write(repo.join("z-last.env"), "private").unwrap();
+            files.install(&repo, &lock)
+        });
+        let err = update.unwrap_err();
+        assert!(err.contains("z-last.env"), "{err}");
+        assert!(!repo.join("obsolete").exists());
+        assert_eq!(std::fs::read(repo.join("a-first")).unwrap(), b"incoming");
+        #[cfg(unix)]
+        let mut editor = std::fs::OpenOptions::new().append(true).open(repo.join("a-first")).unwrap();
+        let message = files.rollback(err.clone());
+        drop(files);
+        let (cause, recovery) = message.split_once(". Checkout recovery files remain at ").unwrap();
+        assert!(Path::new(recovery).starts_with(dunce::canonicalize(repo.join(".git")).unwrap()));
+        assert_eq!(cause, err);
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            editor.write_all(b"\0late save").unwrap();
+            drop(editor);
+            assert_eq!(std::fs::read(Path::new(recovery).join("a-first")).unwrap(), b"incoming\0late save");
+        }
+        #[cfg(not(unix))]
+        assert_eq!(std::fs::read(Path::new(recovery).join("a-first")).unwrap(), b"incoming");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+        assert_eq!(std::fs::read(repo.join("obsolete")).unwrap(), b"original\x00bytes");
+        assert!(!repo.join("a-first").exists());
+        assert_eq!(std::fs::read(repo.join("z-last.env")).unwrap(), b"private");
+        assert_eq!(std::fs::read(repo.join("notes")).unwrap(), b"unstaged");
+    }
+
+    #[test]
+    fn test_merge_into_base_failed_smudge_leaves_the_original_checkout_intact() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        std::fs::write(repo.join("obsolete"), "old file").unwrap();
+        std::fs::write(repo.join(".gitattributes"), "z-filtered -filter\n").unwrap();
+        run_git(&repo, &["add", "obsolete", ".gitattributes"]).unwrap();
+        run_git(&repo, &["commit", "-m", "old file"]).unwrap();
+        let old = head_hash(&repo);
+        run_git(&wt, &["merge", "--ff-only", main]).unwrap();
+        run_git(&wt, &["rm", "obsolete"]).unwrap();
+        for path in ["a-first", "z-filtered"] {
+            std::fs::write(wt.join(path), "incoming").unwrap();
+        }
+        std::fs::write(wt.join(".gitattributes"), "z-filtered filter=broken\n").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "replace old file"]).unwrap();
+        run_git(&repo, &["config", "filter.broken.required", "true"]).unwrap();
+        std::fs::write(repo.join(".git/fail-filter"), "echo intentional-smudge-failure >&2\nexit 1\n").unwrap();
+        run_git(&repo, &["config", "filter.broken.smudge", "sh .git/fail-filter"]).unwrap();
+        run_git(&repo, &["config", "checkout.workers", "1"]).unwrap();
+        let index = repo.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        let err = fast_forward_checkout(&repo, main, &head_hash(&wt)).unwrap_err();
+        assert!(err.contains("intentional-smudge-failure"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+        assert_eq!(std::fs::read(repo.join("obsolete")).unwrap(), b"old file");
+        assert!(!repo.join("a-first").exists());
+        assert!(!repo.join("z-filtered").exists());
+    }
+
+    #[test]
+    fn test_merge_into_base_applies_case_only_rename_with_exact_spelling() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        std::fs::write(repo.join("README.md"), "read me").unwrap();
+        run_git(&repo, &["add", "README.md"]).unwrap();
+        run_git(&repo, &["commit", "-m", "readme"]).unwrap();
+        run_git(&wt, &["merge", "--ff-only", main]).unwrap();
+        run_git(&wt, &["mv", "README.md", "intermediate"]).unwrap();
+        run_git(&wt, &["mv", "intermediate", "Readme.md"]).unwrap();
+        run_git(&wt, &["commit", "-m", "adjust capitalization"]).unwrap();
+        let new = head_hash(&wt);
+        fast_forward_checkout(&repo, main, &new).unwrap();
+        let names: Vec<_> = std::fs::read_dir(&repo).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(names.iter().any(|n| n == "Readme.md"));
+        assert!(!names.iter().any(|n| n == "README.md"));
+        assert_eq!(std::fs::read(repo.join("Readme.md")).unwrap(), b"read me");
+        assert_eq!(run_git(&repo, &["ls-files"]).unwrap(), "Readme.md");
+        assert_eq!(head_hash(&repo), new);
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_layout_transitions_protect_ignored_contents() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        let docs = wt.join("docs");
+        std::fs::write(&docs, "file").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "file"]).unwrap();
+        fast_forward_checkout(&repo, main, &head_hash(&wt)).unwrap();
+
+        run_git(&wt, &["rm", "docs"]).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::write(docs.join("intro"), "page").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "directory"]).unwrap();
+        let directory_commit = head_hash(&wt);
+        fast_forward_checkout(&repo, main, &directory_commit).unwrap();
+        assert_eq!(std::fs::read(repo.join("docs/intro")).unwrap(), b"page");
+
+        run_git(&wt, &["rm", "-r", "docs"]).unwrap();
+        std::fs::write(docs, "replacement").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "file again"]).unwrap();
+        let new = head_hash(&wt);
+        let private = repo.join("docs/local.env");
+        std::fs::write(repo.join(".git/info/exclude"), "*.env\n").unwrap();
+        std::fs::write(&private, "private contents").unwrap();
+        assert!(fast_forward_checkout(&repo, main, &new).is_err());
+        assert_eq!(head_hash(&repo), directory_commit);
+        assert_eq!(std::fs::read(&private).unwrap(), b"private contents");
+        assert_eq!(std::fs::read(repo.join("docs/intro")).unwrap(), b"page");
+        std::fs::remove_file(private).unwrap();
+        fast_forward_checkout(&repo, main, &new).unwrap();
+        assert_eq!(std::fs::read(repo.join("docs")).unwrap(), b"replacement");
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_preserves_a_staged_merge_resolution() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        run_git(&repo, &["switch", "-c", "side"]).unwrap();
+        std::fs::write(repo.join("shared"), "side").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "side"]).unwrap();
+        run_git(&repo, &["switch", main]).unwrap();
+        std::fs::write(repo.join("shared"), "main").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "main"]).unwrap();
+        let old = head_hash(&repo);
+        run_git(&wt, &["merge", "--ff-only", main]).unwrap();
+        std::fs::write(wt.join("incoming"), "incoming").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "incoming"]).unwrap();
+
+        assert!(run_git(&repo, &["merge", "side"]).is_err());
+        std::fs::write(repo.join("shared"), "resolved").unwrap();
+        run_git(&repo, &["add", "shared"]).unwrap();
+        let index = std::fs::read(repo.join(".git/index")).unwrap();
+        let other_parent = run_git(&repo, &["rev-parse", "MERGE_HEAD"]).unwrap();
+        let err = fast_forward_checkout(&repo, main, &head_hash(&wt)).unwrap_err();
+        assert!(err.contains("MERGE_HEAD"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(run_git(&repo, &["rev-parse", "MERGE_HEAD"]).unwrap(), other_parent);
+        assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), index);
+        assert_eq!(std::fs::read(repo.join("shared")).unwrap(), b"resolved");
+        assert!(!repo.join("incoming").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_into_base_quoted_signature_policy_requires_marginal_trust() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        // Let Git's normal OpenPGP verifier consume a deterministic status
+        // transcript, without relying on a developer's keyring or trustdb.
+        let verifier = dir.path().join("verify-signature");
+        std::fs::write(&verifier, "#!/bin/sh\ncat >/dev/null\necho '[GNUPG:] NEWSIG'\necho '[GNUPG:] GOODSIG ABCD Test'\necho '[GNUPG:] TRUST_UNDEFINED'\n").unwrap();
+        std::fs::set_permissions(&verifier, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run_git(&repo, &["config", "gpg.program", verifier.to_str().unwrap()]).unwrap();
+        let old = head_hash(&repo);
+        let tree = run_git(&wt, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        let object = dir.path().join("signed-commit");
+        std::fs::write(&object, format!("tree {tree}\nparent {old}\nauthor Test <test@example.org> 1 +0000\ncommitter Test <test@example.org> 1 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n fixture\n -----END PGP SIGNATURE-----\n\nsigned fixture\n")).unwrap();
+        let commit = run_git(&wt, &["hash-object", "-t", "commit", "-w", object.to_str().unwrap()]).unwrap();
+        run_git(&repo, &["verify-commit", &commit]).expect("fixture passes the generic verifier");
+        run_git(&repo, &["config", &format!("branch.{main}.mergeOptions"), "\"--verify-signatures\""]).unwrap();
+        assert!(run_git(&repo, &["merge", "--ff-only", &commit]).is_err());
+        let err = fast_forward_checkout(&repo, main, &commit).unwrap_err();
+        assert!(err.contains("signature"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        run_git(&repo, &["config", "gpg.minTrustLevel", "undefined"]).unwrap();
+        fast_forward_checkout(&repo, main, &commit).unwrap();
+        assert_eq!(head_hash(&repo), commit);
+    }
+
+    #[test]
+    fn test_merge_into_base_keeps_unrelated_work_in_base_checkout() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+
+        std::fs::write(repo.join("notes.txt"), "committed").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "add notes"]).unwrap();
+
+        run_git(&wt, &["merge", main]).unwrap();
+        std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature commit"]).unwrap();
+
+        // Uncommitted work the merge does not touch.
+        std::fs::write(repo.join("notes.txt"), "unsaved local work").unwrap();
+
+        let result = merge_into_base(&wt, main, false).unwrap();
+        assert_eq!(result.status, "merged");
+        assert_eq!(std::fs::read_to_string(repo.join("feature.txt")).unwrap(), "worktree work");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("notes.txt")).unwrap(),
+            "unsaved local work",
+        );
     }
 
     #[test]
@@ -6604,7 +8332,8 @@ mod tests {
 
         // Resolve
         resolve_conflict_theirs(&wt, "shared.txt").unwrap();
-        complete_merge_into_base(&wt, main, &temp, "feature", false).unwrap();
+        let recovery = complete_merge_into_base(&wt, main, &temp, "feature", false).unwrap().unwrap();
+        assert_eq!(std::fs::read(Path::new(&recovery).join("shared.txt")).unwrap(), b"main version");
 
         // Back on feature in worktree
         let current = run_git(&wt, &["branch", "--show-current"]).unwrap();

@@ -411,7 +411,18 @@ pub async fn dispatch<R: Runtime>(
                 .remove("query");
             Box::pin(dispatch(platform, app, caller, mapped, input)).await
         }
-        "threads.send" | "threads.create" => mutate(platform, app, caller, method, params).await,
+        "threads.send" | "threads.create" => {
+            let work = Box::pin(mutate(platform, app, caller, method, params));
+            if method == "threads.create" {
+                // A background plugin callback can create its workspace
+                // before invoking the native thread-launch tool.
+                service::with_shutdown_admission(app, work)
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else {
+                work.await
+            }
+        }
         "effects.read" => {
             let record = platform.store.read(&caller.installation_id)?;
             platform_authority::assert_active(&record, caller)?;

@@ -2123,14 +2123,17 @@ async fn get_workspace_cwd(workspace_id: &str) -> Result<String, String> {
                     .and_then(Value::as_str)
                     .or_else(|| wid.and_then(|v| v.as_object()).and_then(|o| o.get("0")).and_then(Value::as_str));
                 if wid_str == Some(workspace_id) {
-                    if let Some(cwd) = ws.get("cwd").and_then(Value::as_str) {
-                        return Ok(cwd.to_string());
-                    }
+                    return ws.get("cwd")
+                        .and_then(Value::as_str)
+                        .filter(|cwd| !cwd.is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("Workspace '{workspace_id}' has no working directory"));
                 }
             }
         }
+        return Err(format!("Workspace '{workspace_id}' is not open"));
     }
-    // Fallback to current directory.
+    // An unscoped client works in the directory it was launched in.
     std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .map_err(|e| format!("Cannot determine workspace directory: {e}"))

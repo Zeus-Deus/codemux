@@ -60,6 +60,7 @@ pub struct TabSnapshot {
 /// Debounces disk persistence so that rapid state changes (e.g. drag-swap +
 /// multiple resize events) only result in a single write after a quiet period.
 struct PersistDebouncer {
+    closed: AtomicBool,
     pending: Arc<AtomicBool>,
     last_snapshot: Arc<Mutex<Option<PendingPersist>>>,
     write_lock: Arc<Mutex<()>>,
@@ -83,6 +84,7 @@ impl PendingPersist {
 impl PersistDebouncer {
     fn new() -> Self {
         Self {
+            closed: AtomicBool::new(false),
             pending: Arc::new(AtomicBool::new(false)),
             last_snapshot: Arc::new(Mutex::new(None)),
             write_lock: Arc::new(Mutex::new(())),
@@ -92,6 +94,9 @@ impl PersistDebouncer {
     fn schedule_pending(&self, pending: PendingPersist) {
         {
             let mut guard = self.last_snapshot.lock().unwrap();
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
             *guard = Some(pending);
         }
 
@@ -125,6 +130,13 @@ impl PersistDebouncer {
             }
         });
     }
+
+    fn ensure_open(&self) -> Result<(), String> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err("Layout persistence is closed".into());
+        }
+        Ok(())
+    }
 }
 
 /// Schedule a persist for a mutation that produced no snapshot of its own —
@@ -145,14 +157,28 @@ fn persist_debouncer() -> &'static PersistDebouncer {
 
 /// Synchronously persist the current app state. Called on app close to
 /// ensure the debounced write completes before the process exits.
-pub fn flush_persisted_state(store: &AppStateStore) {
+pub fn flush_persisted_state(store: &AppStateStore) -> Result<(), String> {
     let debouncer = persist_debouncer();
     let _write_guard = debouncer.write_lock.lock().unwrap();
+    debouncer.ensure_open()?;
     debouncer.last_snapshot.lock().unwrap().take();
     let snapshot = store.snapshot();
-    if let Err(e) = save_persisted_state(&snapshot) {
-        eprintln!("[codemux::state] Failed to persist layout state on close: {e}");
+    save_persisted_state(&snapshot)
+}
+
+/// Seal layout persistence before handing ownership to a new process.
+pub(crate) fn finish_layout_persistence(store: &AppStateStore) -> Result<(), String> {
+    let debouncer = persist_debouncer();
+    {
+        let mut pending = debouncer.last_snapshot.lock().unwrap();
+        debouncer.ensure_open()?;
+        debouncer.closed.store(true, Ordering::Release);
+        pending.take();
     }
+    // A writer that already took its snapshot owns this gate until its
+    // save finishes. Wait for it before saving the final state.
+    let _write_guard = debouncer.write_lock.lock().unwrap();
+    save_persisted_state(&store.snapshot())
 }
 
 use crate::project::current_project_root;
@@ -1849,6 +1875,7 @@ impl AppStateStore {
     ) -> Result<(), String> {
         let debouncer = persist_debouncer();
         let _write_guard = debouncer.write_lock.lock().unwrap();
+        debouncer.ensure_open()?;
         debouncer.last_snapshot.lock().unwrap().take();
         save_persisted_state(&self.snapshot())?;
         db.complete_local_import_layout(ids)
@@ -6748,11 +6775,27 @@ pub fn load_persisted_layout() -> PersistedLayout {
     let Some(path) = persisted_layout_path() else {
         return PersistedLayout::Missing;
     };
-    let layout = load_layout_from(&path);
+    load_layout_for_recovery(&path)
+}
+
+/// Called by the layout owner before startup can open any persistent stores.
+pub(crate) fn load_persisted_state_checked() -> Result<Option<AppStateSnapshot>, String> {
+    let path = persisted_layout_path().ok_or("No config directory for workspace layout")?;
+    match load_layout_for_recovery(&path) {
+        PersistedLayout::Loaded(snapshot) => Ok(Some(*snapshot)),
+        PersistedLayout::Missing | PersistedLayout::Unreadable { preserved: true } => Ok(None),
+        PersistedLayout::Unreadable { preserved: false } => Err(format!(
+            "Could not preserve unreadable workspace layout at {}", path.display()
+        )),
+    }
+}
+
+fn load_layout_for_recovery(path: &Path) -> PersistedLayout {
+    let layout = load_layout_from(path);
     if let PersistedLayout::Unreadable { preserved: false } = layout {
         LAYOUT_SAVES_BLOCKED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let pending = matches!(layout, PersistedLayout::Unreadable { .. }) || recovery_pending_at(&path);
+    let pending = matches!(layout, PersistedLayout::Unreadable { .. }) || recovery_pending_at(path);
     LAYOUT_RECOVERY_PENDING.store(pending, std::sync::atomic::Ordering::Relaxed);
     layout
 }
@@ -6903,19 +6946,25 @@ fn load_layout_from(path: &Path) -> PersistedLayout {
     // set aside earlier stay listed.
     let marked = add_to_recovery_marker(path, &aside_name).is_ok();
     let kept = marked && set_aside(path, &aside);
-    if kept {
-        log::error!(
+    let message = if kept {
+        format!(
             "Could not read the saved layout ({error}); kept it as {} and started without it. \
              Rename it back to {} to restore it, or delete it to discard it.",
             aside.display(),
             path.display()
-        );
+        )
     } else {
-        log::error!(
+        format!(
             "Could not read the saved layout at {} ({error}), nor set it aside; \
              layout saving is paused for this run so it is not overwritten",
             path.display()
-        );
+        )
+    };
+    // Startup can inspect the layout before the Tauri logging plugin is installed.
+    if log::log_enabled!(log::Level::Error) {
+        log::error!("{message}");
+    } else {
+        crate::diagnostics::stderr_line(&message);
     }
     PersistedLayout::Unreadable { preserved: kept }
 }
@@ -7617,6 +7666,38 @@ fn persisted_layout_path() -> Option<PathBuf> {
     }
     let base = dirs::config_dir()?;
     Some(base.join(crate::APP_DIR_NAME).join("layout.json"))
+}
+
+/// Hold ownership of the saved layout from startup through the final write.
+/// Socket paths can differ between processes that share this layout.
+pub(crate) fn acquire_layout_lock() -> Result<fs::File, String> {
+    let layout = persisted_layout_path().ok_or("No config directory for workspace layout")?;
+    let parent = layout.parent().ok_or("Workspace layout has no parent directory")?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create the layout directory at {}: {error}", parent.display()))?;
+
+    let lock_path = layout.with_extension("lock");
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(&lock_path)
+        .map_err(|error| format!("Failed to open the layout lock at {}: {error}", lock_path.display()))?;
+    // Keep the lock file in place so contenders always open the same file.
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(fs::TryLockError::WouldBlock) => Err(format!(
+            "Codemux is already running with the workspace layout at {}.",
+            layout.display(),
+        )),
+        Err(fs::TryLockError::Error(error)) => Err(format!(
+            "Failed to acquire the layout lock at {}: {error}",
+            lock_path.display(),
+        )),
+    }
 }
 
 /// Drop the pane statuses that mean nothing after a restart, keeping the ones
@@ -11206,6 +11287,87 @@ mod tests {
     }
 
     #[test]
+    fn layout_handoff_drains_an_in_flight_write_and_rejects_late_writes() {
+        if crate::test_isolation::isolated(
+            "state::state_impl::tests::layout_handoff_drains_an_in_flight_write_and_rejects_late_writes",
+        ) {
+            return;
+        }
+
+        let path = persisted_layout_path().unwrap();
+        let root = path.parent().unwrap();
+        let owner = acquire_layout_lock().unwrap();
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        store.create_empty_workspace_at_path(root.join("earlier"));
+        let earlier_snapshot = store.snapshot();
+        let final_workspace = store.create_empty_workspace_at_path(root.join("final"));
+
+        let (writing_tx, writing_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let debouncer = persist_debouncer();
+        debouncer.schedule_pending(PendingPersist::Lazy(Box::new(move || {
+            writing_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            earlier_snapshot.clone()
+        })));
+        writing_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        std::thread::scope(|scope| {
+            let release = release_tx;
+            let store = &store;
+            let finish = scope.spawn(move || {
+                let result = finish_layout_persistence(store);
+                drop(owner);
+                result
+            });
+
+            // The writer holds the write mutex until released. Once the close
+            // has sealed admission, it must still hold the layout ownership.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !debouncer.closed.load(Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "layout persistence did not close"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(acquire_layout_lock()
+                .unwrap_err()
+                .contains("Codemux is already running"));
+            release.send(()).unwrap();
+            finish.join().unwrap().unwrap();
+        });
+
+        let _successor = acquire_layout_lock().unwrap();
+        let final_layout = load_persisted_state().unwrap();
+        assert!(final_layout
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.workspace_id == final_workspace));
+
+        let successor_store = AppStateStore::default();
+        successor_store.clear_workspaces();
+        successor_store.create_empty_workspace_at_path(root.join("successor"));
+        save_persisted_state(&successor_store.snapshot()).unwrap();
+        let successor_bytes = fs::read(&path).unwrap();
+
+        let late_snapshot = store.snapshot();
+        debouncer.schedule_pending(PendingPersist::Lazy(Box::new(move || late_snapshot.clone())));
+        assert!(debouncer.last_snapshot.lock().unwrap().is_none());
+        assert_eq!(
+            flush_persisted_state(&store).unwrap_err(),
+            "Layout persistence is closed"
+        );
+        let db = crate::database::DatabaseStore::new_in_memory();
+        assert_eq!(
+            store.persist_local_import_layout(&db, &[]).unwrap_err(),
+            "Layout persistence is closed",
+        );
+        assert_eq!(fs::read(path).unwrap(), successor_bytes);
+    }
+
+    #[test]
     fn local_import_windows_layout_writer_has_no_readonly_directory_flush() {
         // Static API-contract regression, runnable on Linux. This is not a
         // Windows runtime test: FlushFileBuffers requires GENERIC_WRITE and
@@ -11286,7 +11448,7 @@ mod tests {
                 0
             );
             store.create_empty_workspace_at_path(path.parent().unwrap().join("ordinary-close"));
-            flush_persisted_state(&store);
+            flush_persisted_state(&store).unwrap();
             assert_eq!(load_persisted_state().unwrap().workspaces.len(), 2);
             let app = tauri::test::mock_app();
             app.manage(store);
