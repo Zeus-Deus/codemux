@@ -104,6 +104,33 @@ describe("FrameDecoder", () => {
     expect(dec.buffered).toBe(0);
   });
 
+  it("preserves a partial next header when releasing a large fragmented frame", () => {
+    const payload = Uint8Array.from({ length: 80 * 1024 }, (_, i) => i % 251);
+    const first = encodeFrame(KIND_BINARY, payload);
+    const nextPayload = new Uint8Array([0xff, 0, 0x81]);
+    const second = encodeFrame(KIND_BINARY, nextPayload);
+    const stream = new Uint8Array(first.length + second.length);
+    stream.set(first);
+    stream.set(second, first.length);
+
+    const dec = new FrameDecoder();
+    const chunkSize = 32 * 1024;
+    const partialHeaderEnd = first.length + 3;
+    for (let offset = 0; offset < partialHeaderEnd; offset += chunkSize) {
+      dec.push(stream.subarray(offset, Math.min(offset + chunkSize, partialHeaderEnd)));
+      if (offset + chunkSize < partialHeaderEnd) expect(dec.next()).toBeNull();
+    }
+    const decodedFirst = dec.next();
+    expect(dec.buffered).toBe(3);
+    expect(dec.next()).toBeNull();
+
+    dec.push(stream.subarray(partialHeaderEnd));
+    expect(dec.next()).toEqual({ kind: KIND_BINARY, payload: nextPayload });
+    expect(decodedFirst).toEqual({ kind: KIND_BINARY, payload });
+    expect(dec.buffered).toBe(0);
+    expect(dec.next()).toBeNull();
+  });
+
   it("throws on an unknown kind byte", () => {
     const dec = new FrameDecoder();
     dec.push(new Uint8Array([0x09, 0, 0, 0, 1, 0xff])); // kind 9
