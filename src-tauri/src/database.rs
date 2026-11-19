@@ -3017,7 +3017,7 @@ fn workspace_by_id(conn: &Connection, id: i64) -> Result<Option<WorkspaceSyncRec
 }
 
 // Both edit baselines and acknowledged payloads contain these wire fields.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct WorkspaceFields {
     title: String,
     host_server_id: Option<String>,
@@ -3034,13 +3034,29 @@ impl WorkspaceFields {
         json.map(serde_json::from_str).transpose().map_err(|e| e.to_string())
     }
 
-    // A clean holder may reflect a later pull of the layout POST. Replay
-    // the acknowledged values, keeping edits made locally since that pull.
-    fn replay(&self, holder: &mut WorkspaceSyncRecord, local_base: Option<&Self>) {
+    fn encode(base: Option<&Self>) -> Result<Option<String>, String> {
+        base.map(serde_json::to_string).transpose().map_err(|e| e.to_string())
+    }
+
+    // Keep each value paired with the baseline for the edit that supplied it.
+    // A clean pull can change the holder without creating any local edits.
+    fn replay(
+        &self,
+        holder: &mut WorkspaceSyncRecord,
+        local_base: Option<&Self>,
+        mut patch_base: Option<&mut Self>,
+    ) {
         macro_rules! replay_field {
             ($field:ident) => {
                 if !holder.dirty || local_base.is_some_and(|b| b.$field == holder.$field) {
                     holder.$field.clone_from(&self.$field);
+                } else if let (Some(local), Some(patch)) = (local_base, patch_base.as_deref_mut()) {
+                    // Consecutive edits share the original base with an unedited
+                    // create. A changed pull or an explicit return to that base
+                    // needs the baseline of the later edit.
+                    if local.$field != self.$field || holder.$field == patch.$field {
+                        patch.$field.clone_from(&local.$field);
+                    }
                 }
             };
         }
@@ -3057,7 +3073,8 @@ impl WorkspaceFields {
 
 fn remember_workspace_patch(conn: &Connection, pushed: &WorkspaceSyncRecord) -> Result<(), String> {
     let mut candidates = conn.prepare(
-        "SELECT w.id, h.edit_base, p.acknowledged
+        "SELECT w.id, h.edit_base, p.acknowledged,
+                CASE WHEN p.row_id IS NULL THEN h.edit_base ELSE p.base END
          FROM workspaces_sync w JOIN workspaces_sync h ON h.id = ?1
          LEFT JOIN workspace_create_patch_bases p ON p.row_id = w.id AND p.holder_id = h.id
          WHERE w.user_id = h.user_id AND w.server_id IS NULL
@@ -3070,26 +3087,29 @@ fn remember_workspace_patch(conn: &Connection, pushed: &WorkspaceSyncRecord) -> 
             params![pushed.id, pushed.host_server_id, pushed.project_uid, pushed.git_branch, pushed.workspace_kind],
             |row| {
                 let layout_id: i64 = row.get(0)?;
-                let base: Option<String> = row.get(1)?;
+                let local_base: Option<String> = row.get(1)?;
                 let previous: Option<String> = row.get(2)?;
-                Ok((layout_id, base, previous))
+                let patch_base: Option<String> = row.get(3)?;
+                Ok((layout_id, local_base, previous, patch_base))
             },
         )
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    for (layout_id, base, previous) in rows {
+    for (layout_id, local_base, previous, patch_base) in rows {
         let mut acknowledged = pushed.clone();
+        let mut patch_base = WorkspaceFields::decode(patch_base.as_deref())?;
         if let Some(previous) = WorkspaceFields::decode(previous.as_deref())? {
-            let local_base = WorkspaceFields::decode(base.as_deref())?;
-            previous.replay(&mut acknowledged, local_base.as_ref());
+            let local_base = WorkspaceFields::decode(local_base.as_deref())?;
+            previous.replay(&mut acknowledged, local_base.as_ref(), patch_base.as_mut());
         }
         let acknowledged = serde_json::to_string(&acknowledged).map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO workspace_create_patch_bases(row_id, holder_id, base, acknowledged)
              VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(row_id, holder_id) DO UPDATE SET acknowledged = excluded.acknowledged",
-            params![layout_id, pushed.id, base, acknowledged],
+             ON CONFLICT(row_id, holder_id) DO UPDATE
+                 SET base = excluded.base, acknowledged = excluded.acknowledged",
+            params![layout_id, pushed.id, WorkspaceFields::encode(patch_base.as_ref())?, acknowledged],
         ).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -3119,11 +3139,12 @@ fn restore_workspace_patch(
     if !patched {
         return Ok((layout, local));
     }
+    let mut patch_base = WorkspaceFields::decode(patch_base.as_deref())?;
     if let Some(acknowledged) = WorkspaceFields::decode(acknowledged.as_deref())? {
-        acknowledged.replay(holder, local.as_ref());
+        acknowledged.replay(holder, local.as_ref(), patch_base.as_mut());
     }
-    // Mark dirty first so the edit trigger does not replace the original
-    // baseline with the values that were just pulled.
+    // Mark dirty first so the edit trigger preserves the per-field baseline
+    // if a conflict keeps this holder pending across retries.
     holder.dirty = true;
     conn.execute("UPDATE workspaces_sync SET dirty = 1 WHERE id = ?1", [holder.id])
         .map_err(|e| e.to_string())?;
@@ -3133,13 +3154,13 @@ fn restore_workspace_patch(
              workspace_kind = ?8, edit_base = ?9 WHERE id = ?10",
         params![holder.title, holder.host_server_id, holder.project_path, holder.project_remote,
             holder.git_branch, holder.git_head_sha, holder.project_uid, holder.workspace_kind,
-            patch_base, holder.id],
+            WorkspaceFields::encode(patch_base.as_ref())?, holder.id],
     ).map_err(|e| e.to_string())?;
     conn.execute(
         "DELETE FROM workspace_create_patch_bases WHERE row_id = ?1 AND holder_id = ?2",
         params![layout_id, holder.id],
     ).map_err(|e| e.to_string())?;
-    Ok((layout, WorkspaceFields::decode(patch_base.as_deref())?))
+    Ok((layout, patch_base))
 }
 
 fn merge_workspace_create(
@@ -7717,6 +7738,33 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
     }
+    #[test]
+    fn workspace_consecutive_patches_merge_with_an_unedited_create() {
+        let db = init_test_database();
+        let branch = Some("main");
+        let project = Some("project");
+        let kind = Some("main");
+        let layout = db.insert_workspace_sync(
+            "layout", "same", Some("host"), Some("/original"), None, branch, None, project, kind,
+        ).unwrap();
+        let holder = db.insert_remote_discovered_workspace_sync(
+            "host", "daemon-id", "same", Some("/original"), None, branch, project, kind, None, None,
+        ).unwrap();
+        db.mark_workspace_sync_synced(holder.id, Some("canonical")).unwrap();
+        for path in ["/first", "/second"] {
+            db.update_remote_discovered_workspace_sync(
+                holder.id, "same", Some(path), None, branch, project, kind, None, None,
+            ).unwrap();
+            let sent = db.dirty_workspace_by_id(holder.id).unwrap().unwrap();
+            db.mark_workspace_sync_pushed(&sent, None).unwrap();
+        }
+        db.mark_workspace_sync_pushed(&layout, Some(("canonical", false))).unwrap();
+        let rows = db.list_dirty_workspaces_sync();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, holder.id);
+        assert_eq!(rows[0].project_path.as_deref(), Some("/second"));
+    }
+
     #[test]
     fn workspace_patch_upgrade_keeps_later_local_edits_after_a_pull() {
         for (acknowledge_later_edit, later_branch) in [

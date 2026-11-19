@@ -1253,23 +1253,53 @@ mod tests {
             ("same rename", "same rename", Some("same rename")),
             ("layout rename", "inventory rename", None),
         ] {
-            check_identity_upsert(layout_title, inventory_title, merged_title, false).await;
+            check_identity_upsert(layout_title, inventory_title, merged_title, CreateRetry::None)
+                .await;
         }
     }
 
     #[tokio::test]
     #[serial]
     async fn identity_upsert_recovers_acknowledged_edits_after_lost_reply_and_pull() {
-        check_identity_upsert("layout rename", "old", Some("layout rename"), true).await;
-        check_identity_upsert("layout rename", "inventory rename", None, true).await;
+        check_identity_upsert("layout rename", "old", Some("layout rename"), CreateRetry::AfterPull).await;
+        check_identity_upsert("layout rename", "inventory rename", None, CreateRetry::AfterPull).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn identity_upsert_preserves_a_path_edited_back_after_pull() {
+        // Changing /other to /layout is an independent layout edit and must conflict.
+        for (layout_start, merged_title) in [("/layout", Some("layout rename")), ("/other", None)] {
+            check_identity_upsert(
+                "layout rename",
+                "old",
+                merged_title,
+                CreateRetry::AfterPathRevert { layout_start },
+            )
+            .await;
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CreateRetry {
+        None,
+        AfterPull,
+        AfterPathRevert { layout_start: &'static str },
     }
 
     async fn check_identity_upsert(
         layout_title: &'static str,
         inventory_title: &str,
         merged_title: Option<&str>,
-        lose_first_reply: bool,
+        retry: CreateRetry,
     ) {
+        let lose_first_reply = !matches!(retry, CreateRetry::None);
+        let revert_path = matches!(retry, CreateRetry::AfterPathRevert { .. });
+        let layout_start = match retry {
+            CreateRetry::AfterPathRevert { layout_start } => layout_start,
+            _ => "/layout",
+        };
+        let expected_path = if revert_path { "/inventory" } else { "/new" };
         for inventory_first in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("sync.db");
@@ -1286,7 +1316,7 @@ mod tests {
                     "layout",
                     "old",
                     host,
-                    Some("/layout"),
+                    Some(layout_start),
                     None,
                     branch,
                     None,
@@ -1367,6 +1397,18 @@ mod tests {
             let mut response: serde_json::Value =
                 serde_json::from_str(&workspace_json("canonical")).unwrap();
             response.as_object_mut().unwrap().extend(layout_body.as_object().unwrap().clone());
+            // The PATCH may also finish in an earlier pass. Its holder
+            // stays clean and available to pull while the POST is pending.
+            let separate_patch = revert_path
+                || (!lose_first_reply && inventory_first && layout_title == "layout rename" && inventory_title == "old");
+            if separate_patch {
+                let pending = db.dirty_workspace_by_id(holder.id).unwrap().unwrap();
+                super::push_update(
+                    &super::sync_client(), &server.url(), "token", &pending, &db,
+                    &mut None, &SyncGuard::unchecked(),
+                ).await.unwrap();
+                assert!(!db.list_workspaces_sync().iter().find(|w| w.id == holder.id).unwrap().dirty);
+            }
             let db = if lose_first_reply {
                 let posted = committed.clone();
                 let lost = server
@@ -1388,7 +1430,8 @@ mod tests {
 
                 // Return whichever write actually reached the server last.
                 let last = committed.lock().unwrap().clone();
-                assert_eq!(&last, if inventory_first { &layout_body } else { &inventory_body });
+                let layout_wrote_last = inventory_first || separate_patch;
+                assert_eq!(&last, if layout_wrote_last { &layout_body } else { &inventory_body });
                 let mut listed = response.clone();
                 listed.as_object_mut().unwrap().extend(last.as_object().unwrap().clone());
                 let list = server
@@ -1401,6 +1444,13 @@ mod tests {
                 list.assert_async().await;
                 let pulled = db.list_workspaces_sync().into_iter().find(|w| w.id == holder.id).unwrap();
                 assert_eq!(pulled.project_path.as_deref(), last["projectPath"].as_str());
+                if revert_path {
+                    assert_eq!(pulled.project_path.as_deref(), Some("/layout"));
+                    db.update_remote_discovered_workspace_sync(
+                        holder.id, &pulled.title, Some("/inventory"), None, branch, project, kind,
+                        Some("/srv/repo"), branch,
+                    ).unwrap();
+                }
                 drop(db);
                 super::ATTEMPTS.lock().unwrap().clear();
                 std::sync::Arc::new(DatabaseStore::test_file(&path))
@@ -1436,27 +1486,18 @@ mod tests {
 
             let mut merged_body = layout_body;
             merged_body["title"] = merged_title.unwrap_or(layout_title).into();
-            merged_body["projectPath"] = "/new".into();
+            merged_body["projectPath"] = expected_path.into();
             if edit_in_flight {
                 merged_body["gitHeadSha"] = "new-head".into();
             }
             let patch = server
                 .mock("PATCH", "/api/workspaces/canonical")
                 .match_body(mockito::Matcher::Json(merged_body))
-                .expect(usize::from(merged_title.is_some()))
+                // If the holder retries first, it also PATCHes the revert before the POST.
+                .expect(usize::from(merged_title.is_some()) + usize::from(inventory_first && revert_path))
                 .create_async()
                 .await;
 
-            // The PATCH may also finish in an earlier pass. Its holder
-            // stays clean and available to pull while the POST is pending.
-            if !lose_first_reply && inventory_first && layout_title == "layout rename" && inventory_title == "old" {
-                let pending = db.dirty_workspace_by_id(holder.id).unwrap().unwrap();
-                super::push_update(
-                    &super::sync_client(), &server.url(), "token", &pending, &db,
-                    &mut None, &SyncGuard::unchecked(),
-                ).await.unwrap();
-                assert!(!db.list_workspaces_sync().iter().find(|w| w.id == holder.id).unwrap().dirty);
-            }
             let first = super::push("token", &db).await;
             drop(db);
             // Reopen between passes: a prior PATCH or a saved receipt
@@ -1471,7 +1512,7 @@ mod tests {
                 let row = &rows[0];
                 assert_eq!(row.id, holder.id);
                 assert_eq!(row.title, title);
-                assert_eq!(row.project_path.as_deref(), Some("/new"));
+                assert_eq!(row.project_path.as_deref(), Some(expected_path));
                 assert_eq!(row.git_head_sha.as_deref(), edit_in_flight.then_some("new-head"));
                 assert_eq!(row.workspace_id.as_deref(), Some("layout"));
                 assert_eq!(row.server_id.as_deref(), Some("canonical"));
@@ -1489,7 +1530,7 @@ mod tests {
                 assert_eq!(layout.project_path.as_deref(), Some("/layout"));
                 let inventory = rows.iter().find(|r| r.id == holder.id).unwrap();
                 assert_eq!(inventory.title, inventory_title);
-                assert_eq!(inventory.project_path.as_deref(), Some("/new"));
+                assert_eq!(inventory.project_path.as_deref(), Some(expected_path));
                 assert!(inventory.dirty && layout.dirty);
             }
             inventory_patch.assert_async().await;
