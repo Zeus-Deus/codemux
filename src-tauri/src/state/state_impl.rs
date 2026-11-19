@@ -271,6 +271,10 @@ pub enum TerminalSessionState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalSessionSnapshot {
     pub session_id: SessionId,
+    /// In-memory provenance for an ID minted in this app process and never
+    /// admitted to the daemon. Restored layouts cannot prove this.
+    #[serde(skip)]
+    pub(crate) daemon_unused: bool,
     pub title: String,
     pub shell: Option<String>,
     pub cwd: String,
@@ -311,6 +315,7 @@ pub struct PtyHydrationWorkspace {
 #[derive(Debug, Clone)]
 pub struct PtyHydrationSession {
     pub session_id: String,
+    pub(crate) daemon_unused: bool,
     pub pane_id: Option<String>,
     pub cwd: String,
     pub original_command: Option<String>,
@@ -1394,6 +1399,7 @@ fn build_pty_hydration_plan(
             });
             PtyHydrationSession {
                 session_id,
+                daemon_unused: persisted.is_some_and(|session| session.daemon_unused),
                 pane_id,
                 cwd: persisted
                     .map(|session| session.cwd.clone())
@@ -1479,6 +1485,9 @@ impl AppStateStore {
         }
         let mut current = self.inner.lock().unwrap();
         self.pr_lookup_authorities.lock().unwrap().clear();
+        for terminal in &mut snapshot.terminal_sessions {
+            terminal.daemon_unused = false;
+        }
         *current = snapshot;
     }
 
@@ -2567,7 +2576,7 @@ impl AppStateStore {
             )
         } else {
             let surface_id = SurfaceId(next_id("surface"));
-            let session_id = SessionId(next_id("session"));
+            let session_id = new_terminal_session_id();
             let base_terminal_index = snapshot.terminal_sessions.len() + 1;
 
             // A single shell session whose cwd is the host directory. The
@@ -2576,6 +2585,7 @@ impl AppStateStore {
             // consistent so the UI shows the right path.
             snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                 session_id: session_id.clone(),
+                daemon_unused: true,
                 title: format!("Terminal {base_terminal_index}"),
                 shell: None,
                 cwd: remote_cwd.clone(),
@@ -2808,9 +2818,10 @@ impl AppStateStore {
         let mut session_ids = Vec::with_capacity(shell_count);
 
         for offset in 0..shell_count {
-            let session_id = SessionId(next_id("session"));
+            let session_id = new_terminal_session_id();
             snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                 session_id: session_id.clone(),
+                daemon_unused: true,
                 title: format!("Terminal {}", base_terminal_index + offset),
                 shell: shell.clone(),
                 cwd: cwd.clone(),
@@ -4812,7 +4823,7 @@ impl AppStateStore {
             ));
         }
 
-        let session_id = SessionId(next_id("session"));
+        let session_id = new_terminal_session_id();
         let pane_id = PaneId(next_id("pane"));
         let cwd = current_project_root().display().to_string();
         let shell = env::var("SHELL").ok();
@@ -4820,6 +4831,7 @@ impl AppStateStore {
 
         snapshot.terminal_sessions.push(TerminalSessionSnapshot {
             session_id: session_id.clone(),
+            daemon_unused: true,
             title: title.clone(),
             shell: shell.clone(),
             cwd: cwd.clone(),
@@ -4899,7 +4911,7 @@ impl AppStateStore {
                 ));
             }
 
-            let session_id = SessionId(next_id("session"));
+            let session_id = new_terminal_session_id();
             let new_pane_id = PaneId(next_id("pane"));
             let split_pane_id = PaneId(next_id("pane"));
             let cwd = snapshot
@@ -4912,6 +4924,7 @@ impl AppStateStore {
 
             snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                 session_id: session_id.clone(),
+                daemon_unused: true,
                 title: title.clone(),
                 shell,
                 cwd,
@@ -5667,7 +5680,7 @@ impl AppStateStore {
         Ok(())
     }
 
-    pub fn update_terminal_session_shell(&self, session: &str, shell: String) -> bool {
+    pub fn update_terminal_session_shell(&self, session: &str, shell: String, uses_daemon: bool) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(terminal) = snapshot
             .terminal_sessions
@@ -5675,6 +5688,7 @@ impl AppStateStore {
             .find(|terminal| terminal.session_id.0 == session)
         {
             terminal.shell = Some(shell);
+            terminal.daemon_unused &= !uses_daemon;
             return true;
         }
         false
@@ -6114,7 +6128,7 @@ impl AppStateStore {
                 let title = next_terminal_tab_title(&workspace.tabs);
                 let surface_id = SurfaceId(next_id("surface"));
                 let pane_id = PaneId(next_id("pane"));
-                let session_id = SessionId(next_id("session"));
+                let session_id = new_terminal_session_id();
                 let cwd = workspace.cwd.clone();
                 let shell = env::var("SHELL").ok();
 
@@ -6131,6 +6145,7 @@ impl AppStateStore {
 
                 snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                     session_id: session_id.clone(),
+                    daemon_unused: true,
                     title: "Terminal".into(),
                     shell,
                     cwd,
@@ -7228,7 +7243,7 @@ fn default_app_state() -> AppStateSnapshot {
     let workspace_id = WorkspaceId(next_id("workspace"));
     let surface_id = SurfaceId(next_id("surface"));
     let pane_id = PaneId(next_id("pane"));
-    let session_id = SessionId(next_id("session"));
+    let session_id = new_terminal_session_id();
     let default_tab_id = next_id("tab");
     let cwd = current_project_root().display().to_string();
     let shell = env::var("SHELL").ok();
@@ -7302,6 +7317,7 @@ fn default_app_state() -> AppStateSnapshot {
         }],
         terminal_sessions: vec![TerminalSessionSnapshot {
             session_id,
+            daemon_unused: true,
             title: "Terminal 1".into(),
             shell,
             cwd,
@@ -8496,6 +8512,12 @@ fn stable_browser_session_name(cwd: &str) -> String {
 fn next_id(prefix: &str) -> String {
     let value = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{value}")
+}
+
+fn new_terminal_session_id() -> SessionId {
+    // A daemon can outlive the app and still own terminal IDs from layouts
+    // that were never saved. Avoid reusing those IDs after a counter reset.
+    SessionId(format!("session-{}", uuid::Uuid::new_v4().simple()))
 }
 
 fn extract_numeric_suffix(value: &str) -> Option<u64> {

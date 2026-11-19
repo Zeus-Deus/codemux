@@ -947,6 +947,7 @@ mod tests {
         let mut snap = store.snapshot();
         snap.terminal_sessions.push(TerminalSessionSnapshot {
             session_id: SessionId(session_id.into()),
+            daemon_unused: false,
             title: "test".into(),
             shell: None,
             cwd: "/tmp".into(),

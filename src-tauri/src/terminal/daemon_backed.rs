@@ -225,6 +225,7 @@ const HYDRATION_CONCURRENCY: usize = 4;
 pub(crate) enum DaemonHydrationFailure {
     AlreadyReserved,
     RequiresGuardedRecovery,
+    LegacyDaemonLocalFallback,
     OwnershipUnavailable(String),
     SafeToFallback(String),
     Ambiguous(String),
@@ -232,7 +233,7 @@ pub(crate) enum DaemonHydrationFailure {
 
 impl DaemonHydrationFailure {
     pub(crate) fn allows_local_fallback(&self) -> bool {
-        matches!(self, Self::SafeToFallback(_))
+        matches!(self, Self::SafeToFallback(_) | Self::LegacyDaemonLocalFallback)
     }
 
     pub(crate) fn is_already_reserved(&self) -> bool {
@@ -246,6 +247,9 @@ impl std::fmt::Display for DaemonHydrationFailure {
             Self::AlreadyReserved => f.write_str("session already reserved by another spawn"),
             Self::RequiresGuardedRecovery => {
                 f.write_str("update the terminal daemon on its host before retrying this shell")
+            }
+            Self::LegacyDaemonLocalFallback => {
+                f.write_str("the local terminal daemon lacks revocable spawn permits")
             }
             Self::OwnershipUnavailable(message) => {
                 write!(f, "Could not save terminal shell ownership: {message}. Retry when local storage is available.")
@@ -740,10 +744,13 @@ async fn spawn_prepared_session<R: Runtime>(
         (Some(existing), true) => existing.shell_id,
         (Some(_), false) => None,
         (None, _) if client.supports_prepared_spawn() => Some(Uuid::new_v4()),
+        (None, _) if workspace.host_id.is_none() && session.daemon_unused && !reconciling => {
+            return Err(DaemonHydrationFailure::LegacyDaemonLocalFallback);
+        }
         (None, _) => {
             // A new shell needs a permit the daemon can revoke if its pane
-            // closes before Spawn arrives. List omits in-flight spawns, so
-            // an empty result cannot authorize a local replacement either.
+            // closes before Spawn arrives. List omits in-flight spawns,
+            // so a restored session needs stronger proof for local fallback.
             return Err(DaemonHydrationFailure::RequiresGuardedRecovery);
         }
     };
@@ -754,7 +761,7 @@ async fn spawn_prepared_session<R: Runtime>(
     let workspace_id = workspace.workspace_id.clone();
     let host_id = workspace.host_id;
     let is_remote = host_id.is_some();
-    if !app_state.update_terminal_session_shell(&session_id, shell.clone()) {
+    if !app_state.update_terminal_session_shell(&session_id, shell.clone(), true) {
         return Err(DaemonHydrationFailure::AlreadyReserved);
     }
     let route_for_runtime = shell_id.map(|_| {
