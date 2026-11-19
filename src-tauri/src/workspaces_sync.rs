@@ -334,6 +334,9 @@ pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
     let client = reqwest::Client::new();
     let dirty = db.list_dirty_workspaces_sync();
     let mut any_failed = false;
+    // The account's list, fetched at most once a pass, and only if a row
+    // turns out to be gone.
+    let mut listed: Option<Option<std::collections::HashSet<String>>> = None;
 
     for row in &dirty {
         let result = if row.deleted_at.is_some() {
@@ -341,7 +344,7 @@ pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
         } else if row.server_id.is_none() {
             push_insert(&client, &base, token, row, db).await
         } else {
-            push_update(&client, &base, token, row, db).await
+            push_update(&client, &base, token, row, db, &mut listed).await
         };
         if let Err(error) = result {
             eprintln!(
@@ -390,7 +393,7 @@ async fn push_insert(
     }
     let parsed: OneWorkspaceResponse =
         resp.json().await.map_err(|e| format!("Parse: {e}"))?;
-    db.mark_workspace_sync_synced(row.id, Some(&parsed.workspace.id))?;
+    db.mark_workspace_sync_pushed(row, Some(&parsed.workspace.id))?;
     Ok(())
 }
 
@@ -400,6 +403,7 @@ async fn push_update(
     token: &str,
     row: &crate::database::WorkspaceSyncRecord,
     db: &DatabaseStore,
+    listed: &mut Option<Option<std::collections::HashSet<String>>>,
 ) -> Result<(), String> {
     let server_id = row
         .server_id
@@ -422,7 +426,7 @@ async fn push_update(
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
-    if resp.status().as_u16() == 404 && server_lacks_workspace(client, base, token, server_id).await {
+    if resp.status().as_u16() == 404 && server_lacks_workspace(client, base, token, server_id, listed).await {
         // Deleted on another device before this edit reached the account.
         // The pull leaves dirty rows alone, so settle it here: the
         // removal wins, as it does for a clean row.
@@ -447,34 +451,40 @@ async fn push_update(
     if !resp.status().is_success() {
         return Err(format!("API error: {}", resp.status()));
     }
-    db.mark_workspace_sync_synced(row.id, None)?;
+    db.mark_workspace_sync_pushed(row, None)?;
     Ok(())
 }
 
 /// Whether the account's workspace list is readable and has no row
 /// `server_id`. A server without the workspaces API answers 404 to
-/// everything, so a 404 alone does not say the row is gone.
+/// everything, so a 404 alone does not say the row is gone. The list is
+/// fetched once per push pass, into `listed`; if it cannot be read, no row
+/// is taken to be gone.
 async fn server_lacks_workspace(
     client: &reqwest::Client,
     base: &str,
     token: &str,
     server_id: &str,
+    listed: &mut Option<Option<std::collections::HashSet<String>>>,
 ) -> bool {
-    let Ok(resp) = client
-        .get(format!("{base}/api/workspaces"))
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-    else {
-        return false;
-    };
-    if !resp.status().is_success() {
-        return false;
+    if listed.is_none() {
+        let ids = async {
+            let resp = client
+                .get(format!("{base}/api/workspaces"))
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let body = resp.json::<ListWorkspacesResponse>().await.ok()?;
+            Some(body.workspaces.into_iter().map(|w| w.id).collect())
+        }
+        .await;
+        *listed = Some(ids);
     }
-    match resp.json::<ListWorkspacesResponse>().await {
-        Ok(body) => !body.workspaces.iter().any(|w| w.id == server_id),
-        Err(_) => false,
-    }
+    matches!(listed, Some(Some(ids)) if !ids.contains(server_id))
 }
 
 async fn push_delete(
@@ -504,7 +514,7 @@ async fn push_delete(
     if !resp.status().is_success() && resp.status().as_u16() != 404 {
         return Err(format!("API error: {}", resp.status()));
     }
-    db.mark_workspace_sync_synced(row.id, None)?;
+    db.mark_workspace_sync_pushed(row, None)?;
     Ok(())
 }
 
@@ -816,6 +826,68 @@ mod tests {
         db.mark_workspace_sync_synced(all[0].id, None).unwrap();
         db.purge_acknowledged_workspace_sync_deletes().unwrap();
         assert_eq!(db.list_workspaces_sync_for_sync().len(), 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_close_made_while_its_row_was_being_uploaded_is_still_pushed() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let db = fresh_db();
+        let row = db
+            .insert_workspace_sync("ws-inflight", "old", None, None, None, Some("main"), None, None, None)
+            .unwrap();
+        db.mark_workspace_sync_synced(row.id, Some("srv-inflight")).unwrap();
+        db.update_workspace_sync_by_workspace_id("ws-inflight", "renamed", None, None, None, Some("main"), None, None, None)
+            .unwrap();
+
+        // The PATCH carrying the rename is in flight when the workspace is
+        // closed; then its success is acknowledged.
+        let in_flight = db.list_dirty_workspaces_sync().pop().unwrap();
+        db.soft_delete_workspace_sync_by_workspace_id("ws-inflight").unwrap();
+        db.mark_workspace_sync_pushed(&in_flight, None).unwrap();
+
+        let delete = server
+            .mock("DELETE", "/api/workspaces/srv-inflight")
+            .with_status(204)
+            .expect(1)
+            .create_async()
+            .await;
+        super::push("token", &db).await.unwrap();
+        delete.assert_async().await;
+        std::env::remove_var("CODEMUX_API_URL");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_account_list_is_fetched_once_per_push_however_many_rows_are_gone() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let db = fresh_db();
+        for (wid, sid) in [("ws-gone-a", "srv-gone-a"), ("ws-gone-b", "srv-gone-b")] {
+            let row = db.insert_workspace_sync(wid, "old", None, None, None, None, None, None, None).unwrap();
+            db.mark_workspace_sync_synced(row.id, Some(sid)).unwrap();
+            db.update_workspace_sync_by_workspace_id(wid, "edited", None, None, None, None, None, None, None)
+                .unwrap();
+        }
+        let _patch = server
+            .mock("PATCH", mockito::Matcher::Regex("^/api/workspaces/srv-gone-".into()))
+            .with_status(404)
+            .create_async()
+            .await;
+        let list = server
+            .mock("GET", "/api/workspaces")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"workspaces":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        super::push("token", &db).await.unwrap();
+        list.assert_async().await;
+        assert!(db.list_workspaces_sync().is_empty(), "both removals are settled");
+        std::env::remove_var("CODEMUX_API_URL");
     }
 
     #[test]
