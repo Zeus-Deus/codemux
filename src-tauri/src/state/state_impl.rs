@@ -14194,6 +14194,33 @@ mod persisted_layout_tests {
     }
 
     #[test]
+    fn startup_preserves_over_limit_scrollback_until_layout_recovery_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = dir.path().join("layout.json");
+        let base = dir.path().join("scrollback");
+        let workspace = base.join("ws");
+        let pane = workspace.join("pane.dat");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(&pane, b"scrollback").unwrap();
+        fs::write(&layout, "invalid json").unwrap();
+
+        assert!(matches!(load_layout_from(&layout), PersistedLayout::Unreadable { preserved: true }));
+        crate::scrollback::cleanup_on_startup(&base, false, recovery_pending_at(&layout), &[], 1);
+        assert_eq!(fs::read(&pane).unwrap(), b"scrollback");
+
+        save_layout_to(&layout, &default_app_state()).unwrap();
+        assert!(matches!(load_layout_from(&layout), PersistedLayout::Loaded(_)));
+        crate::scrollback::cleanup_on_startup(&base, true, recovery_pending_at(&layout), &[], 1);
+        assert_eq!(fs::read(&pane).unwrap(), b"scrollback");
+
+        let backup = fs::read_to_string(recovery_marker(&layout)).unwrap();
+        fs::remove_file(dir.path().join(backup.trim())).unwrap();
+        // An active workspace survives orphan cleanup, so only the disk cap can evict it.
+        crate::scrollback::cleanup_on_startup(&base, true, recovery_pending_at(&layout), &["ws".into()], 1);
+        assert!(!workspace.exists());
+    }
+
+    #[test]
     fn recovery_waits_for_every_copy_set_aside() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("layout.json");

@@ -1018,45 +1018,16 @@ fn build_core_app<R: tauri::Runtime>(
                     .map(|w| w.workspace_id.0.clone())
                     .collect();
 
-                // Windows defensive gate: skip orphan cleanup when layout
-                // failed to load. Otherwise `cleanup_orphan_scrollbacks(&[])`
-                // (called with the empty workspace list produced by
-                // `state.clear_workspaces()`) would wipe every saved
-                // scrollback dir on disk — the second half of the
-                // "terminals start fresh on Windows" cascade. On Linux the
-                // gate is a pass-through (always returns true), preserving
-                // historical behavior verbatim. See
-                // `scrollback::should_run_orphan_cleanup` for the full
-                // failure-mode rationale.
-                // An unreadable layout is not "no workspaces": their
-                // scrollback must survive until the layout is recovered.
-                if scrollback::should_run_orphan_cleanup(layout_loaded)
-                    && !state::layout_recovery_pending()
-                {
-                    let removed = scrollback::cleanup_orphan_scrollbacks(&ws_ids);
-                    if !removed.is_empty() {
-                        eprintln!(
-                            "[codemux::scrollback] Cleaned up {} orphan scrollback dirs",
-                            removed.len()
-                        );
-                    }
-                } else {
-                    eprintln!(
-                        "[codemux::scrollback] Skipping orphan cleanup — layout state was not loaded \
-                         (Windows defensive gate to prevent force-close cascade from wiping scrollback)"
-                    );
-                }
-                // Enforce disk limit from settings
                 let max_mb = settings_sync::load_cache()
                     .map(|s| s.session_restore.max_total_mb)
                     .unwrap_or(100);
-                let freed = scrollback::enforce_disk_limit(max_mb as u64 * 1024 * 1024);
-                if freed > 0 {
-                    eprintln!(
-                        "[codemux::scrollback] Freed {} bytes to stay under {max_mb}MB limit",
-                        freed
-                    );
-                }
+                scrollback::cleanup_on_startup(
+                    &scrollback::scrollback_base(),
+                    layout_loaded,
+                    state::layout_recovery_pending(),
+                    &ws_ids,
+                    max_mb as u64 * 1024 * 1024,
+                );
             }
 
             // GUI-only display-coupled window wiring: size/position restore,
