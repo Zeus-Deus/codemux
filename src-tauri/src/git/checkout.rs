@@ -267,9 +267,6 @@ fn checkout_recovery(checkout: &Path, git_dir: &Path) -> io::Result<(TempDir, Pa
     }
     let container = private_dir(&common, "codemux-recovery-")?;
     let recovery = container.path().join("files");
-    if recovery.to_str().is_none() {
-        return Err(io::Error::other("cannot report the recovery path as text"));
-    }
     let local = private_dir(checkout, ".codemux-checkout-")?;
     let source = local.path().join("files");
     #[cfg(unix)]
@@ -476,11 +473,24 @@ impl PreparedCheckout {
         Ok(())
     }
 
-    fn retain_subtree(&mut self, name: &str) -> String {
+    fn retain(&mut self, path: PathBuf) -> String {
         self.container.disable_cleanup(true);
-        let path = self.recovery.join(name);
         log::warn!("Checkout files retained for saves through open handles at {path:?}");
-        path.display().to_string()
+        if let Some(absolute) = path.to_str() {
+            return absolute.to_owned();
+        }
+        // Only the common directory can contain non-UTF-8 bytes. All names
+        // below it, including tempfile's random suffix, are generated as ASCII.
+        let common = self
+            .container
+            .path()
+            .parent()
+            .expect("absolute recovery container");
+        path.strip_prefix(common)
+            .expect("retained path is inside the recovery container")
+            .to_str()
+            .expect("generated recovery path is ASCII")
+            .to_owned()
     }
 
     pub(super) fn keep_originals(mut self) -> Option<String> {
@@ -488,7 +498,7 @@ impl PreparedCheckout {
             // Installation has consumed the incoming files. Discard any
             // remaining preparation data, such as mirrored .gitattributes.
             let _ = fs::remove_dir_all(self.recovery.join("tree"));
-            Some(self.retain_subtree("original"))
+            Some(self.retain(self.recovery.join("original")))
         } else {
             None
         }
@@ -538,17 +548,20 @@ impl PreparedCheckout {
             }
         }
         if let Some(e) = failure {
-            self.container.disable_cleanup(true);
+            let path = self.retain(self.recovery.clone());
             return format!(
                 "{error}. Could not restore all working files ({e}); checkout recovery files remain at {}",
-                self.recovery.display()
+                super::describe_recovery_dir(&path)
             );
         }
         if uninstalled {
             // These files were briefly live too. Their handles can outlast
             // a successful rollback just as they can outlast a commit.
-            let path = self.retain_subtree("tree");
-            return format!("{error}. Checkout recovery files remain at {path}");
+            let path = self.retain(self.recovery.join("tree"));
+            return format!(
+                "{error}. Checkout recovery files remain at {}",
+                super::describe_recovery_dir(&path)
+            );
         }
         error
     }

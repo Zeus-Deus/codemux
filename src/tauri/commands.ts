@@ -1199,6 +1199,7 @@ export const mergeBranch = (path: string, sourceBranch: string) =>
 export const mergeIntoBase = (path: string, baseBranch: string, deleteSourceBranch: boolean) =>
   invoke<MergeIntoBaseResult>("merge_into_base", { path, baseBranch, deleteSourceBranch });
 
+/** Returns the recovery directory under the same convention as MergeIntoBaseResult.recovery_dir. */
 export const completeMergeIntoBase = (
   path: string, baseBranch: string, tempBranch: string, sourceBranch: string, deleteSourceBranch: boolean,
 ) => invoke<string | null>("complete_merge_into_base", { path, baseBranch, tempBranch, sourceBranch, deleteSourceBranch });

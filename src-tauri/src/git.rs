@@ -1423,13 +1423,7 @@ pub struct ConflictCheckResult {
 
 /// Get the actual git directory (handles worktrees where .git is a file).
 fn resolve_git_dir(repo_path: &Path) -> Result<PathBuf, String> {
-    let output = run_git(repo_path, &["rev-parse", "--git-dir"])?;
-    let git_dir = PathBuf::from(output.trim());
-    if git_dir.is_absolute() {
-        Ok(git_dir)
-    } else {
-        Ok(repo_path.join(git_dir))
-    }
+    git_path(repo_path, "--git-dir").ok_or_else(|| "could not locate checkout git directory".to_string())
 }
 
 pub fn get_merge_state(repo_path: &Path) -> Result<MergeState, String> {
@@ -1805,6 +1799,7 @@ pub struct MergeIntoBaseResult {
     pub source_branch: String,
     pub conflicted_files: Vec<ConflictFile>,
     /// Directory of outgoing files that may still have open writers.
+    /// Relative paths start at the directory printed by `git rev-parse --git-common-dir`.
     pub recovery_dir: Option<String>,
 }
 
@@ -2070,10 +2065,18 @@ fn advance_checkout_head(
     transaction
 }
 
+fn describe_recovery_dir(path: &str) -> String {
+    if Path::new(path).is_relative() {
+        format!("{path} (relative to the directory printed by `git rev-parse --git-common-dir`)")
+    } else {
+        path.to_owned()
+    }
+}
+
 // Once files have been retained, report their location even if a later step fails.
 fn report_checkout_recovery(result: Result<(), String>, recovery_dir: Option<String>) -> Result<Option<String>, String> {
     match (result, recovery_dir) {
-        (Err(error), Some(path)) => Err(format!("{error}. Checkout recovery files remain at {path}")),
+        (Err(error), Some(path)) => Err(format!("{error}. Checkout recovery files remain at {}", describe_recovery_dir(&path))),
         (result, path) => result.map(|()| path),
     }
 }
@@ -2105,7 +2108,8 @@ fn fast_forward_checkout(checkout: &Path, base_branch: &str, commit: &str) -> Re
         let cause = err.error;
         let mut path = err.path;
         path.disable_cleanup(true);
-        format!("advanced {base_ref}, but could not install the new index ({cause}); it is at {}", path.display())
+        let location = path.to_str().unwrap_or("the checkout index lock (append `.lock` to the path printed by `git rev-parse --git-path index`)");
+        format!("advanced {base_ref}, but could not install the new index ({cause}); it is at {location}")
     });
     report_checkout_recovery(installed, recovery_dir)
 }
@@ -2382,6 +2386,7 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch
 }
 
 /// Complete the merge-into-base flow after conflict resolution.
+/// Returns the recovery directory as in [`MergeIntoBaseResult::recovery_dir`].
 pub fn complete_merge_into_base(
     repo_path: &Path,
     base_branch: &str,
@@ -7292,6 +7297,70 @@ mod tests {
 
         assert_eq!(merge_into_base(&wt, "release", false).unwrap().status, "merged");
         assert_eq!(std::fs::read_to_string(odd.join("feature.txt")).unwrap(), "worktree work");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn non_utf8_main_repo() -> (TempDir, PathBuf, PathBuf) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join(std::ffi::OsStr::from_bytes(b"main-\xff"));
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-b", "main"]).unwrap();
+        git_config(&repo);
+        run_git(&repo, &["commit", "--allow-empty", "-m", "initial"]).unwrap();
+        let wt = dir.path().join("feature");
+        run_git(&repo, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]).unwrap();
+        (dir, repo, wt)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_non_utf8_main_repo_reports_moved_originals() {
+        use std::io::Write;
+
+        let (_dir, repo, wt) = non_utf8_main_repo();
+        std::fs::write(wt.join("tracked"), b"original").unwrap();
+        run_git(&wt, &["add", "tracked"]).unwrap();
+        run_git(&wt, &["commit", "-m", "add file"]).unwrap();
+        let added = merge_into_base(&wt, "main", false).unwrap();
+        assert_eq!(added.status, "merged");
+        assert!(added.recovery_dir.is_none());
+        assert_eq!(std::fs::read(repo.join("tracked")).unwrap(), b"original");
+
+        let mut editor = std::fs::File::options().append(true).open(repo.join("tracked")).unwrap();
+        std::fs::write(wt.join("tracked"), b"replacement").unwrap();
+        run_git(&wt, &["commit", "-am", "replace file"]).unwrap();
+        let replaced = merge_into_base(&wt, "main", false).unwrap();
+        assert_eq!(replaced.status, "merged");
+        assert_eq!(std::fs::read(repo.join("tracked")).unwrap(), b"replacement");
+        let reported = PathBuf::from(replaced.recovery_dir.unwrap());
+        assert!(reported.is_relative());
+        editor.write_all(b"\0late save").unwrap();
+        let common = git_path(&wt, "--git-common-dir").unwrap();
+        assert_eq!(std::fs::read(common.join(reported).join("tracked")).unwrap(), b"original\0late save");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_non_utf8_main_repo_completes_resolved_conflict() {
+        let (_dir, repo, wt) = non_utf8_main_repo();
+        for (checkout, contents) in [(&repo, "base"), (&wt, "feature")] {
+            std::fs::write(checkout.join("tracked"), contents).unwrap();
+            run_git(checkout, &["add", "tracked"]).unwrap();
+            run_git(checkout, &["commit", "-m", contents]).unwrap();
+        }
+
+        let merge = merge_into_base(&wt, "main", false).unwrap();
+        assert_eq!(merge.status, "conflicts");
+        std::fs::write(wt.join("tracked"), b"resolved").unwrap();
+        mark_conflict_resolved(&wt, "tracked").unwrap();
+        let recovery = complete_merge_into_base(&wt, "main", &merge.temp_branch.unwrap(), "feature", false)
+            .unwrap().expect("location of the original base file");
+        assert_eq!(std::fs::read(repo.join("tracked")).unwrap(), b"resolved");
+        assert!(Path::new(&recovery).is_relative());
+        let common = git_path(&wt, "--git-common-dir").unwrap();
+        assert_eq!(std::fs::read(common.join(recovery).join("tracked")).unwrap(), b"base");
     }
 
     #[cfg(unix)]
