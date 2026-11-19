@@ -337,9 +337,11 @@ describe("useAppStateInit — lifecycle boundaries", () => {
     { revision: undefined, expectedWorkspace: "ws-B" },
     { revision: 0, expectedWorkspace: "ws-B" },
     { revision: 4, expectedWorkspace: "ws-B" },
+    { revision: 5, expectedWorkspace: "ws-B" },
     { revision: 6, expectedWorkspace: "ws-A" },
   ])("keeps $expectedWorkspace when a retry with revision $revision arrives after a pushed snapshot", async ({ revision, expectedWorkspace }) => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const startup = vi.spyOn(await import("@/lib/perf/interaction-trace"), "markStartup");
     try {
       let resolveRetry!: (snapshot: AppStateSnapshot) => void;
       getAppStateMock
@@ -355,9 +357,49 @@ describe("useAppStateInit — lifecycle boundaries", () => {
       });
       expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-B");
 
+      expect(startup.mock.calls.filter(([phase]) => phase === "initial-snapshot-ready")).toHaveLength(1);
       await act(async () => { resolveRetry({ ...makeAppState("ws-A"), snapshot_revision: revision }); });
       expect(useAppStore.getState().appState?.active_workspace_id).toBe(expectedWorkspace);
+      expect(startup.mock.calls.filter(([phase]) => phase === "initial-snapshot-ready")).toHaveLength(1);
     } finally {
+      startup.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  it("retries until a full snapshot is accepted when a delta overtakes the sign-in fetch", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const startup = vi.spyOn(await import("@/lib/perf/interaction-trace"), "markStartup");
+    try {
+      // The signed-out store still holds the previous session's baseline.
+      useAppStore.getState().setAppState({ ...makeAppState("ws-A"), snapshot_revision: 4 });
+      let resolveRetry!: (snapshot: AppStateSnapshot) => void;
+      getAppStateMock
+        .mockRejectedValueOnce(new Error("reconnecting"))
+        .mockReturnValueOnce(new Promise((resolve) => { resolveRetry = resolve; }))
+        // With the backend idle, the next read returns the current revision again.
+        .mockResolvedValueOnce({ ...makeAppState("ws-B"), snapshot_revision: 5 });
+      const { rerender } = renderHook(({ skip }) => useAppStateInit(skip), { initialProps: { skip: true } });
+      rerender({ skip: false });
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(2);
+
+      act(() => {
+        deliverDelta!({ revision: 5, delta: { domain: "pane_status", pane_id: "p", status: "working" } });
+      });
+      await act(async () => { resolveRetry({ ...makeAppState("ws-B"), snapshot_revision: 4 }); });
+      expect(useAppStore.getState().lastSeenRevision).toBe(5);
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-A");
+      expect(startup.mock.calls.map(([phase]) => phase)).not.toContain("initial-snapshot-ready");
+
+      await act(() => vi.advanceTimersByTimeAsync(2_000));
+      expect(useAppStore.getState().lastSeenRevision).toBe(5);
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-B");
+      expect(startup.mock.calls.filter(([phase]) => phase === "initial-snapshot-ready")).toHaveLength(1);
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(3);
+    } finally {
+      startup.mockRestore();
       error.mockRestore();
     }
   });

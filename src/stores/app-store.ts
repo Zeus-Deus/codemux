@@ -53,10 +53,9 @@ interface AppStore {
   /** `Date.now()` when the pending selection was opened. Lets the activation
    *  helper age out a pending id the backend never confirmed. */
   pendingActivationAt: number | null;
-  /** Highest revision already applied, from either a snapshot or a delta —
-   *  the two share one counter. Snapshots at or below it are stale and
-   *  dropped; deltas must be exactly one above it. See `setAppState` and
-   *  `applyAppStateDelta`. */
+  /** Highest revision already applied, from either a snapshot or a delta.
+   *  A full bootstrap read can establish a baseline at this revision.
+   *  Deltas must be exactly one revision above it. */
   lastSeenRevision: number;
   /** The backend process `lastSeenRevision` was counted by, or `null` before
    *  the first stamped message.
@@ -92,7 +91,7 @@ interface AppStore {
    *  gap is real and only a full snapshot can close it. No-op when the window
    *  named by `windowId` has already been resolved or superseded. */
   expireGapWindow: (windowId: number) => void;
-  setAppState: (snapshot: AppStateSnapshot) => void;
+  setAppState: (snapshot: AppStateSnapshot, mode?: "bootstrap") => void;
   /** Apply one domain delta at `revision`. Immutable and targeted: every
    *  object the delta doesn't name keeps its previous reference, which is the
    *  entire point of the delta path. */
@@ -498,7 +497,7 @@ export const useAppStore = create<AppStore>((set) => ({
   // already hold so unchanged subtrees keep their previous reference. When
   // nothing changed the returned ref equals the previous snapshot, so zustand
   // selector subscribers see zero fan-out. See `@/lib/structural-share`.
-  setAppState: (snapshot) =>
+  setAppState: (snapshot, mode) =>
     set((state) => {
       const revision = snapshot.snapshot_revision ?? 0;
       // Restart guard, BEFORE the ordering guard. A different instance token
@@ -522,14 +521,14 @@ export const useAppStore = create<AppStore>((set) => ({
           gapWindowId: 0,
         };
       }
-      // Ordering guard. The backend stamps every emitted snapshot with a
-      // strictly increasing `snapshot_revision`; a snapshot at or below the
-      // one we already applied lost the race (a background git/PR/port emit
-      // built before the activation emit but delivered after it) and would
-      // otherwise stomp the freshly selected workspace back to the old one.
-      // Revision 0 means "unrevisioned" — restored state, an older backend,
-      // or a mock — and is always applied.
-      if (revision > 0 && revision <= state.lastSeenRevision) return state;
+      // A boot fetch reads the backend's current revision without advancing it.
+      // It can fill in a retained baseline at the same revision on an idle host.
+      // Pushed duplicates are discarded. Revision 0 is unrevisioned.
+      if (
+        revision > 0 &&
+        (revision < state.lastSeenRevision ||
+          (revision === state.lastSeenRevision && mode !== "bootstrap"))
+      ) return state;
 
       const shared = state.appState
         ? shareStructural(state.appState, snapshot)
