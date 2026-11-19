@@ -111,7 +111,10 @@ pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> 
     // new account's automations with the old account's token.
     let _one_at_a_time = SYNC_LOCK.lock().await;
     let db = app.state::<DatabaseStore>();
-    let auth = app.state::<crate::auth::AuthState>();
+    // No auth state means no session to sync for.
+    let Some(auth) = app.try_state::<crate::auth::AuthState>() else {
+        return Ok(());
+    };
     let (generation, token) = auth.session_snapshot(|| valid_token(&db));
     let Some(token) = token else {
         return Ok(());
