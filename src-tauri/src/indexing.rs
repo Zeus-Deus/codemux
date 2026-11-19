@@ -488,6 +488,28 @@ fn search_snapshot(
         return vec![];
     }
 
+    // Rank inexpensive references first. The tuple keeps the public score/path
+    // ordering and preserves the original chunk order when both are equal.
+    let mut best = std::collections::BinaryHeap::new();
+    for (index, chunk) in snapshot.chunks.iter().enumerate() {
+        let haystack = chunk.text.to_lowercase();
+        let score = terms.iter().filter(|term| haystack.contains(term.as_str())).count();
+        if score == 0 {
+            continue;
+        }
+        let rank = (std::cmp::Reverse(score), chunk.file_path.as_str(), index);
+        if best.len() < limit {
+            best.push(rank);
+        } else if let Some(mut worst) = best.peek_mut() {
+            if rank < *worst {
+                *worst = rank;
+            }
+        }
+    }
+    if best.is_empty() {
+        return Vec::new();
+    }
+
     // A file can contribute many matching chunks. Find its symbols through
     // one lookup instead of linearly scanning every indexed file each time.
     let mut files_by_path = HashMap::with_capacity(snapshot.files.len());
@@ -495,19 +517,10 @@ fn search_snapshot(
         files_by_path.entry(file.file_path.as_str()).or_insert(file);
     }
 
-    let mut results = snapshot
-        .chunks
-        .iter()
-        .filter_map(|chunk| {
-            let haystack = chunk.text.to_lowercase();
-            let score = terms
-                .iter()
-                .filter(|term| haystack.contains(term.as_str()))
-                .count();
-            if score == 0 {
-                return None;
-            }
-
+    best.into_sorted_vec()
+        .into_iter()
+        .map(|(std::cmp::Reverse(score), _, index)| {
+            let chunk = &snapshot.chunks[index];
             let matched_symbols = files_by_path
                 .get(chunk.file_path.as_str())
                 .map(|file| {
@@ -522,25 +535,16 @@ fn search_snapshot(
                 })
                 .unwrap_or_default();
 
-            Some(IndexSearchResult {
+            IndexSearchResult {
                 file_path: chunk.file_path.clone(),
                 line_start: chunk.line_start,
                 line_end: chunk.line_end,
                 score,
                 snippet: chunk.text.lines().take(8).collect::<Vec<_>>().join("\n"),
                 matched_symbols,
-            })
+            }
         })
-        .collect::<Vec<_>>();
-
-    results.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.file_path.cmp(&right.file_path))
-    });
-    results.truncate(limit);
-    results
+        .collect()
 }
 
 fn save_index(snapshot: &ProjectIndexSnapshot) -> Result<(), String> {
@@ -644,6 +648,30 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].score, 2);
         assert_eq!(results[0].matched_symbols, vec!["build_index"]);
+    }
+
+    #[test]
+    fn index_search_limits_preserve_rank_and_chunk_order() {
+        let mut snapshot = default_index(PathBuf::new());
+        for (path, text) in [
+            ("z.rs", "fox"),
+            ("b.rs", "FOX jumps"),
+            ("a.rs", "fox jumps once"),
+            ("a.rs", "fox jumps twice"),
+            ("a.rs", "fox jumps again"),
+        ] {
+            snapshot.chunks.push(IndexedChunk {
+                chunk_id: String::new(),
+                file_path: path.into(),
+                line_start: 1,
+                line_end: 1,
+                text: text.into(),
+            });
+        }
+        let snippets = |limit| search_snapshot(&snapshot, "fox jumps", limit)
+            .into_iter().map(|result| result.snippet).collect::<Vec<_>>();
+        assert_eq!(snippets(2), ["fox jumps once", "fox jumps twice"]);
+        assert_eq!(snippets(usize::MAX), ["fox jumps once", "fox jumps twice", "fox jumps again", "FOX jumps", "fox"]);
     }
 
     #[test]
