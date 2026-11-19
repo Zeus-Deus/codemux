@@ -143,6 +143,14 @@ fn persist_debouncer() -> &'static PersistDebouncer {
     PERSIST_DEBOUNCER.get_or_init(PersistDebouncer::new)
 }
 
+/// Keep a layout removal out of an already queued save until the terminal
+/// close records have been written. Run process teardown after releasing it.
+pub(crate) fn with_terminal_close_layout_lock<T>(close: impl FnOnce() -> T) -> T {
+    #[cfg(unix)]
+    let _write_guard = persist_debouncer().write_lock.lock().unwrap();
+    close()
+}
+
 /// Synchronously persist the current app state. Called on app close to
 /// ensure the debounced write completes before the process exits.
 pub fn flush_persisted_state(store: &AppStateStore) {

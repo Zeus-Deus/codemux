@@ -1503,8 +1503,13 @@ fn detach_workspace<R: tauri::Runtime>(
     // Before the workspace leaves state, so no deletion or cleanup sees its
     // folders unclaimed while its chats may still run in them.
     let claim = closing.as_ref().map(crate::checkout_claims::claim_checkout);
-    let result = match state.close_workspace(workspace_id) {
-        Ok(result) => result,
+    let closed = crate::state::with_terminal_close_layout_lock(|| {
+        let mut result = state.close_workspace(workspace_id)?;
+        let terminals = take_closed_terminals(app, std::mem::take(&mut result.removed_sessions));
+        Ok::<_, String>((result, terminals))
+    });
+    let (result, terminal_runtimes) = match closed {
+        Ok(closed) => closed,
         Err(e) => {
             if let Some(claim) = claim {
                 claim.release();
@@ -1543,15 +1548,8 @@ fn detach_workspace<R: tauri::Runtime>(
     // worktrees, slow disk). The caller emits again once done.
     crate::state::emit_app_state(app);
 
-    // Kill the PTY child process trees for every session that used to belong
-    // to this workspace. Sessions are returned atomically from the same lock
-    // acquisition that removed the workspace — no TOCTOU race with concurrent
-    // pane creation. Idempotent on the waiter thread (double-remove is a
-    // no-op) so per-session errors cannot bubble.
-    if let Some(terminal_state) = app.try_state::<crate::terminal::PtyState>() {
-        for session_id in result.removed_sessions {
-            crate::terminal::terminate_pty_session(app, &terminal_state.sessions, &session_id.0);
-        }
+    for (session_id, runtime) in terminal_runtimes {
+        crate::terminal::terminate_removed_session(runtime, &session_id.0);
     }
 
     Ok(Detached {
@@ -1561,6 +1559,22 @@ fn detach_workspace<R: tauri::Runtime>(
         earlier,
         threads: result.removed_agent_chat_threads,
     })
+}
+
+fn take_closed_terminals<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    sessions: impl IntoIterator<Item = crate::state::SessionId>,
+) -> Vec<(crate::state::SessionId, crate::terminal::SessionRuntime)> {
+    let Some(terminal_state) = app.try_state::<crate::terminal::PtyState>() else {
+        return Vec::new();
+    };
+    sessions
+        .into_iter()
+        .filter_map(|id| {
+            crate::terminal::take_terminal_session_for_close(app, &terminal_state.sessions, &id.0)
+                .map(|runtime| (id, runtime))
+        })
+        .collect()
 }
 
 /// Test-only pause in a close, after the workspace left app state and
@@ -2873,19 +2887,18 @@ pub(crate) fn close_pane_impl_with_selection<R: tauri::Runtime>(
     select: bool,
 ) -> Result<Option<String>, String> {
     let removed_browser_id = state.pane_browser_id(&pane_id);
-    let removed = state.close_pane_with_selection(&pane_id, select)?;
+    let (removed, terminals) = crate::state::with_terminal_close_layout_lock(|| {
+        let removed = state.close_pane_with_selection(&pane_id, select)?;
+        let terminals = take_closed_terminals(&app, removed.iter().cloned());
+        Ok::<_, String>((removed, terminals))
+    })?;
     // A `codemux monitor start` flag belongs to the process that was running
     // in this pane. The pane is gone, so the claim is too — and a flag with no
     // pane behind it has no UI left that could ever turn it off.
     state.clear_manual_monitors_for_panes(&[pane_id.clone()]);
 
-    if let Some(ref session_id) = removed {
-        // Kill the PTY child + its process group. `state.close_pane` already
-        // removed the session from the store, so we go straight to the PTY
-        // helper instead of back through `close_terminal_session` (which
-        // would try to re-remove from the store and fail).
-        let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
-        crate::terminal::terminate_pty_session(&app, &terminal_state.sessions, &session_id.0);
+    for (session_id, runtime) in terminals {
+        crate::terminal::terminate_removed_session(runtime, &session_id.0);
     }
 
     if let Some(browser_id) = removed_browser_id {
@@ -3098,7 +3111,11 @@ pub fn close_tab<R: tauri::Runtime>(
     workspace_id: String,
     tab_id: String,
 ) -> Result<(), String> {
-    let result = state.close_tab(&workspace_id, &tab_id)?;
+    let (result, terminals) = crate::state::with_terminal_close_layout_lock(|| {
+        let mut result = state.close_tab(&workspace_id, &tab_id)?;
+        let terminals = take_closed_terminals(&app, std::mem::take(&mut result.removed_sessions));
+        Ok::<_, String>((result, terminals))
+    })?;
 
     // Straight after the removal: a worktree deletion that no longer sees
     // these chats in the workspace finds their stops in flight instead.
@@ -3107,12 +3124,8 @@ pub fn close_tab<R: tauri::Runtime>(
         result.removed_agent_chat_threads,
     );
 
-    // Kill the PTY child + process group for every terminal session that
-    // was attached to this tab. `state.close_tab` already removed them from
-    // the store, so we go straight to the PTY helper.
-    let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
-    for session_id in result.removed_sessions {
-        crate::terminal::terminate_pty_session(&app, &terminal_state.sessions, &session_id.0);
+    for (session_id, runtime) in terminals {
+        crate::terminal::terminate_removed_session(runtime, &session_id.0);
     }
 
     for browser_id in &result.removed_browser_ids {

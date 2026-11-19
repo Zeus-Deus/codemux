@@ -1293,6 +1293,8 @@ fn build_core_app<R: tauri::Runtime>(
             // Codemux plugin (see `claude_plugin`).
             let _ = claude_plugin::local_plugin_dir();
 
+            #[cfg(unix)]
+            terminal::daemon_backed::resume_pending_daemon_closes(&handle);
             terminal::spawn_missing_ptys(handle);
 
             // Warm up the PTY daemon connection. The daemon is now the
