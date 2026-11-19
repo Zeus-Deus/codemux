@@ -32,7 +32,7 @@ fn desktop_rejects_an_unpreserved_layout_before_setup() {
     };
 
     assert!(
-        error.to_string().contains("Could not preserve unreadable workspace layout"),
+        error.to_string().contains("Could not read layout recovery marker"),
         "{error}"
     );
     assert_eq!(fs::read(layout).unwrap(), original);

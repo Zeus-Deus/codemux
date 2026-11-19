@@ -72,6 +72,9 @@ impl LayoutCloseIntent {
                 tab_id,
             } => ("tab", workspace_id, tab_id),
             Self::Workspace(id) => ("workspace", id, ""),
+            // Older workspace closes have an empty target. A consumed archive
+            // closes the same workspace and also removes this exact entry.
+            Self::ConsumedArchive { workspace_id, archive_id } => ("workspace", workspace_id, archive_id),
             Self::Archive(entry) => ("archive", &entry.workspace_id, &entry.archive_id),
         }
     }
@@ -863,7 +866,10 @@ impl DatabaseStore {
     }
 
     pub(crate) fn pending_layout_closes(&self) -> Result<Vec<LayoutCloseIntent>, String> {
-        let conn = self.conn.lock().unwrap();
+        Self::read_layout_closes(&self.conn.lock().unwrap())
+    }
+
+    fn read_layout_closes(conn: &Connection) -> Result<Vec<LayoutCloseIntent>, String> {
         let mut select = conn
             .prepare(
                 "SELECT scope, workspace_id, target_id, payload FROM pending_layout_closes ORDER BY rowid",
@@ -892,7 +898,8 @@ impl DatabaseStore {
                     workspace_id,
                     tab_id: target_id,
                 }),
-                "workspace" => Ok(LayoutCloseIntent::Workspace(workspace_id)),
+                "workspace" if target_id.is_empty() => Ok(LayoutCloseIntent::Workspace(workspace_id)),
+                "workspace" => Ok(LayoutCloseIntent::ConsumedArchive { workspace_id, archive_id: target_id }),
                 "archive" => {
                     let entry: ArchivedWorkspaceSnapshot = serde_json::from_str(
                         payload
@@ -933,11 +940,29 @@ impl DatabaseStore {
         if !crate::state::layout_recovery_pending() {
             return Ok(());
         }
-        self.conn.lock().unwrap().execute(
-            "UPDATE OR REPLACE pending_layout_closes SET scope = 'workspace', target_id = '', payload = NULL
-             WHERE scope = 'archive' AND workspace_id = ?1 AND target_id = ?2",
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        // The entry can also come from a saved layout with no pending archive
+        // insertion. Record its consumption in either case, including retries.
+        tx.execute(
+            "INSERT INTO pending_layout_closes (scope, workspace_id, target_id)
+             VALUES ('workspace', ?1, ?2) ON CONFLICT DO NOTHING",
             params![entry.workspace_id, entry.archive_id],
-        ).map(drop).map_err(|error| error.to_string())
+        ).map_err(|error| error.to_string())?;
+        // Older retained archives for this checkout were displaced when this
+        // entry was installed. Once it is gone they must not be reinstalled.
+        for intent in Self::read_layout_closes(&tx)? {
+            if let LayoutCloseIntent::Archive(prior) = intent {
+                if entry.supersedes_or_matches(&prior) {
+                    tx.execute(
+                        "UPDATE OR REPLACE pending_layout_closes SET scope = 'workspace', payload = NULL
+                         WHERE scope = 'archive' AND workspace_id = ?1 AND target_id = ?2",
+                        params![prior.workspace_id, prior.archive_id],
+                    ).map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub(crate) fn has_pending_layout_close(

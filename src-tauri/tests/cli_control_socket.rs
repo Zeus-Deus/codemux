@@ -125,6 +125,14 @@ impl Serve {
         Self { child: cmd.spawn().unwrap(), root }
     }
 
+    fn restart(&mut self) {
+        assert!(self.child.try_wait().unwrap().is_some());
+        let log = std::fs::File::create(self.root.path().join("serve.log")).unwrap();
+        self.child = serve_command(self.root.path(), free_loopback_port())
+            .stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap();
+        self.wait_ready();
+    }
+
     fn log(&self) -> String {
         std::fs::read_to_string(self.root.path().join("serve.log")).unwrap_or_default()
     }
@@ -705,13 +713,72 @@ fn serve_saves_its_layout_without_overwriting_the_recovery_copy() {
     let status = serve.shutdown().expect("serve should stop after SIGTERM");
     assert!(status.success(), "serve exited with {status}:\n{}", serve.log());
 
-    let saved: Value = serde_json::from_slice(&std::fs::read(&layout).unwrap()).unwrap();
+    let saved: Value = serde_json::from_slice(&std::fs::read(layout.with_extension("json.recovery-session")).unwrap()).unwrap();
     assert!(saved["workspaces"].as_array().unwrap().iter().any(|workspace| {
         workspace["workspace_id"].as_str() == Some(workspace_id.as_str())
     }));
     let backup = std::fs::read_to_string(layout.with_extension("json.recovery-pending")).unwrap();
     assert_eq!(std::fs::read(layout.with_file_name(backup.trim())).unwrap(), corrupt);
     assert_eq!(std::fs::read(scrollback).unwrap(), b"terminal history");
+}
+
+#[test]
+fn serve_keeps_a_repair_installed_during_recovery_through_shutdown() {
+    let mut serve = Serve::start();
+    let (original, _) = serve.workspace("original");
+    assert!(serve.shutdown().unwrap().success());
+    let layout = layout_path(serve.root.path());
+    let repaired = std::fs::read(&layout).unwrap();
+    std::fs::write(&layout, b"broken").unwrap();
+    serve.restart();
+    let backup = recovery_backup_path(&layout);
+    std::fs::write(&backup, &repaired).unwrap();
+    std::fs::rename(backup, &layout).unwrap();
+    let (id, _) = serve.workspace("flush-after-repair");
+    // Closing a workspace forces a journaled layout flush. Normal shutdown
+    // then drains the queued writer and does its guarded final save.
+    serve.ok(&["workspace", "close", &id, "--json"]);
+    assert!(serve.shutdown().unwrap().success(), "{}", serve.log());
+    assert_eq!(std::fs::read(&layout).unwrap(), repaired);
+    serve.restart();
+    serve.ok(&["workspace", "info", &original, "--json"]);
+    assert!(!layout.with_extension("json.recovery-pending").exists());
+}
+
+#[test]
+fn serve_replays_journal_only_sync_closes_during_recovery() {
+    use codemux_lib::state::{build_archive_entry, AppStateSnapshot};
+    let mut serve = Serve::start();
+    let (closed, _) = serve.workspace("close-before-crash");
+    let (archived, _) = serve.workspace("archive-before-crash");
+    assert!(serve.shutdown().unwrap().success());
+    let layout = layout_path(serve.root.path());
+    let original = std::fs::read(&layout).unwrap();
+    let snapshot: AppStateSnapshot = serde_json::from_slice(&original).unwrap();
+    let entry = build_archive_entry(snapshot.workspaces.iter().find(|ws| ws.workspace_id.0 == archived).unwrap());
+    let db = rusqlite::Connection::open(layout.with_file_name("codemux.db")).unwrap();
+    for id in [closed.as_str(), archived.as_str(), "missing-only"] {
+        db.execute("INSERT INTO workspaces_sync (workspace_id, title, server_id, dirty)
+                    VALUES (?1, ?1, 'cloud-' || ?1, 0) ON CONFLICT(user_id, workspace_id)
+                    DO UPDATE SET server_id = excluded.server_id, dirty = 0", [id]).unwrap();
+    }
+    // Exact durable state after the old journal commit, before record_closed.
+    db.execute("INSERT INTO pending_layout_closes VALUES ('workspace', ?1, '', NULL)", [&closed]).unwrap();
+    db.execute("INSERT INTO pending_layout_closes VALUES ('archive', ?1, ?2, ?3)",
+        rusqlite::params![archived, entry.archive_id, serde_json::to_string(&entry).unwrap()]).unwrap();
+    std::fs::write(&layout, b"broken").unwrap();
+    for _ in 0..2 {
+        serve.restart();
+        assert!(serve.shutdown().unwrap().success());
+        for id in [closed.as_str(), archived.as_str(), "missing-only"] {
+            let (deleted, dirty, server): (bool, bool, String) = db.query_row(
+                "SELECT deleted_at IS NOT NULL, dirty, server_id FROM workspaces_sync WHERE workspace_id = ?1",
+                [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+            assert_eq!((deleted, dirty), (id != "missing-only", id != "missing-only"), "{id}");
+            assert_eq!(server, format!("cloud-{id}"));
+        }
+        assert!(recovery_backup_path(&layout).exists());
+    }
 }
 
 // Boot in a fresh process each time so only the saved layout, scrollback,
@@ -782,10 +849,10 @@ fn exercise_recovery_exit(exit: &str) {
     }
 
     let exited = boot(exit);
-    assert!(!layout.with_extension("json.recovery-pending").exists());
+    assert_eq!(layout.with_extension("json.recovery-pending").exists(), exit == "discarded-while-running");
     let expected = if exit == "repaired" { &original } else { &pending_restart };
     assert_eq!(exited["on_boot"], expected["after_create"]);
-    if exit == "repaired" {
+    if matches!(exit, "repaired" | "discarded-while-running") {
         assert_eq!(exited["original"], original["original"]);
     } else {
         // Discard makes the absent workspace eligible for normal cleanup.
@@ -794,13 +861,14 @@ fn exercise_recovery_exit(exit: &str) {
             assert_eq!(exited["original"]["row"][field], original["original"]["row"][field]);
         }
         assert!(exited["original"]["row"]["deleted_at"].is_string());
-        if exit == "discarded-while-running" {
-            assert_eq!(exited["original"]["scrollback"], original["original"]["scrollback"]);
-        } else {
-            assert!(exited["original"]["scrollback"].is_null(), "startup cleans orphan scrollback");
-        }
+        assert!(exited["original"]["scrollback"].is_null(), "startup cleans orphan scrollback");
     }
     let later = boot("later");
+    assert!(!layout.with_extension("json.recovery-pending").exists());
+    if exit == "discarded-while-running" {
+        assert!(later["original"]["row"]["deleted_at"].is_string());
+        assert!(later["original"]["scrollback"].is_null());
+    }
     assert_eq!(later["on_boot"], exited["after_create"]);
     if exit == "repaired" {
         assert_eq!(later["original"], original["original"]);
@@ -860,7 +928,7 @@ fn write_panes_and_reconcile_fixture() {
         std::fs::remove_file(recovery_backup_path(&layout)).unwrap();
         assert!(state::load_persisted_state().is_some());
     }
-    assert_eq!(state::layout_recovery_pending(), matches!(phase.as_str(), "recovery" | "pending-restart"));
+    assert_eq!(state::layout_recovery_pending(), matches!(phase.as_str(), "recovery" | "pending-restart" | "discarded-while-running"));
 
     let layout_ids = |ws: &state::WorkspaceSnapshot| {
         let state::PaneNodeSnapshot::Terminal { pane_id, session_id, .. } = &ws.surfaces[0].root else {

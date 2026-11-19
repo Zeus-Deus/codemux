@@ -2435,9 +2435,7 @@ pub(crate) async fn unarchive_workspace_checked<R: tauri::Runtime>(
             state.restore_workspace_pinned_at(&existing_id, entry.pinned_at)?;
         }
         if select { activate_workspace_impl(app.clone(), state, existing_id.clone())?; }
-        #[cfg(unix)]
-        db.consume_recovery_archive(&entry)?;
-        let _ = state.remove_archived_workspace(&archive_id);
+        retire_restored_archive(state, db, &entry)?;
         crate::state::emit_app_state(&app);
         return Ok(existing_id);
     }
@@ -2579,12 +2577,27 @@ pub(crate) async fn unarchive_workspace_checked<R: tauri::Runtime>(
 
     db.restore_hermes_chat_history(&entry.workspace_id, &restored_id,
         entry.worktree_path.as_deref().unwrap_or(&entry.cwd))?;
-    #[cfg(unix)]
-    db.consume_recovery_archive(&entry)?;
-    let _ = state.remove_archived_workspace(&archive_id);
+    retire_restored_archive(state, db, &entry)?;
     if select { activate_workspace_impl(app.clone(), state, restored_id.clone())?; }
     crate::state::emit_app_state(&app);
     Ok(restored_id)
+}
+
+/// The replacement workspace must reach disk before the consumption journal
+/// can remove its archive on restart.
+fn retire_restored_archive(
+    state: &AppStateStore,
+    _db: &crate::database::DatabaseStore,
+    entry: &crate::state::ArchivedWorkspaceSnapshot,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    if crate::state::layout_recovery_pending() {
+        crate::state::flush_persisted_state(state)?;
+        _db.consume_recovery_archive(entry)?;
+    }
+    // A concurrent delete may already have retired this exact entry.
+    let _ = state.remove_archived_workspace(&entry.archive_id);
+    Ok(())
 }
 
 /// Shared delete implementation behind the Tauri command. Removes the
@@ -4682,8 +4695,8 @@ mod archive_guard_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn consuming_a_recovery_archive_keeps_only_the_original_workspace_close() {
-        const TEST: &str = "commands::workspace::archive_guard_tests::consuming_a_recovery_archive_keeps_only_the_original_workspace_close";
+    async fn consumed_recovery_archive_stays_closed_after_backup_restore() {
+        const TEST: &str = "commands::workspace::archive_guard_tests::consumed_recovery_archive_stays_closed_after_backup_restore";
         if crate::test_isolation::isolated(TEST) {
             return;
         }
@@ -4697,9 +4710,15 @@ mod archive_guard_tests {
         let original = store.snapshot();
         let entry = crate::state::build_archive_entry(&original.workspaces[0]);
         let intent = LayoutCloseIntent::Archive(Box::new(entry.clone()));
+        let mut displaced = entry.clone();
+        displaced.workspace_id = "earlier-workspace".into();
+        displaced.archive_id = uuid::Uuid::new_v4().to_string();
+        displaced.archived_at -= 1;
+        db.record_layout_close(&LayoutCloseIntent::Archive(Box::new(displaced.clone())), &[]).unwrap();
         db.record_layout_close(&intent, &[]).unwrap();
         crate::state::restore_pending_layout_closes(&store, &[intent]).unwrap();
 
+        let archived = store.snapshot();
         crate::state::TEST_RECOVERY_PENDING.with(|flag| flag.set(Some(true)));
         let delete = |files| delete_archived_workspace_impl(
             app.handle().clone(), &store, entry.archive_id.clone(), files, false, false,
@@ -4707,14 +4726,57 @@ mod archive_guard_tests {
         assert!(delete(true).await.is_err(), "a root checkout cannot be deleted as a worktree");
         assert!(db.has_pending_layout_close(&LayoutCloseIntent::Archive(Box::new(entry.clone()))).unwrap());
         delete(false).await.unwrap();
-        let remaining = db.pending_layout_closes().unwrap();
-        assert_eq!(remaining, [LayoutCloseIntent::Workspace(entry.workspace_id.clone())]);
-        for snapshot in [store.snapshot(), original] {
+        db.consume_recovery_archive(&entry).unwrap(); // retry after losing the reply
+        let reopened = crate::database::DatabaseStore::test_file(&root.join("closes.sqlite"));
+        let remaining = reopened.pending_layout_closes().unwrap();
+        assert_eq!(remaining.len(), 2);
+        let mut other = entry.clone();
+        other.archive_id = uuid::Uuid::new_v4().to_string();
+        other.workspace_id = "another-workspace".into();
+        for mut snapshot in [archived, original, store.snapshot()] {
+            snapshot.archived_workspaces.extend([displaced.clone(), other.clone()]);
             store.replace_snapshot(snapshot);
-            crate::state::restore_pending_layout_closes(&store, &remaining).unwrap();
-            assert!(store.find_archived_workspace(&entry.archive_id).is_none());
-            assert!(store.find_workspace(&entry.workspace_id).is_none());
+            for _ in 0..2 {
+                crate::state::restore_pending_layout_closes(&store, &remaining).unwrap();
+                assert!(store.find_archived_workspace(&entry.archive_id).is_none());
+                assert!(store.find_workspace(&entry.workspace_id).is_none());
+                assert!(store.find_archived_workspace(&displaced.archive_id).is_none());
+                assert!(store.find_archived_workspace(&other.archive_id).is_some());
+            }
         }
+        crate::state::TEST_RECOVERY_PENDING.with(|flag| flag.set(Some(false)));
+        crate::state::persist_layout_closes(&store, &reopened, &remaining).unwrap();
+        assert!(reopened.pending_layout_closes().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_unarchive_persists_replacement_before_consuming_an_unjournaled_archive() {
+        const TEST: &str = "commands::workspace::archive_guard_tests::recovery_unarchive_persists_replacement_before_consuming_an_unjournaled_archive";
+        if crate::test_isolation::isolated(TEST) { return; }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        std::fs::write(root.join("layout.json"), b"broken").unwrap();
+        assert!(crate::state::load_persisted_state_checked().unwrap().is_none());
+        let app = tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::test_file(&root.join("closes.sqlite")));
+        app.manage(AppStateStore::default());
+        let db = app.state::<crate::database::DatabaseStore>();
+        let state = app.state::<AppStateStore>();
+        let parent = state.create_empty_workspace_at_path(root.clone()).0;
+        let mut entry = crate::state::build_archive_entry(&state.find_workspace(&parent).unwrap());
+        entry.workspace_id = "old-child".into();
+        entry.parent_workspace_id = Some(parent);
+        state.add_archived_workspace(entry.clone());
+        let restored = unarchive_workspace_impl_with_selection(
+            app.handle().clone(), &state, &db, entry.archive_id.clone(), false,
+        ).await.unwrap();
+        let reboot = AppStateStore::default();
+        reboot.replace_snapshot(crate::state::load_persisted_state_checked().unwrap().unwrap());
+        let reopened = crate::database::DatabaseStore::test_file(&root.join("closes.sqlite"));
+        crate::state::restore_pending_layout_closes(&reboot, &reopened.pending_layout_closes().unwrap()).unwrap();
+        assert!(reboot.find_workspace(&restored).is_some());
+        assert!(reboot.find_workspace(&entry.workspace_id).is_none());
+        assert!(reboot.find_archived_workspace(&entry.archive_id).is_none());
     }
 
     fn close_test_app(store: AppStateStore) -> tauri::App<tauri::test::MockRuntime> {
