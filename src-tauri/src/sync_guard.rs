@@ -81,18 +81,23 @@ impl<'a> SyncGuard<'a> {
     }
 }
 
-/// When each row of a registry was last sent, so a pass can try first the
-/// rows that waited longest. Rows that keep stalling then cannot keep a
-/// healthy row behind them from ever being reached before the budget ends.
+/// Since when each waiting row of a registry has waited: when it joined the
+/// backlog until its first attempt, then when it was last sent. A pass tries
+/// the longest-waiting rows first, so neither rows that keep stalling nor a
+/// stream of new work can keep any row from being reached.
 pub(crate) type Attempts = std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Instant>>>;
 
-/// Sort `rows` (by id) so the least recently attempted come first, never
-/// attempted before all. Entries for rows no longer waiting are dropped, so
-/// the record stays as small as the backlog.
+/// Sort `rows` longest-waiting first (ties by id). A row seen for the first
+/// time starts waiting now. Entries for rows no longer waiting are dropped,
+/// so the record stays as small as the backlog.
 pub(crate) fn order_by_last_attempt<T>(attempts: &Attempts, rows: &mut [T], id: impl Fn(&T) -> i64) {
     let mut attempts = attempts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let waiting: std::collections::HashSet<i64> = rows.iter().map(&id).collect();
     attempts.retain(|row_id, _| waiting.contains(row_id));
+    let now = Instant::now();
+    for row_id in &waiting {
+        attempts.entry(*row_id).or_insert(now);
+    }
     rows.sort_by_key(|row| (attempts.get(&id(row)).copied(), id(row)));
 }
 
@@ -150,7 +155,21 @@ impl Coalescer {
 
 #[cfg(test)]
 mod tests {
-    use super::Coalescer;
+    use super::{order_by_last_attempt, record_attempt, Attempts, Coalescer};
+
+    #[test]
+    fn an_older_retry_goes_before_newer_work() {
+        let attempts: Attempts = std::sync::LazyLock::new(Default::default);
+        // Row 5 has been waiting (it was attempted and failed); rows 1 and 2
+        // are new since.
+        let mut rows = vec![5];
+        order_by_last_attempt(&attempts, &mut rows, |r| *r);
+        record_attempt(&attempts, 5);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let mut rows = vec![1, 2, 5];
+        order_by_last_attempt(&attempts, &mut rows, |r| *r);
+        assert_eq!(rows, [5, 1, 2], "the retry has waited longest");
+    }
 
     #[test]
     fn requests_during_a_pass_collapse_into_one_follow_up() {
