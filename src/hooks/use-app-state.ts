@@ -75,19 +75,41 @@ export function useAppStateInit(skip = false) {
     commit?.();
   }, []);
 
-  // Fetch initial state on mount (skip if not authenticated yet)
+  // Deltas and heartbeats require a baseline. Keep trying after a transient
+  // startup failure until the fetch or a pushed snapshot supplies one.
   useEffect(() => {
     if (skip) return;
     let cancelled = false;
-    getAppState()
-      .then((snapshot) => {
-        if (cancelled) return;
-        setAppState(snapshot);
-        markStartup("initial-snapshot-ready", tracedPayloadMeta(snapshot));
-      })
-      .catch((err) => console.error("Failed to fetch app state:", err));
+    let receivedSnapshot = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Sign-out retains the old workspace. Only a full snapshot accepted during
+    // this session completes startup, whether it was fetched or pushed.
+    const unsubscribe = useAppStore.subscribe((state, previous) => {
+      if (state.fullSnapshotCount === previous.fullSnapshotCount || !state.appState) return;
+      receivedSnapshot = true;
+      unsubscribe();
+      clearTimeout(timer);
+      markStartup("initial-snapshot-ready", tracedPayloadMeta(state.appState));
+    });
+    const fetchInitial = async (retryDelay: number) => {
+      try {
+        const snapshot = await getAppState();
+        // An unrevisioned reply cannot be ordered against a snapshot already received.
+        if (cancelled || (!snapshot.snapshot_revision && receivedSnapshot)) return;
+        setAppState(snapshot, receivedSnapshot ? undefined : "bootstrap");
+      } catch (err) {
+        if (cancelled || receivedSnapshot) return;
+        console.error("Failed to fetch app state:", err);
+      }
+      if (!receivedSnapshot && !cancelled) {
+        timer = setTimeout(() => void fetchInitial(Math.min(retryDelay * 2, 30_000)), retryDelay);
+      }
+    };
+    void fetchInitial(1_000);
     return () => {
       cancelled = true;
+      unsubscribe();
+      clearTimeout(timer);
     };
   }, [setAppState, skip]);
 
