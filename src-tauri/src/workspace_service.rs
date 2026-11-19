@@ -1011,7 +1011,10 @@ mod tests {
         let state = AppStateStore::default();
         let closing = state.create_empty_workspace_at_path(checkout.clone()).0;
         state.set_workspace_worktree(&closing, checkout.display().to_string(), "feat".into());
-        let app = mock_app(state);
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        app.manage(crate::database::DatabaseStore::test_file(&dir.path().join("close.sqlite")));
+        app.manage(crate::terminal::PtyState::default());
         let state = app.state::<AppStateStore>();
         let close = || CloseWorkspace {
             workspace_id: closing.clone(),
@@ -1022,9 +1025,9 @@ mod tests {
         };
         let checked = |checkpoint| WorkspaceService::new(app.handle()).checked(checkpoint);
 
-        // Withdrawn while the pre-flight read git, while Hermes chats
-        // stopped, or while teardown ran: the workspace stays as it was.
-        for passes in [0, 1, 2] {
+        // Withdrawal during preflight, chat shutdown, teardown, or the wait
+        // for the detach worker leaves the workspace open.
+        for passes in [0, 1, 2, 3] {
             let error = checked(withdrawn_after(passes)).close(close()).await.unwrap_err();
             assert_eq!(error, "grant_revoked: withdrawn");
             assert!(state.find_workspace(&closing).is_some());
@@ -1032,7 +1035,7 @@ mod tests {
 
         // Withdrawn while its agents stopped and the lifecycle lock was taken:
         // the close stands, and the files and the branch stay.
-        let error = checked(withdrawn_after(3)).close(close()).await.unwrap_err();
+        let error = checked(withdrawn_after(4)).close(close()).await.unwrap_err();
         assert_eq!(error, "grant_revoked: withdrawn; the workspace was closed and its files were kept");
         assert!(state.find_workspace(&closing).is_none());
         assert!(checkout.join(".git").exists());

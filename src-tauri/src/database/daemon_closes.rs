@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
 
+#[cfg(test)]
+static DAEMON_OWNERSHIP_WRITE_WATCH: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>> =
+    std::sync::Mutex::new(None);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct DaemonWorkspaceRoute {
     pub(crate) workspace_id: String,
@@ -164,6 +168,11 @@ fn read_shell_records(
 }
 
 impl DatabaseStore {
+    #[cfg(test)]
+    pub(crate) fn test_watch_daemon_ownership_writes(&self, notify: tokio::sync::mpsc::UnboundedSender<()>) {
+        *DAEMON_OWNERSHIP_WRITE_WATCH.lock().unwrap() = Some(notify);
+    }
+
     pub(crate) fn has_durable_close_journal(&self) -> bool {
         self.conn.lock().unwrap().path().is_some_and(|path| !path.is_empty())
     }
@@ -227,6 +236,10 @@ impl DatabaseStore {
     }
 
     pub(crate) fn remember_daemon_shell(&self, shell: &PendingDaemonClose) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(notify) = DAEMON_OWNERSHIP_WRITE_WATCH.lock().unwrap().take() {
+            let _ = notify.send(());
+        }
         let conn = self.conn.lock().unwrap();
         if conn.path().is_none_or(str::is_empty) {
             return Err("Terminal shell ownership has no on-disk database".into());

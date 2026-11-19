@@ -272,7 +272,7 @@ pub struct SessionRuntime {
     /// where two callers both passed the "writer/master is None" check while
     /// the slow ConPTY initialization was in flight on Windows.
     pub is_spawning: bool,
-    close_fence: Option<Arc<tokio::sync::Semaphore>>,
+    close_fence: Option<Arc<TerminalCloseSignal>>,
     /// Rotated under the sessions lock whenever a spawn claims this id.
     restart_token: Uuid,
     /// Retains guarded shell cleanup targets until daemon attachment succeeds.
@@ -433,6 +433,14 @@ impl SessionRuntime {
         self.writer.is_some() || self.master.is_some() || self.is_spawning
     }
 
+    #[cfg(unix)]
+    fn pending_spawn_close(&self) -> Option<SessionSpawnBlocked> {
+        self.close_fence.as_ref().map(|fence| SessionSpawnBlocked::ClosePending {
+            fence: fence.clone(),
+            restart_token: self.restart_token,
+        })
+    }
+
     fn status_view(&self) -> TerminalStatusView {
         TerminalStatusView {
             status: self.last_status.clone(),
@@ -474,9 +482,25 @@ pub struct PtyState {
     pub sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     #[cfg(unix)]
     pending_daemon_closes: Arc<daemon_backed::PendingDaemonCloses>,
+    #[cfg(unix)]
+    daemon_ownership: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
 }
 
 impl PtyState {
+    #[cfg(unix)]
+    fn daemon_ownership_gate(&self, session_id: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.daemon_ownership.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(gate) = gates.get(session_id).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        // Only in-flight ownership writes or close drains need the gate. A
+        // pending write keeps it alive across replacement runtime generations.
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(session_id.to_owned(), Arc::downgrade(&gate));
+        gate
+    }
+
     /// Returns a snapshot of session_id -> child PID for all active sessions.
     pub fn get_session_pids(&self) -> HashMap<String, u32> {
         let guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -573,27 +597,43 @@ struct SessionSpawnReservation {
     committed: bool,
 }
 
+#[cfg(any(unix, test))]
+#[derive(Debug)]
+enum SessionSpawnBlocked {
+    #[cfg(unix)]
+    ClosePending {
+        fence: Arc<TerminalCloseSignal>,
+        restart_token: Uuid,
+    },
+    Superseded,
+}
+
 impl SessionSpawnReservation {
+    #[cfg(any(unix, test))]
     fn try_new(
         sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
         session_id: &str,
         expected: Option<Uuid>,
-    ) -> Option<Self> {
+    ) -> Result<Self, SessionSpawnBlocked> {
         let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
         if expected.is_some_and(|token| {
             guard.get(session_id).map_or(Uuid::nil(), |runtime| runtime.restart_token) != token
         }) {
-            return None;
+            return Err(SessionSpawnBlocked::Superseded);
         }
         let remove_on_drop = !guard.contains_key(session_id);
         let runtime = guard
             .entry(session_id.to_string())
             .or_insert_with(|| SessionRuntime::new(session_id));
-        let restart_token = runtime.reserve_spawn()?;
+        #[cfg(unix)]
+        if let Some(blocked) = runtime.pending_spawn_close() {
+            return Err(blocked);
+        }
+        let restart_token = runtime.reserve_spawn().ok_or(SessionSpawnBlocked::Superseded)?;
         #[cfg(unix)]
         let reconciliation = runtime.daemon_reconciliation.clone();
         drop(guard);
-        Some(Self {
+        Ok(Self {
             sessions: sessions.clone(),
             session_id: session_id.to_string(),
             restart_token,
@@ -616,7 +656,9 @@ impl SessionSpawnReservation {
     #[cfg(unix)]
     async fn wait_for_close(&self) {
         while let Some(fence) = self.with_current_runtime(|runtime| runtime.close_fence.clone()).flatten() {
-            let _ = fence.acquire().await;
+            if fence.wait_for_commit().await {
+                break;
+            }
         }
     }
 
@@ -814,13 +856,18 @@ fn is_session_spawn_active(
 fn idle_restart_token(
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
-) -> Option<Uuid> {
+) -> Result<Uuid, SessionSpawnBlocked> {
     let guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
-    match guard.get(session_id) {
-        Some(runtime) if runtime.spawn_active() || runtime.close_fence.is_some() => None,
-        Some(runtime) => Some(runtime.restart_token),
-        None => Some(Uuid::nil()),
+    let Some(runtime) = guard.get(session_id) else {
+        return Ok(Uuid::nil());
+    };
+    if runtime.spawn_active() {
+        return Err(SessionSpawnBlocked::Superseded);
     }
+    if let Some(blocked) = runtime.pending_spawn_close() {
+        return Err(blocked);
+    }
+    Ok(runtime.restart_token)
 }
 
 fn map_status_state(state: &TerminalLifecycleState) -> TerminalSessionState {
@@ -2820,6 +2867,8 @@ impl CommittedTerminalClose {
                 Some((id.clone(), runtime))
             }).collect()
         };
+        #[cfg(unix)]
+        self.fence.pending.committed.store(true, Ordering::Release);
         drop(self.fence);
         #[cfg(unix)]
         if let Some(daemon) = self.daemon {
@@ -2833,10 +2882,33 @@ impl CommittedTerminalClose {
     }
 }
 
+#[derive(Debug)]
+struct TerminalCloseSignal {
+    completed: tokio::sync::Semaphore,
+    #[cfg(unix)]
+    committed: AtomicBool,
+}
+
+impl TerminalCloseSignal {
+    fn new() -> Self {
+        Self {
+            completed: tokio::sync::Semaphore::new(0),
+            #[cfg(unix)]
+            committed: AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_commit(&self) -> bool {
+        let _ = self.completed.acquire().await;
+        self.committed.load(Ordering::Acquire)
+    }
+}
+
 struct TerminalCloseFence {
     sessions: Option<Arc<Mutex<HashMap<String, SessionRuntime>>>>,
     ids: Vec<(state::SessionId, bool)>,
-    pending: Arc<tokio::sync::Semaphore>,
+    pending: Arc<TerminalCloseSignal>,
 }
 
 impl Drop for TerminalCloseFence {
@@ -2856,7 +2928,7 @@ impl Drop for TerminalCloseFence {
                 }
             }
         }
-        self.pending.close();
+        self.pending.completed.close();
     }
 }
 
@@ -2868,7 +2940,7 @@ pub(crate) fn commit_terminal_close<'a, R: Runtime>(
     sessions: Option<&Arc<Mutex<HashMap<String, SessionRuntime>>>>,
     mut intent: state::LayoutCloseIntent,
 ) -> Result<(state::TerminalCloseScope<'a>, CommittedTerminalClose), String> {
-    let pending = Arc::new(tokio::sync::Semaphore::new(0));
+    let pending = Arc::new(TerminalCloseSignal::new());
     let (scope, (workspace_id, session_ids, fence, ready, requires_journal)) = state.prepare_terminal_layout_close(&intent, |workspace_id, ids| {
         let mut fence = TerminalCloseFence { sessions: sessions.cloned(), ids: Vec::new(), pending: pending.clone() };
         let mut runtimes = sessions.map(|sessions| sessions.lock().unwrap_or_else(|error| error.into_inner()));
@@ -2907,6 +2979,15 @@ pub(crate) fn commit_terminal_close<'a, R: Runtime>(
     })?;
     if let state::LayoutCloseIntent::Session { workspace_id: owner, .. } = &mut intent {
         owner.clone_from(&workspace_id);
+    }
+    #[cfg(unix)]
+    if let Some(pty) = app.try_state::<PtyState>() {
+        // Wait only for admitted writes on the terminals being closed.
+        // Later writes see the fence. Neither global mutex is held here.
+        for id in &session_ids {
+            let gate = pty.daemon_ownership_gate(&id.0);
+            let _settled = gate.lock().unwrap_or_else(|error| error.into_inner());
+        }
     }
     #[cfg(unix)]
     let daemon = if let Some(db) = app.try_state::<crate::database::DatabaseStore>()
@@ -6616,7 +6697,7 @@ mod tests {
         assert!(try_reserve_session_spawn(&sessions, id).is_none());
         assert!(restart.release_for_spawn());
         // Hydration may already hold a daemon List snapshot for the old shell.
-        assert!(SessionSpawnReservation::try_new(&sessions, id, Some(old)).is_none());
+        assert!(SessionSpawnReservation::try_new(&sessions, id, Some(old)).is_err());
 
         let replacement = try_reserve_session_spawn(&sessions, id).unwrap();
         assert!(SessionSpawnReservation::for_restart(&sessions, id, Some(replacement), None).is_none());
@@ -6669,7 +6750,7 @@ mod tests {
             let _attempt = SessionSpawnReservation::try_new(&sessions, id, None).unwrap();
         }
         assert!(try_reserve_session_spawn(&sessions, id).is_none());
-        assert!(SessionSpawnReservation::try_new(&sessions, id, None).is_some());
+        assert!(SessionSpawnReservation::try_new(&sessions, id, None).is_ok());
     }
 
     #[cfg(unix)]
@@ -6968,6 +7049,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn workspace_close_journal_contention_leaves_unrelated_terminal_responsive() {
         use crate::database::DatabaseStore;
+        use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
+        use crate::pty_daemon::protocol::{ClientRequest, ServerResponse, PROTOCOL_VERSION};
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::net::UnixListener;
 
         const TEST: &str = "terminal::tests::workspace_close_journal_contention_leaves_unrelated_terminal_responsive";
         if crate::test_isolation::isolated(TEST) {
@@ -6986,8 +7071,10 @@ mod tests {
                 let _ = WRITER_BUSY.get().unwrap().send(());
             }
             std::thread::sleep(Duration::from_millis(10));
-            attempt < 500
+            attempt < 900
         });
+        let (notify_ownership, mut ownership) = tokio::sync::mpsc::unbounded_channel();
+        db.test_watch_daemon_ownership_writes(notify_ownership);
 
         let layout = AppStateStore::default();
         let active = layout.snapshot().active_workspace_id.0;
@@ -6997,6 +7084,9 @@ mod tests {
         let closing = layout.create_workspace_with_layout(folder, state::WorkspacePresetLayout::Single).0;
         let closing_plan = layout.pty_hydration_plan_for_workspace(&closing).unwrap();
         let closing_pane = closing_plan.sessions[0].pane_id.clone().unwrap();
+        let startup_workspace = layout.create_workspace_with_layout(root.clone(), state::WorkspacePresetLayout::Single);
+        let startup_plan = layout.pty_hydration_plan_for_workspace(&startup_workspace.0).unwrap();
+        let startup_session = startup_plan.sessions[0].session_id.clone();
         assert!(layout.activate_workspace(&active));
         let terminal = PtyState::default();
         let sessions = terminal.sessions.clone();
@@ -7007,6 +7097,57 @@ mod tests {
         app.manage(db);
         app.manage(layout);
         app.manage(terminal);
+
+        let socket_path = root.join("contended-spawn.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let daemon_pid = std::process::id();
+        let version = env!("CARGO_PKG_VERSION").to_owned();
+        write_manifest(&DaemonManifest {
+            pid: daemon_pid,
+            socket_path,
+            daemon_version: version.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            started_at: 0,
+        }).unwrap();
+        let (finish_daemon, daemon_finished) = tokio::sync::oneshot::channel();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut prepared = None;
+            for expected in ["hello", "list", "prepare", "spawn", "attach"] {
+                let request = serde_json::from_str::<ClientRequest>(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                let response = match (expected, request) {
+                    ("hello", ClientRequest::Hello { request_id }) => ServerResponse::Hello {
+                        request_id,
+                        protocol_version: PROTOCOL_VERSION,
+                        daemon_pid,
+                        daemon_version: version.clone(),
+                        host_claude_plugin: false,
+                        guarded_shells: true,
+                        prepared_spawn: true,
+                    },
+                    ("list", ClientRequest::List { request_id }) => {
+                        ServerResponse::Listed { request_id, sessions: Vec::new() }
+                    }
+                    ("prepare", ClientRequest::PrepareOwnedSpawn { request_id, session_id, shell_id }) => {
+                        prepared = Some((session_id, shell_id));
+                        ServerResponse::SpawnPrepared { request_id }
+                    }
+                    ("spawn", ClientRequest::SpawnOwned { request_id, session_id, shell_id, .. }) => {
+                        assert_eq!(prepared, Some((session_id.clone(), shell_id)));
+                        ServerResponse::Spawned { request_id, session_id, pid: 4242 }
+                    }
+                    ("attach", ClientRequest::AttachOwned { request_id, session_id, shell_id }) => {
+                        assert_eq!(prepared, Some((session_id.clone(), shell_id)));
+                        ServerResponse::Attached { request_id, session_id }
+                    }
+                    (step, request) => panic!("expected {step}, got {request:?}"),
+                };
+                send_daemon_fixture_response(&mut write, response).await;
+            }
+            let _ = daemon_finished.await;
+        });
 
         let writer = rusqlite::Connection::open(&db_path).unwrap();
         writer.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -7020,6 +7161,11 @@ mod tests {
             })
         };
         tokio::time::timeout(Duration::from_secs(3), busy.recv()).await.unwrap().unwrap();
+        let spawning = tokio::spawn(daemon_backed::spawn_pty_for_session_via_daemon(
+            app.handle().clone(), startup_session,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), ownership.recv()).await
+            .expect("the unrelated spawn should reach its ownership write").unwrap();
         let input = tokio::task::spawn_blocking(move || admit_pty_input(&sessions, &live, b"input"));
         let inspect_layout = {
             let app = app.handle().clone();
@@ -7034,8 +7180,12 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), input),
             tokio::time::timeout(Duration::from_secs(2), inspect_layout),
         );
+        assert!(!spawning.is_finished(), "the ownership write must still be waiting for SQLite");
         writer.execute_batch("ROLLBACK").unwrap();
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), close).await.unwrap().unwrap().unwrap(), active);
+        tokio::time::timeout(Duration::from_secs(5), spawning).await.unwrap().unwrap().unwrap();
+        finish_daemon.send(()).unwrap();
+        daemon.await.unwrap();
         input.expect("journal wait held the terminal sessions lock").unwrap().unwrap();
         let (workspace_open, split) = inspect_layout.expect("journal wait held the app state lock").unwrap();
         assert!(workspace_open);
@@ -7191,6 +7341,187 @@ mod tests {
             assert_eq!(db.pending_daemon_closes().unwrap(), [close]);
         }
         tauri::async_runtime::block_on(assert_exact_close_replays(INACTIVE_CLOSE_DB, Some(Uuid::from_u128(2))));
+    }
+
+    #[cfg(unix)]
+    static HYDRATION_CLOSE_WAIT: std::sync::OnceLock<(String, tokio::sync::Notify)> =
+        std::sync::OnceLock::new();
+
+    #[cfg(unix)]
+    pub(super) fn notify_hydration_waiting_for_close(session_id: &str) {
+        if let Some((_, notify)) = HYDRATION_CLOSE_WAIT.get().filter(|(id, _)| id == session_id) {
+            notify.notify_one();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restored_workspace_hydration_resumes_after_close_journal_fails() {
+        use crate::database::DatabaseStore;
+        use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
+        use crate::pty_daemon::protocol::{ClientRequest, DaemonSessionInfo, ServerResponse, PROTOCOL_VERSION};
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::net::UnixListener;
+
+        const TEST: &str = "terminal::tests::restored_workspace_hydration_resumes_after_close_journal_fails";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+
+        static WRITER_BUSY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+        let busy = WRITER_BUSY.get_or_init(tokio::sync::Notify::new);
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let saved = AppStateStore::default();
+        let original_active = saved.active_workspace_id();
+        let folder = root.join("restored");
+        std::fs::create_dir(&folder).unwrap();
+        let workspace_id = saved.create_workspace_with_layout(folder, state::WorkspacePresetLayout::Single).0;
+        let plan = saved.pty_hydration_plan_for_workspace(&workspace_id).unwrap();
+        let session_id = plan.sessions[0].session_id.clone();
+        assert!(saved.activate_workspace(&original_active));
+        state::flush_persisted_state(&saved);
+        let restored = AppStateStore::default();
+        restored.replace_snapshot(state::load_persisted_state().unwrap());
+
+        let shell_id = Uuid::new_v4();
+        let ownership = PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: workspace_id.clone(),
+                host_id: None,
+                ssh_target: None,
+            },
+            session_id: session_id.clone(),
+            shell_id,
+        };
+        let db_path = root.join("hydration-close.sqlite");
+        let db = DatabaseStore::test_file(&db_path);
+        db.remember_daemon_shell(&ownership).unwrap();
+        db.test_busy_handler(|attempt| {
+            if attempt == 0 {
+                WRITER_BUSY.get().unwrap().notify_one();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            attempt < 500
+        });
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer.execute_batch(
+            "CREATE TRIGGER reject_layout_close BEFORE INSERT ON pending_layout_closes
+             BEGIN SELECT RAISE(ABORT, 'fixture rejected layout close'); END;",
+        ).unwrap();
+
+        let app = tauri::test::mock_app();
+        app.manage(restored);
+        app.manage(PtyState::default());
+        app.manage(db);
+        let sessions = &app.state::<PtyState>().inner().sessions;
+        let (_, waiting_for_close) = HYDRATION_CLOSE_WAIT.get_or_init(|| {
+            (session_id.clone(), tokio::sync::Notify::new())
+        });
+
+        let socket_path = root.join("hydration-close.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let daemon_pid = std::process::id();
+        let daemon_version = env!("CARGO_PKG_VERSION").to_owned();
+        write_manifest(&DaemonManifest {
+            pid: daemon_pid,
+            socket_path,
+            daemon_version: daemon_version.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            started_at: 0,
+        }).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            crate::commands::workspace::activate_workspace(
+                app.handle().clone(), app.state(), workspace_id.clone(),
+            ).unwrap();
+            attach_pty_output(
+                app.state(), app.state(), Channel::new(|_| Ok(())), Some(session_id.clone()), None,
+            ).unwrap();
+            // Complete selection persistence before taking the SQLite writer,
+            // so only the close transaction can trip the busy probe.
+            crate::active_workspace_persistence::flush_latest(app.handle()).unwrap();
+
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let hello = lines.next_line().await.unwrap().unwrap();
+            let ClientRequest::Hello { request_id } = serde_json::from_str(&hello).unwrap() else {
+                panic!("expected the daemon handshake: {hello}");
+            };
+            send_daemon_fixture_response(&mut write, ServerResponse::Hello {
+                request_id,
+                protocol_version: PROTOCOL_VERSION,
+                daemon_pid,
+                daemon_version,
+                host_claude_plugin: false,
+                guarded_shells: true,
+                prepared_spawn: true,
+            }).await;
+            let list = lines.next_line().await.unwrap().unwrap();
+            let ClientRequest::List { request_id } = serde_json::from_str(&list).unwrap() else {
+                panic!("expected the restored workspace's daemon inventory request: {list}");
+            };
+
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let close = {
+                let app = app.handle().clone();
+                let workspace_id = workspace_id.clone();
+                tokio::spawn(async move {
+                    crate::commands::workspace::close_workspace(
+                        app.clone(), app.state(), app.state(), workspace_id, Some(true),
+                    ).await
+                })
+            };
+            busy.notified().await;
+            assert!(with_existing_session_runtime(sessions, &session_id, |runtime| {
+                runtime.close_fence.is_some() && matches!(runtime.last_status.state, TerminalLifecycleState::Starting)
+            }).unwrap());
+
+            send_daemon_fixture_response(&mut write, ServerResponse::Listed {
+                request_id,
+                sessions: vec![DaemonSessionInfo {
+                    session_id: session_id.clone(),
+                    shell_id: Some(shell_id),
+                    workspace_id: workspace_id.clone(),
+                    pid: 4242,
+                    argv: vec!["sh".into()],
+                    cwd: "/".into(),
+                    rows: 24,
+                    cols: 80,
+                    created_at: 0,
+                }],
+            }).await;
+            waiting_for_close.notified().await;
+            assert!(!close.is_finished(), "hydration must reach the fence before rollback");
+            writer.execute_batch("ROLLBACK").unwrap();
+            let error = close.await.unwrap().unwrap_err();
+            assert!(error.contains("fixture rejected layout close"), "{error}");
+
+            let attach = lines.next_line().await.unwrap().unwrap();
+            let ClientRequest::AttachOwned { request_id, session_id: attached, shell_id: attached_shell } =
+                serde_json::from_str(&attach).unwrap()
+            else {
+                panic!("expected the original hydration to attach after rollback: {attach}");
+            };
+            assert_eq!(attached, session_id);
+            assert_eq!(attached_shell, shell_id);
+            send_daemon_fixture_response(&mut write, ServerResponse::Attached {
+                request_id,
+                session_id: attached,
+            }).await;
+
+            while !matches!(
+                get_terminal_status(app.state(), app.state(), Some(session_id.clone())).unwrap().status.state,
+                TerminalLifecycleState::Ready,
+            ) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(app.state::<AppStateStore>().active_workspace_id(), workspace_id);
+            let db = app.state::<DatabaseStore>();
+            assert_eq!(db.daemon_shell_ownership().unwrap(), [ownership]);
+            assert!(db.pending_layout_closes().unwrap().is_empty());
+            assert!(db.pending_daemon_closes().unwrap().is_empty());
+        }).await.expect("the original activation should reach Ready after the close journal rejects its insert");
     }
 
     #[cfg(unix)]
@@ -7855,7 +8186,7 @@ mod tests {
             "the failed attempt must not leave is_spawning reserved"
         );
         assert!(
-            SessionSpawnReservation::try_new(&sessions, "timeout-id", None).is_some(),
+            SessionSpawnReservation::try_new(&sessions, "timeout-id", None).is_ok(),
             "an idempotent retry must be able to reserve immediately"
         );
     }
@@ -7919,7 +8250,7 @@ mod tests {
             Some(TerminalLifecycleState::Failed)
         ));
         assert!(
-            SessionSpawnReservation::try_new(&sessions, "visible-status", None).is_some(),
+            SessionSpawnReservation::try_new(&sessions, "visible-status", None).is_ok(),
             "retaining visible status must not retain is_spawning"
         );
     }

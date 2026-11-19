@@ -17,7 +17,7 @@
 use super::{
     emit_terminal_status_if_current, hydration_workspace_pty_env, queue_or_send_output_if_current,
     with_existing_session_runtime, DaemonReconciliation, DaemonWorkspaceRoute, PtyState,
-    SessionSpawnReservation,
+    SessionSpawnBlocked, SessionSpawnReservation, TerminalCloseSignal,
     TerminalLifecycleState,
     TerminalStatusPayload, DEFAULT_COLS, DEFAULT_ROWS,
 };
@@ -33,7 +33,10 @@ use tauri::{AppHandle, Manager, Runtime, State};
 use uuid::Uuid;
 
 enum DaemonSpawnClaim {
-    Hydrate(Uuid),
+    Hydrate {
+        token: Uuid,
+        pending_close: Option<Arc<TerminalCloseSignal>>,
+    },
     Restart(SessionSpawnReservation),
 }
 
@@ -372,8 +375,14 @@ pub(super) async fn hydrate_workspace_via_daemon<R: Runtime>(
             .sessions
             .into_iter()
             .filter_map(|session| {
-                let token = super::idle_restart_token(&sessions, &session.session_id)?;
-                Some((session, DaemonSpawnClaim::Hydrate(token)))
+                let (token, pending_close) =
+                    match super::idle_restart_token(&sessions, &session.session_id) {
+                        Ok(token) => (token, None),
+                        Err(SessionSpawnBlocked::ClosePending { fence, restart_token }) =>
+                            (restart_token, Some(fence)),
+                        Err(SessionSpawnBlocked::Superseded) => return None,
+                    };
+                Some((session, DaemonSpawnClaim::Hydrate { token, pending_close }))
             })
             .collect(),
     };
@@ -390,7 +399,8 @@ pub(super) async fn hydrate_workspace_via_daemon<R: Runtime>(
     if is_remote {
         for (session, claim) in &pending {
             let token = match claim {
-                DaemonSpawnClaim::Hydrate(token) => *token,
+                DaemonSpawnClaim::Hydrate { token, pending_close: None } => *token,
+                DaemonSpawnClaim::Hydrate { pending_close: Some(_), .. } => continue,
                 DaemonSpawnClaim::Restart(reservation) => reservation.restart_token,
             };
             emit_terminal_status_if_current(
@@ -549,6 +559,110 @@ pub(super) async fn hydrate_workspace_via_daemon<R: Runtime>(
         .collect())
 }
 
+#[derive(Clone)]
+struct GuardedShellOwnership {
+    shell: PendingDaemonClose,
+    recovery: Arc<DaemonReconciliation>,
+    gate: Arc<Mutex<()>>,
+    sessions: Arc<Mutex<HashMap<String, super::SessionRuntime>>>,
+    restart_token: Uuid,
+}
+
+#[derive(Clone, Copy)]
+enum ShellResolution {
+    Current,
+    Rejected { allow_ordinary_retry: bool },
+}
+
+impl GuardedShellOwnership {
+    fn with_current_runtime<T>(&self, work: impl FnOnce(&mut super::SessionRuntime) -> T) -> Option<T> {
+        with_existing_session_runtime(&self.sessions, &self.shell.session_id, |runtime| {
+            (runtime.restart_token == self.restart_token).then(|| work(runtime))
+        }).flatten()
+    }
+
+    async fn remember<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        reattached: bool,
+        reconciling: bool,
+    ) -> Result<bool, DaemonHydrationFailure> {
+        let owner = self.clone();
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || {
+            let _lease = owner.gate.lock().unwrap_or_else(|error| error.into_inner());
+            let registered = owner.with_current_runtime(|runtime| {
+                if runtime.close_fence.is_some() {
+                    return Ok(false);
+                }
+                if !owner.recovery.register_shell(owner.shell.shell_id) {
+                    return Err(DaemonHydrationFailure::AlreadyReserved);
+                }
+                Ok(true)
+            }).unwrap_or(Err(DaemonHydrationFailure::AlreadyReserved))?;
+            if !registered {
+                return Ok(false);
+            }
+
+            // Close observes the registered ID and waits for this lease
+            // before transferring ownership. SQLite needs no global lock.
+            let remembered = app.try_state::<DatabaseStore>()
+                .ok_or_else(|| "Terminal shell ownership database is unavailable".to_owned())
+                .and_then(|db| db.remember_daemon_shell(&owner.shell));
+            if let Err(error) = remembered {
+                if !reattached {
+                    owner.with_current_runtime(|runtime| {
+                        owner.recovery.acknowledge_shell_closed(owner.shell.shell_id);
+                        if !reconciling {
+                            runtime.daemon_reconciliation = None;
+                        }
+                    });
+                    // List omits active spawns. A fresh local shell could
+                    // duplicate another shell whose outcome is unknown.
+                    return Err(DaemonHydrationFailure::OwnershipUnavailable(error));
+                }
+                // Attachment does not create a shell. The runtime retains
+                // the exact cleanup target if disk is unavailable.
+                log::error!("Could not remember existing daemon shell for {}: {error}", owner.shell.session_id);
+            }
+            Ok(true)
+        }).await.map_err(|error| DaemonHydrationFailure::OwnershipUnavailable(error.to_string()))?
+    }
+
+    async fn resolve<R: Runtime>(&self, app: &AppHandle<R>, resolution: ShellResolution) {
+        let owner = self.clone();
+        let app = app.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            let _lease = owner.gate.lock().unwrap_or_else(|error| error.into_inner());
+            let can_update = owner.with_current_runtime(|runtime| {
+                match resolution {
+                    ShellResolution::Current => owner.recovery.retain_shell(owner.shell.shell_id),
+                    ShellResolution::Rejected { allow_ordinary_retry } => {
+                        owner.recovery.acknowledge_shell_closed(owner.shell.shell_id);
+                        if allow_ordinary_retry {
+                            runtime.daemon_reconciliation = None;
+                        }
+                    }
+                }
+                runtime.close_fence.is_none()
+            }).unwrap_or(false);
+            if can_update {
+                if let Some(db) = app.try_state::<DatabaseStore>() {
+                    let result = match resolution {
+                        ShellResolution::Current => db.retain_daemon_shell(&owner.shell),
+                        ShellResolution::Rejected { .. } => db.forget_daemon_shell(&owner.shell),
+                    };
+                    if let Err(error) = result {
+                        log::error!("Could not update daemon shell ownership for {}: {error}", owner.shell.session_id);
+                    }
+                }
+            }
+        }).await {
+            log::error!("Daemon shell ownership worker failed for {}: {error}", self.shell.session_id);
+        }
+    }
+}
+
 /// Daemon-backed shell spawn — the persistent equivalent of
 /// `spawn_pty_for_session_in_process`. Mirrors the env construction,
 /// scrollback restore, and session-adapter wiring of the in-process path
@@ -578,9 +692,22 @@ async fn spawn_prepared_session<R: Runtime>(
     let sessions = terminal_state.sessions.clone();
 
     let reservation = match claim {
-        DaemonSpawnClaim::Hydrate(token) => {
-            SessionSpawnReservation::try_new(&sessions, &session_id, Some(token))
-        }
+        DaemonSpawnClaim::Hydrate { token, mut pending_close } => loop {
+            if let Some(fence) = pending_close.take() {
+                #[cfg(test)]
+                super::tests::notify_hydration_waiting_for_close(&session_id);
+                // A rollback leaves this generation eligible. An accepted
+                // close can remove even a runtime whose generation was nil.
+                if fence.wait_for_commit().await {
+                    break None;
+                }
+            }
+            match SessionSpawnReservation::try_new(&sessions, &session_id, Some(token)) {
+                Ok(reservation) => break Some(reservation),
+                Err(SessionSpawnBlocked::ClosePending { fence, .. }) => pending_close = Some(fence),
+                Err(SessionSpawnBlocked::Superseded) => break None,
+            }
+        },
         DaemonSpawnClaim::Restart(reservation) => Some(reservation),
     };
     let Some(mut reservation) = reservation else {
@@ -926,49 +1053,23 @@ async fn spawn_prepared_session<R: Runtime>(
     // Closing the pane starts a separate worker that waits for this lock.
     // Keeping it until install or failure orders cleanup after Spawn/Attach.
     let guarded_target = reservation.reconciliation.as_ref().zip(shell_id).map(|(recovery, shell_id)| {
-        let ownership = PendingDaemonClose {
-            route: recovery.route.clone(),
-            session_id: session_id.clone(),
-            shell_id,
-        };
-        (recovery, ownership)
+        GuardedShellOwnership {
+            shell: PendingDaemonClose {
+                route: recovery.route.clone(),
+                session_id: session_id.clone(),
+                shell_id,
+            },
+            recovery: recovery.clone(),
+            gate: terminal_state.daemon_ownership_gate(&session_id),
+            sessions: sessions.clone(),
+            restart_token,
+        }
     });
-    let db = app.try_state::<DatabaseStore>();
-    let cleanup_target = if let Some((recovery, ownership)) = &guarded_target {
-        let mut target = recovery.target.lock().await;
+    let cleanup_target = if let Some(ownership) = &guarded_target {
+        let mut target = ownership.recovery.target.lock().await;
         loop {
             reservation.wait_for_close().await;
-            let registered = reservation.with_current_runtime(|runtime| {
-            if runtime.close_fence.is_some() {
-                return Ok(false);
-            }
-            if !recovery.register_shell(ownership.shell_id) {
-                return Err(DaemonHydrationFailure::AlreadyReserved);
-            }
-            // Permanent close takes the same sessions lock before collecting
-            // ownership. It either sees this UUID or prevents the RPC.
-            let remembered = db.as_ref()
-                .ok_or_else(|| "Terminal shell ownership database is unavailable".to_owned())
-                .and_then(|db| db.remember_daemon_shell(ownership));
-            if let Err(error) = remembered {
-                if !reattached {
-                    // No request has been sent. Drop only this proposed UUID
-                    // and leave any earlier shell owned by the retry.
-                    recovery.acknowledge_shell_closed(ownership.shell_id);
-                    if !reconciling {
-                        runtime.daemon_reconciliation = None;
-                    }
-                    // List omits active spawns, so this does not establish
-                    // that a new in-process shell would be safe.
-                    return Err(DaemonHydrationFailure::OwnershipUnavailable(error));
-                }
-                // Attachment does not create a shell. Keep its exact
-                // in-memory cleanup target if persistence is unavailable.
-                log::error!("Could not remember existing daemon shell for {session_id}: {error}");
-            }
-            Ok(true)
-            }).unwrap_or(Err(DaemonHydrationFailure::AlreadyReserved))?;
-            if registered {
+            if ownership.remember(&app, reattached, reconciling).await? {
                 break;
             }
         }
@@ -976,42 +1077,6 @@ async fn spawn_prepared_session<R: Runtime>(
         Some(target)
     } else {
         None
-    };
-    let forget_shell = |allow_ordinary_retry| {
-        if let Some((recovery, ownership)) = &guarded_target {
-            reservation.with_current_runtime(|runtime| {
-                recovery.acknowledge_shell_closed(ownership.shell_id);
-                if let Some(db) = db.as_ref().filter(|_| runtime.close_fence.is_none()) {
-                    if let Err(error) = db.forget_daemon_shell(ownership) {
-                        log::error!("Could not forget rejected daemon shell for {session_id}: {error}");
-                    }
-                }
-                if allow_ordinary_retry {
-                    runtime.daemon_reconciliation = None;
-                }
-            });
-        }
-    };
-    let retain_shell = || {
-        if let Some((recovery, ownership)) = &guarded_target {
-            reservation.with_current_runtime(|runtime| {
-                recovery.retain_shell(ownership.shell_id);
-                if let Some(db) = db.as_ref().filter(|_| runtime.close_fence.is_none()) {
-                    if let Err(error) = db.retain_daemon_shell(ownership) {
-                        log::error!("Could not retire resolved daemon shells for {session_id}: {error}");
-                    }
-                }
-            });
-        }
-    };
-    let spawn_failure = |error| {
-        let failure = classify_spawn_rpc_failure(error);
-        if failure.allows_local_fallback() {
-            // A confirmed rejection leaves no new shell to reconcile. Allow
-            // ordinary retry or local fallback while retaining older targets.
-            forget_shell(!reconciling);
-        }
-        failure
     };
     let prepared_spawn = !reattached && client.supports_prepared_spawn();
 
@@ -1034,20 +1099,23 @@ async fn spawn_prepared_session<R: Runtime>(
             return Err(DaemonHydrationFailure::AlreadyReserved);
         }
         let argv = vec![shell.clone()];
-        if let Some((_, ownership)) = guarded_target.as_ref().filter(|_| prepared_spawn) {
-            let shell_id = ownership.shell_id;
+        if let Some(ownership) = guarded_target.as_ref().filter(|_| prepared_spawn) {
+            let shell_id = ownership.shell.shell_id;
             if let Err(error) = client.prepare_owned_spawn(session_id.clone(), shell_id).await {
-                if matches!(&error, PtyDaemonError::Daemon(message)
-                    if message == &format!("session {session_id} already exists in daemon"))
-                {
-                    forget_shell(false);
+                let occupied = matches!(&error, PtyDaemonError::Daemon(message)
+                    if message == &format!("session {session_id} already exists in daemon"));
+                let failure = classify_spawn_rpc_failure(error);
+                if occupied || failure.allows_local_fallback() {
+                    ownership.resolve(&app, ShellResolution::Rejected {
+                        allow_ordinary_retry: !reconciling && failure.allows_local_fallback(),
+                    }).await;
                 }
-                return Err(spawn_failure(error));
+                return Err(failure);
             }
             // List omits in-flight spawns. Prepare checks their slot and
             // replaces any unused permit, so this acknowledgement proves
             // the previous attempt cannot produce a shell.
-            retain_shell();
+            ownership.resolve(&app, ShellResolution::Current).await;
             if !reservation.is_current() {
                 return Err(DaemonHydrationFailure::AlreadyReserved);
             }
@@ -1066,7 +1134,18 @@ async fn spawn_prepared_session<R: Runtime>(
     if !reservation.is_current() {
         return Err(DaemonHydrationFailure::AlreadyReserved);
     }
-    let pid = spawn_result.map_err(spawn_failure)?;
+    let pid = match spawn_result {
+        Ok(pid) => pid,
+        Err(error) => {
+            let failure = classify_spawn_rpc_failure(error);
+            if let Some(ownership) = guarded_target.as_ref().filter(|_| failure.allows_local_fallback()) {
+                // This attempt did not create a shell. Keep unresolved IDs
+                // from earlier attempts while restoring normal fallback.
+                ownership.resolve(&app, ShellResolution::Rejected { allow_ordinary_retry: !reconciling }).await;
+            }
+            return Err(failure);
+        }
+    };
     let attachment = match shell_id {
         Some(shell_id) => client.attach_owned(session_id.clone(), shell_id).await,
         None => client.attach(session_id.clone()).await,
@@ -1079,10 +1158,10 @@ async fn spawn_prepared_session<R: Runtime>(
             return Err(classify_attach_rpc_failure(error));
         }
     };
-    if !prepared_spawn {
+    if let Some(ownership) = guarded_target.as_ref().filter(|_| !prepared_spawn) {
         // A guarded attach proves this is the installed shell. Keep prior
         // identities through failed attachments, where List can be stale.
-        retain_shell();
+        ownership.resolve(&app, ShellResolution::Current).await;
     }
 
     let writer = DaemonWriter::new(client.clone(), session_id.clone());
