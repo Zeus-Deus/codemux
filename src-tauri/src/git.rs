@@ -1995,119 +1995,192 @@ fn branch_held_by_rebase_or_bisect(repo_path: &Path, branch: &str) -> Result<boo
     Ok(false)
 }
 
-/// Fast-forward the branch checked out in `checkout`, `base_branch`, to
-/// `commit`, moving its index and files with it.
-///
-/// Built from plumbing rather than `git merge`, so that nothing can change
-/// underneath it and no configuration can bend it:
-/// - the checkout's `HEAD.lock` is held throughout, so git refuses any
-///   branch switch there, and HEAD is re-read under it — the branch that
-///   moves is the one that was checked;
-/// - the files move with a two-way `read-tree -u -m`, which refuses to
-///   overwrite uncommitted changes, and ignored files the commit would add
-///   are refused here first (read-tree overwrites those);
-/// - the ref moves by compare-and-swap from the old tip, and the files are
-///   put back if that fails;
-/// - no merge strategy, squash or autostash setting applies, and a
-///   signature requirement (`merge.verifySignatures`, or
-///   `--verify-signatures` in the branch's merge options) is checked.
-fn fast_forward_checkout(
-    repo_path: &Path,
-    checkout: &Path,
-    base_branch: &str,
-    commit: &str,
-) -> Result<(), String> {
-    let base_ref = format!("refs/heads/{base_branch}");
-    let head = git_line(checkout, &["rev-parse", "--path-format=absolute", "--git-path", "HEAD"])
+// Keep Git's index.lock from validation through publishing the replacement
+// index. A switch must take this lock before it can write checkout files.
+fn lock_checkout_index(checkout: &Path) -> Result<(PathBuf, tempfile::TempPath), String> {
+    let index = git_line(checkout, &["rev-parse", "--path-format=absolute", "--git-path", "index"])
         .and_then(path_from_git_bytes)
-        .ok_or_else(|| "could not find the checkout's HEAD".to_string())?;
-    let _lock = HeadLock::acquire(&head)?;
-
-    let expected = format!("ref: {base_ref}");
-    let now = std::fs::read(&head).map_err(|e| format!("could not read the checkout's HEAD ({e})"))?;
-    if now.strip_suffix(b"\n").unwrap_or(&now) != expected.as_bytes() {
-        return Err(format!("the checkout no longer has {base_branch} checked out"));
+        .ok_or_else(|| "could not locate the checkout index".to_string())?;
+    let mut name = index.as_os_str().to_owned();
+    name.push(".lock");
+    let path = PathBuf::from(name);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| format!("could not lock the checkout index ({e})"))?;
+    let lock = tempfile::TempPath::try_from_path(path).map_err(|e| e.to_string())?;
+    std::fs::copy(&index, &lock).map_err(|e| format!("could not copy the checkout index ({e})"))?;
+    // Git uses the index timestamp to detect racily clean entries.
+    if !copy_mtime(&index, &lock) {
+        return Err("could not preserve the checkout index timestamp".into());
     }
+    Ok((index, lock))
+}
+
+// A prepared update to HEAD locks both the symbolic ref and its referent
+// using the repository's ref backend. Inspect the symbolic name under that
+// lock. Closing stdin without 'commit' aborts the transaction.
+fn advance_checkout_head(checkout: &Path, base_ref: &str, old: &str, new: &str) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Read, Seek, Write};
+    use std::process::Stdio;
+
+    // A reference-transaction hook may produce more diagnostics than a pipe
+    // can hold before Git acknowledges 'prepare'.
+    let mut diagnostics = tempfile::tempfile().map_err(|e| e.to_string())?;
+    let stderr = diagnostics.try_clone().map_err(|e| e.to_string())?;
+
+    let mut git = git_command()
+        .current_dir(checkout)
+        .args(["update-ref", "-m", "merge into base: fast-forward", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(stderr)
+        .spawn()
+        .map_err(|e| format!("could not start git update-ref ({e})"))?;
+    let mut input = git.stdin.take().unwrap();
+    let mut output = BufReader::new(git.stdout.take().unwrap());
+    let transaction = (|| {
+        writeln!(input, "start\nupdate HEAD {new} {old}\nprepare").map_err(|e| e.to_string())?;
+        for expected in ["start: ok", "prepare: ok"] {
+            let mut reply = String::new();
+            output.read_line(&mut reply).map_err(|e| e.to_string())?;
+            if reply.trim_end() != expected {
+                return Err("git could not reserve the checkout's HEAD".into());
+            }
+        }
+        if git_line(checkout, &["symbolic-ref", "--quiet", "HEAD"]).as_deref() != Some(base_ref.as_bytes()) {
+            return Err(format!("the checkout no longer has {base_ref} checked out"));
+        }
+        writeln!(input, "commit").map_err(|e| e.to_string())
+    })();
+    drop(input);
+    if !git.wait().map_err(|e| e.to_string())?.success() {
+        let mut bytes = Vec::new();
+        diagnostics.rewind().and_then(|()| diagnostics.read_to_end(&mut bytes)).map_err(|e| e.to_string())?;
+        return Err(format!("git update-ref failed: {}", String::from_utf8_lossy(&bytes).trim()));
+    }
+    transaction
+}
+
+fn fast_forward_checkout(checkout: &Path, base_branch: &str, commit: &str) -> Result<(), String> {
+    let (index, lock) = lock_checkout_index(checkout)?;
+    let base_ref = format!("refs/heads/{base_branch}");
     let old = run_git(checkout, &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")])?;
-    let old = old.trim();
-    let (_, _, is_ff) = run_git_full(checkout, &["merge-base", "--is-ancestor", old, commit])?;
+    let (_, _, is_ff) = run_git_full(checkout, &["merge-base", "--is-ancestor", &old, commit])?;
     if !is_ff {
         return Err(format!("{base_branch} moved while merging and is no longer behind the merged commit"));
     }
-
-    if requires_signed_merges(checkout, base_branch) {
-        run_git(checkout, &["verify-commit", commit]).map_err(|e| {
-            format!("it only takes signed commits, and {commit} has no valid signature ({e})")
-        })?;
+    ensure_checkout_idle(checkout)?;
+    verify_checkout_merge_policy(checkout, base_branch, commit)?;
+    if let Some(path) = untracked_file_in_the_way(checkout, &old, commit)? {
+        return Err(format!("Untracked working tree file '{}' would be overwritten by merge.", path.display()));
     }
-    if let Some(path) = untracked_file_in_the_way(checkout, old, commit)? {
-        return Err(format!(
-            "Untracked working tree file '{}' would be overwritten by merge.",
-            path.display()
-        ));
-    }
-    run_git(checkout, &["read-tree", "-u", "-m", old, commit])?;
+    run_git_with_index(checkout, &lock, &["read-tree", "-n", "-u", "-m", &old, commit])?;
 
-    // Run from the source worktree: updating the ref a checkout's HEAD
-    // names from inside that checkout would also take its `HEAD.lock`.
-    let message = format!("merge into {base_branch}: fast-forward");
-    if let Err(e) = run_git(repo_path, &["update-ref", "-m", &message, &base_ref, commit, old]) {
-        let _ = run_git(checkout, &["read-tree", "-u", "-m", commit, old]);
-        return Err(format!("{base_branch} moved while merging ({e})"));
+    // Refusal by a ref lock, transaction hook or signature policy must
+    // precede any write to the user's files or index.
+    advance_checkout_head(checkout, &base_ref, &old, commit)?;
+    if let Err(e) = run_git_with_index(checkout, &lock, &["read-tree", "-u", "-m", &old, commit]) {
+        // The real index is still the original. A reverse read-tree would
+        // destroy staged entries that happened to match the incoming tree.
+        return match run_git(checkout, &["update-ref", &base_ref, &old, commit]) {
+            Ok(_) => {
+                Err(format!("{e}. Restored {base_ref}; check the working files for partial checkout changes."))
+            }
+            Err(recovery) => Err(format!("{e}. Could not restore {base_ref} to {old}: {recovery}")),
+        };
+    }
+    lock.persist(&index).map_err(|err| {
+        // The ref and files now describe the new tree. Keep the corresponding
+        // index available for recovery if the atomic rename itself fails.
+        let cause = err.error;
+        let mut path = err.path;
+        path.disable_cleanup(true);
+        format!("advanced {base_ref}, but could not install the new index ({cause}); it is at {}", path.display())
+    })
+}
+
+fn ensure_checkout_idle(checkout: &Path) -> Result<(), String> {
+    let git_dir = git_path(checkout, "--git-dir").ok_or("could not locate the checkout's Git directory")?;
+    for state in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+        "BISECT_START",
+    ] {
+        if git_dir.join(state).try_exists().map_err(|e| format!("could not inspect {state} ({e})"))? {
+            return Err(format!("finish or abort the operation in this checkout first ({state})"));
+        }
+    }
+
+    // Reftable stores these refs in its tables instead of loose files.
+    for state in ["CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+        let out = git_command()
+            .current_dir(checkout)
+            .args(["show-ref", "--verify", "--quiet", state])
+            .output()
+            .map_err(|e| e.to_string())?;
+        match out.status.code() {
+            Some(1) if out.stderr.is_empty() => {}
+            Some(0) => return Err(format!("finish or abort the operation in this checkout first ({state})")),
+            _ => return Err(format!("could not inspect {state}: {}", String::from_utf8_lossy(&out.stderr).trim())),
+        }
     }
     Ok(())
 }
 
-/// A checkout's `HEAD.lock`, held for the life of the value. While it
-/// exists git refuses to change that checkout's HEAD.
-struct HeadLock(PathBuf);
-
-impl HeadLock {
-    fn acquire(head: &Path) -> Result<Self, String> {
-        let mut lock = head.as_os_str().to_owned();
-        lock.push(".lock");
-        let lock = PathBuf::from(lock);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    "another git command is changing that checkout right now; try again".to_string()
-                } else {
-                    format!("could not lock the checkout's HEAD ({e})")
-                }
-            })?;
-        Ok(Self(lock))
+fn checkout_config(checkout: &Path, key: &str, boolean: bool) -> Result<Option<String>, String> {
+    let mut cmd = git_command();
+    cmd.current_dir(checkout).arg("config");
+    if boolean {
+        cmd.arg("--type=bool");
+    }
+    let out = cmd.args(["--get", key]).output().map_err(|e| e.to_string())?;
+    match out.status.code() {
+        Some(0) => String::from_utf8(out.stdout).map(Some).map_err(|e| format!("invalid {key}: {e}")),
+        Some(1) if out.stderr.is_empty() => Ok(None),
+        _ => Err(format!("could not read {key}: {}", String::from_utf8_lossy(&out.stderr).trim())),
     }
 }
 
-impl Drop for HeadLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// Whether merges into `base_branch` in `checkout` must be signed, as
-/// `git merge` would enforce.
-fn requires_signed_merges(checkout: &Path, base_branch: &str) -> bool {
-    let configured = git_line(checkout, &["config", "--type=bool", "--get", "merge.verifySignatures"])
-        .is_some_and(|v| v == b"true");
-    let branch_options = git_line(
-        checkout,
-        &["config", "--get", &format!("branch.{base_branch}.mergeOptions")],
-    )
-    .map(|v| String::from_utf8_lossy(&v).into_owned())
-    .unwrap_or_default();
-    let mut required = configured;
-    for option in branch_options.split_whitespace() {
-        match option {
-            "--verify-signatures" => required = true,
-            "--no-verify-signatures" => required = false,
-            _ => {}
+fn verify_checkout_merge_policy(checkout: &Path, base: &str, commit: &str) -> Result<(), String> {
+    let mut required =
+        checkout_config(checkout, "merge.verifySignatures", true)?.is_some_and(|v| v.trim_end() == "true");
+    if let Some(options) = checkout_config(checkout, &format!("branch.{base}.mergeOptions"), false)? {
+        // Only accept self-contained defaults we understand. A value-taking
+        // option may consume the next token, including --no-verify-signatures.
+        for word in options.split_ascii_whitespace() {
+            let option = word
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| word.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(word);
+            match option {
+                "--verify-signatures" => required = true,
+                "--no-verify-signatures" => required = false,
+                "--ff" | "--no-ff" | "--ff-only" | "--squash" | "--no-squash" | "--autostash"
+                | "--no-autostash" => {}
+                s if s.strip_prefix("--strategy=").is_some_and(|name| {
+                    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                }) => {}
+                _ => return Err(format!("cannot safely interpret branch.{base}.mergeOptions: {word}")),
+            }
         }
     }
-    required
+    if required {
+        let policy = checkout_config(checkout, "gpg.minTrustLevel", false)?;
+        let mut args = Vec::new();
+        if policy.is_none() {
+            args.extend(["-c", "gpg.minTrustLevel=marginal"]);
+        }
+        args.extend(["verify-commit", commit]);
+        run_git(checkout, &args).map_err(|e| format!("{commit} has no trusted merge signature ({e})"))?;
+    }
+    Ok(())
 }
 
 /// The first path `old..new` changes that `checkout` does not track but
@@ -2126,20 +2199,55 @@ fn untracked_file_in_the_way(checkout: &Path, old: &str, new: &str) -> Result<Op
             Err(format!("git {} failed: {}", args[0], String::from_utf8_lossy(&output.stderr).trim()))
         }
     };
-    let changed = raw(&["diff", "--name-only", "--no-renames", "-z", old, new, "--"])?;
+    let changed = raw(&["diff", "--diff-filter=AMT", "--name-only", "--no-renames", "-z", old, new, "--"])?;
     let tracked = raw(&["ls-files", "-z"])?;
-    let tracked: std::collections::HashSet<&[u8]> =
-        tracked.split(|&b| b == 0).filter(|p| !p.is_empty()).collect();
+    let tracked: HashSet<&[u8]> = tracked.split(|&b| b == 0).collect();
     for path in changed.split(|&b| b == 0).filter(|p| !p.is_empty()) {
-        if tracked.contains(path) {
-            continue;
-        }
-        let Some(rel) = path_from_git_bytes(path.to_vec()) else { continue };
-        match std::fs::symlink_metadata(checkout.join(&rel)) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            // Anything else — the file exists, or a parent is a file — is in
-            // the way.
-            _ => return Ok(Some(rel)),
+        // Stop at the first missing component or non-directory. Never
+        // follow a symlink into another tree while checking the new path.
+        let ends = path.iter().enumerate().filter_map(|(i, &b)| (b == b'/').then_some(i));
+        for end in ends.chain(std::iter::once(path.len())) {
+            let prefix = &path[..end];
+            let rel = path_from_git_bytes(prefix.to_vec()).ok_or("cannot represent the incoming path")?;
+            let meta = match std::fs::symlink_metadata(checkout.join(&rel)) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(format!("could not inspect {} ({e})", rel.display())),
+            };
+            if !meta.is_dir() {
+                if !tracked.contains(prefix) {
+                    return Ok(Some(rel));
+                }
+                break;
+            }
+            if end == path.len() {
+                // This directory will become a file. Git lists the local
+                // contents absent from the index, including ignored files.
+                let out = git_command()
+                    .current_dir(checkout)
+                    .args([
+                        "--literal-pathspecs",
+                        "ls-files",
+                        "--others",
+                        "--directory",
+                        "--no-empty-directory",
+                        "-z",
+                        "--",
+                    ])
+                    .arg(&rel)
+                    .output()
+                    .map_err(|e| e.to_string())?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "could not inspect {}: {}",
+                        rel.display(),
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+                if !out.stdout.is_empty() {
+                    return Ok(Some(rel));
+                }
+            }
         }
     }
     Ok(None)
@@ -2160,7 +2268,7 @@ fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Res
     match branch_worktree(repo_path, base_branch)? {
         // A guarded fast-forward: see `fast_forward_checkout` for why it is
         // not `git merge`.
-        Some(checkout) => fast_forward_checkout(repo_path, &checkout, base_branch, commit)
+        Some(checkout) => fast_forward_checkout(&checkout, base_branch, commit)
             .map_err(|e| {
                 // Advice only for the failure it fits: the fast-forward is
                 // also refused for other reasons (an unsigned commit, a
@@ -7313,7 +7421,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_forward_refuses_a_checkout_switched_to_another_branch_after_validation() {
+    fn test_merge_into_base_refuses_a_checkout_switched_to_another_branch_after_validation() {
         let (_dir, repo, wt) = setup_worktree_merge_scenario();
         let main = main_branch(&repo).to_string();
         std::fs::write(wt.join("feature.txt"), "worktree work").unwrap();
@@ -7326,7 +7434,7 @@ mod tests {
         // branch at the same tip.
         run_git(&repo, &["switch", "-c", "side"]).unwrap();
 
-        let err = fast_forward_checkout(&wt, &repo, &main, &commit).unwrap_err();
+        let err = fast_forward_checkout(&repo, &main, &commit).unwrap_err();
         assert!(err.contains("no longer has"), "unexpected error: {err}");
         assert_eq!(run_git(&repo, &["rev-parse", &main]).unwrap(), main_before);
         assert_eq!(run_git(&repo, &["rev-parse", "side"]).unwrap(), main_before, "the sibling must not move");
@@ -7335,17 +7443,195 @@ mod tests {
     }
 
     #[test]
-    fn no_branch_switch_gets_in_while_the_checkout_is_locked() {
-        let (_dir, repo, _wt) = setup_worktree_merge_scenario();
-        let head = git_line(&repo, &["rev-parse", "--path-format=absolute", "--git-path", "HEAD"])
-            .and_then(path_from_git_bytes)
-            .unwrap();
-        run_git(&repo, &["branch", "side"]).unwrap();
-        let lock = HeadLock::acquire(&head).unwrap();
-        assert!(run_git(&repo, &["switch", "side"]).is_err(), "git must refuse the switch");
-        assert!(HeadLock::acquire(&head).is_err(), "and so must a second lock");
-        drop(lock);
-        run_git(&repo, &["switch", "side"]).expect("the lock is released on drop");
+    fn test_merge_into_base_index_lock_excludes_a_switch_to_a_different_tree() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        run_git(&repo, &["switch", "-c", "side"]).unwrap();
+        std::fs::write(repo.join("side.txt"), "side tree").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "side tree"]).unwrap();
+        let side = head_hash(&repo);
+        run_git(&repo, &["switch", main]).unwrap();
+        std::fs::write(wt.join("incoming.txt"), "incoming").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "incoming"]).unwrap();
+        let new = head_hash(&wt);
+        // Try the switch from Git's prepared transaction hook, after the
+        // preflight has succeeded but before the base ref is committed.
+        let hooks = repo.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        run_git(&repo, &["config", "core.hooksPath", hooks.to_str().unwrap()]).unwrap();
+        let hook = hooks.join("reference-transaction");
+        std::fs::write(&hook, r#"#!/bin/sh
+if test "$1" = prepared && ! test -f .git/switch-attempt; then
+    git switch side >.git/switch-attempt 2>&1 && exit 1
+    test ! -e side.txt && git diff --cached --quiet || exit 1
+fi
+exit 0
+"#).unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fast_forward_checkout(&repo, main, &new).unwrap();
+        let attempt = std::fs::read_to_string(repo.join(".git/switch-attempt")).unwrap();
+        assert!(attempt.contains("index.lock"), "switch must fail before writing its tree: {attempt}");
+        assert_eq!(run_git(&repo, &["symbolic-ref", "--short", "HEAD"]).unwrap(), main);
+        assert_eq!(head_hash(&repo), new);
+        assert_eq!(run_git(&repo, &["rev-parse", "side"]).unwrap(), side);
+        assert!(!repo.join("side.txt").exists());
+        assert_eq!(std::fs::read(repo.join("incoming.txt")).unwrap(), b"incoming");
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_ref_failure_keeps_matching_staged_entry_byte_for_byte() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        let old = head_hash(&repo);
+        for path in [&repo, &wt] {
+            std::fs::write(path.join("shared.txt"), b"matching staged contents\n").unwrap();
+            run_git(path, &["add", "shared.txt"]).unwrap();
+        }
+        run_git(&wt, &["commit", "-m", "incoming"]).unwrap();
+        let index = repo.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        // Reserve the branch ref so the update will fail, even though the
+        // two-tree merge accepts the user's staged contents.
+        std::fs::write(repo.join(format!(".git/refs/heads/{main}.lock")), "").unwrap();
+        let err = fast_forward_checkout(&repo, main, &head_hash(&wt)).unwrap_err();
+        assert!(err.contains("update-ref"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+        assert_eq!(std::fs::read(repo.join("shared.txt")).unwrap(), b"matching staged contents\n");
+        assert!(!repo.join(".git/index.lock").exists());
+    }
+
+    #[test]
+    fn test_merge_into_base_advances_reftable_checkout() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        let (_, stderr, ok) = run_git_full(dir.path(), &["init", "--ref-format=reftable", "-b", "main", "repo"]).unwrap();
+        if !ok && stderr.contains("unknown option") {
+            return; // Git before 2.45 has no reftable backend.
+        }
+        assert!(ok, "{stderr}");
+        git_config(&repo);
+        run_git(&repo, &["commit", "--allow-empty", "-m", "initial"]).unwrap();
+        let wt = dir.path().join("feature");
+        run_git(&repo, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]).unwrap();
+        std::fs::write(wt.join("incoming"), "feature").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature"]).unwrap();
+        let old = head_hash(&repo);
+        let new = head_hash(&wt);
+        run_git(&repo, &["update-ref", "CHERRY_PICK_HEAD", &new]).unwrap();
+        let err = fast_forward_checkout(&repo, "main", &new).unwrap_err();
+        assert!(err.contains("CHERRY_PICK_HEAD"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert!(!repo.join("incoming").exists());
+        run_git(&repo, &["update-ref", "-d", "CHERRY_PICK_HEAD"]).unwrap();
+        assert_eq!(merge_into_base(&wt, "main", false).unwrap().status, "merged");
+        assert_eq!(std::fs::read(repo.join("incoming")).unwrap(), b"feature");
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_layout_transitions_protect_ignored_contents() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        let docs = wt.join("docs");
+        std::fs::write(&docs, "file").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "file"]).unwrap();
+        fast_forward_checkout(&repo, main, &head_hash(&wt)).unwrap();
+
+        run_git(&wt, &["rm", "docs"]).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::write(docs.join("intro"), "page").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "directory"]).unwrap();
+        let directory_commit = head_hash(&wt);
+        fast_forward_checkout(&repo, main, &directory_commit).unwrap();
+        assert_eq!(std::fs::read(repo.join("docs/intro")).unwrap(), b"page");
+
+        run_git(&wt, &["rm", "-r", "docs"]).unwrap();
+        std::fs::write(docs, "replacement").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "file again"]).unwrap();
+        let new = head_hash(&wt);
+        let private = repo.join("docs/local.env");
+        std::fs::write(repo.join(".git/info/exclude"), "*.env\n").unwrap();
+        std::fs::write(&private, "private contents").unwrap();
+        assert!(fast_forward_checkout(&repo, main, &new).is_err());
+        assert_eq!(head_hash(&repo), directory_commit);
+        assert_eq!(std::fs::read(&private).unwrap(), b"private contents");
+        assert_eq!(std::fs::read(repo.join("docs/intro")).unwrap(), b"page");
+        std::fs::remove_file(private).unwrap();
+        fast_forward_checkout(&repo, main, &new).unwrap();
+        assert_eq!(std::fs::read(repo.join("docs")).unwrap(), b"replacement");
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_preserves_a_staged_merge_resolution() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        run_git(&repo, &["switch", "-c", "side"]).unwrap();
+        std::fs::write(repo.join("shared"), "side").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "side"]).unwrap();
+        run_git(&repo, &["switch", main]).unwrap();
+        std::fs::write(repo.join("shared"), "main").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "main"]).unwrap();
+        let old = head_hash(&repo);
+        run_git(&wt, &["merge", "--ff-only", main]).unwrap();
+        std::fs::write(wt.join("incoming"), "incoming").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "incoming"]).unwrap();
+
+        assert!(run_git(&repo, &["merge", "side"]).is_err());
+        std::fs::write(repo.join("shared"), "resolved").unwrap();
+        run_git(&repo, &["add", "shared"]).unwrap();
+        let index = std::fs::read(repo.join(".git/index")).unwrap();
+        let other_parent = run_git(&repo, &["rev-parse", "MERGE_HEAD"]).unwrap();
+        let err = fast_forward_checkout(&repo, main, &head_hash(&wt)).unwrap_err();
+        assert!(err.contains("MERGE_HEAD"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(run_git(&repo, &["rev-parse", "MERGE_HEAD"]).unwrap(), other_parent);
+        assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), index);
+        assert_eq!(std::fs::read(repo.join("shared")).unwrap(), b"resolved");
+        assert!(!repo.join("incoming").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_into_base_quoted_signature_policy_requires_marginal_trust() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        // Let Git's normal OpenPGP verifier consume a deterministic status
+        // transcript, without relying on a developer's keyring or trustdb.
+        let verifier = dir.path().join("verify-signature");
+        std::fs::write(&verifier, "#!/bin/sh\ncat >/dev/null\necho '[GNUPG:] NEWSIG'\necho '[GNUPG:] GOODSIG ABCD Test'\necho '[GNUPG:] TRUST_UNDEFINED'\n").unwrap();
+        std::fs::set_permissions(&verifier, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run_git(&repo, &["config", "gpg.program", verifier.to_str().unwrap()]).unwrap();
+        let old = head_hash(&repo);
+        let tree = run_git(&wt, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        let object = dir.path().join("signed-commit");
+        std::fs::write(&object, format!("tree {tree}\nparent {old}\nauthor Test <test@example.org> 1 +0000\ncommitter Test <test@example.org> 1 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n fixture\n -----END PGP SIGNATURE-----\n\nsigned fixture\n")).unwrap();
+        let commit = run_git(&wt, &["hash-object", "-t", "commit", "-w", object.to_str().unwrap()]).unwrap();
+        run_git(&repo, &["verify-commit", &commit]).expect("fixture passes the generic verifier");
+        run_git(&repo, &["config", &format!("branch.{main}.mergeOptions"), "\"--verify-signatures\""]).unwrap();
+        assert!(run_git(&repo, &["merge", "--ff-only", &commit]).is_err());
+        let err = fast_forward_checkout(&repo, main, &commit).unwrap_err();
+        assert!(err.contains("signature"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        run_git(&repo, &["config", "gpg.minTrustLevel", "undefined"]).unwrap();
+        fast_forward_checkout(&repo, main, &commit).unwrap();
+        assert_eq!(head_hash(&repo), commit);
     }
 
     #[test]
