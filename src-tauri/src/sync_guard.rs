@@ -29,6 +29,35 @@ pub(crate) fn sync_client_with(timeout: Duration) -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Record dispatch before sending. A lost or malformed success response
+/// leaves the marker intact across restarts. A definite rejection can
+/// release it only if no earlier attempt is outstanding.
+pub(crate) async fn send_create(
+    registry: crate::database::SyncRegistry,
+    db: &crate::database::DatabaseStore,
+    id: i64,
+    guard: &SyncGuard<'_>,
+    request: reqwest::RequestBuilder,
+) -> Result<Option<reqwest::Response>, String> {
+    guard.ensure_current()?;
+    if !guard.commit(|| registry.begin_create(db, id))?? {
+        return Ok(None);
+    }
+    let result = request.send().await;
+    let rejected = match &result {
+        Ok(resp) => matches!(resp.status().as_u16(), 400 | 401 | 403 | 404 | 405 | 422),
+        Err(error) => error.is_connect() || error.is_builder(),
+    };
+    if rejected {
+        guard.commit(|| registry.clear_rejected_create(db, id))??;
+    }
+    let response = result.map_err(|e| format!("Network error: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("API error: {}", response.status()));
+    }
+    Ok(Some(response))
+}
+
 /// The session a sync run works for, and when it must stop starting
 /// requests.
 pub(crate) struct SyncGuard<'a> {
@@ -36,7 +65,7 @@ pub(crate) struct SyncGuard<'a> {
     /// session to follow: tests, and the host-side scheduler, which runs in
     /// its own process with a fixed token.
     session: Option<(&'a AuthState, u64)>,
-    deadline: Option<Instant>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl<'a> SyncGuard<'a> {
@@ -50,7 +79,10 @@ impl<'a> SyncGuard<'a> {
 
     /// Stop starting requests once `budget` from now has passed.
     pub(crate) fn within(self, budget: Duration) -> Self {
-        Self { deadline: Some(Instant::now() + budget), ..self }
+        Self {
+            deadline: Some(tokio::time::Instant::now() + budget),
+            ..self
+        }
     }
 
     /// Run `commit` only while the run's session is still current. Local
@@ -68,7 +100,8 @@ impl<'a> SyncGuard<'a> {
 
     /// Whether the pass is past its deadline and should start nothing new.
     pub(crate) fn expired(&self) -> bool {
-        self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        self.deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
     }
 
     /// Checked before each request: a replaced session's token sends

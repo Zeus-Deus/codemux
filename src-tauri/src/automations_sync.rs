@@ -401,19 +401,22 @@ async fn push_insert(
     db: &DatabaseStore,
     guard: &SyncGuard<'_>,
 ) -> Result<(), String> {
-    guard.ensure_current()?;
-    let resp = client
+    let request = client
         .post(format!("{base}/api/automations"))
         .header("Authorization", format!("Bearer {token}"))
-        .json(&upsert_body(row, local_to_server))
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("API error: {}", resp.status()));
-    }
-    let parsed: OneAutomationResponse =
-        resp.json().await.map_err(|e| format!("Parse: {e}"))?;
+        .json(&upsert_body(row, local_to_server));
+    let Some(resp) = crate::sync_guard::send_create(
+        crate::database::SyncRegistry::Automations,
+        db,
+        row.id,
+        guard,
+        request,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let parsed: OneAutomationResponse = resp.json().await.map_err(|e| format!("Parse: {e}"))?;
     guard.commit(|| db.mark_automation_pushed(row, Some(&parsed.automation.id)))??;
     Ok(())
 }
@@ -515,14 +518,10 @@ async fn push_delete(
     db: &DatabaseStore,
     guard: &SyncGuard<'_>,
 ) -> Result<(), String> {
-    let server_id = match &row.server_id {
-        Some(sid) => sid,
-        None => {
-            // Created and deleted before it ever synced — nothing on
-            // the server. Clear `dirty` so the tombstone is purged.
-            guard.commit(|| db.mark_automation_synced(row.id, None))??;
-            return Ok(());
-        }
+    let Some(server_id) = &row.server_id else {
+        return guard.commit(|| {
+            crate::database::SyncRegistry::Automations.settle_unsent_delete(db, row.id)
+        })?;
     };
     guard.ensure_current()?;
     let resp = client
@@ -576,6 +575,51 @@ mod tests {
             retention_limit: 10,
             trigger_type: None,
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn deletion_after_an_unreadable_create_reply_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sync.db");
+        let db = DatabaseStore::test_file(&path);
+        let row = db.insert_automation(&sample_input()).unwrap();
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        // The account accepts the create, but its success body is truncated
+        // before the client can read the assigned ID.
+        let post = server
+            .mock("POST", "/api/automations")
+            .with_status(201)
+            .with_body("{")
+            .expect(1)
+            .create_async()
+            .await;
+        assert!(super::push("token", &db).await.is_err());
+        db.delete_automation(row.id).unwrap();
+        drop(db);
+
+        let reopened = DatabaseStore::test_file(&path);
+        let list = server.mock("GET", "/api/automations")
+            .with_body(serde_json::json!({"automations": [{
+                "id":"srv-lost", "name":row.name, "prompt":row.prompt,
+                "agent":row.agent, "schedule":row.schedule, "timezone":row.timezone,
+                "enabled":row.enabled, "retentionLimit":row.retention_limit,
+                "projectPath":row.project_path, "createdAt":row.created_at, "updatedAt":row.updated_at
+            }]}).to_string()).expect(1).create_async().await;
+        let delete = server
+            .mock("DELETE", "/api/automations/srv-lost")
+            .expect(0)
+            .create_async()
+            .await;
+        assert!(super::sync_once("token", &reopened).await.is_err());
+        list.assert_async().await;
+        delete.assert_async().await;
+        post.assert_async().await;
+        let pending = reopened.list_dirty_automations();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].deleted_at.is_some() && pending[0].server_id.is_none());
+        std::env::remove_var("CODEMUX_API_URL");
     }
 
     #[tokio::test]
