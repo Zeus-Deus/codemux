@@ -1253,14 +1253,22 @@ mod tests {
             ("same rename", "same rename", Some("same rename")),
             ("layout rename", "inventory rename", None),
         ] {
-            check_identity_upsert(layout_title, inventory_title, merged_title).await;
+            check_identity_upsert(layout_title, inventory_title, merged_title, false).await;
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn identity_upsert_recovers_acknowledged_edits_after_lost_reply_and_pull() {
+        check_identity_upsert("layout rename", "old", Some("layout rename"), true).await;
+        check_identity_upsert("layout rename", "inventory rename", None, true).await;
     }
 
     async fn check_identity_upsert(
         layout_title: &'static str,
         inventory_title: &str,
         merged_title: Option<&str>,
+        lose_first_reply: bool,
     ) {
         for inventory_first in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -1339,10 +1347,16 @@ mod tests {
             let mut inventory_body = identity.clone();
             inventory_body["title"] = inventory_title.into();
             inventory_body["projectPath"] = "/new".into();
-            let before_post = server
+            let committed = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+            let patched = committed.clone();
+            let inventory_patch = server
                 .mock("PATCH", "/api/workspaces/canonical")
-                .match_body(mockito::Matcher::Json(inventory_body))
-                .expect(usize::from(inventory_first))
+                .match_body(mockito::Matcher::Json(inventory_body.clone()))
+                .with_body_from_request(move |request| {
+                    *patched.lock().unwrap() = serde_json::from_slice(request.body().unwrap()).unwrap();
+                    Vec::new()
+                })
+                .expect(usize::from(inventory_first || lose_first_reply))
                 .create_async()
                 .await;
 
@@ -1350,10 +1364,50 @@ mod tests {
             layout_body["title"] = layout_title.into();
             layout_body["projectPath"] = "/layout".into();
             let edit_in_flight = layout_title == "old";
-            let edit = std::sync::Arc::downgrade(&db);
             let mut response: serde_json::Value =
                 serde_json::from_str(&workspace_json("canonical")).unwrap();
             response.as_object_mut().unwrap().extend(layout_body.as_object().unwrap().clone());
+            let db = if lose_first_reply {
+                let posted = committed.clone();
+                let lost = server
+                    .mock("POST", "/api/workspaces")
+                    .match_body(mockito::Matcher::Json(layout_body.clone()))
+                    .with_body_from_request(move |request| {
+                        *posted.lock().unwrap() = serde_json::from_slice(request.body().unwrap()).unwrap();
+                        b"{".to_vec()
+                    })
+                    .expect(1)
+                    .create_async()
+                    .await;
+                assert!(super::push("token", &db).await.unwrap_err().contains("Parse:"));
+                lost.assert_async().await;
+                inventory_patch.assert_async().await;
+                let after_push = db.list_workspaces_sync_for_sync();
+                assert!(!after_push.iter().find(|w| w.id == holder.id).unwrap().dirty);
+                assert!(after_push.iter().find(|w| w.workspace_id.is_some()).unwrap().dirty);
+
+                // Return whichever write actually reached the server last.
+                let last = committed.lock().unwrap().clone();
+                assert_eq!(&last, if inventory_first { &layout_body } else { &inventory_body });
+                let mut listed = response.clone();
+                listed.as_object_mut().unwrap().extend(last.as_object().unwrap().clone());
+                let list = server
+                    .mock("GET", "/api/workspaces")
+                    .with_body(serde_json::json!({"workspaces": [listed]}).to_string())
+                    .expect(1)
+                    .create_async()
+                    .await;
+                super::pull("token", &db).await.unwrap();
+                list.assert_async().await;
+                let pulled = db.list_workspaces_sync().into_iter().find(|w| w.id == holder.id).unwrap();
+                assert_eq!(pulled.project_path.as_deref(), last["projectPath"].as_str());
+                drop(db);
+                super::ATTEMPTS.lock().unwrap().clear();
+                std::sync::Arc::new(DatabaseStore::test_file(&path))
+            } else {
+                db
+            };
+            let edit = std::sync::Arc::downgrade(&db);
             let post = server
                 .mock("POST", "/api/workspaces")
                 .match_body(mockito::Matcher::Json(layout_body.clone()))
@@ -1395,7 +1449,7 @@ mod tests {
 
             // The PATCH may also finish in an earlier pass. Its holder
             // stays clean and available to pull while the POST is pending.
-            if inventory_first && layout_title == "layout rename" && inventory_title == "old" {
+            if !lose_first_reply && inventory_first && layout_title == "layout rename" && inventory_title == "old" {
                 let pending = db.dirty_workspace_by_id(holder.id).unwrap().unwrap();
                 super::push_update(
                     &super::sync_client(), &server.url(), "token", &pending, &db,
@@ -1438,7 +1492,7 @@ mod tests {
                 assert_eq!(inventory.project_path.as_deref(), Some("/new"));
                 assert!(inventory.dirty && layout.dirty);
             }
-            before_post.assert_async().await;
+            inventory_patch.assert_async().await;
             post.assert_async().await;
             patch.assert_async().await;
             std::env::remove_var("CODEMUX_API_URL");
