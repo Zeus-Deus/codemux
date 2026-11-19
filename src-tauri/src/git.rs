@@ -7701,6 +7701,142 @@ exit 0
     }
 
     #[cfg(target_os = "linux")]
+    fn set_test_acl(path: &Path, entries: &str) -> bool {
+        let result = Command::new("setfacl").env("LC_ALL", "C").args(["-m", entries]).arg(path).output();
+        let out = match result {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            result => result.unwrap(),
+        };
+        let error = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() && error.contains("Operation not supported") {
+            return false;
+        }
+        assert!(out.status.success(), "{error}");
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_acl(path: &Path) -> String {
+        let out = Command::new("getfacl").env("LC_ALL", "C").args(["-cn"]).arg(path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_acl_after_directory_rollback() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let parent = repo.join("obsolete");
+        std::fs::create_dir(&parent).unwrap();
+        if !set_test_acl(&parent, "u:65534:r-x,d:u::rwx,d:u:65534:r-x,d:g::---,d:o::---") {
+            return;
+        }
+        let acl = test_acl(&parent);
+        std::fs::write(parent.join("tracked"), b"original").unwrap();
+        run_git(&repo, &["add", "obsolete"]).unwrap();
+        run_git(&repo, &["commit", "-m", "track original"]).unwrap();
+        let old = head_hash(&repo);
+        run_git(&wt, &["merge", "--ff-only", &old]).unwrap();
+        run_git(&wt, &["rm", "-r", "obsolete"]).unwrap();
+        std::fs::write(wt.join("collision.env"), b"incoming").unwrap();
+        run_git(&wt, &["add", "collision.env"]).unwrap();
+        run_git(&wt, &["commit", "-m", "replace obsolete directory"]).unwrap();
+        std::fs::write(repo.join(".git/info/exclude"), "*.env\n").unwrap();
+        std::fs::write(repo.join("collision.env"), b"private").unwrap();
+
+        let index = repo.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        let err = fast_forward_checkout(&repo, main_branch(&repo), &head_hash(&wt)).unwrap_err();
+        assert!(err.contains("collision.env"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+        assert_eq!(std::fs::read(repo.join("collision.env")).unwrap(), b"private");
+        assert_eq!(std::fs::read(parent.join("tracked")).unwrap(), b"original");
+        assert_eq!(test_acl(&parent), acl);
+
+        // A different parent appearing during rollback owns its name. Keep
+        // both the displaced directory and the tracked file in recovery.
+        let (_, lock) = lock_checkout_index(&repo).unwrap();
+        let mut files = checkout::PreparedCheckout::new(&repo, &lock, &old, &head_hash(&wt)).unwrap();
+        let collision = files.install(&repo, &lock).unwrap_err();
+        assert!(collision.contains("collision.env"), "{collision}");
+        let other = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(other.path(), &parent).unwrap();
+        let err = files.rollback(collision);
+        let (_, recovery) = err.split_once("checkout recovery files remain at ").expect(&err);
+        assert_eq!(std::fs::read_link(&parent).unwrap(), other.path());
+        assert!(!other.path().join("tracked").exists());
+        assert_eq!(std::fs::read(Path::new(recovery).join("original/obsolete/tracked")).unwrap(), b"original");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_acl_write_only_file_like_git() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let worktrees = TempDir::new().unwrap();
+        let native = worktrees.path().join("native");
+        run_git(&repo, &["worktree", "add", "--detach", native.to_str().unwrap()]).unwrap();
+        let path = "nested/incoming";
+        for root in [&repo, &native, &wt] {
+            std::fs::create_dir(root.join("nested")).unwrap();
+        }
+        for root in [&repo, &native] {
+            if !set_test_acl(&root.join("nested"), "d:u::-w-,d:g::---,d:o::---") {
+                return;
+            }
+        }
+        std::fs::write(wt.join(path), b"filtered bytes").unwrap();
+        run_git(&wt, &["add", path]).unwrap();
+        run_git(&wt, &["commit", "-m", "add file"]).unwrap();
+        let new = head_hash(&wt);
+        run_git(&native, &["merge", "--ff-only", &new]).unwrap();
+        let native_path = native.join(path);
+        assert_eq!(std::fs::metadata(&native_path).unwrap().permissions().mode() & 0o777, 0o200);
+        // A privileged runner can bypass the read restriction.
+        match std::fs::File::open(&native_path) {
+            Ok(_) => return,
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+        }
+
+        let dest = repo.join(path);
+        {
+            let (_, lock) = lock_checkout_index(&repo).unwrap();
+            let mut files = checkout::PreparedCheckout::new(&repo, &lock, &head_hash(&repo), &new).unwrap();
+            files.install(&repo, &lock).unwrap();
+            let err = files.rollback("simulated ref refusal".into());
+            assert!(!err.contains("Could not restore"), "{err}");
+            assert!(!dest.exists());
+        }
+        // Validate both the held inode's bytes and its identity at the name.
+        for replace in [false, true] {
+            let (_, lock) = lock_checkout_index(&repo).unwrap();
+            let mut files = checkout::PreparedCheckout::new(&repo, &lock, &head_hash(&repo), &new).unwrap();
+            files.install(&repo, &lock).unwrap();
+            if replace {
+                std::fs::rename(&dest, repo.join("moved")).unwrap();
+            }
+            std::fs::write(&dest, b"local edit").unwrap();
+            let err = files.rollback("simulated ref refusal".into());
+            assert!(err.contains("changed during checkout"), "{err}");
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), b"local edit");
+            std::fs::rename(&dest, worktrees.path().join(if replace { "replacement" } else { "edit" })).unwrap();
+        }
+        fast_forward_checkout(&repo, main_branch(&repo), &new).unwrap();
+        assert_eq!(head_hash(&repo), new);
+        assert_eq!(test_acl(&dest), test_acl(&native_path));
+        assert_eq!(run_git(&repo, &["ls-files", "--stage", "--", path]).unwrap(),
+                   run_git(&native, &["ls-files", "--stage", "--", path]).unwrap());
+        for file in [&dest, &native_path] {
+            assert_eq!(std::fs::File::open(file).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(std::fs::read(dest).unwrap(), std::fs::read(native_path).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_merge_into_base_inherits_nested_default_acl_like_git() {
         use std::os::unix::fs::PermissionsExt;
@@ -7715,17 +7851,9 @@ exit 0
         for root in [&repo, &native] {
             let nested = root.join("nested");
             std::fs::create_dir(&nested).unwrap();
-            let result = Command::new("setfacl").env("LC_ALL", "C").args(["-d", "-m", "u::rwx,u:65534:r-x,g::---,m::r-x,o::---"])
-                .arg(&nested).output();
-            let output = match result {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-                result => result.unwrap(),
-            };
-            let error = String::from_utf8_lossy(&output.stderr);
-            if !output.status.success() && error.contains("Operation not supported") {
+            if !set_test_acl(&nested, "d:u::rwx,d:u:65534:r-x,d:g::---,d:m::r-x,d:o::---") {
                 return;
             }
-            assert!(output.status.success(), "{error}");
         }
 
         std::fs::create_dir_all(wt.join("nested/new-dir")).unwrap();
@@ -7752,15 +7880,10 @@ exit 0
         }
         fast_forward_checkout(&repo, main_branch(&repo), &new).unwrap();
 
-        let acl = |path: &Path| {
-            let out = Command::new("getfacl").env("LC_ALL", "C").args(["-cn"]).arg(path).output().unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-            String::from_utf8(out.stdout).unwrap()
-        };
         for path in paths {
-            let expected = acl(&native.join(path));
+            let expected = test_acl(&native.join(path));
             assert!(expected.contains("user:65534:r-x") && expected.contains("other::---"), "{expected}");
-            assert_eq!(acl(&repo.join(path)), expected, "{path}");
+            assert_eq!(test_acl(&repo.join(path)), expected, "{path}");
             assert_eq!(std::fs::metadata(repo.join(path)).unwrap().permissions().mode(),
                        std::fs::metadata(native.join(path)).unwrap().permissions().mode(), "{path}");
             assert_eq!(std::fs::read(repo.join(path)).unwrap(), b"incoming");

@@ -5,7 +5,7 @@ use super::{checkout_config, git_command, git_path, path_from_git_bytes, run_git
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{self, ErrorKind};
+use std::io::{self, BufRead, ErrorKind, Seek, Write};
 use std::path::{Path, PathBuf};
 use tempfile::{NamedTempFile, TempDir, TempPath};
 
@@ -146,6 +146,32 @@ fn copy_local_attributes(
     Ok(())
 }
 
+#[cfg(unix)]
+fn same_file_at(file: &fs::File, path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.metadata()?;
+    let moved = fs::symlink_metadata(path)?;
+    Ok((held.dev(), held.ino()) == (moved.dev(), moved.ino()))
+}
+
+#[cfg(windows)]
+fn open_for_identity(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    fs::File::options()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn same_file_at(file: &fs::File, path: &Path) -> io::Result<bool> {
+    use crate::windows_file_id::file_id;
+    Ok(file_id(&open_for_identity(path)?)? == file_id(file)?)
+}
+
 // Fingerprint the actual checkout representation, including smudged bytes.
 #[derive(PartialEq, Eq)]
 enum FileState {
@@ -169,13 +195,16 @@ impl FileState {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
-        let mut file = options.open(path)?;
+        Self::read_regular(&mut options.open(path)?, path)
+    }
+
+    fn read_regular(file: &mut fs::File, path: &Path) -> io::Result<Self> {
         let meta = file.metadata()?;
         if !meta.is_file() {
             return Err(collision(path));
         }
         let mut hash = Sha256::new();
-        io::copy(&mut file, &mut hash)?;
+        io::copy(file, &mut hash)?;
         Ok(Self::Regular(hash.finalize().into(), meta.permissions()))
     }
 }
@@ -210,8 +239,9 @@ enum Undo {
         dest: PathBuf,
         prepared: PathBuf,
         state: FileState,
+        held: Option<fs::File>,
     },
-    CreateDir(PathBuf, fs::Permissions),
+    RestoreDir(PathBuf, PathBuf),
     RemoveDir(PathBuf),
 }
 
@@ -440,7 +470,7 @@ impl PreparedCheckout {
                     return Err(collision(&dest));
                 }
                 // Git leaves populated submodules in the checkout.
-                remove_empty_dir(&dest, &mut self.undo)?;
+                remove_empty_dir(&dest, &self.recovery, &mut self.undo)?;
             } else if meta.is_dir() {
                 return Err(collision(&dest));
             } else {
@@ -450,7 +480,9 @@ impl PreparedCheckout {
                 self.undo.push(Undo::RestoreFile(backup, dest.clone()));
             }
             for parent in dest.ancestors().skip(1).take_while(|p| *p != checkout) {
-                if needed_dirs.contains(parent) || !remove_empty_dir(parent, &mut self.undo)? {
+                if needed_dirs.contains(parent)
+                    || !remove_empty_dir(parent, &self.recovery, &mut self.undo)?
+                {
                     break;
                 }
             }
@@ -467,15 +499,16 @@ impl PreparedCheckout {
                 continue;
             }
             if fs::symlink_metadata(&dest).is_ok_and(|m| m.is_dir()) {
-                remove_empty_dir(&dest, &mut self.undo)?;
+                remove_empty_dir(&dest, &self.recovery, &mut self.undo)?;
             }
             // The no-replace operation itself protects ignored and untracked
             // files, including files created after Git's validation.
             let prepared = self.recovery.join("tree").join(rel);
-            if fs::symlink_metadata(&prepared)?.is_file() {
-                prepare_regular_file(&prepared, &dir, *kind, &self.recovery, &mut self.undo)?;
-            }
-            let state = FileState::read(&prepared)?;
+            let (state, held) = if fs::symlink_metadata(&prepared)?.is_file() {
+                prepare_regular_file(&prepared, &dir, *kind, &self.recovery, &mut self.undo)?
+            } else {
+                (FileState::read(&prepared)?, None)
+            };
             move_noclobber(prepared.clone(), &dest).map_err(|e| {
                 if e.kind() == ErrorKind::AlreadyExists || dest.is_dir() {
                     collision(&dest)
@@ -487,6 +520,7 @@ impl PreparedCheckout {
                 dest,
                 prepared,
                 state,
+                held,
             });
         }
         Ok(())
@@ -513,6 +547,15 @@ impl PreparedCheckout {
     }
 
     pub(super) fn keep_originals(mut self) -> Option<String> {
+        for action in &self.undo {
+            if let Undo::RestoreDir(backup, _) = action {
+                // A writer with an open directory handle may have created an
+                // entry since the move. Only discard directories still empty.
+                if fs::remove_dir(backup).is_err() {
+                    return Some(self.retain(self.recovery.clone()));
+                }
+            }
+        }
         if self.undo.iter().any(|u| matches!(u, Undo::RestoreFile(..))) {
             // Installation has consumed the incoming files. Discard any
             // remaining preparation data, such as mirrored .gitattributes.
@@ -529,14 +572,24 @@ impl PreparedCheckout {
         let mut uninstalled = false;
         while let Some(action) = self.undo.pop() {
             let result = match action {
-                Undo::RestoreFile(_, dest) if preserve.contains(&dest) => continue,
-                Undo::RestoreFile(backup, dest) => move_noclobber(backup, &dest),
+                Undo::RestoreFile(backup, dest) | Undo::RestoreDir(backup, dest) => {
+                    if dest.ancestors().any(|p| preserve.contains(p)) {
+                        continue;
+                    }
+                    let result = move_noclobber(backup, &dest);
+                    if result.is_err() {
+                        // Do not restore children through a replacement parent.
+                        preserve.insert(dest);
+                    }
+                    result
+                }
                 Undo::UninstallFile {
                     dest,
                     prepared,
                     state,
+                    held,
                 } => {
-                    let result = uninstall_file(&dest, &prepared, state);
+                    let result = uninstall_file(&dest, &prepared, state, held);
                     if result.is_ok() {
                         uninstalled = true;
                     } else {
@@ -546,16 +599,6 @@ impl PreparedCheckout {
                     }
                     result
                 }
-                Undo::CreateDir(dir, mode) => match fs::create_dir(&dir) {
-                    Ok(()) => fs::set_permissions(dir, mode),
-                    Err(e)
-                        if e.kind() == ErrorKind::AlreadyExists
-                            && fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) =>
-                    {
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                },
                 Undo::RemoveDir(dir) => match fs::remove_dir(dir) {
                     // Another process added a file here. Leave its directory.
                     Err(e) if e.kind() == ErrorKind::DirectoryNotEmpty => Ok(()),
@@ -594,20 +637,17 @@ fn prepare_regular_file(
     kind: EntryKind,
     recovery: &Path,
     undo: &mut Vec<Undo>,
-) -> io::Result<()> {
+) -> io::Result<(FileState, Option<fs::File>)> {
     #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     #[cfg(windows)]
     use {
-        crate::windows_file_id::file_id,
         std::os::windows::fs::{MetadataExt, OpenOptionsExt},
-        windows_sys::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_HIDDEN, FILE_FLAG_OPEN_REPARSE_POINT,
-        },
+        windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN,
     };
 
     let mut options = fs::File::options();
-    options.write(true).create_new(true);
+    options.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         options.mode(if kind == EntryKind::Executable {
@@ -627,36 +667,35 @@ fn prepare_regular_file(
         .prefix(".codemux-incoming-")
         .make_in(parent, |p| options.open(p))?;
     let (mut file, mut name) = empty.into_parts();
-    #[cfg(unix)]
-    let created = file.metadata()?;
-    #[cfg(windows)]
-    let created = file_id(&file)?;
     let private = recovery.join("incoming");
     move_noclobber(name.to_path_buf(), &private)?;
     name.disable_cleanup(true);
     // If another writer replaced the temporary name, give rollback the
     // moved object until we know it is ours.
     undo.push(Undo::RestoreFile(private.clone(), name.to_path_buf()));
-    #[cfg(unix)]
-    let same = {
-        let moved = fs::symlink_metadata(&private)?;
-        (moved.dev(), moved.ino()) == (created.dev(), created.ino())
-    };
-    #[cfg(windows)]
-    let same = {
-        let moved = fs::File::options()
-            .access_mode(0)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&private)?;
-        file_id(&moved)? == created
-    };
-    if !same {
+    if !same_file_at(&file, &private)? {
         return Err(changed(&name));
     }
     undo.pop();
-    io::copy(&mut fs::File::open(prepared)?, &mut file)?;
-    drop(file);
-    fs::rename(private, prepared)
+    let mut source = io::BufReader::new(fs::File::open(prepared)?);
+    let mut hash = Sha256::new();
+    loop {
+        let bytes = source.fill_buf()?;
+        if bytes.is_empty() {
+            break;
+        }
+        file.write_all(bytes)?;
+        hash.update(bytes);
+        let count = bytes.len();
+        source.consume(count);
+    }
+    drop(source);
+    let state = FileState::Regular(hash.finalize().into(), file.metadata()?.permissions());
+    // A creation handle can still read an inode whose inherited ACL denies
+    // reopening it. Only spend a descriptor for the transaction in that case.
+    let held = fs::File::open(&private).is_err().then_some(file);
+    fs::rename(private, prepared)?;
+    Ok((state, held))
 }
 
 fn changed(path: &Path) -> io::Error {
@@ -668,15 +707,29 @@ fn changed(path: &Path) -> io::Error {
 
 // Take the installed object back before comparing it. Checking the live
 // path and then unlinking it could discard another save between the two.
-fn uninstall_file(dest: &Path, prepared: &Path, expected: FileState) -> io::Result<()> {
+fn uninstall_file(
+    dest: &Path,
+    prepared: &Path,
+    expected: FileState,
+    held: Option<fs::File>,
+) -> io::Result<()> {
     move_noclobber(dest.to_owned(), prepared)?;
-    let check = FileState::read(prepared).and_then(|actual| {
+    let check = (|| {
+        let actual = if let Some(mut file) = held {
+            if !same_file_at(&file, prepared)? {
+                return Err(changed(dest));
+            }
+            file.rewind()?;
+            FileState::read_regular(&mut file, prepared)?
+        } else {
+            FileState::read(prepared)?
+        };
         if actual == expected {
             Ok(())
         } else {
             Err(changed(dest))
         }
-    });
+    })();
     if check.is_err() {
         move_noclobber(prepared.to_owned(), dest)?;
     }
@@ -724,16 +777,33 @@ fn ensure_dir(dir: &Path, undo: &mut Vec<Undo>) -> io::Result<()> {
     }
 }
 
-fn remove_empty_dir(dir: &Path, undo: &mut Vec<Undo>) -> io::Result<bool> {
-    let mode = fs::symlink_metadata(dir)?.permissions();
-    match fs::remove_dir(dir) {
-        Ok(()) => {
-            undo.push(Undo::CreateDir(dir.to_owned(), mode));
-            Ok(true)
-        }
-        Err(e) if e.kind() == ErrorKind::DirectoryNotEmpty => Ok(false),
-        Err(e) => Err(e),
+fn remove_empty_dir(dir: &Path, recovery: &Path, undo: &mut Vec<Undo>) -> io::Result<bool> {
+    #[cfg(unix)]
+    let held = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(dir)?
+    };
+    #[cfg(windows)]
+    let held = open_for_identity(dir)?;
+    if fs::read_dir(dir)?.next().transpose()?.is_some() {
+        return Ok(false);
     }
+    // Keep the directory itself, including both its access and inheritance
+    // policy. A mkdir/chmod rollback cannot reproduce either ACL.
+    let backup = recovery.join(format!("directory-{}", undo.len()));
+    move_noclobber(dir.to_owned(), &backup)?;
+    undo.push(Undo::RestoreDir(backup.clone(), dir.to_owned()));
+    // A name can change or gain children between inspection and rename.
+    if !held.metadata()?.is_dir()
+        || !same_file_at(&held, &backup)?
+        || fs::read_dir(&backup)?.next().transpose()?.is_some()
+    {
+        return Err(changed(dir));
+    }
+    Ok(true)
 }
 
 #[cfg(not(windows))]
