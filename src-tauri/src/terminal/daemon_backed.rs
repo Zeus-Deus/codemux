@@ -738,13 +738,17 @@ async fn spawn_prepared_session<R: Runtime>(
     let reattached = existing.is_some();
     let shell_id = match (&existing, client.supports_guarded_shells()) {
         (Some(existing), true) => existing.shell_id,
-        // Know the shell identity before Spawn, even if its reply is lost.
-        (None, true) => Some(Uuid::new_v4()),
-        (_, false) => None,
+        (Some(_), false) => None,
+        (None, _) if client.supports_prepared_spawn() => Some(Uuid::new_v4()),
+        (None, _) => {
+            // A new shell needs a permit the daemon can revoke if its pane
+            // closes before Spawn arrives. List omits in-flight spawns, so
+            // an empty result cannot authorize a local replacement either.
+            return Err(DaemonHydrationFailure::RequiresGuardedRecovery);
+        }
     };
-    if reconciling && (shell_id.is_none() || (!reattached && !client.supports_prepared_spawn())) {
-        // Recovery can outlive the pane. A new shell also needs a permit the
-        // daemon can revoke before an already-sent Spawn reaches it.
+    if reconciling && shell_id.is_none() {
+        // Recovery can outlive the pane and must own its exact shell.
         return Err(DaemonHydrationFailure::RequiresGuardedRecovery);
     }
     let workspace_id = workspace.workspace_id.clone();
@@ -1079,8 +1083,6 @@ async fn spawn_prepared_session<R: Runtime>(
     } else {
         None
     };
-    let prepared_spawn = !reattached && client.supports_prepared_spawn();
-
     // Idempotent reattach decision comes from the workspace-level List. The
     // caller performs exactly one List and maps it before any pane tasks fan
     // out, so an eight-pane activation never sends eight identical RPCs.
@@ -1100,36 +1102,30 @@ async fn spawn_prepared_session<R: Runtime>(
             return Err(DaemonHydrationFailure::AlreadyReserved);
         }
         let argv = vec![shell.clone()];
-        if let Some(ownership) = guarded_target.as_ref().filter(|_| prepared_spawn) {
-            let shell_id = ownership.shell.shell_id;
-            if let Err(error) = client.prepare_owned_spawn(session_id.clone(), shell_id).await {
-                let occupied = matches!(&error, PtyDaemonError::Daemon(message)
-                    if message == &format!("session {session_id} already exists in daemon"));
-                let failure = classify_spawn_rpc_failure(error);
-                if occupied || failure.allows_local_fallback() {
-                    ownership.resolve(&app, ShellResolution::Rejected {
-                        allow_ordinary_retry: !reconciling && failure.allows_local_fallback(),
-                    }).await;
-                }
-                return Err(failure);
+        let ownership = guarded_target.as_ref().ok_or(DaemonHydrationFailure::RequiresGuardedRecovery)?;
+        let shell_id = ownership.shell.shell_id;
+        if let Err(error) = client.prepare_owned_spawn(session_id.clone(), shell_id).await {
+            let occupied = matches!(&error, PtyDaemonError::Daemon(message)
+                if message == &format!("session {session_id} already exists in daemon"));
+            let failure = classify_spawn_rpc_failure(error);
+            if occupied || failure.allows_local_fallback() {
+                ownership.resolve(&app, ShellResolution::Rejected {
+                    allow_ordinary_retry: !reconciling && failure.allows_local_fallback(),
+                }).await;
             }
-            // List omits in-flight spawns. Prepare checks their slot and
-            // replaces any unused permit, so this acknowledgement proves
-            // the previous attempt cannot produce a shell.
-            ownership.resolve(&app, ShellResolution::Current).await;
-            if !reservation.is_current() {
-                return Err(DaemonHydrationFailure::AlreadyReserved);
-            }
-            client.spawn_prepared(
-                session_id.clone(), shell_id, workspace_id, argv, effective_cwd, env,
-                DEFAULT_ROWS, DEFAULT_COLS,
-            ).await
-        } else {
-            client.spawn_with_shell_id(
-                session_id.clone(), shell_id, workspace_id, argv, effective_cwd, env,
-                DEFAULT_ROWS, DEFAULT_COLS,
-            ).await
+            return Err(failure);
         }
+        // List omits in-flight spawns. Prepare checks their slot and
+        // replaces any unused permit, so this acknowledgement proves
+        // the previous attempt cannot produce a shell.
+        ownership.resolve(&app, ShellResolution::Current).await;
+        if !reservation.is_current() {
+            return Err(DaemonHydrationFailure::AlreadyReserved);
+        }
+        client.spawn_prepared(
+            session_id.clone(), shell_id, workspace_id, argv, effective_cwd, env,
+            DEFAULT_ROWS, DEFAULT_COLS,
+        ).await
     };
 
     if !reservation.is_current() {
@@ -1159,7 +1155,7 @@ async fn spawn_prepared_session<R: Runtime>(
             return Err(classify_attach_rpc_failure(error));
         }
     };
-    if let Some(ownership) = guarded_target.as_ref().filter(|_| !prepared_spawn) {
+    if let Some(ownership) = guarded_target.as_ref().filter(|_| reattached) {
         // A guarded attach proves this is the installed shell. Keep prior
         // identities through failed attachments, where List can be stale.
         ownership.resolve(&app, ShellResolution::Current).await;

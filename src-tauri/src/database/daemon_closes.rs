@@ -1,6 +1,7 @@
 //! Local journal for layout closes and their independent guarded daemon cleanup.
 
 use super::DatabaseStore;
+use crate::agent_control::{ControlError, ErrorCode};
 use crate::state::{ArchivedWorkspaceSnapshot, LayoutCloseIntent, SessionId};
 use crate::terminal::TerminalCloseError;
 use crate::workspace_service::Checkpoint;
@@ -215,7 +216,8 @@ fn write_layout_close(
     workspace_id: Option<&str>,
     closed_sessions: &[SessionId],
     daemon_closes: &[PendingDaemonClose],
-) -> Result<Vec<PendingDaemonClose>, String> {
+    grant_id: Option<&str>,
+) -> Result<Vec<PendingDaemonClose>, TerminalCloseError> {
     let (scope, intent_workspace_id, target_id) = intent.row_key();
     tx.execute(
         "INSERT INTO pending_layout_closes (scope, workspace_id, target_id, payload)
@@ -241,6 +243,16 @@ fn write_layout_close(
     let mut unique = HashSet::new();
     closes.retain(|close| unique.insert(close.clone()));
     insert_pending_closes(&tx, &closes)?;
+    if let Some(grant_id) = grant_id {
+        // Expiry does not change the database version. Read the grant on
+        // this transaction using the clock at the durable commit boundary.
+        let live = super::mcp_connector::mcp_grant_is_live(&tx, grant_id, crate::mcp_connector::now_ms())
+            .map_err(|error| error.to_string())?;
+        if !live {
+            let error = ControlError::new(ErrorCode::GrantRevoked, "Grant is expired or revoked");
+            return Err(TerminalCloseError::Authorization(error.to_string()));
+        }
+    }
     tx.commit().map_err(|error| error.to_string())?;
     Ok(closes)
 }
@@ -298,16 +310,16 @@ impl DatabaseStore {
             // it is available immediately and the database is still current.
             conn.busy_timeout(Duration::ZERO).map_err(|error| error.to_string())?;
             let tx = begin_authorized_close(&conn, checkpoint)?;
-            return write_layout_close(tx, intent, payload.as_deref(), workspace_id, closed_sessions, daemon_closes)
-                .map_err(TerminalCloseError::Failed);
+            return write_layout_close(
+                tx, intent, payload.as_deref(), workspace_id, closed_sessions, daemon_closes, checkpoint.connector_grant_id(),
+            );
         }
         let mut conn = self.conn.lock().unwrap();
         if conn.path().is_none_or(str::is_empty) {
             return Err(TerminalCloseError::Failed("Terminal close journal has no on-disk database".into()));
         }
         let tx = conn.transaction().map_err(|error| error.to_string())?;
-        write_layout_close(tx, intent, payload.as_deref(), workspace_id, closed_sessions, daemon_closes)
-            .map_err(TerminalCloseError::Failed)
+        write_layout_close(tx, intent, payload.as_deref(), workspace_id, closed_sessions, daemon_closes, None)
     }
 
     pub(crate) fn remember_daemon_shell(&self, shell: &PendingDaemonClose) -> Result<(), String> {

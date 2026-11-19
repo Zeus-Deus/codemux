@@ -30,13 +30,15 @@ use tauri::{AppHandle, Manager, Runtime};
 pub(crate) struct Checkpoint {
     check: Option<Check>,
     background: Option<Check>,
+    #[cfg(unix)]
+    connector_grant_id: Option<String>,
 }
 
 type Check = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 impl Checkpoint {
     pub(crate) fn new(check: impl Fn() -> Result<(), String> + Send + Sync + 'static) -> Self {
-        Self { check: Some(Arc::new(check)), background: None }
+        Self { check: Some(Arc::new(check)), ..Self::default() }
     }
 
     /// Adds the check for work the operation leaves running once it
@@ -63,9 +65,20 @@ impl Checkpoint {
         self.check.is_some()
     }
 
+    #[cfg(unix)]
+    pub(crate) fn with_connector_grant(mut self, grant_id: Option<String>) -> Self {
+        self.connector_grant_id = grant_id;
+        self
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn connector_grant_id(&self) -> Option<&str> {
+        self.connector_grant_id.as_deref()
+    }
+
     /// The checkpoint work left running asks (see [`Self::with_background`]).
     pub(crate) fn background(&self) -> Checkpoint {
-        Checkpoint { check: self.background.clone(), background: None }
+        Checkpoint { check: self.background.clone(), ..Self::default() }
     }
 }
 
@@ -1050,6 +1063,30 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_refuses_grant_revoked_during_journal_contention() {
+        if isolated("workspace_service::tests::close_refuses_grant_revoked_during_journal_contention") {
+            return;
+        }
+        assert_close_refuses_grant_during_contention(GrantDuringJournalContention::Revoked).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_grant_expired_during_journal_contention() {
+        if isolated("workspace_service::tests::close_refuses_grant_expired_during_journal_contention") {
+            return;
+        }
+        assert_close_refuses_grant_during_contention(GrantDuringJournalContention::Expired).await;
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum GrantDuringJournalContention {
+        Revoked,
+        Expired,
+    }
+
+    #[cfg(unix)]
+    async fn assert_close_refuses_grant_during_contention(case: GrantDuringJournalContention) {
         use crate::agent_control::{ControlAccess, ControlCaller, ControlError, ErrorCode};
         use crate::database::daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose};
         use crate::database::mcp_connector::{NewMcpClient, NewMcpGrant};
@@ -1058,9 +1095,6 @@ mod tests {
         use crate::terminal::{PtyState, SessionRuntime, TerminalLifecycleState};
         use std::time::Duration;
 
-        if isolated("workspace_service::tests::close_refuses_grant_revoked_during_journal_contention") {
-            return;
-        }
         let root = crate::test_isolation::isolated_root().unwrap();
         let db_path = root.join("close.sqlite");
         let state = AppStateStore::default();
@@ -1095,6 +1129,10 @@ mod tests {
         let origin = "https://connector.example";
         let redirect = "https://client.example/callback";
         let now = mcp_connector::now_ms();
+        let expires_at = now + match case {
+            GrantDuringJournalContention::Revoked => 60_000,
+            GrantDuringJournalContention::Expired => 4_000,
+        };
         db.mcp_connector_set_config(&serde_json::json!({
             "enabled": true,
             "publicOrigin": origin,
@@ -1113,19 +1151,32 @@ mod tests {
             resource: format!("{origin}/mcp"),
             access: "supervised".into(),
             created_at: now,
-            expires_at: now + 60_000,
+            expires_at,
         }).unwrap();
         let caller = ControlCaller::outside(client_id.into(), grant_id.into(), ControlAccess::Supervised);
         let handle = app.handle().clone();
+        type AuthorizationPause = (tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+        let pause = Arc::new(std::sync::Mutex::new(None::<AuthorizationPause>));
+        let authorization_pause = pause.clone();
         let checkpoint = Checkpoint::new(move || {
-            crate::agent_control::service::authorize(&handle, &caller).map_err(|error| error.to_string())
-        });
+            crate::agent_control::service::authorize(&handle, &caller).map_err(|error| error.to_string())?;
+            let pause = authorization_pause.lock().unwrap().take();
+            if let Some((authorized, resume)) = pause {
+                authorized.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(6)).unwrap();
+            }
+            Ok(())
+        }).with_connector_grant(Some(grant_id.to_owned()));
         checkpoint.check().unwrap();
 
         let (notify, contended) = tokio::sync::oneshot::channel();
         db.test_watch_close_journal_contention(notify);
         let mut writer = rusqlite::Connection::open(&db_path).unwrap();
-        let revocation = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let version = |conn: &rusqlite::Connection| {
+            conn.pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0)).unwrap()
+        };
+        let version_before = version(&writer);
+        let blocker = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         let workspaces = WorkspaceService::new(app.handle()).checked(checkpoint);
         let closing_id = closing.0.clone();
         let close = tokio::spawn(async move {
@@ -1139,11 +1190,36 @@ mod tests {
         });
         tokio::time::timeout(Duration::from_secs(5), contended)
             .await.unwrap().unwrap();
-        assert_eq!(revocation.execute(
-            "UPDATE agent_mcp_grants SET revoked = 1 WHERE id = ?1",
-            [grant_id],
-        ).unwrap(), 1);
-        revocation.commit().unwrap();
+        match case {
+            GrantDuringJournalContention::Revoked => {
+                assert_eq!(blocker.execute(
+                    "UPDATE agent_mcp_grants SET revoked = 1 WHERE id = ?1",
+                    [grant_id],
+                ).unwrap(), 1);
+                blocker.commit().unwrap();
+            }
+            GrantDuringJournalContention::Expired => {
+                // Freeze the writer retry after its real connector check
+                // succeeds, then let time invalidate that answer. No
+                // database write should hint that a recheck is needed.
+                let (authorized, checked) = tokio::sync::oneshot::channel();
+                let (resume, resume_checkpoint) = std::sync::mpsc::channel();
+                *pause.lock().unwrap() = Some((authorized, resume_checkpoint));
+                tokio::time::timeout(Duration::from_secs(3), checked).await.unwrap().unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let remaining = expires_at - mcp_connector::now_ms();
+                        if remaining <= 0 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(remaining as u64)).await;
+                    }
+                }).await.unwrap();
+                blocker.rollback().unwrap();
+                assert_eq!(version(&writer), version_before);
+                resume.send(()).unwrap();
+            }
+        }
 
         let error = tokio::time::timeout(Duration::from_secs(5), close)
             .await.unwrap().unwrap().unwrap_err();

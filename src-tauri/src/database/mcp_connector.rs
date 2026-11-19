@@ -182,6 +182,21 @@ const GRANT_SELECT: &str = "SELECT g.id,g.client_id,c.name,g.redirect_uri,g.reso
 fn alive(now: &str) -> String {
     format!("(g.revoked=0 AND (g.expires_at>{now} OR EXISTS(SELECT 1 FROM agent_mcp_refresh_tokens r WHERE r.grant_id=g.id AND r.used_at IS NULL AND r.expires_at>{now})))")
 }
+
+/// Recheck time-based grant authority within an existing write transaction.
+#[cfg(unix)]
+pub(super) fn mcp_grant_is_live(
+    conn: &rusqlite::Connection,
+    id: &str,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM agent_mcp_grants g WHERE g.id=?1 AND {})", alive("?2")),
+        params![id, now],
+        |row| row.get(0),
+    )
+}
+
 /// Deletes every dead grant at `?1`; their refresh tokens cascade.
 fn delete_dead_grants_sql() -> String {
     format!(
@@ -630,13 +645,22 @@ impl DatabaseStore {
         resource: &str,
         now: i64,
     ) -> Result<Option<McpGrant>, String> {
+        self.mcp_grant_with_clock(id, resource, || now)
+    }
+
+    pub(crate) fn mcp_grant_with_clock(
+        &self,
+        id: &str,
+        resource: &str,
+        now: impl FnOnce() -> i64,
+    ) -> Result<Option<McpGrant>, String> {
         let conn = self.conn.lock().map_err(|_| "MCP store unavailable")?;
         conn.query_row(
             &format!(
                 "{GRANT_SELECT} WHERE g.id=?1 AND g.resource=?2 AND {}",
                 alive("?3")
             ),
-            params![id, resource, now],
+            params![id, resource, now()],
             grant_row,
         )
         .optional()

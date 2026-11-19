@@ -6899,17 +6899,38 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_daemon_reattaches_existing_shells_without_spawning_new_ones() {
+        const TEST: &str = "terminal::tests::legacy_daemon_reattaches_existing_shells_without_spawning_new_ones";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        assert_initial_daemon_spawn(InitialSpawnCase::WithoutPreparedSpawn { guarded_shells: false }).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guarded_daemon_without_permits_reattaches_but_does_not_spawn() {
+        const TEST: &str = "terminal::tests::guarded_daemon_without_permits_reattaches_but_does_not_spawn";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        assert_initial_daemon_spawn(InitialSpawnCase::WithoutPreparedSpawn { guarded_shells: true }).await;
+    }
+
+    #[cfg(unix)]
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum InitialSpawnCase {
         CloseBeforeReply,
         RejectOwnershipInsert,
+        WithoutPreparedSpawn { guarded_shells: bool },
     }
 
     #[cfg(unix)]
     async fn assert_initial_daemon_spawn(case: InitialSpawnCase) {
         use crate::database::DatabaseStore;
         use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
-        use crate::pty_daemon::protocol::{ClientRequest, ServerResponse, PROTOCOL_VERSION};
+        use crate::pty_daemon::protocol::{ClientRequest, DaemonSessionInfo, ServerResponse, PROTOCOL_VERSION};
         use tokio::io::{AsyncBufReadExt, BufReader, Lines};
         use tokio::net::unix::OwnedReadHalf;
         use tokio::net::UnixListener;
@@ -6958,14 +6979,18 @@ mod tests {
             let ClientRequest::Hello { request_id } = request(&mut lines).await else {
                 panic!("expected the initial daemon handshake");
             };
+            let (guarded_shells, prepared_spawn) = match case {
+                InitialSpawnCase::WithoutPreparedSpawn { guarded_shells } => (guarded_shells, false),
+                _ => (true, true),
+            };
             send_daemon_fixture_response(&mut write, ServerResponse::Hello {
                 request_id,
                 protocol_version: PROTOCOL_VERSION,
                 daemon_pid,
                 daemon_version: version,
                 host_claude_plugin: false,
-                guarded_shells: true,
-                prepared_spawn: true,
+                guarded_shells,
+                prepared_spawn,
             }).await;
             let ClientRequest::List { request_id } = request(&mut lines).await else {
                 panic!("expected a lookup for an existing shell");
@@ -6976,7 +7001,12 @@ mod tests {
             }).await;
 
             let db = app.state::<DatabaseStore>();
-            if case == InitialSpawnCase::RejectOwnershipInsert {
+            let expected_failure = match case {
+                InitialSpawnCase::CloseBeforeReply => None,
+                InitialSpawnCase::RejectOwnershipInsert => Some("fixture rejected shell ownership"),
+                InitialSpawnCase::WithoutPreparedSpawn { .. } => Some("update the terminal daemon on its host"),
+            };
+            if let Some(expected_failure) = expected_failure {
                 let terminal = app.state::<PtyState>();
                 let failure = async {
                     loop {
@@ -6998,15 +7028,70 @@ mod tests {
                     biased;
                     line = lines.next_line() => {
                         let line = line.unwrap();
-                        assert!(line.is_none(), "failed ownership write sent a daemon frame: {line:?}");
+                        assert!(line.is_none(), "rejected startup sent a daemon request: {line:?}");
                         failure.await
                     }
                     message = &mut failure => message,
                 };
-                assert!(message.contains("fixture rejected shell ownership"), "{message}");
+                assert!(message.contains(expected_failure), "{message}");
                 assert!(layout.pty_hydration_plan_for_session(&new_session).is_some());
                 assert!(db.daemon_shell_ownership().unwrap().is_empty());
                 assert!(db.pending_daemon_closes().unwrap().is_empty());
+                if !prepared_spawn {
+                    let fallback = close_terminal_session(
+                        app.handle().clone(), new_session.clone(), None,
+                    ).await.unwrap();
+                    assert_eq!(fallback, original);
+                    assert!(layout.pty_hydration_plan_for_session(&new_session).is_none());
+                    assert!(db.pending_daemon_closes().unwrap().is_empty());
+
+                    // A daemon missing the spawn permit can still serve a
+                    // shell that it already owns, using its available attach.
+                    spawn_pty_for_session(app.handle().clone(), original.clone());
+                    let list = request(&mut lines).await;
+                    let ClientRequest::List { request_id } = list else {
+                        panic!("expected an inventory lookup for the existing pane: {list:?}");
+                    };
+                    let existing_shell = guarded_shells.then(Uuid::new_v4);
+                    send_daemon_fixture_response(&mut write, ServerResponse::Listed {
+                        request_id,
+                        sessions: vec![DaemonSessionInfo {
+                            session_id: original.clone(),
+                            shell_id: existing_shell,
+                            workspace_id: plan.workspace.workspace_id.clone(),
+                            pid: 4242,
+                            argv: vec!["sh".into()],
+                            cwd: "/".into(),
+                            rows: 24,
+                            cols: 80,
+                            created_at: 0,
+                        }],
+                    }).await;
+                    let request_id = match request(&mut lines).await {
+                        ClientRequest::AttachOwned { request_id, session_id, shell_id } => {
+                            assert_eq!(session_id, original);
+                            assert_eq!(Some(shell_id), existing_shell);
+                            request_id
+                        }
+                        ClientRequest::Attach { request_id, session_id } => {
+                            assert_eq!(session_id, original);
+                            assert_eq!(existing_shell, None);
+                            request_id
+                        }
+                        other => panic!("expected an attachment to the existing shell: {other:?}"),
+                    };
+                    send_daemon_fixture_response(&mut write, ServerResponse::Attached {
+                        request_id,
+                        session_id: original.clone(),
+                    }).await;
+                    while !with_existing_session_runtime(&terminal.sessions, &original, |runtime| {
+                        matches!(runtime.last_status.state, TerminalLifecycleState::Ready)
+                            && runtime.persistent
+                            && runtime.daemon_shell_id == existing_shell
+                    }).unwrap_or(false) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
                 return;
             }
 

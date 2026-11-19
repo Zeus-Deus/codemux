@@ -350,7 +350,7 @@ pub fn validate_caller<R: Runtime>(
     let issuer = issuer(&cfg, issuer_port(app, &cfg));
     let grant = app
         .state::<DatabaseStore>()
-        .mcp_grant(id, &format!("{issuer}/mcp"), now_ms())
+        .mcp_grant_with_clock(id, &format!("{issuer}/mcp"), now_ms)
         .map_err(|_| ControlError::new(ErrorCode::ConnectorUnavailable, "Grant lookup failed"))?
         .ok_or_else(|| {
             ControlError::new(
