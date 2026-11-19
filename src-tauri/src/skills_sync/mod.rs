@@ -233,7 +233,10 @@ impl SyncEngine {
         let remote = api_client::list_skills(token).await?;
 
         for wire in &remote {
-            match self.apply_remote_skill(wire, &mut mapping, &mut local, &home, &skills_root) {
+            match self
+                .apply_remote_skill(wire, &mut mapping, &mut local, &home, &skills_root)
+                .await
+            {
                 Ok(applied) => {
                     if applied {
                         result.pulled_count += 1;
@@ -274,7 +277,7 @@ impl SyncEngine {
 
     /// Apply one remote skill to the local filesystem +
     /// mapping. Returns `true` if a write happened.
-    fn apply_remote_skill(
+    async fn apply_remote_skill(
         &self,
         wire: &SkillWire,
         mapping: &mut SkillMapping,
@@ -397,8 +400,14 @@ impl SyncEngine {
         };
 
         if should_write {
-            let confine_to = saved_root.as_deref().unwrap_or(skills_root);
-            write_skill_to_disk(&dest, &content_plain, Some(confine_to))?;
+            let root = saved_root.unwrap_or_else(|| skills_root.to_path_buf());
+            let write_dest = dest.clone();
+            // A contested Windows rename can sleep between attempts.
+            tokio::task::spawn_blocking(move || {
+                write_skill_to_disk(&write_dest, &content_plain, Some(&root))
+            })
+            .await
+            .map_err(|e| format!("skill write task failed: {e}"))??;
         }
 
         // Record/refresh the mapping. `last_synced_at_millis` is
@@ -1128,8 +1137,8 @@ mod tests {
 
     // ── apply_remote_skill: pull-write happy path ──────────────
 
-    #[test]
-    fn apply_remote_skill_writes_file_for_first_seen_skill() {
+    #[tokio::test]
+    async fn apply_remote_skill_writes_file_for_first_seen_skill() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
         let mut mapping = SkillMapping::default();
@@ -1151,6 +1160,7 @@ mod tests {
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
+            .await
             .unwrap();
         assert!(applied);
 
@@ -1163,8 +1173,8 @@ mod tests {
         assert_eq!(mapping.skills[0].local_path, dest);
     }
 
-    #[test]
-    fn apply_remote_skill_never_writes_outside_the_skills_root() {
+    #[tokio::test]
+    async fn apply_remote_skill_never_writes_outside_the_skills_root() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
         let mut mapping = SkillMapping::default();
@@ -1179,6 +1189,7 @@ mod tests {
                     home.path(),
                     &home.path().join(".codemux/skills"),
                 )
+                .await
                 .unwrap();
             assert!(!applied, "{name:?} must not be written");
         }
@@ -1188,8 +1199,8 @@ mod tests {
         assert!(!std::path::Path::new("/tmp/escaped-abs/SKILL.md").exists());
     }
 
-    #[test]
-    fn apply_remote_skill_skips_when_server_updated_at_unchanged() {
+    #[tokio::test]
+    async fn apply_remote_skill_skips_when_server_updated_at_unchanged() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
 
@@ -1226,13 +1237,14 @@ mod tests {
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
+            .await
             .unwrap();
         assert!(!applied, "no write when server hasn't changed");
         assert!(!pre_existing_path.exists());
     }
 
-    #[test]
-    fn a_saved_mapping_outside_the_skill_locations_is_dropped_not_written() {
+    #[tokio::test]
+    async fn a_saved_mapping_outside_the_skill_locations_is_dropped_not_written() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
         // Recorded by an older build from an escaping name; it resolves to
@@ -1262,6 +1274,7 @@ mod tests {
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
+            .await
             .unwrap();
         assert!(!applied);
         assert!(mapping.skills.is_empty(), "the unsafe mapping is dropped");
@@ -1269,8 +1282,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn a_new_skill_is_never_written_through_a_linked_folder() {
+    #[tokio::test]
+    async fn a_new_skill_is_never_written_through_a_linked_folder() {
         let home = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
@@ -1285,14 +1298,14 @@ mod tests {
             &mut LocalSkills::default(),
             home.path(),
             &skills_root,
-        );
+        ).await;
         assert!(result.is_err(), "the write must be refused");
         assert!(fs::read_dir(outside.path()).unwrap().next().is_none(), "nothing lands outside");
     }
 
     #[cfg(unix)]
-    #[test]
-    fn an_update_is_never_written_through_a_saved_skill_folder_that_became_a_link() {
+    #[tokio::test]
+    async fn an_update_is_never_written_through_a_saved_skill_folder_that_became_a_link() {
         let home = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
@@ -1317,13 +1330,13 @@ mod tests {
             &mut LocalSkills::default(),
             home.path(),
             &home.path().join(".codemux/skills"),
-        );
+        ).await;
         assert!(result.is_err(), "the write must be refused");
         assert!(fs::read_dir(outside.path()).unwrap().next().is_none(), "nothing lands outside");
     }
 
-    #[test]
-    fn an_update_to_another_providers_saved_skill_still_lands() {
+    #[tokio::test]
+    async fn an_update_to_another_providers_saved_skill_still_lands() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
         let path = home.path().join(".claude/skills/demo/SKILL.md");
@@ -1349,6 +1362,7 @@ mod tests {
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
+            .await
             .unwrap();
         assert!(applied);
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
@@ -1505,8 +1519,8 @@ mod tests {
         no_calls.assert_async().await;
     }
 
-    #[test]
-    fn apply_remote_skill_writes_when_server_newer_than_recorded() {
+    #[tokio::test]
+    async fn apply_remote_skill_writes_when_server_newer_than_recorded() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
 
@@ -1543,13 +1557,14 @@ mod tests {
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
+            .await
             .unwrap();
         assert!(applied);
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new body from server");
     }
 
-    #[test]
-    fn apply_remote_skill_skips_legacy_row_with_empty_name() {
+    #[tokio::test]
+    async fn apply_remote_skill_skips_legacy_row_with_empty_name() {
         // A ciphertext-only row that predates the server-side
         // migration comes back with an empty name. The engine must
         // skip it rather than writing an empty-named skill to disk.
@@ -1567,6 +1582,7 @@ mod tests {
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
+            .await
             .unwrap();
         assert!(!applied, "legacy empty-name row must be skipped");
         assert!(mapping.skills.is_empty());
@@ -1580,19 +1596,20 @@ mod tests {
         path
     }
 
-    fn pull(engine: &SyncEngine, home: &Path, local_files: &[PathBuf], wires: &[SkillWire]) -> SkillMapping {
+    async fn pull(engine: &SyncEngine, home: &Path, local_files: &[PathBuf], wires: &[SkillWire]) -> SkillMapping {
         let mut mapping = SkillMapping::default();
         let mut local = LocalSkills::new(local_files, &mapping, home);
         for wire in wires {
             engine
                 .apply_remote_skill(wire, &mut mapping, &mut local, home, &home.join(".codemux/skills"))
+                .await
                 .unwrap();
         }
         mapping
     }
 
-    #[test]
-    fn unmapped_rows_link_to_the_local_skill_instead_of_duplicating_it() {
+    #[tokio::test]
+    async fn unmapped_rows_link_to_the_local_skill_instead_of_duplicating_it() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
         let same = write_local_skill(home.path(), ".claude/skills", "same", "body");
@@ -1603,7 +1620,7 @@ mod tests {
             // Duplicate rows of a skill this device already owns.
             plain_wire("same", "body", "claude", "user", "3", "2026-04-29T20:00:00Z"),
             plain_wire("edited", "older", "claude", "user", "4", "2026-04-29T20:00:00Z"),
-        ]);
+        ]).await;
 
         let linked: Vec<_> = mapping.skills.iter().map(|e| (e.remote_id.as_str(), e.local_path.clone())).collect();
         assert_eq!(linked, vec![("1", same.clone()), ("2", edited.clone())]);
@@ -1614,28 +1631,28 @@ mod tests {
         assert!(!home.path().join(".codemux/skills").exists());
     }
 
-    #[test]
-    fn duplicate_rows_share_one_pulled_copy() {
+    #[tokio::test]
+    async fn duplicate_rows_share_one_pulled_copy() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
         let mapping = pull(&engine, home.path(), &[], &[
             plain_wire("remote", "first", "claude", "user", "1", "2026-04-29T20:00:00Z"),
             plain_wire("remote", "second", "claude", "user", "2", "2026-04-29T20:00:00Z"),
-        ]);
+        ]).await;
         let dest = destination_path_after_pull("remote", home.path());
         assert_eq!(mapping.skills.len(), 1);
         assert_eq!(mapping.skills[0].local_path, dest);
         assert_eq!(fs::read_to_string(dest).unwrap(), "first");
     }
 
-    #[test]
-    fn a_previously_pulled_copy_is_relinked_not_overwritten() {
+    #[tokio::test]
+    async fn a_previously_pulled_copy_is_relinked_not_overwritten() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
         let copy = write_local_skill(home.path(), ".codemux/skills", "remote", "kept edit");
         let mapping = pull(&engine, home.path(), &[copy.clone()], &[
             plain_wire("remote", "server", "claude", "user", "1", "2026-04-29T20:00:00Z"),
-        ]);
+        ]).await;
         assert_eq!(mapping.skills[0].local_path, copy);
         assert_eq!(fs::read_to_string(copy).unwrap(), "kept edit");
     }
