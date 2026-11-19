@@ -213,6 +213,7 @@ webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 gtk = "0.18"
 
 [target.'cfg(windows)'.dependencies]
+clack-private-fs = "1"
 winx = "0.36"
 # Web Push's ECE encryption uses OpenSSL. Bundle it on Windows instead of
 # requiring users/builders to provide a system OpenSSL installation.

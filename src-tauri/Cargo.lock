@@ -1164,6 +1164,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clack-private-fs"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fcca21d8096fca7f1c3a22c3109e38927c9b587007c9c7a13b327e5a955baba"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1251,6 +1260,7 @@ dependencies = [
  "cap-std",
  "chacha20poly1305",
  "chrono",
+ "clack-private-fs",
  "clap",
  "codemux",
  "dirs",
