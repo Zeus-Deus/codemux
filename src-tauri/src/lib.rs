@@ -952,6 +952,9 @@ fn build_core_app<R: tauri::Runtime>(
             #[cfg(unix)]
             let has_local_fallbacks = handle.state::<database::DatabaseStore>()
                 .has_local_terminal_fallbacks().map_err(std::io::Error::other)?;
+            #[cfg(unix)]
+            let has_local_restarts = handle.state::<database::DatabaseStore>()
+                .has_pending_local_terminal_restarts().map_err(std::io::Error::other)?;
             // Track whether the persisted layout actually loaded. The
             // Windows orphan-cleanup gate below uses this to skip the
             // destructive `cleanup_orphan_scrollbacks(&[])` call after
@@ -959,7 +962,7 @@ fn build_core_app<R: tauri::Runtime>(
             // for the full failure-mode write-up.
             let mut layout_loaded = false;
             #[cfg(unix)]
-            let restored_layout = if has_daemon_recovery || has_local_fallbacks {
+            let restored_layout = if has_daemon_recovery || has_local_fallbacks || has_local_restarts {
                 // Replay may write immediately. Never replace an
                 // unreadable layout with fallback state during startup.
                 state::load_persisted_state_checked().map_err(std::io::Error::other)?
@@ -1028,14 +1031,6 @@ fn build_core_app<R: tauri::Runtime>(
                 &pending_layout_closes,
             ).map_err(std::io::Error::other)?;
             #[cfg(unix)]
-            if has_local_fallbacks {
-                let live = handle.state::<state::AppStateStore>().terminal_session_owners();
-                let db = handle.state::<database::DatabaseStore>();
-                if let Err(error) = db.reconcile_local_terminal_fallbacks(&live) {
-                    log::warn!("Could not prune orphaned local terminal fallback records: {error}");
-                }
-            }
-            #[cfg(unix)]
             if !daemon_shells.is_empty() {
                 // A shell can start before its new pane has reached disk.
                 // Retire these exact shells without hydrating a missing pane.
@@ -1046,6 +1041,26 @@ fn build_core_app<R: tauri::Runtime>(
                         log::error!("Could not journal orphaned daemon shells: {error}");
                     }
                     pending_terminal_closes.extend(orphaned);
+                }
+            }
+            #[cfg(unix)]
+            if has_local_fallbacks || has_local_restarts {
+                let live = handle.state::<state::AppStateStore>().terminal_session_owners();
+                let db = handle.state::<database::DatabaseStore>();
+                if has_local_fallbacks {
+                    if let Err(error) = db.reconcile_local_terminal_fallbacks(&live) {
+                        log::warn!("Could not prune orphaned local terminal fallback records: {error}");
+                    }
+                }
+                if has_local_restarts {
+                    match db.journal_orphan_local_terminal_restarts(&live) {
+                        Ok(orphaned) => {
+                            let mut known: std::collections::HashSet<_> =
+                                pending_terminal_closes.iter().cloned().collect();
+                            pending_terminal_closes.extend(orphaned.into_iter().filter(|close| known.insert(close.clone())));
+                        }
+                        Err(error) => log::warn!("Could not journal orphaned terminal restarts: {error}"),
+                    }
                 }
             }
             // Reconciliation checks canonical pane/workspace ownership. Starting

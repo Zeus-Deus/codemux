@@ -5,7 +5,7 @@ use crate::agent_control::{ControlError, ErrorCode};
 use crate::state::{ArchivedWorkspaceSnapshot, LayoutCloseIntent, SessionId};
 use crate::terminal::TerminalCloseError;
 use crate::workspace_service::Checkpoint;
-use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -31,6 +31,12 @@ pub(crate) struct PendingDaemonClose {
     pub(crate) route: DaemonWorkspaceRoute,
     pub(crate) session_id: String,
     pub(crate) shell_id: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingLocalTerminalRestart {
+    pub shell_id: Option<Uuid>,
+    pub acknowledged: bool,
 }
 
 impl LayoutCloseIntent {
@@ -92,6 +98,13 @@ fn migrate_schema(conn: &Connection) -> rusqlite::Result<()> {
             workspace_id TEXT NOT NULL,
             session_id TEXT NOT NULL,
             PRIMARY KEY (workspace_id, session_id)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS pending_local_terminal_restarts (
+            workspace_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            shell_id BLOB CHECK (shell_id IS NULL OR length(shell_id) = 16),
+            acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0, 1)),
+            PRIMARY KEY (workspace_id, session_id)
         ) WITHOUT ROWID;",
     )?;
     if !layout_table_exists {
@@ -151,6 +164,38 @@ fn delete_local_terminal_fallback(
     )
     .map(drop)
     .map_err(|error| error.to_string())
+}
+
+fn read_local_terminal_restart(
+    conn: &Connection,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<Option<PendingLocalTerminalRestart>, String> {
+    conn.query_row(
+        "SELECT shell_id, acknowledged FROM pending_local_terminal_restarts
+         WHERE workspace_id = ?1 AND session_id = ?2",
+        params![workspace_id, session_id],
+        |row| {
+            Ok(PendingLocalTerminalRestart {
+                shell_id: row.get::<_, Option<[u8; 16]>>(0)?.map(Uuid::from_bytes),
+                acknowledged: row.get(1)?,
+            })
+        },
+    ).optional().map_err(|error| error.to_string())
+}
+
+fn has_local_terminal_fallback(
+    conn: &Connection,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM local_terminal_fallbacks WHERE workspace_id = ?1 AND session_id = ?2
+        )",
+        params![workspace_id, session_id],
+        |row| row.get(0),
+    ).map_err(|error| error.to_string())
 }
 
 fn begin_local_terminal_fallback(conn: &mut Connection) -> Result<Transaction<'_>, String> {
@@ -287,6 +332,23 @@ fn write_layout_close(
                 params![workspace_id, id.0],
             ).map_err(|error| error.to_string())?;
             delete_local_terminal_fallback(&tx, workspace_id, &id.0)?;
+            let retired = tx.query_row(
+                "DELETE FROM pending_local_terminal_restarts
+                 WHERE workspace_id = ?1 AND session_id = ?2 RETURNING shell_id",
+                params![workspace_id, id.0],
+                |row| row.get::<_, Option<[u8; 16]>>(0),
+            ).optional().map_err(|error| error.to_string())?.flatten();
+            if let Some(shell_id) = retired {
+                closes.push(PendingDaemonClose {
+                    route: DaemonWorkspaceRoute {
+                        workspace_id: workspace_id.to_owned(),
+                        host_id: None,
+                        ssh_target: None,
+                    },
+                    session_id: id.0.clone(),
+                    shell_id: Uuid::from_bytes(shell_id),
+                });
+            }
         }
     }
     let mut unique = HashSet::new();
@@ -396,6 +458,15 @@ impl DatabaseStore {
             "DELETE FROM daemon_shell_ownership WHERE route = ?1 AND session_id = ?2 AND shell_id <> ?3",
             params![route, shell.session_id, shell.shell_id.as_bytes().as_slice()],
         ).map_err(|error| error.to_string())?;
+        if shell.route.host_id.is_none() && shell.route.ssh_target.is_none() {
+            // A successful local prepare or attachment identifies the
+            // current shell. Keep a restart still targeting that exact UUID.
+            tx.execute(
+                "DELETE FROM pending_local_terminal_restarts
+                 WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS NOT ?3",
+                params![shell.route.workspace_id, shell.session_id, shell.shell_id.as_bytes().as_slice()],
+            ).map_err(|error| error.to_string())?;
+        }
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -404,13 +475,7 @@ impl DatabaseStore {
     }
 
     pub(crate) fn has_local_terminal_fallback(&self, workspace_id: &str, session_id: &str) -> Result<bool, String> {
-        self.conn.lock().unwrap().query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM local_terminal_fallbacks WHERE workspace_id = ?1 AND session_id = ?2
-            )",
-            params![workspace_id, session_id],
-            |row| row.get(0),
-        ).map_err(|error| error.to_string())
+        has_local_terminal_fallback(&self.conn.lock().unwrap(), workspace_id, session_id)
     }
 
     pub(crate) fn has_local_terminal_fallbacks(&self) -> Result<bool, String> {
@@ -426,8 +491,115 @@ impl DatabaseStore {
     pub(crate) fn remember_local_terminal_fallback(&self, workspace_id: &str, session_id: &str) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = begin_local_terminal_fallback(&mut conn)?;
+        if read_local_terminal_restart(&tx, workspace_id, session_id)?.is_some() {
+            return Err("Terminal restart retirement has not been finalized".into());
+        }
         insert_local_terminal_fallback(&tx, workspace_id, session_id)?;
         tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Start a durable local restart before sending an effectful daemon close.
+    pub(crate) fn begin_local_terminal_restart(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        shell_id: Option<Uuid>,
+    ) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = begin_local_terminal_fallback(&mut conn)?;
+        let shell_bytes = shell_id.as_ref().map(|id| id.as_bytes().as_slice());
+        tx.execute(
+            "INSERT INTO pending_local_terminal_restarts (workspace_id, session_id, shell_id)
+             VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
+            params![workspace_id, session_id, shell_bytes],
+        ).map_err(|error| error.to_string())?;
+        if !read_local_terminal_restart(&tx, workspace_id, session_id)?
+            .is_some_and(|restart| restart.shell_id == shell_id)
+        {
+            return Err("Terminal already has a pending restart for another shell".into());
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn acknowledge_local_terminal_restart(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        shell_id: Option<Uuid>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let shell_bytes = shell_id.as_ref().map(|id| id.as_bytes().as_slice());
+        let updated = conn.execute(
+            "UPDATE pending_local_terminal_restarts SET acknowledged = 1
+             WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS ?3",
+            params![workspace_id, session_id, shell_bytes],
+        ).map_err(|error| error.to_string())?;
+        if updated == 0 {
+            return Err("Terminal restart no longer owns the retired shell".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending_local_terminal_restart(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<Option<PendingLocalTerminalRestart>, String> {
+        read_local_terminal_restart(&self.conn.lock().unwrap(), workspace_id, session_id)
+    }
+
+    pub(crate) fn has_pending_local_terminal_restarts(&self) -> Result<bool, String> {
+        self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending_local_terminal_restarts)",
+            [],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())
+    }
+
+    /// A missing pane needs no replacement. Retain only exact guarded
+    /// cleanup, since a tokenless restart cannot authorize a daemon close.
+    pub(crate) fn journal_orphan_local_terminal_restarts(
+        &self,
+        live: &HashSet<(String, String)>,
+    ) -> Result<Vec<PendingDaemonClose>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let mut orphaned = Vec::new();
+        {
+            let mut select = conn.prepare(
+                "SELECT workspace_id, session_id, shell_id FROM pending_local_terminal_restarts",
+            ).map_err(|error| error.to_string())?;
+            let rows = select.query_map([], |row| {
+                Ok(((row.get::<_, String>(0)?, row.get::<_, String>(1)?), row.get::<_, Option<[u8; 16]>>(2)?))
+            }).map_err(|error| error.to_string())?;
+            for row in rows {
+                let (pair, shell_id) = row.map_err(|error| error.to_string())?;
+                if !live.contains(&pair) {
+                    orphaned.push((pair, shell_id));
+                }
+            }
+        }
+        if orphaned.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let mut closes = Vec::new();
+        for ((workspace_id, session_id), shell_id) in orphaned {
+            let removed = tx.execute(
+                "DELETE FROM pending_local_terminal_restarts
+                 WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS ?3",
+                params![workspace_id, session_id, shell_id.as_ref().map(|id| id.as_slice())],
+            ).map_err(|error| error.to_string())?;
+            if let Some(shell_id) = shell_id.filter(|_| removed != 0) {
+                closes.push(PendingDaemonClose {
+                    route: DaemonWorkspaceRoute { workspace_id, host_id: None, ssh_target: None },
+                    session_id,
+                    shell_id: Uuid::from_bytes(shell_id),
+                });
+            }
+        }
+        insert_pending_closes(&tx, &closes)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(closes)
     }
 
     /// After the observed local daemon has acknowledged retirement, record
@@ -448,6 +620,12 @@ impl DatabaseStore {
         }
         let mut conn = self.conn.lock().unwrap();
         let tx = begin_local_terminal_fallback(&mut conn)?;
+        let expected_shell = retired.map(|shell| shell.shell_id);
+        match read_local_terminal_restart(&tx, workspace_id, session_id)? {
+            Some(restart) if restart.shell_id == expected_shell && restart.acknowledged => {}
+            None if has_local_terminal_fallback(&tx, workspace_id, session_id)? => return Ok(()),
+            _ => return Err("Terminal restart retirement has not been recorded".into()),
+        }
         let pending_close = tx.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM pending_daemon_closes
@@ -463,11 +641,39 @@ impl DatabaseStore {
             delete_owned_shell(&tx, shell)?;
         }
         insert_local_terminal_fallback(&tx, workspace_id, session_id)?;
+        tx.execute(
+            "DELETE FROM pending_local_terminal_restarts
+             WHERE workspace_id = ?1 AND session_id = ?2",
+            params![workspace_id, session_id],
+        ).map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())
     }
 
     pub(crate) fn forget_local_terminal_fallback(&self, workspace_id: &str, session_id: &str) -> Result<(), String> {
-        delete_local_terminal_fallback(&self.conn.lock().unwrap(), workspace_id, session_id)
+        let mut conn = self.conn.lock().unwrap();
+        let has_proof = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM local_terminal_fallbacks WHERE workspace_id = ?1 AND session_id = ?2
+                UNION ALL
+                SELECT 1 FROM pending_local_terminal_restarts
+                WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS NULL
+            )",
+            params![workspace_id, session_id],
+            |row| row.get::<_, bool>(0),
+        ).map_err(|error| error.to_string())?;
+        if !has_proof {
+            return Ok(());
+        }
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        delete_local_terminal_fallback(&tx, workspace_id, session_id)?;
+        // A live shell is enough to invalidate tokenless proof, but cannot
+        // vouch for a restart still tracking a precise UUID.
+        tx.execute(
+            "DELETE FROM pending_local_terminal_restarts
+             WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS NULL",
+            params![workspace_id, session_id],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// Drop proof for panes that never reached disk before the app exited.
@@ -754,6 +960,8 @@ mod tests {
         db.remember_daemon_shell(&retired).unwrap();
         db.remember_daemon_shell(&other_owner).unwrap();
         db.remember_daemon_shell(&other_workspace).unwrap();
+        db.begin_local_terminal_restart(workspace, session, Some(retired.shell_id)).unwrap();
+        db.acknowledge_local_terminal_restart(workspace, session, Some(retired.shell_id)).unwrap();
 
         assert!(db.remember_local_terminal_fallback_after_daemon_close(
             workspace, session, Some(&other_workspace),
@@ -775,12 +983,115 @@ mod tests {
         db.retire_completed_daemon_closes(&other_owner.route, session, &[other_owner.shell_id]).unwrap();
 
         db.remember_local_terminal_fallback_after_daemon_close(workspace, session, Some(&retired)).unwrap();
+        db.begin_local_terminal_restart(workspace, "legacy-session", None).unwrap();
+        db.acknowledge_local_terminal_restart(workspace, "legacy-session", None).unwrap();
         db.remember_local_terminal_fallback_after_daemon_close(workspace, "legacy-session", None).unwrap();
         drop(db);
         let db = DatabaseStore::test_file(&path);
         assert_eq!(db.daemon_shell_ownership().unwrap(), [other_workspace]);
         assert!(db.has_local_terminal_fallback(workspace, session).unwrap());
         assert!(db.has_local_terminal_fallback(workspace, "legacy-session").unwrap());
+    }
+
+    #[test]
+    fn local_restart_journal_preserves_exact_phases_and_transfers_close_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let workspace = "workspace-1";
+        let guarded = "session-2";
+        let legacy = "session-3";
+        let shell_id = Uuid::new_v4();
+        let guarded_shell = PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: workspace.into(),
+                host_id: None,
+                ssh_target: None,
+            },
+            session_id: guarded.into(),
+            shell_id,
+        };
+        let db = DatabaseStore::test_file(&path);
+        db.begin_local_terminal_restart(workspace, guarded, Some(shell_id)).unwrap();
+        db.begin_local_terminal_restart(workspace, guarded, Some(shell_id)).unwrap();
+        assert!(db.begin_local_terminal_restart(workspace, guarded, None).is_err());
+        assert!(db.acknowledge_local_terminal_restart(workspace, guarded, Some(Uuid::new_v4())).is_err());
+        db.begin_local_terminal_restart(workspace, legacy, None).unwrap();
+        db.acknowledge_local_terminal_restart(workspace, legacy, None).unwrap();
+        db.acknowledge_local_terminal_restart(workspace, legacy, None).unwrap();
+        db.begin_local_terminal_restart(workspace, legacy, None).unwrap();
+        drop(db);
+
+        let db = DatabaseStore::test_file(&path);
+        let pending = |session| db.pending_local_terminal_restart(workspace, session).unwrap();
+        let guarded_restart = Some(PendingLocalTerminalRestart {
+            shell_id: Some(shell_id),
+            acknowledged: false,
+        });
+        assert_eq!(pending(guarded), guarded_restart);
+        assert_eq!(pending(legacy), Some(PendingLocalTerminalRestart { shell_id: None, acknowledged: true }));
+        assert!(db.remember_local_terminal_fallback_after_daemon_close(workspace, guarded, Some(&guarded_shell)).is_err());
+        assert!(db.remember_local_terminal_fallback(workspace, guarded).is_err());
+        db.retain_daemon_shell(&guarded_shell).unwrap();
+        assert_eq!(pending(guarded), guarded_restart);
+        db.forget_daemon_shell(&guarded_shell).unwrap();
+
+        let fault = Connection::open(&path).unwrap();
+        fault.execute_batch(
+            "CREATE TRIGGER reject_fallback_proof BEFORE INSERT ON local_terminal_fallbacks
+             BEGIN SELECT RAISE(ABORT, 'fixture cannot record proof'); END;
+             CREATE TRIGGER reject_restart_cleanup BEFORE INSERT ON pending_daemon_closes
+             BEGIN SELECT RAISE(ABORT, 'fixture cannot record close'); END;",
+        ).unwrap();
+        assert!(db.remember_local_terminal_fallback_after_daemon_close(workspace, legacy, None).is_err());
+        assert!(pending(legacy).unwrap().acknowledged);
+        let intent = LayoutCloseIntent::Workspace(workspace.into());
+        let close = || db.record_layout_close_with_shell_ownership(
+            &intent,
+            Some(workspace),
+            &[SessionId(guarded.into()), SessionId(legacy.into())],
+            &[],
+            &Checkpoint::default(),
+        );
+        assert!(close().is_err());
+        assert_eq!(pending(guarded), guarded_restart);
+        assert!(pending(legacy).unwrap().acknowledged);
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+
+        fault.execute_batch("DROP TRIGGER reject_fallback_proof; DROP TRIGGER reject_restart_cleanup").unwrap();
+        db.remember_local_terminal_fallback_after_daemon_close(workspace, legacy, None).unwrap();
+        assert!(pending(legacy).is_none());
+        assert!(db.has_local_terminal_fallback(workspace, legacy).unwrap());
+        assert_eq!(close().unwrap(), [guarded_shell.clone()]);
+        assert!(pending(guarded).is_none());
+        assert!(!db.has_local_terminal_fallback(workspace, legacy).unwrap());
+        assert_eq!(db.pending_daemon_closes().unwrap(), [guarded_shell]);
+    }
+
+    #[test]
+    fn startup_journal_retires_only_missing_local_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::test_file(&dir.path().join("state.sqlite"));
+        let live_workspace = "live-workspace";
+        let missing_workspace = "missing-workspace";
+        let session = "shared-session";
+        let shell_id = Uuid::new_v4();
+        assert!(!db.has_pending_local_terminal_restarts().unwrap());
+        db.begin_local_terminal_restart(live_workspace, session, None).unwrap();
+        db.begin_local_terminal_restart(missing_workspace, "tokenless", None).unwrap();
+        db.begin_local_terminal_restart(missing_workspace, session, Some(shell_id)).unwrap();
+        assert!(db.has_pending_local_terminal_restarts().unwrap());
+
+        let live = HashSet::from([(live_workspace.to_owned(), session.to_owned())]);
+        let queued = db.journal_orphan_local_terminal_restarts(&live).unwrap();
+        assert_eq!(queued, [PendingDaemonClose {
+            route: DaemonWorkspaceRoute { workspace_id: missing_workspace.into(), host_id: None, ssh_target: None },
+            session_id: session.into(),
+            shell_id,
+        }]);
+        assert_eq!(db.pending_daemon_closes().unwrap(), queued);
+        assert!(db.pending_local_terminal_restart(missing_workspace, "tokenless").unwrap().is_none());
+        assert!(db.pending_local_terminal_restart(missing_workspace, session).unwrap().is_none());
+        assert!(db.pending_local_terminal_restart(live_workspace, session).unwrap().is_some());
     }
 
     #[test]

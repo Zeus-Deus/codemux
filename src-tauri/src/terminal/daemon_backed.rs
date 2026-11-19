@@ -346,6 +346,130 @@ async fn has_durable_local_fallback<R: Runtime>(
     })
 }
 
+async fn replay_pending_local_restart<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: &str,
+    client: &PtyDaemonClient,
+    existing: Option<&DaemonSessionInfo>,
+    reservation: &SessionSpawnReservation,
+) -> Result<bool, DaemonHydrationFailure> {
+    let session_id = &reservation.session_id;
+    let read_pending = {
+        let app = app.clone();
+        let workspace_id = workspace_id.to_owned();
+        let session_id = session_id.clone();
+        tokio::task::spawn_blocking(move || {
+            app.try_state::<DatabaseStore>().map_or(Ok(None), |db| {
+                db.pending_local_terminal_restart(&workspace_id, &session_id)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
+    };
+    let pending = match read_pending {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return Ok(false),
+        Err(error) if existing.is_some() => {
+            log::warn!("Could not check pending local restart for {session_id}: {error}");
+            return Ok(false);
+        }
+        Err(error) => return Err(DaemonHydrationFailure::Ambiguous(format!(
+            "could not read the pending terminal restart: {error}"
+        ))),
+    };
+
+    if existing.is_some_and(|shell| pending.shell_id.is_none() || shell.shell_id != pending.shell_id) {
+        // The current attachment is not the journaled guarded shell.
+        return Ok(false);
+    }
+    let retired_shell = pending.shell_id.map(|shell_id| PendingDaemonClose {
+        route: DaemonWorkspaceRoute {
+            workspace_id: workspace_id.to_owned(),
+            host_id: None,
+            ssh_target: None,
+        },
+        session_id: session_id.clone(),
+        shell_id,
+    });
+
+    if !pending.acknowledged || existing.is_some() {
+        // Only a guarded close can be replayed without touching a replacement.
+        let Some(shell_id) = pending.shell_id.filter(|_| client.supports_guarded_shells()) else {
+            return if existing.is_some() {
+                Ok(false)
+            } else {
+                Err(DaemonHydrationFailure::RequiresGuardedRecovery)
+            };
+        };
+        loop {
+            reservation.wait_for_close().await;
+            match reservation.with_current_runtime(|runtime| runtime.close_fence.is_none()) {
+                Some(true) => break,
+                Some(false) => continue,
+                None => return Err(DaemonHydrationFailure::AlreadyReserved),
+            }
+        }
+        if !owns_local_terminal(app, workspace_id, session_id) {
+            return Err(DaemonHydrationFailure::AlreadyReserved);
+        }
+        client.close_owned(session_id.clone(), shell_id).await.map_err(|error| {
+            DaemonHydrationFailure::Ambiguous(format!("could not replay terminal restart: {error}"))
+        })?;
+    }
+
+    let gate = app.state::<PtyState>().daemon_ownership_gate(session_id);
+    loop {
+        reservation.wait_for_close().await;
+        if !reservation.is_current() {
+            return Err(DaemonHydrationFailure::AlreadyReserved);
+        }
+        let app = app.clone();
+        let workspace_id = workspace_id.to_owned();
+        let session_id = session_id.clone();
+        let gate = gate.clone();
+        let sessions = reservation.sessions.clone();
+        let restart_token = reservation.restart_token;
+        let retired_shell = retired_shell.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            let _lease = gate.lock().unwrap_or_else(|error| error.into_inner());
+            let admitted = with_existing_session_runtime(&sessions, &session_id, |runtime| {
+                runtime.restart_token == restart_token && runtime.close_fence.is_none()
+            }).unwrap_or(false);
+            if !admitted {
+                return Ok(false);
+            }
+            if !owns_local_terminal(&app, &workspace_id, &session_id) {
+                return Err("The terminal moved or closed while recovering its restart".to_owned());
+            }
+            let db = app.try_state::<DatabaseStore>()
+                .ok_or_else(|| "The terminal fallback database is unavailable".to_owned())?;
+            if !pending.acknowledged {
+                db.acknowledge_local_terminal_restart(&workspace_id, &session_id, pending.shell_id)?;
+            }
+            db.remember_local_terminal_fallback_after_daemon_close(
+                &workspace_id,
+                &session_id,
+                retired_shell.as_ref(),
+            )?;
+            Ok(true)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
+        .map_err(DaemonHydrationFailure::OwnershipUnavailable)?;
+        if recorded {
+            return Ok(true);
+        }
+    }
+}
+
+fn owns_local_terminal<R: Runtime>(app: &AppHandle<R>, workspace_id: &str, session_id: &str) -> bool {
+    app.state::<AppStateStore>()
+        .pty_hydration_plan_for_session(session_id)
+        .is_some_and(|plan| plan.workspace.workspace_id == workspace_id && plan.workspace.host_id.is_none())
+}
+
 async fn forget_fallback_for_listed_shell<R: Runtime>(
     app: &AppHandle<R>,
     workspace_id: &str,
@@ -358,10 +482,7 @@ async fn forget_fallback_for_listed_shell<R: Runtime>(
     let result = tokio::task::spawn_blocking(move || {
         let Some(db) = app.try_state::<DatabaseStore>() else { return Ok(()); };
         let _lease = gate.lock().unwrap_or_else(|error| error.into_inner());
-        if db.has_local_terminal_fallback(&workspace_id, &checked_session)? {
-            db.forget_local_terminal_fallback(&workspace_id, &checked_session)?;
-        }
-        Ok(())
+        db.forget_local_terminal_fallback(&workspace_id, &checked_session)
     })
     .await
     .map_err(|error| error.to_string())
@@ -745,6 +866,7 @@ async fn spawn_prepared_session<R: Runtime>(
     let app_state: State<'_, AppStateStore> = app.state();
     let sessions = terminal_state.sessions.clone();
 
+    let ordinary_hydration = matches!(&claim, DaemonSpawnClaim::Hydrate { .. });
     let reservation = match claim {
         DaemonSpawnClaim::Hydrate { token, mut pending_close } => loop {
             if let Some(fence) = pending_close.take() {
@@ -787,6 +909,22 @@ async fn spawn_prepared_session<R: Runtime>(
         return Err(DaemonHydrationFailure::Ambiguous(
             "the daemon session belongs to a different workspace".into(),
         ));
+    }
+    if ordinary_hydration
+        && !reconciling
+        && !session.daemon_unused
+        && workspace.host_id.is_none()
+        && client.ssh_target().is_none()
+        && !client.supports_prepared_spawn()
+        && replay_pending_local_restart(
+            &app,
+            &workspace.workspace_id,
+            &client,
+            existing.as_ref(),
+            &reservation,
+        ).await?
+    {
+        return Err(DaemonHydrationFailure::LegacyDaemonLocalFallback);
     }
     let reattached = existing.is_some();
     let shell_id = match (&existing, client.supports_guarded_shells()) {
