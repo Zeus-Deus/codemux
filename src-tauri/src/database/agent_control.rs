@@ -1,6 +1,6 @@
 //! Durable control receipts and message/run correlations.
 use super::DatabaseStore;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -292,7 +292,11 @@ impl DatabaseStore {
         epoch: &str, workspace_id: Option<&str>, thread_id: Option<&str>, sender: Option<(&str, u64)>,
     ) -> Result<Admission, String> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(|e|e.to_string())?;
+        // An independent writer can commit during the receipt lookup. A
+        // deferred WAL read snapshot then cannot upgrade to a writer, even
+        // with a busy timeout. Reserve the writer before reading the key.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
         let existing: Option<(String, String, String)> = tx.query_row(
             "SELECT id, tool, payload_hash FROM agent_control_operations
              WHERE principal=?1 AND request_key=?2",
@@ -1390,6 +1394,55 @@ mod tests {
         let page = db.read_agent_chat_history_page("w","t",None,100).unwrap();
         assert_eq!(page.total_visible_messages,4);
         assert!(!serde_json::to_string(&page).unwrap().contains("native_user_control"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keyed_admission_waits_for_an_independent_layout_close_writer() {
+        use std::sync::{mpsc, Mutex};
+        use std::time::Duration;
+
+        static WAITING_FOR_WRITER: Mutex<Option<mpsc::Sender<()>>> = Mutex::new(None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admission.sqlite");
+        let db = DatabaseStore::test_file(&path);
+        let (notify, waiting) = mpsc::channel();
+        *WAITING_FOR_WRITER.lock().unwrap() = Some(notify);
+        db.test_busy_handler(|attempt| {
+            if let Some(notify) = WAITING_FOR_WRITER.lock().unwrap().take() {
+                let _ = notify.send(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            attempt < 1_000
+        });
+
+        let mut separate = rusqlite::Connection::open(&path).unwrap();
+        let close = separate.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        close.execute(
+            "INSERT INTO pending_layout_closes (scope, workspace_id, target_id)
+             VALUES ('workspace', 'closing-workspace', '')",
+            [],
+        ).unwrap();
+        let admit = || db.admit_control_operation(
+            "client-a", "req-a", "thread_launch", "hash-a", "boot-a",
+            Some("ws-a"), Some("thread-a"),
+        );
+        let first = std::thread::scope(|scope| {
+            let admission = scope.spawn(&admit);
+            let blocked = waiting.recv_timeout(Duration::from_secs(5));
+            close.commit().unwrap();
+            let result = admission.join().unwrap();
+            assert!(
+                blocked.is_ok(),
+                "admission never waited for the other writer: {:?}",
+                result.as_ref().err(),
+            );
+            result.unwrap()
+        });
+        let retry = admit().unwrap();
+        assert!(first.newly_admitted);
+        assert!(!retry.newly_admitted);
+        assert_eq!(first.receipt.operation_id, retry.receipt.operation_id);
     }
 
     #[test]
