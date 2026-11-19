@@ -10,6 +10,7 @@ use crate::git::{CommitLoss, Kept};
 use crate::state::{
     AppStateSnapshot,
     AppStateStore,
+    LayoutCloseIntent,
     NotificationLevel,
     SplitDirection,
     TabKind,
@@ -1347,14 +1348,15 @@ pub(crate) async fn close_workspace_checked<R: tauri::Runtime>(
     .map(|closed| closed.kept)
 }
 
-/// Which route a close came in by. They differ only in where teardown
-/// scripts run (see [`teardown_folder`]).
+/// A workspace close's teardown policy and durable layout operation.
 #[derive(Clone, Copy)]
-enum CloseRoute {
+enum CloseRoute<'a> {
     /// The sidebar's plain close.
     Plain,
-    /// The close dialog, archive, and the MCP / control-socket close.
+    /// The close dialog and the MCP / control-socket close.
     Tracked,
+    /// Tracked teardown plus the archive entry recorded with layout removal.
+    Archive(&'a crate::state::ArchivedWorkspaceSnapshot),
 }
 
 /// The folder a closing workspace's teardown scripts run in. A plain close
@@ -1362,13 +1364,13 @@ enum CloseRoute {
 /// worktree the workspace owns, so archiving a root checkout never runs its
 /// teardown. A chat child workspace has none on any route: it borrows its
 /// parent's folder, which stays in use.
-fn teardown_folder(ws: &crate::state::WorkspaceSnapshot, route: CloseRoute) -> Option<String> {
+fn teardown_folder(ws: &crate::state::WorkspaceSnapshot, route: CloseRoute<'_>) -> Option<String> {
     if ws.is_chat_child() {
         return None;
     }
     match route {
         CloseRoute::Plain => (!ws.is_local_import_snapshot_only()).then(|| ws.cwd.clone()),
-        CloseRoute::Tracked => ws.worktree_path.clone(),
+        CloseRoute::Tracked | CloseRoute::Archive(_) => ws.worktree_path.clone(),
     }
 }
 
@@ -1498,6 +1500,7 @@ fn detach_workspace<R: tauri::Runtime>(
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     workspace_id: &str,
+    route: CloseRoute<'_>,
 ) -> Result<Detached, String> {
     let closing = state.find_workspace(workspace_id);
     // Before the workspace leaves state, so no deletion or cleanup sees its
@@ -1505,7 +1508,11 @@ fn detach_workspace<R: tauri::Runtime>(
     let claim = closing.as_ref().map(crate::checkout_claims::claim_checkout);
     let closed = crate::state::with_terminal_close_layout_lock(|| {
         let mut result = state.close_workspace(workspace_id)?;
-        let terminals = take_closed_terminals(app, std::mem::take(&mut result.removed_sessions));
+        let intent = match route {
+            CloseRoute::Archive(entry) => LayoutCloseIntent::Archive(Box::new(entry.clone())),
+            _ => LayoutCloseIntent::Workspace(workspace_id.to_owned()),
+        };
+        let terminals = take_closed_terminals(app, std::mem::take(&mut result.removed_sessions), intent);
         Ok::<_, String>((result, terminals))
     });
     let (result, terminal_runtimes) = match closed {
@@ -1564,17 +1571,15 @@ fn detach_workspace<R: tauri::Runtime>(
 fn take_closed_terminals<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     sessions: impl IntoIterator<Item = crate::state::SessionId>,
+    intent: LayoutCloseIntent,
 ) -> Vec<(crate::state::SessionId, crate::terminal::SessionRuntime)> {
-    let Some(terminal_state) = app.try_state::<crate::terminal::PtyState>() else {
-        return Vec::new();
-    };
-    sessions
-        .into_iter()
-        .filter_map(|id| {
-            crate::terminal::take_terminal_session_for_close(app, &terminal_state.sessions, &id.0)
-                .map(|runtime| (id, runtime))
-        })
-        .collect()
+    let terminal_state = app.try_state::<crate::terminal::PtyState>();
+    crate::terminal::take_terminal_sessions_for_close(
+        app,
+        terminal_state.as_ref().map(|state| &state.sessions),
+        sessions,
+        intent,
+    )
 }
 
 /// Test-only pause in a close, after the workspace left app state and
@@ -1655,7 +1660,7 @@ pub(crate) fn close_delegated_child_workspace<R: tauri::Runtime>(
     else {
         return Default::default();
     };
-    let Ok(detached) = detach_workspace(app, &state, &db, workspace_id) else {
+    let Ok(detached) = detach_workspace(app, &state, &db, workspace_id, CloseRoute::Tracked) else {
         return Default::default();
     };
     let stops = detached.retire(app);
@@ -1683,7 +1688,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     workspace_id: String,
-    route: CloseRoute,
+    route: CloseRoute<'_>,
     remove_worktree: bool,
     delete_branch: Option<bool>,
     force_delete: Option<bool>,
@@ -1836,7 +1841,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     checkpoint.check()?;
     torn_down.map_err(|e| format!("Teardown failed: {e}\nUse force delete to skip teardown."))?;
 
-    let detached = detach_workspace(&app, state, db, &workspace_id)?;
+    let detached = detach_workspace(&app, state, db, &workspace_id, route)?;
     #[cfg(test)]
     close_pause::reached(&workspace_id).await;
     finish_detach(&app, &workspace_id, ws_host_id).await;
@@ -2125,9 +2130,8 @@ pub(crate) fn archive_refusal_reason(
 /// termination, sync reconcile — with `remove_worktree=false`, so the
 /// files, worktree, and branch stay untouched) plus an
 /// `ArchivedWorkspaceSnapshot` remembering how to restore it. The entry
-/// is built BEFORE the close (the workspace is gone from state after)
-/// but added only AFTER the close succeeded, so a failed teardown never
-/// produces a phantom archive entry.
+/// is built before teardown and journaled with the removal once teardown
+/// succeeds. It is exposed in the archive list after the close finishes.
 pub(crate) async fn archive_workspace_impl<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &AppStateStore,
@@ -2164,7 +2168,7 @@ pub(crate) async fn archive_workspace_checked<R: tauri::Runtime>(
         state,
         db,
         workspace_id,
-        CloseRoute::Tracked,
+        CloseRoute::Archive(&entry),
         false,
         None,
         None,
@@ -2173,11 +2177,17 @@ pub(crate) async fn archive_workspace_checked<R: tauri::Runtime>(
     )
     .await?;
 
-    state.add_archived_workspace(entry);
-    // The close impl already emitted, but that snapshot predates the
-    // entry — emit again so the archive list appears in the same user
-    // action (and the debounced persist picks it up).
+    state.add_archived_workspace(entry.clone());
     crate::state::emit_app_state(&app);
+    #[cfg(unix)]
+    {
+        let intent = LayoutCloseIntent::Archive(Box::new(entry));
+        match db.has_pending_layout_close(&intent) {
+            Ok(true) => terminal::daemon_backed::persist_pending_layout_closes(&app, vec![intent]),
+            Ok(false) => {}
+            Err(error) => log::error!("Could not check pending archive {archive_id}: {error}"),
+        }
+    }
     Ok(archive_id)
 }
 
@@ -2209,6 +2219,20 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
     unarchive_workspace_checked(app, state, db, archive_id, select, &Checkpoint::default()).await
 }
 
+/// Save an unfinished archive before a later command can consume its entry.
+#[cfg(unix)]
+fn settle_pending_archive(
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    entry: &crate::state::ArchivedWorkspaceSnapshot,
+) -> Result<(), String> {
+    let intent = LayoutCloseIntent::Archive(Box::new(entry.clone()));
+    if db.has_pending_layout_close(&intent)? {
+        crate::state::persist_layout_closes(state, db, &[intent])?;
+    }
+    Ok(())
+}
+
 /// [`unarchive_workspace_impl_with_selection`], asking `checkpoint` again
 /// once no other restore runs and wherever the restore's create or adopt
 /// path asks it, its background setup included.
@@ -2232,6 +2256,8 @@ pub(crate) async fn unarchive_workspace_checked<R: tauri::Runtime>(
     let entry = state
         .find_archived_workspace(&archive_id)
         .ok_or_else(|| format!("No archived workspace found for {archive_id}"))?;
+    #[cfg(unix)]
+    settle_pending_archive(state, db, &entry)?;
 
     // A live workspace already at this location (the user re-opened it
     // by hand, or another device restored it) — don't create a
@@ -2457,6 +2483,10 @@ pub(crate) async fn delete_archived_workspace_impl<R: tauri::Runtime>(
     let entry = state
         .find_archived_workspace(&archive_id)
         .ok_or_else(|| format!("No archived workspace found for {archive_id}"))?;
+    #[cfg(unix)]
+    if let Some(db) = app.try_state::<crate::database::DatabaseStore>() {
+        settle_pending_archive(state, &db, &entry)?;
+    }
 
     if delete_worktree
         && (app
@@ -2889,7 +2919,8 @@ pub(crate) fn close_pane_impl_with_selection<R: tauri::Runtime>(
     let removed_browser_id = state.pane_browser_id(&pane_id);
     let (removed, terminals) = crate::state::with_terminal_close_layout_lock(|| {
         let removed = state.close_pane_with_selection(&pane_id, select)?;
-        let terminals = take_closed_terminals(&app, removed.iter().cloned());
+        let intent = LayoutCloseIntent::Pane(pane_id.clone());
+        let terminals = take_closed_terminals(&app, removed.iter().cloned(), intent);
         Ok::<_, String>((removed, terminals))
     })?;
     // A `codemux monitor start` flag belongs to the process that was running
@@ -3113,7 +3144,8 @@ pub fn close_tab<R: tauri::Runtime>(
 ) -> Result<(), String> {
     let (result, terminals) = crate::state::with_terminal_close_layout_lock(|| {
         let mut result = state.close_tab(&workspace_id, &tab_id)?;
-        let terminals = take_closed_terminals(&app, std::mem::take(&mut result.removed_sessions));
+        let intent = LayoutCloseIntent::Tab { workspace_id, tab_id };
+        let terminals = take_closed_terminals(&app, std::mem::take(&mut result.removed_sessions), intent);
         Ok::<_, String>((result, terminals))
     })?;
 

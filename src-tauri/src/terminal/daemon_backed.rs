@@ -23,7 +23,7 @@ use super::{
 };
 use crate::database::{daemon_closes::PendingDaemonClose, DatabaseStore};
 use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
-use crate::state::{AppStateStore, PtyHydrationPlan, PtyHydrationSession, PtyHydrationWorkspace};
+use crate::state::{AppStateStore, LayoutCloseIntent, PtyHydrationPlan, PtyHydrationSession, PtyHydrationWorkspace};
 use futures_util::stream::StreamExt as _;
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::future::Future;
@@ -613,7 +613,27 @@ async fn spawn_prepared_session<R: Runtime>(
     let workspace_id = workspace.workspace_id.clone();
     let host_id = workspace.host_id;
     let is_remote = host_id.is_some();
-    app_state.update_terminal_session_shell(&session_id, shell.clone());
+    if !app_state.update_terminal_session_shell(&session_id, shell.clone()) {
+        return Err(DaemonHydrationFailure::AlreadyReserved);
+    }
+    let route_for_runtime = shell_id.map(|_| {
+        let ssh_target = client.ssh_target().map(str::to_owned);
+        DaemonWorkspaceRoute {
+            workspace_id: workspace_id.clone(),
+            host_id: host_id.filter(|_| ssh_target.is_some()),
+            ssh_target,
+        }
+    });
+    if let Some((route, shell_id)) = route_for_runtime.as_ref().zip(shell_id).filter(|_| !reconciling) {
+        let recovery = Arc::new(DaemonReconciliation::new(
+            route.clone(),
+            Some(shell_id),
+            Some(client.clone()),
+        ));
+        if !reservation.publish_daemon_reconciliation(recovery) {
+            return Err(DaemonHydrationFailure::AlreadyReserved);
+        }
+    }
 
     // ── Scrollback restore + adapter resume parity with in-process path.
     //
@@ -904,6 +924,15 @@ async fn spawn_prepared_session<R: Runtime>(
     } else {
         None
     };
+    let spawn_failure = |error| {
+        let failure = classify_spawn_rpc_failure(error);
+        if guarded_target.is_some() && !reconciling && failure.allows_local_fallback() {
+            // A confirmed rejection leaves no new shell to reconcile. Allow
+            // ordinary retry or local fallback while retaining older targets.
+            reservation.clear_daemon_reconciliation_if_current();
+        }
+        failure
+    };
 
     // Idempotent reattach decision comes from the workspace-level List. The
     // caller performs exactly one List and maps it before any pane tasks fan
@@ -924,14 +953,14 @@ async fn spawn_prepared_session<R: Runtime>(
             return Err(DaemonHydrationFailure::AlreadyReserved);
         }
         let argv = vec![shell.clone()];
-        if let Some((recovery, shell_id)) = guarded_target {
+        if let Some((recovery, shell_id)) = guarded_target.filter(|_| client.supports_prepared_spawn()) {
             if let Err(error) = client.prepare_owned_spawn(session_id.clone(), shell_id).await {
                 if matches!(&error, PtyDaemonError::Daemon(message)
                     if message == &format!("session {session_id} already exists in daemon"))
                 {
                     recovery.acknowledge_shell_closed(shell_id);
                 }
-                return Err(classify_spawn_rpc_failure(error));
+                return Err(spawn_failure(error));
             }
             // List omits in-flight spawns. Prepare checks their slot and
             // replaces any unused permit, so this acknowledgement proves
@@ -955,7 +984,7 @@ async fn spawn_prepared_session<R: Runtime>(
     if !reservation.is_current() {
         return Err(DaemonHydrationFailure::AlreadyReserved);
     }
-    let pid = spawn_result.map_err(classify_spawn_rpc_failure)?;
+    let pid = spawn_result.map_err(spawn_failure)?;
     let attachment = match shell_id {
         Some(shell_id) => client.attach_owned(session_id.clone(), shell_id).await,
         None => client.attach(session_id.clone()).await,
@@ -990,14 +1019,6 @@ async fn spawn_prepared_session<R: Runtime>(
         auto_resume_command.clone()
     };
     let client_for_runtime = client.clone();
-    let route_for_runtime = shell_id.map(|_| {
-        let ssh_target = client.ssh_target().map(str::to_owned);
-        DaemonWorkspaceRoute {
-            workspace_id: workspace.workspace_id.clone(),
-            host_id: host_id.filter(|_| ssh_target.is_some()),
-            ssh_target,
-        }
-    });
     let installed = with_existing_session_runtime(&sessions, &session_id, |runtime| {
         if runtime.restart_token != restart_token {
             return None;
@@ -1204,45 +1225,79 @@ pub(super) struct PreparedDaemonClose {
     journaled: bool,
 }
 
+impl PreparedDaemonClose {
+    fn records(&self) -> impl Iterator<Item = PendingDaemonClose> + '_ {
+        self.shell_ids.iter().map(move |&shell_id| PendingDaemonClose {
+            route: self.route.clone(),
+            session_id: self.session_id.clone(),
+            shell_id,
+        })
+    }
+}
+
 /// One queue and worker per workspace daemon route. A closed pane's cleanup
-/// stays in the journal until the daemon acknowledges it and the layout is saved.
+/// stays in the journal until the daemon acknowledges it.
 #[derive(Default)]
 pub(super) struct PendingDaemonCloses {
     routes: Mutex<HashMap<DaemonWorkspaceRoute, VecDeque<PreparedDaemonClose>>>,
 }
 
-/// Seal shell admission and record every unresolved identity before the
-/// caller drops the runtime. A database failure still gets a live retry.
-pub(super) fn prepare_closed_pane_cleanup<R: Runtime>(
-    app: &AppHandle<R>,
+/// Seal shell admission and collect every unresolved identity for the
+/// close command's SQLite transaction.
+pub(super) fn prepare_closed_pane_cleanup(
     session_id: &str,
     recovery: &Arc<DaemonReconciliation>,
 ) -> PreparedDaemonClose {
-    let mut shell_ids = recovery.take_shells_for_close();
-    let route = recovery.route.clone();
-    let mut journaled = false;
-    // Between closing a shell and preparing its replacement, there may be
-    // no daemon UUID to close. Still record the pane removal for startup.
-    let layout_only = shell_ids.is_empty();
-    if layout_only {
-        shell_ids.push(Uuid::nil());
+    PreparedDaemonClose {
+        route: recovery.route.clone(),
+        session_id: session_id.to_owned(),
+        shell_ids: recovery.take_shells_for_close(),
+        recovery: Some(recovery.clone()),
+        journaled: false,
     }
+}
+
+pub(super) fn commit_layout_close<R: Runtime>(
+    app: &AppHandle<R>,
+    intent: LayoutCloseIntent,
+    mut requests: Vec<PreparedDaemonClose>,
+) {
     if let Some(db) = app.try_state::<DatabaseStore>() {
-        match db.record_pending_daemon_closes(&route, session_id, &shell_ids) {
-            Ok(()) => journaled = true,
-            Err(error) => log::error!("Could not persist terminal close for {session_id}: {error}"),
+        let closes: Vec<_> = requests.iter().flat_map(PreparedDaemonClose::records).collect();
+        match db.record_layout_close(&intent, &closes) {
+            Ok(()) => {
+                for request in &mut requests {
+                    request.journaled = true;
+                }
+                // Archive becomes visible only once the shared close finishes.
+                // Its caller schedules the layout save at that point.
+                if !matches!(&intent, LayoutCloseIntent::Archive(_)) {
+                    persist_pending_layout_closes(app, vec![intent]);
+                }
+            }
+            Err(error) => log::error!("Could not journal layout close {intent:?}: {error}"),
         }
     }
-    if layout_only && !journaled {
-        shell_ids.clear();
+    for request in requests {
+        queue_closed_pane_cleanup(app.clone(), request);
     }
-    PreparedDaemonClose {
-        route,
-        session_id: session_id.to_owned(),
-        shell_ids,
-        recovery: Some(recovery.clone()),
-        journaled,
+}
+
+pub(crate) fn persist_pending_layout_closes<R: Runtime>(
+    app: &AppHandle<R>,
+    intents: Vec<LayoutCloseIntent>,
+) {
+    if intents.is_empty() {
+        return;
     }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = app.state::<AppStateStore>();
+        let db = app.state::<DatabaseStore>();
+        if let Err(error) = crate::state::persist_layout_closes(&store, &db, &intents) {
+            log::error!("Could not persist pending layout closes: {error}");
+        }
+    });
 }
 
 pub(super) fn queue_closed_pane_cleanup<R: Runtime>(app: AppHandle<R>, request: PreparedDaemonClose) {
@@ -1285,17 +1340,6 @@ pub(crate) fn resume_pending_daemon_closes<R: Runtime>(
     }
 }
 
-fn retire_acknowledged_daemon_closes<R: Runtime>(
-    app: &AppHandle<R>,
-    route: &DaemonWorkspaceRoute,
-    session_id: &str,
-    shell_ids: &[Uuid],
-) -> Result<(), String> {
-    let store = app.try_state::<AppStateStore>().ok_or("Workspace layout store is not initialized")?;
-    crate::state::persist_terminal_close(&store, &route.workspace_id, session_id)?;
-    app.state::<DatabaseStore>().retire_completed_daemon_closes(route, session_id, shell_ids)
-}
-
 async fn drain_pending_daemon_closes<R: Runtime>(
     app: AppHandle<R>,
     pending: Arc<PendingDaemonCloses>,
@@ -1309,14 +1353,11 @@ async fn drain_pending_daemon_closes<R: Runtime>(
             // A live restart may have sent one of these RPCs before the pane
             // was closed. Let it finish before sending CloseOwned. The seal
             // taken by prepare prevents any later RPC publishing a new UUID.
-            let daemon_ids = request.shell_ids.iter().copied().filter(|id| !id.is_nil());
             let captured_client = match request.recovery {
-                Some(recovery) if daemon_ids.clone().next().is_some() => {
-                    recovery.target.lock().await.client.clone()
-                }
-                _ => None,
+                Some(recovery) => recovery.target.lock().await.client.clone(),
+                None => None,
             };
-            for shell_id in daemon_ids {
+            for &shell_id in &request.shell_ids {
                 retry_guarded_close(|| async {
                     let acquired = match captured_client.as_ref().filter(|client| !client.is_closed()) {
                         Some(client) => Ok(client.clone()),
@@ -1343,13 +1384,11 @@ async fn drain_pending_daemon_closes<R: Runtime>(
                 }).await;
             }
             if request.journaled {
-                // A crash after the daemon ACK can still leave the pane on
-                // disk. Keep the intent until it can no longer be restored.
                 let app = app.clone();
                 let session_id = request.session_id.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    retire_acknowledged_daemon_closes(
-                        &app, &request.route, &request.session_id, &request.shell_ids,
+                    app.state::<DatabaseStore>().retire_completed_daemon_closes(
+                        &request.route, &request.session_id, &request.shell_ids,
                     )
                 }).await.map_err(|error| error.to_string()).and_then(|result| result);
                 if let Err(error) = result {
@@ -1540,7 +1579,7 @@ mod tests {
 
     #[test]
     fn pending_terminal_close_persists_intent_without_a_shell() {
-        use super::{DaemonReconciliation, DaemonWorkspaceRoute, DatabaseStore};
+        use super::{DaemonReconciliation, DaemonWorkspaceRoute, DatabaseStore, LayoutCloseIntent};
         use tauri::Manager;
 
         let root = tempfile::tempdir().unwrap();
@@ -1555,12 +1594,12 @@ mod tests {
             None,
             None,
         ));
-        let close = super::prepare_closed_pane_cleanup(app.handle(), "session", &recovery);
-        assert!(close.journaled);
-        let rows = app.state::<DatabaseStore>().pending_daemon_closes().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].session_id, "session");
-        assert!(rows[0].shell_id.is_nil());
+        let close = super::prepare_closed_pane_cleanup("session", &recovery);
+        let intent = LayoutCloseIntent::Pane("pane".into());
+        let db = app.state::<DatabaseStore>();
+        db.record_layout_close(&intent, &close.records().collect::<Vec<_>>()).unwrap();
+        assert!(db.pending_daemon_closes().unwrap().is_empty());
+        assert_eq!(db.pending_layout_closes().unwrap(), [intent]);
     }
 
     #[tokio::test]
@@ -1569,7 +1608,7 @@ mod tests {
         if crate::test_isolation::isolated(TEST) {
             return;
         }
-        use super::{AppStateStore, DaemonReconciliation, DaemonWorkspaceRoute, DatabaseStore, PtyState};
+        use super::{AppStateStore, DaemonReconciliation, DaemonWorkspaceRoute, DatabaseStore, LayoutCloseIntent, PtyState};
         use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
         use crate::state;
         use tauri::Manager;
@@ -1582,6 +1621,7 @@ mod tests {
         let session_id = initial_store.active_terminal_session_id().unwrap().0;
         let plan = initial_store.pty_hydration_plan_for_session(&session_id).unwrap();
         let pane_id = plan.sessions[0].pane_id.as_deref().unwrap();
+        let intent = LayoutCloseIntent::Pane(pane_id.to_owned());
         let shell_ids = [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];
         let route = DaemonWorkspaceRoute {
             workspace_id: plan.workspace.workspace_id,
@@ -1602,8 +1642,9 @@ mod tests {
             assert!(recovery.register_shell(shell_ids[1]));
             let _rpc_in_progress = recovery.target.lock().await;
             initial_store.close_pane(pane_id).unwrap();
-            let close = super::prepare_closed_pane_cleanup(app.handle(), &session_id, &recovery);
-            assert!(close.journaled);
+            let close = super::prepare_closed_pane_cleanup(&session_id, &recovery);
+            app.state::<DatabaseStore>()
+                .record_layout_close(&intent, &close.records().collect::<Vec<_>>()).unwrap();
             assert!(!recovery.register_shell(uuid::Uuid::new_v4()));
             // The close command's layout save and both daemon requests are pending.
         }
@@ -1613,13 +1654,15 @@ mod tests {
         relaunched.manage(DatabaseStore::test_file(&db_path));
         let db = relaunched.state::<DatabaseStore>();
         let jobs = db.pending_daemon_closes().unwrap();
+        let intents = db.pending_layout_closes().unwrap();
+        assert_eq!(intents, [intent.clone()]);
         assert_eq!(jobs.len(), 2);
         assert!(jobs.iter().all(|job| job.route == route));
-        state::reserve_pending_terminal_close_ids(&jobs);
+        state::reserve_pending_close_ids(&intents, &jobs);
         let restored = AppStateStore::default();
         restored.replace_snapshot(state::load_persisted_state().unwrap());
         assert!(restored.pty_hydration_plan_for_session(&session_id).is_some());
-        assert!(state::restore_pending_terminal_closes(&restored, &jobs).unwrap());
+        state::restore_pending_layout_closes(&restored, &intents).unwrap();
         assert!(restored.pty_hydration_plan_for_session(&session_id).is_none());
         relaunched.manage(restored);
 
@@ -1680,6 +1723,7 @@ mod tests {
             });
         });
         writer_locked.recv_timeout(Duration::from_secs(5)).unwrap();
+        super::persist_pending_layout_closes(relaunched.handle(), intents);
         super::resume_pending_daemon_closes(relaunched.handle(), jobs);
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), seen.recv()).await.unwrap(), Some(shell_ids[0]));
         allow_ack.send(()).await.unwrap();
@@ -1689,12 +1733,17 @@ mod tests {
         assert_eq!(std::fs::read(root.join("layout.json")).unwrap(), stale_layout);
         allow_ack.send(()).await.unwrap();
         daemon.await.unwrap();
-        assert_eq!(db.pending_daemon_closes().unwrap().len(), 2);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !db.pending_daemon_closes().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(db.pending_layout_closes().unwrap(), [intent]);
         assert_eq!(std::fs::read(root.join("layout.json")).unwrap(), stale_layout);
         release.send(()).unwrap();
         layout_writer.join().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !db.pending_daemon_closes().unwrap().is_empty() {
+            while !db.pending_layout_closes().unwrap().is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.unwrap();

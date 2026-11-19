@@ -274,7 +274,7 @@ pub struct SessionRuntime {
     pub is_spawning: bool,
     /// Rotated under the sessions lock whenever a spawn claims this id.
     restart_token: Uuid,
-    /// Retains the shell cleanup target while a daemon restart is unresolved.
+    /// Retains guarded shell cleanup targets until daemon attachment succeeds.
     #[cfg(unix)]
     daemon_reconciliation: Option<Arc<DaemonReconciliation>>,
     /// Set when this session is owned by the `codemux pty-daemon` process
@@ -550,9 +550,8 @@ fn finish_in_process_session(
 /// RAII ownership for the daemon spawn reservation. Socket errors, RPC
 /// timeouts, task cancellation, and future early-return branches all clear the
 /// `is_spawning` marker automatically unless the successful runtime is
-/// committed. A newly-created placeholder is removed; an existing runtime is
-/// retained so migration output subscribers and the last visible status survive
-/// a failed retry.
+/// committed. A disposable placeholder is removed. A runtime with cleanup
+/// targets, viewers, or visible status survives a failed attempt.
 struct SessionSpawnReservation {
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: String,
@@ -603,6 +602,32 @@ impl SessionSpawnReservation {
         with_existing_session_runtime(&self.sessions, &self.session_id, |runtime| {
             runtime.restart_token == self.restart_token
         }).unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn publish_daemon_reconciliation(&mut self, reconciliation: Arc<DaemonReconciliation>) -> bool {
+        let published = with_existing_session_runtime(&self.sessions, &self.session_id, |runtime| {
+            if runtime.restart_token != self.restart_token {
+                return false;
+            }
+            runtime.daemon_reconciliation = Some(reconciliation.clone());
+            true
+        }).unwrap_or(false);
+        if published {
+            self.reconciliation = Some(reconciliation);
+            // An RPC can create a shell even when its reply is lost.
+            self.remove_on_drop = false;
+        }
+        published
+    }
+
+    #[cfg(unix)]
+    fn clear_daemon_reconciliation_if_current(&self) {
+        with_existing_session_runtime(&self.sessions, &self.session_id, |runtime| {
+            if runtime.restart_token == self.restart_token {
+                runtime.daemon_reconciliation = None;
+            }
+        });
     }
 
     /// Compare the observed shell and take its runtime in one lock. The
@@ -2745,56 +2770,50 @@ pub fn activate_terminal_session<R: Runtime>(
 
 #[cfg(test)]
 fn terminate_pty_session<R: Runtime>(
-    app: &AppHandle<R>,
+    _app: &AppHandle<R>,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
 ) {
-    if let Some(runtime) = take_terminal_session_for_close(app, sessions, session_id) {
+    if let Some(runtime) = remove_session_runtime(sessions, session_id) {
         terminate_removed_session(runtime, session_id);
     }
 }
 
-/// Take ownership of runtime teardown and record any guarded close while
-/// the runtime is still visible. Guarded closes belong to the retry worker.
-/// The caller can release the layout writer lock before terminating any
-/// remaining runtime.
-pub(crate) fn take_terminal_session_for_close<R: Runtime>(
+/// Capture all shell identities and journal the entire layout operation in
+/// one transaction. The caller holds the layout writer lock through this
+/// handoff and terminates any remaining in-process runtimes after release.
+pub(crate) fn take_terminal_sessions_for_close<R: Runtime>(
     app: &AppHandle<R>,
-    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
-    session_id: &str,
-) -> Option<SessionRuntime> {
+    sessions: Option<&Arc<Mutex<HashMap<String, SessionRuntime>>>>,
+    session_ids: impl IntoIterator<Item = state::SessionId>,
+    intent: state::LayoutCloseIntent,
+) -> Vec<(state::SessionId, SessionRuntime)> {
     #[cfg(unix)]
-    let runtime = {
-        let (runtime, cleanup) = {
-            let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
-            let cleanup = sessions
-                .get(session_id)
-                .and_then(|runtime| {
-                    runtime.daemon_reconciliation.clone().or_else(|| {
-                        let route = runtime.daemon_route.clone()?;
-                        let shell_id = runtime.daemon_shell_id?;
-                        Some(Arc::new(DaemonReconciliation::new(
-                            route,
-                            Some(shell_id),
-                            runtime.daemon_client.clone(),
-                        )))
-                    })
-                })
-                .map(|recovery| daemon_backed::prepare_closed_pane_cleanup(app, session_id, &recovery));
-            (sessions.remove(session_id), cleanup)
-        };
-        if let Some(cleanup) = cleanup {
-            daemon_backed::queue_closed_pane_cleanup(app.clone(), cleanup);
-            return None;
+    let mut ready = Vec::new();
+    let mut remaining = Vec::new();
+    if let Some(sessions) = sessions {
+        let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
+        for id in session_ids {
+            let Some(runtime) = sessions.remove(&id.0) else { continue; };
+            #[cfg(unix)]
+            if let Some(recovery) = runtime.daemon_reconciliation.clone().or_else(|| {
+                Some(Arc::new(DaemonReconciliation::new(
+                    runtime.daemon_route.clone()?,
+                    Some(runtime.daemon_shell_id?),
+                    runtime.daemon_client.clone(),
+                )))
+            }) {
+                ready.push(daemon_backed::prepare_closed_pane_cleanup(&id.0, &recovery));
+                continue;
+            }
+            remaining.push((id, runtime));
         }
-        runtime
-    };
+    }
+    #[cfg(unix)]
+    daemon_backed::commit_layout_close(app, intent, ready);
     #[cfg(not(unix))]
-    let runtime = {
-        let _ = app;
-        remove_session_runtime(sessions, session_id)
-    };
-    runtime
+    let _ = (app, intent);
+    remaining
 }
 
 /// Terminate a removed runtime. Its waiter thread owns reaping the child.
@@ -2921,13 +2940,16 @@ pub fn close_terminal_session<R: Runtime>(
     session_id: String,
     select: Option<bool>,
 ) -> Result<String, String> {
-    let (fallback_session, runtime) = state::with_terminal_close_layout_lock(|| {
+    let (fallback_session, runtimes) = state::with_terminal_close_layout_lock(|| {
+        let workspace_id = app_state.workspace_for_terminal_session(&session_id);
         let fallback = app_state.close_terminal_session_with_selection(&session_id, select.unwrap_or(true))?;
-        let runtime = take_terminal_session_for_close(&app, &terminal_state.sessions, &session_id);
-        Ok::<_, String>((fallback, runtime))
+        let workspace_id = workspace_id.ok_or_else(|| format!("No workspace found for terminal {session_id}"))?;
+        let intent = state::LayoutCloseIntent::Session { workspace_id: workspace_id.0, session_id: session_id.clone() };
+        let runtimes = take_terminal_sessions_for_close(&app, Some(&terminal_state.sessions), [state::SessionId(session_id.clone())], intent);
+        Ok::<_, String>((fallback, runtimes))
     })?;
-    if let Some(runtime) = runtime {
-        terminate_removed_session(runtime, &session_id);
+    for (id, runtime) in runtimes {
+        terminate_removed_session(runtime, &id.0);
     }
     state::emit_app_state(&app);
     Ok(fallback_session.0)
@@ -6578,6 +6600,122 @@ mod tests {
             return;
         }
         assert_daemon_reconnect(ReconnectCase::CloseOnSpawn);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closing_a_new_terminal_before_spawn_reply_retires_its_shell() {
+        const TEST: &str = "terminal::tests::closing_a_new_terminal_before_spawn_reply_retires_its_shell";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        use crate::database::DatabaseStore;
+        use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
+        use crate::pty_daemon::protocol::{ClientRequest, ServerResponse, PROTOCOL_VERSION};
+        use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+        use tokio::net::unix::OwnedReadHalf;
+        use tokio::net::UnixListener;
+
+        async fn request(lines: &mut Lines<BufReader<OwnedReadHalf>>) -> ClientRequest {
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let root = crate::test_isolation::isolated_root().unwrap();
+            let socket_path = root.join("initial-spawn.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let daemon_pid = std::process::id();
+            let version = env!("CARGO_PKG_VERSION").to_owned();
+            write_manifest(&DaemonManifest {
+                pid: daemon_pid,
+                socket_path,
+                daemon_version: version.clone(),
+                protocol_version: PROTOCOL_VERSION,
+                started_at: 0,
+            }).unwrap();
+
+            let app = tauri::test::mock_app();
+            app.manage(PtyState::default());
+            app.manage(AppStateStore::default());
+            app.manage(DatabaseStore::test_file(&root.join("close.sqlite")));
+            let layout = app.state::<AppStateStore>();
+            let original = layout.active_terminal_session_id().unwrap().0;
+            let plan = layout.pty_hydration_plan_for_session(&original).unwrap();
+            let pane_id = plan.sessions[0].pane_id.clone().unwrap();
+            let new_session = crate::commands::workspace::split_pane_impl(
+                app.handle().clone(), &layout, pane_id, "horizontal".to_owned(),
+            ).unwrap();
+
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let ClientRequest::Hello { request_id } = request(&mut lines).await else {
+                panic!("expected the initial daemon handshake");
+            };
+            send_daemon_fixture_response(&mut write, ServerResponse::Hello {
+                request_id,
+                protocol_version: PROTOCOL_VERSION,
+                daemon_pid,
+                daemon_version: version,
+                host_claude_plugin: false,
+                guarded_shells: true,
+                prepared_spawn: true,
+            }).await;
+            let ClientRequest::List { request_id } = request(&mut lines).await else {
+                panic!("expected a lookup for an existing shell");
+            };
+            send_daemon_fixture_response(&mut write, ServerResponse::Listed {
+                request_id,
+                sessions: Vec::new(),
+            }).await;
+
+            let prepared = request(&mut lines).await;
+            let ClientRequest::PrepareOwnedSpawn { request_id, session_id, shell_id } = prepared else {
+                panic!("expected a revocable permit for the new pane: {prepared:?}");
+            };
+            assert_eq!(session_id, new_session);
+            assert!(!shell_id.is_nil());
+            send_daemon_fixture_response(&mut write, ServerResponse::SpawnPrepared { request_id }).await;
+
+            let ClientRequest::SpawnOwned { request_id, session_id, shell_id: spawning, .. } = request(&mut lines).await else {
+                panic!("expected a spawn using the prepared permit");
+            };
+            assert_eq!(session_id, new_session);
+            assert_eq!(spawning, shell_id);
+            // The daemon has accepted the spawn, but the app has neither a
+            // spawn reply nor an attached runtime when the pane is closed.
+            let fallback = close_terminal_session(
+                app.handle().clone(), app.state(), app.state(), new_session.clone(), None,
+            ).unwrap();
+            assert_eq!(fallback, original);
+            let db = app.state::<DatabaseStore>();
+            let jobs = db.pending_daemon_closes().unwrap();
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].session_id, new_session);
+            assert_eq!(jobs[0].shell_id, shell_id);
+            send_daemon_fixture_response(&mut write, ServerResponse::Spawned {
+                request_id,
+                session_id,
+                pid: 4242,
+            }).await;
+
+            let close = request(&mut lines).await;
+            let ClientRequest::CloseOwned { request_id, session_id, shell_id: closing } = close else {
+                panic!("expected guarded close instead of attaching the removed pane: {close:?}");
+            };
+            assert_eq!(session_id, new_session);
+            assert_eq!(closing, shell_id);
+            send_daemon_fixture_response(&mut write, ServerResponse::Closed {
+                request_id,
+                attachment_id: None,
+            }).await;
+            while !db.pending_daemon_closes().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(layout.pty_hydration_plan_for_session(&new_session).is_none());
+            let terminals = app.state::<PtyState>();
+            assert!(with_existing_session_runtime(&terminals.sessions, &new_session, |_| ()).is_none());
+        }).await.expect("the newly created pane's daemon shell should close within the test deadline");
     }
 
     #[cfg(unix)]

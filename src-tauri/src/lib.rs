@@ -936,11 +936,12 @@ fn build_core_app<R: tauri::Runtime>(
 
             let handle = app.handle().clone();
             #[cfg(unix)]
-            let pending_terminal_closes = {
+            let (pending_layout_closes, pending_terminal_closes) = {
                 let db = handle.state::<database::DatabaseStore>();
-                let closes = db.pending_daemon_closes().map_err(std::io::Error::other)?;
-                state::reserve_pending_terminal_close_ids(&closes);
-                closes
+                let layout_closes = db.pending_layout_closes().map_err(std::io::Error::other)?;
+                let daemon_closes = db.pending_daemon_closes().map_err(std::io::Error::other)?;
+                state::reserve_pending_close_ids(&layout_closes, &daemon_closes);
+                (layout_closes, daemon_closes)
             };
             // Track whether the persisted layout actually loaded. The
             // Windows orphan-cleanup gate below uses this to skip the
@@ -949,10 +950,10 @@ fn build_core_app<R: tauri::Runtime>(
             // for the full failure-mode write-up.
             let mut layout_loaded = false;
             #[cfg(unix)]
-            let restored_layout = if pending_terminal_closes.is_empty() {
+            let restored_layout = if pending_layout_closes.is_empty() && pending_terminal_closes.is_empty() {
                 state::load_persisted_state()
             } else {
-                // Replay may write immediately after an ACK. Never replace an
+                // Replay may write immediately. Never replace an
                 // unreadable layout with fallback state during startup.
                 state::load_persisted_state_checked().map_err(std::io::Error::other)?
             };
@@ -999,7 +1000,9 @@ fn build_core_app<R: tauri::Runtime>(
                 state.clear_workspaces();
             }
             #[cfg(unix)]
-            if !layout_loaded && mode == AppMode::ServeHeadless && !pending_terminal_closes.is_empty() {
+            if !layout_loaded && mode == AppMode::ServeHeadless
+                && (!pending_layout_closes.is_empty() || !pending_terminal_closes.is_empty())
+            {
                 // The default state was built before reading the close journal.
                 // Allocate this launch's CWD pane above the reserved IDs.
                 handle.state::<state::AppStateStore>()
@@ -1013,12 +1016,10 @@ fn build_core_app<R: tauri::Runtime>(
                 }) {log::warn!("Local import layout recovery remains pending: {error}");}
             }
             #[cfg(unix)]
-            if state::restore_pending_terminal_closes(
+            state::restore_pending_layout_closes(
                 &handle.state::<state::AppStateStore>(),
-                &pending_terminal_closes,
-            ).map_err(std::io::Error::other)? {
-                state::schedule_persist_current(&handle);
-            }
+                &pending_layout_closes,
+            ).map_err(std::io::Error::other)?;
             // Reconciliation checks canonical pane/workspace ownership. Starting
             // it before layout restore can incorrectly hold a saved child result.
             delegation::coordinator::install(app.handle()).map_err(std::io::Error::other)?;
@@ -1325,7 +1326,10 @@ fn build_core_app<R: tauri::Runtime>(
             let _ = claude_plugin::local_plugin_dir();
 
             #[cfg(unix)]
-            terminal::daemon_backed::resume_pending_daemon_closes(&handle, pending_terminal_closes);
+            {
+                terminal::daemon_backed::persist_pending_layout_closes(&handle, pending_layout_closes);
+                terminal::daemon_backed::resume_pending_daemon_closes(&handle, pending_terminal_closes);
+            }
             terminal::spawn_missing_ptys(handle);
 
             // Warm up the PTY daemon connection. The daemon is now the

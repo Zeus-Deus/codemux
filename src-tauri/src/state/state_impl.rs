@@ -139,6 +139,15 @@ pub(crate) fn schedule_persist_current<R: tauri::Runtime>(app: &AppHandle<R>) {
 
 static PERSIST_DEBOUNCER: std::sync::OnceLock<PersistDebouncer> = std::sync::OnceLock::new();
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LayoutCloseIntent {
+    Pane(String),
+    Session { workspace_id: String, session_id: String },
+    Tab { workspace_id: String, tab_id: String },
+    Workspace(String),
+    Archive(Box<ArchivedWorkspaceSnapshot>),
+}
+
 fn persist_debouncer() -> &'static PersistDebouncer {
     PERSIST_DEBOUNCER.get_or_init(PersistDebouncer::new)
 }
@@ -163,30 +172,30 @@ pub fn flush_persisted_state(store: &AppStateStore) {
     }
 }
 
-/// Confirm the pane is absent and commit its removal before retiring a
-/// daemon close record. Coalesce any already queued save of this state.
+/// Commit the full removal before retiring its durable intent.
 #[cfg(unix)]
-pub(crate) fn persist_terminal_close(
+pub(crate) fn persist_layout_closes(
     store: &AppStateStore,
-    workspace_id: &str,
-    session_id: &str,
+    db: &crate::database::DatabaseStore,
+    intents: &[LayoutCloseIntent],
 ) -> Result<(), String> {
     let debouncer = persist_debouncer();
     let _write_guard = debouncer.write_lock.lock().unwrap();
     let pending = debouncer.last_snapshot.lock().unwrap().take();
     let snapshot = store.snapshot();
-    let result = if terminal_pane_for_close_intent(&snapshot, workspace_id, session_id).is_some() {
-        Err("Terminal pane still exists in the layout".into())
+    let saved = if intents.iter().any(|intent| intent.needs_replay(&snapshot)) {
+        Err("A layout close has not finished".into())
     } else {
         save_persisted_state(&snapshot)
     };
-    if result.is_err() {
+    if let Err(error) = saved {
         let mut queued = debouncer.last_snapshot.lock().unwrap();
         if queued.is_none() {
             *queued = pending;
         }
+        return Err(error);
     }
-    result
+    db.retire_layout_closes(intents)
 }
 
 use crate::project::current_project_root;
@@ -769,7 +778,7 @@ impl WorkspaceSnapshot {
 /// Every optional field is `#[serde(default)]` so entries written by a
 /// future version with more fields still load on this one, matching the
 /// additive-field convention used across the snapshot types.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchivedWorkspaceSnapshot {
     /// Identity of the archive entry itself (fresh UUID at archive
     /// time). The original workspace id is NOT reused because a
@@ -4925,6 +4934,10 @@ impl AppStateStore {
         self.close_terminal_session_with_selection(session_id, true)
     }
 
+    pub(crate) fn workspace_for_terminal_session(&self, session_id: &str) -> Option<WorkspaceId> {
+        find_workspace_id_for_session(&self.inner.lock().unwrap().workspaces, session_id)
+    }
+
     pub fn close_terminal_session_with_selection(
         &self,
         session_id: &str,
@@ -6335,16 +6348,15 @@ impl AppStateStore {
                 && workspace.tabs.is_empty()
                 && !workspace.surfaces.is_empty()
             {
-                let tab_id = next_id("tab");
-                let surface_id = workspace
-                    .surfaces
-                    .first()
-                    .map(|s| s.surface_id.clone());
+                let surface_id = workspace.surfaces[0].surface_id.clone();
+                // A close can be journaled before the migrated layout is saved.
+                // Derive the tab ID from the persisted surface so replay can find it.
+                let tab_id = format!("legacy-tab-{}", surface_id.0);
                 workspace.tabs.push(TabSnapshot {
                     tab_id: tab_id.clone(),
                     kind: TabKind::Terminal,
                     title: "Terminal".into(),
-                    surface_id,
+                    surface_id: Some(surface_id),
                     browser_id: None,
                     icon: None,
                 });
@@ -7045,17 +7057,57 @@ pub fn restore_session_ids(snapshot: &AppStateSnapshot) {
 /// A pending close still owns its IDs even after the pane leaves the layout.
 /// Reserve them before imports or restored workspaces allocate new IDs.
 #[cfg(unix)]
-pub(crate) fn reserve_pending_terminal_close_ids(
-    closes: &[crate::database::daemon_closes::PendingDaemonClose],
+pub(crate) fn reserve_pending_close_ids(
+    layout_closes: &[LayoutCloseIntent],
+    daemon_closes: &[crate::database::daemon_closes::PendingDaemonClose],
 ) {
-    if let Some(max_id) = closes
+    if let Some(max_id) = daemon_closes
         .iter()
-        .flat_map(|close| [&close.route.workspace_id, &close.session_id])
+        .flat_map(|close| [close.route.workspace_id.as_str(), close.session_id.as_str()])
+        .chain(layout_closes.iter().flat_map(LayoutCloseIntent::ids))
         .filter_map(|id| extract_numeric_suffix(id))
         .max()
     {
         ID_COUNTER.fetch_max(max_id.saturating_add(1), Ordering::Relaxed);
     }
+}
+
+#[cfg(unix)]
+impl LayoutCloseIntent {
+    fn ids(&self) -> [&str; 2] {
+        match self {
+            Self::Pane(id) | Self::Workspace(id) => [id, ""],
+            Self::Session { workspace_id, session_id } => [workspace_id, session_id],
+            Self::Tab { workspace_id, tab_id } => [workspace_id, tab_id],
+            Self::Archive(entry) => [&entry.workspace_id, ""],
+        }
+    }
+
+    fn needs_replay(&self, snapshot: &AppStateSnapshot) -> bool {
+        match self {
+            Self::Pane(id) => find_pane_location(&snapshot.workspaces, id).is_some(),
+            Self::Session { workspace_id, session_id } => {
+                terminal_pane_for_close_intent(snapshot, workspace_id, session_id).is_some()
+            }
+            Self::Tab { workspace_id, tab_id } => snapshot.workspaces.iter().any(|workspace| {
+                workspace.workspace_id.0 == *workspace_id && workspace.tabs.iter().any(|tab| tab.tab_id == *tab_id)
+            }),
+            Self::Workspace(id) => snapshot.workspaces.iter().any(|workspace| workspace.workspace_id.0 == *id),
+            Self::Archive(entry) => snapshot.workspaces.iter().any(|workspace| workspace.workspace_id.0 == entry.workspace_id)
+                || !archive_installed_or_superseded(snapshot, entry),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn archive_installed_or_superseded(snapshot: &AppStateSnapshot, entry: &ArchivedWorkspaceSnapshot) -> bool {
+    let order = |archive: &ArchivedWorkspaceSnapshot| (archive.archived_at, extract_numeric_suffix(&archive.workspace_id));
+    snapshot.archived_workspaces.iter().any(|other| {
+        other.archive_id == entry.archive_id
+            || (!is_chat_child_entry(entry) && !is_chat_child_entry(other)
+                && other.cwd == entry.cwd && other.worktree_path == entry.worktree_path
+                && order(other) > order(entry))
+    })
 }
 
 #[cfg(unix)]
@@ -7073,22 +7125,40 @@ fn terminal_pane_for_close_intent(
 /// A close intent can outlive the last saved layout. Apply it before any
 /// terminal hydration can reattach to the old shell or launch a replacement.
 #[cfg(unix)]
-pub(crate) fn restore_pending_terminal_closes(
+pub(crate) fn restore_pending_layout_closes(
     store: &AppStateStore,
-    closes: &[crate::database::daemon_closes::PendingDaemonClose],
-) -> Result<bool, String> {
-    let mut removed = false;
+    closes: &[LayoutCloseIntent],
+) -> Result<(), String> {
     for close in closes {
-        let pane_id = {
-            let snapshot = store.inner.lock().unwrap();
-            terminal_pane_for_close_intent(&snapshot, &close.route.workspace_id, &close.session_id)
-        };
-        if let Some(pane_id) = pane_id {
-            store.close_pane_with_selection(&pane_id.0, false)?;
-            removed = true;
+        if !close.needs_replay(&store.inner.lock().unwrap()) {
+            continue;
+        }
+        match close {
+            LayoutCloseIntent::Pane(id) => { store.close_pane_with_selection(id, false)?; }
+            LayoutCloseIntent::Session { workspace_id, session_id } => {
+                let pane = terminal_pane_for_close_intent(&store.inner.lock().unwrap(), workspace_id, session_id);
+                if let Some(pane) = pane {
+                    store.close_pane_with_selection(&pane.0, false)?;
+                }
+            }
+            LayoutCloseIntent::Tab { workspace_id, tab_id } => { store.close_tab(workspace_id, tab_id)?; }
+            LayoutCloseIntent::Workspace(id) => { store.close_workspace(id)?; }
+            LayoutCloseIntent::Archive(entry) => {
+                let (workspace_open, archived) = {
+                    let snapshot = store.inner.lock().unwrap();
+                    (snapshot.workspaces.iter().any(|workspace| workspace.workspace_id.0 == entry.workspace_id),
+                     archive_installed_or_superseded(&snapshot, entry))
+                };
+                if workspace_open {
+                    store.close_workspace(&entry.workspace_id)?;
+                }
+                if !archived {
+                    store.add_archived_workspace((**entry).clone());
+                }
+            }
         }
     }
-    Ok(removed)
+    Ok(())
 }
 
 fn default_app_state() -> AppStateSnapshot {
@@ -9413,6 +9483,174 @@ mod tests {
         assert!(after.workspaces.iter().any(|w| w.workspace_id.0 == ws3_id.0));
         // Active workspace should be set to the first remaining
         assert!(!after.active_workspace_id.0.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_mixed_tab_close_replays_the_whole_tab_after_relaunch() {
+        if crate::test_isolation::isolated("state::state_impl::tests::pending_mixed_tab_close_replays_the_whole_tab_after_relaunch") {
+            return;
+        }
+        assert_scoped_close_replays_after_relaunch(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_migrated_tab_close_replays_before_the_first_migrated_save() {
+        if crate::test_isolation::isolated(
+            "state::state_impl::tests::pending_migrated_tab_close_replays_before_the_first_migrated_save",
+        ) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db_path = root.join("layout-closes.sqlite");
+        let workspace_id = {
+            let store = AppStateStore::default();
+            let mut snapshot = store.snapshot();
+            let workspace_id = snapshot.active_workspace_id.0.clone();
+            snapshot.workspaces[0].tabs.clear();
+            snapshot.workspaces[0].active_tab_id.clear();
+            store.replace_snapshot(snapshot);
+            flush_persisted_state(&store);
+
+            store.migrate_tabs_if_needed();
+            let tab_id = store.find_workspace(&workspace_id).unwrap().active_tab_id;
+            store.close_tab(&workspace_id, &tab_id).unwrap();
+            let intent = LayoutCloseIntent::Tab { workspace_id: workspace_id.clone(), tab_id };
+            crate::database::DatabaseStore::test_file(&db_path)
+                .record_layout_close(&intent, &[])
+                .unwrap();
+            workspace_id
+        };
+
+        let db = crate::database::DatabaseStore::test_file(&db_path);
+        let intents = db.pending_layout_closes().unwrap();
+        let store = AppStateStore::default();
+        let stale_layout = load_persisted_state().unwrap();
+        reserve_pending_close_ids(&intents, &[]);
+        restore_session_ids(&stale_layout);
+        store.replace_snapshot(stale_layout);
+        store.migrate_tabs_if_needed();
+        restore_pending_layout_closes(&store, &intents).unwrap();
+        assert!(store.find_workspace(&workspace_id).unwrap().surfaces.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_workspace_close_replays_the_whole_workspace_after_relaunch() {
+        if crate::test_isolation::isolated("state::state_impl::tests::pending_workspace_close_replays_the_whole_workspace_after_relaunch") {
+            return;
+        }
+        assert_scoped_close_replays_after_relaunch(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_archive_replays_its_entry_after_workspace_removal_was_saved() {
+        if crate::test_isolation::isolated("state::state_impl::tests::pending_archive_replays_its_entry_after_workspace_removal_was_saved") {
+            return;
+        }
+        use crate::database::DatabaseStore;
+
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db_path = root.join("layout-closes.sqlite");
+        let entry = {
+            let store = AppStateStore::default();
+            let workspace_id = store.snapshot().active_workspace_id.0;
+            let entry = build_archive_entry(&store.find_workspace(&workspace_id).unwrap());
+            store.close_workspace(&workspace_id).unwrap();
+            let intent = LayoutCloseIntent::Archive(Box::new(entry.clone()));
+            DatabaseStore::test_file(&db_path).record_layout_close(&intent, &[]).unwrap();
+            // An existing debounce may save the removal before the live
+            // archive entry is published after teardown completes.
+            flush_persisted_state(&store);
+            entry
+        };
+
+        let db = DatabaseStore::test_file(&db_path);
+        let intents = db.pending_layout_closes().unwrap();
+        assert_eq!(intents, [LayoutCloseIntent::Archive(Box::new(entry.clone()))]);
+        let store = AppStateStore::default();
+        store.replace_snapshot(load_persisted_state().unwrap());
+        assert!(store.find_workspace(&entry.workspace_id).is_none());
+        assert!(store.find_archived_workspace(&entry.archive_id).is_none());
+        restore_pending_layout_closes(&store, &intents).unwrap();
+        restore_pending_layout_closes(&store, &intents).unwrap();
+        assert_eq!(store.archived_workspaces_list(), [entry.clone()]);
+        persist_layout_closes(&store, &db, &intents).unwrap();
+        assert_eq!(load_persisted_state().unwrap().archived_workspaces, [entry]);
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    fn assert_scoped_close_replays_after_relaunch(whole_workspace: bool) {
+        use crate::database::daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose};
+        use crate::database::DatabaseStore;
+
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db_path = root.join("layout-closes.sqlite");
+        let (intent, other_workspace, workspace_id, other_tab, closes) = {
+            let store = AppStateStore::default();
+            let other_workspace = store.snapshot().active_workspace_id;
+            let workspace_id = store.create_workspace_with_layout(root.clone(), WorkspacePresetLayout::Single);
+            let (other_tab, _) = store.create_tab(&workspace_id.0, TabKind::Terminal).unwrap();
+            let mut snapshot = store.snapshot();
+            let workspace = snapshot.workspaces.iter_mut().find(|workspace| workspace.workspace_id == workspace_id).unwrap();
+            let tab_id = workspace.tabs[0].tab_id.clone();
+            let surface = &mut workspace.surfaces[0];
+            surface.root = PaneNodeSnapshot::Split {
+                pane_id: PaneId(next_id("split")),
+                direction: SplitDirection::Horizontal,
+                child_sizes: vec![0.5, 0.5],
+                children: vec![surface.root.clone(), PaneNodeSnapshot::AgentChat {
+                    pane_id: PaneId(next_id("pane")),
+                    title: "Keep this chat only if its tab stays open".into(),
+                    thread_id: None,
+                    provider: None,
+                    cwd: None,
+                }],
+            };
+            store.replace_snapshot(snapshot);
+            flush_persisted_state(&store);
+            let (intent, sessions) = if whole_workspace {
+                let result = store.close_workspace(&workspace_id.0).unwrap();
+                (LayoutCloseIntent::Workspace(workspace_id.0.clone()), result.removed_sessions)
+            } else {
+                let result = store.close_tab(&workspace_id.0, &tab_id).unwrap();
+                (LayoutCloseIntent::Tab { workspace_id: workspace_id.0.clone(), tab_id }, result.removed_sessions)
+            };
+            assert_eq!(sessions.len(), if whole_workspace { 2 } else { 1 });
+            let closes: Vec<_> = sessions.into_iter().map(|session| PendingDaemonClose {
+                route: DaemonWorkspaceRoute { workspace_id: workspace_id.0.clone(), host_id: None, ssh_target: None },
+                session_id: session.0,
+                shell_id: uuid::Uuid::new_v4(),
+            }).collect();
+            DatabaseStore::test_file(&db_path).record_layout_close(&intent, &closes).unwrap();
+            // No layout save before the first app stops.
+            (intent, other_workspace, workspace_id, other_tab, closes)
+        };
+
+        let restored = AppStateStore::default();
+        let db = DatabaseStore::test_file(&db_path);
+        let intents = db.pending_layout_closes().unwrap();
+        assert_eq!(intents, [intent.clone()]);
+        assert_eq!(db.pending_daemon_closes().unwrap(), closes);
+        let stale = load_persisted_state().unwrap();
+        assert!(intent.needs_replay(&stale));
+        restored.replace_snapshot(stale);
+        restore_pending_layout_closes(&restored, &intents).unwrap();
+        let restored_snapshot = restored.snapshot();
+        assert!(!intent.needs_replay(&restored_snapshot));
+        assert!(restored_snapshot.workspaces.iter().any(|workspace| workspace.workspace_id == other_workspace));
+        if !whole_workspace {
+            assert!(restored_snapshot.workspaces.iter().any(|workspace| {
+                workspace.workspace_id == workspace_id && workspace.tabs.iter().any(|tab| tab.tab_id == other_tab)
+            }));
+        }
+        persist_layout_closes(&restored, &db, &intents).unwrap();
+        assert!(!intent.needs_replay(&load_persisted_state().unwrap()));
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+        assert_eq!(db.pending_daemon_closes().unwrap(), closes);
     }
 
     /// Regression guard for the PTY child-process leak fix: `close_workspace`
