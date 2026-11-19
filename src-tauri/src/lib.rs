@@ -670,8 +670,6 @@ fn core_startup_plugin<R: tauri::Runtime>(
                 }
                 AppMode::ServeHeadless => (None, headless_layout),
             };
-            // The fallback allocates workspace and pane IDs. Both modes must
-            // know whether a layout is in recovery before creating it.
             app.manage(state::AppStateStore::default());
             app.manage(StartupLayout {
                 snapshot: std::sync::Mutex::new(snapshot),
@@ -1027,7 +1025,6 @@ fn build_core_app<R: tauri::Runtime>(
                         active_workspace_persistence::seed_persisted(workspace_id);
                     }
                 }
-                state::restore_session_ids(&stripped);
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.replace_snapshot(stripped);
                 state.migrate_tabs_if_needed();

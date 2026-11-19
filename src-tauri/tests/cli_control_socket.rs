@@ -714,11 +714,29 @@ fn serve_saves_its_layout_without_overwriting_the_recovery_copy() {
     assert_eq!(std::fs::read(scrollback).unwrap(), b"terminal history");
 }
 
-// Boot in a fresh process each time so the ID allocator resets just as it
-// would after a crash. The test binary can drive the same backend save and
-// reconcile paths as a connected frontend, inside the fixture's state dirs.
+// Boot in a fresh process each time so only the saved layout, scrollback,
+// and database survive the restart.
 #[test]
 fn corrupt_layout_restart_preserves_pane_and_sync_row() {
+    exercise_recovery_exit("discarded-before-boot");
+}
+
+#[test]
+fn corrupt_layout_discard_while_running_preserves_pane_and_sync_row() {
+    exercise_recovery_exit("discarded-while-running");
+}
+
+#[test]
+fn corrupt_layout_repair_preserves_legacy_pane_and_sync_row() {
+    exercise_recovery_exit("repaired");
+}
+
+fn recovery_backup_path(layout: &Path) -> PathBuf {
+    let backup = std::fs::read_to_string(layout.with_extension("json.recovery-pending")).unwrap();
+    layout.with_file_name(backup.trim())
+}
+
+fn exercise_recovery_exit(exit: &str) {
     let root = tempfile::tempdir().unwrap();
     let bin = root.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -740,11 +758,13 @@ fn corrupt_layout_restart_preserves_pane_and_sync_row() {
     };
     let original = boot("original");
     let layout = layout_path(root.path());
+    assert_eq!(original["on_boot"], json!(["workspace-1", "pane-3", "session-4", "surface-2", "tab-5"]));
+    let legacy_layout = std::fs::read(&layout).unwrap();
     std::fs::write(&layout, b"{\"workspaces\":[").unwrap();
     let recovery = boot("recovery");
-    let restored = boot("restored");
-    assert_eq!(restored["on_boot"], recovery["after_create"], "saved recovery identities must restore");
-    for report in [&recovery, &restored] {
+    let pending_restart = boot("pending-restart");
+    assert_eq!(pending_restart["on_boot"], recovery["after_create"], "saved recovery identities must restore");
+    for report in [&recovery, &pending_restart] {
         assert_eq!(report["original"], original["original"], "scrollback bytes, metadata and linked row");
         // Both the fallback and later allocations must be distinct, including
         // sessions: scrollback metadata can also be looked up by session alone.
@@ -752,61 +772,153 @@ fn corrupt_layout_restart_preserves_pane_and_sync_row() {
             assert!(!original["after_create"].as_array().unwrap().contains(id), "reused {id}");
         }
     }
+    if exit == "repaired" {
+        // The user repairs the set-aside layout and restores it over the fallback.
+        let backup = recovery_backup_path(&layout);
+        std::fs::write(&backup, legacy_layout).unwrap();
+        std::fs::rename(backup, &layout).unwrap();
+    } else if exit == "discarded-before-boot" {
+        std::fs::remove_file(recovery_backup_path(&layout)).unwrap();
+    }
+
+    let exited = boot(exit);
+    assert!(!layout.with_extension("json.recovery-pending").exists());
+    let expected = if exit == "repaired" { &original } else { &pending_restart };
+    assert_eq!(exited["on_boot"], expected["after_create"]);
+    if exit == "repaired" {
+        assert_eq!(exited["original"], original["original"]);
+    } else {
+        // Discard makes the absent workspace eligible for normal cleanup.
+        // Its tombstone still belongs to the original cloud workspace.
+        for field in ["id", "workspace_id", "server_id", "title"] {
+            assert_eq!(exited["original"]["row"][field], original["original"]["row"][field]);
+        }
+        assert!(exited["original"]["row"]["deleted_at"].is_string());
+        if exit == "discarded-while-running" {
+            assert_eq!(exited["original"]["scrollback"], original["original"]["scrollback"]);
+        } else {
+            assert!(exited["original"]["scrollback"].is_null(), "startup cleans orphan scrollback");
+        }
+    }
+    let later = boot("later");
+    assert_eq!(later["on_boot"], exited["after_create"]);
+    if exit == "repaired" {
+        assert_eq!(later["original"], original["original"]);
+    }
+    for report in [&exited, &later] {
+        for id in report["created"].as_array().unwrap() {
+            for previous in [&original, &recovery, &pending_restart] {
+                assert!(!previous["after_create"].as_array().unwrap().contains(id), "reused {id}");
+            }
+            assert!(!report["on_boot"].as_array().unwrap().contains(id), "reused live {id}");
+        }
+    }
+}
+
+fn write_legacy_layout(layout: &Path) {
+    use codemux_lib::state;
+
+    // Start from a saved pre-UUID workspace, independent of how this
+    // binary allocates new IDs. All references match its numeric IDs.
+    let mut snapshot = state::AppStateStore::default().snapshot();
+    let ws = &mut snapshot.workspaces[0];
+    ws.workspace_id.0 = "workspace-1".into();
+    snapshot.active_workspace_id = ws.workspace_id.clone();
+    let surface = &mut ws.surfaces[0];
+    surface.surface_id.0 = "surface-2".into();
+    ws.active_surface_id = surface.surface_id.clone();
+    ws.tabs[0].surface_id = Some(surface.surface_id.clone());
+    ws.tabs[0].tab_id = "tab-5".into();
+    ws.active_tab_id = ws.tabs[0].tab_id.clone();
+    let state::PaneNodeSnapshot::Terminal { pane_id, session_id, .. } = &mut surface.root else {
+        panic!("expected a terminal");
+    };
+    pane_id.0 = "pane-3".into();
+    session_id.0 = "session-4".into();
+    surface.active_pane_id = pane_id.clone();
+    snapshot.terminal_sessions[0].session_id = session_id.clone();
+    std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
+    std::fs::write(layout, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 }
 
 #[test]
-#[ignore = "run by corrupt_layout_restart_preserves_pane_and_sync_row in a private home"]
+#[ignore = "run by the recovery tests in a private home"]
 fn write_panes_and_reconcile_fixture() {
     use codemux_lib::{database::DatabaseStore, scrollback, state, workspaces_sync};
     use tauri::Manager;
 
     let phase = std::env::var("CODEMUX_TEST_LAYOUT_BOOT").expect("requires an isolated fixture");
+    let layout = layout_path(&std::env::current_dir().unwrap());
+    if phase == "original" {
+        write_legacy_layout(&layout);
+    }
     let app = codemux_lib::build_headless_app().unwrap();
     let store = app.state::<state::AppStateStore>();
     let db = app.state::<DatabaseStore>();
-    assert_eq!(state::layout_recovery_pending(), phase != "original");
+    if phase == "discarded-while-running" {
+        assert!(state::layout_recovery_pending());
+        std::fs::remove_file(recovery_backup_path(&layout)).unwrap();
+        assert!(state::load_persisted_state().is_some());
+    }
+    assert_eq!(state::layout_recovery_pending(), matches!(phase.as_str(), "recovery" | "pending-restart"));
 
-    let pane_ids = |ws: &state::WorkspaceSnapshot| {
+    let layout_ids = |ws: &state::WorkspaceSnapshot| {
         let state::PaneNodeSnapshot::Terminal { pane_id, session_id, .. } = &ws.surfaces[0].root else {
             panic!("expected a terminal");
         };
-        [ws.workspace_id.0.clone(), pane_id.0.clone(), session_id.0.clone()]
+        [
+            ws.workspace_id.0.clone(), pane_id.0.clone(), session_id.0.clone(),
+            ws.surfaces[0].surface_id.0.clone(), ws.tabs[0].tab_id.clone(),
+        ]
     };
-    let on_boot: Vec<_> = store.snapshot().workspaces.iter().flat_map(pane_ids).collect();
-    store.create_workspace_at_path(std::env::current_dir().unwrap().join(&phase));
+    let on_boot: Vec<_> = store.snapshot().workspaces.iter().flat_map(layout_ids).collect();
+    let created = store.create_workspace_at_path(std::env::current_dir().unwrap().join(&phase));
     let workspaces = store.snapshot().workspaces;
-    let after_create: Vec<_> = workspaces.iter().flat_map(pane_ids).collect();
+    let after_create: Vec<_> = workspaces.iter().flat_map(layout_ids).collect();
+    let transcript = |title: &str| format!("$ echo {title}\r\n\x1b[32m{title}\x1b[0m\r\n");
     for ws in &workspaces {
-        let [workspace_id, pane_id, session_id] = pane_ids(ws);
-        store.rename_workspace(&workspace_id, format!("{phase} {workspace_id}"));
-        let data = format!("$ echo {phase}\r\n\x1b[32m{phase}\x1b[0m\r\n");
+        if ws.workspace_id != created && !matches!(phase.as_str(), "original" | "recovery") {
+            continue;
+        }
+        let [workspace_id, pane_id, session_id, ..] = layout_ids(ws);
+        let title = format!("{phase} {workspace_id}");
+        store.rename_workspace(&workspace_id, title.clone());
         scrollback::save_scrollback(&scrollback::ScrollbackPayload {
-            workspace_id: workspace_id.clone(), pane_id: pane_id.clone(), session_id,
+            workspace_id, pane_id, session_id,
             working_directory: ws.cwd.clone(), original_command: None, cols: 80, rows: 24,
-            data: data.clone(), adapter_captures: Default::default(), adapter_id: None,
+            data: transcript(&title), adapter_captures: Default::default(), adapter_id: None,
             alternate_buffer: false,
         }).unwrap();
-        assert_eq!(scrollback::load_scrollback(&workspace_id, &pane_id).unwrap().data, data);
     }
     workspaces_sync::reconcile_from_state(&db, &store).unwrap();
     let rows = db.list_workspaces_sync();
     for ws in &store.snapshot().workspaces {
+        let [workspace_id, pane_id, session_id, ..] = layout_ids(ws);
+        let saved = scrollback::load_scrollback(&workspace_id, &pane_id).unwrap();
+        assert_eq!(saved.data, transcript(&ws.title));
+        assert_eq!(saved.meta.session_id, session_id);
         assert!(rows.iter().any(|r| r.workspace_id.as_ref() == Some(&ws.workspace_id.0) && r.title == ws.title));
     }
+    let new_row = rows.iter().find(|r| r.workspace_id.as_ref() == Some(&created.0)).unwrap();
+    assert_eq!(new_row.server_id, None, "{phase}: {} inherited an old cloud row", created.0);
     state::flush_persisted_state(&store).unwrap();
 
-    let original_row = || db.list_workspaces_sync().into_iter()
+    let original_row = || db.list_workspaces_sync_for_sync().into_iter()
         .find(|row| row.workspace_id.as_deref() == Some("workspace-1")).unwrap();
     if phase == "original" {
         db.mark_workspace_sync_synced(original_row().id, Some("cloud-original")).unwrap();
     }
     let meta = scrollback::meta_path_for("workspace-1", "pane-3");
+    assert_eq!(meta.exists(), meta.with_extension("dat").exists());
     let report = json!({
         "on_boot": on_boot,
         "after_create": after_create,
+        "created": layout_ids(&store.find_workspace(&created.0).unwrap()),
         "original": {
-            "data": std::fs::read_to_string(meta.with_extension("dat")).unwrap(),
-            "meta": std::fs::read_to_string(meta).unwrap(),
+            "scrollback": meta.exists().then(|| json!({
+                "data": std::fs::read_to_string(meta.with_extension("dat")).unwrap(),
+                "meta": std::fs::read_to_string(meta).unwrap(),
+            })),
             "row": original_row(),
         }
     });

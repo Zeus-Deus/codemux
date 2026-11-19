@@ -214,8 +214,6 @@ pub enum WorkspacePresetLayout {
     Empty,
 }
 
-static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 pub struct WorkspaceId(pub String);
@@ -1925,7 +1923,6 @@ impl AppStateStore {
         }
         Self::restore_import_selection(&current, &mut candidate);
         candidate.active_workspace_id = selection;
-        restore_session_ids(&candidate);
         *current = candidate;
         Ok(ids)
     }
@@ -7220,57 +7217,6 @@ pub fn strip_removed_workspaces_from_snapshot(
     snapshot
 }
 
-pub fn restore_session_ids(snapshot: &AppStateSnapshot) {
-    let max_id = snapshot
-        .workspaces
-        .iter()
-        .flat_map(|workspace| {
-            let mut ids = vec![extract_numeric_suffix(&workspace.workspace_id.0)];
-            ids.extend(workspace.surfaces.iter().flat_map(|surface| {
-                let mut surface_ids = vec![
-                    extract_numeric_suffix(&surface.surface_id.0),
-                    extract_numeric_suffix(&surface.active_pane_id.0),
-                ];
-                surface_ids.extend(collect_numeric_ids_from_node(&surface.root));
-                surface_ids
-            }));
-            ids.extend(workspace.tabs.iter().flat_map(|tab| {
-                let mut tab_ids = vec![extract_numeric_suffix(&tab.tab_id)];
-                if let Some(ref sid) = tab.surface_id {
-                    tab_ids.push(extract_numeric_suffix(&sid.0));
-                }
-                if let Some(ref bid) = tab.browser_id {
-                    tab_ids.push(extract_numeric_suffix(&bid.0));
-                }
-                tab_ids
-            }));
-            ids
-        })
-        .chain(
-            snapshot
-                .terminal_sessions
-                .iter()
-                .map(|session| extract_numeric_suffix(&session.session_id.0)),
-        )
-        .chain(
-            snapshot
-                .browser_sessions
-                .iter()
-                .map(|session| extract_numeric_suffix(&session.browser_id.0)),
-        )
-        .chain(
-            snapshot
-                .agent_browser_sessions
-                .iter()
-                .map(|session| extract_numeric_suffix(&session.session_id.as_str())),
-        )
-        .flatten()
-        .max()
-        .unwrap_or(0);
-
-    ID_COUNTER.store(max_id + 1, Ordering::Relaxed);
-}
-
 fn default_app_state() -> AppStateSnapshot {
     let workspace_id = WorkspaceId(next_id("workspace"));
     let surface_id = SurfaceId(next_id("surface"));
@@ -8638,48 +8584,9 @@ fn stable_browser_session_name(cwd: &str) -> String {
 }
 
 fn next_id(prefix: &str) -> String {
-    // A set-aside layout can own any numeric ID, even after a later boot
-    // restores a saved fallback. Keep new IDs disjoint for the whole recovery.
-    if layout_recovery_pending() {
-        return format!("{prefix}-r{}", uuid::Uuid::new_v4().simple());
-    }
-    let value = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{value}")
-}
-
-fn extract_numeric_suffix(value: &str) -> Option<u64> {
-    value.rsplit('-').next()?.parse::<u64>().ok()
-}
-
-fn collect_numeric_ids_from_node(root: &PaneNodeSnapshot) -> Vec<Option<u64>> {
-    match root {
-        PaneNodeSnapshot::Terminal {
-            pane_id,
-            session_id,
-            ..
-        } => vec![
-            extract_numeric_suffix(&pane_id.0),
-            extract_numeric_suffix(&session_id.0),
-        ],
-        PaneNodeSnapshot::Browser {
-            pane_id,
-            browser_id,
-            ..
-        } => vec![
-            extract_numeric_suffix(&pane_id.0),
-            extract_numeric_suffix(&browser_id.0),
-        ],
-        PaneNodeSnapshot::AgentChat { pane_id, .. } => {
-            vec![extract_numeric_suffix(&pane_id.0)]
-        }
-        PaneNodeSnapshot::Split {
-            pane_id, children, ..
-        } => {
-            let mut ids = vec![extract_numeric_suffix(&pane_id.0)];
-            ids.extend(children.iter().flat_map(collect_numeric_ids_from_node));
-            ids
-        }
-    }
+    // Scrollback and sync rows can outlive the layout that allocated their IDs.
+    // A restored snapshot cannot tell us which IDs are free to reuse.
+    format!("{prefix}-r{}", uuid::Uuid::new_v4().simple())
 }
 
 #[cfg(test)]
