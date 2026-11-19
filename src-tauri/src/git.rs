@@ -7771,7 +7771,7 @@ exit 0
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_merge_into_base_acl_write_only_file_like_git() {
+    fn test_merge_into_base_refuses_a_stale_index_for_a_write_only_file() {
         use std::os::unix::fs::PermissionsExt;
 
         let (_dir, repo, wt) = setup_worktree_merge_scenario();
@@ -7801,39 +7801,46 @@ exit 0
         }
 
         let dest = repo.join(path);
-        {
-            let (_, lock) = lock_checkout_index(&repo).unwrap();
-            let mut files = checkout::PreparedCheckout::new(&repo, &lock, &head_hash(&repo), &new).unwrap();
-            files.install(&repo, &lock).unwrap();
-            let err = files.rollback("simulated ref refusal".into());
-            assert!(!err.contains("Could not restore"), "{err}");
-            assert!(!dest.exists());
-        }
         // Validate both the held inode's bytes and its identity at the name.
         for replace in [false, true] {
             let (_, lock) = lock_checkout_index(&repo).unwrap();
             let mut files = checkout::PreparedCheckout::new(&repo, &lock, &head_hash(&repo), &new).unwrap();
-            files.install(&repo, &lock).unwrap();
+            let refusal = files.install(&repo, &lock).unwrap_err();
+            assert!(refusal.contains("cannot refresh the checkout index"), "{refusal}");
             if replace {
-                std::fs::rename(&dest, repo.join("moved")).unwrap();
+                std::fs::rename(&dest, worktrees.path().join("moved")).unwrap();
             }
             std::fs::write(&dest, b"local edit").unwrap();
-            let err = files.rollback("simulated ref refusal".into());
+            let err = files.rollback(refusal);
             assert!(err.contains("changed during checkout"), "{err}");
             std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert_eq!(std::fs::read(&dest).unwrap(), b"local edit");
             std::fs::rename(&dest, worktrees.path().join(if replace { "replacement" } else { "edit" })).unwrap();
         }
-        fast_forward_checkout(&repo, main_branch(&repo), &new).unwrap();
-        assert_eq!(head_hash(&repo), new);
-        assert_eq!(test_acl(&dest), test_acl(&native_path));
-        assert_eq!(run_git(&repo, &["ls-files", "--stage", "--", path]).unwrap(),
-                   run_git(&native, &["ls-files", "--stage", "--", path]).unwrap());
-        for file in [&dest, &native_path] {
+        let old = head_hash(&repo);
+        let index = repo.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        let err = fast_forward_checkout(&repo, main_branch(&repo), &new).unwrap_err();
+        assert!(err.contains("cannot refresh the checkout index") && err.contains(path), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+        assert!(!dest.exists());
+        // Git may re-read even a matching entry if its mtime is in the same
+        // second as the index. Isolate the stat cache from that racy-Git check.
+        let native_index = git_path(&native, "--git-dir").unwrap().join("index");
+        let mtime = std::fs::metadata(&native_path).unwrap().modified().unwrap();
+        std::fs::File::open(native_index).unwrap().set_modified(mtime + std::time::Duration::from_secs(2)).unwrap();
+        let native_status = run_git(&native, &["status", "--porcelain"]).unwrap();
+        assert_eq!(native_status, "");
+        assert_eq!(run_git(&repo, &["status", "--porcelain"]).unwrap(), native_status);
+        let (_, recovery) = err.split_once("Checkout recovery files remain at ").expect(&err);
+        let retained = Path::new(recovery).join(path);
+        assert_eq!(test_acl(&retained), test_acl(&native_path));
+        for file in [&retained, &native_path] {
             assert_eq!(std::fs::File::open(file).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
             std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        assert_eq!(std::fs::read(dest).unwrap(), std::fs::read(native_path).unwrap());
+        assert_eq!(std::fs::read(retained).unwrap(), std::fs::read(native_path).unwrap());
     }
 
     #[cfg(target_os = "linux")]

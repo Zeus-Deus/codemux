@@ -425,6 +425,21 @@ impl PreparedCheckout {
 
     pub(super) fn install(&mut self, checkout: &Path, lock: &Path) -> Result<(), String> {
         self.install_files(checkout).map_err(|e| e.to_string())?;
+        // Git must reopen each copied file to replace the scratch inode's stat
+        // data. A quiet refresh skips unreadable files like ordinary local edits.
+        for action in &self.undo {
+            if let Undo::UninstallFile {
+                dest,
+                held: Some(_),
+                ..
+            } = action
+            {
+                return Err(format!(
+                    "cannot refresh the checkout index for '{}': Git cannot reopen the installed file for reading",
+                    dest.display()
+                ));
+            }
+        }
         // Moving a file can change its stat data (notably ctime). Refresh
         // clean entries without staging the user's unrelated dirty files.
         run_git_with_index(
