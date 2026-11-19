@@ -105,8 +105,59 @@ pub fn detect_with_project_root(
 /// provider's path the skill originated from. The pull pipeline
 /// uses this to write decrypted skills; the file watcher's
 /// "currently-writing" guard uses it to avoid an echo loop.
+///
+/// Callers check [`is_skill_dir_name`] first: the name comes from the
+/// server, and joining a `../x` or an absolute path here would write
+/// outside the skills root.
 pub fn destination_path_after_pull(name: &str, home: &Path) -> PathBuf {
     home.join(".codemux/skills").join(name).join("SKILL.md")
+}
+
+/// The user-scope skill root (`~/.claude/skills`, `~/.codemux/skills`, …)
+/// that `path` is a `<name>/SKILL.md` under, if any. Remote writes are
+/// confined to it.
+pub fn user_skill_root_for(path: &Path, home: &Path) -> Option<PathBuf> {
+    USER_SCOPE_PROVIDERS.iter().find_map(|(subdir, _)| {
+        let root = home.join(subdir);
+        let rel = path.strip_prefix(&root).ok()?;
+        is_skill_md_layout(rel).then_some(root)
+    })
+}
+
+/// Whether `name` can name a skill's own directory: exactly one ordinary
+/// path component, so it can never climb out of, or replace, the skills
+/// root. Names otherwise stay as free-form as the directories they come
+/// from (other tools allow capitals, `_`, spaces), within what every
+/// platform's file system accepts.
+pub fn is_skill_dir_name(name: &str) -> bool {
+    use std::path::Component;
+    // The name must work as a folder on every device the account syncs to,
+    // so Windows' rules apply everywhere: none of `<>:"/\\|?*` or control
+    // characters, no trailing dot or space, no reserved device name.
+    if name.is_empty()
+        || name.len() > 255
+        || name.chars().any(|c| c.is_control() || r#"<>:"/\|?*"#.contains(c))
+        || name.ends_with(['.', ' '])
+        || is_windows_device_name(name)
+    {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+/// `CON`, `nul.txt`, `COM1`, `LPT²` and the like, which Windows reserves
+/// whatever the extension or case.
+fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end().to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let Some(digit) = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT")) else {
+        return false;
+    };
+    let mut chars = digit.chars();
+    matches!((chars.next(), chars.next()), (Some('1'..='9' | '¹' | '²' | '³'), None))
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -380,6 +431,22 @@ mod tests {
         let home = fake_home();
         let dest = destination_path_after_pull("my-skill", &home);
         assert_eq!(dest, home.join(".codemux/skills/my-skill/SKILL.md"));
+    }
+
+    #[test]
+    fn only_a_single_ordinary_component_names_a_skill_dir() {
+        for ok in ["my-skill", "My_Skill", "skill v2", "a.b", "..hidden-ish", "console", "com10", "lpt0", "com⁴"] {
+            assert!(is_skill_dir_name(ok), "{ok:?}");
+        }
+        for bad in [
+            "", ".", "..", "../x", "../../projects/repo/.claude/skills/x", "/etc",
+            "a/b", "a\\b", "C:\\x", "C:", "x\0", "./x",
+            "what?", "a*b", "a<b", "a>b", "a|b", "say \"hi\"", "tab\there",
+            "trailing.", "trailing ", "CON", "nul", "Com1", "lpt9.txt", "aux.md",
+            "COM¹", "lpt².txt", "com³",
+        ] {
+            assert!(!is_skill_dir_name(bad), "{bad:?}");
+        }
     }
 
     #[test]

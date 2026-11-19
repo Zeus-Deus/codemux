@@ -226,9 +226,13 @@ webview2-com = "=0.38.2"
 # Used by host input injection and Hermes profile filesystem identity.
 # Already in the transitive tree; the explicit dep lets us call the functions.
 windows-sys = { version = "0.59", features = [
+    # NtCreateFile relative to a directory handle, for confined skill writes
+    # (`skills_sync::confined`).
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
-    # CancelIoEx, to release the OpenCode server's stdout read on shutdown.
+    # IO_STATUS_BLOCK for confined skill writes and CancelIoEx for OpenCode shutdown.
     "Win32_System_IO",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
