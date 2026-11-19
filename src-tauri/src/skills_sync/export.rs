@@ -172,6 +172,13 @@ pub async fn import_exported_skills(
     let mut failed_count = 0usize;
 
     for skill in envelope.skills {
+        // Every device on the account would write this name as a
+        // directory, so a file cannot smuggle in a path.
+        if !super::path_detection::is_skill_dir_name(&skill.name) {
+            eprintln!("[skills_sync/import] skipping skill with an unusable name {:?}", skill.name);
+            failed_count += 1;
+            continue;
+        }
         match push_one_skill(token, &skill).await {
             Ok(()) => queued_count += 1,
             Err(err) => {

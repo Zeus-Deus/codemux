@@ -153,11 +153,9 @@ pub fn rebuild_project_index(
     store: State<'_, ProjectIndexStore>,
     app_state: State<'_, crate::state::AppStateStore>,
     project_root: Option<String>,
-) -> Result<ProjectIndexSnapshot, String> {
+) -> Result<std::sync::Arc<ProjectIndexSnapshot>, String> {
     let root = project_root.or_else(|| app_state.active_workspace_cwd().map(|(_, cwd)| cwd));
-    let snapshot = rebuild_index(root)?;
-    store.replace_snapshot(snapshot.clone());
-    Ok(snapshot)
+    rebuild_index(&store, root)
 }
 
 #[tauri::command]

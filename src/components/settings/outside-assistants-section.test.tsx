@@ -683,9 +683,10 @@ it("keeps a token reveal through a failed read and drops it once its row is revo
   expect(screen.getByRole("alert")).toHaveTextContent("Unable to verify connections");
   expect(screen.getByText(issuedToken.token)).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Refresh outside assistants" }));
-  await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
-  expect(screen.getByText(issuedToken.token)).toBeInTheDocument();
   const row = within(screen.getByRole("group", { name: "Token hermes-bot" }));
+  await waitFor(() => expect(row.getByRole("button", { name: "Revoke" })).toBeEnabled());
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.getByText(issuedToken.token)).toBeInTheDocument();
   fireEvent.click(row.getByRole("button", { name: "Revoke" }));
   api.status.mockResolvedValue(snapshot({ ...LISTENING }));
   fireEvent.click(row.getByRole("button", { name: "Revoke access" }));

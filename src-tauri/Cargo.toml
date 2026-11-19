@@ -36,13 +36,15 @@ tar = "0.4"
 # additive: the GUI path never instantiates the mock runtime.
 tauri = { version = "2", features = ["protocol-asset", "test"] }
 tauri-plugin-opener = "2"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 # Embedded workflow JavaScript has no filesystem/network bindings or module loader.
 rquickjs = { version = "0.13", features = ["futures", "parallel"] }
 # Schemas are local data: external file/HTTP resolution is deliberately disabled.
 jsonschema = { version = "0.56", default-features = false }
 notify = "8.2.0"
+cap-std = "4"
+cap-fs-ext = "4"
 toml = "1.0.3"
 json5 = "0.4"
 dirs = "6.0.0"
@@ -59,7 +61,7 @@ tempfile = "3"
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
 libc = "0.2"
-tauri-plugin-single-instance = "2.4.0"
+tauri-plugin-single-instance = "2.4.5"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 # Persistent native-side logging (file in the app log dir + stderr).
@@ -211,6 +213,8 @@ webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 gtk = "0.18"
 
 [target.'cfg(windows)'.dependencies]
+clack-private-fs = "1"
+winx = "0.36"
 # Web Push's ECE encryption uses OpenSSL. Bundle it on Windows instead of
 # requiring users/builders to provide a system OpenSSL installation.
 openssl = { version = "0.10", features = ["vendored"] }
@@ -222,8 +226,14 @@ webview2-com = "=0.38.2"
 # Used by host input injection and Hermes profile filesystem identity.
 # Already in the transitive tree; the explicit dep lets us call the functions.
 windows-sys = { version = "0.59", features = [
+    # NtCreateFile relative to a directory handle, for confined skill writes
+    # (`skills_sync::confined`).
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    # IO_STATUS_BLOCK for confined skill writes and CancelIoEx for OpenCode shutdown.
+    "Win32_System_IO",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

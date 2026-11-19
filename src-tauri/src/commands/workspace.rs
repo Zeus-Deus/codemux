@@ -4821,7 +4821,7 @@ mod archive_guard_tests {
 
         let store = AppStateStore::default();
         let workspace_id = store.create_empty_workspace_at_path(folder).0;
-        crate::state::flush_persisted_state(&store);
+        crate::state::flush_persisted_state(&store).unwrap();
         let saved = std::fs::read(root.join("layout.json")).unwrap();
         let db_path = root.join("workspace-close.sqlite");
         let app = tauri::test::mock_app();

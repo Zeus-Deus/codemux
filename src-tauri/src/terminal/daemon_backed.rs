@@ -2236,7 +2236,7 @@ mod tests {
         std::fs::write(&layout_path, b"invalid layout").unwrap();
         assert!(state::load_persisted_state_checked().is_err());
         assert_eq!(std::fs::read(&layout_path).unwrap(), b"invalid layout");
-        state::flush_persisted_state(&initial_store);
+        state::flush_persisted_state(&initial_store).unwrap();
         let stale_layout = std::fs::read(&layout_path).unwrap();
         {
             let app = tauri::test::mock_app();
@@ -2324,7 +2324,8 @@ mod tests {
             state::with_terminal_close_layout_lock(|| {
                 locked.send(()).unwrap();
                 let _ = wait_for_release.recv_timeout(Duration::from_secs(15));
-            });
+                Ok::<_, String>(())
+            }).unwrap();
         });
         writer_locked.recv_timeout(Duration::from_secs(5)).unwrap();
         super::persist_pending_layout_closes(relaunched.handle(), intents);

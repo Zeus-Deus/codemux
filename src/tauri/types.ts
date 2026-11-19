@@ -647,6 +647,8 @@ export interface MergeIntoBaseResult {
   temp_branch: string | null;
   source_branch: string;
   conflicted_files: ConflictFile[];
+  /** A relative recovery path starts at the directory printed by `git rev-parse --git-common-dir`. */
+  recovery_dir: string | null;
 }
 
 export interface BaseBranchDiff {

@@ -7281,7 +7281,7 @@ mod tests {
                 None
             } else {
                 let saved_session = initial_layout.split_pane(&pane_id, state::SplitDirection::Horizontal).unwrap().0;
-                state::flush_persisted_state(&initial_layout);
+                state::flush_persisted_state(&initial_layout).unwrap();
                 let restored = AppStateStore::default();
                 restored.replace_snapshot(state::load_persisted_state().unwrap());
                 app.manage(restored);
@@ -7433,7 +7433,7 @@ mod tests {
 
                     // A desktop relaunch loses in-memory provenance and the
                     // local PTY. Its layout and the older daemon survive.
-                    state::flush_persisted_state(&layout);
+                    state::flush_persisted_state(&layout).unwrap();
                     terminate_pty_session(app.handle(), &terminal.sessions, &local);
                     let old_client = remove_session_runtime(&terminal.sessions, &original).unwrap()
                         .daemon_client.clone().unwrap();
@@ -7690,7 +7690,7 @@ mod tests {
             let restarting = plan.sessions[0].session_id.clone();
             let pane = plan.sessions[0].pane_id.as_deref().unwrap();
             let sibling = layout.split_pane(pane, state::SplitDirection::Horizontal).unwrap().0;
-            state::flush_persisted_state(&layout);
+            state::flush_persisted_state(&layout).unwrap();
             let restored = AppStateStore::default();
             restored.replace_snapshot(state::load_persisted_state().unwrap());
 
@@ -8015,7 +8015,7 @@ mod tests {
                         restarting.clone()
                     };
                     drop(fault);
-                    state::flush_persisted_state(&app.state::<AppStateStore>());
+                    state::flush_persisted_state(&app.state::<AppStateStore>()).unwrap();
                     drop(remove_session_runtime(sessions, &restarting));
                     let client = remove_session_runtime(sessions, &sibling).unwrap().daemon_client.clone().unwrap();
                     drop(lines);
@@ -8423,7 +8423,7 @@ mod tests {
         let dormant = &plan.sessions[0];
         let sibling = prior_layout.split_pane(dormant.pane_id.as_deref().unwrap(), state::SplitDirection::Horizontal).unwrap();
         assert!(prior_layout.activate_workspace(&active));
-        state::flush_persisted_state(&prior_layout);
+        state::flush_persisted_state(&prior_layout).unwrap();
         let path = root.join("layout.json");
         let saved = std::fs::read(&path).unwrap();
 
@@ -8513,7 +8513,7 @@ mod tests {
                 assert_eq!(fallback, active);
                 let layout = app.state::<AppStateStore>();
                 assert!(layout.find_workspace(&inactive).is_none());
-                state::flush_persisted_state(&layout);
+                state::flush_persisted_state(&layout).unwrap();
             });
             return;
         }
@@ -8536,7 +8536,7 @@ mod tests {
                 shell_id: Uuid::from_u128(1),
             };
             DatabaseStore::test_file(&db_path).remember_daemon_shell(&close).unwrap();
-            state::flush_persisted_state(&layout);
+            state::flush_persisted_state(&layout).unwrap();
             close
         };
 
@@ -8609,7 +8609,7 @@ mod tests {
         let plan = saved.pty_hydration_plan_for_workspace(&workspace_id).unwrap();
         let session_id = plan.sessions[0].session_id.clone();
         assert!(saved.activate_workspace(&original_active));
-        state::flush_persisted_state(&saved);
+        state::flush_persisted_state(&saved).unwrap();
         let restored = AppStateStore::default();
         restored.replace_snapshot(state::load_persisted_state().unwrap());
 
@@ -9353,7 +9353,7 @@ mod tests {
                             host_id: None,
                             ssh_target: None,
                         });
-                        state::flush_persisted_state(&layout_state);
+                        state::flush_persisted_state(&layout_state).unwrap();
                     }
                     if case == ReconnectCase::CloseAfterSpawnRetry {
                         let retry_token = with_existing_session_runtime(&pty_state.sessions, &id, |runtime| {
