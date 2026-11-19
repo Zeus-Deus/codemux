@@ -52,6 +52,7 @@
 use crate::auth::{api_base_url, is_token_expired, load_token};
 use crate::database::DatabaseStore;
 use crate::state::AppStateSnapshot;
+use crate::sync_guard::{sync_client, SyncGuard, SYNC_BUDGET};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,25 +132,88 @@ static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
+    // Queue before reading the session: a pass that waited out a sign-out
+    // or account switch must sync whoever is signed in now, not upload the
+    // new account's rows with the old account's token.
+    let _one_at_a_time = SYNC_LOCK.lock().await;
     let db = app.state::<DatabaseStore>();
-    let token = match valid_token(&db) {
-        Some(t) => t,
-        None => return Ok(()),
+    // No auth state means no session to sync for.
+    let Some(auth) = app.try_state::<crate::auth::AuthState>() else {
+        return Ok(());
     };
-    sync_once(&token, &db).await
+    let (generation, token) = auth.session_snapshot(|| valid_token(&db));
+    let Some(token) = token else {
+        return Ok(());
+    };
+    let guard = SyncGuard::Session { auth: &auth, generation };
+    sync_locked(&token, &db, &guard).await
 }
 
-/// Pull, then push, holding [`SYNC_LOCK`] throughout.
+/// One pull-then-push pass, queued behind any other.
 pub async fn sync_once(token: &str, db: &DatabaseStore) -> Result<(), String> {
     let _one_at_a_time = SYNC_LOCK.lock().await;
-    let pull_err = pull(token, db).await.err();
-    let push_err = push(token, db).await.err();
+    sync_locked(token, db, &SyncGuard::Unchecked).await
+}
+
+/// Pull, then push, within [`SYNC_BUDGET`]. Called with [`SYNC_LOCK`] held.
+/// A pass cut off by the budget may have sent an upload whose answer never
+/// came: every row still waiting for its first upload is then treated as
+/// possibly created (see [`UNCERTAIN_UPLOADS`]).
+async fn sync_locked(token: &str, db: &DatabaseStore, guard: &SyncGuard<'_>) -> Result<(), String> {
+    sync_locked_within(token, db, guard, SYNC_BUDGET).await
+}
+
+async fn sync_locked_within(
+    token: &str,
+    db: &DatabaseStore,
+    guard: &SyncGuard<'_>,
+    budget: std::time::Duration,
+) -> Result<(), String> {
+    let outcome = tokio::time::timeout(budget, async {
+        let pull_err = pull_guarded(token, db, guard).await.err();
+        let push_err = push_guarded(token, db, guard).await.err();
+        (pull_err, push_err)
+    })
+    .await;
+    let Ok((pull_err, push_err)) = outcome else {
+        let mut uncertain = lock_uncertain();
+        for row in db.list_dirty_workspaces_sync() {
+            if row.server_id.is_none() && row.deleted_at.is_none() {
+                uncertain.insert(row.id);
+            }
+        }
+        return Err(format!("timed out after {}s", budget.as_secs()));
+    };
     match (pull_err, push_err) {
         (None, None) => Ok(()),
         (Some(p), None) => Err(format!("pull failed: {p}")),
         (None, Some(p)) => Err(format!("push failed: {p}")),
         (Some(a), Some(b)) => Err(format!("pull failed: {a}; push failed: {b}")),
     }
+}
+
+/// Local rows whose first upload may have created a server row although
+/// no answer said so — the request failed after it could have been sent,
+/// or the pass ran out of time. The next pull links a matching server row
+/// it does not know yet to such a row instead of adding a duplicate, and
+/// until a pull has looked, the row is neither uploaded again nor settled.
+/// In memory only: after a restart such a row is uploaded again.
+static UNCERTAIN_UPLOADS: std::sync::LazyLock<std::sync::Mutex<HashSet<i64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn lock_uncertain() -> std::sync::MutexGuard<'static, HashSet<i64>> {
+    UNCERTAIN_UPLOADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether the server row `w` is the one an uncertain upload of `row` made.
+fn same_workspace(row: &crate::database::WorkspaceSyncRecord, w: &ServerWorkspace) -> bool {
+    row.title == w.title
+        && row.host_server_id == w.host_server_id
+        && row.project_path == w.project_path
+        && row.project_remote == w.project_remote
+        && row.git_branch == w.git_branch
+        && row.project_uid == w.project_uid
+        && row.workspace_kind == w.workspace_kind
 }
 
 fn valid_token(db: &DatabaseStore) -> Option<String> {
@@ -173,8 +237,13 @@ fn valid_token(db: &DatabaseStore) -> Option<String> {
 /// non-null but missing from the server response is treated as a
 /// server-side deletion the local hasn't observed yet.
 pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
+    pull_guarded(token, db, &SyncGuard::Unchecked).await
+}
+
+async fn pull_guarded(token: &str, db: &DatabaseStore, guard: &SyncGuard<'_>) -> Result<(), String> {
     let base = api_base_url();
-    let client = reqwest::Client::new();
+    let client = sync_client();
+    guard.ensure_current()?;
     let resp = client
         .get(format!("{base}/api/workspaces"))
         .header("Authorization", format!("Bearer {token}"))
@@ -191,14 +260,37 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
     }
     let body: ListWorkspacesResponse =
         resp.json().await.map_err(|e| format!("Parse: {e}"))?;
+    // Written only while the session that asked is still current.
+    guard.commit(|| apply_pulled(db, &body))?
+}
 
+fn apply_pulled(db: &DatabaseStore, body: &ListWorkspacesResponse) -> Result<(), String> {
     // Index local rows by server_id so we can detect server-side
     // deletions (server stopped returning a row we know about).
     let local = db.list_workspaces_sync_for_sync();
     let server_ids: std::collections::HashSet<String> =
         body.workspaces.iter().map(|w| w.id.clone()).collect();
+    let known: HashSet<&str> = local.iter().filter_map(|r| r.server_id.as_deref()).collect();
 
-    for w in &body.workspaces {
+    // An upload whose outcome was unknown: a server row this device does
+    // not know yet, matching such a row, is that upload's result.
+    let mut uncertain = lock_uncertain();
+    let mut linked: HashSet<String> = HashSet::new();
+    for w in body.workspaces.iter().filter(|w| !known.contains(w.id.as_str())) {
+        if let Some(row) = local
+            .iter()
+            .find(|r| r.server_id.is_none() && uncertain.contains(&r.id) && same_workspace(r, w))
+        {
+            db.mark_workspace_sync_pushed(row, Some(&w.id))?;
+            uncertain.remove(&row.id);
+            linked.insert(w.id.clone());
+        }
+    }
+    // The list has been seen: an upload that matched nothing made nothing.
+    uncertain.clear();
+    drop(uncertain);
+
+    for w in body.workspaces.iter().filter(|w| !linked.contains(&w.id)) {
         db.upsert_workspace_sync_from_server(
             &w.id,
             &w.title,
@@ -335,21 +427,29 @@ fn dedupe_sibling_rows(db: &DatabaseStore) {
 /// rows; failures are logged and the row stays dirty for the next
 /// sync to retry.
 pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
+    push_guarded(token, db, &SyncGuard::Unchecked).await
+}
+
+async fn push_guarded(token: &str, db: &DatabaseStore, guard: &SyncGuard<'_>) -> Result<(), String> {
     let base = api_base_url();
-    let client = reqwest::Client::new();
-    let dirty = db.list_dirty_workspaces_sync();
+    let client = sync_client();
+    let dirty = guard.commit(|| db.list_dirty_workspaces_sync())?;
     let mut any_failed = false;
     // The account's list, fetched at most once a pass, and only if a row
     // turns out to be gone.
     let mut listed: Option<Option<std::collections::HashSet<String>>> = None;
 
     for row in &dirty {
+        // Waits for a pull to say whether its earlier upload took.
+        if row.server_id.is_none() && lock_uncertain().contains(&row.id) {
+            continue;
+        }
         let result = if row.deleted_at.is_some() {
-            push_delete(&client, &base, token, row, db).await
+            push_delete(&client, &base, token, row, db, guard).await
         } else if row.server_id.is_none() {
-            push_insert(&client, &base, token, row, db).await
+            push_insert(&client, &base, token, row, db, guard).await
         } else {
-            push_update(&client, &base, token, row, db, &mut listed).await
+            push_update(&client, &base, token, row, db, &mut listed, guard).await
         };
         if let Err(error) = result {
             eprintln!(
@@ -360,7 +460,7 @@ pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
         }
     }
 
-    db.purge_acknowledged_workspace_sync_deletes()?;
+    guard.commit(|| db.purge_acknowledged_workspace_sync_deletes())??;
 
     if any_failed {
         Err("one or more workspace pushes failed; see logs".into())
@@ -375,6 +475,7 @@ async fn push_insert(
     token: &str,
     row: &crate::database::WorkspaceSyncRecord,
     db: &DatabaseStore,
+    guard: &SyncGuard<'_>,
 ) -> Result<(), String> {
     let body = WorkspaceUpsertBody {
         title: &row.title,
@@ -386,19 +487,34 @@ async fn push_insert(
         project_uid: row.project_uid.as_deref(),
         workspace_kind: row.workspace_kind.as_deref(),
     };
-    let resp = client
+    guard.ensure_current()?;
+    let resp = match client
         .post(format!("{base}/api/workspaces"))
         .header("Authorization", format!("Bearer {token}"))
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            // Unless it never connected, the server may have made the row.
+            if !e.is_connect() {
+                lock_uncertain().insert(row.id);
+            }
+            return Err(format!("Network error: {e}"));
+        }
+    };
     if !resp.status().is_success() {
         return Err(format!("API error: {}", resp.status()));
     }
-    let parsed: OneWorkspaceResponse =
-        resp.json().await.map_err(|e| format!("Parse: {e}"))?;
-    db.mark_workspace_sync_pushed(row, Some(&parsed.workspace.id))?;
+    let parsed: OneWorkspaceResponse = match resp.json().await {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            lock_uncertain().insert(row.id);
+            return Err(format!("Parse: {e}"));
+        }
+    };
+    guard.commit(|| db.mark_workspace_sync_pushed(row, Some(&parsed.workspace.id)))??;
     Ok(())
 }
 
@@ -409,6 +525,7 @@ async fn push_update(
     row: &crate::database::WorkspaceSyncRecord,
     db: &DatabaseStore,
     listed: &mut Option<Option<std::collections::HashSet<String>>>,
+    guard: &SyncGuard<'_>,
 ) -> Result<(), String> {
     let server_id = row
         .server_id
@@ -424,6 +541,7 @@ async fn push_update(
         project_uid: row.project_uid.as_deref(),
         workspace_kind: row.workspace_kind.as_deref(),
     };
+    guard.ensure_current()?;
     let resp = client
         .patch(format!("{base}/api/workspaces/{server_id}"))
         .header("Authorization", format!("Bearer {token}"))
@@ -431,14 +549,15 @@ async fn push_update(
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
-    if resp.status().as_u16() == 404 && server_lacks_workspace(client, base, token, server_id, listed).await {
+    if resp.status().as_u16() == 404 && server_lacks_workspace(client, base, token, server_id, listed, guard).await {
         // Deleted on another device before this edit reached the account.
         // The pull leaves dirty rows alone, so settle it here: the
         // removal wins, as it does for a clean row.
         eprintln!("[workspaces-sync] server no longer has {server_id}; dropping the local edit");
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        return guard.commit(|| {
         db.mark_workspace_sync_synced(row.id, None)?;
-        return db.upsert_workspace_sync_from_server(
+        db.upsert_workspace_sync_from_server(
             server_id,
             &row.title,
             row.host_server_id.as_deref(),
@@ -451,12 +570,13 @@ async fn push_update(
             Some(&now),
             row.project_uid.as_deref(),
             row.workspace_kind.as_deref(),
-        );
+        )
+        })?;
     }
     if !resp.status().is_success() {
         return Err(format!("API error: {}", resp.status()));
     }
-    db.mark_workspace_sync_pushed(row, None)?;
+    guard.commit(|| db.mark_workspace_sync_pushed(row, None))??;
     Ok(())
 }
 
@@ -471,9 +591,11 @@ async fn server_lacks_workspace(
     token: &str,
     server_id: &str,
     listed: &mut Option<Option<std::collections::HashSet<String>>>,
+    guard: &SyncGuard<'_>,
 ) -> bool {
     if listed.is_none() {
         let ids = async {
+            guard.ensure_current().ok()?;
             let resp = client
                 .get(format!("{base}/api/workspaces"))
                 .header("Authorization", format!("Bearer {token}"))
@@ -498,6 +620,7 @@ async fn push_delete(
     token: &str,
     row: &crate::database::WorkspaceSyncRecord,
     db: &DatabaseStore,
+    guard: &SyncGuard<'_>,
 ) -> Result<(), String> {
     // A row that was created and deleted entirely while offline (no
     // server_id) has nothing to push — clear dirty so the next purge
@@ -505,10 +628,11 @@ async fn push_delete(
     let server_id = match &row.server_id {
         Some(sid) => sid,
         None => {
-            db.mark_workspace_sync_synced(row.id, None)?;
+            guard.commit(|| db.mark_workspace_sync_synced(row.id, None))??;
             return Ok(());
         }
     };
+    guard.ensure_current()?;
     let resp = client
         .delete(format!("{base}/api/workspaces/{server_id}"))
         .header("Authorization", format!("Bearer {token}"))
@@ -519,7 +643,7 @@ async fn push_delete(
     if !resp.status().is_success() && resp.status().as_u16() != 404 {
         return Err(format!("API error: {}", resp.status()));
     }
-    db.mark_workspace_sync_pushed(row, None)?;
+    guard.commit(|| db.mark_workspace_sync_pushed(row, None))??;
     Ok(())
 }
 
@@ -870,6 +994,7 @@ pub async fn sync_workspaces(token: &str, db: &DatabaseStore) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use crate::database::DatabaseStore;
+    use crate::sync_guard::SyncGuard;
     use serial_test::serial;
 
     fn fresh_db() -> DatabaseStore {
@@ -999,16 +1124,22 @@ mod tests {
         std::env::remove_var("CODEMUX_API_URL");
     }
 
-    /// A tiny account API for the race below: each connection is served on
-    /// its own task, so a slow POST holds up nothing else. Counts DELETEs.
-    async fn racing_api(deletes: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> String {
+    type Handler = std::sync::Arc<
+        dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = (&'static str, String)> + Send>>
+            + Send
+            + Sync,
+    >;
+
+    /// A tiny account API: each connection is served on its own task, so a
+    /// slow answer holds up nothing else. `handler` gets the request line.
+    async fn test_api(handler: Handler) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else { return };
-                let deletes = deletes.clone();
+                let handler = handler.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -1019,20 +1150,7 @@ mod tests {
                         }
                     }
                     let line = String::from_utf8_lossy(&request).lines().next().unwrap_or("").to_string();
-                    let (status, body) = if line.starts_with("GET /api/workspaces ") {
-                        ("200 OK", r#"{"workspaces":[]}"#.to_string())
-                    } else if line.starts_with("POST /api/workspaces ") {
-                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                        (
-                            "200 OK",
-                            r#"{"workspace":{"id":"srv-race","title":"new","hostServerId":null,"projectPath":null,"projectRemote":null,"gitBranch":"main","createdAt":"2026-01-01 00:00:00","updatedAt":"2026-01-01 00:00:00","deletedAt":null}}"#.to_string(),
-                        )
-                    } else if line.starts_with("DELETE /api/workspaces/srv-race ") {
-                        deletes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        ("204 No Content", String::new())
-                    } else {
-                        ("404 Not Found", String::new())
-                    };
+                    let (status, body) = handler(line).await;
                     let response = format!(
                         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
@@ -1044,33 +1162,176 @@ mod tests {
         url
     }
 
+    fn workspace_json(id: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","title":"new","hostServerId":null,"projectPath":null,"projectRemote":null,"gitBranch":"main","createdAt":"2026-01-01 00:00:00","updatedAt":"2026-01-01 00:00:00","deletedAt":null}}"#
+        )
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_close_during_a_first_upload_is_sent_by_the_next_sync_with_the_new_id() {
-        let deletes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        std::env::set_var("CODEMUX_API_URL", racing_api(deletes.clone()).await);
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let posted = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let deletes = std::sync::Arc::new(AtomicUsize::new(0));
+        let (p, r, d) = (posted.clone(), release.clone(), deletes.clone());
+        let handler: Handler = std::sync::Arc::new(move |line| {
+            let (p, r, d) = (p.clone(), r.clone(), d.clone());
+            Box::pin(async move {
+                if line.starts_with("GET /api/workspaces ") {
+                    ("200 OK", r#"{"workspaces":[]}"#.to_string())
+                } else if line.starts_with("POST /api/workspaces ") {
+                    // Held until the test has closed the workspace and
+                    // started a second sync.
+                    p.notify_one();
+                    r.notified().await;
+                    ("200 OK", format!(r#"{{"workspace":{}}}"#, workspace_json("srv-race")))
+                } else if line.starts_with("DELETE /api/workspaces/srv-race ") {
+                    d.fetch_add(1, Ordering::SeqCst);
+                    ("204 No Content", String::new())
+                } else {
+                    ("404 Not Found", String::new())
+                }
+            })
+        });
+        std::env::set_var("CODEMUX_API_URL", test_api(handler).await);
         let db = fresh_db();
         db.insert_workspace_sync("ws-race", "new", None, None, None, Some("main"), None, None, None)
             .unwrap();
 
-        // The first sync's upload is slow to answer; while it is in flight
-        // the workspace is closed and a second sync starts.
         let first = super::sync_once("token", &db);
         let second = async {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            posted.notified().await;
             db.soft_delete_workspace_sync_by_workspace_id("ws-race").unwrap();
-            super::sync_once("token", &db).await
+            // The second sync runs alongside while the upload is still held;
+            // given a moment to get going (or to queue), the upload is
+            // answered. With the queue the outcome never depends on that
+            // moment; without it, the second sync would settle the close
+            // before the server id arrives.
+            let (second, ()) = tokio::join!(super::sync_once("token", &db), async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                release.notify_one();
+            });
+            second
         };
         let (first, second) = tokio::join!(first, second);
         std::env::remove_var("CODEMUX_API_URL");
         first.unwrap();
         second.unwrap();
+        assert_eq!(deletes.load(Ordering::SeqCst), 1, "the close goes up as a DELETE for the new id");
+    }
 
-        assert_eq!(
-            deletes.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the close is sent as a DELETE for the id the first upload returned"
-        );
+    #[tokio::test]
+    #[serial]
+    async fn a_pass_queued_across_an_account_switch_sends_nothing() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let list = server.mock("GET", "/api/workspaces").expect(0).create_async().await;
+        let upload = server.mock("POST", "/api/workspaces").expect(0).create_async().await;
+        let db = fresh_db();
+        db.insert_workspace_sync("ws-switch", "new", None, None, None, None, None, None, None).unwrap();
+
+        // The pass resolved account A's session, then waited while the user
+        // switched to account B.
+        let auth = crate::auth::AuthState::default();
+        let (generation, ()) = auth.session_snapshot(|| ());
+        auth.replace_session(|| ());
+        let guard = SyncGuard::Session { auth: &auth, generation };
+
+        // Each half fails on the stale session before sending anything.
+        let _ = super::sync_locked("token", &db, &guard).await;
+        list.assert_async().await;
+        upload.assert_async().await;
+        assert!(db.list_dirty_workspaces_sync()[0].server_id.is_none(), "nothing was uploaded");
+        std::env::remove_var("CODEMUX_API_URL");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn an_answer_that_arrives_after_an_account_switch_is_not_written() {
+        let asked = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (a, r) = (asked.clone(), release.clone());
+        let handler: Handler = std::sync::Arc::new(move |_line| {
+            let (a, r) = (a.clone(), r.clone());
+            Box::pin(async move {
+                a.notify_one();
+                r.notified().await;
+                ("200 OK", format!(r#"{{"workspaces":[{}]}}"#, workspace_json("srv-account-a")))
+            })
+        });
+        std::env::set_var("CODEMUX_API_URL", test_api(handler).await);
+        let db = fresh_db();
+        let auth = crate::auth::AuthState::default();
+        let (generation, ()) = auth.session_snapshot(|| ());
+        let guard = SyncGuard::Session { auth: &auth, generation };
+
+        let pulling = super::pull_guarded("token", &db, &guard);
+        let switch = async {
+            asked.notified().await;
+            auth.replace_session(|| ());
+            release.notify_one();
+        };
+        let (pulled, ()) = tokio::join!(pulling, switch);
+        std::env::remove_var("CODEMUX_API_URL");
+
+        assert!(pulled.is_err());
+        assert!(db.list_workspaces_sync_for_sync().is_empty(), "account A's answer is not written for B");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_stalled_upload_frees_the_queue_and_its_row_is_linked_not_duplicated() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let posts = std::sync::Arc::new(AtomicUsize::new(0));
+        let created = std::sync::Arc::new(AtomicBool::new(false));
+        let (p, c) = (posts.clone(), created.clone());
+        let handler: Handler = std::sync::Arc::new(move |line| {
+            let (p, c) = (p.clone(), c.clone());
+            Box::pin(async move {
+                if line.starts_with("GET /api/workspaces ") {
+                    let listed = if c.load(Ordering::SeqCst) { workspace_json("srv-late") } else { String::new() };
+                    ("200 OK", format!(r#"{{"workspaces":[{listed}]}}"#))
+                } else if line.starts_with("POST /api/workspaces ") {
+                    // The row is made, but the answer never comes back.
+                    p.fetch_add(1, Ordering::SeqCst);
+                    c.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                } else {
+                    ("404 Not Found", String::new())
+                }
+            })
+        });
+        std::env::set_var("CODEMUX_API_URL", test_api(handler).await);
+        let db = fresh_db();
+        db.insert_workspace_sync("ws-late", "new", None, None, None, Some("main"), None, None, None)
+            .unwrap();
+
+        let stalled = super::sync_locked_within(
+            "token",
+            &db,
+            &SyncGuard::Unchecked,
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert!(stalled.is_err(), "the pass gives up within its budget");
+
+        // The queue is free, and the next pass links the row the stalled
+        // upload made instead of uploading it again.
+        tokio::time::timeout(std::time::Duration::from_secs(10), super::sync_once("token", &db))
+            .await
+            .expect("the queue was released")
+            .unwrap();
+        std::env::remove_var("CODEMUX_API_URL");
+        let _ = super::lock_uncertain().drain();
+
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "no second upload");
+        let rows = db.list_workspaces_sync_for_sync();
+        assert_eq!(rows.len(), 1, "no duplicate: {rows:?}");
+        assert_eq!(rows[0].server_id.as_deref(), Some("srv-late"));
+        assert_eq!(rows[0].workspace_id.as_deref(), Some("ws-late"));
     }
 
     #[tokio::test]
