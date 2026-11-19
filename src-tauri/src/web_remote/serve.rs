@@ -19,6 +19,59 @@
 //! path (in `main.rs`) refuses to start when a `serve` instance does.
 
 use crate::web_remote::{self, BIND_SCOPE_ALL};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tauri::{AppHandle, Manager, Runtime};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+
+/// Tracks admitted headless requests until they finish changing state.
+#[derive(Default)]
+pub(crate) struct ShutdownAdmission {
+    closed: AtomicBool,
+    in_flight: Arc<RwLock<()>>,
+}
+
+pub(crate) type ShutdownLease = OwnedRwLockReadGuard<()>;
+const SHUTTING_DOWN: &str = "Codemux is shutting down";
+
+impl ShutdownAdmission {
+    pub(crate) fn admit<R: Runtime>(
+        app: &AppHandle<R>,
+    ) -> Result<Option<ShutdownLease>, &'static str> {
+        app.try_state::<Self>().map(|admission| admission.try_admit()).transpose()
+    }
+
+    pub(super) fn check_open<R: Runtime>(app: &AppHandle<R>) -> Result<(), &'static str> {
+        app.try_state::<Self>().map_or(Ok(()), |admission| admission.ensure_open())
+    }
+
+    fn ensure_open(&self) -> Result<(), &'static str> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SHUTTING_DOWN);
+        }
+        Ok(())
+    }
+
+    fn try_admit(&self) -> Result<ShutdownLease, &'static str> {
+        let permit = Arc::clone(&self.in_flight)
+            .try_read_owned()
+            .map_err(|_| SHUTTING_DOWN)?;
+        self.ensure_open()?;
+        Ok(permit)
+    }
+
+    pub(super) async fn close_and_drain(&self) -> Result<(), String> {
+        self.closed.store(true, Ordering::Release);
+        // Repository setup or teardown can wait indefinitely on an external
+        // command. Keep admission closed if the drain is cancelled.
+        tokio::time::timeout(Duration::from_secs(20), self.in_flight.write())
+            .await
+            .map(|_| ())
+            .map_err(|_| "Timed out waiting for headless requests to finish during shutdown".into())
+    }
+}
 
 /// Options parsed from `codemux serve [--scope …] [--port N] [--relay]`.
 /// Flag semantics mirror `codemux remote enable` exactly.
@@ -46,16 +99,9 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     //    or serve instance (they would fight over the control socket, the DB,
     //    the PTY daemon, and the web-remote port).
     //
-    //    Both directions of the guard key off the SAME fact — who holds the
-    //    control endpoint — so it only works if `serve` actually takes it: the
-    //    check below stops a second `serve` (or a `serve` next to a GUI), and
-    //    `main.rs` runs the identical check before building the GUI. The
-    //    control server is spawned from the Tauri `setup` hook, which is why
-    //    `build_headless_app` has to run that hook (see step 2). While setup
-    //    was skipped, `serve` never took the endpoint: the GUI happily booted
-    //    beside it, a second `serve` got as far as failing on the web-remote
-    //    port with an Address-in-use error instead of this clear message, and
-    //    `codemux remote pair` / `connect status` reported nothing running.
+    //    The socket catches a running backend that may predate the layout
+    //    lock. Desktop performs the same probe after native launch routing.
+    //    The lock also covers startup before the socket is listening.
     if crate::control::control_server_is_running() {
         return Err(
             "Codemux is already running on this machine (GUI or serve) — stop it first, \
@@ -63,6 +109,12 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
                 .to_string(),
         );
     }
+    let _layout_lock = crate::state::acquire_layout_lock()?;
+
+    // Install the listeners before setup starts the control server. Signals
+    // received during startup remain pending until the shutdown wait begins.
+    let shutdown_signal = tauri::async_runtime::block_on(async { register_shutdown_signal() })
+        .map_err(|error| format!("Failed to register shutdown signals: {error}"))?;
 
     // 2. Boot the full app headless (DB, state, control server, PTY warmup,
     //    web_remote restore_on_boot, every background loop) on MockRuntime.
@@ -78,9 +130,8 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     };
     let handle = app.handle().clone();
 
-    // Everything from here is async: run it — and the signal wait — inside one
-    // `block_on`. `app` stays owned in this scope so the backend lives for the
-    // whole session; dropping it would tear the runtime down.
+    // Run startup and the signal wait inside the async runtime. Keep `app`
+    // alive through teardown.
     let result = tauri::async_runtime::block_on(async move {
         // 6. Debug-asset caveat: dev builds embed no frontend (devUrl), so the
         //    served UI only works when the source-tree `dist/` fallback exists.
@@ -137,7 +188,7 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
         //    system to drive, and this process's "event loop" is the signal
         //    wait below. (`build_headless_app` runs the one thing `run()` would
         //    otherwise have been needed for: the `setup` hook.)
-        wait_for_shutdown_signal().await;
+        shutdown_signal.await;
         eprintln!("\n[codemux serve] shutting down…");
         Ok::<(), String>(())
     });
@@ -145,42 +196,52 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     // Mirror the GUI's `RunEvent::Exit` cleanup, then let `app` drop normally
     // so managed provider/server state gets its destructors. A success-path
     // `process::exit` would skip those destructors and leak child processes.
-    // Stop taking outside-assistant connections first, so no network client
-    // starts work against managers that are shutting down.
-    crate::mcp_connector::listener::stop(app.handle());
-    if let Some(platform) =
-        tauri::Manager::try_state::<crate::plugins::platform_transport::PluginPlatformState>(&app)
-    {
-        let _ = tauri::async_runtime::block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            platform.shutdown(),
-        ));
-    }
-    if let Some(coordinator) = tauri::Manager::try_state::<crate::delegation::coordinator::Coordinator>(&app) {
-        tauri::async_runtime::block_on(coordinator.shutdown())?;
-    }
-    // Managed state need not drop on exit; stop OpenCode explicitly.
-    if let Some(manager) = tauri::Manager::try_state::<
-        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
-    >(&app)
-    {
-        if let Err(error) = tauri::async_runtime::block_on(manager.shutdown()) {
-            eprintln!("[codemux::opencode] shutdown incomplete: {error}");
+    // Tokio timers must be constructed inside the runtime. Keep running
+    // the remaining cleanup if a delegation owner failed to shut down.
+    let (drain_result, coordinator_result) = tauri::async_runtime::block_on(async {
+        let drain_result = app.state::<ShutdownAdmission>().close_and_drain().await;
+        crate::mcp_connector::listener::stop(app.handle());
+        let remote = app.state::<web_remote::WebRemoteState>().shared();
+        web_remote::stop_lan(&remote);
+        web_remote::stop_relay(&remote);
+        if let Some(platform) =
+            app.try_state::<crate::plugins::platform_transport::PluginPlatformState>()
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(3), platform.shutdown()).await;
         }
-    }
-    // Remote-workspace ssh tunnels live in a global registry, so dropping
-    // `app` would not stop them.
-    #[cfg(unix)]
-    let _ = tauri::async_runtime::block_on(tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        crate::ssh::shutdown_all(),
-    ));
-    if let Err(error) = crate::active_workspace_persistence::flush_latest(app.handle()) {
-        eprintln!("[codemux::selection] headless shutdown flush failed: {error}");
-    }
+        let coordinator_result =
+            if let Some(coordinator) = app.try_state::<crate::delegation::coordinator::Coordinator>() {
+                coordinator.shutdown().await
+            } else {
+                Ok(())
+            };
+        // Managed state need not drop on exit. Stop OpenCode explicitly.
+        if let Some(manager) = app.try_state::<
+            std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
+        >() {
+            if let Err(error) = manager.shutdown().await {
+                eprintln!("[codemux::opencode] shutdown incomplete: {error}");
+            }
+        }
+        // Remote-workspace SSH tunnels live in a global registry.
+        #[cfg(unix)]
+        let _ = tokio::time::timeout(Duration::from_secs(3), crate::ssh::shutdown_all()).await;
+        (drain_result, coordinator_result)
+    });
+    let persistence_result = flush_shutdown_state(app.handle(), drain_result);
     crate::agent_browser::kill_stream_daemons();
     drop(app);
-    result
+    result.and(coordinator_result).and(persistence_result)
+}
+
+fn flush_shutdown_state<R: Runtime>(app: &AppHandle<R>, drain_result: Result<(), String>) -> Result<(), String> {
+    // A timed-out operation can still be running. Save the current snapshot
+    // and report the timeout so the caller knows the drain was incomplete.
+    let layout_result =
+        crate::state::finish_layout_persistence(&app.state::<crate::state::AppStateStore>());
+    let selection_result = crate::active_workspace_persistence::finish_persistence(app)
+        .map_err(|error| format!("Failed to save the active workspace: {error}"));
+    drain_result.and(layout_result).and(selection_result)
 }
 
 /// Which bind scope a `codemux serve` startup should request, given the
@@ -350,31 +411,26 @@ fn print_footer(relay_only: bool, connector_enabled: bool) {
     println!("Press Ctrl-C (or send SIGTERM) to stop the server.");
 }
 
-/// Block until the process receives SIGINT or SIGTERM. On non-Unix, waits on
-/// Ctrl-C only (SIGTERM has no portable equivalent).
+/// Register the signal listeners and return the future that waits for them.
 #[cfg(unix)]
-async fn wait_for_shutdown_signal() {
+fn register_shutdown_signal() -> std::io::Result<impl Future<Output = ()>> {
     use tokio::signal::unix::{signal, SignalKind};
-    // If a handler can't be installed, fall back to Ctrl-C so we never busy-spin.
-    match (
-        signal(SignalKind::interrupt()),
-        signal(SignalKind::terminate()),
-    ) {
-        (Ok(mut sigint), Ok(mut sigterm)) => {
-            tokio::select! {
-                _ = sigint.recv() => {}
-                _ = sigterm.recv() => {}
-            }
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
         }
-        _ => {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-    }
+    })
 }
 
-#[cfg(not(unix))]
-async fn wait_for_shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+#[cfg(windows)]
+fn register_shutdown_signal() -> std::io::Result<impl Future<Output = ()>> {
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+    Ok(async move {
+        let _ = ctrl_c.recv().await;
+    })
 }
 
 /// Dev-only: does the source-tree `dist/` (the debug asset fallback the
@@ -391,6 +447,37 @@ fn dev_dist_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_shutdown_keeps_requests_closed() {
+        let admission = ShutdownAdmission::default();
+        let in_flight = admission.try_admit().unwrap();
+        assert!(admission.close_and_drain().await.is_err());
+        drop(in_flight);
+        assert!(admission.try_admit().is_err());
+    }
+
+    #[test]
+    fn shutdown_saves_the_current_layout_even_when_the_drain_times_out() {
+        if crate::test_isolation::isolated(
+            "web_remote::serve::tests::shutdown_saves_the_current_layout_even_when_the_drain_times_out",
+        ) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let app = tauri::test::mock_app();
+        let state = crate::state::AppStateStore::default();
+        let workspace = state.create_workspace_at_path(root.clone());
+        app.manage(state);
+
+        let error = "fixture drain timeout";
+        assert_eq!(flush_shutdown_state(app.handle(), Err(error.into())).unwrap_err(), error);
+        let layout = std::fs::read(root.join("layout.json")).unwrap();
+        let layout: serde_json::Value = serde_json::from_slice(&layout).unwrap();
+        assert!(layout["workspaces"].as_array().unwrap().iter().any(|entry| {
+            entry["workspace_id"].as_str() == Some(workspace.0.as_str())
+        }));
+    }
 
     #[test]
     fn explicit_scope_flag_wins_over_persisted_config() {

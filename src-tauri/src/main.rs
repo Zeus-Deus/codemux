@@ -203,21 +203,6 @@ fn main() {
         }
     }
 
-    if codemux_lib::control::control_server_is_running() {
-        let socket_path = codemux_lib::control::control_socket_path();
-        codemux_lib::diagnostics::stderr_line(&format!(
-            "[codemux] Existing Codemux instance detected via control endpoint at {:?}; exiting.",
-            socket_path
-        ));
-        #[cfg(debug_assertions)]
-        codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
-            "[{}] startup_id={} outcome=single_instance_exit",
-            chrono_timestamp(),
-            startup_id
-        ));
-        return;
-    }
-
     #[cfg(debug_assertions)]
     codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
         "[{}] startup_id={} outcome=run_gui",

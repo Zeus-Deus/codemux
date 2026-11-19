@@ -18,6 +18,7 @@ struct PersistRequest {
 
 #[derive(Default)]
 struct PersistQueue {
+    closed: bool,
     next_generation: u64,
     latest_state_revision: u64,
     pending: Option<PersistRequest>,
@@ -35,7 +36,7 @@ impl PersistQueue {
         // Snapshot serialization and event delivery can finish out of order.
         // Reject an older snapshot even when it reaches this queue after a
         // newer selection, otherwise a slow A emit can overwrite B in SQLite.
-        if state_revision < self.latest_state_revision {
+        if self.closed || state_revision < self.latest_state_revision {
             return false;
         }
         if state_revision == self.latest_state_revision
@@ -124,7 +125,7 @@ impl PersistQueue {
     }
 
     fn seed_persisted(&mut self, workspace_id: &str) {
-        if self.worker_running || self.pending.is_some() {
+        if self.closed || self.worker_running || self.pending.is_some() {
             return;
         }
         self.latest_requested = Some(workspace_id.to_owned());
@@ -145,6 +146,9 @@ impl PersistQueue {
     }
 
     fn take_latest_for_flush(&mut self) -> Option<PersistRequest> {
+        if self.closed {
+            return None;
+        }
         let latest = self.latest_desired.clone()?;
         if self.last_persisted.as_deref() == Some(&latest) && self.pending.is_none() {
             return None;
@@ -155,6 +159,12 @@ impl PersistQueue {
             generation: self.next_generation,
             workspace_id: latest,
         })
+    }
+
+    fn close_and_take_latest(&mut self) -> Option<PersistRequest> {
+        let request = self.take_latest_for_flush();
+        self.closed = true;
+        request
     }
 }
 
@@ -304,12 +314,24 @@ pub fn schedule<R: tauri::Runtime>(
     });
 }
 
-/// Shutdown-only synchronous drain. Regular activation never waits for this
-/// lock or SQLite; close/Exit use it so the latest optimistic A→B→C selection
-/// is durable before the process can disappear.
+/// Synchronously drain the latest selection while keeping the queue open.
 pub fn flush_latest<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
+    flush_selection(app, PersistQueue::take_latest_for_flush)
+}
+
+/// Close and synchronously drain the queue before releasing layout ownership.
+pub(crate) fn finish_persistence<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<(), String> {
+    flush_selection(app, PersistQueue::close_and_take_latest)
+}
+
+fn flush_selection<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    take_request: fn(&mut PersistQueue) -> Option<PersistRequest>,
+) -> Result<(), String> {
     let _write_guard = lock_writer();
-    let request = lock_queue().take_latest_for_flush();
+    let request = take_request(&mut lock_queue());
     let Some(request) = request else {
         return Ok(());
     };
@@ -386,6 +408,24 @@ mod tests {
         assert_eq!(flush.workspace_id, "c");
         queue.complete(&flush, true);
         assert!(queue.take_latest_for_flush().is_none());
+    }
+
+    #[test]
+    fn terminal_flush_drains_latest_and_blocks_late_selection_writes() {
+        let mut queue = PersistQueue::default();
+        assert!(queue.enqueue("a", 1));
+        assert!(!queue.enqueue("b", 2));
+
+        let flush = queue.close_and_take_latest().unwrap();
+        assert_eq!(flush.workspace_id, "b");
+        assert!(!queue.enqueue("c", 3));
+        assert!(queue.take().is_none());
+        queue.seed_persisted("d");
+        queue.complete(&flush, false);
+
+        assert_eq!(queue.latest_desired.as_deref(), Some("b"));
+        assert!(queue.take_latest_for_flush().is_none());
+        assert!(queue.close_and_take_latest().is_none());
     }
 
     #[test]

@@ -346,7 +346,14 @@ pub(crate) async fn dispatch<R: Runtime>(
     }
     super::schema::check(&definition.input_schema, &args)
         .map_err(|violation| ControlError::new(ErrorCode::InvalidArguments, violation.to_string()))?;
-    run(id, Call { app, caller, route, args }).await
+    // The handler includes workspace and plugin workflows. Keep it off
+    // the caller's stack, including when it runs under the shutdown scope.
+    let handler = Box::pin(run(id, Call { app, caller, route, args }));
+    if spec.access != Access::Read && !spec.may_wait() {
+        service::with_shutdown_admission(app, handler).await?
+    } else {
+        handler.await
+    }
 }
 
 fn unknown(name: &str) -> ControlError {
