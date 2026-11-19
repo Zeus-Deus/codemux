@@ -37,6 +37,25 @@ pub(crate) struct PendingDaemonClose {
 pub(crate) struct PendingLocalTerminalRestart {
     pub shell_id: Option<Uuid>,
     pub acknowledged: bool,
+    pub replacement_id: Option<Uuid>,
+    pub replacement_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingTerminalReplacement {
+    pub workspace_id: String,
+    pub old_session_id: String,
+    pub replacement_id: Uuid,
+}
+
+impl PendingTerminalReplacement {
+    pub(crate) fn replacement_session_id(&self) -> String {
+        replacement_session_id(self.replacement_id)
+    }
+}
+
+fn replacement_session_id(replacement_id: Uuid) -> String {
+    format!("session-{}", replacement_id.simple())
 }
 
 impl LayoutCloseIntent {
@@ -104,8 +123,37 @@ fn migrate_schema(conn: &Connection) -> rusqlite::Result<()> {
             session_id TEXT NOT NULL,
             shell_id BLOB CHECK (shell_id IS NULL OR length(shell_id) = 16),
             acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0, 1)),
+            replacement_id BLOB CHECK (replacement_id IS NULL OR (shell_id IS NULL AND length(replacement_id) = 16)),
+            replacement_active INTEGER NOT NULL DEFAULT 0
+                CHECK (replacement_active IN (0, 1) AND
+                       (replacement_active = 0 OR (replacement_id IS NOT NULL AND acknowledged = 0))),
             PRIMARY KEY (workspace_id, session_id)
         ) WITHOUT ROWID;",
+    )?;
+    let has_replacement = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pending_local_terminal_restarts')
+         WHERE name = 'replacement_id')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_replacement {
+        // Earlier tokenless restart records lack a safe identity to use
+        // after a lost Close acknowledgment.
+        tx.execute_batch(
+            "ALTER TABLE pending_local_terminal_restarts
+                ADD COLUMN replacement_id BLOB
+                CHECK (replacement_id IS NULL OR (shell_id IS NULL AND length(replacement_id) = 16));
+             ALTER TABLE pending_local_terminal_restarts
+                ADD COLUMN replacement_active INTEGER NOT NULL DEFAULT 0
+                CHECK (replacement_active IN (0, 1) AND
+                       (replacement_active = 0 OR (replacement_id IS NOT NULL AND acknowledged = 0)));
+             UPDATE pending_local_terminal_restarts
+                SET replacement_id = randomblob(16) WHERE shell_id IS NULL;",
+        )?;
+    }
+    tx.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS pending_local_terminal_restart_replacement
+         ON pending_local_terminal_restarts (replacement_id) WHERE replacement_id IS NOT NULL;",
     )?;
     if !layout_table_exists {
         // Pre-release rows only knew how to restore terminal pane removal.
@@ -172,13 +220,15 @@ fn read_local_terminal_restart(
     session_id: &str,
 ) -> Result<Option<PendingLocalTerminalRestart>, String> {
     conn.query_row(
-        "SELECT shell_id, acknowledged FROM pending_local_terminal_restarts
+        "SELECT shell_id, acknowledged, replacement_id, replacement_active FROM pending_local_terminal_restarts
          WHERE workspace_id = ?1 AND session_id = ?2",
         params![workspace_id, session_id],
         |row| {
             Ok(PendingLocalTerminalRestart {
                 shell_id: row.get::<_, Option<[u8; 16]>>(0)?.map(Uuid::from_bytes),
                 acknowledged: row.get(1)?,
+                replacement_id: row.get::<_, Option<[u8; 16]>>(2)?.map(Uuid::from_bytes),
+                replacement_active: row.get(3)?,
             })
         },
     ).optional().map_err(|error| error.to_string())
@@ -334,7 +384,8 @@ fn write_layout_close(
             delete_local_terminal_fallback(&tx, workspace_id, &id.0)?;
             let retired = tx.query_row(
                 "DELETE FROM pending_local_terminal_restarts
-                 WHERE workspace_id = ?1 AND session_id = ?2 RETURNING shell_id",
+                 WHERE workspace_id = ?1 AND session_id = ?2 AND replacement_active = 0
+                 RETURNING shell_id",
                 params![workspace_id, id.0],
                 |row| row.get::<_, Option<[u8; 16]>>(0),
             ).optional().map_err(|error| error.to_string())?.flatten();
@@ -463,7 +514,8 @@ impl DatabaseStore {
             // current shell. Keep a restart still targeting that exact UUID.
             tx.execute(
                 "DELETE FROM pending_local_terminal_restarts
-                 WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS NOT ?3",
+                 WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS NOT ?3
+                    AND replacement_active = 0",
                 params![shell.route.workspace_id, shell.session_id, shell.shell_id.as_bytes().as_slice()],
             ).map_err(|error| error.to_string())?;
         }
@@ -508,13 +560,15 @@ impl DatabaseStore {
         let mut conn = self.conn.lock().unwrap();
         let tx = begin_local_terminal_fallback(&mut conn)?;
         let shell_bytes = shell_id.as_ref().map(|id| id.as_bytes().as_slice());
+        let replacement = shell_id.is_none().then(Uuid::new_v4);
+        let replacement_bytes = replacement.as_ref().map(|id| id.as_bytes().as_slice());
         tx.execute(
-            "INSERT INTO pending_local_terminal_restarts (workspace_id, session_id, shell_id)
-             VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
-            params![workspace_id, session_id, shell_bytes],
+            "INSERT INTO pending_local_terminal_restarts (workspace_id, session_id, shell_id, replacement_id)
+             VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+            params![workspace_id, session_id, shell_bytes, replacement_bytes],
         ).map_err(|error| error.to_string())?;
         if !read_local_terminal_restart(&tx, workspace_id, session_id)?
-            .is_some_and(|restart| restart.shell_id == shell_id)
+            .is_some_and(|restart| restart.shell_id == shell_id && !restart.replacement_active)
         {
             return Err("Terminal already has a pending restart for another shell".into());
         }
@@ -531,7 +585,8 @@ impl DatabaseStore {
         let shell_bytes = shell_id.as_ref().map(|id| id.as_bytes().as_slice());
         let updated = conn.execute(
             "UPDATE pending_local_terminal_restarts SET acknowledged = 1
-             WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS ?3",
+             WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS ?3
+                AND replacement_active = 0",
             params![workspace_id, session_id, shell_bytes],
         ).map_err(|error| error.to_string())?;
         if updated == 0 {
@@ -546,6 +601,66 @@ impl DatabaseStore {
         session_id: &str,
     ) -> Result<Option<PendingLocalTerminalRestart>, String> {
         read_local_terminal_restart(&self.conn.lock().unwrap(), workspace_id, session_id)
+    }
+
+    /// Activate the reserved successor without claiming the old shell was
+    /// retired. Only the new, unused session ID acquires local fallback proof.
+    pub(crate) fn activate_tokenless_local_replacement(
+        &self,
+        workspace_id: &str,
+        old_session_id: &str,
+    ) -> Result<Uuid, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = begin_local_terminal_fallback(&mut conn)?;
+        let restart = read_local_terminal_restart(&tx, workspace_id, old_session_id)?
+            .filter(|restart| restart.shell_id.is_none() && !restart.acknowledged)
+            .ok_or("Terminal has no unacknowledged tokenless restart")?;
+        let replacement_id = restart.replacement_id.ok_or("Terminal restart has no reserved replacement")?;
+        if restart.replacement_active {
+            // Idempotent replay cannot recreate proof after the successor
+            // has since closed or switched to a daemon.
+            return Ok(replacement_id);
+        }
+        let session_id = replacement_session_id(replacement_id);
+        insert_local_terminal_fallback(&tx, workspace_id, &session_id)?;
+        tx.execute(
+            "UPDATE pending_local_terminal_restarts SET replacement_active = 1
+             WHERE workspace_id = ?1 AND session_id = ?2",
+            params![workspace_id, old_session_id],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(replacement_id)
+    }
+
+    pub(crate) fn pending_terminal_replacements(&self) -> Result<Vec<PendingTerminalReplacement>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut select = conn.prepare(
+            "SELECT workspace_id, session_id, replacement_id FROM pending_local_terminal_restarts
+             WHERE replacement_active = 1 ORDER BY workspace_id, session_id",
+        ).map_err(|error| error.to_string())?;
+        let rows = select.query_map([], |row| {
+            Ok(PendingTerminalReplacement {
+                workspace_id: row.get(0)?,
+                old_session_id: row.get(1)?,
+                replacement_id: Uuid::from_bytes(row.get(2)?),
+            })
+        }).map_err(|error| error.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|error| error.to_string())
+    }
+
+    /// Forget an applied alias only after its replacement is saved in layout.
+    pub(crate) fn retire_terminal_replacement(
+        &self,
+        workspace_id: &str,
+        old_session_id: &str,
+        replacement_id: Uuid,
+    ) -> Result<(), String> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM pending_local_terminal_restarts
+             WHERE workspace_id = ?1 AND session_id = ?2 AND replacement_id = ?3
+                AND replacement_active = 1",
+            params![workspace_id, old_session_id, replacement_id.as_bytes().as_slice()],
+        ).map(drop).map_err(|error| error.to_string())
     }
 
     pub(crate) fn has_pending_local_terminal_restarts(&self) -> Result<bool, String> {
@@ -566,7 +681,8 @@ impl DatabaseStore {
         let mut orphaned = Vec::new();
         {
             let mut select = conn.prepare(
-                "SELECT workspace_id, session_id, shell_id FROM pending_local_terminal_restarts",
+                "SELECT workspace_id, session_id, shell_id FROM pending_local_terminal_restarts
+                 WHERE replacement_active = 0",
             ).map_err(|error| error.to_string())?;
             let rows = select.query_map([], |row| {
                 Ok(((row.get::<_, String>(0)?, row.get::<_, String>(1)?), row.get::<_, Option<[u8; 16]>>(2)?))
@@ -586,7 +702,8 @@ impl DatabaseStore {
         for ((workspace_id, session_id), shell_id) in orphaned {
             let removed = tx.execute(
                 "DELETE FROM pending_local_terminal_restarts
-                 WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS ?3",
+                 WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS ?3
+                    AND replacement_active = 0",
                 params![workspace_id, session_id, shell_id.as_ref().map(|id| id.as_slice())],
             ).map_err(|error| error.to_string())?;
             if let Some(shell_id) = shell_id.filter(|_| removed != 0) {
@@ -657,6 +774,7 @@ impl DatabaseStore {
                 UNION ALL
                 SELECT 1 FROM pending_local_terminal_restarts
                 WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS NULL
+                    AND acknowledged = 1 AND replacement_active = 0
             )",
             params![workspace_id, session_id],
             |row| row.get::<_, bool>(0),
@@ -666,11 +784,13 @@ impl DatabaseStore {
         }
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         delete_local_terminal_fallback(&tx, workspace_id, session_id)?;
-        // A live shell is enough to invalidate tokenless proof, but cannot
-        // vouch for a restart still tracking a precise UUID.
+        // Listing a live tokenless shell invalidates an earlier retirement
+        // acknowledgment. Keep its reserved successor: the listed shell
+        // can disappear before Attach, including when the old Close lands.
         tx.execute(
-            "DELETE FROM pending_local_terminal_restarts
-             WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS NULL",
+            "UPDATE pending_local_terminal_restarts SET acknowledged = 0
+             WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS NULL
+                AND acknowledged = 1 AND replacement_active = 0",
             params![workspace_id, session_id],
         ).map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())
@@ -1026,9 +1146,13 @@ mod tests {
         let guarded_restart = Some(PendingLocalTerminalRestart {
             shell_id: Some(shell_id),
             acknowledged: false,
+            replacement_id: None,
+            replacement_active: false,
         });
         assert_eq!(pending(guarded), guarded_restart);
-        assert_eq!(pending(legacy), Some(PendingLocalTerminalRestart { shell_id: None, acknowledged: true }));
+        let legacy_restart = pending(legacy).unwrap();
+        assert!(legacy_restart.shell_id.is_none() && legacy_restart.acknowledged);
+        assert!(legacy_restart.replacement_id.is_some() && !legacy_restart.replacement_active);
         assert!(db.remember_local_terminal_fallback_after_daemon_close(workspace, guarded, Some(&guarded_shell)).is_err());
         assert!(db.remember_local_terminal_fallback(workspace, guarded).is_err());
         db.retain_daemon_shell(&guarded_shell).unwrap();
@@ -1092,6 +1216,113 @@ mod tests {
         assert!(db.pending_local_terminal_restart(missing_workspace, "tokenless").unwrap().is_none());
         assert!(db.pending_local_terminal_restart(missing_workspace, session).unwrap().is_none());
         assert!(db.pending_local_terminal_restart(live_workspace, session).unwrap().is_some());
+    }
+
+    #[test]
+    fn tokenless_successor_is_durable_and_survives_its_own_close_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let workspace = "legacy-workspace";
+        let old_session = "old-session";
+        let db = DatabaseStore::test_file(&path);
+        db.begin_local_terminal_restart(workspace, old_session, None).unwrap();
+        let reserved = db.pending_local_terminal_restart(workspace, old_session).unwrap().unwrap();
+        let replacement_id = reserved.replacement_id.unwrap();
+        assert!(!reserved.replacement_active);
+        assert!(db.pending_terminal_replacements().unwrap().is_empty());
+        assert!(db.activate_tokenless_local_replacement(workspace, "another-session").is_err());
+        drop(db);
+
+        let db = DatabaseStore::test_file(&path);
+        assert_eq!(db.activate_tokenless_local_replacement(workspace, old_session).unwrap(), replacement_id);
+        let alias = PendingTerminalReplacement {
+            workspace_id: workspace.into(),
+            old_session_id: old_session.into(),
+            replacement_id,
+        };
+        let successor = alias.replacement_session_id();
+        assert_eq!(db.pending_terminal_replacements().unwrap(), [alias.clone()]);
+        assert!(!db.has_local_terminal_fallback(workspace, old_session).unwrap());
+        assert!(db.has_local_terminal_fallback(workspace, &successor).unwrap());
+        assert!(db.acknowledge_local_terminal_restart(workspace, old_session, None).is_err());
+        assert!(db.journal_orphan_local_terminal_restarts(&HashSet::new()).unwrap().is_empty());
+        db.forget_local_terminal_fallback(workspace, old_session).unwrap();
+
+        let intent = LayoutCloseIntent::Session {
+            workspace_id: workspace.into(),
+            session_id: successor.clone(),
+        };
+        db.record_layout_close_with_shell_ownership(
+            &intent,
+            Some(workspace),
+            &[SessionId(successor.clone())],
+            &[],
+            &Checkpoint::default(),
+        ).unwrap();
+        assert_eq!(db.activate_tokenless_local_replacement(workspace, old_session).unwrap(), replacement_id);
+        assert!(!db.has_local_terminal_fallback(workspace, &successor).unwrap());
+        drop(db);
+
+        let db = DatabaseStore::test_file(&path);
+        db.retire_terminal_replacement(workspace, old_session, Uuid::new_v4()).unwrap();
+        assert_eq!(db.pending_terminal_replacements().unwrap(), [alias]);
+        assert_eq!(db.pending_layout_closes().unwrap(), [intent]);
+        db.retire_terminal_replacement(workspace, old_session, replacement_id).unwrap();
+        assert!(!db.has_pending_local_terminal_restarts().unwrap());
+    }
+
+    #[test]
+    fn listed_tokenless_shell_invalidates_acknowledgment_and_keeps_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::test_file(&dir.path().join("state.sqlite"));
+        let workspace = "workspace";
+        let old_session = "old-session";
+        db.begin_local_terminal_restart(workspace, old_session, None).unwrap();
+        let pending = || db.pending_local_terminal_restart(workspace, old_session).unwrap().unwrap();
+        let original = pending();
+        assert!(!original.acknowledged);
+        db.forget_local_terminal_fallback(workspace, old_session).unwrap();
+        assert_eq!(pending(), original);
+
+        db.acknowledge_local_terminal_restart(workspace, old_session, None).unwrap();
+        assert!(pending().acknowledged);
+        db.forget_local_terminal_fallback(workspace, old_session).unwrap();
+        assert_eq!(pending(), original);
+        assert_eq!(
+            db.activate_tokenless_local_replacement(workspace, old_session).unwrap(),
+            original.replacement_id.unwrap(),
+        );
+    }
+
+    #[test]
+    fn migration_reserves_distinct_successors_for_previous_tokenless_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pending_local_terminal_restarts (
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                shell_id BLOB,
+                acknowledged INTEGER NOT NULL,
+                PRIMARY KEY (workspace_id, session_id)
+            ) WITHOUT ROWID;
+            INSERT INTO pending_local_terminal_restarts VALUES ('workspace', 'first', NULL, 0);
+            INSERT INTO pending_local_terminal_restarts VALUES ('workspace', 'second', NULL, 1);
+            INSERT INTO pending_local_terminal_restarts VALUES ('workspace', 'guarded', zeroblob(16), 0);",
+        ).unwrap();
+        drop(conn);
+
+        let db = DatabaseStore::test_file(&path);
+        let read = |session| db.pending_local_terminal_restart("workspace", session).unwrap().unwrap();
+        let first = read("first");
+        let second = read("second");
+        assert!(first.replacement_id.is_some() && !first.replacement_active && !first.acknowledged);
+        assert!(second.replacement_id.is_some() && !second.replacement_active && second.acknowledged);
+        assert_ne!(first.replacement_id, second.replacement_id);
+        assert!(read("guarded").replacement_id.is_none());
+        assert!(db.activate_tokenless_local_replacement("workspace", "second").is_err());
+        assert_eq!(db.activate_tokenless_local_replacement("workspace", "first").unwrap(), first.replacement_id.unwrap());
     }
 
     #[test]

@@ -197,6 +197,50 @@ pub(crate) fn persist_layout_closes(
     db.retire_layout_closes(intents)
 }
 
+/// Keep the old-to-new binding until layout.json no longer names the old
+/// session. A closed successor can leave both identities absent.
+#[cfg(unix)]
+pub(crate) fn persist_terminal_replacements(
+    store: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    replacements: &[crate::database::daemon_closes::PendingTerminalReplacement],
+) -> Result<(), String> {
+    if replacements.is_empty() {
+        return Ok(());
+    }
+    let debouncer = persist_debouncer();
+    let _write_guard = debouncer.write_lock.lock().unwrap();
+    let pending = debouncer.last_snapshot.lock().unwrap().take();
+    let snapshot = store.snapshot();
+    let saved = if replacements.iter().any(|replacement| {
+        workspace_is_local(&snapshot, &replacement.workspace_id)
+            && terminal_pane_for_close_intent(
+                &snapshot,
+                &replacement.workspace_id,
+                &replacement.old_session_id,
+            ).is_some()
+    }) {
+        Err("A terminal replacement has not finished".to_owned())
+    } else {
+        save_persisted_state(&snapshot)
+    };
+    if let Err(error) = saved {
+        let mut queued = debouncer.last_snapshot.lock().unwrap();
+        if queued.is_none() {
+            *queued = pending;
+        }
+        return Err(error);
+    }
+    for replacement in replacements {
+        db.retire_terminal_replacement(
+            &replacement.workspace_id,
+            &replacement.old_session_id,
+            replacement.replacement_id,
+        )?;
+    }
+    Ok(())
+}
+
 use crate::project::current_project_root;
 
 const APP_STATE_SCHEMA_VERSION: u32 = 1;
@@ -1818,6 +1862,68 @@ impl AppStateStore {
         plan.sessions
             .retain(|session| session.session_id == session_id);
         (!plan.sessions.is_empty()).then_some(plan)
+    }
+
+    /// Rebind a legacy terminal's pane to its journaled successor. The
+    /// caller holds the layout write lock and can hand off runtime ownership
+    /// under the same state lock before publishing the new identity.
+    #[cfg(unix)]
+    pub(crate) fn replace_terminal_session(
+        &self,
+        workspace_id: &str,
+        old_session_id: &str,
+        replacement_id: &str,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<bool, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(workspace_index) = snapshot.workspaces.iter()
+            .position(|workspace| workspace.workspace_id.0 == workspace_id)
+        else {
+            return Ok(false);
+        };
+        let workspace = &snapshot.workspaces[workspace_index];
+        let Some(surface_index) = workspace.surfaces.iter()
+            .position(|surface| pane_tree_contains_session(&surface.root, old_session_id))
+        else {
+            return Ok(false);
+        };
+        if workspace.host_id.is_some() {
+            // A workspace move can win before an activated replacement is
+            // applied. Preserve the device's binding to the original ID.
+            return Ok(false);
+        }
+        let session_index = snapshot.terminal_sessions.iter()
+            .position(|session| session.session_id.0 == old_session_id)
+            .ok_or("The restarting terminal has no session record")?;
+        if snapshot.terminal_sessions.iter().any(|session| session.session_id.0 == replacement_id)
+            || snapshot.workspaces.iter().flat_map(|workspace| &workspace.surfaces)
+                .any(|surface| pane_tree_contains_session(&surface.root, replacement_id))
+        {
+            return Err("The replacement terminal identity is already in use".to_owned());
+        }
+        if !admit() {
+            return Ok(false);
+        }
+        let replacement = SessionId(replacement_id.to_owned());
+        let root = &mut snapshot.workspaces[workspace_index].surfaces[surface_index].root;
+        let binding = terminal_session_binding_mut(root, old_session_id)
+            .expect("validated terminal binding under the state lock");
+        *binding = replacement.clone();
+
+        let session = &mut snapshot.terminal_sessions[session_index];
+        session.session_id = replacement.clone();
+        session.daemon_unused = false;
+        session.state = TerminalSessionState::Starting;
+        session.last_message = None;
+        session.exit_code = None;
+        for notification in &mut snapshot.notifications {
+            if notification.workspace_id.0 == workspace_id
+                && notification.session_id.as_ref().is_some_and(|id| id.0 == old_session_id)
+            {
+                notification.session_id = Some(replacement.clone());
+            }
+        }
+        Ok(true)
     }
 
     pub fn activate_pane(&self, pane_id: &str) -> bool {
@@ -7209,6 +7315,53 @@ fn terminal_pane_for_close_intent(
         .find_map(|surface| find_terminal_pane_id(&surface.root, session_id))
 }
 
+#[cfg(unix)]
+fn workspace_is_local(snapshot: &AppStateSnapshot, workspace_id: &str) -> bool {
+    snapshot.workspaces.iter().any(|workspace| {
+        workspace.workspace_id.0 == workspace_id && workspace.host_id.is_none()
+    })
+}
+
+/// Install activated successors before replaying closes that may refer to the
+/// new IDs. Translate an older session-scoped close in memory and keep its
+/// original key for journal retirement.
+#[cfg(unix)]
+pub(crate) fn restore_terminal_replacements_and_layout_closes(
+    store: &AppStateStore,
+    replacements: &[crate::database::daemon_closes::PendingTerminalReplacement],
+    closes: &[LayoutCloseIntent],
+) -> Result<(), String> {
+    if replacements.is_empty() {
+        return restore_pending_layout_closes(store, closes);
+    }
+    for replacement in replacements {
+        store.replace_terminal_session(
+            &replacement.workspace_id,
+            &replacement.old_session_id,
+            &replacement.replacement_session_id(),
+            || true,
+        )?;
+    }
+    let snapshot = store.inner.lock().unwrap();
+    let closes: Vec<_> = closes.iter().map(|close| {
+        if let LayoutCloseIntent::Session { workspace_id, session_id } = close {
+            if let Some(replacement) = replacements.iter().find(|replacement| {
+                replacement.workspace_id == *workspace_id
+                    && replacement.old_session_id == *session_id
+                    && workspace_is_local(&snapshot, workspace_id)
+            }) {
+                return LayoutCloseIntent::Session {
+                    workspace_id: workspace_id.clone(),
+                    session_id: replacement.replacement_session_id(),
+                };
+            }
+        }
+        close.clone()
+    }).collect();
+    drop(snapshot);
+    restore_pending_layout_closes(store, &closes)
+}
+
 /// A close intent can outlive the last saved layout. Apply it before any
 /// terminal hydration can reattach to the old shell or launch a replacement.
 #[cfg(unix)]
@@ -7487,6 +7640,19 @@ pub fn find_terminal_pane_id(root: &PaneNodeSnapshot, target_session_id: &str) -
         PaneNodeSnapshot::Split { children, .. } => children
             .iter()
             .find_map(|child| find_terminal_pane_id(child, target_session_id)),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn terminal_session_binding_mut<'a>(
+    root: &'a mut PaneNodeSnapshot,
+    target_session_id: &str,
+) -> Option<&'a mut SessionId> {
+    match root {
+        PaneNodeSnapshot::Terminal { session_id, .. } if session_id.0 == target_session_id => Some(session_id),
+        PaneNodeSnapshot::Split { children, .. } => children.iter_mut()
+            .find_map(|child| terminal_session_binding_mut(child, target_session_id)),
         _ => None,
     }
 }
@@ -9659,6 +9825,97 @@ mod tests {
         store.migrate_tabs_if_needed();
         restore_pending_layout_closes(&store, &intents).unwrap();
         assert!(store.find_workspace(&workspace_id).unwrap().surfaces.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_replacement_replays_before_a_pending_session_close() {
+        const TEST: &str = "state::state_impl::tests::terminal_replacement_replays_before_a_pending_session_close";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db = crate::database::DatabaseStore::test_file(&root.join("replacements.sqlite"));
+
+        for close_successor in [None, Some(false), Some(true)] {
+            let original = AppStateStore::default();
+            let workspace_id = original.active_workspace_id();
+            let plan = original.pty_hydration_plan_for_workspace(&workspace_id).unwrap();
+            let old = &plan.sessions[0];
+            let pane_id = old.pane_id.as_deref().unwrap();
+            let sibling = original.split_pane(pane_id, SplitDirection::Horizontal).unwrap();
+            flush_persisted_state(&original);
+
+            db.begin_local_terminal_restart(&workspace_id, &old.session_id, None).unwrap();
+            db.activate_tokenless_local_replacement(&workspace_id, &old.session_id).unwrap();
+            let replacements = db.pending_terminal_replacements().unwrap();
+            assert_eq!(replacements.len(), 1);
+            let replacement = replacements[0].replacement_session_id();
+            assert!(persist_terminal_replacements(&original, &db, &replacements).is_err());
+
+            let closes = if let Some(successor) = close_successor {
+                let close = LayoutCloseIntent::Session {
+                    workspace_id: workspace_id.clone(),
+                    session_id: if successor { replacement.clone() } else { old.session_id.clone() },
+                };
+                db.record_layout_close(&close, &[]).unwrap();
+                db.pending_layout_closes().unwrap()
+            } else {
+                Vec::new()
+            };
+            let restored = AppStateStore::default();
+            restored.replace_snapshot(load_persisted_state().unwrap());
+            for _ in 0..2 {
+                restore_terminal_replacements_and_layout_closes(&restored, &replacements, &closes).unwrap();
+                assert!(restored.pty_hydration_plan_for_session(&old.session_id).is_none());
+                assert!(restored.pty_hydration_plan_for_session(&sibling.0).is_some());
+                let current = restored.pty_hydration_plan_for_session(&replacement);
+                if close_successor.is_none() {
+                    assert_eq!(current.unwrap().sessions[0].pane_id.as_deref(), Some(pane_id));
+                } else {
+                    assert!(current.is_none());
+                }
+            }
+            persist_terminal_replacements(&restored, &db, &replacements).unwrap();
+            assert!(db.pending_terminal_replacements().unwrap().is_empty());
+            let saved = load_persisted_state().unwrap();
+            assert!(terminal_pane_for_close_intent(&saved, &workspace_id, &old.session_id).is_none());
+            assert_eq!(
+                terminal_pane_for_close_intent(&saved, &workspace_id, &replacement).is_some(),
+                close_successor.is_none(),
+            );
+            persist_layout_closes(&restored, &db, &closes).unwrap();
+            assert!(db.pending_layout_closes().unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_replacement_preserves_a_pane_moved_to_a_device() {
+        const TEST: &str = "state::state_impl::tests::terminal_replacement_preserves_a_pane_moved_to_a_device";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db = crate::database::DatabaseStore::test_file(&root.join("replacements.sqlite"));
+        let store = AppStateStore::default();
+        let workspace_id = store.active_workspace_id();
+        let plan = store.pty_hydration_plan_for_workspace(&workspace_id).unwrap();
+        let session_id = &plan.sessions[0].session_id;
+        db.begin_local_terminal_restart(&workspace_id, session_id, None).unwrap();
+        db.activate_tokenless_local_replacement(&workspace_id, session_id).unwrap();
+        let replacements = db.pending_terminal_replacements().unwrap();
+        store.set_workspace_host_id(&workspace_id, Some(17)).unwrap();
+
+        restore_terminal_replacements_and_layout_closes(&store, &replacements, &[]).unwrap();
+        persist_terminal_replacements(&store, &db, &replacements).unwrap();
+
+        let saved = load_persisted_state().unwrap();
+        assert!(terminal_pane_for_close_intent(&saved, &workspace_id, session_id).is_some());
+        assert!(terminal_pane_for_close_intent(
+            &saved, &workspace_id, &replacements[0].replacement_session_id(),
+        ).is_none());
+        assert!(db.pending_terminal_replacements().unwrap().is_empty());
     }
 
     #[cfg(unix)]

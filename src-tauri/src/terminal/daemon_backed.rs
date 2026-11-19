@@ -21,7 +21,10 @@ use super::{
     TerminalCloseError, TerminalLifecycleState,
     TerminalStatusPayload, DEFAULT_COLS, DEFAULT_ROWS,
 };
-use crate::database::{daemon_closes::PendingDaemonClose, DatabaseStore};
+use crate::database::{
+    daemon_closes::{PendingDaemonClose, PendingTerminalReplacement},
+    DatabaseStore,
+};
 use crate::workspace_service::Checkpoint;
 use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
 use crate::state::{AppStateStore, LayoutCloseIntent, PtyHydrationPlan, PtyHydrationSession, PtyHydrationWorkspace, SessionId};
@@ -39,6 +42,23 @@ enum DaemonSpawnClaim {
         pending_close: Option<Arc<TerminalCloseSignal>>,
     },
     Restart(SessionSpawnReservation),
+}
+
+#[derive(Default)]
+pub(super) struct DaemonHydrationResult {
+    pub failures: Vec<(String, DaemonHydrationFailure)>,
+    pub restarted_locally: bool,
+}
+
+enum DaemonSpawnOutcome {
+    DaemonShell,
+    LocalRestart { ready: bool },
+}
+
+enum LocalRestartReplay {
+    None,
+    Retired,
+    UseReplacement,
 }
 
 /// Should `spawn_pty_for_session_via_daemon` synthesize a "relaunch this
@@ -349,10 +369,10 @@ async fn has_durable_local_fallback<R: Runtime>(
 async fn replay_pending_local_restart<R: Runtime>(
     app: &AppHandle<R>,
     workspace_id: &str,
-    client: &PtyDaemonClient,
+    client: &Arc<PtyDaemonClient>,
     existing: Option<&DaemonSessionInfo>,
     reservation: &SessionSpawnReservation,
-) -> Result<bool, DaemonHydrationFailure> {
+) -> Result<LocalRestartReplay, DaemonHydrationFailure> {
     let session_id = &reservation.session_id;
     let read_pending = {
         let app = app.clone();
@@ -369,19 +389,38 @@ async fn replay_pending_local_restart<R: Runtime>(
     };
     let pending = match read_pending {
         Ok(Some(pending)) => pending,
-        Ok(None) => return Ok(false),
+        Ok(None) => return Ok(LocalRestartReplay::None),
         Err(error) if existing.is_some() => {
             log::warn!("Could not check pending local restart for {session_id}: {error}");
-            return Ok(false);
+            return Ok(LocalRestartReplay::None);
         }
         Err(error) => return Err(DaemonHydrationFailure::Ambiguous(format!(
             "could not read the pending terminal restart: {error}"
         ))),
     };
 
+    if let Some(recovery) = &reservation.reconciliation {
+        if recovery.route.workspace_id != workspace_id
+            || recovery.route.host_id.is_some()
+            || recovery.route.ssh_target.is_some()
+            || recovery.shells_for_close().as_slice() != pending.shell_id.as_slice()
+        {
+            return Ok(LocalRestartReplay::None);
+        }
+    }
+    if pending.replacement_active {
+        // An earlier attempt committed the successor before the layout
+        // changed. Finish that handoff without contacting the old shell.
+        return Ok(LocalRestartReplay::UseReplacement);
+    }
     if existing.is_some_and(|shell| pending.shell_id.is_none() || shell.shell_id != pending.shell_id) {
-        // The current attachment is not the journaled guarded shell.
-        return Ok(false);
+        // Preserve a live tokenless shell or a different guarded shell.
+        return Ok(LocalRestartReplay::None);
+    }
+    if pending.shell_id.is_none() && !pending.acknowledged {
+        // List omits in-flight spawns. The journal reserved another session
+        // ID so the pane can recover without taking over this daemon identity.
+        return Ok(LocalRestartReplay::UseReplacement);
     }
     let retired_shell = pending.shell_id.map(|shell_id| PendingDaemonClose {
         route: DaemonWorkspaceRoute {
@@ -396,11 +435,11 @@ async fn replay_pending_local_restart<R: Runtime>(
     if !pending.acknowledged || existing.is_some() {
         // Only a guarded close can be replayed without touching a replacement.
         let Some(shell_id) = pending.shell_id.filter(|_| client.supports_guarded_shells()) else {
-            return if existing.is_some() {
-                Ok(false)
-            } else {
-                Err(DaemonHydrationFailure::RequiresGuardedRecovery)
-            };
+            return Err(DaemonHydrationFailure::RequiresGuardedRecovery);
+        };
+        let mut target = match &reservation.reconciliation {
+            Some(recovery) => Some(recovery.target.lock().await),
+            None => None,
         };
         loop {
             reservation.wait_for_close().await;
@@ -413,9 +452,18 @@ async fn replay_pending_local_restart<R: Runtime>(
         if !owns_local_terminal(app, workspace_id, session_id) {
             return Err(DaemonHydrationFailure::AlreadyReserved);
         }
+        if let Some(target) = &mut target {
+            target.client = Some(client.clone());
+        }
         client.close_owned(session_id.clone(), shell_id).await.map_err(|error| {
             DaemonHydrationFailure::Ambiguous(format!("could not replay terminal restart: {error}"))
         })?;
+        if let Some(recovery) = &reservation.reconciliation {
+            recovery.acknowledge_shell_closed(shell_id);
+            let _ = recovery.retired_local_shell.set(super::RetiredLocalDaemonShell {
+                shell_id: Some(shell_id),
+            });
+        }
     }
 
     let gate = app.state::<PtyState>().daemon_ownership_gate(session_id);
@@ -459,7 +507,97 @@ async fn replay_pending_local_restart<R: Runtime>(
         .and_then(|result| result)
         .map_err(DaemonHydrationFailure::OwnershipUnavailable)?;
         if recorded {
-            return Ok(true);
+            return Ok(LocalRestartReplay::Retired);
+        }
+    }
+}
+
+async fn spawn_tokenless_restart_replacement<R: Runtime>(
+    app: AppHandle<R>,
+    workspace_id: String,
+    mut reservation: SessionSpawnReservation,
+) -> Result<bool, DaemonHydrationFailure> {
+    reservation.remove_on_drop = false;
+    loop {
+        reservation.wait_for_close().await;
+        if !reservation.is_current() {
+            return Err(DaemonHydrationFailure::AlreadyReserved);
+        }
+
+        let worker_app = app.clone();
+        let workspace_id = workspace_id.clone();
+        let session_id = reservation.session_id.clone();
+        let restart_token = reservation.restart_token;
+        let sessions = reservation.sessions.clone();
+        let replaced = tauri::async_runtime::spawn_blocking(move || {
+            let store = worker_app.state::<AppStateStore>();
+            let db = worker_app.try_state::<DatabaseStore>()
+                .ok_or_else(|| "The terminal fallback database is unavailable".to_owned())?;
+            let gate = worker_app.state::<PtyState>().daemon_ownership_gate(&session_id);
+            let replacement_token = Uuid::new_v4();
+            let mut retired_runtime = None;
+            let replaced = crate::state::with_terminal_close_layout_lock(|| {
+                let _lease = gate.lock().unwrap_or_else(|error| error.into_inner());
+                let admitted = with_existing_session_runtime(&sessions, &session_id, |runtime| {
+                    runtime.restart_token == restart_token && runtime.close_fence.is_none()
+                }).unwrap_or(false);
+                if !admitted {
+                    return Ok(None);
+                }
+                if !owns_local_terminal(&worker_app, &workspace_id, &session_id) {
+                    return Err("The terminal moved or closed while recovering its restart".into());
+                }
+                let replacement_id = db.activate_tokenless_local_replacement(&workspace_id, &session_id)?;
+                let mapping = PendingTerminalReplacement {
+                    workspace_id,
+                    old_session_id: session_id,
+                    replacement_id,
+                };
+                let replacement_session_id = mapping.replacement_session_id();
+                let changed = store.replace_terminal_session(
+                    &mapping.workspace_id,
+                    &mapping.old_session_id,
+                    &replacement_session_id,
+                    || {
+                        let mut runtimes = sessions.lock().unwrap_or_else(|error| error.into_inner());
+                        if !runtimes.get(&mapping.old_session_id).is_some_and(|runtime| {
+                            runtime.restart_token == restart_token && runtime.close_fence.is_none()
+                        }) || runtimes.contains_key(&replacement_session_id) {
+                            return false;
+                        }
+                        retired_runtime = runtimes.remove(&mapping.old_session_id);
+                        let mut successor = super::SessionRuntime::new(&replacement_session_id);
+                        successor.restart_token = replacement_token;
+                        runtimes.insert(replacement_session_id.clone(), successor);
+                        true
+                    },
+                )?;
+                if !changed {
+                    return Err("The terminal changed while restoring its replacement".into());
+                }
+                Ok::<_, String>(Some((mapping, replacement_session_id)))
+            })?;
+            drop(retired_runtime);
+            let Some((mapping, replacement_session_id)) = replaced else {
+                return Ok(None);
+            };
+            if let Err(error) = crate::state::persist_terminal_replacements(&store, &db, &[mapping]) {
+                log::warn!("Could not persist terminal replacement for {replacement_session_id}: {error}");
+            }
+            crate::state::emit_app_state(&worker_app);
+            Ok::<_, String>(Some(super::spawn_pty_for_session_in_process(
+                worker_app.clone(),
+                replacement_session_id,
+                Some(replacement_token),
+                true,
+            )))
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
+        .map_err(DaemonHydrationFailure::OwnershipUnavailable)?;
+        if let Some(ready) = replaced {
+            return Ok(ready);
         }
     }
 }
@@ -508,7 +646,7 @@ pub(crate) async fn spawn_pty_for_session_via_daemon<R: Runtime>(
             )
         })?;
     let failures = hydrate_workspace_via_daemon(app, plan, None).await?;
-    failures
+    failures.failures
         .into_iter()
         .next()
         .map(|(_, error)| Err(error))
@@ -530,7 +668,7 @@ pub(super) async fn hydrate_workspace_via_daemon<R: Runtime>(
     app: AppHandle<R>,
     plan: PtyHydrationPlan,
     restart: Option<SessionSpawnReservation>,
-) -> Result<Vec<(String, DaemonHydrationFailure)>, DaemonHydrationFailure> {
+) -> Result<DaemonHydrationResult, DaemonHydrationFailure> {
     let hydration_started = std::time::Instant::now();
     let terminal_state: State<'_, PtyState> = app.state();
     let sessions = terminal_state.sessions.clone();
@@ -565,7 +703,7 @@ pub(super) async fn hydrate_workspace_via_daemon<R: Runtime>(
             "pty.workspace-hydration",
             hydration_started.elapsed(),
         );
-        return Ok(Vec::new());
+        return Ok(DaemonHydrationResult::default());
     }
 
     let workspace = Arc::new(plan.workspace);
@@ -727,10 +865,15 @@ pub(super) async fn hydrate_workspace_via_daemon<R: Runtime>(
         .collect()
         .await;
     crate::diagnostics::record_perf_timing("pty.workspace-hydration", hydration_started.elapsed());
-    Ok(results
-        .into_iter()
-        .filter_map(|(session_id, result)| result.err().map(|error| (session_id, error)))
-        .collect())
+    let mut outcome = DaemonHydrationResult::default();
+    for (session_id, result) in results {
+        match result {
+            Ok(DaemonSpawnOutcome::DaemonShell) => {}
+            Ok(DaemonSpawnOutcome::LocalRestart { ready }) => outcome.restarted_locally |= ready,
+            Err(error) => outcome.failures.push((session_id, error)),
+        }
+    }
+    Ok(outcome)
 }
 
 #[derive(Clone)]
@@ -858,7 +1001,7 @@ async fn spawn_prepared_session<R: Runtime>(
     shell: String,
     session_restore_enabled: bool,
     claim: DaemonSpawnClaim,
-) -> Result<(), DaemonHydrationFailure> {
+) -> Result<DaemonSpawnOutcome, DaemonHydrationFailure> {
     let session_id = session.session_id.clone();
     let entry_ts = std::time::Instant::now();
     crate::trace_cloud_push!("[trace:{session_id}] spawn_via_daemon ENTRY t=0ms");
@@ -866,7 +1009,6 @@ async fn spawn_prepared_session<R: Runtime>(
     let app_state: State<'_, AppStateStore> = app.state();
     let sessions = terminal_state.sessions.clone();
 
-    let ordinary_hydration = matches!(&claim, DaemonSpawnClaim::Hydrate { .. });
     let reservation = match claim {
         DaemonSpawnClaim::Hydrate { token, mut pending_close } => loop {
             if let Some(fence) = pending_close.take() {
@@ -910,21 +1052,34 @@ async fn spawn_prepared_session<R: Runtime>(
             "the daemon session belongs to a different workspace".into(),
         ));
     }
-    if ordinary_hydration
-        && !reconciling
-        && !session.daemon_unused
+    if !session.daemon_unused
         && workspace.host_id.is_none()
         && client.ssh_target().is_none()
         && !client.supports_prepared_spawn()
-        && replay_pending_local_restart(
+    {
+        match replay_pending_local_restart(
             &app,
             &workspace.workspace_id,
             &client,
             existing.as_ref(),
             &reservation,
-        ).await?
-    {
-        return Err(DaemonHydrationFailure::LegacyDaemonLocalFallback);
+        ).await? {
+            LocalRestartReplay::None => {}
+            LocalRestartReplay::Retired => {
+                let ready = super::spawn_retired_local_shell(app, reservation)
+                    .await
+                    .map_err(DaemonHydrationFailure::Ambiguous)?;
+                return Ok(DaemonSpawnOutcome::LocalRestart { ready });
+            }
+            LocalRestartReplay::UseReplacement => {
+                let ready = spawn_tokenless_restart_replacement(
+                    app,
+                    workspace.workspace_id.clone(),
+                    reservation,
+                ).await?;
+                return Ok(DaemonSpawnOutcome::LocalRestart { ready });
+            }
+        }
     }
     let reattached = existing.is_some();
     let shell_id = match (&existing, client.supports_guarded_shells()) {
@@ -1484,7 +1639,7 @@ async fn spawn_prepared_session<R: Runtime>(
                                 );
                                 // Don't write the command — let the bare bash
                                 // prompt remain on the pane as a fallback.
-                                return Ok(());
+                                return Ok(DaemonSpawnOutcome::DaemonShell);
                             }
                             // result == "OK" → proceed to write.
                             // result == anything-else (SSH error, etc.) →
@@ -1589,7 +1744,7 @@ async fn spawn_prepared_session<R: Runtime>(
         );
     });
 
-    Ok(())
+    Ok(DaemonSpawnOutcome::DaemonShell)
 }
 
 pub(super) struct PreparedDaemonClose {

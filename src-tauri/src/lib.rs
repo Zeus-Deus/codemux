@@ -955,6 +955,13 @@ fn build_core_app<R: tauri::Runtime>(
             #[cfg(unix)]
             let has_local_restarts = handle.state::<database::DatabaseStore>()
                 .has_pending_local_terminal_restarts().map_err(std::io::Error::other)?;
+            #[cfg(unix)]
+            let terminal_replacements = if has_local_restarts {
+                handle.state::<database::DatabaseStore>()
+                    .pending_terminal_replacements().map_err(std::io::Error::other)?
+            } else {
+                Vec::new()
+            };
             // Track whether the persisted layout actually loaded. The
             // Windows orphan-cleanup gate below uses this to skip the
             // destructive `cleanup_orphan_scrollbacks(&[])` call after
@@ -1026,10 +1033,18 @@ fn build_core_app<R: tauri::Runtime>(
                 }) {log::warn!("Local import layout recovery remains pending: {error}");}
             }
             #[cfg(unix)]
-            state::restore_pending_layout_closes(
-                &handle.state::<state::AppStateStore>(),
-                &pending_layout_closes,
-            ).map_err(std::io::Error::other)?;
+            {
+                let store = handle.state::<state::AppStateStore>();
+                state::restore_terminal_replacements_and_layout_closes(
+                    &store,
+                    &terminal_replacements,
+                    &pending_layout_closes,
+                ).map_err(std::io::Error::other)?;
+                let db = handle.state::<database::DatabaseStore>();
+                if let Err(error) = state::persist_terminal_replacements(&store, &db, &terminal_replacements) {
+                    log::warn!("Could not save replayed terminal replacements: {error}");
+                }
+            }
             #[cfg(unix)]
             if !daemon_shells.is_empty() {
                 // A shell can start before its new pane has reached disk.

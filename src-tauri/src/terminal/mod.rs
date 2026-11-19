@@ -2780,7 +2780,7 @@ pub fn spawn_missing_ptys_for_workspace<R: Runtime>(app: AppHandle<R>, workspace
             use futures_util::StreamExt as _;
             let failures =
                 match daemon_backed::hydrate_workspace_via_daemon(app.clone(), plan, None).await {
-                    Ok(failures) => failures,
+                    Ok(outcome) => outcome.failures,
                     // The workspace-level error arrives pre-classified: a
                     // List timeout against a stalled-but-alive daemon stays
                     // retry-only for every missing session, while a daemon
@@ -3440,7 +3440,11 @@ async fn persist_local_shell_restart<R: Runtime>(
                         db.begin_local_terminal_restart(&workspace_id, &session_id, shell_id)?;
                     }
                     LocalRestartJournalStep::ConfirmRetirement => {
-                        db.acknowledge_local_terminal_restart(&workspace_id, &session_id, shell_id)?;
+                        if db.pending_local_terminal_restart(&workspace_id, &session_id)?
+                            .is_some_and(|pending| !pending.acknowledged)
+                        {
+                            db.acknowledge_local_terminal_restart(&workspace_id, &session_id, shell_id)?;
+                        }
                         db.remember_local_terminal_fallback_after_daemon_close(
                             &workspace_id, &session_id, acknowledged.as_ref(),
                         )?;
@@ -3487,6 +3491,16 @@ async fn restart_retired_local_shell<R: Runtime>(
             return Err(message);
         }
     }
+    spawn_retired_local_shell(app, reservation).await
+}
+
+#[cfg(unix)]
+async fn spawn_retired_local_shell<R: Runtime>(
+    app: AppHandle<R>,
+    reservation: SessionSpawnReservation,
+) -> Result<bool, String> {
+    let session_id = reservation.session_id.clone();
+    let restart_token = reservation.restart_token;
     if !reservation.release_for_spawn() {
         return Ok(false);
     }
@@ -3634,7 +3648,8 @@ pub async fn restart_terminal_session<R: Runtime>(
         let hydrate = async move {
             let result = daemon_backed::hydrate_workspace_via_daemon(app.clone(), plan, Some(reservation)).await;
             let error = match result {
-                Ok(failures) => failures.into_iter().next().map(|(_, error)| error),
+                Ok(outcome) if outcome.restarted_locally => return true,
+                Ok(outcome) => outcome.failures.into_iter().next().map(|(_, error)| error),
                 Err(error) => Some(error),
             };
             if let Some(error) = error.filter(|error| !error.is_already_reserved()) {
@@ -3651,7 +3666,7 @@ pub async fn restart_terminal_session<R: Runtime>(
                     if current {
                         handle_daemon_spawn_failure(app, session_id, error, is_remote).await;
                     }
-                    return;
+                    return false;
                 }
                 emit_terminal_status_if_current(
                     &app,
@@ -3660,16 +3675,18 @@ pub async fn restart_terminal_session<R: Runtime>(
                     Some(token),
                 );
             }
+            false
         };
         if restart_daemon {
             // Keep the cleanup route and reservation through the replacement
             // Spawn instead of releasing them between the two shell lifetimes.
-            tauri::async_runtime::spawn(hydrate);
+            tauri::async_runtime::spawn(async move {
+                hydrate.await;
+            });
             return Ok(true);
         }
-        hydrate.await;
         // A surviving shell is reattached without a restart marker.
-        return Ok(false);
+        return Ok(hydrate.await);
     }
     let _ = plan;
     if app.state::<AppStateStore>().pty_hydration_plan_for_session(&session_id).is_none()
@@ -7601,6 +7618,16 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn tokenless_shell_restart_uses_fresh_successor_after_losing_ack() {
+        const TEST: &str = "terminal::tests::tokenless_shell_restart_uses_fresh_successor_after_losing_ack";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        assert_inherited_daemon_shell_restarts(InheritedRestartCase::TokenlessAckFailureRelaunch).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn inherited_shell_restart_replays_unrecorded_ack_after_relaunch() {
         const TEST: &str = "terminal::tests::inherited_shell_restart_replays_unrecorded_ack_after_relaunch";
         if crate::test_isolation::isolated(TEST) {
@@ -7610,14 +7637,26 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn inherited_guarded_restart_replays_close_after_losing_reply() {
+        const TEST: &str = "terminal::tests::inherited_guarded_restart_replays_close_after_losing_reply";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        assert_inherited_daemon_shell_restarts(InheritedRestartCase::GuardedLostCloseReply).await;
+    }
+
+    #[cfg(unix)]
     enum InheritedRestartCase {
         Tokenless,
         TokenlessDetachFailure,
         TokenlessStorageFailureRelaunch,
+        TokenlessAckFailureRelaunch,
         Guarded,
         GuardedStorageFailure,
         GuardedStorageFailureRelaunch,
         GuardedAckFailureRelaunch,
+        GuardedLostCloseReply,
     }
 
     #[cfg(unix)]
@@ -7633,6 +7672,7 @@ mod tests {
             InheritedRestartCase::Tokenless
                 | InheritedRestartCase::TokenlessDetachFailure
                 | InheritedRestartCase::TokenlessStorageFailureRelaunch
+                | InheritedRestartCase::TokenlessAckFailureRelaunch
         );
         tokio::time::timeout(Duration::from_secs(10), async {
             let root = crate::test_isolation::isolated_root().unwrap();
@@ -7674,7 +7714,7 @@ mod tests {
             let daemon_pid = std::process::id();
             write_manifest(&DaemonManifest {
                 pid: daemon_pid,
-                socket_path,
+                socket_path: socket_path.clone(),
                 daemon_version: "0.0.0".into(),
                 protocol_version: PROTOCOL_VERSION,
                 started_at: 0,
@@ -7712,6 +7752,48 @@ mod tests {
             );
             assert!(!db.has_local_terminal_fallback(&workspace_id, &restarting).unwrap());
 
+            let sibling_socket = if matches!(case, InheritedRestartCase::GuardedLostCloseReply) {
+                use crate::pty_daemon::PtyDaemonClient;
+                // Keep a separate subscription to the same daemon so the
+                // transport failure under test affects only the target RPC.
+                let client = PtyDaemonClient::connect(&socket_path).await.unwrap();
+                let (peer, _) = listener.accept().await.unwrap();
+                let (read, mut write) = peer.into_split();
+                let mut lines = BufReader::new(read).lines();
+                let attach = {
+                    let client = client.clone();
+                    let sibling = sibling.clone();
+                    let shell_id = surviving.shell_id.unwrap();
+                    tokio::spawn(async move {
+                        client.hello().await.unwrap();
+                        client.attach_owned(sibling, shell_id).await.unwrap()
+                    })
+                };
+                let ClientRequest::Hello { request_id } = request(&mut lines).await else {
+                    panic!("expected the sibling observer's handshake");
+                };
+                send_daemon_fixture_response(&mut write, ServerResponse::Hello {
+                    request_id,
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_pid,
+                    daemon_version: "0.0.0".into(),
+                    host_claude_plugin: false,
+                    guarded_shells: true,
+                    prepared_spawn: false,
+                }).await;
+                attach_fixture_shell(&mut lines, &mut write, std::slice::from_ref(&surviving)).await;
+                let output = attach.await.unwrap();
+                let writer = daemon_backed::DaemonWriter::new(client.clone(), sibling.clone());
+                with_existing_session_runtime(sessions, &sibling, |runtime| {
+                    runtime.writer = Some(Box::new(writer.clone()));
+                    runtime.daemon_writer = Some(writer);
+                    runtime.daemon_client = Some(client);
+                }).unwrap();
+                Some((lines, write, output))
+            } else {
+                None
+            };
+
             // A real daemon exit preserves the pane's last restart token and
             // removes only its attachment. The sibling keeps the same socket.
             let attachment_id = guarded_shells.then(|| attachments[&restarting]);
@@ -7737,7 +7819,7 @@ mod tests {
                      BEGIN SELECT RAISE(ABORT, 'fixture could not store fallback'); END;",
                     "fixture could not store fallback",
                 )),
-                InheritedRestartCase::GuardedAckFailureRelaunch => Some((
+                InheritedRestartCase::GuardedAckFailureRelaunch | InheritedRestartCase::TokenlessAckFailureRelaunch => Some((
                     "CREATE TRIGGER reject_restart_storage BEFORE UPDATE OF acknowledged ON pending_local_terminal_restarts
                      BEGIN SELECT RAISE(ABORT, 'fixture could not record retirement'); END;",
                     "fixture could not record retirement",
@@ -7763,7 +7845,49 @@ mod tests {
             };
             assert_eq!(closed_session, restarting);
             assert_eq!(closed_shell, exited.shell_id);
-            send_daemon_fixture_response(&mut write, ServerResponse::Closed { request_id, attachment_id }).await;
+            if matches!(case, InheritedRestartCase::GuardedLostCloseReply) {
+                let pending = db.pending_local_terminal_restart(&workspace_id, &restarting).unwrap().unwrap();
+                assert_eq!(pending.shell_id, exited.shell_id);
+                assert!(!pending.acknowledged);
+                // The daemon has retired this exact shell. Close only the
+                // request socket before its reply and keep its listener.
+                drop(lines);
+                drop(write);
+                let (socket, _) = listener.accept().await.unwrap();
+                let (read, next_write) = socket.into_split();
+                lines = BufReader::new(read).lines();
+                write = next_write;
+                let ClientRequest::Hello { request_id } = request(&mut lines).await else {
+                    panic!("expected the original app to reconnect");
+                };
+                send_daemon_fixture_response(&mut write, ServerResponse::Hello {
+                    request_id,
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_pid,
+                    daemon_version: "0.0.0".into(),
+                    host_claude_plugin: false,
+                    guarded_shells: true,
+                    prepared_spawn: false,
+                }).await;
+                let ClientRequest::List { request_id } = request(&mut lines).await else {
+                    panic!("expected reconnect inventory after losing the close reply");
+                };
+                send_daemon_fixture_response(&mut write, ServerResponse::Listed {
+                    request_id,
+                    sessions: vec![surviving.clone()],
+                }).await;
+                let replayed = request(&mut lines).await;
+                let ClientRequest::CloseOwned { request_id, session_id, shell_id } = replayed else {
+                    panic!("expected replay of the guarded close, received {replayed:?}");
+                };
+                assert_eq!(session_id, restarting);
+                assert_eq!(Some(shell_id), exited.shell_id);
+                send_daemon_fixture_response(&mut write, ServerResponse::Closed {
+                    request_id, attachment_id: None,
+                }).await;
+            } else {
+                send_daemon_fixture_response(&mut write, ServerResponse::Closed { request_id, attachment_id }).await;
+            }
             if !guarded_shells {
                 let ClientRequest::Detach { request_id, session_id } = request(&mut lines).await else {
                     panic!("expected the tokenless shell to detach after Close");
@@ -7806,16 +7930,21 @@ mod tests {
                     InheritedRestartCase::GuardedStorageFailureRelaunch
                         | InheritedRestartCase::GuardedAckFailureRelaunch
                         | InheritedRestartCase::TokenlessStorageFailureRelaunch
+                        | InheritedRestartCase::TokenlessAckFailureRelaunch
                 ) {
                     let replay_close = matches!(case, InheritedRestartCase::GuardedAckFailureRelaunch);
-                    let shell_id = exited.shell_id.as_ref().map(|id| id.as_bytes().as_slice());
-                    let recorded_ack: bool = fault.query_row(
-                        "SELECT acknowledged FROM pending_local_terminal_restarts
-                         WHERE workspace_id = ?1 AND session_id = ?2 AND shell_id IS ?3",
-                        rusqlite::params![workspace_id, restarting, shell_id],
-                        |row| row.get(0),
-                    ).unwrap();
-                    assert_eq!(recorded_ack, !replay_close);
+                    let use_successor = matches!(case, InheritedRestartCase::TokenlessAckFailureRelaunch);
+                    let pending = db.pending_local_terminal_restart(&workspace_id, &restarting).unwrap().unwrap();
+                    assert_eq!(pending.shell_id, exited.shell_id);
+                    assert_eq!(pending.acknowledged, !replay_close && !use_successor);
+                    let local_session = if use_successor {
+                        assert!(!pending.replacement_active);
+                        let replacement = format!("session-{}", pending.replacement_id.unwrap().simple());
+                        assert_ne!(replacement, restarting);
+                        replacement
+                    } else {
+                        restarting.clone()
+                    };
                     drop(fault);
                     state::flush_persisted_state(&app.state::<AppStateStore>());
                     drop(remove_session_runtime(sessions, &restarting));
@@ -7825,7 +7954,9 @@ mod tests {
                     while !client.is_closed() {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    assert_restored_daemon_restart(&listener, &db_path, &exited, &surviving, replay_close).await;
+                    assert_restored_daemon_restart(
+                        &listener, &db_path, &exited, &surviving, &local_session, replay_close,
+                    ).await;
                     return;
                 }
                 start_restart(failed_token)
@@ -7856,9 +7987,14 @@ mod tests {
                 assert!(ownership.is_empty());
             }
             assert_eq!(with_existing_session_runtime(sessions, &sibling, |runtime| {
+                assert!(matches!(runtime.last_status.state, TerminalLifecycleState::Ready));
                 (runtime.persistent, runtime.restart_token, runtime.daemon_shell_id, runtime.child_pid)
             }), Some((true, sibling_token, surviving.shell_id, Some(surviving.pid))));
-            assert_fixture_shell_accepts_input(&mut lines, &mut write, sessions, &sibling).await;
+            if let Some((mut lines, mut write, _output)) = sibling_socket {
+                assert_fixture_shell_accepts_input(&mut lines, &mut write, sessions, &sibling).await;
+            } else {
+                assert_fixture_shell_accepts_input(&mut lines, &mut write, sessions, &sibling).await;
+            }
             terminate_pty_session(app.handle(), sessions, &restarting);
         }).await.expect("an inherited local shell should restart without disturbing its sibling");
     }
@@ -7869,6 +8005,7 @@ mod tests {
         db_path: &std::path::Path,
         retired: &crate::pty_daemon::protocol::DaemonSessionInfo,
         surviving: &crate::pty_daemon::protocol::DaemonSessionInfo,
+        local_session: &str,
         replay_close: bool,
     ) {
         use self::daemon_fixture::*;
@@ -7878,6 +8015,8 @@ mod tests {
 
         let restored = AppStateStore::default();
         restored.replace_snapshot(state::load_persisted_state().unwrap());
+        let saved = restored.pty_hydration_plan_for_session(&retired.session_id).unwrap();
+        let saved_pane = &saved.sessions[0].pane_id;
         let app = tauri::test::mock_app();
         app.manage(restored);
         app.manage(PtyState::default());
@@ -7904,7 +8043,7 @@ mod tests {
         let sessions = &terminal.sessions;
         let ready = async {
             tokio::join!(
-                wait_for_fixture_terminal(sessions, &retired.session_id),
+                wait_for_fixture_terminal(sessions, local_session),
                 wait_for_fixture_terminal(sessions, &surviving.session_id),
             );
         };
@@ -7955,9 +8094,16 @@ mod tests {
         }
         assert_eq!(replayed_close, replay_close, "startup may replay only an unrecorded guarded close");
         assert!(attached_sibling);
-        assert_in_process_fixture_shell(sessions, &retired.session_id);
+        assert_in_process_fixture_shell(sessions, local_session);
+        let layout = app.state::<AppStateStore>();
+        let active = layout.pty_hydration_plan_for_session(local_session).unwrap();
+        assert_eq!(&active.sessions[0].pane_id, saved_pane);
         let db = app.state::<DatabaseStore>();
-        assert!(db.has_local_terminal_fallback(&retired.workspace_id, &retired.session_id).unwrap());
+        assert!(db.has_local_terminal_fallback(&retired.workspace_id, local_session).unwrap());
+        if local_session != retired.session_id {
+            assert!(layout.pty_hydration_plan_for_session(&retired.session_id).is_none());
+            assert!(!db.has_local_terminal_fallback(&retired.workspace_id, &retired.session_id).unwrap());
+        }
         let ownership = db.daemon_shell_ownership().unwrap();
         if let Some(shell_id) = surviving.shell_id {
             assert_eq!(ownership.len(), 1);
@@ -7967,7 +8113,7 @@ mod tests {
             assert!(ownership.is_empty());
         }
         assert_fixture_shell_accepts_input(&mut lines, &mut write, sessions, &surviving.session_id).await;
-        terminate_pty_session(app.handle(), sessions, &retired.session_id);
+        terminate_pty_session(app.handle(), sessions, local_session);
     }
 
     #[cfg(unix)]
