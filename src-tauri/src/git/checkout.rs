@@ -2,6 +2,7 @@
 //! entries Git actually changed, keeping the originals until HEAD commits.
 
 use super::{checkout_config, git_command, git_path, path_from_git_bytes, run_git_with_index};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -145,9 +146,64 @@ fn copy_local_attributes(
     Ok(())
 }
 
+// Fingerprint the actual checkout representation, including smudged bytes.
+#[derive(PartialEq, Eq)]
+enum FileState {
+    Regular([u8; 32], fs::Permissions),
+    Symlink(std::ffi::OsString),
+}
+
+impl FileState {
+    fn read(path: &Path) -> io::Result<Self> {
+        let meta = fs::symlink_metadata(path)?;
+        if meta.is_symlink() {
+            return Ok(Self::Symlink(fs::read_link(path)?.into_os_string()));
+        }
+        if !meta.is_file() {
+            return Err(collision(path));
+        }
+        let mut options = fs::File::options();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut file = options.open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(collision(path));
+        }
+        let mut hash = Sha256::new();
+        io::copy(&mut file, &mut hash)?;
+        Ok(Self::Regular(hash.finalize().into(), meta.permissions()))
+    }
+}
+
+// A missing tracked file is a meaningful state on both sides of validation.
+fn file_at(root: &Path, rel: &Path) -> io::Result<Option<FileState>> {
+    if !parents_are_directories(root, rel)? {
+        return Ok(None);
+    }
+    match FileState::read(&root.join(rel)) {
+        Ok(state) => Ok(Some(state)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+enum Original {
+    Gitlink,
+    Tracked(Option<FileState>),
+}
+
 enum Undo {
     RestoreFile(PathBuf, PathBuf),
-    RemoveFile(PathBuf),
+    UninstallFile {
+        dest: PathBuf,
+        prepared: PathBuf,
+        state: FileState,
+    },
     CreateDir(PathBuf, fs::Permissions),
     RemoveDir(PathBuf),
 }
@@ -155,13 +211,22 @@ enum Undo {
 pub(super) struct PreparedCheckout {
     scratch: TempDir,
     index: TempPath,
-    remove: Vec<(PathBuf, bool)>,
+    remove: Vec<(PathBuf, Original)>,
     install: Vec<(PathBuf, bool)>,
     undo: Vec<Undo>,
 }
 
 impl PreparedCheckout {
     pub(super) fn new(checkout: &Path, lock: &Path, old: &str, new: &str) -> Result<Self, String> {
+        // Git may clear skip-worktree when a path is present on disk. The
+        // empty preparation tree cannot reproduce that live sparse decision.
+        if checkout_config(checkout, "core.sparseCheckout", true)?
+            .is_some_and(|v| v.trim_end() == "true")
+        {
+            return Err(
+                "cannot atomically update a base checkout with sparse checkout enabled".into(),
+            );
+        }
         let git_dir =
             git_path(checkout, "--git-dir").ok_or("could not locate checkout git directory")?;
         let mut scratch = tempfile::Builder::new();
@@ -227,6 +292,20 @@ impl PreparedCheckout {
                     .into(),
             );
         }
+        // Capture the outgoing bytes before the final live dry run. The
+        // index lock excludes Git writers, but editors need no such lock.
+        let remove = remove
+            .into_iter()
+            .map(|(rel, gitlink)| {
+                let original = if gitlink {
+                    Original::Gitlink
+                } else {
+                    Original::Tracked(file_at(checkout, &rel)?)
+                };
+                Ok((rel, original))
+            })
+            .collect::<io::Result<_>>()
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             remove,
             install,
@@ -245,6 +324,17 @@ impl PreparedCheckout {
             &self.index,
             &["update-index", "-q", "--ignore-submodules", "--refresh"],
         )?;
+        // Validate the actual objects we took out of the checkout, even if
+        // an editor wrote through an open handle while installation ran.
+        let backups = self.scratch.path().join("original");
+        for (rel, original) in &self.remove {
+            if let Original::Tracked(expected) = original {
+                let actual = file_at(&backups, rel).map_err(|e| e.to_string())?;
+                if actual != *expected {
+                    return Err(changed(&checkout.join(rel)).to_string());
+                }
+            }
+        }
         fs::rename(&self.index, lock)
             .map_err(|e| format!("could not prepare the checkout index ({e})"))
     }
@@ -255,7 +345,7 @@ impl PreparedCheckout {
             .iter()
             .flat_map(|(rel, _)| rel.ancestors().skip(1).map(|p| checkout.join(p)))
             .collect();
-        for (rel, gitlink) in &self.remove {
+        for (rel, original) in &self.remove {
             let dest = checkout.join(rel);
             // An absent parent (including a symlink in its place) makes
             // this tracked leaf absent. Never walk through that symlink.
@@ -267,7 +357,7 @@ impl PreparedCheckout {
                 Err(e) if e.kind() == ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
-            if *gitlink {
+            if matches!(original, Original::Gitlink) {
                 if !meta.is_dir() {
                     return Err(collision(&dest));
                 }
@@ -303,24 +393,44 @@ impl PreparedCheckout {
             }
             // The no-replace operation itself protects ignored and untracked
             // files, including files created after Git's validation.
-            move_noclobber(self.scratch.path().join("tree").join(rel), &dest).map_err(|e| {
+            let prepared = self.scratch.path().join("tree").join(rel);
+            let state = FileState::read(&prepared)?;
+            move_noclobber(prepared.clone(), &dest).map_err(|e| {
                 if e.kind() == ErrorKind::AlreadyExists || dest.is_dir() {
                     collision(&dest)
                 } else {
                     e
                 }
             })?;
-            self.undo.push(Undo::RemoveFile(dest));
+            self.undo.push(Undo::UninstallFile {
+                dest,
+                prepared,
+                state,
+            });
         }
         Ok(())
     }
 
     pub(super) fn rollback(&mut self, error: String) -> String {
         let mut failure = None;
+        let mut preserve = HashSet::new();
         while let Some(action) = self.undo.pop() {
             let result = match action {
+                Undo::RestoreFile(_, dest) if preserve.contains(&dest) => continue,
                 Undo::RestoreFile(backup, dest) => move_noclobber(backup, &dest),
-                Undo::RemoveFile(dest) => fs::remove_file(dest),
+                Undo::UninstallFile {
+                    dest,
+                    prepared,
+                    state,
+                } => {
+                    let result = uninstall_file(&dest, &prepared, state);
+                    if result.is_err() {
+                        // Also preserve a deletion if the user removed the
+                        // installed file before we could roll it back.
+                        preserve.insert(dest);
+                    }
+                    result
+                }
                 Undo::CreateDir(dir, mode) => match fs::create_dir(&dir) {
                     Ok(()) => fs::set_permissions(dir, mode),
                     Err(e)
@@ -344,12 +454,36 @@ impl PreparedCheckout {
         if let Some(e) = failure {
             self.scratch.disable_cleanup(true);
             return format!(
-                "{error}. Could not restore all working files ({e}); originals remain at {}",
-                self.scratch.path().join("original").display()
+                "{error}. Could not restore all working files ({e}); checkout recovery files remain at {}",
+                self.scratch.path().display()
             );
         }
         error
     }
+}
+
+fn changed(path: &Path) -> io::Error {
+    io::Error::other(format!(
+        "working tree file '{}' changed during checkout",
+        path.display()
+    ))
+}
+
+// Take the installed object back before comparing it. Checking the live
+// path and then unlinking it could discard another save between the two.
+fn uninstall_file(dest: &Path, prepared: &Path, expected: FileState) -> io::Result<()> {
+    move_noclobber(dest.to_owned(), prepared)?;
+    let check = FileState::read(prepared).and_then(|actual| {
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(changed(dest))
+        }
+    });
+    if check.is_err() {
+        move_noclobber(prepared.to_owned(), dest)?;
+    }
+    check
 }
 
 fn collision(path: &Path) -> io::Error {

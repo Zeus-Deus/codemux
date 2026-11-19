@@ -7491,6 +7491,101 @@ exit 0
     }
 
     #[test]
+    fn test_merge_into_base_preserves_late_materialization_outside_sparse_patterns() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        for dir in ["included", "outside"] {
+            std::fs::create_dir(repo.join(dir)).unwrap();
+            std::fs::write(repo.join(dir).join("tracked"), b"original").unwrap();
+        }
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "both directories"]).unwrap();
+        let old = head_hash(&repo);
+        run_git(&wt, &["merge", "--ff-only", main]).unwrap();
+        std::fs::write(wt.join("included/tracked"), b"incoming").unwrap();
+        run_git(&wt, &["commit", "-am", "only update the included path"]).unwrap();
+        run_git(&repo, &["sparse-checkout", "set", "--cone", "included"]).unwrap();
+        let edited = repo.join("outside/tracked");
+        assert!(!edited.exists());
+        std::fs::create_dir_all(edited.parent().unwrap()).unwrap();
+        std::fs::write(&edited, b"private\x00edit").unwrap();
+        let index = repo.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+
+        let result = fast_forward_checkout(&repo, main, &head_hash(&wt));
+        assert_eq!(std::fs::read(edited).unwrap(), b"private\x00edit");
+        let err = result.unwrap_err();
+        assert!(err.contains("sparse"), "{err}");
+        assert_eq!(std::fs::read(repo.join("included/tracked")).unwrap(), b"original");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+    }
+
+    fn setup_incoming_tracked_update() -> (TempDir, PathBuf, String, String) {
+        let (dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+        let tracked = repo.join("tracked");
+        std::fs::write(&tracked, b"old\x00data").unwrap();
+        run_git(&repo, &["add", "tracked"]).unwrap();
+        run_git(&repo, &["commit", "-m", "old file"]).unwrap();
+        let old = head_hash(&repo);
+        run_git(&wt, &["merge", "--ff-only", main]).unwrap();
+        std::fs::write(wt.join("tracked"), b"incoming").unwrap();
+        run_git(&wt, &["commit", "-am", "replace tracked file"]).unwrap();
+        (dir, repo, old, head_hash(&wt))
+    }
+
+    #[test]
+    fn test_merge_into_base_preserves_late_save_to_a_tracked_file() {
+        let (_dir, repo, old, new) = setup_incoming_tracked_update();
+        let main = main_branch(&repo);
+        let tracked = repo.join("tracked");
+        let (index, lock) = lock_checkout_index(&repo).unwrap();
+        let before = std::fs::read(&index).unwrap();
+        let mut files = checkout::PreparedCheckout::new(&repo, &lock, &old, &new).unwrap();
+
+        let update = advance_checkout_head(&repo, &format!("refs/heads/{main}"), &old, &new, || {
+            run_git_with_index(&repo, &lock, &["read-tree", "-n", "-u", "-m", &old, &new])?;
+            // Same inode, size and mtime. The saved bytes distinguish the edit.
+            let file = std::fs::File::options().write(true).open(&tracked).unwrap();
+            let modified = file.metadata().unwrap().modified().unwrap();
+            std::fs::write(&tracked, b"new\x00edit").unwrap();
+            file.set_modified(modified).unwrap();
+            files.install(&repo, &lock).map_err(|e| files.rollback(e))
+        });
+        assert_eq!(std::fs::read(&tracked).unwrap(), b"new\x00edit");
+        let err = update.unwrap_err();
+        assert!(err.contains("tracked"), "{err}");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+    }
+
+    #[test]
+    fn test_merge_into_base_preserves_an_edit_to_an_installed_file_during_rollback() {
+        let (_dir, repo, old, new) = setup_incoming_tracked_update();
+        let main = main_branch(&repo);
+        let tracked = repo.join("tracked");
+        let (index, lock) = lock_checkout_index(&repo).unwrap();
+        let before = std::fs::read(&index).unwrap();
+        let mut files = checkout::PreparedCheckout::new(&repo, &lock, &old, &new).unwrap();
+
+        let update = advance_checkout_head(&repo, &format!("refs/heads/{main}"), &old, &new, || {
+            run_git_with_index(&repo, &lock, &["read-tree", "-n", "-u", "-m", &old, &new])?;
+            files.install(&repo, &lock)?;
+            assert_eq!(std::fs::read(&tracked).unwrap(), b"incoming");
+            std::fs::write(&tracked, b"saved after install").unwrap();
+            Err("simulated refusal".into())
+        });
+        let err = files.rollback(update.unwrap_err());
+        drop(files);
+        assert_eq!(std::fs::read(&tracked).unwrap(), b"saved after install");
+        assert_eq!(head_hash(&repo), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+        let (_, recovery) = err.split_once("checkout recovery files remain at ").expect(&err);
+        assert_eq!(std::fs::read(Path::new(recovery).join("original/tracked")).unwrap(), b"old\x00data");
+    }
+
+    #[test]
     fn test_merge_into_base_recovers_partial_install_without_rebuilding_the_index() {
         let (_dir, repo, wt) = setup_worktree_merge_scenario();
         let main = main_branch(&repo);
