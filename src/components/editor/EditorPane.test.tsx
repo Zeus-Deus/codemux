@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { EditorView } from "@codemirror/view";
 import { undo } from "@codemirror/commands";
+import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 
 // A one-file fake disk: `signature` moves with every write, like size+mtime.
 const disk = { content: "", version: 0 };
@@ -28,7 +29,7 @@ vi.mock("@/lib/editor-languages", async () => ({
 
 import { EditorPane } from "./EditorPane";
 import { useEditorStore } from "@/stores/editor-store";
-import { readFile } from "@/tauri/commands";
+import { closeTab, fileSignature, readFile } from "@/tauri/commands";
 
 // CodeMirror measures selection rectangles; jsdom has no layout for ranges.
 Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
@@ -42,6 +43,16 @@ function agentWrites(content: string) {
   disk.version++;
 }
 
+function delayNextWrite() {
+  let finish!: () => void;
+  const wait = new Promise<void>((done) => { finish = done; });
+  writeFile.mockImplementationOnce(async (_path, content) => {
+    await wait;
+    agentWrites(content);
+  });
+  return finish;
+}
+
 /** Window focus runs an immediate disk check, so no timers are needed. */
 async function checkDisk() {
   await act(async () => {
@@ -49,12 +60,12 @@ async function checkDisk() {
   });
 }
 
-async function openEditor(embedded = false) {
+async function openEditor(embedded = false, expectedContent = disk.content) {
   const { container } = render(<EditorPane tabId={TAB} embedded={embedded} />);
   await waitFor(() => {
     const el = container.querySelector(".cm-editor");
     expect(el && EditorView.findFromDOM(el as HTMLElement)?.state.doc.toString()).toBe(
-      disk.content,
+      expectedContent,
     );
   });
   return EditorView.findFromDOM(container.querySelector(".cm-editor") as HTMLElement)!;
@@ -83,6 +94,56 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("EditorPane disk sync", () => {
+  it("restores unsaved edits after switching away and lets the user save them", async () => {
+    const before = await openEditor();
+    type(before, "// unfinished\n");
+    const draft = before.state.doc.toString();
+    cleanup();
+
+    const restored = await openEditor(false, draft);
+    expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(true);
+    expect(localStorage.getItem("codemux-editor")).not.toContain("unfinished");
+    save(restored);
+    await waitFor(() => expect(disk.content).toBe(draft));
+    expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(false);
+  });
+
+  it("restores an empty draft and detects an outside edit made while the pane was hidden", async () => {
+    const before = await openEditor();
+    act(() => before.dispatch({ changes: { from: 0, to: before.state.doc.length } }));
+    cleanup();
+    agentWrites("// agent edit\n");
+
+    const restored = await openEditor(false, "");
+    expect(await screen.findByRole("alert")).toHaveTextContent(/changed on disk/i);
+    save(restored);
+    await act(async () => {});
+    expect(writeFile).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+    expect(restored.state.doc.toString()).toBe("// agent edit\n");
+  });
+
+  it("saves an empty raw Markdown draft after switching directly between documents", async () => {
+    const markdownTab = "readme";
+    const markdownPath = "/repo/README.md";
+    disk.content = "# Readme\n";
+    useEditorStore.getState().initTab(markdownTab, { filePath: markdownPath });
+
+    const pane = (id: string) => <EditorPane tabId={id} embedded viewMode="raw" />;
+    const { container, rerender } = render(pane(markdownTab));
+    const view = () => EditorView.findFromDOM(container.querySelector(".cm-editor") as HTMLElement)!;
+    await waitFor(() => expect(view().state.doc.toString()).toBe("# Readme\n"));
+    act(() => view().dispatch({ changes: { from: 0, to: view().state.doc.length } }));
+
+    vi.mocked(readFile).mockResolvedValueOnce("const a = 1;\n");
+    rerender(pane(TAB));
+    await waitFor(() => expect(view().state.doc.toString()).toBe("const a = 1;\n"));
+
+    rerender(pane(markdownTab));
+    save(view());
+    await waitFor(() => expect(writeFile).toHaveBeenCalledWith(markdownPath, ""));
+  });
+
   it("ignores an earlier file read after another file has loaded", async () => {
     let finishOldRead!: (value: string) => void;
     vi.mocked(readFile).mockImplementationOnce(() => new Promise((done) => { finishOldRead = done; }));
@@ -122,10 +183,7 @@ describe("EditorPane disk sync", () => {
     const view = await openEditor();
     type(view, "// saved edit\n");
     const saved = view.state.doc.toString();
-    let finishWrite!: () => void;
-    writeFile.mockImplementationOnce((_path, content) => new Promise<void>((done) => {
-      finishWrite = () => { disk.content = content; disk.version++; done(); };
-    }));
+    const finishWrite = delayNextWrite();
     save(view);
     await waitFor(() => expect(writeFile).toHaveBeenCalledWith(PATH, saved));
     type(view, "// unsaved edit\n");
@@ -135,25 +193,172 @@ describe("EditorPane disk sync", () => {
     expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(true);
   });
 
+  it.each([false, true])("honors a save across a pane switch during the disk check (outside edit: %s)", async (changed) => {
+    const original = await openEditor();
+    type(original, "// save before switching\n");
+    const saving = original.state.doc.toString();
+    let finishStat!: (signature: string) => void;
+    vi.mocked(fileSignature).mockImplementationOnce(() => new Promise((done) => { finishStat = done; }));
+    save(original);
+    cleanup();
+    const current = await openEditor(false, saving);
+    if (changed) agentWrites("// external edit\n");
+    await act(async () => { finishStat(`v${disk.version}`); });
+    if (changed) {
+      expect(await screen.findByRole("alert")).toHaveTextContent(/changed on disk/i);
+      expect(writeFile).not.toHaveBeenCalled();
+      expect(current.state.doc.toString()).toBe(saving);
+    } else {
+      expect(disk.content).toBe(saving);
+      expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(false);
+    }
+  });
+
   it("does not reset a remounted pane when the previous pane's write finishes", async () => {
     const original = await openEditor();
     type(original, "// previous pane edit\n");
     const saving = original.state.doc.toString();
-    let finishWrite!: () => void;
-    writeFile.mockImplementationOnce((_path, content) => new Promise<void>((done) => {
-      finishWrite = () => { disk.content = content; disk.version++; done(); };
-    }));
+    const finishWrite = delayNextWrite();
     save(original);
     await waitFor(() => expect(writeFile).toHaveBeenCalledWith(PATH, saving));
     cleanup();
-    const current = await openEditor();
-    const baseline = current.state.doc.toString();
+    const current = await openEditor(false, saving);
     type(current, "// new pane edit\n");
     await act(async () => { finishWrite(); });
     expect(disk.content).toBe(saving);
-    expect(current.state.doc.toString()).toBe(`${baseline}// new pane edit\n`);
-    expect(useEditorStore.getState().tabs[TAB].baselineContent).toBe(baseline);
+    expect(current.state.doc.toString()).toBe(`${saving}// new pane edit\n`);
+    expect(useEditorStore.getState().tabs[TAB].baselineContent).toBe(saving);
     expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(true);
+    await checkDisk();
+    expect(screen.queryByRole("alert")).toBeNull();
+    save(current);
+    await waitFor(() => expect(disk.content).toBe(`${saving}// new pane edit\n`));
+    expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(false);
+  });
+
+  it("saves an undo back to the old baseline after the previous pane finishes writing", async () => {
+    const original = await openEditor();
+    const baseline = disk.content;
+    type(original, "// first save\n");
+    const saving = original.state.doc.toString();
+    const finishWrite = delayNextWrite();
+    save(original);
+    await waitFor(() => expect(writeFile).toHaveBeenCalledOnce());
+    act(() => { undo(original); });
+    expect(original.state.doc.toString()).toBe(baseline);
+    cleanup();
+
+    const current = await openEditor(false, baseline);
+    save(current);
+    expect(writeFile).toHaveBeenCalledTimes(1);
+    cleanup();
+    await act(async () => { finishWrite(); });
+    await waitFor(() => expect(writeFile.mock.calls).toEqual([[PATH, saving], [PATH, baseline]]));
+    expect(disk.content).toBe(baseline);
+    expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(false);
+  });
+
+  it("keeps a completed write from changing a replacement tab with the same file", async () => {
+    const original = await openEditor();
+    type(original, "// closed tab\n");
+    const finishWrite = delayNextWrite();
+    save(original);
+    await waitFor(() => expect(writeFile).toHaveBeenCalledOnce());
+    cleanup();
+    const editor = useEditorStore.getState();
+    editor.removeTab(TAB);
+    editor.initTab(TAB, { filePath: PATH });
+    const current = await openEditor();
+    const baseline = disk.content;
+    type(current, "// replacement tab\n");
+    await act(async () => { finishWrite(); });
+
+    expect(editor.getTab(TAB)?.baselineContent).toBe(baseline);
+    expect(editor.getTab(TAB)?.isDirty).toBe(true);
+    await checkDisk();
+    expect(await screen.findByRole("alert")).toHaveTextContent(/changed on disk/i);
+    expect(current.state.doc.toString()).toBe(`${baseline}// replacement tab\n`);
+  });
+
+  it("writes the newest requested save before closing the editor tab", async () => {
+    const view = await openEditor();
+    const contentsAtClose: string[] = [];
+    mockIPC((command) => {
+      if (command === "close_tab") contentsAtClose.push(disk.content);
+    });
+    try {
+      const finishWrite = delayNextWrite();
+      type(view, "// first\n");
+      save(view);
+      await waitFor(() => expect(writeFile).toHaveBeenCalledOnce());
+      type(view, "// second\n");
+      const latest = view.state.doc.toString();
+      save(view);
+      await act(async () => {
+        const closing = closeTab("workspace", TAB);
+        finishWrite();
+        await closing;
+      });
+      expect(contentsAtClose).toEqual([latest]);
+      expect(disk.content).toBe(latest);
+      expect(useEditorStore.getState().getTab(TAB)).toBeUndefined();
+    } finally {
+      clearMocks();
+    }
+  });
+
+  it("keeps a closing tab open when its pending save finds a conflicting disk edit", async () => {
+    const view = await openEditor();
+    type(view, "// mine\n");
+    let finishStat!: (signature: string) => void;
+    vi.mocked(fileSignature).mockImplementationOnce(() => new Promise((done) => { finishStat = done; }));
+    save(view);
+    const blocked = expect(closeTab("workspace", TAB)).rejects.toThrow(/unsaved changes/i);
+    agentWrites("// theirs\n");
+    await act(async () => { finishStat(`v${disk.version}`); await blocked; });
+    expect(screen.getByRole("alert")).toHaveTextContent(/changed on disk/i);
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(useEditorStore.getState().getTab(TAB)?.suspendedDraft).toBe("const a = 1;\n// mine\n");
+  });
+
+  it.each(["success", "failure"] as const)("blocks edits and Save while the close reply is pending (%s)", async (outcome) => {
+    const view = await openEditor();
+    type(view, "// existing draft\n");
+    const draft = view.state.doc.toString();
+    let finishClose!: () => void;
+    mockIPC((command) => {
+      if (command === "close_tab") return new Promise<void>((resolve, reject) => {
+        finishClose = () => outcome === "success" ? resolve() : reject(new Error("Close failed"));
+      });
+    });
+    try {
+      let closing!: ReturnType<typeof closeTab>;
+      act(() => {
+        closing = closeTab("workspace", TAB);
+        // The close and the edit happen before React can render the new state.
+        undo(view);
+        type(view, "// same tick\n");
+        save(view);
+      });
+      type(view, "// still closing\n");
+      save(view);
+      await act(async () => {});
+      expect.soft(view.state.doc.toString()).toBe(draft);
+      expect.soft(writeFile).not.toHaveBeenCalled();
+      if (outcome === "failure") {
+        const failed = expect(closing).rejects.toThrow("Close failed");
+        await act(async () => { finishClose(); await failed; });
+        expect(useEditorStore.getState().getTab(TAB)?.isDirty).toBe(true);
+        type(view, "// recovered\n");
+        save(view);
+        await waitFor(() => expect(disk.content).toBe(`${draft}// recovered\n`));
+      } else {
+        await act(async () => { finishClose(); await closing; });
+        expect(useEditorStore.getState().getTab(TAB)).toBeUndefined();
+      }
+    } finally {
+      clearMocks();
+    }
   });
 
   it("reloads a clean buffer in place when the file changes on disk", async () => {
@@ -196,33 +401,17 @@ describe("EditorPane disk sync", () => {
     expect(screen.getByRole("status").closest(".hidden")).toBeNull();
   });
 
-  it("ignores a disk check that read the file while a save was in flight", async () => {
+  it("ignores a disk read that started before a save and resolved after it", async () => {
     const view = await openEditor();
     type(view, "// mine\n");
-
-    // Hold the write open, start a check that reads the old file, then let
-    // the write land before the check's read resolves.
-    let finishWrite!: () => void;
-    writeFile.mockImplementationOnce(
-      (_path: string, content: string) =>
-        new Promise<void>((resolve) => {
-          finishWrite = () => {
-            disk.content = content;
-            disk.version++;
-            resolve();
-          };
-        }),
-    );
-    save(view);
-    await waitFor(() => expect(writeFile).toHaveBeenCalled());
 
     let finishRead!: (content: string) => void;
     vi.mocked(readFile).mockImplementationOnce(
       () => new Promise<string>((resolve) => (finishRead = resolve)),
     );
-    agentWrites(disk.content); // the truncate step of the write moves the stat
     await checkDisk();
-    await act(async () => finishWrite());
+    save(view);
+    await waitFor(() => expect(disk.content).toBe("const a = 1;\n// mine\n"));
     await act(async () => finishRead("const a = 1;\n"));
 
     expect(view.state.doc.toString()).toBe("const a = 1;\n// mine\n");

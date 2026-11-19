@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, highlightSpecialChars } from "@codemirror/view";
-import { EditorState, Compartment, Transaction } from "@codemirror/state";
+import { Annotation, EditorState, Compartment, Transaction } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { bracketMatching, indentOnInput } from "@codemirror/language";
 import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
@@ -57,6 +57,8 @@ export const DISK_POLL_MS = 2000;
 const NOTICE_MS = 1500;
 /** Matches the `duration-150` surface fade on the notice. */
 const NOTICE_FADE_MS = 150;
+const bufferSync = Annotation.define<boolean>();
+const readOnly = [EditorState.readOnly.of(true), EditorView.editable.of(false)];
 
 /** Swap the document for `next` by replacing only the span that differs, so
  *  the cursor, selection and scroll position outside an agent's edit stay
@@ -78,7 +80,7 @@ function replaceDocument(view: EditorView, next: string, addToHistory: boolean) 
   }
   view.dispatch({
     changes: { from: start, to: prevEnd, insert: next.slice(start, nextEnd) },
-    annotations: Transaction.addToHistory.of(addToHistory),
+    annotations: [Transaction.addToHistory.of(addToHistory), bufferSync.of(true)],
   });
 }
 
@@ -94,6 +96,7 @@ export function EditorPane({
   const themeCompartment = useRef(new Compartment());
   const languageCompartment = useRef(new Compartment());
   const wrapCompartment = useRef(new Compartment());
+  const editability = useRef(new Compartment());
   const isLoadingRef = useRef(false);
 
   const theme = useSyntaxThemeColors();
@@ -106,6 +109,7 @@ export function EditorPane({
 
   const filePath = tab?.filePath ?? null;
   const isDirty = tab?.isDirty ?? false;
+  const isClosing = Boolean(tab?.closing);
   const baselineContent = tab?.baselineContent ?? "";
   const revealRequest = tab?.revealRequest;
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -233,8 +237,9 @@ export function EditorPane({
   );
 
   const checkDisk = useCallback(async () => {
-    const path = useEditorStore.getState().getTab(tabId)?.filePath;
-    if (!path || checkingDiskRef.current) return;
+    const tab = useEditorStore.getState().getTab(tabId);
+    const path = tab?.filePath;
+    if (!path || tab.pendingSave || checkingDiskRef.current) return;
     checkingDiskRef.current = true;
     const epoch = diskEpochRef.current;
     try {
@@ -258,65 +263,68 @@ export function EditorPane({
   // Save handler
   const handleSave = useCallback(async () => {
     const view = viewRef.current;
-    const path = useEditorStore.getState().getTab(tabId)?.filePath;
-    if (!view || !path) return;
+    const editor = useEditorStore.getState();
+    const tab = editor.getTab(tabId);
+    const path = tab?.filePath;
+    if (!view || !path || tab.closing || isLoadingRef.current) return;
 
     // A pending conflict means disk holds a version the user has not
     // chosen to replace yet; Reload or Keep mine decides, not Ctrl+S.
     if (diskConflictRef.current != null) return;
 
-    const c = view.state.doc.toString();
+    const submitted = view.state.doc.toString();
+    const knownSignature = tab.pendingSave ? null : diskSignatureRef.current;
+    const save = editor.beginSave(tabId, submitted);
+    let written: string | undefined;
+    diskEpochRef.current++;
     try {
+      if (save.previous) {
+        await save.previous;
+        if (!save.ownsTab() || (viewRef.current === view && diskConflictRef.current != null)) return;
+      }
       // Refuse to silently overwrite a version written since this buffer
       // last synced with disk (an agent edit, typically).
       const signature = await fileSignature(path).catch(() => null);
-      if (viewRef.current !== view || useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
-      if (signature !== null && signature !== diskSignatureRef.current) {
+      if (!save.ownsTab()) return;
+      if (signature !== null && signature !== knownSignature) {
         const disk = await readFile(path);
-        if (viewRef.current !== view || useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
-        diskSignatureRef.current = signature;
-        const baseline = useEditorStore.getState().getTab(tabId)?.baselineContent;
-        if (disk !== baseline && disk !== c) {
-          setDiskConflict(disk);
+        if (!save.ownsTab()) return;
+        if (viewRef.current === view) diskSignatureRef.current = signature;
+        const baseline = editor.getTab(tabId)?.baselineContent;
+        if (disk !== baseline && disk !== submitted) {
+          if (viewRef.current === view) setDiskConflict(disk);
           return;
         }
       }
-      diskEpochRef.current++;
-      await writeFile(path, c);
-      // Again after the write: a check that started while it was in flight
-      // may have read the old (or half-written) file.
-      diskEpochRef.current++;
-      // The tab may have moved files or remounted while the write awaited
-      // disk. Its current pane owns the baseline and unsaved edits now.
-      if (viewRef.current !== view || useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
+      await writeFile(path, submitted);
+      written = submitted;
+      if (!save.ownsTab() || viewRef.current !== view) return;
       // Unknown until the next check re-reads it, which also confirms the
       // write landed as this buffer.
       diskSignatureRef.current = null;
-      setBaselineContent(tabId, c);
-      // The write saves the captured buffer; edits made while it awaited
-      // disk still belong to the current buffer and must remain unsaved.
-      const current = view.state.doc.toString();
-      setDirty(tabId, current !== c);
-      setContent(current);
       setDiskConflict(null);
       flashNotice("saved");
     } catch (err) {
       toast.error(`Couldn't save ${path.split("/").pop() ?? path}`, {
         description: String(err),
       });
+    } finally {
+      save.finish(written);
     }
-  }, [tabId, setBaselineContent, setDirty, setDiskConflict, flashNotice]);
+  }, [tabId, setDiskConflict, flashNotice]);
 
   const reloadFromDisk = useCallback(() => {
-    if (diskConflict == null) return;
+    const tab = useEditorStore.getState().getTab(tabId);
+    if (diskConflict == null || !tab || tab.closing) return;
     adoptDiskContent(diskConflict, true);
     flashNotice("reloaded");
-  }, [diskConflict, adoptDiskContent, flashNotice]);
+  }, [diskConflict, tabId, adoptDiskContent, flashNotice]);
 
   /** Keep the unsaved edits and treat the newer disk version as the base,
    *  so the next save deliberately replaces it. */
   const keepMine = useCallback(() => {
-    if (diskConflict == null) return;
+    const tab = useEditorStore.getState().getTab(tabId);
+    if (diskConflict == null || !tab || tab.closing) return;
     const view = viewRef.current;
     setBaselineContent(tabId, diskConflict);
     setDirty(tabId, view != null && view.state.doc.toString() !== diskConflict);
@@ -337,7 +345,9 @@ export function EditorPane({
     const updateListener = EditorView.updateListener.of((update) => {
       if (update.docChanged && !isLoadingRef.current) {
         const c = update.state.doc.toString();
-        const baseline = useEditorStore.getState().getTab(tabId)?.baselineContent ?? "";
+        const tab = useEditorStore.getState().getTab(tabId);
+        if (tab?.pendingSave) tab.pendingSave.draft = c;
+        const baseline = tab?.baselineContent ?? "";
         setDirty(tabId, c !== baseline);
         setContent(c);
       }
@@ -372,10 +382,22 @@ export function EditorPane({
         langExt,
         updateListener,
         wrapCompartment.current.of(wrap ? EditorView.lineWrapping : []),
+        editability.current.of(isClosing ? readOnly : []),
       ],
     });
 
-    const view = new EditorView({ state, parent: containerRef.current });
+    const view = new EditorView({
+      state,
+      parent: containerRef.current,
+      dispatchTransactions(transactions, editor) {
+        // Close takes effect before React refreshes the read-only facets.
+        // Undo and redo bypass ordinary CodeMirror transaction filters.
+        const tab = useEditorStore.getState().getTab(tabId);
+        if (!tab) return;
+        if (tab.closing && transactions.some((tr) => tr.docChanged && !tr.annotation(bufferSync))) return;
+        editor.update(transactions);
+      },
+    });
     viewRef.current = view;
 
     return () => {
@@ -384,6 +406,13 @@ export function EditorPane({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (view && view.state.readOnly !== isClosing) {
+      view.dispatch({ effects: editability.current.reconfigure(isClosing ? readOnly : []) });
+    }
+  }, [isClosing, tabId]);
 
   // Wrap is a compartment so the deck's pane-bar toggle can flip it
   // without tearing the editor down and reloading the file.
@@ -437,27 +466,42 @@ export function EditorPane({
     // resolved, which on a workspace switch with an editor tab open
     // doubled the wall clock (IPC round-trip + module load + parse)
     // for no reason \u2014 neither call needs the other's result.
-    const readPromise = readFile(filePath);
     const langPromise = loadLanguage(filePath);
 
-    readPromise
-      .then((c) => {
-        if (cancelled) return;
-        // Out of the undo history: Ctrl+Z must not empty a freshly opened file.
-        view.dispatch({
-          changes: { from: 0, to: view.state.doc.length, insert: c },
-          annotations: Transaction.addToHistory.of(false),
+    const tab = useEditorStore.getState().getTab(tabId);
+    const draft = tab?.pendingSave?.draft ?? (tab?.isDirty ? tab.suspendedDraft : undefined);
+    if (draft !== undefined) {
+      replaceDocument(view, draft, false);
+      setContent(draft);
+      setLoadedFilePath(filePath);
+      isLoadingRef.current = false;
+      // Compare disk with the original baseline, just as if the pane had
+      // stayed open. A changed or unreadable file must not replace the draft.
+      if (tab?.pendingSave) {
+        void tab.pendingSave.done.then(() => { if (!cancelled) void checkDisk(); });
+      } else {
+        void checkDisk();
+      }
+    } else {
+      void readFile(filePath)
+        .then((c) => {
+          if (cancelled || useEditorStore.getState().getTab(tabId)?.filePath !== filePath) return;
+          // Out of the undo history: Ctrl+Z must not empty a freshly opened file.
+          view.dispatch({
+            changes: { from: 0, to: view.state.doc.length, insert: c },
+            annotations: [Transaction.addToHistory.of(false), bufferSync.of(true)],
+          });
+          setBaselineContent(tabId, c);
+          setContent(c);
+          setLoadedFilePath(filePath);
+        })
+        .catch((err) => {
+          if (!cancelled) setErrorMsg(String(err));
+        })
+        .finally(() => {
+          if (!cancelled) isLoadingRef.current = false;
         });
-        setBaselineContent(tabId, c);
-        setContent(c);
-        setLoadedFilePath(filePath);
-      })
-      .catch((err) => {
-        if (!cancelled) setErrorMsg(String(err));
-      })
-      .finally(() => {
-        if (!cancelled) isLoadingRef.current = false;
-      });
+    }
 
     // Apply the language as soon as it's ready, independently of the
     // text content being in the document. CodeMirror's language
@@ -477,8 +521,12 @@ export function EditorPane({
       cancelled = true;
       isLoadingRef.current = false;
       diskEpochRef.current++;
+      const editor = useEditorStore.getState();
+      if (editor.getTab(tabId)?.isDirty) {
+        editor.suspendDraft(tabId, filePath, view.state.doc.toString());
+      }
     };
-  }, [filePath, tabId, setBaselineContent, setDiskConflict]);
+  }, [filePath, tabId, setBaselineContent, setDiskConflict, checkDisk]);
 
   // Watch the open text file for edits made outside the editor. Polling a
   // stat matches how the diff and changes panels refresh; checks also run
@@ -547,22 +595,10 @@ export function EditorPane({
     viewMode,
   ]);
 
-  // When switching back to raw, sync content from store in case it changed
+  // Rendered mode only hides CodeMirror; its document stays current.
   useEffect(() => {
-    if (viewMode === "raw" && viewRef.current && isMd) {
-      const view = viewRef.current;
-      const current = view.state.doc.toString();
-      if (current !== content && content) {
-        isLoadingRef.current = true;
-        view.dispatch({
-          changes: { from: 0, to: view.state.doc.length, insert: content },
-        });
-        isLoadingRef.current = false;
-      }
-      // Focus the editor when switching to raw
-      view.focus();
-    }
-  }, [viewMode, isMd, content]);
+    if (viewMode === "raw" && isMd) viewRef.current?.focus();
+  }, [viewMode, isMd, tabId]);
 
   if (!filePath) {
     return (
@@ -670,13 +706,14 @@ export function EditorPane({
           <span className="min-w-0 flex-1 text-label text-foreground">
             Changed on disk. Your edits are unsaved.
           </span>
-          <Button size="xs" variant="outline" className="shrink-0" onClick={reloadFromDisk}>
+          <Button size="xs" variant="outline" className="shrink-0" disabled={isClosing} onClick={reloadFromDisk}>
             Reload
           </Button>
           <Button
             size="xs"
             variant="ghost"
             className="shrink-0"
+            disabled={isClosing}
             onClick={keepMine}
             title="Keep your edits. Saving will replace the version on disk."
           >

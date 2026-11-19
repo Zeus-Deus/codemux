@@ -199,9 +199,9 @@ async function guardedClose(
   const run = () =>
     close()
       .then(remember)
-      .catch(console.error);
+      .catch((error) => { toast.failure(`Couldn't close ${title}`, error); });
   const appState = useAppStore.getState().appState;
-  const reason = appState ? await closeRisk(appState, panes) : null;
+  const reason = appState && panes.length > 0 ? await closeRisk(appState, panes) : null;
   if (!reason) return run();
   const store = useCloseGuardStore.getState();
   // A newer request replaces an unanswered one; the older close is dropped.
