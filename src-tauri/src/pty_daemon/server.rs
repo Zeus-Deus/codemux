@@ -149,9 +149,8 @@ struct DaemonSession {
     /// owns one receiver; the read thread and waiter thread are the only
     /// senders.
     frame_tx: broadcast::Sender<SessionFrame>,
-    /// Replay buffer for cold-start. Ring-buffered: when full, oldest bytes
-    /// are evicted in 4KB chunks so the trim cost stays bounded.
-    replay: Arc<Mutex<Vec<u8>>>,
+    /// Cold-start replay window. Evicting old bytes leaves the rest in place.
+    replay: Arc<Mutex<VecDeque<u8>>>,
     /// Final exit code once the waiter thread has reaped the child. Used
     /// by late attachers who connect after the child exited: they see this
     /// value in the `Listed` response instead of getting silence.
@@ -174,6 +173,13 @@ struct Subscription {
     backlog: VecDeque<SessionFrame>,
 }
 
+fn append_replay(replay: &mut VecDeque<u8>, chunk: &[u8]) {
+    let chunk = &chunk[chunk.len().saturating_sub(REPLAY_BUFFER_BYTES)..];
+    let excess = (replay.len() + chunk.len()).saturating_sub(REPLAY_BUFFER_BYTES);
+    replay.drain(..excess);
+    replay.extend(chunk);
+}
+
 /// Subscribe to live output and capture the replay snapshot as one step.
 /// The read loop appends and publishes each chunk under the same replay
 /// lock, so every chunk lands in exactly one of the snapshot or `rx`.
@@ -181,8 +187,11 @@ async fn subscribe(session: &Arc<DaemonSession>, prefix: &[u8]) -> Subscription 
     let replay = session.replay.lock().await;
     let exit_code = session.exit_code.lock().await;
     let rx = session.frame_tx.subscribe();
-    let mut snapshot = prefix.to_vec();
-    snapshot.extend_from_slice(&replay);
+    let mut snapshot = Vec::with_capacity(prefix.len() + replay.len());
+    snapshot.extend_from_slice(prefix);
+    let (first, second) = replay.as_slices();
+    snapshot.extend_from_slice(first);
+    snapshot.extend_from_slice(second);
     let mut backlog = VecDeque::new();
     if !snapshot.is_empty() {
         backlog.push_back(SessionFrame::Output(snapshot));
@@ -868,7 +877,7 @@ async fn spawn_pty(
     };
 
     let (tx, _rx) = broadcast::channel::<SessionFrame>(OUTPUT_CHANNEL_CAPACITY);
-    let replay = Arc::new(Mutex::new(Vec::with_capacity(REPLAY_BUFFER_BYTES)));
+    let replay = Arc::new(Mutex::new(VecDeque::with_capacity(REPLAY_BUFFER_BYTES)));
     let exit_code = Arc::new(Mutex::new(None));
     let flow_paused = Arc::new(AtomicBool::new(false));
 
@@ -947,11 +956,7 @@ async fn spawn_pty(
                     // still holding the lock so `subscribe` sees each chunk
                     // in exactly one of its snapshot or the live stream.
                     let mut rb = read_replay.blocking_lock();
-                    rb.extend_from_slice(&chunk);
-                    if rb.len() > REPLAY_BUFFER_BYTES {
-                        let excess = rb.len() - REPLAY_BUFFER_BYTES;
-                        rb.drain(0..excess);
-                    }
+                    append_replay(&mut rb, &chunk);
                     let _ = read_tx.send(SessionFrame::Output(chunk));
                 }
                 Err(error) => {
@@ -1056,7 +1061,7 @@ mod tests {
             writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
             master: Arc::new(Mutex::new(pair.master)),
             frame_tx,
-            replay: Arc::new(Mutex::new(Vec::new())),
+            replay: Arc::new(Mutex::new(VecDeque::with_capacity(REPLAY_BUFFER_BYTES))),
             exit_code: Arc::new(Mutex::new(None)),
             flow_paused: Arc::new(AtomicBool::new(false)),
         });
@@ -1088,10 +1093,31 @@ mod tests {
 
     async fn publish_test_output(session: &super::DaemonSession, bytes: &[u8]) {
         let mut replay = session.replay.lock().await;
-        replay.extend_from_slice(bytes);
+        super::append_replay(&mut replay, bytes);
         let _ = session
             .frame_tx
             .send(super::SessionFrame::Output(bytes.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn replay_retains_the_newest_bytes_in_order_after_wrapping() {
+        use super::*;
+
+        let (_state, session) = output_test_session(2).await;
+        let mut first = vec![b'a'; REPLAY_BUFFER_BYTES - 2];
+        first[..2].copy_from_slice(b"xy");
+        publish_test_output(&session, &first).await;
+        publish_test_output(&session, b"bcde").await;
+
+        let mut subscription = subscribe(&session, RESYNC_PREFIX).await;
+        let Some(SessionFrame::Output(snapshot)) = subscription.backlog.pop_front() else {
+            panic!("expected snapshot");
+        };
+        let mut expected = RESYNC_PREFIX.to_vec();
+        expected.extend_from_slice(&first[2..]);
+        expected.extend_from_slice(b"bcde");
+        assert_eq!(snapshot, expected);
+        assert!(subscription.backlog.is_empty());
     }
 
     #[tokio::test]
@@ -1148,7 +1174,7 @@ mod tests {
         // Attach parks on the replay lock while the producer publishes the
         // next chunk. That chunk must appear in the snapshot exactly once.
         ready.await.unwrap();
-        replay.extend_from_slice(b"during");
+        append_replay(&mut replay, b"during");
         let _ = session
             .frame_tx
             .send(SessionFrame::Output(b"during".to_vec()));
