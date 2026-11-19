@@ -23,7 +23,7 @@ use tauri::{ipc::Channel, AppHandle, Emitter, Manager, Runtime, State};
 use uuid::Uuid;
 
 #[cfg(unix)]
-use crate::database::daemon_closes::DaemonWorkspaceRoute;
+use crate::database::daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose};
 use crate::project::current_project_root;
 use crate::settings_sync;
 use crate::state::{self, AppStateStore, TerminalSessionState};
@@ -599,35 +599,27 @@ impl SessionSpawnReservation {
 
     #[cfg(unix)]
     fn is_current(&self) -> bool {
+        self.with_current_runtime(|_| ()).is_some()
+    }
+
+    #[cfg(unix)]
+    fn with_current_runtime<T>(&self, f: impl FnOnce(&mut SessionRuntime) -> T) -> Option<T> {
         with_existing_session_runtime(&self.sessions, &self.session_id, |runtime| {
-            runtime.restart_token == self.restart_token
-        }).unwrap_or(false)
+            (runtime.restart_token == self.restart_token).then(|| f(runtime))
+        }).flatten()
     }
 
     #[cfg(unix)]
     fn publish_daemon_reconciliation(&mut self, reconciliation: Arc<DaemonReconciliation>) -> bool {
-        let published = with_existing_session_runtime(&self.sessions, &self.session_id, |runtime| {
-            if runtime.restart_token != self.restart_token {
-                return false;
-            }
+        let published = self.with_current_runtime(|runtime| {
             runtime.daemon_reconciliation = Some(reconciliation.clone());
-            true
-        }).unwrap_or(false);
+        }).is_some();
         if published {
             self.reconciliation = Some(reconciliation);
             // An RPC can create a shell even when its reply is lost.
             self.remove_on_drop = false;
         }
         published
-    }
-
-    #[cfg(unix)]
-    fn clear_daemon_reconciliation_if_current(&self) {
-        with_existing_session_runtime(&self.sessions, &self.session_id, |runtime| {
-            if runtime.restart_token == self.restart_token {
-                runtime.daemon_reconciliation = None;
-            }
-        });
     }
 
     /// Compare the observed shell and take its runtime in one lock. The
@@ -2785,15 +2777,17 @@ fn terminate_pty_session<R: Runtime>(
 pub(crate) fn take_terminal_sessions_for_close<R: Runtime>(
     app: &AppHandle<R>,
     sessions: Option<&Arc<Mutex<HashMap<String, SessionRuntime>>>>,
+    workspace_id: Option<&str>,
     session_ids: impl IntoIterator<Item = state::SessionId>,
     intent: state::LayoutCloseIntent,
 ) -> Vec<(state::SessionId, SessionRuntime)> {
+    let session_ids: Vec<_> = session_ids.into_iter().collect();
     #[cfg(unix)]
     let mut ready = Vec::new();
     let mut remaining = Vec::new();
     if let Some(sessions) = sessions {
         let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
-        for id in session_ids {
+        for id in &session_ids {
             let Some(runtime) = sessions.remove(&id.0) else { continue; };
             #[cfg(unix)]
             if let Some(recovery) = runtime.daemon_reconciliation.clone().or_else(|| {
@@ -2806,13 +2800,13 @@ pub(crate) fn take_terminal_sessions_for_close<R: Runtime>(
                 ready.push(daemon_backed::prepare_closed_pane_cleanup(&id.0, &recovery));
                 continue;
             }
-            remaining.push((id, runtime));
+            remaining.push((id.clone(), runtime));
         }
     }
     #[cfg(unix)]
-    daemon_backed::commit_layout_close(app, intent, ready);
+    daemon_backed::commit_layout_close(app, intent, workspace_id, &session_ids, ready);
     #[cfg(not(unix))]
-    let _ = (app, intent);
+    let _ = (app, workspace_id, intent);
     remaining
 }
 
@@ -2944,8 +2938,8 @@ pub fn close_terminal_session<R: Runtime>(
         let workspace_id = app_state.workspace_for_terminal_session(&session_id);
         let fallback = app_state.close_terminal_session_with_selection(&session_id, select.unwrap_or(true))?;
         let workspace_id = workspace_id.ok_or_else(|| format!("No workspace found for terminal {session_id}"))?;
-        let intent = state::LayoutCloseIntent::Session { workspace_id: workspace_id.0, session_id: session_id.clone() };
-        let runtimes = take_terminal_sessions_for_close(&app, Some(&terminal_state.sessions), [state::SessionId(session_id.clone())], intent);
+        let intent = state::LayoutCloseIntent::Session { workspace_id: workspace_id.0.clone(), session_id: session_id.clone() };
+        let runtimes = take_terminal_sessions_for_close(&app, Some(&terminal_state.sessions), Some(&workspace_id.0), [state::SessionId(session_id.clone())], intent);
         Ok::<_, String>((fallback, runtimes))
     })?;
     for (id, runtime) in runtimes {
@@ -2972,7 +2966,8 @@ pub fn close_terminal_session<R: Runtime>(
 /// "respawn into same session id" pattern and its terminate semantics
 /// should stay unchanged.
 #[cfg(unix)]
-pub(crate) fn terminate_pty_session_keep_channel(
+pub(crate) fn terminate_pty_session_keep_channel<R: Runtime>(
+    app: &AppHandle<R>,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
 ) {
@@ -2985,7 +2980,7 @@ pub(crate) fn terminate_pty_session_keep_channel(
         }
         let daemon_client = rt.daemon_client.take();
         let shell_id = rt.daemon_shell_id.take();
-        rt.daemon_route = None;
+        let daemon_route = rt.daemon_route.take();
         rt.child_pid = None;
         rt.writer = None;
         rt.daemon_writer = None;
@@ -3000,29 +2995,35 @@ pub(crate) fn terminate_pty_session_keep_channel(
         rt.resume_command = None;
         // PRESERVED (the whole point): output_subscribers,
         // pending_output, pending_output_bytes, last_status.
-        Some((daemon_client, shell_id))
+        Some((daemon_client, shell_id, daemon_route))
     })
     .flatten();
 
     match handled {
-        Some((daemon_client, shell_id)) => {
+        Some((daemon_client, shell_id, daemon_route)) => {
             // Tell the (old) daemon to close its side of the session.
             // For remote workspaces this is the per-workspace SSH-
             // tunneled client; for local persistent it's the singleton
             // local daemon client. Background tokio task so we stay
             // sync at this call site.
             if let Some(client) = daemon_client {
+                let app = app.clone();
                 let session_id = session_id.to_string();
                 tauri::async_runtime::spawn(async move {
                     let close = match shell_id {
                         Some(shell_id) => client.close_owned(session_id.clone(), shell_id).await,
                         None => client.close(session_id.clone()).await,
                     };
-                    if let Err(error) = close {
-                        eprintln!(
+                    match close {
+                        Ok(()) => {
+                            if let Some((route, shell_id)) = daemon_route.zip(shell_id) {
+                                forget_closed_daemon_shell(&app, route, &session_id, shell_id);
+                            }
+                        }
+                        Err(error) => eprintln!(
                             "[codemux::terminal] daemon close (keep-channel) failed for \
                              {session_id}: {error}"
-                        );
+                        ),
                     }
                 });
             }
@@ -3033,6 +3034,25 @@ pub(crate) fn terminate_pty_session_keep_channel(
             if let Some(runtime) = remove_session_runtime(sessions, session_id) {
                 terminate_removed_session(runtime, session_id);
             }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn forget_closed_daemon_shell<R: Runtime>(
+    app: &AppHandle<R>,
+    route: DaemonWorkspaceRoute,
+    session_id: &str,
+    shell_id: Uuid,
+) {
+    if let Some(db) = app.try_state::<crate::database::DatabaseStore>() {
+        let shell = PendingDaemonClose {
+            route,
+            session_id: session_id.to_owned(),
+            shell_id,
+        };
+        if let Err(error) = db.forget_daemon_shell(&shell) {
+            log::error!("Could not retire closed daemon shell for {session_id}: {error}");
         }
     }
 }
@@ -3090,6 +3110,7 @@ pub async fn restart_terminal_session<R: Runtime>(
                 if close.is_ok() {
                     if let Some(shell_id) = runtime.daemon_shell_id {
                         recovery.acknowledge_shell_closed(shell_id);
+                        forget_closed_daemon_shell(&app, recovery.route.clone(), &session_id, shell_id);
                     }
                     target.client = None;
                 }
@@ -4350,7 +4371,8 @@ mod tests {
                 guard.insert("session-X".into(), rt);
             }
 
-            terminate_pty_session_keep_channel(&sessions, "session-X");
+            let app = tauri::test::mock_app();
+            terminate_pty_session_keep_channel(app.handle(), &sessions, "session-X");
             // Give the spawned tokio task a tick to run, even though
             // we're not asserting on its side-effects.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -6675,6 +6697,12 @@ mod tests {
             };
             assert_eq!(session_id, new_session);
             assert!(!shell_id.is_nil());
+            let db = app.state::<DatabaseStore>();
+            let ownership = db.daemon_shell_ownership().unwrap();
+            assert_eq!(ownership.len(), 1);
+            assert_eq!(ownership[0].route.workspace_id, plan.workspace.workspace_id);
+            assert_eq!(ownership[0].session_id, new_session);
+            assert_eq!(ownership[0].shell_id, shell_id);
             send_daemon_fixture_response(&mut write, ServerResponse::SpawnPrepared { request_id }).await;
 
             let ClientRequest::SpawnOwned { request_id, session_id, shell_id: spawning, .. } = request(&mut lines).await else {
@@ -6688,11 +6716,8 @@ mod tests {
                 app.handle().clone(), app.state(), app.state(), new_session.clone(), None,
             ).unwrap();
             assert_eq!(fallback, original);
-            let db = app.state::<DatabaseStore>();
-            let jobs = db.pending_daemon_closes().unwrap();
-            assert_eq!(jobs.len(), 1);
-            assert_eq!(jobs[0].session_id, new_session);
-            assert_eq!(jobs[0].shell_id, shell_id);
+            assert!(db.daemon_shell_ownership().unwrap().is_empty());
+            assert_eq!(db.pending_daemon_closes().unwrap(), ownership);
             send_daemon_fixture_response(&mut write, ServerResponse::Spawned {
                 request_id,
                 session_id,
@@ -6732,6 +6757,96 @@ mod tests {
     const INSTALLED_CLOSE_DB: &str = "installed-close.sqlite";
 
     #[cfg(unix)]
+    const INACTIVE_CLOSE_DB: &str = "inactive-close.sqlite";
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_inactive_workspace_replays_its_exact_daemon_close() {
+        use crate::database::daemon_closes::PendingDaemonClose;
+        use crate::database::DatabaseStore;
+        use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
+
+        const TEST: &str = "terminal::tests::restored_inactive_workspace_replays_its_exact_daemon_close";
+        const CLOSING_PROCESS: &str = "CODEMUX_TEST_INACTIVE_CLOSE_PROCESS";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db_path = root.join(INACTIVE_CLOSE_DB);
+        if std::env::var_os(CLOSING_PROCESS).is_some() {
+            tauri::async_runtime::block_on(async {
+                let restored = state::load_persisted_state().unwrap();
+                let active = restored.active_workspace_id.0.clone();
+                let inactive = restored.workspaces.iter()
+                    .find(|workspace| workspace.workspace_id.0 != active)
+                    .unwrap().workspace_id.0.clone();
+                let layout = AppStateStore::default();
+                layout.replace_snapshot(restored);
+                let app = tauri::test::mock_app();
+                app.manage(PtyState::default());
+                app.manage(DatabaseStore::test_file(&db_path));
+                app.manage(layout);
+
+                // Startup has never visited or hydrated this workspace.
+                assert!(app.state::<PtyState>().sessions.lock().unwrap().is_empty());
+                let fallback = tokio::time::timeout(Duration::from_secs(10),
+                    crate::commands::workspace::close_workspace(
+                        app.handle().clone(), app.state(), app.state(), inactive.clone(), Some(true),
+                    ),
+                ).await.unwrap().unwrap();
+                assert_eq!(fallback, active);
+                let layout = app.state::<AppStateStore>();
+                assert!(layout.find_workspace(&inactive).is_none());
+                state::flush_persisted_state(&layout);
+            });
+            return;
+        }
+
+        let close = {
+            let layout = AppStateStore::default();
+            let active = layout.snapshot().active_workspace_id.0;
+            let folder = root.join("inactive");
+            std::fs::create_dir(&folder).unwrap();
+            let inactive = layout.create_workspace_with_layout(folder, state::WorkspacePresetLayout::Single);
+            assert!(layout.activate_workspace(&active));
+            let plan = layout.pty_hydration_plan_for_workspace(&inactive.0).unwrap();
+            let close = PendingDaemonClose {
+                route: DaemonWorkspaceRoute {
+                    workspace_id: inactive.0,
+                    host_id: None,
+                    ssh_target: None,
+                },
+                session_id: plan.sessions[0].session_id.clone(),
+                shell_id: Uuid::from_u128(1),
+            };
+            DatabaseStore::test_file(&db_path).remember_daemon_shell(&close).unwrap();
+            state::flush_persisted_state(&layout);
+            close
+        };
+
+        // Leave a real socket bound without answering its handshake. The
+        // closing process cannot reach the daemon before it exits.
+        let socket_path = root.join("offline-daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        write_manifest(&DaemonManifest {
+            pid: std::process::id(),
+            socket_path,
+            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            protocol_version: crate::pty_daemon::PROTOCOL_VERSION,
+            started_at: 0,
+        }).unwrap();
+        run_close_fixture_process(TEST, CLOSING_PROCESS);
+        drop(listener);
+
+        {
+            let db = DatabaseStore::test_file(&db_path);
+            assert!(db.daemon_shell_ownership().unwrap().is_empty());
+            assert_eq!(db.pending_daemon_closes().unwrap(), [close]);
+        }
+        tauri::async_runtime::block_on(assert_exact_close_replays(INACTIVE_CLOSE_DB, Some(Uuid::from_u128(2))));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn installed_replacement_close_replays_after_daemon_disconnect_and_relaunch() {
         const TEST: &str = "terminal::tests::installed_replacement_close_replays_after_daemon_disconnect_and_relaunch";
@@ -6746,9 +6861,15 @@ mod tests {
 
         // The first app's cleanup worker must be gone before the new app
         // has a chance to access the recovered daemon.
+        run_close_fixture_process(TEST, CLOSING_PROCESS);
+        tauri::async_runtime::block_on(assert_exact_close_replays(INSTALLED_CLOSE_DB, None));
+    }
+
+    #[cfg(unix)]
+    fn run_close_fixture_process(test: &str, phase_env: &str) {
         let closing = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--nocapture"])
-            .env(CLOSING_PROCESS, "1")
+            .args(["--exact", test, "--nocapture"])
+            .env(phase_env, "1")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&closing.stdout);
@@ -6757,11 +6878,10 @@ mod tests {
             "closing app: {stdout}\n{}",
             String::from_utf8_lossy(&closing.stderr)
         );
-        tauri::async_runtime::block_on(assert_installed_close_replays());
     }
 
     #[cfg(unix)]
-    async fn assert_installed_close_replays() {
+    async fn assert_exact_close_replays(db_file: &str, replacement: Option<Uuid>) {
         use crate::database::DatabaseStore;
         use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
         use crate::pty_daemon::protocol::{ClientRequest, ServerResponse, PROTOCOL_VERSION};
@@ -6770,7 +6890,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(10), async {
             let root = crate::test_isolation::isolated_root().unwrap();
-            let db = DatabaseStore::test_file(&root.join(INSTALLED_CLOSE_DB));
+            let db = DatabaseStore::test_file(&root.join(db_file));
             let jobs = db.pending_daemon_closes().unwrap();
             assert_eq!(jobs.len(), 1, "the installed shell's close must survive relaunch");
             let job = jobs[0].clone();
@@ -6814,10 +6934,17 @@ mod tests {
                 let ClientRequest::CloseOwned { request_id, session_id, shell_id } =
                     serde_json::from_str(&close).unwrap()
                 else {
-                    panic!("expected the installed replacement's guarded close: {close}");
+                    panic!("expected a guarded close without a new shell lookup: {close}");
                 };
                 assert_eq!(session_id, job.session_id);
                 assert_eq!(shell_id, job.shell_id);
+                // A later shell can use the same session ID. The daemon only
+                // removes the currently installed shell when the UUID matches.
+                let mut installed = Some(replacement.unwrap_or(job.shell_id));
+                if installed == Some(shell_id) {
+                    installed = None;
+                }
+                assert_eq!(installed, replacement);
                 send_daemon_fixture_response(&mut write, ServerResponse::Closed {
                     request_id,
                     attachment_id: None,
@@ -6828,7 +6955,7 @@ mod tests {
             while !app.state::<DatabaseStore>().pending_daemon_closes().unwrap().is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("the installed replacement's close should replay after relaunch");
+        }).await.expect("the exact daemon close should replay after relaunch");
     }
 
     #[cfg(unix)]

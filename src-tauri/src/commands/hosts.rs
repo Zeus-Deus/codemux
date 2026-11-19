@@ -1861,6 +1861,7 @@ fn terminate_workspace_sessions<R: tauri::Runtime>(
         // a fresh runtime with no channel, so all post-respawn output
         // buffers in pending_output until something forces a re-attach.
         crate::terminal::terminate_pty_session_keep_channel(
+            app,
             &pty_state.sessions,
             &sid,
         );

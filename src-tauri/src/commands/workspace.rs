@@ -1512,7 +1512,7 @@ fn detach_workspace<R: tauri::Runtime>(
             CloseRoute::Archive(entry) => LayoutCloseIntent::Archive(Box::new(entry.clone())),
             _ => LayoutCloseIntent::Workspace(workspace_id.to_owned()),
         };
-        let terminals = take_closed_terminals(app, std::mem::take(&mut result.removed_sessions), intent);
+        let terminals = take_closed_terminals(app, Some(workspace_id), std::mem::take(&mut result.removed_sessions), intent);
         Ok::<_, String>((result, terminals))
     });
     let (result, terminal_runtimes) = match closed {
@@ -1570,6 +1570,7 @@ fn detach_workspace<R: tauri::Runtime>(
 
 fn take_closed_terminals<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
+    workspace_id: Option<&str>,
     sessions: impl IntoIterator<Item = crate::state::SessionId>,
     intent: LayoutCloseIntent,
 ) -> Vec<(crate::state::SessionId, crate::terminal::SessionRuntime)> {
@@ -1577,6 +1578,7 @@ fn take_closed_terminals<R: tauri::Runtime>(
     crate::terminal::take_terminal_sessions_for_close(
         app,
         terminal_state.as_ref().map(|state| &state.sessions),
+        workspace_id,
         sessions,
         intent,
     )
@@ -2918,9 +2920,10 @@ pub(crate) fn close_pane_impl_with_selection<R: tauri::Runtime>(
 ) -> Result<Option<String>, String> {
     let removed_browser_id = state.pane_browser_id(&pane_id);
     let (removed, terminals) = crate::state::with_terminal_close_layout_lock(|| {
+        let workspace_id = state.workspace_id_for_pane(&pane_id);
         let removed = state.close_pane_with_selection(&pane_id, select)?;
         let intent = LayoutCloseIntent::Pane(pane_id.clone());
-        let terminals = take_closed_terminals(&app, removed.iter().cloned(), intent);
+        let terminals = take_closed_terminals(&app, workspace_id.as_deref(), removed.iter().cloned(), intent);
         Ok::<_, String>((removed, terminals))
     })?;
     // A `codemux monitor start` flag belongs to the process that was running
@@ -3144,8 +3147,8 @@ pub fn close_tab<R: tauri::Runtime>(
 ) -> Result<(), String> {
     let (result, terminals) = crate::state::with_terminal_close_layout_lock(|| {
         let mut result = state.close_tab(&workspace_id, &tab_id)?;
-        let intent = LayoutCloseIntent::Tab { workspace_id, tab_id };
-        let terminals = take_closed_terminals(&app, std::mem::take(&mut result.removed_sessions), intent);
+        let intent = LayoutCloseIntent::Tab { workspace_id: workspace_id.clone(), tab_id };
+        let terminals = take_closed_terminals(&app, Some(&workspace_id), std::mem::take(&mut result.removed_sessions), intent);
         Ok::<_, String>((result, terminals))
     })?;
 

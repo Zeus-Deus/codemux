@@ -1,9 +1,10 @@
 //! Local journal for layout closes and their independent guarded daemon cleanup.
 
 use super::DatabaseStore;
-use crate::state::{ArchivedWorkspaceSnapshot, LayoutCloseIntent};
+use crate::state::{ArchivedWorkspaceSnapshot, LayoutCloseIntent, SessionId};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -13,7 +14,7 @@ pub(crate) struct DaemonWorkspaceRoute {
     pub(crate) ssh_target: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PendingDaemonClose {
     pub(crate) route: DaemonWorkspaceRoute,
     pub(crate) session_id: String,
@@ -65,7 +66,16 @@ fn migrate_schema(conn: &Connection) -> rusqlite::Result<()> {
             target_id TEXT NOT NULL,
             payload TEXT CHECK ((scope = 'archive') = (payload IS NOT NULL)),
             PRIMARY KEY (scope, workspace_id, target_id)
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS daemon_shell_ownership (
+            route TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            shell_id BLOB NOT NULL CHECK (length(shell_id) = 16),
+            PRIMARY KEY (route, session_id, shell_id)
+        );
+        CREATE INDEX IF NOT EXISTS daemon_shell_ownership_session
+            ON daemon_shell_ownership (workspace_id, session_id);",
     )?;
     if !layout_table_exists {
         // Pre-release rows only knew how to restore terminal pane removal.
@@ -80,19 +90,105 @@ fn migrate_schema(conn: &Connection) -> rusqlite::Result<()> {
     tx.commit()
 }
 
+fn insert_pending_closes(conn: &Connection, closes: &[PendingDaemonClose]) -> Result<(), String> {
+    let mut insert = conn
+        .prepare_cached(
+            "INSERT INTO pending_daemon_closes (route, session_id, shell_id)
+         VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
+        )
+        .map_err(|error| error.to_string())?;
+    for close in closes {
+        let route = serde_json::to_string(&close.route).map_err(|error| error.to_string())?;
+        insert
+            .execute(params![
+                route,
+                close.session_id,
+                close.shell_id.as_bytes().as_slice()
+            ])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn delete_owned_shell(conn: &Connection, shell: &PendingDaemonClose) -> Result<usize, String> {
+    let route = serde_json::to_string(&shell.route).map_err(|error| error.to_string())?;
+    conn.execute(
+        "DELETE FROM daemon_shell_ownership WHERE route = ?1 AND session_id = ?2 AND shell_id = ?3",
+        params![
+            route,
+            shell.session_id,
+            shell.shell_id.as_bytes().as_slice()
+        ],
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn insert_owned_shell(conn: &Connection, shell: &PendingDaemonClose) -> Result<(), String> {
+    let route = serde_json::to_string(&shell.route).map_err(|error| error.to_string())?;
+    conn.execute(
+        "INSERT INTO daemon_shell_ownership (route, workspace_id, session_id, shell_id)
+         VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+        params![
+            route,
+            shell.route.workspace_id,
+            shell.session_id,
+            shell.shell_id.as_bytes().as_slice()
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn read_shell_records(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<PendingDaemonClose>, String> {
+    let mut select = conn
+        .prepare_cached(sql)
+        .map_err(|error| error.to_string())?;
+    let rows = select
+        .query_map(params, |row| {
+            Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| {
+        let (route, session_id, shell_id) = row.map_err(|error| error.to_string())?;
+        Ok(PendingDaemonClose {
+            route: serde_json::from_str(&route).map_err(|error| error.to_string())?,
+            session_id,
+            shell_id: Uuid::from_bytes(shell_id),
+        })
+    })
+    .collect()
+}
+
 impl DatabaseStore {
+    #[cfg(test)]
     pub(crate) fn record_layout_close(
         &self,
         intent: &LayoutCloseIntent,
         daemon_closes: &[PendingDaemonClose],
     ) -> Result<(), String> {
+        self.record_layout_close_with_shell_ownership(intent, None, &[], daemon_closes)
+            .map(drop)
+    }
+
+    /// A layout removal and all exact shells it owned must survive together.
+    pub(crate) fn record_layout_close_with_shell_ownership(
+        &self,
+        intent: &LayoutCloseIntent,
+        workspace_id: Option<&str>,
+        closed_sessions: &[SessionId],
+        daemon_closes: &[PendingDaemonClose],
+    ) -> Result<Vec<PendingDaemonClose>, String> {
         let payload = match intent {
             LayoutCloseIntent::Archive(entry) => {
                 Some(serde_json::to_string(entry).map_err(|error| error.to_string())?)
             }
             _ => None,
         };
-        let (scope, workspace_id, target_id) = intent.row_key();
+        let (scope, intent_workspace_id, target_id) = intent.row_key();
         let mut conn = self.conn.lock().unwrap();
         if conn.path().is_none_or(str::is_empty) {
             return Err("Terminal close journal has no on-disk database".into());
@@ -101,26 +197,73 @@ impl DatabaseStore {
         tx.execute(
             "INSERT INTO pending_layout_closes (scope, workspace_id, target_id, payload)
              VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
-            params![scope, workspace_id, target_id, payload],
+            params![scope, intent_workspace_id, target_id, payload],
         )
         .map_err(|error| error.to_string())?;
-        {
-            let mut insert = tx
-                .prepare_cached(
-                    "INSERT INTO pending_daemon_closes (route, session_id, shell_id)
-                 VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
-                )
-                .map_err(|error| error.to_string())?;
-            for close in daemon_closes {
-                let route =
-                    serde_json::to_string(&close.route).map_err(|error| error.to_string())?;
-                insert
-                    .execute(params![
-                        route,
-                        close.session_id,
-                        close.shell_id.as_bytes().as_slice()
-                    ])
-                    .map_err(|error| error.to_string())?;
+        let mut closes = daemon_closes.to_vec();
+        if let Some(workspace_id) = workspace_id {
+            for id in closed_sessions {
+                closes.extend(read_shell_records(
+                    &tx,
+                    "SELECT route, session_id, shell_id FROM daemon_shell_ownership
+                     WHERE workspace_id = ?1 AND session_id = ?2 ORDER BY rowid",
+                    params![workspace_id, id.0],
+                )?);
+                tx.execute(
+                    "DELETE FROM daemon_shell_ownership WHERE workspace_id = ?1 AND session_id = ?2",
+                    params![workspace_id, id.0],
+                ).map_err(|error| error.to_string())?;
+            }
+        }
+        let mut unique = HashSet::new();
+        closes.retain(|close| unique.insert(close.clone()));
+        insert_pending_closes(&tx, &closes)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(closes)
+    }
+
+    pub(crate) fn remember_daemon_shell(&self, shell: &PendingDaemonClose) -> Result<(), String> {
+        insert_owned_shell(&self.conn.lock().unwrap(), shell)
+    }
+
+    /// The caller still owns the live reservation and has proved the other
+    /// UUIDs on this daemon cannot survive. Recover a missed earlier insert.
+    pub(crate) fn retain_daemon_shell(&self, shell: &PendingDaemonClose) -> Result<(), String> {
+        let route = serde_json::to_string(&shell.route).map_err(|error| error.to_string())?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        insert_owned_shell(&tx, shell)?;
+        tx.execute(
+            "DELETE FROM daemon_shell_ownership WHERE route = ?1 AND session_id = ?2 AND shell_id <> ?3",
+            params![route, shell.session_id, shell.shell_id.as_bytes().as_slice()],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn forget_daemon_shell(&self, shell: &PendingDaemonClose) -> Result<(), String> {
+        delete_owned_shell(&self.conn.lock().unwrap(), shell).map(drop)
+    }
+
+    pub(crate) fn daemon_shell_ownership(&self) -> Result<Vec<PendingDaemonClose>, String> {
+        read_shell_records(
+            &self.conn.lock().unwrap(),
+            "SELECT route, session_id, shell_id FROM daemon_shell_ownership ORDER BY rowid",
+            [],
+        )
+    }
+
+    pub(crate) fn journal_orphan_daemon_shells(
+        &self,
+        shells: &[PendingDaemonClose],
+    ) -> Result<(), String> {
+        if shells.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        for shell in shells {
+            if delete_owned_shell(&tx, shell)? != 0 {
+                insert_pending_closes(&tx, std::slice::from_ref(shell))?;
             }
         }
         tx.commit().map_err(|error| error.to_string())
@@ -208,25 +351,11 @@ impl DatabaseStore {
     }
 
     pub(crate) fn pending_daemon_closes(&self) -> Result<Vec<PendingDaemonClose>, String> {
-        let conn = self.conn.lock().unwrap();
-        let mut select = conn
-            .prepare("SELECT route, session_id, shell_id FROM pending_daemon_closes ORDER BY rowid")
-            .map_err(|error| error.to_string())?;
-        let rows = select
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
-            })
-            .map_err(|error| error.to_string())?;
-        rows.map(|row| {
-            let (route, session_id, shell_id) = row.map_err(|error| error.to_string())?;
-            let route = serde_json::from_str(&route).map_err(|error| error.to_string())?;
-            Ok(PendingDaemonClose {
-                route,
-                session_id,
-                shell_id: Uuid::from_bytes(shell_id),
-            })
-        })
-        .collect()
+        read_shell_records(
+            &self.conn.lock().unwrap(),
+            "SELECT route, session_id, shell_id FROM pending_daemon_closes ORDER BY rowid",
+            [],
+        )
     }
 
     pub(crate) fn retire_completed_daemon_closes(
@@ -255,6 +384,88 @@ impl DatabaseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dormant_daemon_shell_ownership_moves_atomically_with_its_workspace_close() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.sqlite");
+        let session_id = SessionId("session-7".into());
+        let record = |workspace_id: &str, host_id, target: &str| PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: workspace_id.into(),
+                host_id: Some(host_id),
+                ssh_target: Some(target.into()),
+            },
+            session_id: session_id.0.clone(),
+            shell_id: Uuid::new_v4(),
+        };
+        let old = record("workspace-1", 1, "original-host");
+        let installed = record("workspace-1", 1, "original-host");
+        let other_host = record("workspace-1", 2, "other-host");
+        let other_workspace = record("workspace-2", 1, "original-host");
+        {
+            let db = DatabaseStore::test_file(&path);
+            db.remember_daemon_shell(&old).unwrap();
+            db.remember_daemon_shell(&other_host).unwrap();
+            db.remember_daemon_shell(&other_workspace).unwrap();
+            db.retain_daemon_shell(&installed).unwrap();
+        }
+
+        let intent = LayoutCloseIntent::Workspace("workspace-1".into());
+        let transfer = |db: &DatabaseStore| {
+            db.record_layout_close_with_shell_ownership(
+                &intent,
+                Some("workspace-1"),
+                std::slice::from_ref(&session_id),
+                std::slice::from_ref(&installed),
+            )
+        };
+        {
+            let db = DatabaseStore::test_file(&path);
+            db.conn
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER block_pending_close BEFORE INSERT ON pending_daemon_closes
+                 BEGIN SELECT RAISE(ABORT, 'fixture cannot record close'); END;",
+                )
+                .unwrap();
+            assert!(transfer(&db).is_err());
+            assert!(db.pending_layout_closes().unwrap().is_empty());
+            assert_eq!(
+                db.daemon_shell_ownership().unwrap(),
+                [
+                    other_host.clone(),
+                    other_workspace.clone(),
+                    installed.clone()
+                ]
+            );
+            db.conn
+                .lock()
+                .unwrap()
+                .execute_batch("DROP TRIGGER block_pending_close")
+                .unwrap();
+            assert_eq!(
+                transfer(&db).unwrap(),
+                [installed.clone(), other_host.clone()]
+            );
+        }
+
+        let db = DatabaseStore::test_file(&path);
+        assert_eq!(db.pending_layout_closes().unwrap(), [intent]);
+        assert_eq!(db.pending_daemon_closes().unwrap(), [installed, other_host]);
+        assert_eq!(
+            db.daemon_shell_ownership().unwrap(),
+            [other_workspace.clone()]
+        );
+        db.journal_orphan_daemon_shells(std::slice::from_ref(&other_workspace))
+            .unwrap();
+        assert!(db.daemon_shell_ownership().unwrap().is_empty());
+        assert_eq!(
+            db.pending_daemon_closes().unwrap().last(),
+            Some(&other_workspace)
+        );
+    }
 
     #[test]
     fn pending_close_journal_reopens_and_acknowledges_only_the_exact_route_and_shell() {

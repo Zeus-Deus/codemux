@@ -23,7 +23,7 @@ use super::{
 };
 use crate::database::{daemon_closes::PendingDaemonClose, DatabaseStore};
 use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
-use crate::state::{AppStateStore, LayoutCloseIntent, PtyHydrationPlan, PtyHydrationSession, PtyHydrationWorkspace};
+use crate::state::{AppStateStore, LayoutCloseIntent, PtyHydrationPlan, PtyHydrationSession, PtyHydrationWorkspace, SessionId};
 use futures_util::stream::StreamExt as _;
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::future::Future;
@@ -598,6 +598,11 @@ async fn spawn_prepared_session<R: Runtime>(
     if !reservation.is_current() {
         return Err(DaemonHydrationFailure::AlreadyReserved);
     }
+    if existing.as_ref().is_some_and(|shell| shell.workspace_id != workspace.workspace_id) {
+        return Err(DaemonHydrationFailure::Ambiguous(
+            "the daemon session belongs to a different workspace".into(),
+        ));
+    }
     let reattached = existing.is_some();
     let shell_id = match (&existing, client.supports_guarded_shells()) {
         (Some(existing), true) => existing.shell_id,
@@ -617,6 +622,9 @@ async fn spawn_prepared_session<R: Runtime>(
         return Err(DaemonHydrationFailure::AlreadyReserved);
     }
     let route_for_runtime = shell_id.map(|_| {
+        if let Some(recovery) = &reservation.reconciliation {
+            return recovery.route.clone();
+        }
         let ssh_target = client.ssh_target().map(str::to_owned);
         DaemonWorkspaceRoute {
             workspace_id: workspace_id.clone(),
@@ -913,10 +921,31 @@ async fn spawn_prepared_session<R: Runtime>(
     // Publish the exact cleanup target before sending an effectful RPC.
     // Closing the pane starts a separate worker that waits for this lock.
     // Keeping it until install or failure orders cleanup after Spawn/Attach.
-    let guarded_target = reservation.reconciliation.as_ref().zip(shell_id);
-    let cleanup_target = if let Some((recovery, shell_id)) = guarded_target {
+    let guarded_target = reservation.reconciliation.as_ref().zip(shell_id).map(|(recovery, shell_id)| {
+        let ownership = PendingDaemonClose {
+            route: recovery.route.clone(),
+            session_id: session_id.clone(),
+            shell_id,
+        };
+        (recovery, ownership)
+    });
+    let db = app.try_state::<DatabaseStore>();
+    let cleanup_target = if let Some((recovery, ownership)) = &guarded_target {
         let mut target = recovery.target.lock().await;
-        if !reservation.is_current() || !recovery.register_shell(shell_id) {
+        let registered = reservation.with_current_runtime(|_| {
+            if !recovery.register_shell(ownership.shell_id) {
+                return false;
+            }
+            // Permanent close takes the same sessions lock before collecting
+            // ownership. It either sees this UUID or prevents the RPC.
+            if let Some(db) = &db {
+                if let Err(error) = db.remember_daemon_shell(ownership) {
+                    log::error!("Could not remember daemon shell for {session_id}: {error}");
+                }
+            }
+            true
+        }).unwrap_or(false);
+        if !registered {
             return Err(DaemonHydrationFailure::AlreadyReserved);
         }
         target.client = Some(client.clone());
@@ -924,15 +953,43 @@ async fn spawn_prepared_session<R: Runtime>(
     } else {
         None
     };
+    let forget_shell = |allow_ordinary_retry| {
+        if let Some((recovery, ownership)) = &guarded_target {
+            reservation.with_current_runtime(|runtime| {
+                recovery.acknowledge_shell_closed(ownership.shell_id);
+                if let Some(db) = &db {
+                    if let Err(error) = db.forget_daemon_shell(ownership) {
+                        log::error!("Could not forget rejected daemon shell for {session_id}: {error}");
+                    }
+                }
+                if allow_ordinary_retry {
+                    runtime.daemon_reconciliation = None;
+                }
+            });
+        }
+    };
+    let retain_shell = || {
+        if let Some((recovery, ownership)) = &guarded_target {
+            reservation.with_current_runtime(|_| {
+                recovery.retain_shell(ownership.shell_id);
+                if let Some(db) = &db {
+                    if let Err(error) = db.retain_daemon_shell(ownership) {
+                        log::error!("Could not retire resolved daemon shells for {session_id}: {error}");
+                    }
+                }
+            });
+        }
+    };
     let spawn_failure = |error| {
         let failure = classify_spawn_rpc_failure(error);
-        if guarded_target.is_some() && !reconciling && failure.allows_local_fallback() {
+        if failure.allows_local_fallback() {
             // A confirmed rejection leaves no new shell to reconcile. Allow
             // ordinary retry or local fallback while retaining older targets.
-            reservation.clear_daemon_reconciliation_if_current();
+            forget_shell(!reconciling);
         }
         failure
     };
+    let prepared_spawn = !reattached && client.supports_prepared_spawn();
 
     // Idempotent reattach decision comes from the workspace-level List. The
     // caller performs exactly one List and maps it before any pane tasks fan
@@ -953,19 +1010,20 @@ async fn spawn_prepared_session<R: Runtime>(
             return Err(DaemonHydrationFailure::AlreadyReserved);
         }
         let argv = vec![shell.clone()];
-        if let Some((recovery, shell_id)) = guarded_target.filter(|_| client.supports_prepared_spawn()) {
+        if let Some((_, ownership)) = guarded_target.as_ref().filter(|_| prepared_spawn) {
+            let shell_id = ownership.shell_id;
             if let Err(error) = client.prepare_owned_spawn(session_id.clone(), shell_id).await {
                 if matches!(&error, PtyDaemonError::Daemon(message)
                     if message == &format!("session {session_id} already exists in daemon"))
                 {
-                    recovery.acknowledge_shell_closed(shell_id);
+                    forget_shell(false);
                 }
                 return Err(spawn_failure(error));
             }
             // List omits in-flight spawns. Prepare checks their slot and
             // replaces any unused permit, so this acknowledgement proves
             // the previous attempt cannot produce a shell.
-            recovery.retain_shell(shell_id);
+            retain_shell();
             if !reservation.is_current() {
                 return Err(DaemonHydrationFailure::AlreadyReserved);
             }
@@ -997,10 +1055,10 @@ async fn spawn_prepared_session<R: Runtime>(
             return Err(classify_attach_rpc_failure(error));
         }
     };
-    if let Some((recovery, shell_id)) = guarded_target.filter(|_| reattached) {
+    if !prepared_spawn {
         // A guarded attach proves this is the installed shell. Keep prior
         // identities through failed attachments, where List can be stale.
-        recovery.retain_shell(shell_id);
+        retain_shell();
     }
 
     let writer = DaemonWriter::new(client.clone(), session_id.clone());
@@ -1260,14 +1318,29 @@ pub(super) fn prepare_closed_pane_cleanup(
 pub(super) fn commit_layout_close<R: Runtime>(
     app: &AppHandle<R>,
     intent: LayoutCloseIntent,
+    workspace_id: Option<&str>,
+    closed_sessions: &[SessionId],
     mut requests: Vec<PreparedDaemonClose>,
 ) {
+    let mut restored = Vec::new();
     if let Some(db) = app.try_state::<DatabaseStore>() {
         let closes: Vec<_> = requests.iter().flat_map(PreparedDaemonClose::records).collect();
-        match db.record_layout_close(&intent, &closes) {
-            Ok(()) => {
+        match db.record_layout_close_with_shell_ownership(&intent, workspace_id, closed_sessions, &closes) {
+            Ok(owners) => {
                 for request in &mut requests {
                     request.journaled = true;
+                }
+                for owner in owners {
+                    let live = requests.iter_mut().find(|request| {
+                        request.route == owner.route && request.session_id == owner.session_id
+                    });
+                    if let Some(request) = live {
+                        if !request.shell_ids.contains(&owner.shell_id) {
+                            request.shell_ids.push(owner.shell_id);
+                        }
+                    } else {
+                        restored.push(owner);
+                    }
                 }
                 // Archive becomes visible only once the shared close finishes.
                 // Its caller schedules the layout save at that point.
@@ -1281,6 +1354,7 @@ pub(super) fn commit_layout_close<R: Runtime>(
     for request in requests {
         queue_closed_pane_cleanup(app.clone(), request);
     }
+    resume_pending_daemon_closes(app, restored);
 }
 
 pub(crate) fn persist_pending_layout_closes<R: Runtime>(

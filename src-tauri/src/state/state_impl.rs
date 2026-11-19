@@ -4447,6 +4447,32 @@ impl AppStateStore {
         map
     }
 
+    #[cfg(unix)]
+    pub(crate) fn orphaned_daemon_shells(
+        &self,
+        shells: Vec<crate::database::daemon_closes::PendingDaemonClose>,
+    ) -> Vec<crate::database::daemon_closes::PendingDaemonClose> {
+        let snapshot = self.inner.lock().unwrap();
+        let sessions_by_workspace: std::collections::HashMap<_, _> = snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                (
+                    workspace.workspace_id.0.as_str(),
+                    collect_terminal_sessions(&workspace.surfaces),
+                )
+            })
+            .collect();
+        shells
+            .into_iter()
+            .filter(|shell| {
+                sessions_by_workspace
+                    .get(shell.route.workspace_id.as_str())
+                    .is_none_or(|sessions| !sessions.contains(&shell.session_id))
+            })
+            .collect()
+    }
+
     pub fn active_workspace_cwd(&self) -> Option<(String, String)> {
         let snapshot = self.inner.lock().unwrap();
         let workspace = snapshot
@@ -9492,6 +9518,38 @@ mod tests {
             return;
         }
         assert_scoped_close_replays_after_relaunch(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_daemon_shells_require_a_matching_workspace_and_session() {
+        use crate::database::daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose};
+
+        let store = AppStateStore::default();
+        let live = PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: store.snapshot().active_workspace_id.0,
+                host_id: None,
+                ssh_target: None,
+            },
+            session_id: store.active_terminal_session_id().unwrap().0,
+            shell_id: uuid::Uuid::new_v4(),
+        };
+        let missing_pane = PendingDaemonClose {
+            session_id: "missing-session".into(),
+            ..live.clone()
+        };
+        let missing_workspace = PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: "missing-workspace".into(),
+                ..live.route.clone()
+            },
+            ..live.clone()
+        };
+        assert_eq!(
+            store.orphaned_daemon_shells(vec![live, missing_pane.clone(), missing_workspace.clone()]),
+            [missing_pane, missing_workspace],
+        );
     }
 
     #[cfg(unix)]

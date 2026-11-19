@@ -936,13 +936,19 @@ fn build_core_app<R: tauri::Runtime>(
 
             let handle = app.handle().clone();
             #[cfg(unix)]
-            let (pending_layout_closes, pending_terminal_closes) = {
+            let (pending_layout_closes, mut pending_terminal_closes, daemon_shells) = {
                 let db = handle.state::<database::DatabaseStore>();
                 let layout_closes = db.pending_layout_closes().map_err(std::io::Error::other)?;
                 let daemon_closes = db.pending_daemon_closes().map_err(std::io::Error::other)?;
+                let daemon_shells = db.daemon_shell_ownership().map_err(std::io::Error::other)?;
                 state::reserve_pending_close_ids(&layout_closes, &daemon_closes);
-                (layout_closes, daemon_closes)
+                state::reserve_pending_close_ids(&[], &daemon_shells);
+                (layout_closes, daemon_closes, daemon_shells)
             };
+            #[cfg(unix)]
+            let has_daemon_recovery = !pending_layout_closes.is_empty()
+                || !pending_terminal_closes.is_empty()
+                || !daemon_shells.is_empty();
             // Track whether the persisted layout actually loaded. The
             // Windows orphan-cleanup gate below uses this to skip the
             // destructive `cleanup_orphan_scrollbacks(&[])` call after
@@ -950,12 +956,12 @@ fn build_core_app<R: tauri::Runtime>(
             // for the full failure-mode write-up.
             let mut layout_loaded = false;
             #[cfg(unix)]
-            let restored_layout = if pending_layout_closes.is_empty() && pending_terminal_closes.is_empty() {
-                state::load_persisted_state()
-            } else {
+            let restored_layout = if has_daemon_recovery {
                 // Replay may write immediately. Never replace an
                 // unreadable layout with fallback state during startup.
                 state::load_persisted_state_checked().map_err(std::io::Error::other)?
+            } else {
+                state::load_persisted_state()
             };
             #[cfg(not(unix))]
             let restored_layout = state::load_persisted_state();
@@ -1000,10 +1006,8 @@ fn build_core_app<R: tauri::Runtime>(
                 state.clear_workspaces();
             }
             #[cfg(unix)]
-            if !layout_loaded && mode == AppMode::ServeHeadless
-                && (!pending_layout_closes.is_empty() || !pending_terminal_closes.is_empty())
-            {
-                // The default state was built before reading the close journal.
+            if !layout_loaded && mode == AppMode::ServeHeadless && has_daemon_recovery {
+                // The default state was built before reading the shell records.
                 // Allocate this launch's CWD pane above the reserved IDs.
                 handle.state::<state::AppStateStore>()
                     .replace_snapshot(state::AppStateStore::default().snapshot());
@@ -1020,6 +1024,19 @@ fn build_core_app<R: tauri::Runtime>(
                 &handle.state::<state::AppStateStore>(),
                 &pending_layout_closes,
             ).map_err(std::io::Error::other)?;
+            #[cfg(unix)]
+            if !daemon_shells.is_empty() {
+                // A shell can start before its new pane has reached disk.
+                // Retire these exact shells without hydrating a missing pane.
+                let orphaned = handle.state::<state::AppStateStore>().orphaned_daemon_shells(daemon_shells);
+                if !orphaned.is_empty() {
+                    let db = handle.state::<database::DatabaseStore>();
+                    if let Err(error) = db.journal_orphan_daemon_shells(&orphaned) {
+                        log::error!("Could not journal orphaned daemon shells: {error}");
+                    }
+                    pending_terminal_closes.extend(orphaned);
+                }
+            }
             // Reconciliation checks canonical pane/workspace ownership. Starting
             // it before layout restore can incorrectly hold a saved child result.
             delegation::coordinator::install(app.handle()).map_err(std::io::Error::other)?;
