@@ -41,6 +41,12 @@ impl EventHub {
     /// Subscribe `conn_id` to `event`, registering the backing desktop
     /// listener if this is the first subscriber for that event name.
     pub fn subscribe<R: Runtime>(&self, app: &AppHandle<R>, conn_id: u64, event: &str, out: OutboundTx) {
+        // The name comes straight off the wire, and Tauri panics on a name
+        // it would refuse — here, with the hub lock held, which would
+        // poison the hub for every connection.
+        if !is_listenable_event(event) {
+            return;
+        }
         // Desktop-only surfaces: plugin file changes and the plugin chat tap
         // never reach a web client.
         if !matches!(event,"plugins_platform_changed"|"plugins_platform_catalogue_changed")
@@ -50,7 +56,7 @@ impl EventHub {
         {
             return;
         }
-        let mut map = self.inner.lock().unwrap();
+        let mut map = lock(&self.inner);
         let entry = map.entry(event.to_string()).or_insert_with(|| {
             let inner = self.inner.clone();
             let event_name = event.to_string();
@@ -68,7 +74,7 @@ impl EventHub {
     /// Unsubscribe `conn_id` from `event`; tear the desktop listener down
     /// when the last subscriber leaves.
     pub fn unsubscribe<R: Runtime>(&self, app: &AppHandle<R>, conn_id: u64, event: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = lock(&self.inner);
         if let Some(entry) = map.get_mut(event) {
             entry.subscribers.remove(&conn_id);
             if entry.subscribers.is_empty() {
@@ -81,7 +87,7 @@ impl EventHub {
     /// Drop every subscription held by a connection (WS closed). Any event
     /// left with no subscribers has its desktop listener removed.
     pub fn remove_conn<R: Runtime>(&self, app: &AppHandle<R>, conn_id: u64) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = lock(&self.inner);
         let mut emptied = Vec::new();
         for (name, entry) in map.iter_mut() {
             if entry.subscribers.remove(&conn_id).is_some() && entry.subscribers.is_empty() {
@@ -106,6 +112,31 @@ impl EventHub {
     }
 }
 
+/// Longest event name a remote client may subscribe to. Codemux's own
+/// names are far shorter; the cap keeps the map's keys bounded.
+const MAX_EVENT_NAME_LEN: usize = 128;
+
+/// Whether `event` is a name Tauri accepts (alphanumerics, `-`, `/`, `:`,
+/// `_`), non-empty and of a sane length.
+fn is_listenable_event(event: &str) -> bool {
+    !event.is_empty()
+        && event.len() <= MAX_EVENT_NAME_LEN
+        && event
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '/' | ':' | '_'))
+}
+
+/// The hub's map, even after a panic elsewhere poisoned its lock: the map
+/// is only ever changed by whole inserts and removals, so it stays coherent,
+/// and one bad frame must not take remote events down for everyone. This
+/// runs inside Tauri's emit loop, where a panic would poison Tauri's own
+/// listener table.
+fn lock(
+    inner: &Mutex<HashMap<String, EventEntry>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, EventEntry>> {
+    inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Forward one emission to every current subscriber of `event`. The
 /// payload string is the JSON the emitter serialised; we re-embed it
 /// verbatim (parsed back to a value so it nests, not double-encodes).
@@ -117,7 +148,7 @@ fn fan_out(inner: &Arc<Mutex<HashMap<String, EventEntry>>>, event: &str, payload
         return;
     }
     let frame = json!({ "t": "event", "event": event, "payload": data }).to_string();
-    let map = inner.lock().unwrap();
+    let map = lock(inner);
     if let Some(entry) = map.get(event) {
         for out in entry.subscribers.values() {
             let _ = out.send(Message::Text(frame.clone()));
@@ -164,6 +195,43 @@ mod tests {
                 other => panic!("expected text, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_name_tauri_would_refuse_is_ignored_not_panicked_on() {
+        let app = tauri::test::mock_app();
+        let hub = EventHub::default();
+        for bad in ["a b", "", "x\u{0}", "a.b", "evt\n", &"a".repeat(MAX_EVENT_NAME_LEN + 1)] {
+            let (out, _rx) = crate::web_remote::server::test_outbound();
+            hub.subscribe(app.handle(), 1, bad, out);
+            assert_eq!(hub.subscriber_count(bad), 0, "{bad:?} must not register");
+        }
+
+        // The hub still works for a real event afterwards.
+        let (out, _rx) = crate::web_remote::server::test_outbound();
+        hub.subscribe(app.handle(), 1, "app-state-changed", out);
+        assert_eq!(hub.subscriber_count("app-state-changed"), 1);
+        hub.remove_conn(app.handle(), 1);
+        assert_eq!(hub.subscriber_count("app-state-changed"), 0);
+    }
+
+    #[test]
+    fn fan_out_still_delivers_after_the_hub_lock_is_poisoned() {
+        let (tx, mut rx) = crate::web_remote::server::test_outbound();
+        let inner: Arc<Mutex<HashMap<String, EventEntry>>> = Arc::new(Mutex::new(HashMap::from([(
+            "app-state".to_string(),
+            EventEntry { handler_id: 0, subscribers: HashMap::from([(1u64, tx)]) },
+        )])));
+        let poisoner = inner.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the hub lock");
+        })
+        .join();
+        assert!(inner.is_poisoned());
+
+        fan_out(&inner, "app-state", "{}");
+        assert!(matches!(rx.try_recv(), Ok(Message::Text(_))), "the subscriber still gets the event");
     }
 
     #[test]
