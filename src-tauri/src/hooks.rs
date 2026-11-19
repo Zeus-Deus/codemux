@@ -555,6 +555,20 @@ impl HookFile {
     }
 
     fn replace(&self, content: &[u8], executable: bool) -> std::io::Result<()> {
+        self.replace_inner(
+            content,
+            executable,
+            #[cfg(all(windows, test))]
+            || {},
+        )
+    }
+
+    fn replace_inner(
+        &self,
+        content: &[u8],
+        executable: bool,
+        #[cfg(all(windows, test))] mut before_retry: impl FnMut(),
+    ) -> std::io::Result<()> {
         if self.original.as_deref() == Some(content) {
             return Ok(());
         }
@@ -609,6 +623,8 @@ impl HookFile {
                         // Readers and scanners can briefly block replacement on Windows.
                         // Keep the staged file and recheck for edits before each retry.
                         staged = error.file;
+                        #[cfg(test)]
+                        before_retry();
                         std::thread::sleep(Duration::from_millis(10));
                         continue;
                     }
@@ -2579,13 +2595,11 @@ case "$URL" in *:43199/*) exit 7 ;; *) exit 0 ;; esac
         let path = home.path().join("notify.ps1");
         std::fs::write(&path, "old").unwrap();
         let snapshot = HookFile::read(&path).unwrap();
-        let reader = hook_reader_without_share_delete(&path);
-        let writer = std::thread::spawn(move || snapshot.replace(b"new", false));
-        std::thread::sleep(Duration::from_millis(100));
-        let was_waiting = !writer.is_finished();
-        drop(reader);
-        writer.join().unwrap().unwrap();
-        assert!(was_waiting);
+        let mut reader = Some(hook_reader_without_share_delete(&path));
+        snapshot
+            .replace_inner(b"new", false, || drop(reader.take()))
+            .unwrap();
+        assert!(reader.is_none(), "replacement never retried");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
     }
@@ -2617,12 +2631,13 @@ case "$URL" in *:43199/*) exit 7 ;; *) exit 0 ;; esac
         let path = home.path().join("notify.ps1");
         std::fs::write(&path, "old").unwrap();
         let snapshot = HookFile::read(&path).unwrap();
-        let reader = hook_reader_without_share_delete(&path);
-        let writer = std::thread::spawn(move || snapshot.replace(b"new", false));
-        std::thread::sleep(Duration::from_millis(100));
-        std::fs::write(&path, "user edit").unwrap();
-        drop(reader);
-        let error = writer.join().unwrap().unwrap_err();
+        let mut reader = Some(hook_reader_without_share_delete(&path));
+        let error = snapshot
+            .replace_inner(b"new", false, || {
+                std::fs::write(&path, "user edit").unwrap();
+                drop(reader.take());
+            })
+            .unwrap_err();
         assert!(error.to_string().contains("changed during update"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "user edit");
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);

@@ -93,6 +93,8 @@ pub mod fs_size;
 pub mod hosts_upgrade;
 pub mod hosts_inventory;
 pub mod workspace_paths;
+#[cfg(windows)]
+mod windows_file_id;
 pub mod workspace_service;
 pub mod project_identity;
 pub mod workspaces_sync;
@@ -1334,7 +1336,6 @@ fn build_core_app<R: tauri::Runtime>(
                 if let Some((_, cwd)) = app_state.active_workspace_cwd() {
                     index_store.initialize_for_project(std::path::PathBuf::from(cwd));
                 }
-                indexing::spawn_index_watcher(index_store);
             }
 
             control::spawn_control_server(app.handle().clone());

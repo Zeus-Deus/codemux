@@ -7311,11 +7311,9 @@ pub(crate) async fn open_thread_pane_checked<R: Runtime>(
             .0;
         break (pane_id.0, true);
     };
-    drop(dispatch_guard);
-
     // Pane activation selects the workspace/surface, while tab activation is
-    // a separate state field. Resolve both from one immutable snapshot and
-    // then update them before emitting the final state once.
+    // a separate state field. Keep a new pane's dispatch guard through lookup
+    // and selection so a waiting delete cannot remove it between these steps.
     let snapshot = state.snapshot();
     let location = snapshot.workspaces.iter().find_map(|workspace| {
         workspace.surfaces.iter().find_map(|surface| {
@@ -7342,6 +7340,7 @@ pub(crate) async fn open_thread_pane_checked<R: Runtime>(
         }
     }
     crate::state::emit_app_state(app);
+    drop(dispatch_guard);
 
     Ok(OpenedThreadPane {
         pane_id,

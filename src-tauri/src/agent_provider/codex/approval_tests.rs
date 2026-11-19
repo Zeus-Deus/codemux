@@ -96,8 +96,9 @@ async fn turn_completed(rx: &mut broadcast::Receiver<ProviderRuntimeEvent>) {
     .await
 }
 
-fn turn(text: &str) -> SendTurnInput {
+fn turn(session: &CodexSession, text: &str) -> SendTurnInput {
     let mut input = super::tests::queued("approval").input;
+    input.thread_id = session.thread_id.clone();
     input.text = text.into();
     input
 }
@@ -108,7 +109,7 @@ async fn approvals_resolve_on_answer_and_settle_when_their_turn_ends() {
     let dir = tempfile::tempdir().unwrap();
     let (tx, mut rx) = broadcast::channel(256);
     let session = CodexSession::spawn_and_initialize(
-        ThreadId("t".into()),
+        ThreadId("approval-settlement-fixture".into()),
         dir.path().into(),
         Some("fixture-model".into()),
         None,
@@ -136,7 +137,7 @@ async fn approvals_resolve_on_answer_and_settle_when_their_turn_ends() {
     .unwrap();
 
     // An answered approval reports its decision; Codex itself never does.
-    session.enqueue_or_send(turn("first")).await.unwrap();
+    session.enqueue_or_send(turn(&session, "first")).await.unwrap();
     let request = opened(&mut rx).await;
     let allow = ApprovalDecision::Allow {
         updated_input: None,
@@ -170,7 +171,7 @@ async fn approvals_resolve_on_answer_and_settle_when_their_turn_ends() {
     assert_eq!(reply["result"], json!({"decision": "accept"}));
 
     // Stop during an approval settles it and unblocks the next send.
-    session.enqueue_or_send(turn("second")).await.unwrap();
+    session.enqueue_or_send(turn(&session, "second")).await.unwrap();
     let request = opened(&mut rx).await;
     session.interrupt_turn(None).await.unwrap();
     assert_eq!(resolved(&mut rx).await, (request, json!({"decision": "cancel"})));
@@ -181,7 +182,7 @@ async fn approvals_resolve_on_answer_and_settle_when_their_turn_ends() {
     // request and the completion race on separate tasks: either the request
     // is published and cancelled before the completion, or it arrives after
     // the turn settled and is dropped unpublished. Nothing may follow it.
-    let third = session.enqueue_or_send(turn("third")).await.unwrap();
+    let third = session.enqueue_or_send(turn(&session, "third")).await.unwrap();
     assert!(matches!(third, SendOutcome::Started(_)), "{third:?}");
     let mut opened_ids = Vec::new();
     loop {
@@ -212,7 +213,7 @@ async fn approvals_resolve_on_answer_and_settle_when_their_turn_ends() {
 
     // A sub-agent approval outlives the parent turn, then the app-server
     // crashes with no parent turn in flight: the request still expires.
-    session.enqueue_or_send(turn("fourth")).await.unwrap();
+    session.enqueue_or_send(turn(&session, "fourth")).await.unwrap();
     let request = opened(&mut rx).await;
     let expired = next_matching(&mut rx, |event| match event {
         ProviderRuntimeEvent::RequestResolved { request_id, .. } if request_id == request => {
@@ -280,7 +281,7 @@ async fn a_retry_that_never_resumes_fails_the_turn_once() {
     let dir = tempfile::tempdir().unwrap();
     let (tx, mut rx) = broadcast::channel(256);
     let session = CodexSession::spawn_and_initialize(
-        ThreadId("t".into()),
+        ThreadId("approval-stalled-retry-fixture".into()),
         dir.path().into(),
         Some("fixture-model".into()),
         None,
@@ -307,7 +308,7 @@ async fn a_retry_that_never_resumes_fails_the_turn_once() {
     .await
     .unwrap();
 
-    session.enqueue_or_send(turn("first")).await.unwrap();
+    session.enqueue_or_send(turn(&session, "first")).await.unwrap();
     let status = next_matching(&mut rx, |event| match event {
         ProviderRuntimeEvent::TurnCompleted { status, .. } => Some(status),
         _ => None,
