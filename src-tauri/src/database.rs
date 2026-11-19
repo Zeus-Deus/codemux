@@ -2266,6 +2266,44 @@ impl DatabaseStore {
 
     /// Clear dirty after a successful push. Optionally stamp the
     /// server_id (first push only). Mirrors `mark_host_synced`.
+    /// Acknowledge a push of `pushed`: record the server id a POST
+    /// returned, and clear `dirty` only if the row still holds exactly what
+    /// was sent. A change made while the request was in flight — an edit,
+    /// or a close's tombstone — stays dirty for the next push.
+    pub fn mark_workspace_sync_pushed(
+        &self,
+        pushed: &WorkspaceSyncRecord,
+        server_id: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE workspaces_sync
+             SET server_id = COALESCE(?1, server_id),
+                 dirty = CASE
+                     WHEN title IS ?2 AND host_server_id IS ?3 AND project_path IS ?4
+                      AND project_remote IS ?5 AND git_branch IS ?6 AND git_head_sha IS ?7
+                      AND project_uid IS ?8 AND workspace_kind IS ?9 AND deleted_at IS ?10
+                     THEN 0 ELSE dirty
+                 END
+             WHERE id = ?11",
+            params![
+                server_id,
+                pushed.title,
+                pushed.host_server_id,
+                pushed.project_path,
+                pushed.project_remote,
+                pushed.git_branch,
+                pushed.git_head_sha,
+                pushed.project_uid,
+                pushed.workspace_kind,
+                pushed.deleted_at,
+                pushed.id,
+            ],
+        )
+        .map_err(|e| format!("Failed to mark workspace sync row pushed: {e}"))?;
+        Ok(())
+    }
+
     pub fn mark_workspace_sync_synced(
         &self,
         id: i64,
@@ -3227,6 +3265,42 @@ impl DatabaseStore {
 
     /// Clear `dirty` after a successful push; optionally stamp the
     /// server-assigned id on the first upload.
+    /// Acknowledge a push of `pushed`: record the server id a POST
+    /// returned, and clear `dirty` only if the row still holds exactly what
+    /// was sent; a change made meanwhile stays dirty for the next push.
+    pub fn mark_automation_pushed(&self, pushed: &AutomationRecord, server_id: Option<&str>) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automations
+             SET server_id = COALESCE(?1, server_id),
+                 dirty = CASE
+                     WHEN name IS ?2 AND prompt IS ?3 AND agent IS ?4 AND schedule IS ?5
+                      AND timezone IS ?6 AND host_id IS ?7 AND project_path IS ?8
+                      AND project_remote IS ?9 AND enabled IS ?10 AND retention_limit IS ?11
+                      AND deleted_at IS ?12
+                     THEN 0 ELSE dirty
+                 END
+             WHERE id = ?13",
+            params![
+                server_id,
+                pushed.name,
+                pushed.prompt,
+                pushed.agent,
+                pushed.schedule,
+                pushed.timezone,
+                pushed.host_id,
+                pushed.project_path,
+                pushed.project_remote,
+                pushed.enabled as i64,
+                pushed.retention_limit,
+                pushed.deleted_at,
+                pushed.id,
+            ],
+        )
+        .map_err(|e| format!("Failed to mark automation pushed: {e}"))?;
+        Ok(())
+    }
+
     pub fn mark_automation_synced(&self, id: i64, server_id: Option<&str>) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         if let Some(sid) = server_id {

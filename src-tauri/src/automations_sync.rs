@@ -246,6 +246,9 @@ pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
     let (local_to_server, _server_to_local) = host_maps(db);
     let dirty = db.list_dirty_automations();
     let mut any_failed = false;
+    // The account's list, fetched at most once a pass, and only if a row
+    // turns out to be gone.
+    let mut listed: Option<Option<std::collections::HashSet<String>>> = None;
 
     for row in &dirty {
         // Webhook automations stay on this device: the API has no trigger
@@ -263,7 +266,7 @@ pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
         } else if row.server_id.is_none() {
             push_insert(&client, &base, token, row, &local_to_server, db).await
         } else {
-            push_update(&client, &base, token, row, &local_to_server, db).await
+            push_update(&client, &base, token, row, &local_to_server, db, &mut listed).await
         };
         if let Err(error) = result {
             eprintln!("[automations-sync] push failed for local id {}: {error}", row.id);
@@ -318,7 +321,7 @@ async fn push_insert(
     }
     let parsed: OneAutomationResponse =
         resp.json().await.map_err(|e| format!("Parse: {e}"))?;
-    db.mark_automation_synced(row.id, Some(&parsed.automation.id))?;
+    db.mark_automation_pushed(row, Some(&parsed.automation.id))?;
     Ok(())
 }
 
@@ -329,6 +332,7 @@ async fn push_update(
     row: &AutomationRecord,
     local_to_server: &HashMap<i64, String>,
     db: &DatabaseStore,
+    listed: &mut Option<Option<std::collections::HashSet<String>>>,
 ) -> Result<(), String> {
     let server_id = row
         .server_id
@@ -341,7 +345,7 @@ async fn push_update(
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
-    if resp.status().as_u16() == 404 && server_lacks_automation(client, base, token, server_id).await {
+    if resp.status().as_u16() == 404 && server_lacks_automation(client, base, token, server_id, listed).await {
         // Deleted on another device before this edit reached the account.
         // The pull leaves dirty rows alone, so settle it here: the
         // removal wins, as it does for a clean row.
@@ -368,34 +372,40 @@ async fn push_update(
     if !resp.status().is_success() {
         return Err(format!("API error: {}", resp.status()));
     }
-    db.mark_automation_synced(row.id, None)?;
+    db.mark_automation_pushed(row, None)?;
     Ok(())
 }
 
 /// Whether the account's automation list is readable and has no row
 /// `server_id`. A server without the automations API answers 404 to
-/// everything, so a 404 alone does not say the row is gone.
+/// everything, so a 404 alone does not say the row is gone. The list is
+/// fetched once per push pass, into `listed`; if it cannot be read, no row
+/// is taken to be gone.
 async fn server_lacks_automation(
     client: &reqwest::Client,
     base: &str,
     token: &str,
     server_id: &str,
+    listed: &mut Option<Option<std::collections::HashSet<String>>>,
 ) -> bool {
-    let Ok(resp) = client
-        .get(format!("{base}/api/automations"))
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-    else {
-        return false;
-    };
-    if !resp.status().is_success() {
-        return false;
+    if listed.is_none() {
+        let ids = async {
+            let resp = client
+                .get(format!("{base}/api/automations"))
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let body = resp.json::<ListAutomationsResponse>().await.ok()?;
+            Some(body.automations.into_iter().map(|a| a.id).collect())
+        }
+        .await;
+        *listed = Some(ids);
     }
-    match resp.json::<ListAutomationsResponse>().await {
-        Ok(body) => !body.automations.iter().any(|a| a.id == server_id),
-        Err(_) => false,
-    }
+    matches!(listed, Some(Some(ids)) if !ids.contains(server_id))
 }
 
 async fn push_delete(
@@ -426,7 +436,7 @@ async fn push_delete(
     }
     // Clear `dirty` so `purge_acknowledged_automation_deletes` removes
     // the tombstone on the next pass.
-    db.mark_automation_synced(row.id, None)?;
+    db.mark_automation_pushed(row, None)?;
     Ok(())
 }
 
@@ -623,6 +633,26 @@ mod tests {
             "createdAt":"2026-01-01T00:00:00Z",
             "updatedAt":"2026-01-01T00:00:00Z","deletedAt":null}}"#
         )
+    }
+
+    #[test]
+    fn an_edit_made_while_its_automation_was_being_uploaded_stays_dirty() {
+        let db = init_test_database();
+        let row = db.insert_automation(&sample_input()).unwrap();
+        db.mark_automation_synced(row.id, Some("srv-inflight")).unwrap();
+        db.set_automation_enabled(row.id, false).unwrap();
+
+        // The PATCH carrying the pause is in flight when it is deleted.
+        let in_flight = db.get_automation(row.id).unwrap();
+        db.delete_automation(row.id).unwrap();
+        db.mark_automation_pushed(&in_flight, None).unwrap();
+
+        let after = db
+            .list_automations_for_sync()
+            .into_iter()
+            .find(|r| r.id == row.id)
+            .unwrap();
+        assert!(after.deleted_at.is_some() && after.dirty, "the deletion still goes up");
     }
 
     #[tokio::test]
