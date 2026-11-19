@@ -52,7 +52,7 @@
 use crate::auth::{api_base_url, is_token_expired, load_token};
 use crate::database::DatabaseStore;
 use crate::state::AppStateSnapshot;
-use crate::sync_guard::{sync_client, SyncGuard, SYNC_BUDGET};
+use crate::sync_guard::{order_by_last_attempt, record_attempt, sync_client, Attempts, SyncGuard, SYNC_BUDGET};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,6 +130,9 @@ static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// deletion whose row the first pass is still uploading, before that
 /// upload returns the server id the DELETE needs.
 static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// When each row was last sent (see [`order_by_last_attempt`]).
+static ATTEMPTS: Attempts = std::sync::LazyLock::new(Default::default);
 
 pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
     // Queue before reading the session: a pass that waited out a sign-out
@@ -383,13 +386,20 @@ async fn push_guarded(
     client: &reqwest::Client,
 ) -> Result<(), String> {
     let base = api_base_url();
-    let dirty = guard.commit(|| db.list_dirty_workspaces_sync())?;
+    let mut dirty = guard.commit(|| db.list_dirty_workspaces_sync())?;
+    order_by_last_attempt(&ATTEMPTS, &mut dirty, |row| row.id);
     let mut any_failed = false;
     // The account's list, fetched at most once a pass, and only if a row
     // turns out to be gone.
     let mut listed: Option<Option<std::collections::HashSet<String>>> = None;
 
     for row in &dirty {
+        // Out of time: the rest goes first next pass.
+        if guard.expired() {
+            any_failed = true;
+            break;
+        }
+        record_attempt(&ATTEMPTS, row.id);
         let result = if row.deleted_at.is_some() {
             push_delete(client, &base, token, row, db, guard).await
         } else if row.server_id.is_none() {
@@ -1247,6 +1257,47 @@ mod tests {
         assert!(row.server_id.is_none() && row.dirty);
         let queue_free = tokio::time::timeout(std::time::Duration::from_secs(1), super::SYNC_LOCK.lock()).await;
         assert!(queue_free.is_ok(), "nothing holds the queue");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_healthy_row_behind_stalling_ones_is_sent_by_a_later_pass() {
+        let handler: Handler = std::sync::Arc::new(move |line| {
+            Box::pin(async move {
+                if line.starts_with("GET /api/workspaces ") {
+                    ("200 OK", r#"{"workspaces":[]}"#.to_string())
+                } else if line.starts_with("PATCH /api/workspaces/srv-stall ") {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                } else if line.starts_with("PATCH /api/workspaces/srv-ok ") {
+                    ("200 OK", "{}".to_string())
+                } else {
+                    ("404 Not Found", String::new())
+                }
+            })
+        });
+        std::env::set_var("CODEMUX_API_URL", test_api(handler).await);
+        // Row ids repeat across test databases; start from a clean record.
+        super::ATTEMPTS.lock().unwrap().clear();
+        let db = fresh_db();
+        // The stalling row sorts first by id.
+        for (wid, sid) in [("ws-stall-first", "srv-stall"), ("ws-ok-second", "srv-ok")] {
+            let row = db.insert_workspace_sync(wid, "old", None, None, None, None, None, None, None).unwrap();
+            db.mark_workspace_sync_synced(row.id, Some(sid)).unwrap();
+            db.update_workspace_sync_by_workspace_id(wid, "edited", None, None, None, None, None, None, None)
+                .unwrap();
+        }
+        let client = crate::sync_guard::sync_client_with(std::time::Duration::from_millis(300));
+        let budget = std::time::Duration::from_millis(200);
+        let ok_is_clean = |db: &DatabaseStore| {
+            !db.list_dirty_workspaces_sync().iter().any(|r| r.server_id.as_deref() == Some("srv-ok"))
+        };
+
+        let _ = super::sync_with("token", &db, &SyncGuard::unchecked().within(budget), &client).await;
+        assert!(!ok_is_clean(&db), "precondition: the stall used up the first pass");
+        let _ = super::sync_with("token", &db, &SyncGuard::unchecked().within(budget), &client).await;
+        std::env::remove_var("CODEMUX_API_URL");
+        assert!(ok_is_clean(&db), "the waiting row goes first next time and is sent");
     }
 
     #[tokio::test]

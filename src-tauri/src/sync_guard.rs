@@ -66,12 +66,102 @@ impl<'a> SyncGuard<'a> {
         }
     }
 
+    /// Whether the pass is past its deadline and should start nothing new.
+    pub(crate) fn expired(&self) -> bool {
+        self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
     /// Checked before each request: a replaced session's token sends
     /// nothing more, and a pass past its deadline starts nothing new.
     pub(crate) fn ensure_current(&self) -> Result<(), String> {
-        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if self.expired() {
             return Err("sync ran out of time; the rest waits for the next pass".to_string());
         }
         self.commit(|| ())
+    }
+}
+
+/// When each row of a registry was last sent, so a pass can try first the
+/// rows that waited longest. Rows that keep stalling then cannot keep a
+/// healthy row behind them from ever being reached before the budget ends.
+pub(crate) type Attempts = std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Instant>>>;
+
+/// Sort `rows` (by id) so the least recently attempted come first, never
+/// attempted before all. Entries for rows no longer waiting are dropped, so
+/// the record stays as small as the backlog.
+pub(crate) fn order_by_last_attempt<T>(attempts: &Attempts, rows: &mut [T], id: impl Fn(&T) -> i64) {
+    let mut attempts = attempts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let waiting: std::collections::HashSet<i64> = rows.iter().map(&id).collect();
+    attempts.retain(|row_id, _| waiting.contains(row_id));
+    rows.sort_by_key(|row| (attempts.get(&id(row)).copied(), id(row)));
+}
+
+/// Record that the row `id` is being sent now.
+pub(crate) fn record_attempt(attempts: &Attempts, id: i64) {
+    attempts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(id, Instant::now());
+}
+
+/// Coalesces fire-and-forget sync requests: one pass runs at a time, and
+/// any number of requests made meanwhile collapse into a single follow-up
+/// pass, which starts after the last of them — so nothing a request was
+/// made for is missed, and nothing piles up.
+#[derive(Default)]
+pub(crate) struct Coalescer {
+    state: std::sync::Mutex<(bool, bool)>,
+}
+
+impl Coalescer {
+    pub(crate) const fn new() -> Self {
+        Self { state: std::sync::Mutex::new((false, false)) }
+    }
+
+    /// A pass is wanted. `true`: the caller starts the runner; `false`: one
+    /// is running and will make a follow-up pass.
+    pub(crate) fn request(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (running, again) = &mut *state;
+        if *running {
+            *again = true;
+            false
+        } else {
+            *running = true;
+            *again = false;
+            true
+        }
+    }
+
+    /// The runner finished a pass. `true`: run another, for requests made
+    /// during it; `false`: the runner is done.
+    pub(crate) fn finished_pass(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (running, again) = &mut *state;
+        if *again {
+            *again = false;
+            true
+        } else {
+            *running = false;
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Coalescer;
+
+    #[test]
+    fn requests_during_a_pass_collapse_into_one_follow_up() {
+        let background = Coalescer::new();
+        assert!(background.request(), "the first request starts the runner");
+        for _ in 0..5 {
+            assert!(!background.request(), "a running pass absorbs further requests");
+        }
+        assert!(background.finished_pass(), "they get exactly one follow-up pass");
+        assert!(!background.finished_pass(), "and then the runner stops");
+        assert!(background.request(), "the next request starts a new runner");
+        assert!(!background.finished_pass());
     }
 }
