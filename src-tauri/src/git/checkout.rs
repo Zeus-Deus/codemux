@@ -192,6 +192,13 @@ fn file_at(root: &Path, rel: &Path) -> io::Result<Option<FileState>> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Gitlink,
+    Executable,
+    Other,
+}
+
 enum Original {
     Gitlink,
     Tracked(Option<FileState>),
@@ -213,7 +220,7 @@ pub(super) struct PreparedCheckout {
     recovery: PathBuf,
     index: TempPath,
     remove: Vec<(PathBuf, Original)>,
-    install: Vec<(PathBuf, bool)>,
+    install: Vec<(PathBuf, EntryKind)>,
     undo: Vec<Undo>,
 }
 
@@ -273,8 +280,8 @@ fn checkout_recovery(checkout: &Path, git_dir: &Path) -> io::Result<(TempDir, Pa
     create_recovery_root(&source)?;
     #[cfg(windows)]
     clack_private_fs::create_dir(&source)?;
-    // Incoming files should inherit the checkout's ordinary ACLs when Git
-    // prepares them. Only the enclosing recovery root needs to be private.
+    // Keep Git's scratch tree under ordinary checkout inheritance. Installed
+    // regular files acquire the permissions of their individual live parents.
     let tree = local.path().join("tree");
     fs::create_dir(&tree)?;
     fs::rename(tree, source.join("tree"))?;
@@ -336,7 +343,16 @@ impl PreparedCheckout {
         let changed = |from: &Entries, to: &Entries| -> Vec<_> {
             from.iter()
                 .filter(|(p, entry)| to.get(*p) != Some(entry))
-                .map(|(p, entry)| (p.clone(), entry.starts_with(b"160000 ")))
+                .map(|(p, entry)| {
+                    let kind = if entry.starts_with(b"160000 ") {
+                        EntryKind::Gitlink
+                    } else if entry.starts_with(b"100755 ") {
+                        EntryKind::Executable
+                    } else {
+                        EntryKind::Other
+                    };
+                    (p.clone(), kind)
+                })
                 .collect()
         };
         let remove = changed(&before, &after);
@@ -344,7 +360,7 @@ impl PreparedCheckout {
         if remove
             .iter()
             .chain(&install)
-            .any(|(p, gitlink)| *gitlink && checkout.join(p).join(".git").exists())
+            .any(|(p, kind)| *kind == EntryKind::Gitlink && checkout.join(p).join(".git").exists())
             && checkout_config(checkout, "submodule.recurse", true)?
                 .is_some_and(|v| v.trim_end() == "true")
         {
@@ -357,8 +373,8 @@ impl PreparedCheckout {
         // index lock excludes Git writers, but editors need no such lock.
         let remove = remove
             .into_iter()
-            .map(|(rel, gitlink)| {
-                let original = if gitlink {
+            .map(|(rel, kind)| {
+                let original = if kind == EntryKind::Gitlink {
                     Original::Gitlink
                 } else {
                     Original::Tracked(file_at(checkout, &rel)?)
@@ -439,14 +455,14 @@ impl PreparedCheckout {
                 }
             }
         }
-        for (rel, gitlink) in &self.install {
+        for (rel, kind) in &self.install {
             let dest = checkout.join(rel);
             let mut dir = checkout.to_owned();
             for part in rel.parent().unwrap_or(Path::new("")).components() {
                 dir.push(part);
                 ensure_dir(&dir, &mut self.undo)?;
             }
-            if *gitlink {
+            if *kind == EntryKind::Gitlink {
                 ensure_dir(&dest, &mut self.undo)?;
                 continue;
             }
@@ -456,6 +472,9 @@ impl PreparedCheckout {
             // The no-replace operation itself protects ignored and untracked
             // files, including files created after Git's validation.
             let prepared = self.recovery.join("tree").join(rel);
+            if fs::symlink_metadata(&prepared)?.is_file() {
+                prepare_regular_file(&prepared, &dir, *kind, &self.recovery, &mut self.undo)?;
+            }
             let state = FileState::read(&prepared)?;
             move_noclobber(prepared.clone(), &dest).map_err(|e| {
                 if e.kind() == ErrorKind::AlreadyExists || dest.is_dir() {
@@ -565,6 +584,79 @@ impl PreparedCheckout {
         }
         error
     }
+}
+
+// Create the inode in the live parent so the OS applies its inheritance rules.
+// Move it into private recovery before filling it with Git's filtered bytes.
+fn prepare_regular_file(
+    prepared: &Path,
+    parent: &Path,
+    kind: EntryKind,
+    recovery: &Path,
+    undo: &mut Vec<Undo>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    #[cfg(windows)]
+    use {
+        crate::windows_file_id::file_id,
+        std::os::windows::fs::{MetadataExt, OpenOptionsExt},
+        windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_HIDDEN, FILE_FLAG_OPEN_REPARSE_POINT,
+        },
+    };
+
+    let mut options = fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(if kind == EntryKind::Executable {
+            0o777
+        } else {
+            0o666
+        });
+    }
+    #[cfg(windows)]
+    {
+        // Git for Windows may hide dotfiles according to core.hideDotFiles.
+        options.attributes(fs::metadata(prepared)?.file_attributes() & FILE_ATTRIBUTE_HIDDEN);
+        let _ = kind;
+    }
+
+    let empty = tempfile::Builder::new()
+        .prefix(".codemux-incoming-")
+        .make_in(parent, |p| options.open(p))?;
+    let (mut file, mut name) = empty.into_parts();
+    #[cfg(unix)]
+    let created = file.metadata()?;
+    #[cfg(windows)]
+    let created = file_id(&file)?;
+    let private = recovery.join("incoming");
+    move_noclobber(name.to_path_buf(), &private)?;
+    name.disable_cleanup(true);
+    // If another writer replaced the temporary name, give rollback the
+    // moved object until we know it is ours.
+    undo.push(Undo::RestoreFile(private.clone(), name.to_path_buf()));
+    #[cfg(unix)]
+    let same = {
+        let moved = fs::symlink_metadata(&private)?;
+        (moved.dev(), moved.ino()) == (created.dev(), created.ino())
+    };
+    #[cfg(windows)]
+    let same = {
+        let moved = fs::File::options()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&private)?;
+        file_id(&moved)? == created
+    };
+    if !same {
+        return Err(changed(&name));
+    }
+    undo.pop();
+    io::copy(&mut fs::File::open(prepared)?, &mut file)?;
+    drop(file);
+    fs::rename(private, prepared)
 }
 
 fn changed(path: &Path) -> io::Error {

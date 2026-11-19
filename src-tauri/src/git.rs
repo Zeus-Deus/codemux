@@ -7700,6 +7700,73 @@ exit 0
         assert_eq!(std::fs::read(recovery.join("tracked")).unwrap(), b"old\0data\0late save");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_inherits_nested_default_acl_like_git() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        let worktrees = TempDir::new().unwrap();
+        let native = worktrees.path().join("native");
+        let wt = worktrees.path().join("feature");
+        run_git(&repo, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]).unwrap();
+        run_git(&repo, &["worktree", "add", "--detach", native.to_str().unwrap()]).unwrap();
+        for root in [&repo, &native] {
+            let nested = root.join("nested");
+            std::fs::create_dir(&nested).unwrap();
+            let result = Command::new("setfacl").env("LC_ALL", "C").args(["-d", "-m", "u::rwx,u:65534:r-x,g::---,m::r-x,o::---"])
+                .arg(&nested).output();
+            let output = match result {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                result => result.unwrap(),
+            };
+            let error = String::from_utf8_lossy(&output.stderr);
+            if !output.status.success() && error.contains("Operation not supported") {
+                return;
+            }
+            assert!(output.status.success(), "{error}");
+        }
+
+        std::fs::create_dir_all(wt.join("nested/new-dir")).unwrap();
+        let paths = ["nested/plain", "nested/new-dir/executable"];
+        for path in paths {
+            std::fs::write(wt.join(path), b"incoming").unwrap();
+        }
+        run_git(&wt, &["add", "nested"]).unwrap();
+        run_git(&wt, &["update-index", "--chmod=+x", paths[1]]).unwrap();
+        run_git(&wt, &["commit", "-m", "add regular and executable files"]).unwrap();
+        let new = head_hash(&wt);
+        run_git(&native, &["merge", "--ff-only", &new]).unwrap();
+        // A ref refusal after installation must still recognize the installed
+        // files, whose permissions now differ from the original scratch files.
+        {
+            let (_, lock) = lock_checkout_index(&repo).unwrap();
+            let mut files = checkout::PreparedCheckout::new(&repo, &lock, &head_hash(&repo), &new).unwrap();
+            files.install(&repo, &lock).unwrap();
+            let error = files.rollback("simulated ref refusal".into());
+            assert!(!error.contains("Could not restore"), "{error}");
+            for path in paths {
+                assert!(!repo.join(path).exists(), "{path} remained after rollback");
+            }
+        }
+        fast_forward_checkout(&repo, main_branch(&repo), &new).unwrap();
+
+        let acl = |path: &Path| {
+            let out = Command::new("getfacl").env("LC_ALL", "C").args(["-cn"]).arg(path).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        for path in paths {
+            let expected = acl(&native.join(path));
+            assert!(expected.contains("user:65534:r-x") && expected.contains("other::---"), "{expected}");
+            assert_eq!(acl(&repo.join(path)), expected, "{path}");
+            assert_eq!(std::fs::metadata(repo.join(path)).unwrap().permissions().mode(),
+                       std::fs::metadata(native.join(path)).unwrap().permissions().mode(), "{path}");
+            assert_eq!(std::fs::read(repo.join(path)).unwrap(), b"incoming");
+        }
+    }
+
     // /dev/shm normally gives Linux CI a second writable filesystem without mounts.
     #[cfg(target_os = "linux")]
     #[test]
