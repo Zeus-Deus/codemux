@@ -54,10 +54,8 @@ fn identity(path: &Path) -> Result<String, String> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-        use windows_sys::Win32::Storage::FileSystem::{
-            FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO,
-        };
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
         // Windows can tunnel a replaced directory's creation time. Use the
         // volume and 128-bit file ID so replacement cannot inherit its identity.
@@ -68,26 +66,10 @@ fn identity(path: &Path) -> Result<String, String> {
             .map_err(|_| {
                 "unsupported: filesystem cannot identify profile replacement".to_string()
             })?;
-        let mut info = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
-        // SAFETY: the live directory handle and writable buffer are valid for
-        // this call. The buffer is read only after Windows reports success.
-        let success = unsafe {
-            GetFileInformationByHandleEx(
-                directory.as_raw_handle(),
-                FileIdInfo,
-                info.as_mut_ptr().cast(),
-                std::mem::size_of::<FILE_ID_INFO>() as u32,
-            )
-        };
-        if success == 0 {
-            return Err("unsupported: filesystem cannot identify profile replacement".into());
-        }
-        let info = unsafe { info.assume_init() };
-        Ok(format!(
-            "{}:{:032x}",
-            info.VolumeSerialNumber,
-            u128::from_le_bytes(info.FileId.Identifier)
-        ))
+        let (volume, id) = crate::windows_file_id::file_id(&directory).map_err(|_| {
+            "unsupported: filesystem cannot identify profile replacement".to_string()
+        })?;
+        Ok(format!("{volume}:{id:032x}"))
     }
     #[cfg(not(any(unix, windows)))]
     {
