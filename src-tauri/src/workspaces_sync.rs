@@ -1496,6 +1496,43 @@ mod tests {
 
     #[test]
     #[serial]
+    fn a_recovery_time_close_survives_a_pull_and_goes_up_with_the_push() {
+        let db = fresh_db();
+        // An already-synced copy, and an unrelated workspace missing from
+        // the fallback layout.
+        for (wid, sid) in [("ws-pull-closed", "srv-pull-closed"), ("ws-pull-missing", "srv-pull-missing")] {
+            let row = db.insert_workspace_sync(wid, "copy", None, None, None, None, None, None, None).unwrap();
+            db.mark_workspace_sync_synced(row.id, Some(sid)).unwrap();
+        }
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+        super::record_closed(&db, "ws-pull-closed").unwrap();
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+
+        // The pull: the server still lists both as live.
+        for sid in ["srv-pull-closed", "srv-pull-missing"] {
+            db.upsert_workspace_sync_from_server(
+                sid, "copy", None, None, None, None, None,
+                "2026-01-01 00:00:00", "2026-01-01 00:00:00", None, None, None,
+            )
+            .unwrap();
+        }
+
+        let dirty = db.list_dirty_workspaces_sync();
+        let closed = dirty.iter().find(|r| r.server_id.as_deref() == Some("srv-pull-closed"));
+        assert!(
+            closed.is_some_and(|r| r.deleted_at.is_some()),
+            "the close stays a dirty tombstone, so the push sends its DELETE"
+        );
+        assert!(
+            db.list_workspaces_sync().iter().any(|r| r.server_id.as_deref() == Some("srv-pull-missing")),
+            "the unrelated missing workspace stays live"
+        );
+        let _ = db.delete_ui_state_with_prefix(super::CLOSED_DURING_RECOVERY);
+    }
+
+    #[test]
+    #[serial]
     fn a_close_whose_save_failed_is_saved_on_a_later_tick_and_survives_a_restart() {
         let db = fresh_db();
         crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
