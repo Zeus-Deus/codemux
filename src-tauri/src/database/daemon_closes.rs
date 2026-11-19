@@ -1,4 +1,4 @@
-//! Local journal for exact terminal-shell closes that the daemon has not acknowledged.
+//! Local journal for terminal closes pending daemon acknowledgment or layout persistence.
 
 use super::DatabaseStore;
 use rusqlite::{params, Connection};
@@ -16,6 +16,7 @@ pub(crate) struct DaemonWorkspaceRoute {
 pub(crate) struct PendingDaemonClose {
     pub(crate) route: DaemonWorkspaceRoute,
     pub(crate) session_id: String,
+    // A nil UUID records a layout removal with no shell left to close.
     pub(crate) shell_id: Uuid,
 }
 
@@ -87,16 +88,26 @@ impl DatabaseStore {
         .collect()
     }
 
-    pub(crate) fn acknowledge_pending_daemon_close(
+    pub(crate) fn retire_completed_daemon_closes(
         &self,
-        pending: &PendingDaemonClose,
+        route: &DaemonWorkspaceRoute,
+        session_id: &str,
+        shell_ids: &[Uuid],
     ) -> Result<(), String> {
-        let route = serde_json::to_string(&pending.route).map_err(|error| error.to_string())?;
-        self.conn.lock().unwrap().execute(
-            "DELETE FROM pending_daemon_closes WHERE route = ?1 AND session_id = ?2 AND shell_id = ?3",
-            params![route, pending.session_id, pending.shell_id.as_bytes().as_slice()],
-        ).map_err(|error| error.to_string())?;
-        Ok(())
+        let route = serde_json::to_string(route).map_err(|error| error.to_string())?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        {
+            let mut delete = tx.prepare_cached(
+                "DELETE FROM pending_daemon_closes WHERE route = ?1 AND session_id = ?2 AND shell_id = ?3",
+            ).map_err(|error| error.to_string())?;
+            for shell_id in shell_ids {
+                delete
+                    .execute(params![route, session_id, shell_id.as_bytes().as_slice()])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 }
 
@@ -135,7 +146,8 @@ mod tests {
             assert_eq!(jobs.len(), 3);
             assert_eq!(jobs[0].route, route);
             assert_eq!(jobs[0].shell_id, first);
-            db.acknowledge_pending_daemon_close(&jobs[0]).unwrap();
+            db.retire_completed_daemon_closes(&route, "session", &[first])
+                .unwrap();
         }
 
         let db = DatabaseStore::test_file(&path);

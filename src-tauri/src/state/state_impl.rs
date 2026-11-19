@@ -129,7 +129,7 @@ impl PersistDebouncer {
 
 /// Schedule a persist for a mutation that produced no snapshot of its own —
 /// the store is cloned once, at flush time, off the mutating thread.
-fn schedule_persist_current<R: tauri::Runtime>(app: &AppHandle<R>) {
+pub(crate) fn schedule_persist_current<R: tauri::Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     persist_debouncer().schedule_pending(PendingPersist::Lazy(Box::new(move || {
         let state: State<'_, AppStateStore> = app.state();
@@ -161,6 +161,32 @@ pub fn flush_persisted_state(store: &AppStateStore) {
     if let Err(e) = save_persisted_state(&snapshot) {
         eprintln!("[codemux::state] Failed to persist layout state on close: {e}");
     }
+}
+
+/// Confirm the pane is absent and commit its removal before retiring a
+/// daemon close record. Coalesce any already queued save of this state.
+#[cfg(unix)]
+pub(crate) fn persist_terminal_close(
+    store: &AppStateStore,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let debouncer = persist_debouncer();
+    let _write_guard = debouncer.write_lock.lock().unwrap();
+    let pending = debouncer.last_snapshot.lock().unwrap().take();
+    let snapshot = store.snapshot();
+    let result = if terminal_pane_for_close_intent(&snapshot, workspace_id, session_id).is_some() {
+        Err("Terminal pane still exists in the layout".into())
+    } else {
+        save_persisted_state(&snapshot)
+    };
+    if result.is_err() {
+        let mut queued = debouncer.last_snapshot.lock().unwrap();
+        if queued.is_none() {
+            *queued = pending;
+        }
+    }
+    result
 }
 
 use crate::project::current_project_root;
@@ -6692,9 +6718,26 @@ fn emit_debouncer() -> &'static EmitDebouncer {
 }
 
 pub fn load_persisted_state() -> Option<AppStateSnapshot> {
-    let path = persisted_layout_path()?;
-    let contents = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    load_persisted_state_checked().ok().flatten()
+}
+
+/// A missing layout is normal on first launch. Other load errors mean the
+/// existing layout cannot be safely replaced by a fresh workspace snapshot.
+pub(crate) fn load_persisted_state_checked() -> Result<Option<AppStateSnapshot>, String> {
+    let path = persisted_layout_path().ok_or("No config directory for workspace layout")?;
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            && fs::symlink_metadata(&path).is_err_and(|metadata_error| {
+                metadata_error.kind() == std::io::ErrorKind::NotFound
+            }) => return Ok(None),
+        Err(error) => {
+            return Err(format!("Failed to read workspace layout at {}: {error}", path.display()));
+        }
+    };
+    serde_json::from_str(&contents).map(Some).map_err(|error| {
+        format!("Failed to decode workspace layout at {}: {error}", path.display())
+    })
 }
 
 /// Remove all browser panes and browser sessions from a snapshot.
@@ -6996,7 +7039,56 @@ pub fn restore_session_ids(snapshot: &AppStateSnapshot) {
         .max()
         .unwrap_or(0);
 
-    ID_COUNTER.store(max_id + 1, Ordering::Relaxed);
+    ID_COUNTER.fetch_max(max_id.saturating_add(1), Ordering::Relaxed);
+}
+
+/// A pending close still owns its IDs even after the pane leaves the layout.
+/// Reserve them before imports or restored workspaces allocate new IDs.
+#[cfg(unix)]
+pub(crate) fn reserve_pending_terminal_close_ids(
+    closes: &[crate::database::daemon_closes::PendingDaemonClose],
+) {
+    if let Some(max_id) = closes
+        .iter()
+        .flat_map(|close| [&close.route.workspace_id, &close.session_id])
+        .filter_map(|id| extract_numeric_suffix(id))
+        .max()
+    {
+        ID_COUNTER.fetch_max(max_id.saturating_add(1), Ordering::Relaxed);
+    }
+}
+
+#[cfg(unix)]
+fn terminal_pane_for_close_intent(
+    snapshot: &AppStateSnapshot,
+    workspace_id: &str,
+    session_id: &str,
+) -> Option<PaneId> {
+    snapshot.workspaces.iter()
+        .find(|workspace| workspace.workspace_id.0 == workspace_id)?
+        .surfaces.iter()
+        .find_map(|surface| find_terminal_pane_id(&surface.root, session_id))
+}
+
+/// A close intent can outlive the last saved layout. Apply it before any
+/// terminal hydration can reattach to the old shell or launch a replacement.
+#[cfg(unix)]
+pub(crate) fn restore_pending_terminal_closes(
+    store: &AppStateStore,
+    closes: &[crate::database::daemon_closes::PendingDaemonClose],
+) -> Result<bool, String> {
+    let mut removed = false;
+    for close in closes {
+        let pane_id = {
+            let snapshot = store.inner.lock().unwrap();
+            terminal_pane_for_close_intent(&snapshot, &close.route.workspace_id, &close.session_id)
+        };
+        if let Some(pane_id) = pane_id {
+            store.close_pane_with_selection(&pane_id.0, false)?;
+            removed = true;
+        }
+    }
+    Ok(removed)
 }
 
 fn default_app_state() -> AppStateSnapshot {

@@ -935,13 +935,30 @@ fn build_core_app<R: tauri::Runtime>(
             }
 
             let handle = app.handle().clone();
+            #[cfg(unix)]
+            let pending_terminal_closes = {
+                let db = handle.state::<database::DatabaseStore>();
+                let closes = db.pending_daemon_closes().map_err(std::io::Error::other)?;
+                state::reserve_pending_terminal_close_ids(&closes);
+                closes
+            };
             // Track whether the persisted layout actually loaded. The
             // Windows orphan-cleanup gate below uses this to skip the
             // destructive `cleanup_orphan_scrollbacks(&[])` call after
             // a force-close cascade. See `scrollback::should_run_orphan_cleanup`
             // for the full failure-mode write-up.
             let mut layout_loaded = false;
-            if let Some(snapshot) = state::load_persisted_state() {
+            #[cfg(unix)]
+            let restored_layout = if pending_terminal_closes.is_empty() {
+                state::load_persisted_state()
+            } else {
+                // Replay may write immediately after an ACK. Never replace an
+                // unreadable layout with fallback state during startup.
+                state::load_persisted_state_checked().map_err(std::io::Error::other)?
+            };
+            #[cfg(not(unix))]
+            let restored_layout = state::load_persisted_state();
+            if let Some(snapshot) = restored_layout {
                 let mut stripped = state::strip_removed_workspaces_from_snapshot(snapshot);
                 // The coalesced SQLite stream is authoritative for selection;
                 // layout.json remains authoritative for the pane/layout body.
@@ -981,12 +998,26 @@ fn build_core_app<R: tauri::Runtime>(
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.clear_workspaces();
             }
+            #[cfg(unix)]
+            if !layout_loaded && mode == AppMode::ServeHeadless && !pending_terminal_closes.is_empty() {
+                // The default state was built before reading the close journal.
+                // Allocate this launch's CWD pane above the reserved IDs.
+                handle.state::<state::AppStateStore>()
+                    .replace_snapshot(state::AppStateStore::default().snapshot());
+            }
             {
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 let db: tauri::State<'_, database::DatabaseStore> = handle.state();
                 if let Err(error) = state.recover_local_import_layout(&db).and_then(|ids| {
                     if ids.is_empty() {Ok(())} else {state.persist_local_import_layout(&db,&ids)}
                 }) {log::warn!("Local import layout recovery remains pending: {error}");}
+            }
+            #[cfg(unix)]
+            if state::restore_pending_terminal_closes(
+                &handle.state::<state::AppStateStore>(),
+                &pending_terminal_closes,
+            ).map_err(std::io::Error::other)? {
+                state::schedule_persist_current(&handle);
             }
             // Reconciliation checks canonical pane/workspace ownership. Starting
             // it before layout restore can incorrectly hold a saved child result.
@@ -1294,7 +1325,7 @@ fn build_core_app<R: tauri::Runtime>(
             let _ = claude_plugin::local_plugin_dir();
 
             #[cfg(unix)]
-            terminal::daemon_backed::resume_pending_daemon_closes(&handle);
+            terminal::daemon_backed::resume_pending_daemon_closes(&handle, pending_terminal_closes);
             terminal::spawn_missing_ptys(handle);
 
             // Warm up the PTY daemon connection. The daemon is now the

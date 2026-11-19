@@ -307,6 +307,9 @@ pub struct SessionRuntime {
     pub daemon_client: Option<Arc<crate::pty_daemon::PtyDaemonClient>>,
     #[cfg(unix)]
     daemon_shell_id: Option<Uuid>,
+    /// Route captured from the daemon that installed this guarded shell.
+    #[cfg(unix)]
+    daemon_route: Option<DaemonWorkspaceRoute>,
 }
 
 #[cfg(unix)]
@@ -406,6 +409,8 @@ impl SessionRuntime {
             daemon_client: None,
             #[cfg(unix)]
             daemon_shell_id: None,
+            #[cfg(unix)]
+            daemon_route: None,
         }
     }
 
@@ -630,20 +635,25 @@ impl SessionSpawnReservation {
         #[cfg(unix)]
         let reconciliation = current.and_then(|runtime| {
             runtime.daemon_reconciliation.clone().or_else(|| {
-                let (workspace, configured_target) = workspace.filter(|_| runtime.persistent)?;
-                let (host_id, ssh_target) = match runtime.daemon_client.as_ref() {
-                    Some(client) => {
-                        let target = client.ssh_target().map(str::to_owned);
-                        (workspace.host_id.filter(|_| target.is_some()), target)
-                    }
-                    None => (workspace.host_id, configured_target),
-                };
-                Some(Arc::new(DaemonReconciliation::new(
+                let route = if let Some(route) = &runtime.daemon_route {
+                    route.clone()
+                } else {
+                    let (workspace, configured_target) = workspace.filter(|_| runtime.persistent)?;
+                    let (host_id, ssh_target) = match runtime.daemon_client.as_ref() {
+                        Some(client) => {
+                            let target = client.ssh_target().map(str::to_owned);
+                            (workspace.host_id.filter(|_| target.is_some()), target)
+                        }
+                        None => (workspace.host_id, configured_target),
+                    };
                     DaemonWorkspaceRoute {
                         workspace_id: workspace.workspace_id.clone(),
                         host_id,
                         ssh_target,
-                    },
+                    }
+                };
+                Some(Arc::new(DaemonReconciliation::new(
+                    route,
                     runtime.daemon_shell_id,
                     runtime.daemon_client.clone(),
                 )))
@@ -2040,6 +2050,7 @@ async fn handle_daemon_spawn_failure<R: Runtime>(
                 runtime.resume_command = None;
                 runtime.daemon_client = None;
                 runtime.daemon_shell_id = None;
+                runtime.daemon_route = None;
             },
         );
         emit_terminal_status(
@@ -2744,8 +2755,9 @@ fn terminate_pty_session<R: Runtime>(
 }
 
 /// Take ownership of runtime teardown and record any guarded close while
-/// the spawn reservation is still visible. The caller can release the
-/// layout writer lock before terminating the process.
+/// the runtime is still visible. Guarded closes belong to the retry worker.
+/// The caller can release the layout writer lock before terminating any
+/// remaining runtime.
 pub(crate) fn take_terminal_session_for_close<R: Runtime>(
     app: &AppHandle<R>,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
@@ -2757,12 +2769,23 @@ pub(crate) fn take_terminal_session_for_close<R: Runtime>(
             let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
             let cleanup = sessions
                 .get(session_id)
-                .and_then(|runtime| runtime.daemon_reconciliation.as_ref())
-                .map(|recovery| daemon_backed::prepare_closed_pane_cleanup(app, session_id, recovery));
+                .and_then(|runtime| {
+                    runtime.daemon_reconciliation.clone().or_else(|| {
+                        let route = runtime.daemon_route.clone()?;
+                        let shell_id = runtime.daemon_shell_id?;
+                        Some(Arc::new(DaemonReconciliation::new(
+                            route,
+                            Some(shell_id),
+                            runtime.daemon_client.clone(),
+                        )))
+                    })
+                })
+                .map(|recovery| daemon_backed::prepare_closed_pane_cleanup(app, session_id, &recovery));
             (sessions.remove(session_id), cleanup)
         };
         if let Some(cleanup) = cleanup {
             daemon_backed::queue_closed_pane_cleanup(app.clone(), cleanup);
+            return None;
         }
         runtime
     };
@@ -2940,6 +2963,7 @@ pub(crate) fn terminate_pty_session_keep_channel(
         }
         let daemon_client = rt.daemon_client.take();
         let shell_id = rt.daemon_shell_id.take();
+        rt.daemon_route = None;
         rt.child_pid = None;
         rt.writer = None;
         rt.daemon_writer = None;
@@ -6567,6 +6591,109 @@ mod tests {
     }
 
     #[cfg(unix)]
+    const INSTALLED_CLOSE_DB: &str = "installed-close.sqlite";
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_replacement_close_replays_after_daemon_disconnect_and_relaunch() {
+        const TEST: &str = "terminal::tests::installed_replacement_close_replays_after_daemon_disconnect_and_relaunch";
+        const CLOSING_PROCESS: &str = "CODEMUX_TEST_INSTALLED_CLOSE_PROCESS";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        if std::env::var_os(CLOSING_PROCESS).is_some() {
+            assert_daemon_reconnect(ReconnectCase::InstalledCloseAfterDisconnect);
+            return;
+        }
+
+        // The first app's cleanup worker must be gone before the new app
+        // has a chance to access the recovered daemon.
+        let closing = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CLOSING_PROCESS, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&closing.stdout);
+        assert!(
+            closing.status.success() && stdout.contains("1 passed"),
+            "closing app: {stdout}\n{}",
+            String::from_utf8_lossy(&closing.stderr)
+        );
+        tauri::async_runtime::block_on(assert_installed_close_replays());
+    }
+
+    #[cfg(unix)]
+    async fn assert_installed_close_replays() {
+        use crate::database::DatabaseStore;
+        use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
+        use crate::pty_daemon::protocol::{ClientRequest, ServerResponse, PROTOCOL_VERSION};
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::net::UnixListener;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let root = crate::test_isolation::isolated_root().unwrap();
+            let db = DatabaseStore::test_file(&root.join(INSTALLED_CLOSE_DB));
+            let jobs = db.pending_daemon_closes().unwrap();
+            assert_eq!(jobs.len(), 1, "the installed shell's close must survive relaunch");
+            let job = jobs[0].clone();
+            let state = AppStateStore::default();
+            state.replace_snapshot(crate::state::load_persisted_state().unwrap());
+            assert!(state.pty_hydration_plan_for_session(&job.session_id).is_none());
+            let app = tauri::test::mock_app();
+            app.manage(PtyState::default());
+            app.manage(state);
+            app.manage(db);
+
+            let socket_path = root.join("recovered-daemon.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let daemon_pid = std::process::id();
+            let version = env!("CARGO_PKG_VERSION").to_string();
+            write_manifest(&DaemonManifest {
+                pid: daemon_pid,
+                socket_path,
+                daemon_version: version.clone(),
+                protocol_version: PROTOCOL_VERSION,
+                started_at: 0,
+            }).unwrap();
+            let daemon = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let (read, mut write) = socket.into_split();
+                let mut lines = BufReader::new(read).lines();
+                let hello = lines.next_line().await.unwrap().unwrap();
+                let ClientRequest::Hello { request_id } = serde_json::from_str(&hello).unwrap() else {
+                    panic!("expected the recovered daemon handshake: {hello}");
+                };
+                send_daemon_fixture_response(&mut write, ServerResponse::Hello {
+                    request_id,
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_pid,
+                    daemon_version: version,
+                    host_claude_plugin: false,
+                    guarded_shells: true,
+                    prepared_spawn: true,
+                }).await;
+                let close = lines.next_line().await.unwrap().unwrap();
+                let ClientRequest::CloseOwned { request_id, session_id, shell_id } =
+                    serde_json::from_str(&close).unwrap()
+                else {
+                    panic!("expected the installed replacement's guarded close: {close}");
+                };
+                assert_eq!(session_id, job.session_id);
+                assert_eq!(shell_id, job.shell_id);
+                send_daemon_fixture_response(&mut write, ServerResponse::Closed {
+                    request_id,
+                    attachment_id: None,
+                }).await;
+            });
+            daemon_backed::resume_pending_daemon_closes(app.handle(), jobs);
+            daemon.await.unwrap();
+            while !app.state::<DatabaseStore>().pending_daemon_closes().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the installed replacement's close should replay after relaunch");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn restart_guard_retains_the_first_spawn_identity_when_retry_conflicts() {
         const TEST: &str = "terminal::tests::restart_guard_retains_the_first_spawn_identity_when_retry_conflicts";
@@ -6633,12 +6760,25 @@ mod tests {
         CloseOnAttach,
         CloseOnSpawn,
         SuccessfulRestartCloseOnSpawn,
+        InstalledCloseAfterDisconnect,
         CloseAfterSpawnRetry,
         CloseOnOldConnection,
         CloseOnListDisconnect,
         CloseAfterAttachDisconnect,
         LegacyClose,
         LegacyOpen,
+    }
+
+    #[cfg(unix)]
+    async fn send_daemon_fixture_response(
+        write: &mut tokio::net::unix::OwnedWriteHalf,
+        response: crate::pty_daemon::protocol::ServerResponse,
+    ) {
+        use crate::pty_daemon::protocol::Frame;
+        use tokio::io::AsyncWriteExt;
+        let mut frame = serde_json::to_vec(&Frame::Response(response)).unwrap();
+        frame.push(b'\n');
+        write.write_all(&frame).await.unwrap();
     }
 
     #[cfg(unix)]
@@ -6661,10 +6801,16 @@ mod tests {
                     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
                     use tokio::net::{UnixListener, UnixStream};
 
+                    let installed_outage = case == ReconnectCase::InstalledCloseAfterDisconnect;
+                    let acknowledged_old_close = installed_outage || case == ReconnectCase::SuccessfulRestartCloseOnSpawn;
                     let app = tauri::test::mock_app();
                     app.manage(PtyState::default());
                     app.manage(AppStateStore::default());
-                    app.manage(crate::database::DatabaseStore::new_in_memory());
+                    app.manage(if installed_outage {
+                        crate::database::DatabaseStore::test_file(&root.join(INSTALLED_CLOSE_DB))
+                    } else {
+                        crate::database::DatabaseStore::new_in_memory()
+                    });
                     let layout_state = app.state::<AppStateStore>();
                     let id = layout_state.active_terminal_session_id().unwrap().0;
                     let workspace_id = layout_state.snapshot().active_workspace_id.0;
@@ -6688,9 +6834,7 @@ mod tests {
                     let (old_stream, old_peer) = UnixStream::pair().unwrap();
                     let old = PtyDaemonClient::from_test_stream(old_stream, Duration::from_secs(1));
                     let (finish_old, old_finished) = tokio::sync::oneshot::channel();
-                    let old_daemon = if matches!(case,
-                        ReconnectCase::CloseOnOldConnection | ReconnectCase::SuccessfulRestartCloseOnSpawn
-                    ) {
+                    let old_daemon = if acknowledged_old_close || case == ReconnectCase::CloseOnOldConnection {
                         let close_pane = close_pane.clone();
                         let version = version.clone();
                         let old_id = id.clone();
@@ -6722,11 +6866,9 @@ mod tests {
                             };
                             assert_eq!(session_id, old_id);
                             assert_eq!(shell_id, survivor_shell_id);
-                            if case == ReconnectCase::SuccessfulRestartCloseOnSpawn {
+                            if acknowledged_old_close {
                                 let closed = ServerResponse::Closed { request_id, attachment_id: None };
-                                let mut frame = serde_json::to_vec(&Frame::Response(closed)).unwrap();
-                                frame.push(b'\n');
-                                write.write_all(&frame).await.unwrap();
+                                send_daemon_fixture_response(&mut write, closed).await;
                                 // A successful close here must take the ordinary
                                 // restart path, with the original socket still healthy.
                                 let _ = old_finished.await;
@@ -6781,6 +6923,7 @@ mod tests {
 
                     let surviving_id = id.clone();
                     let (finish, finished) = tokio::sync::oneshot::channel();
+                    let (disconnect, disconnect_requested) = tokio::sync::oneshot::channel();
                     let (cleanup_ack, cleanup_observed) = tokio::sync::oneshot::channel();
                     let closes_on_new_connection = matches!(
                         case,
@@ -6797,6 +6940,9 @@ mod tests {
                             ReconnectCase::CloseOnAttach => &["hello", "list", "attach", "close"],
                             ReconnectCase::CloseOnSpawn | ReconnectCase::SuccessfulRestartCloseOnSpawn => {
                                 &["hello", "list", "prepare", "spawn", "close"]
+                            }
+                            ReconnectCase::InstalledCloseAfterDisconnect => {
+                                &["hello", "list", "prepare", "spawn", "attach"]
                             }
                             ReconnectCase::CloseAfterSpawnRetry => &[
                                 "hello", "list", "prepare", "spawn_disconnect", "reconnect",
@@ -6840,7 +6986,7 @@ mod tests {
                                     if case == ReconnectCase::LegacyClose {
                                         daemon_close_pane(surviving_id.clone());
                                     }
-                                    let sessions = (!matches!(case,
+                                    let sessions = (!installed_outage && !matches!(case,
                                         ReconnectCase::CloseOnSpawn | ReconnectCase::CloseAfterAttachDisconnect
                                             | ReconnectCase::SuccessfulRestartCloseOnSpawn
                                             | ReconnectCase::CloseAfterSpawnRetry
@@ -6914,9 +7060,17 @@ mod tests {
                                 }
                                 (step, request) => panic!("expected {step}, received {request:?}"),
                             };
-                            let mut frame = serde_json::to_vec(&Frame::Response(response)).unwrap();
-                            frame.push(b'\n');
-                            write.write_all(&frame).await.unwrap();
+                            send_daemon_fixture_response(&mut write, response).await;
+                        }
+                        if installed_outage {
+                            disconnect_requested.await.unwrap();
+                            drop(lines);
+                            drop(write);
+                            // Keep the endpoint bound but give the first app no
+                            // way to complete a reconnect during the outage.
+                            finished.await.unwrap();
+                            drop(listener);
+                            return;
                         }
                         if closes_on_new_connection {
                             cleanup_ack.send(()).unwrap();
@@ -6944,7 +7098,39 @@ mod tests {
                         id.clone(),
                         Some(old_token.to_string()),
                     ).await.unwrap();
-                    assert_eq!(restarted, case == ReconnectCase::SuccessfulRestartCloseOnSpawn);
+                    assert_eq!(restarted, acknowledged_old_close);
+                    if installed_outage {
+                        let (shell_id, client) = loop {
+                            let ready = with_existing_session_runtime(&pty_state.sessions, &id, |runtime| {
+                                matches!(runtime.last_status.state, TerminalLifecycleState::Ready).then(|| {
+                                    assert!(runtime.persistent);
+                                    assert!(runtime.daemon_reconciliation.is_none());
+                                    (runtime.daemon_shell_id.unwrap(), runtime.daemon_client.clone().unwrap())
+                                })
+                            }).flatten();
+                            if let Some(ready) = ready {
+                                break ready;
+                            }
+                            tokio::task::yield_now().await;
+                        };
+                        assert_ne!(shell_id, survivor_shell_id);
+                        disconnect.send(()).unwrap();
+                        while !client.is_closed() {
+                            tokio::task::yield_now().await;
+                        }
+                        close_pane(id.clone());
+                        let db = app.state::<crate::database::DatabaseStore>();
+                        let jobs = db.pending_daemon_closes().unwrap();
+                        assert_eq!(jobs.len(), 1, "closing the installed shell must record its UUID");
+                        assert_eq!(jobs[0].session_id, id);
+                        assert_eq!(jobs[0].shell_id, shell_id);
+                        assert_eq!(jobs[0].route, DaemonWorkspaceRoute {
+                            workspace_id: layout_state.snapshot().active_workspace_id.0,
+                            host_id: None,
+                            ssh_target: None,
+                        });
+                        state::flush_persisted_state(&layout_state);
+                    }
                     if case == ReconnectCase::CloseAfterSpawnRetry {
                         let retry_token = with_existing_session_runtime(&pty_state.sessions, &id, |runtime| {
                             assert!(matches!(runtime.last_status.state, TerminalLifecycleState::Failed));
@@ -6984,7 +7170,7 @@ mod tests {
                     }).is_some();
                     assert_eq!(runtime_exists, !closes);
                     if let Some(old_daemon) = old_daemon {
-                        if case == ReconnectCase::SuccessfulRestartCloseOnSpawn {
+                        if acknowledged_old_close {
                             finish_old.send(()).unwrap();
                         }
                         old_daemon.await.unwrap();
