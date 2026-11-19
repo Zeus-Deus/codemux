@@ -19,22 +19,11 @@ use axum::{
 };
 use serde_json::json;
 use tauri::{AppHandle, Runtime};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::Semaphore;
+
+use crate::web_remote::ListenerLife;
 
 use super::webhook::{DeliveryRejection, WebhookRequest, MAX_WEBHOOK_BODY_BYTES};
-
-/// The shutdown flag of the listener that serves a request, attached by
-/// `web_remote::start_server`. `true` once that listener is stopped or
-/// replaced; graceful shutdown still lets in-flight requests finish, and
-/// those must not start runs.
-#[derive(Clone)]
-pub struct ListenerLife(pub watch::Receiver<bool>);
-
-impl ListenerLife {
-    fn live(&self) -> bool {
-        !*self.0.borrow()
-    }
-}
 
 /// Requests one listener handles at once, from reading the body through
 /// validation. Extra requests are refused before their bodies are read, so
@@ -212,6 +201,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tauri::Manager;
+    use tokio::sync::watch;
     use tower::ServiceExt;
 
     struct Harness {

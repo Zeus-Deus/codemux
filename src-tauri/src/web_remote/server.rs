@@ -210,14 +210,15 @@ pub enum Transport {
 struct ConnInfo {
     session_id: String,
     transport: Transport,
-    out: OutboundTx,
+    /// Present for control transports. Browser streams own their own writer.
+    out: Option<OutboundTx>,
     /// Set `true` to force this socket closed (revocation / keepalive death /
     /// outbound overflow).
     close: watch::Sender<bool>,
 }
 
-/// Tracks every open WebSocket so a revoked session's sockets can be
-/// dropped immediately and the UI can show live-connection state.
+/// Tracks control connections and browser streams so revocation can close
+/// both. Connection status and control authority count only the former.
 #[derive(Default)]
 pub struct ConnectionRegistry {
     conns: Mutex<HashMap<u64, ConnInfo>>,
@@ -236,6 +237,24 @@ impl ConnectionRegistry {
         session_id: &str,
         transport: Transport,
         out: OutboundTx,
+        close: watch::Sender<bool>,
+    ) -> u64 {
+        self.register_connection(session_id, transport, Some(out), close)
+    }
+
+    pub(super) fn register_browser_proxy(
+        &self,
+        session_id: &str,
+        close: watch::Sender<bool>,
+    ) -> u64 {
+        self.register_connection(session_id, Transport::Lan, None, close)
+    }
+
+    fn register_connection(
+        &self,
+        session_id: &str,
+        transport: Transport,
+        out: Option<OutboundTx>,
         close: watch::Sender<bool>,
     ) -> u64 {
         let id = self.next.fetch_add(1, Ordering::SeqCst);
@@ -280,35 +299,38 @@ impl ConnectionRegistry {
     }
 
     pub(super) fn session_for_connection(&self, id: u64) -> Option<String> {
-        self.conns.lock().unwrap().get(&id).map(|c| c.session_id.clone())
+        self.conns
+            .lock()
+            .unwrap()
+            .get(&id)
+            .filter(|c| c.out.is_some())
+            .map(|c| c.session_id.clone())
     }
 
-    /// Number of live sockets.
+    /// Number of live control connections.
     pub fn active_count(&self) -> usize {
-        self.conns.lock().unwrap().len()
+        self.conns
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|c| c.out.is_some())
+            .count()
     }
 
-    /// Whether a session currently has at least one live socket.
+    /// Whether a session currently has at least one live control connection.
     pub fn session_live(&self, session_id: &str) -> bool {
         self.conns
             .lock()
             .unwrap()
             .values()
-            .any(|c| c.session_id == session_id)
+            .any(|c| c.session_id == session_id && c.out.is_some())
     }
 
     /// Force every socket for a session closed. Returns the count closed.
-    /// Sends a Close frame to the client and trips the connection's close
-    /// signal so its read loop unwinds and releases its channels/events.
+    /// Trips the connection's close signal and queues a Close frame for
+    /// control connections, whose readers then release their subscriptions.
     pub fn close_session(&self, session_id: &str) -> usize {
-        let conns = self.conns.lock().unwrap();
-        let mut closed = 0;
-        for c in conns.values().filter(|c| c.session_id == session_id) {
-            let _ = c.out.send(Message::Close(None));
-            let _ = c.close.send(true);
-            closed += 1;
-        }
-        closed
+        self.close_matching(|c| c.session_id == session_id)
     }
 
     /// Force *every* live socket closed. Used when the whole server is
@@ -316,24 +338,25 @@ impl ConnectionRegistry {
     /// connected loses control immediately — turning the master switch off is
     /// a security action, and graceful shutdown alone would let existing
     /// WebSockets linger indefinitely (they never close on their own). Same
-    /// mechanism as [`close_session`]: frame a Close and trip each close signal.
+    /// mechanism as [`close_session`].
     pub fn close_all(&self) -> usize {
-        let conns = self.conns.lock().unwrap();
-        for c in conns.values() {
-            let _ = c.out.send(Message::Close(None));
-            let _ = c.close.send(true);
-        }
-        conns.len()
+        self.close_matching(|_| true)
     }
 
     /// Force every socket that arrived over `transport` closed, leaving the
     /// other transport's sockets alone. Used when one way in is turned off or
     /// the LAN listener rebinds to a new port/scope.
     pub fn close_transport(&self, transport: Transport) -> usize {
+        self.close_matching(|c| c.transport == transport)
+    }
+
+    fn close_matching(&self, matches: impl Fn(&ConnInfo) -> bool) -> usize {
         let conns = self.conns.lock().unwrap();
         let mut closed = 0;
-        for c in conns.values().filter(|c| c.transport == transport) {
-            let _ = c.out.send(Message::Close(None));
+        for c in conns.values().filter(|c| matches(c)) {
+            if let Some(out) = &c.out {
+                let _ = out.send(Message::Close(None));
+            }
             let _ = c.close.send(true);
             closed += 1;
         }
@@ -689,12 +712,7 @@ async fn ws_upgrade<R: Runtime>(
 
     // Re-validate at upgrade time: the session may have been revoked (or
     // its approval withdrawn) in the 30s the ticket was valid.
-    let still_valid = app
-        .state::<crate::database::DatabaseStore>()
-        .web_remote_get_session(&session_id)
-        .map(|s| !s.revoked && s.approved)
-        .unwrap_or(false);
-    if !still_valid {
+    if !session_active(&app, &session_id) {
         return (StatusCode::FORBIDDEN, "session not active").into_response();
     }
 
@@ -703,6 +721,12 @@ async fn ws_upgrade<R: Runtime>(
         let plaintext = !super::endpoints::is_local_peer(peer.ip());
         handle_socket(app_for_socket, session_id, socket, compress_frames, plaintext)
     })
+}
+
+pub(super) fn session_active<R: Runtime>(app: &AppHandle<R>, session_id: &str) -> bool {
+    app.state::<crate::database::DatabaseStore>()
+        .web_remote_get_session(session_id)
+        .is_some_and(|s| !s.revoked && s.approved)
 }
 
 /// Serve a frontend asset. Missing route-looking paths fall back to
@@ -1200,6 +1224,36 @@ mod tests {
 
         assert_eq!(reg.close_transport(Transport::Relay), 1);
         assert!(matches!(rx_relay.try_recv(), Ok(Message::Close(_))));
+    }
+
+    #[test]
+    fn browser_proxy_connections_follow_session_and_lan_lifecycles() {
+        let registry = ConnectionRegistry::default();
+        let (close_phone, phone_closed) = watch::channel(false);
+        let (close_tablet, tablet_closed) = watch::channel(false);
+        let phone = registry.register_browser_proxy("phone", close_phone);
+        let tablet = registry.register_browser_proxy("tablet", close_tablet);
+        let (out_relay, _relay_out) = test_outbound();
+        let (close_relay, relay_closed) = watch::channel(false);
+        registry.register("relay", Transport::Relay, out_relay, close_relay);
+
+        // A browser stream alone does not grant control-connection authority
+        // or inflate the connection count for a device with multiple panes.
+        assert_eq!(registry.active_count(), 1);
+        assert!(!registry.session_live("phone"));
+        assert!(registry.session_for_connection(phone).is_none());
+
+        assert_eq!(registry.close_session("phone"), 1);
+        assert!(*phone_closed.borrow());
+        assert!(!*tablet_closed.borrow());
+        registry.unregister(phone);
+
+        assert_eq!(registry.close_transport(Transport::Lan), 1);
+        assert!(*tablet_closed.borrow());
+        assert!(!*relay_closed.borrow());
+        registry.unregister(tablet);
+        assert_eq!(registry.close_all(), 1);
+        assert!(*relay_closed.borrow());
     }
 
     // ── Session gate (backs the assets + proxy route auth) ──────────
