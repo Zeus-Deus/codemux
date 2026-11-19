@@ -2246,8 +2246,25 @@ impl DatabaseStore {
         pushed: &WorkspaceSyncRecord,
         server_id: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to mark workspace sync row pushed: {e}"))?;
+        // The server can answer an upload with the id of a row it already
+        // had (it matches workspaces by identity), and a pull may already
+        // have mirrored that row here, unadopted, after an earlier answer
+        // was lost. That mirror is this row's own server copy: it gives way,
+        // so this row — with its local workspace and any newer edits — takes
+        // the id. A mirror adopted by a local workspace is left alone.
+        if let Some(sid) = server_id {
+            tx.execute(
+                "DELETE FROM workspaces_sync
+                 WHERE user_id = 'local' AND server_id = ?1 AND id != ?2 AND workspace_id IS NULL",
+                params![sid, pushed.id],
+            )
+            .map_err(|e| format!("Failed to merge the server's copy of a workspace: {e}"))?;
+        }
+        tx.execute(
             "UPDATE workspaces_sync
              SET server_id = COALESCE(?1, server_id),
                  dirty = CASE
@@ -2272,6 +2289,7 @@ impl DatabaseStore {
             ],
         )
         .map_err(|e| format!("Failed to mark workspace sync row pushed: {e}"))?;
+        tx.commit().map_err(|e| format!("Failed to mark workspace sync row pushed: {e}"))?;
         Ok(())
     }
 
