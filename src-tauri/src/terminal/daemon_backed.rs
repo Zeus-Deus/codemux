@@ -1850,7 +1850,7 @@ impl CommittedDaemonClose {
     pub(super) fn finish<R: Runtime>(self, app: &AppHandle<R>) {
         // Archive becomes visible after the shared close finishes.
         if !matches!(&self.intent, LayoutCloseIntent::Archive(_)) {
-            persist_pending_layout_closes(app, vec![self.intent]);
+            crate::state::persist_pending_layout_closes(app, vec![self.intent]);
         }
         for request in self.requests {
             queue_closed_pane_cleanup(app.clone(), request);
@@ -1887,23 +1887,6 @@ pub(super) fn commit_layout_close(
         }
     }
     Ok(CommittedDaemonClose { intent, requests, restored })
-}
-
-pub(crate) fn persist_pending_layout_closes<R: Runtime>(
-    app: &AppHandle<R>,
-    intents: Vec<LayoutCloseIntent>,
-) {
-    if intents.is_empty() {
-        return;
-    }
-    let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = app.state::<AppStateStore>();
-        let db = app.state::<DatabaseStore>();
-        if let Err(error) = crate::state::persist_layout_closes(&store, &db, &intents) {
-            log::error!("Could not persist pending layout closes: {error}");
-        }
-    });
 }
 
 pub(super) fn queue_closed_pane_cleanup<R: Runtime>(app: AppHandle<R>, request: PreparedDaemonClose) {
@@ -2336,7 +2319,7 @@ mod tests {
             }).unwrap();
         });
         writer_locked.recv_timeout(Duration::from_secs(5)).unwrap();
-        super::persist_pending_layout_closes(relaunched.handle(), intents);
+        crate::state::persist_pending_layout_closes(relaunched.handle(), intents);
         super::resume_pending_daemon_closes(relaunched.handle(), jobs);
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), seen.recv()).await.unwrap(), Some(shell_ids[0]));
         allow_ack.send(()).await.unwrap();

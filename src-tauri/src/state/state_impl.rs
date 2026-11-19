@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -231,8 +231,24 @@ pub(crate) fn finish_layout_persistence(store: &AppStateStore) -> Result<(), Str
     save_persisted_state(&store.snapshot())
 }
 
+pub(crate) fn persist_pending_layout_closes<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    intents: Vec<LayoutCloseIntent>,
+) {
+    if intents.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = app.state::<AppStateStore>();
+        let db = app.state::<crate::database::DatabaseStore>();
+        if let Err(error) = persist_layout_closes(&store, &db, &intents) {
+            log::error!("Could not persist pending layout closes: {error}");
+        }
+    });
+}
+
 /// Commit the full removal before retiring its durable intent.
-#[cfg(unix)]
 pub(crate) fn persist_layout_closes(
     store: &AppStateStore,
     db: &crate::database::DatabaseStore,
@@ -298,7 +314,11 @@ pub(crate) fn persist_terminal_replacements(
     if layout_recovery_pending() {
         return Ok(());
     }
+    let retained = retained_layouts();
     for replacement in replacements {
+        if retained.protects_session(&replacement.workspace_id, &replacement.old_session_id) {
+            continue;
+        }
         db.retire_terminal_replacement(
             &replacement.workspace_id,
             &replacement.old_session_id,
@@ -4649,38 +4669,39 @@ impl AppStateStore {
     }
 
     #[cfg(unix)]
-    pub(crate) fn terminal_session_owners(&self) -> std::collections::HashSet<(String, String)> {
+    pub(crate) fn terminal_session_owners(
+        &self,
+        replacements: &[crate::database::daemon_closes::PendingTerminalReplacement],
+    ) -> HashSet<(String, String)> {
         let snapshot = self.inner.lock().unwrap();
-        snapshot.workspaces.iter().flat_map(|workspace| {
+        let mut owners: HashSet<_> = snapshot.workspaces.iter().flat_map(|workspace| {
             collect_terminal_sessions(&workspace.surfaces).into_iter()
                 .map(|session_id| (workspace.workspace_id.0.clone(), session_id))
-        }).collect()
+        }).collect();
+        let retained = retained_layouts();
+        for (workspace, sessions) in &retained.workspaces {
+            owners.extend(sessions.iter().map(|session| (workspace.clone(), session.clone())));
+        }
+        // A retained pane may still name the predecessor of a shell already
+        // running under its durable successor ID.
+        for replacement in replacements {
+            if retained.protects_session(&replacement.workspace_id, &replacement.old_session_id) {
+                owners.insert((replacement.workspace_id.clone(), replacement.replacement_session_id()));
+            }
+        }
+        owners
     }
 
     #[cfg(unix)]
     pub(crate) fn orphaned_daemon_shells(
         &self,
         shells: Vec<crate::database::daemon_closes::PendingDaemonClose>,
+        replacements: &[crate::database::daemon_closes::PendingTerminalReplacement],
     ) -> Vec<crate::database::daemon_closes::PendingDaemonClose> {
-        let snapshot = self.inner.lock().unwrap();
-        let sessions_by_workspace: std::collections::HashMap<_, _> = snapshot
-            .workspaces
-            .iter()
-            .map(|workspace| {
-                (
-                    workspace.workspace_id.0.as_str(),
-                    collect_terminal_sessions(&workspace.surfaces),
-                )
-            })
-            .collect();
-        shells
-            .into_iter()
-            .filter(|shell| {
-                sessions_by_workspace
-                    .get(shell.route.workspace_id.as_str())
-                    .is_none_or(|sessions| !sessions.contains(&shell.session_id))
-            })
-            .collect()
+        let owners = self.terminal_session_owners(replacements);
+        shells.into_iter().filter(|shell|
+            !owners.contains(&(shell.route.workspace_id.clone(), shell.session_id.clone()))
+        ).collect()
     }
 
     pub fn active_workspace_cwd(&self) -> Option<(String, String)> {
@@ -7034,6 +7055,72 @@ pub enum PersistedLayout {
 static RECOVERY_SAVE_BASE: Mutex<Option<String>> = Mutex::new(None);
 static LAYOUT_SAVES_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// A saved recovery layout remains restorable across ordinary primary saves.
+/// Pin its resource IDs at startup; deleting the copy while stopped releases
+/// them on the next boot. Older recovery-saved files use the same naming scheme.
+#[derive(Default)]
+pub(crate) struct RetainedLayouts {
+    workspaces: HashMap<String, HashSet<String>>,
+    pub(crate) unreadable: bool,
+}
+
+impl RetainedLayouts {
+    fn read(path: &Path) -> Self {
+        let mut retained = Self::default();
+        let Some(name) = path.file_name() else { return Self { unreadable: true, ..retained } };
+        let prefix = format!("{}.recovery-saved-", name.to_string_lossy());
+        let directory = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return retained,
+            Err(_) => return Self { unreadable: true, ..retained },
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { retained.unreadable = true; continue };
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|n| n.strip_prefix(&prefix)).and_then(|n| n.strip_suffix(".json")) else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(id).is_err() { continue; }
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                retained.unreadable = true;
+                continue;
+            }
+            match read_layout::<AppStateSnapshot>(&entry.path()) {
+                Ok(Some((snapshot, _))) => {
+                    for workspace in snapshot.workspaces {
+                        retained.workspaces.entry(workspace.workspace_id.0).or_default()
+                            .extend(collect_terminal_sessions(&workspace.surfaces));
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => retained.unreadable = true,
+            }
+        }
+        retained
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.unreadable && self.workspaces.is_empty()
+    }
+
+    pub(crate) fn protects(&self, workspace_id: &str) -> bool {
+        self.unreadable || self.workspaces.contains_key(workspace_id)
+    }
+
+    #[cfg(unix)]
+    fn protects_session(&self, workspace: &str, session: &str) -> bool {
+        self.unreadable || self.workspaces.get(workspace).is_some_and(|sessions| sessions.contains(session))
+    }
+}
+
+static RETAINED_LAYOUTS: std::sync::LazyLock<Mutex<Arc<RetainedLayouts>>> =
+    std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn retained_layouts() -> Arc<RetainedLayouts> {
+    RETAINED_LAYOUTS.lock().unwrap().clone()
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test overrides for the two process-wide flags, per test thread.
@@ -7065,6 +7152,10 @@ fn layout_saves_blocked() -> bool {
 }
 
 pub fn load_persisted_layout() -> PersistedLayout {
+    // MoveFileExW can reject replacement even during a brief read of the old
+    // destination. Serialize in-process readers with ordinary and deferred saves.
+    #[cfg(windows)]
+    let _read_guard = persist_debouncer().write_lock.lock().unwrap();
     let Some(path) = persisted_layout_path() else {
         return PersistedLayout::Missing;
     };
@@ -7089,6 +7180,7 @@ pub(crate) fn load_persisted_state_checked() -> Result<Option<AppStateSnapshot>,
     let (snapshot, base) = open_layout(&path).inspect_err(|_| {
         LAYOUT_SAVES_BLOCKED.store(true, Ordering::Relaxed);
     })?;
+    *RETAINED_LAYOUTS.lock().unwrap() = Arc::new(RetainedLayouts::read(&path));
     *RECOVERY_SAVE_BASE.lock().unwrap() = base;
     Ok(snapshot)
 }
@@ -7118,20 +7210,41 @@ fn open_layout_file(path: &Path) -> std::io::Result<Option<fs::File>> {
 }
 
 struct LayoutSource {
-    file: fs::File,
+    id: std::io::Result<(u64, u128)>,
     bytes: Vec<u8>,
 }
 
-fn read_layout<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<(T, LayoutSource)>, String> {
+fn read_layout_file<T: serde::de::DeserializeOwned>(mut file: fs::File) -> Result<(T, Vec<u8>), String> {
     use std::io::Read;
-    let Some(mut file) = open_layout_file(path).map_err(|e| e.to_string())? else { return Ok(None) };
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    // Windows cannot replace the destination while this reader still owns it.
+    drop(file);
     let snapshot = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    Ok(Some((snapshot, LayoutSource { file, bytes })))
+    Ok((snapshot, bytes))
 }
 
-fn recovery_base(listed: &str, primary: Option<&LayoutSource>) -> std::io::Result<String> {
+fn read_layout<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<(T, Vec<u8>)>, String> {
+    open_layout_file(path).map_err(|e| e.to_string())?.map(read_layout_file).transpose()
+}
+
+// Take the identity and bytes from the same open file, even across an external
+// rename. An identity error matters only when comparing a readable primary to
+// a recovery session; it must never quarantine an otherwise valid layout.
+fn read_primary_layout(path: &Path) -> Result<Option<(AppStateSnapshot, LayoutSource)>, String> {
+    let Some(file) = open_layout_file(path).map_err(|e| e.to_string())? else { return Ok(None) };
+    #[cfg(unix)]
+    let id = {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata().map(|m| (m.dev(), u128::from(m.ino())))
+    };
+    #[cfg(windows)]
+    let id = crate::windows_file_id::file_id(&file);
+    let (snapshot, bytes) = read_layout_file(file)?;
+    Ok(Some((snapshot, LayoutSource { id, bytes })))
+}
+
+fn recovery_base(listed: &str, primary: Option<LayoutSource>) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     // The first backup names this recovery across later set-asides. Older
     // releases saved a fallback at the primary path. A replacement there,
@@ -7139,18 +7252,11 @@ fn recovery_base(listed: &str, primary: Option<&LayoutSource>) -> std::io::Resul
     let mut hash = Sha256::new();
     hash.update(listed.lines().next().unwrap_or_default().as_bytes());
     hash.update([0]);
-    if let Some(LayoutSource { file, bytes }) = primary {
-        #[cfg(unix)]
-        let (volume, id) = {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = file.metadata()?;
-            (metadata.dev(), metadata.ino() as u128)
-        };
-        #[cfg(windows)]
-        let (volume, id) = crate::windows_file_id::file_id(file)?;
+    if let Some(source) = primary {
+        let (volume, id) = source.id?;
         hash.update(volume.to_le_bytes());
         hash.update(id.to_le_bytes());
-        hash.update(bytes);
+        hash.update(source.bytes);
     }
     Ok(format!("{:x}", hash.finalize()))
 }
@@ -7167,7 +7273,7 @@ fn open_layout(path: &Path) -> Result<(Option<AppStateSnapshot>, Option<String>)
     // the subsequent read sees the restored primary.
     let mut pending = listed.as_ref().is_some_and(|names| backups_pending(path, names));
     let session = recovery_session_path(path);
-    let (mut snapshot, primary_source) = match read_layout(path) {
+    let (mut snapshot, primary_source) = match read_primary_layout(path) {
         Ok(Some((snapshot, source))) => (Some(snapshot), Some(source)),
         Ok(None) => (None, None),
         Err(error) => {
@@ -7178,10 +7284,11 @@ fn open_layout(path: &Path) -> Result<(Option<AppStateSnapshot>, Option<String>)
         }
     };
     let Some(names) = listed else { return Ok((snapshot, None)) };
-    let base = recovery_base(&names, primary_source.as_ref())
+    let primary_missing = primary_source.is_none();
+    let base = recovery_base(&names, primary_source)
         .map_err(|e| format!("Could not identify the primary layout {}: {e}", path.display()))?;
     match read_layout::<RecoverySnapshot<AppStateSnapshot>>(&session) {
-        Ok(Some((mut saved, _))) if saved.recovery_base == base || primary_source.is_none() => {
+        Ok(Some((mut saved, _))) if saved.recovery_base == base || primary_missing => {
             if pending && saved.recovery_base != base {
                 // Quarantining another primary (including on the previous boot)
                 // left this session as the only readable layout. Bind it to the
@@ -7196,14 +7303,14 @@ fn open_layout(path: &Path) -> Result<(Option<AppStateSnapshot>, Option<String>)
             }
             snapshot = Some(saved.snapshot);
         }
-        Ok(Some((_, source))) => {
+        Ok(Some((_, bytes))) => {
             // The repair owns the primary. Keep the exact session bytes,
             // including unknown fields, before another save can reuse its path.
             let aside = path.with_added_extension(format!("recovery-saved-{}.json", uuid::Uuid::now_v7()));
-            write_layout_bytes(&aside, &source.bytes)?;
+            write_layout_bytes(&aside, &bytes)?;
             fs::remove_file(&session).map_err(|e| format!("Could not retire saved recovery session: {e}"))?;
             let message = format!("Using repaired layout {}. Work saved during recovery is in {}. \
-                To restore it, stop the backend and copy that file over the layout.", path.display(), aside.display());
+                To restore it, stop the backend and copy that file over the layout. Delete the saved copy when you no longer need it.", path.display(), aside.display());
             if log::log_enabled!(log::Level::Warn) {
                 log::warn!("{message}");
             } else {
@@ -7631,7 +7738,6 @@ pub fn strip_removed_workspaces_from_snapshot(
     snapshot
 }
 
-#[cfg(unix)]
 impl LayoutCloseIntent {
     fn needs_replay(&self, snapshot: &AppStateSnapshot) -> bool {
         match self {
@@ -7654,10 +7760,8 @@ impl LayoutCloseIntent {
     }
 }
 
-#[cfg(unix)]
 enum ArchiveChange { Install, Remove }
 
-#[cfg(unix)]
 impl PendingArchive {
     pub(crate) fn replacement_in(&self, snapshot: &AppStateSnapshot) -> bool {
         self.restored_workspace_id.as_ref().is_some_and(|id|
@@ -7674,7 +7778,6 @@ impl PendingArchive {
     }
 }
 
-#[cfg(unix)]
 fn archive_installed_or_superseded(snapshot: &AppStateSnapshot, entry: &ArchivedWorkspaceSnapshot) -> bool {
     snapshot.archived_workspaces.iter().any(|other| other.supersedes_or_matches(entry))
 }
@@ -7697,7 +7800,6 @@ impl ArchivedWorkspaceSnapshot {
     }
 }
 
-#[cfg(unix)]
 fn terminal_pane_for_close_intent(
     snapshot: &AppStateSnapshot,
     workspace_id: &str,
@@ -7758,7 +7860,6 @@ pub(crate) fn restore_terminal_replacements_and_layout_closes(
 
 /// A close intent can outlive the last saved layout. Apply it before any
 /// terminal hydration can reattach to the old shell or launch a replacement.
-#[cfg(unix)]
 pub(crate) fn restore_pending_layout_closes(
     store: &AppStateStore,
     closes: &[LayoutCloseIntent],
@@ -10250,7 +10351,7 @@ mod tests {
             ..live.clone()
         };
         assert_eq!(
-            store.orphaned_daemon_shells(vec![live, missing_pane.clone(), missing_workspace.clone()]),
+            store.orphaned_daemon_shells(vec![live, missing_pane.clone(), missing_workspace.clone()], &[]),
             [missing_pane, missing_workspace],
         );
     }
@@ -15326,6 +15427,87 @@ mod persisted_layout_tests {
             let (saved, _) = read_layout::<AppStateSnapshot>(&copies[0]).unwrap().unwrap();
             assert!(saved.workspaces.iter().any(|ws| ws.workspace_id == added));
         }
+    }
+
+    #[test]
+    fn retained_recovery_workspace_survives_startup_cleanup_and_reconcile() {
+        const TEST: &str = "state::state_impl::persisted_layout_tests::retained_recovery_workspace_survives_startup_cleanup_and_reconcile";
+        if crate::test_isolation::isolated(TEST) { return; }
+        let path = persisted_layout_path().unwrap();
+        let root = path.parent().unwrap();
+        fs::write(&path, b"broken").unwrap();
+        assert!(load_persisted_state_checked().unwrap().is_none());
+        let store = AppStateStore::default();
+        let workspace = store.snapshot().active_workspace_id.0;
+        let session = store.active_terminal_session_id().unwrap().0;
+        let pane = terminal_pane_for_close_intent(&store.snapshot(), &workspace, &session).unwrap().0;
+        let explicitly_closed = store.create_empty_workspace_at_path_with_selection(root.to_owned(), false);
+        let scrollback = crate::scrollback::scrollback_base();
+        assert!(scrollback.starts_with(root));
+        let payload = crate::scrollback::ScrollbackPayload {
+            workspace_id: workspace.clone(), pane_id: pane.clone(), session_id: session.clone(),
+            working_directory: root.display().to_string(), original_command: None, cols: 80, rows: 24,
+            data: "saved terminal output".into(), adapter_captures: HashMap::new(), adapter_id: None, alternate_buffer: false,
+        };
+        crate::scrollback::save_scrollback(&payload).unwrap();
+        fs::create_dir_all(scrollback.join("orphan")).unwrap();
+        let db = crate::database::DatabaseStore::test_file(&root.join("sync.sqlite"));
+        crate::workspaces_sync::reconcile_from_state(&db, &store).unwrap();
+        let row = db.list_workspaces_sync().into_iter().find(|r| r.workspace_id.as_ref() == Some(&workspace)).unwrap();
+        db.mark_workspace_sync_synced(row.id, Some("linked-cloud-id")).unwrap();
+        flush_persisted_state(&store).unwrap();
+
+        let backup = fs::read_to_string(recovery_marker(&path)).unwrap();
+        let backup = root.join(backup.trim());
+        save_layout_to(&backup, &default_app_state()).unwrap();
+        fs::rename(backup, &path).unwrap();
+        for _ in 0..2 {
+            store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+            assert!(store.find_workspace(&workspace).is_none());
+            #[cfg(unix)]
+            {
+                use crate::database::daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose, PendingTerminalReplacement};
+                let replacement = PendingTerminalReplacement {
+                    workspace_id: workspace.clone(), old_session_id: session.clone(), replacement_id: uuid::Uuid::new_v4(),
+                };
+                let successor = replacement.replacement_session_id();
+                let live = store.terminal_session_owners(std::slice::from_ref(&replacement));
+                assert!(live.contains(&(workspace.clone(), session.clone())));
+                let shell = PendingDaemonClose {
+                    route: DaemonWorkspaceRoute { workspace_id: workspace.clone(), host_id: None, ssh_target: None },
+                    session_id: successor, shell_id: uuid::Uuid::new_v4(),
+                };
+                let orphan = PendingDaemonClose { session_id: "orphan-session".into(), ..shell.clone() };
+                assert_eq!(store.orphaned_daemon_shells(vec![shell, orphan.clone()], &[replacement]), [orphan]);
+            }
+            let active = store.workspace_ids().into_iter().collect::<Vec<_>>();
+            crate::scrollback::cleanup_on_startup(&scrollback, true, layout_recovery_pending(), &active, 1);
+            crate::workspaces_sync::reconcile_from_state(&db, &store).unwrap();
+            assert_eq!(crate::scrollback::load_scrollback(&workspace, &pane).unwrap().data, payload.data);
+            assert!(!scrollback.join("orphan").exists());
+            let row = db.list_workspaces_sync().into_iter().find(|r| r.server_id.as_deref() == Some("linked-cloud-id")).unwrap();
+            assert!(row.deleted_at.is_none() && !row.dirty);
+            flush_persisted_state(&store).unwrap();
+        }
+        let retained = fs::read_dir(root).unwrap().map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("layout.json.recovery-saved-")).unwrap();
+        fs::copy(&retained, &path).unwrap();
+        store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+        assert!(terminal_pane_for_close_intent(&store.snapshot(), &workspace, &session).is_some());
+        crate::workspaces_sync::reconcile_from_state(&db, &store).unwrap();
+        assert_eq!(crate::scrollback::load_scrollback(&workspace, &pane).unwrap().data, payload.data);
+        crate::workspaces_sync::record_closed(&db, &explicitly_closed.0).unwrap();
+        crate::workspaces_sync::reconcile_from_state(&db, &store).unwrap();
+        assert!(db.list_dirty_workspaces_sync().iter().any(|r|
+            r.workspace_id.as_deref() == Some(&explicitly_closed.0) && r.deleted_at.is_some()));
+        // Discard the copy and boot the repaired primary again: normal cleanup resumes.
+        fs::remove_file(retained).unwrap();
+        save_layout_to(&path, &default_app_state()).unwrap();
+        store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+        crate::scrollback::cleanup_on_startup(&scrollback, true, layout_recovery_pending(), &[], 1);
+        crate::workspaces_sync::reconcile_from_state(&db, &store).unwrap();
+        assert!(crate::scrollback::load_scrollback(&workspace, &pane).is_none());
+        assert!(!db.list_workspaces_sync().iter().any(|r| r.id == row.id));
     }
 
     #[test]

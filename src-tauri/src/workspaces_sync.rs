@@ -680,7 +680,7 @@ fn closed_during_recovery(db: &DatabaseStore) -> Result<HashSet<String>, String>
 /// never re-adds that workspace and retries the deletion every tick.
 pub fn record_closed(db: &DatabaseStore, workspace_id: &str) -> Result<(), String> {
     let _serialised = lock(&RECONCILE_LOCK);
-    if crate::state::layout_recovery_pending()
+    if (crate::state::layout_recovery_pending() || crate::state::retained_layouts().protects(workspace_id))
         && db.set_ui_state(&format!("{CLOSED_DURING_RECOVERY}{workspace_id}"), "1").is_err()
     {
         lock(&CLOSED_UNPERSISTED).insert(workspace_id.to_string());
@@ -743,10 +743,14 @@ fn reconcile_inner(
     let _serialised = lock(&RECONCILE_LOCK);
     let present_now = current_ids();
     let recovering = crate::state::layout_recovery_pending();
-    let closed = if recovering {
+    let retained = crate::state::retained_layouts();
+    let closed = if recovering || !retained.is_empty() {
         persist_unsaved_closes(db);
         match closed_during_recovery(db) {
-            Ok(closed) => closed,
+            Ok(mut closed) => {
+                closed.retain(|wid| recovering || retained.protects(wid));
+                closed
+            }
             Err(error) => {
                 // Without the list, any write here could re-add a closed
                 // workspace; try again next tick.
@@ -886,13 +890,14 @@ fn reconcile_inner(
     // from it is missing, not closed: deleting its row would remove it from
     // every other device too. Nothing is inferred then; a workspace really
     // closed has its row deleted by the close itself (`record_closed`).
-    if recovering {
-        for wid in &closed {
-            // Idempotent; retries a close whose own write failed.
-            if let Err(error) = db.soft_delete_workspace_sync_by_workspace_id(wid) {
-                eprintln!("[workspaces-sync] soft-delete failed for {wid}: {error}");
-            }
+    for wid in &closed {
+        // Retained layouts also suppress inferred deletion of these IDs.
+        // An explicit close still wins and its write can be retried.
+        if let Err(error) = db.soft_delete_workspace_sync_by_workspace_id(wid) {
+            eprintln!("[workspaces-sync] soft-delete failed for {wid}: {error}");
         }
+    }
+    if recovering {
         return Ok(());
     }
     // Read membership again: a workspace adopted after the first read may
@@ -900,7 +905,7 @@ fn reconcile_inner(
     let present_late = current_ids();
     for row in &sync_rows {
         if let Some(wid) = &row.workspace_id {
-            if !live_wids.contains(wid) && !present_now.contains(wid) && !present_late.contains(wid) {
+            if !live_wids.contains(wid) && !present_now.contains(wid) && !present_late.contains(wid) && !retained.protects(wid) {
                 if let Err(error) =
                     db.soft_delete_workspace_sync_by_workspace_id(wid)
                 {

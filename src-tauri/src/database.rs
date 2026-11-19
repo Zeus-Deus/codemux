@@ -20,6 +20,7 @@ pub mod queued_turns;
 pub mod restart_resumes;
 #[cfg(unix)]
 pub(crate) mod daemon_closes;
+mod layout_closes;
 
 /// Merge every session row matching `group` (an `agent_chat_sessions`
 /// predicate over `?1 = key`) into `survivor` (`?2`), which must match it
@@ -1422,6 +1423,8 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     restart_resumes::create_schema(conn)?;
     #[cfg(unix)]
     daemon_closes::create_schema(conn)?;
+    #[cfg(windows)]
+    layout_closes::create_schema(conn).map_err(|e| e.to_string())?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new

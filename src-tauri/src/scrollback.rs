@@ -108,6 +108,10 @@ impl ScrollbackCache {
 // ── Paths ──────────────────────────────────────────────────────
 
 pub(crate) fn scrollback_base() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = crate::test_isolation::isolated_root() {
+        return root.join("scrollback");
+    }
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
     data_dir.join(crate::APP_DIR_NAME).join("scrollback")
@@ -309,7 +313,7 @@ pub(crate) fn cleanup_on_startup(
     active_workspace_ids: &[String],
     max_bytes: u64,
 ) {
-    if recovery_pending {
+    if recovery_pending || crate::state::retained_layouts().unreadable {
         eprintln!("[codemux::scrollback] Skipping startup cleanup during layout recovery");
         return;
     }
@@ -353,12 +357,13 @@ pub(crate) fn cleanup_orphan_scrollbacks_in(
     };
 
     let mut removed = Vec::new();
+    let retained = crate::state::retained_layouts();
     for entry in entries.flatten() {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
         let dir_name = entry.file_name().to_string_lossy().to_string();
-        if !active_workspace_ids.contains(&dir_name) {
+        if !active_workspace_ids.contains(&dir_name) && !retained.protects(&dir_name) {
             let _ = fs::remove_dir_all(entry.path());
             removed.push(dir_name);
         }
@@ -418,12 +423,14 @@ fn enforce_disk_limit_in(base: &Path, max_bytes: u64) -> u64 {
 
     let mut freed = 0u64;
     let overshoot = current_total - max_bytes;
+    let retained = crate::state::retained_layouts();
     for (path, size, _) in &workspaces {
         if freed >= overshoot {
             break;
         }
-        let _ = fs::remove_dir_all(path);
-        freed += size;
+        if !retained.protects(&path.file_name().unwrap().to_string_lossy()) && fs::remove_dir_all(path).is_ok() {
+            freed += size;
+        }
     }
 
     freed

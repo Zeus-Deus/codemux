@@ -3099,8 +3099,11 @@ pub(crate) fn commit_terminal_close<'a, R: Runtime>(
     };
     #[cfg(not(unix))]
     {
-        let _ = (app, workspace_id, intent, ready, requires_journal);
+        let _ = (workspace_id, ready, requires_journal);
         checkpoint.check().map_err(TerminalCloseError::Authorization)?;
+        if let Some(db) = app.try_state::<crate::database::DatabaseStore>() {
+            db.record_recovery_workspace_close(&intent)?;
+        }
     }
     Ok((scope, CommittedTerminalClose {
         fence,

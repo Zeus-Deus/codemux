@@ -1002,16 +1002,17 @@ fn build_core_app<R: tauri::Runtime>(
             }
 
             let handle = app.handle().clone();
+            let pending_layout_closes = handle.state::<database::DatabaseStore>()
+                .pending_layout_closes().map_err(std::io::Error::other)?;
             #[cfg(unix)]
-            let (pending_layout_closes, mut pending_terminal_closes, daemon_shells) = {
+            let (mut pending_terminal_closes, daemon_shells) = {
                 let db = handle.state::<database::DatabaseStore>();
-                let layout_closes = db.pending_layout_closes().map_err(std::io::Error::other)?;
                 let daemon_closes = db.pending_daemon_closes().map_err(std::io::Error::other)?;
                 let daemon_shells = db.daemon_shell_ownership().map_err(std::io::Error::other)?;
-                (layout_closes, daemon_closes, daemon_shells)
+                (daemon_closes, daemon_shells)
             };
             #[cfg(unix)]
-            let recovery_pending = state::layout_recovery_pending();
+            let recovery_pending = state::layout_recovery_pending() || state::retained_layouts().unreadable;
             #[cfg(unix)]
             let has_local_fallbacks = handle.state::<database::DatabaseStore>()
                 .has_local_terminal_fallbacks().map_err(std::io::Error::other)?;
@@ -1077,14 +1078,16 @@ fn build_core_app<R: tauri::Runtime>(
                     if ids.is_empty() {Ok(())} else {state.persist_local_import_layout(&db,&ids)}
                 }) {log::warn!("Local import layout recovery remains pending: {error}");}
             }
-            #[cfg(unix)]
             {
                 let store = handle.state::<state::AppStateStore>();
+                #[cfg(unix)]
                 state::restore_terminal_replacements_and_layout_closes(
                     &store,
                     &terminal_replacements,
                     &pending_layout_closes,
                 ).map_err(std::io::Error::other)?;
+                #[cfg(windows)]
+                state::restore_pending_layout_closes(&store, &pending_layout_closes).map_err(std::io::Error::other)?;
                 let db = handle.state::<database::DatabaseStore>();
                 // The close journal commits before the command updates the sync
                 // mirror. Replay explicit closes even if the layout already
@@ -1096,11 +1099,8 @@ fn build_core_app<R: tauri::Runtime>(
                 }
                 // Make archived chats available before commands can reuse or
                 // supersede an intent. Retirement follows the durable layout save.
-                if pending_layout_closes.iter().any(|intent| matches!(intent,
-                    state::LayoutCloseIntent::Archive(archive) if archive.restored_workspace_id.is_some())) {
-                    db.settle_layout_closes(&pending_layout_closes, &store.snapshot(), false)
-                        .map_err(std::io::Error::other)?;
-                }
+                db.settle_startup_chat_history(&pending_layout_closes, &store.snapshot()).map_err(std::io::Error::other)?;
+                #[cfg(unix)]
                 if let Err(error) = state::persist_terminal_replacements(&store, &db, &terminal_replacements) {
                     log::warn!("Could not save replayed terminal replacements: {error}");
                 }
@@ -1110,7 +1110,7 @@ fn build_core_app<R: tauri::Runtime>(
             if !recovery_pending && !daemon_shells.is_empty() {
                 // A shell can start before its new pane has reached disk.
                 // Retire these exact shells without hydrating a missing pane.
-                let orphaned = handle.state::<state::AppStateStore>().orphaned_daemon_shells(daemon_shells);
+                let orphaned = handle.state::<state::AppStateStore>().orphaned_daemon_shells(daemon_shells, &terminal_replacements);
                 if !orphaned.is_empty() {
                     let db = handle.state::<database::DatabaseStore>();
                     if let Err(error) = db.journal_orphan_daemon_shells(&orphaned) {
@@ -1121,7 +1121,7 @@ fn build_core_app<R: tauri::Runtime>(
             }
             #[cfg(unix)]
             if !recovery_pending && (has_local_fallbacks || has_local_restarts) {
-                let live = handle.state::<state::AppStateStore>().terminal_session_owners();
+                let live = handle.state::<state::AppStateStore>().terminal_session_owners(&terminal_replacements);
                 let db = handle.state::<database::DatabaseStore>();
                 if has_local_fallbacks {
                     if let Err(error) = db.reconcile_local_terminal_fallbacks(&live) {
@@ -1423,9 +1423,9 @@ fn build_core_app<R: tauri::Runtime>(
             // Codemux plugin (see `claude_plugin`).
             let _ = claude_plugin::local_plugin_dir();
 
+            state::persist_pending_layout_closes(&handle, pending_layout_closes);
             #[cfg(unix)]
             {
-                terminal::daemon_backed::persist_pending_layout_closes(&handle, pending_layout_closes);
                 terminal::daemon_backed::resume_pending_daemon_closes(&handle, pending_terminal_closes);
             }
             terminal::spawn_missing_ptys(handle);
