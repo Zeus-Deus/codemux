@@ -269,6 +269,162 @@ describe("useAppStateInit — lifecycle boundaries", () => {
     expect(useAppStore.getState().appState).toBeNull();
   });
 
+  it("loads the workspace after transient startup failures without waiting for another snapshot event", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      getAppStateMock
+        .mockRejectedValueOnce(new Error("connection interrupted"))
+        .mockRejectedValueOnce(new Error("reconnecting"))
+        .mockResolvedValueOnce(makeAppState("ws-B"));
+      renderHook(() => useAppStateInit());
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(2);
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(2);
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-B");
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(3);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it.each(["snapshot", "unchanged snapshot", "sign-out"] as const)("stops retrying the initial fetch after %s", async (boundary) => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      if (boundary === "unchanged snapshot") useAppStore.getState().setAppState(makeAppState("ws-A"));
+      getAppStateMock.mockRejectedValue(new Error("connection interrupted"));
+      const { rerender } = renderHook(({ skip }) => useAppStateInit(skip), { initialProps: { skip: false } });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      if (boundary !== "sign-out") {
+        act(() => deliverSnapshot!(makeAppState("ws-A")));
+      } else {
+        rerender({ skip: true });
+      }
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(1);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("retries a failed sign-in fetch even when the previous workspace snapshot is still in memory", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      getAppStateMock
+        .mockResolvedValueOnce(makeAppState("ws-A"))
+        .mockRejectedValueOnce(new Error("reconnecting"))
+        .mockResolvedValueOnce(makeAppState("ws-B"));
+      const { rerender } = renderHook(({ skip }) => useAppStateInit(skip), { initialProps: { skip: false } });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      rerender({ skip: true });
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-A");
+
+      rerender({ skip: false });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(getAppStateMock).toHaveBeenCalledTimes(2);
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-A");
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-B");
+      expect(getAppStateMock).toHaveBeenCalledTimes(3);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it.each([
+    { revision: undefined, expectedWorkspace: "ws-B" },
+    { revision: 0, expectedWorkspace: "ws-B" },
+    { revision: 4, expectedWorkspace: "ws-B" },
+    { revision: 5, expectedWorkspace: "ws-B" },
+    { revision: 6, expectedWorkspace: "ws-A" },
+  ])("keeps $expectedWorkspace when a retry with revision $revision arrives after a pushed snapshot", async ({ revision, expectedWorkspace }) => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const startup = vi.spyOn(await import("@/lib/perf/interaction-trace"), "markStartup");
+    try {
+      let resolveRetry!: (snapshot: AppStateSnapshot) => void;
+      getAppStateMock
+        .mockRejectedValueOnce(new Error("reconnecting"))
+        .mockReturnValueOnce(new Promise((resolve) => { resolveRetry = resolve; }));
+      renderHook(() => useAppStateInit());
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(2);
+
+      act(() => {
+        deliverSnapshot!({ ...makeAppState("ws-B"), snapshot_revision: 5 });
+        vi.advanceTimersByTime(16);
+      });
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-B");
+
+      expect(startup.mock.calls.filter(([phase]) => phase === "initial-snapshot-ready")).toHaveLength(1);
+      await act(async () => { resolveRetry({ ...makeAppState("ws-A"), snapshot_revision: revision }); });
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe(expectedWorkspace);
+      expect(startup.mock.calls.filter(([phase]) => phase === "initial-snapshot-ready")).toHaveLength(1);
+    } finally {
+      startup.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  it("retries until a full snapshot is accepted when a delta overtakes the sign-in fetch", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const startup = vi.spyOn(await import("@/lib/perf/interaction-trace"), "markStartup");
+    try {
+      // The signed-out store still holds the previous session's baseline.
+      useAppStore.getState().setAppState({ ...makeAppState("ws-A"), snapshot_revision: 4 });
+      let resolveRetry!: (snapshot: AppStateSnapshot) => void;
+      getAppStateMock
+        .mockRejectedValueOnce(new Error("reconnecting"))
+        .mockReturnValueOnce(new Promise((resolve) => { resolveRetry = resolve; }))
+        // With the backend idle, the next read returns the current revision again.
+        .mockResolvedValueOnce({ ...makeAppState("ws-B"), snapshot_revision: 5 });
+      const { rerender } = renderHook(({ skip }) => useAppStateInit(skip), { initialProps: { skip: true } });
+      rerender({ skip: false });
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(2);
+
+      act(() => {
+        deliverDelta!({ revision: 5, delta: { domain: "pane_status", pane_id: "p", status: "working" } });
+      });
+      await act(async () => { resolveRetry({ ...makeAppState("ws-B"), snapshot_revision: 4 }); });
+      expect(useAppStore.getState().lastSeenRevision).toBe(5);
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-A");
+      expect(startup.mock.calls.map(([phase]) => phase)).not.toContain("initial-snapshot-ready");
+
+      await act(() => vi.advanceTimersByTimeAsync(2_000));
+      expect(useAppStore.getState().lastSeenRevision).toBe(5);
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-B");
+      expect(startup.mock.calls.filter(([phase]) => phase === "initial-snapshot-ready")).toHaveLength(1);
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(3);
+    } finally {
+      startup.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  it("continues retrying after a delta and an out-of-date full snapshot", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      useAppStore.getState().setAppState({ ...makeAppState("ws-A"), snapshot_revision: 4 });
+      getAppStateMock
+        .mockRejectedValueOnce(new Error("reconnecting"))
+        .mockResolvedValueOnce({ ...makeAppState("ws-B"), snapshot_revision: 6 });
+      renderHook(() => useAppStateInit());
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      act(() => {
+        deliverDelta!({ revision: 5, delta: { domain: "pane_status", pane_id: "p", status: "working" } });
+        deliverSnapshot!({ ...makeAppState("ws-A"), snapshot_revision: 4 });
+      });
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(getAppStateMock).toHaveBeenCalledTimes(2);
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-B");
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it("abandons an in-flight resync when unmounted without applying its late snapshot", async () => {
     let resolve!: (snapshot: AppStateSnapshot) => void;
     const { unmount } = renderHook(() => useAppStateInit());

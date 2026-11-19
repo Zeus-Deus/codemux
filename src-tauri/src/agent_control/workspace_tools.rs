@@ -451,12 +451,16 @@ async fn known_parent<R: Runtime>(app: &AppHandle<R>, path: String) -> Result<St
 /// chat's turn and a web-remote session's connection, so it asks only what a
 /// person withdraws ([`service::authorize_background`]).
 pub(super) fn checkpoint<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller) -> Checkpoint {
+    #[cfg(unix)]
+    let grant_id = caller.grant_id.clone();
     let (app, caller) = (app.clone(), caller.clone());
     let (setup_app, setup_caller) = (app.clone(), caller.clone());
-    Checkpoint::new(move || service::authorize(&app, &caller).map_err(|error| error.to_string()))
-        .with_background(move || {
-            service::authorize_background(&setup_app, &setup_caller).map_err(|error| error.to_string())
-        })
+    let check = Checkpoint::new(move || service::authorize(&app, &caller).map_err(|error| error.to_string()));
+    #[cfg(unix)]
+    let check = check.with_connector_grant(grant_id);
+    check.with_background(move || {
+        service::authorize_background(&setup_app, &setup_caller).map_err(|error| error.to_string())
+    })
 }
 
 /// Maps the workspace and git layers' `prefix: message` errors to codes. Text

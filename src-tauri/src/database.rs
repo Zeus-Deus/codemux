@@ -18,6 +18,8 @@ pub mod turn_diffs;
 pub mod mobile_push;
 pub mod queued_turns;
 pub mod restart_resumes;
+#[cfg(unix)]
+pub(crate) mod daemon_closes;
 
 /// Merge every session row matching `group` (an `agent_chat_sessions`
 /// predicate over `?1 = key`) into `survivor` (`?2`), which must match it
@@ -1418,6 +1420,8 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     message_delivery::migrate(conn)?;
     provider_switch::create_schema(conn)?;
     restart_resumes::create_schema(conn)?;
+    #[cfg(unix)]
+    daemon_closes::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new
@@ -1519,6 +1523,11 @@ impl DatabaseStore {
         let conn = open_connection(path).unwrap();
         create_schema(&conn).unwrap();
         Self { conn: Mutex::new(conn) }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_busy_handler(&self, handler: fn(i32) -> bool) {
+        self.conn.lock().unwrap().busy_handler(Some(handler)).unwrap();
     }
 
     /// Create an in-memory database (fallback if file DB fails, and for tests).

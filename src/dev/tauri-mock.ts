@@ -936,6 +936,12 @@ interface MockPtyChannelEntry {
 }
 
 const ptyChannels = new Map<string, MockPtyChannelEntry>();
+const ptyRestartTokens = new Map<string, string>();
+let nextPtyRestartToken = 0;
+
+function mockRestartToken(sessionId: string): string {
+  return ptyRestartTokens.get(sessionId) ?? `initial:${sessionId}`;
+}
 
 const MOCK_TERMINAL_BANNER =
   "\r\n  \x1b[2m(mock terminal — no PTY in plain-browser dev; " +
@@ -981,6 +987,7 @@ function mockShellInput(sessionId: string, data: string): void {
         setMockSessionState(sessionId, "exited", message, code);
         emitEvent("terminal-status", {
           session_id: sessionId,
+          restart_token: mockRestartToken(sessionId),
           state: "exited",
           message,
           exit_code: code,
@@ -7773,6 +7780,7 @@ const handlers: Record<string, Handler> = {
     if (session?.state === "exited") {
       return {
         session_id: a.sessionId as string,
+        restart_token: mockRestartToken(a.sessionId as string),
         state: "exited",
         message: session.last_message,
         exit_code: session.exit_code,
@@ -7780,6 +7788,7 @@ const handlers: Record<string, Handler> = {
     }
     return {
       session_id: a.sessionId as string,
+      restart_token: mockRestartToken(a.sessionId as string),
       state: "ready",
       message: null,
       exit_code: null,
@@ -7804,15 +7813,21 @@ const handlers: Record<string, Handler> = {
   },
   restart_terminal_session: (a) => {
     const sessionId = a.sessionId as string;
+    if (a.expectedRestartToken !== undefined && a.expectedRestartToken !== mockRestartToken(sessionId)) {
+      return false;
+    }
+    const token = `restart:${++nextPtyRestartToken}`;
+    ptyRestartTokens.set(sessionId, token);
     ptyLineBuffers.delete(sessionId);
     setMockSessionState(sessionId, "ready", null, null);
     emitEvent("terminal-status", {
       session_id: sessionId,
+      restart_token: token,
       state: "ready",
       message: null,
       exit_code: null,
     });
-    return undefined;
+    return true;
   },
   detach_pty_output: (a) => {
     ptyChannels.delete(a.sessionId as string);

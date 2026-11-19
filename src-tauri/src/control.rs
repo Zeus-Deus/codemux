@@ -1532,15 +1532,18 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
             // existing `close_pane_impl`. State-layer `close_pane`
             // handles the last-pane case by removing the surface + tab;
             // workspace stays open until explicitly closed.
-            let state: State<'_, AppStateStore> = app.state();
             let pane_id = request
                 .params
                 .get("pane_id")
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .ok_or_else(|| "Missing required parameter: pane_id".to_string());
-            pane_id.and_then(|pid| {
-                crate::commands::workspace::close_pane_impl(app.clone(), &state, pid.clone())
+            match pane_id {
+                Ok(pid) => {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let state = app.state::<AppStateStore>();
+                        crate::commands::workspace::close_pane_impl(app.clone(), &state, pid.clone())
                     .map(|removed_session_id| {
                         serde_json::json!({
                             "pane_id": pid,
@@ -1548,7 +1551,10 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                             "removed_session_id": removed_session_id,
                         })
                     })
-            })
+                    }).await.map_err(|error| error.to_string()).and_then(|result| result)
+                }
+                Err(error) => Err(error),
+            }
         }
         // ── Monitoring (provider-agnostic) ───────────────────────────────
         //

@@ -30,13 +30,15 @@ use tauri::{AppHandle, Manager, Runtime};
 pub(crate) struct Checkpoint {
     check: Option<Check>,
     background: Option<Check>,
+    #[cfg(unix)]
+    connector_grant_id: Option<String>,
 }
 
 type Check = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 impl Checkpoint {
     pub(crate) fn new(check: impl Fn() -> Result<(), String> + Send + Sync + 'static) -> Self {
-        Self { check: Some(Arc::new(check)), background: None }
+        Self { check: Some(Arc::new(check)), ..Self::default() }
     }
 
     /// Adds the check for work the operation leaves running once it
@@ -58,9 +60,25 @@ impl Checkpoint {
         self.check.as_ref().map_or(Ok(()), |check| check())
     }
 
+    #[cfg(unix)]
+    pub(crate) fn requires_check(&self) -> bool {
+        self.check.is_some()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_connector_grant(mut self, grant_id: Option<String>) -> Self {
+        self.connector_grant_id = grant_id;
+        self
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn connector_grant_id(&self) -> Option<&str> {
+        self.connector_grant_id.as_deref()
+    }
+
     /// The checkpoint work left running asks (see [`Self::with_background`]).
     pub(crate) fn background(&self) -> Checkpoint {
-        Checkpoint { check: self.background.clone(), background: None }
+        Checkpoint { check: self.background.clone(), ..Self::default() }
     }
 }
 
@@ -1011,7 +1029,10 @@ mod tests {
         let state = AppStateStore::default();
         let closing = state.create_empty_workspace_at_path(checkout.clone()).0;
         state.set_workspace_worktree(&closing, checkout.display().to_string(), "feat".into());
-        let app = mock_app(state);
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        app.manage(crate::database::DatabaseStore::test_file(&dir.path().join("close.sqlite")));
+        app.manage(crate::terminal::PtyState::default());
         let state = app.state::<AppStateStore>();
         let close = || CloseWorkspace {
             workspace_id: closing.clone(),
@@ -1022,9 +1043,9 @@ mod tests {
         };
         let checked = |checkpoint| WorkspaceService::new(app.handle()).checked(checkpoint);
 
-        // Withdrawn while the pre-flight read git, while Hermes chats
-        // stopped, or while teardown ran: the workspace stays as it was.
-        for passes in [0, 1, 2] {
+        // Withdrawal during preflight, chat shutdown, teardown, or the wait
+        // for the detach worker leaves the workspace open.
+        for passes in [0, 1, 2, 3] {
             let error = checked(withdrawn_after(passes)).close(close()).await.unwrap_err();
             assert_eq!(error, "grant_revoked: withdrawn");
             assert!(state.find_workspace(&closing).is_some());
@@ -1032,11 +1053,186 @@ mod tests {
 
         // Withdrawn while its agents stopped and the lifecycle lock was taken:
         // the close stands, and the files and the branch stay.
-        let error = checked(withdrawn_after(3)).close(close()).await.unwrap_err();
+        let error = checked(withdrawn_after(4)).close(close()).await.unwrap_err();
         assert_eq!(error, "grant_revoked: withdrawn; the workspace was closed and its files were kept");
         assert!(state.find_workspace(&closing).is_none());
         assert!(checkout.join(".git").exists());
         git(&project, &["rev-parse", "--verify", "refs/heads/feat"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_grant_revoked_during_journal_contention() {
+        if isolated("workspace_service::tests::close_refuses_grant_revoked_during_journal_contention") {
+            return;
+        }
+        assert_close_refuses_grant_during_contention(GrantDuringJournalContention::Revoked).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_grant_expired_during_journal_contention() {
+        if isolated("workspace_service::tests::close_refuses_grant_expired_during_journal_contention") {
+            return;
+        }
+        assert_close_refuses_grant_during_contention(GrantDuringJournalContention::Expired).await;
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum GrantDuringJournalContention {
+        Revoked,
+        Expired,
+    }
+
+    #[cfg(unix)]
+    async fn assert_close_refuses_grant_during_contention(case: GrantDuringJournalContention) {
+        use crate::agent_control::{ControlAccess, ControlCaller, ControlError, ErrorCode};
+        use crate::database::daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose};
+        use crate::database::mcp_connector::{NewMcpClient, NewMcpGrant};
+        use crate::database::DatabaseStore;
+        use crate::mcp_connector::{self, McpConnectorState};
+        use crate::terminal::{PtyState, SessionRuntime, TerminalLifecycleState};
+        use std::time::Duration;
+
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db_path = root.join("close.sqlite");
+        let state = AppStateStore::default();
+        let closing = state.create_workspace_with_layout(root, WorkspacePresetLayout::Single);
+        let plan = state.pty_hydration_plan_for_workspace(&closing.0).unwrap();
+        let session_id = plan.sessions[0].session_id.clone();
+        let shell = PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: closing.0.clone(),
+                host_id: None,
+                ssh_target: None,
+            },
+            session_id: session_id.clone(),
+            shell_id: uuid::Uuid::new_v4(),
+        };
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        app.manage(PtyState::default());
+        app.manage(DatabaseStore::test_file(&db_path));
+        app.manage(McpConnectorState::default());
+        let db = app.state::<DatabaseStore>();
+        db.remember_daemon_shell(&shell).unwrap();
+        let pty = app.state::<PtyState>();
+        let mut runtime = SessionRuntime::new(&session_id);
+        runtime.persistent = true;
+        runtime.writer = Some(Box::new(std::io::sink()));
+        runtime.last_status.state = TerminalLifecycleState::Ready;
+        pty.sessions.lock().unwrap().insert(session_id.clone(), runtime);
+
+        let client_id = "close-test-client";
+        let grant_id = "close-test-grant";
+        let origin = "https://connector.example";
+        let redirect = "https://client.example/callback";
+        let now = mcp_connector::now_ms();
+        let expires_at = now + match case {
+            GrantDuringJournalContention::Revoked => 60_000,
+            GrantDuringJournalContention::Expired => 4_000,
+        };
+        db.mcp_connector_set_config(&serde_json::json!({
+            "enabled": true,
+            "publicOrigin": origin,
+        }).to_string()).unwrap();
+        db.mcp_register_client(NewMcpClient {
+            id: client_id.into(),
+            name: "Workspace close test".into(),
+            redirects: vec![redirect.into()],
+            created_at: now,
+        }, now).unwrap();
+        db.mcp_mint_grant(NewMcpGrant {
+            id: grant_id.into(),
+            client_id: client_id.into(),
+            token_hash: "fixture-close-grant".into(),
+            redirect_uri: redirect.into(),
+            resource: format!("{origin}/mcp"),
+            access: "supervised".into(),
+            created_at: now,
+            expires_at,
+        }).unwrap();
+        let caller = ControlCaller::outside(client_id.into(), grant_id.into(), ControlAccess::Supervised);
+        let handle = app.handle().clone();
+        type AuthorizationPause = (tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+        let pause = Arc::new(std::sync::Mutex::new(None::<AuthorizationPause>));
+        let authorization_pause = pause.clone();
+        let checkpoint = Checkpoint::new(move || {
+            crate::agent_control::service::authorize(&handle, &caller).map_err(|error| error.to_string())?;
+            let pause = authorization_pause.lock().unwrap().take();
+            if let Some((authorized, resume)) = pause {
+                authorized.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(6)).unwrap();
+            }
+            Ok(())
+        }).with_connector_grant(Some(grant_id.to_owned()));
+        checkpoint.check().unwrap();
+
+        let (notify, contended) = tokio::sync::oneshot::channel();
+        db.test_watch_close_journal_contention(notify);
+        let mut writer = rusqlite::Connection::open(&db_path).unwrap();
+        let version = |conn: &rusqlite::Connection| {
+            conn.pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0)).unwrap()
+        };
+        let version_before = version(&writer);
+        let blocker = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let workspaces = WorkspaceService::new(app.handle()).checked(checkpoint);
+        let closing_id = closing.0.clone();
+        let close = tokio::spawn(async move {
+            workspaces.close(CloseWorkspace {
+                workspace_id: closing_id,
+                remove_worktree: false,
+                delete_branch: false,
+                force: true,
+                commits: CommitLoss::Allow,
+            }).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), contended)
+            .await.unwrap().unwrap();
+        match case {
+            GrantDuringJournalContention::Revoked => {
+                assert_eq!(blocker.execute(
+                    "UPDATE agent_mcp_grants SET revoked = 1 WHERE id = ?1",
+                    [grant_id],
+                ).unwrap(), 1);
+                blocker.commit().unwrap();
+            }
+            GrantDuringJournalContention::Expired => {
+                // Freeze the writer retry after its real connector check
+                // succeeds, then let time invalidate that answer. No
+                // database write should hint that a recheck is needed.
+                let (authorized, checked) = tokio::sync::oneshot::channel();
+                let (resume, resume_checkpoint) = std::sync::mpsc::channel();
+                *pause.lock().unwrap() = Some((authorized, resume_checkpoint));
+                tokio::time::timeout(Duration::from_secs(3), checked).await.unwrap().unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let remaining = expires_at - mcp_connector::now_ms();
+                        if remaining <= 0 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(remaining as u64)).await;
+                    }
+                }).await.unwrap();
+                blocker.rollback().unwrap();
+                assert_eq!(version(&writer), version_before);
+                resume.send(()).unwrap();
+            }
+        }
+
+        let error = tokio::time::timeout(Duration::from_secs(5), close)
+            .await.unwrap().unwrap().unwrap_err();
+        assert_eq!(ControlError::from_text(error, ErrorCode::NativeControlFailed).code, ErrorCode::GrantRevoked);
+        assert!(app.state::<AppStateStore>().find_workspace(&closing.0).is_some());
+        let sessions = pty.sessions.lock().unwrap();
+        let runtime = sessions.get(&session_id).unwrap();
+        assert!(runtime.persistent && runtime.writer.is_some());
+        assert!(matches!(runtime.last_status.state, TerminalLifecycleState::Ready));
+        drop(sessions);
+        assert_eq!(db.daemon_shell_ownership().unwrap(), [shell]);
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+        assert!(db.pending_daemon_closes().unwrap().is_empty());
     }
 
     /// A new worktree's setup runs once the create returned, so it asks the

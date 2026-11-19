@@ -71,6 +71,8 @@ import { createWritePump } from "./terminal-write-pump";
 import { createIdleScrollbackSerializer } from "./scrollback-idle-serializer";
 import { parkTeardown, flushTeardown } from "./deferred-teardown";
 import { useAppStore, getSessionWorkspaceId } from "@/stores/app-store";
+import { releaseRemoteChannel } from "@/remote/channel";
+import { remoteViewHost } from "@/remote/client-view";
 import { useRemoteReconnectEpoch } from "@/remote/remote-connection-store";
 import {
   useTerminalCwdStore,
@@ -97,6 +99,9 @@ interface Props {
 const OVERLAY_FADE_MS = 150;
 
 const LINK_HINT = "Ctrl+click to open";
+
+// A shell restart belongs to the session even when its pane is remounted.
+const pendingRestarts = new Map<string, Promise<boolean | null>>();
 
 const EXIT_CHIP_CLASS =
   "status-meta inline-flex items-center rounded-sm px-1.5 py-0.5 text-label font-mono";
@@ -194,6 +199,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   // Track props for closures
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
+  const previousVisibilityRef = useRef(visible);
 
   // ── Kitty protocol scanning ──
   const scanKittyProtocol = useCallback((data: Uint8Array | string) => {
@@ -261,7 +267,11 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   // static slots. The Tailwind classes on the slots define the look;
   // `describeTerminalStatus` decides which are visible.
   const updateStatusOverlay = useCallback((status: TerminalStatusPayload) => {
-    statusRef.current = status;
+    const previous = statusRef.current;
+    // Local overlays can change the message without observing a new shell.
+    statusRef.current = status.restart_token === undefined && previous.session_id === status.session_id
+      ? { ...status, restart_token: previous.restart_token }
+      : status;
     if (status.state === "ready") {
       const target = getSessionWorkspaceId(status.session_id) ?? undefined;
       markPaneReady("terminal", { target });
@@ -350,6 +360,8 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   // ── Main mount/teardown effect ──
   useEffect(() => {
     const sid = sessionId;
+    const host = remoteViewHost();
+    const restartKey = JSON.stringify([host, sid]);
 
     // Switching back to a session whose teardown is still parked (A → B → A):
     // finish it NOW, before this mount builds a second Terminal for the same
@@ -880,6 +892,16 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // Net: 3 sequential round-trips → 1 parallel pair + 1 = effectively
     // 2 round-trips per terminal on switch.
     let cancelled = false;
+    let outputEpoch = 0;
+    const mountOutputEpoch = outputEpoch;
+    let restarting = false;
+    let outputChannel: Channel<unknown> | null = null;
+    let pendingOutputIpc: Promise<unknown> | undefined;
+    const ownsOutput = (epoch: number) => !cancelled && epoch === outputEpoch;
+    const releaseOutputChannel = () => {
+      if (outputChannel) releaseRemoteChannel(outputChannel.id);
+      outputChannel = null;
+    };
     const attachStarted = performance.now();
 
     // ── Throttled write pump + PTY producer back-pressure ──
@@ -934,16 +956,52 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       },
     });
 
+    const installOutputChannel = async (channel: Channel<unknown>, epoch: number): Promise<boolean> => {
+      try {
+        const generation = (await attachPtyOutput(sid, channel)) ?? null;
+        if (!ownsOutput(epoch)) {
+          // Teardown already released the callback, but could not detach
+          // without the generation. Finish before restart replaces the PTY.
+          if (generation != null && remoteViewHost() === host) {
+            await detachPtyOutput(sid, generation).catch(console.error);
+          }
+          return false;
+        }
+        attachedSessionRef.current = sid;
+        attachedGenerationRef.current = generation;
+        // Apply a pause that crossed the high watermark before the attach
+        // reply supplied a generation.
+        if (flowPaused && generation != null) {
+          pausePtyOutput(sid, generation).catch((err) => {
+            flowPaused = false;
+            console.error(`[codemux] flow-control pause failed for ${sid}:`, err);
+          });
+        }
+      } catch (err) {
+        if (!ownsOutput(epoch)) return false;
+        releaseOutputChannel();
+        updateStatusOverlay({
+          session_id: sid,
+          state: "failed",
+          message: `Failed to attach terminal output: ${String(err)}`,
+          exit_code: null,
+        });
+        return false;
+      }
+
+      return true;
+    };
+
     // Finish parsing restored output at its recorded geometry before fitting
     // the pane and subscribing to live output. Shared with shell restart.
-    const attachOutput = async (): Promise<boolean> => {
+    const attachOutput = async (epoch: number): Promise<boolean> => {
       // The pump may still have history split across macrotasks; xterm then
       // parses each write asynchronously. Wait for BOTH queues before fit can
       // change the coordinates of a saved prompt or absolute cursor sequence.
       await pump.flush();
-      if (cancelled) return false;
+      if (!ownsOutput(epoch)) return false;
       await new Promise<void>(resolve => term.write("", resolve));
-      if (cancelled) return false;
+      if (!ownsOutput(epoch)) return false;
       // Size both ends before subscribing: attach can synchronously replay
       // output, including ConPTY's absolute cursor positions. A spawning PTY
       // may not have its master yet; retain the subscription in that case so
@@ -956,10 +1014,11 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         } else if (visibleRef.current) {
           fitAddon.fit();
           if (term.cols > 0 && term.rows > 0) {
-            await resizePty(sid, term.cols, term.rows).catch(console.error);
+            pendingOutputIpc = resizePty(sid, term.cols, term.rows).catch(console.error);
+            await pendingOutputIpc;
           }
         }
-        if (cancelled) return false;
+        if (!ownsOutput(epoch)) return false;
         // A resize may have arrived while this IPC was pending. Refit the
         // latest geometry before exposing output; never issue concurrent
         // startup resizes or require another event to recover the new size.
@@ -970,7 +1029,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       // reads kittyLevel on every keystroke, so it can't wait behind the
       // throttled pump) then enqueues the bytes for the shared drain.
       const channel = new Channel<unknown>((payload) => {
-        if (cancelled) return;
+        if (!ownsOutput(epoch)) return;
         const bytes = extractBytes(payload);
         if (!bytes) return;
         // First live byte on a migrating pane means the replacement PTY is
@@ -988,48 +1047,30 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         scanKittyProtocol(bytes);
         pump.enqueue(bytes);
       });
+      outputChannel = channel;
+      const attaching = installOutputChannel(channel, epoch);
+      pendingOutputIpc = attaching;
+      return attaching;
+    };
 
-      try {
-        const generation = (await attachPtyOutput(sid, channel)) ?? null;
-        if (cancelled) {
-          // Unmounted during the attach round-trip: the cleanup below ran
-          // before we recorded the generation, so tear down the subscriber we
-          // just installed here — otherwise it lingers in the backend fan-out
-          // set (dropping bytes via the `cancelled` guard) until the session
-          // closes.
-          if (generation != null) {
-            detachPtyOutput(sid, generation).catch(console.error);
-          }
-          return false;
-        }
-        attachedSessionRef.current = sid;
-        attachedGenerationRef.current = generation;
-        // Reconcile a pause that crossed the HIGH watermark during the
-        // pre-attach scrollback restore, when we had no generation to attribute
-        // it to. Now that we're a subscriber, apply it.
-        if (flowPaused && generation != null) {
-          pausePtyOutput(sid, generation).catch((err) => {
-            flowPaused = false;
-            console.error(`[codemux] flow-control pause failed for ${sid}:`, err);
-          });
-        }
-      } catch (err) {
-        if (cancelled) return false;
-        updateStatusOverlay({
-          session_id: sid,
-          state: "failed",
-          message: `Failed to attach terminal output: ${String(err)}`,
-          exit_code: null,
-        });
-        return false;
-      }
-
-      return true;
+    const showTerminalStatus = (status: TerminalStatusPayload) => {
+      const session = useAppStore.getState().appState?.terminal_sessions.find(
+        (session) => session.session_id === sid,
+      );
+      updateStatusOverlay(reconcileMountedStatus(status, session));
     };
 
     restartRef.current = async () => {
-      // The old runtime, and this pane's subscription with it, is gone once
-      // the backend respawns, so drop the stale generation and protocol state.
+      if (cancelled || restarting || pendingRestarts.has(restartKey)) return;
+      const observedStatus = statusRef.current;
+      if (observedStatus.session_id !== sid || (observedStatus.state !== "exited" && observedStatus.state !== "failed")) {
+        return;
+      }
+      restarting = true;
+      const epoch = ++outputEpoch;
+      const restartToken = observedStatus.restart_token;
+      releaseOutputChannel();
+      const generation = attachedGenerationRef.current;
       attachedSessionRef.current = null;
       attachedGenerationRef.current = null;
       replayReadyRef.current = false;
@@ -1043,26 +1084,76 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         message: "Restarting shell…",
         exit_code: null,
       });
+      const restart = (async () => {
+        // Retry can be offered after a local read or attach failure, before
+        // this pane has observed a shell token.
+        const statusAtClick = restartToken === undefined ? getTerminalStatus(sid).catch(() => null) : null;
+        // Finish any issued startup resize or attach before replacing the
+        // PTY. A late detach could otherwise hit a reused generation.
+        if (pendingOutputIpc) await pendingOutputIpc;
+        if (remoteViewHost() !== host) return null;
+        if (generation != null) await detachPtyOutput(sid, generation).catch(console.error);
+        if (remoteViewHost() !== host) return null;
+
+        let expectedToken = restartToken;
+        if (statusAtClick) {
+          const status = await statusAtClick;
+          if (!status) throw new Error("Could not read terminal status");
+          if (remoteViewHost() !== host) return null;
+          if (status.state !== "exited" && status.state !== "failed") return false;
+          expectedToken = status.restart_token;
+        }
+        if (!expectedToken) {
+          throw new Error("Update Codemux on the host to restart this shell safely.");
+        }
+        const { appState } = useAppStore.getState();
+        // A closed session may disappear while its pane's IPC drains.
+        if (appState && !appState.terminal_sessions.some((session) => session.session_id === sid)) {
+          return null;
+        }
+        return (await restartTerminalSession(sid, expectedToken)) !== false;
+      })();
+      pendingRestarts.set(restartKey, restart);
       try {
-        await restartTerminalSession(sid);
-      } catch (err) {
-        if (cancelled) return;
-        updateStatusOverlay({
-          session_id: sid,
-          state: "failed",
-          message: `Failed to restart shell: ${String(err)}`,
-          exit_code: null,
-        });
-        return;
+        let restarted: boolean | null;
+        try {
+          restarted = await restart;
+        } catch (err) {
+          if (!ownsOutput(epoch)) return;
+          updateStatusOverlay({
+            session_id: sid,
+            state: "failed",
+            message: `Failed to restart shell: ${String(err)}`,
+            exit_code: null,
+          });
+          return;
+        } finally {
+          pendingRestarts.delete(restartKey);
+        }
+        if (restarted === null || !ownsOutput(epoch) || remoteViewHost() !== host) return;
+        if (restarted) {
+          pump.enqueue(
+            new TextEncoder().encode("\r\n\x1b[2m── shell restarted ──\x1b[0m\r\n\r\n"),
+          );
+        } else {
+          const status = await getTerminalStatus(sid).catch(() => null);
+          if (!ownsOutput(epoch) || remoteViewHost() !== host) return;
+          if (status) showTerminalStatus(status);
+        }
+        if (await attachOutput(epoch) && ownsOutput(epoch)) term.focus();
+      } finally {
+        restarting = false;
       }
-      if (cancelled) return;
-      pump.enqueue(
-        new TextEncoder().encode("\r\n\x1b[2m── shell restarted ──\x1b[0m\r\n\r\n"),
-      );
-      if (await attachOutput()) term.focus();
     };
 
     (async () => {
+      // A remount must attach to the replacement PTY, not the one that is
+      // about to be torn down. Read the status after the restart settles.
+      const restart = pendingRestarts.get(restartKey);
+      if (restart) {
+        await restart.catch(() => {});
+        if (!ownsOutput(mountOutputEpoch)) return;
+      }
       // O(1) reverse-index lookup; see `buildSessionWorkspaceIndex`.
       const workspaceId = getSessionWorkspaceId(sid);
       const restoreEnabled = useSyncedSettingsStore.getState().settings.session_restore.enabled;
@@ -1079,7 +1170,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
           : Promise.resolve(null),
         getTerminalStatus(sid),
       ]);
-      if (cancelled) return;
+      if (!ownsOutput(mountOutputEpoch)) return;
 
       // Enqueue scrollback first so historical bytes drain before any live
       // channel byte (FIFO order on the shared pump preserves the parser's
@@ -1111,10 +1202,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
       // Update overlay from whichever result we got.
       if (statusResult.status === "fulfilled") {
-        const session = useAppStore
-          .getState()
-          .appState?.terminal_sessions.find((s) => s.session_id === sid);
-        updateStatusOverlay(reconcileMountedStatus(statusResult.value, session));
+        showTerminalStatus(statusResult.value);
       } else {
         updateStatusOverlay({
           session_id: sid,
@@ -1124,7 +1212,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         });
       }
 
-      if (!(await attachOutput())) return;
+      if (!(await attachOutput(mountOutputEpoch))) return;
 
       // Timing log gated to slow mounts so steady-state stays quiet.
       // The user can grep stderr for `[codemux::terminal-mount]` while
@@ -1169,6 +1257,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // ── Cleanup ──
     return () => {
       cancelled = true;
+      releaseOutputChannel();
 
       const attachedGeneration = attachedGenerationRef.current;
       if (attachedSessionRef.current && attachedGeneration != null) {
@@ -1344,12 +1433,12 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
   useEffect(() => { void syncTerminalSize(); }, [phoneControl, mirrorSize?.cols, mirrorSize?.rows, syncTerminalSize]);
 
-  // Resizes are skipped while the pane is hidden, so a split or a panel change
-  // made then leaves the shell at its old width. Re-sync on the first frame
-  // the pane is shown again, before the next keystroke can wrap at the stale
-  // width.
+  // Startup sizes the PTY before attaching. Re-sync on a later reveal because
+  // splits or panel changes while the pane was hidden can leave a stale size.
   useEffect(() => {
-    if (!visible) return;
+    const becameVisible = visible && !previousVisibilityRef.current;
+    previousVisibilityRef.current = visible;
+    if (!becameVisible) return;
     const frame = requestAnimationFrame(() => {
       void syncTerminalSize();
     });

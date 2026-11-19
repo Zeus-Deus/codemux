@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex};
+use uuid::Uuid;
 
 /// Path of the per-socket liveness pidfile, set once in `run()`. A
 /// `<socket>.pid` sidecar lets an SSH-tunnel reconnect (and the host-side
@@ -99,7 +100,7 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 512;
 /// whatever the partial stream left behind. RIS also clears terminal modes
 /// (alt screen, mouse, bracketed paste), so a full-screen app may need to
 /// redraw if the replay buffer no longer holds the sequences that set them.
-const RESYNC_PREFIX: &[u8] = b"\x18\x1bc";
+pub(crate) const RESYNC_PREFIX: &[u8] = b"\x18\x1bc";
 
 /// Maximum size of the "cold-start replay" buffer per session. Captures
 /// recent output so a freshly-attached client sees something on-screen
@@ -132,6 +133,7 @@ enum SessionFrame {
 
 struct DaemonSession {
     session_id: String,
+    shell_id: Uuid,
     workspace_id: String,
     pid: u32,
     argv: Vec<String>,
@@ -149,9 +151,8 @@ struct DaemonSession {
     /// owns one receiver; the read thread and waiter thread are the only
     /// senders.
     frame_tx: broadcast::Sender<SessionFrame>,
-    /// Replay buffer for cold-start. Ring-buffered: when full, oldest bytes
-    /// are evicted in 4KB chunks so the trim cost stays bounded.
-    replay: Arc<Mutex<Vec<u8>>>,
+    /// Cold-start replay window. Evicting old bytes leaves the rest in place.
+    replay: Arc<Mutex<VecDeque<u8>>>,
     /// Final exit code once the waiter thread has reaped the child. Used
     /// by late attachers who connect after the child exited: they see this
     /// value in the `Listed` response instead of getting silence.
@@ -168,10 +169,19 @@ struct DaemonSession {
 struct Subscription {
     // Retain the snapshot even after the waiter removes an exited session.
     session: Arc<DaemonSession>,
+    request_id: Option<u64>,
+    tagged: bool,
     rx: broadcast::Receiver<SessionFrame>,
     /// Frames owed to this connection alone, delivered before anything on
     /// `rx`: the replay snapshot, plus `Exited` for an already-ended session.
     backlog: VecDeque<SessionFrame>,
+}
+
+fn append_replay(replay: &mut VecDeque<u8>, chunk: &[u8]) {
+    let chunk = &chunk[chunk.len().saturating_sub(REPLAY_BUFFER_BYTES)..];
+    let excess = (replay.len() + chunk.len()).saturating_sub(REPLAY_BUFFER_BYTES);
+    replay.drain(..excess);
+    replay.extend(chunk);
 }
 
 /// Subscribe to live output and capture the replay snapshot as one step.
@@ -181,8 +191,11 @@ async fn subscribe(session: &Arc<DaemonSession>, prefix: &[u8]) -> Subscription 
     let replay = session.replay.lock().await;
     let exit_code = session.exit_code.lock().await;
     let rx = session.frame_tx.subscribe();
-    let mut snapshot = prefix.to_vec();
-    snapshot.extend_from_slice(&replay);
+    let mut snapshot = Vec::with_capacity(prefix.len() + replay.len());
+    snapshot.extend_from_slice(prefix);
+    let (first, second) = replay.as_slices();
+    snapshot.extend_from_slice(first);
+    snapshot.extend_from_slice(second);
     let mut backlog = VecDeque::new();
     if !snapshot.is_empty() {
         backlog.push_back(SessionFrame::Output(snapshot));
@@ -197,14 +210,45 @@ async fn subscribe(session: &Arc<DaemonSession>, prefix: &[u8]) -> Subscription 
     drop(replay);
     Subscription {
         session: session.clone(),
+        request_id: None,
+        tagged: false,
         rx,
         backlog,
     }
 }
 
+const SPAWN_PREPARATION_TTL: Duration = Duration::from_secs(30);
+
+struct PreparedSpawn {
+    shell_id: Uuid,
+    expires_at: Instant,
+}
+
 #[derive(Default)]
 struct DaemonState {
     sessions: HashMap<String, Arc<DaemonSession>>,
+    prepared_spawns: HashMap<String, PreparedSpawn>,
+    spawning: HashMap<String, Uuid>,
+}
+
+impl DaemonState {
+    fn prune_spawn_preparations(&mut self, now: Instant) {
+        self.prepared_spawns.retain(|_, permit| permit.expires_at > now);
+    }
+
+    fn is_idle(&mut self) -> bool {
+        self.prune_spawn_preparations(Instant::now());
+        self.sessions.is_empty() && self.prepared_spawns.is_empty() && self.spawning.is_empty()
+    }
+
+    fn has_shell_or_active_spawn(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id) || self.spawning.contains_key(session_id)
+    }
+}
+
+enum SpawnClaim {
+    Immediate(Option<Uuid>),
+    Prepared(Uuid),
 }
 
 type SharedState = Arc<Mutex<DaemonState>>;
@@ -303,7 +347,7 @@ pub async fn run(socket_path: PathBuf) -> Result<(), String> {
                 Some(tokio::time::Instant::now());
             loop {
                 tokio::time::sleep(CHECK_INTERVAL).await;
-                if !reaper_state.lock().await.sessions.is_empty() {
+                if !reaper_state.lock().await.is_idle() {
                     idle_since = None;
                     continue;
                 }
@@ -314,7 +358,7 @@ pub async fn run(socket_path: PathBuf) -> Result<(), String> {
                 }
                 // Re-check under the lock right before exit — never reap a
                 // daemon that just gained a session between the poll and now.
-                if !reaper_state.lock().await.sessions.is_empty() {
+                if !reaper_state.lock().await.is_idle() {
                     idle_since = None;
                     continue;
                 }
@@ -393,7 +437,10 @@ async fn handle_connection(
                                 "[codemux::pty_daemon] client lagged {skipped} frames on \
                                  session {sid}, resyncing from replay"
                             );
-                            *sub = subscribe(&sub.session, RESYNC_PREFIX).await;
+                            let mut replay = subscribe(&sub.session, RESYNC_PREFIX).await;
+                            replay.request_id = sub.request_id;
+                            replay.tagged = sub.tagged;
+                            *sub = replay;
                             continue;
                         }
                         Err(broadcast::error::TryRecvError::Closed) => {
@@ -407,6 +454,7 @@ async fn handle_connection(
                     SessionFrame::Output(data) => {
                         let frame = Frame::Event(ServerEvent::Output {
                             session_id: sid.clone(),
+                            attachment_id: sub.request_id.filter(|_| sub.tagged),
                             data_b64: base64::engine::general_purpose::STANDARD.encode(&data),
                         });
                         write_frame(&mut write_half, &frame).await?;
@@ -415,6 +463,7 @@ async fn handle_connection(
                     SessionFrame::Exited(code) => {
                         let frame = Frame::Event(ServerEvent::Exited {
                             session_id: sid.clone(),
+                            attachment_id: sub.request_id.filter(|_| sub.tagged),
                             exit_code: code,
                         });
                         write_frame(&mut write_half, &frame).await?;
@@ -519,59 +568,68 @@ async fn handle_request(
             daemon_pid: std::process::id(),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             host_claude_plugin: HOST_CLAUDE_PLUGIN.get().is_some(),
+            guarded_shells: true,
+            prepared_spawn: true,
         },
+        ClientRequest::PrepareOwnedSpawn { request_id, session_id, shell_id } => {
+            let mut guard = state.lock().await;
+            let now = Instant::now();
+            guard.prune_spawn_preparations(now);
+            if guard.has_shell_or_active_spawn(&session_id) {
+                return ServerResponse::Error {
+                    request_id,
+                    message: format!("session {session_id} already exists in daemon"),
+                };
+            }
+            guard.prepared_spawns.insert(session_id, PreparedSpawn {
+                shell_id,
+                expires_at: now + SPAWN_PREPARATION_TTL,
+            });
+            ServerResponse::SpawnPrepared { request_id }
+        }
         ClientRequest::Spawn {
             request_id,
             session_id,
+            workspace_id,
+            shell_id,
+            argv,
+            cwd,
+            env,
+            rows,
+            cols,
+        } => {
+            let result = spawn_pty(
+                &state, session_id.clone(), SpawnClaim::Immediate(shell_id),
+                workspace_id, argv, cwd, env, rows, cols,
+            ).await;
+            spawn_response(request_id, session_id, result)
+        }
+        ClientRequest::SpawnOwned {
+            request_id,
+            session_id,
+            shell_id,
             workspace_id,
             argv,
             cwd,
             env,
             rows,
             cols,
-        } => match spawn_pty(&state, session_id.clone(), workspace_id, argv, cwd, env, rows, cols)
-            .await
-        {
-            Ok(pid) => ServerResponse::Spawned {
-                request_id,
-                session_id,
-                pid,
-            },
-            Err(error) => ServerResponse::Error {
-                request_id,
-                message: error,
-            },
-        },
+        } => {
+            let result = spawn_pty(
+                &state, session_id.clone(), SpawnClaim::Prepared(shell_id),
+                workspace_id, argv, cwd, env, rows, cols,
+            ).await;
+            spawn_response(request_id, session_id, result)
+        }
         ClientRequest::Attach {
             request_id,
             session_id,
-        } => {
-            let guard = state.lock().await;
-            let session = match guard.sessions.get(&session_id) {
-                Some(s) => s.clone(),
-                None => {
-                    return ServerResponse::Error {
-                        request_id,
-                        message: format!("unknown session {session_id}"),
-                    };
-                }
-            };
-            drop(guard);
-            // Fail-safe: a fresh attach always resumes the read loop. If a
-            // previous client paused this session and then crashed or
-            // dropped its connection without resuming, the new client would
-            // otherwise inherit a wedged (paused) PTY. Clearing here means a
-            // stuck pause self-heals on the next attach (e.g. app restart,
-            // reopening the pane).
-            session.flow_paused.store(false, Ordering::Relaxed);
-            // The replay goes to this connection only; other viewers of the
-            // session already have that output.
-            attached.insert(session_id.clone(), subscribe(&session, b"").await);
-            ServerResponse::Attached {
-                request_id,
-                session_id,
-            }
-        }
+        } => attach_session(&state, attached, request_id, session_id, None).await,
+        ClientRequest::AttachOwned {
+            request_id,
+            session_id,
+            shell_id,
+        } => attach_session(&state, attached, request_id, session_id, Some(shell_id)).await,
         ClientRequest::Detach {
             request_id,
             session_id,
@@ -669,19 +727,47 @@ async fn handle_request(
             request_id,
             session_id,
         } => {
-            let session = {
+            let session = state.lock().await.sessions.remove(&session_id);
+            if let Some(session) = session {
+                terminate_session(&session);
+            }
+            ServerResponse::Closed { request_id, attachment_id: None }
+        }
+        ClientRequest::CloseOwned {
+            request_id,
+            session_id,
+            shell_id,
+        } => {
+            let (session, attachment_id) = {
                 let mut guard = state.lock().await;
-                guard.sessions.remove(&session_id)
+                let session = if guard.sessions.get(&session_id)
+                    .is_some_and(|session| session.shell_id == shell_id)
+                {
+                    guard.sessions.remove(&session_id)
+                } else {
+                    None
+                };
+                if guard.spawning.get(&session_id) == Some(&shell_id) {
+                    guard.spawning.remove(&session_id);
+                }
+                if guard.prepared_spawns.get(&session_id)
+                    .is_some_and(|permit| permit.shell_id == shell_id)
+                {
+                    guard.prepared_spawns.remove(&session_id);
+                }
+                let attachment_id = if attached.get(&session_id)
+                    .is_some_and(|subscription| subscription.session.shell_id == shell_id)
+                {
+                    attached.remove(&session_id).and_then(|subscription| subscription.request_id)
+                } else {
+                    None
+                };
+                (session, attachment_id)
             };
             if let Some(session) = session {
-                // Clear any pause first so a read thread parked in the
-                // flow-control gate wakes, reads EOF on the now-killed
-                // master, and exits — otherwise it would leak (parked
-                // forever holding the broadcast sender).
-                session.flow_paused.store(false, Ordering::Relaxed);
-                kill_session_pid(session.pid);
+                terminate_session(&session);
             }
-            ServerResponse::Closed { request_id }
+            ServerResponse::Closed { request_id, attachment_id }
         }
         ClientRequest::List { request_id } => {
             let guard = state.lock().await;
@@ -690,6 +776,7 @@ async fn handle_request(
                 .values()
                 .map(|s| DaemonSessionInfo {
                     session_id: s.session_id.clone(),
+                    shell_id: Some(s.shell_id),
                     workspace_id: s.workspace_id.clone(),
                     pid: s.pid,
                     argv: s.argv.clone(),
@@ -744,9 +831,60 @@ async fn handle_request(
     }
 }
 
+async fn attach_session(
+    state: &SharedState,
+    attached: &mut HashMap<String, Subscription>,
+    request_id: u64,
+    session_id: String,
+    shell_id: Option<Uuid>,
+) -> ServerResponse {
+    let session = state.lock().await.sessions.get(&session_id).cloned();
+    let Some(session) = session.filter(|session| shell_id.is_none_or(|id| id == session.shell_id)) else {
+        return ServerResponse::Error {
+            request_id,
+            message: format!("unknown session {session_id}"),
+        };
+    };
+    if shell_id.is_some()
+        && attached.get(&session_id).is_some_and(|subscription| {
+            subscription.request_id.is_some_and(|latest| latest > request_id)
+        })
+    {
+        return ServerResponse::Error {
+            request_id,
+            message: format!("a newer attachment owns session {session_id}"),
+        };
+    }
+    // Attaching resumes a shell left flow-paused by a disconnected client.
+    session.flow_paused.store(false, Ordering::Relaxed);
+    let mut subscription = subscribe(&session, b"").await;
+    subscription.request_id = Some(request_id);
+    subscription.tagged = shell_id.is_some();
+    attached.insert(session_id.clone(), subscription);
+    ServerResponse::Attached { request_id, session_id }
+}
+
+fn terminate_session(session: &DaemonSession) {
+    // Resume the reader so it can observe EOF after the process is gone.
+    session.flow_paused.store(false, Ordering::Relaxed);
+    kill_session_pid(session.pid);
+}
+
+fn spawn_response(
+    request_id: u64,
+    session_id: String,
+    result: Result<u32, String>,
+) -> ServerResponse {
+    match result {
+        Ok(pid) => ServerResponse::Spawned { request_id, session_id, pid },
+        Err(message) => ServerResponse::Error { request_id, message },
+    }
+}
+
 async fn spawn_pty(
     state: &SharedState,
     session_id: String,
+    claim: SpawnClaim,
     workspace_id: String,
     argv: Vec<String>,
     cwd: String,
@@ -758,16 +896,53 @@ async fn spawn_pty(
         return Err("argv is empty".into());
     }
 
-    // Refuse to double-spawn the same id — the Tauri side is supposed to
-    // generate fresh ids per request, but tests and panics can break that
-    // invariant.
-    {
-        let guard = state.lock().await;
-        if guard.sessions.contains_key(&session_id) {
+    let shell_id = {
+        let mut guard = state.lock().await;
+        if guard.has_shell_or_active_spawn(&session_id) {
             return Err(format!("session {session_id} already exists in daemon"));
         }
-    }
+        let shell_id = match claim {
+            SpawnClaim::Immediate(shell_id) => shell_id.unwrap_or_else(Uuid::new_v4),
+            SpawnClaim::Prepared(shell_id) => {
+                let available = guard.prepared_spawns.get(&session_id).is_some_and(|permit| {
+                    permit.shell_id == shell_id && permit.expires_at > Instant::now()
+                });
+                if !available {
+                    return Err(format!("no active spawn preparation for session {session_id}"));
+                }
+                shell_id
+            }
+        };
+        // Claim the slot and consume its permit atomically. A normal Spawn
+        // also supersedes an unused preparation for the same session.
+        guard.prepared_spawns.remove(&session_id);
+        guard.spawning.insert(session_id.clone(), shell_id);
+        shell_id
+    };
 
+    let result = spawn_reserved_pty(
+        state, session_id.clone(), shell_id, workspace_id, argv, cwd, env, rows, cols,
+    ).await;
+    if result.is_err() {
+        let mut guard = state.lock().await;
+        if guard.spawning.get(&session_id) == Some(&shell_id) {
+            guard.spawning.remove(&session_id);
+        }
+    }
+    result
+}
+
+async fn spawn_reserved_pty(
+    state: &SharedState,
+    session_id: String,
+    shell_id: Uuid,
+    workspace_id: String,
+    argv: Vec<String>,
+    cwd: String,
+    env: Vec<(String, String)>,
+    rows: u16,
+    cols: u16,
+) -> Result<u32, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -868,12 +1043,13 @@ async fn spawn_pty(
     };
 
     let (tx, _rx) = broadcast::channel::<SessionFrame>(OUTPUT_CHANNEL_CAPACITY);
-    let replay = Arc::new(Mutex::new(Vec::with_capacity(REPLAY_BUFFER_BYTES)));
+    let replay = Arc::new(Mutex::new(VecDeque::with_capacity(REPLAY_BUFFER_BYTES)));
     let exit_code = Arc::new(Mutex::new(None));
     let flow_paused = Arc::new(AtomicBool::new(false));
 
     let session = Arc::new(DaemonSession {
         session_id: session_id.clone(),
+        shell_id,
         workspace_id,
         pid,
         argv,
@@ -894,6 +1070,13 @@ async fn spawn_pty(
 
     {
         let mut guard = state.lock().await;
+        if guard.spawning.get(&session_id) != Some(&shell_id) {
+            drop(guard);
+            terminate_session(&session);
+            let _ = child.wait();
+            return Err(format!("spawn cancelled for session {session_id}"));
+        }
+        guard.spawning.remove(&session_id);
         guard.sessions.insert(session_id.clone(), session.clone());
     }
 
@@ -947,11 +1130,7 @@ async fn spawn_pty(
                     // still holding the lock so `subscribe` sees each chunk
                     // in exactly one of its snapshot or the live stream.
                     let mut rb = read_replay.blocking_lock();
-                    rb.extend_from_slice(&chunk);
-                    if rb.len() > REPLAY_BUFFER_BYTES {
-                        let excess = rb.len() - REPLAY_BUFFER_BYTES;
-                        rb.drain(0..excess);
-                    }
+                    append_replay(&mut rb, &chunk);
                     let _ = read_tx.send(SessionFrame::Output(chunk));
                 }
                 Err(error) => {
@@ -972,6 +1151,7 @@ async fn spawn_pty(
     // the rt handle so we can hop back into the tokio world to drop the
     // session under the same `Mutex` everyone else uses.
     let wait_session_id = session_id.clone();
+    let wait_session = Arc::downgrade(&session);
     let wait_state = state.clone();
     let wait_tx = tx;
     let wait_exit_code = exit_code;
@@ -992,17 +1172,20 @@ async fn spawn_pty(
                 -1
             }
         };
-        // Record the exit code so late-attachers see it.
+        // Remove only this incarnation before telling a client it can restart.
+        // Close may have already removed it and a same-id spawn may own the slot.
         rt_handle.block_on(async {
+            let mut guard = wait_state.lock().await;
+            if guard.sessions.get(&wait_session_id).is_some_and(|session| {
+                std::ptr::eq(Arc::as_ptr(session), wait_session.as_ptr())
+            }) {
+                guard.sessions.remove(&wait_session_id);
+            }
+            drop(guard);
+            // Record the code for subscriptions that already obtained the session.
             let mut exit_code = wait_exit_code.lock().await;
             *exit_code = Some(code);
             let _ = wait_tx.send(SessionFrame::Exited(code));
-        });
-        // Evict from the daemon's session map so subsequent
-        // Write/Resize/Attach for this id error with "unknown session".
-        rt_handle.block_on(async {
-            let mut guard = wait_state.lock().await;
-            guard.sessions.remove(&wait_session_id);
         });
     });
 
@@ -1046,6 +1229,7 @@ mod tests {
         let (frame_tx, _) = broadcast::channel(capacity);
         let session = Arc::new(DaemonSession {
             session_id: "output-test".into(),
+            shell_id: Uuid::new_v4(),
             workspace_id: "test".into(),
             pid: 0,
             argv: vec![],
@@ -1056,7 +1240,7 @@ mod tests {
             writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
             master: Arc::new(Mutex::new(pair.master)),
             frame_tx,
-            replay: Arc::new(Mutex::new(Vec::new())),
+            replay: Arc::new(Mutex::new(VecDeque::with_capacity(REPLAY_BUFFER_BYTES))),
             exit_code: Arc::new(Mutex::new(None)),
             flow_paused: Arc::new(AtomicBool::new(false)),
         });
@@ -1088,10 +1272,117 @@ mod tests {
 
     async fn publish_test_output(session: &super::DaemonSession, bytes: &[u8]) {
         let mut replay = session.replay.lock().await;
-        replay.extend_from_slice(bytes);
+        super::append_replay(&mut replay, bytes);
         let _ = session
             .frame_tx
             .send(super::SessionFrame::Output(bytes.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn guarded_close_cancels_delayed_spawn_without_touching_replacement() {
+        use super::*;
+
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let (spawner, spawn_task) = output_test_client(state.clone());
+        let (closer, close_task) = output_test_client(state.clone());
+        spawner.hello().await.unwrap();
+        closer.hello().await.unwrap();
+        assert!(spawner.supports_prepared_spawn());
+
+        let id = "delayed-spawn";
+        let cancelled = Uuid::new_v4();
+        spawner.prepare_owned_spawn(id.into(), cancelled).await.unwrap();
+        closer.close_owned(id.into(), cancelled).await.unwrap();
+
+        // An unused permit can expire or be superseded without affecting
+        // another shell's identity.
+        let expired = Uuid::new_v4();
+        spawner.prepare_owned_spawn(id.into(), expired).await.unwrap();
+        state.lock().await.prepared_spawns.get_mut(id).unwrap().expires_at = Instant::now();
+        let spawn = |shell_id| {
+            spawner.spawn_prepared(
+                id.into(), shell_id, "workspace".into(),
+                vec!["/bin/sleep".into(), "15".into()],
+                "/".into(), vec![], 24, 80,
+            )
+        };
+        assert!(spawn(expired).await.unwrap_err().to_string().contains("no active spawn preparation"));
+
+        let superseded = Uuid::new_v4();
+        spawner.prepare_owned_spawn(id.into(), superseded).await.unwrap();
+        let replacement = Uuid::new_v4();
+        spawner.prepare_owned_spawn(id.into(), replacement).await.unwrap();
+        closer.close_owned(id.into(), cancelled).await.unwrap();
+        for stale in [cancelled, superseded] {
+            assert!(spawn(stale).await.unwrap_err().to_string().contains("no active spawn preparation"));
+        }
+        assert!(closer.list().await.unwrap().is_empty());
+
+        let pid = spawn(replacement).await.unwrap();
+        let sessions = closer.list().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].shell_id, Some(replacement));
+        assert_eq!(sessions[0].pid, pid);
+
+        closer.close_owned(id.into(), replacement).await.unwrap();
+        assert!(closer.list().await.unwrap().is_empty());
+        spawn_task.abort();
+        close_task.abort();
+    }
+
+    #[tokio::test]
+    async fn guarded_close_keeps_same_id_replacement_and_its_subscription() {
+        use super::*;
+        let (state, old_shell) = output_test_session(8).await;
+        let (_, replacement) = output_test_session(8).await;
+        let id = old_shell.session_id.clone();
+        let (client, task) = output_test_client(state.clone());
+        client.hello().await.unwrap();
+        assert!(client.supports_guarded_shells());
+        let mut old_output = client.attach_owned(id.clone(), old_shell.shell_id).await.unwrap();
+
+        state.lock().await.sessions.insert(id.clone(), replacement.clone());
+        client.close_owned(id.clone(), old_shell.shell_id).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), old_output.recv()).await.unwrap(),
+            None,
+            "guarded close retires this connection's old subscription"
+        );
+        assert_eq!(client.list().await.unwrap()[0].shell_id, Some(replacement.shell_id));
+
+        let mut new_output = client.attach_owned(id.clone(), replacement.shell_id).await.unwrap();
+        assert!(client.attach_owned(id.clone(), old_shell.shell_id).await.is_err());
+        client.close_owned(id.clone(), old_shell.shell_id).await.unwrap();
+        publish_test_output(&replacement, b"replacement is alive").await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), new_output.recv()).await.unwrap().unwrap(),
+            b"replacement is alive"
+        );
+        client.close_owned(id, replacement.shell_id).await.unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), new_output.recv()).await.unwrap(), None);
+        assert!(client.list().await.unwrap().is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn replay_retains_the_newest_bytes_in_order_after_wrapping() {
+        use super::*;
+
+        let (_state, session) = output_test_session(2).await;
+        let mut first = vec![b'a'; REPLAY_BUFFER_BYTES - 2];
+        first[..2].copy_from_slice(b"xy");
+        publish_test_output(&session, &first).await;
+        publish_test_output(&session, b"bcde").await;
+
+        let mut subscription = subscribe(&session, RESYNC_PREFIX).await;
+        let Some(SessionFrame::Output(snapshot)) = subscription.backlog.pop_front() else {
+            panic!("expected snapshot");
+        };
+        let mut expected = RESYNC_PREFIX.to_vec();
+        expected.extend_from_slice(&first[2..]);
+        expected.extend_from_slice(b"bcde");
+        assert_eq!(snapshot, expected);
+        assert!(subscription.backlog.is_empty());
     }
 
     #[tokio::test]
@@ -1148,7 +1439,7 @@ mod tests {
         // Attach parks on the replay lock while the producer publishes the
         // next chunk. That chunk must appear in the snapshot exactly once.
         ready.await.unwrap();
-        replay.extend_from_slice(b"during");
+        append_replay(&mut replay, b"during");
         let _ = session
             .frame_tx
             .send(SessionFrame::Output(b"during".to_vec()));
@@ -1211,7 +1502,15 @@ mod tests {
 
         let (state, session) = output_test_session(2).await;
         let (client, task) = output_test_client(state.clone());
-        let mut output = client.attach(session.session_id.clone()).await.unwrap();
+        let output = client.attach(session.session_id.clone()).await.unwrap();
+        // An owned attachment must retain its tag across resync for both
+        // the replay snapshot and the exit that retires the receiver.
+        let (owner, owner_task) = output_test_client(state.clone());
+        owner.hello().await.unwrap();
+        let owned_output = owner
+            .attach_owned(session.session_id.clone(), session.shell_id)
+            .await
+            .unwrap();
         for bytes in [b"one".as_slice(), b"two", b"three"] {
             publish_test_output(&session, bytes).await;
         }
@@ -1221,16 +1520,19 @@ mod tests {
             let _ = session.frame_tx.send(SessionFrame::Exited(7));
         }
         state.lock().await.sessions.remove(&session.session_id);
-        let replay = tokio::time::timeout(Duration::from_secs(1), output.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(replay, b"\x18\x1bconetwothree");
-        assert!(tokio::time::timeout(Duration::from_secs(1), output.recv())
-            .await
-            .unwrap()
-            .is_none());
+        for mut receiver in [output, owned_output] {
+            let replay = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(replay, b"\x18\x1bconetwothree");
+            assert!(tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .is_none());
+        }
         task.abort();
+        owner_task.abort();
     }
 
     #[tokio::test]
@@ -1409,7 +1711,7 @@ mod tests {
             let blocked_response = tokio::time::timeout(Duration::from_secs(5), writing).await;
             let independent = watchdog.join().unwrap();
             started.unwrap().unwrap();
-            assert!(matches!(closed, ServerResponse::Closed { request_id: 3 }));
+            assert!(matches!(closed, ServerResponse::Closed { request_id: 3, .. }));
             assert!(matches!(
                 response,
                 ServerResponse::Written { request_id: 2 }

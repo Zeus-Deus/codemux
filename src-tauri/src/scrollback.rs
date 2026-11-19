@@ -184,6 +184,18 @@ pub fn load_scrollback(workspace_id: &str, pane_id: &str) -> Option<ScrollbackRe
     Some(ScrollbackRestore { data, meta })
 }
 
+/// Read a predecessor's metadata only from the pane it previously owned.
+pub(crate) fn load_scrollback_meta_for_predecessor(
+    workspace_id: &str,
+    pane_id: &str,
+    predecessor_id: &str,
+) -> Option<(String, String, ScrollbackMeta)> {
+    let bytes = fs::read(meta_path(workspace_id, pane_id)).ok()?;
+    let meta: ScrollbackMeta = serde_json::from_slice(&bytes).ok()?;
+    (meta.workspace_id == workspace_id && meta.pane_id == pane_id && meta.session_id == predecessor_id)
+        .then(|| (workspace_id.to_owned(), pane_id.to_owned(), meta))
+}
+
 /// Find scrollback metadata for a live session by session_id.
 /// Scans all workspace scrollback metadata files on disk.
 pub fn find_scrollback_meta_for_session(
@@ -792,6 +804,29 @@ mod tests {
     }
 
     #[test]
+    fn predecessor_scrollback_requires_the_exact_owner() {
+        const TEST: &str = "scrollback::tests::predecessor_scrollback_requires_the_exact_owner";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        let (workspace, pane, predecessor) = ("workspace", "pane", "predecessor");
+        save_scrollback(&test_payload_with_session(workspace, pane, predecessor)).unwrap();
+
+        let (_, _, meta) = load_scrollback_meta_for_predecessor(workspace, pane, predecessor)
+            .expect("metadata belongs to this pane and predecessor");
+        assert!(load_scrollback_meta_for_predecessor(workspace, pane, "other-session").is_none());
+
+        let path = meta_path(workspace, pane);
+        for foreign in [
+            ScrollbackMeta { workspace_id: "other-workspace".into(), ..meta.clone() },
+            ScrollbackMeta { pane_id: "other-pane".into(), ..meta.clone() },
+        ] {
+            fs::write(&path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+            assert!(load_scrollback_meta_for_predecessor(workspace, pane, predecessor).is_none());
+        }
+    }
+
+    #[test]
     fn find_scrollback_meta_for_sessions_resolves_a_batch_in_one_walk() {
         let pid = std::process::id();
         let ws_a = format!("test-ws-batch-a-{pid}");
@@ -977,6 +1012,8 @@ mod tests {
         let mut snap = store.snapshot();
         snap.terminal_sessions.push(TerminalSessionSnapshot {
             session_id: SessionId(session_id.into()),
+            daemon_unused: false,
+            restore_predecessor_session_id: None,
             title: "test".into(),
             shell: None,
             cwd: "/tmp".into(),

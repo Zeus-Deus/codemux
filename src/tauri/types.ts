@@ -476,6 +476,8 @@ export interface TerminalSessionSnapshot {
 
 export interface TerminalStatusPayload {
   session_id: string;
+  /** Opaque identity used to restart only the observed shell. */
+  restart_token?: string;
   // "migrating" is a transient cloud-push / pull-back state — shown as a
   // "Switching to <host>…" overlay between the old PTY dying and the
   // replacement session's first output. It only ever rides this event;

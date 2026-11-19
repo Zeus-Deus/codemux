@@ -1002,6 +1002,29 @@ fn build_core_app<R: tauri::Runtime>(
             }
 
             let handle = app.handle().clone();
+            #[cfg(unix)]
+            let (pending_layout_closes, mut pending_terminal_closes, daemon_shells) = {
+                let db = handle.state::<database::DatabaseStore>();
+                let layout_closes = db.pending_layout_closes().map_err(std::io::Error::other)?;
+                let daemon_closes = db.pending_daemon_closes().map_err(std::io::Error::other)?;
+                let daemon_shells = db.daemon_shell_ownership().map_err(std::io::Error::other)?;
+                (layout_closes, daemon_closes, daemon_shells)
+            };
+            #[cfg(unix)]
+            let recovery_pending = state::layout_recovery_pending();
+            #[cfg(unix)]
+            let has_local_fallbacks = handle.state::<database::DatabaseStore>()
+                .has_local_terminal_fallbacks().map_err(std::io::Error::other)?;
+            #[cfg(unix)]
+            let has_local_restarts = handle.state::<database::DatabaseStore>()
+                .has_pending_local_terminal_restarts().map_err(std::io::Error::other)?;
+            #[cfg(unix)]
+            let terminal_replacements = if has_local_restarts {
+                handle.state::<database::DatabaseStore>()
+                    .pending_terminal_replacements().map_err(std::io::Error::other)?
+            } else {
+                Vec::new()
+            };
             // Track whether the persisted layout actually loaded. The
             // Windows orphan-cleanup gate below uses this to skip the
             // destructive `cleanup_orphan_scrollbacks(&[])` call after
@@ -1053,6 +1076,53 @@ fn build_core_app<R: tauri::Runtime>(
                 if let Err(error) = state.recover_local_import_layout(&db).and_then(|ids| {
                     if ids.is_empty() {Ok(())} else {state.persist_local_import_layout(&db,&ids)}
                 }) {log::warn!("Local import layout recovery remains pending: {error}");}
+            }
+            #[cfg(unix)]
+            {
+                let store = handle.state::<state::AppStateStore>();
+                state::restore_terminal_replacements_and_layout_closes(
+                    &store,
+                    &terminal_replacements,
+                    &pending_layout_closes,
+                ).map_err(std::io::Error::other)?;
+                let db = handle.state::<database::DatabaseStore>();
+                if let Err(error) = state::persist_terminal_replacements(&store, &db, &terminal_replacements) {
+                    log::warn!("Could not save replayed terminal replacements: {error}");
+                }
+            }
+            #[cfg(unix)]
+            // A missing pane can still own a shell or restart in the set-aside layout.
+            if !recovery_pending && !daemon_shells.is_empty() {
+                // A shell can start before its new pane has reached disk.
+                // Retire these exact shells without hydrating a missing pane.
+                let orphaned = handle.state::<state::AppStateStore>().orphaned_daemon_shells(daemon_shells);
+                if !orphaned.is_empty() {
+                    let db = handle.state::<database::DatabaseStore>();
+                    if let Err(error) = db.journal_orphan_daemon_shells(&orphaned) {
+                        log::error!("Could not journal orphaned daemon shells: {error}");
+                    }
+                    pending_terminal_closes.extend(orphaned);
+                }
+            }
+            #[cfg(unix)]
+            if !recovery_pending && (has_local_fallbacks || has_local_restarts) {
+                let live = handle.state::<state::AppStateStore>().terminal_session_owners();
+                let db = handle.state::<database::DatabaseStore>();
+                if has_local_fallbacks {
+                    if let Err(error) = db.reconcile_local_terminal_fallbacks(&live) {
+                        log::warn!("Could not prune orphaned local terminal fallback records: {error}");
+                    }
+                }
+                if has_local_restarts {
+                    match db.journal_orphan_local_terminal_restarts(&live) {
+                        Ok(orphaned) => {
+                            let mut known: std::collections::HashSet<_> =
+                                pending_terminal_closes.iter().cloned().collect();
+                            pending_terminal_closes.extend(orphaned.into_iter().filter(|close| known.insert(close.clone())));
+                        }
+                        Err(error) => log::warn!("Could not journal orphaned terminal restarts: {error}"),
+                    }
+                }
             }
             // Reconciliation checks canonical pane/workspace ownership. Starting
             // it before layout restore can incorrectly hold a saved child result.
@@ -1338,6 +1408,11 @@ fn build_core_app<R: tauri::Runtime>(
             // Codemux plugin (see `claude_plugin`).
             let _ = claude_plugin::local_plugin_dir();
 
+            #[cfg(unix)]
+            {
+                terminal::daemon_backed::persist_pending_layout_closes(&handle, pending_layout_closes);
+                terminal::daemon_backed::resume_pending_daemon_closes(&handle, pending_terminal_closes);
+            }
             terminal::spawn_missing_ptys(handle);
 
             // Warm up the PTY daemon connection. The daemon is now the

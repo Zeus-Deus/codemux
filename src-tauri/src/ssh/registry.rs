@@ -22,12 +22,17 @@
 
 #![cfg(unix)]
 
+use crate::pty_daemon::{PtyDaemonClient, PtyDaemonError};
 use crate::ssh::tunnel_supervisor::{TunnelStatus, TunnelSupervisor};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::Emitter;
 use tokio::sync::{Mutex, OnceCell};
+
+// Non-interactive SSH shells may omit ~/.local/bin from PATH.
+const REMOTE_DAEMON_BINARY: &str = "$HOME/.local/bin/codemux-remote";
 
 /// Payload for the `tunnel-status-changed` event the UI listens to so it
 /// can render a "Reconnecting…" / "Connection lost" pill on remote
@@ -185,15 +190,58 @@ pub fn remote_socket_for_workspace(workspace_id: &str) -> String {
 ///
 /// Keyed by workspace_id. Entries are removed when the workspace's
 /// supervisor is shut down (on pull-back or close).
-static WORKSPACE_CLIENTS: OnceCell<
-    Mutex<HashMap<String, std::sync::Arc<crate::pty_daemon::PtyDaemonClient>>>,
-> = OnceCell::const_new();
+static WORKSPACE_CLIENTS: OnceCell<Mutex<HashMap<String, Arc<PtyDaemonClient>>>> =
+    OnceCell::const_new();
 
-async fn workspace_clients(
-) -> &'static Mutex<HashMap<String, std::sync::Arc<crate::pty_daemon::PtyDaemonClient>>> {
+async fn workspace_clients() -> &'static Mutex<HashMap<String, Arc<PtyDaemonClient>>> {
     WORKSPACE_CLIENTS
         .get_or_init(|| async { Mutex::new(HashMap::new()) })
         .await
+}
+
+/// A tunnel to the original owner of a shell after its workspace has moved.
+/// Keeps its own client so it can never use the workspace's current host.
+pub(crate) struct CleanupDaemonTunnel {
+    key: String,
+    client: Option<Arc<PtyDaemonClient>>,
+}
+
+impl CleanupDaemonTunnel {
+    pub(crate) async fn start(workspace_id: &str, ssh_target: &str) -> Self {
+        let key = format!("terminal-cleanup:{}", uuid::Uuid::new_v4());
+        let mut supervisors = registry().await.lock().await;
+        // Register without an await after spawning so cancellation cannot
+        // leave a live tunnel outside the app's shutdown registry.
+        let supervisor = TunnelSupervisor::spawn(
+            ssh_target.to_string(),
+            remote_socket_for_workspace(workspace_id),
+            local_socket_for_workspace(&key),
+            REMOTE_DAEMON_BINARY.to_string(),
+        );
+        supervisors.insert(key.clone(), supervisor);
+        Self { key, client: None }
+    }
+
+    pub(crate) async fn client(
+        &mut self,
+        workspace_id: &str,
+    ) -> Result<Arc<PtyDaemonClient>, PtyDaemonError> {
+        if let Some(client) = &self.client {
+            if !client.is_closed() {
+                return Ok(client.clone());
+            }
+        }
+        let supervisor = get_supervisor(&self.key)
+            .await
+            .ok_or_else(|| PtyDaemonError::Daemon("terminal cleanup tunnel shut down".into()))?;
+        let client = connect_tunnel_daemon(workspace_id, &supervisor).await?;
+        self.client = Some(client.clone());
+        Ok(client)
+    }
+
+    pub(crate) async fn shutdown(self) {
+        shutdown_supervisor(&self.key).await;
+    }
 }
 
 /// Resolve the `PtyDaemonClient` for a workspace given its host
@@ -218,9 +266,8 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     workspace_id: &str,
     host_id: Option<i64>,
-) -> Result<std::sync::Arc<crate::pty_daemon::PtyDaemonClient>, crate::pty_daemon::PtyDaemonError> {
-    use crate::pty_daemon::{ensure_daemon, PtyDaemonClient, PtyDaemonError};
-    use std::time::{Duration, Instant};
+) -> Result<Arc<PtyDaemonClient>, PtyDaemonError> {
+    use crate::pty_daemon::ensure_daemon;
     use tauri::Manager;
 
     // Local fast path.
@@ -265,21 +312,11 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
                 })?;
             let local_socket = local_socket_for_workspace(workspace_id);
             let remote_socket = remote_socket_for_workspace(workspace_id);
-            let s = crate::ssh::TunnelSupervisor::spawn(
+            let s = TunnelSupervisor::spawn(
                 host.ssh_target.clone(),
                 remote_socket,
                 local_socket,
-                // Same absolute path the push flow uses (see
-                // commands/hosts.rs:workspace_push_to_host). Non-
-                // interactive SSH shells don't have ~/.local/bin on
-                // PATH (only interactive shells do via ~/.profile /
-                // ~/.bashrc), so the bare `codemux-remote` would fail
-                // → SSH exits immediately → supervisor loops forever
-                // → client_for_workspace times out at 20s. This used
-                // to break "open app, click a remote workspace pane,
-                // session-X spawn fails" — the lazy path here was
-                // forgotten when the push path was fixed.
-                "$HOME/.local/bin/codemux-remote".to_string(),
+                REMOTE_DAEMON_BINARY.to_string(),
             );
             install_supervisor(workspace_id, s.clone()).await;
             spawn_tunnel_status_forwarder(app.clone(), workspace_id.to_string(), &s);
@@ -287,6 +324,19 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
         }
     };
 
+    let client = connect_tunnel_daemon(workspace_id, &supervisor).await?;
+    workspace_clients()
+        .await
+        .lock()
+        .await
+        .insert(workspace_id.to_string(), client.clone());
+    Ok(client)
+}
+
+async fn connect_tunnel_daemon(
+    workspace_id: &str,
+    supervisor: &TunnelSupervisor,
+) -> Result<Arc<PtyDaemonClient>, PtyDaemonError> {
     // Wait for the tunnel to become Connected (or fail loudly).
     // Connected fires when the LOCAL socket file appears, i.e.
     // when SSH -L successfully bound the local side. It does NOT
@@ -310,7 +360,6 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
     loop {
         iter += 1;
         let status = rx.borrow_and_update().clone();
-        use crate::ssh::TunnelStatus;
         // Log every iteration for the first few + every ~5s after
         // so the log doesn't drown but we see the polling alive.
         if iter <= 3 || iter % 10 == 0 {
@@ -363,7 +412,7 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
     // between for the happy path) — silence the warning.
     #[allow(unused_assignments)]
     let mut last_err: Option<String> = None;
-    let client_arc = loop {
+    loop {
         if Instant::now() >= connect_deadline {
             return Err(PtyDaemonError::Daemon(format!(
                 "tunnel up but remote daemon never responded after 20s \
@@ -388,6 +437,7 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
                 let remaining = connect_deadline.saturating_duration_since(Instant::now());
                 match tokio::time::timeout(remaining, c.hello_with_host_plugin()).await {
                     Ok(Ok(((pid, version, _), host_claude_plugin))) => {
+                        c.set_ssh_target(supervisor.ssh_target());
                         eprintln!(
                             "[client_for_workspace:{workspace_id}] daemon reached: \
                              pid={pid} version={version}"
@@ -403,7 +453,7 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
                                  Codemux terminal closes)"
                             );
                         }
-                        break c;
+                        return Ok(c);
                     }
                     Ok(Err(error)) => {
                         last_err = Some(format!("hello: {error}"));
@@ -426,13 +476,7 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
         }
         let remaining = connect_deadline.saturating_duration_since(Instant::now());
         tokio::time::sleep(Duration::from_millis(500).min(remaining)).await;
-    };
-    {
-        let map = workspace_clients().await;
-        let mut guard = map.lock().await;
-        guard.insert(workspace_id.to_string(), client_arc.clone());
     }
-    Ok(client_arc)
 }
 
 /// Forget the cached client for a workspace. Called on pull-back
