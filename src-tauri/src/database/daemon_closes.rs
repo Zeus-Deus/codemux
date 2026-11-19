@@ -153,6 +153,36 @@ fn delete_local_terminal_fallback(
     .map_err(|error| error.to_string())
 }
 
+fn begin_local_terminal_fallback(conn: &mut Connection) -> Result<Transaction<'_>, String> {
+    if conn.path().is_none_or(str::is_empty) {
+        return Err("Terminal fallback proof has no on-disk database".into());
+    }
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())
+}
+
+fn insert_local_terminal_fallback(
+    tx: &Transaction<'_>,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let daemon_owned = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM daemon_shell_ownership WHERE workspace_id = ?1 AND session_id = ?2
+        )",
+        params![workspace_id, session_id],
+        |row| row.get::<_, bool>(0),
+    ).map_err(|error| error.to_string())?;
+    if daemon_owned {
+        return Err("Terminal already has a recorded daemon shell".into());
+    }
+    tx.execute(
+        "INSERT INTO local_terminal_fallbacks (workspace_id, session_id)
+         VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        params![workspace_id, session_id],
+    ).map(drop).map_err(|error| error.to_string())
+}
+
 fn insert_owned_shell(tx: &Transaction<'_>, shell: &PendingDaemonClose) -> Result<(), String> {
     let route = serde_json::to_string(&shell.route).map_err(|error| error.to_string())?;
     tx.execute(
@@ -395,26 +425,44 @@ impl DatabaseStore {
     /// daemon owner always takes precedence over fallback proof.
     pub(crate) fn remember_local_terminal_fallback(&self, workspace_id: &str, session_id: &str) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
-        if conn.path().is_none_or(str::is_empty) {
-            return Err("Terminal fallback proof has no on-disk database".into());
+        let tx = begin_local_terminal_fallback(&mut conn)?;
+        insert_local_terminal_fallback(&tx, workspace_id, session_id)?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// After the observed local daemon has acknowledged retirement, record
+    /// fallback for the same pane. The caller owns its live spawn reservation.
+    pub(crate) fn remember_local_terminal_fallback_after_daemon_close(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        retired: Option<&PendingDaemonClose>,
+    ) -> Result<(), String> {
+        if retired.is_some_and(|shell| {
+            shell.route.workspace_id != workspace_id
+                || shell.session_id != session_id
+                || shell.route.host_id.is_some()
+                || shell.route.ssh_target.is_some()
+        }) {
+            return Err("Retired daemon shell does not match this local terminal".into());
         }
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        let daemon_owned = tx.query_row(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = begin_local_terminal_fallback(&mut conn)?;
+        let pending_close = tx.query_row(
             "SELECT EXISTS(
-                SELECT 1 FROM daemon_shell_ownership WHERE workspace_id = ?1 AND session_id = ?2
+                SELECT 1 FROM pending_daemon_closes
+                WHERE session_id = ?2 AND json_extract(route, '$.workspace_id') = ?1
             )",
             params![workspace_id, session_id],
             |row| row.get::<_, bool>(0),
         ).map_err(|error| error.to_string())?;
-        if daemon_owned {
-            return Err("Terminal already has a recorded daemon shell".into());
+        if pending_close {
+            return Err("Terminal still has pending daemon cleanup".into());
         }
-        tx.execute(
-            "INSERT INTO local_terminal_fallbacks (workspace_id, session_id)
-             VALUES (?1, ?2) ON CONFLICT DO NOTHING",
-            params![workspace_id, session_id],
-        ).map_err(|error| error.to_string())?;
+        if let Some(shell) = retired {
+            delete_owned_shell(&tx, shell)?;
+        }
+        insert_local_terminal_fallback(&tx, workspace_id, session_id)?;
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -674,6 +722,65 @@ mod tests {
         db.reconcile_local_terminal_fallbacks(&live).unwrap();
         assert!(!db.has_local_terminal_fallback(abandoned_workspace, other_session).unwrap());
         assert!(db.has_local_terminal_fallback(other_workspace, other_session).unwrap());
+    }
+
+    #[test]
+    fn acknowledged_daemon_close_records_fallback_only_without_other_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let db = DatabaseStore::test_file(&path);
+        let workspace = "workspace-1";
+        let session = "session-2";
+        let retired = PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: workspace.into(),
+                host_id: None,
+                ssh_target: None,
+            },
+            session_id: session.into(),
+            shell_id: Uuid::new_v4(),
+        };
+        let other_owner = PendingDaemonClose {
+            shell_id: Uuid::new_v4(),
+            ..retired.clone()
+        };
+        let other_workspace = PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: "workspace-3".into(),
+                ..retired.route.clone()
+            },
+            ..retired.clone()
+        };
+        db.remember_daemon_shell(&retired).unwrap();
+        db.remember_daemon_shell(&other_owner).unwrap();
+        db.remember_daemon_shell(&other_workspace).unwrap();
+
+        assert!(db.remember_local_terminal_fallback_after_daemon_close(
+            workspace, session, Some(&other_workspace),
+        ).is_err());
+        assert!(db.remember_local_terminal_fallback_after_daemon_close(
+            workspace, session, Some(&retired),
+        ).is_err());
+        assert_eq!(db.daemon_shell_ownership().unwrap(), [
+            retired.clone(), other_owner.clone(), other_workspace.clone(),
+        ]);
+        assert!(!db.has_local_terminal_fallback(workspace, session).unwrap());
+
+        db.journal_orphan_daemon_shells(std::slice::from_ref(&other_owner)).unwrap();
+        assert!(db.remember_local_terminal_fallback_after_daemon_close(
+            workspace, session, Some(&retired),
+        ).is_err());
+        assert_eq!(db.daemon_shell_ownership().unwrap(), [retired.clone(), other_workspace.clone()]);
+        assert_eq!(db.pending_daemon_closes().unwrap(), [other_owner.clone()]);
+        db.retire_completed_daemon_closes(&other_owner.route, session, &[other_owner.shell_id]).unwrap();
+
+        db.remember_local_terminal_fallback_after_daemon_close(workspace, session, Some(&retired)).unwrap();
+        db.remember_local_terminal_fallback_after_daemon_close(workspace, "legacy-session", None).unwrap();
+        drop(db);
+        let db = DatabaseStore::test_file(&path);
+        assert_eq!(db.daemon_shell_ownership().unwrap(), [other_workspace]);
+        assert!(db.has_local_terminal_fallback(workspace, session).unwrap());
+        assert!(db.has_local_terminal_fallback(workspace, "legacy-session").unwrap());
     }
 
     #[test]
