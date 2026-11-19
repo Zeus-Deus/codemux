@@ -1327,6 +1327,34 @@ mod tests {
 
     #[test]
     #[serial]
+    fn a_host_inventory_holder_clean_or_with_pending_work_is_never_dropped() {
+        for (sid, edited) in [("srv-inv-clean", false), ("srv-inv-dirty", true)] {
+            let db = fresh_db();
+            let holder = db
+                .insert_remote_discovered_workspace_sync(
+                    "host-1", "origin-1", "t", Some("/srv/p"), None, Some("main"), None, None, Some("/srv/p"), None,
+                )
+                .unwrap();
+            db.mark_workspace_sync_synced(holder.id, Some(sid)).unwrap();
+            if edited {
+                db.update_remote_discovered_workspace_sync(
+                    holder.id, "renamed", Some("/srv/p"), None, Some("main"), None, None, Some("/srv/p"), None,
+                )
+                .unwrap();
+            }
+            let retried = db
+                .insert_workspace_sync("ws-retry", "t", None, None, None, Some("main"), None, None, None)
+                .unwrap();
+
+            assert!(db.mark_workspace_sync_pushed(&retried, Some(sid)).is_err(), "{sid}");
+            let kept = db.list_workspaces_sync_for_sync().into_iter().find(|r| r.id == holder.id).unwrap();
+            assert_eq!(kept.origin_uid.as_deref(), Some("origin-1"), "{sid}: its host identity is kept");
+            assert_eq!(kept.dirty, edited, "{sid}: and its pending change");
+        }
+    }
+
+    #[test]
+    #[serial]
     fn an_adopted_row_holding_the_id_is_never_dropped() {
         let db = fresh_db();
         let adopted = db

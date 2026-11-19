@@ -2281,14 +2281,18 @@ impl DatabaseStore {
             .map_err(|e| format!("Failed to mark workspace sync row pushed: {e}"))?;
         // The server can answer an upload with the id of a row it already
         // had (it matches workspaces by identity), and a pull may already
-        // have mirrored that row here, unadopted, after an earlier answer
-        // was lost. That mirror is this row's own server copy: it gives way,
-        // so this row — with its local workspace and any newer edits — takes
-        // the id. A mirror adopted by a local workspace is left alone.
+        // have mirrored that row here after an earlier answer was lost. A
+        // plain mirror of it — clean, not adopted by a local workspace, and
+        // not a host-inventory row with identity of its own — is this row's
+        // own server copy: it gives way, so this row (with its local
+        // workspace and any newer edits) takes the id. Any other holder is
+        // left alone, and the id is not taken.
         if let Some(sid) = server_id {
             tx.execute(
                 "DELETE FROM workspaces_sync
-                 WHERE user_id = 'local' AND server_id = ?1 AND id != ?2 AND workspace_id IS NULL",
+                 WHERE user_id = 'local' AND server_id = ?1 AND id != ?2
+                   AND workspace_id IS NULL AND dirty = 0
+                   AND origin_uid IS NULL AND origin_path IS NULL",
                 params![sid, pushed.id],
             )
             .map_err(|e| format!("Failed to merge the server's copy of a workspace: {e}"))?;
