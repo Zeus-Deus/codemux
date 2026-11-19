@@ -2144,9 +2144,9 @@ async fn handle_daemon_spawn_failure<R: Runtime>(
     }
 
     eprintln!("[codemux::terminal] persistent-shell path failed; falling back to in-process spawn");
-    let require_unused_local_id = matches!(error, daemon_backed::DaemonHydrationFailure::LegacyDaemonLocalFallback);
+    let legacy_daemon_fallback = matches!(error, daemon_backed::DaemonHydrationFailure::LegacyDaemonLocalFallback);
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        spawn_pty_for_session_in_process(app, session_id, None, require_unused_local_id);
+        spawn_pty_for_session_in_process(app, session_id, None, legacy_daemon_fallback);
     })
     .await;
 }
@@ -2181,55 +2181,95 @@ fn daemon_spawn_failure_status(
     }
 }
 
+fn retry_in_process_spawn_after_close<R: Runtime>(
+    app: AppHandle<R>,
+    session_id: String,
+    fence: Arc<TerminalCloseSignal>,
+    restart_token: Uuid,
+    legacy_daemon_fallback: bool,
+) {
+    // Wait off the blocking pool and keep the original runtime generation.
+    tauri::async_runtime::spawn(async move {
+        #[cfg(all(unix, test))]
+        tests::notify_hydration_waiting_for_close(&session_id);
+        if !fence.wait_for_commit().await {
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                spawn_pty_for_session_in_process(app, session_id, Some(restart_token), legacy_daemon_fallback);
+            }).await;
+        }
+    });
+}
+
 fn spawn_pty_for_session_in_process<R: Runtime>(
     app: AppHandle<R>,
     session_id: String,
     expected: Option<Uuid>,
-    require_unused_local_id: bool,
+    legacy_daemon_fallback: bool,
 ) {
-    let sessions = app.state::<PtyState>().sessions.clone();
+    let terminal_state = app.state::<PtyState>();
+    let sessions = terminal_state.sessions.clone();
     let restart_token = match try_reserve_in_process_spawn(&sessions, &session_id, expected) {
         Ok(token) => token,
         Err(SessionSpawnBlocked::Superseded) => return,
         Err(SessionSpawnBlocked::ClosePending { fence, restart_token }) => {
-            // A pending close need not occupy a blocking worker. Retry
-            // the same generation only if the close is rolled back.
-            tauri::async_runtime::spawn(async move {
-                #[cfg(all(unix, test))]
-                tests::notify_hydration_waiting_for_close(&session_id);
-                if !fence.wait_for_commit().await {
-                    let _ = tauri::async_runtime::spawn_blocking(move || {
-                        spawn_pty_for_session_in_process(app, session_id, Some(restart_token), require_unused_local_id);
-                    }).await;
-                }
-            });
+            retry_in_process_spawn_after_close(app, session_id, fence, restart_token, legacy_daemon_fallback);
             return;
         }
     };
     let app_state: State<'_, AppStateStore> = app.state();
-    let Some(plan) = app_state.pty_hydration_plan_for_session(&session_id) else {
+    if app_state.pty_hydration_plan_for_session(&session_id).is_none() {
         let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
         if guard.get(&session_id).is_some_and(|rt| rt.restart_token == restart_token) {
             guard.remove(&session_id);
         }
         return;
-    };
-    if require_unused_local_id
-        && (plan.workspace.host_id.is_some() || !plan.sessions.iter().any(|session| session.daemon_unused))
-    {
-        emit_terminal_status_if_current(
-            &app,
-            &sessions,
-            TerminalStatusPayload {
-                session_id: session_id.clone(),
-                state: TerminalLifecycleState::Failed,
-                message: Some("Update the terminal daemon on its host before retrying this shell".into()),
-                exit_code: None,
-            },
-            Some(restart_token),
-        );
-        release_failed_spawn(&sessions, &session_id, restart_token);
-        return;
+    }
+    #[cfg(unix)]
+    if legacy_daemon_fallback {
+        let gate = terminal_state.daemon_ownership_gate(&session_id);
+        let _lease = gate.lock().unwrap_or_else(|error| error.into_inner());
+        let close_fence = with_existing_session_runtime(&sessions, &session_id, |runtime| {
+            (runtime.restart_token == restart_token).then(|| runtime.close_fence.clone())
+        }).flatten();
+        match close_fence {
+            None => return,
+            Some(Some(fence)) => {
+                release_failed_spawn(&sessions, &session_id, restart_token);
+                retry_in_process_spawn_after_close(app, session_id, fence, restart_token, true);
+                return;
+            }
+            Some(None) => {}
+        }
+        let proof = app_state.pty_hydration_plan_for_session(&session_id)
+            .filter(|plan| plan.workspace.host_id.is_none())
+            .ok_or_else(|| "The terminal moved or closed while starting. Retry to reconnect.".to_owned())
+            .and_then(|plan| {
+                let db = app.try_state::<crate::database::DatabaseStore>()
+                    .ok_or_else(|| "The terminal fallback database is unavailable".to_owned())?;
+                let workspace_id = &plan.workspace.workspace_id;
+                if plan.sessions.iter().any(|session| session.daemon_unused) {
+                    db.remember_local_terminal_fallback(workspace_id, &session_id)
+                } else if db.has_local_terminal_fallback(workspace_id, &session_id)? {
+                    Ok(())
+                } else {
+                    Err("Update the terminal daemon on its host before retrying this shell".into())
+                }
+            });
+        if let Err(message) = proof {
+            emit_terminal_status_if_current(
+                &app,
+                &sessions,
+                TerminalStatusPayload {
+                    session_id: session_id.clone(),
+                    state: TerminalLifecycleState::Failed,
+                    message: Some(message),
+                    exit_code: None,
+                },
+                Some(restart_token),
+            );
+            release_failed_spawn(&sessions, &session_id, restart_token);
+            return;
+        }
     }
 
     emit_terminal_status(
@@ -6951,11 +6991,79 @@ mod tests {
         use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
         use crate::pty_daemon::protocol::{ClientRequest, DaemonSessionInfo, ServerResponse, PROTOCOL_VERSION};
         use tokio::io::{AsyncBufReadExt, BufReader, Lines};
-        use tokio::net::unix::OwnedReadHalf;
+        use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
         use tokio::net::UnixListener;
 
-        async fn request(lines: &mut Lines<BufReader<OwnedReadHalf>>) -> ClientRequest {
+        type FixtureLines = Lines<BufReader<OwnedReadHalf>>;
+
+        async fn request(lines: &mut FixtureLines) -> ClientRequest {
             serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
+        }
+
+        async fn attach_fixture_shell(
+            lines: &mut FixtureLines,
+            write: &mut OwnedWriteHalf,
+            shell: &DaemonSessionInfo,
+        ) {
+            let request_id = match request(lines).await {
+                ClientRequest::AttachOwned { request_id, session_id, shell_id } => {
+                    assert_eq!(session_id, shell.session_id);
+                    assert_eq!(Some(shell_id), shell.shell_id);
+                    request_id
+                }
+                ClientRequest::Attach { request_id, session_id } => {
+                    assert_eq!(session_id, shell.session_id);
+                    assert_eq!(shell.shell_id, None);
+                    request_id
+                }
+                other => panic!("expected an attachment to the existing shell: {other:?}"),
+            };
+            send_daemon_fixture_response(write, ServerResponse::Attached {
+                request_id,
+                session_id: shell.session_id.clone(),
+            }).await;
+        }
+
+        async fn wait_for_fixture_terminal(
+            sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+            session_id: &str,
+        ) -> Uuid {
+            loop {
+                if let Some(token) = with_existing_session_runtime(sessions, session_id, |runtime| {
+                    match runtime.last_status.state {
+                        TerminalLifecycleState::Ready => Some(runtime.restart_token),
+                        TerminalLifecycleState::Failed => panic!(
+                            "terminal {session_id} failed to start: {:?}", runtime.last_status.message
+                        ),
+                        _ => None,
+                    }
+                }).flatten() {
+                    return token;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        fn assert_in_process_fixture_shell(sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>, session_id: &str) {
+            assert_eq!(with_existing_session_runtime(sessions, session_id, |runtime| {
+                !runtime.persistent && runtime.master.is_some() && runtime.child_pid.is_some()
+            }), Some(true), "terminal {session_id} should have an in-process PTY");
+        }
+
+        async fn assert_fixture_shell_accepts_input(
+            lines: &mut FixtureLines,
+            write: &mut OwnedWriteHalf,
+            sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+            session_id: &str,
+        ) {
+            let ack = queue_pty_input(sessions, session_id, b"still attached").unwrap().unwrap();
+            let write_request = request(lines).await;
+            let ClientRequest::Write { request_id, session_id: target, .. } = write_request else {
+                panic!("expected input on the daemon connection: {write_request:?}");
+            };
+            assert_eq!(target, session_id);
+            send_daemon_fixture_response(write, ServerResponse::Written { request_id }).await;
+            ack.await.unwrap().unwrap();
         }
 
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -7024,7 +7132,7 @@ mod tests {
                 request_id,
                 protocol_version: PROTOCOL_VERSION,
                 daemon_pid,
-                daemon_version: version,
+                daemon_version: version.clone(),
                 host_claude_plugin: false,
                 guarded_shells,
                 prepared_spawn,
@@ -7104,60 +7212,16 @@ mod tests {
                         request_id,
                         sessions: vec![existing.clone()],
                     }).await;
-                    let request_id = match request(&mut lines).await {
-                        ClientRequest::AttachOwned { request_id, session_id, shell_id } => {
-                            assert_eq!(session_id, original);
-                            assert_eq!(Some(shell_id), existing.shell_id);
-                            request_id
-                        }
-                        ClientRequest::Attach { request_id, session_id } => {
-                            assert_eq!(session_id, original);
-                            assert_eq!(existing.shell_id, None);
-                            request_id
-                        }
-                        other => panic!("expected an attachment to the existing shell: {other:?}"),
-                    };
-                    send_daemon_fixture_response(&mut write, ServerResponse::Attached {
-                        request_id,
-                        session_id: original.clone(),
-                    }).await;
-                    let original_restart_token = loop {
-                        if let Some(token) = with_existing_session_runtime(&terminal.sessions, &original, |runtime| {
-                            matches!(runtime.last_status.state, TerminalLifecycleState::Ready).then(|| {
-                                assert!(runtime.persistent);
-                                assert_eq!(runtime.daemon_shell_id, existing.shell_id);
-                                runtime.restart_token
-                            })
-                        }).flatten() {
-                            break token;
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    };
+                    attach_fixture_shell(&mut lines, &mut write, &existing).await;
+                    let original_restart_token = wait_for_fixture_terminal(&terminal.sessions, &original).await;
 
                     let local = crate::commands::workspace::split_pane_impl(
                         app.handle().clone(), &layout, pane_id, "horizontal".to_owned(),
                     ).unwrap();
-                    let local_ready = async {
-                        loop {
-                            if let Some(ready) = with_existing_session_runtime(&terminal.sessions, &local, |runtime| {
-                                match runtime.last_status.state {
-                                    TerminalLifecycleState::Ready => Some(
-                                        !runtime.persistent && runtime.master.is_some() && runtime.child_pid.is_some()
-                                    ),
-                                    TerminalLifecycleState::Failed => panic!(
-                                        "fresh local pane failed to start: {:?}", runtime.last_status.message
-                                    ),
-                                    _ => None,
-                                }
-                            }).flatten() {
-                                break ready;
-                            }
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                    };
+                    let local_ready = wait_for_fixture_terminal(&terminal.sessions, &local);
                     tokio::pin!(local_ready);
                     let mut listed = false;
-                    let ready = loop {
+                    loop {
                         tokio::select! {
                             biased;
                             line = lines.next_line() => {
@@ -7172,23 +7236,81 @@ mod tests {
                                     other => panic!("fresh local startup should send no daemon spawn: {other:?}"),
                                 }
                             }
-                            ready = &mut local_ready => break ready,
+                            _ = &mut local_ready => break,
                         }
-                    };
-                    assert!(ready, "fresh local pane should reach Ready with an in-process PTY");
+                    }
+                    assert_in_process_fixture_shell(&terminal.sessions, &local);
                     assert_eq!(with_existing_session_runtime(&terminal.sessions, &original, |runtime| {
-                        (runtime.restart_token, runtime.daemon_shell_id, runtime.child_pid)
-                    }), Some((original_restart_token, existing.shell_id, Some(existing.pid))));
+                        (runtime.persistent, runtime.restart_token, runtime.daemon_shell_id, runtime.child_pid)
+                    }), Some((true, original_restart_token, existing.shell_id, Some(existing.pid))));
+                    assert_fixture_shell_accepts_input(&mut lines, &mut write, &terminal.sessions, &original).await;
 
-                    let ack = queue_pty_input(&terminal.sessions, &original, b"still attached").unwrap().unwrap();
-                    let write_request = request(&mut lines).await;
-                    let ClientRequest::Write { request_id, session_id, .. } = write_request else {
-                        panic!("expected input on the original daemon connection: {write_request:?}");
-                    };
-                    assert_eq!(session_id, original);
-                    send_daemon_fixture_response(&mut write, ServerResponse::Written { request_id }).await;
-                    ack.await.unwrap().unwrap();
+                    // A desktop relaunch loses in-memory provenance and the
+                    // local PTY. Its layout and the older daemon survive.
+                    state::flush_persisted_state(&layout);
                     terminate_pty_session(app.handle(), &terminal.sessions, &local);
+                    let old_client = remove_session_runtime(&terminal.sessions, &original).unwrap()
+                        .daemon_client.clone().unwrap();
+                    drop(lines);
+                    drop(write);
+                    while !old_client.is_closed() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+
+                    let restored = AppStateStore::default();
+                    restored.replace_snapshot(state::load_persisted_state().unwrap());
+                    let plan = restored.pty_hydration_plan_for_session(&local).unwrap();
+                    assert!(!plan.sessions[0].daemon_unused, "layout must supply no in-memory proof");
+                    let relaunched = tauri::test::mock_app();
+                    relaunched.manage(PtyState::default());
+                    relaunched.manage(restored);
+                    relaunched.manage(DatabaseStore::test_file(&db_path));
+                    spawn_missing_ptys(relaunched.handle().clone());
+
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let (read, mut write) = socket.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    let ClientRequest::Hello { request_id } = request(&mut lines).await else {
+                        panic!("expected the relaunched app to adopt the older daemon");
+                    };
+                    send_daemon_fixture_response(&mut write, ServerResponse::Hello {
+                        request_id,
+                        protocol_version: PROTOCOL_VERSION,
+                        daemon_pid,
+                        daemon_version: version,
+                        host_claude_plugin: false,
+                        guarded_shells,
+                        prepared_spawn,
+                    }).await;
+                    let ClientRequest::List { request_id } = request(&mut lines).await else {
+                        panic!("expected one inventory lookup for the restored workspace");
+                    };
+                    send_daemon_fixture_response(&mut write, ServerResponse::Listed {
+                        request_id,
+                        sessions: vec![existing.clone()],
+                    }).await;
+                    attach_fixture_shell(&mut lines, &mut write, &existing).await;
+
+                    let terminal = relaunched.state::<PtyState>();
+                    let ready = async {
+                        tokio::join!(
+                            wait_for_fixture_terminal(&terminal.sessions, &original),
+                            wait_for_fixture_terminal(&terminal.sessions, &local),
+                        );
+                    };
+                    tokio::select! {
+                        biased;
+                        line = lines.next_line() => {
+                            panic!("restoring the fallback pane should send no daemon spawn: {:?}", line.unwrap());
+                        }
+                        () = ready => {}
+                    }
+                    assert_in_process_fixture_shell(&terminal.sessions, &local);
+                    assert_eq!(with_existing_session_runtime(&terminal.sessions, &original, |runtime| {
+                        (runtime.persistent, runtime.daemon_shell_id, runtime.child_pid)
+                    }), Some((true, existing.shell_id, Some(existing.pid))));
+                    assert_fixture_shell_accepts_input(&mut lines, &mut write, &terminal.sessions, &original).await;
+                    terminate_pty_session(relaunched.handle(), &terminal.sessions, &local);
                 }
                 return;
             }

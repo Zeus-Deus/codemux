@@ -4468,6 +4468,15 @@ impl AppStateStore {
     }
 
     #[cfg(unix)]
+    pub(crate) fn terminal_session_owners(&self) -> std::collections::HashSet<(String, String)> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot.workspaces.iter().flat_map(|workspace| {
+            collect_terminal_sessions(&workspace.surfaces).into_iter()
+                .map(|session_id| (workspace.workspace_id.0.clone(), session_id))
+        }).collect()
+    }
+
+    #[cfg(unix)]
     pub(crate) fn orphaned_daemon_shells(
         &self,
         shells: Vec<crate::database::daemon_closes::PendingDaemonClose>,

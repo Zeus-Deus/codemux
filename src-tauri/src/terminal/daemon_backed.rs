@@ -323,6 +323,54 @@ async fn list_daemon_session_map(
         .collect())
 }
 
+async fn has_durable_local_fallback<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<bool, DaemonHydrationFailure> {
+    let app = app.clone();
+    let workspace_id = workspace_id.to_owned();
+    let session_id = session_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        app.try_state::<DatabaseStore>().map_or(Ok(false), |db| {
+            db.has_local_terminal_fallback(&workspace_id, &session_id)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result)
+    .map_err(|error| {
+        DaemonHydrationFailure::Ambiguous(format!(
+            "could not read the local terminal fallback record: {error}"
+        ))
+    })
+}
+
+async fn forget_fallback_for_listed_shell<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: &str,
+    session_id: &str,
+    gate: Arc<Mutex<()>>,
+) {
+    let app = app.clone();
+    let workspace_id = workspace_id.to_owned();
+    let checked_session = session_id.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        let Some(db) = app.try_state::<DatabaseStore>() else { return Ok(()); };
+        let _lease = gate.lock().unwrap_or_else(|error| error.into_inner());
+        if db.has_local_terminal_fallback(&workspace_id, &checked_session)? {
+            db.forget_local_terminal_fallback(&workspace_id, &checked_session)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result);
+    if let Err(error) = result {
+        log::warn!("Could not retire local fallback proof for existing daemon shell {session_id}: {error}");
+    }
+}
+
 /// Compatibility entry point for a newly-created single pane. Restored
 /// workspaces call [`hydrate_workspace_via_daemon`] with all descriptors at
 /// once, which is what enables the one-List invariant.
@@ -610,7 +658,8 @@ impl GuardedShellOwnership {
             }
 
             // Close observes the registered ID and waits for this lease
-            // before transferring ownership. SQLite needs no global lock.
+            // before transferring ownership. The write also retires local
+            // fallback proof before any RPC can create the shell.
             let remembered = app.try_state::<DatabaseStore>()
                 .ok_or_else(|| "Terminal shell ownership database is unavailable".to_owned())
                 .and_then(|db| db.remember_daemon_shell(&owner.shell));
@@ -744,13 +793,23 @@ async fn spawn_prepared_session<R: Runtime>(
         (Some(existing), true) => existing.shell_id,
         (Some(_), false) => None,
         (None, _) if client.supports_prepared_spawn() => Some(Uuid::new_v4()),
-        (None, _) if workspace.host_id.is_none() && session.daemon_unused && !reconciling => {
-            return Err(DaemonHydrationFailure::LegacyDaemonLocalFallback);
-        }
         (None, _) => {
             // A new shell needs a permit the daemon can revoke if its pane
             // closes before Spawn arrives. List omits in-flight spawns,
             // so a restored session needs stronger proof for local fallback.
+            if workspace.host_id.is_none() && !reconciling {
+                let can_fallback = if session.daemon_unused {
+                    Ok(true)
+                } else {
+                    has_durable_local_fallback(&app, &workspace.workspace_id, &session_id).await
+                };
+                if !reservation.is_current() {
+                    return Err(DaemonHydrationFailure::AlreadyReserved);
+                }
+                if can_fallback? {
+                    return Err(DaemonHydrationFailure::LegacyDaemonLocalFallback);
+                }
+            }
             return Err(DaemonHydrationFailure::RequiresGuardedRecovery);
         }
     };
@@ -763,6 +822,19 @@ async fn spawn_prepared_session<R: Runtime>(
     let is_remote = host_id.is_some();
     if !app_state.update_terminal_session_shell(&session_id, shell.clone(), true) {
         return Err(DaemonHydrationFailure::AlreadyReserved);
+    }
+    if reattached && shell_id.is_none() {
+        // A listed shell disproves local-only ownership even when an older
+        // daemon cannot supply a UUID for the guarded ownership write.
+        forget_fallback_for_listed_shell(
+            &app,
+            &workspace_id,
+            &session_id,
+            terminal_state.daemon_ownership_gate(&session_id),
+        ).await;
+        if !reservation.is_current() {
+            return Err(DaemonHydrationFailure::AlreadyReserved);
+        }
     }
     let route_for_runtime = shell_id.map(|_| {
         if let Some(recovery) = &reservation.reconciliation {
