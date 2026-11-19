@@ -1738,7 +1738,8 @@ mod tests {
         fs::write(root.join("notes.txt"), b"caf\xe9").unwrap();
         fs::write(root.join("main.rs"), "fn search_me() {}").unwrap();
 
-        let snapshot = rebuild_index(Some(root.display().to_string())).unwrap();
+        let store = ProjectIndexStore::default();
+        let snapshot = rebuild_index(&store, Some(root.display().to_string())).unwrap();
         assert_eq!(snapshot.file_count, 1);
         let results = search_snapshot(&snapshot, "search_me", 1);
         assert_eq!(results.len(), 1);
