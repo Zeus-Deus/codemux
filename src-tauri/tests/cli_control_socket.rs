@@ -714,6 +714,105 @@ fn serve_saves_its_layout_without_overwriting_the_recovery_copy() {
     assert_eq!(std::fs::read(scrollback).unwrap(), b"terminal history");
 }
 
+// Boot in a fresh process each time so the ID allocator resets just as it
+// would after a crash. The test binary can drive the same backend save and
+// reconcile paths as a connected frontend, inside the fixture's state dirs.
+#[test]
+fn corrupt_layout_restart_preserves_pane_and_sync_row() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    for program in ["pkill", "fuser"] {
+        std::os::unix::fs::symlink("/bin/true", bin.join(program)).unwrap();
+    }
+    let boot = |phase: &str| -> Value {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        isolate(&mut cmd, root.path());
+        let output = cmd
+            .env("CODEMUX_TEST_LAYOUT_BOOT", phase)
+            .env("CODEMUX_DISABLE_PTY_DAEMON", "1")
+            .env("CODEMUX_API_URL", "http://127.0.0.1:1")
+            .env("SHELL", "/bin/true")
+            .args(["--ignored", "--exact", "write_panes_and_reconcile_fixture", "--nocapture"])
+            .output().unwrap();
+        assert!(output.status.success(), "{phase} boot:\n{}", String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice(&std::fs::read(root.path().join(format!("{phase}.json"))).unwrap()).unwrap()
+    };
+    let original = boot("original");
+    let layout = layout_path(root.path());
+    std::fs::write(&layout, b"{\"workspaces\":[").unwrap();
+    let recovery = boot("recovery");
+    let restored = boot("restored");
+    assert_eq!(restored["on_boot"], recovery["after_create"], "saved recovery identities must restore");
+    for report in [&recovery, &restored] {
+        assert_eq!(report["original"], original["original"], "scrollback bytes, metadata and linked row");
+        // Both the fallback and later allocations must be distinct, including
+        // sessions: scrollback metadata can also be looked up by session alone.
+        for id in report["after_create"].as_array().unwrap() {
+            assert!(!original["after_create"].as_array().unwrap().contains(id), "reused {id}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "run by corrupt_layout_restart_preserves_pane_and_sync_row in a private home"]
+fn write_panes_and_reconcile_fixture() {
+    use codemux_lib::{database::DatabaseStore, scrollback, state, workspaces_sync};
+    use tauri::Manager;
+
+    let phase = std::env::var("CODEMUX_TEST_LAYOUT_BOOT").expect("requires an isolated fixture");
+    let app = codemux_lib::build_headless_app().unwrap();
+    let store = app.state::<state::AppStateStore>();
+    let db = app.state::<DatabaseStore>();
+    assert_eq!(state::layout_recovery_pending(), phase != "original");
+
+    let pane_ids = |ws: &state::WorkspaceSnapshot| {
+        let state::PaneNodeSnapshot::Terminal { pane_id, session_id, .. } = &ws.surfaces[0].root else {
+            panic!("expected a terminal");
+        };
+        [ws.workspace_id.0.clone(), pane_id.0.clone(), session_id.0.clone()]
+    };
+    let on_boot: Vec<_> = store.snapshot().workspaces.iter().flat_map(pane_ids).collect();
+    store.create_workspace_at_path(std::env::current_dir().unwrap().join(&phase));
+    let workspaces = store.snapshot().workspaces;
+    let after_create: Vec<_> = workspaces.iter().flat_map(pane_ids).collect();
+    for ws in &workspaces {
+        let [workspace_id, pane_id, session_id] = pane_ids(ws);
+        store.rename_workspace(&workspace_id, format!("{phase} {workspace_id}"));
+        let data = format!("$ echo {phase}\r\n\x1b[32m{phase}\x1b[0m\r\n");
+        scrollback::save_scrollback(&scrollback::ScrollbackPayload {
+            workspace_id: workspace_id.clone(), pane_id: pane_id.clone(), session_id,
+            working_directory: ws.cwd.clone(), original_command: None, cols: 80, rows: 24,
+            data: data.clone(), adapter_captures: Default::default(), adapter_id: None,
+            alternate_buffer: false,
+        }).unwrap();
+        assert_eq!(scrollback::load_scrollback(&workspace_id, &pane_id).unwrap().data, data);
+    }
+    workspaces_sync::reconcile_from_state(&db, &store).unwrap();
+    let rows = db.list_workspaces_sync();
+    for ws in &store.snapshot().workspaces {
+        assert!(rows.iter().any(|r| r.workspace_id.as_ref() == Some(&ws.workspace_id.0) && r.title == ws.title));
+    }
+    state::flush_persisted_state(&store).unwrap();
+
+    let original_row = || db.list_workspaces_sync().into_iter()
+        .find(|row| row.workspace_id.as_deref() == Some("workspace-1")).unwrap();
+    if phase == "original" {
+        db.mark_workspace_sync_synced(original_row().id, Some("cloud-original")).unwrap();
+    }
+    let meta = scrollback::meta_path_for("workspace-1", "pane-3");
+    let report = json!({
+        "on_boot": on_boot,
+        "after_create": after_create,
+        "original": {
+            "data": std::fs::read_to_string(meta.with_extension("dat")).unwrap(),
+            "meta": std::fs::read_to_string(meta).unwrap(),
+            "row": original_row(),
+        }
+    });
+    std::fs::write(format!("{phase}.json"), serde_json::to_vec(&report).unwrap()).unwrap();
+}
+
 #[test]
 fn serve_refuses_to_share_a_layout_with_another_instance() {
     use std::os::unix::fs::MetadataExt;

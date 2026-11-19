@@ -8638,6 +8638,11 @@ fn stable_browser_session_name(cwd: &str) -> String {
 }
 
 fn next_id(prefix: &str) -> String {
+    // A set-aside layout can own any numeric ID, even after a later boot
+    // restores a saved fallback. Keep new IDs disjoint for the whole recovery.
+    if layout_recovery_pending() {
+        return format!("{prefix}-r{}", uuid::Uuid::new_v4().simple());
+    }
     let value = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{value}")
 }

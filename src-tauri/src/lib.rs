@@ -670,6 +670,9 @@ fn core_startup_plugin<R: tauri::Runtime>(
                 }
                 AppMode::ServeHeadless => (None, headless_layout),
             };
+            // The fallback allocates workspace and pane IDs. Both modes must
+            // know whether a layout is in recovery before creating it.
+            app.manage(state::AppStateStore::default());
             app.manage(StartupLayout {
                 snapshot: std::sync::Mutex::new(snapshot),
                 ownership: std::sync::Mutex::new(ownership),
@@ -719,7 +722,6 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(mode)
         .manage(plugins::commands::PluginsState::default())
         .manage(plugins::platform_transport::PluginPlatformState::default())
-        .manage(state::AppStateStore::default())
         // Live per-host reachability for the Devices page. Filled by
         // `hosts_inventory` (Unix only); on Windows every host reads as
         // never probed. The persisted facts (last seen, disk) live on
