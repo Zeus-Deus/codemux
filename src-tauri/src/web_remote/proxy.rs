@@ -473,6 +473,131 @@ fn dechunk(mut data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web_remote::{auth, server};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::{tungstenite, WebSocketStream};
+
+    async fn bind_test_daemon() -> TcpListener {
+        // Keep the successful bind for the whole test. Only connect the proxy
+        // to this listener, even if a real daemon already owns another port.
+        for port in (BROWSER_PORT_MIN..=BROWSER_PORT_MAX).rev() {
+            match TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(listener) => return listener,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(e) => panic!("binding loopback test daemon on {port}: {e}"),
+            }
+        }
+        panic!("no free loopback port in the browser daemon range");
+    }
+
+    type TestSocket = WebSocketStream<TcpStream>;
+
+    async fn open_bridge(
+        proxy: std::net::SocketAddr,
+        daemon: &TcpListener,
+        token: &str,
+    ) -> (TestSocket, TestSocket) {
+        use tungstenite::client::IntoClientRequest;
+
+        let port = daemon.local_addr().unwrap().port();
+        let mut request = format!("ws://{proxy}/proxy/browser/{port}/ws")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            header::COOKIE,
+            format!("{}={token}", server::SESSION_COOKIE)
+                .parse()
+                .unwrap(),
+        );
+        let (client, _) =
+            tokio_tungstenite::client_async(request, TcpStream::connect(proxy).await.unwrap())
+                .await
+                .expect("authorized browser upgrade");
+        let (stream, _) = daemon.accept().await.unwrap();
+        let upstream = tokio_tungstenite::accept_async(stream).await.unwrap();
+        (client, upstream)
+    }
+
+    async fn forward_frame(from: &mut TestSocket, to: &mut TestSocket, text: &str) {
+        let frame = TungMessage::text(text);
+        from.send(frame.clone()).await.unwrap();
+        assert_eq!(to.next().await.unwrap().unwrap(), frame);
+    }
+
+    async fn assert_peer_closed(socket: &mut TestSocket) {
+        use std::io::ErrorKind;
+        use tungstenite::{error::ProtocolError, Error};
+
+        match socket.next().await {
+            None | Some(Ok(TungMessage::Close(_))) => {}
+            // Cancelling the bridge drops its TCP sockets without a close handshake.
+            Some(Err(Error::Protocol(ProtocolError::ResetWithoutClosingHandshake))) => {}
+            Some(Err(Error::Io(e)))
+                if matches!(
+                    e.kind(),
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::UnexpectedEof
+                ) => {}
+            other => panic!("expected the bridge to close the socket, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn active_bridges_close_on_session_revocation_and_listener_shutdown() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let app = tauri::test::mock_app();
+            let db = crate::database::DatabaseStore::new_in_memory();
+            for id in ["phone", "tablet"] {
+                db.web_remote_insert_session(id, None, None, &auth::sha256_hex(id), true)
+                    .unwrap();
+            }
+            app.manage(db);
+            app.manage(WebRemoteState::default());
+            let shared = app.state::<WebRemoteState>().shared();
+
+            let daemon = bind_test_daemon().await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = listener.local_addr().unwrap();
+            let (shutdown, rx) = watch::channel(false);
+            let mut life = ListenerLife(rx);
+            let router = server::router(app.handle().clone()).layer(Extension(life.clone()));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async move { life.stopped().await })
+                    .await
+                    .unwrap();
+            });
+
+            let (mut phone, mut phone_daemon) = open_bridge(proxy, &daemon, "phone").await;
+            let (mut tablet, mut tablet_daemon) = open_bridge(proxy, &daemon, "tablet").await;
+            forward_frame(&mut phone, &mut phone_daemon, "phone input").await;
+            forward_frame(&mut tablet, &mut tablet_daemon, "tablet input").await;
+
+            crate::web_remote::web_remote_revoke_session(app.handle().clone(), "phone".into())
+                .unwrap();
+            assert_peer_closed(&mut phone).await;
+            assert_peer_closed(&mut phone_daemon).await;
+            assert_eq!(
+                shared.connections.close_session("phone"),
+                0,
+                "revoked bridge still registered"
+            );
+            forward_frame(&mut tablet_daemon, &mut tablet, "tablet still connected").await;
+
+            shutdown.send(true).unwrap();
+            assert_peer_closed(&mut tablet).await;
+            assert_peer_closed(&mut tablet_daemon).await;
+            assert_eq!(
+                shared.connections.close_all(),
+                0,
+                "stopped listener left a registration"
+            );
+            server.await.unwrap();
+        })
+        .await
+        .expect("loopback bridges must respond to revocation and listener shutdown");
+    }
 
     #[tokio::test]
     async fn listener_shutdown_before_upgrade_is_still_observed() {
