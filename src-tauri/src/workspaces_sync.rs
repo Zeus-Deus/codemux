@@ -124,21 +124,26 @@ static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// triggers. Resolves the database + token from the app state and
 /// calls pull-then-push. Returns Ok(()) if the user isn't signed in
 /// (sync isn't an error in that case).
+/// One sync pass at a time. Without it a second pass — a background tick
+/// and "Sync now", or two edits each scheduling a sync — could settle a
+/// deletion whose row the first pass is still uploading, before that
+/// upload returns the server id the DELETE needs.
+static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
     let db = app.state::<DatabaseStore>();
     let token = match valid_token(&db) {
         Some(t) => t,
         None => return Ok(()),
     };
-    let db_ref: &DatabaseStore = &db;
-    let pull_err = match pull(&token, db_ref).await {
-        Ok(()) => None,
-        Err(e) => Some(e),
-    };
-    let push_err = match push(&token, db_ref).await {
-        Ok(()) => None,
-        Err(e) => Some(e),
-    };
+    sync_once(&token, &db).await
+}
+
+/// Pull, then push, holding [`SYNC_LOCK`] throughout.
+pub async fn sync_once(token: &str, db: &DatabaseStore) -> Result<(), String> {
+    let _one_at_a_time = SYNC_LOCK.lock().await;
+    let pull_err = pull(token, db).await.err();
+    let push_err = push(token, db).await.err();
     match (pull_err, push_err) {
         (None, None) => Ok(()),
         (Some(p), None) => Err(format!("pull failed: {p}")),
@@ -856,6 +861,80 @@ mod tests {
         super::push("token", &db).await.unwrap();
         delete.assert_async().await;
         std::env::remove_var("CODEMUX_API_URL");
+    }
+
+    /// A tiny account API for the race below: each connection is served on
+    /// its own task, so a slow POST holds up nothing else. Counts DELETEs.
+    async fn racing_api(deletes: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let deletes = deletes.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&request).lines().next().unwrap_or("").to_string();
+                    let (status, body) = if line.starts_with("GET /api/workspaces ") {
+                        ("200 OK", r#"{"workspaces":[]}"#.to_string())
+                    } else if line.starts_with("POST /api/workspaces ") {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                        (
+                            "200 OK",
+                            r#"{"workspace":{"id":"srv-race","title":"new","hostServerId":null,"projectPath":null,"projectRemote":null,"gitBranch":"main","createdAt":"2026-01-01 00:00:00","updatedAt":"2026-01-01 00:00:00","deletedAt":null}}"#.to_string(),
+                        )
+                    } else if line.starts_with("DELETE /api/workspaces/srv-race ") {
+                        deletes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        ("204 No Content", String::new())
+                    } else {
+                        ("404 Not Found", String::new())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        url
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_close_during_a_first_upload_is_sent_by_the_next_sync_with_the_new_id() {
+        let deletes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::env::set_var("CODEMUX_API_URL", racing_api(deletes.clone()).await);
+        let db = fresh_db();
+        db.insert_workspace_sync("ws-race", "new", None, None, None, Some("main"), None, None, None)
+            .unwrap();
+
+        // The first sync's upload is slow to answer; while it is in flight
+        // the workspace is closed and a second sync starts.
+        let first = super::sync_once("token", &db);
+        let second = async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            db.soft_delete_workspace_sync_by_workspace_id("ws-race").unwrap();
+            super::sync_once("token", &db).await
+        };
+        let (first, second) = tokio::join!(first, second);
+        std::env::remove_var("CODEMUX_API_URL");
+        first.unwrap();
+        second.unwrap();
+
+        assert_eq!(
+            deletes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the close is sent as a DELETE for the id the first upload returned"
+        );
     }
 
     #[tokio::test]

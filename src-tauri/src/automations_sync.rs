@@ -98,15 +98,26 @@ fn host_maps(db: &DatabaseStore) -> (HashMap<i64, String>, HashMap<String, i64>)
 
 /// Resolve the local DB + token from app state and run pull-then-push.
 /// `Ok(())` when the user is not signed in — sync is not an error then.
+/// One sync pass at a time. Without it a second pass — a background tick
+/// and "Sync now", or two edits each scheduling a sync — could settle a
+/// deletion whose row the first pass is still uploading, before that
+/// upload returns the server id the DELETE needs.
+static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
     let db = app.state::<DatabaseStore>();
     let token = match valid_token(&db) {
         Some(t) => t,
         None => return Ok(()),
     };
-    let db_ref: &DatabaseStore = &db;
-    let pull_err = pull(&token, db_ref, None).await.err();
-    let push_err = push(&token, db_ref).await.err();
+    sync_once(&token, &db).await
+}
+
+/// Pull, then push, holding [`SYNC_LOCK`] throughout.
+pub async fn sync_once(token: &str, db: &DatabaseStore) -> Result<(), String> {
+    let _one_at_a_time = SYNC_LOCK.lock().await;
+    let pull_err = pull(token, db, None).await.err();
+    let push_err = push(token, db).await.err();
     match (pull_err, push_err) {
         (None, None) => Ok(()),
         (Some(p), None) => Err(format!("pull failed: {p}")),
