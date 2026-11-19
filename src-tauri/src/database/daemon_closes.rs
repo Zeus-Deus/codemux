@@ -2,7 +2,7 @@
 
 use super::DatabaseStore;
 use crate::agent_control::{ControlError, ErrorCode};
-use crate::state::{ArchivedWorkspaceSnapshot, LayoutCloseIntent, PendingArchive, SessionId};
+use crate::state::{AppStateSnapshot, ArchivedWorkspaceSnapshot, LayoutCloseIntent, PendingArchive, SessionId};
 use crate::terminal::TerminalCloseError;
 use crate::workspace_service::Checkpoint;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -66,6 +66,53 @@ impl PendingArchive {
             return Err("Archive close payload has a different identity".into());
         }
         Ok(archive)
+    }
+
+    fn capture_history(&mut self, tx: &Transaction<'_>, legacy_replacement: Option<&str>) -> Result<(), String> {
+        // Legacy intents moved rows eagerly without recording thread IDs. A
+        // retained native binding can prove a moved thread's original owner.
+        let mut stmt = tx.prepare(
+            "SELECT s.thread_id FROM agent_chat_sessions s
+             WHERE s.provider = 'hermes' AND s.cwd = ?2 AND
+                (s.workspace_id = ?1 OR (s.workspace_id = ?3 AND EXISTS (
+                    SELECT 1 FROM hermes_bindings b WHERE b.thread_id = s.thread_id
+                    AND b.workspace_id = ?1 AND b.cwd = ?2)))
+             ORDER BY s.thread_id",
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![self.entry.workspace_id, self.history_cwd(), legacy_replacement], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        self.hermes_thread_ids = Some(rows.collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())?);
+        Ok(())
+    }
+
+    fn history_cwd(&self) -> &str {
+        self.entry.worktree_path.as_deref().unwrap_or(&self.entry.cwd)
+    }
+
+    fn settle_history(&mut self, tx: &Transaction<'_>, replacement_present: bool) -> Result<(), String> {
+        let Some(replacement) = self.restored_workspace_id.clone() else { return Ok(()) };
+        if replacement == self.entry.workspace_id { return Ok(()) }
+        if self.hermes_thread_ids.is_none() {
+            self.capture_history(tx, Some(&replacement))?;
+            let payload = serde_json::to_string(self).map_err(|e| e.to_string())?;
+            tx.execute("UPDATE pending_layout_closes SET payload=?3
+                WHERE scope='archive' AND workspace_id=?1 AND target_id=?2",
+                params![self.entry.workspace_id, self.entry.archive_id, payload]).map_err(|e| e.to_string())?;
+        }
+        let archived = self.entry.workspace_id.as_str();
+        let (from, to) = if replacement_present {
+            (archived, replacement.as_str())
+        } else {
+            (replacement.as_str(), archived)
+        };
+        let mut update = tx.prepare_cached(
+            "UPDATE agent_chat_sessions SET workspace_id=?2
+             WHERE workspace_id=?1 AND cwd=?3 AND provider='hermes' AND thread_id=?4",
+        ).map_err(|e| e.to_string())?;
+        for thread in self.hermes_thread_ids.iter().flatten() {
+            update.execute(params![from, to, self.history_cwd(), thread]).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -393,6 +440,16 @@ fn write_layout_close(
     if let Some(id) = intent.closed_workspace_id() {
         // Once the user closes or rearchives the replacement, its absence
         // from a later snapshot must not bring the original archive back.
+        let mut select = tx.prepare("SELECT workspace_id, target_id, payload FROM pending_layout_closes
+            WHERE scope='archive' AND json_extract(payload, '$.restored_workspace_id') = ?1")
+            .map_err(|e| e.to_string())?;
+        let parents = select.query_map([id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        }).map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
+        drop(select);
+        for (workspace, archive, payload) in parents {
+            PendingArchive::from_payload(&payload, &workspace, &archive)?.settle_history(&tx, true)?;
+        }
         tx.execute(
             "UPDATE OR REPLACE pending_layout_closes SET scope = 'workspace', payload = NULL
              WHERE scope = 'archive' AND json_extract(payload, '$.restored_workspace_id') = ?1",
@@ -932,17 +989,29 @@ impl DatabaseStore {
         .collect()
     }
 
-    pub(crate) fn retire_layout_closes(&self, intents: &[LayoutCloseIntent]) -> Result<(), String> {
+    /// Settle history and, once the final primary is durable, acknowledge the
+    /// same intent atomically. A queued save may hold an older archive payload.
+    pub(crate) fn settle_layout_closes(
+        &self,
+        intents: &[LayoutCloseIntent],
+        snapshot: &AppStateSnapshot,
+        retire: bool,
+    ) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
-        {
-            let mut delete = tx.prepare_cached(
-                "DELETE FROM pending_layout_closes WHERE scope = ?1 AND workspace_id = ?2 AND target_id = ?3",
-            ).map_err(|error| error.to_string())?;
-            for intent in intents {
-                delete
-                    .execute(intent.row_key())
-                    .map_err(|error| error.to_string())?;
+        for intent in intents {
+            if let LayoutCloseIntent::Archive(expected) = intent {
+                let Some(mut current) = Self::read_pending_archive(&tx, &expected.entry)? else { continue };
+                if current.restored_workspace_id != expected.restored_workspace_id || current.entry != expected.entry {
+                    continue;
+                }
+                current.settle_history(&tx, current.replacement_in(snapshot))?;
+            }
+            if retire {
+                tx.execute(
+                    "DELETE FROM pending_layout_closes WHERE scope = ?1 AND workspace_id = ?2 AND target_id = ?3",
+                    intent.row_key(),
+                ).map_err(|e| e.to_string())?;
             }
         }
         tx.commit().map_err(|error| error.to_string())
@@ -954,9 +1023,9 @@ impl DatabaseStore {
         &self,
         entry: &ArchivedWorkspaceSnapshot,
         restored_workspace_id: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<PendingArchive>, String> {
         if !crate::state::layout_recovery_pending() {
-            return Ok(());
+            return Ok(None);
         }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
@@ -974,17 +1043,26 @@ impl DatabaseStore {
                 }
             }
         }
-        if let Some(id) = restored_workspace_id {
-            let archive = PendingArchive { entry: entry.clone(), restored_workspace_id: Some(id.to_owned()) };
+        let recorded = if let Some(id) = restored_workspace_id {
+            let previous = Self::read_pending_archive(&tx, entry)?
+                .filter(|prior| prior.restored_workspace_id.as_deref() == Some(id));
+            let legacy = previous.is_some();
+            let mut archive = previous.unwrap_or_else(|| PendingArchive {
+                entry: entry.clone(), restored_workspace_id: Some(id.to_owned()), hermes_thread_ids: None,
+            });
+            if archive.hermes_thread_ids.is_none() {
+                archive.capture_history(&tx, legacy.then_some(id))?;
+            }
             let payload = serde_json::to_string(&archive).map_err(|error| error.to_string())?;
             // An explicit delete wins over a concurrent restore or a retry.
-            tx.execute(
+            let changed = tx.execute(
                 "INSERT INTO pending_layout_closes (scope, workspace_id, target_id, payload)
                  SELECT 'archive', ?1, ?2, ?3 WHERE NOT EXISTS (
                     SELECT 1 FROM pending_layout_closes WHERE scope = 'workspace' AND workspace_id = ?1 AND target_id = ?2
                  ) ON CONFLICT(scope, workspace_id, target_id) DO UPDATE SET payload = excluded.payload",
                 params![entry.workspace_id, entry.archive_id, payload],
             ).map_err(|error| error.to_string())?;
+            (changed != 0).then_some(archive)
         } else {
             // The archive may have come from a layout with no journal row.
             tx.execute(
@@ -992,12 +1070,18 @@ impl DatabaseStore {
                  VALUES ('workspace', ?1, ?2) ON CONFLICT DO NOTHING",
                 params![entry.workspace_id, entry.archive_id],
             ).map_err(|error| error.to_string())?;
-        }
-        tx.commit().map_err(|error| error.to_string())
+            None
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(recorded)
     }
 
     pub(crate) fn pending_archive(&self, entry: &ArchivedWorkspaceSnapshot) -> Result<Option<PendingArchive>, String> {
-        let payload = self.conn.lock().unwrap().query_row(
+        Self::read_pending_archive(&self.conn.lock().unwrap(), entry)
+    }
+
+    fn read_pending_archive(conn: &Connection, entry: &ArchivedWorkspaceSnapshot) -> Result<Option<PendingArchive>, String> {
+        let payload = conn.query_row(
             "SELECT payload FROM pending_layout_closes WHERE scope = 'archive' AND workspace_id = ?1 AND target_id = ?2",
             params![entry.workspace_id, entry.archive_id], |row| row.get::<_, String>(0),
         ).optional().map_err(|error| error.to_string())?;
@@ -1583,6 +1667,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_unarchive_settles_only_proven_history_before_acknowledging() {
+        let root = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::test_file(&root.path().join("history.sqlite"));
+        let store = crate::state::AppStateStore::default();
+        let mut selected = store.snapshot();
+        let replacement = selected.workspaces[0].workspace_id.0.clone();
+        let mut entry = crate::state::build_archive_entry(&selected.workspaces[0]);
+        entry.workspace_id = "old-workspace".into();
+        entry.worktree_path = Some(root.path().display().to_string());
+        let cwd = entry.worktree_path.as_deref().unwrap();
+        // An older build already moved a conversation to the replacement.
+        for (thread, owner) in [("moved", &replacement), ("unrelated", &replacement), ("still-archived", &entry.workspace_id)] {
+            db.upsert_agent_chat_session(thread, owner, Some(cwd), "hermes").unwrap();
+        }
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO hermes_bindings(thread_id,workspace_id,cwd,binding) VALUES ('moved',?1,?2,'{}')",
+            params![entry.workspace_id, cwd],
+        ).unwrap();
+        let pending = PendingArchive { entry: entry.clone(), restored_workspace_id: Some(replacement.clone()), hermes_thread_ids: None };
+        db.record_layout_close(&LayoutCloseIntent::Archive(Box::new(pending)), &[]).unwrap();
+        let intents = db.pending_layout_closes().unwrap();
+        db.settle_layout_closes(&intents, &selected, false).unwrap();
+        assert_eq!(db.get_agent_chat_session("still-archived").unwrap().workspace_id, replacement);
+        selected.workspaces.clear();
+        selected.archived_workspaces.push(entry.clone());
+        db.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER fail_transfer BEFORE UPDATE OF workspace_id ON agent_chat_sessions
+             BEGIN SELECT RAISE(ABORT, 'fixture transfer failure'); END;",
+        ).unwrap();
+        assert!(db.settle_layout_closes(&intents, &selected, true).is_err());
+        assert!(db.pending_archive(&entry).unwrap().is_some());
+        assert_eq!(db.get_agent_chat_session("moved").unwrap().workspace_id, replacement);
+        db.conn.lock().unwrap().execute_batch("DROP TRIGGER fail_transfer").unwrap();
+        db.settle_layout_closes(&intents, &selected, true).unwrap();
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+        for thread in ["moved", "still-archived"] {
+            assert_eq!(db.get_agent_chat_session(thread).unwrap().workspace_id, entry.workspace_id);
+        }
+        assert_eq!(db.get_agent_chat_session("unrelated").unwrap().workspace_id, replacement);
+    }
+
+    #[test]
     fn old_pane_rows_migrate_to_scoped_layout_intents_once() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("state.sqlite");
@@ -1624,7 +1750,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [shell]
             );
-            db.retire_layout_closes(&[session]).unwrap();
+            db.settle_layout_closes(&[session], &crate::state::AppStateStore::default().snapshot(), true).unwrap();
         }
         let db = DatabaseStore::test_file(&path);
         assert!(db.pending_layout_closes().unwrap().is_empty());

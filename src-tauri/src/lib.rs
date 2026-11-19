@@ -1094,6 +1094,13 @@ fn build_core_app<R: tauri::Runtime>(
                         workspaces_sync::record_closed(&db, id).map_err(std::io::Error::other)?;
                     }
                 }
+                // Make archived chats available before commands can reuse or
+                // supersede an intent. Retirement follows the durable layout save.
+                if pending_layout_closes.iter().any(|intent| matches!(intent,
+                    state::LayoutCloseIntent::Archive(archive) if archive.restored_workspace_id.is_some())) {
+                    db.settle_layout_closes(&pending_layout_closes, &store.snapshot(), false)
+                        .map_err(std::io::Error::other)?;
+                }
                 if let Err(error) = state::persist_terminal_replacements(&store, &db, &terminal_replacements) {
                     log::warn!("Could not save replayed terminal replacements: {error}");
                 }
