@@ -1246,9 +1246,26 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn identity_upsert_links_the_layout_and_sends_only_current_inventory_edits() {
+    async fn identity_upsert_merges_only_edited_fields_in_either_push_order() {
+        for (layout_title, inventory_title, merged_title) in [
+            ("old", "inventory rename", Some("inventory rename")),
+            ("layout rename", "old", Some("layout rename")),
+            ("same rename", "same rename", Some("same rename")),
+            ("layout rename", "inventory rename", None),
+        ] {
+            check_identity_upsert(layout_title, inventory_title, merged_title).await;
+        }
+    }
+
+    async fn check_identity_upsert(
+        layout_title: &'static str,
+        inventory_title: &str,
+        merged_title: Option<&str>,
+    ) {
         for inventory_first in [false, true] {
-            let db = std::sync::Arc::new(fresh_db());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sync.db");
+            let db = std::sync::Arc::new(DatabaseStore::test_file(&path));
             let mut server = mockito::Server::new_async().await;
             std::env::set_var("CODEMUX_API_URL", server.url());
             super::ATTEMPTS.lock().unwrap().clear();
@@ -1258,7 +1275,27 @@ mod tests {
             let kind = Some("main");
             let insert_layout = || {
                 db.insert_workspace_sync(
-                    "layout", "old", host, None, None, branch, None, project, kind,
+                    "layout",
+                    "old",
+                    host,
+                    Some("/layout"),
+                    None,
+                    branch,
+                    None,
+                    project,
+                    kind,
+                )
+                .unwrap();
+                db.update_workspace_sync_by_workspace_id(
+                    "layout",
+                    layout_title,
+                    host,
+                    Some("/layout"),
+                    None,
+                    branch,
+                    None,
+                    project,
+                    kind,
                 )
                 .unwrap();
             };
@@ -1270,7 +1307,7 @@ mod tests {
                     "host",
                     "daemon-id",
                     "old",
-                    None,
+                    Some("/inventory"),
                     None,
                     branch,
                     project,
@@ -1279,12 +1316,11 @@ mod tests {
                     branch,
                 )
                 .unwrap();
-            db.mark_workspace_sync_synced(holder.id, Some("canonical"))
-                .unwrap();
+            db.mark_workspace_sync_synced(holder.id, Some("canonical")).unwrap();
             db.update_remote_discovered_workspace_sync(
                 holder.id,
-                "inventory rename",
-                None,
+                inventory_title,
+                Some("/new"),
                 None,
                 branch,
                 project,
@@ -1296,69 +1332,115 @@ mod tests {
             if inventory_first {
                 insert_layout();
             }
+
+            let identity = serde_json::json!({
+                "hostServerId":"host", "projectUid":"project", "workspaceKind":"main", "gitBranch":"main"
+            });
+            let mut inventory_body = identity.clone();
+            inventory_body["title"] = inventory_title.into();
+            inventory_body["projectPath"] = "/new".into();
             let before_post = server
                 .mock("PATCH", "/api/workspaces/canonical")
-                .match_body(mockito::Matcher::Json(serde_json::json!({
-                    "title": "inventory rename", "hostServerId":"host", "projectUid":"project",
-                    "workspaceKind":"main", "gitBranch":"main"
-                })))
-                .with_status(200)
+                .match_body(mockito::Matcher::Json(inventory_body))
                 .expect(usize::from(inventory_first))
                 .create_async()
                 .await;
-            let identity = serde_json::json!({"hostServerId":"host","projectUid":"project","workspaceKind":"main","gitBranch":"main"});
-            let edit = db.clone();
+
+            let mut layout_body = identity.clone();
+            layout_body["title"] = layout_title.into();
+            layout_body["projectPath"] = "/layout".into();
+            let edit_in_flight = layout_title == "old";
+            let edit = std::sync::Arc::downgrade(&db);
+            let mut response: serde_json::Value =
+                serde_json::from_str(&workspace_json("canonical")).unwrap();
+            response.as_object_mut().unwrap().extend(layout_body.as_object().unwrap().clone());
             let post = server
                 .mock("POST", "/api/workspaces")
-                .match_body(mockito::Matcher::PartialJson(identity.clone()))
+                .match_body(mockito::Matcher::Json(layout_body.clone()))
                 .with_body_from_request(move |_| {
-                    edit.update_workspace_sync_by_workspace_id(
-                        "layout",
-                        "old",
-                        host,
-                        None,
-                        None,
-                        branch,
-                        Some("new-head"),
-                        project,
-                        kind,
-                    )
-                    .unwrap();
-                    let mut response: serde_json::Value =
-                        serde_json::from_str(&workspace_json("canonical")).unwrap();
-                    response
-                        .as_object_mut()
-                        .unwrap()
-                        .extend(identity.as_object().unwrap().clone());
+                    if edit_in_flight {
+                        edit.upgrade()
+                            .unwrap()
+                            .update_workspace_sync_by_workspace_id(
+                                "layout",
+                                layout_title,
+                                host,
+                                Some("/layout"),
+                                None,
+                                branch,
+                                Some("new-head"),
+                                project,
+                                kind,
+                            )
+                            .unwrap();
+                    }
                     serde_json::to_vec(&serde_json::json!({"workspace":response})).unwrap()
                 })
                 .expect(1)
                 .create_async()
                 .await;
+
+            let mut merged_body = layout_body;
+            merged_body["title"] = merged_title.unwrap_or(layout_title).into();
+            merged_body["projectPath"] = "/new".into();
+            if edit_in_flight {
+                merged_body["gitHeadSha"] = "new-head".into();
+            }
             let patch = server
                 .mock("PATCH", "/api/workspaces/canonical")
-                .match_body(mockito::Matcher::PartialJson(
-                    serde_json::json!({"title":"inventory rename","gitHeadSha":"new-head"}),
-                ))
-                .with_status(200)
-                .expect(1)
+                .match_body(mockito::Matcher::Json(merged_body))
+                .expect(usize::from(merged_title.is_some()))
                 .create_async()
                 .await;
-            for _ in 0..2 {
-                super::push("token", &db).await.unwrap();
+
+            // The PATCH may also finish in an earlier pass. Its holder
+            // stays clean and available to pull while the POST is pending.
+            if inventory_first && layout_title == "layout rename" && inventory_title == "old" {
+                let pending = db.dirty_workspace_by_id(holder.id).unwrap().unwrap();
+                super::push_update(
+                    &super::sync_client(), &server.url(), "token", &pending, &db,
+                    &mut None, &SyncGuard::unchecked(),
+                ).await.unwrap();
+                assert!(!db.list_workspaces_sync().iter().find(|w| w.id == holder.id).unwrap().dirty);
+            }
+            let first = super::push("token", &db).await;
+            drop(db);
+            // Reopen between passes: a prior PATCH or a saved receipt
+            // must not turn a conflicting field into an acknowledged one.
+            let reopened = DatabaseStore::test_file(&path);
+            let second = super::push("token", &reopened).await;
+            let rows = reopened.list_workspaces_sync_for_sync();
+            if let Some(title) = merged_title {
+                first.unwrap();
+                second.unwrap();
+                assert_eq!(rows.len(), 1);
+                let row = &rows[0];
+                assert_eq!(row.id, holder.id);
+                assert_eq!(row.title, title);
+                assert_eq!(row.project_path.as_deref(), Some("/new"));
+                assert_eq!(row.git_head_sha.as_deref(), edit_in_flight.then_some("new-head"));
+                assert_eq!(row.workspace_id.as_deref(), Some("layout"));
+                assert_eq!(row.server_id.as_deref(), Some("canonical"));
+                assert_eq!(row.origin_uid.as_deref(), Some("daemon-id"));
+                assert_eq!(row.origin_path.as_deref(), Some("/srv/repo"));
+                assert_eq!(row.default_branch.as_deref(), branch);
+                assert!(!row.dirty);
+            } else {
+                for result in [first, second] {
+                    assert!(result.unwrap_err().contains("conflicts with local row"));
+                }
+                assert_eq!(rows.len(), 2);
+                let layout = rows.iter().find(|r| r.workspace_id.is_some()).unwrap();
+                assert_eq!(layout.title, layout_title);
+                assert_eq!(layout.project_path.as_deref(), Some("/layout"));
+                let inventory = rows.iter().find(|r| r.id == holder.id).unwrap();
+                assert_eq!(inventory.title, inventory_title);
+                assert_eq!(inventory.project_path.as_deref(), Some("/new"));
+                assert!(inventory.dirty && layout.dirty);
             }
             before_post.assert_async().await;
             post.assert_async().await;
             patch.assert_async().await;
-            let rows = db.list_workspaces_sync_for_sync();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].id, holder.id);
-            assert_eq!(rows[0].workspace_id.as_deref(), Some("layout"));
-            assert_eq!(rows[0].server_id.as_deref(), Some("canonical"));
-            assert_eq!(rows[0].origin_uid.as_deref(), Some("daemon-id"));
-            assert_eq!(rows[0].origin_path.as_deref(), Some("/srv/repo"));
-            assert_eq!(rows[0].default_branch.as_deref(), branch);
-            assert!(!rows[0].dirty);
             std::env::remove_var("CODEMUX_API_URL");
         }
     }

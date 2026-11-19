@@ -264,7 +264,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 25;
+const SCHEMA_VERSION: u32 = 26;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -1204,6 +1204,15 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             sent TEXT NOT NULL
         );
 
+        -- Keep the base of a PATCH that a pending same-identity POST could
+        -- overwrite. Only the returned server ID can confirm its holder.
+        CREATE TABLE IF NOT EXISTS workspace_create_patch_bases (
+            row_id INTEGER NOT NULL REFERENCES workspaces_sync(id) ON DELETE CASCADE,
+            holder_id INTEGER NOT NULL REFERENCES workspaces_sync(id) ON DELETE CASCADE,
+            base TEXT,
+            PRIMARY KEY (row_id, holder_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_workspaces_sync_user
             ON workspaces_sync(user_id, deleted_at);
         CREATE INDEX IF NOT EXISTS idx_workspaces_sync_dirty
@@ -1246,6 +1255,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE automations ADD COLUMN project_remote TEXT",
         "ALTER TABLE automations ADD COLUMN create_pending INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE workspaces_sync ADD COLUMN create_pending INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE workspaces_sync ADD COLUMN edit_base TEXT",
         // Devices page: local-only host observations (see the `hosts`
         // CREATE above for why a server pull must never touch these).
         "ALTER TABLE hosts ADD COLUMN last_seen_at TEXT",
@@ -1360,6 +1370,25 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         }
     }
 
+    // Capture the inputs to the first local edit on each side of a create
+    // collision. Subsequent edits (including reverts) compare to that same
+    // snapshot. Already-dirty linked rows from older clients have no base.
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS workspace_capture_edit_base
+         AFTER UPDATE OF title, host_server_id, project_path, project_remote, git_branch,
+                         git_head_sha, project_uid, workspace_kind, deleted_at ON workspaces_sync
+         WHEN NEW.dirty = 1 AND (OLD.dirty = 0 OR (OLD.server_id IS NULL AND OLD.edit_base IS NULL))
+         BEGIN
+             UPDATE workspaces_sync SET edit_base = json_object(
+                 'title', OLD.title, 'host_server_id', OLD.host_server_id,
+                 'project_path', OLD.project_path, 'project_remote', OLD.project_remote,
+                 'git_branch', OLD.git_branch, 'git_head_sha', OLD.git_head_sha,
+                 'project_uid', OLD.project_uid, 'workspace_kind', OLD.workspace_kind
+             ) WHERE id = NEW.id;
+         END;",
+    )
+    .map_err(|e| format!("Failed to install workspace edit tracking: {e}"))?;
+
     let installed_schema_version = conn
         .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
             row.get::<_, Option<u32>>(0)
@@ -1375,6 +1404,17 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
              UPDATE workspaces_sync SET create_pending = 1 WHERE dirty = 1 AND server_id IS NULL;",
         )
         .map_err(|e| format!("Failed to migrate unresolved registry uploads: {e}"))?;
+    }
+
+    // Older receipts can refer to a holder whose PATCH already cleared
+    // dirty. Preserve both sides before the first pull after upgrading.
+    if (1..26).contains(&installed_schema_version) {
+        conn.execute(
+            "UPDATE workspaces_sync SET dirty = 1 WHERE user_id = 'local' AND server_id IN
+             (SELECT server_id FROM workspace_create_receipts)",
+            [],
+        )
+        .map_err(|e| format!("Failed to preserve workspace create conflicts: {e}"))?;
     }
 
     // Upgrading users already have transcript rows when the v14 table first
@@ -2317,6 +2357,19 @@ impl DatabaseStore {
     /// merged either its fields or its entire row into a different holder.
     pub fn dirty_workspace_by_id(&self, id: i64) -> Result<Option<WorkspaceSyncRecord>, String> {
         let conn = self.conn.lock().unwrap();
+        // A conflicting POST has already reached this server ID. Keep its
+        // holder intact for reconciliation, even after reopening the DB.
+        let held: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces_sync w JOIN workspace_create_receipts r
+                               ON r.server_id = w.server_id WHERE w.id = ?1)",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if held {
+            return Ok(None);
+        }
         Ok(workspace_by_id(&conn, id)?.filter(|r| r.dirty))
     }
 
@@ -2363,9 +2416,11 @@ impl DatabaseStore {
                 };
                 let mut holder =
                     workspace_by_id(&tx, holder_id)?.ok_or("workspace holder disappeared")?;
-                // A PATCH earlier in this pass may have cleared dirty just
-                // before this POST overwrote it on the server.
-                holder.dirty |= holder_was_queued;
+                let (layout_base, holder_base, patched) =
+                    workspace_edit_bases(&tx, pushed.id, holder_id)?;
+                // A preceding acknowledgement (including DELETE) can have
+                // cleared dirty before this POST named the same row.
+                holder.dirty |= holder_was_queued || patched;
                 let plain_mirror = !holder.dirty
                     && holder.workspace_id.is_none()
                     && holder.origin_uid.is_none()
@@ -2373,7 +2428,13 @@ impl DatabaseStore {
                 if plain_mirror {
                     tx.execute("DELETE FROM workspaces_sync WHERE id = ?1", [holder_id])
                         .map_err(|e| e.to_string())?;
-                } else if let Some(merged) = merge_workspace_create(pushed, current, &holder) {
+                } else if let Some(merged) = merge_workspace_create(
+                    pushed,
+                    current,
+                    &holder,
+                    layout_base.as_ref(),
+                    holder_base.as_ref(),
+                ) {
                     // Release the unique workspace_id before binding it to the
                     // canonical row. All identity and mutation changes commit together.
                     tx.execute("DELETE FROM workspaces_sync WHERE id = ?1", [pushed.id])
@@ -2391,6 +2452,10 @@ impl DatabaseStore {
                         ).map_err(|e| e.to_string())?;
                     canonical = holder_id;
                 } else {
+                    if holder.dirty {
+                        tx.execute("UPDATE workspaces_sync SET dirty = 1 WHERE id = ?1", [holder_id])
+                            .map_err(|e| e.to_string())?;
+                    }
                     tx.execute(
                         "INSERT OR IGNORE INTO workspace_create_receipts (row_id, server_id, sent)
                              VALUES (?1, ?2, ?3)",
@@ -2413,6 +2478,21 @@ impl DatabaseStore {
                 [pushed.id],
             )
             .map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM workspace_create_patch_bases WHERE row_id = ?1", [pushed.id])
+                .map_err(|e| e.to_string())?;
+        } else if pushed.deleted_at.is_none() {
+            // A later POST may overwrite this PATCH, even in another pass.
+            // Remember the original base but acknowledge the PATCH normally.
+            // If the POST returns a different ID, its candidates are discarded.
+            tx.execute(
+                "INSERT OR IGNORE INTO workspace_create_patch_bases(row_id, holder_id, base)
+                 SELECT w.id, h.id, h.edit_base FROM workspaces_sync w, workspaces_sync h
+                 WHERE h.id = ?1 AND w.user_id = h.user_id AND w.server_id IS NULL
+                   AND w.dirty = 1 AND w.deleted_at IS NULL
+                   AND w.host_server_id = ?2 AND w.project_uid = ?3
+                   AND w.git_branch IS ?4 AND w.workspace_kind IS ?5",
+                params![pushed.id, pushed.host_server_id, pushed.project_uid, pushed.git_branch, pushed.workspace_kind],
+            ).map_err(|e| e.to_string())?;
         }
         tx.execute(
             "UPDATE workspaces_sync
@@ -2439,6 +2519,13 @@ impl DatabaseStore {
             ],
         )
         .map_err(|e| format!("Failed to mark workspace sync row pushed: {e}"))?;
+        // If further changes remain after this acknowledgement, their base
+        // is now the payload the server accepted.
+        tx.execute(
+            "UPDATE workspaces_sync SET edit_base = ?1 WHERE id = ?2 AND dirty = 1",
+            params![serde_json::to_string(pushed).map_err(|e| e.to_string())?, canonical],
+        )
+        .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| format!("Failed to mark workspace sync row pushed: {e}"))?;
         Ok(())
     }
@@ -2923,10 +3010,44 @@ fn workspace_by_id(conn: &Connection, id: i64) -> Result<Option<WorkspaceSyncRec
     .map_err(|e| e.to_string())
 }
 
+#[derive(Deserialize)]
+struct WorkspaceEditBase {
+    title: String,
+    host_server_id: Option<String>,
+    project_path: Option<String>,
+    project_remote: Option<String>,
+    git_branch: Option<String>,
+    git_head_sha: Option<String>,
+    project_uid: Option<String>,
+    workspace_kind: Option<String>,
+}
+
+fn workspace_edit_bases(
+    conn: &Connection,
+    layout_id: i64,
+    holder_id: i64,
+) -> Result<(Option<WorkspaceEditBase>, Option<WorkspaceEditBase>, bool), String> {
+    let (layout, holder, patched): (Option<String>, Option<String>, bool) = conn.query_row(
+        "SELECT l.edit_base, CASE WHEN p.row_id IS NULL THEN h.edit_base ELSE p.base END,
+                p.row_id IS NOT NULL
+         FROM workspaces_sync l JOIN workspaces_sync h ON h.id = ?2
+         LEFT JOIN workspace_create_patch_bases p ON p.row_id = l.id AND p.holder_id = h.id
+         WHERE l.id = ?1",
+        params![layout_id, holder_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).map_err(|e| e.to_string())?;
+    let decode = |base: Option<String>| {
+        base.map(|json| serde_json::from_str(&json).map_err(|e| e.to_string())).transpose()
+    };
+    Ok((decode(layout)?, decode(holder)?, patched))
+}
+
 fn merge_workspace_create(
     sent: &WorkspaceSyncRecord,
     mut current: WorkspaceSyncRecord,
     holder: &WorkspaceSyncRecord,
+    layout_base: Option<&WorkspaceEditBase>,
+    holder_base: Option<&WorkspaceEditBase>,
 ) -> Option<WorkspaceSyncRecord> {
     // The account upserts on this identity. Two independent adoptions or
     // daemon identities can still describe different local owners.
@@ -2953,53 +3074,31 @@ fn merge_workspace_create(
         .default_branch
         .or_else(|| holder.default_branch.clone());
     if holder.dirty {
-        // Apply the holder's pending fields unless the layout also edited
-        // that field while the request was in flight. Conflicting writes
-        // need an explicit decision; the receipt keeps both rows intact.
-        fn merge<T: Clone + PartialEq>(current: &mut T, sent: &T, pending: &T) -> Option<()> {
-            if current == sent {
-                current.clone_from(pending);
-            } else if pending != sent && current != pending {
-                return None;
-            }
-            Some(())
+        // An unedited create has no local edit history. Its submitted
+        // values can still differ from the holder's last synced values.
+        // Without a known holder base, differing legacy edits stay pending.
+        macro_rules! merge_field {
+            ($field:ident) => {
+                if current.$field != holder.$field {
+                    let base = &holder_base?.$field;
+                    if &holder.$field != base {
+                        let original = layout_base.map(|b| &b.$field).unwrap_or(base);
+                        if &current.$field != original || current.$field != sent.$field {
+                            return None;
+                        }
+                        current.$field.clone_from(&holder.$field);
+                    }
+                }
+            };
         }
-        merge(&mut current.title, &sent.title, &holder.title)?;
-        merge(
-            &mut current.host_server_id,
-            &sent.host_server_id,
-            &holder.host_server_id,
-        )?;
-        merge(
-            &mut current.project_path,
-            &sent.project_path,
-            &holder.project_path,
-        )?;
-        merge(
-            &mut current.project_remote,
-            &sent.project_remote,
-            &holder.project_remote,
-        )?;
-        merge(
-            &mut current.git_branch,
-            &sent.git_branch,
-            &holder.git_branch,
-        )?;
-        merge(
-            &mut current.git_head_sha,
-            &sent.git_head_sha,
-            &holder.git_head_sha,
-        )?;
-        merge(
-            &mut current.project_uid,
-            &sent.project_uid,
-            &holder.project_uid,
-        )?;
-        merge(
-            &mut current.workspace_kind,
-            &sent.workspace_kind,
-            &holder.workspace_kind,
-        )?;
+        merge_field!(title);
+        merge_field!(host_server_id);
+        merge_field!(project_path);
+        merge_field!(project_remote);
+        merge_field!(git_branch);
+        merge_field!(git_head_sha);
+        merge_field!(project_uid);
+        merge_field!(workspace_kind);
         current.deleted_at = current.deleted_at.or_else(|| holder.deleted_at.clone());
         current.updated_at = current.updated_at.max(holder.updated_at.clone());
     }
@@ -7518,6 +7617,78 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
     }
+    #[test]
+    fn workspace_edit_base_upgrade_preserves_a_previously_acknowledged_conflict() {
+        let db = init_test_database();
+        let holder = db
+            .insert_remote_discovered_workspace_sync(
+                "host",
+                "daemon-id",
+                "inventory rename",
+                None,
+                None,
+                Some("main"),
+                Some("project"),
+                Some("main"),
+                None,
+                None,
+            )
+            .unwrap();
+        db.mark_workspace_sync_synced(holder.id, Some("canonical")).unwrap();
+        let layout = db
+            .insert_workspace_sync(
+                "layout",
+                "layout rename",
+                Some("host"),
+                None,
+                None,
+                Some("main"),
+                None,
+                Some("project"),
+                Some("main"),
+            )
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER workspace_capture_edit_base;
+                 ALTER TABLE workspaces_sync DROP COLUMN edit_base;
+                 UPDATE schema_version SET version = 25;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspace_create_receipts(row_id, server_id, sent)
+                 VALUES (?1, 'canonical', ?2)",
+                params![layout.id, serde_json::to_string(&layout).unwrap()],
+            )
+            .unwrap();
+            create_schema(&conn).unwrap();
+        }
+        db.upsert_workspace_sync_from_server(
+            "canonical",
+            "layout rename",
+            Some("host"),
+            None,
+            None,
+            Some("main"),
+            None,
+            "",
+            "",
+            None,
+            Some("project"),
+            Some("main"),
+        )
+        .unwrap();
+        let (sent, sid) = db.workspace_create_receipt(layout.id).unwrap().unwrap();
+        assert!(db
+            .mark_workspace_sync_pushed(&sent, Some((&sid, false)))
+            .unwrap_err()
+            .contains("conflicts with local row"));
+        let rows = db.list_dirty_workspaces_sync();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().find(|r| r.id == holder.id).unwrap().title, "inventory rename");
+    }
+
     #[test]
     fn registry_create_migration_preserves_unresolved_uploads() {
         let db = init_test_database();
