@@ -195,11 +195,18 @@ impl DatabaseStore {
     }
 
     #[cfg(any(windows, test))]
-    pub(crate) fn record_recovery_workspace_close(&self, intent: &LayoutCloseIntent) -> Result<(), String> {
-        let Some(workspace) = intent.closed_workspace_id() else { return Ok(()) };
+    pub(crate) fn record_recovery_layout_close(&self, intent: &LayoutCloseIntent) -> Result<(), String> {
+        let check_pending_parent = if crate::state::layout_recovery_pending()
+            || crate::state::retained_layouts().references_close(intent)
+        {
+            None
+        } else {
+            let Some(workspace) = intent.closed_workspace_id() else { return Ok(()) };
+            Some(workspace)
+        };
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        if !crate::state::layout_recovery_pending() {
+        if let Some(workspace) = check_pending_parent {
             // Startup can have selected a durable primary while the
             // conditional unarchive is still waiting for acknowledgement.
             let pending: bool = tx.query_row(
@@ -285,6 +292,15 @@ impl DatabaseStore {
         snapshot: &AppStateSnapshot,
         retire: bool,
     ) -> Result<(), String> {
+        let retained = crate::state::retained_layouts();
+        #[cfg(unix)]
+        let alias_owners = if retire && !retained.is_empty()
+            && intents.iter().any(|intent| matches!(intent, LayoutCloseIntent::Session { .. }))
+        {
+            retained.terminal_owners(&Self::read_terminal_replacements(tx)?)
+        } else {
+            Default::default()
+        };
         for intent in intents {
             if let LayoutCloseIntent::Archive(expected) = intent {
                 let Some(mut current) = Self::read_pending_archive(tx, &expected.entry)? else { continue };
@@ -293,7 +309,13 @@ impl DatabaseStore {
                 }
                 current.settle_history(tx, current.replacement_in(snapshot))?;
             }
-            if retire {
+            #[cfg(unix)]
+            if let LayoutCloseIntent::Session { workspace_id, session_id } = intent {
+                if alias_owners.contains(&(workspace_id.clone(), session_id.clone())) {
+                    continue;
+                }
+            }
+            if retire && !retained.references_close(intent) {
                 tx.execute(
                     "DELETE FROM pending_layout_closes WHERE scope = ?1 AND workspace_id = ?2 AND target_id = ?3",
                     intent.row_key(),
@@ -310,7 +332,7 @@ impl DatabaseStore {
         entry: &ArchivedWorkspaceSnapshot,
         restored_workspace_id: Option<&str>,
     ) -> Result<Option<PendingArchive>, String> {
-        if !crate::state::layout_recovery_pending() {
+        if !crate::state::layout_recovery_pending() && !crate::state::retained_layouts().references_archive(entry) {
             return Ok(None);
         }
         let mut conn = self.conn.lock().unwrap();

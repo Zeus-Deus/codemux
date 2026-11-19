@@ -268,7 +268,7 @@ pub(crate) fn closed_paths(db: &crate::database::DatabaseStore) -> Vec<String> {
 
 /// Every path a live workspace has open, in [`path_key`] spelling,
 /// including folders its chat panes were pointed at.
-fn live_paths(snapshot: &AppStateSnapshot) -> HashSet<PathBuf> {
+pub(crate) fn live_paths(snapshot: &AppStateSnapshot) -> HashSet<PathBuf> {
     open_paths(snapshot, true)
 }
 
@@ -317,12 +317,18 @@ fn gather_candidates(
     closed: &[ClosedWorktree],
     root: &Path,
 ) -> Vec<Candidate> {
+    let retained = crate::state::retained_layouts();
+    if retained.unreadable {
+        return Vec::new();
+    }
     let live = live_paths(snapshot);
     let mut index: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
     let mut out: Vec<Candidate> = Vec::new();
     let mut push = |candidate: Candidate| {
         let key = path_key(&candidate.path);
-        if key == root || !key.starts_with(root) || !candidate.path.is_dir() || is_open(&live, &key) {
+        if key == root || !key.starts_with(root) || !candidate.path.is_dir()
+            || is_open(&live, &key) || is_open(&retained.checkout_paths, &key)
+        {
             return;
         }
         // An archive entry can outlive a later reopen and close of the same
@@ -799,7 +805,12 @@ fn remove_unless_in_use(
     remove: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let _fence = state.fence_checkout_removal(path, |snapshot| {
-        if is_open(&live_paths(snapshot), &path_key(path)) {
+        let key = path_key(path);
+        let retained = crate::state::retained_layouts();
+        if retained.unreadable || is_open(&retained.checkout_paths, &key) {
+            return Err("A saved recovery layout may still use this checkout".to_owned());
+        }
+        if is_open(&live_paths(snapshot), &key) {
             return Err("A workspace opened it again".to_string());
         }
         match activity(path, &[]) {
@@ -1260,6 +1271,53 @@ mod tests {
         let live_paths = HashSet::from([path_key(&open.join("sub"))]);
         assert!(is_open(&live_paths, &path_key(&open)));
         assert!(!is_open(&live_paths, &path_key(&closed)));
+    }
+
+    #[test]
+    fn retained_layout_keeps_a_local_checkout_at_scan_and_removal() {
+        const TEST: &str = "worktree_cleanup::tests::retained_layout_keeps_a_local_checkout_at_scan_and_removal";
+        if crate::test_isolation::isolated(TEST) { return; }
+        let layout = crate::test_isolation::isolated_root().unwrap().join("layout.json");
+        let retained = layout.with_added_extension("recovery-saved-00000000-0000-0000-0000-000000000001.json");
+        let (dir, _, wt) = repo_with_worktree();
+        let managed = path_key(dir.path());
+        let store = AppStateStore::default();
+        let mut original = store.snapshot();
+        let ws = &mut original.workspaces[0];
+        ws.worktree_path = Some(wt.display().to_string());
+        let mut archive = crate::state::build_archive_entry(ws);
+        archive.archived_at = 0;
+        let mut repaired = original.clone();
+        repaired.workspaces.clear();
+        repaired.terminal_sessions.clear();
+        repaired.archived_workspaces.push(archive);
+        std::fs::write(&layout, serde_json::to_vec(&repaired).unwrap()).unwrap();
+        let boot = || store.replace_snapshot(crate::state::load_persisted_state_checked().unwrap().unwrap());
+        let candidates = || gather_candidates(&store.snapshot(), &[], &managed);
+        boot();
+        let initial = candidates();
+        assert_eq!(initial.len(), 1);
+        let stale = judge(&initial[0], &inspect(&wt), NOW, &mut || None, None, false).unwrap();
+        assert!(stale.kept_because.is_none());
+
+        std::fs::write(&retained, serde_json::to_vec(&original).unwrap()).unwrap();
+        boot();
+        assert!(candidates().is_empty());
+        assert!(remove_unless_in_use(&store, &wt, remove_worktree).unwrap_err().contains("recovery layout"));
+        assert!(wt.join(".git").exists());
+
+        std::fs::write(&retained, b"unreadable").unwrap();
+        boot();
+        assert!(candidates().is_empty());
+        assert!(remove_unless_in_use(&store, &wt, remove_worktree).is_err());
+        // The same path on a remote host does not pin the local checkout.
+        original.workspaces[0].attach_only = true;
+        original.workspaces[0].host_id = Some(1);
+        std::fs::write(retained, serde_json::to_vec(&original).unwrap()).unwrap();
+        boot();
+        assert_eq!(candidates().len(), 1);
+        remove_unless_in_use(&store, &wt, remove_worktree).unwrap();
+        assert!(!wt.exists());
     }
 
     #[test]

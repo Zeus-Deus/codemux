@@ -315,8 +315,18 @@ pub(crate) fn persist_terminal_replacements(
         return Ok(());
     }
     let retained = retained_layouts();
+    if retained.unreadable {
+        return Ok(());
+    }
+    // A live restart hands us only its newest edge. Older journal rows can
+    // connect that edge to a session in a saved recovery layout.
+    let protected = if retained.is_empty() {
+        HashSet::new()
+    } else {
+        retained.terminal_owners(&db.pending_terminal_replacements()?)
+    };
     for replacement in replacements {
-        if retained.protects_session(&replacement.workspace_id, &replacement.old_session_id) {
+        if protected.contains(&(replacement.workspace_id.clone(), replacement.old_session_id.clone())) {
             continue;
         }
         db.retire_terminal_replacement(
@@ -882,6 +892,27 @@ pub struct WorkspaceSnapshot {
 }
 
 impl WorkspaceSnapshot {
+    fn migrate_legacy_tab(&mut self) {
+        if self.workspace_type == WorkspaceType::Standard
+            && self.tabs.is_empty()
+            && !self.surfaces.is_empty()
+        {
+            let surface_id = self.surfaces[0].surface_id.clone();
+            // A close can be journaled before the migrated layout is saved.
+            // Derive the tab ID from the persisted surface so replay can find it.
+            let tab_id = format!("legacy-tab-{}", surface_id.0);
+            self.tabs.push(TabSnapshot {
+                tab_id: tab_id.clone(),
+                kind: TabKind::Terminal,
+                title: "Terminal".into(),
+                surface_id: Some(surface_id),
+                browser_id: None,
+                icon: None,
+            });
+            self.active_tab_id = tab_id;
+        }
+    }
+
     /// A workspace started for an agent's chat: it borrows the folder of
     /// the workspace it came from and owns no files.
     pub fn is_chat_child(&self) -> bool {
@@ -4678,17 +4709,7 @@ impl AppStateStore {
             collect_terminal_sessions(&workspace.surfaces).into_iter()
                 .map(|session_id| (workspace.workspace_id.0.clone(), session_id))
         }).collect();
-        let retained = retained_layouts();
-        for (workspace, sessions) in &retained.workspaces {
-            owners.extend(sessions.iter().map(|session| (workspace.clone(), session.clone())));
-        }
-        // A retained pane may still name the predecessor of a shell already
-        // running under its durable successor ID.
-        for replacement in replacements {
-            if retained.protects_session(&replacement.workspace_id, &replacement.old_session_id) {
-                owners.insert((replacement.workspace_id.clone(), replacement.replacement_session_id()));
-            }
-        }
+        owners.extend(retained_layouts().terminal_owners(replacements));
         owners
     }
 
@@ -6644,24 +6665,7 @@ impl AppStateStore {
     pub fn migrate_tabs_if_needed(&self) {
         let mut snapshot = self.inner.lock().unwrap();
         for workspace in &mut snapshot.workspaces {
-            if workspace.workspace_type == WorkspaceType::Standard
-                && workspace.tabs.is_empty()
-                && !workspace.surfaces.is_empty()
-            {
-                let surface_id = workspace.surfaces[0].surface_id.clone();
-                // A close can be journaled before the migrated layout is saved.
-                // Derive the tab ID from the persisted surface so replay can find it.
-                let tab_id = format!("legacy-tab-{}", surface_id.0);
-                workspace.tabs.push(TabSnapshot {
-                    tab_id: tab_id.clone(),
-                    kind: TabKind::Terminal,
-                    title: "Terminal".into(),
-                    surface_id: Some(surface_id),
-                    browser_id: None,
-                    icon: None,
-                });
-                workspace.active_tab_id = tab_id;
-            }
+            workspace.migrate_legacy_tab();
         }
     }
 
@@ -7061,6 +7065,10 @@ static LAYOUT_SAVES_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::
 #[derive(Default)]
 pub(crate) struct RetainedLayouts {
     workspaces: HashMap<String, HashSet<String>>,
+    panes: HashSet<String>,
+    tabs: HashSet<(String, String)>,
+    archives: HashSet<String>,
+    pub(crate) checkout_paths: HashSet<PathBuf>,
     pub(crate) unreadable: bool,
 }
 
@@ -7088,7 +7096,15 @@ impl RetainedLayouts {
             }
             match read_layout::<AppStateSnapshot>(&entry.path()) {
                 Ok(Some((snapshot, _))) => {
-                    for workspace in snapshot.workspaces {
+                    retained.checkout_paths.extend(crate::worktree_cleanup::live_paths(&snapshot));
+                    retained.archives.extend(snapshot.archived_workspaces.into_iter().map(|entry| entry.archive_id));
+                    for mut workspace in snapshot.workspaces {
+                        workspace.migrate_legacy_tab();
+                        for surface in &workspace.surfaces {
+                            retained.panes.extend(collect_pane_ids_from_node(&surface.root));
+                        }
+                        retained.tabs.extend(workspace.tabs.into_iter()
+                            .map(|tab| (workspace.workspace_id.0.clone(), tab.tab_id)));
                         retained.workspaces.entry(workspace.workspace_id.0).or_default()
                             .extend(collect_terminal_sessions(&workspace.surfaces));
                     }
@@ -7108,9 +7124,39 @@ impl RetainedLayouts {
         self.unreadable || self.workspaces.contains_key(workspace_id)
     }
 
+    pub(crate) fn references_archive(&self, entry: &ArchivedWorkspaceSnapshot) -> bool {
+        self.protects(&entry.workspace_id) || self.archives.contains(&entry.archive_id)
+    }
+
+    pub(crate) fn references_close(&self, intent: &LayoutCloseIntent) -> bool {
+        self.unreadable || match intent {
+            LayoutCloseIntent::Pane(id) => self.panes.contains(id),
+            LayoutCloseIntent::Tab { workspace_id, tab_id } =>
+                self.tabs.contains(&(workspace_id.clone(), tab_id.clone())),
+            LayoutCloseIntent::Session { workspace_id, session_id } =>
+                self.workspaces.get(workspace_id).is_some_and(|sessions| sessions.contains(session_id)),
+            LayoutCloseIntent::Workspace(id) => self.protects(id),
+            LayoutCloseIntent::ConsumedArchive { workspace_id, archive_id } =>
+                self.protects(workspace_id) || self.archives.contains(archive_id),
+            LayoutCloseIntent::Archive(archive) => self.references_archive(&archive.entry),
+        }
+    }
+
     #[cfg(unix)]
-    fn protects_session(&self, workspace: &str, session: &str) -> bool {
-        self.unreadable || self.workspaces.get(workspace).is_some_and(|sessions| sessions.contains(session))
+    pub(crate) fn terminal_owners(
+        &self,
+        replacements: &[crate::database::daemon_closes::PendingTerminalReplacement],
+    ) -> HashSet<(String, String)> {
+        let mut owners: HashSet<_> = self.workspaces.iter().flat_map(|(workspace, sessions)|
+            sessions.iter().map(|id| (workspace.clone(), id.clone()))
+        ).collect();
+        // The journal returns predecessors before their successors.
+        for replacement in replacements {
+            if owners.contains(&(replacement.workspace_id.clone(), replacement.old_session_id.clone())) {
+                owners.insert((replacement.workspace_id.clone(), replacement.replacement_session_id()));
+            }
+        }
+        owners
     }
 }
 
@@ -7830,31 +7876,25 @@ pub(crate) fn restore_terminal_replacements_and_layout_closes(
     if replacements.is_empty() {
         return restore_pending_layout_closes(store, closes);
     }
+    let mut closes = closes.to_vec();
     for replacement in replacements {
+        let successor = replacement.replacement_session_id();
         store.replace_terminal_session(
             &replacement.workspace_id,
             &replacement.old_session_id,
-            &replacement.replacement_session_id(),
+            &successor,
             || true,
         )?;
-    }
-    let snapshot = store.inner.lock().unwrap();
-    let closes: Vec<_> = closes.iter().map(|close| {
-        if let LayoutCloseIntent::Session { workspace_id, session_id } = close {
-            if let Some(replacement) = replacements.iter().find(|replacement| {
-                replacement.workspace_id == *workspace_id
-                    && replacement.old_session_id == *session_id
-                    && workspace_is_local(&snapshot, workspace_id)
-            }) {
-                return LayoutCloseIntent::Session {
-                    workspace_id: workspace_id.clone(),
-                    session_id: replacement.replacement_session_id(),
-                };
+        if workspace_is_local(&store.inner.lock().unwrap(), &replacement.workspace_id) {
+            for close in &mut closes {
+                if let LayoutCloseIntent::Session { workspace_id, session_id } = close {
+                    if *workspace_id == replacement.workspace_id && *session_id == replacement.old_session_id {
+                        session_id.clone_from(&successor);
+                    }
+                }
             }
         }
-        close.clone()
-    }).collect();
-    drop(snapshot);
+    }
     restore_pending_layout_closes(store, &closes)
 }
 
@@ -10473,6 +10513,88 @@ mod tests {
             persist_layout_closes(&restored, &db, &closes).unwrap();
             assert!(db.pending_layout_closes().unwrap().is_empty());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_layout_resolves_replacement_chains_for_replay_closes_and_cleanup() {
+        use crate::database::{DatabaseStore, daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose, PendingTerminalReplacement}};
+        const TEST: &str = "state::state_impl::tests::retained_layout_resolves_replacement_chains_for_replay_closes_and_cleanup";
+        if crate::test_isolation::isolated(TEST) { return; }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let layout = persisted_layout_path().unwrap();
+        let retained = layout.with_added_extension("recovery-saved-00000000-0000-0000-0000-000000000001.json");
+        let db_path = root.join("shells.sqlite");
+        let db = DatabaseStore::test_file(&db_path);
+        let store = AppStateStore::default();
+        let workspace = store.active_workspace_id();
+        let old = store.active_terminal_session_id().unwrap();
+        // Make the second journal row sort before the first by primary key.
+        let a = "session-zz-original";
+        assert!(store.replace_terminal_session(&workspace, &old.0, a, || true).unwrap());
+        save_layout_to(&retained, &store.snapshot()).unwrap();
+        fs::copy(&retained, &layout).unwrap();
+        store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+        let replace = |old: &str| {
+            db.begin_local_terminal_restart(&workspace, old, None).unwrap();
+            let id = db.activate_tokenless_local_replacement(&workspace, old).unwrap();
+            let mapping = PendingTerminalReplacement {
+                workspace_id: workspace.clone(), old_session_id: old.to_owned(), replacement_id: id,
+            };
+            let successor = mapping.replacement_session_id();
+            assert!(store.replace_terminal_session(&workspace, old, &successor, || true).unwrap());
+            // The live restart persists just the alias it activated.
+            persist_terminal_replacements(&store, &db, &[mapping]).unwrap();
+            successor
+        };
+        let b = replace(a);
+        let c = replace(&b);
+        drop(db);
+
+        // Boot an unrelated primary. Run the journal and orphan reconciliation
+        // before selecting the original, retained layout again.
+        save_layout_to(&layout, &default_app_state()).unwrap();
+        store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+        assert!(store.find_workspace(&workspace).is_none());
+        let db = DatabaseStore::test_file(&db_path);
+        let replacements = db.pending_terminal_replacements().unwrap();
+        assert_eq!(replacements.len(), 2);
+        persist_terminal_replacements(&store, &db, &replacements).unwrap();
+        let owners = store.terminal_session_owners(&replacements);
+        db.reconcile_local_terminal_fallbacks(&owners).unwrap();
+        assert!(db.has_local_terminal_fallback(&workspace, &c).unwrap());
+        let shell = PendingDaemonClose {
+            route: DaemonWorkspaceRoute { workspace_id: workspace.clone(), host_id: None, ssh_target: None },
+            session_id: c.clone(), shell_id: uuid::Uuid::new_v4(),
+        };
+        assert!(store.orphaned_daemon_shells(vec![shell.clone()], &replacements).is_empty());
+
+        fs::copy(&retained, &layout).unwrap();
+        let saved = load_persisted_state_checked().unwrap().unwrap();
+        let replacements = db.pending_terminal_replacements().unwrap();
+        store.replace_snapshot(saved.clone());
+        restore_terminal_replacements_and_layout_closes(&store, &replacements, &[]).unwrap();
+        let current = store.pty_hydration_plan_for_session(&c).unwrap();
+        assert_eq!(current.sessions[0].restore_predecessor_session_id.as_deref(), Some(b.as_str()));
+        for id in [a, &b, &c] {
+            let close = LayoutCloseIntent::Session { workspace_id: workspace.clone(), session_id: id.to_owned() };
+            db.record_layout_close(&close, &[]).unwrap();
+            store.replace_snapshot(saved.clone());
+            restore_terminal_replacements_and_layout_closes(&store, &replacements, std::slice::from_ref(&close)).unwrap();
+            assert!(store.pty_hydration_plan_for_session(&c).is_none());
+            persist_layout_closes(&store, &db, std::slice::from_ref(&close)).unwrap();
+            assert!(db.pending_layout_closes().unwrap().contains(&close));
+        }
+        fs::remove_file(retained).unwrap();
+        store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+        persist_terminal_replacements(&store, &db, &replacements).unwrap();
+        assert!(db.pending_terminal_replacements().unwrap().is_empty());
+        let closes = db.pending_layout_closes().unwrap();
+        persist_layout_closes(&store, &db, &closes).unwrap();
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+        db.reconcile_local_terminal_fallbacks(&store.terminal_session_owners(&[])).unwrap();
+        assert!(!db.has_local_terminal_fallback(&workspace, &c).unwrap());
+        assert_eq!(store.orphaned_daemon_shells(vec![shell.clone()], &[]), [shell]);
     }
 
     #[cfg(unix)]

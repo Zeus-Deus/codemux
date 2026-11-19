@@ -612,10 +612,15 @@ impl DatabaseStore {
     }
 
     pub(crate) fn pending_terminal_replacements(&self) -> Result<Vec<PendingTerminalReplacement>, String> {
-        let conn = self.conn.lock().unwrap();
+        Self::read_terminal_replacements(&self.conn.lock().unwrap())
+    }
+
+    /// Order each chain from the oldest binding to the newest. Session UUIDs
+    /// and the composite primary key carry no chronological information.
+    pub(super) fn read_terminal_replacements(conn: &Connection) -> Result<Vec<PendingTerminalReplacement>, String> {
         let mut select = conn.prepare(
             "SELECT workspace_id, session_id, replacement_id FROM pending_local_terminal_restarts
-             WHERE replacement_active = 1 ORDER BY workspace_id, session_id",
+             WHERE replacement_active = 1",
         ).map_err(|error| error.to_string())?;
         let rows = select.query_map([], |row| {
             Ok(PendingTerminalReplacement {
@@ -624,7 +629,25 @@ impl DatabaseStore {
                 replacement_id: Uuid::from_bytes(row.get(2)?),
             })
         }).map_err(|error| error.to_string())?;
-        rows.collect::<Result<_, _>>().map_err(|error| error.to_string())
+        let mut edges = std::collections::BTreeMap::new();
+        let mut successors = HashSet::new();
+        for row in rows {
+            let edge = row.map_err(|error| error.to_string())?;
+            successors.insert((edge.workspace_id.clone(), edge.replacement_session_id()));
+            edges.insert((edge.workspace_id.clone(), edge.old_session_id.clone()), edge);
+        }
+        let roots: Vec<_> = edges.keys().filter(|key| !successors.contains(*key)).cloned().collect();
+        let mut ordered = Vec::with_capacity(edges.len());
+        for mut key in roots {
+            while let Some(edge) = edges.remove(&key) {
+                key.1 = edge.replacement_session_id();
+                ordered.push(edge);
+            }
+        }
+        if !edges.is_empty() {
+            return Err("Terminal replacement journal contains a cycle".into());
+        }
+        Ok(ordered)
     }
 
     /// Forget an applied alias only after its replacement is saved in layout.
