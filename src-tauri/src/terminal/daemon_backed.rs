@@ -57,6 +57,7 @@ enum DaemonSpawnOutcome {
 
 enum LocalRestartReplay {
     None,
+    AttachSurvivingTokenless,
     Retired,
     UseReplacement,
 }
@@ -412,6 +413,19 @@ async fn replay_pending_local_restart<R: Runtime>(
         // An earlier attempt committed the successor before the layout
         // changed. Finish that handoff without contacting the old shell.
         return Ok(LocalRestartReplay::UseReplacement);
+    }
+    if pending.shell_id.is_none()
+        && !pending.acknowledged
+        && reservation.reconciliation.is_some()
+        && existing.is_some_and(|shell| {
+            shell.shell_id.is_none()
+                && shell.workspace_id == workspace_id
+                && shell.session_id == session_id.as_str()
+        })
+    {
+        // The local slot survived a lost Close. The journal and inventory
+        // allow reattachment to it, without replaying an unguarded Close.
+        return Ok(LocalRestartReplay::AttachSurvivingTokenless);
     }
     if existing.is_some_and(|shell| pending.shell_id.is_none() || shell.shell_id != pending.shell_id) {
         // Preserve a live tokenless shell or a different guarded shell.
@@ -797,7 +811,23 @@ pub(super) async fn hydrate_workspace_via_daemon<R: Runtime>(
             .iter()
             .map(|session| session.session_id.as_str())
             .collect();
-        let disk_meta: HashMap<_, _> = crate::scrollback::find_scrollback_meta_for_sessions(&wanted);
+        let mut disk_meta = crate::scrollback::find_scrollback_meta_for_sessions(&wanted);
+        if !is_remote {
+            for session in &prep_sessions {
+                let Some((pane_id, predecessor_id)) = session.pane_id.as_deref()
+                    .zip(session.restore_predecessor_session_id.as_deref())
+                else {
+                    continue;
+                };
+                if let Entry::Vacant(entry) = disk_meta.entry(session.session_id.clone()) {
+                    if let Some(meta) = crate::scrollback::load_scrollback_meta_for_predecessor(
+                        &prep_workspace.workspace_id, pane_id, predecessor_id,
+                    ) {
+                        entry.insert(meta);
+                    }
+                }
+            }
+        }
         let shell = if is_remote {
             "bash".to_string()
         } else {
@@ -1052,7 +1082,7 @@ async fn spawn_prepared_session<R: Runtime>(
             "the daemon session belongs to a different workspace".into(),
         ));
     }
-    if !session.daemon_unused
+    let attach_surviving_tokenless = if !session.daemon_unused
         && workspace.host_id.is_none()
         && client.ssh_target().is_none()
         && !client.supports_prepared_spawn()
@@ -1064,7 +1094,8 @@ async fn spawn_prepared_session<R: Runtime>(
             existing.as_ref(),
             &reservation,
         ).await? {
-            LocalRestartReplay::None => {}
+            LocalRestartReplay::None => false,
+            LocalRestartReplay::AttachSurvivingTokenless => true,
             LocalRestartReplay::Retired => {
                 let ready = super::spawn_retired_local_shell(app, reservation)
                     .await
@@ -1080,7 +1111,9 @@ async fn spawn_prepared_session<R: Runtime>(
                 return Ok(DaemonSpawnOutcome::LocalRestart { ready });
             }
         }
-    }
+    } else {
+        false
+    };
     let reattached = existing.is_some();
     let shell_id = match (&existing, client.supports_guarded_shells()) {
         (Some(existing), true) => existing.shell_id,
@@ -1106,7 +1139,7 @@ async fn spawn_prepared_session<R: Runtime>(
             return Err(DaemonHydrationFailure::RequiresGuardedRecovery);
         }
     };
-    if reconciling && shell_id.is_none() {
+    if reconciling && shell_id.is_none() && !attach_surviving_tokenless {
         // Recovery can outlive the pane and must own its exact shell.
         return Err(DaemonHydrationFailure::RequiresGuardedRecovery);
     }
@@ -1515,6 +1548,19 @@ async fn spawn_prepared_session<R: Runtime>(
             return Err(failure);
         }
     };
+    if attach_surviving_tokenless {
+        loop {
+            reservation.wait_for_close().await;
+            match reservation.with_current_runtime(|runtime| runtime.close_fence.is_none()) {
+                Some(true) => break,
+                Some(false) => continue,
+                None => return Err(DaemonHydrationFailure::AlreadyReserved),
+            }
+        }
+        if !owns_local_terminal(&app, &workspace.workspace_id, &session_id) {
+            return Err(DaemonHydrationFailure::AlreadyReserved);
+        }
+    }
     let attachment = match shell_id {
         Some(shell_id) => client.attach_owned(session_id.clone(), shell_id).await,
         None => client.attach(session_id.clone()).await,

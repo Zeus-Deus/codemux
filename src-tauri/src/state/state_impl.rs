@@ -319,6 +319,10 @@ pub struct TerminalSessionSnapshot {
     /// admitted to the daemon. Restored layouts cannot prove this.
     #[serde(skip)]
     pub(crate) daemon_unused: bool,
+    /// Saved scrollback can still name the legacy session this pane replaced.
+    /// Only restore metadata may use this identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restore_predecessor_session_id: Option<String>,
     pub title: String,
     pub shell: Option<String>,
     pub cwd: String,
@@ -360,6 +364,7 @@ pub struct PtyHydrationWorkspace {
 pub struct PtyHydrationSession {
     pub session_id: String,
     pub(crate) daemon_unused: bool,
+    pub(crate) restore_predecessor_session_id: Option<String>,
     pub pane_id: Option<String>,
     pub cwd: String,
     pub original_command: Option<String>,
@@ -1444,6 +1449,8 @@ fn build_pty_hydration_plan(
             PtyHydrationSession {
                 session_id,
                 daemon_unused: persisted.is_some_and(|session| session.daemon_unused),
+                restore_predecessor_session_id: persisted
+                    .and_then(|session| session.restore_predecessor_session_id.clone()),
                 pane_id,
                 cwd: persisted
                     .map(|session| session.cwd.clone())
@@ -1912,6 +1919,7 @@ impl AppStateStore {
 
         let session = &mut snapshot.terminal_sessions[session_index];
         session.session_id = replacement.clone();
+        session.restore_predecessor_session_id = Some(old_session_id.to_owned());
         session.daemon_unused = false;
         session.state = TerminalSessionState::Starting;
         session.last_message = None;
@@ -2692,6 +2700,7 @@ impl AppStateStore {
             snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                 session_id: session_id.clone(),
                 daemon_unused: true,
+                restore_predecessor_session_id: None,
                 title: format!("Terminal {base_terminal_index}"),
                 shell: None,
                 cwd: remote_cwd.clone(),
@@ -2928,6 +2937,7 @@ impl AppStateStore {
             snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                 session_id: session_id.clone(),
                 daemon_unused: true,
+                restore_predecessor_session_id: None,
                 title: format!("Terminal {}", base_terminal_index + offset),
                 shell: shell.clone(),
                 cwd: cwd.clone(),
@@ -4947,6 +4957,7 @@ impl AppStateStore {
         snapshot.terminal_sessions.push(TerminalSessionSnapshot {
             session_id: session_id.clone(),
             daemon_unused: true,
+            restore_predecessor_session_id: None,
             title: title.clone(),
             shell: shell.clone(),
             cwd: cwd.clone(),
@@ -5040,6 +5051,7 @@ impl AppStateStore {
             snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                 session_id: session_id.clone(),
                 daemon_unused: true,
+                restore_predecessor_session_id: None,
                 title: title.clone(),
                 shell,
                 cwd,
@@ -6261,6 +6273,7 @@ impl AppStateStore {
                 snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                     session_id: session_id.clone(),
                     daemon_unused: true,
+                    restore_predecessor_session_id: None,
                     title: "Terminal".into(),
                     shell,
                     cwd,
@@ -7480,6 +7493,7 @@ fn default_app_state() -> AppStateSnapshot {
         terminal_sessions: vec![TerminalSessionSnapshot {
             session_id,
             daemon_unused: true,
+            restore_predecessor_session_id: None,
             title: "Terminal 1".into(),
             shell,
             cwd,
@@ -9871,7 +9885,12 @@ mod tests {
                 assert!(restored.pty_hydration_plan_for_session(&sibling.0).is_some());
                 let current = restored.pty_hydration_plan_for_session(&replacement);
                 if close_successor.is_none() {
-                    assert_eq!(current.unwrap().sessions[0].pane_id.as_deref(), Some(pane_id));
+                    let current = current.unwrap();
+                    assert_eq!(current.sessions[0].pane_id.as_deref(), Some(pane_id));
+                    assert_eq!(
+                        current.sessions[0].restore_predecessor_session_id.as_deref(),
+                        Some(old.session_id.as_str()),
+                    );
                 } else {
                     assert!(current.is_none());
                 }
@@ -9884,6 +9903,15 @@ mod tests {
                 terminal_pane_for_close_intent(&saved, &workspace_id, &replacement).is_some(),
                 close_successor.is_none(),
             );
+            if close_successor.is_none() {
+                let successor = saved.terminal_sessions.iter()
+                    .find(|session| session.session_id.0 == replacement)
+                    .unwrap();
+                assert_eq!(
+                    successor.restore_predecessor_session_id.as_deref(),
+                    Some(old.session_id.as_str()),
+                );
+            }
             persist_layout_closes(&restored, &db, &closes).unwrap();
             assert!(db.pending_layout_closes().unwrap().is_empty());
         }

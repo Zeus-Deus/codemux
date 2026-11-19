@@ -917,21 +917,6 @@ fn build_resume_launch_command(original_command: &str, resume_args: &str) -> Str
     format!("{original} {args}")
 }
 
-fn resolve_resume_command(
-    snapshot: &crate::state::AppStateSnapshot,
-    meta: &crate::scrollback::ScrollbackMeta,
-    adapter_state: &crate::session_adapters::AdapterState,
-) -> Option<String> {
-    let original_command = meta.original_command.clone().or_else(|| {
-        snapshot
-            .terminal_sessions
-            .iter()
-            .find(|session| session.session_id.0 == meta.session_id)
-            .and_then(|session| session.original_command.clone())
-    });
-    resolve_resume_command_from_original(original_command, meta, adapter_state)
-}
-
 fn resolve_resume_command_from_original(
     original_command: Option<String>,
     meta: &crate::scrollback::ScrollbackMeta,
@@ -2373,13 +2358,12 @@ fn spawn_pty_for_session_in_process<R: Runtime>(
     // Also detect restored sessions so preset auto-launch can be skipped and
     // the full resume command can be injected later.
     let mut auto_resume_command: Option<String> = None;
-    if let Some((_ws_id, pane_id)) = snapshot.workspaces.iter().find_map(|ws| {
-        ws.surfaces
-            .iter()
-            .find_map(|s| crate::state::find_terminal_pane_id(&s.root, &session_id))
-            .map(|pane_id| (ws.workspace_id.0.clone(), pane_id.0))
-    }) {
-        cmd.env("CODEMUX_PANE_ID", &pane_id);
+    let pane_id = owning_ws.and_then(|ws| {
+        ws.surfaces.iter()
+            .find_map(|surface| crate::state::find_terminal_pane_id(&surface.root, &session_id))
+    });
+    if let Some(pane_id) = &pane_id {
+        cmd.env("CODEMUX_PANE_ID", &pane_id.0);
     }
 
     let session_restore_enabled = settings_sync::load_cache()
@@ -2387,9 +2371,19 @@ fn spawn_pty_for_session_in_process<R: Runtime>(
         .unwrap_or(true);
     if session_restore_enabled {
         if let Some(adapter_state) = app.try_state::<crate::session_adapters::AdapterState>() {
-            if let Some((ws_id, pane_id, meta)) =
-                crate::scrollback::find_scrollback_meta_for_session(&session_id)
-            {
+            let session = snapshot.terminal_sessions.iter()
+                .find(|session| session.session_id.0 == session_id);
+            let metadata = crate::scrollback::find_scrollback_meta_for_session(&session_id)
+                .or_else(|| {
+                    let workspace = owning_ws.filter(|workspace| workspace.host_id.is_none())?;
+                    let predecessor_id = session?.restore_predecessor_session_id.as_deref()?;
+                    crate::scrollback::load_scrollback_meta_for_predecessor(
+                        &workspace.workspace_id.0,
+                        &pane_id.as_ref()?.0,
+                        predecessor_id,
+                    )
+                });
+            if let Some((ws_id, pane_id, meta)) = metadata {
                 // Override CWD with the original working directory so CWD-scoped
                 // tools (e.g. `claude --resume`) find their sessions.
                 let effective_cwd = resolve_session_cwd(
@@ -2399,8 +2393,10 @@ fn spawn_pty_for_session_in_process<R: Runtime>(
                 cmd.cwd(&effective_cwd);
                 cwd = effective_cwd;
                 cmd.env("CODEMUX_PANE_ID", &pane_id);
+                let original_command = meta.original_command.clone()
+                    .or_else(|| session.and_then(|session| session.original_command.clone()));
                 if let Some(resume_command) =
-                    resolve_resume_command(&snapshot, &meta, &adapter_state)
+                    resolve_resume_command_from_original(original_command, &meta, &adapter_state)
                 {
                     eprintln!(
                         "[codemux::terminal] Skipping auto-launch for {session_id}: restored session found at {ws_id}/{pane_id}"
@@ -7647,11 +7643,22 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn inherited_tokenless_restart_reattaches_when_close_was_not_applied() {
+        const TEST: &str = "terminal::tests::inherited_tokenless_restart_reattaches_when_close_was_not_applied";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        assert_inherited_daemon_shell_restarts(InheritedRestartCase::TokenlessLostCloseBeforeApplication).await;
+    }
+
+    #[cfg(unix)]
     enum InheritedRestartCase {
         Tokenless,
         TokenlessDetachFailure,
         TokenlessStorageFailureRelaunch,
         TokenlessAckFailureRelaunch,
+        TokenlessLostCloseBeforeApplication,
         Guarded,
         GuardedStorageFailure,
         GuardedStorageFailureRelaunch,
@@ -7673,6 +7680,7 @@ mod tests {
                 | InheritedRestartCase::TokenlessDetachFailure
                 | InheritedRestartCase::TokenlessStorageFailureRelaunch
                 | InheritedRestartCase::TokenlessAckFailureRelaunch
+                | InheritedRestartCase::TokenlessLostCloseBeforeApplication
         );
         tokio::time::timeout(Duration::from_secs(10), async {
             let root = crate::test_isolation::isolated_root().unwrap();
@@ -7752,7 +7760,18 @@ mod tests {
             );
             assert!(!db.has_local_terminal_fallback(&workspace_id, &restarting).unwrap());
 
-            let sibling_socket = if matches!(case, InheritedRestartCase::GuardedLostCloseReply) {
+            let start_restart = |token: Uuid| {
+                let app = app.handle().clone();
+                let session_id = restarting.clone();
+                tokio::spawn(async move {
+                    restart_terminal_session(app.clone(), app.state(), session_id, Some(token.to_string())).await
+                })
+            };
+            let sibling_socket = if matches!(
+                case,
+                InheritedRestartCase::GuardedLostCloseReply
+                    | InheritedRestartCase::TokenlessLostCloseBeforeApplication
+            ) {
                 use crate::pty_daemon::PtyDaemonClient;
                 // Keep a separate subscription to the same daemon so the
                 // transport failure under test affects only the target RPC.
@@ -7763,10 +7782,13 @@ mod tests {
                 let attach = {
                     let client = client.clone();
                     let sibling = sibling.clone();
-                    let shell_id = surviving.shell_id.unwrap();
+                    let shell_id = surviving.shell_id;
                     tokio::spawn(async move {
                         client.hello().await.unwrap();
-                        client.attach_owned(sibling, shell_id).await.unwrap()
+                        match shell_id {
+                            Some(shell_id) => client.attach_owned(sibling, shell_id).await.unwrap(),
+                            None => client.attach(sibling).await.unwrap(),
+                        }
                     })
                 };
                 let ClientRequest::Hello { request_id } = request(&mut lines).await else {
@@ -7778,7 +7800,7 @@ mod tests {
                     daemon_pid,
                     daemon_version: "0.0.0".into(),
                     host_claude_plugin: false,
-                    guarded_shells: true,
+                    guarded_shells,
                     prepared_spawn: false,
                 }).await;
                 attach_fixture_shell(&mut lines, &mut write, std::slice::from_ref(&surviving)).await;
@@ -7793,6 +7815,60 @@ mod tests {
             } else {
                 None
             };
+
+            if matches!(case, InheritedRestartCase::TokenlessLostCloseBeforeApplication) {
+                // Lose the original socket while both shells are live. Retry
+                // can journal Close intent but cannot deliver it on that socket.
+                drop(lines);
+                drop(write);
+                while !matches!(
+                    get_terminal_status(app.state(), app.state(), Some(restarting.clone())).unwrap().status.state,
+                    TerminalLifecycleState::Exited,
+                ) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let restart = start_restart(old_token);
+                let (socket, _) = listener.accept().await.unwrap();
+                let (read, next_write) = socket.into_split();
+                let mut lines = BufReader::new(read).lines();
+                let mut write = next_write;
+                let ClientRequest::Hello { request_id } = request(&mut lines).await else {
+                    panic!("expected the app to reconnect to the legacy daemon");
+                };
+                let pending = db.pending_local_terminal_restart(&workspace_id, &restarting).unwrap().unwrap();
+                assert!(pending.shell_id.is_none() && !pending.acknowledged);
+                send_daemon_fixture_response(&mut write, ServerResponse::Hello {
+                    request_id,
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_pid,
+                    daemon_version: "0.0.0".into(),
+                    host_claude_plugin: false,
+                    guarded_shells: false,
+                    prepared_spawn: false,
+                }).await;
+                let ClientRequest::List { request_id } = request(&mut lines).await else {
+                    panic!("expected to inspect the surviving terminals");
+                };
+                send_daemon_fixture_response(&mut write, ServerResponse::Listed {
+                    request_id,
+                    sessions: existing,
+                }).await;
+                attach_fixture_shell(&mut lines, &mut write, std::slice::from_ref(&exited)).await;
+                assert!(!restart.await.unwrap().unwrap(), "reattaching must not report a new shell");
+                let reattached_token = wait_for_fixture_terminal(sessions, &restarting).await;
+                assert_ne!(reattached_token, old_token);
+                assert_eq!(with_existing_session_runtime(sessions, &restarting, |runtime| {
+                    (runtime.persistent, runtime.child_pid)
+                }), Some((true, Some(exited.pid))));
+                assert_eq!(db.pending_local_terminal_restart(&workspace_id, &restarting).unwrap(), Some(pending));
+                assert!(!db.has_local_terminal_fallback(&workspace_id, &restarting).unwrap());
+                assert_fixture_shell_accepts_input(&mut lines, &mut write, sessions, &restarting).await;
+
+                let (mut sibling_lines, mut sibling_write, _output) = sibling_socket.unwrap();
+                assert_eq!(wait_for_fixture_terminal(sessions, &sibling).await, sibling_token);
+                assert_fixture_shell_accepts_input(&mut sibling_lines, &mut sibling_write, sessions, &sibling).await;
+                return;
+            }
 
             // A real daemon exit preserves the pane's last restart token and
             // removes only its attachment. The sibling keeps the same socket.
@@ -7830,13 +7906,6 @@ mod tests {
                 fault.execute_batch(trigger).unwrap();
                 (fault, expected_error)
             });
-            let start_restart = |token: Uuid| {
-                let app = app.handle().clone();
-                let session_id = restarting.clone();
-                tokio::spawn(async move {
-                    restart_terminal_session(app.clone(), app.state(), session_id, Some(token.to_string())).await
-                })
-            };
             let restart = start_restart(old_token);
             let (request_id, closed_session, closed_shell) = match request(&mut lines).await {
                 ClientRequest::Close { request_id, session_id } => (request_id, session_id, None),
@@ -8017,10 +8086,43 @@ mod tests {
         restored.replace_snapshot(state::load_persisted_state().unwrap());
         let saved = restored.pty_hydration_plan_for_session(&retired.session_id).unwrap();
         let saved_pane = &saved.sessions[0].pane_id;
+        const RESUME_COMMAND: &str = "/bin/sh ./resume-fixture";
+        const SAVED_RUN_ID: &str = "fixture-agent-run";
+        let resume_probe = (local_session != retired.session_id).then(|| {
+            let directory = db_path.parent().unwrap().join("previous-agent-cwd");
+            std::fs::create_dir(&directory).unwrap();
+            let directory = directory.canonicalize().unwrap();
+            assert_ne!(directory.to_str().unwrap(), saved.sessions[0].cwd);
+            std::fs::write(directory.join("resume-fixture"),
+                r#"printf '%s\n' "$PWD" "$CODEMUX_SESSION_ID" "$CODEMUX_PANE_ID" "$@" > resume.tmp
+/bin/mv resume.tmp resume.report
+"#,
+            ).unwrap();
+            // The original command can come from the layout. Only the
+            // predecessor's scrollback knows its actual CWD and run ID.
+            assert!(restored.update_terminal_session_command(&retired.session_id, RESUME_COMMAND.into()));
+            crate::scrollback::save_scrollback(&crate::scrollback::ScrollbackPayload {
+                pane_id: saved_pane.clone().unwrap(),
+                session_id: retired.session_id.clone(),
+                workspace_id: retired.workspace_id.clone(),
+                working_directory: directory.to_str().unwrap().to_owned(),
+                original_command: None,
+                cols: 80,
+                rows: 24,
+                data: "previous terminal output".into(),
+                adapter_captures: HashMap::from([("claude_session_id".into(), SAVED_RUN_ID.into())]),
+                adapter_id: Some("claude-code".into()),
+                alternate_buffer: false,
+            }).unwrap();
+            directory
+        });
         let app = tauri::test::mock_app();
         app.manage(restored);
         app.manage(PtyState::default());
         app.manage(DatabaseStore::test_file(db_path));
+        if resume_probe.is_some() {
+            app.manage(crate::session_adapters::AdapterState::new());
+        }
         spawn_missing_ptys(app.handle().clone());
 
         let (socket, _) = listener.accept().await.unwrap();
@@ -8103,6 +8205,26 @@ mod tests {
         if local_session != retired.session_id {
             assert!(layout.pty_hydration_plan_for_session(&retired.session_id).is_none());
             assert!(!db.has_local_terminal_fallback(&retired.workspace_id, &retired.session_id).unwrap());
+        }
+        if let Some(directory) = resume_probe {
+            let resume_command = format!("{RESUME_COMMAND} --resume {SAVED_RUN_ID}");
+            assert_eq!(with_existing_session_runtime(sessions, local_session, |runtime| {
+                (runtime.skip_preset_launch, runtime.resume_command.clone())
+            }), Some((true, Some(resume_command))));
+            let path = directory.join("resume.report");
+            let report = loop {
+                match std::fs::read_to_string(&path) {
+                    Ok(report) => break report,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("could not read terminal resume report: {error}"),
+                }
+            };
+            let fields = report.lines().collect::<Vec<_>>();
+            assert_eq!(fields.len(), 5, "{report}");
+            assert_eq!(std::fs::canonicalize(fields[0]).unwrap(), directory);
+            assert_eq!(&fields[1..], &[local_session, saved_pane.as_deref().unwrap(), "--resume", SAVED_RUN_ID]);
         }
         let ownership = db.daemon_shell_ownership().unwrap();
         if let Some(shell_id) = surviving.shell_id {
