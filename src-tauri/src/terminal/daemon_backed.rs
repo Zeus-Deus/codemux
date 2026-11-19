@@ -21,7 +21,8 @@ use super::{
     TerminalLifecycleState,
     TerminalStatusPayload, DEFAULT_COLS, DEFAULT_ROWS,
 };
-use crate::database::{daemon_closes::PendingDaemonClose, DatabaseStore};
+use crate::database::{daemon_closes::{PendingDaemonClose, TerminalCloseError}, DatabaseStore};
+use crate::workspace_service::Checkpoint;
 use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
 use crate::state::{AppStateStore, LayoutCloseIntent, PtyHydrationPlan, PtyHydrationSession, PtyHydrationWorkspace, SessionId};
 use futures_util::stream::StreamExt as _;
@@ -1450,11 +1451,15 @@ pub(super) fn commit_layout_close(
     workspace_id: &str,
     closed_sessions: &[SessionId],
     mut requests: Vec<PreparedDaemonClose>,
-) -> Result<CommittedDaemonClose, String> {
+    checkpoint: &Checkpoint,
+) -> Result<CommittedDaemonClose, TerminalCloseError> {
     let mut restored = Vec::new();
     let closes: Vec<_> = requests.iter().flat_map(PreparedDaemonClose::records).collect();
-    let owners = db.record_layout_close_with_shell_ownership(&intent, Some(workspace_id), closed_sessions, &closes)
-        .map_err(|error| format!("Could not journal layout close: {error}"))?;
+    let owners = db.record_layout_close_with_shell_ownership(&intent, Some(workspace_id), closed_sessions, &closes, checkpoint)
+        .map_err(|error| match error {
+            TerminalCloseError::Failed(message) => format!("Could not journal layout close: {message}").into(),
+            error => error,
+        })?;
     for owner in owners {
         let live = requests.iter_mut().find(|request| {
             request.route == owner.route && request.session_id == owner.session_id

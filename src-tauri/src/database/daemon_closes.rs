@@ -2,14 +2,40 @@
 
 use super::DatabaseStore;
 use crate::state::{ArchivedWorkspaceSnapshot, LayoutCloseIntent, SessionId};
+use crate::workspace_service::Checkpoint;
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[cfg(test)]
 static DAEMON_OWNERSHIP_WRITE_WATCH: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>> =
     std::sync::Mutex::new(None);
+
+#[cfg(all(test, unix))]
+static CLOSE_JOURNAL_CONTENTION: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+#[derive(Debug)]
+pub(crate) enum TerminalCloseError {
+    Failed(String),
+    Authorization(String),
+}
+
+impl From<String> for TerminalCloseError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<TerminalCloseError> for String {
+    fn from(error: TerminalCloseError) -> Self {
+        match error {
+            TerminalCloseError::Failed(message) | TerminalCloseError::Authorization(message) => message,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct DaemonWorkspaceRoute {
@@ -167,10 +193,86 @@ fn read_shell_records(
     .collect()
 }
 
+fn begin_authorized_close<'a>(
+    conn: &'a Connection,
+    checkpoint: &Checkpoint,
+) -> Result<Transaction<'a>, TerminalCloseError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let version: i64 = conn.pragma_query_value(None, "data_version", |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        checkpoint.check().map_err(TerminalCloseError::Authorization)?;
+        match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+            Ok(tx) => {
+                let current = tx.pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
+                    .map_err(|error| error.to_string())?;
+                // A durable grant may have changed between the checkpoint
+                // and writer admission. Reauthorize against the newer data.
+                if current == version {
+                    return Ok(tx);
+                }
+            }
+            Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) => {
+                #[cfg(all(test, unix))]
+                if let Some(notify) = CLOSE_JOURNAL_CONTENTION.lock().unwrap().take() {
+                    let _ = notify.send(());
+                }
+            }
+            Err(error) => return Err(error.to_string().into()),
+        }
+        if Instant::now() >= deadline {
+            return Err("Timed out waiting for terminal close journal".to_owned().into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn write_layout_close(
+    tx: Transaction<'_>,
+    intent: &LayoutCloseIntent,
+    payload: Option<&str>,
+    workspace_id: Option<&str>,
+    closed_sessions: &[SessionId],
+    daemon_closes: &[PendingDaemonClose],
+) -> Result<Vec<PendingDaemonClose>, String> {
+    let (scope, intent_workspace_id, target_id) = intent.row_key();
+    tx.execute(
+        "INSERT INTO pending_layout_closes (scope, workspace_id, target_id, payload)
+         VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+        params![scope, intent_workspace_id, target_id, payload],
+    )
+    .map_err(|error| error.to_string())?;
+    let mut closes = daemon_closes.to_vec();
+    if let Some(workspace_id) = workspace_id {
+        for id in closed_sessions {
+            closes.extend(read_shell_records(
+                &tx,
+                "SELECT route, session_id, shell_id FROM daemon_shell_ownership
+                 WHERE workspace_id = ?1 AND session_id = ?2 ORDER BY rowid",
+                params![workspace_id, id.0],
+            )?);
+            tx.execute(
+                "DELETE FROM daemon_shell_ownership WHERE workspace_id = ?1 AND session_id = ?2",
+                params![workspace_id, id.0],
+            ).map_err(|error| error.to_string())?;
+        }
+    }
+    let mut unique = HashSet::new();
+    closes.retain(|close| unique.insert(close.clone()));
+    insert_pending_closes(&tx, &closes)?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(closes)
+}
+
 impl DatabaseStore {
     #[cfg(test)]
     pub(crate) fn test_watch_daemon_ownership_writes(&self, notify: tokio::sync::mpsc::UnboundedSender<()>) {
         *DAEMON_OWNERSHIP_WRITE_WATCH.lock().unwrap() = Some(notify);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_watch_close_journal_contention(&self, notify: tokio::sync::oneshot::Sender<()>) {
+        *CLOSE_JOURNAL_CONTENTION.lock().unwrap() = Some(notify);
     }
 
     pub(crate) fn has_durable_close_journal(&self) -> bool {
@@ -183,8 +285,9 @@ impl DatabaseStore {
         intent: &LayoutCloseIntent,
         daemon_closes: &[PendingDaemonClose],
     ) -> Result<(), String> {
-        self.record_layout_close_with_shell_ownership(intent, None, &[], daemon_closes)
+        self.record_layout_close_with_shell_ownership(intent, None, &[], daemon_closes, &Checkpoint::default())
             .map(drop)
+            .map_err(String::from)
     }
 
     /// A layout removal and all exact shells it owned must survive together.
@@ -194,45 +297,36 @@ impl DatabaseStore {
         workspace_id: Option<&str>,
         closed_sessions: &[SessionId],
         daemon_closes: &[PendingDaemonClose],
-    ) -> Result<Vec<PendingDaemonClose>, String> {
+        checkpoint: &Checkpoint,
+    ) -> Result<Vec<PendingDaemonClose>, TerminalCloseError> {
         let payload = match intent {
             LayoutCloseIntent::Archive(entry) => {
                 Some(serde_json::to_string(entry).map_err(|error| error.to_string())?)
             }
             _ => None,
         };
-        let (scope, intent_workspace_id, target_id) = intent.row_key();
+        if checkpoint.requires_check() {
+            let path = {
+                let conn = self.conn.lock().unwrap();
+                conn.path().filter(|path| !path.is_empty()).map(std::path::PathBuf::from)
+                    .ok_or_else(|| "Terminal close journal has no on-disk database".to_owned())?
+            };
+            let conn = super::open_connection(&path)?;
+            // A checkpoint may need the main DB and authority locks. Run it
+            // without the SQLite writer lock, then only take that lock if
+            // it is available immediately and the database is still current.
+            conn.busy_timeout(Duration::ZERO).map_err(|error| error.to_string())?;
+            let tx = begin_authorized_close(&conn, checkpoint)?;
+            return write_layout_close(tx, intent, payload.as_deref(), workspace_id, closed_sessions, daemon_closes)
+                .map_err(TerminalCloseError::Failed);
+        }
         let mut conn = self.conn.lock().unwrap();
         if conn.path().is_none_or(str::is_empty) {
-            return Err("Terminal close journal has no on-disk database".into());
+            return Err(TerminalCloseError::Failed("Terminal close journal has no on-disk database".into()));
         }
         let tx = conn.transaction().map_err(|error| error.to_string())?;
-        tx.execute(
-            "INSERT INTO pending_layout_closes (scope, workspace_id, target_id, payload)
-             VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
-            params![scope, intent_workspace_id, target_id, payload],
-        )
-        .map_err(|error| error.to_string())?;
-        let mut closes = daemon_closes.to_vec();
-        if let Some(workspace_id) = workspace_id {
-            for id in closed_sessions {
-                closes.extend(read_shell_records(
-                    &tx,
-                    "SELECT route, session_id, shell_id FROM daemon_shell_ownership
-                     WHERE workspace_id = ?1 AND session_id = ?2 ORDER BY rowid",
-                    params![workspace_id, id.0],
-                )?);
-                tx.execute(
-                    "DELETE FROM daemon_shell_ownership WHERE workspace_id = ?1 AND session_id = ?2",
-                    params![workspace_id, id.0],
-                ).map_err(|error| error.to_string())?;
-            }
-        }
-        let mut unique = HashSet::new();
-        closes.retain(|close| unique.insert(close.clone()));
-        insert_pending_closes(&tx, &closes)?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(closes)
+        write_layout_close(tx, intent, payload.as_deref(), workspace_id, closed_sessions, daemon_closes)
+            .map_err(TerminalCloseError::Failed)
     }
 
     pub(crate) fn remember_daemon_shell(&self, shell: &PendingDaemonClose) -> Result<(), String> {
@@ -455,7 +549,9 @@ mod tests {
                 Some("workspace-1"),
                 std::slice::from_ref(&session_id),
                 std::slice::from_ref(&installed),
+                &Checkpoint::default(),
             )
+            .map_err(String::from)
         };
         {
             let db = DatabaseStore::test_file(&path);

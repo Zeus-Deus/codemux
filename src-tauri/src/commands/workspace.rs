@@ -1503,6 +1503,7 @@ fn detach_workspace<R: tauri::Runtime>(
     db: &crate::database::DatabaseStore,
     workspace_id: &str,
     route: CloseRoute<'_>,
+    checkpoint: &Checkpoint,
 ) -> Result<Detached, String> {
     let closing = state.find_workspace(workspace_id);
     // Before the workspace leaves state, so no deletion or cleanup sees its
@@ -1513,14 +1514,14 @@ fn detach_workspace<R: tauri::Runtime>(
             CloseRoute::Archive(entry) => LayoutCloseIntent::Archive(Box::new(entry.clone())),
             _ => LayoutCloseIntent::Workspace(workspace_id.to_owned()),
         };
-        let (_scope, terminal_close) = commit_closed_terminals(app, state, intent)?;
+        let (_scope, terminal_close) = commit_closed_terminals(app, state, intent, checkpoint)?;
         let result = state.close_workspace(workspace_id).unwrap_or_else(|_| crate::state::CloseWorkspaceResult {
             fallback: state.snapshot().active_workspace_id,
             removed_sessions: Vec::new(),
             removed_agent_chat_threads: Vec::new(),
             removed_agent_browser_sessions: Vec::new(),
         });
-        Ok::<_, String>((result, terminal_close))
+        Ok::<_, crate::database::daemon_closes::TerminalCloseError>((result, terminal_close))
     });
     let (result, terminal_close) = match closed {
         Ok(closed) => closed,
@@ -1528,7 +1529,11 @@ fn detach_workspace<R: tauri::Runtime>(
             if let Some(claim) = claim {
                 claim.release();
             }
-            return Err(format!("Failed to close workspace: {e}"));
+            use crate::database::daemon_closes::TerminalCloseError;
+            return Err(match e {
+                TerminalCloseError::Failed(error) => format!("Failed to close workspace: {error}"),
+                TerminalCloseError::Authorization(error) => error,
+            });
         }
     };
     // Before any await: a chat closed just before this may still be
@@ -1577,13 +1582,15 @@ fn commit_closed_terminals<'a, R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &'a AppStateStore,
     intent: LayoutCloseIntent,
-) -> Result<(crate::state::TerminalCloseScope<'a>, crate::terminal::CommittedTerminalClose), String> {
+    checkpoint: &Checkpoint,
+) -> Result<(crate::state::TerminalCloseScope<'a>, crate::terminal::CommittedTerminalClose), crate::database::daemon_closes::TerminalCloseError> {
     let terminal_state = app.try_state::<crate::terminal::PtyState>();
     crate::terminal::commit_terminal_close(
         app,
         state,
         terminal_state.as_ref().map(|state| &state.sessions),
         intent,
+        checkpoint,
     )
 }
 
@@ -1653,7 +1660,7 @@ pub(crate) fn detach_reconciled_copy<R: tauri::Runtime>(
     let state = app.state::<AppStateStore>();
     let db = app.state::<crate::database::DatabaseStore>();
     let attempt = WorkspaceCloseAttempt::begin(app, workspace_id)?;
-    let detached = detach_workspace(app, &state, &db, workspace_id, CloseRoute::Tracked)
+    let detached = detach_workspace(app, &state, &db, workspace_id, CloseRoute::Tracked, &Checkpoint::default())
         .map_err(|error| attempt.close_error(&state, error))?;
     attempt.set_teardown(None);
     let host_id = detached.closing.as_ref().and_then(|workspace| workspace.host_id);
@@ -1688,7 +1695,7 @@ pub(crate) fn close_delegated_child_workspace<R: tauri::Runtime>(
     else {
         return Default::default();
     };
-    let Ok(detached) = detach_workspace(app, &state, &db, workspace_id, CloseRoute::Tracked) else {
+    let Ok(detached) = detach_workspace(app, &state, &db, workspace_id, CloseRoute::Tracked, &Checkpoint::default()) else {
         return Default::default();
     };
     let stops = detached.retire(app, true);
@@ -1956,9 +1963,10 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     let detach_checkpoint = checkpoint.clone();
     let closing = attempt.clone();
     let detached = tauri::async_runtime::spawn_blocking(move || {
-        detach_checkpoint.check()?;
         let route = archive.as_ref().map(CloseRoute::Archive).unwrap_or(ordinary_route);
-        let detached = detach_workspace(&detach_app, &detach_app.state(), &detach_app.state(), &detach_id, route)?;
+        let detached = detach_workspace(
+            &detach_app, &detach_app.state(), &detach_app.state(), &detach_id, route, &detach_checkpoint,
+        )?;
         closing.set_teardown(None);
         Ok::<_, String>(detached)
     }).await
@@ -3045,7 +3053,7 @@ pub(crate) fn close_pane_impl_with_selection<R: tauri::Runtime>(
     let removed_browser_id = state.pane_browser_id(&pane_id);
     let (removed, terminal_close) = crate::state::with_terminal_close_layout_lock(|| {
         let intent = LayoutCloseIntent::Pane(pane_id.clone());
-        let (_scope, terminal_close) = commit_closed_terminals(&app, state, intent)?;
+        let (_scope, terminal_close) = commit_closed_terminals(&app, state, intent, &Checkpoint::default())?;
         let removed = state.close_pane_with_selection(&pane_id, select).unwrap_or(None);
         Ok::<_, String>((removed, terminal_close))
     })?;
@@ -3277,7 +3285,7 @@ fn close_tab_sync<R: tauri::Runtime>(
     let state = app.state::<AppStateStore>();
     let (result, terminal_close) = crate::state::with_terminal_close_layout_lock(|| {
         let intent = LayoutCloseIntent::Tab { workspace_id: workspace_id.clone(), tab_id: tab_id.clone() };
-        let (_scope, terminal_close) = commit_closed_terminals(&app, &state, intent)?;
+        let (_scope, terminal_close) = commit_closed_terminals(&app, &state, intent, &Checkpoint::default())?;
         let result = state.close_tab(&workspace_id, &tab_id).unwrap_or_else(|_| crate::state::CloseTabResult {
             removed_sessions: Vec::new(),
             removed_browser_ids: Vec::new(),

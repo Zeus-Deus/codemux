@@ -58,6 +58,10 @@ impl Checkpoint {
         self.check.as_ref().map_or(Ok(()), |check| check())
     }
 
+    pub(crate) fn requires_check(&self) -> bool {
+        self.check.is_some()
+    }
+
     /// The checkpoint work left running asks (see [`Self::with_background`]).
     pub(crate) fn background(&self) -> Checkpoint {
         Checkpoint { check: self.background.clone(), background: None }
@@ -1040,6 +1044,118 @@ mod tests {
         assert!(state.find_workspace(&closing).is_none());
         assert!(checkout.join(".git").exists());
         git(&project, &["rev-parse", "--verify", "refs/heads/feat"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_grant_revoked_during_journal_contention() {
+        use crate::agent_control::{ControlAccess, ControlCaller, ControlError, ErrorCode};
+        use crate::database::daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose};
+        use crate::database::mcp_connector::{NewMcpClient, NewMcpGrant};
+        use crate::database::DatabaseStore;
+        use crate::mcp_connector::{self, McpConnectorState};
+        use crate::terminal::{PtyState, SessionRuntime, TerminalLifecycleState};
+        use std::time::Duration;
+
+        if isolated("workspace_service::tests::close_refuses_grant_revoked_during_journal_contention") {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db_path = root.join("close.sqlite");
+        let state = AppStateStore::default();
+        let closing = state.create_workspace_with_layout(root, WorkspacePresetLayout::Single);
+        let plan = state.pty_hydration_plan_for_workspace(&closing.0).unwrap();
+        let session_id = plan.sessions[0].session_id.clone();
+        let shell = PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: closing.0.clone(),
+                host_id: None,
+                ssh_target: None,
+            },
+            session_id: session_id.clone(),
+            shell_id: uuid::Uuid::new_v4(),
+        };
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        app.manage(PtyState::default());
+        app.manage(DatabaseStore::test_file(&db_path));
+        app.manage(McpConnectorState::default());
+        let db = app.state::<DatabaseStore>();
+        db.remember_daemon_shell(&shell).unwrap();
+        let pty = app.state::<PtyState>();
+        let mut runtime = SessionRuntime::new(&session_id);
+        runtime.persistent = true;
+        runtime.writer = Some(Box::new(std::io::sink()));
+        runtime.last_status.state = TerminalLifecycleState::Ready;
+        pty.sessions.lock().unwrap().insert(session_id.clone(), runtime);
+
+        let client_id = "close-test-client";
+        let grant_id = "close-test-grant";
+        let origin = "https://connector.example";
+        let redirect = "https://client.example/callback";
+        let now = mcp_connector::now_ms();
+        db.mcp_connector_set_config(&serde_json::json!({
+            "enabled": true,
+            "publicOrigin": origin,
+        }).to_string()).unwrap();
+        db.mcp_register_client(NewMcpClient {
+            id: client_id.into(),
+            name: "Workspace close test".into(),
+            redirects: vec![redirect.into()],
+            created_at: now,
+        }, now).unwrap();
+        db.mcp_mint_grant(NewMcpGrant {
+            id: grant_id.into(),
+            client_id: client_id.into(),
+            token_hash: "fixture-close-grant".into(),
+            redirect_uri: redirect.into(),
+            resource: format!("{origin}/mcp"),
+            access: "supervised".into(),
+            created_at: now,
+            expires_at: now + 60_000,
+        }).unwrap();
+        let caller = ControlCaller::outside(client_id.into(), grant_id.into(), ControlAccess::Supervised);
+        let handle = app.handle().clone();
+        let checkpoint = Checkpoint::new(move || {
+            crate::agent_control::service::authorize(&handle, &caller).map_err(|error| error.to_string())
+        });
+        checkpoint.check().unwrap();
+
+        let (notify, contended) = tokio::sync::oneshot::channel();
+        db.test_watch_close_journal_contention(notify);
+        let mut writer = rusqlite::Connection::open(&db_path).unwrap();
+        let revocation = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let workspaces = WorkspaceService::new(app.handle()).checked(checkpoint);
+        let closing_id = closing.0.clone();
+        let close = tokio::spawn(async move {
+            workspaces.close(CloseWorkspace {
+                workspace_id: closing_id,
+                remove_worktree: false,
+                delete_branch: false,
+                force: true,
+                commits: CommitLoss::Allow,
+            }).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), contended)
+            .await.unwrap().unwrap();
+        assert_eq!(revocation.execute(
+            "UPDATE agent_mcp_grants SET revoked = 1 WHERE id = ?1",
+            [grant_id],
+        ).unwrap(), 1);
+        revocation.commit().unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(5), close)
+            .await.unwrap().unwrap().unwrap_err();
+        assert_eq!(ControlError::from_text(error, ErrorCode::NativeControlFailed).code, ErrorCode::GrantRevoked);
+        assert!(app.state::<AppStateStore>().find_workspace(&closing.0).is_some());
+        let sessions = pty.sessions.lock().unwrap();
+        let runtime = sessions.get(&session_id).unwrap();
+        assert!(runtime.persistent && runtime.writer.is_some());
+        assert!(matches!(runtime.last_status.state, TerminalLifecycleState::Ready));
+        drop(sessions);
+        assert_eq!(db.daemon_shell_ownership().unwrap(), [shell]);
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+        assert!(db.pending_daemon_closes().unwrap().is_empty());
     }
 
     /// A new worktree's setup runs once the create returned, so it asks the
