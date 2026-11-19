@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
-use crate::sync_guard::{sync_client, SyncGuard, SYNC_BUDGET};
+use crate::sync_guard::{order_by_last_attempt, record_attempt, sync_client, Attempts, SyncGuard, SYNC_BUDGET};
 use crate::auth::{api_base_url, is_token_expired, load_token};
 use crate::database::automation_triggers::AutomationTrigger;
 use crate::database::{AutomationRecord, DatabaseStore};
@@ -104,6 +104,32 @@ fn host_maps(db: &DatabaseStore) -> (HashMap<i64, String>, HashMap<String, i64>)
 /// deletion whose row the first pass is still uploading, before that
 /// upload returns the server id the DELETE needs.
 static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// When each row was last sent (see [`order_by_last_attempt`]).
+static ATTEMPTS: Attempts = std::sync::LazyLock::new(Default::default);
+
+/// Coalesces [`schedule_background_sync`] requests.
+pub(crate) static BACKGROUND: crate::sync_guard::Coalescer = crate::sync_guard::Coalescer::new();
+
+/// Sync in the background, fire-and-forget. Requests made while a pass is
+/// running collapse into one follow-up pass after it, so mutations and
+/// scheduler ticks never queue up a pass each. A failed sync is logged, not
+/// surfaced: the rows stay dirty and a later pass retries them.
+pub fn schedule_background_sync<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
+    if !BACKGROUND.request() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if let Err(error) = try_sync_with_app(&app).await {
+                eprintln!("[codemux::automations] background sync failed: {error}");
+            }
+            if !BACKGROUND.finished_pass() {
+                break;
+            }
+        }
+    });
+}
 
 pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
     // Queue before reading the session: a pass that waited out a sign-out
@@ -302,13 +328,20 @@ async fn push_guarded(
     client: &reqwest::Client,
 ) -> Result<(), String> {
     let base = api_base_url();
-    let (local_to_server, dirty) = guard.commit(|| (host_maps(db).0, db.list_dirty_automations()))?;
+    let (local_to_server, mut dirty) = guard.commit(|| (host_maps(db).0, db.list_dirty_automations()))?;
+    order_by_last_attempt(&ATTEMPTS, &mut dirty, |row| row.id);
     let mut any_failed = false;
     // The account's list, fetched at most once a pass, and only if a row
     // turns out to be gone.
     let mut listed: Option<Option<std::collections::HashSet<String>>> = None;
 
     for row in &dirty {
+        // Out of time: the rest goes first next pass.
+        if guard.expired() {
+            any_failed = true;
+            break;
+        }
+        record_attempt(&ATTEMPTS, row.id);
         // Webhook automations stay on this device: the API has no trigger
         // field, so another device would read one as a broken schedule.
         // Clear `dirty` instead, which also lets a tombstone be purged.
