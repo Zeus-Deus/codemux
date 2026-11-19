@@ -119,65 +119,37 @@ pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> 
     let Some(token) = token else {
         return Ok(());
     };
-    let guard = SyncGuard::Session { auth: &auth, generation };
-    sync_locked(&token, &db, &guard).await
+    sync_locked(&token, &db, SyncGuard::session(&auth, generation)).await
 }
 
 /// One pull-then-push pass, queued behind any other.
 pub async fn sync_once(token: &str, db: &DatabaseStore) -> Result<(), String> {
     let _one_at_a_time = SYNC_LOCK.lock().await;
-    sync_locked(token, db, &SyncGuard::Unchecked).await
+    sync_locked(token, db, SyncGuard::unchecked()).await
 }
 
-/// Pull, then push, within [`SYNC_BUDGET`]. Called with [`SYNC_LOCK`] held.
-/// A pass cut off by the budget may have sent an upload whose answer never
-/// came: every automation still waiting for its first upload is then
-/// treated as possibly created (see [`UNCERTAIN_UPLOADS`]).
-async fn sync_locked(token: &str, db: &DatabaseStore, guard: &SyncGuard<'_>) -> Result<(), String> {
-    let outcome = tokio::time::timeout(SYNC_BUDGET, async {
-        let pull_err = pull_guarded(token, db, None, guard).await.err();
-        let push_err = push_guarded(token, db, guard).await.err();
-        (pull_err, push_err)
-    })
-    .await;
-    let Ok((pull_err, push_err)) = outcome else {
-        let mut uncertain = lock_uncertain();
-        for row in db.list_dirty_automations() {
-            if row.server_id.is_none() && row.deleted_at.is_none() {
-                uncertain.insert(row.id);
-            }
-        }
-        return Err(format!("timed out after {}s", SYNC_BUDGET.as_secs()));
-    };
+/// Pull, then push. Called with [`SYNC_LOCK`] held. The pass stops
+/// starting requests once [`SYNC_BUDGET`] is spent, but never abandons one
+/// it has started: each request ends by its own timeout, so the pass always
+/// learns whether an upload took — or keeps the row to try again.
+async fn sync_locked(token: &str, db: &DatabaseStore, guard: SyncGuard<'_>) -> Result<(), String> {
+    sync_with(token, db, &guard.within(SYNC_BUDGET), &sync_client()).await
+}
+
+async fn sync_with(
+    token: &str,
+    db: &DatabaseStore,
+    guard: &SyncGuard<'_>,
+    client: &reqwest::Client,
+) -> Result<(), String> {
+    let pull_err = pull_guarded(token, db, None, guard, client).await.err();
+    let push_err = push_guarded(token, db, guard, client).await.err();
     match (pull_err, push_err) {
         (None, None) => Ok(()),
         (Some(p), None) => Err(format!("pull failed: {p}")),
         (None, Some(p)) => Err(format!("push failed: {p}")),
         (Some(a), Some(b)) => Err(format!("pull failed: {a}; push failed: {b}")),
     }
-}
-
-/// Automations whose first upload may have created a server row although
-/// no answer said so. The next pull links a matching server row it does not
-/// know yet to such an automation instead of adding a duplicate; until a
-/// pull has looked, it is neither uploaded again nor settled. In memory
-/// only: after a restart it is uploaded again.
-static UNCERTAIN_UPLOADS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i64>>> =
-    std::sync::LazyLock::new(Default::default);
-
-fn lock_uncertain() -> std::sync::MutexGuard<'static, std::collections::HashSet<i64>> {
-    UNCERTAIN_UPLOADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Whether the server row `a` is the one an uncertain upload of `row` made.
-fn same_automation(row: &AutomationRecord, a: &ServerAutomation) -> bool {
-    row.name == a.name
-        && row.prompt == a.prompt
-        && row.agent == a.agent
-        && row.schedule == a.schedule
-        && row.timezone == a.timezone
-        && row.project_path == a.project_path
-        && row.project_remote == a.project_remote
 }
 
 fn valid_token(db: &DatabaseStore) -> Option<String> {
@@ -202,7 +174,7 @@ pub async fn pull(
     db: &DatabaseStore,
     host_filter: Option<&str>,
 ) -> Result<(), String> {
-    pull_guarded(token, db, host_filter, &SyncGuard::Unchecked).await
+    pull_guarded(token, db, host_filter, &SyncGuard::unchecked(), &sync_client()).await
 }
 
 async fn pull_guarded(
@@ -210,9 +182,9 @@ async fn pull_guarded(
     db: &DatabaseStore,
     host_filter: Option<&str>,
     guard: &SyncGuard<'_>,
+    client: &reqwest::Client,
 ) -> Result<(), String> {
     let base = api_base_url();
-    let client = sync_client();
     guard.ensure_current()?;
     let mut url = format!("{base}/api/automations");
     if let Some(host) = host_filter {
@@ -234,39 +206,16 @@ async fn pull_guarded(
     let body: ListAutomationsResponse =
         resp.json().await.map_err(|e| format!("Parse: {e}"))?;
     // Written only while the session that asked is still current.
-    guard.commit(|| apply_pulled(db, &body, host_filter.is_none()))?
+    guard.commit(|| apply_pulled(db, &body))?
 }
 
-/// `resolve_uploads`: whether this list is the whole account's, so it can
-/// settle uploads whose outcome was unknown (a host-filtered one cannot).
-fn apply_pulled(db: &DatabaseStore, body: &ListAutomationsResponse, resolve_uploads: bool) -> Result<(), String> {
+fn apply_pulled(db: &DatabaseStore, body: &ListAutomationsResponse) -> Result<(), String> {
     let (_local_to_server, server_to_local) = host_maps(db);
     let local = db.list_automations_for_sync();
     let server_ids: std::collections::HashSet<String> =
         body.automations.iter().map(|a| a.id.clone()).collect();
 
-    // An upload whose outcome was unknown: a server row this device does
-    // not know yet, matching such an automation, is that upload's result.
-    let mut linked: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if resolve_uploads {
-        let known: std::collections::HashSet<&str> =
-            local.iter().filter_map(|r| r.server_id.as_deref()).collect();
-        let mut uncertain = lock_uncertain();
-        for a in body.automations.iter().filter(|a| !known.contains(a.id.as_str())) {
-            if let Some(row) = local
-                .iter()
-                .find(|r| r.server_id.is_none() && uncertain.contains(&r.id) && same_automation(r, a))
-            {
-                db.mark_automation_pushed(row, Some(&a.id))?;
-                uncertain.remove(&row.id);
-                linked.insert(a.id.clone());
-            }
-        }
-        // The list has been seen: an upload that matched nothing made nothing.
-        uncertain.clear();
-    }
-
-    for a in body.automations.iter().filter(|a| !linked.contains(&a.id)) {
+    for a in &body.automations {
         let host_id = a
             .host_server_id
             .as_ref()
@@ -343,12 +292,16 @@ fn apply_pulled(db: &DatabaseStore, body: &ListAutomationsResponse, resolve_uplo
 /// Push dirty local automations. Each row is handled independently so
 /// one failure does not strand the rest.
 pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
-    push_guarded(token, db, &SyncGuard::Unchecked).await
+    push_guarded(token, db, &SyncGuard::unchecked(), &sync_client()).await
 }
 
-async fn push_guarded(token: &str, db: &DatabaseStore, guard: &SyncGuard<'_>) -> Result<(), String> {
+async fn push_guarded(
+    token: &str,
+    db: &DatabaseStore,
+    guard: &SyncGuard<'_>,
+    client: &reqwest::Client,
+) -> Result<(), String> {
     let base = api_base_url();
-    let client = sync_client();
     let (local_to_server, dirty) = guard.commit(|| (host_maps(db).0, db.list_dirty_automations()))?;
     let mut any_failed = false;
     // The account's list, fetched at most once a pass, and only if a row
@@ -366,16 +319,12 @@ async fn push_guarded(token: &str, db: &DatabaseStore, guard: &SyncGuard<'_>) ->
             }
             continue;
         }
-        // Waits for a pull to say whether its earlier upload took.
-        if row.server_id.is_none() && lock_uncertain().contains(&row.id) {
-            continue;
-        }
         let result = if row.deleted_at.is_some() {
-            push_delete(&client, &base, token, row, db, guard).await
+            push_delete(client, &base, token, row, db, guard).await
         } else if row.server_id.is_none() {
-            push_insert(&client, &base, token, row, &local_to_server, db, guard).await
+            push_insert(client, &base, token, row, &local_to_server, db, guard).await
         } else {
-            push_update(&client, &base, token, row, &local_to_server, db, &mut listed, guard).await
+            push_update(client, &base, token, row, &local_to_server, db, &mut listed, guard).await
         };
         if let Err(error) = result {
             eprintln!("[automations-sync] push failed for local id {}: {error}", row.id);
@@ -420,32 +369,18 @@ async fn push_insert(
     guard: &SyncGuard<'_>,
 ) -> Result<(), String> {
     guard.ensure_current()?;
-    let resp = match client
+    let resp = client
         .post(format!("{base}/api/automations"))
         .header("Authorization", format!("Bearer {token}"))
         .json(&upsert_body(row, local_to_server))
         .send()
         .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            // Unless it never connected, the server may have made the row.
-            if !e.is_connect() {
-                lock_uncertain().insert(row.id);
-            }
-            return Err(format!("Network error: {e}"));
-        }
-    };
+        .map_err(|e| format!("Network error: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("API error: {}", resp.status()));
     }
-    let parsed: OneAutomationResponse = match resp.json().await {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            lock_uncertain().insert(row.id);
-            return Err(format!("Parse: {e}"));
-        }
-    };
+    let parsed: OneAutomationResponse =
+        resp.json().await.map_err(|e| format!("Parse: {e}"))?;
     guard.commit(|| db.mark_automation_pushed(row, Some(&parsed.automation.id)))??;
     Ok(())
 }
