@@ -145,75 +145,37 @@ pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> 
     let Some(token) = token else {
         return Ok(());
     };
-    let guard = SyncGuard::Session { auth: &auth, generation };
-    sync_locked(&token, &db, &guard).await
+    sync_locked(&token, &db, SyncGuard::session(&auth, generation)).await
 }
 
 /// One pull-then-push pass, queued behind any other.
 pub async fn sync_once(token: &str, db: &DatabaseStore) -> Result<(), String> {
     let _one_at_a_time = SYNC_LOCK.lock().await;
-    sync_locked(token, db, &SyncGuard::Unchecked).await
+    sync_locked(token, db, SyncGuard::unchecked()).await
 }
 
-/// Pull, then push, within [`SYNC_BUDGET`]. Called with [`SYNC_LOCK`] held.
-/// A pass cut off by the budget may have sent an upload whose answer never
-/// came: every row still waiting for its first upload is then treated as
-/// possibly created (see [`UNCERTAIN_UPLOADS`]).
-async fn sync_locked(token: &str, db: &DatabaseStore, guard: &SyncGuard<'_>) -> Result<(), String> {
-    sync_locked_within(token, db, guard, SYNC_BUDGET).await
+/// Pull, then push. Called with [`SYNC_LOCK`] held. The pass stops
+/// starting requests once [`SYNC_BUDGET`] is spent, but never abandons one
+/// it has started: each request ends by its own timeout, so the pass always
+/// learns whether an upload took — or keeps the row to try again.
+async fn sync_locked(token: &str, db: &DatabaseStore, guard: SyncGuard<'_>) -> Result<(), String> {
+    sync_with(token, db, &guard.within(SYNC_BUDGET), &sync_client()).await
 }
 
-async fn sync_locked_within(
+async fn sync_with(
     token: &str,
     db: &DatabaseStore,
     guard: &SyncGuard<'_>,
-    budget: std::time::Duration,
+    client: &reqwest::Client,
 ) -> Result<(), String> {
-    let outcome = tokio::time::timeout(budget, async {
-        let pull_err = pull_guarded(token, db, guard).await.err();
-        let push_err = push_guarded(token, db, guard).await.err();
-        (pull_err, push_err)
-    })
-    .await;
-    let Ok((pull_err, push_err)) = outcome else {
-        let mut uncertain = lock_uncertain();
-        for row in db.list_dirty_workspaces_sync() {
-            if row.server_id.is_none() && row.deleted_at.is_none() {
-                uncertain.insert(row.id);
-            }
-        }
-        return Err(format!("timed out after {}s", budget.as_secs()));
-    };
+    let pull_err = pull_guarded(token, db, guard, client).await.err();
+    let push_err = push_guarded(token, db, guard, client).await.err();
     match (pull_err, push_err) {
         (None, None) => Ok(()),
         (Some(p), None) => Err(format!("pull failed: {p}")),
         (None, Some(p)) => Err(format!("push failed: {p}")),
         (Some(a), Some(b)) => Err(format!("pull failed: {a}; push failed: {b}")),
     }
-}
-
-/// Local rows whose first upload may have created a server row although
-/// no answer said so — the request failed after it could have been sent,
-/// or the pass ran out of time. The next pull links a matching server row
-/// it does not know yet to such a row instead of adding a duplicate, and
-/// until a pull has looked, the row is neither uploaded again nor settled.
-/// In memory only: after a restart such a row is uploaded again.
-static UNCERTAIN_UPLOADS: std::sync::LazyLock<std::sync::Mutex<HashSet<i64>>> =
-    std::sync::LazyLock::new(Default::default);
-
-fn lock_uncertain() -> std::sync::MutexGuard<'static, HashSet<i64>> {
-    UNCERTAIN_UPLOADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Whether the server row `w` is the one an uncertain upload of `row` made.
-fn same_workspace(row: &crate::database::WorkspaceSyncRecord, w: &ServerWorkspace) -> bool {
-    row.title == w.title
-        && row.host_server_id == w.host_server_id
-        && row.project_path == w.project_path
-        && row.project_remote == w.project_remote
-        && row.git_branch == w.git_branch
-        && row.project_uid == w.project_uid
-        && row.workspace_kind == w.workspace_kind
 }
 
 fn valid_token(db: &DatabaseStore) -> Option<String> {
@@ -237,12 +199,16 @@ fn valid_token(db: &DatabaseStore) -> Option<String> {
 /// non-null but missing from the server response is treated as a
 /// server-side deletion the local hasn't observed yet.
 pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
-    pull_guarded(token, db, &SyncGuard::Unchecked).await
+    pull_guarded(token, db, &SyncGuard::unchecked(), &sync_client()).await
 }
 
-async fn pull_guarded(token: &str, db: &DatabaseStore, guard: &SyncGuard<'_>) -> Result<(), String> {
+async fn pull_guarded(
+    token: &str,
+    db: &DatabaseStore,
+    guard: &SyncGuard<'_>,
+    client: &reqwest::Client,
+) -> Result<(), String> {
     let base = api_base_url();
-    let client = sync_client();
     guard.ensure_current()?;
     let resp = client
         .get(format!("{base}/api/workspaces"))
@@ -270,27 +236,7 @@ fn apply_pulled(db: &DatabaseStore, body: &ListWorkspacesResponse) -> Result<(),
     let local = db.list_workspaces_sync_for_sync();
     let server_ids: std::collections::HashSet<String> =
         body.workspaces.iter().map(|w| w.id.clone()).collect();
-    let known: HashSet<&str> = local.iter().filter_map(|r| r.server_id.as_deref()).collect();
-
-    // An upload whose outcome was unknown: a server row this device does
-    // not know yet, matching such a row, is that upload's result.
-    let mut uncertain = lock_uncertain();
-    let mut linked: HashSet<String> = HashSet::new();
-    for w in body.workspaces.iter().filter(|w| !known.contains(w.id.as_str())) {
-        if let Some(row) = local
-            .iter()
-            .find(|r| r.server_id.is_none() && uncertain.contains(&r.id) && same_workspace(r, w))
-        {
-            db.mark_workspace_sync_pushed(row, Some(&w.id))?;
-            uncertain.remove(&row.id);
-            linked.insert(w.id.clone());
-        }
-    }
-    // The list has been seen: an upload that matched nothing made nothing.
-    uncertain.clear();
-    drop(uncertain);
-
-    for w in body.workspaces.iter().filter(|w| !linked.contains(&w.id)) {
+    for w in &body.workspaces {
         db.upsert_workspace_sync_from_server(
             &w.id,
             &w.title,
@@ -427,12 +373,16 @@ fn dedupe_sibling_rows(db: &DatabaseStore) {
 /// rows; failures are logged and the row stays dirty for the next
 /// sync to retry.
 pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
-    push_guarded(token, db, &SyncGuard::Unchecked).await
+    push_guarded(token, db, &SyncGuard::unchecked(), &sync_client()).await
 }
 
-async fn push_guarded(token: &str, db: &DatabaseStore, guard: &SyncGuard<'_>) -> Result<(), String> {
+async fn push_guarded(
+    token: &str,
+    db: &DatabaseStore,
+    guard: &SyncGuard<'_>,
+    client: &reqwest::Client,
+) -> Result<(), String> {
     let base = api_base_url();
-    let client = sync_client();
     let dirty = guard.commit(|| db.list_dirty_workspaces_sync())?;
     let mut any_failed = false;
     // The account's list, fetched at most once a pass, and only if a row
@@ -440,16 +390,12 @@ async fn push_guarded(token: &str, db: &DatabaseStore, guard: &SyncGuard<'_>) ->
     let mut listed: Option<Option<std::collections::HashSet<String>>> = None;
 
     for row in &dirty {
-        // Waits for a pull to say whether its earlier upload took.
-        if row.server_id.is_none() && lock_uncertain().contains(&row.id) {
-            continue;
-        }
         let result = if row.deleted_at.is_some() {
-            push_delete(&client, &base, token, row, db, guard).await
+            push_delete(client, &base, token, row, db, guard).await
         } else if row.server_id.is_none() {
-            push_insert(&client, &base, token, row, db, guard).await
+            push_insert(client, &base, token, row, db, guard).await
         } else {
-            push_update(&client, &base, token, row, db, &mut listed, guard).await
+            push_update(client, &base, token, row, db, &mut listed, guard).await
         };
         if let Err(error) = result {
             eprintln!(
@@ -488,32 +434,18 @@ async fn push_insert(
         workspace_kind: row.workspace_kind.as_deref(),
     };
     guard.ensure_current()?;
-    let resp = match client
+    let resp = client
         .post(format!("{base}/api/workspaces"))
         .header("Authorization", format!("Bearer {token}"))
         .json(&body)
         .send()
         .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            // Unless it never connected, the server may have made the row.
-            if !e.is_connect() {
-                lock_uncertain().insert(row.id);
-            }
-            return Err(format!("Network error: {e}"));
-        }
-    };
+        .map_err(|e| format!("Network error: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("API error: {}", resp.status()));
     }
-    let parsed: OneWorkspaceResponse = match resp.json().await {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            lock_uncertain().insert(row.id);
-            return Err(format!("Parse: {e}"));
-        }
-    };
+    let parsed: OneWorkspaceResponse =
+        resp.json().await.map_err(|e| format!("Parse: {e}"))?;
     guard.commit(|| db.mark_workspace_sync_pushed(row, Some(&parsed.workspace.id)))??;
     Ok(())
 }
@@ -1237,10 +1169,8 @@ mod tests {
         let auth = crate::auth::AuthState::default();
         let (generation, ()) = auth.session_snapshot(|| ());
         auth.replace_session(|| ());
-        let guard = SyncGuard::Session { auth: &auth, generation };
-
         // Each half fails on the stale session before sending anything.
-        let _ = super::sync_locked("token", &db, &guard).await;
+        let _ = super::sync_locked("token", &db, SyncGuard::session(&auth, generation)).await;
         list.assert_async().await;
         upload.assert_async().await;
         assert!(db.list_dirty_workspaces_sync()[0].server_id.is_none(), "nothing was uploaded");
@@ -1265,9 +1195,10 @@ mod tests {
         let db = fresh_db();
         let auth = crate::auth::AuthState::default();
         let (generation, ()) = auth.session_snapshot(|| ());
-        let guard = SyncGuard::Session { auth: &auth, generation };
+        let guard = SyncGuard::session(&auth, generation);
+        let client = crate::sync_guard::sync_client();
 
-        let pulling = super::pull_guarded("token", &db, &guard);
+        let pulling = super::pull_guarded("token", &db, &guard, &client);
         let switch = async {
             asked.notified().await;
             auth.replace_session(|| ());
@@ -1282,21 +1213,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn a_stalled_upload_frees_the_queue_and_its_row_is_linked_not_duplicated() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        let posts = std::sync::Arc::new(AtomicUsize::new(0));
-        let created = std::sync::Arc::new(AtomicBool::new(false));
-        let (p, c) = (posts.clone(), created.clone());
+    async fn a_stalled_upload_ends_by_its_own_timeout_and_frees_the_queue() {
         let handler: Handler = std::sync::Arc::new(move |line| {
-            let (p, c) = (p.clone(), c.clone());
             Box::pin(async move {
                 if line.starts_with("GET /api/workspaces ") {
-                    let listed = if c.load(Ordering::SeqCst) { workspace_json("srv-late") } else { String::new() };
-                    ("200 OK", format!(r#"{{"workspaces":[{listed}]}}"#))
+                    ("200 OK", r#"{"workspaces":[]}"#.to_string())
                 } else if line.starts_with("POST /api/workspaces ") {
-                    // The row is made, but the answer never comes back.
-                    p.fetch_add(1, Ordering::SeqCst);
-                    c.store(true, Ordering::SeqCst);
+                    // Never answered.
                     std::future::pending::<()>().await;
                     unreachable!()
                 } else {
@@ -1306,32 +1229,42 @@ mod tests {
         });
         std::env::set_var("CODEMUX_API_URL", test_api(handler).await);
         let db = fresh_db();
-        db.insert_workspace_sync("ws-late", "new", None, None, None, Some("main"), None, None, None)
+        db.insert_workspace_sync("ws-stall", "new", None, None, None, Some("main"), None, None, None)
             .unwrap();
 
-        let stalled = super::sync_locked_within(
-            "token",
-            &db,
-            &SyncGuard::Unchecked,
-            std::time::Duration::from_millis(300),
-        )
-        .await;
-        assert!(stalled.is_err(), "the pass gives up within its budget");
+        // A request timeout short enough for a test; in the app it is 30s.
+        let client = crate::sync_guard::sync_client_with(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let stalled = super::sync_with("token", &db, &SyncGuard::unchecked(), &client).await;
+        assert!(stalled.is_err(), "the upload's own timeout ends the pass");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
 
-        // The queue is free, and the next pass links the row the stalled
-        // upload made instead of uploading it again.
-        tokio::time::timeout(std::time::Duration::from_secs(10), super::sync_once("token", &db))
-            .await
-            .expect("the queue was released")
-            .unwrap();
+        // The queue is free for the next pass, and the row is kept to try
+        // again rather than dropped.
         std::env::remove_var("CODEMUX_API_URL");
-        let _ = super::lock_uncertain().drain();
+        let row = db.list_dirty_workspaces_sync().pop().unwrap();
+        assert_eq!(row.workspace_id.as_deref(), Some("ws-stall"));
+        assert!(row.server_id.is_none() && row.dirty);
+        let queue_free = tokio::time::timeout(std::time::Duration::from_secs(1), super::SYNC_LOCK.lock()).await;
+        assert!(queue_free.is_ok(), "nothing holds the queue");
+    }
 
-        assert_eq!(posts.load(Ordering::SeqCst), 1, "no second upload");
-        let rows = db.list_workspaces_sync_for_sync();
-        assert_eq!(rows.len(), 1, "no duplicate: {rows:?}");
-        assert_eq!(rows[0].server_id.as_deref(), Some("srv-late"));
-        assert_eq!(rows[0].workspace_id.as_deref(), Some("ws-late"));
+    #[tokio::test]
+    #[serial]
+    async fn a_pass_past_its_deadline_starts_no_request() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let list = server.mock("GET", "/api/workspaces").expect(0).create_async().await;
+        let upload = server.mock("POST", "/api/workspaces").expect(0).create_async().await;
+        let db = fresh_db();
+        db.insert_workspace_sync("ws-late-pass", "new", None, None, None, None, None, None, None).unwrap();
+
+        let guard = SyncGuard::unchecked().within(std::time::Duration::ZERO);
+        let client = crate::sync_guard::sync_client();
+        assert!(super::sync_with("token", &db, &guard, &client).await.is_err());
+        list.assert_async().await;
+        upload.assert_async().await;
+        std::env::remove_var("CODEMUX_API_URL");
     }
 
     #[tokio::test]
