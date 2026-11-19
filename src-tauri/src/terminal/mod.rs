@@ -272,6 +272,7 @@ pub struct SessionRuntime {
     /// where two callers both passed the "writer/master is None" check while
     /// the slow ConPTY initialization was in flight on Windows.
     pub is_spawning: bool,
+    close_fence: Option<Arc<tokio::sync::Semaphore>>,
     /// Rotated under the sessions lock whenever a spawn claims this id.
     restart_token: Uuid,
     /// Retains guarded shell cleanup targets until daemon attachment succeeds.
@@ -405,6 +406,7 @@ impl SessionRuntime {
             skip_preset_launch: false,
             resume_command: None,
             is_spawning: false,
+            close_fence: None,
             restart_token: Uuid::nil(),
             #[cfg(unix)]
             daemon_reconciliation: None,
@@ -419,7 +421,7 @@ impl SessionRuntime {
     }
 
     fn reserve_spawn(&mut self) -> Option<Uuid> {
-        if self.spawn_active() {
+        if self.spawn_active() || self.close_fence.is_some() {
             return None;
         }
         self.is_spawning = true;
@@ -489,7 +491,11 @@ fn remove_session_runtime(
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
 ) -> Option<SessionRuntime> {
-    sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id)
+    let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    if sessions.get(session_id).is_some_and(|runtime| runtime.close_fence.is_some()) {
+        return None;
+    }
+    sessions.remove(session_id)
 }
 
 /// Atomically reserve a session id for a spawn attempt.
@@ -547,6 +553,7 @@ fn finish_in_process_session(
         let mut exited = SessionRuntime::new(&status.session_id);
         exited.restart_token = restart_token;
         exited.last_status = status.clone();
+        exited.close_fence = runtime.close_fence.clone();
         Some(std::mem::replace(runtime, exited))
     }).flatten()
 }
@@ -607,6 +614,13 @@ impl SessionSpawnReservation {
     }
 
     #[cfg(unix)]
+    async fn wait_for_close(&self) {
+        while let Some(fence) = self.with_current_runtime(|runtime| runtime.close_fence.clone()).flatten() {
+            let _ = fence.acquire().await;
+        }
+    }
+
+    #[cfg(unix)]
     fn with_current_runtime<T>(&self, f: impl FnOnce(&mut SessionRuntime) -> T) -> Option<T> {
         with_existing_session_runtime(&self.sessions, &self.session_id, |runtime| {
             (runtime.restart_token == self.restart_token).then(|| f(runtime))
@@ -637,7 +651,7 @@ impl SessionSpawnReservation {
         let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
         let current = guard.get(session_id);
         let observed = current.map_or(Uuid::nil(), |runtime| runtime.restart_token);
-        if current.is_some_and(|runtime| runtime.is_spawning) {
+        if current.is_some_and(|runtime| runtime.is_spawning || runtime.close_fence.is_some()) {
             return None;
         }
         if let Some(expected) = expected {
@@ -730,6 +744,7 @@ impl SessionSpawnReservation {
                 return false;
             }
             old.output_subscribers.append(&mut runtime.output_subscribers);
+            old.close_fence = runtime.close_fence.clone();
             recompute_flow_paused(&old);
             *runtime = old;
             true
@@ -757,7 +772,7 @@ impl Drop for SessionSpawnReservation {
                     // shape would strand the later in-process fallback with no
                     // frontend subscriber.
                     runtime.is_spawning = false;
-                    self.remove_on_drop && !spawn_placeholder_is_observable(runtime)
+                    self.remove_on_drop && runtime.close_fence.is_none() && !spawn_placeholder_is_observable(runtime)
                 })
                 .unwrap_or(false);
             if remove_placeholder {
@@ -802,7 +817,7 @@ fn idle_restart_token(
 ) -> Option<Uuid> {
     let guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
     match guard.get(session_id) {
-        Some(runtime) if runtime.spawn_active() => None,
+        Some(runtime) if runtime.spawn_active() || runtime.close_fence.is_some() => None,
         Some(runtime) => Some(runtime.restart_token),
         None => Some(Uuid::nil()),
     }
@@ -2779,84 +2794,140 @@ fn terminate_pty_session<R: Runtime>(
 }
 
 pub(crate) struct CommittedTerminalClose {
-    runtimes: Vec<(state::SessionId, SessionRuntime)>,
+    fence: TerminalCloseFence,
     #[cfg(unix)]
     daemon: Option<daemon_backed::CommittedDaemonClose>,
 }
 
 impl CommittedTerminalClose {
     pub(crate) fn finish<R: Runtime>(self, app: &AppHandle<R>) {
+        let runtimes: Vec<_> = {
+            let mut sessions = self.fence.sessions.as_ref().map(|sessions| {
+                sessions.lock().unwrap_or_else(|error| error.into_inner())
+            });
+            #[cfg(unix)]
+            if let Some(daemon) = &self.daemon {
+                daemon.seal();
+            }
+            self.fence.ids.iter().filter_map(|(id, _)| {
+                let runtime = sessions.as_mut()?.remove(&id.0)?;
+                #[cfg(unix)]
+                if runtime.daemon_reconciliation.is_some()
+                    || (runtime.daemon_route.is_some() && runtime.daemon_shell_id.is_some())
+                {
+                    return None;
+                }
+                Some((id.clone(), runtime))
+            }).collect()
+        };
+        drop(self.fence);
         #[cfg(unix)]
         if let Some(daemon) = self.daemon {
             daemon.finish(app);
         }
         #[cfg(not(unix))]
         let _ = app;
-        for (id, runtime) in self.runtimes {
+        for (id, runtime) in runtimes {
             terminate_removed_session(runtime, &id.0);
         }
     }
 }
 
-/// Journal the close while holding the layout and session locks. Until the
-/// transaction commits, neither layout nor terminal runtimes may change.
-pub(crate) fn commit_terminal_close<R: Runtime>(
+struct TerminalCloseFence {
+    sessions: Option<Arc<Mutex<HashMap<String, SessionRuntime>>>>,
+    ids: Vec<(state::SessionId, bool)>,
+    pending: Arc<tokio::sync::Semaphore>,
+}
+
+impl Drop for TerminalCloseFence {
+    fn drop(&mut self) {
+        if let Some(sessions) = &self.sessions {
+            let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
+            for (id, inserted) in &self.ids {
+                if let Some(runtime) = sessions.get_mut(&id.0) {
+                    let owns_fence = runtime.close_fence.as_ref()
+                        .is_some_and(|pending| Arc::ptr_eq(pending, &self.pending));
+                    if owns_fence {
+                        runtime.close_fence = None;
+                        if *inserted && !runtime.spawn_active() && !spawn_placeholder_is_observable(runtime) {
+                            sessions.remove(&id.0);
+                        }
+                    }
+                }
+            }
+        }
+        self.pending.close();
+    }
+}
+
+/// Fence only the affected terminal reservations. SQLite runs outside the
+/// app-state and sessions mutexes, on the caller's blocking worker.
+pub(crate) fn commit_terminal_close<'a, R: Runtime>(
     app: &AppHandle<R>,
+    state: &'a AppStateStore,
     sessions: Option<&Arc<Mutex<HashMap<String, SessionRuntime>>>>,
-    workspace_id: &str,
-    session_ids: &[state::SessionId],
-    intent: state::LayoutCloseIntent,
-) -> Result<CommittedTerminalClose, String> {
-    let mut sessions = sessions.map(|sessions| sessions.lock().unwrap_or_else(|error| error.into_inner()));
+    mut intent: state::LayoutCloseIntent,
+) -> Result<(state::TerminalCloseScope<'a>, CommittedTerminalClose), String> {
+    let pending = Arc::new(tokio::sync::Semaphore::new(0));
+    let (scope, (workspace_id, session_ids, fence, ready, requires_journal)) = state.prepare_terminal_layout_close(&intent, |workspace_id, ids| {
+        let mut fence = TerminalCloseFence { sessions: sessions.cloned(), ids: Vec::new(), pending: pending.clone() };
+        let mut runtimes = sessions.map(|sessions| sessions.lock().unwrap_or_else(|error| error.into_inner()));
+        #[cfg(unix)]
+        let mut ready = Vec::new();
+        #[cfg(not(unix))]
+        let ready = ();
+        let mut requires_journal = false;
+        for id in ids {
+            if let Some(runtimes) = &mut runtimes {
+                let inserted = !runtimes.contains_key(&id.0);
+                let runtime = runtimes.entry(id.0.clone()).or_insert_with(|| SessionRuntime::new(&id.0));
+                runtime.close_fence = Some(pending.clone());
+                fence.ids.push((id.clone(), inserted));
+                #[cfg(unix)]
+                {
+                    let recovery = runtime.daemon_reconciliation.clone().or_else(|| Some(Arc::new(
+                        DaemonReconciliation::new(
+                            runtime.daemon_route.clone()?,
+                            Some(runtime.daemon_shell_id?),
+                            runtime.daemon_client.clone(),
+                        ),
+                    )));
+                    if let Some(recovery) = recovery {
+                        ready.push(daemon_backed::prepare_closed_pane_cleanup(&id.0, &recovery));
+                    }
+                    let known_untracked = runtime.daemon_reconciliation.is_none() && runtime.daemon_shell_id.is_none()
+                        && if runtime.persistent { runtime.daemon_client.is_some() } else { runtime.child_pid.is_some() };
+                    requires_journal |= !known_untracked;
+                }
+            } else {
+                requires_journal = true;
+            }
+        }
+        (workspace_id.to_owned(), ids.to_vec(), fence, ready, requires_journal)
+    })?;
+    if let state::LayoutCloseIntent::Session { workspace_id: owner, .. } = &mut intent {
+        owner.clone_from(&workspace_id);
+    }
     #[cfg(unix)]
     let daemon = if let Some(db) = app.try_state::<crate::database::DatabaseStore>()
         .filter(|db| db.has_durable_close_journal())
     {
-        let ready = session_ids.iter().filter_map(|id| {
-            let runtime = sessions.as_ref()?.get(&id.0)?;
-            let recovery = runtime.daemon_reconciliation.clone().or_else(|| Some(Arc::new(
-                DaemonReconciliation::new(
-                    runtime.daemon_route.clone()?,
-                    Some(runtime.daemon_shell_id?),
-                    runtime.daemon_client.clone(),
-                ),
-            )))?;
-            Some(daemon_backed::prepare_closed_pane_cleanup(&id.0, &recovery))
-        }).collect();
-        let close = daemon_backed::commit_layout_close(&db, intent, workspace_id, session_ids, ready)?;
-        close.seal();
-        Some(close)
+        Some(daemon_backed::commit_layout_close(&db, intent, &workspace_id, &session_ids, ready)?)
     } else {
         // Missing and unhydrated runtimes cannot rule out a daemon shell
         // whose owner exists only in the unavailable on-disk database.
-        let requires_journal = session_ids.iter().any(|id| {
-            !sessions.as_ref().and_then(|sessions| sessions.get(&id.0)).is_some_and(|runtime| {
-                runtime.daemon_reconciliation.is_none() && runtime.daemon_shell_id.is_none()
-                    && if runtime.persistent { runtime.daemon_client.is_some() } else { runtime.child_pid.is_some() }
-            })
-        });
         if requires_journal {
             return Err("Cannot close terminal sessions while the durable close journal is unavailable".into());
         }
         None
     };
     #[cfg(not(unix))]
-    let _ = (app, workspace_id, intent);
-    let runtimes = session_ids.iter().filter_map(|id| {
-        let runtime = sessions.as_mut()?.remove(&id.0)?;
-        #[cfg(unix)]
-        if runtime.daemon_reconciliation.is_some()
-            || (runtime.daemon_route.is_some() && runtime.daemon_shell_id.is_some())
-        {
-            return None;
-        }
-        Some((id.clone(), runtime))
-    }).collect();
-    Ok(CommittedTerminalClose {
-        runtimes,
+    let _ = (app, workspace_id, intent, ready, requires_journal);
+    Ok((scope, CommittedTerminalClose {
+        fence,
         #[cfg(unix)]
         daemon,
-    })
+    }))
 }
 
 /// Terminate a removed runtime. Its waiter thread owns reaping the child.
@@ -2976,7 +3047,19 @@ pub(crate) fn terminate_removed_session(mut runtime: SessionRuntime, session_id:
 }
 
 #[tauri::command]
-pub fn close_terminal_session<R: Runtime>(
+pub async fn close_terminal_session<R: Runtime>(
+    app: AppHandle<R>,
+    session_id: String,
+    select: Option<bool>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let terminal_state = app.state::<PtyState>();
+        let app_state = app.state::<AppStateStore>();
+        close_terminal_session_sync(app.clone(), terminal_state, app_state, session_id, select)
+    }).await.map_err(|error| error.to_string())?
+}
+
+fn close_terminal_session_sync<R: Runtime>(
     app: AppHandle<R>,
     terminal_state: State<'_, PtyState>,
     app_state: State<'_, AppStateStore>,
@@ -2984,13 +3067,20 @@ pub fn close_terminal_session<R: Runtime>(
     select: Option<bool>,
 ) -> Result<String, String> {
     let (fallback_session, close) = state::with_terminal_close_layout_lock(|| {
-        app_state.close_terminal_session_with_precommit(&session_id, select.unwrap_or(true), |workspace_id, ids| {
-            let intent = state::LayoutCloseIntent::Session {
-                workspace_id: workspace_id.to_owned(),
-                session_id: session_id.clone(),
-            };
-            commit_terminal_close(&app, Some(&terminal_state.sessions), workspace_id, ids, intent)
-        })
+        let intent = state::LayoutCloseIntent::Session { workspace_id: String::new(), session_id: session_id.clone() };
+        let (_scope, close) = commit_terminal_close(&app, &app_state, Some(&terminal_state.sessions), intent)?;
+        let fallback = app_state.close_terminal_session_with_selection(&session_id, select.unwrap_or(true))
+            .unwrap_or_else(|_| {
+                // Once journaled, an intervening layout removal must not
+                // veto the close by changing the original fallback pane.
+                if let Some(plan) = app_state.pty_hydration_plan_for_session(&session_id) {
+                    if let Some(pane_id) = plan.sessions.first().and_then(|session| session.pane_id.as_deref()) {
+                        let _ = app_state.close_pane_with_selection(pane_id, select.unwrap_or(true));
+                    }
+                }
+                app_state.active_terminal_session_id().unwrap_or_else(|| state::SessionId(String::new()))
+            });
+        Ok::<_, String>((fallback, close))
     })?;
     close.finish(&app);
     state::emit_app_state(&app);
@@ -3023,6 +3113,9 @@ pub(crate) fn terminate_pty_session_keep_channel<R: Runtime>(
     // a persistent session we handled, None otherwise (we then fall
     // through to the regular terminate).
     let handled = with_existing_session_runtime(sessions, session_id, |rt| {
+        if rt.close_fence.is_some() {
+            return Some((None, None, None));
+        }
         if !rt.persistent {
             return None;
         }
@@ -6824,7 +6917,7 @@ mod tests {
             assert_eq!(spawning, shell_id);
             // The daemon has accepted the spawn, but the app has neither a
             // spawn reply nor an attached runtime when the pane is closed.
-            let fallback = close_terminal_session(
+            let fallback = close_terminal_session_sync(
                 app.handle().clone(), app.state(), app.state(), new_session.clone(), None,
             ).unwrap();
             assert_eq!(fallback, original);
@@ -6870,6 +6963,84 @@ mod tests {
 
     #[cfg(unix)]
     const INACTIVE_CLOSE_DB: &str = "inactive-close.sqlite";
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_close_journal_contention_leaves_unrelated_terminal_responsive() {
+        use crate::database::DatabaseStore;
+
+        const TEST: &str = "terminal::tests::workspace_close_journal_contention_leaves_unrelated_terminal_responsive";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+
+        static WRITER_BUSY: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<()>> =
+            std::sync::OnceLock::new();
+        let (notify_busy, mut busy) = tokio::sync::mpsc::unbounded_channel();
+        WRITER_BUSY.set(notify_busy).unwrap();
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db_path = root.join("contended-close.sqlite");
+        let db = DatabaseStore::test_file(&db_path);
+        db.test_busy_handler(|attempt| {
+            if attempt == 0 {
+                let _ = WRITER_BUSY.get().unwrap().send(());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            attempt < 500
+        });
+
+        let layout = AppStateStore::default();
+        let active = layout.snapshot().active_workspace_id.0;
+        let live = layout.active_terminal_session_id().unwrap().0;
+        let folder = root.join("closing");
+        std::fs::create_dir(&folder).unwrap();
+        let closing = layout.create_workspace_with_layout(folder, state::WorkspacePresetLayout::Single).0;
+        let closing_plan = layout.pty_hydration_plan_for_workspace(&closing).unwrap();
+        let closing_pane = closing_plan.sessions[0].pane_id.clone().unwrap();
+        assert!(layout.activate_workspace(&active));
+        let terminal = PtyState::default();
+        let sessions = terminal.sessions.clone();
+        let mut runtime = SessionRuntime::new(&live);
+        runtime.writer = Some(Box::new(std::io::sink()));
+        sessions.lock().unwrap().insert(live.clone(), runtime);
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        app.manage(layout);
+        app.manage(terminal);
+
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let close = {
+            let app = app.handle().clone();
+            let closing = closing.clone();
+            tokio::spawn(async move {
+                crate::commands::workspace::close_workspace(
+                    app.clone(), app.state(), app.state(), closing, Some(true),
+                ).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(3), busy.recv()).await.unwrap().unwrap();
+        let input = tokio::task::spawn_blocking(move || admit_pty_input(&sessions, &live, b"input"));
+        let inspect_layout = {
+            let app = app.handle().clone();
+            tokio::task::spawn_blocking(move || {
+                let state = app.state::<AppStateStore>();
+                let workspace_open = state.find_workspace(&closing).is_some();
+                let split = state.split_pane(&closing_pane, state::SplitDirection::Horizontal);
+                (workspace_open, split)
+            })
+        };
+        let (input, inspect_layout) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(2), input),
+            tokio::time::timeout(Duration::from_secs(2), inspect_layout),
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), close).await.unwrap().unwrap().unwrap(), active);
+        input.expect("journal wait held the terminal sessions lock").unwrap().unwrap();
+        let (workspace_open, split) = inspect_layout.expect("journal wait held the app state lock").unwrap();
+        assert!(workspace_open);
+        assert!(split.is_err(), "the pending close must fence terminal creation within its workspace");
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -7282,7 +7453,7 @@ mod tests {
                     let survivor_shell_id = Uuid::new_v4();
                     let close_app = app.handle().clone();
                     let close_pane = move |session_id: String| {
-                        close_terminal_session(
+                        close_terminal_session_sync(
                             close_app.clone(), close_app.state(), close_app.state(), session_id, None,
                         ).unwrap();
                     };

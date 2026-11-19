@@ -936,7 +936,12 @@ async fn spawn_prepared_session<R: Runtime>(
     let db = app.try_state::<DatabaseStore>();
     let cleanup_target = if let Some((recovery, ownership)) = &guarded_target {
         let mut target = recovery.target.lock().await;
-        reservation.with_current_runtime(|runtime| {
+        loop {
+            reservation.wait_for_close().await;
+            let registered = reservation.with_current_runtime(|runtime| {
+            if runtime.close_fence.is_some() {
+                return Ok(false);
+            }
             if !recovery.register_shell(ownership.shell_id) {
                 return Err(DaemonHydrationFailure::AlreadyReserved);
             }
@@ -961,8 +966,12 @@ async fn spawn_prepared_session<R: Runtime>(
                 // in-memory cleanup target if persistence is unavailable.
                 log::error!("Could not remember existing daemon shell for {session_id}: {error}");
             }
-            Ok(())
-        }).unwrap_or(Err(DaemonHydrationFailure::AlreadyReserved))?;
+            Ok(true)
+            }).unwrap_or(Err(DaemonHydrationFailure::AlreadyReserved))?;
+            if registered {
+                break;
+            }
+        }
         target.client = Some(client.clone());
         Some(target)
     } else {
@@ -972,7 +981,7 @@ async fn spawn_prepared_session<R: Runtime>(
         if let Some((recovery, ownership)) = &guarded_target {
             reservation.with_current_runtime(|runtime| {
                 recovery.acknowledge_shell_closed(ownership.shell_id);
-                if let Some(db) = &db {
+                if let Some(db) = db.as_ref().filter(|_| runtime.close_fence.is_none()) {
                     if let Err(error) = db.forget_daemon_shell(ownership) {
                         log::error!("Could not forget rejected daemon shell for {session_id}: {error}");
                     }
@@ -985,9 +994,9 @@ async fn spawn_prepared_session<R: Runtime>(
     };
     let retain_shell = || {
         if let Some((recovery, ownership)) = &guarded_target {
-            reservation.with_current_runtime(|_| {
+            reservation.with_current_runtime(|runtime| {
                 recovery.retain_shell(ownership.shell_id);
-                if let Some(db) = &db {
+                if let Some(db) = db.as_ref().filter(|_| runtime.close_fence.is_none()) {
                     if let Err(error) = db.retain_daemon_shell(ownership) {
                         log::error!("Could not retire resolved daemon shells for {session_id}: {error}");
                     }

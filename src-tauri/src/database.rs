@@ -1525,6 +1525,11 @@ impl DatabaseStore {
         Self { conn: Mutex::new(conn) }
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_busy_handler(&self, handler: fn(i32) -> bool) {
+        self.conn.lock().unwrap().busy_handler(Some(handler)).unwrap();
+    }
+
     /// Create an in-memory database (fallback if file DB fails, and for tests).
     pub fn new_in_memory() -> Self {
         let conn = Connection::open_in_memory().expect("Failed to open in-memory database");

@@ -155,7 +155,6 @@ fn persist_debouncer() -> &'static PersistDebouncer {
 /// Keep a layout removal out of an already queued save until the terminal
 /// close records have been written. Run process teardown after releasing it.
 pub(crate) fn with_terminal_close_layout_lock<T>(close: impl FnOnce() -> T) -> T {
-    #[cfg(unix)]
     let _write_guard = persist_debouncer().write_lock.lock().unwrap();
     close()
 }
@@ -1126,9 +1125,18 @@ pub struct RemoteAttachWorkspace {
 
 pub struct AppStateStore {
     inner: Mutex<AppStateSnapshot>,
+    terminal_close_scope: Mutex<Option<(WorkspaceId, Option<SurfaceId>)>>,
     // Runtime-only lookup authority, bounded by live workspace ids. Always
     // acquire `inner` first; validation and PR publication share that lock.
     pr_lookup_authorities: Mutex<HashMap<String, Arc<()>>>,
+}
+
+pub(crate) struct TerminalCloseScope<'a>(&'a Mutex<Option<(WorkspaceId, Option<SurfaceId>)>>);
+
+impl Drop for TerminalCloseScope<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().take();
+    }
 }
 
 /// Authority captured before a workspace PR lookup starts. Arc identity is a
@@ -1308,6 +1316,7 @@ impl Default for AppStateStore {
         Self {
             inner: Mutex::new(default_app_state()),
             pr_lookup_authorities: Mutex::new(HashMap::new()),
+            terminal_close_scope: Mutex::new(None),
         }
     }
 }
@@ -4507,6 +4516,80 @@ impl AppStateStore {
         false
     }
 
+    /// Read the original close scope and lease its terminal membership until
+    /// the caller finishes journaling and publishes the removal.
+    pub(crate) fn prepare_terminal_layout_close<T>(
+        &self,
+        intent: &LayoutCloseIntent,
+        prepare: impl FnOnce(&str, &[SessionId]) -> T,
+    ) -> Result<(TerminalCloseScope<'_>, T), String> {
+        let snapshot = self.inner.lock().unwrap();
+        let workspace = |id: &str| snapshot.workspaces.iter().find(|workspace| workspace.workspace_id.0 == id)
+            .ok_or_else(|| format!("No workspace found for {id}"));
+        let (workspace, sessions, scope) = match intent {
+            LayoutCloseIntent::Workspace(id) => {
+                let workspace = workspace(id)?;
+                let sessions = collect_terminal_sessions(&workspace.surfaces).into_iter().map(SessionId).collect();
+                (workspace, sessions, Some(None))
+            }
+            LayoutCloseIntent::Archive(entry) => {
+                let workspace = workspace(&entry.workspace_id)?;
+                let sessions = collect_terminal_sessions(&workspace.surfaces).into_iter().map(SessionId).collect();
+                (workspace, sessions, Some(None))
+            }
+            LayoutCloseIntent::Tab { workspace_id, tab_id } => {
+                let workspace = workspace(workspace_id)?;
+                let tab = workspace.tabs.iter().find(|tab| tab.tab_id == *tab_id)
+                    .ok_or_else(|| format!("No tab found for {tab_id}"))?;
+                let mut sessions = Vec::new();
+                if let Some(surface_id) = &tab.surface_id {
+                    if let Some(surface) = workspace.surfaces.iter().find(|surface| surface.surface_id == *surface_id) {
+                        collect_session_ids_from_tree(&surface.root, &mut sessions);
+                    }
+                }
+                (workspace, sessions, tab.surface_id.clone().map(Some))
+            }
+            LayoutCloseIntent::Pane(id) => {
+                let (workspace, surface) = find_pane_location(&snapshot.workspaces, id)
+                    .ok_or_else(|| format!("No pane found for {id}"))?;
+                let workspace = &snapshot.workspaces[workspace];
+                let root = &workspace.surfaces[surface].root;
+                if let Some(remaining) = remove_pane_from_tree(root, id) {
+                    first_leaf_pane_id(&remaining).ok_or("No fallback pane available after close")?;
+                }
+                let sessions = session_id_for_pane(root, &PaneId(id.clone())).into_iter().collect();
+                (workspace, sessions, None)
+            }
+            LayoutCloseIntent::Session { workspace_id: _, session_id } => {
+                if snapshot.terminal_sessions.len() <= 1 {
+                    return Err("Cannot close the last terminal session".into());
+                }
+                let session = snapshot.terminal_sessions.iter().find(|session| session.session_id.0 == *session_id)
+                    .ok_or_else(|| format!("No terminal session found for {session_id}"))?;
+                let (workspace, surface) = snapshot.workspaces.iter().find_map(|workspace| {
+                    workspace.surfaces.iter().find(|surface| pane_tree_contains_session(&surface.root, session_id))
+                        .map(|surface| (workspace, surface))
+                }).ok_or_else(|| format!("No fallback session available after closing {session_id}"))?;
+                let root = remove_terminal_from_tree(&surface.root, session_id)
+                    .ok_or_else(|| format!("Unable to remove session {session_id} from pane tree"))?;
+                first_terminal_pane(&root).ok_or("Pane tree lost its last terminal pane unexpectedly")?;
+                (workspace, vec![session.session_id.clone()], None)
+            }
+        };
+        *self.terminal_close_scope.lock().unwrap() = scope.map(|surface| (workspace.workspace_id.clone(), surface));
+        let lease = TerminalCloseScope(&self.terminal_close_scope);
+        Ok((lease, prepare(&workspace.workspace_id.0, &sessions)))
+    }
+
+    fn check_terminal_creation(&self, workspace: &WorkspaceId, surface: Option<&SurfaceId>) -> Result<(), String> {
+        if self.terminal_close_scope.lock().unwrap().as_ref().is_some_and(|(closing, target)| {
+            closing == workspace && (target.is_none() || target.as_ref() == surface)
+        }) {
+            return Err("Cannot create a terminal while its workspace or tab is closing".into());
+        }
+        Ok(())
+    }
+
     pub fn close_workspace(&self, workspace_id: &str) -> Result<CloseWorkspaceResult, String> {
         self.close_workspace_with_precommit(workspace_id, |_, _| Ok(()))
             .map(|(result, ())| result)
@@ -4715,12 +4798,13 @@ impl AppStateStore {
     pub fn create_terminal_session(&self) -> Result<SessionId, String> {
         let mut snapshot = self.inner.lock().unwrap();
         let active_workspace_id = snapshot.active_workspace_id.clone();
-        let workspace_terminal_count = snapshot
+        let workspace = snapshot
             .workspaces
             .iter()
             .find(|workspace| workspace.workspace_id == active_workspace_id)
-            .map(terminal_count_for_workspace)
             .ok_or_else(|| "No active workspace available".to_string())?;
+        self.check_terminal_creation(&active_workspace_id, Some(&workspace.active_surface_id))?;
+        let workspace_terminal_count = terminal_count_for_workspace(workspace);
 
         if workspace_terminal_count >= MAX_TERMINAL_SESSIONS {
             return Err(format!(
@@ -4801,6 +4885,8 @@ impl AppStateStore {
             let (workspace_index, surface_index) =
                 find_pane_location(&snapshot.workspaces, pane_id)
                     .ok_or_else(|| format!("No pane found for {pane_id}"))?;
+            let workspace = &snapshot.workspaces[workspace_index];
+            self.check_terminal_creation(&workspace.workspace_id, Some(&workspace.surfaces[surface_index].surface_id))?;
             let workspace_terminal_count = snapshot
                 .workspaces
                 .get(workspace_index)
@@ -6018,6 +6104,7 @@ impl AppStateStore {
             .iter_mut()
             .find(|w| w.workspace_id.0 == workspace_id)
             .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+        self.check_terminal_creation(&workspace.workspace_id, None)?;
 
         let tab_id = next_id("tab");
         let mut new_session_id: Option<SessionId> = None;
