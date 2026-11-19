@@ -372,10 +372,14 @@ impl DaemonReconciliation {
             .unresolved.retain(|id| *id == shell_id);
     }
 
-    fn take_shells_for_close(&self) -> Vec<Uuid> {
+    fn shells_for_close(&self) -> Vec<Uuid> {
+        self.shells.lock().unwrap_or_else(|error| error.into_inner()).unresolved.clone()
+    }
+
+    fn seal_for_close(&self) {
         let mut shells = self.shells.lock().unwrap_or_else(|error| error.into_inner());
         shells.closing = true;
-        std::mem::take(&mut shells.unresolved)
+        shells.unresolved.clear();
     }
 }
 
@@ -2091,7 +2095,10 @@ fn daemon_spawn_failure_status(
     error: daemon_backed::DaemonHydrationFailure,
     is_remote: bool,
 ) -> TerminalStatusPayload {
-    let message = if matches!(error, daemon_backed::DaemonHydrationFailure::RequiresGuardedRecovery) {
+    let message = if matches!(error,
+        daemon_backed::DaemonHydrationFailure::RequiresGuardedRecovery
+        | daemon_backed::DaemonHydrationFailure::OwnershipUnavailable(_)
+    ) {
         error.to_string()
     } else if is_remote {
         format!(
@@ -2771,43 +2778,85 @@ fn terminate_pty_session<R: Runtime>(
     }
 }
 
-/// Capture all shell identities and journal the entire layout operation in
-/// one transaction. The caller holds the layout writer lock through this
-/// handoff and terminates any remaining in-process runtimes after release.
-pub(crate) fn take_terminal_sessions_for_close<R: Runtime>(
+pub(crate) struct CommittedTerminalClose {
+    runtimes: Vec<(state::SessionId, SessionRuntime)>,
+    #[cfg(unix)]
+    daemon: Option<daemon_backed::CommittedDaemonClose>,
+}
+
+impl CommittedTerminalClose {
+    pub(crate) fn finish<R: Runtime>(self, app: &AppHandle<R>) {
+        #[cfg(unix)]
+        if let Some(daemon) = self.daemon {
+            daemon.finish(app);
+        }
+        #[cfg(not(unix))]
+        let _ = app;
+        for (id, runtime) in self.runtimes {
+            terminate_removed_session(runtime, &id.0);
+        }
+    }
+}
+
+/// Journal the close while holding the layout and session locks. Until the
+/// transaction commits, neither layout nor terminal runtimes may change.
+pub(crate) fn commit_terminal_close<R: Runtime>(
     app: &AppHandle<R>,
     sessions: Option<&Arc<Mutex<HashMap<String, SessionRuntime>>>>,
-    workspace_id: Option<&str>,
-    session_ids: impl IntoIterator<Item = state::SessionId>,
+    workspace_id: &str,
+    session_ids: &[state::SessionId],
     intent: state::LayoutCloseIntent,
-) -> Vec<(state::SessionId, SessionRuntime)> {
-    let session_ids: Vec<_> = session_ids.into_iter().collect();
+) -> Result<CommittedTerminalClose, String> {
+    let mut sessions = sessions.map(|sessions| sessions.lock().unwrap_or_else(|error| error.into_inner()));
     #[cfg(unix)]
-    let mut ready = Vec::new();
-    let mut remaining = Vec::new();
-    if let Some(sessions) = sessions {
-        let mut sessions = sessions.lock().unwrap_or_else(|error| error.into_inner());
-        for id in &session_ids {
-            let Some(runtime) = sessions.remove(&id.0) else { continue; };
-            #[cfg(unix)]
-            if let Some(recovery) = runtime.daemon_reconciliation.clone().or_else(|| {
-                Some(Arc::new(DaemonReconciliation::new(
+    let daemon = if let Some(db) = app.try_state::<crate::database::DatabaseStore>()
+        .filter(|db| db.has_durable_close_journal())
+    {
+        let ready = session_ids.iter().filter_map(|id| {
+            let runtime = sessions.as_ref()?.get(&id.0)?;
+            let recovery = runtime.daemon_reconciliation.clone().or_else(|| Some(Arc::new(
+                DaemonReconciliation::new(
                     runtime.daemon_route.clone()?,
                     Some(runtime.daemon_shell_id?),
                     runtime.daemon_client.clone(),
-                )))
-            }) {
-                ready.push(daemon_backed::prepare_closed_pane_cleanup(&id.0, &recovery));
-                continue;
-            }
-            remaining.push((id.clone(), runtime));
+                ),
+            )))?;
+            Some(daemon_backed::prepare_closed_pane_cleanup(&id.0, &recovery))
+        }).collect();
+        let close = daemon_backed::commit_layout_close(&db, intent, workspace_id, session_ids, ready)?;
+        close.seal();
+        Some(close)
+    } else {
+        // Missing and unhydrated runtimes cannot rule out a daemon shell
+        // whose owner exists only in the unavailable on-disk database.
+        let requires_journal = session_ids.iter().any(|id| {
+            !sessions.as_ref().and_then(|sessions| sessions.get(&id.0)).is_some_and(|runtime| {
+                runtime.daemon_reconciliation.is_none() && runtime.daemon_shell_id.is_none()
+                    && if runtime.persistent { runtime.daemon_client.is_some() } else { runtime.child_pid.is_some() }
+            })
+        });
+        if requires_journal {
+            return Err("Cannot close terminal sessions while the durable close journal is unavailable".into());
         }
-    }
-    #[cfg(unix)]
-    daemon_backed::commit_layout_close(app, intent, workspace_id, &session_ids, ready);
+        None
+    };
     #[cfg(not(unix))]
     let _ = (app, workspace_id, intent);
-    remaining
+    let runtimes = session_ids.iter().filter_map(|id| {
+        let runtime = sessions.as_mut()?.remove(&id.0)?;
+        #[cfg(unix)]
+        if runtime.daemon_reconciliation.is_some()
+            || (runtime.daemon_route.is_some() && runtime.daemon_shell_id.is_some())
+        {
+            return None;
+        }
+        Some((id.clone(), runtime))
+    }).collect();
+    Ok(CommittedTerminalClose {
+        runtimes,
+        #[cfg(unix)]
+        daemon,
+    })
 }
 
 /// Terminate a removed runtime. Its waiter thread owns reaping the child.
@@ -2934,17 +2983,16 @@ pub fn close_terminal_session<R: Runtime>(
     session_id: String,
     select: Option<bool>,
 ) -> Result<String, String> {
-    let (fallback_session, runtimes) = state::with_terminal_close_layout_lock(|| {
-        let workspace_id = app_state.workspace_for_terminal_session(&session_id);
-        let fallback = app_state.close_terminal_session_with_selection(&session_id, select.unwrap_or(true))?;
-        let workspace_id = workspace_id.ok_or_else(|| format!("No workspace found for terminal {session_id}"))?;
-        let intent = state::LayoutCloseIntent::Session { workspace_id: workspace_id.0.clone(), session_id: session_id.clone() };
-        let runtimes = take_terminal_sessions_for_close(&app, Some(&terminal_state.sessions), Some(&workspace_id.0), [state::SessionId(session_id.clone())], intent);
-        Ok::<_, String>((fallback, runtimes))
+    let (fallback_session, close) = state::with_terminal_close_layout_lock(|| {
+        app_state.close_terminal_session_with_precommit(&session_id, select.unwrap_or(true), |workspace_id, ids| {
+            let intent = state::LayoutCloseIntent::Session {
+                workspace_id: workspace_id.to_owned(),
+                session_id: session_id.clone(),
+            };
+            commit_terminal_close(&app, Some(&terminal_state.sessions), workspace_id, ids, intent)
+        })
     })?;
-    for (id, runtime) in runtimes {
-        terminate_removed_session(runtime, &id.0);
-    }
+    close.finish(&app);
     state::emit_app_state(&app);
     Ok(fallback_session.0)
 }
@@ -6631,6 +6679,28 @@ mod tests {
         if crate::test_isolation::isolated(TEST) {
             return;
         }
+        assert_initial_daemon_spawn(InitialSpawnCase::CloseBeforeReply).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_daemon_spawn_stops_when_ownership_cannot_be_persisted() {
+        const TEST: &str = "terminal::tests::initial_daemon_spawn_stops_when_ownership_cannot_be_persisted";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        assert_initial_daemon_spawn(InitialSpawnCase::RejectOwnershipInsert).await;
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum InitialSpawnCase {
+        CloseBeforeReply,
+        RejectOwnershipInsert,
+    }
+
+    #[cfg(unix)]
+    async fn assert_initial_daemon_spawn(case: InitialSpawnCase) {
         use crate::database::DatabaseStore;
         use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
         use crate::pty_daemon::protocol::{ClientRequest, ServerResponse, PROTOCOL_VERSION};
@@ -6659,7 +6729,15 @@ mod tests {
             let app = tauri::test::mock_app();
             app.manage(PtyState::default());
             app.manage(AppStateStore::default());
-            app.manage(DatabaseStore::test_file(&root.join("close.sqlite")));
+            let db_path = root.join("close.sqlite");
+            let database = DatabaseStore::test_file(&db_path);
+            if case == InitialSpawnCase::RejectOwnershipInsert {
+                rusqlite::Connection::open(&db_path).unwrap().execute_batch(
+                    "CREATE TRIGGER fail_shell_ownership BEFORE INSERT ON daemon_shell_ownership
+                     BEGIN SELECT RAISE(ABORT, 'fixture rejected shell ownership'); END;",
+                ).unwrap();
+            }
+            app.manage(database);
             let layout = app.state::<AppStateStore>();
             let original = layout.active_terminal_session_id().unwrap().0;
             let plan = layout.pty_hydration_plan_for_session(&original).unwrap();
@@ -6691,13 +6769,47 @@ mod tests {
                 sessions: Vec::new(),
             }).await;
 
+            let db = app.state::<DatabaseStore>();
+            if case == InitialSpawnCase::RejectOwnershipInsert {
+                let terminal = app.state::<PtyState>();
+                let failure = async {
+                    loop {
+                        let message = with_existing_session_runtime(&terminal.sessions, &new_session, |runtime| {
+                            matches!(runtime.last_status.state, TerminalLifecycleState::Failed).then(|| {
+                                assert!(!runtime.is_spawning, "pane must be able to retry");
+                                assert!(runtime.writer.is_none(), "no shell should have started");
+                                runtime.last_status.message.clone().unwrap()
+                            })
+                        }).flatten();
+                        if let Some(message) = message {
+                            break message;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                };
+                tokio::pin!(failure);
+                let message = tokio::select! {
+                    biased;
+                    line = lines.next_line() => {
+                        let line = line.unwrap();
+                        assert!(line.is_none(), "failed ownership write sent a daemon frame: {line:?}");
+                        failure.await
+                    }
+                    message = &mut failure => message,
+                };
+                assert!(message.contains("fixture rejected shell ownership"), "{message}");
+                assert!(layout.pty_hydration_plan_for_session(&new_session).is_some());
+                assert!(db.daemon_shell_ownership().unwrap().is_empty());
+                assert!(db.pending_daemon_closes().unwrap().is_empty());
+                return;
+            }
+
             let prepared = request(&mut lines).await;
             let ClientRequest::PrepareOwnedSpawn { request_id, session_id, shell_id } = prepared else {
                 panic!("expected a revocable permit for the new pane: {prepared:?}");
             };
             assert_eq!(session_id, new_session);
             assert!(!shell_id.is_nil());
-            let db = app.state::<DatabaseStore>();
             let ownership = db.daemon_shell_ownership().unwrap();
             assert_eq!(ownership.len(), 1);
             assert_eq!(ownership[0].route.workspace_id, plan.workspace.workspace_id);
@@ -6740,7 +6852,7 @@ mod tests {
             assert!(layout.pty_hydration_plan_for_session(&new_session).is_none());
             let terminals = app.state::<PtyState>();
             assert!(with_existing_session_runtime(&terminals.sessions, &new_session, |_| ()).is_none());
-        }).await.expect("the newly created pane's daemon shell should close within the test deadline");
+        }).await.expect("initial daemon spawn fixture did not finish within the test deadline");
     }
 
     #[cfg(unix)]
@@ -6760,11 +6872,85 @@ mod tests {
     const INACTIVE_CLOSE_DB: &str = "inactive-close.sqlite";
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn inactive_workspace_close_leaves_state_intact_when_journal_insert_fails() {
+        use crate::database::daemon_closes::PendingDaemonClose;
+        use crate::database::DatabaseStore;
+
+        const TEST: &str = "terminal::tests::inactive_workspace_close_leaves_state_intact_when_journal_insert_fails";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db_path = root.join(INACTIVE_CLOSE_DB);
+        let prior_layout = AppStateStore::default();
+        let active = prior_layout.snapshot().active_workspace_id.0;
+        let folder = root.join("inactive");
+        std::fs::create_dir(&folder).unwrap();
+        let inactive = prior_layout.create_workspace_with_layout(folder, state::WorkspacePresetLayout::Single).0;
+        let plan = prior_layout.pty_hydration_plan_for_workspace(&inactive).unwrap();
+        let dormant = &plan.sessions[0];
+        let sibling = prior_layout.split_pane(dormant.pane_id.as_deref().unwrap(), state::SplitDirection::Horizontal).unwrap();
+        assert!(prior_layout.activate_workspace(&active));
+        state::flush_persisted_state(&prior_layout);
+        let path = root.join("layout.json");
+        let saved = std::fs::read(&path).unwrap();
+
+        let ownership = PendingDaemonClose {
+            route: DaemonWorkspaceRoute { workspace_id: inactive.clone(), host_id: None, ssh_target: None },
+            session_id: dormant.session_id.clone(),
+            shell_id: Uuid::from_u128(1),
+        };
+        DatabaseStore::test_file(&db_path).remember_daemon_shell(&ownership).unwrap();
+        let restored = AppStateStore::default();
+        restored.replace_snapshot(state::load_persisted_state().unwrap());
+        let app = tauri::test::mock_app();
+        app.manage(restored);
+        app.manage(PtyState::default());
+        app.manage(DatabaseStore::test_file(&db_path));
+        let db = app.state::<DatabaseStore>();
+        let layout = app.state::<AppStateStore>();
+        let sessions = &app.state::<PtyState>().inner().sessions;
+        // This sibling has a pending runtime, but the dormant shell's UUID
+        // remains known only to the file-backed ownership table.
+        let sibling_token = try_reserve_session_spawn(sessions, &sibling.0).unwrap();
+        let before = serde_json::to_value(layout.snapshot()).unwrap();
+        let fault = rusqlite::Connection::open(&db_path).unwrap();
+        fault.execute_batch(
+            "CREATE TRIGGER reject_close_insert BEFORE INSERT ON pending_daemon_closes
+             BEGIN SELECT RAISE(ABORT, 'fixture rejected pending close'); END;",
+        ).unwrap();
+
+        let close = || crate::commands::workspace::close_workspace(
+            app.handle().clone(), app.state(), app.state(), inactive.clone(), Some(true),
+        );
+        let error = close().await.unwrap_err();
+        assert!(error.contains("fixture rejected pending close"), "{error}");
+        assert_eq!(serde_json::to_value(layout.snapshot()).unwrap(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(with_existing_session_runtime(sessions, &sibling.0, |runtime| {
+            (runtime.restart_token, runtime.is_spawning)
+        }), Some((sibling_token, true)));
+        assert!(with_existing_session_runtime(sessions, &dormant.session_id, |_| ()).is_none());
+        assert_eq!(db.daemon_shell_ownership().unwrap(), [ownership.clone()]);
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+        assert!(db.pending_daemon_closes().unwrap().is_empty());
+
+        fault.execute_batch("DROP TRIGGER reject_close_insert").unwrap();
+        let _offline_daemon = bind_unresponsive_daemon_fixture(&root);
+        assert_eq!(close().await.unwrap(), active);
+        assert!(layout.find_workspace(&inactive).is_none());
+        assert!(with_existing_session_runtime(sessions, &sibling.0, |_| ()).is_none());
+        assert!(db.daemon_shell_ownership().unwrap().is_empty());
+        assert_eq!(db.pending_daemon_closes().unwrap(), [ownership]);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn restored_inactive_workspace_replays_its_exact_daemon_close() {
         use crate::database::daemon_closes::PendingDaemonClose;
         use crate::database::DatabaseStore;
-        use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
 
         const TEST: &str = "terminal::tests::restored_inactive_workspace_replays_its_exact_daemon_close";
         const CLOSING_PROCESS: &str = "CODEMUX_TEST_INACTIVE_CLOSE_PROCESS";
@@ -6824,17 +7010,7 @@ mod tests {
             close
         };
 
-        // Leave a real socket bound without answering its handshake. The
-        // closing process cannot reach the daemon before it exits.
-        let socket_path = root.join("offline-daemon.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        write_manifest(&DaemonManifest {
-            pid: std::process::id(),
-            socket_path,
-            daemon_version: env!("CARGO_PKG_VERSION").into(),
-            protocol_version: crate::pty_daemon::PROTOCOL_VERSION,
-            started_at: 0,
-        }).unwrap();
+        let listener = bind_unresponsive_daemon_fixture(&root);
         run_close_fixture_process(TEST, CLOSING_PROCESS);
         drop(listener);
 
@@ -6844,6 +7020,23 @@ mod tests {
             assert_eq!(db.pending_daemon_closes().unwrap(), [close]);
         }
         tauri::async_runtime::block_on(assert_exact_close_replays(INACTIVE_CLOSE_DB, Some(Uuid::from_u128(2))));
+    }
+
+    #[cfg(unix)]
+    fn bind_unresponsive_daemon_fixture(root: &std::path::Path) -> std::os::unix::net::UnixListener {
+        use crate::pty_daemon::manifest::{write_manifest, DaemonManifest};
+
+        // Let callers dial without ever completing a handshake or close.
+        let socket_path = root.join("offline-daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        write_manifest(&DaemonManifest {
+            pid: std::process::id(),
+            socket_path,
+            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            protocol_version: crate::pty_daemon::PROTOCOL_VERSION,
+            started_at: 0,
+        }).unwrap();
+        listener
     }
 
     #[cfg(unix)]
@@ -7071,11 +7264,8 @@ mod tests {
                     let app = tauri::test::mock_app();
                     app.manage(PtyState::default());
                     app.manage(AppStateStore::default());
-                    app.manage(if installed_outage {
-                        crate::database::DatabaseStore::test_file(&root.join(INSTALLED_CLOSE_DB))
-                    } else {
-                        crate::database::DatabaseStore::new_in_memory()
-                    });
+                    let db_file = if installed_outage { INSTALLED_CLOSE_DB } else { "reconnect.sqlite" };
+                    app.manage(crate::database::DatabaseStore::test_file(&root.join(db_file)));
                     let layout_state = app.state::<AppStateStore>();
                     let id = layout_state.active_terminal_session_id().unwrap().0;
                     let workspace_id = layout_state.snapshot().active_workspace_id.0;

@@ -221,6 +221,7 @@ const HYDRATION_CONCURRENCY: usize = 4;
 pub(crate) enum DaemonHydrationFailure {
     AlreadyReserved,
     RequiresGuardedRecovery,
+    OwnershipUnavailable(String),
     SafeToFallback(String),
     Ambiguous(String),
 }
@@ -241,6 +242,9 @@ impl std::fmt::Display for DaemonHydrationFailure {
             Self::AlreadyReserved => f.write_str("session already reserved by another spawn"),
             Self::RequiresGuardedRecovery => {
                 f.write_str("update the terminal daemon on its host before retrying this shell")
+            }
+            Self::OwnershipUnavailable(message) => {
+                write!(f, "Could not save terminal shell ownership: {message}. Retry when local storage is available.")
             }
             Self::SafeToFallback(message) | Self::Ambiguous(message) => f.write_str(message),
         }
@@ -932,22 +936,33 @@ async fn spawn_prepared_session<R: Runtime>(
     let db = app.try_state::<DatabaseStore>();
     let cleanup_target = if let Some((recovery, ownership)) = &guarded_target {
         let mut target = recovery.target.lock().await;
-        let registered = reservation.with_current_runtime(|_| {
+        reservation.with_current_runtime(|runtime| {
             if !recovery.register_shell(ownership.shell_id) {
-                return false;
+                return Err(DaemonHydrationFailure::AlreadyReserved);
             }
             // Permanent close takes the same sessions lock before collecting
             // ownership. It either sees this UUID or prevents the RPC.
-            if let Some(db) = &db {
-                if let Err(error) = db.remember_daemon_shell(ownership) {
-                    log::error!("Could not remember daemon shell for {session_id}: {error}");
+            let remembered = db.as_ref()
+                .ok_or_else(|| "Terminal shell ownership database is unavailable".to_owned())
+                .and_then(|db| db.remember_daemon_shell(ownership));
+            if let Err(error) = remembered {
+                if !reattached {
+                    // No request has been sent. Drop only this proposed UUID
+                    // and leave any earlier shell owned by the retry.
+                    recovery.acknowledge_shell_closed(ownership.shell_id);
+                    if !reconciling {
+                        runtime.daemon_reconciliation = None;
+                    }
+                    // List omits active spawns, so this does not establish
+                    // that a new in-process shell would be safe.
+                    return Err(DaemonHydrationFailure::OwnershipUnavailable(error));
                 }
+                // Attachment does not create a shell. Keep its exact
+                // in-memory cleanup target if persistence is unavailable.
+                log::error!("Could not remember existing daemon shell for {session_id}: {error}");
             }
-            true
-        }).unwrap_or(false);
-        if !registered {
-            return Err(DaemonHydrationFailure::AlreadyReserved);
-        }
+            Ok(())
+        }).unwrap_or(Err(DaemonHydrationFailure::AlreadyReserved))?;
         target.client = Some(client.clone());
         Some(target)
     } else {
@@ -1280,7 +1295,6 @@ pub(super) struct PreparedDaemonClose {
     session_id: String,
     shell_ids: Vec<Uuid>,
     recovery: Option<Arc<DaemonReconciliation>>,
-    journaled: bool,
 }
 
 impl PreparedDaemonClose {
@@ -1300,8 +1314,7 @@ pub(super) struct PendingDaemonCloses {
     routes: Mutex<HashMap<DaemonWorkspaceRoute, VecDeque<PreparedDaemonClose>>>,
 }
 
-/// Seal shell admission and collect every unresolved identity for the
-/// close command's SQLite transaction.
+/// Collect unresolved identities without changing a live reservation.
 pub(super) fn prepare_closed_pane_cleanup(
     session_id: &str,
     recovery: &Arc<DaemonReconciliation>,
@@ -1309,52 +1322,64 @@ pub(super) fn prepare_closed_pane_cleanup(
     PreparedDaemonClose {
         route: recovery.route.clone(),
         session_id: session_id.to_owned(),
-        shell_ids: recovery.take_shells_for_close(),
+        shell_ids: recovery.shells_for_close(),
         recovery: Some(recovery.clone()),
-        journaled: false,
     }
 }
 
-pub(super) fn commit_layout_close<R: Runtime>(
-    app: &AppHandle<R>,
+pub(super) struct CommittedDaemonClose {
     intent: LayoutCloseIntent,
-    workspace_id: Option<&str>,
-    closed_sessions: &[SessionId],
-    mut requests: Vec<PreparedDaemonClose>,
-) {
-    let mut restored = Vec::new();
-    if let Some(db) = app.try_state::<DatabaseStore>() {
-        let closes: Vec<_> = requests.iter().flat_map(PreparedDaemonClose::records).collect();
-        match db.record_layout_close_with_shell_ownership(&intent, workspace_id, closed_sessions, &closes) {
-            Ok(owners) => {
-                for request in &mut requests {
-                    request.journaled = true;
-                }
-                for owner in owners {
-                    let live = requests.iter_mut().find(|request| {
-                        request.route == owner.route && request.session_id == owner.session_id
-                    });
-                    if let Some(request) = live {
-                        if !request.shell_ids.contains(&owner.shell_id) {
-                            request.shell_ids.push(owner.shell_id);
-                        }
-                    } else {
-                        restored.push(owner);
-                    }
-                }
-                // Archive becomes visible only once the shared close finishes.
-                // Its caller schedules the layout save at that point.
-                if !matches!(&intent, LayoutCloseIntent::Archive(_)) {
-                    persist_pending_layout_closes(app, vec![intent]);
-                }
+    requests: Vec<PreparedDaemonClose>,
+    restored: Vec<PendingDaemonClose>,
+}
+
+impl CommittedDaemonClose {
+    /// Registration takes the same sessions lock as the close caller.
+    /// Seal admission once the exact identities have reached SQLite.
+    pub(super) fn seal(&self) {
+        for request in &self.requests {
+            if let Some(recovery) = &request.recovery {
+                recovery.seal_for_close();
             }
-            Err(error) => log::error!("Could not journal layout close {intent:?}: {error}"),
         }
     }
-    for request in requests {
-        queue_closed_pane_cleanup(app.clone(), request);
+
+    pub(super) fn finish<R: Runtime>(self, app: &AppHandle<R>) {
+        // Archive becomes visible after the shared close finishes.
+        if !matches!(&self.intent, LayoutCloseIntent::Archive(_)) {
+            persist_pending_layout_closes(app, vec![self.intent]);
+        }
+        for request in self.requests {
+            queue_closed_pane_cleanup(app.clone(), request);
+        }
+        resume_pending_daemon_closes(app, self.restored);
     }
-    resume_pending_daemon_closes(app, restored);
+}
+
+pub(super) fn commit_layout_close(
+    db: &DatabaseStore,
+    intent: LayoutCloseIntent,
+    workspace_id: &str,
+    closed_sessions: &[SessionId],
+    mut requests: Vec<PreparedDaemonClose>,
+) -> Result<CommittedDaemonClose, String> {
+    let mut restored = Vec::new();
+    let closes: Vec<_> = requests.iter().flat_map(PreparedDaemonClose::records).collect();
+    let owners = db.record_layout_close_with_shell_ownership(&intent, Some(workspace_id), closed_sessions, &closes)
+        .map_err(|error| format!("Could not journal layout close: {error}"))?;
+    for owner in owners {
+        let live = requests.iter_mut().find(|request| {
+            request.route == owner.route && request.session_id == owner.session_id
+        });
+        if let Some(request) = live {
+            if !request.shell_ids.contains(&owner.shell_id) {
+                request.shell_ids.push(owner.shell_id);
+            }
+        } else {
+            restored.push(owner);
+        }
+    }
+    Ok(CommittedDaemonClose { intent, requests, restored })
 }
 
 pub(crate) fn persist_pending_layout_closes<R: Runtime>(
@@ -1409,7 +1434,6 @@ pub(crate) fn resume_pending_daemon_closes<R: Runtime>(
             session_id,
             shell_ids,
             recovery: None,
-            journaled: true,
         });
     }
 }
@@ -1457,17 +1481,15 @@ async fn drain_pending_daemon_closes<R: Runtime>(
                         && client.close_owned(request.session_id.clone(), shell_id).await.is_ok()
                 }).await;
             }
-            if request.journaled {
-                let app = app.clone();
-                let session_id = request.session_id.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    app.state::<DatabaseStore>().retire_completed_daemon_closes(
-                        &request.route, &request.session_id, &request.shell_ids,
-                    )
-                }).await.map_err(|error| error.to_string()).and_then(|result| result);
-                if let Err(error) = result {
-                    log::error!("Could not retire acknowledged terminal close for {session_id}: {error}");
-                }
+            let app = app.clone();
+            let session_id = request.session_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                app.state::<DatabaseStore>().retire_completed_daemon_closes(
+                    &request.route, &request.session_id, &request.shell_ids,
+                )
+            }).await.map_err(|error| error.to_string()).and_then(|result| result);
+            if let Err(error) = result {
+                log::error!("Could not retire acknowledged terminal close for {session_id}: {error}");
             }
             continue;
         }
@@ -1719,6 +1741,7 @@ mod tests {
             let close = super::prepare_closed_pane_cleanup(&session_id, &recovery);
             app.state::<DatabaseStore>()
                 .record_layout_close(&intent, &close.records().collect::<Vec<_>>()).unwrap();
+            recovery.seal_for_close();
             assert!(!recovery.register_shell(uuid::Uuid::new_v4()));
             // The close command's layout save and both daemon requests are pending.
         }

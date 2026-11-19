@@ -164,6 +164,10 @@ fn read_shell_records(
 }
 
 impl DatabaseStore {
+    pub(crate) fn has_durable_close_journal(&self) -> bool {
+        self.conn.lock().unwrap().path().is_some_and(|path| !path.is_empty())
+    }
+
     #[cfg(test)]
     pub(crate) fn record_layout_close(
         &self,
@@ -223,7 +227,11 @@ impl DatabaseStore {
     }
 
     pub(crate) fn remember_daemon_shell(&self, shell: &PendingDaemonClose) -> Result<(), String> {
-        insert_owned_shell(&self.conn.lock().unwrap(), shell)
+        let conn = self.conn.lock().unwrap();
+        if conn.path().is_none_or(str::is_empty) {
+            return Err("Terminal shell ownership has no on-disk database".into());
+        }
+        insert_owned_shell(&conn, shell)
     }
 
     /// The caller still owns the live reservation and has proved the other
@@ -384,6 +392,22 @@ impl DatabaseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_database_cannot_record_guarded_shell_ownership() {
+        let db = DatabaseStore::new_in_memory();
+        let shell = PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: "workspace-1".into(),
+                host_id: None,
+                ssh_target: None,
+            },
+            session_id: "session-2".into(),
+            shell_id: Uuid::new_v4(),
+        };
+        assert!(db.remember_daemon_shell(&shell).is_err());
+        assert!(db.daemon_shell_ownership().unwrap().is_empty());
+    }
 
     #[test]
     fn dormant_daemon_shell_ownership_moves_atomically_with_its_workspace_close() {

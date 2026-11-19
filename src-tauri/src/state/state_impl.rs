@@ -4508,75 +4508,35 @@ impl AppStateStore {
     }
 
     pub fn close_workspace(&self, workspace_id: &str) -> Result<CloseWorkspaceResult, String> {
+        self.close_workspace_with_precommit(workspace_id, |_, _| Ok(()))
+            .map(|(result, ())| result)
+    }
+
+    pub(crate) fn close_workspace_with_precommit<T>(
+        &self,
+        workspace_id: &str,
+        precommit: impl FnOnce(&str, &[SessionId]) -> Result<T, String>,
+    ) -> Result<(CloseWorkspaceResult, T), String> {
         let mut snapshot = self.inner.lock().unwrap();
-
-        if snapshot.workspaces.len() <= 1 {
-            let workspace_index = snapshot
-                .workspaces
-                .iter()
-                .position(|workspace| workspace.workspace_id.0 == workspace_id)
-                .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
-
-            let removed = snapshot.workspaces.remove(workspace_index);
-            self.pr_lookup_authorities
-                .lock()
-                .unwrap()
-                .remove(workspace_id);
-            let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
-            let removed_agent_chat_threads = collect_agent_chat_threads(&removed.surfaces);
-            snapshot
-                .notifications
-                .retain(|notification| notification.workspace_id != removed.workspace_id);
-            snapshot.terminal_sessions.retain(|session| {
-                !removed_session_id_strings
-                    .iter()
-                    .any(|id| id == &session.session_id.0)
-            });
-            let removed_agent_browser_sessions: Vec<String> = snapshot
-                .agent_browser_sessions
-                .iter()
-                .filter(|s| s.workspace_id.0 == workspace_id)
-                .map(|s| s.cli_session_name.clone())
-                .collect();
-            snapshot
-                .agent_browser_sessions
-                .retain(|s| s.workspace_id.0 != workspace_id);
-            snapshot.active_workspace_id = WorkspaceId("".into());
-            // Every pane in the workspace just went away, and with it any
-            // `codemux monitor start` claim made against one.
-            prune_manual_monitors(&mut snapshot);
-            return Ok(CloseWorkspaceResult {
-                fallback: WorkspaceId("".into()),
-                removed_sessions: removed_session_id_strings
-                    .into_iter()
-                    .map(SessionId)
-                    .collect(),
-                removed_agent_chat_threads,
-                removed_agent_browser_sessions,
-            });
-        }
-
         let workspace_index = snapshot
             .workspaces
             .iter()
             .position(|workspace| workspace.workspace_id.0 == workspace_id)
             .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
 
+        let removed_sessions: Vec<_> = collect_terminal_sessions(&snapshot.workspaces[workspace_index].surfaces)
+            .into_iter().map(SessionId).collect();
+        let prepared = precommit(workspace_id, &removed_sessions)?;
         let removed = snapshot.workspaces.remove(workspace_index);
         self.pr_lookup_authorities
             .lock()
             .unwrap()
             .remove(workspace_id);
-        let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
         let removed_agent_chat_threads = collect_agent_chat_threads(&removed.surfaces);
         snapshot
             .notifications
             .retain(|notification| notification.workspace_id != removed.workspace_id);
-        snapshot.terminal_sessions.retain(|session| {
-            !removed_session_id_strings
-                .iter()
-                .any(|id| id == &session.session_id.0)
-        });
+        snapshot.terminal_sessions.retain(|session| !removed_sessions.contains(&session.session_id));
         let removed_agent_browser_sessions: Vec<String> = snapshot
             .agent_browser_sessions
             .iter()
@@ -4592,22 +4552,19 @@ impl AppStateStore {
             .find(|w| w.workspace_id == snapshot.active_workspace_id)
             .or_else(|| snapshot.workspaces.first())
             .map(|workspace| workspace.workspace_id.clone())
-            .ok_or_else(|| "No fallback workspace available".to_string())?;
+            .unwrap_or_else(|| WorkspaceId(String::new()));
         snapshot.active_workspace_id = fallback_workspace.clone();
         // Same for the ordinary multi-workspace path: archiving routes
         // through here too (`close_workspace_with_worktree_impl`), so this is
         // the one choke point both removals share.
         prune_manual_monitors(&mut snapshot);
 
-        Ok(CloseWorkspaceResult {
+        Ok((CloseWorkspaceResult {
             fallback: fallback_workspace,
-            removed_sessions: removed_session_id_strings
-                .into_iter()
-                .map(SessionId)
-                .collect(),
+            removed_sessions,
             removed_agent_chat_threads,
             removed_agent_browser_sessions,
-        })
+        }, prepared))
     }
 
     /// Add an archive entry, first evicting any stale entry for the same
@@ -4960,15 +4917,21 @@ impl AppStateStore {
         self.close_terminal_session_with_selection(session_id, true)
     }
 
-    pub(crate) fn workspace_for_terminal_session(&self, session_id: &str) -> Option<WorkspaceId> {
-        find_workspace_id_for_session(&self.inner.lock().unwrap().workspaces, session_id)
-    }
-
     pub fn close_terminal_session_with_selection(
         &self,
         session_id: &str,
         select: bool,
     ) -> Result<SessionId, String> {
+        self.close_terminal_session_with_precommit(session_id, select, |_, _| Ok(()))
+            .map(|(fallback, ())| fallback)
+    }
+
+    pub(crate) fn close_terminal_session_with_precommit<T>(
+        &self,
+        session_id: &str,
+        select: bool,
+        precommit: impl FnOnce(&str, &[SessionId]) -> Result<T, String>,
+    ) -> Result<(SessionId, T), String> {
         let mut snapshot = self.inner.lock().unwrap();
         Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
             if snapshot.terminal_sessions.len() <= 1 {
@@ -4980,41 +4943,27 @@ impl AppStateStore {
                 .iter()
                 .position(|session| session.session_id.0 == session_id)
                 .ok_or_else(|| format!("No terminal session found for {session_id}"))?;
+            let (workspace_index, surface_index) = snapshot.workspaces.iter().enumerate().find_map(|(index, workspace)| {
+                workspace.surfaces.iter().position(|surface| pane_tree_contains_session(&surface.root, session_id))
+                    .map(|surface| (index, surface))
+            }).ok_or_else(|| format!("No fallback session available after closing {session_id}"))?;
+            let workspace = &snapshot.workspaces[workspace_index];
+            let surface = &workspace.surfaces[surface_index];
+            let updated_root = remove_terminal_from_tree(&surface.root, session_id)
+                .ok_or_else(|| format!("Unable to remove session {session_id} from pane tree"))?;
+            let (next_pane_id, next_session_id) = first_terminal_pane(&updated_root)
+                .ok_or_else(|| "Pane tree lost its last terminal pane unexpectedly".to_string())?;
+            let closing = &snapshot.terminal_sessions[session_index].session_id;
+            let prepared = precommit(&workspace.workspace_id.0, std::slice::from_ref(closing))?;
+
             snapshot.terminal_sessions.remove(session_index);
-
-            let mut fallback_session_id: Option<SessionId> = None;
-            let mut next_active_workspace_id: Option<WorkspaceId> = None;
-
-            for workspace in &mut snapshot.workspaces {
-                for surface in &mut workspace.surfaces {
-                    if !pane_tree_contains_session(&surface.root, session_id) {
-                        continue;
-                    }
-
-                    let updated_root = remove_terminal_from_tree(&surface.root, session_id)
-                        .ok_or_else(|| {
-                            format!("Unable to remove session {session_id} from pane tree")
-                        })?;
-                    let (next_pane_id, next_session_id) = first_terminal_pane(&updated_root)
-                        .ok_or_else(|| {
-                            "Pane tree lost its last terminal pane unexpectedly".to_string()
-                        })?;
-
-                    surface.root = updated_root;
-                    surface.active_pane_id = next_pane_id;
-                    workspace.active_surface_id = surface.surface_id.clone();
-                    next_active_workspace_id = Some(workspace.workspace_id.clone());
-                    fallback_session_id = Some(next_session_id);
-                    break;
-                }
-            }
-
-            if let Some(workspace_id) = next_active_workspace_id {
-                snapshot.active_workspace_id = workspace_id;
-            }
-
-            fallback_session_id
-                .ok_or_else(|| format!("No fallback session available after closing {session_id}"))
+            let workspace = &mut snapshot.workspaces[workspace_index];
+            let surface = &mut workspace.surfaces[surface_index];
+            surface.root = updated_root;
+            surface.active_pane_id = next_pane_id;
+            workspace.active_surface_id = surface.surface_id.clone();
+            snapshot.active_workspace_id = workspace.workspace_id.clone();
+            Ok((next_session_id, prepared))
         })
     }
 
@@ -5046,6 +4995,16 @@ impl AppStateStore {
         pane_id: &str,
         select: bool,
     ) -> Result<Option<SessionId>, String> {
+        self.close_pane_with_precommit(pane_id, select, |_, _| Ok(()))
+            .map(|(removed, ())| removed)
+    }
+
+    pub(crate) fn close_pane_with_precommit<T>(
+        &self,
+        pane_id: &str,
+        select: bool,
+        precommit: impl FnOnce(&str, &[SessionId]) -> Result<T, String>,
+    ) -> Result<(Option<SessionId>, T), String> {
         let mut snapshot = self.inner.lock().unwrap();
         Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
             let (workspace_index, surface_index) =
@@ -5053,49 +5012,30 @@ impl AppStateStore {
                     .ok_or_else(|| format!("No pane found for {pane_id}"))?;
 
             let target_pane = PaneId(pane_id.to_string());
-            let removed_session_id = {
-                let surface = snapshot
-                    .workspaces
-                    .get(workspace_index)
-                    .and_then(|workspace| workspace.surfaces.get(surface_index))
-                    .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
-                session_id_for_pane(&surface.root, &target_pane)
+            let workspace = &snapshot.workspaces[workspace_index];
+            let surface = &workspace.surfaces[surface_index];
+            let removed_session_id = session_id_for_pane(&surface.root, &target_pane);
+            let removed_browser_id = browser_id_for_pane(&surface.root, &target_pane);
+            let remaining_panes = if let Some(new_root) = remove_pane_from_tree(&surface.root, pane_id) {
+                // Keep focus on the current pane if it survived. Otherwise
+                // prefer the neighbor over the leftmost leaf.
+                let ordered_before = collect_leaf_pane_ids(&surface.root);
+                let next_active_pane = active_id_after_removal(&ordered_before, &surface.active_pane_id, pane_id)
+                    .filter(|pid| pane_tree_contains_pane(&new_root, &pid.0))
+                    .or_else(|| first_leaf_pane_id(&new_root))
+                    .ok_or_else(|| "No fallback pane available after close".to_string())?;
+                Some((new_root, next_active_pane))
+            } else {
+                None
             };
-            let removed_browser_id = {
-                let surface = snapshot
-                    .workspaces
-                    .get(workspace_index)
-                    .and_then(|workspace| workspace.surfaces.get(surface_index))
-                    .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
-                browser_id_for_pane(&surface.root, &target_pane)
-            };
+            let prepared = precommit(&workspace.workspace_id.0, removed_session_id.as_slice())?;
 
             let active_workspace_id: WorkspaceId;
 
             {
-                let workspace = snapshot
-                    .workspaces
-                    .get_mut(workspace_index)
-                    .ok_or_else(|| "Workspace disappeared while closing pane".to_string())?;
-                let surface = workspace
-                    .surfaces
-                    .get_mut(surface_index)
-                    .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
-
-                let ordered_before = collect_leaf_pane_ids(&surface.root);
-                let active_before = surface.active_pane_id.clone();
-                let updated_root = remove_pane_from_tree(&surface.root, pane_id);
-
-                if let Some(new_root) = updated_root {
-                    // Pane removed but surface still has content. Keep focus on the
-                    // current pane when a different pane was closed; when the active
-                    // pane itself was closed, move to the adjacent pane (next, then
-                    // previous) rather than the leftmost leaf.
-                    let next_active_pane =
-                        active_id_after_removal(&ordered_before, &active_before, pane_id)
-                            .filter(|pid| pane_tree_contains_pane(&new_root, &pid.0))
-                            .or_else(|| first_leaf_pane_id(&new_root))
-                            .ok_or_else(|| "No fallback pane available after close".to_string())?;
+                let workspace = &mut snapshot.workspaces[workspace_index];
+                if let Some((new_root, next_active_pane)) = remaining_panes {
+                    let surface = &mut workspace.surfaces[surface_index];
                     surface.root = new_root;
                     surface.active_pane_id = next_active_pane;
                     workspace.active_surface_id = surface.surface_id.clone();
@@ -5148,7 +5088,7 @@ impl AppStateStore {
                     .retain(|browser| browser.browser_id != browser_id);
             }
 
-            Ok(removed_session_id)
+            Ok((removed_session_id, prepared))
         })
     }
 
@@ -6195,6 +6135,16 @@ impl AppStateStore {
     }
 
     pub fn close_tab(&self, workspace_id: &str, tab_id: &str) -> Result<CloseTabResult, String> {
+        self.close_tab_with_precommit(workspace_id, tab_id, |_, _| Ok(()))
+            .map(|(result, ())| result)
+    }
+
+    pub(crate) fn close_tab_with_precommit<T>(
+        &self,
+        workspace_id: &str,
+        tab_id: &str,
+        precommit: impl FnOnce(&str, &[SessionId]) -> Result<T, String>,
+    ) -> Result<(CloseTabResult, T), String> {
         let mut snapshot = self.inner.lock().unwrap();
         let workspace = snapshot
             .workspaces
@@ -6208,7 +6158,7 @@ impl AppStateStore {
             .position(|t| t.tab_id == tab_id)
             .ok_or_else(|| format!("No tab found for {tab_id}"))?;
 
-        let tab = workspace.tabs.remove(tab_index);
+        let tab = &workspace.tabs[tab_index];
 
         // Collect resources to clean up
         let mut removed_sessions: Vec<SessionId> = vec![];
@@ -6223,20 +6173,20 @@ impl AppStateStore {
 
         // If terminal tab, remove its surface and collect session + browser IDs
         // from the pane tree (browser panes are embedded in splits, not on the tab).
-        if let Some(ref surface_id) = tab.surface_id {
-            if let Some(surface_index) = workspace
-                .surfaces
-                .iter()
-                .position(|s| s.surface_id == *surface_id)
-            {
-                let surface = workspace.surfaces.remove(surface_index);
-                collect_session_ids_from_tree(&surface.root, &mut removed_sessions);
-                collect_browser_ids_from_tree(&surface.root, &mut removed_browser_ids);
-                collect_agent_chat_threads_from_tree(
-                    &surface.root,
-                    &mut removed_agent_chat_threads,
-                );
-            }
+        let surface_index = tab.surface_id.as_ref().and_then(|surface_id| {
+            workspace.surfaces.iter().position(|surface| surface.surface_id == *surface_id)
+        });
+        if let Some(index) = surface_index {
+            let surface = &workspace.surfaces[index];
+            collect_session_ids_from_tree(&surface.root, &mut removed_sessions);
+            collect_browser_ids_from_tree(&surface.root, &mut removed_browser_ids);
+            collect_agent_chat_threads_from_tree(&surface.root, &mut removed_agent_chat_threads);
+        }
+
+        let prepared = precommit(workspace_id, &removed_sessions)?;
+        workspace.tabs.remove(tab_index);
+        if let Some(index) = surface_index {
+            workspace.surfaces.remove(index);
         }
 
         // If closed tab was active, activate adjacent tab (or clear if no tabs left)
@@ -6276,11 +6226,11 @@ impl AppStateStore {
                 .retain(|b| b.browser_id != *browser_id);
         }
 
-        Ok(CloseTabResult {
+        Ok((CloseTabResult {
             removed_sessions,
             removed_browser_ids,
             removed_agent_chat_threads,
-        })
+        }, prepared))
     }
 
     pub fn activate_tab(&self, workspace_id: &str, tab_id: &str) -> Result<(), String> {

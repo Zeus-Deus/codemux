@@ -1507,15 +1507,15 @@ fn detach_workspace<R: tauri::Runtime>(
     // folders unclaimed while its chats may still run in them.
     let claim = closing.as_ref().map(crate::checkout_claims::claim_checkout);
     let closed = crate::state::with_terminal_close_layout_lock(|| {
-        let mut result = state.close_workspace(workspace_id)?;
-        let intent = match route {
-            CloseRoute::Archive(entry) => LayoutCloseIntent::Archive(Box::new(entry.clone())),
-            _ => LayoutCloseIntent::Workspace(workspace_id.to_owned()),
-        };
-        let terminals = take_closed_terminals(app, Some(workspace_id), std::mem::take(&mut result.removed_sessions), intent);
-        Ok::<_, String>((result, terminals))
+        state.close_workspace_with_precommit(workspace_id, |workspace_id, ids| {
+            let intent = match route {
+                CloseRoute::Archive(entry) => LayoutCloseIntent::Archive(Box::new(entry.clone())),
+                _ => LayoutCloseIntent::Workspace(workspace_id.to_owned()),
+            };
+            commit_closed_terminals(app, workspace_id, ids, intent)
+        })
     });
-    let (result, terminal_runtimes) = match closed {
+    let (result, terminal_close) = match closed {
         Ok(closed) => closed,
         Err(e) => {
             if let Some(claim) = claim {
@@ -1555,9 +1555,7 @@ fn detach_workspace<R: tauri::Runtime>(
     // worktrees, slow disk). The caller emits again once done.
     crate::state::emit_app_state(app);
 
-    for (session_id, runtime) in terminal_runtimes {
-        crate::terminal::terminate_removed_session(runtime, &session_id.0);
-    }
+    terminal_close.finish(app);
 
     Ok(Detached {
         closing,
@@ -1568,14 +1566,14 @@ fn detach_workspace<R: tauri::Runtime>(
     })
 }
 
-fn take_closed_terminals<R: tauri::Runtime>(
+fn commit_closed_terminals<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    workspace_id: Option<&str>,
-    sessions: impl IntoIterator<Item = crate::state::SessionId>,
+    workspace_id: &str,
+    sessions: &[crate::state::SessionId],
     intent: LayoutCloseIntent,
-) -> Vec<(crate::state::SessionId, crate::terminal::SessionRuntime)> {
+) -> Result<crate::terminal::CommittedTerminalClose, String> {
     let terminal_state = app.try_state::<crate::terminal::PtyState>();
-    crate::terminal::take_terminal_sessions_for_close(
+    crate::terminal::commit_terminal_close(
         app,
         terminal_state.as_ref().map(|state| &state.sessions),
         workspace_id,
@@ -2919,21 +2917,18 @@ pub(crate) fn close_pane_impl_with_selection<R: tauri::Runtime>(
     select: bool,
 ) -> Result<Option<String>, String> {
     let removed_browser_id = state.pane_browser_id(&pane_id);
-    let (removed, terminals) = crate::state::with_terminal_close_layout_lock(|| {
-        let workspace_id = state.workspace_id_for_pane(&pane_id);
-        let removed = state.close_pane_with_selection(&pane_id, select)?;
-        let intent = LayoutCloseIntent::Pane(pane_id.clone());
-        let terminals = take_closed_terminals(&app, workspace_id.as_deref(), removed.iter().cloned(), intent);
-        Ok::<_, String>((removed, terminals))
+    let (removed, terminal_close) = crate::state::with_terminal_close_layout_lock(|| {
+        state.close_pane_with_precommit(&pane_id, select, |workspace_id, ids| {
+            let intent = LayoutCloseIntent::Pane(pane_id.clone());
+            commit_closed_terminals(&app, workspace_id, ids, intent)
+        })
     })?;
     // A `codemux monitor start` flag belongs to the process that was running
     // in this pane. The pane is gone, so the claim is too — and a flag with no
     // pane behind it has no UI left that could ever turn it off.
     state.clear_manual_monitors_for_panes(&[pane_id.clone()]);
 
-    for (session_id, runtime) in terminals {
-        crate::terminal::terminate_removed_session(runtime, &session_id.0);
-    }
+    terminal_close.finish(&app);
 
     if let Some(browser_id) = removed_browser_id {
         // User explicitly closed this browser pane — mark dismissed so the agent
@@ -3145,11 +3140,11 @@ pub fn close_tab<R: tauri::Runtime>(
     workspace_id: String,
     tab_id: String,
 ) -> Result<(), String> {
-    let (result, terminals) = crate::state::with_terminal_close_layout_lock(|| {
-        let mut result = state.close_tab(&workspace_id, &tab_id)?;
-        let intent = LayoutCloseIntent::Tab { workspace_id: workspace_id.clone(), tab_id };
-        let terminals = take_closed_terminals(&app, Some(&workspace_id), std::mem::take(&mut result.removed_sessions), intent);
-        Ok::<_, String>((result, terminals))
+    let (result, terminal_close) = crate::state::with_terminal_close_layout_lock(|| {
+        state.close_tab_with_precommit(&workspace_id, &tab_id, |workspace_id, ids| {
+            let intent = LayoutCloseIntent::Tab { workspace_id: workspace_id.to_owned(), tab_id: tab_id.clone() };
+            commit_closed_terminals(&app, workspace_id, ids, intent)
+        })
     })?;
 
     // Straight after the removal: a worktree deletion that no longer sees
@@ -3159,9 +3154,7 @@ pub fn close_tab<R: tauri::Runtime>(
         result.removed_agent_chat_threads,
     );
 
-    for (session_id, runtime) in terminals {
-        crate::terminal::terminate_removed_session(runtime, &session_id.0);
-    }
+    terminal_close.finish(&app);
 
     for browser_id in &result.removed_browser_ids {
         // Tab close is cleanup, not explicit dismissal — agent can reopen the pane.
