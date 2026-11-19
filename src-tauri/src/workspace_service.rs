@@ -58,6 +58,7 @@ impl Checkpoint {
         self.check.as_ref().map_or(Ok(()), |check| check())
     }
 
+    #[cfg(unix)]
     pub(crate) fn requires_check(&self) -> bool {
         self.check.is_some()
     }

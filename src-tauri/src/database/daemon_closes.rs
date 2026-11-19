@@ -2,6 +2,7 @@
 
 use super::DatabaseStore;
 use crate::state::{ArchivedWorkspaceSnapshot, LayoutCloseIntent, SessionId};
+use crate::terminal::TerminalCloseError;
 use crate::workspace_service::Checkpoint;
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -16,26 +17,6 @@ static DAEMON_OWNERSHIP_WRITE_WATCH: std::sync::Mutex<Option<tokio::sync::mpsc::
 #[cfg(all(test, unix))]
 static CLOSE_JOURNAL_CONTENTION: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>> =
     std::sync::Mutex::new(None);
-
-#[derive(Debug)]
-pub(crate) enum TerminalCloseError {
-    Failed(String),
-    Authorization(String),
-}
-
-impl From<String> for TerminalCloseError {
-    fn from(error: String) -> Self {
-        Self::Failed(error)
-    }
-}
-
-impl From<TerminalCloseError> for String {
-    fn from(error: TerminalCloseError) -> Self {
-        match error {
-            TerminalCloseError::Failed(message) | TerminalCloseError::Authorization(message) => message,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct DaemonWorkspaceRoute {

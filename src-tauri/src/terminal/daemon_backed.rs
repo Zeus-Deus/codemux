@@ -18,10 +18,10 @@ use super::{
     emit_terminal_status_if_current, hydration_workspace_pty_env, queue_or_send_output_if_current,
     with_existing_session_runtime, DaemonReconciliation, DaemonWorkspaceRoute, PtyState,
     SessionSpawnBlocked, SessionSpawnReservation, TerminalCloseSignal,
-    TerminalLifecycleState,
+    TerminalCloseError, TerminalLifecycleState,
     TerminalStatusPayload, DEFAULT_COLS, DEFAULT_ROWS,
 };
-use crate::database::{daemon_closes::{PendingDaemonClose, TerminalCloseError}, DatabaseStore};
+use crate::database::{daemon_closes::PendingDaemonClose, DatabaseStore};
 use crate::workspace_service::Checkpoint;
 use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
 use crate::state::{AppStateStore, LayoutCloseIntent, PtyHydrationPlan, PtyHydrationSession, PtyHydrationWorkspace, SessionId};

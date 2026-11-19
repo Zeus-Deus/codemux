@@ -24,7 +24,6 @@ use uuid::Uuid;
 
 #[cfg(unix)]
 use crate::database::daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose};
-use crate::database::daemon_closes::TerminalCloseError;
 use crate::project::current_project_root;
 use crate::settings_sync;
 use crate::state::{self, AppStateStore, TerminalSessionState};
@@ -2845,6 +2844,26 @@ fn terminate_pty_session<R: Runtime>(
 ) {
     if let Some(runtime) = remove_session_runtime(sessions, session_id) {
         terminate_removed_session(runtime, session_id);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum TerminalCloseError {
+    Failed(String),
+    Authorization(String),
+}
+
+impl From<String> for TerminalCloseError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<TerminalCloseError> for String {
+    fn from(error: TerminalCloseError) -> Self {
+        match error {
+            TerminalCloseError::Failed(message) | TerminalCloseError::Authorization(message) => message,
+        }
     }
 }
 

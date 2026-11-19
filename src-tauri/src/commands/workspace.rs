@@ -18,7 +18,7 @@ use crate::state::{
     WorkspaceType,
     WorktreeWorkspaceClaim,
 };
-use crate::terminal;
+use crate::terminal::{self, TerminalCloseError};
 use crate::workspace_paths::paths_equal;
 use crate::workspace_service::{
     Checkpoint, CloseWorkspace, OpenWorkspace, OpenedWorkspace, PresetLaunch, WorktreeBase,
@@ -1521,7 +1521,7 @@ fn detach_workspace<R: tauri::Runtime>(
             removed_agent_chat_threads: Vec::new(),
             removed_agent_browser_sessions: Vec::new(),
         });
-        Ok::<_, crate::database::daemon_closes::TerminalCloseError>((result, terminal_close))
+        Ok::<_, TerminalCloseError>((result, terminal_close))
     });
     let (result, terminal_close) = match closed {
         Ok(closed) => closed,
@@ -1529,7 +1529,6 @@ fn detach_workspace<R: tauri::Runtime>(
             if let Some(claim) = claim {
                 claim.release();
             }
-            use crate::database::daemon_closes::TerminalCloseError;
             return Err(match e {
                 TerminalCloseError::Failed(error) => format!("Failed to close workspace: {error}"),
                 TerminalCloseError::Authorization(error) => error,
@@ -1583,7 +1582,7 @@ fn commit_closed_terminals<'a, R: tauri::Runtime>(
     state: &'a AppStateStore,
     intent: LayoutCloseIntent,
     checkpoint: &Checkpoint,
-) -> Result<(crate::state::TerminalCloseScope<'a>, crate::terminal::CommittedTerminalClose), crate::database::daemon_closes::TerminalCloseError> {
+) -> Result<(crate::state::TerminalCloseScope<'a>, crate::terminal::CommittedTerminalClose), TerminalCloseError> {
     let terminal_state = app.try_state::<crate::terminal::PtyState>();
     crate::terminal::commit_terminal_close(
         app,
