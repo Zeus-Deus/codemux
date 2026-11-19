@@ -209,7 +209,8 @@ enum Undo {
 }
 
 pub(super) struct PreparedCheckout {
-    scratch: TempDir,
+    container: TempDir,
+    recovery: PathBuf,
     index: TempPath,
     remove: Vec<(PathBuf, Original)>,
     install: Vec<(PathBuf, bool)>,
@@ -227,6 +228,64 @@ fn private_dir(parent: &Path, prefix: &str) -> io::Result<TempDir> {
     builder.tempdir_in(parent)
 }
 
+#[cfg(unix)]
+fn create_recovery_root(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    // On macOS an inherited allow ACL can override the directory's mode.
+    #[cfg(target_os = "macos")]
+    if !std::process::Command::new("/bin/chmod")
+        .arg("-N")
+        .arg(path)
+        .status()?
+        .success()
+    {
+        return Err(io::Error::other(
+            "could not clear inherited recovery permissions",
+        ));
+    }
+    if path.metadata()?.permissions().mode() & 0o777 != 0o700 {
+        return Err(io::Error::other(
+            "recovery directory must be accessible only to its owner",
+        ));
+    }
+    Ok(())
+}
+
+// Reserve recovery with a real directory rename before the ref transaction.
+// Starting on the checkout side keeps its filename semantics.
+fn checkout_recovery(checkout: &Path, git_dir: &Path) -> io::Result<(TempDir, PathBuf)> {
+    let common = git_path(checkout, "--git-common-dir")
+        .ok_or_else(|| io::Error::other("could not locate common Git directory"))?;
+    let common = dunce::canonicalize(common)?;
+    if common != dunce::canonicalize(git_dir)? && common.starts_with(dunce::canonicalize(checkout)?)
+    {
+        return Err(io::Error::other(
+            "common Git directory is inside the linked checkout",
+        ));
+    }
+    let container = private_dir(&common, "codemux-recovery-")?;
+    let recovery = container.path().join("files");
+    if recovery.to_str().is_none() {
+        return Err(io::Error::other("cannot report the recovery path as text"));
+    }
+    let local = private_dir(checkout, ".codemux-checkout-")?;
+    let source = local.path().join("files");
+    #[cfg(unix)]
+    create_recovery_root(&source)?;
+    #[cfg(windows)]
+    clack_private_fs::create_dir(&source)?;
+    // Incoming files should inherit the checkout's ordinary ACLs when Git
+    // prepares them. Only the enclosing recovery root needs to be private.
+    let tree = local.path().join("tree");
+    fs::create_dir(&tree)?;
+    fs::rename(tree, source.join("tree"))?;
+    fs::create_dir(source.join("original"))?;
+    fs::rename(source, &recovery)?;
+    Ok((container, recovery))
+}
+
 impl PreparedCheckout {
     pub(super) fn new(checkout: &Path, lock: &Path, old: &str, new: &str) -> Result<Self, String> {
         // Git may clear skip-worktree when a path is present on disk. The
@@ -240,12 +299,10 @@ impl PreparedCheckout {
         }
         let git_dir =
             git_path(checkout, "--git-dir").ok_or("could not locate checkout git directory")?;
-        let scratch = private_dir(checkout, ".codemux-checkout-").map_err(|e| e.to_string())?;
-        // Recovery can stay here when the Git directory is on another volume.
-        // Keep those private files out of status and ordinary `git add`.
-        fs::write(scratch.path().join(".gitignore"), b"*\n").map_err(|e| e.to_string())?;
-        let tree = scratch.path().join("tree");
-        fs::create_dir(&tree).map_err(|e| e.to_string())?;
+        let (container, recovery) = checkout_recovery(checkout, &git_dir).map_err(|e| {
+            format!("could not reserve a recovery directory on the checkout filesystem ({e})")
+        })?;
+        let tree = recovery.join("tree");
         // --index-output leaves the original copy available for the live
         // dry run. Keep the result on the index filesystem for atomic rename.
         let index = NamedTempFile::new_in(lock.parent().ok_or("missing index directory")?)
@@ -316,7 +373,8 @@ impl PreparedCheckout {
         Ok(Self {
             remove,
             install,
-            scratch,
+            container,
+            recovery,
             index,
             undo: Vec::new(),
         })
@@ -333,7 +391,7 @@ impl PreparedCheckout {
         )?;
         // Validate the actual objects we took out of the checkout, even if
         // an editor wrote through an open handle while installation ran.
-        let backups = self.scratch.path().join("original");
+        let backups = self.recovery.join("original");
         for (rel, original) in &self.remove {
             if let Original::Tracked(expected) = original {
                 let actual = file_at(&backups, rel).map_err(|e| e.to_string())?;
@@ -373,7 +431,7 @@ impl PreparedCheckout {
             } else if meta.is_dir() {
                 return Err(collision(&dest));
             } else {
-                let backup = self.scratch.path().join("original").join(rel);
+                let backup = self.recovery.join("original").join(rel);
                 fs::create_dir_all(backup.parent().unwrap())?;
                 fs::rename(&dest, &backup)?;
                 self.undo.push(Undo::RestoreFile(backup, dest.clone()));
@@ -400,7 +458,7 @@ impl PreparedCheckout {
             }
             // The no-replace operation itself protects ignored and untracked
             // files, including files created after Git's validation.
-            let prepared = self.scratch.path().join("tree").join(rel);
+            let prepared = self.recovery.join("tree").join(rel);
             let state = FileState::read(&prepared)?;
             move_noclobber(prepared.clone(), &dest).map_err(|e| {
                 if e.kind() == ErrorKind::AlreadyExists || dest.is_dir() {
@@ -418,33 +476,22 @@ impl PreparedCheckout {
         Ok(())
     }
 
-    // Renaming the directory keeps the same files reachable even when an
-    // editor writes through an old descriptor after the merge returns.
     fn retain_subtree(&mut self, name: &str) -> String {
-        let source = self.scratch.path().join(name);
-        // The common Git directory outlives removal of a linked worktree.
-        let recovery = git_path(self.scratch.path(), "--git-common-dir")
-            .and_then(|dir| private_dir(&dir, "codemux-recovery-").ok());
-        let path = match recovery {
-            Some(dir) if fs::rename(&source, dir.path().join(name)).is_ok() => {
-                dir.keep().join(name)
-            }
-            _ => {
-                // The worktree may be on another filesystem. Copying would
-                // sever the connection to open handles, so keep the files in place.
-                self.scratch.disable_cleanup(true);
-                source
-            }
-        };
+        self.container.disable_cleanup(true);
+        let path = self.recovery.join(name);
         log::warn!("Checkout files retained for saves through open handles at {path:?}");
         path.display().to_string()
     }
 
     pub(super) fn keep_originals(mut self) -> Option<String> {
-        self.undo
-            .iter()
-            .any(|u| matches!(u, Undo::RestoreFile(..)))
-            .then(|| self.retain_subtree("original"))
+        if self.undo.iter().any(|u| matches!(u, Undo::RestoreFile(..))) {
+            // Installation has consumed the incoming files. Discard any
+            // remaining preparation data, such as mirrored .gitattributes.
+            let _ = fs::remove_dir_all(self.recovery.join("tree"));
+            Some(self.retain_subtree("original"))
+        } else {
+            None
+        }
     }
 
     pub(super) fn rollback(&mut self, error: String) -> String {
@@ -491,10 +538,10 @@ impl PreparedCheckout {
             }
         }
         if let Some(e) = failure {
-            self.scratch.disable_cleanup(true);
+            self.container.disable_cleanup(true);
             return format!(
                 "{error}. Could not restore all working files ({e}); checkout recovery files remain at {}",
-                self.scratch.path().display()
+                self.recovery.display()
             );
         }
         if uninstalled {

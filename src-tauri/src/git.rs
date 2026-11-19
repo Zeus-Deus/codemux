@@ -7552,20 +7552,63 @@ exit 0
     #[test]
     fn test_merge_into_base_preserves_writes_through_an_outgoing_file_descriptor() {
         use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
 
-        let (_dir, repo, wt) = setup_incoming_tracked_update();
-        let tracked = repo.join("tracked");
+        let (dir, repo, wt) = setup_incoming_tracked_update();
+        let base = dir.path().join("release-wt");
+        run_git(&repo, &["worktree", "add", "-b", "release", base.to_str().unwrap()]).unwrap();
+        let tracked = base.join("tracked");
         let mut editor = std::fs::OpenOptions::new().append(true).open(&tracked).unwrap();
-        let result = merge_into_base(&wt, main_branch(&repo), false).unwrap();
+        let result = merge_into_base(&wt, "release", false).unwrap();
         assert_eq!(result.status, "merged");
+        assert_eq!(std::fs::read(&tracked).unwrap(), b"incoming");
+        assert!(git_status(&base).unwrap().is_empty());
 
-        // The transaction, final fingerprint and scratch cleanup have all finished.
+        let recovery = PathBuf::from(result.recovery_dir.expect("reported location of the outgoing file"));
+        let private = recovery.parent().unwrap();
+        assert!(private.starts_with(dunce::canonicalize(repo.join(".git")).unwrap()));
+        assert_eq!(std::fs::metadata(private).unwrap().permissions().mode() & 0o077, 0);
+        run_git(&repo, &["worktree", "remove", base.to_str().unwrap()]).unwrap();
+        assert!(!base.exists());
         editor.write_all(b"\0late save").unwrap();
         drop(editor);
-        let recovery = PathBuf::from(result.recovery_dir.expect("reported location of the outgoing file"));
         assert_eq!(std::fs::read(recovery.join("tracked")).unwrap(), b"old\0data\0late save");
-        assert_eq!(std::fs::read(&tracked).unwrap(), b"incoming");
-        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    // /dev/shm normally gives Linux CI a second writable filesystem without mounts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_merge_into_base_refuses_cross_device_recovery_before_install() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let (_dir, repo, wt) = setup_incoming_tracked_update();
+        let Ok(other_volume) = TempDir::new_in("/dev/shm") else { return };
+        if std::fs::metadata(other_volume.path()).unwrap().dev() == std::fs::metadata(&repo).unwrap().dev() {
+            return;
+        }
+
+        let base = other_volume.path().join("base");
+        run_git(&repo, &["worktree", "add", "-b", "release", base.to_str().unwrap()]).unwrap();
+        let index = git_path(&base, "--git-dir").unwrap().join("index");
+        let before = std::fs::read(&index).unwrap();
+        let old = head_hash(&base);
+        let tracked = base.join("tracked");
+        let inode = std::fs::metadata(&tracked).unwrap().ino();
+
+        let hooks = repo.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        run_git(&repo, &["config", "core.hooksPath", hooks.to_str().unwrap()]).unwrap();
+        let hook = hooks.join("reference-transaction");
+        std::fs::write(&hook, "#!/bin/sh\ntouch ref-hook-ran\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = fast_forward_checkout(&base, "release", &head_hash(&wt)).unwrap_err();
+        assert!(err.contains("recovery"), "{err}");
+        assert!(!base.join("ref-hook-ran").exists());
+        assert_eq!(head_hash(&base), old);
+        assert_eq!(std::fs::read(index).unwrap(), before);
+        assert_eq!(std::fs::metadata(&tracked).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(tracked).unwrap(), b"old\0data");
     }
 
     #[test]
@@ -7617,6 +7660,7 @@ exit 0
         assert_eq!(head_hash(&repo), old);
         assert_eq!(std::fs::read(index).unwrap(), before);
         let (_, recovery) = err.split_once("checkout recovery files remain at ").expect(&err);
+        assert!(Path::new(recovery).starts_with(dunce::canonicalize(repo.join(".git")).unwrap()));
         assert_eq!(std::fs::read(Path::new(recovery).join("original/tracked")).unwrap(), b"old\x00data");
     }
 
@@ -7658,6 +7702,7 @@ exit 0
         let message = files.rollback(err.clone());
         drop(files);
         let (cause, recovery) = message.split_once(". Checkout recovery files remain at ").unwrap();
+        assert!(Path::new(recovery).starts_with(dunce::canonicalize(repo.join(".git")).unwrap()));
         assert_eq!(cause, err);
         #[cfg(unix)]
         {
