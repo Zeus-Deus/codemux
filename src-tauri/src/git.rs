@@ -1804,6 +1804,8 @@ pub struct MergeIntoBaseResult {
     pub temp_branch: Option<String>,
     pub source_branch: String,
     pub conflicted_files: Vec<ConflictFile>,
+    /// Directory of outgoing files that may still have open writers.
+    pub recovery_dir: Option<String>,
 }
 
 /// The worktree where `branch` is checked out, if any.
@@ -2068,7 +2070,15 @@ fn advance_checkout_head(
     transaction
 }
 
-fn fast_forward_checkout(checkout: &Path, base_branch: &str, commit: &str) -> Result<(), String> {
+// Once files have been retained, report their location even if a later step fails.
+fn report_checkout_recovery(result: Result<(), String>, recovery_dir: Option<String>) -> Result<Option<String>, String> {
+    match (result, recovery_dir) {
+        (Err(error), Some(path)) => Err(format!("{error}. Checkout recovery files remain at {path}")),
+        (result, path) => result.map(|()| path),
+    }
+}
+
+fn fast_forward_checkout(checkout: &Path, base_branch: &str, commit: &str) -> Result<Option<String>, String> {
     let (index, lock) = lock_checkout_index(checkout)?;
     let base_ref = format!("refs/heads/{base_branch}");
     let old = run_git(checkout, &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")])?;
@@ -2088,14 +2098,16 @@ fn fast_forward_checkout(checkout: &Path, base_branch: &str, commit: &str) -> Re
     if let Err(e) = update {
         return Err(files.rollback(e));
     }
-    lock.persist(&index).map_err(|err| {
+    let recovery_dir = files.keep_originals();
+    let installed = lock.persist(&index).map_err(|err| {
         // The ref and files now describe the new tree. Keep the corresponding
         // index available for recovery if the atomic rename itself fails.
         let cause = err.error;
         let mut path = err.path;
         path.disable_cleanup(true);
         format!("advanced {base_ref}, but could not install the new index ({cause}); it is at {}", path.display())
-    })
+    });
+    report_checkout_recovery(installed, recovery_dir)
 }
 
 fn ensure_checkout_idle(checkout: &Path) -> Result<(), String> {
@@ -2190,9 +2202,9 @@ fn verify_checkout_merge_policy(checkout: &Path, base: &str, commit: &str) -> Re
 ///
 /// Either way the ref is read back afterwards: callers go on to delete the
 /// merged branch, which is only safe once the base really holds `commit`.
-fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Result<(), String> {
+fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Result<Option<String>, String> {
     let base_ref = format!("refs/heads/{base_branch}");
-    match branch_worktree(repo_path, base_branch)? {
+    let recovery_dir = match branch_worktree(repo_path, base_branch)? {
         // A guarded fast-forward: see `fast_forward_checkout` for why it is
         // not `git merge`.
         Some(checkout) => fast_forward_checkout(&checkout, base_branch, commit)
@@ -2228,17 +2240,18 @@ fn advance_base_branch(repo_path: &Path, base_branch: &str, commit: &str) -> Res
                     "Cannot update {base_branch}: another worktree is in the middle of rebasing or bisecting it. Finish or abort that first."
                 ));
             }
-            run_git(repo_path, &["branch", "-f", "--end-of-options", base_branch, commit]).map(|_| ())?
+            run_git(repo_path, &["branch", "-f", "--end-of-options", base_branch, commit])?;
+            None
         }
-    }
-    let now = run_git(repo_path, &["rev-parse", "--verify", &base_ref])?;
-    if now.trim() != commit {
-        return Err(format!(
-            "Cannot update {base_branch}: it is at {} instead of the merged commit {commit}.",
-            now.trim()
-        ));
-    }
-    Ok(())
+    };
+    let verified = run_git(repo_path, &["rev-parse", "--verify", &base_ref]).and_then(|now| {
+        if now.trim() == commit {
+            Ok(())
+        } else {
+            Err(format!("Cannot update {base_branch}: it is at {} instead of the merged commit {commit}.", now.trim()))
+        }
+    });
+    report_checkout_recovery(verified, recovery_dir)
 }
 
 /// Safely merge the current branch into a base branch using a temporary resolver branch.
@@ -2267,6 +2280,7 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch
     if source_head.trim() == merge_base.trim() {
         return Ok(MergeIntoBaseResult {
             status: "already_up_to_date".to_string(),
+            recovery_dir: None,
             temp_branch: None,
             source_branch,
             conflicted_files: Vec::new(),
@@ -2281,6 +2295,7 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch
     if is_ancestor {
         return Ok(MergeIntoBaseResult {
             status: "already_up_to_date".to_string(),
+            recovery_dir: None,
             temp_branch: None,
             source_branch,
             conflicted_files: Vec::new(),
@@ -2319,28 +2334,19 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch
             return Err("Cannot fast-forward base branch — history has diverged".to_string());
         }
         let temp_commit = run_git(repo_path, &["rev-parse", &temp_branch])?;
-        if let Err(e) = advance_base_branch(repo_path, base_branch, temp_commit.trim()) {
-            run_git(repo_path, &["checkout", &source_branch])?;
-            let _ = run_git(repo_path, &["branch", "-D", &temp_branch]);
-            return Err(e);
-        }
-
-        if delete_source_branch {
-            // Delete source while still on temp (can't delete a checked-out branch)
-            let _ = run_git(repo_path, &["branch", "-d", &source_branch]);
-            // Land on base if possible, otherwise detach (worktree scenario)
-            if run_git(repo_path, &["checkout", base_branch]).is_err() {
-                run_git(repo_path, &["checkout", "--detach"])?;
+        let recovery_dir = match advance_base_branch(repo_path, base_branch, temp_commit.trim()) {
+            Ok(path) => path,
+            Err(e) => {
+                run_git(repo_path, &["checkout", &source_branch])
+                    .map_err(|restore| format!("{e}. Could not return to {source_branch} ({restore})"))?;
+                let _ = run_git(repo_path, &["branch", "-D", &temp_branch]);
+                return Err(e);
             }
-        } else {
-            run_git(repo_path, &["checkout", &source_branch])?;
-        }
-        // Force-delete temp: -d would fail because temp isn't merged into HEAD (source),
-        // but its content is safely in base via branch -f above
-        let _ = run_git(repo_path, &["branch", "-D", &temp_branch]);
-
+        };
+        let finished = finish_resolver_branch(repo_path, base_branch, &temp_branch, &source_branch, delete_source_branch);
         return Ok(MergeIntoBaseResult {
             status: "merged".to_string(),
+            recovery_dir: report_checkout_recovery(finished, recovery_dir)?,
             temp_branch: None,
             source_branch,
             conflicted_files: Vec::new(),
@@ -2368,6 +2374,7 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch
 
     Ok(MergeIntoBaseResult {
         status: "conflicts".to_string(),
+        recovery_dir: None,
         temp_branch: Some(temp_branch),
         source_branch,
         conflicted_files,
@@ -2381,7 +2388,7 @@ pub fn complete_merge_into_base(
     temp_branch: &str,
     source_branch: &str,
     delete_source_branch: bool,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     // Verify all conflicts are resolved
     let status = git_status(repo_path)?;
     let unresolved: Vec<_> = status.iter().filter(|f| f.status == FileStatus::Conflicted).collect();
@@ -2405,8 +2412,14 @@ pub fn complete_merge_into_base(
         return Err("Cannot fast-forward base branch — history has diverged".to_string());
     }
     let temp_commit = run_git(repo_path, &["rev-parse", temp_branch])?;
-    advance_base_branch(repo_path, base_branch, temp_commit.trim())?;
+    let recovery_dir = advance_base_branch(repo_path, base_branch, temp_commit.trim())?;
+    let finished = finish_resolver_branch(repo_path, base_branch, temp_branch, source_branch, delete_source_branch);
+    report_checkout_recovery(finished, recovery_dir)
+}
 
+fn finish_resolver_branch(
+    repo_path: &Path, base_branch: &str, temp_branch: &str, source_branch: &str, delete_source_branch: bool,
+) -> Result<(), String> {
     if delete_source_branch {
         // Delete source while still on temp (can't delete a checked-out branch)
         let _ = run_git(repo_path, &["branch", "-d", source_branch]);
@@ -6884,6 +6897,7 @@ mod tests {
         let result = merge_into_base(&wt, main, false).unwrap();
         assert_eq!(result.status, "merged");
         assert!(result.temp_branch.is_none(), "temp branch should be cleaned up");
+        assert!(result.recovery_dir.is_none(), "additions moved no originals");
 
         // User stays on feature in the worktree
         let current = run_git(&wt, &["branch", "--show-current"]).unwrap();
@@ -7521,23 +7535,43 @@ exit 0
         assert_eq!(std::fs::read(index).unwrap(), before);
     }
 
-    fn setup_incoming_tracked_update() -> (TempDir, PathBuf, String, String) {
+    fn setup_incoming_tracked_update() -> (TempDir, PathBuf, PathBuf) {
         let (dir, repo, wt) = setup_worktree_merge_scenario();
         let main = main_branch(&repo);
         let tracked = repo.join("tracked");
         std::fs::write(&tracked, b"old\x00data").unwrap();
         run_git(&repo, &["add", "tracked"]).unwrap();
         run_git(&repo, &["commit", "-m", "old file"]).unwrap();
-        let old = head_hash(&repo);
         run_git(&wt, &["merge", "--ff-only", main]).unwrap();
         std::fs::write(wt.join("tracked"), b"incoming").unwrap();
         run_git(&wt, &["commit", "-am", "replace tracked file"]).unwrap();
-        (dir, repo, old, head_hash(&wt))
+        (dir, repo, wt)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_into_base_preserves_writes_through_an_outgoing_file_descriptor() {
+        use std::io::Write;
+
+        let (_dir, repo, wt) = setup_incoming_tracked_update();
+        let tracked = repo.join("tracked");
+        let mut editor = std::fs::OpenOptions::new().append(true).open(&tracked).unwrap();
+        let result = merge_into_base(&wt, main_branch(&repo), false).unwrap();
+        assert_eq!(result.status, "merged");
+
+        // The transaction, final fingerprint and scratch cleanup have all finished.
+        editor.write_all(b"\0late save").unwrap();
+        drop(editor);
+        let recovery = PathBuf::from(result.recovery_dir.expect("reported location of the outgoing file"));
+        assert_eq!(std::fs::read(recovery.join("tracked")).unwrap(), b"old\0data\0late save");
+        assert_eq!(std::fs::read(&tracked).unwrap(), b"incoming");
+        assert!(git_status(&repo).unwrap().is_empty());
     }
 
     #[test]
     fn test_merge_into_base_preserves_late_save_to_a_tracked_file() {
-        let (_dir, repo, old, new) = setup_incoming_tracked_update();
+        let (_dir, repo, wt) = setup_incoming_tracked_update();
+        let (old, new) = (head_hash(&repo), head_hash(&wt));
         let main = main_branch(&repo);
         let tracked = repo.join("tracked");
         let (index, lock) = lock_checkout_index(&repo).unwrap();
@@ -7562,7 +7596,8 @@ exit 0
 
     #[test]
     fn test_merge_into_base_preserves_an_edit_to_an_installed_file_during_rollback() {
-        let (_dir, repo, old, new) = setup_incoming_tracked_update();
+        let (_dir, repo, wt) = setup_incoming_tracked_update();
+        let (old, new) = (head_hash(&repo), head_hash(&wt));
         let main = main_branch(&repo);
         let tracked = repo.join("tracked");
         let (index, lock) = lock_checkout_index(&repo).unwrap();
@@ -7618,7 +7653,21 @@ exit 0
         assert!(err.contains("z-last.env"), "{err}");
         assert!(!repo.join("obsolete").exists());
         assert_eq!(std::fs::read(repo.join("a-first")).unwrap(), b"incoming");
-        assert_eq!(files.rollback(err.clone()), err);
+        #[cfg(unix)]
+        let mut editor = std::fs::OpenOptions::new().append(true).open(repo.join("a-first")).unwrap();
+        let message = files.rollback(err.clone());
+        drop(files);
+        let (cause, recovery) = message.split_once(". Checkout recovery files remain at ").unwrap();
+        assert_eq!(cause, err);
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            editor.write_all(b"\0late save").unwrap();
+            drop(editor);
+            assert_eq!(std::fs::read(Path::new(recovery).join("a-first")).unwrap(), b"incoming\0late save");
+        }
+        #[cfg(not(unix))]
+        assert_eq!(std::fs::read(Path::new(recovery).join("a-first")).unwrap(), b"incoming");
         assert_eq!(head_hash(&repo), old);
         assert_eq!(std::fs::read(index).unwrap(), before);
         assert_eq!(std::fs::read(repo.join("obsolete")).unwrap(), b"original\x00bytes");
@@ -7916,7 +7965,8 @@ exit 0
 
         // Resolve
         resolve_conflict_theirs(&wt, "shared.txt").unwrap();
-        complete_merge_into_base(&wt, main, &temp, "feature", false).unwrap();
+        let recovery = complete_merge_into_base(&wt, main, &temp, "feature", false).unwrap().unwrap();
+        assert_eq!(std::fs::read(Path::new(&recovery).join("shared.txt")).unwrap(), b"main version");
 
         // Back on feature in worktree
         let current = run_git(&wt, &["branch", "--show-current"]).unwrap();

@@ -1201,7 +1201,7 @@ export const mergeIntoBase = (path: string, baseBranch: string, deleteSourceBran
 
 export const completeMergeIntoBase = (
   path: string, baseBranch: string, tempBranch: string, sourceBranch: string, deleteSourceBranch: boolean,
-) => invoke("complete_merge_into_base", { path, baseBranch, tempBranch, sourceBranch, deleteSourceBranch });
+) => invoke<string | null>("complete_merge_into_base", { path, baseBranch, tempBranch, sourceBranch, deleteSourceBranch });
 
 export const abortMergeIntoBase = (path: string, sourceBranch: string, tempBranch: string) =>
   invoke("abort_merge_into_base", { path, sourceBranch, tempBranch });

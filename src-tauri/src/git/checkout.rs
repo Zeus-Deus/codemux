@@ -1,5 +1,5 @@
 //! Prepare a two-tree checkout away from the live files. Only publish the
-//! entries Git actually changed, keeping the originals until HEAD commits.
+//! entries Git actually changed, keeping moved files reachable by open handles.
 
 use super::{checkout_config, git_command, git_path, path_from_git_bytes, run_git_with_index};
 use sha2::{Digest, Sha256};
@@ -216,6 +216,17 @@ pub(super) struct PreparedCheckout {
     undo: Vec<Undo>,
 }
 
+fn private_dir(parent: &Path, prefix: &str) -> io::Result<TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(parent)
+}
+
 impl PreparedCheckout {
     pub(super) fn new(checkout: &Path, lock: &Path, old: &str, new: &str) -> Result<Self, String> {
         // Git may clear skip-worktree when a path is present on disk. The
@@ -229,14 +240,10 @@ impl PreparedCheckout {
         }
         let git_dir =
             git_path(checkout, "--git-dir").ok_or("could not locate checkout git directory")?;
-        let mut scratch = tempfile::Builder::new();
-        scratch.prefix(".codemux-checkout-");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            scratch.permissions(fs::Permissions::from_mode(0o700));
-        }
-        let scratch = scratch.tempdir_in(checkout).map_err(|e| e.to_string())?;
+        let scratch = private_dir(checkout, ".codemux-checkout-").map_err(|e| e.to_string())?;
+        // Recovery can stay here when the Git directory is on another volume.
+        // Keep those private files out of status and ordinary `git add`.
+        fs::write(scratch.path().join(".gitignore"), b"*\n").map_err(|e| e.to_string())?;
         let tree = scratch.path().join("tree");
         fs::create_dir(&tree).map_err(|e| e.to_string())?;
         // --index-output leaves the original copy available for the live
@@ -411,9 +418,39 @@ impl PreparedCheckout {
         Ok(())
     }
 
+    // Renaming the directory keeps the same files reachable even when an
+    // editor writes through an old descriptor after the merge returns.
+    fn retain_subtree(&mut self, name: &str) -> String {
+        let source = self.scratch.path().join(name);
+        // The common Git directory outlives removal of a linked worktree.
+        let recovery = git_path(self.scratch.path(), "--git-common-dir")
+            .and_then(|dir| private_dir(&dir, "codemux-recovery-").ok());
+        let path = match recovery {
+            Some(dir) if fs::rename(&source, dir.path().join(name)).is_ok() => {
+                dir.keep().join(name)
+            }
+            _ => {
+                // The worktree may be on another filesystem. Copying would
+                // sever the connection to open handles, so keep the files in place.
+                self.scratch.disable_cleanup(true);
+                source
+            }
+        };
+        log::warn!("Checkout files retained for saves through open handles at {path:?}");
+        path.display().to_string()
+    }
+
+    pub(super) fn keep_originals(mut self) -> Option<String> {
+        self.undo
+            .iter()
+            .any(|u| matches!(u, Undo::RestoreFile(..)))
+            .then(|| self.retain_subtree("original"))
+    }
+
     pub(super) fn rollback(&mut self, error: String) -> String {
         let mut failure = None;
         let mut preserve = HashSet::new();
+        let mut uninstalled = false;
         while let Some(action) = self.undo.pop() {
             let result = match action {
                 Undo::RestoreFile(_, dest) if preserve.contains(&dest) => continue,
@@ -424,7 +461,9 @@ impl PreparedCheckout {
                     state,
                 } => {
                     let result = uninstall_file(&dest, &prepared, state);
-                    if result.is_err() {
+                    if result.is_ok() {
+                        uninstalled = true;
+                    } else {
                         // Also preserve a deletion if the user removed the
                         // installed file before we could roll it back.
                         preserve.insert(dest);
@@ -457,6 +496,12 @@ impl PreparedCheckout {
                 "{error}. Could not restore all working files ({e}); checkout recovery files remain at {}",
                 self.scratch.path().display()
             );
+        }
+        if uninstalled {
+            // These files were briefly live too. Their handles can outlast
+            // a successful rollback just as they can outlast a commit.
+            let path = self.retain_subtree("tree");
+            return format!("{error}. Checkout recovery files remain at {path}");
         }
         error
     }

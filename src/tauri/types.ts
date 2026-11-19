@@ -645,6 +645,7 @@ export interface MergeIntoBaseResult {
   temp_branch: string | null;
   source_branch: string;
   conflicted_files: ConflictFile[];
+  recovery_dir: string | null;
 }
 
 export interface BaseBranchDiff {
