@@ -52,6 +52,7 @@
 use crate::auth::{api_base_url, is_token_expired, load_token};
 use crate::database::DatabaseStore;
 use crate::state::AppStateSnapshot;
+use crate::sync_guard::{order_by_last_attempt, record_attempt, sync_client, Attempts, SyncGuard, SYNC_BUDGET};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -124,21 +125,54 @@ static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// triggers. Resolves the database + token from the app state and
 /// calls pull-then-push. Returns Ok(()) if the user isn't signed in
 /// (sync isn't an error in that case).
+/// One sync pass at a time. Without it a second pass — a background tick
+/// and "Sync now", or two edits each scheduling a sync — could settle a
+/// deletion whose row the first pass is still uploading, before that
+/// upload returns the server id the DELETE needs.
+static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// When each row was last sent (see [`order_by_last_attempt`]).
+static ATTEMPTS: Attempts = std::sync::LazyLock::new(Default::default);
+
 pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
+    // Queue before reading the session: a pass that waited out a sign-out
+    // or account switch must sync whoever is signed in now, not upload the
+    // new account's rows with the old account's token.
+    let _one_at_a_time = SYNC_LOCK.lock().await;
     let db = app.state::<DatabaseStore>();
-    let token = match valid_token(&db) {
-        Some(t) => t,
-        None => return Ok(()),
+    // No auth state means no session to sync for.
+    let Some(auth) = app.try_state::<crate::auth::AuthState>() else {
+        return Ok(());
     };
-    let db_ref: &DatabaseStore = &db;
-    let pull_err = match pull(&token, db_ref).await {
-        Ok(()) => None,
-        Err(e) => Some(e),
+    let (generation, token) = auth.session_snapshot(|| valid_token(&db));
+    let Some(token) = token else {
+        return Ok(());
     };
-    let push_err = match push(&token, db_ref).await {
-        Ok(()) => None,
-        Err(e) => Some(e),
-    };
+    sync_locked(&token, &db, SyncGuard::session(&auth, generation)).await
+}
+
+/// One pull-then-push pass, queued behind any other.
+pub async fn sync_once(token: &str, db: &DatabaseStore) -> Result<(), String> {
+    let _one_at_a_time = SYNC_LOCK.lock().await;
+    sync_locked(token, db, SyncGuard::unchecked()).await
+}
+
+/// Pull, then push. Called with [`SYNC_LOCK`] held. The pass stops
+/// starting requests once [`SYNC_BUDGET`] is spent, but never abandons one
+/// it has started: each request ends by its own timeout, so the pass always
+/// learns whether an upload took — or keeps the row to try again.
+async fn sync_locked(token: &str, db: &DatabaseStore, guard: SyncGuard<'_>) -> Result<(), String> {
+    sync_with(token, db, &guard.within(SYNC_BUDGET), &sync_client()).await
+}
+
+async fn sync_with(
+    token: &str,
+    db: &DatabaseStore,
+    guard: &SyncGuard<'_>,
+    client: &reqwest::Client,
+) -> Result<(), String> {
+    let pull_err = pull_guarded(token, db, guard, client).await.err();
+    let push_err = push_guarded(token, db, guard, client).await.err();
     match (pull_err, push_err) {
         (None, None) => Ok(()),
         (Some(p), None) => Err(format!("pull failed: {p}")),
@@ -168,8 +202,17 @@ fn valid_token(db: &DatabaseStore) -> Option<String> {
 /// non-null but missing from the server response is treated as a
 /// server-side deletion the local hasn't observed yet.
 pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
+    pull_guarded(token, db, &SyncGuard::unchecked(), &sync_client()).await
+}
+
+async fn pull_guarded(
+    token: &str,
+    db: &DatabaseStore,
+    guard: &SyncGuard<'_>,
+    client: &reqwest::Client,
+) -> Result<(), String> {
     let base = api_base_url();
-    let client = reqwest::Client::new();
+    guard.ensure_current()?;
     let resp = client
         .get(format!("{base}/api/workspaces"))
         .header("Authorization", format!("Bearer {token}"))
@@ -186,13 +229,16 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
     }
     let body: ListWorkspacesResponse =
         resp.json().await.map_err(|e| format!("Parse: {e}"))?;
+    // Written only while the session that asked is still current.
+    guard.commit(|| apply_pulled(db, &body))?
+}
 
+fn apply_pulled(db: &DatabaseStore, body: &ListWorkspacesResponse) -> Result<(), String> {
     // Index local rows by server_id so we can detect server-side
     // deletions (server stopped returning a row we know about).
     let local = db.list_workspaces_sync_for_sync();
     let server_ids: std::collections::HashSet<String> =
         body.workspaces.iter().map(|w| w.id.clone()).collect();
-
     for w in &body.workspaces {
         db.upsert_workspace_sync_from_server(
             &w.id,
@@ -213,10 +259,11 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
     // Server-side deletion sweep: if a local row has a server_id the
     // server no longer returns, it was deleted elsewhere. Tombstone
     // it locally — dirty stays 0 (server-sourced changes are always
-    // clean).
+    // clean). A row with unpushed changes is left to its push, which
+    // settles a row the server dropped (see `push_update`).
     for local_row in &local {
         if let Some(sid) = &local_row.server_id {
-            if !server_ids.contains(sid) && local_row.deleted_at.is_none() {
+            if !server_ids.contains(sid) && local_row.deleted_at.is_none() && !local_row.dirty {
                 eprintln!(
                     "[workspaces-sync] server no longer has {sid}; tombstoning locally"
                 );
@@ -329,18 +376,36 @@ fn dedupe_sibling_rows(db: &DatabaseStore) {
 /// rows; failures are logged and the row stays dirty for the next
 /// sync to retry.
 pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
+    push_guarded(token, db, &SyncGuard::unchecked(), &sync_client()).await
+}
+
+async fn push_guarded(
+    token: &str,
+    db: &DatabaseStore,
+    guard: &SyncGuard<'_>,
+    client: &reqwest::Client,
+) -> Result<(), String> {
     let base = api_base_url();
-    let client = reqwest::Client::new();
-    let dirty = db.list_dirty_workspaces_sync();
+    let mut dirty = guard.commit(|| db.list_dirty_workspaces_sync())?;
+    order_by_last_attempt(&ATTEMPTS, &mut dirty, |row| row.id);
     let mut any_failed = false;
+    // The account's list, fetched at most once a pass, and only if a row
+    // turns out to be gone.
+    let mut listed: Option<Option<std::collections::HashSet<String>>> = None;
 
     for row in &dirty {
+        // Out of time: the rest goes first next pass.
+        if guard.expired() {
+            any_failed = true;
+            break;
+        }
+        record_attempt(&ATTEMPTS, row.id);
         let result = if row.deleted_at.is_some() {
-            push_delete(&client, &base, token, row, db).await
+            push_delete(client, &base, token, row, db, guard).await
         } else if row.server_id.is_none() {
-            push_insert(&client, &base, token, row, db).await
+            push_insert(client, &base, token, row, db, guard).await
         } else {
-            push_update(&client, &base, token, row, db).await
+            push_update(client, &base, token, row, db, &mut listed, guard).await
         };
         if let Err(error) = result {
             eprintln!(
@@ -351,7 +416,7 @@ pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
         }
     }
 
-    db.purge_acknowledged_workspace_sync_deletes()?;
+    guard.commit(|| db.purge_acknowledged_workspace_sync_deletes())??;
 
     if any_failed {
         Err("one or more workspace pushes failed; see logs".into())
@@ -366,6 +431,7 @@ async fn push_insert(
     token: &str,
     row: &crate::database::WorkspaceSyncRecord,
     db: &DatabaseStore,
+    guard: &SyncGuard<'_>,
 ) -> Result<(), String> {
     let body = WorkspaceUpsertBody {
         title: &row.title,
@@ -377,6 +443,7 @@ async fn push_insert(
         project_uid: row.project_uid.as_deref(),
         workspace_kind: row.workspace_kind.as_deref(),
     };
+    guard.ensure_current()?;
     let resp = client
         .post(format!("{base}/api/workspaces"))
         .header("Authorization", format!("Bearer {token}"))
@@ -389,7 +456,7 @@ async fn push_insert(
     }
     let parsed: OneWorkspaceResponse =
         resp.json().await.map_err(|e| format!("Parse: {e}"))?;
-    db.mark_workspace_sync_synced(row.id, Some(&parsed.workspace.id))?;
+    guard.commit(|| db.mark_workspace_sync_pushed(row, Some(&parsed.workspace.id)))??;
     Ok(())
 }
 
@@ -399,6 +466,8 @@ async fn push_update(
     token: &str,
     row: &crate::database::WorkspaceSyncRecord,
     db: &DatabaseStore,
+    listed: &mut Option<Option<std::collections::HashSet<String>>>,
+    guard: &SyncGuard<'_>,
 ) -> Result<(), String> {
     let server_id = row
         .server_id
@@ -414,6 +483,7 @@ async fn push_update(
         project_uid: row.project_uid.as_deref(),
         workspace_kind: row.workspace_kind.as_deref(),
     };
+    guard.ensure_current()?;
     let resp = client
         .patch(format!("{base}/api/workspaces/{server_id}"))
         .header("Authorization", format!("Bearer {token}"))
@@ -421,11 +491,69 @@ async fn push_update(
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
+    if resp.status().as_u16() == 404 && server_lacks_workspace(client, base, token, server_id, listed, guard).await {
+        // Deleted on another device before this edit reached the account.
+        // The pull leaves dirty rows alone, so settle it here: the
+        // removal wins, as it does for a clean row.
+        eprintln!("[workspaces-sync] server no longer has {server_id}; dropping the local edit");
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        return guard.commit(|| {
+        db.mark_workspace_sync_synced(row.id, None)?;
+        db.upsert_workspace_sync_from_server(
+            server_id,
+            &row.title,
+            row.host_server_id.as_deref(),
+            row.project_path.as_deref(),
+            row.project_remote.as_deref(),
+            row.git_branch.as_deref(),
+            row.git_head_sha.as_deref(),
+            &row.created_at,
+            &now,
+            Some(&now),
+            row.project_uid.as_deref(),
+            row.workspace_kind.as_deref(),
+        )
+        })?;
+    }
     if !resp.status().is_success() {
         return Err(format!("API error: {}", resp.status()));
     }
-    db.mark_workspace_sync_synced(row.id, None)?;
+    guard.commit(|| db.mark_workspace_sync_pushed(row, None))??;
     Ok(())
+}
+
+/// Whether the account's workspace list is readable and has no row
+/// `server_id`. A server without the workspaces API answers 404 to
+/// everything, so a 404 alone does not say the row is gone. The list is
+/// fetched once per push pass, into `listed`; if it cannot be read, no row
+/// is taken to be gone.
+async fn server_lacks_workspace(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    server_id: &str,
+    listed: &mut Option<Option<std::collections::HashSet<String>>>,
+    guard: &SyncGuard<'_>,
+) -> bool {
+    if listed.is_none() {
+        let ids = async {
+            guard.ensure_current().ok()?;
+            let resp = client
+                .get(format!("{base}/api/workspaces"))
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let body = resp.json::<ListWorkspacesResponse>().await.ok()?;
+            Some(body.workspaces.into_iter().map(|w| w.id).collect())
+        }
+        .await;
+        *listed = Some(ids);
+    }
+    matches!(listed, Some(Some(ids)) if !ids.contains(server_id))
 }
 
 async fn push_delete(
@@ -434,6 +562,7 @@ async fn push_delete(
     token: &str,
     row: &crate::database::WorkspaceSyncRecord,
     db: &DatabaseStore,
+    guard: &SyncGuard<'_>,
 ) -> Result<(), String> {
     // A row that was created and deleted entirely while offline (no
     // server_id) has nothing to push — clear dirty so the next purge
@@ -441,10 +570,11 @@ async fn push_delete(
     let server_id = match &row.server_id {
         Some(sid) => sid,
         None => {
-            db.mark_workspace_sync_synced(row.id, None)?;
+            guard.commit(|| db.mark_workspace_sync_synced(row.id, None))??;
             return Ok(());
         }
     };
+    guard.ensure_current()?;
     let resp = client
         .delete(format!("{base}/api/workspaces/{server_id}"))
         .header("Authorization", format!("Bearer {token}"))
@@ -455,7 +585,7 @@ async fn push_delete(
     if !resp.status().is_success() && resp.status().as_u16() != 404 {
         return Err(format!("API error: {}", resp.status()));
     }
-    db.mark_workspace_sync_synced(row.id, None)?;
+    guard.commit(|| db.mark_workspace_sync_pushed(row, None))??;
     Ok(())
 }
 
@@ -507,10 +637,133 @@ fn read_git_head_sha(path: &str) -> Option<String> {
 ///
 /// Returns Ok even on partial failure: individual row failures are
 /// logged so a corrupt row doesn't strand the whole tick.
+/// Serialises recording a close with reconciling, so a reconcile working
+/// from a snapshot taken before a close cannot slip a row in after it.
+static RECONCILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `ui_state` key prefix: one row per workspace closed while a layout
+/// recovery is pending (`<prefix><workspace id>`), so recording one close
+/// never rewrites, or loses, another.
+const CLOSED_DURING_RECOVERY: &str = "workspaces_sync.closed_during_recovery:";
+
+/// Closes not yet saved; retried every reconcile until they are.
+static CLOSED_UNPERSISTED: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Save every close still held only in memory; each is forgotten from
+/// memory only once its row is written.
+fn persist_unsaved_closes(db: &DatabaseStore) {
+    let mut unsaved = lock(&CLOSED_UNPERSISTED);
+    unsaved.retain(|wid| db.set_ui_state(&format!("{CLOSED_DURING_RECOVERY}{wid}"), "1").is_err());
+}
+
+/// Every workspace closed while the current layout recovery is pending, or
+/// an error if the saved ones cannot be read.
+fn closed_during_recovery(db: &DatabaseStore) -> Result<HashSet<String>, String> {
+    let mut closed: HashSet<String> = db
+        .ui_state_keys_with_prefix(CLOSED_DURING_RECOVERY)?
+        .into_iter()
+        .filter_map(|key| key.strip_prefix(CLOSED_DURING_RECOVERY).map(str::to_string))
+        .collect();
+    closed.extend(lock(&CLOSED_UNPERSISTED).iter().cloned());
+    Ok(closed)
+}
+
+/// The user closed `workspace_id`: mark its sync row deleted. While a
+/// layout recovery is pending, reconcile infers no closes, so the close is
+/// also remembered — saved so it survives a restart, and kept in memory
+/// and retried until that save works — and reconcile keeps applying it: it
+/// never re-adds that workspace and retries the deletion every tick.
+pub fn record_closed(db: &DatabaseStore, workspace_id: &str) -> Result<(), String> {
+    let _serialised = lock(&RECONCILE_LOCK);
+    if (crate::state::layout_recovery_pending() || crate::state::retained_layouts().protects(workspace_id))
+        && db.set_ui_state(&format!("{CLOSED_DURING_RECOVERY}{workspace_id}"), "1").is_err()
+    {
+        lock(&CLOSED_UNPERSISTED).insert(workspace_id.to_string());
+    }
+    db.soft_delete_workspace_sync_by_workspace_id(workspace_id)
+}
+
+/// Mirror `snapshot` into the sync table, taking it as current state.
+/// Production code calls [`reconcile_from_state`], which checks the state
+/// as it is now as well.
 pub fn reconcile_from_snapshot(
     db: &DatabaseStore,
     snapshot: &AppStateSnapshot,
 ) -> Result<(), String> {
+    let ids: HashSet<String> = snapshot.workspaces.iter().map(|w| w.workspace_id.0.clone()).collect();
+    reconcile_inner(db, snapshot, &|| ids.clone())
+}
+
+/// Take a snapshot of `state` and mirror it. A pass can be delayed anywhere —
+/// after taking its snapshot, or in the Git reads — while workspaces open
+/// and close. So before writing anything, under the lock, it also reads
+/// which workspaces exist now: it writes rows only for workspaces in both
+/// its snapshot and current state (so it never republishes one closed
+/// meanwhile), and deletes a row only when its workspace is in neither —
+/// reading current state once more just before, after the rows (so it
+/// never deletes one opened or adopted meanwhile). A stale pass can at worst write
+/// a workspace's older details, which the next one corrects.
+pub fn reconcile_from_state(
+    db: &DatabaseStore,
+    state: &crate::state::AppStateStore,
+) -> Result<(), String> {
+    let snapshot = state.snapshot();
+    reconcile_inner(db, &snapshot, &|| state.workspace_ids())
+}
+
+fn reconcile_inner(
+    db: &DatabaseStore,
+    snapshot: &AppStateSnapshot,
+    current_ids: &dyn Fn() -> HashSet<String>,
+) -> Result<(), String> {
+    // Git first, outside the lock: a slow repository must not hold up a
+    // close being recorded.
+    let heads: HashMap<String, Option<String>> = snapshot
+        .workspaces
+        .iter()
+        // Only the workspaces the loop below mirrors.
+        .filter(|ws| {
+            !ws.attach_only
+                && !matches!(
+                    ws.workspace_type,
+                    crate::state::WorkspaceType::Removed | crate::state::WorkspaceType::Home
+                )
+        })
+        .map(|ws| {
+            let path = ws.worktree_path.as_deref().unwrap_or(ws.cwd.as_str());
+            (ws.workspace_id.0.clone(), read_git_head_sha(path))
+        })
+        .collect();
+
+    let _serialised = lock(&RECONCILE_LOCK);
+    let present_now = current_ids();
+    let recovering = crate::state::layout_recovery_pending();
+    let retained = crate::state::retained_layouts();
+    let closed = if recovering || !retained.is_empty() {
+        persist_unsaved_closes(db);
+        match closed_during_recovery(db) {
+            Ok(mut closed) => {
+                closed.retain(|wid| recovering || retained.protects(wid));
+                closed
+            }
+            Err(error) => {
+                // Without the list, any write here could re-add a closed
+                // workspace; try again next tick.
+                eprintln!("[workspaces-sync] cannot read recovery-time closes ({error}); skipping this reconcile");
+                return Ok(());
+            }
+        }
+    } else {
+        // Recovery over: closes are inferred again, so the list is done.
+        let _ = db.delete_ui_state_with_prefix(CLOSED_DURING_RECOVERY);
+        lock(&CLOSED_UNPERSISTED).clear();
+        HashSet::new()
+    };
     // Build local host_id → server_id map for translating
     // WorkspaceSnapshot.host_id (i64) into host_server_id (TEXT).
     let host_id_to_server: HashMap<i64, String> = db
@@ -552,6 +805,11 @@ pub fn reconcile_from_snapshot(
         }
 
         let wid = ws.workspace_id.0.clone();
+        // Closed since this snapshot was taken, or during recovery: a
+        // snapshot that still lists it is older than the close.
+        if closed.contains(&wid) || !present_now.contains(&wid) {
+            continue;
+        }
         live_wids.insert(wid.clone());
 
         let host_server_id = ws
@@ -573,17 +831,12 @@ pub fn reconcile_from_snapshot(
         let project_uid = ws.project_uid.as_deref();
         let workspace_kind = ws.workspace_kind.as_deref();
 
-        // Read the workspace's git HEAD sha so Phase-4 divergence
-        // detection can compare across devices. Best-effort: if
-        // git isn't installed, the workspace isn't a git repo, or
-        // it has no commits, we leave it as None. Use the
-        // worktree_path when set, else fall back to cwd.
-        let head_path = ws
-            .worktree_path
-            .as_deref()
-            .or(Some(ws.cwd.as_str()))
-            .unwrap_or("");
-        let git_head_sha: Option<String> = read_git_head_sha(head_path);
+        // The workspace's git HEAD sha (read above, outside the lock) so
+        // Phase-4 divergence detection can compare across devices.
+        // Best-effort: None if git isn't installed, the workspace isn't a
+        // git repo, or it has no commits. From the worktree_path when set,
+        // else the cwd.
+        let git_head_sha: Option<String> = heads.get(&wid).cloned().flatten();
         let git_head_sha_ref = git_head_sha.as_deref();
 
         if let Some(existing) = sync_by_wid.get(wid.as_str()) {
@@ -632,9 +885,27 @@ pub fn reconcile_from_snapshot(
     // Soft-delete sync rows whose workspace_id is no longer in
     // app_state. Rows with no workspace_id (pulled-only) are skipped
     // by construction (the filter_map above excludes them).
+    //
+    // While an unreadable saved layout awaits recovery, a workspace missing
+    // from it is missing, not closed: deleting its row would remove it from
+    // every other device too. Nothing is inferred then; a workspace really
+    // closed has its row deleted by the close itself (`record_closed`).
+    for wid in &closed {
+        // Retained layouts also suppress inferred deletion of these IDs.
+        // An explicit close still wins and its write can be retried.
+        if let Err(error) = db.soft_delete_workspace_sync_by_workspace_id(wid) {
+            eprintln!("[workspaces-sync] soft-delete failed for {wid}: {error}");
+        }
+    }
+    if recovering {
+        return Ok(());
+    }
+    // Read membership again: a workspace adopted after the first read may
+    // have linked one of `sync_rows` since.
+    let present_late = current_ids();
     for row in &sync_rows {
         if let Some(wid) = &row.workspace_id {
-            if !live_wids.contains(wid) {
+            if !live_wids.contains(wid) && !present_now.contains(wid) && !present_late.contains(wid) && !retained.protects(wid) {
                 if let Err(error) =
                     db.soft_delete_workspace_sync_by_workspace_id(wid)
                 {
@@ -670,6 +941,7 @@ pub async fn sync_workspaces(token: &str, db: &DatabaseStore) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use crate::database::DatabaseStore;
+    use crate::sync_guard::SyncGuard;
     use serial_test::serial;
 
     fn fresh_db() -> DatabaseStore {
@@ -767,6 +1039,431 @@ mod tests {
         db.mark_workspace_sync_synced(all[0].id, None).unwrap();
         db.purge_acknowledged_workspace_sync_deletes().unwrap();
         assert_eq!(db.list_workspaces_sync_for_sync().len(), 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_close_made_while_its_row_was_being_uploaded_is_still_pushed() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let db = fresh_db();
+        let row = db
+            .insert_workspace_sync("ws-inflight", "old", None, None, None, Some("main"), None, None, None)
+            .unwrap();
+        db.mark_workspace_sync_synced(row.id, Some("srv-inflight")).unwrap();
+        db.update_workspace_sync_by_workspace_id("ws-inflight", "renamed", None, None, None, Some("main"), None, None, None)
+            .unwrap();
+
+        // The PATCH carrying the rename is in flight when the workspace is
+        // closed; then its success is acknowledged.
+        let in_flight = db.list_dirty_workspaces_sync().pop().unwrap();
+        db.soft_delete_workspace_sync_by_workspace_id("ws-inflight").unwrap();
+        db.mark_workspace_sync_pushed(&in_flight, None).unwrap();
+
+        let delete = server
+            .mock("DELETE", "/api/workspaces/srv-inflight")
+            .with_status(204)
+            .expect(1)
+            .create_async()
+            .await;
+        super::push("token", &db).await.unwrap();
+        delete.assert_async().await;
+        std::env::remove_var("CODEMUX_API_URL");
+    }
+
+    type Handler = std::sync::Arc<
+        dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = (&'static str, String)> + Send>>
+            + Send
+            + Sync,
+    >;
+
+    /// A tiny account API: each connection is served on its own task, so a
+    /// slow answer holds up nothing else. `handler` gets the request line.
+    async fn test_api(handler: Handler) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&request).lines().next().unwrap_or("").to_string();
+                    let (status, body) = handler(line).await;
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        url
+    }
+
+    fn workspace_json(id: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","title":"new","hostServerId":null,"projectPath":null,"projectRemote":null,"gitBranch":"main","createdAt":"2026-01-01 00:00:00","updatedAt":"2026-01-01 00:00:00","deletedAt":null}}"#
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_close_during_a_first_upload_is_sent_by_the_next_sync_with_the_new_id() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let posted = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let deletes = std::sync::Arc::new(AtomicUsize::new(0));
+        let (p, r, d) = (posted.clone(), release.clone(), deletes.clone());
+        let handler: Handler = std::sync::Arc::new(move |line| {
+            let (p, r, d) = (p.clone(), r.clone(), d.clone());
+            Box::pin(async move {
+                if line.starts_with("GET /api/workspaces ") {
+                    ("200 OK", r#"{"workspaces":[]}"#.to_string())
+                } else if line.starts_with("POST /api/workspaces ") {
+                    // Held until the test has closed the workspace and
+                    // started a second sync.
+                    p.notify_one();
+                    r.notified().await;
+                    ("200 OK", format!(r#"{{"workspace":{}}}"#, workspace_json("srv-race")))
+                } else if line.starts_with("DELETE /api/workspaces/srv-race ") {
+                    d.fetch_add(1, Ordering::SeqCst);
+                    ("204 No Content", String::new())
+                } else {
+                    ("404 Not Found", String::new())
+                }
+            })
+        });
+        std::env::set_var("CODEMUX_API_URL", test_api(handler).await);
+        let db = fresh_db();
+        db.insert_workspace_sync("ws-race", "new", None, None, None, Some("main"), None, None, None)
+            .unwrap();
+
+        let first = super::sync_once("token", &db);
+        let second = async {
+            posted.notified().await;
+            db.soft_delete_workspace_sync_by_workspace_id("ws-race").unwrap();
+            // The second sync runs alongside while the upload is still held;
+            // given a moment to get going (or to queue), the upload is
+            // answered. With the queue the outcome never depends on that
+            // moment; without it, the second sync would settle the close
+            // before the server id arrives.
+            let (second, ()) = tokio::join!(super::sync_once("token", &db), async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                release.notify_one();
+            });
+            second
+        };
+        let (first, second) = tokio::join!(first, second);
+        std::env::remove_var("CODEMUX_API_URL");
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(deletes.load(Ordering::SeqCst), 1, "the close goes up as a DELETE for the new id");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_pass_queued_across_an_account_switch_sends_nothing() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let list = server.mock("GET", "/api/workspaces").expect(0).create_async().await;
+        let upload = server.mock("POST", "/api/workspaces").expect(0).create_async().await;
+        let db = fresh_db();
+        db.insert_workspace_sync("ws-switch", "new", None, None, None, None, None, None, None).unwrap();
+
+        // The pass resolved account A's session, then waited while the user
+        // switched to account B.
+        let auth = crate::auth::AuthState::default();
+        let (generation, ()) = auth.session_snapshot(|| ());
+        auth.replace_session(|| ());
+        // Each half fails on the stale session before sending anything.
+        let _ = super::sync_locked("token", &db, SyncGuard::session(&auth, generation)).await;
+        list.assert_async().await;
+        upload.assert_async().await;
+        assert!(db.list_dirty_workspaces_sync()[0].server_id.is_none(), "nothing was uploaded");
+        std::env::remove_var("CODEMUX_API_URL");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn an_answer_that_arrives_after_an_account_switch_is_not_written() {
+        let asked = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (a, r) = (asked.clone(), release.clone());
+        let handler: Handler = std::sync::Arc::new(move |_line| {
+            let (a, r) = (a.clone(), r.clone());
+            Box::pin(async move {
+                a.notify_one();
+                r.notified().await;
+                ("200 OK", format!(r#"{{"workspaces":[{}]}}"#, workspace_json("srv-account-a")))
+            })
+        });
+        std::env::set_var("CODEMUX_API_URL", test_api(handler).await);
+        let db = fresh_db();
+        let auth = crate::auth::AuthState::default();
+        let (generation, ()) = auth.session_snapshot(|| ());
+        let guard = SyncGuard::session(&auth, generation);
+        let client = crate::sync_guard::sync_client();
+
+        let pulling = super::pull_guarded("token", &db, &guard, &client);
+        let switch = async {
+            asked.notified().await;
+            auth.replace_session(|| ());
+            release.notify_one();
+        };
+        let (pulled, ()) = tokio::join!(pulling, switch);
+        std::env::remove_var("CODEMUX_API_URL");
+
+        assert!(pulled.is_err());
+        assert!(db.list_workspaces_sync_for_sync().is_empty(), "account A's answer is not written for B");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_stalled_upload_ends_by_its_own_timeout_and_frees_the_queue() {
+        let handler: Handler = std::sync::Arc::new(move |line| {
+            Box::pin(async move {
+                if line.starts_with("GET /api/workspaces ") {
+                    ("200 OK", r#"{"workspaces":[]}"#.to_string())
+                } else if line.starts_with("POST /api/workspaces ") {
+                    // Never answered.
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                } else {
+                    ("404 Not Found", String::new())
+                }
+            })
+        });
+        std::env::set_var("CODEMUX_API_URL", test_api(handler).await);
+        let db = fresh_db();
+        db.insert_workspace_sync("ws-stall", "new", None, None, None, Some("main"), None, None, None)
+            .unwrap();
+
+        // A request timeout short enough for a test; in the app it is 30s.
+        let client = crate::sync_guard::sync_client_with(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let stalled = super::sync_with("token", &db, &SyncGuard::unchecked(), &client).await;
+        assert!(stalled.is_err(), "the upload's own timeout ends the pass");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // The queue is free for the next pass, and the row is kept to try
+        // again rather than dropped.
+        std::env::remove_var("CODEMUX_API_URL");
+        let row = db.list_dirty_workspaces_sync().pop().unwrap();
+        assert_eq!(row.workspace_id.as_deref(), Some("ws-stall"));
+        assert!(row.server_id.is_none() && row.dirty);
+        let queue_free = tokio::time::timeout(std::time::Duration::from_secs(1), super::SYNC_LOCK.lock()).await;
+        assert!(queue_free.is_ok(), "nothing holds the queue");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_healthy_row_behind_stalling_ones_is_sent_by_a_later_pass() {
+        let handler: Handler = std::sync::Arc::new(move |line| {
+            Box::pin(async move {
+                if line.starts_with("GET /api/workspaces ") {
+                    ("200 OK", r#"{"workspaces":[]}"#.to_string())
+                } else if line.starts_with("PATCH /api/workspaces/srv-stall ") {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                } else if line.starts_with("PATCH /api/workspaces/srv-ok ") {
+                    ("200 OK", "{}".to_string())
+                } else {
+                    ("404 Not Found", String::new())
+                }
+            })
+        });
+        std::env::set_var("CODEMUX_API_URL", test_api(handler).await);
+        // Row ids repeat across test databases; start from a clean record.
+        super::ATTEMPTS.lock().unwrap().clear();
+        let db = fresh_db();
+        // The stalling row sorts first by id.
+        for (wid, sid) in [("ws-stall-first", "srv-stall"), ("ws-ok-second", "srv-ok")] {
+            let row = db.insert_workspace_sync(wid, "old", None, None, None, None, None, None, None).unwrap();
+            db.mark_workspace_sync_synced(row.id, Some(sid)).unwrap();
+            db.update_workspace_sync_by_workspace_id(wid, "edited", None, None, None, None, None, None, None)
+                .unwrap();
+        }
+        let client = crate::sync_guard::sync_client_with(std::time::Duration::from_millis(300));
+        let budget = std::time::Duration::from_millis(200);
+        let ok_is_clean = |db: &DatabaseStore| {
+            !db.list_dirty_workspaces_sync().iter().any(|r| r.server_id.as_deref() == Some("srv-ok"))
+        };
+
+        let _ = super::sync_with("token", &db, &SyncGuard::unchecked().within(budget), &client).await;
+        assert!(!ok_is_clean(&db), "precondition: the stall used up the first pass");
+        let _ = super::sync_with("token", &db, &SyncGuard::unchecked().within(budget), &client).await;
+        std::env::remove_var("CODEMUX_API_URL");
+        assert!(ok_is_clean(&db), "the waiting row goes first next time and is sent");
+    }
+
+    #[test]
+    #[serial]
+    fn a_retry_answered_with_an_already_mirrored_id_leaves_one_linked_row() {
+        let db = fresh_db();
+        // The local workspace's first upload lost its answer, and a pull
+        // then mirrored the server's copy as an unadopted row.
+        let original = db
+            .insert_workspace_sync("ws-retried", "title", None, None, None, Some("main"), None, None, None)
+            .unwrap();
+        db.upsert_workspace_sync_from_server(
+            "srv-same", "title", None, None, None, Some("main"), None,
+            "2026-01-01 00:00:00", "2026-01-01 00:00:00", None, None, None,
+        )
+        .unwrap();
+
+        // The retry's answer names that same server row.
+        db.mark_workspace_sync_pushed(&original, Some("srv-same")).unwrap();
+
+        let rows = db.list_workspaces_sync_for_sync();
+        assert_eq!(rows.len(), 1, "one row: {rows:?}");
+        assert_eq!(rows[0].server_id.as_deref(), Some("srv-same"));
+        assert_eq!(rows[0].workspace_id.as_deref(), Some("ws-retried"), "the local workspace stays linked");
+        assert!(!rows[0].dirty);
+    }
+
+    #[test]
+    #[serial]
+    fn a_host_inventory_holder_clean_or_with_pending_work_is_never_dropped() {
+        for (sid, edited) in [("srv-inv-clean", false), ("srv-inv-dirty", true)] {
+            let db = fresh_db();
+            let holder = db
+                .insert_remote_discovered_workspace_sync(
+                    "host-1", "origin-1", "t", Some("/srv/p"), None, Some("main"), None, None, Some("/srv/p"), None,
+                )
+                .unwrap();
+            db.mark_workspace_sync_synced(holder.id, Some(sid)).unwrap();
+            if edited {
+                db.update_remote_discovered_workspace_sync(
+                    holder.id, "renamed", Some("/srv/p"), None, Some("main"), None, None, Some("/srv/p"), None,
+                )
+                .unwrap();
+            }
+            let retried = db
+                .insert_workspace_sync("ws-retry", "t", None, None, None, Some("main"), None, None, None)
+                .unwrap();
+
+            assert!(db.mark_workspace_sync_pushed(&retried, Some(sid)).is_err(), "{sid}");
+            let kept = db.list_workspaces_sync_for_sync().into_iter().find(|r| r.id == holder.id).unwrap();
+            assert_eq!(kept.origin_uid.as_deref(), Some("origin-1"), "{sid}: its host identity is kept");
+            assert_eq!(kept.dirty, edited, "{sid}: and its pending change");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn an_adopted_row_holding_the_id_is_never_dropped() {
+        let db = fresh_db();
+        let adopted = db
+            .insert_workspace_sync("ws-adopted-holder", "a", None, None, None, None, None, None, None)
+            .unwrap();
+        db.mark_workspace_sync_synced(adopted.id, Some("srv-held")).unwrap();
+        let other = db
+            .insert_workspace_sync("ws-other", "b", None, None, None, None, None, None, None)
+            .unwrap();
+
+        assert!(db.mark_workspace_sync_pushed(&other, Some("srv-held")).is_err());
+        assert_eq!(db.list_workspaces_sync_for_sync().len(), 2, "nothing is dropped");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_pass_past_its_deadline_starts_no_request() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let list = server.mock("GET", "/api/workspaces").expect(0).create_async().await;
+        let upload = server.mock("POST", "/api/workspaces").expect(0).create_async().await;
+        let db = fresh_db();
+        db.insert_workspace_sync("ws-late-pass", "new", None, None, None, None, None, None, None).unwrap();
+
+        let guard = SyncGuard::unchecked().within(std::time::Duration::ZERO);
+        let client = crate::sync_guard::sync_client();
+        assert!(super::sync_with("token", &db, &guard, &client).await.is_err());
+        list.assert_async().await;
+        upload.assert_async().await;
+        std::env::remove_var("CODEMUX_API_URL");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_account_list_is_fetched_once_per_push_however_many_rows_are_gone() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let db = fresh_db();
+        for (wid, sid) in [("ws-gone-a", "srv-gone-a"), ("ws-gone-b", "srv-gone-b")] {
+            let row = db.insert_workspace_sync(wid, "old", None, None, None, None, None, None, None).unwrap();
+            db.mark_workspace_sync_synced(row.id, Some(sid)).unwrap();
+            db.update_workspace_sync_by_workspace_id(wid, "edited", None, None, None, None, None, None, None)
+                .unwrap();
+        }
+        let _patch = server
+            .mock("PATCH", mockito::Matcher::Regex("^/api/workspaces/srv-gone-".into()))
+            .with_status(404)
+            .create_async()
+            .await;
+        let list = server
+            .mock("GET", "/api/workspaces")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"workspaces":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        super::push("token", &db).await.unwrap();
+        list.assert_async().await;
+        assert!(db.list_workspaces_sync().is_empty(), "both removals are settled");
+        std::env::remove_var("CODEMUX_API_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn upsert_from_server_keeps_unpushed_edits_and_deletes() {
+        let db = fresh_db();
+        let server_copy = |id: &str, title: &str| {
+            db.upsert_workspace_sync_from_server(
+                id, title, None, None, None, Some("main"), None,
+                "2026-01-01 00:00:00", "2026-01-01 00:00:00", None, None, None,
+            )
+            .unwrap();
+        };
+        for (workspace, sid) in [("workspace-1", "1"), ("workspace-2", "2"), ("workspace-3", "3")] {
+            let row = db
+                .insert_workspace_sync(workspace, "old", None, None, None, Some("main"), None, None, None)
+                .unwrap();
+            db.mark_workspace_sync_synced(row.id, Some(sid)).unwrap();
+        }
+        db.update_workspace_sync_by_workspace_id(
+            "workspace-1", "renamed", None, None, None, Some("feature"), None, None, None,
+        )
+        .unwrap();
+        db.soft_delete_workspace_sync_by_workspace_id("workspace-2").unwrap();
+
+        // The server still has the old copy of each.
+        for sid in ["1", "2", "3"] {
+            server_copy(sid, "server title");
+        }
+
+        let rows = db.list_workspaces_sync_for_sync();
+        assert_eq!(rows.len(), 3, "no duplicate rows");
+        let row = |sid: &str| rows.iter().find(|r| r.server_id.as_deref() == Some(sid)).unwrap();
+        assert_eq!(row("1").title, "renamed", "a rename is not reverted");
+        assert_eq!(row("1").git_branch.as_deref(), Some("feature"));
+        assert!(row("1").dirty, "and still goes up with the push");
+        assert!(
+            row("2").deleted_at.is_some() && row("2").dirty,
+            "a closed workspace is not resurrected"
+        );
+        assert_eq!(row("3").title, "server title", "a clean row still takes the server copy");
+        assert!(!row("3").dirty);
     }
 
     #[test]
@@ -1133,6 +1830,202 @@ mod tests {
             !db.list_workspaces_sync()[0].dirty,
             "unchanged identity must not re-mark the row dirty"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn during_layout_recovery_only_workspaces_really_closed_are_deleted() {
+        let db = fresh_db();
+        // Rows synced before the unreadable layout. One is missing from the
+        // fallback; the other is restored and then closed, before any
+        // background reconcile has run.
+        for wid in ["ws-recovery-missing", "ws-recovery-closed"] {
+            db.insert_workspace_sync(wid, "old", None, None, None, None, None, None, None).unwrap();
+        }
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+
+        // The close: an explicit record, then the reconcile the close path
+        // runs with the post-close snapshot.
+        super::record_closed(&db, "ws-recovery-closed").unwrap();
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+
+        let live = |wid: &str| db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some(wid));
+        assert!(!live("ws-recovery-closed"), "a workspace really closed is deleted");
+        assert!(live("ws-recovery-missing"), "a missing one is not");
+    }
+
+    #[test]
+    #[serial]
+    fn a_close_during_recovery_holds_against_a_stale_reconcile_and_a_restart() {
+        let db = fresh_db();
+        let stale = make_snapshot(vec![make_ws("ws-close-stale", "closed")]);
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+        let live = |db: &DatabaseStore| {
+            db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some("ws-close-stale"))
+        };
+
+        // Closed before it ever had a row; then a reconcile from a snapshot
+        // taken before the close.
+        super::record_closed(&db, "ws-close-stale").unwrap();
+        super::reconcile_from_snapshot(&db, &stale).unwrap();
+        assert!(!live(&db), "a stale snapshot does not re-add a closed workspace");
+
+        // A row that slipped in anyway (or whose deletion failed) is deleted
+        // on the next tick — also after a restart, from the persisted list.
+        super::lock(&super::CLOSED_UNPERSISTED).clear();
+        db.insert_workspace_sync("ws-close-stale", "closed", None, None, None, None, None, None, None)
+            .unwrap();
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        assert!(!live(&db), "the close is retried");
+
+        // Once recovery is over the list is cleared.
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        assert!(db.ui_state_keys_with_prefix(super::CLOSED_DURING_RECOVERY).unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_reconcile_from_an_older_snapshot_never_undoes_a_newer_one() {
+        let db = fresh_db();
+        // A newer pass published a workspace opened after the old pass took
+        // its snapshot; the old pass, delayed anywhere since, then runs.
+        super::reconcile_from_snapshot(&db, &make_snapshot(vec![make_ws("ws-after-stale", "new")])).unwrap();
+        let now: std::collections::HashSet<String> = ["ws-after-stale".to_string()].into();
+        super::reconcile_inner(&db, &make_snapshot(Vec::new()), &|| now.clone()).unwrap();
+
+        assert!(
+            db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some("ws-after-stale")),
+            "the stale pass must not delete a workspace that exists now"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_reconcile_from_an_older_snapshot_never_republishes_a_closed_workspace() {
+        let db = fresh_db();
+        // The old pass captured the workspace; it was closed before the pass
+        // wrote its first row; then the pass resumes.
+        let before_close = make_snapshot(vec![make_ws("ws-closed-race", "closed")]);
+        super::reconcile_inner(&db, &before_close, &|| std::collections::HashSet::new()).unwrap();
+
+        assert!(
+            db.list_workspaces_sync_for_sync()
+                .iter()
+                .all(|r| r.workspace_id.as_deref() != Some("ws-closed-race")),
+            "no row may be left to publish for a workspace closed meanwhile"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_row_adopted_during_a_reconcile_is_not_deleted() {
+        let db = fresh_db();
+        // The adoption links an existing row to a new workspace after the
+        // pass's first look at current state.
+        let row = db
+            .insert_workspace_sync("ws-adopted-midway", "adopted", None, None, None, None, None, None, None)
+            .unwrap();
+        db.mark_workspace_sync_synced(row.id, Some("srv-adopted")).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let current = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                std::collections::HashSet::new()
+            } else {
+                ["ws-adopted-midway".to_string()].into()
+            }
+        };
+        super::reconcile_inner(&db, &make_snapshot(Vec::new()), &current).unwrap();
+
+        assert!(
+            db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some("ws-adopted-midway")),
+            "a workspace adopted meanwhile must keep its row"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn during_recovery_only_the_closed_copy_is_deleted() {
+        let db = fresh_db();
+        for wid in ["ws-copy-closed", "ws-copy-missing"] {
+            db.insert_workspace_sync(wid, "copy", None, None, None, None, None, None, None).unwrap();
+        }
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+        // What closing a standalone copy now does after removing it.
+        super::record_closed(&db, "ws-copy-closed").unwrap();
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+
+        let live = |wid: &str| db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some(wid));
+        assert!(!live("ws-copy-closed"), "the closed copy is deleted");
+        assert!(live("ws-copy-missing"), "an unrelated missing workspace is not");
+        let _ = db.delete_ui_state_with_prefix(super::CLOSED_DURING_RECOVERY);
+    }
+
+    #[test]
+    #[serial]
+    fn a_recovery_time_close_survives_a_pull_and_goes_up_with_the_push() {
+        let db = fresh_db();
+        // An already-synced copy, and an unrelated workspace missing from
+        // the fallback layout.
+        for (wid, sid) in [("ws-pull-closed", "srv-pull-closed"), ("ws-pull-missing", "srv-pull-missing")] {
+            let row = db.insert_workspace_sync(wid, "copy", None, None, None, None, None, None, None).unwrap();
+            db.mark_workspace_sync_synced(row.id, Some(sid)).unwrap();
+        }
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+        super::record_closed(&db, "ws-pull-closed").unwrap();
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+
+        // The pull: the server still lists both as live.
+        for sid in ["srv-pull-closed", "srv-pull-missing"] {
+            db.upsert_workspace_sync_from_server(
+                sid, "copy", None, None, None, None, None,
+                "2026-01-01 00:00:00", "2026-01-01 00:00:00", None, None, None,
+            )
+            .unwrap();
+        }
+
+        let dirty = db.list_dirty_workspaces_sync();
+        let closed = dirty.iter().find(|r| r.server_id.as_deref() == Some("srv-pull-closed"));
+        assert!(
+            closed.is_some_and(|r| r.deleted_at.is_some()),
+            "the close stays a dirty tombstone, so the push sends its DELETE"
+        );
+        assert!(
+            db.list_workspaces_sync().iter().any(|r| r.server_id.as_deref() == Some("srv-pull-missing")),
+            "the unrelated missing workspace stays live"
+        );
+        let _ = db.delete_ui_state_with_prefix(super::CLOSED_DURING_RECOVERY);
+    }
+
+    #[test]
+    #[serial]
+    fn a_close_whose_save_failed_is_saved_on_a_later_tick_and_survives_a_restart() {
+        let db = fresh_db();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+        // The close's own save failed: it is held only in memory.
+        super::lock(&super::CLOSED_UNPERSISTED).insert("ws-close-unsaved".to_string());
+
+        // A later tick saves it and forgets it from memory.
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        assert!(super::lock(&super::CLOSED_UNPERSISTED).is_empty());
+        assert_eq!(
+            db.ui_state_keys_with_prefix(super::CLOSED_DURING_RECOVERY).unwrap(),
+            [format!("{}ws-close-unsaved", super::CLOSED_DURING_RECOVERY)]
+        );
+
+        // After a restart, a snapshot from before the close does not
+        // re-add it.
+        super::reconcile_from_snapshot(&db, &make_snapshot(vec![make_ws("ws-close-unsaved", "x")])).unwrap();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+        assert!(!db
+            .list_workspaces_sync()
+            .iter()
+            .any(|r| r.workspace_id.as_deref() == Some("ws-close-unsaved")));
+        let _ = db.delete_ui_state_with_prefix(super::CLOSED_DURING_RECOVERY);
     }
 
     #[test]

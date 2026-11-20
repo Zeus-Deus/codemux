@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -157,7 +157,37 @@ pub(crate) enum LayoutCloseIntent {
     Session { workspace_id: String, session_id: String },
     Tab { workspace_id: String, tab_id: String },
     Workspace(String),
-    Archive(Box<ArchivedWorkspaceSnapshot>),
+    Archive(Box<PendingArchive>),
+    ConsumedArchive { workspace_id: String, archive_id: String },
+}
+
+/// Older archive journal payloads are the flattened entry alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingArchive {
+    #[serde(flatten)]
+    pub(crate) entry: ArchivedWorkspaceSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restored_workspace_id: Option<String>,
+    // Only these conversations followed this unarchive. The replacement can
+    // already own other Hermes chats in exactly the same checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) hermes_thread_ids: Option<Vec<String>>,
+}
+
+impl LayoutCloseIntent {
+    pub(crate) fn archive(entry: ArchivedWorkspaceSnapshot) -> Self {
+        Self::Archive(Box::new(PendingArchive { entry, restored_workspace_id: None, hermes_thread_ids: None }))
+    }
+
+    pub(crate) fn closed_workspace_id(&self) -> Option<&str> {
+        match self {
+            Self::Workspace(id) | Self::ConsumedArchive { workspace_id: id, .. } => Some(id),
+            Self::Archive(archive) if archive.restored_workspace_id.as_deref() != Some(&archive.entry.workspace_id) => {
+                Some(&archive.entry.workspace_id)
+            }
+            _ => None,
+        }
+    }
 }
 
 fn persist_debouncer() -> &'static PersistDebouncer {
@@ -201,8 +231,24 @@ pub(crate) fn finish_layout_persistence(store: &AppStateStore) -> Result<(), Str
     save_persisted_state(&store.snapshot())
 }
 
+pub(crate) fn persist_pending_layout_closes<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    intents: Vec<LayoutCloseIntent>,
+) {
+    if intents.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = app.state::<AppStateStore>();
+        let db = app.state::<crate::database::DatabaseStore>();
+        if let Err(error) = persist_layout_closes(&store, &db, &intents) {
+            log::error!("Could not persist pending layout closes: {error}");
+        }
+    });
+}
+
 /// Commit the full removal before retiring its durable intent.
-#[cfg(unix)]
 pub(crate) fn persist_layout_closes(
     store: &AppStateStore,
     db: &crate::database::DatabaseStore,
@@ -225,7 +271,8 @@ pub(crate) fn persist_layout_closes(
         }
         return Err(error);
     }
-    db.retire_layout_closes(intents)
+    // A restored backup may still contain the closed pane, tab, or workspace.
+    db.settle_layout_closes(intents, &snapshot, !layout_recovery_pending())
 }
 
 /// Keep the old-to-new binding until layout.json no longer names the old
@@ -263,7 +310,25 @@ pub(crate) fn persist_terminal_replacements(
         }
         return Err(error);
     }
+    // The backup can still reference the old session after the fallback was saved.
+    if layout_recovery_pending() {
+        return Ok(());
+    }
+    let retained = retained_layouts();
+    if retained.unreadable {
+        return Ok(());
+    }
+    // A live restart hands us only its newest edge. Older journal rows can
+    // connect that edge to a session in a saved recovery layout.
+    let protected = if retained.is_empty() {
+        HashSet::new()
+    } else {
+        retained.terminal_owners(&db.pending_terminal_replacements()?)
+    };
     for replacement in replacements {
+        if protected.contains(&(replacement.workspace_id.clone(), replacement.old_session_id.clone())) {
+            continue;
+        }
         db.retire_terminal_replacement(
             &replacement.workspace_id,
             &replacement.old_session_id,
@@ -305,8 +370,6 @@ pub enum WorkspacePresetLayout {
     /// bundled `create_worktree_workspace` command.
     Empty,
 }
-
-static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
@@ -829,6 +892,27 @@ pub struct WorkspaceSnapshot {
 }
 
 impl WorkspaceSnapshot {
+    fn migrate_legacy_tab(&mut self) {
+        if self.workspace_type == WorkspaceType::Standard
+            && self.tabs.is_empty()
+            && !self.surfaces.is_empty()
+        {
+            let surface_id = self.surfaces[0].surface_id.clone();
+            // A close can be journaled before the migrated layout is saved.
+            // Derive the tab ID from the persisted surface so replay can find it.
+            let tab_id = format!("legacy-tab-{}", surface_id.0);
+            self.tabs.push(TabSnapshot {
+                tab_id: tab_id.clone(),
+                kind: TabKind::Terminal,
+                title: "Terminal".into(),
+                surface_id: Some(surface_id),
+                browser_id: None,
+                icon: None,
+            });
+            self.active_tab_id = tab_id;
+        }
+    }
+
     /// A workspace started for an agent's chat: it borrows the folder of
     /// the workspace it came from and owns no files.
     pub fn is_chat_child(&self) -> bool {
@@ -954,7 +1038,7 @@ pub fn is_chat_child_entry(entry: &ArchivedWorkspaceSnapshot) -> bool {
 /// phantom archive entry).
 pub fn build_archive_entry(ws: &WorkspaceSnapshot) -> ArchivedWorkspaceSnapshot {
     ArchivedWorkspaceSnapshot {
-        archive_id: uuid::Uuid::new_v4().to_string(),
+        archive_id: uuid::Uuid::now_v7().to_string(),
         workspace_id: ws.workspace_id.0.clone(),
         title: ws.title.clone(),
         cwd: ws.cwd.clone(),
@@ -2106,7 +2190,6 @@ impl AppStateStore {
         }
         Self::restore_import_selection(&current, &mut candidate);
         candidate.active_workspace_id = selection;
-        restore_session_ids(&candidate);
         *current = candidate;
         Ok(ids)
     }
@@ -2723,7 +2806,7 @@ impl AppStateStore {
             )
         } else {
             let surface_id = SurfaceId(next_id("surface"));
-            let session_id = new_terminal_session_id();
+            let session_id = SessionId(next_id("session"));
             let base_terminal_index = snapshot.terminal_sessions.len() + 1;
 
             // A single shell session whose cwd is the host directory. The
@@ -2966,7 +3049,7 @@ impl AppStateStore {
         let mut session_ids = Vec::with_capacity(shell_count);
 
         for offset in 0..shell_count {
-            let session_id = new_terminal_session_id();
+            let session_id = SessionId(next_id("session"));
             snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                 session_id: session_id.clone(),
                 daemon_unused: true,
@@ -4617,38 +4700,29 @@ impl AppStateStore {
     }
 
     #[cfg(unix)]
-    pub(crate) fn terminal_session_owners(&self) -> std::collections::HashSet<(String, String)> {
+    pub(crate) fn terminal_session_owners(
+        &self,
+        replacements: &[crate::database::daemon_closes::PendingTerminalReplacement],
+    ) -> HashSet<(String, String)> {
         let snapshot = self.inner.lock().unwrap();
-        snapshot.workspaces.iter().flat_map(|workspace| {
+        let mut owners: HashSet<_> = snapshot.workspaces.iter().flat_map(|workspace| {
             collect_terminal_sessions(&workspace.surfaces).into_iter()
                 .map(|session_id| (workspace.workspace_id.0.clone(), session_id))
-        }).collect()
+        }).collect();
+        owners.extend(retained_layouts().terminal_owners(replacements));
+        owners
     }
 
     #[cfg(unix)]
     pub(crate) fn orphaned_daemon_shells(
         &self,
         shells: Vec<crate::database::daemon_closes::PendingDaemonClose>,
+        replacements: &[crate::database::daemon_closes::PendingTerminalReplacement],
     ) -> Vec<crate::database::daemon_closes::PendingDaemonClose> {
-        let snapshot = self.inner.lock().unwrap();
-        let sessions_by_workspace: std::collections::HashMap<_, _> = snapshot
-            .workspaces
-            .iter()
-            .map(|workspace| {
-                (
-                    workspace.workspace_id.0.as_str(),
-                    collect_terminal_sessions(&workspace.surfaces),
-                )
-            })
-            .collect();
-        shells
-            .into_iter()
-            .filter(|shell| {
-                sessions_by_workspace
-                    .get(shell.route.workspace_id.as_str())
-                    .is_none_or(|sessions| !sessions.contains(&shell.session_id))
-            })
-            .collect()
+        let owners = self.terminal_session_owners(replacements);
+        shells.into_iter().filter(|shell|
+            !owners.contains(&(shell.route.workspace_id.clone(), shell.session_id.clone()))
+        ).collect()
     }
 
     pub fn active_workspace_cwd(&self) -> Option<(String, String)> {
@@ -4696,13 +4770,14 @@ impl AppStateStore {
         let workspace = |id: &str| snapshot.workspaces.iter().find(|workspace| workspace.workspace_id.0 == id)
             .ok_or_else(|| format!("No workspace found for {id}"));
         let (workspace, sessions, scope) = match intent {
+            LayoutCloseIntent::ConsumedArchive { .. } => return Err("Archive consumption is a replay-only close".into()),
             LayoutCloseIntent::Workspace(id) => {
                 let workspace = workspace(id)?;
                 let sessions = collect_terminal_sessions(&workspace.surfaces).into_iter().map(SessionId).collect();
                 (workspace, sessions, Some(None))
             }
-            LayoutCloseIntent::Archive(entry) => {
-                let workspace = workspace(&entry.workspace_id)?;
+            LayoutCloseIntent::Archive(archive) => {
+                let workspace = workspace(&archive.entry.workspace_id)?;
                 let sessions = collect_terminal_sessions(&workspace.surfaces).into_iter().map(SessionId).collect();
                 (workspace, sessions, Some(None))
             }
@@ -4863,6 +4938,13 @@ impl AppStateStore {
         self.inner.lock().unwrap().archived_workspaces.clone()
     }
 
+    /// The ids of every workspace in state right now, without cloning the
+    /// rest of it.
+    pub fn workspace_ids(&self) -> std::collections::HashSet<String> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot.workspaces.iter().map(|w| w.workspace_id.0.clone()).collect()
+    }
+
     /// Clone of the live workspace with `workspace_id`, if any — the
     /// narrow sibling of `snapshot()` for single-workspace lookups.
     pub fn find_workspace(&self, workspace_id: &str) -> Option<WorkspaceSnapshot> {
@@ -4981,7 +5063,7 @@ impl AppStateStore {
             ));
         }
 
-        let session_id = new_terminal_session_id();
+        let session_id = SessionId(next_id("session"));
         let pane_id = PaneId(next_id("pane"));
         let cwd = current_project_root().display().to_string();
         let shell = env::var("SHELL").ok();
@@ -5070,7 +5152,7 @@ impl AppStateStore {
                 ));
             }
 
-            let session_id = new_terminal_session_id();
+            let session_id = SessionId(next_id("session"));
             let new_pane_id = PaneId(next_id("pane"));
             let split_pane_id = PaneId(next_id("pane"));
             let cwd = snapshot
@@ -6288,7 +6370,7 @@ impl AppStateStore {
                 let title = next_terminal_tab_title(&workspace.tabs);
                 let surface_id = SurfaceId(next_id("surface"));
                 let pane_id = PaneId(next_id("pane"));
-                let session_id = new_terminal_session_id();
+                let session_id = SessionId(next_id("session"));
                 let cwd = workspace.cwd.clone();
                 let shell = env::var("SHELL").ok();
 
@@ -6583,24 +6665,7 @@ impl AppStateStore {
     pub fn migrate_tabs_if_needed(&self) {
         let mut snapshot = self.inner.lock().unwrap();
         for workspace in &mut snapshot.workspaces {
-            if workspace.workspace_type == WorkspaceType::Standard
-                && workspace.tabs.is_empty()
-                && !workspace.surfaces.is_empty()
-            {
-                let surface_id = workspace.surfaces[0].surface_id.clone();
-                // A close can be journaled before the migrated layout is saved.
-                // Derive the tab ID from the persisted surface so replay can find it.
-                let tab_id = format!("legacy-tab-{}", surface_id.0);
-                workspace.tabs.push(TabSnapshot {
-                    tab_id: tab_id.clone(),
-                    kind: TabKind::Terminal,
-                    title: "Terminal".into(),
-                    surface_id: Some(surface_id),
-                    browser_id: None,
-                    icon: None,
-                });
-                workspace.active_tab_id = tab_id;
-            }
+            workspace.migrate_legacy_tab();
         }
     }
 
@@ -6969,26 +7034,503 @@ fn emit_debouncer() -> &'static EmitDebouncer {
 }
 
 pub fn load_persisted_state() -> Option<AppStateSnapshot> {
-    load_persisted_state_checked().ok().flatten()
+    match load_persisted_layout() {
+        PersistedLayout::Loaded(snapshot) => Some(*snapshot),
+        PersistedLayout::Missing | PersistedLayout::Unreadable { .. } => None,
+    }
 }
 
-/// A missing layout is normal on first launch. Other load errors mean the
-/// existing layout cannot be safely replaced by a fresh workspace snapshot.
+/// What startup found where the layout is saved.
+pub enum PersistedLayout {
+    /// No layout yet: a first launch.
+    Missing,
+    Loaded(Box<AppStateSnapshot>),
+    /// A layout exists but could not be read — a newer build's format after
+    /// a downgrade, a hand edit, disk damage. See [`open_layout`] for
+    /// how it is preserved, and [`layout_recovery_pending`].
+    Unreadable {
+        /// Whether a copy was set aside where no save can replace it.
+        preserved: bool,
+    },
+}
+
+// Pinned by the layout owner before any writer starts. A repair can arrive
+// between any two filesystem operations during the rest of this process.
+static RECOVERY_SAVE_BASE: Mutex<Option<String>> = Mutex::new(None);
+static LAYOUT_SAVES_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A saved recovery layout remains restorable across ordinary primary saves.
+/// Pin its resource IDs at startup; deleting the copy while stopped releases
+/// them on the next boot. Older recovery-saved files use the same naming scheme.
+#[derive(Default)]
+pub(crate) struct RetainedLayouts {
+    workspaces: HashMap<String, HashSet<String>>,
+    panes: HashSet<String>,
+    tabs: HashSet<(String, String)>,
+    archives: HashSet<String>,
+    pub(crate) checkout_paths: HashSet<PathBuf>,
+    pub(crate) unreadable: bool,
+}
+
+impl RetainedLayouts {
+    fn read(path: &Path) -> Self {
+        let mut retained = Self::default();
+        let Some(name) = path.file_name() else { return Self { unreadable: true, ..retained } };
+        let prefix = format!("{}.recovery-saved-", name.to_string_lossy());
+        let directory = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return retained,
+            Err(_) => return Self { unreadable: true, ..retained },
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { retained.unreadable = true; continue };
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|n| n.strip_prefix(&prefix)).and_then(|n| n.strip_suffix(".json")) else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(id).is_err() { continue; }
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                retained.unreadable = true;
+                continue;
+            }
+            match read_layout::<AppStateSnapshot>(&entry.path()) {
+                Ok(Some((snapshot, _))) => {
+                    retained.checkout_paths.extend(crate::worktree_cleanup::live_paths(&snapshot));
+                    retained.archives.extend(snapshot.archived_workspaces.into_iter().map(|entry| entry.archive_id));
+                    for mut workspace in snapshot.workspaces {
+                        workspace.migrate_legacy_tab();
+                        for surface in &workspace.surfaces {
+                            retained.panes.extend(collect_pane_ids_from_node(&surface.root));
+                        }
+                        retained.tabs.extend(workspace.tabs.into_iter()
+                            .map(|tab| (workspace.workspace_id.0.clone(), tab.tab_id)));
+                        retained.workspaces.entry(workspace.workspace_id.0).or_default()
+                            .extend(collect_terminal_sessions(&workspace.surfaces));
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => retained.unreadable = true,
+            }
+        }
+        retained
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.unreadable && self.workspaces.is_empty()
+    }
+
+    pub(crate) fn protects(&self, workspace_id: &str) -> bool {
+        self.unreadable || self.workspaces.contains_key(workspace_id)
+    }
+
+    pub(crate) fn references_archive(&self, entry: &ArchivedWorkspaceSnapshot) -> bool {
+        self.protects(&entry.workspace_id) || self.archives.contains(&entry.archive_id)
+    }
+
+    pub(crate) fn references_close(&self, intent: &LayoutCloseIntent) -> bool {
+        self.unreadable || match intent {
+            LayoutCloseIntent::Pane(id) => self.panes.contains(id),
+            LayoutCloseIntent::Tab { workspace_id, tab_id } =>
+                self.tabs.contains(&(workspace_id.clone(), tab_id.clone())),
+            LayoutCloseIntent::Session { workspace_id, session_id } =>
+                self.workspaces.get(workspace_id).is_some_and(|sessions| sessions.contains(session_id)),
+            LayoutCloseIntent::Workspace(id) => self.protects(id),
+            LayoutCloseIntent::ConsumedArchive { workspace_id, archive_id } =>
+                self.protects(workspace_id) || self.archives.contains(archive_id),
+            LayoutCloseIntent::Archive(archive) => self.references_archive(&archive.entry),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn terminal_owners(
+        &self,
+        replacements: &[crate::database::daemon_closes::PendingTerminalReplacement],
+    ) -> HashSet<(String, String)> {
+        let mut owners: HashSet<_> = self.workspaces.iter().flat_map(|(workspace, sessions)|
+            sessions.iter().map(|id| (workspace.clone(), id.clone()))
+        ).collect();
+        // The journal returns predecessors before their successors.
+        for replacement in replacements {
+            if owners.contains(&(replacement.workspace_id.clone(), replacement.old_session_id.clone())) {
+                owners.insert((replacement.workspace_id.clone(), replacement.replacement_session_id()));
+            }
+        }
+        owners
+    }
+}
+
+static RETAINED_LAYOUTS: std::sync::LazyLock<Mutex<Arc<RetainedLayouts>>> =
+    std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn retained_layouts() -> Arc<RetainedLayouts> {
+    RETAINED_LAYOUTS.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test overrides for the two process-wide flags, per test thread.
+    pub(crate) static TEST_RECOVERY_PENDING: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_SAVES_BLOCKED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a saved layout that could not be read is still waiting to be
+/// restored or discarded at startup. A running recovery owner always saves
+/// separately, even after a backup is renamed or removed. Until restart,
+/// workspaces missing from the layout are missing, not closed: nothing tied
+/// to them (their scrollback, their synced rows) may be cleaned up.
+pub fn layout_recovery_pending() -> bool {
+    #[cfg(test)]
+    if let Some(pending) = TEST_RECOVERY_PENDING.with(std::cell::Cell::get) {
+        return pending;
+    }
+    RECOVERY_SAVE_BASE.lock().unwrap().is_some()
+}
+
+/// Whether saving the layout is paused, because an unreadable layout could
+/// not be set aside and `layout.json` still holds its only copy.
+fn layout_saves_blocked() -> bool {
+    #[cfg(test)]
+    if let Some(blocked) = TEST_SAVES_BLOCKED.with(std::cell::Cell::get) {
+        return blocked;
+    }
+    LAYOUT_SAVES_BLOCKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn load_persisted_layout() -> PersistedLayout {
+    // MoveFileExW can reject replacement even during a brief read of the old
+    // destination. Serialize in-process readers with ordinary and deferred saves.
+    #[cfg(windows)]
+    let _read_guard = persist_debouncer().write_lock.lock().unwrap();
+    let Some(path) = persisted_layout_path() else {
+        return PersistedLayout::Missing;
+    };
+    let base = RECOVERY_SAVE_BASE.lock().unwrap().clone();
+    if let Some(base) = base {
+        match read_layout::<RecoverySnapshot<Box<AppStateSnapshot>>>(&recovery_session_path(&path)) {
+            Ok(Some((saved, _))) if saved.recovery_base == base => return PersistedLayout::Loaded(saved.snapshot),
+            Err(_) => return PersistedLayout::Unreadable { preserved: false },
+            _ => {}
+        }
+    }
+    match read_layout(&path) {
+        Ok(Some((snapshot, _))) => PersistedLayout::Loaded(snapshot),
+        Ok(None) => PersistedLayout::Missing,
+        Err(_) => PersistedLayout::Unreadable { preserved: false },
+    }
+}
+
+/// Called by the layout owner before startup can open any persistent stores.
 pub(crate) fn load_persisted_state_checked() -> Result<Option<AppStateSnapshot>, String> {
     let path = persisted_layout_path().ok_or("No config directory for workspace layout")?;
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
+    let (snapshot, base) = open_layout(&path).inspect_err(|_| {
+        LAYOUT_SAVES_BLOCKED.store(true, Ordering::Relaxed);
+    })?;
+    *RETAINED_LAYOUTS.lock().unwrap() = Arc::new(RetainedLayouts::read(&path));
+    *RECOVERY_SAVE_BASE.lock().unwrap() = base;
+    Ok(snapshot)
+}
+
+fn recovery_session_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".recovery-session");
+    PathBuf::from(name)
+}
+
+#[derive(Serialize, Deserialize)]
+struct RecoverySnapshot<T> {
+    recovery_base: String,
+    // A user can restore a repaired recovery snapshot as an ordinary layout.
+    #[serde(flatten)]
+    snapshot: T,
+}
+
+// Only an absent entry is missing. A dangling symlink is someone's layout.
+fn open_layout_file(path: &Path) -> std::io::Result<Option<fs::File>> {
+    match fs::File::open(path) {
+        Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
-            && fs::symlink_metadata(&path).is_err_and(|metadata_error| {
-                metadata_error.kind() == std::io::ErrorKind::NotFound
-            }) => return Ok(None),
+            && fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+struct LayoutSource {
+    id: std::io::Result<(u64, u128)>,
+    bytes: Vec<u8>,
+}
+
+fn read_layout_file<T: serde::de::DeserializeOwned>(mut file: fs::File) -> Result<(T, Vec<u8>), String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    // Windows cannot replace the destination while this reader still owns it.
+    drop(file);
+    let snapshot = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    Ok((snapshot, bytes))
+}
+
+fn read_layout<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<(T, Vec<u8>)>, String> {
+    open_layout_file(path).map_err(|e| e.to_string())?.map(read_layout_file).transpose()
+}
+
+// Take the identity and bytes from the same open file, even across an external
+// rename. An identity error matters only when comparing a readable primary to
+// a recovery session; it must never quarantine an otherwise valid layout.
+fn read_primary_layout(path: &Path) -> Result<Option<(AppStateSnapshot, LayoutSource)>, String> {
+    let Some(file) = open_layout_file(path).map_err(|e| e.to_string())? else { return Ok(None) };
+    #[cfg(unix)]
+    let id = {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata().map(|m| (m.dev(), u128::from(m.ino())))
+    };
+    #[cfg(windows)]
+    let id = crate::windows_file_id::file_id(&file);
+    let (snapshot, bytes) = read_layout_file(file)?;
+    Ok(Some((snapshot, LayoutSource { id, bytes })))
+}
+
+fn recovery_base(listed: &str, primary: Option<LayoutSource>) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    // The first backup names this recovery across later set-asides. Older
+    // releases saved a fallback at the primary path. A replacement there,
+    // even a byte-identical one, or an in-place repair takes precedence.
+    let mut hash = Sha256::new();
+    hash.update(listed.lines().next().unwrap_or_default().as_bytes());
+    hash.update([0]);
+    if let Some(source) = primary {
+        let (volume, id) = source.id?;
+        hash.update(volume.to_le_bytes());
+        hash.update(id.to_le_bytes());
+        hash.update(source.bytes);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn open_layout(path: &Path) -> Result<(Option<AppStateSnapshot>, Option<String>), String> {
+    let marker = recovery_marker(path);
+    let read_marker = || open_layout_file(&marker)
+        .and_then(|file| file.map(std::io::read_to_string).transpose())
+        .map_err(|error| format!("Could not read layout recovery marker {}: {error}", marker.display()));
+    let mut listed = read_marker()?;
+    let required_marker = || read_marker()?.ok_or_else(|| "Layout recovery marker disappeared during startup".to_string());
+    // Observe the backups BEFORE reading the primary. If a concurrent restore
+    // moved the last backup, either this owner stays on the separate path or
+    // the subsequent read sees the restored primary.
+    let mut pending = listed.as_ref().is_some_and(|names| backups_pending(path, names));
+    let session = recovery_session_path(path);
+    let (mut snapshot, primary_source) = match read_primary_layout(path) {
+        Ok(Some((snapshot, source))) => (Some(snapshot), Some(source)),
+        Ok(None) => (None, None),
         Err(error) => {
-            return Err(format!("Failed to read workspace layout at {}: {error}", path.display()));
+            preserve_unreadable_layout(path, path, &error)?;
+            listed = Some(required_marker()?);
+            pending = true;
+            (None, None)
         }
     };
-    serde_json::from_str(&contents).map(Some).map_err(|error| {
-        format!("Failed to decode workspace layout at {}: {error}", path.display())
+    let Some(names) = listed else { return Ok((snapshot, None)) };
+    let primary_missing = primary_source.is_none();
+    let base = recovery_base(&names, primary_source)
+        .map_err(|e| format!("Could not identify the primary layout {}: {e}", path.display()))?;
+    match read_layout::<RecoverySnapshot<AppStateSnapshot>>(&session) {
+        Ok(Some((mut saved, _))) if saved.recovery_base == base || primary_missing => {
+            if pending && saved.recovery_base != base {
+                // Quarantining another primary (including on the previous boot)
+                // left this session as the only readable layout. Bind it to the
+                // absent primary before any reader or writer uses the new base.
+                saved.recovery_base.clone_from(&base);
+                write_layout_to(&session, &saved)?;
+            }
+            if !pending {
+                // Discarding the last backup adopts the session. Keep the
+                // marker until its snapshot is durable, including on retry.
+                save_layout_to(path, &saved.snapshot)?;
+            }
+            snapshot = Some(saved.snapshot);
+        }
+        Ok(Some((_, bytes))) => {
+            // The repair owns the primary. Keep the exact session bytes,
+            // including unknown fields, before another save can reuse its path.
+            let aside = path.with_added_extension(format!("recovery-saved-{}.json", uuid::Uuid::now_v7()));
+            write_layout_bytes(&aside, &bytes)?;
+            fs::remove_file(&session).map_err(|e| format!("Could not retire saved recovery session: {e}"))?;
+            let message = format!("Using repaired layout {}. Work saved during recovery is in {}. \
+                To restore it, stop the backend and copy that file over the layout. Delete the saved copy when you no longer need it.", path.display(), aside.display());
+            if log::log_enabled!(log::Level::Warn) {
+                log::warn!("{message}");
+            } else {
+                crate::diagnostics::stderr_line(&message);
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            preserve_unreadable_layout(&session, path, &error)?;
+            pending = true;
+        }
+    }
+    if pending {
+        Ok((snapshot, Some(base)))
+    } else {
+        // The selected primary is durable. Retire the session first so a
+        // crash cannot leave it unmarked for an unrelated future recovery.
+        match fs::remove_file(session) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Could not retire layout recovery session: {e}")),
+        }
+        fs::remove_file(marker).map_err(|e| format!("Could not retire layout recovery marker: {e}"))?;
+        Ok((snapshot, None))
+    }
+}
+
+/// The marker recording that the layout at `path` was set aside.
+fn recovery_marker(path: &Path) -> PathBuf {
+    let mut marker = path.as_os_str().to_owned();
+    marker.push(".recovery-pending");
+    PathBuf::from(marker)
+}
+
+/// Whether the layout at `path` has a set-aside copy still waiting. The
+/// marker lists every copy set aside, one name per line; recovery is over
+/// only once all of them are gone — renamed back over `layout.json` to
+/// restore one, or deleted to discard it. Anything that cannot be checked
+/// counts as still waiting: only "not found" means gone.
+#[cfg(test)]
+fn recovery_pending_at(path: &Path) -> bool {
+    match fs::read_to_string(recovery_marker(path)) {
+        Ok(listed) => backups_pending(path, &listed),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+fn backups_pending(path: &Path, listed: &str) -> bool {
+    let Some(dir) = path.parent() else {
+        return true;
+    };
+    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    listed.lines().map(str::trim).filter(|n| !n.is_empty()).any(|name| {
+        // A torn or unrecognised name cannot vouch that its copy is gone.
+        !is_aside_name(&file_name, name)
+            || !fs::symlink_metadata(dir.join(name)).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
     })
+}
+
+/// Preserve the layout at `path` as `aside`, never replacing anything
+/// already there, and durably — see [`move_no_clobber_durably`]. Where the
+/// entry cannot be moved, its bytes are copied into a new file instead.
+fn set_aside(path: &Path, aside: &Path) -> bool {
+    if move_no_clobber_durably(path, aside).is_ok() {
+        return true;
+    }
+    // Where the entry cannot be moved, copy its bytes into a new file and
+    // move that into place the same way.
+    let Some(dir) = aside.parent() else {
+        return false;
+    };
+    let Ok(mut source) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(mut copy) = tempfile::NamedTempFile::new_in(dir) else {
+        return false;
+    };
+    if std::io::copy(&mut source, &mut copy).is_err() || copy.as_file().sync_all().is_err() {
+        return false;
+    }
+    let copy = copy.into_temp_path();
+    move_no_clobber_durably(&copy, aside).is_ok()
+}
+
+/// Whether `name` is a set-aside name for `file_name` exactly as
+/// [`preserve_unreadable_layout`] makes them: `<file>.unreadable-<millis>-<8 hex>`.
+fn is_aside_name(file_name: &str, name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(file_name).and_then(|r| r.strip_prefix(".unreadable-")) else {
+        return false;
+    };
+    let Some((millis, suffix)) = rest.split_once('-') else {
+        return false;
+    };
+    !millis.is_empty()
+        && millis.bytes().all(|b| b.is_ascii_digit())
+        && suffix.len() == 8
+        && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Add `aside_name` to the recovery marker beside `path`, keeping every
+/// copy already listed. The whole marker is rewritten in a temporary file
+/// beside it and moved into place, so it is never left half-written.
+fn add_to_recovery_marker(path: &Path, aside_name: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let marker = recovery_marker(path);
+    let mut listed = match fs::read_to_string(&marker) {
+        Ok(listed) => listed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    // Whatever an earlier write left — even a torn last line — stays on a
+    // line of its own.
+    if !listed.is_empty() && !listed.ends_with('\n') {
+        listed.push('\n');
+    }
+    listed.push_str(aside_name);
+    listed.push('\n');
+    let dir = marker.parent().ok_or_else(|| std::io::Error::other("no folder for the recovery marker"))?;
+    let mut replacement = tempfile::NamedTempFile::new_in(dir)?;
+    replacement.write_all(listed.as_bytes())?;
+    replacement.as_file().sync_all()?;
+    // Durable before the layout is touched: a crash must not leave a set-aside
+    // copy that no marker remembers.
+    publish_durably(replacement, &marker).map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+fn load_layout_from(path: &Path) -> PersistedLayout {
+    match open_layout(path) {
+        Ok((Some(snapshot), _)) => PersistedLayout::Loaded(Box::new(snapshot)),
+        Ok((None, None)) => PersistedLayout::Missing,
+        Ok((None, Some(_))) => PersistedLayout::Unreadable { preserved: true },
+        Err(_) => PersistedLayout::Unreadable { preserved: false },
+    }
+}
+
+/// Preserve an unreadable primary or session before admitting any writes.
+/// Every copy is listed in the primary layout's marker and can be restored
+/// to its primary path.
+fn preserve_unreadable_layout(source: &Path, path: &Path, error: &str) -> Result<(), String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".unreadable-{stamp}-{:08x}", rand::random::<u32>()));
+    let aside = PathBuf::from(aside);
+    let aside_name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // The marker goes first: if it cannot be written, nothing else is
+    // trusted to remember the copy, and `layout.json` stays as it is. Copies
+    // set aside earlier stay listed.
+    let marked = add_to_recovery_marker(path, &aside_name).is_ok();
+    let kept = marked && set_aside(source, &aside);
+    let message = if kept {
+        format!(
+            "Could not read the saved layout ({error}); kept it as {} and started without it. \
+             Stop the Codemux backend before repairing and renaming it to {}, or deleting it to discard it. Then restart Codemux.",
+            aside.display(),
+            path.display()
+        )
+    } else {
+        format!(
+            "Could not read the saved layout at {} ({error}), nor set it aside; \
+             layout saving is paused for this run so it is not overwritten",
+            source.display()
+        )
+    };
+    // Startup can inspect the layout before the Tauri logging plugin is installed.
+    if log::log_enabled!(log::Level::Error) {
+        log::error!("{message}");
+    } else {
+        crate::diagnostics::stderr_line(&message);
+    }
+    if kept { Ok(()) } else { Err(format!("Could not preserve unreadable workspace layout at {}", source.display())) }
 }
 
 /// Remove all browser panes and browser sessions from a snapshot.
@@ -7242,86 +7784,7 @@ pub fn strip_removed_workspaces_from_snapshot(
     snapshot
 }
 
-pub fn restore_session_ids(snapshot: &AppStateSnapshot) {
-    let max_id = snapshot
-        .workspaces
-        .iter()
-        .flat_map(|workspace| {
-            let mut ids = vec![extract_numeric_suffix(&workspace.workspace_id.0)];
-            ids.extend(workspace.surfaces.iter().flat_map(|surface| {
-                let mut surface_ids = vec![
-                    extract_numeric_suffix(&surface.surface_id.0),
-                    extract_numeric_suffix(&surface.active_pane_id.0),
-                ];
-                surface_ids.extend(collect_numeric_ids_from_node(&surface.root));
-                surface_ids
-            }));
-            ids.extend(workspace.tabs.iter().flat_map(|tab| {
-                let mut tab_ids = vec![extract_numeric_suffix(&tab.tab_id)];
-                if let Some(ref sid) = tab.surface_id {
-                    tab_ids.push(extract_numeric_suffix(&sid.0));
-                }
-                if let Some(ref bid) = tab.browser_id {
-                    tab_ids.push(extract_numeric_suffix(&bid.0));
-                }
-                tab_ids
-            }));
-            ids
-        })
-        .chain(
-            snapshot
-                .terminal_sessions
-                .iter()
-                .map(|session| extract_numeric_suffix(&session.session_id.0)),
-        )
-        .chain(
-            snapshot
-                .browser_sessions
-                .iter()
-                .map(|session| extract_numeric_suffix(&session.browser_id.0)),
-        )
-        .chain(
-            snapshot
-                .agent_browser_sessions
-                .iter()
-                .map(|session| extract_numeric_suffix(&session.session_id.as_str())),
-        )
-        .flatten()
-        .max()
-        .unwrap_or(0);
-
-    ID_COUNTER.fetch_max(max_id.saturating_add(1), Ordering::Relaxed);
-}
-
-/// A pending close still owns its IDs even after the pane leaves the layout.
-/// Reserve them before imports or restored workspaces allocate new IDs.
-#[cfg(unix)]
-pub(crate) fn reserve_pending_close_ids(
-    layout_closes: &[LayoutCloseIntent],
-    daemon_closes: &[crate::database::daemon_closes::PendingDaemonClose],
-) {
-    if let Some(max_id) = daemon_closes
-        .iter()
-        .flat_map(|close| [close.route.workspace_id.as_str(), close.session_id.as_str()])
-        .chain(layout_closes.iter().flat_map(LayoutCloseIntent::ids))
-        .filter_map(|id| extract_numeric_suffix(id))
-        .max()
-    {
-        ID_COUNTER.fetch_max(max_id.saturating_add(1), Ordering::Relaxed);
-    }
-}
-
-#[cfg(unix)]
 impl LayoutCloseIntent {
-    fn ids(&self) -> [&str; 2] {
-        match self {
-            Self::Pane(id) | Self::Workspace(id) => [id, ""],
-            Self::Session { workspace_id, session_id } => [workspace_id, session_id],
-            Self::Tab { workspace_id, tab_id } => [workspace_id, tab_id],
-            Self::Archive(entry) => [&entry.workspace_id, ""],
-        }
-    }
-
     fn needs_replay(&self, snapshot: &AppStateSnapshot) -> bool {
         match self {
             Self::Pane(id) => find_pane_location(&snapshot.workspaces, id).is_some(),
@@ -7332,24 +7795,57 @@ impl LayoutCloseIntent {
                 workspace.workspace_id.0 == *workspace_id && workspace.tabs.iter().any(|tab| tab.tab_id == *tab_id)
             }),
             Self::Workspace(id) => snapshot.workspaces.iter().any(|workspace| workspace.workspace_id.0 == *id),
-            Self::Archive(entry) => snapshot.workspaces.iter().any(|workspace| workspace.workspace_id.0 == entry.workspace_id)
-                || !archive_installed_or_superseded(snapshot, entry),
+            Self::ConsumedArchive { workspace_id, archive_id } =>
+                snapshot.workspaces.iter().any(|ws| ws.workspace_id.0 == *workspace_id)
+                    || snapshot.archived_workspaces.iter().any(|entry| entry.archive_id == *archive_id),
+            Self::Archive(archive) => {
+                self.closed_workspace_id().is_some_and(|id| snapshot.workspaces.iter().any(|ws| ws.workspace_id.0 == id))
+                    || archive.change_for(snapshot).is_some()
+            }
         }
     }
 }
 
-#[cfg(unix)]
-fn archive_installed_or_superseded(snapshot: &AppStateSnapshot, entry: &ArchivedWorkspaceSnapshot) -> bool {
-    let order = |archive: &ArchivedWorkspaceSnapshot| (archive.archived_at, extract_numeric_suffix(&archive.workspace_id));
-    snapshot.archived_workspaces.iter().any(|other| {
-        other.archive_id == entry.archive_id
-            || (!is_chat_child_entry(entry) && !is_chat_child_entry(other)
-                && other.cwd == entry.cwd && other.worktree_path == entry.worktree_path
-                && order(other) > order(entry))
-    })
+enum ArchiveChange { Install, Remove }
+
+impl PendingArchive {
+    pub(crate) fn replacement_in(&self, snapshot: &AppStateSnapshot) -> bool {
+        self.restored_workspace_id.as_ref().is_some_and(|id|
+            snapshot.workspaces.iter().any(|workspace| &workspace.workspace_id.0 == id))
+    }
+
+    fn change_for(&self, snapshot: &AppStateSnapshot) -> Option<ArchiveChange> {
+        if self.replacement_in(snapshot) {
+            snapshot.archived_workspaces.iter().any(|e| e.archive_id == self.entry.archive_id)
+                .then_some(ArchiveChange::Remove)
+        } else {
+            (!archive_installed_or_superseded(snapshot, &self.entry)).then_some(ArchiveChange::Install)
+        }
+    }
 }
 
-#[cfg(unix)]
+fn archive_installed_or_superseded(snapshot: &AppStateSnapshot, entry: &ArchivedWorkspaceSnapshot) -> bool {
+    snapshot.archived_workspaces.iter().any(|other| other.supersedes_or_matches(entry))
+}
+
+impl ArchivedWorkspaceSnapshot {
+    pub(crate) fn supersedes_or_matches(&self, entry: &Self) -> bool {
+        // Archives have second-resolution timestamps. New archive UUIDs order
+        // same-second entries; older archives used the numeric workspace counter.
+        let order = |archive: &ArchivedWorkspaceSnapshot| {
+            let archive_uuid = uuid::Uuid::parse_str(&archive.archive_id).ok()
+                .filter(|id| id.get_version_num() == 7);
+            let legacy_counter = archive.workspace_id.rsplit_once('-')
+                .and_then(|(_, suffix)| suffix.parse::<u64>().ok());
+            (archive.archived_at, archive_uuid, legacy_counter)
+        };
+        self.archive_id == entry.archive_id
+            || (!is_chat_child_entry(entry) && !is_chat_child_entry(self)
+                && self.cwd == entry.cwd && self.worktree_path == entry.worktree_path
+                && order(self) > order(entry))
+    }
+}
+
 fn terminal_pane_for_close_intent(
     snapshot: &AppStateSnapshot,
     workspace_id: &str,
@@ -7380,37 +7876,30 @@ pub(crate) fn restore_terminal_replacements_and_layout_closes(
     if replacements.is_empty() {
         return restore_pending_layout_closes(store, closes);
     }
+    let mut closes = closes.to_vec();
     for replacement in replacements {
+        let successor = replacement.replacement_session_id();
         store.replace_terminal_session(
             &replacement.workspace_id,
             &replacement.old_session_id,
-            &replacement.replacement_session_id(),
+            &successor,
             || true,
         )?;
-    }
-    let snapshot = store.inner.lock().unwrap();
-    let closes: Vec<_> = closes.iter().map(|close| {
-        if let LayoutCloseIntent::Session { workspace_id, session_id } = close {
-            if let Some(replacement) = replacements.iter().find(|replacement| {
-                replacement.workspace_id == *workspace_id
-                    && replacement.old_session_id == *session_id
-                    && workspace_is_local(&snapshot, workspace_id)
-            }) {
-                return LayoutCloseIntent::Session {
-                    workspace_id: workspace_id.clone(),
-                    session_id: replacement.replacement_session_id(),
-                };
+        if workspace_is_local(&store.inner.lock().unwrap(), &replacement.workspace_id) {
+            for close in &mut closes {
+                if let LayoutCloseIntent::Session { workspace_id, session_id } = close {
+                    if *workspace_id == replacement.workspace_id && *session_id == replacement.old_session_id {
+                        session_id.clone_from(&successor);
+                    }
+                }
             }
         }
-        close.clone()
-    }).collect();
-    drop(snapshot);
+    }
     restore_pending_layout_closes(store, &closes)
 }
 
 /// A close intent can outlive the last saved layout. Apply it before any
 /// terminal hydration can reattach to the old shell or launch a replacement.
-#[cfg(unix)]
 pub(crate) fn restore_pending_layout_closes(
     store: &AppStateStore,
     closes: &[LayoutCloseIntent],
@@ -7429,17 +7918,25 @@ pub(crate) fn restore_pending_layout_closes(
             }
             LayoutCloseIntent::Tab { workspace_id, tab_id } => { store.close_tab(workspace_id, tab_id)?; }
             LayoutCloseIntent::Workspace(id) => { store.close_workspace(id)?; }
-            LayoutCloseIntent::Archive(entry) => {
-                let (workspace_open, archived) = {
-                    let snapshot = store.inner.lock().unwrap();
-                    (snapshot.workspaces.iter().any(|workspace| workspace.workspace_id.0 == entry.workspace_id),
-                     archive_installed_or_superseded(&snapshot, entry))
-                };
-                if workspace_open {
-                    store.close_workspace(&entry.workspace_id)?;
+            LayoutCloseIntent::ConsumedArchive { workspace_id, archive_id } => {
+                if store.find_workspace(workspace_id).is_some() {
+                    store.close_workspace(workspace_id)?;
                 }
-                if !archived {
-                    store.add_archived_workspace((**entry).clone());
+                if store.find_archived_workspace(archive_id).is_some() {
+                    store.remove_archived_workspace(archive_id)?;
+                }
+            }
+            LayoutCloseIntent::Archive(archive) => {
+                if let Some(id) = close.closed_workspace_id() {
+                    if store.find_workspace(id).is_some() {
+                        store.close_workspace(id)?;
+                    }
+                }
+                let change = archive.change_for(&store.inner.lock().unwrap());
+                match change {
+                    Some(ArchiveChange::Install) => store.add_archived_workspace(archive.entry.clone()),
+                    Some(ArchiveChange::Remove) => { store.remove_archived_workspace(&archive.entry.archive_id)?; }
+                    None => {}
                 }
             }
         }
@@ -7451,7 +7948,7 @@ fn default_app_state() -> AppStateSnapshot {
     let workspace_id = WorkspaceId(next_id("workspace"));
     let surface_id = SurfaceId(next_id("surface"));
     let pane_id = PaneId(next_id("pane"));
-    let session_id = new_terminal_session_id();
+    let session_id = SessionId(next_id("session"));
     let default_tab_id = next_id("tab");
     let cwd = current_project_root().display().to_string();
     let shell = env::var("SHELL").ok();
@@ -7959,28 +8456,14 @@ fn persistable_snapshot(snapshot: &AppStateSnapshot) -> AppStateSnapshot {
     snapshot
 }
 
-fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
-    use std::io::Write;
-    let path = persisted_layout_path().ok_or("No config directory for layout persistence")?;
-    let parent = path
-        .parent()
-        .ok_or("No parent directory for layout persistence")?;
-    fs::create_dir_all(parent).map_err(|error| format!("Failed to create config dir: {error}"))?;
-
-    let snapshot = persistable_snapshot(snapshot);
-    let json = serde_json::to_string_pretty(&snapshot)
-        .map_err(|error| format!("Failed to serialize layout state: {error}"))?;
-    // Same-directory temporary file keeps replacement atomic. A short write or
-    // failed file sync leaves the previous layout untouched and the journal pending.
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| format!("Failed to create layout temporary file: {error}"))?;
-    temporary
-        .write_all(json.as_bytes())
-        .and_then(|()| temporary.as_file().sync_all())
-        .map_err(|error| format!("Failed to write/sync layout state: {error}"))?;
+/// Move a fully written and synced `temporary` file over `path`, and make
+/// the replacement durable before returning: the directory entry is synced
+/// on Unix, and on Windows the move is written through.
+fn publish_durably(temporary: tempfile::NamedTempFile, path: &Path) -> Result<(), String> {
+    let parent = path.parent().ok_or("No parent directory for a durable replace")?;
     #[cfg(not(windows))]
     temporary
-        .persist(&path)
+        .persist(path)
         .map_err(|error| format!("Failed to replace layout state: {error}"))?;
     // Commit the directory entry before SQLite may mark the layout complete.
     // After a rename, a sync failure still leaves a whole valid layout, but the
@@ -8047,6 +8530,94 @@ fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: make the next directory sync on this thread fail.
+    static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Commit a directory's entries to disk (Unix).
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DIR_SYNC.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Move `from` to `to` without replacing anything already at `to`, and make
+/// it durable before returning. The entry itself moves, so a link stays a
+/// link.
+fn move_no_clobber_durably(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // A hard link fails if `to` exists. It is made durable before the old
+        // name is dropped, so a crash or a failed sync never leaves the file
+        // with neither name; should dropping it fail, `to` still holds the
+        // same file.
+        fs::hard_link(from, to)?;
+        let dir = to.parent().ok_or_else(|| std::io::Error::other("no folder"))?;
+        sync_dir(dir)?;
+        let _ = fs::remove_file(from);
+        sync_dir(dir)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+        let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
+        let (source, destination) = (wide(from), wide(to));
+        // Without MOVEFILE_REPLACE_EXISTING the move fails if `to` exists;
+        // WRITE_THROUGH returns only once it is on disk.
+        // SAFETY: both buffers are owned, NUL-terminated UTF-16 paths.
+        if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
+    let path = persisted_layout_path().ok_or("No config directory for layout persistence")?;
+    let base = RECOVERY_SAVE_BASE.lock().unwrap().clone();
+    if let Some(recovery_base) = base {
+        let snapshot = RecoverySnapshot { recovery_base, snapshot: persistable_snapshot(snapshot) };
+        write_layout_to(&recovery_session_path(&path), &snapshot)
+    } else {
+        save_layout_to(&path, snapshot)
+    }
+}
+
+fn save_layout_to(path: &Path, snapshot: &AppStateSnapshot) -> Result<(), String> {
+    write_layout_to(path, &persistable_snapshot(snapshot))
+}
+
+fn write_layout_to(path: &Path, snapshot: &impl Serialize) -> Result<(), String> {
+    if layout_saves_blocked() {
+        return Err("Layout saving is paused: the unreadable layout could not be set aside".into());
+    }
+    let json = serde_json::to_vec_pretty(snapshot)
+        .map_err(|error| format!("Failed to serialize layout state: {error}"))?;
+    write_layout_bytes(path, &json)
+}
+
+fn write_layout_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let parent = path.parent().ok_or("No parent directory for layout persistence")?;
+    fs::create_dir_all(parent).map_err(|error| format!("Failed to create config dir: {error}"))?;
+
+    // Same-directory temporary file keeps replacement atomic. A short write or
+    // failed file sync leaves the previous layout untouched and the journal pending.
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("Failed to create layout temporary file: {error}"))?;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| format!("Failed to write/sync layout state: {error}"))?;
+    publish_durably(temporary, path)
 }
 
 fn find_workspace_id_for_session(
@@ -8764,49 +9335,9 @@ fn stable_browser_session_name(cwd: &str) -> String {
 }
 
 fn next_id(prefix: &str) -> String {
-    let value = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{value}")
-}
-
-fn new_terminal_session_id() -> SessionId {
-    // A daemon can outlive the app and still own terminal IDs from layouts
-    // that were never saved. Avoid reusing those IDs after a counter reset.
-    SessionId(format!("session-{}", uuid::Uuid::new_v4().simple()))
-}
-
-fn extract_numeric_suffix(value: &str) -> Option<u64> {
-    value.rsplit('-').next()?.parse::<u64>().ok()
-}
-
-fn collect_numeric_ids_from_node(root: &PaneNodeSnapshot) -> Vec<Option<u64>> {
-    match root {
-        PaneNodeSnapshot::Terminal {
-            pane_id,
-            session_id,
-            ..
-        } => vec![
-            extract_numeric_suffix(&pane_id.0),
-            extract_numeric_suffix(&session_id.0),
-        ],
-        PaneNodeSnapshot::Browser {
-            pane_id,
-            browser_id,
-            ..
-        } => vec![
-            extract_numeric_suffix(&pane_id.0),
-            extract_numeric_suffix(&browser_id.0),
-        ],
-        PaneNodeSnapshot::AgentChat { pane_id, .. } => {
-            vec![extract_numeric_suffix(&pane_id.0)]
-        }
-        PaneNodeSnapshot::Split {
-            pane_id, children, ..
-        } => {
-            let mut ids = vec![extract_numeric_suffix(&pane_id.0)];
-            ids.extend(children.iter().flat_map(collect_numeric_ids_from_node));
-            ids
-        }
-    }
+    // Scrollback and sync rows can outlive the layout that allocated their IDs.
+    // A restored snapshot cannot tell us which IDs are free to reuse.
+    format!("{prefix}-r{}", uuid::Uuid::new_v4().simple())
 }
 
 #[cfg(test)]
@@ -9860,7 +10391,7 @@ mod tests {
             ..live.clone()
         };
         assert_eq!(
-            store.orphaned_daemon_shells(vec![live, missing_pane.clone(), missing_workspace.clone()]),
+            store.orphaned_daemon_shells(vec![live, missing_pane.clone(), missing_workspace.clone()], &[]),
             [missing_pane, missing_workspace],
         );
     }
@@ -9898,8 +10429,6 @@ mod tests {
         let intents = db.pending_layout_closes().unwrap();
         let store = AppStateStore::default();
         let stale_layout = load_persisted_state().unwrap();
-        reserve_pending_close_ids(&intents, &[]);
-        restore_session_ids(&stale_layout);
         store.replace_snapshot(stale_layout);
         store.migrate_tabs_if_needed();
         restore_pending_layout_closes(&store, &intents).unwrap();
@@ -9960,6 +10489,10 @@ mod tests {
                     assert!(current.is_none());
                 }
             }
+            TEST_RECOVERY_PENDING.with(|flag| flag.set(Some(true)));
+            persist_terminal_replacements(&restored, &db, &replacements).unwrap();
+            assert_eq!(db.pending_terminal_replacements().unwrap(), replacements);
+            TEST_RECOVERY_PENDING.with(|flag| flag.set(None));
             persist_terminal_replacements(&restored, &db, &replacements).unwrap();
             assert!(db.pending_terminal_replacements().unwrap().is_empty());
             let saved = load_persisted_state().unwrap();
@@ -9980,6 +10513,88 @@ mod tests {
             persist_layout_closes(&restored, &db, &closes).unwrap();
             assert!(db.pending_layout_closes().unwrap().is_empty());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_layout_resolves_replacement_chains_for_replay_closes_and_cleanup() {
+        use crate::database::{DatabaseStore, daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose, PendingTerminalReplacement}};
+        const TEST: &str = "state::state_impl::tests::retained_layout_resolves_replacement_chains_for_replay_closes_and_cleanup";
+        if crate::test_isolation::isolated(TEST) { return; }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let layout = persisted_layout_path().unwrap();
+        let retained = layout.with_added_extension("recovery-saved-00000000-0000-0000-0000-000000000001.json");
+        let db_path = root.join("shells.sqlite");
+        let db = DatabaseStore::test_file(&db_path);
+        let store = AppStateStore::default();
+        let workspace = store.active_workspace_id();
+        let old = store.active_terminal_session_id().unwrap();
+        // Make the second journal row sort before the first by primary key.
+        let a = "session-zz-original";
+        assert!(store.replace_terminal_session(&workspace, &old.0, a, || true).unwrap());
+        save_layout_to(&retained, &store.snapshot()).unwrap();
+        fs::copy(&retained, &layout).unwrap();
+        store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+        let replace = |old: &str| {
+            db.begin_local_terminal_restart(&workspace, old, None).unwrap();
+            let id = db.activate_tokenless_local_replacement(&workspace, old).unwrap();
+            let mapping = PendingTerminalReplacement {
+                workspace_id: workspace.clone(), old_session_id: old.to_owned(), replacement_id: id,
+            };
+            let successor = mapping.replacement_session_id();
+            assert!(store.replace_terminal_session(&workspace, old, &successor, || true).unwrap());
+            // The live restart persists just the alias it activated.
+            persist_terminal_replacements(&store, &db, &[mapping]).unwrap();
+            successor
+        };
+        let b = replace(a);
+        let c = replace(&b);
+        drop(db);
+
+        // Boot an unrelated primary. Run the journal and orphan reconciliation
+        // before selecting the original, retained layout again.
+        save_layout_to(&layout, &default_app_state()).unwrap();
+        store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+        assert!(store.find_workspace(&workspace).is_none());
+        let db = DatabaseStore::test_file(&db_path);
+        let replacements = db.pending_terminal_replacements().unwrap();
+        assert_eq!(replacements.len(), 2);
+        persist_terminal_replacements(&store, &db, &replacements).unwrap();
+        let owners = store.terminal_session_owners(&replacements);
+        db.reconcile_local_terminal_fallbacks(&owners).unwrap();
+        assert!(db.has_local_terminal_fallback(&workspace, &c).unwrap());
+        let shell = PendingDaemonClose {
+            route: DaemonWorkspaceRoute { workspace_id: workspace.clone(), host_id: None, ssh_target: None },
+            session_id: c.clone(), shell_id: uuid::Uuid::new_v4(),
+        };
+        assert!(store.orphaned_daemon_shells(vec![shell.clone()], &replacements).is_empty());
+
+        fs::copy(&retained, &layout).unwrap();
+        let saved = load_persisted_state_checked().unwrap().unwrap();
+        let replacements = db.pending_terminal_replacements().unwrap();
+        store.replace_snapshot(saved.clone());
+        restore_terminal_replacements_and_layout_closes(&store, &replacements, &[]).unwrap();
+        let current = store.pty_hydration_plan_for_session(&c).unwrap();
+        assert_eq!(current.sessions[0].restore_predecessor_session_id.as_deref(), Some(b.as_str()));
+        for id in [a, &b, &c] {
+            let close = LayoutCloseIntent::Session { workspace_id: workspace.clone(), session_id: id.to_owned() };
+            db.record_layout_close(&close, &[]).unwrap();
+            store.replace_snapshot(saved.clone());
+            restore_terminal_replacements_and_layout_closes(&store, &replacements, std::slice::from_ref(&close)).unwrap();
+            assert!(store.pty_hydration_plan_for_session(&c).is_none());
+            persist_layout_closes(&store, &db, std::slice::from_ref(&close)).unwrap();
+            assert!(db.pending_layout_closes().unwrap().contains(&close));
+        }
+        fs::remove_file(retained).unwrap();
+        store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+        persist_terminal_replacements(&store, &db, &replacements).unwrap();
+        assert!(db.pending_terminal_replacements().unwrap().is_empty());
+        let closes = db.pending_layout_closes().unwrap();
+        persist_layout_closes(&store, &db, &closes).unwrap();
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+        db.reconcile_local_terminal_fallbacks(&store.terminal_session_owners(&[])).unwrap();
+        assert!(!db.has_local_terminal_fallback(&workspace, &c).unwrap());
+        assert_eq!(store.orphaned_daemon_shells(vec![shell.clone()], &[]), [shell]);
     }
 
     #[cfg(unix)]
@@ -10022,6 +10637,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn pending_archive_keeps_the_newer_same_second_entry() {
+        let store = AppStateStore::default();
+        let workspace = store.snapshot().workspaces.remove(0);
+        let mut earlier = build_archive_entry(&workspace);
+        let mut later = build_archive_entry(&workspace);
+        later.archived_at = earlier.archived_at;
+        later.workspace_id = next_id("workspace");
+        store.add_archived_workspace(later.clone());
+        restore_pending_layout_closes(&store, &[LayoutCloseIntent::archive(earlier.clone())]).unwrap();
+        assert_eq!(store.archived_workspaces_list(), [later.clone()]);
+
+        earlier.archive_id = uuid::Uuid::new_v4().to_string();
+        earlier.workspace_id = "workspace-9".into();
+        later.archive_id = uuid::Uuid::new_v4().to_string();
+        later.workspace_id = "workspace-10".into();
+        store.add_archived_workspace(later.clone());
+        restore_pending_layout_closes(&store, &[LayoutCloseIntent::archive(earlier)]).unwrap();
+        assert_eq!(store.archived_workspaces_list(), [later]);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn pending_archive_replays_its_entry_after_workspace_removal_was_saved() {
         if crate::test_isolation::isolated("state::state_impl::tests::pending_archive_replays_its_entry_after_workspace_removal_was_saved") {
             return;
@@ -10035,7 +10672,7 @@ mod tests {
             let workspace_id = store.snapshot().active_workspace_id.0;
             let entry = build_archive_entry(&store.find_workspace(&workspace_id).unwrap());
             store.close_workspace(&workspace_id).unwrap();
-            let intent = LayoutCloseIntent::Archive(Box::new(entry.clone()));
+            let intent = LayoutCloseIntent::archive(entry.clone());
             DatabaseStore::test_file(&db_path).record_layout_close(&intent, &[]).unwrap();
             // An existing debounce may save the removal before the live
             // archive entry is published after teardown completes.
@@ -10045,7 +10682,7 @@ mod tests {
 
         let db = DatabaseStore::test_file(&db_path);
         let intents = db.pending_layout_closes().unwrap();
-        assert_eq!(intents, [LayoutCloseIntent::Archive(Box::new(entry.clone()))]);
+        assert_eq!(intents, [LayoutCloseIntent::archive(entry.clone())]);
         let store = AppStateStore::default();
         store.replace_snapshot(load_persisted_state().unwrap());
         assert!(store.find_workspace(&entry.workspace_id).is_none());
@@ -11833,11 +12470,12 @@ mod tests {
         // Windows runtime test: FlushFileBuffers requires GENERIC_WRITE and
         // opening a directory for write is not a supported substitute.
         let source = include_str!("state_impl.rs");
+        // The layout writer's durable replace lives in `publish_durably`.
         let writer = source
-            .split("fn save_persisted_state(")
+            .split("fn publish_durably(")
             .nth(1)
             .unwrap()
-            .split("fn find_workspace_id_for_session(")
+            .split("fn move_no_clobber_durably(")
             .next()
             .unwrap();
         let windows = writer.split("#[cfg(windows)]").nth(1).unwrap();
@@ -14757,5 +15395,494 @@ mod reserved_workspace_id_tests {
         );
         assert_eq!(store.snapshot().workspaces.len(), count);
         assert!(store.find_workspace(&unused.0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod persisted_layout_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_layout_is_a_first_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(load_layout_from(&dir.path().join("layout.json")), PersistedLayout::Missing));
+    }
+
+    #[test]
+    fn an_unreadable_layout_is_kept_aside_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        // A layout this build cannot parse, e.g. one a newer build wrote.
+        let original = r#"{"workspaces":[{"tabs":[{"kind":"from-the-future"}]}]}"#;
+        fs::write(&path, original).unwrap();
+
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
+        assert!(!path.exists(), "nothing may save over it now");
+        let aside: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("layout.json.unreadable-"))
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(fs::read_to_string(dir.path().join(&aside[0])).unwrap(), original);
+        assert!(recovery_pending_at(&path));
+    }
+
+    #[test]
+    fn queued_recovery_save_and_final_flush_preserve_a_concurrent_repair() {
+        const TEST: &str = "state::state_impl::persisted_layout_tests::queued_recovery_save_and_final_flush_preserve_a_concurrent_repair";
+        if crate::test_isolation::isolated(TEST) { return; }
+        let path = persisted_layout_path().unwrap();
+        fs::write(&path, b"broken").unwrap();
+        assert!(load_persisted_state_checked().unwrap().is_none());
+        let store = AppStateStore::default();
+        let fallback = store.snapshot();
+        let (entered, writing) = std::sync::mpsc::channel();
+        let (release, paused) = std::sync::mpsc::channel();
+        persist_debouncer().schedule_pending(PendingPersist::Lazy(Box::new(move || {
+            entered.send(()).unwrap();
+            paused.recv().unwrap();
+            fallback.clone()
+        })));
+        writing.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let repaired = serde_json::to_vec(&default_app_state()).unwrap();
+        let listed = fs::read_to_string(recovery_marker(&path)).unwrap();
+        let backup = path.with_file_name(listed.trim());
+        fs::write(&backup, &repaired).unwrap();
+        fs::rename(backup, &path).unwrap();
+        release.send(()).unwrap();
+        flush_persisted_state(&store).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), repaired);
+        assert!(layout_recovery_pending());
+        finish_layout_persistence(&store).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), repaired);
+        assert_eq!(open_layout(&path).unwrap().0.unwrap().active_workspace_id,
+            serde_json::from_slice::<AppStateSnapshot>(&repaired).unwrap().active_workspace_id);
+    }
+
+    #[test]
+    fn recovery_session_survives_a_second_unreadable_primary_and_shutdown() {
+        const TEST: &str = "state::state_impl::persisted_layout_tests::recovery_session_survives_a_second_unreadable_primary_and_shutdown";
+        if crate::test_isolation::isolated(TEST) { return; }
+        let path = persisted_layout_path().unwrap();
+        fs::write(&path, b"first corrupt layout").unwrap();
+        assert!(load_persisted_state_checked().unwrap().is_none());
+        // Older versions wrote a usable fallback at the primary path.
+        save_layout_to(&path, &default_app_state()).unwrap();
+        let store = AppStateStore::default();
+        store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+        let added = store.create_empty_workspace_at_path(path.parent().unwrap().to_owned());
+        flush_persisted_state(&store).unwrap();
+        let session = recovery_session_path(&path);
+        let before_quarantine = fs::read(&session).unwrap();
+        fs::write(&path, b"second corrupt layout").unwrap();
+
+        for boot in 0..2 {
+            if boot == 1 {
+                // Crash boundary: the primary was set aside but the session
+                // still has the base from before quarantine.
+                fs::write(&session, &before_quarantine).unwrap();
+            }
+            let loaded = load_persisted_state_checked().unwrap().expect("valid recovery session");
+            store.replace_snapshot(loaded);
+            assert!(store.find_workspace(&added.0).is_some());
+            assert!(load_persisted_state().unwrap().workspaces.iter().any(|ws| ws.workspace_id == added));
+            assert!(layout_recovery_pending());
+        }
+        finish_layout_persistence(&store).unwrap();
+        assert!(!path.exists());
+        let listed = fs::read_to_string(recovery_marker(&path)).unwrap();
+        let copies: Vec<_> = listed.lines().map(|name| path.with_file_name(name)).collect();
+        assert_eq!(copies.len(), 2);
+        for (copy, original) in copies.iter().zip(["first corrupt layout", "second corrupt layout"]) {
+            assert_eq!(fs::read_to_string(copy).unwrap(), original);
+            fs::remove_file(copy).unwrap();
+        }
+        for _ in 0..2 {
+            let (loaded, base) = open_layout(&path).unwrap();
+            assert!(base.is_none());
+            assert!(loaded.unwrap().workspaces.iter().any(|ws| ws.workspace_id == added));
+        }
+    }
+
+    #[test]
+    fn repaired_primary_preserves_recovery_work_with_one_backup() {
+        if crate::test_isolation::isolated("state::state_impl::persisted_layout_tests::repaired_primary_preserves_recovery_work_with_one_backup") { return; }
+        check_saved_recovery_work(1);
+    }
+
+    #[test]
+    fn repaired_primary_preserves_recovery_work_with_multiple_backups() {
+        if crate::test_isolation::isolated("state::state_impl::persisted_layout_tests::repaired_primary_preserves_recovery_work_with_multiple_backups") { return; }
+        check_saved_recovery_work(2);
+    }
+
+    fn check_saved_recovery_work(backups: usize) {
+        let path = persisted_layout_path().unwrap();
+        let dir = path.parent().unwrap();
+        for _ in 0..backups {
+            fs::write(&path, b"broken").unwrap();
+            assert!(load_persisted_state_checked().unwrap().is_none());
+        }
+        let store = AppStateStore::default();
+        let added = store.create_empty_workspace_at_path(dir.join("during-recovery"));
+        flush_persisted_state(&store).unwrap();
+        let original = fs::read(recovery_session_path(&path)).unwrap();
+        let names = fs::read_to_string(recovery_marker(&path)).unwrap();
+        let repaired = default_app_state();
+        let first = dir.join(names.lines().next().unwrap());
+        save_layout_to(&first, &repaired).unwrap();
+        fs::rename(first, &path).unwrap();
+
+        for _ in 0..2 {
+            store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+            assert_eq!(store.snapshot().active_workspace_id, repaired.active_workspace_id);
+            assert!(store.find_workspace(&added.0).is_none());
+            assert_eq!(layout_recovery_pending(), backups > 1);
+            flush_persisted_state(&store).unwrap();
+            let copies: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().path())
+                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("layout.json.recovery-saved-"))
+                .collect();
+            assert_eq!(copies.len(), 1);
+            assert_eq!(fs::read(&copies[0]).unwrap(), original);
+            let (saved, _) = read_layout::<AppStateSnapshot>(&copies[0]).unwrap().unwrap();
+            assert!(saved.workspaces.iter().any(|ws| ws.workspace_id == added));
+        }
+    }
+
+    #[test]
+    fn retained_recovery_workspace_survives_startup_cleanup_and_reconcile() {
+        const TEST: &str = "state::state_impl::persisted_layout_tests::retained_recovery_workspace_survives_startup_cleanup_and_reconcile";
+        if crate::test_isolation::isolated(TEST) { return; }
+        let path = persisted_layout_path().unwrap();
+        let root = path.parent().unwrap();
+        fs::write(&path, b"broken").unwrap();
+        assert!(load_persisted_state_checked().unwrap().is_none());
+        let store = AppStateStore::default();
+        let workspace = store.snapshot().active_workspace_id.0;
+        let session = store.active_terminal_session_id().unwrap().0;
+        let pane = terminal_pane_for_close_intent(&store.snapshot(), &workspace, &session).unwrap().0;
+        let explicitly_closed = store.create_empty_workspace_at_path_with_selection(root.to_owned(), false);
+        let scrollback = crate::scrollback::scrollback_base();
+        assert!(scrollback.starts_with(root));
+        let payload = crate::scrollback::ScrollbackPayload {
+            workspace_id: workspace.clone(), pane_id: pane.clone(), session_id: session.clone(),
+            working_directory: root.display().to_string(), original_command: None, cols: 80, rows: 24,
+            data: "saved terminal output".into(), adapter_captures: HashMap::new(), adapter_id: None, alternate_buffer: false,
+        };
+        crate::scrollback::save_scrollback(&payload).unwrap();
+        fs::create_dir_all(scrollback.join("orphan")).unwrap();
+        let db = crate::database::DatabaseStore::test_file(&root.join("sync.sqlite"));
+        crate::workspaces_sync::reconcile_from_state(&db, &store).unwrap();
+        let row = db.list_workspaces_sync().into_iter().find(|r| r.workspace_id.as_ref() == Some(&workspace)).unwrap();
+        db.mark_workspace_sync_synced(row.id, Some("linked-cloud-id")).unwrap();
+        flush_persisted_state(&store).unwrap();
+
+        let backup = fs::read_to_string(recovery_marker(&path)).unwrap();
+        let backup = root.join(backup.trim());
+        save_layout_to(&backup, &default_app_state()).unwrap();
+        fs::rename(backup, &path).unwrap();
+        for _ in 0..2 {
+            store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+            assert!(store.find_workspace(&workspace).is_none());
+            #[cfg(unix)]
+            {
+                use crate::database::daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose, PendingTerminalReplacement};
+                let replacement = PendingTerminalReplacement {
+                    workspace_id: workspace.clone(), old_session_id: session.clone(), replacement_id: uuid::Uuid::new_v4(),
+                };
+                let successor = replacement.replacement_session_id();
+                let live = store.terminal_session_owners(std::slice::from_ref(&replacement));
+                assert!(live.contains(&(workspace.clone(), session.clone())));
+                let shell = PendingDaemonClose {
+                    route: DaemonWorkspaceRoute { workspace_id: workspace.clone(), host_id: None, ssh_target: None },
+                    session_id: successor, shell_id: uuid::Uuid::new_v4(),
+                };
+                let orphan = PendingDaemonClose { session_id: "orphan-session".into(), ..shell.clone() };
+                assert_eq!(store.orphaned_daemon_shells(vec![shell, orphan.clone()], &[replacement]), [orphan]);
+            }
+            let active = store.workspace_ids().into_iter().collect::<Vec<_>>();
+            crate::scrollback::cleanup_on_startup(&scrollback, true, layout_recovery_pending(), &active, 1);
+            crate::workspaces_sync::reconcile_from_state(&db, &store).unwrap();
+            assert_eq!(crate::scrollback::load_scrollback(&workspace, &pane).unwrap().data, payload.data);
+            assert!(!scrollback.join("orphan").exists());
+            let row = db.list_workspaces_sync().into_iter().find(|r| r.server_id.as_deref() == Some("linked-cloud-id")).unwrap();
+            assert!(row.deleted_at.is_none() && !row.dirty);
+            flush_persisted_state(&store).unwrap();
+        }
+        let retained = fs::read_dir(root).unwrap().map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("layout.json.recovery-saved-")).unwrap();
+        fs::copy(&retained, &path).unwrap();
+        store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+        assert!(terminal_pane_for_close_intent(&store.snapshot(), &workspace, &session).is_some());
+        crate::workspaces_sync::reconcile_from_state(&db, &store).unwrap();
+        assert_eq!(crate::scrollback::load_scrollback(&workspace, &pane).unwrap().data, payload.data);
+        crate::workspaces_sync::record_closed(&db, &explicitly_closed.0).unwrap();
+        crate::workspaces_sync::reconcile_from_state(&db, &store).unwrap();
+        assert!(db.list_dirty_workspaces_sync().iter().any(|r|
+            r.workspace_id.as_deref() == Some(&explicitly_closed.0) && r.deleted_at.is_some()));
+        // Discard the copy and boot the repaired primary again: normal cleanup resumes.
+        fs::remove_file(retained).unwrap();
+        save_layout_to(&path, &default_app_state()).unwrap();
+        store.replace_snapshot(load_persisted_state_checked().unwrap().unwrap());
+        crate::scrollback::cleanup_on_startup(&scrollback, true, layout_recovery_pending(), &[], 1);
+        crate::workspaces_sync::reconcile_from_state(&db, &store).unwrap();
+        assert!(crate::scrollback::load_scrollback(&workspace, &pane).is_none());
+        assert!(!db.list_workspaces_sync().iter().any(|r| r.id == row.id));
+    }
+
+    #[test]
+    fn legacy_primary_fallback_yields_to_a_repair_while_another_backup_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        for _ in 0..2 {
+            fs::write(&path, "broken").unwrap();
+            assert!(open_layout(&path).unwrap().1.is_some());
+        }
+        let legacy = default_app_state();
+        save_layout_to(&path, &legacy).unwrap();
+        let (loaded, base) = open_layout(&path).unwrap();
+        assert_eq!(loaded.unwrap().active_workspace_id, legacy.active_workspace_id);
+        let newer = default_app_state();
+        write_layout_to(&recovery_session_path(&path),
+            &RecoverySnapshot { recovery_base: base.unwrap(), snapshot: &newer }).unwrap();
+        assert_eq!(open_layout(&path).unwrap().0.unwrap().active_workspace_id, newer.active_workspace_id);
+
+        let listed = fs::read_to_string(recovery_marker(&path)).unwrap();
+        let backups: Vec<_> = listed.lines().map(|name| dir.path().join(name)).collect();
+        let repaired = legacy;
+        fs::copy(&path, &backups[0]).unwrap();
+        fs::rename(&backups[0], &path).unwrap();
+        let (loaded, base) = open_layout(&path).unwrap();
+        assert_eq!(loaded.unwrap().active_workspace_id, repaired.active_workspace_id);
+        assert!(base.is_some());
+        fs::remove_file(&backups[1]).unwrap();
+        let (loaded, base) = open_layout(&path).unwrap();
+        assert_eq!(loaded.unwrap().active_workspace_id, repaired.active_workspace_id);
+        assert!(base.is_none());
+    }
+
+    #[test]
+    fn recovery_outlives_a_restart_after_the_fallback_layout_was_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        fs::write(&path, "not json").unwrap();
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
+
+        // A previous release saved its fallback directly at the primary path.
+        save_layout_to(&path, &default_app_state()).unwrap();
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Loaded(_)));
+        assert!(recovery_pending_at(&path), "a parsable fallback must not end the recovery");
+
+        // Discarding (or restoring) the set-aside copy ends it.
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with("layout.json.unreadable-") {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        assert!(!recovery_pending_at(&path));
+        open_layout(&path).unwrap();
+        assert!(!recovery_marker(&path).exists());
+    }
+
+    #[test]
+    fn startup_preserves_over_limit_scrollback_until_layout_recovery_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = dir.path().join("layout.json");
+        let base = dir.path().join("scrollback");
+        let workspace = base.join("ws");
+        let pane = workspace.join("pane.dat");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(&pane, b"scrollback").unwrap();
+        fs::write(&layout, "invalid json").unwrap();
+
+        assert!(matches!(load_layout_from(&layout), PersistedLayout::Unreadable { preserved: true }));
+        crate::scrollback::cleanup_on_startup(&base, false, recovery_pending_at(&layout), &[], 1);
+        assert_eq!(fs::read(&pane).unwrap(), b"scrollback");
+
+        save_layout_to(&layout, &default_app_state()).unwrap();
+        assert!(matches!(load_layout_from(&layout), PersistedLayout::Loaded(_)));
+        crate::scrollback::cleanup_on_startup(&base, true, recovery_pending_at(&layout), &[], 1);
+        assert_eq!(fs::read(&pane).unwrap(), b"scrollback");
+
+        let backup = fs::read_to_string(recovery_marker(&layout)).unwrap();
+        fs::remove_file(dir.path().join(backup.trim())).unwrap();
+        // An active workspace survives orphan cleanup, so only the disk cap can evict it.
+        crate::scrollback::cleanup_on_startup(&base, true, recovery_pending_at(&layout), &["ws".into()], 1);
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn recovery_waits_for_every_copy_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let asides = |dir: &Path| -> Vec<PathBuf> {
+            let mut found: Vec<_> = fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("layout.json.unreadable-"))
+                .collect();
+            found.sort();
+            found
+        };
+        fs::write(&path, "first broken layout").unwrap();
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
+        // The fallback layout later turns unreadable too — in the same
+        // millisecond, even: the names still differ.
+        fs::write(&path, "second broken layout").unwrap();
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
+        let both = asides(dir.path());
+        assert_eq!(both.len(), 2);
+
+        fs::remove_file(&both[1]).unwrap();
+        assert!(recovery_pending_at(&path), "the first copy still waits");
+        fs::remove_file(&both[0]).unwrap();
+        assert!(!recovery_pending_at(&path));
+    }
+
+    #[test]
+    fn a_torn_marker_entry_keeps_recovery_pending_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        // An earlier copy, whose marker entry was torn mid-write.
+        fs::write(dir.path().join("layout.json.unreadable-1700000000000-0123abcd"), "earliest").unwrap();
+        fs::write(recovery_marker(&path), "layout.json.unreadable-17000").unwrap();
+
+        // Another unreadable layout is set aside, then the fallback saved.
+        fs::write(&path, "not json").unwrap();
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
+        let marker = fs::read_to_string(recovery_marker(&path)).unwrap();
+        assert!(marker.starts_with("layout.json.unreadable-17000\n"), "the torn line stays on its own: {marker:?}");
+        save_layout_to(&path, &default_app_state()).unwrap();
+
+        // Even with the newer copy discarded, the torn entry cannot vouch.
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("layout.json.unreadable-") && !name.contains("1700000000000") {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        assert!(recovery_pending_at(&path));
+    }
+
+    #[test]
+    fn aside_names_are_recognised_exactly() {
+        assert!(is_aside_name("layout.json", "layout.json.unreadable-1700000000000-0123abcd"));
+        for bad in [
+            "layout.json.unreadable-17000",
+            "layout.json.unreadable-1700000000000-0123",
+            "layout.json.unreadable-x-0123abcd",
+            "other.json.unreadable-1-0123abcd",
+            "layout.json/copy",
+        ] {
+            assert!(!is_aside_name("layout.json", bad), "{bad}");
+        }
+    }
+
+    // Unix only: the directory sync is a Unix step.
+    #[cfg(unix)]
+    #[test]
+    fn the_layout_keeps_its_name_until_its_copy_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let aside = dir.path().join("layout.json.unreadable-1-0123abcd");
+        fs::write(&path, "broken layout").unwrap();
+
+        FAIL_DIR_SYNC.with(|fail| fail.set(true));
+        assert!(move_no_clobber_durably(&path, &aside).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "broken layout", "the original is still in place");
+    }
+
+    #[test]
+    fn setting_aside_never_replaces_an_earlier_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let aside = dir.path().join("layout.json.unreadable-taken");
+        fs::write(&path, "newer broken layout").unwrap();
+        fs::write(&aside, "earlier copy").unwrap();
+
+        assert!(!set_aside(&path, &aside), "a taken name is refused");
+        assert_eq!(fs::read_to_string(&aside).unwrap(), "earlier copy");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "newer broken layout");
+    }
+
+    // Unix only: a symlink needs no privilege there.
+    #[cfg(unix)]
+    #[test]
+    fn a_layout_link_whose_target_is_gone_is_kept_not_treated_as_a_first_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let target = dir.path().join("dotfiles-layout.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Unreadable { preserved: true }));
+        assert!(recovery_pending_at(&path), "so cleanup stays off");
+        let kept: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("layout.json.unreadable-"))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read_link(&kept[0]).unwrap(), target, "the link itself is what was kept");
+
+        // A later save writes a fresh layout.json; the kept link is untouched.
+        save_layout_to(&path, &default_app_state()).unwrap();
+        assert_eq!(fs::read_link(&kept[0]).unwrap(), target);
+        assert!(recovery_pending_at(&path));
+    }
+
+    #[test]
+    fn recovery_state_that_cannot_be_read_still_counts_as_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        // A marker that cannot be read as a file.
+        fs::create_dir(recovery_marker(&path)).unwrap();
+        assert!(recovery_pending_at(&path));
+        fs::remove_dir(recovery_marker(&path)).unwrap();
+
+        // A listed copy whose existence cannot be checked. Unix only: a path
+        // through a file is "not a directory" there, while Windows reports
+        // it as "path not found".
+        #[cfg(unix)]
+        {
+            fs::write(&path, "{}").unwrap();
+            fs::write(recovery_marker(&path), "layout.json/copy\n").unwrap();
+            assert!(recovery_pending_at(&path));
+            assert!(recovery_marker(&path).exists(), "and the marker is left alone");
+        }
+    }
+
+    // Unix only: a read-only directory is how this test makes setting the
+    // layout aside fail.
+    #[cfg(unix)]
+    #[test]
+    fn a_layout_that_cannot_be_set_aside_is_never_saved_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        fs::write(&path, "not json").unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let layout = load_layout_from(&path);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(layout, PersistedLayout::Unreadable { preserved: false }));
+
+        // Writes work again, but saving stays paused for this run.
+        TEST_SAVES_BLOCKED.with(|b| b.set(Some(true)));
+        let saved = save_layout_to(&path, &default_app_state());
+        TEST_SAVES_BLOCKED.with(|b| b.set(None));
+        assert!(saved.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not json", "the only copy is intact");
+    }
+
+    #[test]
+    fn a_saved_layout_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        fs::write(&path, serde_json::to_string(&default_app_state()).unwrap()).unwrap();
+        assert!(matches!(load_layout_from(&path), PersistedLayout::Loaded(_)));
+        assert!(path.exists());
     }
 }

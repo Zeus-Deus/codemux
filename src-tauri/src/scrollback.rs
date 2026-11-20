@@ -107,7 +107,11 @@ impl ScrollbackCache {
 
 // ── Paths ──────────────────────────────────────────────────────
 
-fn scrollback_base() -> PathBuf {
+pub(crate) fn scrollback_base() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = crate::test_isolation::isolated_root() {
+        return root.join("scrollback");
+    }
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
     data_dir.join(crate::APP_DIR_NAME).join("scrollback")
@@ -300,6 +304,33 @@ pub fn remove_workspace_scrollback(workspace_id: &str) {
     }
 }
 
+/// Both cleanup passes can remove whole workspace directories. While the
+/// layout is set aside, any directory could belong to a recoverable workspace.
+pub(crate) fn cleanup_on_startup(
+    base: &Path,
+    layout_loaded: bool,
+    recovery_pending: bool,
+    active_workspace_ids: &[String],
+    max_bytes: u64,
+) {
+    if recovery_pending || crate::state::retained_layouts().unreadable {
+        eprintln!("[codemux::scrollback] Skipping startup cleanup during layout recovery");
+        return;
+    }
+    if should_run_orphan_cleanup(layout_loaded) {
+        let removed = cleanup_orphan_scrollbacks_in(base, active_workspace_ids);
+        if !removed.is_empty() {
+            eprintln!("[codemux::scrollback] Cleaned up {} orphan scrollback dirs", removed.len());
+        }
+    } else {
+        eprintln!("[codemux::scrollback] Skipping orphan cleanup because the layout was not loaded");
+    }
+    let freed = enforce_disk_limit_in(base, max_bytes);
+    if freed > 0 {
+        eprintln!("[codemux::scrollback] Freed {freed} bytes to stay under the {max_bytes}-byte limit");
+    }
+}
+
 /// Remove scrollback for a single pane.
 pub fn remove_pane_scrollback(workspace_id: &str, pane_id: &str) {
     let _ = fs::remove_file(data_path(workspace_id, pane_id));
@@ -326,12 +357,13 @@ pub(crate) fn cleanup_orphan_scrollbacks_in(
     };
 
     let mut removed = Vec::new();
+    let retained = crate::state::retained_layouts();
     for entry in entries.flatten() {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
         let dir_name = entry.file_name().to_string_lossy().to_string();
-        if !active_workspace_ids.contains(&dir_name) {
+        if !active_workspace_ids.contains(&dir_name) && !retained.protects(&dir_name) {
             let _ = fs::remove_dir_all(entry.path());
             removed.push(dir_name);
         }
@@ -343,7 +375,10 @@ pub(crate) fn cleanup_orphan_scrollbacks_in(
 /// Removes oldest workspaces first until under the limit.
 /// Returns the number of bytes freed.
 pub fn enforce_disk_limit(max_bytes: u64) -> u64 {
-    let base = scrollback_base();
+    enforce_disk_limit_in(&scrollback_base(), max_bytes)
+}
+
+fn enforce_disk_limit_in(base: &Path, max_bytes: u64) -> u64 {
     if !base.exists() {
         return 0;
     }
@@ -351,7 +386,7 @@ pub fn enforce_disk_limit(max_bytes: u64) -> u64 {
     // Collect (workspace_dir, total_size, oldest_mtime)
     let mut workspaces: Vec<(PathBuf, u64, u64)> = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(&base) {
+    if let Ok(entries) = fs::read_dir(base) {
         for entry in entries.flatten() {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
@@ -388,12 +423,14 @@ pub fn enforce_disk_limit(max_bytes: u64) -> u64 {
 
     let mut freed = 0u64;
     let overshoot = current_total - max_bytes;
+    let retained = crate::state::retained_layouts();
     for (path, size, _) in &workspaces {
         if freed >= overshoot {
             break;
         }
-        let _ = fs::remove_dir_all(path);
-        freed += size;
+        if !retained.protects(&path.file_name().unwrap().to_string_lossy()) && fs::remove_dir_all(path).is_ok() {
+            freed += size;
+        }
     }
 
     freed

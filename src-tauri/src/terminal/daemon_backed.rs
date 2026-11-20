@@ -1850,7 +1850,7 @@ impl CommittedDaemonClose {
     pub(super) fn finish<R: Runtime>(self, app: &AppHandle<R>) {
         // Archive becomes visible after the shared close finishes.
         if !matches!(&self.intent, LayoutCloseIntent::Archive(_)) {
-            persist_pending_layout_closes(app, vec![self.intent]);
+            crate::state::persist_pending_layout_closes(app, vec![self.intent]);
         }
         for request in self.requests {
             queue_closed_pane_cleanup(app.clone(), request);
@@ -1887,23 +1887,6 @@ pub(super) fn commit_layout_close(
         }
     }
     Ok(CommittedDaemonClose { intent, requests, restored })
-}
-
-pub(crate) fn persist_pending_layout_closes<R: Runtime>(
-    app: &AppHandle<R>,
-    intents: Vec<LayoutCloseIntent>,
-) {
-    if intents.is_empty() {
-        return;
-    }
-    let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = app.state::<AppStateStore>();
-        let db = app.state::<DatabaseStore>();
-        if let Err(error) = crate::state::persist_layout_closes(&store, &db, &intents) {
-            log::error!("Could not persist pending layout closes: {error}");
-        }
-    });
 }
 
 pub(super) fn queue_closed_pane_cleanup<R: Runtime>(app: AppHandle<R>, request: PreparedDaemonClose) {
@@ -2233,9 +2216,6 @@ mod tests {
         };
         let layout_path = root.join("layout.json");
         assert!(state::load_persisted_state_checked().unwrap().is_none());
-        std::fs::write(&layout_path, b"invalid layout").unwrap();
-        assert!(state::load_persisted_state_checked().is_err());
-        assert_eq!(std::fs::read(&layout_path).unwrap(), b"invalid layout");
         state::flush_persisted_state(&initial_store).unwrap();
         let stale_layout = std::fs::read(&layout_path).unwrap();
         {
@@ -2262,9 +2242,20 @@ mod tests {
         assert_eq!(intents, [intent.clone()]);
         assert_eq!(jobs.len(), 2);
         assert!(jobs.iter().all(|job| job.route == route));
-        state::reserve_pending_close_ids(&intents, &jobs);
+        // A fallback save cannot acknowledge a close against the set-aside layout.
+        std::fs::write(&layout_path, b"invalid layout").unwrap();
+        assert!(state::load_persisted_state_checked().unwrap().is_none());
+        assert!(state::layout_recovery_pending());
+        state::persist_layout_closes(&AppStateStore::default(), &db, &intents).unwrap();
+        assert_eq!(db.pending_layout_closes().unwrap(), intents);
+        let marker = std::fs::read_to_string(layout_path.with_extension("json.recovery-pending")).unwrap();
+        let backup = root.join(marker.trim());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"invalid layout");
+        std::fs::write(&backup, &stale_layout).unwrap();
+        std::fs::rename(backup, &layout_path).unwrap();
         let restored = AppStateStore::default();
-        restored.replace_snapshot(state::load_persisted_state().unwrap());
+        restored.replace_snapshot(state::load_persisted_state_checked().unwrap().unwrap());
+        assert!(!state::layout_recovery_pending());
         assert!(restored.pty_hydration_plan_for_session(&session_id).is_some());
         state::restore_pending_layout_closes(&restored, &intents).unwrap();
         assert!(restored.pty_hydration_plan_for_session(&session_id).is_none());
@@ -2328,7 +2319,7 @@ mod tests {
             }).unwrap();
         });
         writer_locked.recv_timeout(Duration::from_secs(5)).unwrap();
-        super::persist_pending_layout_closes(relaunched.handle(), intents);
+        crate::state::persist_pending_layout_closes(relaunched.handle(), intents);
         super::resume_pending_daemon_closes(relaunched.handle(), jobs);
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), seen.recv()).await.unwrap(), Some(shell_ids[0]));
         allow_ack.send(()).await.unwrap();

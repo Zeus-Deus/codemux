@@ -20,6 +20,7 @@ pub mod queued_turns;
 pub mod restart_resumes;
 #[cfg(unix)]
 pub(crate) mod daemon_closes;
+mod layout_closes;
 
 /// Merge every session row matching `group` (an `agent_chat_sessions`
 /// predicate over `?1 = key`) into `survivor` (`?2`), which must match it
@@ -1422,6 +1423,8 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     restart_resumes::create_schema(conn)?;
     #[cfg(unix)]
     daemon_closes::create_schema(conn)?;
+    #[cfg(windows)]
+    layout_closes::create_schema(conn).map_err(|e| e.to_string())?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new
@@ -1618,6 +1621,35 @@ impl DatabaseStore {
             params![key, value],
         )
         .map_err(|e| format!("Failed to set ui_state: {e}"))?;
+        Ok(())
+    }
+
+    /// Every `ui_state` key that starts with `prefix`. Unlike
+    /// [`Self::get_ui_state`], a failed read is an error, not "none".
+    pub fn ui_state_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT key FROM ui_state
+                 WHERE user_id = 'local' AND substr(key, 1, length(?1)) = ?1",
+            )
+            .map_err(|e| format!("Failed to list ui_state: {e}"))?;
+        let keys = stmt
+            .query_map(params![prefix], |row| row.get(0))
+            .map_err(|e| format!("Failed to list ui_state: {e}"))?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| format!("Failed to list ui_state: {e}"));
+        keys
+    }
+
+    /// Delete every `ui_state` key that starts with `prefix`.
+    pub fn delete_ui_state_with_prefix(&self, prefix: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM ui_state WHERE user_id = 'local' AND substr(key, 1, length(?1)) = ?1",
+            params![prefix],
+        )
+        .map_err(|e| format!("Failed to delete ui_state: {e}"))?;
         Ok(())
     }
 
@@ -2246,6 +2278,66 @@ impl DatabaseStore {
 
     /// Clear dirty after a successful push. Optionally stamp the
     /// server_id (first push only). Mirrors `mark_host_synced`.
+    /// Acknowledge a push of `pushed`: record the server id a POST
+    /// returned, and clear `dirty` only if the row still holds exactly what
+    /// was sent. A change made while the request was in flight — an edit,
+    /// or a close's tombstone — stays dirty for the next push.
+    pub fn mark_workspace_sync_pushed(
+        &self,
+        pushed: &WorkspaceSyncRecord,
+        server_id: Option<&str>,
+    ) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to mark workspace sync row pushed: {e}"))?;
+        // The server can answer an upload with the id of a row it already
+        // had (it matches workspaces by identity), and a pull may already
+        // have mirrored that row here after an earlier answer was lost. A
+        // plain mirror of it — clean, not adopted by a local workspace, and
+        // not a host-inventory row with identity of its own — is this row's
+        // own server copy: it gives way, so this row (with its local
+        // workspace and any newer edits) takes the id. Any other holder is
+        // left alone, and the id is not taken.
+        if let Some(sid) = server_id {
+            tx.execute(
+                "DELETE FROM workspaces_sync
+                 WHERE user_id = 'local' AND server_id = ?1 AND id != ?2
+                   AND workspace_id IS NULL AND dirty = 0
+                   AND origin_uid IS NULL AND origin_path IS NULL",
+                params![sid, pushed.id],
+            )
+            .map_err(|e| format!("Failed to merge the server's copy of a workspace: {e}"))?;
+        }
+        tx.execute(
+            "UPDATE workspaces_sync
+             SET server_id = COALESCE(?1, server_id),
+                 dirty = CASE
+                     WHEN title IS ?2 AND host_server_id IS ?3 AND project_path IS ?4
+                      AND project_remote IS ?5 AND git_branch IS ?6 AND git_head_sha IS ?7
+                      AND project_uid IS ?8 AND workspace_kind IS ?9 AND deleted_at IS ?10
+                     THEN 0 ELSE dirty
+                 END
+             WHERE id = ?11",
+            params![
+                server_id,
+                pushed.title,
+                pushed.host_server_id,
+                pushed.project_path,
+                pushed.project_remote,
+                pushed.git_branch,
+                pushed.git_head_sha,
+                pushed.project_uid,
+                pushed.workspace_kind,
+                pushed.deleted_at,
+                pushed.id,
+            ],
+        )
+        .map_err(|e| format!("Failed to mark workspace sync row pushed: {e}"))?;
+        tx.commit().map_err(|e| format!("Failed to mark workspace sync row pushed: {e}"))?;
+        Ok(())
+    }
+
     pub fn mark_workspace_sync_synced(
         &self,
         id: i64,
@@ -2283,6 +2375,11 @@ impl DatabaseStore {
     /// Idempotent upsert from a server pull. Always sets `dirty = 0`.
     /// Does NOT clobber the local `workspace_id` if one is already
     /// stamped — adoption is sticky.
+    ///
+    /// A local row with unpushed changes (`dirty = 1`) is left alone:
+    /// the server copy predates the local edit or delete, and the next
+    /// push sends it. Checked here, under the connection lock, so an
+    /// edit that lands mid-pull is covered too.
     pub fn upsert_workspace_sync_from_server(
         &self,
         server_id: &str,
@@ -2315,7 +2412,7 @@ impl DatabaseStore {
                      project_uid = COALESCE(?11, project_uid),
                      workspace_kind = COALESCE(?12, workspace_kind),
                      dirty = 0
-                 WHERE user_id = 'local' AND server_id = ?10",
+                 WHERE user_id = 'local' AND server_id = ?10 AND dirty = 0",
                 params![
                     title,
                     host_server_id,
@@ -2332,7 +2429,16 @@ impl DatabaseStore {
                 ],
             )
             .map_err(|e| format!("Failed to update workspace sync from server: {e}"))?;
-        if updated == 0 {
+        // Nothing updated: either the row is new to this install, or it
+        // exists with local changes pending. Only the former is inserted.
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces_sync WHERE user_id = 'local' AND server_id = ?1)",
+                params![server_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to look up workspace sync from server: {e}"))?;
+        if updated == 0 && !exists {
             conn.execute(
                 "INSERT INTO workspaces_sync
                     (user_id, server_id, workspace_id, title, host_server_id,
@@ -3193,6 +3299,42 @@ impl DatabaseStore {
 
     /// Clear `dirty` after a successful push; optionally stamp the
     /// server-assigned id on the first upload.
+    /// Acknowledge a push of `pushed`: record the server id a POST
+    /// returned, and clear `dirty` only if the row still holds exactly what
+    /// was sent; a change made meanwhile stays dirty for the next push.
+    pub fn mark_automation_pushed(&self, pushed: &AutomationRecord, server_id: Option<&str>) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automations
+             SET server_id = COALESCE(?1, server_id),
+                 dirty = CASE
+                     WHEN name IS ?2 AND prompt IS ?3 AND agent IS ?4 AND schedule IS ?5
+                      AND timezone IS ?6 AND host_id IS ?7 AND project_path IS ?8
+                      AND project_remote IS ?9 AND enabled IS ?10 AND retention_limit IS ?11
+                      AND deleted_at IS ?12
+                     THEN 0 ELSE dirty
+                 END
+             WHERE id = ?13",
+            params![
+                server_id,
+                pushed.name,
+                pushed.prompt,
+                pushed.agent,
+                pushed.schedule,
+                pushed.timezone,
+                pushed.host_id,
+                pushed.project_path,
+                pushed.project_remote,
+                pushed.enabled as i64,
+                pushed.retention_limit,
+                pushed.deleted_at,
+                pushed.id,
+            ],
+        )
+        .map_err(|e| format!("Failed to mark automation pushed: {e}"))?;
+        Ok(())
+    }
+
     pub fn mark_automation_synced(&self, id: i64, server_id: Option<&str>) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         if let Some(sid) = server_id {
@@ -3214,6 +3356,10 @@ impl DatabaseStore {
     /// Always written `dirty = 0` (server rows are authoritative).
     /// `next_run_at` / `last_run_at` are derived per-device and are not
     /// carried over the wire, so a server upsert leaves them untouched.
+    ///
+    /// A local row with unpushed changes (`dirty = 1`) is left alone:
+    /// the server copy predates the user's edit, pause or delete, and
+    /// the next push sends it.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_automation_from_server(
         &self,
@@ -3241,7 +3387,7 @@ impl DatabaseStore {
                      project_remote = ?8, enabled = ?9, retention_limit = ?10,
                      created_at = ?11, updated_at = ?12, deleted_at = ?13,
                      dirty = 0
-                 WHERE user_id = 'local' AND server_id = ?14",
+                 WHERE user_id = 'local' AND server_id = ?14 AND dirty = 0",
                 params![
                     name,
                     prompt,
@@ -3260,7 +3406,16 @@ impl DatabaseStore {
                 ],
             )
             .map_err(|e| format!("Failed to update automation from server: {e}"))?;
-        if updated == 0 {
+        // Nothing updated: either the row is new to this install, or it
+        // exists with local changes pending. Only the former is inserted.
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automations WHERE user_id = 'local' AND server_id = ?1)",
+                params![server_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to look up automation from server: {e}"))?;
+        if updated == 0 && !exists {
             conn.execute(
                 "INSERT INTO automations
                     (user_id, server_id, name, prompt, agent, schedule,
