@@ -11,15 +11,41 @@
 //! The binary is a Tauri `resource`, not an `externalBin`, because
 //! linuxdeploy's patchelf corrupts Bun executables (commit 025fa19).
 //!
-//! Each role keeps its own path override env var, so tests and e2e harnesses
-//! can still point one role at a different executable.
+//! # Path overrides
+//!
+//! | Variable                                | Points at                          | Role argument |
+//! |-----------------------------------------|------------------------------------|---------------|
+//! | `CODEMUX_CLAUDE_SIDECAR_PATH`           | any Claude sidecar executable      | none          |
+//! | `CODEMUX_MANAGED_WORKFLOW_SIDECAR_PATH` | a managed workflow-only executable | none          |
+//! | `CODEMUX_PLUGIN_HOST_PATH`              | a plugin host-only executable      | none          |
+//! | `CODEMUX_SIDECAR_PATH`                  | a multi-role `codemux-sidecar`     | yes           |
+//!
+//! A role's own variable wins and is launched exactly as before the merge,
+//! with no role argument or role environment. `CODEMUX_SIDECAR_PATH`
+//! replaces the bundled binary for every role and, like it, receives both
+//! (Claude needs neither: it is the default role).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::agent_provider::claude::sidecar_path::target_triple;
 
 /// File name stem of the bundled executable.
 pub const BINARY_STEM: &str = "codemux-sidecar";
+
+/// Overrides the multi-role binary for every role; see the module docs.
+pub const PATH_ENV: &str = "CODEMUX_SIDECAR_PATH";
+
+/// Role a `codemux-sidecar` process falls back to when its first argument
+/// is not a role selector. Codemux sets it only in the plugin host's
+/// environment ([`SidecarRole::env`]), so plugin code that re-executes
+/// `process.execPath` (this binary) with ordinary arguments gets the plugin
+/// host back, as it did when the plugin host was its own binary. It must be
+/// in the real process environment: Bun child processes do not see
+/// assignments to `process.env`. The desktop removes an inherited one at
+/// startup, because Claude spawn sites rely on the default role.
+pub const ROLE_ENV: &str = "CODEMUX_SIDECAR_ROLE";
 
 /// Which program a bundled sidecar process runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,8 +56,8 @@ pub enum SidecarRole {
 }
 
 impl SidecarRole {
-    /// Env var that overrides this role's executable path. Honored verbatim
-    /// and ahead of every bundled location.
+    /// Env var that overrides this role's executable path. Honored verbatim,
+    /// ahead of every other location, and launched without a role argument.
     pub const fn path_env(self) -> &'static str {
         match self {
             Self::Claude => "CODEMUX_CLAUDE_SIDECAR_PATH",
@@ -40,13 +66,11 @@ impl SidecarRole {
         }
     }
 
-    /// Arguments that must come first on the command line to select this
-    /// role. Claude needs none: it is the binary's default role, which is
-    /// what every Claude spawn site and SSH devices (which install the binary
-    /// as `codemux-claude-sidecar` and run it without arguments) rely on.
-    /// The other roles' programs ignore unknown arguments, so the role
-    /// argument is also harmless when an override points at a standalone
-    /// build of that program.
+    /// Arguments that must come first on the multi-role binary's command
+    /// line to select this role. Claude needs none: it is the binary's
+    /// default role, which is what every Claude spawn site and SSH devices
+    /// (which install the binary as `codemux-claude-sidecar` and run it
+    /// without arguments) rely on.
     pub fn args(self) -> Vec<String> {
         match self {
             Self::Claude => Vec::new(),
@@ -54,6 +78,28 @@ impl SidecarRole {
             Self::PluginHost => vec!["--codemux-role=plugin-host".into()],
         }
     }
+
+    /// Environment the multi-role binary is started with for this role. Only
+    /// the plugin host records its role for its descendants: the other roles
+    /// run agents whose shells would otherwise turn a bare `codemux-sidecar`
+    /// (e.g. a Codemux dev build started from an agent's terminal) into the
+    /// wrong program.
+    pub fn env(self) -> Vec<(String, String)> {
+        match self {
+            Self::PluginHost => vec![(ROLE_ENV.into(), "plugin-host".into())],
+            Self::Claude | Self::ManagedWorkflow => Vec::new(),
+        }
+    }
+}
+
+/// An executable, the leading arguments and the environment it must be
+/// started with. Spawn sites put no arguments before `args` (a role selector
+/// must come first) and apply `env` after any environment filtering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidecarCommand {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 /// `.exe` on Windows, empty elsewhere.
@@ -77,48 +123,111 @@ pub fn dev_binaries_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries")
 }
 
-/// The role's non-empty path override, if set.
-pub fn path_override(role: SidecarRole) -> Option<PathBuf> {
-    std::env::var_os(role.path_env())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record Tauri's resource dir at startup so spawn sites without an
+/// `AppHandle` (the managed workflow adapters) find the bundled binary.
+/// Later calls are ignored.
+pub fn set_resource_dir(dir: PathBuf) {
+    let _ = RESOURCE_DIR.set(dir);
 }
 
-/// Resolve the executable to launch for `role`.
+fn non_empty_env(name: &str) -> Option<OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+/// The role's non-empty path override, if set.
+pub fn path_override(role: SidecarRole) -> Option<PathBuf> {
+    non_empty_env(role.path_env()).map(PathBuf::from)
+}
+
+/// The non-empty [`PATH_ENV`] override, if set.
+pub fn unified_override() -> Option<PathBuf> {
+    non_empty_env(PATH_ENV).map(PathBuf::from)
+}
+
+/// Resolve how to launch `role`.
 ///
 /// Priority:
 ///   1. The role's [`SidecarRole::path_env`] override, returned verbatim
-///      without an existence check (harnesses pin paths they own).
-///   2. `<resource_dir>/binaries/codemux-sidecar-<triple>` — the packaged
-///      location Tauri copies from the `resources` glob.
-///   3. Debug builds only: the `src-tauri/binaries/` copy, because
+///      without an existence check (harnesses pin paths they own) and with
+///      no role argument or environment.
+///   2. The [`PATH_ENV`] override, verbatim, with the role's arguments and
+///      environment, as for the bundled binary.
+///   3. `<resource_dir>/binaries/codemux-sidecar-<triple>` — the packaged
+///      location Tauri copies from the `resources` glob. Without an explicit
+///      `resource_dir`, the one recorded by [`set_resource_dir`].
+///   4. Debug builds only: the `src-tauri/binaries/` copy, because
 ///      `npm run tauri:dev` does not stage it into the resource dir.
 ///
 /// `None` when the binary exists nowhere (e.g. a checkout that never ran
 /// the build script); callers report the feature as unavailable.
-pub fn resolve(role: SidecarRole, resource_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Some(explicit) = path_override(role) {
-        return Some(explicit);
-    }
+pub fn resolve_command(role: SidecarRole, resource_dir: Option<&Path>) -> Option<SidecarCommand> {
+    let resource_dir = resource_dir.or_else(|| RESOURCE_DIR.get().map(PathBuf::as_path));
+    let mut dirs = Vec::new();
     if let Some(dir) = resource_dir {
-        let candidate = dir.join("binaries").join(binary_name());
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+        dirs.push(dir.join("binaries"));
     }
-    #[cfg(debug_assertions)]
-    {
-        let candidate = dev_binaries_dir().join(binary_name());
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+    if cfg!(debug_assertions) {
+        dirs.push(dev_binaries_dir());
     }
-    None
+    resolve_command_from(role, |name| non_empty_env(name), &dirs)
+}
+
+/// [`resolve_command`] with the environment and the directories searched
+/// for the bundled binary supplied by the caller.
+fn resolve_command_from(
+    role: SidecarRole,
+    env: impl Fn(&str) -> Option<OsString>,
+    dirs: &[PathBuf],
+) -> Option<SidecarCommand> {
+    if let Some(program) = env(role.path_env()) {
+        return Some(SidecarCommand {
+            program: program.into(),
+            args: Vec::new(),
+            env: Vec::new(),
+        });
+    }
+    let program = env(PATH_ENV).map(PathBuf::from).or_else(|| {
+        dirs.iter()
+            .map(|dir| dir.join(binary_name()))
+            .find(|candidate| candidate.is_file())
+    })?;
+    Some(SidecarCommand {
+        program,
+        args: role.args(),
+        env: role.env(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ROLES: [SidecarRole; 3] = [
+        SidecarRole::Claude,
+        SidecarRole::ManagedWorkflow,
+        SidecarRole::PluginHost,
+    ];
+
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let vars: Vec<(String, OsString)> = vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), OsString::from(value)))
+            .collect();
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    fn staged_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join(binary_name());
+        std::fs::write(&binary, b"bundled").unwrap();
+        (dir, binary)
+    }
 
     #[test]
     fn binary_name_is_triple_qualified() {
@@ -135,34 +244,118 @@ mod tests {
             SidecarRole::ManagedWorkflow.args(),
             ["--codemux-role=managed-workflow"]
         );
-        assert_eq!(SidecarRole::PluginHost.args(), ["--codemux-role=plugin-host"]);
+        assert_eq!(
+            SidecarRole::PluginHost.args(),
+            ["--codemux-role=plugin-host"]
+        );
+    }
+
+    #[test]
+    fn only_the_plugin_host_records_its_role_for_descendants() {
+        assert!(SidecarRole::Claude.env().is_empty());
+        assert!(SidecarRole::ManagedWorkflow.env().is_empty());
+        assert_eq!(
+            SidecarRole::PluginHost.env(),
+            [(
+                "CODEMUX_SIDECAR_ROLE".to_string(),
+                "plugin-host".to_string()
+            )]
+        );
     }
 
     #[test]
     fn roles_keep_their_existing_override_variables() {
-        assert_eq!(SidecarRole::Claude.path_env(), "CODEMUX_CLAUDE_SIDECAR_PATH");
+        assert_eq!(
+            SidecarRole::Claude.path_env(),
+            "CODEMUX_CLAUDE_SIDECAR_PATH"
+        );
         assert_eq!(
             SidecarRole::ManagedWorkflow.path_env(),
             "CODEMUX_MANAGED_WORKFLOW_SIDECAR_PATH"
         );
-        assert_eq!(SidecarRole::PluginHost.path_env(), "CODEMUX_PLUGIN_HOST_PATH");
+        assert_eq!(
+            SidecarRole::PluginHost.path_env(),
+            "CODEMUX_PLUGIN_HOST_PATH"
+        );
     }
 
     #[test]
-    fn every_role_resolves_the_same_bundled_binary() {
-        // The managed and plugin overrides are only set by tests and
-        // harnesses; this test does not touch any override.
-        if path_override(SidecarRole::ManagedWorkflow).is_some()
-            || path_override(SidecarRole::PluginHost).is_some()
-        {
-            return;
+    fn a_role_override_launches_verbatim_without_a_role_argument() {
+        let (dir, _) = staged_dir();
+        for role in ROLES {
+            // It also beats the multi-role override and the bundled binary.
+            let env = env_of(&[
+                (role.path_env(), "/opt/standalone"),
+                (PATH_ENV, "/opt/multi"),
+            ]);
+            assert_eq!(
+                resolve_command_from(role, env, &[dir.path().into()]),
+                Some(SidecarCommand {
+                    program: "/opt/standalone".into(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                }),
+                "{role:?}"
+            );
         }
-        let resources = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(resources.path().join("binaries")).unwrap();
-        let staged = resources.path().join("binaries").join(binary_name());
-        std::fs::write(&staged, b"bundled").unwrap();
-        for role in [SidecarRole::ManagedWorkflow, SidecarRole::PluginHost] {
-            assert_eq!(resolve(role, Some(resources.path())), Some(staged.clone()));
+    }
+
+    #[test]
+    fn the_multi_role_override_receives_the_role_argument() {
+        let (dir, _) = staged_dir();
+        for role in ROLES {
+            let env = env_of(&[(PATH_ENV, "/opt/multi")]);
+            assert_eq!(
+                resolve_command_from(role, env, &[dir.path().into()]),
+                Some(SidecarCommand {
+                    program: "/opt/multi".into(),
+                    args: role.args(),
+                    env: role.env(),
+                }),
+                "{role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn another_roles_override_does_not_apply() {
+        let (dir, staged) = staged_dir();
+        let env = env_of(&[(SidecarRole::PluginHost.path_env(), "/opt/plugin-host")]);
+        assert_eq!(
+            resolve_command_from(SidecarRole::ManagedWorkflow, env, &[dir.path().into()]),
+            Some(SidecarCommand {
+                program: staged,
+                args: SidecarRole::ManagedWorkflow.args(),
+                env: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn every_role_launches_the_bundled_binary_with_its_role_argument() {
+        let empty = tempfile::tempdir().unwrap();
+        let (dir, staged) = staged_dir();
+        for role in ROLES {
+            assert_eq!(
+                resolve_command_from(role, env_of(&[]), &[empty.path().into(), dir.path().into()]),
+                Some(SidecarCommand {
+                    program: staged.clone(),
+                    args: role.args(),
+                    env: role.env(),
+                }),
+                "{role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_resolves_without_an_override_or_a_staged_binary() {
+        let empty = tempfile::tempdir().unwrap();
+        for role in ROLES {
+            assert_eq!(
+                resolve_command_from(role, env_of(&[]), &[empty.path().into()]),
+                None
+            );
         }
     }
 }

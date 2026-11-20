@@ -163,8 +163,9 @@ jobs:
           bun run typecheck
           bun test
 
-      - name: Plugin host worker tests
-        run: node --test sidecar/plugin-host/worker.test.mjs
+      - name: Plugin host worker and sidecar role tests
+        # Interpreter run; the rust job repeats both against the compiled binary.
+        run: node --test sidecar/plugin-host/worker.test.mjs sidecar/codemux-sidecar.test.mjs
 
       - name: Plugin SDK typecheck and executable examples
         run: |
@@ -390,6 +391,7 @@ jobs:
           SIDECAR="./src-tauri/binaries/codemux-sidecar-$TARGET$SUFFIX"
           "$SIDECAR" --codemux-role=plugin-host --check
           "$SIDECAR" --codemux-role=managed-workflow --check
+          CODEMUX_SIDECAR_TEST_BINARY="$SIDECAR" node --test sidecar/codemux-sidecar.test.mjs
           CODEMUX_PLUGIN_HOST_TEST_BINARY="$SIDECAR" node --test sidecar/plugin-host/worker.test.mjs
           CODEMUX_PLUGIN_HOST_TEST_BINARY="$SIDECAR" npm run test:plugin-sdk
 

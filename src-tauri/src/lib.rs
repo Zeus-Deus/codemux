@@ -1505,11 +1505,13 @@ fn build_core_app<R: tauri::Runtime>(
             // editing one first. No-op when signed out.
             crate::hosts_sync::spawn_startup_host_sync(app.handle().clone());
 
-            // Resolve the bundled sidecar's Claude and managed workflow roles
-            // and pin their paths via env vars so the adapters (which have no
-            // AppHandle access at construction time) can find them. Both
-            // roles live in one binary (see `bundled_sidecar`).
-            // `resolve_sidecar` honors an already-set override, then Tauri's
+            // Resolve the bundled sidecar's Claude role and pin its path via
+            // an env var so the adapters (which have no AppHandle access at
+            // construction time) can find it. The other roles live in the
+            // same binary (see `bundled_sidecar`) and need a role argument, so
+            // their spawn sites resolve it from the resource dir recorded
+            // here instead of a pinned path, which would be launched without
+            // one. `resolve_sidecar` honors an already-set override, then Tauri's
             // resource dir (the per-target binary staged into the
             // `codemux-sidecar-*` resources glob for release builds), then — debug builds only —
             // the `src-tauri/binaries/` dev-tree copy that `npm run
@@ -1524,6 +1526,13 @@ fn build_core_app<R: tauri::Runtime>(
             // out of linuxdeploy's scan path. See `tauri.conf.json` for the
             // mirror change.
             let resource_dir = app.handle().path().resource_dir().ok();
+            if let Some(dir) = &resource_dir {
+                crate::bundled_sidecar::set_resource_dir(dir.clone());
+            }
+            // Claude spawn sites rely on the binary's default role, which an
+            // inherited role selector would override. Codemux sets it only in
+            // the plugin host's environment, which its descendants inherit.
+            std::env::remove_var(crate::bundled_sidecar::ROLE_ENV);
             if let Some(sidecar) = agent_provider::claude::sidecar_path::resolve_sidecar(
                 resource_dir.as_deref(),
             ) {
@@ -1531,9 +1540,6 @@ fn build_core_app<R: tauri::Runtime>(
                     agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV,
                     sidecar,
                 );
-            }
-            if let Some(sidecar) = agent_provider::managed_bridge::resolve_sidecar(resource_dir.as_deref()) {
-                std::env::set_var(agent_provider::managed_bridge::SIDECAR_PATH_ENV, sidecar);
             }
 
             // Agent-chat provider registry initialisation.

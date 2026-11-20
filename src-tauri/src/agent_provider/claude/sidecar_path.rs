@@ -9,9 +9,11 @@
 //! Search order:
 //!   1. `CODEMUX_CLAUDE_SIDECAR_PATH` env var (tests and manual
 //!      overrides).
-//!   2. `<manifest-dir>/binaries/codemux-sidecar-<triple>` —
+//!   2. `CODEMUX_SIDECAR_PATH`, the multi-role binary override shared with
+//!      the other roles (see [`crate::bundled_sidecar`]).
+//!   3. `<manifest-dir>/binaries/codemux-sidecar-<triple>` —
 //!      the dev-tree location.
-//!   3. `<manifest-dir>/binaries/codemux-sidecar` — an optional
+//!   4. `<manifest-dir>/binaries/codemux-sidecar` — an optional
 //!      triple-less fallback for environments that flatten names.
 //!
 //! Tauri resource-dir resolution is intentionally NOT attempted by
@@ -67,6 +69,9 @@ fn candidate_paths() -> Vec<PathBuf> {
     if let Some(explicit) = bundled_sidecar::path_override(SidecarRole::Claude) {
         candidates.push(explicit);
     }
+    if let Some(multi_role) = bundled_sidecar::unified_override() {
+        candidates.push(multi_role);
+    }
 
     let binaries = bundled_sidecar::dev_binaries_dir();
     candidates.push(binaries.join(sidecar_binary_name()));
@@ -107,17 +112,22 @@ pub fn resolve_sidecar_path() -> Result<PathBuf, ProviderError> {
 /// Tauri `resource_dir` IS available (unlike the adapter-side
 /// [`resolve_sidecar_path`]). Returns the path that should be pinned
 /// into [`SIDECAR_PATH_ENV`] so downstream adapter code — which has no
-/// `AppHandle` — finds the same binary. See [`bundled_sidecar::resolve`]
-/// for the priority order: an already-set override (returned verbatim),
-/// then the resource dir, then (debug builds only) the dev-tree copy that
-/// `npm run tauri:dev` does not stage into the resource dir.
+/// `AppHandle` — finds the same binary. See
+/// [`bundled_sidecar::resolve_command`] for the priority order: an
+/// already-set override (returned verbatim), then the multi-role
+/// `CODEMUX_SIDECAR_PATH` override, then the resource dir, then (debug
+/// builds only) the dev-tree copy that `npm run tauri:dev` does not stage
+/// into the resource dir.
 ///
 /// Returns `None` when the binary exists nowhere (e.g. a fresh
 /// checkout that never ran the build script); callers should leave the
 /// provider slot empty rather than panic — resolution then falls to
 /// `provider_not_configured` semantics.
 pub fn resolve_sidecar(resource_dir: Option<&Path>) -> Option<PathBuf> {
-    bundled_sidecar::resolve(SidecarRole::Claude, resource_dir)
+    // Claude is the default role, so its command never carries arguments
+    // and the path alone is enough to launch it.
+    bundled_sidecar::resolve_command(SidecarRole::Claude, resource_dir)
+        .map(|command| command.program)
 }
 
 /// Assert the sidecar binary exists — used by the provider's health

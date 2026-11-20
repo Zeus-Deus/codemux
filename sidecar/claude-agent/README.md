@@ -36,6 +36,15 @@ Windows), which runs this sidecar when started without a
 `--codemux-role` argument. The SSH remote path installs the same binary
 on devices as `~/.local/bin/codemux-claude-sidecar`.
 
+The role comes from a leading `--codemux-role=<role>` argument, else
+`CODEMUX_SIDECAR_ROLE`, else Claude. Codemux sets `CODEMUX_SIDECAR_ROLE`
+only when it starts the plugin host, so plugin code that re-executes
+`process.execPath` gets the plugin host back; see
+`sidecar/codemux-sidecar.mjs`. Codemux's path overrides
+(`CODEMUX_CLAUDE_SIDECAR_PATH`, `CODEMUX_SIDECAR_PATH` for the multi-role
+binary, and the per-role ones) are listed in
+`src-tauri/src/bundled_sidecar.rs`.
+
 For a Claude-only binary while debugging (e.g. the orchestration-live
 e2e harness), `bun install && bun run build` writes
 `dist/codemux-claude-sidecar`.

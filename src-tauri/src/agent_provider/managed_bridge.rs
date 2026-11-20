@@ -56,20 +56,20 @@ pub fn event_stream(
     ))
 }
 
-/// The managed workflow role of the bundled sidecar; see
-/// [`bundled_sidecar::resolve`] for the search order.
-pub fn resolve_sidecar(resource_dir: Option<&Path>) -> Option<PathBuf> {
-    bundled_sidecar::resolve(SidecarRole::ManagedWorkflow, resource_dir)
-}
-
-/// Program and leading arguments that start the managed workflow sidecar.
-/// Spawn sites append nothing before these arguments: the role selector must
-/// come first.
+/// Program and leading arguments that start the managed workflow sidecar;
+/// see [`bundled_sidecar::resolve_command`] for the search order. A
+/// [`SIDECAR_PATH_ENV`] override is launched without the role argument, as
+/// before the sidecars shared a binary. Spawn sites put nothing before the
+/// arguments: the role selector must come first.
 pub fn sidecar_command(provider: ProviderKind) -> Result<(PathBuf, Vec<String>), ProviderError> {
-    let program = resolve_sidecar(None).ok_or_else(|| ProviderError::ValidationError {
+    let command = bundled_sidecar::resolve_command(SidecarRole::ManagedWorkflow, None).ok_or_else(|| ProviderError::ValidationError {
         message: format!("managed-start-rejected: setup_required: {provider:?} workflow sidecar is missing. Rebuild CodeMux with scripts/build-sidecars.sh."),
     })?;
-    Ok((program, SidecarRole::ManagedWorkflow.args()))
+    debug_assert!(
+        command.env.is_empty(),
+        "the managed workflow role sets no environment"
+    );
+    Ok((command.program, command.args))
 }
 
 #[derive(Deserialize)]
