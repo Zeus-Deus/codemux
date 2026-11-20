@@ -211,7 +211,7 @@ fn show_desktop_notification_blocking<R: Runtime>(
     #[cfg(target_os = "linux")]
     handle.wait_for_action(|action| {
         if action == "default" {
-            focus_app(app);
+            crate::desktop::focus_main_window(app);
             let _ = app.emit(
                 NOTIFICATION_ACTIVATE_EVENT,
                 NotificationActivatePayload {
@@ -226,27 +226,6 @@ fn show_desktop_notification_blocking<R: Runtime>(
     {
         let _ = handle;
         let _ = app;
-    }
-}
-
-/// Bring the Codemux window to the foreground. On Hyprland this includes
-/// jumping to whichever workspace the window currently lives on.
-fn focus_app<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let class = format!("class:{}", app.config().identifier);
-        let _ = Command::new("hyprctl")
-            .args(["dispatch", "focuswindow", &class])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
     }
 }
 

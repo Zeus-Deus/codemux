@@ -3155,8 +3155,8 @@ pub fn notify_attention<R: tauri::Runtime>(
     let notification_id =
         state.add_notification(session_id, pane_id, message, NotificationLevel::Attention)?;
 
-    // Test harnesses never reach the real desktop (no popup, no focus
-    // steal); see `notifications::is_test_harness`.
+    // Test harnesses never reach the real desktop (no popup or urgency
+    // hint); see `notifications::is_test_harness`.
     if desktop.unwrap_or(true) && !crate::notifications::is_test_harness(&app) {
         // `notify-rust`'s Windows backend (WinRT Toast) does not expose
         // `.hint()` / `.urgency()` / `notify_rust::Hint::*` — those are
@@ -3177,19 +3177,11 @@ pub fn notify_attention<R: tauri::Runtime>(
         }
         let _ = notification.show();
 
+        // Never take focus unprompted. The native urgency hint flashes the
+        // taskbar entry on Windows, bounces the dock icon on macOS, and marks
+        // the window urgent on X11/Wayland, leaving the switch to the user.
         if let Some(window) = app.get_webview_window("main") {
-            let _ = window.show();
-            let _ = window.unminimize();
-            let _ = window.set_focus();
             let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            let class = format!("class:{}", app.config().identifier);
-            let _ = crate::execution::host_command("hyprctl")
-                .args(["dispatch", "focuswindow", &class])
-                .output();
         }
     }
 
