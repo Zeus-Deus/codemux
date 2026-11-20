@@ -128,9 +128,22 @@ try {
 
   const installer = resolve(process.argv[2]);
   const appDir = join(process.env.RUNNER_TEMP, 'Codemux install with spaces');
-  await mkdir(appDir, { recursive: true });
+  // Releases through v0.27.0 shipped these; src-tauri/windows/installer-hooks.nsh
+  // removes them after an install and before an uninstall. Seed them as an
+  // older install would have left them, and install the way the updater does.
+  const retiredSidecars = ['codemux-claude-sidecar', 'codemux-managed-workflow-sidecar', 'codemux-plugin-host']
+    .map(name => join(appDir, 'binaries', `${name}-x86_64-pc-windows-msvc.exe`));
+  const seedRetiredSidecars = () => Promise.all(retiredSidecars.map(file => writeFile(file, 'retired')));
+  const assertRetiredSidecarsGone = async when => {
+    for (const file of retiredSidecars) {
+      await assert.rejects(stat(file), { code: 'ENOENT' }, `${file} must not survive ${when}`);
+    }
+  };
+  await mkdir(join(appDir, 'binaries'), { recursive: true });
+  await seedRetiredSidecars();
   // NSIS requires /D= to be the final, unquoted argument, including spaces.
-  await run(installer, ['/S', `/D=${appDir}`], undefined, { windowsVerbatimArguments: true });
+  await run(installer, ['/S', '/UPDATE', `/D=${appDir}`], undefined, { windowsVerbatimArguments: true });
+  await assertRetiredSidecarsGone('an update install');
   const bundledSidecar = join(appDir, 'binaries', 'codemux-sidecar-x86_64-pc-windows-msvc.exe');
   assert.ok((await stat(bundledSidecar)).size > 0, 'Installer must ship the Claude sidecar');
   evidence.bundledSidecar = bundledSidecar;
@@ -208,6 +221,14 @@ try {
       });
     }
   }
+
+  // The uninstaller only knows the current resource list; the hook covers the
+  // retired files. `_?=` runs it in place and waits for it to finish.
+  await seedRetiredSidecars();
+  await run(join(appDir, 'uninstall.exe'), ['/S', `_?=${appDir}`], undefined, { windowsVerbatimArguments: true });
+  await assertRetiredSidecarsGone('an uninstall');
+  await assert.rejects(stat(bundledSidecar), { code: 'ENOENT' }, 'Uninstall must remove the bundled sidecar');
+  evidence.checks.push({ label: 'retired-sidecars-removed', install: true, uninstall: true });
 } catch (error) {
   evidence.failure = String(error.stack ?? error);
   throw error;
