@@ -6,7 +6,7 @@
 git clone git@github.com:Zeus-Deus/codemux.git
 cd codemux
 
-# Check that system dependencies are installed
+# Linux only: check that system dependencies are installed
 bash scripts/check-deps.sh
 
 # Install npm dependencies (also patches agent-browser via postinstall)
@@ -25,6 +25,7 @@ npm run tauri:dev
 
 - **Rust 1.75+** via [rustup](https://rustup.rs): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - **Node.js 20+** with npm
+- **Bun 1.3.12** for building the desktop sidecars. The build checks this exact version.
 - **Tauri CLI** installed automatically as an npm devDependency (`@tauri-apps/cli`)
 
 ### System Libraries
@@ -51,7 +52,7 @@ sudo dnf install webkit2gtk4.1-devel openssl-devel curl wget file libappindicato
 
 ### Dependency Check Script
 
-Run `bash scripts/check-deps.sh` to verify all required and optional dependencies. The script is read-only and never installs anything.
+On Linux, run `bash scripts/check-deps.sh` to check required and optional dependencies. On Windows, follow the [Tauri prerequisites for Windows](https://v2.tauri.app/start/prerequisites/#windows).
 
 ## Build and Run
 
