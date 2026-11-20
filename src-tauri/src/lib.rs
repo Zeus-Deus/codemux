@@ -1529,10 +1529,6 @@ fn build_core_app<R: tauri::Runtime>(
             if let Some(dir) = &resource_dir {
                 crate::bundled_sidecar::set_resource_dir(dir.clone());
             }
-            // Claude spawn sites rely on the binary's default role, which an
-            // inherited role selector would override. Codemux sets it only in
-            // the plugin host's environment, which its descendants inherit.
-            std::env::remove_var(crate::bundled_sidecar::ROLE_ENV);
             if let Some(sidecar) = agent_provider::claude::sidecar_path::resolve_sidecar(
                 resource_dir.as_deref(),
             ) {

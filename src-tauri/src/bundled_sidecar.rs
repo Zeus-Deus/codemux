@@ -43,9 +43,23 @@ pub const PATH_ENV: &str = "CODEMUX_SIDECAR_PATH";
 /// `process.execPath` (this binary) with ordinary arguments gets the plugin
 /// host back, as it did when the plugin host was its own binary. It must be
 /// in the real process environment: Bun child processes do not see
-/// assignments to `process.env`. The desktop removes an inherited one at
-/// startup, because Claude spawn sites rely on the default role.
+/// assignments to `process.env`. Claude spawn sites rely on the default
+/// role, so Codemux's executables drop an inherited one first thing
+/// ([`scrub_inherited_role`]) and user terminals never get one
+/// (`terminal::strip_agent_identity_env`).
 pub const ROLE_ENV: &str = "CODEMUX_SIDECAR_ROLE";
+
+/// Drops a [`ROLE_ENV`] this process inherited, e.g. when Codemux is started
+/// from a shell under the plugin host. Call it first in `main`, before any
+/// thread or child starts: everything started later inherits the process
+/// environment, and removing a variable races with concurrent reads of it.
+pub fn scrub_inherited_role() {
+    if std::env::var_os(ROLE_ENV).is_some() {
+        // SAFETY: called at the top of `main`, while the process is still
+        // single-threaded (the same pattern as the identity scrub).
+        unsafe { std::env::remove_var(ROLE_ENV) };
+    }
+}
 
 /// Which program a bundled sidecar process runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,6 +217,28 @@ fn resolve_command_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executables_drop_an_inherited_role_before_anything_else() {
+        for (file, source, signature) in [
+            ("main.rs", include_str!("main.rs"), "\nfn main() {"),
+            (
+                "bin/codemux_remote.rs",
+                include_str!("bin/codemux_remote.rs"),
+                "\n#[cfg(unix)]\nfn main() -> ExitCode {",
+            ),
+        ] {
+            // A Windows checkout can carry CRLF line endings.
+            let source = source.replace("\r\n", "\n");
+            let start = source.find(signature).unwrap_or_else(|| panic!("{file}: `{}` not found", signature.trim()));
+            let first = source[start + signature.len()..]
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with("//"))
+                .unwrap();
+            assert_eq!(first, "codemux_lib::bundled_sidecar::scrub_inherited_role();", "{file}");
+        }
+    }
 
     const ROLES: [SidecarRole; 3] = [
         SidecarRole::Claude,
