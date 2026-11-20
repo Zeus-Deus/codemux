@@ -90,6 +90,7 @@ pub mod skills_sync;
 pub mod session_adapters;
 pub mod settings_sync;
 pub mod hosts_sync;
+pub(crate) mod sync_guard;
 pub mod hosts_status;
 pub mod fs_size;
 #[cfg(unix)]

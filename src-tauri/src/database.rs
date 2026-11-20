@@ -266,7 +266,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 24;
+const SCHEMA_VERSION: u32 = 27;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -1198,6 +1198,24 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             UNIQUE(user_id, workspace_id)
         );
 
+        -- A successful POST can name a cloud ID already owned here. Keep
+        -- the answer until both local identities can be reconciled safely.
+        CREATE TABLE IF NOT EXISTS workspace_create_receipts (
+            row_id INTEGER PRIMARY KEY REFERENCES workspaces_sync(id) ON DELETE CASCADE,
+            server_id TEXT NOT NULL,
+            sent TEXT NOT NULL
+        );
+
+        -- A pending same-identity POST could overwrite this PATCH. Only
+        -- the returned server ID can confirm which holder to reconcile.
+        CREATE TABLE IF NOT EXISTS workspace_create_patch_bases (
+            row_id INTEGER NOT NULL REFERENCES workspaces_sync(id) ON DELETE CASCADE,
+            holder_id INTEGER NOT NULL REFERENCES workspaces_sync(id) ON DELETE CASCADE,
+            base TEXT,
+            acknowledged TEXT,
+            PRIMARY KEY (row_id, holder_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_workspaces_sync_user
             ON workspaces_sync(user_id, deleted_at);
         CREATE INDEX IF NOT EXISTS idx_workspaces_sync_dirty
@@ -1238,6 +1256,10 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         // create it.
         "DROP TABLE IF EXISTS openflow_history",
         "ALTER TABLE automations ADD COLUMN project_remote TEXT",
+        "ALTER TABLE automations ADD COLUMN create_pending INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE workspaces_sync ADD COLUMN create_pending INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE workspaces_sync ADD COLUMN edit_base TEXT",
+        "ALTER TABLE workspace_create_patch_bases ADD COLUMN acknowledged TEXT",
         // Devices page: local-only host observations (see the `hosts`
         // CREATE above for why a server pull must never touch these).
         "ALTER TABLE hosts ADD COLUMN last_seen_at TEXT",
@@ -1352,12 +1374,67 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         }
     }
 
+    // Capture the inputs to the first local edit on each side of a create
+    // collision. Subsequent edits (including reverts) compare to that same
+    // snapshot. Already-dirty linked rows from older clients have no base.
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS workspace_capture_edit_base
+         AFTER UPDATE OF title, host_server_id, project_path, project_remote, git_branch,
+                         git_head_sha, project_uid, workspace_kind, deleted_at ON workspaces_sync
+         WHEN NEW.dirty = 1 AND (OLD.dirty = 0 OR (OLD.server_id IS NULL AND OLD.edit_base IS NULL))
+         BEGIN
+             UPDATE workspaces_sync SET edit_base = json_object(
+                 'title', OLD.title, 'host_server_id', OLD.host_server_id,
+                 'project_path', OLD.project_path, 'project_remote', OLD.project_remote,
+                 'git_branch', OLD.git_branch, 'git_head_sha', OLD.git_head_sha,
+                 'project_uid', OLD.project_uid, 'workspace_kind', OLD.workspace_kind
+             ) WHERE id = NEW.id;
+         END;",
+    )
+    .map_err(|e| format!("Failed to install workspace edit tracking: {e}"))?;
+
     let installed_schema_version = conn
         .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
             row.get::<_, Option<u32>>(0)
         })
         .map_err(|e| format!("Failed to read installed schema version: {e}"))?
         .unwrap_or(0);
+
+    // Older clients did not record send attempts. Until a POST is
+    // acknowledged, a pre-existing unlinked row may already exist remotely.
+    if (1..25).contains(&installed_schema_version) {
+        conn.execute_batch(
+            "UPDATE automations SET create_pending = 1 WHERE dirty = 1 AND server_id IS NULL;
+             UPDATE workspaces_sync SET create_pending = 1 WHERE dirty = 1 AND server_id IS NULL;",
+        )
+        .map_err(|e| format!("Failed to migrate unresolved registry uploads: {e}"))?;
+    }
+
+    // Older receipts can refer to a holder whose PATCH already cleared
+    // dirty. Preserve both sides before the first pull after upgrading.
+    if (1..26).contains(&installed_schema_version) {
+        conn.execute(
+            "UPDATE workspaces_sync SET dirty = 1 WHERE user_id = 'local' AND server_id IN
+             (SELECT server_id FROM workspace_create_receipts)",
+            [],
+        )
+        .map_err(|e| format!("Failed to preserve workspace create conflicts: {e}"))?;
+    }
+
+    // v26 retained only the baseline. Save the holder values still on disk
+    // before a pull can replace them. Previously overwritten values are lost.
+    if installed_schema_version == 26 {
+        conn.execute(
+            "UPDATE workspace_create_patch_bases AS p SET acknowledged = json_object(
+                 'title', h.title, 'host_server_id', h.host_server_id, 'project_path', h.project_path,
+                 'project_remote', h.project_remote, 'git_branch', h.git_branch,
+                 'git_head_sha', h.git_head_sha, 'project_uid', h.project_uid,
+                 'workspace_kind', h.workspace_kind)
+             FROM workspaces_sync h WHERE h.id = p.holder_id AND p.acknowledged IS NULL",
+            [],
+        )
+        .map_err(|e| format!("Failed to preserve acknowledged workspace edits: {e}"))?;
+    }
 
     // Upgrading users already have transcript rows when the v14 table first
     // appears. Backfill once during that migration; triggers maintain every
@@ -2077,6 +2154,64 @@ pub struct WorkspaceSyncRecord {
     pub dirty: bool,
 }
 
+/// Both registries use the same tombstone protocol. Mark an upload before
+/// sending it so that a missing server ID after a crash is distinguishable
+/// from a create that never left this device.
+#[derive(Clone, Copy)]
+pub(crate) enum SyncRegistry {
+    Workspaces,
+    Automations,
+}
+
+impl SyncRegistry {
+    fn table(self) -> &'static str {
+        match self {
+            Self::Workspaces => "workspaces_sync",
+            Self::Automations => "automations",
+        }
+    }
+
+    /// A later rejection cannot disprove an earlier lost reply. Distinguish
+    /// zero, one, and multiple outstanding attempts, even across processes.
+    pub(crate) fn begin_create(self, db: &DatabaseStore, id: i64) -> Result<bool, String> {
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                &format!(
+                    "UPDATE {} SET create_pending = MIN(2, create_pending + 1)
+                      WHERE id = ?1 AND server_id IS NULL AND deleted_at IS NULL AND dirty = 1",
+                    self.table()
+                ),
+                [id],
+            )
+            .map(|changed| changed != 0)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn clear_rejected_create(self, db: &DatabaseStore, id: i64) -> Result<(), String> {
+        db.conn.lock().unwrap().execute(
+            &format!("UPDATE {} SET create_pending = 0 WHERE id = ?1 AND server_id IS NULL AND create_pending = 1", self.table()),
+            [id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub(crate) fn settle_unsent_delete(self, db: &DatabaseStore, id: i64) -> Result<(), String> {
+        let changed = db.conn.lock().unwrap().execute(
+            &format!("UPDATE {} SET dirty = 0 WHERE id = ?1 AND server_id IS NULL AND deleted_at IS NOT NULL AND create_pending = 0", self.table()),
+            [id],
+        ).map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err(format!(
+                "{} row {id} still awaits its create acknowledgement",
+                self.table()
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl DatabaseStore {
     /// Insert a freshly-created local workspace into the sync mirror.
     /// Marked dirty so the next push uploads it. Returns the row so
@@ -2244,8 +2379,172 @@ impl DatabaseStore {
             .unwrap_or_default()
     }
 
-    /// Clear dirty after a successful push. Optionally stamp the
-    /// server_id (first push only). Mirrors `mark_host_synced`.
+    /// Re-read a queued mutation: a previous POST in this pass can have
+    /// merged either its fields or its entire row into a different holder.
+    pub fn dirty_workspace_by_id(&self, id: i64) -> Result<Option<WorkspaceSyncRecord>, String> {
+        let conn = self.conn.lock().unwrap();
+        // A conflicting POST has already reached this server ID. Keep its
+        // holder intact for reconciliation, even after reopening the DB.
+        let held: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces_sync w JOIN workspace_create_receipts r
+                               ON r.server_id = w.server_id WHERE w.id = ?1)",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if held {
+            return Ok(None);
+        }
+        Ok(workspace_by_id(&conn, id)?.filter(|r| r.dirty))
+    }
+
+    pub fn workspace_create_receipt(
+        &self,
+        id: i64,
+    ) -> Result<Option<(WorkspaceSyncRecord, String)>, String> {
+        let conn = self.conn.lock().unwrap();
+        let receipt = conn
+            .query_row(
+                "SELECT sent, server_id FROM workspace_create_receipts WHERE row_id = ?1",
+                [id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        receipt
+            .map(|(sent, sid)| {
+                serde_json::from_str(&sent)
+                    .map(|row| (row, sid))
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()
+    }
+
+    /// Acknowledge only the values sent, even when the POST was answered
+    /// with an ID already mirrored on this device.
+    pub fn mark_workspace_sync_pushed(
+        &self,
+        pushed: &WorkspaceSyncRecord,
+        post: Option<(&str, bool)>,
+    ) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let mut canonical = pushed.id;
+        if let Some((sid, holder_was_queued)) = post {
+            let holder_id: Option<i64> = tx.query_row(
+                "SELECT id FROM workspaces_sync WHERE user_id = 'local' AND server_id = ?1 AND id != ?2",
+                params![sid, pushed.id], |r| r.get(0),
+            ).optional().map_err(|e| e.to_string())?;
+            if let Some(holder_id) = holder_id {
+                let Some(current) = workspace_by_id(&tx, pushed.id)? else {
+                    return Ok(());
+                };
+                let mut holder =
+                    workspace_by_id(&tx, holder_id)?.ok_or("workspace holder disappeared")?;
+                let (layout_base, holder_base) =
+                    restore_workspace_patch(&tx, pushed.id, &mut holder)?;
+                // A preceding acknowledgement (including DELETE) can have
+                // cleared dirty before this POST named the same row.
+                holder.dirty |= holder_was_queued;
+                let plain_mirror = !holder.dirty
+                    && holder.workspace_id.is_none()
+                    && holder.origin_uid.is_none()
+                    && holder.origin_path.is_none();
+                if plain_mirror {
+                    tx.execute("DELETE FROM workspaces_sync WHERE id = ?1", [holder_id])
+                        .map_err(|e| e.to_string())?;
+                } else if let Some(merged) = merge_workspace_create(
+                    pushed,
+                    current,
+                    &holder,
+                    layout_base.as_ref(),
+                    holder_base.as_ref(),
+                ) {
+                    // Release the unique workspace_id before binding it to the
+                    // canonical row. All identity and mutation changes commit together.
+                    tx.execute("DELETE FROM workspaces_sync WHERE id = ?1", [pushed.id])
+                        .map_err(|e| e.to_string())?;
+                    tx.execute(
+                            "UPDATE workspaces_sync SET workspace_id = ?1, origin_uid = ?2,
+                                 origin_path = ?3, default_branch = ?4, title = ?5, host_server_id = ?6,
+                                 project_path = ?7, project_remote = ?8, git_branch = ?9, git_head_sha = ?10,
+                                 project_uid = ?11, workspace_kind = ?12, deleted_at = ?13,
+                                 updated_at = ?14, dirty = 1 WHERE id = ?15",
+                            params![merged.workspace_id, merged.origin_uid, merged.origin_path, merged.default_branch,
+                                merged.title, merged.host_server_id, merged.project_path, merged.project_remote,
+                                merged.git_branch, merged.git_head_sha, merged.project_uid, merged.workspace_kind,
+                                merged.deleted_at, merged.updated_at, holder_id],
+                        ).map_err(|e| e.to_string())?;
+                    canonical = holder_id;
+                } else {
+                    if holder.dirty {
+                        tx.execute("UPDATE workspaces_sync SET dirty = 1 WHERE id = ?1", [holder_id])
+                            .map_err(|e| e.to_string())?;
+                    }
+                    tx.execute(
+                        "INSERT OR IGNORE INTO workspace_create_receipts (row_id, server_id, sent)
+                             VALUES (?1, ?2, ?3)",
+                        params![
+                            pushed.id,
+                            sid,
+                            serde_json::to_string(pushed).map_err(|e| e.to_string())?
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    tx.commit().map_err(|e| e.to_string())?;
+                    return Err(format!(
+                        "workspace {} conflicts with local row {holder_id} for server ID {sid}",
+                        pushed.id
+                    ));
+                }
+            }
+            tx.execute(
+                "DELETE FROM workspace_create_receipts WHERE row_id = ?1",
+                [pushed.id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM workspace_create_patch_bases WHERE row_id = ?1", [pushed.id])
+                .map_err(|e| e.to_string())?;
+        } else if pushed.deleted_at.is_none() {
+            remember_workspace_patch(&tx, pushed)?;
+        }
+        tx.execute(
+            "UPDATE workspaces_sync
+             SET server_id = COALESCE(?1, server_id), create_pending = 0,
+                 dirty = CASE
+                     WHEN title IS ?2 AND host_server_id IS ?3 AND project_path IS ?4
+                      AND project_remote IS ?5 AND git_branch IS ?6 AND git_head_sha IS ?7
+                      AND project_uid IS ?8 AND workspace_kind IS ?9 AND deleted_at IS ?10
+                     THEN 0 ELSE dirty
+                 END
+             WHERE id = ?11",
+            params![
+                post.map(|(sid, _)| sid),
+                pushed.title,
+                pushed.host_server_id,
+                pushed.project_path,
+                pushed.project_remote,
+                pushed.git_branch,
+                pushed.git_head_sha,
+                pushed.project_uid,
+                pushed.workspace_kind,
+                pushed.deleted_at,
+                canonical,
+            ],
+        )
+        .map_err(|e| format!("Failed to mark workspace sync row pushed: {e}"))?;
+        // If further changes remain after this acknowledgement, their base
+        // is now the payload the server accepted.
+        tx.execute(
+            "UPDATE workspaces_sync SET edit_base = ?1 WHERE id = ?2 AND dirty = 1",
+            params![serde_json::to_string(pushed).map_err(|e| e.to_string())?, canonical],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| format!("Failed to mark workspace sync row pushed: {e}"))?;
+        Ok(())
+    }
+
     pub fn mark_workspace_sync_synced(
         &self,
         id: i64,
@@ -2283,6 +2582,11 @@ impl DatabaseStore {
     /// Idempotent upsert from a server pull. Always sets `dirty = 0`.
     /// Does NOT clobber the local `workspace_id` if one is already
     /// stamped — adoption is sticky.
+    ///
+    /// A local row with unpushed changes (`dirty = 1`) is left alone:
+    /// the server copy predates the local edit or delete, and the next
+    /// push sends it. Checked here, under the connection lock, so an
+    /// edit that lands mid-pull is covered too.
     pub fn upsert_workspace_sync_from_server(
         &self,
         server_id: &str,
@@ -2315,7 +2619,7 @@ impl DatabaseStore {
                      project_uid = COALESCE(?11, project_uid),
                      workspace_kind = COALESCE(?12, workspace_kind),
                      dirty = 0
-                 WHERE user_id = 'local' AND server_id = ?10",
+                 WHERE user_id = 'local' AND server_id = ?10 AND dirty = 0",
                 params![
                     title,
                     host_server_id,
@@ -2332,7 +2636,16 @@ impl DatabaseStore {
                 ],
             )
             .map_err(|e| format!("Failed to update workspace sync from server: {e}"))?;
-        if updated == 0 {
+        // Nothing updated: either the row is new to this install, or it
+        // exists with local changes pending. Only the former is inserted.
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces_sync WHERE user_id = 'local' AND server_id = ?1)",
+                params![server_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to look up workspace sync from server: {e}"))?;
+        if updated == 0 && !exists {
             conn.execute(
                 "INSERT INTO workspaces_sync
                     (user_id, server_id, workspace_id, title, host_server_id,
@@ -2697,6 +3010,229 @@ impl DatabaseStore {
         .map_err(|e| format!("Failed to soft-delete remote-discovered row: {e}"))?;
         Ok(())
     }
+}
+
+fn workspace_by_id(conn: &Connection, id: i64) -> Result<Option<WorkspaceSyncRecord>, String> {
+    conn.query_row(
+        "SELECT id, server_id, workspace_id, title, host_server_id, project_path,
+                project_remote, git_branch, git_head_sha, created_at, updated_at, deleted_at,
+                dirty, origin_uid, project_uid, workspace_kind, origin_path, default_branch
+         FROM workspaces_sync WHERE id = ?1",
+        [id],
+        row_to_workspace_sync,
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+// Both edit baselines and acknowledged payloads contain these wire fields.
+#[derive(Deserialize, Serialize)]
+struct WorkspaceFields {
+    title: String,
+    host_server_id: Option<String>,
+    project_path: Option<String>,
+    project_remote: Option<String>,
+    git_branch: Option<String>,
+    git_head_sha: Option<String>,
+    project_uid: Option<String>,
+    workspace_kind: Option<String>,
+}
+
+impl WorkspaceFields {
+    fn decode(json: Option<&str>) -> Result<Option<Self>, String> {
+        json.map(serde_json::from_str).transpose().map_err(|e| e.to_string())
+    }
+
+    fn encode(base: Option<&Self>) -> Result<Option<String>, String> {
+        base.map(serde_json::to_string).transpose().map_err(|e| e.to_string())
+    }
+
+    // Keep each value paired with the baseline for the edit that supplied it.
+    // A clean pull can change the holder without creating any local edits.
+    fn replay(
+        &self,
+        holder: &mut WorkspaceSyncRecord,
+        local_base: Option<&Self>,
+        mut patch_base: Option<&mut Self>,
+    ) {
+        macro_rules! replay_field {
+            ($field:ident) => {
+                if !holder.dirty || local_base.is_some_and(|b| b.$field == holder.$field) {
+                    holder.$field.clone_from(&self.$field);
+                } else if let (Some(local), Some(patch)) = (local_base, patch_base.as_deref_mut()) {
+                    // Consecutive edits share the original base with an unedited
+                    // create. A changed pull or an explicit return to that base
+                    // needs the baseline of the later edit.
+                    if local.$field != self.$field || holder.$field == patch.$field {
+                        patch.$field.clone_from(&local.$field);
+                    }
+                }
+            };
+        }
+        replay_field!(title);
+        replay_field!(host_server_id);
+        replay_field!(project_path);
+        replay_field!(project_remote);
+        replay_field!(git_branch);
+        replay_field!(git_head_sha);
+        replay_field!(project_uid);
+        replay_field!(workspace_kind);
+    }
+}
+
+fn remember_workspace_patch(conn: &Connection, pushed: &WorkspaceSyncRecord) -> Result<(), String> {
+    let mut candidates = conn.prepare(
+        "SELECT w.id, h.edit_base, p.acknowledged,
+                CASE WHEN p.row_id IS NULL THEN h.edit_base ELSE p.base END
+         FROM workspaces_sync w JOIN workspaces_sync h ON h.id = ?1
+         LEFT JOIN workspace_create_patch_bases p ON p.row_id = w.id AND p.holder_id = h.id
+         WHERE w.user_id = h.user_id AND w.server_id IS NULL
+           AND w.dirty = 1 AND w.deleted_at IS NULL
+           AND (p.row_id IS NOT NULL OR (w.host_server_id = ?2 AND w.project_uid = ?3
+                AND w.git_branch IS ?4 AND w.workspace_kind IS ?5))",
+    ).map_err(|e| e.to_string())?;
+    let rows = candidates
+        .query_map(
+            params![pushed.id, pushed.host_server_id, pushed.project_uid, pushed.git_branch, pushed.workspace_kind],
+            |row| {
+                let layout_id: i64 = row.get(0)?;
+                let local_base: Option<String> = row.get(1)?;
+                let previous: Option<String> = row.get(2)?;
+                let patch_base: Option<String> = row.get(3)?;
+                Ok((layout_id, local_base, previous, patch_base))
+            },
+        )
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (layout_id, local_base, previous, patch_base) in rows {
+        let mut acknowledged = pushed.clone();
+        let mut patch_base = WorkspaceFields::decode(patch_base.as_deref())?;
+        if let Some(previous) = WorkspaceFields::decode(previous.as_deref())? {
+            let local_base = WorkspaceFields::decode(local_base.as_deref())?;
+            previous.replay(&mut acknowledged, local_base.as_ref(), patch_base.as_mut());
+        }
+        let acknowledged = serde_json::to_string(&acknowledged).map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO workspace_create_patch_bases(row_id, holder_id, base, acknowledged)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(row_id, holder_id) DO UPDATE
+                 SET base = excluded.base, acknowledged = excluded.acknowledged",
+            params![layout_id, pushed.id, WorkspaceFields::encode(patch_base.as_ref())?, acknowledged],
+        ).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// Only a create receipt confirms that this PATCH belongs to the same
+// server row. Restore its local edits in the reconciliation transaction.
+// A divergent layout then leaves both versions available across restarts.
+fn restore_workspace_patch(
+    conn: &Connection,
+    layout_id: i64,
+    holder: &mut WorkspaceSyncRecord,
+) -> Result<(Option<WorkspaceFields>, Option<WorkspaceFields>), String> {
+    let (layout, local, patch_base, acknowledged, patched) = conn.query_row(
+        "SELECT l.edit_base, h.edit_base, p.base, p.acknowledged, p.row_id IS NOT NULL
+         FROM workspaces_sync l JOIN workspaces_sync h ON h.id = ?2
+         LEFT JOIN workspace_create_patch_bases p ON p.row_id = l.id AND p.holder_id = h.id
+         WHERE l.id = ?1",
+        params![layout_id, holder.id],
+        |row| {
+            let snapshot = |column: usize| row.get::<_, Option<String>>(column);
+            Ok((snapshot(0)?, snapshot(1)?, snapshot(2)?, snapshot(3)?, row.get::<_, bool>(4)?))
+        },
+    ).map_err(|e| e.to_string())?;
+    let layout = WorkspaceFields::decode(layout.as_deref())?;
+    let local = WorkspaceFields::decode(local.as_deref())?;
+    if !patched {
+        return Ok((layout, local));
+    }
+    let mut patch_base = WorkspaceFields::decode(patch_base.as_deref())?;
+    if let Some(acknowledged) = WorkspaceFields::decode(acknowledged.as_deref())? {
+        acknowledged.replay(holder, local.as_ref(), patch_base.as_mut());
+    }
+    // Mark dirty first so the edit trigger preserves the per-field baseline
+    // if a conflict keeps this holder pending across retries.
+    holder.dirty = true;
+    conn.execute("UPDATE workspaces_sync SET dirty = 1 WHERE id = ?1", [holder.id])
+        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE workspaces_sync SET title = ?1, host_server_id = ?2, project_path = ?3,
+             project_remote = ?4, git_branch = ?5, git_head_sha = ?6, project_uid = ?7,
+             workspace_kind = ?8, edit_base = ?9 WHERE id = ?10",
+        params![holder.title, holder.host_server_id, holder.project_path, holder.project_remote,
+            holder.git_branch, holder.git_head_sha, holder.project_uid, holder.workspace_kind,
+            WorkspaceFields::encode(patch_base.as_ref())?, holder.id],
+    ).map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM workspace_create_patch_bases WHERE row_id = ?1 AND holder_id = ?2",
+        params![layout_id, holder.id],
+    ).map_err(|e| e.to_string())?;
+    Ok((layout, patch_base))
+}
+
+fn merge_workspace_create(
+    sent: &WorkspaceSyncRecord,
+    mut current: WorkspaceSyncRecord,
+    holder: &WorkspaceSyncRecord,
+    layout_base: Option<&WorkspaceFields>,
+    holder_base: Option<&WorkspaceFields>,
+) -> Option<WorkspaceSyncRecord> {
+    // The account upserts on this identity. Two independent adoptions or
+    // daemon identities can still describe different local owners.
+    if sent.host_server_id.is_none()
+        || sent.project_uid.is_none()
+        || sent.host_server_id != holder.host_server_id
+        || sent.project_uid != holder.project_uid
+        || sent.git_branch != holder.git_branch
+        || sent.workspace_kind != holder.workspace_kind
+        || (holder.origin_uid.is_some() && current.host_server_id != holder.host_server_id)
+        || (current.workspace_id.is_some()
+            && holder.workspace_id.is_some()
+            && current.workspace_id != holder.workspace_id)
+        || (current.origin_uid.is_some()
+            && holder.origin_uid.is_some()
+            && current.origin_uid != holder.origin_uid)
+    {
+        return None;
+    }
+    current.workspace_id = current.workspace_id.or_else(|| holder.workspace_id.clone());
+    current.origin_uid = current.origin_uid.or_else(|| holder.origin_uid.clone());
+    current.origin_path = current.origin_path.or_else(|| holder.origin_path.clone());
+    current.default_branch = current
+        .default_branch
+        .or_else(|| holder.default_branch.clone());
+    if holder.dirty {
+        // An unedited create has no local edit history. Its submitted
+        // values can still differ from the holder's last synced values.
+        // Without a known holder base, differing legacy edits stay pending.
+        macro_rules! merge_field {
+            ($field:ident) => {
+                if current.$field != holder.$field {
+                    let base = &holder_base?.$field;
+                    if &holder.$field != base {
+                        let original = layout_base.map(|b| &b.$field).unwrap_or(base);
+                        if &current.$field != original || current.$field != sent.$field {
+                            return None;
+                        }
+                        current.$field.clone_from(&holder.$field);
+                    }
+                }
+            };
+        }
+        merge_field!(title);
+        merge_field!(host_server_id);
+        merge_field!(project_path);
+        merge_field!(project_remote);
+        merge_field!(git_branch);
+        merge_field!(git_head_sha);
+        merge_field!(project_uid);
+        merge_field!(workspace_kind);
+        current.deleted_at = current.deleted_at.or_else(|| holder.deleted_at.clone());
+        current.updated_at = current.updated_at.max(holder.updated_at.clone());
+    }
+    Some(current)
 }
 
 fn row_to_workspace_sync(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceSyncRecord> {
@@ -3193,6 +3729,42 @@ impl DatabaseStore {
 
     /// Clear `dirty` after a successful push; optionally stamp the
     /// server-assigned id on the first upload.
+    /// Acknowledge a push of `pushed`: record the server id a POST
+    /// returned, and clear `dirty` only if the row still holds exactly what
+    /// was sent; a change made meanwhile stays dirty for the next push.
+    pub fn mark_automation_pushed(&self, pushed: &AutomationRecord, server_id: Option<&str>) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automations
+             SET server_id = COALESCE(?1, server_id), create_pending = 0,
+                 dirty = CASE
+                     WHEN name IS ?2 AND prompt IS ?3 AND agent IS ?4 AND schedule IS ?5
+                      AND timezone IS ?6 AND host_id IS ?7 AND project_path IS ?8
+                      AND project_remote IS ?9 AND enabled IS ?10 AND retention_limit IS ?11
+                      AND deleted_at IS ?12
+                     THEN 0 ELSE dirty
+                 END
+             WHERE id = ?13",
+            params![
+                server_id,
+                pushed.name,
+                pushed.prompt,
+                pushed.agent,
+                pushed.schedule,
+                pushed.timezone,
+                pushed.host_id,
+                pushed.project_path,
+                pushed.project_remote,
+                pushed.enabled as i64,
+                pushed.retention_limit,
+                pushed.deleted_at,
+                pushed.id,
+            ],
+        )
+        .map_err(|e| format!("Failed to mark automation pushed: {e}"))?;
+        Ok(())
+    }
+
     pub fn mark_automation_synced(&self, id: i64, server_id: Option<&str>) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         if let Some(sid) = server_id {
@@ -3214,6 +3786,10 @@ impl DatabaseStore {
     /// Always written `dirty = 0` (server rows are authoritative).
     /// `next_run_at` / `last_run_at` are derived per-device and are not
     /// carried over the wire, so a server upsert leaves them untouched.
+    ///
+    /// A local row with unpushed changes (`dirty = 1`) is left alone:
+    /// the server copy predates the user's edit, pause or delete, and
+    /// the next push sends it.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_automation_from_server(
         &self,
@@ -3241,7 +3817,7 @@ impl DatabaseStore {
                      project_remote = ?8, enabled = ?9, retention_limit = ?10,
                      created_at = ?11, updated_at = ?12, deleted_at = ?13,
                      dirty = 0
-                 WHERE user_id = 'local' AND server_id = ?14",
+                 WHERE user_id = 'local' AND server_id = ?14 AND dirty = 0",
                 params![
                     name,
                     prompt,
@@ -3260,7 +3836,16 @@ impl DatabaseStore {
                 ],
             )
             .map_err(|e| format!("Failed to update automation from server: {e}"))?;
-        if updated == 0 {
+        // Nothing updated: either the row is new to this install, or it
+        // exists with local changes pending. Only the former is inserted.
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automations WHERE user_id = 'local' AND server_id = ?1)",
+                params![server_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to look up automation from server: {e}"))?;
+        if updated == 0 && !exists {
             conn.execute(
                 "INSERT INTO automations
                     (user_id, server_id, name, prompt, agent, schedule,
@@ -7162,6 +7747,213 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
     }
+    #[test]
+    fn workspace_consecutive_patches_merge_with_an_unedited_create() {
+        let db = init_test_database();
+        let branch = Some("main");
+        let project = Some("project");
+        let kind = Some("main");
+        let layout = db.insert_workspace_sync(
+            "layout", "same", Some("host"), Some("/original"), None, branch, None, project, kind,
+        ).unwrap();
+        let holder = db.insert_remote_discovered_workspace_sync(
+            "host", "daemon-id", "same", Some("/original"), None, branch, project, kind, None, None,
+        ).unwrap();
+        db.mark_workspace_sync_synced(holder.id, Some("canonical")).unwrap();
+        for path in ["/first", "/second"] {
+            db.update_remote_discovered_workspace_sync(
+                holder.id, "same", Some(path), None, branch, project, kind, None, None,
+            ).unwrap();
+            let sent = db.dirty_workspace_by_id(holder.id).unwrap().unwrap();
+            db.mark_workspace_sync_pushed(&sent, None).unwrap();
+        }
+        db.mark_workspace_sync_pushed(&layout, Some(("canonical", false))).unwrap();
+        let rows = db.list_dirty_workspaces_sync();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, holder.id);
+        assert_eq!(rows[0].project_path.as_deref(), Some("/second"));
+    }
+
+    #[test]
+    fn workspace_patch_upgrade_keeps_later_local_edits_after_a_pull() {
+        for (acknowledge_later_edit, later_branch) in [
+            (false, Some("main")),
+            (true, Some("main")),
+            (true, Some("other")),
+        ] {
+            let db = init_test_database();
+            let host = Some("host");
+            let branch = Some("main");
+            let project = Some("project");
+            let kind = Some("main");
+            let layout = db.insert_workspace_sync(
+                "layout", "old", host, Some("/layout"), None, branch, None, project, kind,
+            ).unwrap();
+            db.update_workspace_sync_by_workspace_id(
+                "layout", "layout rename", host, Some("/layout"), None, branch, None, project, kind,
+            ).unwrap();
+            let holder = db.insert_remote_discovered_workspace_sync(
+                "host", "daemon-id", "old", Some("/inventory"), None, branch, project, kind, None, None,
+            ).unwrap();
+            db.mark_workspace_sync_synced(holder.id, Some("canonical")).unwrap();
+            db.update_remote_discovered_workspace_sync(
+                holder.id, "old", Some("/new"), None, branch, project, kind, None, None,
+            ).unwrap();
+            let acknowledge = || {
+                let sent = db.dirty_workspace_by_id(holder.id).unwrap().unwrap();
+                db.mark_workspace_sync_pushed(&sent, None).unwrap();
+            };
+            acknowledge();
+            {
+                let conn = db.conn.lock().unwrap();
+                conn.execute_batch(
+                    "ALTER TABLE workspace_create_patch_bases DROP COLUMN acknowledged;
+                     UPDATE schema_version SET version = 26;",
+                ).unwrap();
+                create_schema(&conn).unwrap();
+            }
+            let pull_layout = || db.upsert_workspace_sync_from_server(
+                "canonical", "layout rename", host, Some("/layout"), None, branch, None,
+                "", "", None, project, kind,
+            ).unwrap();
+            pull_layout();
+            db.update_remote_discovered_workspace_sync(
+                holder.id, "layout rename", Some("/layout"), Some("new remote"), later_branch,
+                project, kind, None, None,
+            ).unwrap();
+            if acknowledge_later_edit {
+                acknowledge();
+                pull_layout();
+            }
+            let sent = db.dirty_workspace_by_id(layout.id).unwrap().unwrap();
+            let result = db.mark_workspace_sync_pushed(&sent, Some(("canonical", false)));
+            let rows = db.list_dirty_workspaces_sync();
+            if later_branch == branch {
+                result.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].title, "layout rename");
+            } else {
+                assert!(result.unwrap_err().contains("conflicts with local row"));
+                assert_eq!(rows.len(), 2);
+            }
+            let inventory = rows.iter().find(|row| row.id == holder.id).unwrap();
+            assert_eq!(inventory.git_branch.as_deref(), later_branch);
+            assert_eq!(inventory.project_path.as_deref(), Some("/new"));
+            assert_eq!(inventory.project_remote.as_deref(), Some("new remote"));
+        }
+    }
+
+    #[test]
+    fn workspace_edit_base_upgrade_preserves_a_previously_acknowledged_conflict() {
+        let db = init_test_database();
+        let holder = db
+            .insert_remote_discovered_workspace_sync(
+                "host",
+                "daemon-id",
+                "inventory rename",
+                None,
+                None,
+                Some("main"),
+                Some("project"),
+                Some("main"),
+                None,
+                None,
+            )
+            .unwrap();
+        db.mark_workspace_sync_synced(holder.id, Some("canonical")).unwrap();
+        let layout = db
+            .insert_workspace_sync(
+                "layout",
+                "layout rename",
+                Some("host"),
+                None,
+                None,
+                Some("main"),
+                None,
+                Some("project"),
+                Some("main"),
+            )
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER workspace_capture_edit_base;
+                 ALTER TABLE workspaces_sync DROP COLUMN edit_base;
+                 UPDATE schema_version SET version = 25;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspace_create_receipts(row_id, server_id, sent)
+                 VALUES (?1, 'canonical', ?2)",
+                params![layout.id, serde_json::to_string(&layout).unwrap()],
+            )
+            .unwrap();
+            create_schema(&conn).unwrap();
+        }
+        db.upsert_workspace_sync_from_server(
+            "canonical",
+            "layout rename",
+            Some("host"),
+            None,
+            None,
+            Some("main"),
+            None,
+            "",
+            "",
+            None,
+            Some("project"),
+            Some("main"),
+        )
+        .unwrap();
+        let (sent, sid) = db.workspace_create_receipt(layout.id).unwrap().unwrap();
+        assert!(db
+            .mark_workspace_sync_pushed(&sent, Some((&sid, false)))
+            .unwrap_err()
+            .contains("conflicts with local row"));
+        let rows = db.list_dirty_workspaces_sync();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().find(|r| r.id == holder.id).unwrap().title, "inventory rename");
+    }
+
+    #[test]
+    fn registry_create_migration_preserves_unresolved_uploads() {
+        let db = init_test_database();
+        let workspace = db
+            .insert_workspace_sync("old", "old", None, None, None, None, None, None, None)
+            .unwrap();
+        let automation = db.insert_automation(&sample_automation("old")).unwrap();
+        db.soft_delete_workspace_sync_by_workspace_id("old")
+            .unwrap();
+        db.delete_automation(automation.id).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "ALTER TABLE automations DROP COLUMN create_pending;
+                 ALTER TABLE workspaces_sync DROP COLUMN create_pending;
+                 DROP TABLE workspace_create_receipts;
+                 UPDATE schema_version SET version = 24;",
+            )
+            .unwrap();
+            create_schema(&conn).unwrap();
+            create_schema(&conn).unwrap();
+        }
+        assert!(SyncRegistry::Workspaces
+            .settle_unsent_delete(&db, workspace.id)
+            .is_err());
+        assert!(SyncRegistry::Automations
+            .settle_unsent_delete(&db, automation.id)
+            .is_err());
+
+        let offline = db.insert_automation(&sample_automation("offline")).unwrap();
+        db.delete_automation(offline.id).unwrap();
+        SyncRegistry::Automations
+            .settle_unsent_delete(&db, offline.id)
+            .unwrap();
+        db.purge_acknowledged_automation_deletes().unwrap();
+        assert_eq!(db.list_dirty_automations().len(), 1);
+        assert_eq!(db.list_dirty_automations()[0].id, automation.id);
+    }
+
     #[test]
     fn schema_version_set() {
         let db = init_test_database();
