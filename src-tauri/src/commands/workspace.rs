@@ -24,6 +24,7 @@ use crate::workspace_service::{
     Checkpoint, CloseWorkspace, OpenWorkspace, OpenedWorkspace, PresetLaunch, WorktreeBase,
     WorktreeRequest,
 };
+use notify_rust::Notification;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -3157,43 +3158,32 @@ pub fn notify_attention<R: tauri::Runtime>(
     // Test harnesses never reach the real desktop (no popup or urgency
     // hint); see `notifications::is_test_harness`.
     if desktop.unwrap_or(true) && !crate::notifications::is_test_harness(&app) {
-        // On Linux, clicking the popup focuses Codemux and opens the pane,
-        // like an agent notification.
-        #[cfg(target_os = "linux")]
-        if let Some((workspace_id, pane_id)) = state.notification_location(&notification_id) {
-            crate::notifications::show_attention_notification(
-                &app,
-                body,
-                workspace_id,
-                pane_id.unwrap_or_default(),
-            );
-        }
-
-        // `notify-rust`'s Windows backend (WinRT Toast) does not expose
-        // `.hint()` / `.urgency()` / `notify_rust::Hint::*` — those are
-        // XDG/D-Bus concepts only available when the crate is built for
-        // Unix. On Windows the toast gets priority/grouping from its own
-        // API, so a plain `summary + body + show` is the right degradation.
-        #[cfg(not(target_os = "linux"))]
+        // `notify-rust` only exposes `.hint()` / `.urgency()` /
+        // `notify_rust::Hint::*` on its XDG/D-Bus backend (Linux and the
+        // BSDs); the Windows toast and macOS backends lack them, so those get
+        // a plain `summary + body + show`.
+        //
+        // No `default` action: a click then gets the platform's own handling.
+        // GNOME Shell and KDE activate the sender app, and Omarchy's
+        // notification service focuses the sender's window.
+        let mut notification = Notification::new();
+        notification.summary("Codemux").body(&body);
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
-            let mut notification = notify_rust::Notification::new();
-            notification.summary("Codemux").body(&body);
-            #[cfg(unix)]
-            {
-                notification
-                    .hint(notify_rust::Hint::DesktopEntry(app.config().identifier.clone()))
-                    .hint(notify_rust::Hint::Transient(true))
-                    // Normal urgency, not Critical: see notifications.rs for
-                    // the reasoning. Critical is non-expiring on mako/dunst/
-                    // GNOME/KDE — wrong fit for routine attention requests.
-                    .urgency(notify_rust::Urgency::Normal);
-            }
-            let _ = notification.show();
+            notification
+                .hint(notify_rust::Hint::DesktopEntry(app.config().identifier.clone()))
+                .hint(notify_rust::Hint::Transient(true))
+                // Normal urgency, not Critical: see notifications.rs for
+                // the reasoning. Critical is non-expiring on mako/dunst/
+                // GNOME/KDE — wrong fit for routine attention requests.
+                .urgency(notify_rust::Urgency::Normal);
         }
+        let _ = notification.show();
 
         // Never take focus unprompted. The native urgency hint flashes the
         // taskbar entry on Windows, bounces the dock icon on macOS, and marks
-        // the window urgent on X11/Wayland, leaving the switch to the user.
+        // the window urgent on X11 (GTK3 ignores it on Wayland, where the popup
+        // is the only signal), leaving the switch to the user.
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
         }
