@@ -26,7 +26,8 @@
 //      is usually the user's workspace, cannot set it.
 //   3. Claude. SSH devices install this binary as
 //      `~/.local/bin/codemux-claude-sidecar` and start it without arguments,
-//      as they did when it was a Claude-only binary.
+//      as they did when it was a Claude-only binary. Every Claude start, local
+//      or over SSH, removes `CODEMUX_SIDECAR_ROLE` from the environment first.
 //
 // Programs are imported lazily, so only the selected program's module graph
 // is evaluated and an import-time failure in one cannot affect the others.

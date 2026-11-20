@@ -45,8 +45,10 @@ pub const PATH_ENV: &str = "CODEMUX_SIDECAR_PATH";
 /// in the real process environment: Bun child processes do not see
 /// assignments to `process.env`. Claude spawn sites rely on the default
 /// role, so Codemux's executables drop an inherited one first thing
-/// ([`scrub_inherited_role`]) and user terminals never get one
-/// (`terminal::strip_agent_identity_env`).
+/// ([`scrub_inherited_role`]), user terminals never get one
+/// (`terminal::strip_agent_identity_env`), and the Claude spawn boundary
+/// removes it after any env overlay: `JsonRpcChild` for local starts, the
+/// device launch script (`ssh::sidecar`) for SSH starts.
 pub const ROLE_ENV: &str = "CODEMUX_SIDECAR_ROLE";
 
 /// Drops a [`ROLE_ENV`] this process inherited, e.g. when Codemux is started
