@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { readFile, writeFile, mkdir, rename, stat } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, rm, stat } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -44,14 +44,42 @@ async function run(program, args, env, options) {
     return result.output;
   } finally { clearTimeout(timer); }
 }
-async function until(label, fn) {
-  const deadline = Date.now() + 60000;
+async function until(label, fn, timeout = 60000) {
+  const deadline = Date.now() + timeout;
   let last;
   while (Date.now() < deadline) {
     try { const value = await fn(); if (value) return value; } catch (error) { last = error; }
     await delay(250);
   }
   throw Error(`${label}: ${last?.message ?? 'timed out'}`);
+}
+const exists = file => stat(file).then(() => true, error => {
+  if (error.code === 'ENOENT') return false;
+  throw error;
+});
+// Holds `file` open with no sharing, as a still-running old sidecar holds its
+// .exe, until the returned function releases it.
+async function holdOpen(file) {
+  const holder = start('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    "$f = [System.IO.File]::Open($env:CODEMUX_HELD_FILE, 'Open', 'Read', 'None'); [Console]::Out.WriteLine('held'); [void][Console]::In.ReadLine(); $f.Close()"],
+  { ...process.env, CODEMUX_HELD_FILE: file });
+  const timer = setTimeout(() => { void stop(holder); }, 60000);
+  try {
+    await new Promise((resolve, reject) => {
+      createInterface({ input: holder.stdout }).on('line', line => { if (line.trim() === 'held') resolve(); });
+      holder.done.then(result => reject(Error(`Holding ${file} failed: ${result.output}`)));
+    });
+  } finally { clearTimeout(timer); }
+  return async () => {
+    holder.stdin.end('\n');
+    const result = await holder.done;
+    assert.equal(result.code, 0, result.output);
+  };
+}
+// Whether Windows will delete `file` at the next restart.
+async function deletedAtRestart(file) {
+  const { output } = await start('reg.exe', ['query', 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager', '/v', 'PendingFileRenameOperations']).done;
+  return output.toLowerCase().includes(file.toLowerCase());
 }
 function rpc(program, env) {
   const child = start(program, [], env);
@@ -139,10 +167,38 @@ try {
       await assert.rejects(stat(file), { code: 'ENOENT' }, `${file} must not survive ${when}`);
     }
   };
+  // The hook deletes them in order and retries a file that is in use, so the
+  // last one is held open: a sidecar of the old app that is still exiting.
+  const heldRetired = retiredSidecars.at(-1);
+  const retiredOutcome = {};
   await mkdir(join(appDir, 'binaries'), { recursive: true });
   await seedRetiredSidecars();
-  // NSIS requires /D= to be the final, unquoted argument, including spaces.
-  await run(installer, ['/S', '/UPDATE', `/D=${appDir}`], undefined, { windowsVerbatimArguments: true });
+  let release = await holdOpen(heldRetired);
+  try {
+    // NSIS requires /D= to be the final, unquoted argument, including spaces.
+    const installing = start(installer, ['/S', '/UPDATE', `/D=${appDir}`], undefined, { windowsVerbatimArguments: true });
+    const timer = setTimeout(() => { void stop(installing); }, 300000);
+    let exited = false;
+    installing.done.then(() => { exited = true; });
+    try {
+      // Once the others are gone the hook is retrying the held file.
+      await until('Install hook reaches the held retired sidecar', async () => {
+        if (exited) return true;
+        for (const file of retiredSidecars.slice(0, -1)) if (await exists(file)) return false;
+        return true;
+      }, 300000);
+      await release(); release = undefined;
+      const result = await installing.done;
+      assert.equal(result.code, 0, `${installer}: ${result.output}`);
+    } finally { clearTimeout(timer); }
+  } finally { await release?.(); }
+  // Released within its retries, it is deleted. Released too late, it must
+  // at least be scheduled for deletion at restart.
+  if (await exists(heldRetired)) {
+    assert.ok(await deletedAtRestart(heldRetired), `${heldRetired} survived the update install unscheduled`);
+    retiredOutcome.install = 'deleted-at-restart';
+    await rm(heldRetired);
+  } else retiredOutcome.install = 'deleted-after-release';
   await assertRetiredSidecarsGone('an update install');
   const bundledSidecar = join(appDir, 'binaries', 'codemux-sidecar-x86_64-pc-windows-msvc.exe');
   assert.ok((await stat(bundledSidecar)).size > 0, 'Installer must ship the Claude sidecar');
@@ -223,12 +279,27 @@ try {
   }
 
   // The uninstaller only knows the current resource list; the hook covers the
-  // retired files. `_?=` runs it in place and waits for it to finish.
+  // retired files. `_?=` runs it in place and waits for it to finish. This
+  // time a held file stays in use throughout, so it must be scheduled for
+  // deletion at restart. Scheduling needs administrator rights, which hosted
+  // runners have; without them the hook can only log the file. A different
+  // file than above, so a restart entry left by the install cannot count.
   await seedRetiredSidecars();
-  await run(join(appDir, 'uninstall.exe'), ['/S', `_?=${appDir}`], undefined, { windowsVerbatimArguments: true });
-  await assertRetiredSidecarsGone('an uninstall');
+  const stillRunning = retiredSidecars[0];
+  release = await holdOpen(stillRunning);
+  try {
+    await run(join(appDir, 'uninstall.exe'), ['/S', `_?=${appDir}`], undefined, { windowsVerbatimArguments: true });
+  } finally { await release(); release = undefined; }
+  for (const file of retiredSidecars.slice(1)) {
+    await assert.rejects(stat(file), { code: 'ENOENT' }, `${file} must not survive an uninstall`);
+  }
+  const elevated = (await start('net.exe', ['session']).done).code === 0;
+  if (elevated) assert.ok(await deletedAtRestart(stillRunning), `${stillRunning} survived the uninstall unscheduled`);
+  else assert.ok(await exists(stillRunning));
+  retiredOutcome.uninstall = elevated ? 'deleted-at-restart' : 'left-in-use-without-admin';
+  await rm(stillRunning);
   await assert.rejects(stat(bundledSidecar), { code: 'ENOENT' }, 'Uninstall must remove the bundled sidecar');
-  evidence.checks.push({ label: 'retired-sidecars-removed', install: true, uninstall: true });
+  evidence.checks.push({ label: 'retired-sidecars-removed', ...retiredOutcome });
 } catch (error) {
   evidence.failure = String(error.stack ?? error);
   throw error;
