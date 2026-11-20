@@ -6347,6 +6347,25 @@ impl AppStateStore {
         Ok(notification_id)
     }
 
+    /// The workspace and pane a notification is about, for opening it from
+    /// its native popup.
+    pub fn notification_location(
+        &self,
+        notification_id: &str,
+    ) -> Option<(String, Option<String>)> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .notifications
+            .iter()
+            .find(|notification| notification.notification_id == notification_id)
+            .map(|notification| {
+                (
+                    notification.workspace_id.0.clone(),
+                    notification.pane_id.as_ref().map(|pane| pane.0.clone()),
+                )
+            })
+    }
+
     // ---- Tab management ----
 
     pub fn create_tab(
@@ -13300,6 +13319,37 @@ mod tests {
 
         store.set_workspace_muted(&ws_id.0, true);
         assert!(store.notification_target_for_thread("thread-a").unwrap().muted);
+    }
+
+    #[test]
+    fn notification_location_names_the_pane_an_attention_popup_opens() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let pane = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
+            .unwrap();
+
+        let with_pane = store
+            .add_notification(
+                None,
+                Some(pane.0.clone()),
+                "look".into(),
+                NotificationLevel::Attention,
+            )
+            .unwrap();
+        assert_eq!(
+            store.notification_location(&with_pane),
+            Some((ws_id.0.clone(), Some(pane.0.clone())))
+        );
+
+        let without_pane = store
+            .add_notification(None, None, "look".into(), NotificationLevel::Attention)
+            .unwrap();
+        assert_eq!(
+            store.notification_location(&without_pane),
+            Some((ws_id.0.clone(), None))
+        );
+        assert_eq!(store.notification_location("notification-missing"), None);
     }
 
     #[test]

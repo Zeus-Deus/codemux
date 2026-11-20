@@ -116,7 +116,15 @@ pub fn notify_agent<R: Runtime>(
             .map(|settings| settings.notifications)
             .unwrap_or_default();
         if prefs.desktop_enabled {
-            show_desktop_notification(app, &payload);
+            show_desktop_notification(
+                app,
+                payload.title.clone(),
+                payload.body.clone(),
+                NotificationActivatePayload {
+                    workspace_id: payload.workspace_id.clone(),
+                    pane_id: payload.pane_id.clone(),
+                },
+            );
         }
         if prefs.sound_enabled {
             play_completion_sound();
@@ -164,18 +172,45 @@ fn agent_payload(notice: AgentNotice, target: &NotificationTarget) -> Notificati
 /// their async event bridge, so a panic there would kill the bridge and stop
 /// every later event from that provider. A plain thread also keeps
 /// `wait_for_action` from blocking the caller.
-fn show_desktop_notification<R: Runtime>(app: &AppHandle<R>, payload: &NotificationPayload) {
+fn show_desktop_notification<R: Runtime>(
+    app: &AppHandle<R>,
+    title: String,
+    body: String,
+    target: NotificationActivatePayload,
+) {
     let app = app.clone();
-    let payload = payload.clone();
-    std::thread::spawn(move || show_desktop_notification_blocking(&app, &payload));
+    std::thread::spawn(move || show_desktop_notification_blocking(&app, &title, &body, target));
+}
+
+/// Raise an attention popup that, when clicked, focuses Codemux and opens
+/// `pane_id` in `workspace_id` like an agent notification (an empty `pane_id`
+/// opens just the workspace).
+#[cfg(target_os = "linux")]
+pub(crate) fn show_attention_notification<R: Runtime>(
+    app: &AppHandle<R>,
+    body: String,
+    workspace_id: String,
+    pane_id: String,
+) {
+    show_desktop_notification(
+        app,
+        "Codemux".to_string(),
+        body,
+        NotificationActivatePayload {
+            workspace_id,
+            pane_id,
+        },
+    );
 }
 
 fn show_desktop_notification_blocking<R: Runtime>(
     app: &AppHandle<R>,
-    payload: &NotificationPayload,
+    title: &str,
+    body: &str,
+    target: NotificationActivatePayload,
 ) {
     let mut notification = notify_rust::Notification::new();
-    notification.summary(&payload.title).body(&payload.body);
+    notification.summary(title).body(body);
 
     #[cfg(unix)]
     {
@@ -208,17 +243,13 @@ fn show_desktop_notification_blocking<R: Runtime>(
     // open the agent's pane. This already runs on its own thread, so the wait
     // does not block the caller. On other platforms `wait_for_action` is a
     // no-op or unavailable, so the notify-rust click handler is the only path.
+    // The pane opens first so a slow compositor fallback in
+    // `focus_main_window` cannot delay it.
     #[cfg(target_os = "linux")]
     handle.wait_for_action(|action| {
         if action == "default" {
+            let _ = app.emit(NOTIFICATION_ACTIVATE_EVENT, target);
             crate::desktop::focus_main_window(app);
-            let _ = app.emit(
-                NOTIFICATION_ACTIVATE_EVENT,
-                NotificationActivatePayload {
-                    workspace_id: payload.workspace_id.clone(),
-                    pane_id: payload.pane_id.clone(),
-                },
-            );
         }
     });
 
@@ -226,6 +257,7 @@ fn show_desktop_notification_blocking<R: Runtime>(
     {
         let _ = handle;
         let _ = app;
+        let _ = target;
     }
 }
 

@@ -24,7 +24,6 @@ use crate::workspace_service::{
     Checkpoint, CloseWorkspace, OpenWorkspace, OpenedWorkspace, PresetLaunch, WorktreeBase,
     WorktreeRequest,
 };
-use notify_rust::Notification;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -3158,24 +3157,39 @@ pub fn notify_attention<R: tauri::Runtime>(
     // Test harnesses never reach the real desktop (no popup or urgency
     // hint); see `notifications::is_test_harness`.
     if desktop.unwrap_or(true) && !crate::notifications::is_test_harness(&app) {
+        // On Linux, clicking the popup focuses Codemux and opens the pane,
+        // like an agent notification.
+        #[cfg(target_os = "linux")]
+        if let Some((workspace_id, pane_id)) = state.notification_location(&notification_id) {
+            crate::notifications::show_attention_notification(
+                &app,
+                body,
+                workspace_id,
+                pane_id.unwrap_or_default(),
+            );
+        }
+
         // `notify-rust`'s Windows backend (WinRT Toast) does not expose
         // `.hint()` / `.urgency()` / `notify_rust::Hint::*` — those are
         // XDG/D-Bus concepts only available when the crate is built for
         // Unix. On Windows the toast gets priority/grouping from its own
         // API, so a plain `summary + body + show` is the right degradation.
-        let mut notification = Notification::new();
-        notification.summary("Codemux").body(&body);
-        #[cfg(unix)]
+        #[cfg(not(target_os = "linux"))]
         {
-            notification
-                .hint(notify_rust::Hint::DesktopEntry(app.config().identifier.clone()))
-                .hint(notify_rust::Hint::Transient(true))
-                // Normal urgency, not Critical: see notifications.rs for
-                // the reasoning. Critical is non-expiring on mako/dunst/
-                // GNOME/KDE — wrong fit for routine attention requests.
-                .urgency(notify_rust::Urgency::Normal);
+            let mut notification = notify_rust::Notification::new();
+            notification.summary("Codemux").body(&body);
+            #[cfg(unix)]
+            {
+                notification
+                    .hint(notify_rust::Hint::DesktopEntry(app.config().identifier.clone()))
+                    .hint(notify_rust::Hint::Transient(true))
+                    // Normal urgency, not Critical: see notifications.rs for
+                    // the reasoning. Critical is non-expiring on mako/dunst/
+                    // GNOME/KDE — wrong fit for routine attention requests.
+                    .urgency(notify_rust::Urgency::Normal);
+            }
+            let _ = notification.show();
         }
-        let _ = notification.show();
 
         // Never take focus unprompted. The native urgency hint flashes the
         // taskbar entry on Windows, bounces the dock icon on macOS, and marks
