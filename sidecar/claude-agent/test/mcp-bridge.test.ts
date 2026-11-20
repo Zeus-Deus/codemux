@@ -14,7 +14,7 @@
 //      whose tool callbacks RPC out and wrap upstream errors as
 //      `isError: true` results so the SDK never sees a thrown promise.
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 
 import { parseLine } from "../src/rpc.ts";
 import {
@@ -186,6 +186,32 @@ test("round 4: the SDK list response cannot expose denied targets", async () => 
 
 afterEach(() => {
   _resetUpstreamRpcForTests();
+});
+
+test("the SDK bridge lets built-in browser calls outlast the host's 120-second deadline", async () => {
+  const timers = spyOn(globalThis, "setTimeout");
+  const budgets: Array<number | undefined> = [];
+  try {
+    setMcpBridgeWriter((line) => {
+      // sendUpstreamRequest starts its timer immediately before writing the request.
+      budgets.push(timers.mock.calls.at(-1)?.[1]);
+      const { id } = JSON.parse(line);
+      dispatchResponse({ jsonrpc: "2.0", id, result: { content: [] } });
+    });
+    for (const [serverId, name] of [
+      ["codemux-self", "browser_navigate"],
+      ["codemux-self", "git_status"],
+      ["other-server", "browser_navigate"],
+    ] as const) {
+      const tool = { name, serverId, prefixedName: name, description: name, inputSchema: { type: "object" } };
+      const result = await callSdk(buildCodemuxMcpServer([tool]), name, {});
+      expect(result).toMatchObject({ result: { content: [] } });
+    }
+    expect(budgets[0]).toBeGreaterThan(120_000);
+    expect(budgets.slice(1)).toEqual([60_000, 60_000]);
+  } finally {
+    timers.mockRestore();
+  }
 });
 
 describe("parseLine", () => {

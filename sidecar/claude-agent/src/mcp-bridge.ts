@@ -25,7 +25,7 @@ import {
 import { z } from "zod";
 
 import { logger } from "./logger.ts";
-import { sendUpstreamRequest } from "./upstream-rpc.ts";
+import { OUTBOUND_REQUEST_TIMEOUT_MS, sendUpstreamRequest } from "./upstream-rpc.ts";
 import {
   PluginPermissionError,
   type PluginBridgeGuard,
@@ -34,6 +34,10 @@ import {
 /** Method name on the Rust side that handles tool dispatch. Mirrored
  *  in `src-tauri/src/agent_provider/claude/session.rs::METHOD_MCP_TOOL_CALL`. */
 export const METHOD_MCP_TOOL_CALL = "mcp-tool-call";
+
+// The host's BROWSER_RELAY_TIMEOUT is 120 seconds, including cold browser startup.
+// Give the reply the same 30-second margin as an ordinary MCP call.
+const BROWSER_REQUEST_TIMEOUT_MS = 150_000;
 
 /** Wire shape of one tool registration. Matches Rust's
  *  `commands/mcp.rs` serialization of `McpTool` (camelCase fields). */
@@ -128,6 +132,9 @@ function toolToSdkDefinition(
           ...(tool.prefixedName === "codemux_list_plugin_tools" ? { directPluginTools } : {}),
         },
         writeLine,
+        tool.serverId === "codemux-self" && tool.name.startsWith("browser_")
+          ? BROWSER_REQUEST_TIMEOUT_MS
+          : OUTBOUND_REQUEST_TIMEOUT_MS,
       );
       if (tool.prefixedName === "codemux_list_plugin_tools") {
         if (!guard)
