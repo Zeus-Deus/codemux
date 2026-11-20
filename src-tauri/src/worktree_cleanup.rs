@@ -318,7 +318,8 @@ fn gather_candidates(
     root: &Path,
 ) -> Vec<Candidate> {
     let retained = crate::state::retained_layouts();
-    if retained.unreadable {
+    // A pending unreadable backup can own any checkout missing from the primary.
+    if crate::state::layout_recovery_pending() || retained.unreadable {
         return Vec::new();
     }
     let live = live_paths(snapshot);
@@ -807,7 +808,10 @@ fn remove_unless_in_use(
     let _fence = state.fence_checkout_removal(path, |snapshot| {
         let key = path_key(path);
         let retained = crate::state::retained_layouts();
-        if retained.unreadable || is_open(&retained.checkout_paths, &key) {
+        if crate::state::layout_recovery_pending()
+            || retained.unreadable
+            || is_open(&retained.checkout_paths, &key)
+        {
             return Err("A saved recovery layout may still use this checkout".to_owned());
         }
         if is_open(&live_paths(snapshot), &key) {
@@ -1274,8 +1278,8 @@ mod tests {
     }
 
     #[test]
-    fn retained_layout_keeps_a_local_checkout_at_scan_and_removal() {
-        const TEST: &str = "worktree_cleanup::tests::retained_layout_keeps_a_local_checkout_at_scan_and_removal";
+    fn recovery_layouts_keep_a_local_checkout_at_scan_and_removal() {
+        const TEST: &str = "worktree_cleanup::tests::recovery_layouts_keep_a_local_checkout_at_scan_and_removal";
         if crate::test_isolation::isolated(TEST) { return; }
         let layout = crate::test_isolation::isolated_root().unwrap().join("layout.json");
         let retained = layout.with_added_extension("recovery-saved-00000000-0000-0000-0000-000000000001.json");
@@ -1291,7 +1295,8 @@ mod tests {
         repaired.workspaces.clear();
         repaired.terminal_sessions.clear();
         repaired.archived_workspaces.push(archive);
-        std::fs::write(&layout, serde_json::to_vec(&repaired).unwrap()).unwrap();
+        let primary = serde_json::to_vec(&repaired).unwrap();
+        std::fs::write(&layout, &primary).unwrap();
         let boot = || store.replace_snapshot(crate::state::load_persisted_state_checked().unwrap().unwrap());
         let candidates = || gather_candidates(&store.snapshot(), &[], &managed);
         boot();
@@ -1299,6 +1304,28 @@ mod tests {
         assert_eq!(initial.len(), 1);
         let stale = judge(&initial[0], &inspect(&wt), NOW, &mut || None, None, false).unwrap();
         assert!(stale.kept_because.is_none());
+
+        // The checkout was selected before recovery. Quarantine its truncated
+        // live layout, then boot the readable primary that only has the archive.
+        let mut truncated = serde_json::to_vec(&original).unwrap();
+        truncated.pop();
+        std::fs::write(&layout, &truncated).unwrap();
+        assert!(crate::state::load_persisted_state_checked().unwrap().is_none());
+        let listed = std::fs::read_to_string(layout.with_added_extension("recovery-pending")).unwrap();
+        let backup = layout.with_file_name(listed.trim());
+        assert_eq!(std::fs::read(&backup).unwrap(), truncated);
+        std::fs::write(&layout, &primary).unwrap();
+        boot();
+        assert!(crate::state::layout_recovery_pending());
+        assert!(candidates().is_empty());
+        let error = remove_unless_in_use(&store, &initial[0].path, remove_worktree).unwrap_err();
+        assert!(error.contains("recovery layout"), "{error}");
+        assert!(wt.join(".git").is_file());
+
+        std::fs::remove_file(backup).unwrap();
+        boot();
+        assert!(!crate::state::layout_recovery_pending());
+        assert_eq!(candidates(), initial);
 
         std::fs::write(&retained, serde_json::to_vec(&original).unwrap()).unwrap();
         boot();
