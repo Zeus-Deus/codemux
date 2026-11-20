@@ -3623,10 +3623,18 @@ pub(crate) fn ensure_worktree_removable(worktree_path: &Path) -> Result<(), Stri
     // Check for uncommitted changes. Untracked files are listed explicitly:
     // `status.showUntrackedFiles=no` would otherwise hide files that the
     // forced removal goes on to delete.
-    let status = run_git_permissive(
+    //
+    // A status that fails cannot vouch for the tree, so it refuses rather
+    // than reading as "clean" and letting the forced removal go ahead. A
+    // checkout already gone has nothing left to lose.
+    if !worktree_path.exists() {
+        return Ok(());
+    }
+    let status = run_git(
         worktree_path,
         &["status", "--porcelain", "--untracked-files=all"],
-    );
+    )
+    .map_err(|e| format!("Could not check the worktree for uncommitted changes ({e}). Use force to override."))?;
     let dirty_count = status.lines().filter(|l| !l.is_empty()).count();
     if dirty_count > 0 {
         return Err(format!(
@@ -3640,7 +3648,8 @@ pub(crate) fn ensure_worktree_removable(worktree_path: &Path) -> Result<(), Stri
         &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
     );
     if !upstream.is_empty() && !upstream.contains("fatal") {
-        let unpushed = run_git_permissive(worktree_path, &["log", "@{upstream}..HEAD", "--oneline"]);
+        let unpushed = run_git(worktree_path, &["log", "@{upstream}..HEAD", "--oneline"])
+            .map_err(|e| format!("Could not check the worktree for unpushed commits ({e}). Use force to override."))?;
         let unpushed_count = unpushed.lines().filter(|l| !l.is_empty()).count();
         if unpushed_count > 0 {
             return Err(format!(
@@ -10093,6 +10102,27 @@ mod worktree_guard_tests {
         assert!(error.contains("uncommitted change(s)"));
         assert!(error.contains("Use force to override."));
         assert!(tmp.path().join("untracked/notes.txt").exists());
+    }
+
+    #[test]
+    fn unreadable_status_refuses_instead_of_reading_as_clean() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        std::fs::write(repo.join("dirty.txt"), "uncommitted").unwrap();
+        // A corrupt index makes `git status` fail outright.
+        std::fs::write(repo.join(".git/index"), "not an index").unwrap();
+
+        let err = ensure_worktree_removable(&repo)
+            .expect_err("a status that fails must not pass as a clean tree");
+        assert!(err.contains("Use force to override."), "unexpected guard message: {err}");
+    }
+
+    #[test]
+    fn missing_worktree_is_removable() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(ensure_worktree_removable(&tmp.path().join("gone")), Ok(()));
     }
 
     #[test]
