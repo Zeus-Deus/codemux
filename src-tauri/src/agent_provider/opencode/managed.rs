@@ -32,9 +32,10 @@ pub async fn spawn(
     let binary = super::discovery::prepared_binary()
         .await
         .map_err(|message| setup(&message))?;
+    let (program, args) = managed_bridge::sidecar_command(ProviderKind::OpenCode)?;
     let config = SpawnConfig {
-        program: managed_bridge::sidecar_path(ProviderKind::OpenCode)?,
-        args: vec![],
+        program,
+        args,
         env: input.env.clone().unwrap_or_default(),
         cwd: Some(input.cwd.clone()),
         default_timeout: Duration::from_secs(60),

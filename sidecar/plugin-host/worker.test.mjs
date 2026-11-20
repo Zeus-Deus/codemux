@@ -10,7 +10,8 @@ async function fixture(t, code) {
   const directory = await mkdtemp(path.join(tmpdir(), "codemux-plugin-worker-"));
   await writeFile(path.join(directory, "plugin.mjs"), code);
   const child = spawn(process.env.CODEMUX_PLUGIN_HOST_TEST_BINARY || process.execPath,
-    process.env.CODEMUX_PLUGIN_HOST_TEST_BINARY ? [] : [fileURLToPath(new URL("./main.mjs", import.meta.url))],
+    // The bundled binary needs its role selector first; it runs Claude by default.
+    process.env.CODEMUX_PLUGIN_HOST_TEST_BINARY ? ["--codemux-role=plugin-host"] : [fileURLToPath(new URL("./main.mjs", import.meta.url))],
     { stdio: ["pipe", "pipe", "pipe"], env: { PATH: process.env.PATH } });
   const queue = [], waiters = [];
   let input = "", failure;

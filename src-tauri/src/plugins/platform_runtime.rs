@@ -22,10 +22,12 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::bundled_sidecar::{self, SidecarRole};
+
 const MAX_MESSAGE: usize = 1_048_576;
 const MAX_MESSAGES_PER_INVOCATION: usize = 10_000;
 const MAX_HOST_CALLS: usize = 4096;
-pub const PLUGIN_HOST_PATH_ENV: &str = "CODEMUX_PLUGIN_HOST_PATH";
+pub const PLUGIN_HOST_PATH_ENV: &str = SidecarRole::PluginHost.path_env();
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,6 +125,8 @@ pub type PluginHostCallback = Arc<
 #[derive(Clone, Debug)]
 pub struct PluginRuntimeConfig {
     pub executable: Option<PathBuf>,
+    /// Leading arguments; for the bundled sidecar they select the plugin
+    /// host role and must stay first.
     pub args: Vec<String>,
     pub startup_timeout: Duration,
     pub invocation_timeout: Duration,
@@ -134,7 +138,7 @@ impl Default for PluginRuntimeConfig {
     fn default() -> Self {
         Self {
             executable: resolve_plugin_host(None),
-            args: vec![],
+            args: SidecarRole::PluginHost.args(),
             startup_timeout: Duration::from_secs(10),
             invocation_timeout: Duration::from_secs(30),
             stop_grace: Duration::from_millis(500),
@@ -143,31 +147,11 @@ impl Default for PluginRuntimeConfig {
         }
     }
 }
+/// The plugin host role of the bundled sidecar; see
+/// [`bundled_sidecar::resolve`] for the search order. Launch it with
+/// [`SidecarRole::PluginHost`]'s arguments first.
 pub fn resolve_plugin_host(resources: Option<&Path>) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(PLUGIN_HOST_PATH_ENV).filter(|s| !s.is_empty()) {
-        return Some(path.into());
-    }
-    let name = format!(
-        "codemux-plugin-host-{}{}",
-        crate::agent_provider::claude::sidecar_path::target_triple(),
-        if cfg!(windows) { ".exe" } else { "" }
-    );
-    if let Some(resources) = resources {
-        let path = resources.join("binaries").join(&name);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    #[cfg(debug_assertions)]
-    {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("binaries")
-            .join(&name);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
+    bundled_sidecar::resolve(SidecarRole::PluginHost, resources)
 }
 struct Slot {
     generation: String,

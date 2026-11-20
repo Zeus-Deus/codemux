@@ -36,14 +36,20 @@ pub fn initialize_runtime() {
         }
     }
 }
+/// The Claude sidecar beside `codemux-remote`: the bundled multi-role binary
+/// (Claude is its default role) as an app bundle or dev tree stages it, the
+/// name SSH devices install it under, or an older Claude-only build.
 fn sibling_sidecar(exe: &Path) -> Option<PathBuf> {
     let parent = exe.parent()?;
-    let qualified = format!(
-        "codemux-claude-sidecar-{}",
-        crate::agent_provider::claude::sidecar_path::target_triple()
-    );
+    let triple = crate::agent_provider::claude::sidecar_path::target_triple();
+    let names = [
+        crate::bundled_sidecar::binary_name(),
+        "codemux-claude-sidecar".to_string(),
+        format!("codemux-claude-sidecar-{triple}"),
+        crate::bundled_sidecar::BINARY_STEM.to_string(),
+    ];
     for folder in [parent.to_path_buf(), parent.join("binaries")] {
-        for name in [&qualified, "codemux-claude-sidecar"] {
+        for name in &names {
             let path = folder.join(name);
             if crate::agent_provider::claude::sidecar_path::is_executable(&path) {
                 return Some(path);
@@ -549,6 +555,14 @@ mod tests {
         assert!(sibling_sidecar(&executable).is_none());
         std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(sibling_sidecar(&executable), Some(sidecar));
+        // An app bundle's binaries/ folder holds the multi-role binary, which
+        // runs Claude by default; its staged name wins over older names.
+        let binaries = dir.path().join("binaries");
+        std::fs::create_dir(&binaries).unwrap();
+        let staged = binaries.join(crate::bundled_sidecar::binary_name());
+        std::fs::write(&staged, "fixture").unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(sibling_sidecar(&binaries.join("codemux-remote")), Some(staged));
     }
     pub(super) fn request() -> LaunchRequest {
         LaunchRequest {

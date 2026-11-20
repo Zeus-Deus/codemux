@@ -2,13 +2,13 @@
 //!
 //! These tests prove the full pipeline:
 //!   * A separate Bun TypeScript project compiles to a standalone binary.
-//!   * Tauri's `externalBin` convention stages it at
-//!     `src-tauri/binaries/codemux-claude-sidecar-<triple>`.
+//!   * `scripts/build-sidecars.sh` stages it, as the default role of the
+//!     shared bundled binary, at `src-tauri/binaries/codemux-sidecar-<triple>`.
 //!   * The Rust side spawns it via [`JsonRpcChild`] and speaks JSON-RPC
 //!     over stdio.
 //!
 //! If the binary is missing at test time (developer has not yet run
-//! `bun run build` / `scripts/build-claude-sidecar.sh`) the tests print
+//! `scripts/build-sidecars.sh`) the tests print
 //! a clear message and return cleanly rather than failing — in that
 //! case the test run is a no-op, matching how the `agent-browser`
 //! sidecar is handled.
@@ -32,13 +32,12 @@ fn try_sidecar_binary_path() -> Option<PathBuf> {
     // conventional way to discover this at runtime.
     let triple = current_target_triple();
     let ext = if triple.contains("windows") { ".exe" } else { "" };
-    let path = binaries.join(format!("codemux-claude-sidecar-{triple}{ext}"));
+    let path = binaries.join(format!("codemux-sidecar-{triple}{ext}"));
     if path.exists() && is_executable(&path) {
         Some(path)
     } else {
-        // Fallback: bare name, which Tauri's `externalBin` accepts at
-        // runtime but we do not rely on in tests.
-        let bare = binaries.join(format!("codemux-claude-sidecar{ext}"));
+        // Fallback: the triple-less name some environments flatten to.
+        let bare = binaries.join(format!("codemux-sidecar{ext}"));
         if bare.exists() && is_executable(&bare) {
             Some(bare)
         } else {
@@ -93,8 +92,7 @@ fn require_sidecar() -> Option<PathBuf> {
         None => {
             eprintln!(
                 "[sidecar_ping] sidecar binary not found; build with \
-                 `cd sidecar/claude-agent && bun run build` or \
-                 `bash scripts/build-claude-sidecar.sh` and retry"
+                 `bash scripts/build-sidecars.sh` and retry"
             );
             None
         }

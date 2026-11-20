@@ -1,5 +1,6 @@
 // Policy tests need no provider calls. The native regression additionally uses
-// CODEMUX_TEST_BUN_SIDECAR, staged by CI, and CODEMUX_TEST_PATCHELF or PATH.
+// CODEMUX_TEST_BUN_SIDECAR (the bundled codemux-sidecar binary staged by
+// scripts/build-sidecars.sh) and CODEMUX_TEST_PATCHELF or PATH.
 import assert from "node:assert/strict";
 import { chmod, copyFile, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
@@ -11,7 +12,7 @@ import { tauriBuildEnv } from "./tauri-env.mjs";
 
 const wrapper = fileURLToPath(new URL("./appimage-patchelf.sh", import.meta.url));
 const linux = process.platform === "linux";
-const fixtureName = "codemux-managed-workflow-sidecar-x86_64-unknown-linux-gnu";
+const fixtureName = "codemux-sidecar-x86_64-unknown-linux-gnu";
 async function ownedFixture(callback) {
   const root = await mkdtemp(join(tmpdir(), "codemux appimage-"));
   try { await callback(root); } finally { await rm(root, { recursive: true, force: true }); }
@@ -55,15 +56,13 @@ test("only exact RPATH writes to owned GNU Bun sidecars are skipped; other argum
     await executable(join(root, "readelf"), '#!/bin/sh\nprintf "[4] .bun PROGBITS\\n"\n');
     const env = { ...process.env, PATH: `${root}:${process.env.PATH}`, CODEMUX_REAL_PATCHELF: patcher, CODEMUX_TEST_ARGS: log };
     const resource = join(root, "codemux.AppDir/usr/lib/codemux/binaries");
-    for (const name of ["codemux-managed-workflow-sidecar", "codemux-claude-sidecar"]) {
-      for (const target of ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]) run(wrapper, ["--set-rpath", "$ORIGIN", join(resource, `${name}-${target}`)], { env });
-    }
+    for (const target of ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]) run(wrapper, ["--set-rpath", "$ORIGIN", join(resource, `codemux-sidecar-${target}`)], { env });
     const owned = join(resource, fixtureName);
     for (const args of [
       ["--print-rpath", owned], ["--remove-rpath", owned], ["--set-rpath", "$ORIGIN", owned, "extra"],
       ["--set-rpath", "$ORIGIN", join(root, fixtureName)],
-      ["--set-rpath", "$ORIGIN", join(resource, "codemux-managed-workflow-sidecar-x86_64-unknown-linux-musl")],
-      ["--set-rpath", "$ORIGIN", join(resource, "codemux-managed-workflow-sidecar-x86_64-pc-windows-msvc.exe")],
+      ["--set-rpath", "$ORIGIN", join(resource, "codemux-sidecar-x86_64-unknown-linux-musl")],
+      ["--set-rpath", "$ORIGIN", join(resource, "codemux-sidecar-x86_64-pc-windows-msvc.exe")],
       ["--set-rpath", "$ORIGIN", join(resource, "node_modules/@cursor/sdk-linux-x64/vendor/tree-sitter/binding.node")],
     ]) {
       const result = spawnSync(wrapper, args, { env });
@@ -99,7 +98,7 @@ test("actual Bun sidecar stays byte-identical, dynamically loadable and native-r
     run(wrapper, ["--set-rpath", "$ORIGIN", sidecar], { env: { ...process.env, CODEMUX_REAL_PATCHELF: real } });
     assert.deepEqual(await readFile(sidecar), await readFile(source));
     run("ldd", [sidecar]);
-    const readiness = JSON.parse(run(sidecar, ["--check-native"]).stdout);
+    const readiness = JSON.parse(run(sidecar, ["--codemux-role=managed-workflow", "--check-native"]).stdout);
     assert.equal(readiness.modelTurns, 0);
     assert.equal(readiness.ripgrepReady, true);
     assert.equal(readiness.parserReady, true);
@@ -116,7 +115,7 @@ test("actual Bun sidecar stays byte-identical, dynamically loadable and native-r
     assert.match(run(sandbox, ["--help"]).stdout, /Sandboxing helper/);
     // The SDK's native files still use the real patcher; this compiled native
     // fixture proves relocation and execution, even under a matching filename.
-    const nativeSource = join(root, "fixture.c"), native = join(resource, "codemux-claude-sidecar-x86_64-unknown-linux-gnu");
+    const nativeSource = join(root, "fixture.c"), native = join(resource, "codemux-sidecar-aarch64-unknown-linux-gnu");
     await writeFile(nativeSource, '#include <stdio.h>\nint main(void) { puts("native helper"); return 0; }\n');
     run("cc", [nativeSource, "-o", native]);
     run(wrapper, ["--set-rpath", "$ORIGIN", native], { env: { ...process.env, CODEMUX_REAL_PATCHELF: real } });

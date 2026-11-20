@@ -19,9 +19,10 @@ use super::{
     ProviderRuntimeEvent, ProviderSession, ProviderSessionId, SendTurnInput, SessionStatus,
     StartSessionInput, ThreadId, TurnId, TurnStartResult, TurnStatus, TurnUsage,
 };
+use crate::bundled_sidecar::{self, SidecarRole};
 use crate::json_rpc_child::{JsonRpcChild, RpcChildError, RpcError, SpawnConfig};
 
-pub const SIDECAR_PATH_ENV: &str = "CODEMUX_MANAGED_WORKFLOW_SIDECAR_PATH";
+pub const SIDECAR_PATH_ENV: &str = SidecarRole::ManagedWorkflow.path_env();
 
 fn pre_spawn_rejected(message: &str) -> ProviderError {
     ProviderError::ValidationError {
@@ -55,37 +56,20 @@ pub fn event_stream(
     ))
 }
 
+/// The managed workflow role of the bundled sidecar; see
+/// [`bundled_sidecar::resolve`] for the search order.
 pub fn resolve_sidecar(resource_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(SIDECAR_PATH_ENV).filter(|value| !value.is_empty()) {
-        return Some(path.into());
-    }
-    let suffix = if cfg!(windows) { ".exe" } else { "" };
-    let name = format!(
-        "codemux-managed-workflow-sidecar-{}{suffix}",
-        super::claude::sidecar_path::target_triple()
-    );
-    if let Some(resources) = resource_dir {
-        let path = resources.join("binaries").join(&name);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    #[cfg(debug_assertions)]
-    {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("binaries")
-            .join(name);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
+    bundled_sidecar::resolve(SidecarRole::ManagedWorkflow, resource_dir)
 }
 
-pub fn sidecar_path(provider: ProviderKind) -> Result<PathBuf, ProviderError> {
-    resolve_sidecar(None).ok_or_else(|| ProviderError::ValidationError {
-        message: format!("managed-start-rejected: setup_required: {provider:?} workflow sidecar is missing. Rebuild CodeMux with scripts/build-managed-workflow-sidecar.sh."),
-    })
+/// Program and leading arguments that start the managed workflow sidecar.
+/// Spawn sites append nothing before these arguments: the role selector must
+/// come first.
+pub fn sidecar_command(provider: ProviderKind) -> Result<(PathBuf, Vec<String>), ProviderError> {
+    let program = resolve_sidecar(None).ok_or_else(|| ProviderError::ValidationError {
+        message: format!("managed-start-rejected: setup_required: {provider:?} workflow sidecar is missing. Rebuild CodeMux with scripts/build-sidecars.sh."),
+    })?;
+    Ok((program, SidecarRole::ManagedWorkflow.args()))
 }
 
 #[derive(Deserialize)]

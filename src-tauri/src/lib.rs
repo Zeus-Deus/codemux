@@ -24,6 +24,7 @@ pub mod auth;
 pub mod automations;
 pub mod automations_sync;
 pub mod branch_name;
+pub mod bundled_sidecar;
 pub mod json_rpc_child;
 pub mod local_session_import;
 pub mod mcp_cleanup;
@@ -1504,18 +1505,19 @@ fn build_core_app<R: tauri::Runtime>(
             // editing one first. No-op when signed out.
             crate::hosts_sync::spawn_startup_host_sync(app.handle().clone());
 
-            // Resolve the bundled claude-agent sidecar and pin the path via
-            // env var so the adapter (which has no AppHandle access at
-            // construction time) can find it. `resolve_sidecar` honors an
-            // already-set override, then Tauri's resource dir (the
-            // per-target binary staged into the `codemux-claude-sidecar-*`
-            // resources glob for release builds), then — debug builds only —
+            // Resolve the bundled sidecar's Claude and managed workflow roles
+            // and pin their paths via env vars so the adapters (which have no
+            // AppHandle access at construction time) can find them. Both
+            // roles live in one binary (see `bundled_sidecar`).
+            // `resolve_sidecar` honors an already-set override, then Tauri's
+            // resource dir (the per-target binary staged into the
+            // `codemux-sidecar-*` resources glob for release builds), then — debug builds only —
             // the `src-tauri/binaries/` dev-tree copy that `npm run
             // tauri:dev` does not stage into the resource dir. Returns `None`
             // when the binary exists nowhere, leaving the provider slot empty
             // (provider_not_configured) rather than pinning a bad path.
             //
-            // The bun --compile binary is huge (~100 MB) with the dynamic
+            // The bun --compile binary is huge (~110 MB) with the dynamic
             // section at offset 96 MB, which patchelf corrupts when run by
             // linuxdeploy during AppImage bundling. Shipping it as a resource
             // (usr/share/...) instead of an externalBin (usr/bin/) keeps it

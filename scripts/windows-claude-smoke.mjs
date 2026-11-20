@@ -92,8 +92,9 @@ const stalePath = process.env[pathKey].split(';').filter(entry => {
 }).join(';');
 const staleEnv = { ...process.env, [pathKey]: stalePath };
 const repairedEnv = { ...staleEnv, [pathKey]: `${dirname(install.cli)};${stalePath}` };
-const sidecar = resolve('sidecar/claude-agent/dist/codemux-claude-sidecar-windows-x64.exe');
-const stagedSidecar = resolve('src-tauri/binaries/codemux-claude-sidecar-x86_64-pc-windows-msvc.exe');
+// The bundled multi-role sidecar runs Claude when started without a role.
+const sidecar = resolve('sidecar/dist/codemux-sidecar-x86_64-pc-windows-msvc.exe');
+const stagedSidecar = resolve('src-tauri/binaries/codemux-sidecar-x86_64-pc-windows-msvc.exe');
 let debugPolicy = false;
 let socket;
 let hiddenCli;
@@ -130,7 +131,7 @@ try {
   await mkdir(appDir, { recursive: true });
   // NSIS requires /D= to be the final, unquoted argument, including spaces.
   await run(installer, ['/S', `/D=${appDir}`], undefined, { windowsVerbatimArguments: true });
-  const bundledSidecar = join(appDir, 'binaries', 'codemux-claude-sidecar-x86_64-pc-windows-msvc.exe');
+  const bundledSidecar = join(appDir, 'binaries', 'codemux-sidecar-x86_64-pc-windows-msvc.exe');
   assert.ok((await stat(bundledSidecar)).size > 0, 'Installer must ship the Claude sidecar');
   evidence.bundledSidecar = bundledSidecar;
   // A debug app can fall back to the checkout's staged sidecar. Hide that

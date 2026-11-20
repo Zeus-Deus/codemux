@@ -42,7 +42,7 @@ From the repository root:
 ```sh
 node node_modules/typescript/bin/tsc -p packages/plugin-sdk/tsconfig.json
 node --test packages/plugin-sdk/test/*.test.mjs examples/plugins/platform-*/test/*.test.mjs
-CODEMUX_PLUGIN_HOST_TEST_BINARY=./src-tauri/binaries/codemux-plugin-host-x86_64-unknown-linux-gnu node --test examples/plugins/platform-*/test/*.test.mjs
+CODEMUX_PLUGIN_HOST_TEST_BINARY=./src-tauri/binaries/codemux-sidecar-x86_64-unknown-linux-gnu node --test examples/plugins/platform-*/test/*.test.mjs
 ```
 
 The worker tests use persisted deterministic host fixtures; native integration tests separately verify grants, receipts, committed provenance and host stamps. `platform-frozen-v1/plugin.mjs` is hash-pinned release input and never rebuilt against this package. To prepare this package for publication, run its build explicitly, then `npm pack --ignore-scripts`; no publication occurs automatically.

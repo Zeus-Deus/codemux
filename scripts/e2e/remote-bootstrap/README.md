@@ -268,7 +268,7 @@ report. `run_connect_off` now does config-then-service, the same order
      `NO_STRIP=1` gets past this.
   2. With stripping skipped, the `gtk` plugin then aborts (exit 134) while
      deploying dependencies for the bun-compiled
-     `codemux-claude-sidecar-*` — the same patchelf-corruption class of
+     `codemux-sidecar-*` — the same patchelf-corruption class of
      problem that made that sidecar a `resource` instead of an `externalBin`
      (see commit 025fa19).
 

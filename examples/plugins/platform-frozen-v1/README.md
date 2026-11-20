@@ -12,5 +12,5 @@ The fixture discovers an unknown optional capability as absent, refuses activati
 
 ```sh
 node --test examples/plugins/platform-frozen-v1/test/*.test.mjs
-CODEMUX_PLUGIN_HOST_TEST_BINARY=./src-tauri/binaries/codemux-plugin-host-x86_64-unknown-linux-gnu node --test examples/plugins/platform-frozen-v1/test/*.test.mjs
+CODEMUX_PLUGIN_HOST_TEST_BINARY=./src-tauri/binaries/codemux-sidecar-x86_64-unknown-linux-gnu node --test examples/plugins/platform-frozen-v1/test/*.test.mjs
 ```

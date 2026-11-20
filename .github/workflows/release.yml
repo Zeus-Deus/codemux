@@ -86,11 +86,11 @@ jobs:
         run: npm ci
 
       - name: Setup Bun
-        # The claude-agent sidecar (sidecar/claude-agent/) is a small
-        # TypeScript project compiled to a standalone binary with `bun
-        # build --compile`. Installed here so the stage step below can
-        # produce the per-target sidecar binary before tauri-action
-        # picks it up via `externalBin`.
+        # The bundled sidecar (sidecar/codemux-sidecar.mjs: the Claude
+        # sidecar, managed workflow sidecar and plugin host) is compiled to
+        # one standalone binary with `bun build --compile`. Installed here
+        # so the stage step below can produce the per-target binary before
+        # tauri-action bundles it from `bundle.resources`.
         #
         # Pinned to 1.2.21 (not `latest`) because Bun 1.3+ compiles its
         # standalone binaries against glibc 2.36+ symbols. The Linux
@@ -105,42 +105,37 @@ jobs:
         with:
           bun-version: "1.3.12"
 
-      - name: Stage claude-agent sidecar binary
-        # Mirrors the agent-browser stage below: explicit pre-stage
-        # rather than relying on tauri's beforeBuildCommand, so
-        # failures show up in a dedicated log step.
+      - name: Stage bundled sidecar
+        # One Bun binary carries the Claude sidecar, the managed workflow
+        # sidecar (SDK code plus its native assets; nothing is installed at
+        # runtime) and the plugin host. Mirrors the agent-browser stage
+        # below: explicit pre-stage rather than relying on tauri's
+        # beforeBuildCommand, so failures show up in a dedicated log step.
         shell: bash
         run: |
           # --strict: refuse to fall through to "unknown target — skipping",
           # which would leave whatever is already in src-tauri/binaries/ for
           # the bundler to pick up. A release must never bundle a sidecar
           # this step did not itself produce.
-          bash scripts/build-claude-sidecar.sh --strict
+          bash scripts/build-sidecars.sh --strict
           TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
           case "$TARGET" in
-            *windows*) DEST="src-tauri/binaries/codemux-claude-sidecar-$TARGET.exe" ;;
-            *)         DEST="src-tauri/binaries/codemux-claude-sidecar-$TARGET" ;;
+            *windows*) DEST="src-tauri/binaries/codemux-sidecar-$TARGET.exe" ;;
+            *)         DEST="src-tauri/binaries/codemux-sidecar-$TARGET" ;;
           esac
           if [ ! -s "$DEST" ]; then
-            echo "::error::build-claude-sidecar.sh did not produce a non-empty binary at $DEST"
+            echo "::error::build-sidecars.sh did not produce a non-empty binary at $DEST"
             echo "::error::Target: $TARGET"
             ls -la src-tauri/binaries/ || true
             exit 1
           fi
-
-      - name: Stage managed workflow sidecar
-        # SDK code and native assets ship together; no install happens at runtime.
-        shell: bash
-        run: bash scripts/build-managed-workflow-sidecar.sh --strict
-
-      - name: Build bundled plugin host
-        shell: bash
-        run: bash scripts/build-plugin-host.sh --strict
+          "$DEST" --codemux-role=plugin-host --check
+          "$DEST" --codemux-role=managed-workflow --check
 
       - name: Managed workflow bundled native readiness
         if: runner.os == 'Linux'
         shell: bash
-        run: src-tauri/binaries/codemux-managed-workflow-sidecar-x86_64-unknown-linux-gnu --check-native
+        run: src-tauri/binaries/codemux-sidecar-x86_64-unknown-linux-gnu --codemux-role=managed-workflow --check-native
 
       - name: Stage agent-browser sidecar binary
         # `shell: bash` works on both Linux and windows-latest because Git
@@ -279,7 +274,7 @@ jobs:
           # plugin-appimage `:continuous` rebuild — see pre-cache step above)
           # but cheap insurance against a future similar incident.
           NO_STRIP: "true"
-          # Keep linuxdeploy's patchelf away from the Bun-compiled sidecars;
+          # Keep linuxdeploy's patchelf away from the Bun-compiled sidecar;
           # rewriting their rpath corrupts them and aborts the AppImage step.
           # See scripts/patchelf-skip-bun.sh.
           PATCHELF: ${{ github.workspace }}/scripts/patchelf-skip-bun.sh

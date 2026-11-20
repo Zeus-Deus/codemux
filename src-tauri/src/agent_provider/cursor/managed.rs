@@ -19,9 +19,10 @@ pub async fn spawn(
     if input.context_window.is_some() || input.fast_mode {
         return Err(ProviderError::ValidationError { message: "managed-start-rejected: Cursor SDK workflows do not support CLI context or fast mode overrides".into() });
     }
+    let (program, args) = managed_bridge::sidecar_command(ProviderKind::Cursor)?;
     let config = SpawnConfig {
-        program: managed_bridge::sidecar_path(ProviderKind::Cursor)?,
-        args: vec![],
+        program,
+        args,
         env: input.env.clone().unwrap_or_default(),
         cwd: Some(input.cwd.clone()),
         default_timeout: Duration::from_secs(45),

@@ -1,19 +1,17 @@
-//! Resolve the path to the bundled claude-agent sidecar binary.
+//! Resolve the path to the bundled claude-agent sidecar.
 //!
-//! The sidecar is a Bun-compiled TypeScript binary staged under
-//! `src-tauri/binaries/codemux-claude-sidecar-<triple>[.exe]` in dev
-//! builds and bundled into the installer via Tauri's `resources`
-//! mechanism in release builds. (Originally shipped via `externalBin`,
-//! moved to `resources` because linuxdeploy's patchelf step corrupts
-//! the ~100 MB bun-compiled binary — see commit 025fa19.) This module
-//! finds whichever copy is reachable from the current process.
+//! The Claude sidecar is the default role of the shared Bun executable
+//! `codemux-sidecar-<triple>[.exe]` (see [`crate::bundled_sidecar`]), staged
+//! under `src-tauri/binaries/` in dev builds and bundled into the installer
+//! via Tauri's `resources` mechanism in release builds. Claude is the
+//! binary's default role, so Claude spawn sites pass no role argument.
 //!
 //! Search order:
 //!   1. `CODEMUX_CLAUDE_SIDECAR_PATH` env var (tests and manual
 //!      overrides).
-//!   2. `<manifest-dir>/binaries/codemux-claude-sidecar-<triple>` —
+//!   2. `<manifest-dir>/binaries/codemux-sidecar-<triple>` —
 //!      the dev-tree location.
-//!   3. `<manifest-dir>/binaries/codemux-claude-sidecar` — an optional
+//!   3. `<manifest-dir>/binaries/codemux-sidecar` — an optional
 //!      triple-less fallback for environments that flatten names.
 //!
 //! Tauri resource-dir resolution is intentionally NOT attempted by
@@ -29,9 +27,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent_provider::{ProviderError, ProviderKind};
+use crate::bundled_sidecar::{self, SidecarRole};
 
 /// Env var honored as the highest-priority override.
-pub const SIDECAR_PATH_ENV: &str = "CODEMUX_CLAUDE_SIDECAR_PATH";
+pub const SIDECAR_PATH_ENV: &str = SidecarRole::Claude.path_env();
 
 /// Best-effort Rust target triple for the running binary.
 ///
@@ -54,45 +53,28 @@ pub fn target_triple() -> &'static str {
     }
 }
 
-/// `.exe` suffix on Windows, empty elsewhere. Kept private since
-/// callers only need the full resolved path.
-fn exe_suffix() -> &'static str {
-    if cfg!(windows) {
-        ".exe"
-    } else {
-        ""
-    }
-}
-
 /// Triple-qualified file name of the staged sidecar binary, e.g.
-/// `codemux-claude-sidecar-x86_64-unknown-linux-gnu[.exe]`. This is
-/// the name `scripts/build-claude-sidecar.sh` writes into
-/// `src-tauri/binaries/` and the name Tauri copies into the resource
-/// dir for release builds.
+/// `codemux-sidecar-x86_64-unknown-linux-gnu[.exe]`, shared with the other
+/// bundled roles. Tests that stage a fake sidecar use it.
 fn sidecar_binary_name() -> String {
-    format!("codemux-claude-sidecar-{}{}", target_triple(), exe_suffix())
-}
-
-/// The `CODEMUX_CLAUDE_SIDECAR_PATH` override, if set to a non-empty
-/// value. Highest-priority source everywhere the sidecar is resolved.
-fn env_override() -> Option<PathBuf> {
-    match std::env::var(SIDECAR_PATH_ENV) {
-        Ok(value) if !value.is_empty() => Some(PathBuf::from(value)),
-        _ => None,
-    }
+    bundled_sidecar::binary_name()
 }
 
 /// Candidate locations to probe, in priority order.
 fn candidate_paths() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Some(explicit) = env_override() {
+    if let Some(explicit) = bundled_sidecar::path_override(SidecarRole::Claude) {
         candidates.push(explicit);
     }
 
-    let binaries = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries");
+    let binaries = bundled_sidecar::dev_binaries_dir();
     candidates.push(binaries.join(sidecar_binary_name()));
-    candidates.push(binaries.join(format!("codemux-claude-sidecar{}", exe_suffix())));
+    candidates.push(binaries.join(format!(
+        "{}{}",
+        bundled_sidecar::BINARY_STEM,
+        bundled_sidecar::exe_suffix()
+    )));
 
     candidates
 }
@@ -116,7 +98,7 @@ pub fn resolve_sidecar_path() -> Result<PathBuf, ProviderError> {
         provider: ProviderKind::Claude,
         hint: format!(
             "claude-agent sidecar binary not found. Set {SIDECAR_PATH_ENV} or run \
-             `bash scripts/build-claude-sidecar.sh` to stage it. Searched: {listed}"
+             `bash scripts/build-sidecars.sh` to stage it. Searched: {listed}"
         ),
     })
 }
@@ -125,50 +107,17 @@ pub fn resolve_sidecar_path() -> Result<PathBuf, ProviderError> {
 /// Tauri `resource_dir` IS available (unlike the adapter-side
 /// [`resolve_sidecar_path`]). Returns the path that should be pinned
 /// into [`SIDECAR_PATH_ENV`] so downstream adapter code — which has no
-/// `AppHandle` — finds the same binary.
-///
-/// Priority:
-///   1. An already-set [`SIDECAR_PATH_ENV`] override — returned
-///      verbatim and never overridden, because the e2e suite and unit
-///      tests pin it explicitly.
-///   2. `<resource_dir>/binaries/codemux-claude-sidecar-<triple>` —
-///      the packaged/release location Tauri copies from the
-///      `resources` glob in `tauri.conf.json`.
-///   3. Debug builds only: `<CARGO_MANIFEST_DIR>/binaries/…` — the
-///      dev-tree copy staged by `scripts/build-claude-sidecar.sh`.
-///      `resource_dir` does NOT contain it under `npm run tauri:dev`,
-///      so without this fallback the chat GUI fails to spawn the
-///      sidecar in run-from-source builds. Compiled out of release
-///      builds via `debug_assertions`, so release resolution stays
-///      resource-dir only.
+/// `AppHandle` — finds the same binary. See [`bundled_sidecar::resolve`]
+/// for the priority order: an already-set override (returned verbatim),
+/// then the resource dir, then (debug builds only) the dev-tree copy that
+/// `npm run tauri:dev` does not stage into the resource dir.
 ///
 /// Returns `None` when the binary exists nowhere (e.g. a fresh
 /// checkout that never ran the build script); callers should leave the
 /// provider slot empty rather than panic — resolution then falls to
 /// `provider_not_configured` semantics.
 pub fn resolve_sidecar(resource_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Some(explicit) = env_override() {
-        return Some(explicit);
-    }
-
-    if let Some(dir) = resource_dir {
-        let candidate = dir.join("binaries").join(sidecar_binary_name());
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    {
-        let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("binaries")
-            .join(sidecar_binary_name());
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    None
+    bundled_sidecar::resolve(SidecarRole::Claude, resource_dir)
 }
 
 /// Assert the sidecar binary exists — used by the provider's health
@@ -237,7 +186,7 @@ mod tests {
         assert!(cps
             .iter()
             .any(|p| p.to_string_lossy().contains("binaries")
-                && p.to_string_lossy().contains("codemux-claude-sidecar")));
+                && p.to_string_lossy().contains("codemux-sidecar")));
     }
 
     #[test]
@@ -306,9 +255,7 @@ mod tests {
         // deterministic everywhere.
         let empty_resource = unique_tmp_dir();
         std::fs::create_dir_all(&empty_resource).unwrap();
-        let manifest_copy = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("binaries")
-            .join(sidecar_binary_name());
+        let manifest_copy = bundled_sidecar::dev_binaries_dir().join(sidecar_binary_name());
 
         let resolved = resolve_sidecar(Some(&empty_resource));
 
