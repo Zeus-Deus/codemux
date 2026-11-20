@@ -6,6 +6,9 @@
 //     node --test sidecar/codemux-sidecar.test.mjs
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { ROLE_ENV, selectRole } from "./sidecar-role.mjs";
 
@@ -34,18 +37,20 @@ test("no argument and no (or an empty) environment role means Claude", () => {
 
 const binary = process.env.CODEMUX_SIDECAR_TEST_BINARY;
 const skip = binary ? false : "set CODEMUX_SIDECAR_TEST_BINARY to the compiled codemux-sidecar";
-function run(args, { env = {}, input } = {}) {
-  const result = spawnSync(binary, args, {
+function run(args, { env = {}, input, cwd, program = binary } = {}) {
+  const result = spawnSync(program, args, {
+    cwd,
     // Only PATH and the variables under test: an inherited role must not leak in.
     env: { PATH: process.env.PATH, ...env }, input, encoding: "utf8", timeout: 30_000,
   });
   assert.equal(result.error, undefined);
   return result;
 }
+const PING = '{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}\n';
 const PLUGIN_HOST_CHECK = '{"protocol":1,"runtime":"codemux-plugin-host"}\n';
 
 test("compiled: no role runs the Claude sidecar", { skip }, () => {
-  const result = run([], { input: '{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}\n' });
+  const result = run([], { input: PING });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /"id":1,"result":\{"pong":true/);
 });
@@ -65,5 +70,21 @@ test("compiled: an unknown role fails before any program starts", { skip }, () =
     assert.equal(result.status, 2);
     assert.equal(result.stdout, "");
     assert.match(result.stderr, /unknown role "nope"/);
+  }
+});
+test("compiled: a .env or bunfig.toml in the working directory cannot change the role or run code", { skip }, (t) => {
+  // Sidecars run in the user's workspace. Check under the installed name and
+  // the SSH alias, both started without arguments.
+  const dir = mkdtempSync(join(tmpdir(), "codemux-sidecar-dotenv-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, ".env"), `${ROLE_ENV}=plugin-host\n`);
+  writeFileSync(join(dir, "bunfig.toml"), 'preload = ["./preload.mjs"]\n');
+  writeFileSync(join(dir, "preload.mjs"), 'process.stderr.write("workspace preload ran\\n"); process.exit(3);\n');
+  const alias = join(dir, `codemux-claude-sidecar${process.platform === "win32" ? ".exe" : ""}`);
+  copyFileSync(binary, alias);
+  for (const program of [binary, alias]) {
+    const result = run([], { input: PING, cwd: dir, program });
+    assert.equal(result.status, 0, `${program}: ${result.stderr}`);
+    assert.match(result.stdout, /"id":1,"result":\{"pong":true/, program);
   }
 });

@@ -21,6 +21,9 @@
 //      ordinary arguments gets the plugin host again rather than Claude, as
 //      when the plugin host was its own binary. It has to come from the
 //      launcher: Bun child processes do not see assignments to `process.env`.
+//      The binary is built without `.env`/bunfig autoloading
+//      (scripts/build-sidecars.sh), so a file in the working directory, which
+//      is usually the user's workspace, cannot set it.
 //   3. Claude. SSH devices install this binary as
 //      `~/.local/bin/codemux-claude-sidecar` and start it without arguments,
 //      as they did when it was a Claude-only binary.

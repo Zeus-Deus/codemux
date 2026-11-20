@@ -80,7 +80,14 @@ mkdir -p "$binary_dir" "$sidecar_dir/dist"
 # The Cursor SDK's native package is per-platform, so install the target's.
 (cd "$sidecar_dir/managed-workflow" && bun install --frozen-lockfile --os "$sdk_os" --cpu "$sdk_arch")
 
-(cd "$sidecar_dir" && bun build --compile --target="$bun_target" --outfile="$source_binary" codemux-sidecar.mjs)
+# A compiled Bun executable loads `.env` files and `bunfig.toml` from its
+# working directory by default. The sidecars run in the user's workspace, so
+# that would let a workspace file set CODEMUX_SIDECAR_ROLE, inject variables
+# into the Claude CLI's environment, or preload code. Codemux passes every
+# variable the sidecars need explicitly, so turn both off. (tsconfig.json and
+# package.json autoloading are already off by default.)
+(cd "$sidecar_dir" && bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
+  --target="$bun_target" --outfile="$source_binary" codemux-sidecar.mjs)
 if [ ! -s "$source_binary" ]; then
   rm -f "$stamp"
   log "ERROR: bun reported success but produced no usable binary at: $source_binary"
