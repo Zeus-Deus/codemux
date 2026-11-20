@@ -17,22 +17,25 @@
 ; without Codemux's exit handler, and the template's running-app check only
 ; looks for codemux.exe. Its Claude sidecar exits once its stdin closes and
 ; its plugin host is killed with its job object, but neither is instant. So
-; each file gets a few attempts, then is scheduled for deletion at the next
-; Windows restart (this needs rights to schedule it; an install without them
-; leaves the file and logs it). That never asks for a restart: the template's
-; finish page would offer one, selected, for a file nobody runs any more.
+; each file gets a few attempts over about 3.5 s. A file still in use after
+; that is left in place and logged, and the install still succeeds; this
+; hook runs on every install, so the next update deletes it. Nothing is
+; scheduled for deletion at restart: NSIS reports a reboot deletion as
+; scheduled even when an install without admin rights could not schedule
+; it, and Windows deletes by path, so a rollback to v0.27.0 before the
+; restart would lose its own sidecar.
 ;
-; CI (scripts/windows-claude-smoke.mjs) seeds the three files, installs with
-; `/S /UPDATE` while one is locked until the hook is retrying it, uninstalls
-; while one stays locked, and checks the outcome each time. To check a real
-; upgrade by hand: install v0.27.0, run the new `*-setup.exe /UPDATE` (or update
+; CI (scripts/windows-claude-smoke.mjs) seeds the three files and installs
+; with `/S /UPDATE` while one is released during the retries and one stays
+; locked throughout, then uninstalls, checking which files remain each time.
+; To check a real upgrade by hand: install v0.27.0, run the new `*-setup.exe /UPDATE` (or update
 ; in-app), and confirm the install directory's `binaries\` holds only
 ; `codemux-sidecar-*.exe` and `node_modules\`; then uninstall and confirm
 ; `binaries\` is gone.
 
 !include LogicLib.nsh
 
-; Attempts before falling back to deletion at restart, 500 ms apart.
+; Attempts per file, 500 ms apart.
 !define CODEMUX_RETIRED_SIDECAR_ATTEMPTS 8
 
 ; Uses $R1 as the attempt counter; the caller saves it.
@@ -40,15 +43,7 @@
   StrCpy $R1 0
   ${DoWhile} ${FileExists} "${FILE}"
     ${If} $R1 >= ${CODEMUX_RETIRED_SIDECAR_ATTEMPTS}
-      ; The flag is restored by the caller; here it reports whether this
-      ; file was scheduled.
-      SetRebootFlag false
-      Delete /REBOOTOK "${FILE}"
-      ${If} ${RebootFlag}
-        DetailPrint "Codemux: ${FILE} is in use; Windows will delete it at the next restart."
-      ${Else}
-        DetailPrint "Codemux: could not delete ${FILE}; it is in use."
-      ${EndIf}
+      DetailPrint "Codemux: ${FILE} is still in use; the next update will remove it."
       ${Break}
     ${EndIf}
     ${If} $R1 > 0
@@ -60,26 +55,14 @@
 !macroend
 
 !macro CODEMUX_DELETE_RETIRED_SIDECARS
-  Push $R0
   Push $R1
-  StrCpy $R0 0
-  ${If} ${RebootFlag}
-    StrCpy $R0 1
-  ${EndIf}
-  ; scripts/windows-claude-smoke.mjs locks the last file and releases it once
-  ; the first two are gone; keep the plugin host last.
+  ; scripts/windows-claude-smoke.mjs relies on this order: it takes the
+  ; first file's deletion as the sign that the hook is retrying the second.
   !insertmacro CODEMUX_DELETE_RETIRED_SIDECAR "$INSTDIR\binaries\codemux-claude-sidecar-x86_64-pc-windows-msvc.exe"
   !insertmacro CODEMUX_DELETE_RETIRED_SIDECAR "$INSTDIR\binaries\codemux-managed-workflow-sidecar-x86_64-pc-windows-msvc.exe"
   !insertmacro CODEMUX_DELETE_RETIRED_SIDECAR "$INSTDIR\binaries\codemux-plugin-host-x86_64-pc-windows-msvc.exe"
-  ; Restore the template's reboot flag, and clear the error flag the
-  ; attempts set (a template check must not see it).
-  ${If} $R0 = 1
-    SetRebootFlag true
-  ${Else}
-    SetRebootFlag false
-  ${EndIf}
   Pop $R1
-  Pop $R0
+  ; A failed attempt sets the error flag; a template check must not see it.
   ClearErrors
 !macroend
 

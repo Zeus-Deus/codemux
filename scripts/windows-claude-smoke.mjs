@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { readFile, writeFile, mkdir, rename, rm, stat } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, stat } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -16,14 +16,15 @@ const owned = new Set();
 function start(program, args, env = process.env, options = {}) {
   const child = spawn(program, args, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], ...options });
   owned.add(child);
-  child.once('exit', () => owned.delete(child));
+  child.once('close', () => owned.delete(child));
   child.once('error', () => owned.delete(child));
   let output = '';
   child.stdout.on('data', data => { output = (output + data).slice(-20000); });
   child.stderr.on('data', data => { output = (output + data).slice(-20000); });
+  // `close`, not `exit`: only then has all of the output been read.
   child.done = new Promise((done, fail) => {
     child.once('error', fail);
-    child.once('exit', code => done({ code, output }));
+    child.once('close', code => done({ code, output }));
   });
   child.done.catch(() => {});
   return child;
@@ -44,12 +45,12 @@ async function run(program, args, env, options) {
     return result.output;
   } finally { clearTimeout(timer); }
 }
-async function until(label, fn, timeout = 60000) {
+async function until(label, fn, timeout = 60000, interval = 250) {
   const deadline = Date.now() + timeout;
   let last;
   while (Date.now() < deadline) {
     try { const value = await fn(); if (value) return value; } catch (error) { last = error; }
-    await delay(250);
+    await delay(interval);
   }
   throw Error(`${label}: ${last?.message ?? 'timed out'}`);
 }
@@ -58,10 +59,11 @@ const exists = file => stat(file).then(() => true, error => {
   throw error;
 });
 // Holds `file` open with no sharing, as a still-running old sidecar holds its
-// .exe, until the returned function releases it.
+// .exe, until the returned function releases it. Resolves only once the
+// handle is open: a failed open stops the script before it prints `held`.
 async function holdOpen(file) {
   const holder = start('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    "$f = [System.IO.File]::Open($env:CODEMUX_HELD_FILE, 'Open', 'Read', 'None'); [Console]::Out.WriteLine('held'); [void][Console]::In.ReadLine(); $f.Close()"],
+    "$ErrorActionPreference = 'Stop'; $f = [System.IO.File]::Open($env:CODEMUX_HELD_FILE, 'Open', 'Read', 'None'); [Console]::Out.WriteLine('held'); [void][Console]::In.ReadLine(); $f.Close()"],
   { ...process.env, CODEMUX_HELD_FILE: file });
   const timer = setTimeout(() => { void stop(holder); }, 60000);
   try {
@@ -75,11 +77,6 @@ async function holdOpen(file) {
     const result = await holder.done;
     assert.equal(result.code, 0, result.output);
   };
-}
-// Whether Windows will delete `file` at the next restart.
-async function deletedAtRestart(file) {
-  const { output } = await start('reg.exe', ['query', 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager', '/v', 'PendingFileRenameOperations']).done;
-  return output.toLowerCase().includes(file.toLowerCase());
 }
 function rpc(program, env) {
   const child = start(program, [], env);
@@ -157,23 +154,18 @@ try {
   const installer = resolve(process.argv[2]);
   const appDir = join(process.env.RUNNER_TEMP, 'Codemux install with spaces');
   // Releases through v0.27.0 shipped these; src-tauri/windows/installer-hooks.nsh
-  // removes them after an install and before an uninstall. Seed them as an
-  // older install would have left them, and install the way the updater does.
+  // removes them after an install and before an uninstall, in this order,
+  // retrying one that is in use for about 3.5 s. Seed them as an older install
+  // would have left them, and install the way the updater does, with two held
+  // open as sidecars of the old app that are still exiting.
   const retiredSidecars = ['codemux-claude-sidecar', 'codemux-managed-workflow-sidecar', 'codemux-plugin-host']
     .map(name => join(appDir, 'binaries', `${name}-x86_64-pc-windows-msvc.exe`));
   const seedRetiredSidecars = () => Promise.all(retiredSidecars.map(file => writeFile(file, 'retired')));
-  const assertRetiredSidecarsGone = async when => {
-    for (const file of retiredSidecars) {
-      await assert.rejects(stat(file), { code: 'ENOENT' }, `${file} must not survive ${when}`);
-    }
-  };
-  // The hook deletes them in order and retries a file that is in use, so the
-  // last one is held open: a sidecar of the old app that is still exiting.
-  const heldRetired = retiredSidecars.at(-1);
-  const retiredOutcome = {};
+  const [unlocked, releasedDuringRetries, heldThroughout] = retiredSidecars;
   await mkdir(join(appDir, 'binaries'), { recursive: true });
   await seedRetiredSidecars();
-  let release = await holdOpen(heldRetired);
+  let releaseRetried = await holdOpen(releasedDuringRetries);
+  let releaseHeld = await holdOpen(heldThroughout);
   try {
     // NSIS requires /D= to be the final, unquoted argument, including spaces.
     const installing = start(installer, ['/S', '/UPDATE', `/D=${appDir}`], undefined, { windowsVerbatimArguments: true });
@@ -181,25 +173,23 @@ try {
     let exited = false;
     installing.done.then(() => { exited = true; });
     try {
-      // Once the others are gone the hook is retrying the held file.
-      await until('Install hook reaches the held retired sidecar', async () => {
-        if (exited) return true;
-        for (const file of retiredSidecars.slice(0, -1)) if (await exists(file)) return false;
-        return true;
-      }, 300000);
-      await release(); release = undefined;
+      // The first file's deletion means the hook has just started retrying
+      // the second. Release that one about 1 s into its retries: deleted only
+      // if the hook tries again.
+      await until('Install hook deletes the unlocked retired sidecar', async () => exited || !(await exists(unlocked)), 300000, 50);
+      await delay(1000);
+      await releaseRetried(); releaseRetried = undefined;
       const result = await installing.done;
+      // A file in use throughout must not fail the update.
       assert.equal(result.code, 0, `${installer}: ${result.output}`);
     } finally { clearTimeout(timer); }
-  } finally { await release?.(); }
-  // Released within its retries, it is deleted. Released too late, it must
-  // at least be scheduled for deletion at restart.
-  if (await exists(heldRetired)) {
-    assert.ok(await deletedAtRestart(heldRetired), `${heldRetired} survived the update install unscheduled`);
-    retiredOutcome.install = 'deleted-at-restart';
-    await rm(heldRetired);
-  } else retiredOutcome.install = 'deleted-after-release';
-  await assertRetiredSidecarsGone('an update install');
+    assert.equal(await exists(unlocked), false, `${unlocked} survived the update install`);
+    assert.equal(await exists(releasedDuringRetries), false, `${releasedDuringRetries} was released during the hook's retries but survived the update install`);
+    assert.equal(await exists(heldThroughout), true, `${heldThroughout} was in use throughout the update install but is gone`);
+  } finally {
+    await releaseRetried?.();
+    await releaseHeld(); releaseHeld = undefined;
+  }
   const bundledSidecar = join(appDir, 'binaries', 'codemux-sidecar-x86_64-pc-windows-msvc.exe');
   assert.ok((await stat(bundledSidecar)).size > 0, 'Installer must ship the Claude sidecar');
   evidence.bundledSidecar = bundledSidecar;
@@ -279,27 +269,18 @@ try {
   }
 
   // The uninstaller only knows the current resource list; the hook covers the
-  // retired files. `_?=` runs it in place and waits for it to finish. This
-  // time a held file stays in use throughout, so it must be scheduled for
-  // deletion at restart. Scheduling needs administrator rights, which hosted
-  // runners have; without them the hook can only log the file. A different
-  // file than above, so a restart entry left by the install cannot count.
+  // retired files. `_?=` runs it in place and waits for it to finish.
   await seedRetiredSidecars();
-  const stillRunning = retiredSidecars[0];
-  release = await holdOpen(stillRunning);
-  try {
-    await run(join(appDir, 'uninstall.exe'), ['/S', `_?=${appDir}`], undefined, { windowsVerbatimArguments: true });
-  } finally { await release(); release = undefined; }
-  for (const file of retiredSidecars.slice(1)) {
-    await assert.rejects(stat(file), { code: 'ENOENT' }, `${file} must not survive an uninstall`);
+  await run(join(appDir, 'uninstall.exe'), ['/S', `_?=${appDir}`], undefined, { windowsVerbatimArguments: true });
+  for (const file of retiredSidecars) {
+    assert.equal(await exists(file), false, `${file} survived the uninstall`);
   }
-  const elevated = (await start('net.exe', ['session']).done).code === 0;
-  if (elevated) assert.ok(await deletedAtRestart(stillRunning), `${stillRunning} survived the uninstall unscheduled`);
-  else assert.ok(await exists(stillRunning));
-  retiredOutcome.uninstall = elevated ? 'deleted-at-restart' : 'left-in-use-without-admin';
-  await rm(stillRunning);
   await assert.rejects(stat(bundledSidecar), { code: 'ENOENT' }, 'Uninstall must remove the bundled sidecar');
-  evidence.checks.push({ label: 'retired-sidecars-removed', ...retiredOutcome });
+  evidence.checks.push({
+    label: 'retired-sidecars',
+    install: { deleted: [unlocked, releasedDuringRetries], leftInUse: heldThroughout },
+    uninstall: { deleted: retiredSidecars },
+  });
 } catch (error) {
   evidence.failure = String(error.stack ?? error);
   throw error;
