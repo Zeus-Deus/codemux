@@ -3165,7 +3165,9 @@ pub fn notify_attention<R: tauri::Runtime>(
         //
         // No `default` action: a click then gets the platform's own handling.
         // GNOME Shell and KDE activate the sender app, and Omarchy's
-        // notification service focuses the sender's window.
+        // notification service focuses the sender's window. Stock mako only
+        // invokes advertised actions, so there a click just dismisses the
+        // popup; the urgency hint below is the remaining signal.
         let mut notification = Notification::new();
         notification.summary("Codemux").body(&body);
         #[cfg(all(unix, not(target_os = "macos")))]
