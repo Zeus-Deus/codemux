@@ -60,11 +60,14 @@ fn sibling_sidecar(exe: &Path) -> Option<PathBuf> {
 }
 /// Explicit overrides come first, the Claude-specific one before the shared
 /// multi-role one, then the runtime installed beside `codemux-remote`. `None`
-/// means none of these applies.
+/// means none of these applies. A relative override is resolved against
+/// `cwd`, this process's working directory, so the returned path still works
+/// when a child runs in the home directory or a workspace.
 fn resolve_explicit_or_sibling(
     claude_override: Option<std::ffi::OsString>,
     shared_override: Option<std::ffi::OsString>,
     exe: Option<&Path>,
+    cwd: Option<&Path>,
 ) -> Option<Result<PathBuf, String>> {
     use crate::agent_provider::claude::sidecar_path as sidecar;
     let overrides = [
@@ -74,6 +77,10 @@ fn resolve_explicit_or_sibling(
     for (value, name) in overrides {
         if let Some(explicit) = value.filter(|s| !s.is_empty()) {
             let path = PathBuf::from(explicit);
+            let path = match cwd {
+                Some(cwd) if path.is_relative() => cwd.join(path),
+                _ => path,
+            };
             return Some(if sidecar::is_executable(&path) {
                 Ok(path)
             } else {
@@ -88,10 +95,12 @@ fn resolve_explicit_or_sibling(
 fn resolve_sidecar() -> Result<PathBuf, String> {
     use crate::agent_provider::claude::sidecar_path as sidecar;
     let exe = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
     if let Some(resolved) = resolve_explicit_or_sibling(
         std::env::var_os(sidecar::SIDECAR_PATH_ENV),
         std::env::var_os(crate::bundled_sidecar::PATH_ENV),
         exe.as_deref(),
+        cwd.as_deref(),
     ) {
         return resolved;
     }
@@ -602,7 +611,7 @@ mod tests {
         let claude = executable_fixture("claude-sidecar");
         let exe = dir.path().join("codemux-remote");
         let resolve = |c: Option<&Path>, s: Option<&Path>| {
-            resolve_explicit_or_sibling(c.map(Into::into), s.map(Into::into), Some(&exe))
+            resolve_explicit_or_sibling(c.map(Into::into), s.map(Into::into), Some(&exe), None)
         };
         assert_eq!(resolve(None, None), Some(Ok(sibling)));
         assert_eq!(resolve(None, Some(&shared)), Some(Ok(shared.clone())));
@@ -611,6 +620,15 @@ mod tests {
         let missing = dir.path().join("missing");
         let err = resolve(None, Some(&missing)).unwrap().unwrap_err();
         assert!(err.contains(crate::bundled_sidecar::PATH_ENV), "{err}");
+        // A relative override is pinned to the launching directory, so a
+        // child started elsewhere still finds it.
+        let pinned = resolve_explicit_or_sibling(
+            None,
+            Some("shared-sidecar".into()),
+            Some(&exe),
+            Some(dir.path()),
+        );
+        assert_eq!(pinned, Some(Ok(shared)));
     }
     pub(super) fn request() -> LaunchRequest {
         LaunchRequest {
