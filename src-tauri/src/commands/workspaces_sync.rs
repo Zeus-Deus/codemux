@@ -385,7 +385,7 @@ pub async fn workspaces_sync_now<R: tauri::Runtime>(
             &snapshot,
         )?;
     }
-    crate::workspaces_sync::try_sync_with_app(&app).await
+    crate::workspaces_sync::sync_now_with_app(&app).await
 }
 
 // ─── Open on host (attach in place, no pull) ────────────────────

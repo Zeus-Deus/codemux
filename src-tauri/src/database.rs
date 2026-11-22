@@ -2244,6 +2244,20 @@ impl DatabaseStore {
             .unwrap_or_default()
     }
 
+    pub(crate) fn get_dirty_workspace_sync(&self, id: i64) -> Option<WorkspaceSyncRecord> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, server_id, workspace_id, title, host_server_id,
+                    project_path, project_remote, git_branch, git_head_sha,
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind, origin_path, default_branch
+             FROM workspaces_sync WHERE id = ?1 AND user_id = 'local' AND dirty = 1",
+            params![id],
+            row_to_workspace_sync,
+        )
+        .optional()
+        .unwrap_or(None)
+    }
+
     /// Bind a first-upload receipt even if a newer edit or close needs another push.
     pub(crate) fn mark_workspace_sync_pushed(
         &self,
@@ -3261,6 +3275,20 @@ impl DatabaseStore {
             }
         };
         rows.filter_map(|r| r.ok()).collect()
+    }
+
+    pub(crate) fn get_dirty_automation(&self, id: i64) -> Option<AutomationRecord> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!(
+                "SELECT {AUTOMATION_COLUMNS} FROM automations
+                 WHERE id = ?1 AND user_id = 'local' AND dirty = 1"
+            ),
+            params![id],
+            row_to_automation,
+        )
+        .optional()
+        .unwrap_or(None)
     }
 
     /// Bind a first-upload receipt even if a newer edit or close needs another push.

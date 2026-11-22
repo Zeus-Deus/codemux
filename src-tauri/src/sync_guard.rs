@@ -6,7 +6,8 @@
 //! write what the old account answered into the new account's data — the
 //! same contract `hosts_sync` keeps with its own session type.
 
-use std::sync::{Arc, Mutex, Weak};
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::auth::{api_base_url, is_token_expired, load_token, AuthState};
@@ -15,43 +16,33 @@ use crate::database::DatabaseStore;
 const LINKED_BUDGET: Duration = Duration::from_secs(60);
 const LINKED_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One first-upload batch per current session. A late receipt is guarded by
-/// its original auth generation, so a new session can use its own slot.
-pub(crate) struct CreateGate(Mutex<Option<CreateSlot>>);
+/// Track only rows being uploaded. A pending receipt keeps the same local
+/// row from being sent again or purged, even if the auth session changes.
+#[derive(Default)]
+pub(crate) struct InFlightCreates(Mutex<HashSet<i64>>);
 
-pub(crate) struct CreatePermit;
-
-struct CreateSlot {
-    generation: Option<u64>,
-    permit: Weak<CreatePermit>,
-}
-
-impl CreateGate {
-    pub(crate) const fn new() -> Self {
-        Self(Mutex::new(None))
+impl InFlightCreates {
+    pub(crate) fn try_start(&self, id: i64) -> Option<CreatePermit<'_>> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(id)
+            .then(|| CreatePermit { creates: self, id })
     }
 
-    /// Call under the registry lock. An unscoped, fixed-token caller shares
-    /// the existing slot, but cannot displace it.
-    pub(crate) fn try_acquire(&self, generation: Option<u64>) -> Option<Arc<CreatePermit>> {
-        let mut slot = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(owner) = slot.as_ref() {
-            let shares_slot = generation.is_none()
-                || owner.generation.is_none()
-                || owner.generation == generation;
-            if shares_slot && owner.permit.strong_count() != 0 {
-                return None;
-            }
-        }
-        let permit = Arc::new(CreatePermit);
-        *slot = Some(CreateSlot {
-            generation,
-            permit: Arc::downgrade(&permit),
-        });
-        Some(permit)
+    pub(crate) fn contains(&self, id: i64) -> bool {
+        self.0.lock().unwrap().contains(&id)
+    }
+}
+
+pub(crate) struct CreatePermit<'a> {
+    creates: &'a InFlightCreates,
+    id: i64,
+}
+
+impl Drop for CreatePermit<'_> {
+    fn drop(&mut self) {
+        self.creates.0.lock().unwrap().remove(&self.id);
     }
 }
 
@@ -195,15 +186,13 @@ impl<'a> SyncGuard<'a> {
     }
 }
 
-/// When each row of a registry was last sent, so a pass can try first the
-/// rows that waited longest. Rows that keep stalling then cannot keep a
-/// healthy row behind them from ever being reached before the budget ends.
+/// When each row became eligible or was last sent, so a pass can try first
+/// the rows that have waited longest.
 pub(crate) type Attempts =
     std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Instant>>>;
 
-/// Sort `rows` (by id) so the least recently attempted come first, never
-/// attempted before all. Entries for rows no longer waiting are dropped, so
-/// the record stays as small as the backlog.
+/// Sort oldest first, counting from admission for new work and from the last
+/// attempt for retries. Entries for rows no longer waiting are dropped.
 pub(crate) fn order_by_last_attempt<T>(
     attempts: &Attempts,
     rows: &mut [T],
@@ -212,9 +201,13 @@ pub(crate) fn order_by_last_attempt<T>(
     let mut attempts = attempts
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let waiting: std::collections::HashSet<i64> = rows.iter().map(&id).collect();
+    let waiting: HashSet<i64> = rows.iter().map(&id).collect();
     attempts.retain(|row_id, _| waiting.contains(row_id));
-    rows.sort_by_key(|row| (attempts.get(&id(row)).copied(), id(row)));
+    let now = Instant::now();
+    for row_id in waiting {
+        attempts.entry(row_id).or_insert(now);
+    }
+    rows.sort_by_key(|row| (attempts[&id(row)], id(row)));
 }
 
 /// Record that the row `id` is being sent now.
@@ -279,7 +272,22 @@ impl Coalescer {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthState, Coalescer, CreateGate, SyncGuard};
+    use super::{order_by_last_attempt, Attempts, Coalescer};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn fresh_rows_do_not_overtake_waiting_retries() {
+        let attempts: Attempts = std::sync::LazyLock::new(Default::default);
+        let now = Instant::now();
+        attempts.lock().unwrap().extend([
+            (1, now - Duration::from_secs(1)),
+            (2, now - Duration::from_secs(2)),
+        ]);
+
+        let mut rows = [3, 2, 1];
+        order_by_last_attempt(&attempts, &mut rows, |id| *id);
+        assert_eq!(rows, [2, 1, 3]);
+    }
 
     #[test]
     fn requests_during_a_pass_collapse_into_one_follow_up() {
@@ -298,29 +306,5 @@ mod tests {
         assert!(!background.finished_pass(), "and then the runner stops");
         assert!(background.request(), "the next request starts a new runner");
         assert!(!background.finished_pass());
-    }
-
-    #[test]
-    fn a_new_session_replaces_the_create_slot_and_rejects_the_old_commit() {
-        let auth = AuthState::default();
-        let gate = CreateGate::new();
-        let (old_generation, ()) = auth.session_snapshot(|| ());
-        let old_guard = SyncGuard::session(&auth, old_generation);
-        let old_permit = gate.try_acquire(Some(old_generation)).unwrap();
-        assert!(gate.try_acquire(Some(old_generation)).is_none());
-        assert!(
-            gate.try_acquire(None).is_none(),
-            "fixed calls share the slot"
-        );
-
-        let (new_generation, ()) = auth.replace_session_with_generation(|| ());
-        let new_guard = SyncGuard::session(&auth, new_generation);
-        let new_permit = gate.try_acquire(Some(new_generation)).unwrap();
-        assert!(old_guard.commit(|| panic!("stale commit")).is_err());
-        assert!(new_guard.commit(|| ()).is_ok());
-        drop(old_permit);
-        assert!(gate.try_acquire(Some(new_generation)).is_none());
-        drop(new_permit);
-        assert!(gate.try_acquire(Some(new_generation)).is_some());
     }
 }
