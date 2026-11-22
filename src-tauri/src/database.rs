@@ -2244,47 +2244,33 @@ impl DatabaseStore {
             .unwrap_or_default()
     }
 
-    pub(crate) fn get_dirty_workspace_sync(&self, id: i64) -> Option<WorkspaceSyncRecord> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT id, server_id, workspace_id, title, host_server_id,
-                    project_path, project_remote, git_branch, git_head_sha,
-                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind, origin_path, default_branch
-             FROM workspaces_sync WHERE id = ?1 AND user_id = 'local' AND dirty = 1",
-            params![id],
-            row_to_workspace_sync,
-        )
-        .optional()
-        .unwrap_or(None)
-    }
-
-    /// Bind a first-upload receipt even if a newer edit or close needs another push.
+    /// Clear dirty only if the linked row still matches the acknowledged write.
     pub(crate) fn mark_workspace_sync_pushed(
         &self,
         pushed: &WorkspaceSyncRecord,
-        server_id: Option<&str>,
     ) -> Result<(), String> {
-        self.finish_workspace_sync_push(pushed, server_id, false)
+        self.finish_workspace_sync_push(pushed, false)
     }
 
     /// Accept a confirmed server deletion if the PATCH snapshot still matches.
-    pub(crate) fn mark_workspace_sync_missing(&self, pushed: &WorkspaceSyncRecord) -> Result<(), String> {
-        self.finish_workspace_sync_push(pushed, None, true)
+    pub(crate) fn mark_workspace_sync_missing(
+        &self,
+        pushed: &WorkspaceSyncRecord,
+    ) -> Result<(), String> {
+        self.finish_workspace_sync_push(pushed, true)
     }
 
     fn finish_workspace_sync_push(
         &self,
         pushed: &WorkspaceSyncRecord,
-        server_id: Option<&str>,
         missing: bool,
     ) -> Result<(), String> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
             "UPDATE workspaces_sync SET dirty = 0,
                  deleted_at = CASE WHEN ?1 THEN datetime('now') ELSE deleted_at END,
                  updated_at = CASE WHEN ?1 THEN datetime('now') ELSE updated_at END
-             WHERE id = ?2 AND server_id IS ?3
+             WHERE id = ?2 AND server_id = ?3
                AND title IS ?4 AND host_server_id IS ?5 AND project_path IS ?6
                AND project_remote IS ?7 AND git_branch IS ?8 AND git_head_sha IS ?9
                AND project_uid IS ?10 AND workspace_kind IS ?11 AND deleted_at IS ?12",
@@ -2304,14 +2290,7 @@ impl DatabaseStore {
             ],
         )
         .map_err(|e| format!("Failed to acknowledge workspace sync row: {e}"))?;
-        if let Some(server_id) = server_id {
-            tx.execute(
-                "UPDATE workspaces_sync SET server_id = ?1 WHERE id = ?2 AND server_id IS NULL",
-                params![server_id, pushed.id],
-            )
-            .map_err(|e| format!("Failed to bind workspace sync row to its server ID: {e}"))?;
-        }
-        tx.commit().map_err(|e| e.to_string())
+        Ok(())
     }
 
     /// Clear dirty and optionally stamp the server ID.
@@ -2349,7 +2328,7 @@ impl DatabaseStore {
         Ok(())
     }
 
-    /// Idempotent upsert from a server pull. Always sets `dirty = 0`.
+    /// Idempotent upsert from a server pull. Writes clean rows.
     /// Does NOT clobber the local `workspace_id` if one is already
     /// stamped — adoption is sticky.
     ///
@@ -3277,47 +3256,27 @@ impl DatabaseStore {
         rows.filter_map(|r| r.ok()).collect()
     }
 
-    pub(crate) fn get_dirty_automation(&self, id: i64) -> Option<AutomationRecord> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            &format!(
-                "SELECT {AUTOMATION_COLUMNS} FROM automations
-                 WHERE id = ?1 AND user_id = 'local' AND dirty = 1"
-            ),
-            params![id],
-            row_to_automation,
-        )
-        .optional()
-        .unwrap_or(None)
-    }
-
-    /// Bind a first-upload receipt even if a newer edit or close needs another push.
-    pub(crate) fn mark_automation_pushed(
-        &self,
-        pushed: &AutomationRecord,
-        server_id: Option<&str>,
-    ) -> Result<(), String> {
-        self.finish_automation_push(pushed, server_id, false)
+    /// Clear dirty only if the linked row still matches the acknowledged write.
+    pub(crate) fn mark_automation_pushed(&self, pushed: &AutomationRecord) -> Result<(), String> {
+        self.finish_automation_push(pushed, false)
     }
 
     /// Accept a confirmed server deletion if the PATCH snapshot still matches.
     pub(crate) fn mark_automation_missing(&self, pushed: &AutomationRecord) -> Result<(), String> {
-        self.finish_automation_push(pushed, None, true)
+        self.finish_automation_push(pushed, true)
     }
 
     fn finish_automation_push(
         &self,
         pushed: &AutomationRecord,
-        server_id: Option<&str>,
         missing: bool,
     ) -> Result<(), String> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
             "UPDATE automations SET dirty = 0,
                  deleted_at = CASE WHEN ?1 THEN datetime('now') ELSE deleted_at END,
                  updated_at = CASE WHEN ?1 THEN datetime('now') ELSE updated_at END
-             WHERE id = ?2 AND server_id IS ?3
+             WHERE id = ?2 AND server_id = ?3
                AND name IS ?4 AND prompt IS ?5 AND agent IS ?6
                AND schedule IS ?7 AND timezone IS ?8 AND host_id IS ?9
                AND project_path IS ?10 AND project_remote IS ?11 AND enabled IS ?12
@@ -3340,14 +3299,7 @@ impl DatabaseStore {
             ],
         )
         .map_err(|e| format!("Failed to acknowledge automation: {e}"))?;
-        if let Some(server_id) = server_id {
-            tx.execute(
-                "UPDATE automations SET server_id = ?1 WHERE id = ?2 AND server_id IS NULL",
-                params![server_id, pushed.id],
-            )
-            .map_err(|e| format!("Failed to bind automation to its server ID: {e}"))?;
-        }
-        tx.commit().map_err(|e| e.to_string())
+        Ok(())
     }
 
     /// Clear dirty and optionally stamp the server ID.
@@ -3369,7 +3321,7 @@ impl DatabaseStore {
     }
 
     /// Upsert a row received from the server, matched by `server_id`.
-    /// Always written `dirty = 0` (server rows are authoritative).
+    /// Writes clean rows.
     /// `next_run_at` / `last_run_at` are derived per-device and are not
     /// carried over the wire, so a server upsert leaves them untouched.
     ///

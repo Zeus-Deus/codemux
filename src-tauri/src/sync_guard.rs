@@ -1,13 +1,7 @@
-//! Keeping an account sync run on the account it started for, and within
-//! its time.
-//!
-//! A run resolves the signed-in session once. After a sign-out or account
-//! switch it must not send anything more with that session's token, nor
-//! write what the old account answered into the new account's data — the
-//! same contract `hosts_sync` keeps with its own session type.
+//! Bound the time spent syncing linked rows and keep each signed-in pass
+//! tied to the session it started with.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::auth::{api_base_url, is_token_expired, load_token, AuthState};
@@ -15,36 +9,6 @@ use crate::database::DatabaseStore;
 
 const LINKED_BUDGET: Duration = Duration::from_secs(60);
 const LINKED_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Track only rows being uploaded. A pending receipt keeps the same local
-/// row from being sent again or purged, even if the auth session changes.
-#[derive(Default)]
-pub(crate) struct InFlightCreates(Mutex<HashSet<i64>>);
-
-impl InFlightCreates {
-    pub(crate) fn try_start(&self, id: i64) -> Option<CreatePermit<'_>> {
-        self.0
-            .lock()
-            .unwrap()
-            .insert(id)
-            .then(|| CreatePermit { creates: self, id })
-    }
-
-    pub(crate) fn contains(&self, id: i64) -> bool {
-        self.0.lock().unwrap().contains(&id)
-    }
-}
-
-pub(crate) struct CreatePermit<'a> {
-    creates: &'a InFlightCreates,
-    id: i64,
-}
-
-impl Drop for CreatePermit<'_> {
-    fn drop(&mut self) {
-        self.creates.0.lock().unwrap().remove(&self.id);
-    }
-}
 
 pub(crate) fn signed_in_token(auth: &AuthState, db: &DatabaseStore) -> (u64, Option<String>) {
     auth.session_snapshot(|| {
@@ -62,31 +26,19 @@ pub(crate) struct SyncRequest<'a> {
 
 impl<'a> SyncRequest<'a> {
     pub(crate) fn linked(token: &'a str, guard: SyncGuard<'a>) -> Self {
-        Self::new(token, guard.within(LINKED_BUDGET))
-    }
-
-    pub(crate) fn new(token: &'a str, guard: SyncGuard<'a>) -> Self {
         Self {
             token,
             base: api_base_url(),
-            guard,
+            guard: guard.within(LINKED_BUDGET),
             client: reqwest::Client::new(),
         }
     }
 
     pub(crate) fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let bounded = method != reqwest::Method::POST;
-        let request = self
-            .client
+        self.client
             .request(method, format!("{}{path}", self.base))
-            .bearer_auth(self.token);
-        if bounded {
-            request.timeout(LINKED_REQUEST_TIMEOUT)
-        } else {
-            // A first POST can commit before its receipt reaches us. Keep
-            // reading the receipt even when it outlasts a linked pass.
-            request
-        }
+            .bearer_auth(self.token)
+            .timeout(LINKED_REQUEST_TIMEOUT)
     }
 
     pub(crate) async fn send(
@@ -116,11 +68,6 @@ pub(crate) fn combine(pull: Result<(), String>, push: Result<(), String>) -> Res
         (Ok(()), Err(p)) => Err(format!("push failed: {p}")),
         (Err(a), Err(b)) => Err(format!("pull failed: {a}; push failed: {b}")),
     }
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub(crate) struct CreateReceipt {
-    pub(crate) id: String,
 }
 
 /// The session a sync run works for, and when it must stop starting
@@ -193,11 +140,7 @@ pub(crate) type Attempts =
 
 /// Sort oldest first, counting from admission for new work and from the last
 /// attempt for retries. Entries for rows no longer waiting are dropped.
-pub(crate) fn order_by_last_attempt<T>(
-    attempts: &Attempts,
-    rows: &mut [T],
-    id: impl Fn(&T) -> i64,
-) {
+pub(crate) fn order_by_last_attempt<T>(attempts: &Attempts, rows: &mut [T], id: impl Fn(&T) -> i64) {
     let mut attempts = attempts
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -218,61 +161,9 @@ pub(crate) fn record_attempt(attempts: &Attempts, id: i64) {
         .insert(id, Instant::now());
 }
 
-/// Coalesces fire-and-forget sync requests: one pass runs at a time, and
-/// any number of requests made meanwhile collapse into a single follow-up
-/// pass, which starts after the last of them — so nothing a request was
-/// made for is missed, and nothing piles up.
-#[derive(Default)]
-pub(crate) struct Coalescer {
-    state: std::sync::Mutex<(bool, bool)>,
-}
-
-impl Coalescer {
-    pub(crate) const fn new() -> Self {
-        Self {
-            state: std::sync::Mutex::new((false, false)),
-        }
-    }
-
-    /// A pass is wanted. `true`: the caller starts the runner; `false`: one
-    /// is running and will make a follow-up pass.
-    pub(crate) fn request(&self) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (running, again) = &mut *state;
-        if *running {
-            *again = true;
-            false
-        } else {
-            *running = true;
-            *again = false;
-            true
-        }
-    }
-
-    /// The runner finished a pass. `true`: run another, for requests made
-    /// during it; `false`: the runner is done.
-    pub(crate) fn finished_pass(&self) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (running, again) = &mut *state;
-        if *again {
-            *again = false;
-            true
-        } else {
-            *running = false;
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{order_by_last_attempt, Attempts, Coalescer};
+    use super::{order_by_last_attempt, Attempts};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -287,24 +178,5 @@ mod tests {
         let mut rows = [3, 2, 1];
         order_by_last_attempt(&attempts, &mut rows, |id| *id);
         assert_eq!(rows, [2, 1, 3]);
-    }
-
-    #[test]
-    fn requests_during_a_pass_collapse_into_one_follow_up() {
-        let background = Coalescer::new();
-        assert!(background.request(), "the first request starts the runner");
-        for _ in 0..5 {
-            assert!(
-                !background.request(),
-                "a running pass absorbs further requests"
-            );
-        }
-        assert!(
-            background.finished_pass(),
-            "they get exactly one follow-up pass"
-        );
-        assert!(!background.finished_pass(), "and then the runner stops");
-        assert!(background.request(), "the next request starts a new runner");
-        assert!(!background.finished_pass());
     }
 }

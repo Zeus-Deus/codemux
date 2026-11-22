@@ -380,9 +380,16 @@ pub fn set_webhook_signature_impl(
     Ok(record.into())
 }
 
-/// Coalesce background syncs triggered by mutations or scheduler ticks.
+/// Fire-and-forget background sync after a mutation, so the user's
+/// other devices pick up the change within seconds. A failed sync is
+/// logged, not surfaced — the row stays `dirty` and the next sync
+/// retries. Mirrors `commands::hosts::schedule_background_sync`.
 pub fn schedule_automations_sync<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
-    crate::automations_sync::schedule_background_sync(app);
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = crate::automations_sync::try_sync_with_app(&app).await {
+            eprintln!("[codemux::automations] background sync failed: {error}");
+        }
+    });
 }
 
 // ── Tauri command surface ──
