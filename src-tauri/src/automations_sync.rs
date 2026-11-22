@@ -14,7 +14,6 @@
 //! treated as "endpoint not deployed yet" — a harmless skip.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -77,10 +76,6 @@ struct AutomationUpsertBody<'a> {
     retention_limit: i64,
 }
 
-/// Guards against overlapping sync runs (foreground sync vs. the
-/// fire-and-forget sync each mutation triggers).
-static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-
 /// Build the two host-identity maps: local `host_id` → `server_id`, and
 /// `server_id` → local `host_id`. Only hosts that have synced (have a
 /// `server_id`) appear.
@@ -107,11 +102,20 @@ pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> 
     let Some(token) = valid_token(&db) else {
         return Ok(());
     };
-    sync_locked(&token, &db).await
+    sync_locked(&token, &db, true).await
 }
 
-async fn sync_locked(token: &str, db: &DatabaseStore) -> Result<(), String> {
-    let pull_err = pull_locked(token, db, None).await.err();
+async fn sync_locked(
+    token: &str,
+    db: &DatabaseStore,
+    push_after_pull_error: bool,
+) -> Result<(), String> {
+    let pull = pull_locked(token, db, None).await;
+    if !push_after_pull_error {
+        pull?;
+        return push_locked(token, db).await;
+    }
+    let pull_err = pull.err();
     let push_err = push_locked(token, db).await.err();
     match (pull_err, push_err) {
         (None, None) => Ok(()),
@@ -447,20 +451,12 @@ async fn push_delete(
     Ok(())
 }
 
-/// Foreground sync with the in-progress guard. Used at scheduler
-/// startup and by the periodic pull in the tick loop.
+/// Foreground sync with a fixed token. Skip if another pass owns the lock.
 pub async fn sync_automations(token: &str, db: &DatabaseStore) -> Result<(), String> {
-    if SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+    let Ok(_one_at_a_time) = SYNC_LOCK.try_lock() else {
         return Ok(());
-    }
-    let result = async {
-        pull(token, db, None).await?;
-        push(token, db).await?;
-        Ok(())
-    }
-    .await;
-    SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-    result
+    };
+    sync_locked(token, db, false).await
 }
 
 #[cfg(test)]
@@ -670,6 +666,13 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let db = std::sync::Arc::new(init_test_database());
         let id = db.insert_automation(&sample_input()).unwrap().id;
+        let pull = server
+            .mock("GET", "/api/automations")
+            .match_header("authorization", "Bearer fixed-token")
+            .with_status(200)
+            .with_body(r#"{"automations":[]}"#)
+            .create_async()
+            .await;
         let upload = server
             .mock("POST", "/api/automations")
             .with_status(200)
@@ -694,7 +697,7 @@ mod tests {
 
         std::env::set_var("CODEMUX_API_URL", server.url());
         let result = async {
-            push("token", &db).await?;
+            sync_automations("fixed-token", &db).await?;
             let pending = db.list_dirty_automations().pop();
             push("token", &db).await?;
             Ok::<_, String>(pending)
@@ -706,6 +709,7 @@ mod tests {
         assert_eq!(pending.server_id.as_deref(), Some("srv-new"));
         assert!(!pending.enabled);
         assert!(db.list_dirty_automations().is_empty());
+        pull.assert_async().await;
         upload.assert_async().await;
         patch.assert_async().await;
     }
