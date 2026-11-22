@@ -195,6 +195,20 @@ pub(crate) struct RunningServer {
     shutdown: tokio::sync::watch::Sender<bool>,
 }
 
+/// The shutdown signal for the exact LAN listener that accepted a request.
+#[derive(Clone)]
+pub(crate) struct ListenerLife(pub(crate) tokio::sync::watch::Receiver<bool>);
+
+impl ListenerLife {
+    pub(crate) fn live(&self) -> bool {
+        !*self.0.borrow()
+    }
+
+    async fn stopped(&mut self) {
+        let _ = self.0.wait_for(|stopped| *stopped).await;
+    }
+}
+
 /// Everything shared across the server, its handlers, and the commands.
 /// Lives behind an `Arc` inside the managed [`WebRemoteState`] and is
 /// constructed before the Tauri app exists (the channel interceptor in
@@ -1050,12 +1064,10 @@ async fn bind_listeners<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) ->
     }
 
     for (listener, mut shutdown_rx) in servers {
-        // Webhook intake reads this listener's own shutdown flag, so a
-        // delivery still uploading when the listener is stopped or replaced
-        // never starts a run.
-        let router = server::router(app.clone()).layer(axum::Extension(
-            crate::automations::webhook_http::ListenerLife(shutdown_rx.clone()),
-        ));
+        // In-flight webhook deliveries and browser upgrades belong to this
+        // listener even when a replacement has already started.
+        let router = server::router(app.clone())
+            .layer(axum::Extension(ListenerLife(shutdown_rx.clone())));
         tokio::spawn(async move {
             let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
             let result = axum::serve(listener, service)
@@ -1762,10 +1774,9 @@ pub fn web_remote_reject_session<R: Runtime>(
     session_id: String,
 ) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
-    // Close live sockets first, then erase the pending row entirely.
-    shared.connections.close_session(&session_id);
     app.state::<crate::database::DatabaseStore>()
         .web_remote_delete_session(&session_id)?;
+    shared.connections.close_session(&session_id);
     emit_state_changed(&app);
     Ok(build_status(&app, &shared))
 }

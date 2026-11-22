@@ -360,6 +360,7 @@ impl<R: Runtime> WorkspaceLaunchHost<R> {
         let mut caller = caller.clone();
         let control = caller.control.as_mut().ok_or("stale_caller: workspace launch requires authenticated chat authority")?;
         service::authorize_native(&app, control, false).map_err(|e|e.to_string())?;
+        let shutdown_admission = crate::web_remote::serve::ShutdownAdmission::admit(&self.app)?;
         let epoch = app.state::<crate::agent_control::NativeControlState>().epoch.clone();
         let thread = uuid::Uuid::new_v4().to_string();
         let admission = control.admit(|| app.state::<crate::database::DatabaseStore>().admit_control_operation_for_thread(
@@ -368,6 +369,8 @@ impl<R: Runtime> WorkspaceLaunchHost<R> {
         let operation = admission.receipt.operation_id;
         if control.thread_id().is_some() {control.admitted=Some(crate::agent_control::AdmittedAuthority::Operation {operation_id:operation.clone()});}
         tauri::async_runtime::spawn(async move {
+            // The tool returns before this task updates the workspace layout.
+            let _shutdown_admission = shutdown_admission;
             let outcome = start(&app, &caller, input, provider, target, repo, branch, base, &thread).await;
             if outcome.is_err() {
                 let _ = app.state::<crate::database::DatabaseStore>().orchestration_launch_finished(&thread);

@@ -1041,6 +1041,22 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
         }
         return control_response(Err(error.to_string()));
     }
+    // Registry tools use their own access class for admission. Legacy writes
+    // need a lease across their handler, including async worktree setup.
+    let _shutdown_lease = if request.command != "tool_call"
+        && !crate::agent_control::registry::is_socket_alias(&request.command)
+    {
+        match crate::web_remote::serve::ShutdownAdmission::admit(app) {
+            Ok(lease) if required != crate::agent_control::Access::Read => lease,
+            Ok(_) => None,
+            Err(error) => return control_response(Err(crate::agent_control::ControlError::new(
+                crate::agent_control::ErrorCode::AppUnavailable,
+                error,
+            ).to_string())),
+        }
+    } else {
+        None
+    };
     let result = match request.command.as_str() {
         "delegation_local_context" => match request.params.get("threadId").or_else(||request.params.get("thread_id")).and_then(Value::as_str) {
             Some(thread)=>crate::commands::delegation::delegation_local_context(app.clone(),thread.into()).await,
@@ -1516,15 +1532,18 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
             // existing `close_pane_impl`. State-layer `close_pane`
             // handles the last-pane case by removing the surface + tab;
             // workspace stays open until explicitly closed.
-            let state: State<'_, AppStateStore> = app.state();
             let pane_id = request
                 .params
                 .get("pane_id")
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .ok_or_else(|| "Missing required parameter: pane_id".to_string());
-            pane_id.and_then(|pid| {
-                crate::commands::workspace::close_pane_impl(app.clone(), &state, pid.clone())
+            match pane_id {
+                Ok(pid) => {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let state = app.state::<AppStateStore>();
+                        crate::commands::workspace::close_pane_impl(app.clone(), &state, pid.clone())
                     .map(|removed_session_id| {
                         serde_json::json!({
                             "pane_id": pid,
@@ -1532,7 +1551,10 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                             "removed_session_id": removed_session_id,
                         })
                     })
-            })
+                    }).await.map_err(|error| error.to_string()).and_then(|result| result)
+                }
+                Err(error) => Err(error),
+            }
         }
         // ── Monitoring (provider-agnostic) ───────────────────────────────
         //
@@ -1960,11 +1982,7 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                     state.active_workspace_cwd().map(|(_, cwd)| cwd)
                 });
             let store: State<'_, indexing::ProjectIndexStore> = app.state();
-            indexing::rebuild_index(project_root)
-                .map(|snapshot| {
-                    store.replace_snapshot(snapshot.clone());
-                    snapshot
-                })
+            indexing::rebuild_index(&store, project_root)
                 .and_then(|snapshot| serde_json::to_value(snapshot).map_err(|error| error.to_string()))
         }
         "index_status" => {

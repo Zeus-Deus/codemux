@@ -5,6 +5,7 @@ import {
   clearAgentChatAttach,
   registerAgentChatAttach,
 } from "@/lib/agent-chat/attach-registry";
+import { releaseRemoteChannel } from "@/remote/channel";
 import { useRemoteReconnectEpoch } from "@/remote/remote-connection-store";
 import {
   attachAgentChatOutput,
@@ -70,10 +71,12 @@ export function useAgentChatEvents(
     // would miss it for good (see lib/agent-chat/attach-registry.ts).
     registerAgentChatAttach(threadId, attached);
     attached.catch((error) => {
+      if (!cancelled) releaseRemoteChannel(channel.id);
       console.error("[agent-chat] attach_agent_chat_output failed:", error);
     });
     return () => {
       cancelled = true;
+      releaseRemoteChannel(channel.id);
       clearAgentChatAttach(threadId, attached);
       // Serialize detach behind the attach so out-of-order delivery
       // can't detach before the attach registers. The generation

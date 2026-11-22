@@ -902,6 +902,11 @@ async fn hermes_workspace_delete_is_blocked_even_with_force() {
 #[tokio::test]
 async fn hermes_deletion_rechecks_cleanup_hold_under_lifecycle_lock() {
     use tauri::Manager;
+    const TEST: &str = "agent_provider::hermes::tests::hermes_deletion_rechecks_cleanup_hold_under_lifecycle_lock";
+    if crate::test_isolation::isolated(TEST) {
+        return;
+    }
+
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let work = root.path().join("work");
@@ -934,7 +939,9 @@ async fn hermes_deletion_rechecks_cleanup_hold_under_lifecycle_lock() {
     }
     let app = tauri::test::mock_app();
     app.manage(crate::state::AppStateStore::default());
-    app.manage(crate::database::init_test_database());
+    app.manage(crate::database::DatabaseStore::test_file(
+        &root.path().join("state.sqlite"),
+    ));
     app.manage(crate::terminal::PtyState::default());
     let state = app.state::<crate::state::AppStateStore>();
     let db = app.state::<crate::database::DatabaseStore>();
@@ -953,14 +960,18 @@ async fn hermes_deletion_rechecks_cleanup_hold_under_lifecycle_lock() {
     tokio::pin!(deleting);
     // Everything before the delete, including the state close, proceeds
     // while a Hermes start holds the lock.
-    for _ in 0..1000 {
-        assert!(futures_util::poll!(&mut deleting).is_pending());
-        if !state.snapshot().workspaces.iter().any(|w| w.workspace_id == workspace) {
-            break;
+    let workspace_closed = async {
+        while state.find_workspace(&workspace.0).is_some() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    tokio::select! {
+        biased;
+        result = &mut deleting => panic!("Deletion completed before the lifecycle hold was recorded: {result:?}"),
+        closed = tokio::time::timeout(Duration::from_secs(5), workspace_closed) => {
+            closed.expect("Workspace close should finish while Hermes holds the lifecycle lock");
+        }
     }
-    assert!(!state.snapshot().workspaces.iter().any(|w| w.workspace_id == workspace));
     let mut binding = test_binding(root.path());
     binding.workspace_id = None;
     binding.cwd = work.canonicalize().unwrap();

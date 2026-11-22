@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
-import { attachPtyOutput, createBrowserPane, getTerminalScrollback, resizePty, writeToPty } from "@/tauri/commands";
+import { attachPtyOutput, createBrowserPane, getTerminalScrollback, resizePty, restartTerminalSession, writeToPty } from "@/tauri/commands";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
+import { remoteViewHost, setRemoteViewHost } from "@/remote/client-view";
 import {
   flushAllTeardowns,
   setTeardownScheduler,
@@ -24,6 +25,7 @@ const h = vi.hoisted(() => ({
   webgls: [] as { index: number; disposed: number }[],
   serializeCalls: 0,
   serializeAddons: 0,
+  nextChannelId: 0,
   mobile: false,
   tabCount: 1,
   split: false,
@@ -33,6 +35,8 @@ const h = vi.hoisted(() => ({
     exit_code: null as number | null,
   },
   sessionState: "ready",
+  sessionRemoved: false,
+  restartToken: "original-shell" as string | undefined,
   sessionCols: 80,
   sessionRows: 24,
   parse: null as (() => void) | null,
@@ -192,7 +196,9 @@ vi.mock("./webgl-renderer-probe", () => ({
 
 vi.mock("./terminal-write-pump", () => ({
   createWritePump: () => ({
-    enqueue: () => {},
+    enqueue: (data: Uint8Array) => {
+      if (new TextDecoder().decode(data).includes("shell restarted")) h.log.push("restart-marker");
+    },
     enqueueString: () => {
       const terminal = h.terminals[h.terminals.length - 1]!;
       h.log.push(`restore:${terminal.cols}x${terminal.rows}`);
@@ -227,6 +233,7 @@ vi.mock("@/tauri/commands", () => ({
   resumePtyOutput: vi.fn(async () => {}),
   getTerminalStatus: vi.fn(async (session_id: string) => ({
     session_id,
+    restart_token: h.restartToken,
     ...h.status,
   })),
   restartTerminalSession: vi.fn(async () => {
@@ -243,6 +250,7 @@ vi.mock("@/tauri/commands", () => ({
     h.log.push("uncache");
   }),
   Channel: class {
+    id = h.nextChannelId++;
     constructor(_onmessage: (payload: unknown) => void) {}
   },
 }));
@@ -325,7 +333,7 @@ vi.mock("@/stores/app-store", () => ({
             rows: h.sessionRows,
             adapter_captures: {},
           },
-        ],
+        ].filter((session) => !h.sessionRemoved || session.session_id !== "sess-a"),
       },
     }),
   }),
@@ -676,7 +684,14 @@ describe("TerminalPane exited shell", () => {
     h.webgls.length = 0;
     h.serializeAddons = 0;
     h.mobile = false;
+    h.holdParse = false;
+    h.parse = null;
+    h.fitCols = 80;
+    h.fitRows = 24;
+    detachPtyOutput.mockClear();
     vi.mocked(attachPtyOutput).mockClear();
+    vi.mocked(resizePty).mockReset().mockResolvedValue(undefined);
+    vi.mocked(restartTerminalSession).mockClear();
   });
 
   afterEach(() => {
@@ -685,10 +700,16 @@ describe("TerminalPane exited shell", () => {
     setTeardownScheduler(null);
     h.status = { state: "ready", message: null, exit_code: null };
     h.sessionState = "ready";
+    h.sessionRemoved = false;
+    h.restartToken = "original-shell";
+    vi.unstubAllGlobals();
   });
 
   it("says the process exited and restarts the shell in place", async () => {
     schedulerHarness();
+    const unregisterCallback = vi.fn();
+    vi.stubGlobal("__CODEMUX_REMOTE__", true);
+    vi.stubGlobal("__TAURI_INTERNALS__", { unregisterCallback });
     h.status = { state: "exited", message: "Shell exited with code 2", exit_code: 2 };
     h.sessionState = "exited";
     const view = renderPane("sess-a");
@@ -698,16 +719,246 @@ describe("TerminalPane exited shell", () => {
     expect(view.getByText("Exit code 2")).toBeTruthy();
     expect(view.queryByText("Terminal starting")).toBeNull();
     expect(attachPtyOutput).toHaveBeenCalledTimes(1);
+    const first = vi.mocked(attachPtyOutput).mock.calls[0][1].id;
 
     await act(async () => {
       fireEvent.click(view.getByRole("button", { name: "Restart shell" }));
     });
 
     expect(h.log).toContain("restart");
+    expect(restartTerminalSession).toHaveBeenCalledExactlyOnceWith("sess-a", "original-shell");
     // The respawned runtime has no subscribers, so the pane attaches again.
     expect(attachPtyOutput).toHaveBeenCalledTimes(2);
+    const second = vi.mocked(attachPtyOutput).mock.calls[1][1].id;
+    expect(unregisterCallback.mock.calls).toEqual([[first]]);
     // Still the same xterm: the old output stays above the restart marker.
     expect(h.terminals).toHaveLength(1);
+    view.unmount();
+    expect(unregisterCallback.mock.calls).toEqual([[first], [second]]);
+  });
+
+  it("requires a host lifecycle token for a deferred restart", async () => {
+    schedulerHarness();
+    h.status = { state: "exited", message: null, exit_code: 0 };
+    h.sessionState = "exited";
+    h.restartToken = undefined;
+    let finishAttach!: (generation: number) => void;
+    vi.mocked(attachPtyOutput).mockReturnValueOnce(new Promise(resolve => { finishAttach = resolve; }));
+    const view = renderPane("sess-a");
+    await act(async () => {});
+
+    fireEvent.click(view.getByRole("button", { name: "Restart shell" }));
+    expect(restartTerminalSession).not.toHaveBeenCalled();
+    await act(async () => finishAttach(1));
+
+    expect(restartTerminalSession).not.toHaveBeenCalled();
+    expect(view.getByText(/Update Codemux on the host to restart this shell safely/)).toBeTruthy();
+  });
+
+  it("supersedes the mount attach while its scrollback is still parsing", async () => {
+    schedulerHarness();
+    const unregisterCallback = vi.fn();
+    vi.stubGlobal("__CODEMUX_REMOTE__", true);
+    vi.stubGlobal("__TAURI_INTERNALS__", { unregisterCallback });
+    h.status = { state: "exited", message: null, exit_code: 0 };
+    h.sessionState = "exited";
+    h.holdParse = true;
+    const view = renderPane("sess-a");
+    await act(async () => {});
+    const finishMountParse = h.parse;
+    expect(finishMountParse).not.toBeNull();
+    expect(attachPtyOutput).not.toHaveBeenCalled();
+
+    h.holdParse = false;
+    await act(async () => fireEvent.click(view.getByRole("button", { name: "Restart shell" })));
+    await act(async () => finishMountParse?.());
+    expect(attachPtyOutput).toHaveBeenCalledOnce();
+    const channel = vi.mocked(attachPtyOutput).mock.calls[0][1];
+    view.unmount();
+    expect(unregisterCallback.mock.calls).toEqual([[channel.id]]);
+    expect(detachPtyOutput).toHaveBeenCalledExactlyOnceWith("sess-a", 1);
+  });
+
+  it("detaches an in-flight mount before restart can reuse its generation", async () => {
+    schedulerHarness();
+    const unregisterCallback = vi.fn();
+    vi.stubGlobal("__CODEMUX_REMOTE__", true);
+    vi.stubGlobal("__TAURI_INTERNALS__", { unregisterCallback });
+    h.status = { state: "exited", message: null, exit_code: 0 };
+    h.sessionState = "exited";
+    let finishAttach!: (generation: number) => void;
+    vi.mocked(attachPtyOutput).mockReturnValueOnce(new Promise(resolve => { finishAttach = resolve; }));
+    const view = renderPane("sess-a");
+    await act(async () => {});
+    const mountChannel = vi.mocked(attachPtyOutput).mock.calls[0][1];
+
+    await act(async () => fireEvent.click(view.getByRole("button", { name: "Restart shell" })));
+    expect(h.log).not.toContain("restart");
+    expect(unregisterCallback.mock.calls).toEqual([[mountChannel.id]]);
+
+    await act(async () => finishAttach(1));
+    expect(h.log.indexOf("detach")).toBeLessThan(h.log.indexOf("restart"));
+    expect(detachPtyOutput).toHaveBeenCalledExactlyOnceWith("sess-a", 1);
+    expect(attachPtyOutput).toHaveBeenCalledTimes(2);
+    const replacement = vi.mocked(attachPtyOutput).mock.calls[1][1];
+    view.unmount();
+    expect(unregisterCallback.mock.calls).toEqual([[mountChannel.id], [replacement.id]]);
+    expect(detachPtyOutput.mock.calls).toEqual([["sess-a", 1], ["sess-a", 1]]);
+  });
+
+  it("waits for an issued mount resize before sizing the restarted PTY", async () => {
+    schedulerHarness();
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.set(++nextFrame, callback);
+      return nextFrame;
+    });
+    vi.stubGlobal("cancelAnimationFrame", (frame: number) => frames.delete(frame));
+    h.status = { state: "exited", message: null, exit_code: 0 };
+    h.sessionState = "exited";
+    let finishResize!: () => void;
+    vi.mocked(resizePty).mockReturnValueOnce(new Promise<void>(resolve => { finishResize = resolve; }));
+    const view = renderPane("sess-a");
+    await act(async () => {});
+    expect(resizePty).toHaveBeenCalledExactlyOnceWith("sess-a", 80, 24);
+
+    h.fitCols = 100;
+    h.fitRows = 40;
+    await act(async () => fireEvent.click(view.getByRole("button", { name: "Restart shell" })));
+    expect(h.log).not.toContain("restart");
+    expect(attachPtyOutput).not.toHaveBeenCalled();
+
+    await act(async () => finishResize());
+    // A busy renderer can paint its first frame after the replacement attaches.
+    await act(async () => {
+      const pending = [...frames.values()];
+      frames.clear();
+      for (const callback of pending) callback(performance.now());
+    });
+    expect(h.log).toContain("restart");
+    expect(vi.mocked(resizePty).mock.calls).toEqual([
+      ["sess-a", 80, 24], ["sess-a", 100, 40],
+    ]);
+    expect(attachPtyOutput).toHaveBeenCalledOnce();
+    const replacementResize = vi.mocked(resizePty).mock.invocationCallOrder[1];
+    expect(vi.mocked(restartTerminalSession).mock.invocationCallOrder[0]).toBeLessThan(replacementResize);
+    expect(replacementResize).toBeLessThan(vi.mocked(attachPtyOutput).mock.invocationCallOrder[0]);
+  });
+
+  it("finishes a requested restart if the pane unmounts during attach", async () => {
+    schedulerHarness();
+    const unregisterCallback = vi.fn();
+    vi.stubGlobal("__CODEMUX_REMOTE__", true);
+    vi.stubGlobal("__TAURI_INTERNALS__", { unregisterCallback });
+    h.status = { state: "exited", message: null, exit_code: 0 };
+    h.sessionState = "exited";
+    let finishAttach!: (generation: number) => void;
+    vi.mocked(attachPtyOutput).mockReturnValueOnce(new Promise(resolve => { finishAttach = resolve; }));
+    let acknowledgeRestart!: () => void;
+    const acknowledged = new Promise<void>(resolve => { acknowledgeRestart = resolve; });
+    vi.mocked(restartTerminalSession).mockImplementationOnce(() => {
+      h.log.push("restart");
+      return acknowledged;
+    });
+    const view = renderPane("sess-a");
+    await act(async () => {});
+    const original = vi.mocked(attachPtyOutput).mock.calls[0][1];
+
+    fireEvent.click(view.getByRole("button", { name: "Restart shell" }));
+    view.unmount();
+    const remounted = renderPane("sess-a");
+    await act(async () => {});
+    expect(restartTerminalSession).not.toHaveBeenCalled();
+    expect(attachPtyOutput).toHaveBeenCalledOnce();
+    expect(unregisterCallback.mock.calls).toEqual([[original.id]]);
+
+    await act(async () => finishAttach(1));
+    expect(detachPtyOutput).toHaveBeenCalledExactlyOnceWith("sess-a", 1);
+    expect(restartTerminalSession).toHaveBeenCalledExactlyOnceWith("sess-a", "original-shell");
+    expect(h.log.indexOf("detach")).toBeLessThan(h.log.indexOf("restart"));
+    expect(attachPtyOutput).toHaveBeenCalledOnce();
+
+    await act(async () => acknowledgeRestart());
+    expect(attachPtyOutput).toHaveBeenCalledTimes(2);
+    const replacement = vi.mocked(attachPtyOutput).mock.calls[1][1];
+    remounted.unmount();
+    expect(unregisterCallback.mock.calls).toEqual([[original.id], [replacement.id]]);
+  });
+
+  it("attaches to a shell another client restarted while the request was queued", async () => {
+    schedulerHarness();
+    h.status = { state: "exited", message: null, exit_code: 0 };
+    h.sessionState = "exited";
+    let finishAttach!: (generation: number) => void;
+    vi.mocked(attachPtyOutput).mockReturnValueOnce(new Promise(resolve => { finishAttach = resolve; }));
+    vi.mocked(restartTerminalSession).mockImplementationOnce(async (_sessionId, token) => (
+      token === h.restartToken
+    ));
+    const view = renderPane("sess-a");
+    await act(async () => {});
+    fireEvent.click(view.getByRole("button", { name: "Restart shell" }));
+
+    h.restartToken = "replacement-shell";
+    h.status = { state: "ready", message: null, exit_code: null };
+    h.sessionState = "ready";
+    await act(async () => finishAttach(1));
+
+    expect(restartTerminalSession).toHaveBeenCalledExactlyOnceWith("sess-a", "original-shell");
+    expect(h.log).not.toContain("restart-marker");
+    expect(attachPtyOutput).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["session closes", "host changes"])(
+    "drops the queued restart if the %s",
+    async (change) => {
+      schedulerHarness();
+      h.status = { state: "exited", message: null, exit_code: 0 };
+      h.sessionState = "exited";
+      let finishAttach!: (generation: number) => void;
+      vi.mocked(attachPtyOutput).mockReturnValueOnce(new Promise(resolve => { finishAttach = resolve; }));
+      const view = renderPane("sess-a");
+      await act(async () => {});
+      fireEvent.click(view.getByRole("button", { name: "Restart shell" }));
+      view.unmount();
+
+      const host = remoteViewHost();
+      try {
+        if (change === "session closes") h.sessionRemoved = true;
+        else setRemoteViewHost("other-device");
+        await act(async () => finishAttach(1));
+        expect(restartTerminalSession).not.toHaveBeenCalled();
+        expect(attachPtyOutput).toHaveBeenCalledOnce();
+        if (change === "host changes") expect(detachPtyOutput).not.toHaveBeenCalled();
+      } finally {
+        setRemoteViewHost(host);
+      }
+    },
+  );
+
+  it("can retry a rejected restart after releasing the old subscription", async () => {
+    schedulerHarness();
+    const unregisterCallback = vi.fn();
+    vi.stubGlobal("__CODEMUX_REMOTE__", true);
+    vi.stubGlobal("__TAURI_INTERNALS__", { unregisterCallback });
+    h.status = { state: "exited", message: null, exit_code: 0 };
+    h.sessionState = "exited";
+    vi.mocked(restartTerminalSession).mockRejectedValueOnce(new Error("connection lost"));
+    const view = renderPane("sess-a");
+    await act(async () => {});
+    const mountChannel = vi.mocked(attachPtyOutput).mock.calls[0][1];
+
+    await act(async () => fireEvent.click(view.getByRole("button", { name: "Restart shell" })));
+    expect(view.getByText("Failed to restart shell: Error: connection lost")).toBeTruthy();
+    expect(unregisterCallback.mock.calls).toEqual([[mountChannel.id]]);
+    expect(detachPtyOutput).toHaveBeenCalledExactlyOnceWith("sess-a", 1);
+    expect(attachPtyOutput).toHaveBeenCalledOnce();
+
+    await act(async () => fireEvent.click(view.getByRole("button", { name: "Retry" })));
+    expect(vi.mocked(restartTerminalSession).mock.calls).toEqual([
+      ["sess-a", "original-shell"], ["sess-a", "original-shell"],
+    ]);
+    expect(attachPtyOutput).toHaveBeenCalledTimes(2);
   });
 
   it("hands focus to Restart from the terminal but not from the find bar", async () => {

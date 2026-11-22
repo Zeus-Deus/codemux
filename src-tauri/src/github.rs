@@ -2513,10 +2513,26 @@ pub fn create_pull_request(
     if draft {
         args.push("--draft");
     }
-    args.extend_from_slice(&["--json", "number,url,state,title,headRefName,baseRefName,isDraft"]);
 
-    let v = run_gh_json(repo_path, &args)?;
+    // `gh pr create` has no `--json`; on success it prints the new pull
+    // request's URL, so read that back and ask for the fields by URL.
+    let output = run_gh(repo_path, &args)?;
+    let url = created_pr_url(&output)
+        .ok_or_else(|| format!("gh did not report the new pull request's URL: {}", output.trim()))?;
+    let v = run_gh_json(
+        repo_path,
+        &["pr", "view", url, "--json", "number,url,state,title,headRefName,baseRefName,isDraft"],
+    )?;
     Ok(parse_pr_json(&v))
+}
+
+/// The pull request URL in `gh pr create`'s output: the last line that is
+/// a URL, since gh may print notices before it.
+fn created_pr_url(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .map(str::trim)
+        .rfind(|line| line.starts_with("https://") || line.starts_with("http://"))
 }
 
 pub fn list_pull_requests(
@@ -3946,6 +3962,21 @@ fn parse_incoming_pr_json(v: &serde_json::Value) -> IncomingPrItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn created_pr_url_is_the_last_url_gh_prints() {
+        assert_eq!(
+            created_pr_url("https://github.com/o/r/pull/7\n"),
+            Some("https://github.com/o/r/pull/7")
+        );
+        assert_eq!(
+            created_pr_url(
+                "Warning: 1 uncommitted change\nsee https://cli.github.com\n\n  https://github.com/o/r/pull/8  \n"
+            ),
+            Some("https://github.com/o/r/pull/8")
+        );
+        assert_eq!(created_pr_url("aborted\n"), None);
+    }
 
     #[test]
     fn test_parse_pr_info_from_gh_json() {

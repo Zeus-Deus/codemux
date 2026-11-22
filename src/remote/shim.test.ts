@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { Channel } from "@tauri-apps/api/core";
+import { releaseRemoteChannel } from "./channel";
 import { installShim, type ShimHandle } from "./shim";
 import { FakeWebSocket, createFakeFetch, buildBinaryFrame, flushMicrotasks } from "./testing";
 
@@ -157,6 +158,25 @@ describe("terminal attach serialization", () => {
 });
 
 describe("event listen/unlisten refcounting", () => {
+  it("releases the callback when a listener unsubscribes", async () => {
+    const { ws } = await setup();
+    const i = internals();
+    const received: unknown[] = [];
+    const cb = i.transformCallback((payload) => received.push(payload));
+    const event = "evt";
+    const eventId = (await i.invoke("plugin:event|listen", { event, handler: cb })) as number;
+
+    ws.recvText({ t: "event", event, payload: "before unlisten" });
+    expect(received).toHaveLength(1);
+
+    eventInternals().unregisterListener(event, eventId);
+    await i.invoke("plugin:event|unlisten", { event, eventId });
+    // A channel frame looks up the same callback table directly. Going
+    // through the event map would only verify the listener row was removed.
+    ws.recvText({ t: "chan", ch: cb, idx: 0, data: "late" });
+    expect(received).toHaveLength(1);
+  });
+
   it("sends one listen for many subscribers and one unlisten at the last", async () => {
     const { ws } = await setup();
     const i = internals();
@@ -245,5 +265,9 @@ describe("channel machinery (real @tauri-apps Channel)", () => {
     expect(messages[0]).toBe("first");
     expect(messages[1]).toBeInstanceOf(Uint8Array);
     expect(Array.from(messages[1] as Uint8Array)).toEqual([65, 66]);
+
+    releaseRemoteChannel(channel.id);
+    ws.recvText({ t: "chan", ch: channel.id, idx: 2, data: "after release" });
+    expect(messages).toHaveLength(2);
   });
 });

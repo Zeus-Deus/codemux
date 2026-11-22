@@ -7311,11 +7311,9 @@ pub(crate) async fn open_thread_pane_checked<R: Runtime>(
             .0;
         break (pane_id.0, true);
     };
-    drop(dispatch_guard);
-
     // Pane activation selects the workspace/surface, while tab activation is
-    // a separate state field. Resolve both from one immutable snapshot and
-    // then update them before emitting the final state once.
+    // a separate state field. Keep a new pane's dispatch guard through lookup
+    // and selection so a waiting delete cannot remove it between these steps.
     let snapshot = state.snapshot();
     let location = snapshot.workspaces.iter().find_map(|workspace| {
         workspace.surfaces.iter().find_map(|surface| {
@@ -7342,6 +7340,7 @@ pub(crate) async fn open_thread_pane_checked<R: Runtime>(
         }
     }
     crate::state::emit_app_state(app);
+    drop(dispatch_guard);
 
     Ok(OpenedThreadPane {
         pane_id,
@@ -13028,6 +13027,7 @@ mod tests {
         stopped: Mutex<Vec<String>>,
         started_on: Mutex<Vec<Option<i64>>>,
         stop_started: tokio::sync::Notify,
+        stop_completed: tokio::sync::Notify,
         stop_release: Option<Arc<tokio::sync::Notify>>,
         fail_stop: bool,
         /// Limits `stop_release` and `fail_stop` to this thread's stop.
@@ -13110,6 +13110,7 @@ mod tests {
             }
             self.stopped.lock().unwrap().push(thread_id.0.clone());
             self.live.lock().unwrap().remove(&thread_id.0);
+            self.stop_completed.notify_one();
             Ok(())
         }
         async fn list_sessions(
@@ -13132,7 +13133,15 @@ mod tests {
         host_id: Option<i64>,
         provider: Arc<PlacementProvider>,
     ) -> (tauri::App<tauri::test::MockRuntime>, String) {
-        let db = DatabaseStore::new_in_memory();
+        placement_app_with_database(thread, host_id, provider, DatabaseStore::new_in_memory()).await
+    }
+
+    async fn placement_app_with_database(
+        thread: &str,
+        host_id: Option<i64>,
+        provider: Arc<PlacementProvider>,
+        db: DatabaseStore,
+    ) -> (tauri::App<tauri::test::MockRuntime>, String) {
         let host = db.insert_host("ai-node", "deus@ai-node").unwrap();
         let state = AppStateStore::default();
         let workspace = state.snapshot().active_workspace_id.0;
@@ -13303,8 +13312,10 @@ mod tests {
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         }
         let worktree = crate::git::git_create_worktree(repo.path(), "close-agent", true, None, None).unwrap();
+        // The default workspace includes a terminal whose close is journaled.
+        let db = DatabaseStore::test_file(&repo.path().join(".git/agent-chat.sqlite"));
         provider.live.lock().unwrap().insert(thread.to_string());
-        let (app, workspace) = placement_app(thread, None, provider).await;
+        let (app, workspace) = placement_app_with_database(thread, None, provider, db).await;
         app.manage(crate::terminal::PtyState::default());
         app.manage(SubagentTracker::default());
         let state = app.state::<AppStateStore>();
@@ -13546,7 +13557,11 @@ mod tests {
             return;
         }
         let provider = Arc::new(PlacementProvider::default());
-        let (app, workspace) = placement_app("tab-parent", None, provider.clone()).await;
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("workspace");
+        std::fs::create_dir(&folder).unwrap();
+        let db = DatabaseStore::test_file(&root.path().join("agent-chat.sqlite"));
+        let (app, workspace) = placement_app_with_database("tab-parent", None, provider.clone(), db).await;
         app.manage(crate::terminal::PtyState::default());
         app.manage(SubagentTracker::default());
         app.manage(RunActivityTracker::default());
@@ -13554,8 +13569,7 @@ mod tests {
         let handle = app.handle().clone();
         let state = handle.state::<AppStateStore>();
         let db = handle.state::<DatabaseStore>();
-        let folder = tempfile::tempdir().unwrap();
-        let cwd = folder.path().display().to_string();
+        let cwd = folder.display().to_string();
         state.update_workspace_cwd(&workspace, cwd.clone());
         let live = |id: &str| state.find_workspace(id).is_some();
 
@@ -13587,7 +13601,7 @@ mod tests {
         // Closing the workspace, through the plain close command.
         state.create_agent_chat_pane(&workspace, Some(ProviderKind::Codex), None, Some(crate::presets::LaunchMode::NewTab), Some("plain-parent".into())).unwrap();
         let plain = chat_child(&handle, &provider, &workspace, &cwd, "plain-child", Some("plain-parent"));
-        let keep = state.create_empty_workspace_at_path(folder.path().join("other")).0;
+        let keep = state.create_empty_workspace_at_path(folder.join("other")).0;
         super::super::workspace::close_workspace(handle.clone(), handle.state(), handle.state(), workspace.clone(), Some(true)).await.unwrap();
         assert!(!live(&workspace));
         assert!(!live(&plain), "the plain close closes it");
@@ -13787,6 +13801,7 @@ mod tests {
         close_chat_child_first(&handle, &provider, &child).await;
 
         let mut close = delete_worktree_workspace(&handle, &workspace);
+        tokio::time::timeout(Duration::from_secs(5), provider.stop_completed.notified()).await.unwrap();
         let waited = tokio::time::timeout(Duration::from_millis(200), &mut close).await.is_err();
         assert!(waited, "deletion finished while the earlier child's agent was stopping");
         assert!(worktree.exists());
@@ -13987,6 +14002,7 @@ mod tests {
         let (child_close, release) = pause_chat_child_close(&handle, &child).await;
 
         let mut delete = delete_worktree_workspace(&handle, &workspace);
+        tokio::time::timeout(Duration::from_secs(5), provider.stop_completed.notified()).await.unwrap();
         let waited = tokio::time::timeout(Duration::from_millis(200), &mut delete).await.is_err();
         assert!(waited, "deletion finished before the closing child's chat was told to stop");
         assert!(worktree.exists());

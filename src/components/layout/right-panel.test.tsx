@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { toast } from "sonner";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkflowRunItem } from "@/lib/agent-chat/types";
@@ -14,6 +15,7 @@ import type {
 } from "@/tauri/types";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
+import { useEditorStore } from "@/stores/editor-store";
 import {
   DEFAULT_RIGHT_PANEL_PANES,
   RIGHT_PANEL_EMPTY,
@@ -93,7 +95,7 @@ vi.mock("@/tauri/commands", async (importOriginal) => ({
 }));
 
 import { RightPanel } from "./right-panel";
-import { docPaneId } from "./right-panel/pane-registry";
+import { docEditorTabId, docPaneId } from "./right-panel/pane-registry";
 
 function chatPane(threadId: string | null): PaneNodeSnapshot {
   return {
@@ -223,6 +225,7 @@ function seedBrowserSession(session: AgentBrowserSession | null) {
 }
 
 beforeEach(() => {
+  useEditorStore.setState({ tabs: {} });
   useUIStore.setState({
     rightPanelTabs: {},
     rightPanelPanes: {},
@@ -441,6 +444,79 @@ describe("RightPanel deck", () => {
     await user.click(screen.getByTestId("right-panel-add-pane"));
     await user.click(await screen.findByRole("menuitem", { name: "Changes" }));
     expect(screen.getByTestId("changes-tab")).toBeInTheDocument();
+  });
+
+  it("drops the editor buffer when the user closes a document in the deck", async () => {
+    const filePath = "/p/example.txt";
+    const tabId = docEditorTabId("ws-1", filePath);
+    useEditorStore.getState().initTab(tabId, { filePath });
+    useUIStore.setState({
+      rightPanelPanes: { "ws-1": [...DEFAULT_RIGHT_PANEL_PANES, docPaneId(filePath)] },
+    });
+    renderDeck();
+
+    await userEvent.setup().click(screen.getByRole("button", { name: "Close example.txt" }));
+    expect(useEditorStore.getState().getTab(tabId)).toBeUndefined();
+  });
+
+  function beginDocumentSave() {
+    const filePath = "/p/saving.txt";
+    const paneId = docPaneId(filePath);
+    const tabId = docEditorTabId("ws-1", filePath);
+    const editor = useEditorStore.getState();
+    editor.initTab(tabId, { filePath });
+    editor.setDirty(tabId, true);
+    useUIStore.getState().addRightPanelPane("ws-1", paneId);
+    return { paneId, tabId, editor, save: editor.beginSave(tabId, "first edit") };
+  }
+
+  it("keeps a closing document in the deck until its last queued save finishes", async () => {
+    const { paneId, tabId, editor, save } = beginDocumentSave();
+    editor.getTab(tabId)!.pendingSave!.draft = "latest edit";
+    const latest = editor.beginSave(tabId, "latest edit");
+    renderDeck();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Close saving.txt" }));
+    await act(async () => { save.finish("first edit"); });
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).toContain(paneId);
+    expect(latest.ownsTab()).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: "Changes" }));
+    await act(async () => { latest.finish("latest edit"); });
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).not.toContain(paneId);
+    expect(editor.getTab(tabId)).toBeUndefined();
+    expect(useUIStore.getState().getRightPanelTab("ws-1")).toBe("changes");
+  });
+
+  it("closes the other requested tabs and keeps the document when a save fails", async () => {
+    const { paneId, tabId, editor, save } = beginDocumentSave();
+    const error = vi.spyOn(toast, "error").mockReturnValue("save-feedback");
+    renderDeck();
+    try {
+      fireEvent.contextMenu(screen.getByRole("button", { name: "Files" }));
+      await userEvent.click(await screen.findByRole("menuitem", { name: "Close tabs to the right" }));
+      expect(useUIStore.getState().getRightPanelPanes("ws-1")).toEqual(["files", paneId]);
+      await act(async () => { save.finish(); });
+      expect(editor.getTab(tabId)?.suspendedDraft).toBe("first edit");
+      expect(screen.getByRole("button", { name: "Close saving.txt" })).toBeInTheDocument();
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("saving.txt"));
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("leaves a replacement document open when an earlier close resumes", async () => {
+    const { paneId, tabId, editor, save } = beginDocumentSave();
+    renderDeck();
+    await userEvent.click(screen.getByRole("button", { name: "Close saving.txt" }));
+    await act(async () => {
+      save.finish("first edit");
+      await Promise.resolve();
+      editor.removeTab(tabId);
+      editor.initTab(tabId, { filePath: "/p/saving.txt" });
+    });
+    expect(editor.getTab(tabId)?.baselineContent).toBe("");
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).toContain(paneId);
   });
 
   // Closing the pane you're looking at must land somewhere, not on a blank

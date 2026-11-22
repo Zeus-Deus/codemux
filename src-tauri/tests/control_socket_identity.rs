@@ -500,6 +500,27 @@ fn mcp_git_tools_take_file_names_as_paths() {
     assert_eq!(git(&repo, &["log", "--format=%s"]), "--amend\nfirst", "a new commit, not an amended one");
 }
 
+#[test]
+fn mcp_git_tools_use_launch_directory_only_without_a_workspace() {
+    let serve = Serve::start(&[]);
+    let cwd = serve.root.path();
+    git(cwd, &["init"]);
+    let file = cwd.join("local.txt");
+    std::fs::write(&file, "original\n").unwrap();
+    git(cwd, &["add", "local.txt"]);
+    std::fs::write(&file, "edited in launch directory\n").unwrap();
+    let mut mcp = Mcp::start(&serve, &["--client", "integration-bot", "--access", "read-only"]);
+
+    let args = json!({ "file": "local.txt" });
+    let missing = mcp.call_in("closed-workspace", "git_diff", args.clone());
+    assert_eq!(missing["isError"], true, "{missing}");
+    assert!(missing["content"][0]["text"].as_str().unwrap().contains("closed-workspace"), "{missing}");
+
+    let unscoped = mcp.call("git_diff", args);
+    assert_ne!(unscoped["isError"], true, "{unscoped}");
+    assert!(unscoped["content"][0]["text"].as_str().unwrap().contains("+edited in launch directory"), "{unscoped}");
+}
+
 /// Whether `id` is an open workspace.
 fn is_open(serve: &Serve, id: &str) -> bool {
     let state = serve.json("get_app_state", "{}", &[]);

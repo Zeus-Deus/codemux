@@ -47,7 +47,13 @@ export const plugin:PluginModule={activate(ctx){ctx.handle('action:test',async()
 });
 test('package archive contains the emitted self-contained API and no workspace runtime imports',async()=>{
   // Invoke the CLI through Node: Windows npm.cmd is not an executable file.
-  const [packed]=JSON.parse(execFileSync(process.execPath,[await npmCli(),'pack','--dry-run','--ignore-scripts','--json'],{cwd:path.join(root,'packages/plugin-sdk'),encoding:'utf8',stdio:['ignore','pipe','pipe']}));
+  const output = execFileSync(process.execPath, [await npmCli(), 'pack', '--dry-run', '--ignore-scripts', '--json'], {
+    cwd: path.join(root, 'packages/plugin-sdk'), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  // npm 12 keys the results by package name. Earlier versions return an array.
+  const packages = Object.values(JSON.parse(output));
+  assert.equal(packages.length, 1);
+  const [packed] = packages;
   const files=packed.files.map(file=>file.path);assert.ok(files.includes('dist/index.js'));assert.ok(files.includes('dist/index.d.ts'));assert.ok(files.includes('README.md'));
   assert.ok(files.every(file=>file==='package.json'||file==='README.md'||file==='LICENSE.md'||file==='THIRD_PARTY_NOTICES.md'||file.startsWith('dist/')));
 });

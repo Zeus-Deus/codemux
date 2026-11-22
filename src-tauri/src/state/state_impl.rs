@@ -60,6 +60,7 @@ pub struct TabSnapshot {
 /// Debounces disk persistence so that rapid state changes (e.g. drag-swap +
 /// multiple resize events) only result in a single write after a quiet period.
 struct PersistDebouncer {
+    closed: AtomicBool,
     pending: Arc<AtomicBool>,
     last_snapshot: Arc<Mutex<Option<PendingPersist>>>,
     write_lock: Arc<Mutex<()>>,
@@ -83,6 +84,7 @@ impl PendingPersist {
 impl PersistDebouncer {
     fn new() -> Self {
         Self {
+            closed: AtomicBool::new(false),
             pending: Arc::new(AtomicBool::new(false)),
             last_snapshot: Arc::new(Mutex::new(None)),
             write_lock: Arc::new(Mutex::new(())),
@@ -92,6 +94,9 @@ impl PersistDebouncer {
     fn schedule_pending(&self, pending: PendingPersist) {
         {
             let mut guard = self.last_snapshot.lock().unwrap();
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
             *guard = Some(pending);
         }
 
@@ -125,11 +130,18 @@ impl PersistDebouncer {
             }
         });
     }
+
+    fn ensure_open(&self) -> Result<(), String> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err("Layout persistence is closed".into());
+        }
+        Ok(())
+    }
 }
 
 /// Schedule a persist for a mutation that produced no snapshot of its own —
 /// the store is cloned once, at flush time, off the mutating thread.
-fn schedule_persist_current<R: tauri::Runtime>(app: &AppHandle<R>) {
+pub(crate) fn schedule_persist_current<R: tauri::Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     persist_debouncer().schedule_pending(PendingPersist::Lazy(Box::new(move || {
         let state: State<'_, AppStateStore> = app.state();
@@ -139,20 +151,126 @@ fn schedule_persist_current<R: tauri::Runtime>(app: &AppHandle<R>) {
 
 static PERSIST_DEBOUNCER: std::sync::OnceLock<PersistDebouncer> = std::sync::OnceLock::new();
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LayoutCloseIntent {
+    Pane(String),
+    Session { workspace_id: String, session_id: String },
+    Tab { workspace_id: String, tab_id: String },
+    Workspace(String),
+    Archive(Box<ArchivedWorkspaceSnapshot>),
+}
+
 fn persist_debouncer() -> &'static PersistDebouncer {
     PERSIST_DEBOUNCER.get_or_init(PersistDebouncer::new)
 }
 
-/// Synchronously persist the current app state. Called on app close to
-/// ensure the debounced write completes before the process exits.
-pub fn flush_persisted_state(store: &AppStateStore) {
+/// Keep a layout removal out of an already queued save until the terminal
+/// close records have been written. Run process teardown after releasing it.
+pub(crate) fn with_terminal_close_layout_lock<T, E: From<String>>(
+    close: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
     let debouncer = persist_debouncer();
     let _write_guard = debouncer.write_lock.lock().unwrap();
+    debouncer.ensure_open()?;
+    close()
+}
+
+/// Synchronously persist the current app state. Called on app close to
+/// ensure the debounced write completes before the process exits.
+pub fn flush_persisted_state(store: &AppStateStore) -> Result<(), String> {
+    let debouncer = persist_debouncer();
+    let _write_guard = debouncer.write_lock.lock().unwrap();
+    debouncer.ensure_open()?;
     debouncer.last_snapshot.lock().unwrap().take();
     let snapshot = store.snapshot();
-    if let Err(e) = save_persisted_state(&snapshot) {
-        eprintln!("[codemux::state] Failed to persist layout state on close: {e}");
+    save_persisted_state(&snapshot)
+}
+
+/// Seal layout persistence before handing ownership to a new process.
+pub(crate) fn finish_layout_persistence(store: &AppStateStore) -> Result<(), String> {
+    let debouncer = persist_debouncer();
+    {
+        let mut pending = debouncer.last_snapshot.lock().unwrap();
+        debouncer.ensure_open()?;
+        debouncer.closed.store(true, Ordering::Release);
+        pending.take();
     }
+    // A writer that already took its snapshot owns this gate until its
+    // save finishes. Wait for it before saving the final state.
+    let _write_guard = debouncer.write_lock.lock().unwrap();
+    save_persisted_state(&store.snapshot())
+}
+
+/// Commit the full removal before retiring its durable intent.
+#[cfg(unix)]
+pub(crate) fn persist_layout_closes(
+    store: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    intents: &[LayoutCloseIntent],
+) -> Result<(), String> {
+    let debouncer = persist_debouncer();
+    let _write_guard = debouncer.write_lock.lock().unwrap();
+    debouncer.ensure_open()?;
+    let pending = debouncer.last_snapshot.lock().unwrap().take();
+    let snapshot = store.snapshot();
+    let saved = if intents.iter().any(|intent| intent.needs_replay(&snapshot)) {
+        Err("A layout close has not finished".into())
+    } else {
+        save_persisted_state(&snapshot)
+    };
+    if let Err(error) = saved {
+        let mut queued = debouncer.last_snapshot.lock().unwrap();
+        if queued.is_none() {
+            *queued = pending;
+        }
+        return Err(error);
+    }
+    db.retire_layout_closes(intents)
+}
+
+/// Keep the old-to-new binding until layout.json no longer names the old
+/// session. A closed successor can leave both identities absent.
+#[cfg(unix)]
+pub(crate) fn persist_terminal_replacements(
+    store: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    replacements: &[crate::database::daemon_closes::PendingTerminalReplacement],
+) -> Result<(), String> {
+    if replacements.is_empty() {
+        return Ok(());
+    }
+    let debouncer = persist_debouncer();
+    let _write_guard = debouncer.write_lock.lock().unwrap();
+    debouncer.ensure_open()?;
+    let pending = debouncer.last_snapshot.lock().unwrap().take();
+    let snapshot = store.snapshot();
+    let saved = if replacements.iter().any(|replacement| {
+        workspace_is_local(&snapshot, &replacement.workspace_id)
+            && terminal_pane_for_close_intent(
+                &snapshot,
+                &replacement.workspace_id,
+                &replacement.old_session_id,
+            ).is_some()
+    }) {
+        Err("A terminal replacement has not finished".to_owned())
+    } else {
+        save_persisted_state(&snapshot)
+    };
+    if let Err(error) = saved {
+        let mut queued = debouncer.last_snapshot.lock().unwrap();
+        if queued.is_none() {
+            *queued = pending;
+        }
+        return Err(error);
+    }
+    for replacement in replacements {
+        db.retire_terminal_replacement(
+            &replacement.workspace_id,
+            &replacement.old_session_id,
+            replacement.replacement_id,
+        )?;
+    }
+    Ok(())
 }
 
 use crate::project::current_project_root;
@@ -229,6 +347,14 @@ pub enum TerminalSessionState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalSessionSnapshot {
     pub session_id: SessionId,
+    /// In-memory provenance for an ID minted in this app process and never
+    /// admitted to the daemon. Restored layouts cannot prove this.
+    #[serde(skip)]
+    pub(crate) daemon_unused: bool,
+    /// Saved scrollback can still name the legacy session this pane replaced.
+    /// Only restore metadata may use this identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restore_predecessor_session_id: Option<String>,
     pub title: String,
     pub shell: Option<String>,
     pub cwd: String,
@@ -269,6 +395,8 @@ pub struct PtyHydrationWorkspace {
 #[derive(Debug, Clone)]
 pub struct PtyHydrationSession {
     pub session_id: String,
+    pub(crate) daemon_unused: bool,
+    pub(crate) restore_predecessor_session_id: Option<String>,
     pub pane_id: Option<String>,
     pub cwd: String,
     pub original_command: Option<String>,
@@ -735,7 +863,7 @@ impl WorkspaceSnapshot {
 /// Every optional field is `#[serde(default)]` so entries written by a
 /// future version with more fields still load on this one, matching the
 /// additive-field convention used across the snapshot types.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchivedWorkspaceSnapshot {
     /// Identity of the archive entry itself (fresh UUID at archive
     /// time). The original workspace id is NOT reused because a
@@ -1083,9 +1211,18 @@ pub struct RemoteAttachWorkspace {
 
 pub struct AppStateStore {
     inner: Mutex<AppStateSnapshot>,
+    terminal_close_scope: Mutex<Option<(WorkspaceId, Option<SurfaceId>)>>,
     // Runtime-only lookup authority, bounded by live workspace ids. Always
     // acquire `inner` first; validation and PR publication share that lock.
     pr_lookup_authorities: Mutex<HashMap<String, Arc<()>>>,
+}
+
+pub(crate) struct TerminalCloseScope<'a>(&'a Mutex<Option<(WorkspaceId, Option<SurfaceId>)>>);
+
+impl Drop for TerminalCloseScope<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().take();
+    }
 }
 
 /// Authority captured before a workspace PR lookup starts. Arc identity is a
@@ -1265,6 +1402,7 @@ impl Default for AppStateStore {
         Self {
             inner: Mutex::new(default_app_state()),
             pr_lookup_authorities: Mutex::new(HashMap::new()),
+            terminal_close_scope: Mutex::new(None),
         }
     }
 }
@@ -1342,6 +1480,9 @@ fn build_pty_hydration_plan(
             });
             PtyHydrationSession {
                 session_id,
+                daemon_unused: persisted.is_some_and(|session| session.daemon_unused),
+                restore_predecessor_session_id: persisted
+                    .and_then(|session| session.restore_predecessor_session_id.clone()),
                 pane_id,
                 cwd: persisted
                     .map(|session| session.cwd.clone())
@@ -1427,6 +1568,9 @@ impl AppStateStore {
         }
         let mut current = self.inner.lock().unwrap();
         self.pr_lookup_authorities.lock().unwrap().clear();
+        for terminal in &mut snapshot.terminal_sessions {
+            terminal.daemon_unused = false;
+        }
         *current = snapshot;
     }
 
@@ -1759,6 +1903,69 @@ impl AppStateStore {
         (!plan.sessions.is_empty()).then_some(plan)
     }
 
+    /// Rebind a legacy terminal's pane to its journaled successor. The
+    /// caller holds the layout write lock and can hand off runtime ownership
+    /// under the same state lock before publishing the new identity.
+    #[cfg(unix)]
+    pub(crate) fn replace_terminal_session(
+        &self,
+        workspace_id: &str,
+        old_session_id: &str,
+        replacement_id: &str,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<bool, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(workspace_index) = snapshot.workspaces.iter()
+            .position(|workspace| workspace.workspace_id.0 == workspace_id)
+        else {
+            return Ok(false);
+        };
+        let workspace = &snapshot.workspaces[workspace_index];
+        let Some(surface_index) = workspace.surfaces.iter()
+            .position(|surface| pane_tree_contains_session(&surface.root, old_session_id))
+        else {
+            return Ok(false);
+        };
+        if workspace.host_id.is_some() {
+            // A workspace move can win before an activated replacement is
+            // applied. Preserve the device's binding to the original ID.
+            return Ok(false);
+        }
+        let session_index = snapshot.terminal_sessions.iter()
+            .position(|session| session.session_id.0 == old_session_id)
+            .ok_or("The restarting terminal has no session record")?;
+        if snapshot.terminal_sessions.iter().any(|session| session.session_id.0 == replacement_id)
+            || snapshot.workspaces.iter().flat_map(|workspace| &workspace.surfaces)
+                .any(|surface| pane_tree_contains_session(&surface.root, replacement_id))
+        {
+            return Err("The replacement terminal identity is already in use".to_owned());
+        }
+        if !admit() {
+            return Ok(false);
+        }
+        let replacement = SessionId(replacement_id.to_owned());
+        let root = &mut snapshot.workspaces[workspace_index].surfaces[surface_index].root;
+        let binding = terminal_session_binding_mut(root, old_session_id)
+            .expect("validated terminal binding under the state lock");
+        *binding = replacement.clone();
+
+        let session = &mut snapshot.terminal_sessions[session_index];
+        session.session_id = replacement.clone();
+        session.restore_predecessor_session_id = Some(old_session_id.to_owned());
+        session.daemon_unused = false;
+        session.state = TerminalSessionState::Starting;
+        session.last_message = None;
+        session.exit_code = None;
+        for notification in &mut snapshot.notifications {
+            if notification.workspace_id.0 == workspace_id
+                && notification.session_id.as_ref().is_some_and(|id| id.0 == old_session_id)
+            {
+                notification.session_id = Some(replacement.clone());
+            }
+        }
+        Ok(true)
+    }
+
     pub fn activate_pane(&self, pane_id: &str) -> bool {
         self.activate_pane_with_selection(pane_id, true)
     }
@@ -1849,6 +2056,7 @@ impl AppStateStore {
     ) -> Result<(), String> {
         let debouncer = persist_debouncer();
         let _write_guard = debouncer.write_lock.lock().unwrap();
+        debouncer.ensure_open()?;
         debouncer.last_snapshot.lock().unwrap().take();
         save_persisted_state(&self.snapshot())?;
         db.complete_local_import_layout(ids)
@@ -2515,7 +2723,7 @@ impl AppStateStore {
             )
         } else {
             let surface_id = SurfaceId(next_id("surface"));
-            let session_id = SessionId(next_id("session"));
+            let session_id = new_terminal_session_id();
             let base_terminal_index = snapshot.terminal_sessions.len() + 1;
 
             // A single shell session whose cwd is the host directory. The
@@ -2524,6 +2732,8 @@ impl AppStateStore {
             // consistent so the UI shows the right path.
             snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                 session_id: session_id.clone(),
+                daemon_unused: true,
+                restore_predecessor_session_id: None,
                 title: format!("Terminal {base_terminal_index}"),
                 shell: None,
                 cwd: remote_cwd.clone(),
@@ -2756,9 +2966,11 @@ impl AppStateStore {
         let mut session_ids = Vec::with_capacity(shell_count);
 
         for offset in 0..shell_count {
-            let session_id = SessionId(next_id("session"));
+            let session_id = new_terminal_session_id();
             snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                 session_id: session_id.clone(),
+                daemon_unused: true,
+                restore_predecessor_session_id: None,
                 title: format!("Terminal {}", base_terminal_index + offset),
                 shell: shell.clone(),
                 cwd: cwd.clone(),
@@ -4404,6 +4616,41 @@ impl AppStateStore {
         map
     }
 
+    #[cfg(unix)]
+    pub(crate) fn terminal_session_owners(&self) -> std::collections::HashSet<(String, String)> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot.workspaces.iter().flat_map(|workspace| {
+            collect_terminal_sessions(&workspace.surfaces).into_iter()
+                .map(|session_id| (workspace.workspace_id.0.clone(), session_id))
+        }).collect()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn orphaned_daemon_shells(
+        &self,
+        shells: Vec<crate::database::daemon_closes::PendingDaemonClose>,
+    ) -> Vec<crate::database::daemon_closes::PendingDaemonClose> {
+        let snapshot = self.inner.lock().unwrap();
+        let sessions_by_workspace: std::collections::HashMap<_, _> = snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                (
+                    workspace.workspace_id.0.as_str(),
+                    collect_terminal_sessions(&workspace.surfaces),
+                )
+            })
+            .collect();
+        shells
+            .into_iter()
+            .filter(|shell| {
+                sessions_by_workspace
+                    .get(shell.route.workspace_id.as_str())
+                    .is_none_or(|sessions| !sessions.contains(&shell.session_id))
+            })
+            .collect()
+    }
+
     pub fn active_workspace_cwd(&self) -> Option<(String, String)> {
         let snapshot = self.inner.lock().unwrap();
         let workspace = snapshot
@@ -4438,76 +4685,110 @@ impl AppStateStore {
         false
     }
 
-    pub fn close_workspace(&self, workspace_id: &str) -> Result<CloseWorkspaceResult, String> {
-        let mut snapshot = self.inner.lock().unwrap();
+    /// Read the original close scope and lease its terminal membership until
+    /// the caller finishes journaling and publishes the removal.
+    pub(crate) fn prepare_terminal_layout_close<T>(
+        &self,
+        intent: &LayoutCloseIntent,
+        prepare: impl FnOnce(&str, &[SessionId]) -> T,
+    ) -> Result<(TerminalCloseScope<'_>, T), String> {
+        let snapshot = self.inner.lock().unwrap();
+        let workspace = |id: &str| snapshot.workspaces.iter().find(|workspace| workspace.workspace_id.0 == id)
+            .ok_or_else(|| format!("No workspace found for {id}"));
+        let (workspace, sessions, scope) = match intent {
+            LayoutCloseIntent::Workspace(id) => {
+                let workspace = workspace(id)?;
+                let sessions = collect_terminal_sessions(&workspace.surfaces).into_iter().map(SessionId).collect();
+                (workspace, sessions, Some(None))
+            }
+            LayoutCloseIntent::Archive(entry) => {
+                let workspace = workspace(&entry.workspace_id)?;
+                let sessions = collect_terminal_sessions(&workspace.surfaces).into_iter().map(SessionId).collect();
+                (workspace, sessions, Some(None))
+            }
+            LayoutCloseIntent::Tab { workspace_id, tab_id } => {
+                let workspace = workspace(workspace_id)?;
+                let tab = workspace.tabs.iter().find(|tab| tab.tab_id == *tab_id)
+                    .ok_or_else(|| format!("No tab found for {tab_id}"))?;
+                let mut sessions = Vec::new();
+                if let Some(surface_id) = &tab.surface_id {
+                    if let Some(surface) = workspace.surfaces.iter().find(|surface| surface.surface_id == *surface_id) {
+                        collect_session_ids_from_tree(&surface.root, &mut sessions);
+                    }
+                }
+                (workspace, sessions, tab.surface_id.clone().map(Some))
+            }
+            LayoutCloseIntent::Pane(id) => {
+                let (workspace, surface) = find_pane_location(&snapshot.workspaces, id)
+                    .ok_or_else(|| format!("No pane found for {id}"))?;
+                let workspace = &snapshot.workspaces[workspace];
+                let root = &workspace.surfaces[surface].root;
+                if let Some(remaining) = remove_pane_from_tree(root, id) {
+                    first_leaf_pane_id(&remaining).ok_or("No fallback pane available after close")?;
+                }
+                let sessions = session_id_for_pane(root, &PaneId(id.clone())).into_iter().collect();
+                (workspace, sessions, None)
+            }
+            LayoutCloseIntent::Session { workspace_id: _, session_id } => {
+                if snapshot.terminal_sessions.len() <= 1 {
+                    return Err("Cannot close the last terminal session".into());
+                }
+                let session = snapshot.terminal_sessions.iter().find(|session| session.session_id.0 == *session_id)
+                    .ok_or_else(|| format!("No terminal session found for {session_id}"))?;
+                let (workspace, surface) = snapshot.workspaces.iter().find_map(|workspace| {
+                    workspace.surfaces.iter().find(|surface| pane_tree_contains_session(&surface.root, session_id))
+                        .map(|surface| (workspace, surface))
+                }).ok_or_else(|| format!("No fallback session available after closing {session_id}"))?;
+                let root = remove_terminal_from_tree(&surface.root, session_id)
+                    .ok_or_else(|| format!("Unable to remove session {session_id} from pane tree"))?;
+                first_terminal_pane(&root).ok_or("Pane tree lost its last terminal pane unexpectedly")?;
+                (workspace, vec![session.session_id.clone()], None)
+            }
+        };
+        *self.terminal_close_scope.lock().unwrap() = scope.map(|surface| (workspace.workspace_id.clone(), surface));
+        let lease = TerminalCloseScope(&self.terminal_close_scope);
+        Ok((lease, prepare(&workspace.workspace_id.0, &sessions)))
+    }
 
-        if snapshot.workspaces.len() <= 1 {
-            let workspace_index = snapshot
-                .workspaces
-                .iter()
-                .position(|workspace| workspace.workspace_id.0 == workspace_id)
-                .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
-
-            let removed = snapshot.workspaces.remove(workspace_index);
-            self.pr_lookup_authorities
-                .lock()
-                .unwrap()
-                .remove(workspace_id);
-            let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
-            let removed_agent_chat_threads = collect_agent_chat_threads(&removed.surfaces);
-            snapshot
-                .notifications
-                .retain(|notification| notification.workspace_id != removed.workspace_id);
-            snapshot.terminal_sessions.retain(|session| {
-                !removed_session_id_strings
-                    .iter()
-                    .any(|id| id == &session.session_id.0)
-            });
-            let removed_agent_browser_sessions: Vec<String> = snapshot
-                .agent_browser_sessions
-                .iter()
-                .filter(|s| s.workspace_id.0 == workspace_id)
-                .map(|s| s.cli_session_name.clone())
-                .collect();
-            snapshot
-                .agent_browser_sessions
-                .retain(|s| s.workspace_id.0 != workspace_id);
-            snapshot.active_workspace_id = WorkspaceId("".into());
-            // Every pane in the workspace just went away, and with it any
-            // `codemux monitor start` claim made against one.
-            prune_manual_monitors(&mut snapshot);
-            return Ok(CloseWorkspaceResult {
-                fallback: WorkspaceId("".into()),
-                removed_sessions: removed_session_id_strings
-                    .into_iter()
-                    .map(SessionId)
-                    .collect(),
-                removed_agent_chat_threads,
-                removed_agent_browser_sessions,
-            });
+    fn check_terminal_creation(&self, workspace: &WorkspaceId, surface: Option<&SurfaceId>) -> Result<(), String> {
+        if self.terminal_close_scope.lock().unwrap().as_ref().is_some_and(|(closing, target)| {
+            closing == workspace && (target.is_none() || target.as_ref() == surface)
+        }) {
+            return Err("Cannot create a terminal while its workspace or tab is closing".into());
         }
+        Ok(())
+    }
 
+    pub fn close_workspace(&self, workspace_id: &str) -> Result<CloseWorkspaceResult, String> {
+        self.close_workspace_with_precommit(workspace_id, |_, _| Ok(()))
+            .map(|(result, ())| result)
+    }
+
+    pub(crate) fn close_workspace_with_precommit<T>(
+        &self,
+        workspace_id: &str,
+        precommit: impl FnOnce(&str, &[SessionId]) -> Result<T, String>,
+    ) -> Result<(CloseWorkspaceResult, T), String> {
+        let mut snapshot = self.inner.lock().unwrap();
         let workspace_index = snapshot
             .workspaces
             .iter()
             .position(|workspace| workspace.workspace_id.0 == workspace_id)
             .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
 
+        let removed_sessions: Vec<_> = collect_terminal_sessions(&snapshot.workspaces[workspace_index].surfaces)
+            .into_iter().map(SessionId).collect();
+        let prepared = precommit(workspace_id, &removed_sessions)?;
         let removed = snapshot.workspaces.remove(workspace_index);
         self.pr_lookup_authorities
             .lock()
             .unwrap()
             .remove(workspace_id);
-        let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
         let removed_agent_chat_threads = collect_agent_chat_threads(&removed.surfaces);
         snapshot
             .notifications
             .retain(|notification| notification.workspace_id != removed.workspace_id);
-        snapshot.terminal_sessions.retain(|session| {
-            !removed_session_id_strings
-                .iter()
-                .any(|id| id == &session.session_id.0)
-        });
+        snapshot.terminal_sessions.retain(|session| !removed_sessions.contains(&session.session_id));
         let removed_agent_browser_sessions: Vec<String> = snapshot
             .agent_browser_sessions
             .iter()
@@ -4523,22 +4804,19 @@ impl AppStateStore {
             .find(|w| w.workspace_id == snapshot.active_workspace_id)
             .or_else(|| snapshot.workspaces.first())
             .map(|workspace| workspace.workspace_id.clone())
-            .ok_or_else(|| "No fallback workspace available".to_string())?;
+            .unwrap_or_else(|| WorkspaceId(String::new()));
         snapshot.active_workspace_id = fallback_workspace.clone();
         // Same for the ordinary multi-workspace path: archiving routes
         // through here too (`close_workspace_with_worktree_impl`), so this is
         // the one choke point both removals share.
         prune_manual_monitors(&mut snapshot);
 
-        Ok(CloseWorkspaceResult {
+        Ok((CloseWorkspaceResult {
             fallback: fallback_workspace,
-            removed_sessions: removed_session_id_strings
-                .into_iter()
-                .map(SessionId)
-                .collect(),
+            removed_sessions,
             removed_agent_chat_threads,
             removed_agent_browser_sessions,
-        })
+        }, prepared))
     }
 
     /// Add an archive entry, first evicting any stale entry for the same
@@ -4689,12 +4967,13 @@ impl AppStateStore {
     pub fn create_terminal_session(&self) -> Result<SessionId, String> {
         let mut snapshot = self.inner.lock().unwrap();
         let active_workspace_id = snapshot.active_workspace_id.clone();
-        let workspace_terminal_count = snapshot
+        let workspace = snapshot
             .workspaces
             .iter()
             .find(|workspace| workspace.workspace_id == active_workspace_id)
-            .map(terminal_count_for_workspace)
             .ok_or_else(|| "No active workspace available".to_string())?;
+        self.check_terminal_creation(&active_workspace_id, Some(&workspace.active_surface_id))?;
+        let workspace_terminal_count = terminal_count_for_workspace(workspace);
 
         if workspace_terminal_count >= MAX_TERMINAL_SESSIONS {
             return Err(format!(
@@ -4702,7 +4981,7 @@ impl AppStateStore {
             ));
         }
 
-        let session_id = SessionId(next_id("session"));
+        let session_id = new_terminal_session_id();
         let pane_id = PaneId(next_id("pane"));
         let cwd = current_project_root().display().to_string();
         let shell = env::var("SHELL").ok();
@@ -4710,6 +4989,8 @@ impl AppStateStore {
 
         snapshot.terminal_sessions.push(TerminalSessionSnapshot {
             session_id: session_id.clone(),
+            daemon_unused: true,
+            restore_predecessor_session_id: None,
             title: title.clone(),
             shell: shell.clone(),
             cwd: cwd.clone(),
@@ -4775,6 +5056,8 @@ impl AppStateStore {
             let (workspace_index, surface_index) =
                 find_pane_location(&snapshot.workspaces, pane_id)
                     .ok_or_else(|| format!("No pane found for {pane_id}"))?;
+            let workspace = &snapshot.workspaces[workspace_index];
+            self.check_terminal_creation(&workspace.workspace_id, Some(&workspace.surfaces[surface_index].surface_id))?;
             let workspace_terminal_count = snapshot
                 .workspaces
                 .get(workspace_index)
@@ -4787,7 +5070,7 @@ impl AppStateStore {
                 ));
             }
 
-            let session_id = SessionId(next_id("session"));
+            let session_id = new_terminal_session_id();
             let new_pane_id = PaneId(next_id("pane"));
             let split_pane_id = PaneId(next_id("pane"));
             let cwd = snapshot
@@ -4800,6 +5083,8 @@ impl AppStateStore {
 
             snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                 session_id: session_id.clone(),
+                daemon_unused: true,
+                restore_predecessor_session_id: None,
                 title: title.clone(),
                 shell,
                 cwd,
@@ -4896,6 +5181,16 @@ impl AppStateStore {
         session_id: &str,
         select: bool,
     ) -> Result<SessionId, String> {
+        self.close_terminal_session_with_precommit(session_id, select, |_, _| Ok(()))
+            .map(|(fallback, ())| fallback)
+    }
+
+    pub(crate) fn close_terminal_session_with_precommit<T>(
+        &self,
+        session_id: &str,
+        select: bool,
+        precommit: impl FnOnce(&str, &[SessionId]) -> Result<T, String>,
+    ) -> Result<(SessionId, T), String> {
         let mut snapshot = self.inner.lock().unwrap();
         Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
             if snapshot.terminal_sessions.len() <= 1 {
@@ -4907,41 +5202,27 @@ impl AppStateStore {
                 .iter()
                 .position(|session| session.session_id.0 == session_id)
                 .ok_or_else(|| format!("No terminal session found for {session_id}"))?;
+            let (workspace_index, surface_index) = snapshot.workspaces.iter().enumerate().find_map(|(index, workspace)| {
+                workspace.surfaces.iter().position(|surface| pane_tree_contains_session(&surface.root, session_id))
+                    .map(|surface| (index, surface))
+            }).ok_or_else(|| format!("No fallback session available after closing {session_id}"))?;
+            let workspace = &snapshot.workspaces[workspace_index];
+            let surface = &workspace.surfaces[surface_index];
+            let updated_root = remove_terminal_from_tree(&surface.root, session_id)
+                .ok_or_else(|| format!("Unable to remove session {session_id} from pane tree"))?;
+            let (next_pane_id, next_session_id) = first_terminal_pane(&updated_root)
+                .ok_or_else(|| "Pane tree lost its last terminal pane unexpectedly".to_string())?;
+            let closing = &snapshot.terminal_sessions[session_index].session_id;
+            let prepared = precommit(&workspace.workspace_id.0, std::slice::from_ref(closing))?;
+
             snapshot.terminal_sessions.remove(session_index);
-
-            let mut fallback_session_id: Option<SessionId> = None;
-            let mut next_active_workspace_id: Option<WorkspaceId> = None;
-
-            for workspace in &mut snapshot.workspaces {
-                for surface in &mut workspace.surfaces {
-                    if !pane_tree_contains_session(&surface.root, session_id) {
-                        continue;
-                    }
-
-                    let updated_root = remove_terminal_from_tree(&surface.root, session_id)
-                        .ok_or_else(|| {
-                            format!("Unable to remove session {session_id} from pane tree")
-                        })?;
-                    let (next_pane_id, next_session_id) = first_terminal_pane(&updated_root)
-                        .ok_or_else(|| {
-                            "Pane tree lost its last terminal pane unexpectedly".to_string()
-                        })?;
-
-                    surface.root = updated_root;
-                    surface.active_pane_id = next_pane_id;
-                    workspace.active_surface_id = surface.surface_id.clone();
-                    next_active_workspace_id = Some(workspace.workspace_id.clone());
-                    fallback_session_id = Some(next_session_id);
-                    break;
-                }
-            }
-
-            if let Some(workspace_id) = next_active_workspace_id {
-                snapshot.active_workspace_id = workspace_id;
-            }
-
-            fallback_session_id
-                .ok_or_else(|| format!("No fallback session available after closing {session_id}"))
+            let workspace = &mut snapshot.workspaces[workspace_index];
+            let surface = &mut workspace.surfaces[surface_index];
+            surface.root = updated_root;
+            surface.active_pane_id = next_pane_id;
+            workspace.active_surface_id = surface.surface_id.clone();
+            snapshot.active_workspace_id = workspace.workspace_id.clone();
+            Ok((next_session_id, prepared))
         })
     }
 
@@ -4973,6 +5254,16 @@ impl AppStateStore {
         pane_id: &str,
         select: bool,
     ) -> Result<Option<SessionId>, String> {
+        self.close_pane_with_precommit(pane_id, select, |_, _| Ok(()))
+            .map(|(removed, ())| removed)
+    }
+
+    pub(crate) fn close_pane_with_precommit<T>(
+        &self,
+        pane_id: &str,
+        select: bool,
+        precommit: impl FnOnce(&str, &[SessionId]) -> Result<T, String>,
+    ) -> Result<(Option<SessionId>, T), String> {
         let mut snapshot = self.inner.lock().unwrap();
         Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
             let (workspace_index, surface_index) =
@@ -4980,49 +5271,30 @@ impl AppStateStore {
                     .ok_or_else(|| format!("No pane found for {pane_id}"))?;
 
             let target_pane = PaneId(pane_id.to_string());
-            let removed_session_id = {
-                let surface = snapshot
-                    .workspaces
-                    .get(workspace_index)
-                    .and_then(|workspace| workspace.surfaces.get(surface_index))
-                    .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
-                session_id_for_pane(&surface.root, &target_pane)
+            let workspace = &snapshot.workspaces[workspace_index];
+            let surface = &workspace.surfaces[surface_index];
+            let removed_session_id = session_id_for_pane(&surface.root, &target_pane);
+            let removed_browser_id = browser_id_for_pane(&surface.root, &target_pane);
+            let remaining_panes = if let Some(new_root) = remove_pane_from_tree(&surface.root, pane_id) {
+                // Keep focus on the current pane if it survived. Otherwise
+                // prefer the neighbor over the leftmost leaf.
+                let ordered_before = collect_leaf_pane_ids(&surface.root);
+                let next_active_pane = active_id_after_removal(&ordered_before, &surface.active_pane_id, pane_id)
+                    .filter(|pid| pane_tree_contains_pane(&new_root, &pid.0))
+                    .or_else(|| first_leaf_pane_id(&new_root))
+                    .ok_or_else(|| "No fallback pane available after close".to_string())?;
+                Some((new_root, next_active_pane))
+            } else {
+                None
             };
-            let removed_browser_id = {
-                let surface = snapshot
-                    .workspaces
-                    .get(workspace_index)
-                    .and_then(|workspace| workspace.surfaces.get(surface_index))
-                    .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
-                browser_id_for_pane(&surface.root, &target_pane)
-            };
+            let prepared = precommit(&workspace.workspace_id.0, removed_session_id.as_slice())?;
 
             let active_workspace_id: WorkspaceId;
 
             {
-                let workspace = snapshot
-                    .workspaces
-                    .get_mut(workspace_index)
-                    .ok_or_else(|| "Workspace disappeared while closing pane".to_string())?;
-                let surface = workspace
-                    .surfaces
-                    .get_mut(surface_index)
-                    .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
-
-                let ordered_before = collect_leaf_pane_ids(&surface.root);
-                let active_before = surface.active_pane_id.clone();
-                let updated_root = remove_pane_from_tree(&surface.root, pane_id);
-
-                if let Some(new_root) = updated_root {
-                    // Pane removed but surface still has content. Keep focus on the
-                    // current pane when a different pane was closed; when the active
-                    // pane itself was closed, move to the adjacent pane (next, then
-                    // previous) rather than the leftmost leaf.
-                    let next_active_pane =
-                        active_id_after_removal(&ordered_before, &active_before, pane_id)
-                            .filter(|pid| pane_tree_contains_pane(&new_root, &pid.0))
-                            .or_else(|| first_leaf_pane_id(&new_root))
-                            .ok_or_else(|| "No fallback pane available after close".to_string())?;
+                let workspace = &mut snapshot.workspaces[workspace_index];
+                if let Some((new_root, next_active_pane)) = remaining_panes {
+                    let surface = &mut workspace.surfaces[surface_index];
                     surface.root = new_root;
                     surface.active_pane_id = next_active_pane;
                     workspace.active_surface_id = surface.surface_id.clone();
@@ -5075,7 +5347,7 @@ impl AppStateStore {
                     .retain(|browser| browser.browser_id != browser_id);
             }
 
-            Ok(removed_session_id)
+            Ok((removed_session_id, prepared))
         })
     }
 
@@ -5568,7 +5840,7 @@ impl AppStateStore {
         Ok(())
     }
 
-    pub fn update_terminal_session_shell(&self, session: &str, shell: String) -> bool {
+    pub fn update_terminal_session_shell(&self, session: &str, shell: String, uses_daemon: bool) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(terminal) = snapshot
             .terminal_sessions
@@ -5576,6 +5848,7 @@ impl AppStateStore {
             .find(|terminal| terminal.session_id.0 == session)
         {
             terminal.shell = Some(shell);
+            terminal.daemon_unused &= !uses_daemon;
             return true;
         }
         false
@@ -6005,6 +6278,7 @@ impl AppStateStore {
             .iter_mut()
             .find(|w| w.workspace_id.0 == workspace_id)
             .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+        self.check_terminal_creation(&workspace.workspace_id, None)?;
 
         let tab_id = next_id("tab");
         let mut new_session_id: Option<SessionId> = None;
@@ -6014,7 +6288,7 @@ impl AppStateStore {
                 let title = next_terminal_tab_title(&workspace.tabs);
                 let surface_id = SurfaceId(next_id("surface"));
                 let pane_id = PaneId(next_id("pane"));
-                let session_id = SessionId(next_id("session"));
+                let session_id = new_terminal_session_id();
                 let cwd = workspace.cwd.clone();
                 let shell = env::var("SHELL").ok();
 
@@ -6031,6 +6305,8 @@ impl AppStateStore {
 
                 snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                     session_id: session_id.clone(),
+                    daemon_unused: true,
+                    restore_predecessor_session_id: None,
                     title: "Terminal".into(),
                     shell,
                     cwd,
@@ -6122,6 +6398,16 @@ impl AppStateStore {
     }
 
     pub fn close_tab(&self, workspace_id: &str, tab_id: &str) -> Result<CloseTabResult, String> {
+        self.close_tab_with_precommit(workspace_id, tab_id, |_, _| Ok(()))
+            .map(|(result, ())| result)
+    }
+
+    pub(crate) fn close_tab_with_precommit<T>(
+        &self,
+        workspace_id: &str,
+        tab_id: &str,
+        precommit: impl FnOnce(&str, &[SessionId]) -> Result<T, String>,
+    ) -> Result<(CloseTabResult, T), String> {
         let mut snapshot = self.inner.lock().unwrap();
         let workspace = snapshot
             .workspaces
@@ -6135,7 +6421,7 @@ impl AppStateStore {
             .position(|t| t.tab_id == tab_id)
             .ok_or_else(|| format!("No tab found for {tab_id}"))?;
 
-        let tab = workspace.tabs.remove(tab_index);
+        let tab = &workspace.tabs[tab_index];
 
         // Collect resources to clean up
         let mut removed_sessions: Vec<SessionId> = vec![];
@@ -6150,20 +6436,20 @@ impl AppStateStore {
 
         // If terminal tab, remove its surface and collect session + browser IDs
         // from the pane tree (browser panes are embedded in splits, not on the tab).
-        if let Some(ref surface_id) = tab.surface_id {
-            if let Some(surface_index) = workspace
-                .surfaces
-                .iter()
-                .position(|s| s.surface_id == *surface_id)
-            {
-                let surface = workspace.surfaces.remove(surface_index);
-                collect_session_ids_from_tree(&surface.root, &mut removed_sessions);
-                collect_browser_ids_from_tree(&surface.root, &mut removed_browser_ids);
-                collect_agent_chat_threads_from_tree(
-                    &surface.root,
-                    &mut removed_agent_chat_threads,
-                );
-            }
+        let surface_index = tab.surface_id.as_ref().and_then(|surface_id| {
+            workspace.surfaces.iter().position(|surface| surface.surface_id == *surface_id)
+        });
+        if let Some(index) = surface_index {
+            let surface = &workspace.surfaces[index];
+            collect_session_ids_from_tree(&surface.root, &mut removed_sessions);
+            collect_browser_ids_from_tree(&surface.root, &mut removed_browser_ids);
+            collect_agent_chat_threads_from_tree(&surface.root, &mut removed_agent_chat_threads);
+        }
+
+        let prepared = precommit(workspace_id, &removed_sessions)?;
+        workspace.tabs.remove(tab_index);
+        if let Some(index) = surface_index {
+            workspace.surfaces.remove(index);
         }
 
         // If closed tab was active, activate adjacent tab (or clear if no tabs left)
@@ -6203,11 +6489,11 @@ impl AppStateStore {
                 .retain(|b| b.browser_id != *browser_id);
         }
 
-        Ok(CloseTabResult {
+        Ok((CloseTabResult {
             removed_sessions,
             removed_browser_ids,
             removed_agent_chat_threads,
-        })
+        }, prepared))
     }
 
     pub fn activate_tab(&self, workspace_id: &str, tab_id: &str) -> Result<(), String> {
@@ -6301,16 +6587,15 @@ impl AppStateStore {
                 && workspace.tabs.is_empty()
                 && !workspace.surfaces.is_empty()
             {
-                let tab_id = next_id("tab");
-                let surface_id = workspace
-                    .surfaces
-                    .first()
-                    .map(|s| s.surface_id.clone());
+                let surface_id = workspace.surfaces[0].surface_id.clone();
+                // A close can be journaled before the migrated layout is saved.
+                // Derive the tab ID from the persisted surface so replay can find it.
+                let tab_id = format!("legacy-tab-{}", surface_id.0);
                 workspace.tabs.push(TabSnapshot {
                     tab_id: tab_id.clone(),
                     kind: TabKind::Terminal,
                     title: "Terminal".into(),
-                    surface_id,
+                    surface_id: Some(surface_id),
                     browser_id: None,
                     icon: None,
                 });
@@ -6684,9 +6969,26 @@ fn emit_debouncer() -> &'static EmitDebouncer {
 }
 
 pub fn load_persisted_state() -> Option<AppStateSnapshot> {
-    let path = persisted_layout_path()?;
-    let contents = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    load_persisted_state_checked().ok().flatten()
+}
+
+/// A missing layout is normal on first launch. Other load errors mean the
+/// existing layout cannot be safely replaced by a fresh workspace snapshot.
+pub(crate) fn load_persisted_state_checked() -> Result<Option<AppStateSnapshot>, String> {
+    let path = persisted_layout_path().ok_or("No config directory for workspace layout")?;
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            && fs::symlink_metadata(&path).is_err_and(|metadata_error| {
+                metadata_error.kind() == std::io::ErrorKind::NotFound
+            }) => return Ok(None),
+        Err(error) => {
+            return Err(format!("Failed to read workspace layout at {}: {error}", path.display()));
+        }
+    };
+    serde_json::from_str(&contents).map(Some).map_err(|error| {
+        format!("Failed to decode workspace layout at {}: {error}", path.display())
+    })
 }
 
 /// Remove all browser panes and browser sessions from a snapshot.
@@ -6988,14 +7290,168 @@ pub fn restore_session_ids(snapshot: &AppStateSnapshot) {
         .max()
         .unwrap_or(0);
 
-    ID_COUNTER.store(max_id + 1, Ordering::Relaxed);
+    ID_COUNTER.fetch_max(max_id.saturating_add(1), Ordering::Relaxed);
+}
+
+/// A pending close still owns its IDs even after the pane leaves the layout.
+/// Reserve them before imports or restored workspaces allocate new IDs.
+#[cfg(unix)]
+pub(crate) fn reserve_pending_close_ids(
+    layout_closes: &[LayoutCloseIntent],
+    daemon_closes: &[crate::database::daemon_closes::PendingDaemonClose],
+) {
+    if let Some(max_id) = daemon_closes
+        .iter()
+        .flat_map(|close| [close.route.workspace_id.as_str(), close.session_id.as_str()])
+        .chain(layout_closes.iter().flat_map(LayoutCloseIntent::ids))
+        .filter_map(|id| extract_numeric_suffix(id))
+        .max()
+    {
+        ID_COUNTER.fetch_max(max_id.saturating_add(1), Ordering::Relaxed);
+    }
+}
+
+#[cfg(unix)]
+impl LayoutCloseIntent {
+    fn ids(&self) -> [&str; 2] {
+        match self {
+            Self::Pane(id) | Self::Workspace(id) => [id, ""],
+            Self::Session { workspace_id, session_id } => [workspace_id, session_id],
+            Self::Tab { workspace_id, tab_id } => [workspace_id, tab_id],
+            Self::Archive(entry) => [&entry.workspace_id, ""],
+        }
+    }
+
+    fn needs_replay(&self, snapshot: &AppStateSnapshot) -> bool {
+        match self {
+            Self::Pane(id) => find_pane_location(&snapshot.workspaces, id).is_some(),
+            Self::Session { workspace_id, session_id } => {
+                terminal_pane_for_close_intent(snapshot, workspace_id, session_id).is_some()
+            }
+            Self::Tab { workspace_id, tab_id } => snapshot.workspaces.iter().any(|workspace| {
+                workspace.workspace_id.0 == *workspace_id && workspace.tabs.iter().any(|tab| tab.tab_id == *tab_id)
+            }),
+            Self::Workspace(id) => snapshot.workspaces.iter().any(|workspace| workspace.workspace_id.0 == *id),
+            Self::Archive(entry) => snapshot.workspaces.iter().any(|workspace| workspace.workspace_id.0 == entry.workspace_id)
+                || !archive_installed_or_superseded(snapshot, entry),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn archive_installed_or_superseded(snapshot: &AppStateSnapshot, entry: &ArchivedWorkspaceSnapshot) -> bool {
+    let order = |archive: &ArchivedWorkspaceSnapshot| (archive.archived_at, extract_numeric_suffix(&archive.workspace_id));
+    snapshot.archived_workspaces.iter().any(|other| {
+        other.archive_id == entry.archive_id
+            || (!is_chat_child_entry(entry) && !is_chat_child_entry(other)
+                && other.cwd == entry.cwd && other.worktree_path == entry.worktree_path
+                && order(other) > order(entry))
+    })
+}
+
+#[cfg(unix)]
+fn terminal_pane_for_close_intent(
+    snapshot: &AppStateSnapshot,
+    workspace_id: &str,
+    session_id: &str,
+) -> Option<PaneId> {
+    snapshot.workspaces.iter()
+        .find(|workspace| workspace.workspace_id.0 == workspace_id)?
+        .surfaces.iter()
+        .find_map(|surface| find_terminal_pane_id(&surface.root, session_id))
+}
+
+#[cfg(unix)]
+fn workspace_is_local(snapshot: &AppStateSnapshot, workspace_id: &str) -> bool {
+    snapshot.workspaces.iter().any(|workspace| {
+        workspace.workspace_id.0 == workspace_id && workspace.host_id.is_none()
+    })
+}
+
+/// Install activated successors before replaying closes that may refer to the
+/// new IDs. Translate an older session-scoped close in memory and keep its
+/// original key for journal retirement.
+#[cfg(unix)]
+pub(crate) fn restore_terminal_replacements_and_layout_closes(
+    store: &AppStateStore,
+    replacements: &[crate::database::daemon_closes::PendingTerminalReplacement],
+    closes: &[LayoutCloseIntent],
+) -> Result<(), String> {
+    if replacements.is_empty() {
+        return restore_pending_layout_closes(store, closes);
+    }
+    for replacement in replacements {
+        store.replace_terminal_session(
+            &replacement.workspace_id,
+            &replacement.old_session_id,
+            &replacement.replacement_session_id(),
+            || true,
+        )?;
+    }
+    let snapshot = store.inner.lock().unwrap();
+    let closes: Vec<_> = closes.iter().map(|close| {
+        if let LayoutCloseIntent::Session { workspace_id, session_id } = close {
+            if let Some(replacement) = replacements.iter().find(|replacement| {
+                replacement.workspace_id == *workspace_id
+                    && replacement.old_session_id == *session_id
+                    && workspace_is_local(&snapshot, workspace_id)
+            }) {
+                return LayoutCloseIntent::Session {
+                    workspace_id: workspace_id.clone(),
+                    session_id: replacement.replacement_session_id(),
+                };
+            }
+        }
+        close.clone()
+    }).collect();
+    drop(snapshot);
+    restore_pending_layout_closes(store, &closes)
+}
+
+/// A close intent can outlive the last saved layout. Apply it before any
+/// terminal hydration can reattach to the old shell or launch a replacement.
+#[cfg(unix)]
+pub(crate) fn restore_pending_layout_closes(
+    store: &AppStateStore,
+    closes: &[LayoutCloseIntent],
+) -> Result<(), String> {
+    for close in closes {
+        if !close.needs_replay(&store.inner.lock().unwrap()) {
+            continue;
+        }
+        match close {
+            LayoutCloseIntent::Pane(id) => { store.close_pane_with_selection(id, false)?; }
+            LayoutCloseIntent::Session { workspace_id, session_id } => {
+                let pane = terminal_pane_for_close_intent(&store.inner.lock().unwrap(), workspace_id, session_id);
+                if let Some(pane) = pane {
+                    store.close_pane_with_selection(&pane.0, false)?;
+                }
+            }
+            LayoutCloseIntent::Tab { workspace_id, tab_id } => { store.close_tab(workspace_id, tab_id)?; }
+            LayoutCloseIntent::Workspace(id) => { store.close_workspace(id)?; }
+            LayoutCloseIntent::Archive(entry) => {
+                let (workspace_open, archived) = {
+                    let snapshot = store.inner.lock().unwrap();
+                    (snapshot.workspaces.iter().any(|workspace| workspace.workspace_id.0 == entry.workspace_id),
+                     archive_installed_or_superseded(&snapshot, entry))
+                };
+                if workspace_open {
+                    store.close_workspace(&entry.workspace_id)?;
+                }
+                if !archived {
+                    store.add_archived_workspace((**entry).clone());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn default_app_state() -> AppStateSnapshot {
     let workspace_id = WorkspaceId(next_id("workspace"));
     let surface_id = SurfaceId(next_id("surface"));
     let pane_id = PaneId(next_id("pane"));
-    let session_id = SessionId(next_id("session"));
+    let session_id = new_terminal_session_id();
     let default_tab_id = next_id("tab");
     let cwd = current_project_root().display().to_string();
     let shell = env::var("SHELL").ok();
@@ -7069,6 +7525,8 @@ fn default_app_state() -> AppStateSnapshot {
         }],
         terminal_sessions: vec![TerminalSessionSnapshot {
             session_id,
+            daemon_unused: true,
+            restore_predecessor_session_id: None,
             title: "Terminal 1".into(),
             shell,
             cwd,
@@ -7233,6 +7691,19 @@ pub fn find_terminal_pane_id(root: &PaneNodeSnapshot, target_session_id: &str) -
     }
 }
 
+#[cfg(unix)]
+fn terminal_session_binding_mut<'a>(
+    root: &'a mut PaneNodeSnapshot,
+    target_session_id: &str,
+) -> Option<&'a mut SessionId> {
+    match root {
+        PaneNodeSnapshot::Terminal { session_id, .. } if session_id.0 == target_session_id => Some(session_id),
+        PaneNodeSnapshot::Split { children, .. } => children.iter_mut()
+            .find_map(|child| terminal_session_binding_mut(child, target_session_id)),
+        _ => None,
+    }
+}
+
 /// Resolve a chat `thread_id` to the `AgentChat` pane bound to it, if any.
 /// The chat-pane counterpart to [`find_terminal_pane_id`]: the terminal
 /// walker matches on the PTY `session_id` and skips `AgentChat` nodes, so
@@ -7386,6 +7857,38 @@ fn persisted_layout_path() -> Option<PathBuf> {
     }
     let base = dirs::config_dir()?;
     Some(base.join(crate::APP_DIR_NAME).join("layout.json"))
+}
+
+/// Hold ownership of the saved layout from startup through the final write.
+/// Socket paths can differ between processes that share this layout.
+pub(crate) fn acquire_layout_lock() -> Result<fs::File, String> {
+    let layout = persisted_layout_path().ok_or("No config directory for workspace layout")?;
+    let parent = layout.parent().ok_or("Workspace layout has no parent directory")?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create the layout directory at {}: {error}", parent.display()))?;
+
+    let lock_path = layout.with_extension("lock");
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(&lock_path)
+        .map_err(|error| format!("Failed to open the layout lock at {}: {error}", lock_path.display()))?;
+    // Keep the lock file in place so contenders always open the same file.
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(fs::TryLockError::WouldBlock) => Err(format!(
+            "Codemux is already running with the workspace layout at {}.",
+            layout.display(),
+        )),
+        Err(fs::TryLockError::Error(error)) => Err(format!(
+            "Failed to acquire the layout lock at {}: {error}",
+            lock_path.display(),
+        )),
+    }
 }
 
 /// Drop the pane statuses that mean nothing after a restart, keeping the ones
@@ -8263,6 +8766,12 @@ fn stable_browser_session_name(cwd: &str) -> String {
 fn next_id(prefix: &str) -> String {
     let value = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{value}")
+}
+
+fn new_terminal_session_id() -> SessionId {
+    // A daemon can outlive the app and still own terminal IDs from layouts
+    // that were never saved. Avoid reusing those IDs after a counter reset.
+    SessionId(format!("session-{}", uuid::Uuid::new_v4().simple()))
 }
 
 fn extract_numeric_suffix(value: &str) -> Option<u64> {
@@ -9313,6 +9822,311 @@ mod tests {
         assert!(after.workspaces.iter().any(|w| w.workspace_id.0 == ws3_id.0));
         // Active workspace should be set to the first remaining
         assert!(!after.active_workspace_id.0.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_mixed_tab_close_replays_the_whole_tab_after_relaunch() {
+        if crate::test_isolation::isolated("state::state_impl::tests::pending_mixed_tab_close_replays_the_whole_tab_after_relaunch") {
+            return;
+        }
+        assert_scoped_close_replays_after_relaunch(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_daemon_shells_require_a_matching_workspace_and_session() {
+        use crate::database::daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose};
+
+        let store = AppStateStore::default();
+        let live = PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: store.snapshot().active_workspace_id.0,
+                host_id: None,
+                ssh_target: None,
+            },
+            session_id: store.active_terminal_session_id().unwrap().0,
+            shell_id: uuid::Uuid::new_v4(),
+        };
+        let missing_pane = PendingDaemonClose {
+            session_id: "missing-session".into(),
+            ..live.clone()
+        };
+        let missing_workspace = PendingDaemonClose {
+            route: DaemonWorkspaceRoute {
+                workspace_id: "missing-workspace".into(),
+                ..live.route.clone()
+            },
+            ..live.clone()
+        };
+        assert_eq!(
+            store.orphaned_daemon_shells(vec![live, missing_pane.clone(), missing_workspace.clone()]),
+            [missing_pane, missing_workspace],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_migrated_tab_close_replays_before_the_first_migrated_save() {
+        if crate::test_isolation::isolated(
+            "state::state_impl::tests::pending_migrated_tab_close_replays_before_the_first_migrated_save",
+        ) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db_path = root.join("layout-closes.sqlite");
+        let workspace_id = {
+            let store = AppStateStore::default();
+            let mut snapshot = store.snapshot();
+            let workspace_id = snapshot.active_workspace_id.0.clone();
+            snapshot.workspaces[0].tabs.clear();
+            snapshot.workspaces[0].active_tab_id.clear();
+            store.replace_snapshot(snapshot);
+            flush_persisted_state(&store).unwrap();
+
+            store.migrate_tabs_if_needed();
+            let tab_id = store.find_workspace(&workspace_id).unwrap().active_tab_id;
+            store.close_tab(&workspace_id, &tab_id).unwrap();
+            let intent = LayoutCloseIntent::Tab { workspace_id: workspace_id.clone(), tab_id };
+            crate::database::DatabaseStore::test_file(&db_path)
+                .record_layout_close(&intent, &[])
+                .unwrap();
+            workspace_id
+        };
+
+        let db = crate::database::DatabaseStore::test_file(&db_path);
+        let intents = db.pending_layout_closes().unwrap();
+        let store = AppStateStore::default();
+        let stale_layout = load_persisted_state().unwrap();
+        reserve_pending_close_ids(&intents, &[]);
+        restore_session_ids(&stale_layout);
+        store.replace_snapshot(stale_layout);
+        store.migrate_tabs_if_needed();
+        restore_pending_layout_closes(&store, &intents).unwrap();
+        assert!(store.find_workspace(&workspace_id).unwrap().surfaces.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_replacement_replays_before_a_pending_session_close() {
+        const TEST: &str = "state::state_impl::tests::terminal_replacement_replays_before_a_pending_session_close";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db = crate::database::DatabaseStore::test_file(&root.join("replacements.sqlite"));
+
+        for close_successor in [None, Some(false), Some(true)] {
+            let original = AppStateStore::default();
+            let workspace_id = original.active_workspace_id();
+            let plan = original.pty_hydration_plan_for_workspace(&workspace_id).unwrap();
+            let old = &plan.sessions[0];
+            let pane_id = old.pane_id.as_deref().unwrap();
+            let sibling = original.split_pane(pane_id, SplitDirection::Horizontal).unwrap();
+            flush_persisted_state(&original).unwrap();
+
+            db.begin_local_terminal_restart(&workspace_id, &old.session_id, None).unwrap();
+            db.activate_tokenless_local_replacement(&workspace_id, &old.session_id).unwrap();
+            let replacements = db.pending_terminal_replacements().unwrap();
+            assert_eq!(replacements.len(), 1);
+            let replacement = replacements[0].replacement_session_id();
+            assert!(persist_terminal_replacements(&original, &db, &replacements).is_err());
+
+            let closes = if let Some(successor) = close_successor {
+                let close = LayoutCloseIntent::Session {
+                    workspace_id: workspace_id.clone(),
+                    session_id: if successor { replacement.clone() } else { old.session_id.clone() },
+                };
+                db.record_layout_close(&close, &[]).unwrap();
+                db.pending_layout_closes().unwrap()
+            } else {
+                Vec::new()
+            };
+            let restored = AppStateStore::default();
+            restored.replace_snapshot(load_persisted_state().unwrap());
+            for _ in 0..2 {
+                restore_terminal_replacements_and_layout_closes(&restored, &replacements, &closes).unwrap();
+                assert!(restored.pty_hydration_plan_for_session(&old.session_id).is_none());
+                assert!(restored.pty_hydration_plan_for_session(&sibling.0).is_some());
+                let current = restored.pty_hydration_plan_for_session(&replacement);
+                if close_successor.is_none() {
+                    let current = current.unwrap();
+                    assert_eq!(current.sessions[0].pane_id.as_deref(), Some(pane_id));
+                    assert_eq!(
+                        current.sessions[0].restore_predecessor_session_id.as_deref(),
+                        Some(old.session_id.as_str()),
+                    );
+                } else {
+                    assert!(current.is_none());
+                }
+            }
+            persist_terminal_replacements(&restored, &db, &replacements).unwrap();
+            assert!(db.pending_terminal_replacements().unwrap().is_empty());
+            let saved = load_persisted_state().unwrap();
+            assert!(terminal_pane_for_close_intent(&saved, &workspace_id, &old.session_id).is_none());
+            assert_eq!(
+                terminal_pane_for_close_intent(&saved, &workspace_id, &replacement).is_some(),
+                close_successor.is_none(),
+            );
+            if close_successor.is_none() {
+                let successor = saved.terminal_sessions.iter()
+                    .find(|session| session.session_id.0 == replacement)
+                    .unwrap();
+                assert_eq!(
+                    successor.restore_predecessor_session_id.as_deref(),
+                    Some(old.session_id.as_str()),
+                );
+            }
+            persist_layout_closes(&restored, &db, &closes).unwrap();
+            assert!(db.pending_layout_closes().unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_replacement_preserves_a_pane_moved_to_a_device() {
+        const TEST: &str = "state::state_impl::tests::terminal_replacement_preserves_a_pane_moved_to_a_device";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db = crate::database::DatabaseStore::test_file(&root.join("replacements.sqlite"));
+        let store = AppStateStore::default();
+        let workspace_id = store.active_workspace_id();
+        let plan = store.pty_hydration_plan_for_workspace(&workspace_id).unwrap();
+        let session_id = &plan.sessions[0].session_id;
+        db.begin_local_terminal_restart(&workspace_id, session_id, None).unwrap();
+        db.activate_tokenless_local_replacement(&workspace_id, session_id).unwrap();
+        let replacements = db.pending_terminal_replacements().unwrap();
+        store.set_workspace_host_id(&workspace_id, Some(17)).unwrap();
+
+        restore_terminal_replacements_and_layout_closes(&store, &replacements, &[]).unwrap();
+        persist_terminal_replacements(&store, &db, &replacements).unwrap();
+
+        let saved = load_persisted_state().unwrap();
+        assert!(terminal_pane_for_close_intent(&saved, &workspace_id, session_id).is_some());
+        assert!(terminal_pane_for_close_intent(
+            &saved, &workspace_id, &replacements[0].replacement_session_id(),
+        ).is_none());
+        assert!(db.pending_terminal_replacements().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_workspace_close_replays_the_whole_workspace_after_relaunch() {
+        if crate::test_isolation::isolated("state::state_impl::tests::pending_workspace_close_replays_the_whole_workspace_after_relaunch") {
+            return;
+        }
+        assert_scoped_close_replays_after_relaunch(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_archive_replays_its_entry_after_workspace_removal_was_saved() {
+        if crate::test_isolation::isolated("state::state_impl::tests::pending_archive_replays_its_entry_after_workspace_removal_was_saved") {
+            return;
+        }
+        use crate::database::DatabaseStore;
+
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db_path = root.join("layout-closes.sqlite");
+        let entry = {
+            let store = AppStateStore::default();
+            let workspace_id = store.snapshot().active_workspace_id.0;
+            let entry = build_archive_entry(&store.find_workspace(&workspace_id).unwrap());
+            store.close_workspace(&workspace_id).unwrap();
+            let intent = LayoutCloseIntent::Archive(Box::new(entry.clone()));
+            DatabaseStore::test_file(&db_path).record_layout_close(&intent, &[]).unwrap();
+            // An existing debounce may save the removal before the live
+            // archive entry is published after teardown completes.
+            flush_persisted_state(&store).unwrap();
+            entry
+        };
+
+        let db = DatabaseStore::test_file(&db_path);
+        let intents = db.pending_layout_closes().unwrap();
+        assert_eq!(intents, [LayoutCloseIntent::Archive(Box::new(entry.clone()))]);
+        let store = AppStateStore::default();
+        store.replace_snapshot(load_persisted_state().unwrap());
+        assert!(store.find_workspace(&entry.workspace_id).is_none());
+        assert!(store.find_archived_workspace(&entry.archive_id).is_none());
+        restore_pending_layout_closes(&store, &intents).unwrap();
+        restore_pending_layout_closes(&store, &intents).unwrap();
+        assert_eq!(store.archived_workspaces_list(), [entry.clone()]);
+        persist_layout_closes(&store, &db, &intents).unwrap();
+        assert_eq!(load_persisted_state().unwrap().archived_workspaces, [entry]);
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    fn assert_scoped_close_replays_after_relaunch(whole_workspace: bool) {
+        use crate::database::daemon_closes::{DaemonWorkspaceRoute, PendingDaemonClose};
+        use crate::database::DatabaseStore;
+
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let db_path = root.join("layout-closes.sqlite");
+        let (intent, other_workspace, workspace_id, other_tab, closes) = {
+            let store = AppStateStore::default();
+            let other_workspace = store.snapshot().active_workspace_id;
+            let workspace_id = store.create_workspace_with_layout(root.clone(), WorkspacePresetLayout::Single);
+            let (other_tab, _) = store.create_tab(&workspace_id.0, TabKind::Terminal).unwrap();
+            let mut snapshot = store.snapshot();
+            let workspace = snapshot.workspaces.iter_mut().find(|workspace| workspace.workspace_id == workspace_id).unwrap();
+            let tab_id = workspace.tabs[0].tab_id.clone();
+            let surface = &mut workspace.surfaces[0];
+            surface.root = PaneNodeSnapshot::Split {
+                pane_id: PaneId(next_id("split")),
+                direction: SplitDirection::Horizontal,
+                child_sizes: vec![0.5, 0.5],
+                children: vec![surface.root.clone(), PaneNodeSnapshot::AgentChat {
+                    pane_id: PaneId(next_id("pane")),
+                    title: "Keep this chat only if its tab stays open".into(),
+                    thread_id: None,
+                    provider: None,
+                    cwd: None,
+                }],
+            };
+            store.replace_snapshot(snapshot);
+            flush_persisted_state(&store).unwrap();
+            let (intent, sessions) = if whole_workspace {
+                let result = store.close_workspace(&workspace_id.0).unwrap();
+                (LayoutCloseIntent::Workspace(workspace_id.0.clone()), result.removed_sessions)
+            } else {
+                let result = store.close_tab(&workspace_id.0, &tab_id).unwrap();
+                (LayoutCloseIntent::Tab { workspace_id: workspace_id.0.clone(), tab_id }, result.removed_sessions)
+            };
+            assert_eq!(sessions.len(), if whole_workspace { 2 } else { 1 });
+            let closes: Vec<_> = sessions.into_iter().map(|session| PendingDaemonClose {
+                route: DaemonWorkspaceRoute { workspace_id: workspace_id.0.clone(), host_id: None, ssh_target: None },
+                session_id: session.0,
+                shell_id: uuid::Uuid::new_v4(),
+            }).collect();
+            DatabaseStore::test_file(&db_path).record_layout_close(&intent, &closes).unwrap();
+            // No layout save before the first app stops.
+            (intent, other_workspace, workspace_id, other_tab, closes)
+        };
+
+        let restored = AppStateStore::default();
+        let db = DatabaseStore::test_file(&db_path);
+        let intents = db.pending_layout_closes().unwrap();
+        assert_eq!(intents, [intent.clone()]);
+        assert_eq!(db.pending_daemon_closes().unwrap(), closes);
+        let stale = load_persisted_state().unwrap();
+        assert!(intent.needs_replay(&stale));
+        restored.replace_snapshot(stale);
+        restore_pending_layout_closes(&restored, &intents).unwrap();
+        let restored_snapshot = restored.snapshot();
+        assert!(!intent.needs_replay(&restored_snapshot));
+        assert!(restored_snapshot.workspaces.iter().any(|workspace| workspace.workspace_id == other_workspace));
+        if !whole_workspace {
+            assert!(restored_snapshot.workspaces.iter().any(|workspace| {
+                workspace.workspace_id == workspace_id && workspace.tabs.iter().any(|tab| tab.tab_id == other_tab)
+            }));
+        }
+        persist_layout_closes(&restored, &db, &intents).unwrap();
+        assert!(!intent.needs_replay(&load_persisted_state().unwrap()));
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+        assert_eq!(db.pending_daemon_closes().unwrap(), closes);
     }
 
     /// Regression guard for the PTY child-process leak fix: `close_workspace`
@@ -10910,6 +11724,110 @@ mod tests {
     }
 
     #[test]
+    fn layout_handoff_drains_an_in_flight_write_and_rejects_late_writes() {
+        if crate::test_isolation::isolated(
+            "state::state_impl::tests::layout_handoff_drains_an_in_flight_write_and_rejects_late_writes",
+        ) {
+            return;
+        }
+
+        let path = persisted_layout_path().unwrap();
+        let root = path.parent().unwrap();
+        let owner = acquire_layout_lock().unwrap();
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        store.create_empty_workspace_at_path(root.join("earlier"));
+        let earlier_snapshot = store.snapshot();
+        let final_workspace = store.create_empty_workspace_at_path(root.join("final"));
+
+        let (writing_tx, writing_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let debouncer = persist_debouncer();
+        debouncer.schedule_pending(PendingPersist::Lazy(Box::new(move || {
+            writing_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            earlier_snapshot.clone()
+        })));
+        writing_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        std::thread::scope(|scope| {
+            let release = release_tx;
+            let store = &store;
+            let finish = scope.spawn(move || {
+                let result = finish_layout_persistence(store);
+                drop(owner);
+                result
+            });
+
+            // The writer holds the write mutex until released. Once the close
+            // has sealed admission, it must still hold the layout ownership.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !debouncer.closed.load(Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "layout persistence did not close"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(acquire_layout_lock()
+                .unwrap_err()
+                .contains("Codemux is already running"));
+            release.send(()).unwrap();
+            finish.join().unwrap().unwrap();
+        });
+
+        let _successor = acquire_layout_lock().unwrap();
+        let final_layout = load_persisted_state().unwrap();
+        assert!(final_layout
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.workspace_id == final_workspace));
+
+        let successor_store = AppStateStore::default();
+        successor_store.clear_workspaces();
+        successor_store.create_empty_workspace_at_path(root.join("successor"));
+        save_persisted_state(&successor_store.snapshot()).unwrap();
+        let successor_bytes = fs::read(&path).unwrap();
+
+        let late_snapshot = store.snapshot();
+        debouncer.schedule_pending(PendingPersist::Lazy(Box::new(move || late_snapshot.clone())));
+        assert!(debouncer.last_snapshot.lock().unwrap().is_none());
+        assert_eq!(
+            flush_persisted_state(&store).unwrap_err(),
+            "Layout persistence is closed"
+        );
+        let db = crate::database::DatabaseStore::new_in_memory();
+        assert_eq!(
+            store.persist_local_import_layout(&db, &[]).unwrap_err(),
+            "Layout persistence is closed",
+        );
+        assert_eq!(
+            with_terminal_close_layout_lock(|| -> Result<(), String> {
+                panic!("terminal close admitted after layout handoff")
+            }).unwrap_err(),
+            "Layout persistence is closed",
+        );
+        #[cfg(unix)]
+        {
+            let close = LayoutCloseIntent::Workspace("closed-workspace".into());
+            assert_eq!(
+                persist_layout_closes(&store, &db, &[close]).unwrap_err(),
+                "Layout persistence is closed",
+            );
+            let replacement = crate::database::daemon_closes::PendingTerminalReplacement {
+                workspace_id: final_workspace.0,
+                old_session_id: "old-session".into(),
+                replacement_id: uuid::Uuid::new_v4(),
+            };
+            assert_eq!(
+                persist_terminal_replacements(&store, &db, &[replacement]).unwrap_err(),
+                "Layout persistence is closed",
+            );
+        }
+        assert_eq!(fs::read(path).unwrap(), successor_bytes);
+    }
+
+    #[test]
     fn local_import_windows_layout_writer_has_no_readonly_directory_flush() {
         // Static API-contract regression, runnable on Linux. This is not a
         // Windows runtime test: FlushFileBuffers requires GENERIC_WRITE and
@@ -10989,7 +11907,7 @@ mod tests {
                 0
             );
             store.create_empty_workspace_at_path(path.parent().unwrap().join("ordinary-close"));
-            flush_persisted_state(&store);
+            flush_persisted_state(&store).unwrap();
             assert_eq!(load_persisted_state().unwrap().workspaces.len(), 2);
             let app = tauri::test::mock_app();
             app.manage(store);

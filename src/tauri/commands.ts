@@ -6,6 +6,7 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 
 import { bytesToBase64 } from "@/lib/agent-chat/attachment-block";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { useEditorStore } from "@/stores/editor-store";
 import {
   noteLocalActivationFallback,
   noteLocalWorkspaceActivation,
@@ -350,8 +351,8 @@ export const activateTerminalSession = async (sessionId: string) => {
 export const closeTerminalSession = (sessionId: string) =>
   invoke<string>("close_terminal_session", { sessionId });
 
-export const restartTerminalSession = (sessionId: string) =>
-  invoke("restart_terminal_session", { sessionId });
+export const restartTerminalSession = (sessionId: string, expectedRestartToken: string) =>
+  invoke<boolean | null | void>("restart_terminal_session", { sessionId, expectedRestartToken });
 
 export const createWorkspace = (cwd: string | null = null) =>
   invoke<string>("create_workspace", { cwd });
@@ -595,7 +596,7 @@ async function refreshRemoteWorkspaceView(workspaceId: string, tabId: string | u
 }
 
 export const closeTab = (workspaceId: string, tabId: string) =>
-  invoke("close_tab", { workspaceId, tabId });
+  useEditorStore.getState().closeTab(tabId, () => invoke("close_tab", { workspaceId, tabId }));
 
 export const activateTab = async (workspaceId: string, tabId: string) => {
   const sequence = beginRemoteNavigation();
@@ -1199,9 +1200,10 @@ export const mergeBranch = (path: string, sourceBranch: string) =>
 export const mergeIntoBase = (path: string, baseBranch: string, deleteSourceBranch: boolean) =>
   invoke<MergeIntoBaseResult>("merge_into_base", { path, baseBranch, deleteSourceBranch });
 
+/** Returns the recovery directory under the same convention as MergeIntoBaseResult.recovery_dir. */
 export const completeMergeIntoBase = (
   path: string, baseBranch: string, tempBranch: string, sourceBranch: string, deleteSourceBranch: boolean,
-) => invoke("complete_merge_into_base", { path, baseBranch, tempBranch, sourceBranch, deleteSourceBranch });
+) => invoke<string | null>("complete_merge_into_base", { path, baseBranch, tempBranch, sourceBranch, deleteSourceBranch });
 
 export const abortMergeIntoBase = (path: string, sourceBranch: string, tempBranch: string) =>
   invoke("abort_merge_into_base", { path, sourceBranch, tempBranch });

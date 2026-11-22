@@ -10,6 +10,7 @@ use crate::git::{CommitLoss, Kept};
 use crate::state::{
     AppStateSnapshot,
     AppStateStore,
+    LayoutCloseIntent,
     NotificationLevel,
     SplitDirection,
     TabKind,
@@ -17,7 +18,7 @@ use crate::state::{
     WorkspaceType,
     WorktreeWorkspaceClaim,
 };
-use crate::terminal;
+use crate::terminal::{self, TerminalCloseError};
 use crate::workspace_paths::paths_equal;
 use crate::workspace_service::{
     Checkpoint, CloseWorkspace, OpenWorkspace, OpenedWorkspace, PresetLaunch, WorktreeBase,
@@ -25,8 +26,9 @@ use crate::workspace_service::{
 };
 use notify_rust::Notification;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 
@@ -1250,10 +1252,7 @@ pub async fn close_workspace_with_worktree<R: tauri::Runtime>(
 /// close command on daemon teardown: `manager.close()` is already
 /// timeout-bounded internally (see the module doc in `agent_browser.rs`),
 /// so there's no correctness reason to await it here, only a latency one.
-/// `pub(crate)` so every `AppStateStore::close_workspace` call site
-/// (the two close commands here and the
-/// workspaces-sync reconcile/rollback paths) shares the one
-/// implementation instead of drifting.
+/// The workspaces-sync adoption rollback also uses this for empty shells.
 pub(crate) fn reap_agent_browser_sessions<R: tauri::Runtime>(app: &tauri::AppHandle<R>, names: Vec<String>) {
     if names.is_empty() {
         return;
@@ -1347,14 +1346,15 @@ pub(crate) async fn close_workspace_checked<R: tauri::Runtime>(
     .map(|closed| closed.kept)
 }
 
-/// Which route a close came in by. They differ only in where teardown
-/// scripts run (see [`teardown_folder`]).
+/// A workspace close's teardown policy and durable layout operation.
 #[derive(Clone, Copy)]
-enum CloseRoute {
+enum CloseRoute<'a> {
     /// The sidebar's plain close.
     Plain,
-    /// The close dialog, archive, and the MCP / control-socket close.
+    /// The close dialog and the MCP / control-socket close.
     Tracked,
+    /// Tracked teardown plus the archive entry recorded with layout removal.
+    Archive(&'a crate::state::ArchivedWorkspaceSnapshot),
 }
 
 /// The folder a closing workspace's teardown scripts run in. A plain close
@@ -1362,13 +1362,13 @@ enum CloseRoute {
 /// worktree the workspace owns, so archiving a root checkout never runs its
 /// teardown. A chat child workspace has none on any route: it borrows its
 /// parent's folder, which stays in use.
-fn teardown_folder(ws: &crate::state::WorkspaceSnapshot, route: CloseRoute) -> Option<String> {
+fn teardown_folder(ws: &crate::state::WorkspaceSnapshot, route: CloseRoute<'_>) -> Option<String> {
     if ws.is_chat_child() {
         return None;
     }
     match route {
         CloseRoute::Plain => (!ws.is_local_import_snapshot_only()).then(|| ws.cwd.clone()),
-        CloseRoute::Tracked => ws.worktree_path.clone(),
+        CloseRoute::Tracked | CloseRoute::Archive(_) => ws.worktree_path.clone(),
     }
 }
 
@@ -1478,12 +1478,16 @@ struct Detached {
 impl Detached {
     /// Stop its chats, keeping its files. Cleanup may offer the checkout
     /// once every stop is acknowledged.
-    fn retire<R: tauri::Runtime>(self, app: &tauri::AppHandle<R>) -> crate::checkout_claims::Stops {
+    fn retire<R: tauri::Runtime>(
+        self,
+        app: &tauri::AppHandle<R>,
+        record_close: bool,
+    ) -> crate::checkout_claims::Stops {
         let issued = crate::commands::agent_chat::shutdown_agent_chat_threads(app, self.threads);
         let mut stops = self.earlier.clone();
         stops.extend(issued.clone());
         if let (Some(ws), Some(claim)) = (self.closing.as_ref(), self.claim) {
-            crate::worktree_cleanup::retire_workspace(app, claim, ws, self.earlier, issued, true);
+            crate::worktree_cleanup::retire_workspace(app, claim, ws, self.earlier, issued, record_close);
         }
         stops
     }
@@ -1498,18 +1502,37 @@ fn detach_workspace<R: tauri::Runtime>(
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     workspace_id: &str,
+    route: CloseRoute<'_>,
+    checkpoint: &Checkpoint,
 ) -> Result<Detached, String> {
     let closing = state.find_workspace(workspace_id);
     // Before the workspace leaves state, so no deletion or cleanup sees its
     // folders unclaimed while its chats may still run in them.
     let claim = closing.as_ref().map(crate::checkout_claims::claim_checkout);
-    let result = match state.close_workspace(workspace_id) {
-        Ok(result) => result,
+    let closed = crate::state::with_terminal_close_layout_lock(|| {
+        let intent = match route {
+            CloseRoute::Archive(entry) => LayoutCloseIntent::Archive(Box::new(entry.clone())),
+            _ => LayoutCloseIntent::Workspace(workspace_id.to_owned()),
+        };
+        let (_scope, terminal_close) = commit_closed_terminals(app, state, intent, checkpoint)?;
+        let result = state.close_workspace(workspace_id).unwrap_or_else(|_| crate::state::CloseWorkspaceResult {
+            fallback: state.snapshot().active_workspace_id,
+            removed_sessions: Vec::new(),
+            removed_agent_chat_threads: Vec::new(),
+            removed_agent_browser_sessions: Vec::new(),
+        });
+        Ok::<_, TerminalCloseError>((result, terminal_close))
+    });
+    let (result, terminal_close) = match closed {
+        Ok(closed) => closed,
         Err(e) => {
             if let Some(claim) = claim {
                 claim.release();
             }
-            return Err(format!("Failed to close workspace: {e}"));
+            return Err(match e {
+                TerminalCloseError::Failed(error) => format!("Failed to close workspace: {error}"),
+                TerminalCloseError::Authorization(error) => error,
+            });
         }
     };
     // Before any await: a chat closed just before this may still be
@@ -1543,16 +1566,7 @@ fn detach_workspace<R: tauri::Runtime>(
     // worktrees, slow disk). The caller emits again once done.
     crate::state::emit_app_state(app);
 
-    // Kill the PTY child process trees for every session that used to belong
-    // to this workspace. Sessions are returned atomically from the same lock
-    // acquisition that removed the workspace — no TOCTOU race with concurrent
-    // pane creation. Idempotent on the waiter thread (double-remove is a
-    // no-op) so per-session errors cannot bubble.
-    if let Some(terminal_state) = app.try_state::<crate::terminal::PtyState>() {
-        for session_id in result.removed_sessions {
-            crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
-        }
-    }
+    terminal_close.finish(app);
 
     Ok(Detached {
         closing,
@@ -1561,6 +1575,22 @@ fn detach_workspace<R: tauri::Runtime>(
         earlier,
         threads: result.removed_agent_chat_threads,
     })
+}
+
+fn commit_closed_terminals<'a, R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &'a AppStateStore,
+    intent: LayoutCloseIntent,
+    checkpoint: &Checkpoint,
+) -> Result<(crate::state::TerminalCloseScope<'a>, crate::terminal::CommittedTerminalClose), TerminalCloseError> {
+    let terminal_state = app.try_state::<crate::terminal::PtyState>();
+    crate::terminal::commit_terminal_close(
+        app,
+        state,
+        terminal_state.as_ref().map(|state| &state.sessions),
+        intent,
+        checkpoint,
+    )
 }
 
 /// Test-only pause in a close, after the workspace left app state and
@@ -1620,6 +1650,29 @@ async fn finish_detach<R: tauri::Runtime>(app: &tauri::AppHandle<R>, workspace_i
     }
 }
 
+/// Detach a reconciled standalone copy without running checkout scripts or
+/// registering its directory for worktree cleanup. Runs on a blocking worker.
+pub(crate) fn detach_reconciled_copy<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    workspace_id: &str,
+) -> Result<(), String> {
+    let state = app.state::<AppStateStore>();
+    let db = app.state::<crate::database::DatabaseStore>();
+    let attempt = WorkspaceCloseAttempt::begin(app, workspace_id)?;
+    let detached = detach_workspace(app, &state, &db, workspace_id, CloseRoute::Tracked, &Checkpoint::default())
+        .map_err(|error| attempt.close_error(&state, error))?;
+    attempt.set_teardown(None);
+    let host_id = detached.closing.as_ref().and_then(|workspace| workspace.host_id);
+    detached.retire(app, false);
+    let app = app.clone();
+    let workspace_id = workspace_id.to_owned();
+    tauri::async_runtime::spawn(async move {
+        finish_detach(&app, &workspace_id, host_id).await;
+        crate::state::emit_app_state(&app);
+    });
+    Ok(())
+}
+
 /// Close the chat child workspace `workspace_id` because the chat that
 /// delegated its task closed. Synchronous, so its own delegated children
 /// close in the same step. Returns the stops it started, including theirs.
@@ -1641,10 +1694,10 @@ pub(crate) fn close_delegated_child_workspace<R: tauri::Runtime>(
     else {
         return Default::default();
     };
-    let Ok(detached) = detach_workspace(app, &state, &db, workspace_id) else {
+    let Ok(detached) = detach_workspace(app, &state, &db, workspace_id, CloseRoute::Tracked, &Checkpoint::default()) else {
         return Default::default();
     };
-    let stops = detached.retire(app);
+    let stops = detached.retire(app, true);
     let app = app.clone();
     let workspace_id = workspace_id.to_string();
     tauri::async_runtime::spawn(async move {
@@ -1663,19 +1716,90 @@ struct Closed {
     kept: Option<Kept>,
 }
 
+#[derive(PartialEq, Eq)]
+struct CompletedTeardown {
+    folder: String,
+    commands: Vec<String>,
+}
+
+#[derive(Default)]
+struct WorkspaceCloseProgress {
+    active: bool,
+    teardown: Option<CompletedTeardown>,
+}
+
+#[derive(Clone, Default)]
+struct WorkspaceCloseAttempts(Arc<Mutex<HashMap<String, WorkspaceCloseProgress>>>);
+
+/// Serialize attempts for this workspace without holding a lock while a
+/// configured script runs. A failed detach leaves its teardown receipt for
+/// the next close in this process.
+struct WorkspaceCloseAttempt {
+    attempts: WorkspaceCloseAttempts,
+    workspace_id: String,
+}
+
+impl WorkspaceCloseAttempt {
+    fn begin<R: tauri::Runtime>(app: &tauri::AppHandle<R>, workspace_id: &str) -> Result<Self, String> {
+        if app.try_state::<WorkspaceCloseAttempts>().is_none() {
+            app.manage(WorkspaceCloseAttempts::default());
+        }
+        let attempts = app.state::<WorkspaceCloseAttempts>().inner().clone();
+        {
+            let mut all = attempts.0.lock().unwrap();
+            let progress = all.entry(workspace_id.to_owned()).or_default();
+            if progress.active {
+                return Err("A close is already in progress for this workspace".into());
+            }
+            progress.active = true;
+        }
+        Ok(Self { attempts, workspace_id: workspace_id.to_owned() })
+    }
+
+    fn already_ran(&self, teardown: &CompletedTeardown) -> bool {
+        self.attempts.0.lock().unwrap()[&self.workspace_id].teardown.as_ref() == Some(teardown)
+    }
+
+    fn set_teardown(&self, teardown: Option<CompletedTeardown>) {
+        self.attempts.0.lock().unwrap().get_mut(&self.workspace_id).unwrap().teardown = teardown;
+    }
+
+    fn close_error(&self, state: &AppStateStore, error: String) -> String {
+        let completed = self.attempts.0.lock().unwrap()[&self.workspace_id].teardown.is_some();
+        if completed && state.find_workspace(&self.workspace_id).is_some() {
+            format!("{error}\nTeardown already completed. The workspace is still open.")
+        } else {
+            error
+        }
+    }
+}
+
+impl Drop for WorkspaceCloseAttempt {
+    fn drop(&mut self) {
+        let mut all = self.attempts.0.lock().unwrap();
+        let progress = all.get_mut(&self.workspace_id).unwrap();
+        if progress.teardown.is_some() {
+            progress.active = false;
+        } else {
+            all.remove(&self.workspace_id);
+        }
+    }
+}
+
 /// The close itself, behind every close route.
 async fn close_workspace_tracked<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     workspace_id: String,
-    route: CloseRoute,
+    route: CloseRoute<'_>,
     remove_worktree: bool,
     delete_branch: Option<bool>,
     force_delete: Option<bool>,
     commits: CommitLoss,
     checkpoint: &Checkpoint,
 ) -> Result<Closed, String> {
+    let attempt = Arc::new(WorkspaceCloseAttempt::begin(&app, &workspace_id)?);
     // Fast refusal while the workspace is still intact. Not under the
     // Hermes lifecycle lock: teardown must not serialize every close, so
     // the hold is re-checked under the lock right before the delete.
@@ -1807,22 +1931,48 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     if !force && !hermes_pending {
         if let Some(folder) = teardown {
             let commands = crate::scripts::teardown_commands(Path::new(&folder), Some(db));
-            let (title, id, checkpoint) = (ws_title.clone(), workspace_id.clone(), checkpoint.clone());
-            torn_down = tokio::task::spawn_blocking(move || {
-                crate::scripts::run_teardown_scripts(Path::new(&folder), &title, &id, &commands, &checkpoint)
-            })
-            .await
-            .unwrap_or_else(|error| Err(format!("teardown task failed: {error}")));
+            let teardown = CompletedTeardown { folder, commands };
+            if !teardown.commands.is_empty() && !attempt.already_ran(&teardown) {
+                let (title, id, checkpoint) = (ws_title.clone(), workspace_id.clone(), checkpoint.clone());
+                let running = attempt.clone();
+                torn_down = tokio::task::spawn_blocking(move || {
+                    crate::scripts::run_teardown_scripts(Path::new(&teardown.folder), &title, &id, &teardown.commands, &checkpoint)?;
+                    running.set_teardown(Some(teardown));
+                    Ok(())
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("teardown task failed: {error}")));
+            }
         }
     }
     // So may teardown: a requester whose authority was withdrawn meanwhile
     // closes nothing, so the workspace stays open and its chats keep
     // running. Asked before the teardown's own result, so a teardown it
     // stopped fails with the refusal's code.
-    checkpoint.check()?;
+    checkpoint.check().map_err(|error| attempt.close_error(state, error))?;
     torn_down.map_err(|e| format!("Teardown failed: {e}\nUse force delete to skip teardown."))?;
 
-    let detached = detach_workspace(&app, state, db, &workspace_id)?;
+    let archive = match route {
+        CloseRoute::Archive(entry) => Some(entry.clone()),
+        _ => None,
+    };
+    let ordinary_route = if matches!(route, CloseRoute::Plain) { CloseRoute::Plain } else { CloseRoute::Tracked };
+    let detach_app = app.clone();
+    let detach_id = workspace_id.clone();
+    let detach_checkpoint = checkpoint.clone();
+    let closing = attempt.clone();
+    let detached = tauri::async_runtime::spawn_blocking(move || {
+        let route = archive.as_ref().map(CloseRoute::Archive).unwrap_or(ordinary_route);
+        let detached = detach_workspace(
+            &detach_app, &detach_app.state(), &detach_app.state(), &detach_id, route, &detach_checkpoint,
+        )?;
+        closing.set_teardown(None);
+        Ok::<_, String>(detached)
+    }).await
+        .map_err(|error| format!("Workspace close task failed: {error}"))
+        .and_then(|result| result)
+        .map_err(|error| attempt.close_error(state, error))?;
+    drop(attempt);
     #[cfg(test)]
     close_pause::reached(&workspace_id).await;
     finish_detach(&app, &workspace_id, ws_host_id).await;
@@ -1830,7 +1980,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
 
     let deleting = worktree_path.filter(|_| remove_worktree);
     let Some(wt_path) = deleting else {
-        detached.retire(&app);
+        detached.retire(&app, true);
         crate::state::emit_app_state(&app);
         return Ok(Closed { fallback, kept: None });
     };
@@ -2111,9 +2261,8 @@ pub(crate) fn archive_refusal_reason(
 /// termination, sync reconcile — with `remove_worktree=false`, so the
 /// files, worktree, and branch stay untouched) plus an
 /// `ArchivedWorkspaceSnapshot` remembering how to restore it. The entry
-/// is built BEFORE the close (the workspace is gone from state after)
-/// but added only AFTER the close succeeded, so a failed teardown never
-/// produces a phantom archive entry.
+/// is built before teardown and journaled with the removal once teardown
+/// succeeds. It is exposed in the archive list after the close finishes.
 pub(crate) async fn archive_workspace_impl<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &AppStateStore,
@@ -2150,7 +2299,7 @@ pub(crate) async fn archive_workspace_checked<R: tauri::Runtime>(
         state,
         db,
         workspace_id,
-        CloseRoute::Tracked,
+        CloseRoute::Archive(&entry),
         false,
         None,
         None,
@@ -2159,11 +2308,17 @@ pub(crate) async fn archive_workspace_checked<R: tauri::Runtime>(
     )
     .await?;
 
-    state.add_archived_workspace(entry);
-    // The close impl already emitted, but that snapshot predates the
-    // entry — emit again so the archive list appears in the same user
-    // action (and the debounced persist picks it up).
+    state.add_archived_workspace(entry.clone());
     crate::state::emit_app_state(&app);
+    #[cfg(unix)]
+    {
+        let intent = LayoutCloseIntent::Archive(Box::new(entry));
+        match db.has_pending_layout_close(&intent) {
+            Ok(true) => terminal::daemon_backed::persist_pending_layout_closes(&app, vec![intent]),
+            Ok(false) => {}
+            Err(error) => log::error!("Could not check pending archive {archive_id}: {error}"),
+        }
+    }
     Ok(archive_id)
 }
 
@@ -2195,6 +2350,20 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
     unarchive_workspace_checked(app, state, db, archive_id, select, &Checkpoint::default()).await
 }
 
+/// Save an unfinished archive before a later command can consume its entry.
+#[cfg(unix)]
+fn settle_pending_archive(
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    entry: &crate::state::ArchivedWorkspaceSnapshot,
+) -> Result<(), String> {
+    let intent = LayoutCloseIntent::Archive(Box::new(entry.clone()));
+    if db.has_pending_layout_close(&intent)? {
+        crate::state::persist_layout_closes(state, db, &[intent])?;
+    }
+    Ok(())
+}
+
 /// [`unarchive_workspace_impl_with_selection`], asking `checkpoint` again
 /// once no other restore runs and wherever the restore's create or adopt
 /// path asks it, its background setup included.
@@ -2218,6 +2387,8 @@ pub(crate) async fn unarchive_workspace_checked<R: tauri::Runtime>(
     let entry = state
         .find_archived_workspace(&archive_id)
         .ok_or_else(|| format!("No archived workspace found for {archive_id}"))?;
+    #[cfg(unix)]
+    settle_pending_archive(state, db, &entry)?;
 
     // A live workspace already at this location (the user re-opened it
     // by hand, or another device restored it) — don't create a
@@ -2443,6 +2614,10 @@ pub(crate) async fn delete_archived_workspace_impl<R: tauri::Runtime>(
     let entry = state
         .find_archived_workspace(&archive_id)
         .ok_or_else(|| format!("No archived workspace found for {archive_id}"))?;
+    #[cfg(unix)]
+    if let Some(db) = app.try_state::<crate::database::DatabaseStore>() {
+        settle_pending_archive(state, &db, &entry)?;
+    }
 
     if delete_worktree
         && (app
@@ -2838,13 +3013,15 @@ pub fn cycle_pane<R: tauri::Runtime>(
 }
 
 #[tauri::command]
-pub fn close_pane<R: tauri::Runtime>(
+pub async fn close_pane<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
-    state: State<'_, AppStateStore>,
     pane_id: String,
     select: Option<bool>,
 ) -> Result<Option<String>, String> {
-    close_pane_impl_with_selection(app, &state, pane_id, select.unwrap_or(true))
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppStateStore>();
+        close_pane_impl_with_selection(app.clone(), &state, pane_id, select.unwrap_or(true))
+    }).await.map_err(|error| error.to_string())?
 }
 
 /// Shared close-pane implementation backing both the Tauri command
@@ -2873,20 +3050,18 @@ pub(crate) fn close_pane_impl_with_selection<R: tauri::Runtime>(
     select: bool,
 ) -> Result<Option<String>, String> {
     let removed_browser_id = state.pane_browser_id(&pane_id);
-    let removed = state.close_pane_with_selection(&pane_id, select)?;
+    let (removed, terminal_close) = crate::state::with_terminal_close_layout_lock(|| {
+        let intent = LayoutCloseIntent::Pane(pane_id.clone());
+        let (_scope, terminal_close) = commit_closed_terminals(&app, state, intent, &Checkpoint::default())?;
+        let removed = state.close_pane_with_selection(&pane_id, select).unwrap_or(None);
+        Ok::<_, String>((removed, terminal_close))
+    })?;
     // A `codemux monitor start` flag belongs to the process that was running
     // in this pane. The pane is gone, so the claim is too — and a flag with no
     // pane behind it has no UI left that could ever turn it off.
     state.clear_manual_monitors_for_panes(&[pane_id.clone()]);
 
-    if let Some(ref session_id) = removed {
-        // Kill the PTY child + its process group. `state.close_pane` already
-        // removed the session from the store, so we go straight to the PTY
-        // helper instead of back through `close_terminal_session` (which
-        // would try to re-remove from the store and fail).
-        let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
-        crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
-    }
+    terminal_close.finish(&app);
 
     if let Some(browser_id) = removed_browser_id {
         // User explicitly closed this browser pane — mark dismissed so the agent
@@ -3092,13 +3267,31 @@ pub fn create_tab<R: tauri::Runtime>(
 }
 
 #[tauri::command]
-pub fn close_tab<R: tauri::Runtime>(
+pub async fn close_tab<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
-    state: State<'_, AppStateStore>,
     workspace_id: String,
     tab_id: String,
 ) -> Result<(), String> {
-    let result = state.close_tab(&workspace_id, &tab_id)?;
+    tauri::async_runtime::spawn_blocking(move || close_tab_sync(app, workspace_id, tab_id))
+        .await.map_err(|error| error.to_string())?
+}
+
+fn close_tab_sync<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    workspace_id: String,
+    tab_id: String,
+) -> Result<(), String> {
+    let state = app.state::<AppStateStore>();
+    let (result, terminal_close) = crate::state::with_terminal_close_layout_lock(|| {
+        let intent = LayoutCloseIntent::Tab { workspace_id: workspace_id.clone(), tab_id: tab_id.clone() };
+        let (_scope, terminal_close) = commit_closed_terminals(&app, &state, intent, &Checkpoint::default())?;
+        let result = state.close_tab(&workspace_id, &tab_id).unwrap_or_else(|_| crate::state::CloseTabResult {
+            removed_sessions: Vec::new(),
+            removed_browser_ids: Vec::new(),
+            removed_agent_chat_threads: Vec::new(),
+        });
+        Ok::<_, String>((result, terminal_close))
+    })?;
 
     // Straight after the removal: a worktree deletion that no longer sees
     // these chats in the workspace finds their stops in flight instead.
@@ -3107,13 +3300,7 @@ pub fn close_tab<R: tauri::Runtime>(
         result.removed_agent_chat_threads,
     );
 
-    // Kill the PTY child + process group for every terminal session that
-    // was attached to this tab. `state.close_tab` already removed them from
-    // the store, so we go straight to the PTY helper.
-    let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
-    for session_id in result.removed_sessions {
-        crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
-    }
+    terminal_close.finish(&app);
 
     for browser_id in &result.removed_browser_ids {
         // Tab close is cleanup, not explicit dismissal — agent can reopen the pane.
@@ -4613,6 +4800,59 @@ mod archive_guard_tests {
         // The plain close of the folder's own workspace does run them.
         close_workspace(app.handle().clone(), app.state(), app.state(), parent, None).await.unwrap();
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "Parent\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonforced_workspace_close_retries_journal_without_rerunning_teardown() {
+        const TEST: &str = "commands::workspace::archive_guard_tests::nonforced_workspace_close_retries_journal_without_rerunning_teardown";
+        if crate::test_isolation::isolated(TEST) {
+            return;
+        }
+
+        let root = crate::test_isolation::isolated_root().unwrap();
+        let folder = root.join("workspace");
+        std::fs::create_dir_all(folder.join(".codemux")).unwrap();
+        std::fs::write(
+            folder.join(".codemux/config.json"),
+            r#"{"teardown": ["echo teardown >> teardown-ran"]}"#,
+        ).unwrap();
+        let marker = folder.join("teardown-ran");
+
+        let store = AppStateStore::default();
+        let workspace_id = store.create_empty_workspace_at_path(folder).0;
+        crate::state::flush_persisted_state(&store).unwrap();
+        let saved = std::fs::read(root.join("layout.json")).unwrap();
+        let db_path = root.join("workspace-close.sqlite");
+        let app = tauri::test::mock_app();
+        app.manage(store);
+        app.manage(crate::terminal::PtyState::default());
+        app.manage(crate::database::DatabaseStore::test_file(&db_path));
+        let state = app.state::<AppStateStore>();
+        let db = app.state::<crate::database::DatabaseStore>();
+        let fault = rusqlite::Connection::open(&db_path).unwrap();
+        fault.execute_batch(
+            "CREATE TRIGGER reject_layout_close BEFORE INSERT ON pending_layout_closes
+             BEGIN SELECT RAISE(ABORT, 'fixture rejected the close intent'); END;",
+        ).unwrap();
+
+        let close = || close_workspace(
+            app.handle().clone(), app.state(), app.state(), workspace_id.clone(), Some(false),
+        );
+        for _ in 0..2 {
+            let error = close().await.unwrap_err();
+            assert!(error.contains("fixture rejected the close intent"), "{error}");
+            assert!(error.contains("Teardown already completed. The workspace is still open."), "{error}");
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "teardown\n");
+            assert!(state.find_workspace(&workspace_id).is_some());
+            assert_eq!(std::fs::read(root.join("layout.json")).unwrap(), saved);
+            assert!(db.pending_layout_closes().unwrap().is_empty());
+        }
+
+        fault.execute_batch("DROP TRIGGER reject_layout_close").unwrap();
+        close().await.unwrap();
+        assert!(state.find_workspace(&workspace_id).is_none());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "teardown\n");
     }
 
     /// Where each close route runs teardown scripts. The sidebar's plain

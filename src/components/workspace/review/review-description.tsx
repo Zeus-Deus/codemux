@@ -195,7 +195,7 @@ export function ReviewDescription({
       ) : text ? (
         <div className="flex flex-col items-start">
           <div className={cn("w-full", isFolded && "relative max-h-40 overflow-hidden")}>
-            <MarkdownRendered content={text} inline />
+            <MarkdownRendered content={text} inline untrusted />
             {isFolded && (
               // Scrim only — the last visible line fades out instead of
               // being sliced through. The control below is the control.

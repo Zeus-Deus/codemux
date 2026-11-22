@@ -211,7 +211,7 @@ async fn chatgpt_stop_reaps_owned_child_even_when_stdout_closes_early() {
     let binary = fixture_binary(dir.path());
     let (tx, _) = broadcast::channel(32);
     let session = CodexSession::spawn_and_initialize(
-        ThreadId("t".into()),
+        ThreadId("managed-stop-reaps-child-fixture".into()),
         dir.path().into(),
         Some("fixture-model".into()),
         None,
@@ -242,6 +242,7 @@ async fn chatgpt_stop_reaps_owned_child_even_when_stdout_closes_early() {
         .find_map(|v| v["spawn"].as_u64())
         .unwrap();
     let mut input = super::tests::queued("one").input;
+    input.thread_id = session.thread_id.clone();
     input.text = "close".into();
     session.enqueue_or_send(input).await.unwrap();
     for _ in 0..100 {

@@ -1,5 +1,5 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 
 import type { AgentChatEventPayload } from "@/tauri/events";
@@ -15,6 +15,7 @@ const { FakeChannel, attachAgentChatOutput, detachAgentChatOutput } =
   vi.hoisted(() => {
     class FakeChannel<T> {
       static instances: FakeChannel<unknown>[] = [];
+      id = FakeChannel.instances.length;
       onmessage: (payload: T) => void;
       constructor(onmessage: (payload: T) => void) {
         this.onmessage = onmessage;
@@ -64,6 +65,7 @@ describe("useAgentChatEvents", () => {
     attachAgentChatOutput.mockReset().mockResolvedValue(7);
     detachAgentChatOutput.mockReset().mockResolvedValue(undefined);
   });
+  afterEach(() => vi.unstubAllGlobals());
 
   it("tracks custom session liveness only from this thread's native channel envelope", () => {
     useCustomAcp.setState({ bindings: { "thread-1": { agent_id: "synthetic" } as never }, live: {} });
@@ -173,14 +175,17 @@ describe("useAgentChatEvents", () => {
     expect(handler).toHaveBeenCalledTimes(1);
   });
 
-  it("re-attaches after a web-remote reconnect and detaches the dead channel", async () => {
+  it("releases the old channel on web-remote reconnect and the new one on unmount", async () => {
     // Earlier tests leave their hooks mounted; they would re-attach too.
     cleanup();
     attachAgentChatOutput.mockClear();
     detachAgentChatOutput.mockClear();
+    const unregisterCallback = vi.fn();
+    vi.stubGlobal("__CODEMUX_REMOTE__", true);
+    vi.stubGlobal("__TAURI_INTERNALS__", { unregisterCallback });
     const handler = vi.fn();
     act(() => useRemoteConnectionStore.getState().setConnected("desk"));
-    renderHook(() => useAgentChatEvents("thread-1", handler));
+    const { unmount } = renderHook(() => useAgentChatEvents("thread-1", handler));
     const dead = lastChannel();
 
     // The first connect is not a reconnect; a drop and recovery is.
@@ -190,15 +195,21 @@ describe("useAgentChatEvents", () => {
 
     expect(attachAgentChatOutput).toHaveBeenCalledTimes(2);
     expect(lastChannel()).not.toBe(dead);
+    expect(unregisterCallback.mock.calls).toEqual([[dead.id]]);
     await waitFor(() =>
       expect(detachAgentChatOutput).toHaveBeenCalledWith("thread-1", 7),
     );
     act(() => lastChannel().onmessage(payloadFor("thread-1", "tok")));
     expect(handler).toHaveBeenCalledTimes(1);
+    unmount();
+    expect(unregisterCallback.mock.calls).toEqual([[dead.id], [lastChannel().id]]);
   });
 
   it("skips detach when attach failed", async () => {
     attachAgentChatOutput.mockRejectedValue(new Error("backend gone"));
+    const unregisterCallback = vi.fn();
+    vi.stubGlobal("__CODEMUX_REMOTE__", true);
+    vi.stubGlobal("__TAURI_INTERNALS__", { unregisterCallback });
     const consoleError = vi
       .spyOn(console, "error")
       .mockImplementation(() => {});
@@ -206,6 +217,7 @@ describe("useAgentChatEvents", () => {
       useAgentChatEvents("thread-1", vi.fn()),
     );
     await waitFor(() => expect(consoleError).toHaveBeenCalled());
+    expect(unregisterCallback).toHaveBeenCalledWith(lastChannel().id);
     unmount();
     // Let the rejected-detach microtask settle; detach must not fire.
     await act(async () => {});
