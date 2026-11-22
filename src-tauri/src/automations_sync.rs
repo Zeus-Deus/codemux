@@ -100,9 +100,12 @@ fn host_maps(db: &DatabaseStore) -> (HashMap<i64, String>, HashMap<String, i64>)
 static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static ATTEMPTS: Attempts = std::sync::LazyLock::new(Default::default);
 
-/// Pull and push the signed-in user's registry. Skip when signed out.
+/// Sync the signed-in user's registry in the background.
 pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
-    let linked_lock = SYNC_LOCK.lock().await;
+    // The scheduler retries pending writes on its next tick.
+    let Ok(linked_lock) = SYNC_LOCK.try_lock() else {
+        return Ok(());
+    };
     let Some(auth) = app.try_state::<AuthState>() else {
         return Ok(());
     };
@@ -671,6 +674,58 @@ mod tests {
             .find(|r| r.id == row.id)
             .unwrap();
         assert!(after.deleted_at.is_some() && after.dirty, "the deletion still goes up");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn background_sync_skips_a_busy_linked_pass_and_retries_pending_edits() {
+        use crate::auth::save_token;
+        use futures_util::FutureExt;
+
+        let app = tauri::test::mock_app();
+        app.manage(init_test_database());
+        app.manage(AuthState::default());
+        let db = app.state::<DatabaseStore>();
+        save_token(&db, "token", "2099-01-01T00:00:00Z").unwrap();
+        let row = db.insert_automation(&sample_input()).unwrap();
+        db.mark_automation_synced(row.id, Some("srv-paused"))
+            .unwrap();
+        db.set_automation_enabled(row.id, false).unwrap();
+
+        let linked_lock = SYNC_LOCK.lock().await;
+        assert!(matches!(
+            try_sync_with_app(app.handle()).now_or_never(),
+            Some(Ok(()))
+        ));
+        assert!(db.get_automation(row.id).unwrap().dirty);
+        drop(linked_lock);
+
+        let mut server = mockito::Server::new_async().await;
+        let list = server
+            .mock("GET", "/api/automations")
+            .with_body(format!(
+                r#"{{"automations":[{}]}}"#,
+                server_copy("srv-paused", "Paused")
+            ))
+            .create_async()
+            .await;
+        let patch = server
+            .mock("PATCH", "/api/automations/srv-paused")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({ "enabled": false }),
+            ))
+            .with_status(204)
+            .create_async()
+            .await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let result = try_sync_with_app(app.handle()).await;
+        std::env::remove_var("CODEMUX_API_URL");
+
+        result.unwrap();
+        list.assert_async().await;
+        patch.assert_async().await;
+        let row = db.get_automation(row.id).unwrap();
+        assert!(!row.enabled && !row.dirty);
     }
 
     #[tokio::test]
