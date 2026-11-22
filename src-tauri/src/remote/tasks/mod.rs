@@ -58,21 +58,42 @@ fn sibling_sidecar(exe: &Path) -> Option<PathBuf> {
     }
     None
 }
+/// Explicit overrides come first, the Claude-specific one before the shared
+/// multi-role one, then the runtime installed beside `codemux-remote`. `None`
+/// means none of these applies.
+fn resolve_explicit_or_sibling(
+    claude_override: Option<std::ffi::OsString>,
+    shared_override: Option<std::ffi::OsString>,
+    exe: Option<&Path>,
+) -> Option<Result<PathBuf, String>> {
+    use crate::agent_provider::claude::sidecar_path as sidecar;
+    let overrides = [
+        (claude_override, sidecar::SIDECAR_PATH_ENV),
+        (shared_override, crate::bundled_sidecar::PATH_ENV),
+    ];
+    for (value, name) in overrides {
+        if let Some(explicit) = value.filter(|s| !s.is_empty()) {
+            let path = PathBuf::from(explicit);
+            return Some(if sidecar::is_executable(&path) {
+                Ok(path)
+            } else {
+                Err(format!(
+                    "Claude sidecar override is missing or not executable; repair {name} on this host"
+                ))
+            });
+        }
+    }
+    exe.and_then(sibling_sidecar).map(Ok)
+}
 fn resolve_sidecar() -> Result<PathBuf, String> {
     use crate::agent_provider::claude::sidecar_path as sidecar;
-    if let Some(explicit) = std::env::var_os(sidecar::SIDECAR_PATH_ENV).filter(|s| !s.is_empty()) {
-        let path = PathBuf::from(explicit);
-        return if sidecar::is_executable(&path) {
-            Ok(path)
-        } else {
-            Err("Claude sidecar override is missing or not executable; repair CODEMUX_CLAUDE_SIDECAR_PATH on this host".into())
-        };
-    }
-    if let Some(path) = std::env::current_exe()
-        .ok()
-        .and_then(|p| sibling_sidecar(&p))
-    {
-        return Ok(path);
+    let exe = std::env::current_exe().ok();
+    if let Some(resolved) = resolve_explicit_or_sibling(
+        std::env::var_os(sidecar::SIDECAR_PATH_ENV),
+        std::env::var_os(crate::bundled_sidecar::PATH_ENV),
+        exe.as_deref(),
+    ) {
+        return resolved;
     }
     let path=sidecar::resolve_sidecar_path().map_err(|e|format!("Claude runtime unavailable: {e}. Install the matching executable codemux-claude-sidecar beside codemux-remote."))?;
     if !sidecar::is_executable(&path) {
@@ -563,6 +584,33 @@ mod tests {
         std::fs::write(&staged, "fixture").unwrap();
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(sibling_sidecar(&binaries.join("codemux-remote")), Some(staged));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_overrides_win_over_the_sibling_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable_fixture = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "fixture").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        };
+        let sibling = executable_fixture("codemux-claude-sidecar");
+        let shared = executable_fixture("shared-sidecar");
+        let claude = executable_fixture("claude-sidecar");
+        let exe = dir.path().join("codemux-remote");
+        let resolve = |c: Option<&Path>, s: Option<&Path>| {
+            resolve_explicit_or_sibling(c.map(Into::into), s.map(Into::into), Some(&exe))
+        };
+        assert_eq!(resolve(None, None), Some(Ok(sibling)));
+        assert_eq!(resolve(None, Some(&shared)), Some(Ok(shared.clone())));
+        assert_eq!(resolve(Some(&claude), Some(&shared)), Some(Ok(claude)));
+        // A broken shared override is reported, not skipped for the sibling.
+        let missing = dir.path().join("missing");
+        let err = resolve(None, Some(&missing)).unwrap().unwrap_err();
+        assert!(err.contains(crate::bundled_sidecar::PATH_ENV), "{err}");
     }
     pub(super) fn request() -> LaunchRequest {
         LaunchRequest {
