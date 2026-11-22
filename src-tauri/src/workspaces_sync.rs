@@ -582,10 +582,133 @@ fn read_git_head_sha(path: &str) -> Option<String> {
 ///
 /// Returns Ok even on partial failure: individual row failures are
 /// logged so a corrupt row doesn't strand the whole tick.
+/// Serialises recording a close with reconciling, so a reconcile working
+/// from a snapshot taken before a close cannot slip a row in after it.
+static RECONCILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `ui_state` key prefix: one row per workspace closed while a layout
+/// recovery is pending (`<prefix><workspace id>`), so recording one close
+/// never rewrites, or loses, another.
+const CLOSED_DURING_RECOVERY: &str = "workspaces_sync.closed_during_recovery:";
+
+/// Closes not yet saved; retried every reconcile until they are.
+static CLOSED_UNPERSISTED: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Save every close still held only in memory; each is forgotten from
+/// memory only once its row is written.
+fn persist_unsaved_closes(db: &DatabaseStore) {
+    let mut unsaved = lock(&CLOSED_UNPERSISTED);
+    unsaved.retain(|wid| db.set_ui_state(&format!("{CLOSED_DURING_RECOVERY}{wid}"), "1").is_err());
+}
+
+/// Every workspace closed while the current layout recovery is pending, or
+/// an error if the saved ones cannot be read.
+fn closed_during_recovery(db: &DatabaseStore) -> Result<HashSet<String>, String> {
+    let mut closed: HashSet<String> = db
+        .ui_state_keys_with_prefix(CLOSED_DURING_RECOVERY)?
+        .into_iter()
+        .filter_map(|key| key.strip_prefix(CLOSED_DURING_RECOVERY).map(str::to_string))
+        .collect();
+    closed.extend(lock(&CLOSED_UNPERSISTED).iter().cloned());
+    Ok(closed)
+}
+
+/// The user closed `workspace_id`: mark its sync row deleted. While a
+/// layout recovery is pending, reconcile infers no closes, so the close is
+/// also remembered — saved so it survives a restart, and kept in memory
+/// and retried until that save works — and reconcile keeps applying it: it
+/// never re-adds that workspace and retries the deletion every tick.
+pub fn record_closed(db: &DatabaseStore, workspace_id: &str) -> Result<(), String> {
+    let _serialised = lock(&RECONCILE_LOCK);
+    if (crate::state::layout_recovery_pending() || crate::state::retained_layouts().protects(workspace_id))
+        && db.set_ui_state(&format!("{CLOSED_DURING_RECOVERY}{workspace_id}"), "1").is_err()
+    {
+        lock(&CLOSED_UNPERSISTED).insert(workspace_id.to_string());
+    }
+    db.soft_delete_workspace_sync_by_workspace_id(workspace_id)
+}
+
+/// Mirror `snapshot` into the sync table, taking it as current state.
+/// Production code calls [`reconcile_from_state`], which checks the state
+/// as it is now as well.
 pub fn reconcile_from_snapshot(
     db: &DatabaseStore,
     snapshot: &AppStateSnapshot,
 ) -> Result<(), String> {
+    let ids: HashSet<String> = snapshot.workspaces.iter().map(|w| w.workspace_id.0.clone()).collect();
+    reconcile_inner(db, snapshot, &|| ids.clone())
+}
+
+/// Take a snapshot of `state` and mirror it. A pass can be delayed anywhere —
+/// after taking its snapshot, or in the Git reads — while workspaces open
+/// and close. So before writing anything, under the lock, it also reads
+/// which workspaces exist now: it writes rows only for workspaces in both
+/// its snapshot and current state (so it never republishes one closed
+/// meanwhile), and deletes a row only when its workspace is in neither —
+/// reading current state once more just before, after the rows (so it
+/// never deletes one opened or adopted meanwhile). A stale pass can at worst write
+/// a workspace's older details, which the next one corrects.
+pub fn reconcile_from_state(
+    db: &DatabaseStore,
+    state: &crate::state::AppStateStore,
+) -> Result<(), String> {
+    let snapshot = state.snapshot();
+    reconcile_inner(db, &snapshot, &|| state.workspace_ids())
+}
+
+fn reconcile_inner(
+    db: &DatabaseStore,
+    snapshot: &AppStateSnapshot,
+    current_ids: &dyn Fn() -> HashSet<String>,
+) -> Result<(), String> {
+    // Git first, outside the lock: a slow repository must not hold up a
+    // close being recorded.
+    let heads: HashMap<String, Option<String>> = snapshot
+        .workspaces
+        .iter()
+        // Only the workspaces the loop below mirrors.
+        .filter(|ws| {
+            !ws.attach_only
+                && !matches!(
+                    ws.workspace_type,
+                    crate::state::WorkspaceType::Removed | crate::state::WorkspaceType::Home
+                )
+        })
+        .map(|ws| {
+            let path = ws.worktree_path.as_deref().unwrap_or(ws.cwd.as_str());
+            (ws.workspace_id.0.clone(), read_git_head_sha(path))
+        })
+        .collect();
+
+    let _serialised = lock(&RECONCILE_LOCK);
+    let present_now = current_ids();
+    let recovering = crate::state::layout_recovery_pending();
+    let retained = crate::state::retained_layouts();
+    let closed = if recovering || !retained.is_empty() {
+        persist_unsaved_closes(db);
+        match closed_during_recovery(db) {
+            Ok(mut closed) => {
+                closed.retain(|wid| recovering || retained.protects(wid));
+                closed
+            }
+            Err(error) => {
+                // Without the list, any write here could re-add a closed
+                // workspace; try again next tick.
+                eprintln!("[workspaces-sync] cannot read recovery-time closes ({error}); skipping this reconcile");
+                return Ok(());
+            }
+        }
+    } else {
+        // Recovery over: closes are inferred again, so the list is done.
+        let _ = db.delete_ui_state_with_prefix(CLOSED_DURING_RECOVERY);
+        lock(&CLOSED_UNPERSISTED).clear();
+        HashSet::new()
+    };
     // Build local host_id → server_id map for translating
     // WorkspaceSnapshot.host_id (i64) into host_server_id (TEXT).
     let host_id_to_server: HashMap<i64, String> = db
@@ -627,6 +750,11 @@ pub fn reconcile_from_snapshot(
         }
 
         let wid = ws.workspace_id.0.clone();
+        // Closed since this snapshot was taken, or during recovery: a
+        // snapshot that still lists it is older than the close.
+        if closed.contains(&wid) || !present_now.contains(&wid) {
+            continue;
+        }
         live_wids.insert(wid.clone());
 
         let host_server_id = ws
@@ -648,17 +776,12 @@ pub fn reconcile_from_snapshot(
         let project_uid = ws.project_uid.as_deref();
         let workspace_kind = ws.workspace_kind.as_deref();
 
-        // Read the workspace's git HEAD sha so Phase-4 divergence
-        // detection can compare across devices. Best-effort: if
-        // git isn't installed, the workspace isn't a git repo, or
-        // it has no commits, we leave it as None. Use the
-        // worktree_path when set, else fall back to cwd.
-        let head_path = ws
-            .worktree_path
-            .as_deref()
-            .or(Some(ws.cwd.as_str()))
-            .unwrap_or("");
-        let git_head_sha: Option<String> = read_git_head_sha(head_path);
+        // The workspace's git HEAD sha (read above, outside the lock) so
+        // Phase-4 divergence detection can compare across devices.
+        // Best-effort: None if git isn't installed, the workspace isn't a
+        // git repo, or it has no commits. From the worktree_path when set,
+        // else the cwd.
+        let git_head_sha: Option<String> = heads.get(&wid).cloned().flatten();
         let git_head_sha_ref = git_head_sha.as_deref();
 
         if let Some(existing) = sync_by_wid.get(wid.as_str()) {
@@ -707,9 +830,27 @@ pub fn reconcile_from_snapshot(
     // Soft-delete sync rows whose workspace_id is no longer in
     // app_state. Rows with no workspace_id (pulled-only) are skipped
     // by construction (the filter_map above excludes them).
+    //
+    // While an unreadable saved layout awaits recovery, a workspace missing
+    // from it is missing, not closed: deleting its row would remove it from
+    // every other device too. Nothing is inferred then; a workspace really
+    // closed has its row deleted by the close itself (`record_closed`).
+    for wid in &closed {
+        // Retained layouts also suppress inferred deletion of these IDs.
+        // An explicit close still wins and its write can be retried.
+        if let Err(error) = db.soft_delete_workspace_sync_by_workspace_id(wid) {
+            eprintln!("[workspaces-sync] soft-delete failed for {wid}: {error}");
+        }
+    }
+    if recovering {
+        return Ok(());
+    }
+    // Read membership again: a workspace adopted after the first read may
+    // have linked one of `sync_rows` since.
+    let present_late = current_ids();
     for row in &sync_rows {
         if let Some(wid) = &row.workspace_id {
-            if !live_wids.contains(wid) {
+            if !live_wids.contains(wid) && !present_now.contains(wid) && !present_late.contains(wid) && !retained.protects(wid) {
                 if let Err(error) =
                     db.soft_delete_workspace_sync_by_workspace_id(wid)
                 {
@@ -1535,6 +1676,229 @@ mod tests {
             !db.list_workspaces_sync()[0].dirty,
             "unchanged identity must not re-mark the row dirty"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn during_layout_recovery_only_workspaces_really_closed_are_deleted() {
+        let db = fresh_db();
+        // Rows synced before the unreadable layout. One is missing from the
+        // fallback; the other is restored and then closed, before any
+        // background reconcile has run.
+        for wid in ["ws-recovery-missing", "ws-recovery-closed"] {
+            db.insert_workspace_sync(wid, "old", None, None, None, None, None, None, None).unwrap();
+        }
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+
+        // The close: an explicit record, then the reconcile the close path
+        // runs with the post-close snapshot.
+        super::record_closed(&db, "ws-recovery-closed").unwrap();
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+
+        let live = |wid: &str| db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some(wid));
+        assert!(!live("ws-recovery-closed"), "a workspace really closed is deleted");
+        assert!(live("ws-recovery-missing"), "a missing one is not");
+    }
+
+    #[test]
+    #[serial]
+    fn a_close_during_recovery_holds_against_a_stale_reconcile_and_a_restart() {
+        let db = fresh_db();
+        let stale = make_snapshot(vec![make_ws("ws-close-stale", "closed")]);
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+        let live = |db: &DatabaseStore| {
+            db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some("ws-close-stale"))
+        };
+
+        // Closed before it ever had a row; then a reconcile from a snapshot
+        // taken before the close.
+        super::record_closed(&db, "ws-close-stale").unwrap();
+        super::reconcile_from_snapshot(&db, &stale).unwrap();
+        assert!(!live(&db), "a stale snapshot does not re-add a closed workspace");
+
+        // A row that slipped in anyway (or whose deletion failed) is deleted
+        // on the next tick — also after a restart, from the persisted list.
+        super::lock(&super::CLOSED_UNPERSISTED).clear();
+        db.insert_workspace_sync("ws-close-stale", "closed", None, None, None, None, None, None, None)
+            .unwrap();
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        assert!(!live(&db), "the close is retried");
+
+        // Once recovery is over the list is cleared.
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        assert!(db.ui_state_keys_with_prefix(super::CLOSED_DURING_RECOVERY).unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_reconcile_from_an_older_snapshot_never_undoes_a_newer_one() {
+        let db = fresh_db();
+        // A newer pass published a workspace opened after the old pass took
+        // its snapshot; the old pass, delayed anywhere since, then runs.
+        super::reconcile_from_snapshot(&db, &make_snapshot(vec![make_ws("ws-after-stale", "new")])).unwrap();
+        let now: std::collections::HashSet<String> = ["ws-after-stale".to_string()].into();
+        super::reconcile_inner(&db, &make_snapshot(Vec::new()), &|| now.clone()).unwrap();
+
+        assert!(
+            db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some("ws-after-stale")),
+            "the stale pass must not delete a workspace that exists now"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_reconcile_from_an_older_snapshot_never_republishes_a_closed_workspace() {
+        let db = fresh_db();
+        // The old pass captured the workspace; it was closed before the pass
+        // wrote its first row; then the pass resumes.
+        let before_close = make_snapshot(vec![make_ws("ws-closed-race", "closed")]);
+        super::reconcile_inner(&db, &before_close, &|| std::collections::HashSet::new()).unwrap();
+
+        assert!(
+            db.list_workspaces_sync_for_sync()
+                .iter()
+                .all(|r| r.workspace_id.as_deref() != Some("ws-closed-race")),
+            "no row may be left to publish for a workspace closed meanwhile"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_row_adopted_during_a_reconcile_is_not_deleted() {
+        let db = fresh_db();
+        // The adoption links an existing row to a new workspace after the
+        // pass's first look at current state.
+        let row = db
+            .insert_workspace_sync("ws-adopted-midway", "adopted", None, None, None, None, None, None, None)
+            .unwrap();
+        db.mark_workspace_sync_synced(row.id, Some("srv-adopted")).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let current = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                std::collections::HashSet::new()
+            } else {
+                ["ws-adopted-midway".to_string()].into()
+            }
+        };
+        super::reconcile_inner(&db, &make_snapshot(Vec::new()), &current).unwrap();
+
+        assert!(
+            db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some("ws-adopted-midway")),
+            "a workspace adopted meanwhile must keep its row"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn during_recovery_only_the_closed_copy_is_deleted() {
+        let db = fresh_db();
+        for wid in ["ws-copy-closed", "ws-copy-missing"] {
+            db.insert_workspace_sync(wid, "copy", None, None, None, None, None, None, None).unwrap();
+        }
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+        // What closing a standalone copy now does after removing it.
+        super::record_closed(&db, "ws-copy-closed").unwrap();
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+
+        let live = |wid: &str| db.list_workspaces_sync().iter().any(|r| r.workspace_id.as_deref() == Some(wid));
+        assert!(!live("ws-copy-closed"), "the closed copy is deleted");
+        assert!(live("ws-copy-missing"), "an unrelated missing workspace is not");
+        let _ = db.delete_ui_state_with_prefix(super::CLOSED_DURING_RECOVERY);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_recovery_time_close_survives_a_pull_and_goes_up_with_the_push() {
+        use crate::auth::{save_token, AuthState};
+        use tauri::Manager;
+
+        let app = tauri::test::mock_app();
+        app.manage(fresh_db());
+        app.manage(AuthState::default());
+        let db = app.state::<DatabaseStore>();
+        save_token(&db, "token", "2099-01-01T00:00:00Z").unwrap();
+        // An already-synced copy, and an unrelated workspace missing from
+        // the fallback layout.
+        for (wid, sid) in [("ws-pull-closed", "srv-pull-closed"), ("ws-pull-missing", "srv-pull-missing")] {
+            let row = db.insert_workspace_sync(wid, "copy", None, None, None, None, None, None, None).unwrap();
+            db.mark_workspace_sync_synced(row.id, Some(sid)).unwrap();
+        }
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+        super::record_closed(&db, "ws-pull-closed").unwrap();
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+
+        // The server still lists both as live. Only the explicit close should
+        // be sent back as a DELETE, then purged from the local sync table.
+        let mut server = mockito::Server::new_async().await;
+        let workspaces = ["srv-pull-closed", "srv-pull-missing"].map(|id| {
+            serde_json::json!({
+                "id": id,
+                "title": "copy",
+                "createdAt": "2026-01-01 00:00:00",
+                "updatedAt": "2026-01-01 00:00:00",
+            })
+        });
+        let list = server
+            .mock("GET", "/api/workspaces")
+            .match_header("authorization", "Bearer token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({ "workspaces": workspaces }).to_string())
+            .create_async()
+            .await;
+        let delete = server
+            .mock("DELETE", "/api/workspaces/srv-pull-closed")
+            .match_header("authorization", "Bearer token")
+            .with_status(204)
+            .create_async()
+            .await;
+        let previous_url = std::env::var_os("CODEMUX_API_URL");
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let result = super::try_sync_with_app(app.handle()).await;
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+        match previous_url {
+            Some(url) => std::env::set_var("CODEMUX_API_URL", url),
+            None => std::env::remove_var("CODEMUX_API_URL"),
+        }
+        result.unwrap();
+        list.assert_async().await;
+        delete.assert_async().await;
+
+        let rows = db.list_workspaces_sync_for_sync();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server_id.as_deref(), Some("srv-pull-missing"));
+        assert!(rows[0].deleted_at.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn a_close_whose_save_failed_is_saved_on_a_later_tick_and_survives_a_restart() {
+        let db = fresh_db();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(Some(true)));
+        // The close's own save failed: it is held only in memory.
+        super::lock(&super::CLOSED_UNPERSISTED).insert("ws-close-unsaved".to_string());
+
+        // A later tick saves it and forgets it from memory.
+        super::reconcile_from_snapshot(&db, &make_snapshot(Vec::new())).unwrap();
+        assert!(super::lock(&super::CLOSED_UNPERSISTED).is_empty());
+        assert_eq!(
+            db.ui_state_keys_with_prefix(super::CLOSED_DURING_RECOVERY).unwrap(),
+            [format!("{}ws-close-unsaved", super::CLOSED_DURING_RECOVERY)]
+        );
+
+        // After a restart, a snapshot from before the close does not
+        // re-add it.
+        super::reconcile_from_snapshot(&db, &make_snapshot(vec![make_ws("ws-close-unsaved", "x")])).unwrap();
+        crate::state::TEST_RECOVERY_PENDING.with(|p| p.set(None));
+        assert!(!db
+            .list_workspaces_sync()
+            .iter()
+            .any(|r| r.workspace_id.as_deref() == Some("ws-close-unsaved")));
+        let _ = db.delete_ui_state_with_prefix(super::CLOSED_DURING_RECOVERY);
     }
 
     #[test]

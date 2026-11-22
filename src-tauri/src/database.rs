@@ -20,6 +20,7 @@ pub mod queued_turns;
 pub mod restart_resumes;
 #[cfg(unix)]
 pub(crate) mod daemon_closes;
+mod layout_closes;
 
 /// Merge every session row matching `group` (an `agent_chat_sessions`
 /// predicate over `?1 = key`) into `survivor` (`?2`), which must match it
@@ -1422,6 +1423,8 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     restart_resumes::create_schema(conn)?;
     #[cfg(unix)]
     daemon_closes::create_schema(conn)?;
+    #[cfg(windows)]
+    layout_closes::create_schema(conn).map_err(|e| e.to_string())?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new
@@ -1618,6 +1621,35 @@ impl DatabaseStore {
             params![key, value],
         )
         .map_err(|e| format!("Failed to set ui_state: {e}"))?;
+        Ok(())
+    }
+
+    /// Every `ui_state` key that starts with `prefix`. Unlike
+    /// [`Self::get_ui_state`], a failed read is an error, not "none".
+    pub fn ui_state_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT key FROM ui_state
+                 WHERE user_id = 'local' AND substr(key, 1, length(?1)) = ?1",
+            )
+            .map_err(|e| format!("Failed to list ui_state: {e}"))?;
+        let keys = stmt
+            .query_map(params![prefix], |row| row.get(0))
+            .map_err(|e| format!("Failed to list ui_state: {e}"))?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| format!("Failed to list ui_state: {e}"));
+        keys
+    }
+
+    /// Delete every `ui_state` key that starts with `prefix`.
+    pub fn delete_ui_state_with_prefix(&self, prefix: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM ui_state WHERE user_id = 'local' AND substr(key, 1, length(?1)) = ?1",
+            params![prefix],
+        )
+        .map_err(|e| format!("Failed to delete ui_state: {e}"))?;
         Ok(())
     }
 

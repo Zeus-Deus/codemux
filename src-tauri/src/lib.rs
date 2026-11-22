@@ -657,8 +657,6 @@ fn core_startup_plugin<R: tauri::Runtime>(
             let (ownership, snapshot) = match mode {
                 AppMode::Gui => {
                     let lock = state::acquire_layout_lock().map_err(std::io::Error::other)?;
-                    let snapshot =
-                        state::load_persisted_state_checked().map_err(std::io::Error::other)?;
                     // Also exclude a running backend that predates the layout lock.
                     if control::control_server_is_running() {
                         return Err(std::io::Error::other(
@@ -666,10 +664,13 @@ fn core_startup_plugin<R: tauri::Runtime>(
                         )
                         .into());
                     }
+                    let snapshot =
+                        state::load_persisted_state_checked().map_err(std::io::Error::other)?;
                     (Some(lock), snapshot)
                 }
                 AppMode::ServeHeadless => (None, headless_layout),
             };
+            app.manage(state::AppStateStore::default());
             app.manage(StartupLayout {
                 snapshot: std::sync::Mutex::new(snapshot),
                 ownership: std::sync::Mutex::new(ownership),
@@ -719,7 +720,6 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(mode)
         .manage(plugins::commands::PluginsState::default())
         .manage(plugins::platform_transport::PluginPlatformState::default())
-        .manage(state::AppStateStore::default())
         // Live per-host reachability for the Devices page. Filled by
         // `hosts_inventory` (Unix only); on Windows every host reads as
         // never probed. The persisted facts (last seen, disk) live on
@@ -1002,20 +1002,17 @@ fn build_core_app<R: tauri::Runtime>(
             }
 
             let handle = app.handle().clone();
+            let pending_layout_closes = handle.state::<database::DatabaseStore>()
+                .pending_layout_closes().map_err(std::io::Error::other)?;
             #[cfg(unix)]
-            let (pending_layout_closes, mut pending_terminal_closes, daemon_shells) = {
+            let (mut pending_terminal_closes, daemon_shells) = {
                 let db = handle.state::<database::DatabaseStore>();
-                let layout_closes = db.pending_layout_closes().map_err(std::io::Error::other)?;
                 let daemon_closes = db.pending_daemon_closes().map_err(std::io::Error::other)?;
                 let daemon_shells = db.daemon_shell_ownership().map_err(std::io::Error::other)?;
-                state::reserve_pending_close_ids(&layout_closes, &daemon_closes);
-                state::reserve_pending_close_ids(&[], &daemon_shells);
-                (layout_closes, daemon_closes, daemon_shells)
+                (daemon_closes, daemon_shells)
             };
             #[cfg(unix)]
-            let has_daemon_recovery = !pending_layout_closes.is_empty()
-                || !pending_terminal_closes.is_empty()
-                || !daemon_shells.is_empty();
+            let recovery_pending = state::layout_recovery_pending() || state::retained_layouts().unreadable;
             #[cfg(unix)]
             let has_local_fallbacks = handle.state::<database::DatabaseStore>()
                 .has_local_terminal_fallbacks().map_err(std::io::Error::other)?;
@@ -1052,7 +1049,6 @@ fn build_core_app<R: tauri::Runtime>(
                         active_workspace_persistence::seed_persisted(workspace_id);
                     }
                 }
-                state::restore_session_ids(&stripped);
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.replace_snapshot(stripped);
                 state.migrate_tabs_if_needed();
@@ -1070,18 +1066,10 @@ fn build_core_app<R: tauri::Runtime>(
                 layout_loaded = true;
                 diagnostics::record_startup_milestone("startup.layout-restored");
             } else if mode == AppMode::Gui {
-                // First launch — no persisted layout exists. Replace the
-                // default_app_state (which creates a CWD workspace) with an
-                // empty state so the user sees the splash screen instead.
+                // First launch or recovery: show the splash screen instead
+                // of the CWD workspace created by default_app_state.
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.clear_workspaces();
-            }
-            #[cfg(unix)]
-            if !layout_loaded && mode == AppMode::ServeHeadless && has_daemon_recovery {
-                // The default state was built before reading the shell records.
-                // Allocate this launch's CWD pane above the reserved IDs.
-                handle.state::<state::AppStateStore>()
-                    .replace_snapshot(state::AppStateStore::default().snapshot());
             }
             {
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
@@ -1090,24 +1078,39 @@ fn build_core_app<R: tauri::Runtime>(
                     if ids.is_empty() {Ok(())} else {state.persist_local_import_layout(&db,&ids)}
                 }) {log::warn!("Local import layout recovery remains pending: {error}");}
             }
-            #[cfg(unix)]
             {
                 let store = handle.state::<state::AppStateStore>();
+                #[cfg(unix)]
                 state::restore_terminal_replacements_and_layout_closes(
                     &store,
                     &terminal_replacements,
                     &pending_layout_closes,
                 ).map_err(std::io::Error::other)?;
+                #[cfg(windows)]
+                state::restore_pending_layout_closes(&store, &pending_layout_closes).map_err(std::io::Error::other)?;
                 let db = handle.state::<database::DatabaseStore>();
+                // The close journal commits before the command updates the sync
+                // mirror. Replay explicit closes even if the layout already
+                // reflects them, before any journal retirement or sync tick.
+                for close in &pending_layout_closes {
+                    if let Some(id) = close.closed_workspace_id() {
+                        workspaces_sync::record_closed(&db, id).map_err(std::io::Error::other)?;
+                    }
+                }
+                // Make archived chats available before commands can reuse or
+                // supersede an intent. Retirement follows the durable layout save.
+                db.settle_startup_chat_history(&pending_layout_closes, &store.snapshot()).map_err(std::io::Error::other)?;
+                #[cfg(unix)]
                 if let Err(error) = state::persist_terminal_replacements(&store, &db, &terminal_replacements) {
                     log::warn!("Could not save replayed terminal replacements: {error}");
                 }
             }
             #[cfg(unix)]
-            if !daemon_shells.is_empty() {
+            // A missing pane can still own a shell or restart in the set-aside layout.
+            if !recovery_pending && !daemon_shells.is_empty() {
                 // A shell can start before its new pane has reached disk.
                 // Retire these exact shells without hydrating a missing pane.
-                let orphaned = handle.state::<state::AppStateStore>().orphaned_daemon_shells(daemon_shells);
+                let orphaned = handle.state::<state::AppStateStore>().orphaned_daemon_shells(daemon_shells, &terminal_replacements);
                 if !orphaned.is_empty() {
                     let db = handle.state::<database::DatabaseStore>();
                     if let Err(error) = db.journal_orphan_daemon_shells(&orphaned) {
@@ -1117,8 +1120,8 @@ fn build_core_app<R: tauri::Runtime>(
                 }
             }
             #[cfg(unix)]
-            if has_local_fallbacks || has_local_restarts {
-                let live = handle.state::<state::AppStateStore>().terminal_session_owners();
+            if !recovery_pending && (has_local_fallbacks || has_local_restarts) {
+                let live = handle.state::<state::AppStateStore>().terminal_session_owners(&terminal_replacements);
                 let db = handle.state::<database::DatabaseStore>();
                 if has_local_fallbacks {
                     if let Err(error) = db.reconcile_local_terminal_fallbacks(&live) {
@@ -1163,41 +1166,16 @@ fn build_core_app<R: tauri::Runtime>(
                     .map(|w| w.workspace_id.0.clone())
                     .collect();
 
-                // Windows defensive gate: skip orphan cleanup when there is
-                // no saved layout. Otherwise `cleanup_orphan_scrollbacks(&[])`
-                // (called with the empty workspace list produced by
-                // `state.clear_workspaces()`) would wipe every saved
-                // scrollback dir on disk — the second half of the
-                // "terminals start fresh on Windows" cascade. On Linux the
-                // gate is a pass-through (always returns true), preserving
-                // historical behavior verbatim. See
-                // `scrollback::should_run_orphan_cleanup` for the full
-                // failure-mode rationale.
-                if scrollback::should_run_orphan_cleanup(layout_loaded) {
-                    let removed = scrollback::cleanup_orphan_scrollbacks(&ws_ids);
-                    if !removed.is_empty() {
-                        eprintln!(
-                            "[codemux::scrollback] Cleaned up {} orphan scrollback dirs",
-                            removed.len()
-                        );
-                    }
-                } else {
-                    eprintln!(
-                        "[codemux::scrollback] Skipping orphan cleanup — layout state was not loaded \
-                         (Windows defensive gate to prevent force-close cascade from wiping scrollback)"
-                    );
-                }
-                // Enforce disk limit from settings
                 let max_mb = settings_sync::load_cache()
                     .map(|s| s.session_restore.max_total_mb)
                     .unwrap_or(100);
-                let freed = scrollback::enforce_disk_limit(max_mb as u64 * 1024 * 1024);
-                if freed > 0 {
-                    eprintln!(
-                        "[codemux::scrollback] Freed {} bytes to stay under {max_mb}MB limit",
-                        freed
-                    );
-                }
+                scrollback::cleanup_on_startup(
+                    &scrollback::scrollback_base(),
+                    layout_loaded,
+                    state::layout_recovery_pending(),
+                    &ws_ids,
+                    max_mb as u64 * 1024 * 1024,
+                );
             }
 
             // GUI-only display-coupled window wiring: size/position restore,
@@ -1445,9 +1423,9 @@ fn build_core_app<R: tauri::Runtime>(
             // Codemux plugin (see `claude_plugin`).
             let _ = claude_plugin::local_plugin_dir();
 
+            state::persist_pending_layout_closes(&handle, pending_layout_closes);
             #[cfg(unix)]
             {
-                terminal::daemon_backed::persist_pending_layout_closes(&handle, pending_layout_closes);
                 terminal::daemon_backed::resume_pending_daemon_closes(&handle, pending_terminal_closes);
             }
             terminal::spawn_missing_ptys(handle);
@@ -2787,10 +2765,9 @@ fn build_core_app<R: tauri::Runtime>(
                         sync_handle.state();
                     let db: tauri::State<'_, database::DatabaseStore> =
                         sync_handle.state();
-                    let snapshot = app_state.snapshot();
-                    if let Err(error) = workspaces_sync::reconcile_from_snapshot(
+                    if let Err(error) = workspaces_sync::reconcile_from_state(
                         db.inner(),
-                        &snapshot,
+                        app_state.inner(),
                     ) {
                         eprintln!(
                             "[codemux::workspaces-sync] reconcile failed: {error}"
@@ -3501,8 +3478,8 @@ fn build_core_app<R: tauri::Runtime>(
 /// busy-loops); a single call to run setup on a runtime we own is exactly what
 /// it still does correctly.
 pub fn build_headless_app() -> tauri::Result<tauri::App<tauri::test::MockRuntime>> {
-    // Reject an unreadable layout before setup can publish fallback state or
-    // recover an import. Either operation can schedule or write a new layout.
+    // Preserve any unreadable layout before setup can publish fallback
+    // state or recover an import. Both can write a new layout.
     let layout = state::load_persisted_state_checked().map_err(std::io::Error::other)?;
     let mut app = build_core_app(
         tauri::Builder::<tauri::test::MockRuntime>::new(),

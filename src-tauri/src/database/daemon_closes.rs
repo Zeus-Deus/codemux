@@ -2,7 +2,7 @@
 
 use super::DatabaseStore;
 use crate::agent_control::{ControlError, ErrorCode};
-use crate::state::{ArchivedWorkspaceSnapshot, LayoutCloseIntent, SessionId};
+use crate::state::{LayoutCloseIntent, SessionId};
 use crate::terminal::TerminalCloseError;
 use crate::workspace_service::Checkpoint;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -59,24 +59,6 @@ fn replacement_session_id(replacement_id: Uuid) -> String {
     format!("session-{}", replacement_id.simple())
 }
 
-impl LayoutCloseIntent {
-    fn row_key(&self) -> (&str, &str, &str) {
-        match self {
-            Self::Pane(id) => ("pane", "", id),
-            Self::Session {
-                workspace_id,
-                session_id,
-            } => ("session", workspace_id, session_id),
-            Self::Tab {
-                workspace_id,
-                tab_id,
-            } => ("tab", workspace_id, tab_id),
-            Self::Workspace(id) => ("workspace", id, ""),
-            Self::Archive(entry) => ("archive", &entry.workspace_id, &entry.archive_id),
-        }
-    }
-}
-
 pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
     migrate_schema(conn)
         .map_err(|error| format!("Failed to initialize terminal close journal: {error}"))
@@ -89,6 +71,7 @@ fn migrate_schema(conn: &Connection) -> rusqlite::Result<()> {
         [],
         |row| row.get(0),
     )?;
+    super::layout_closes::create_schema(&tx)?;
     // The shell can outlive both the layout workspace and its saved host.
     // The captured route is part of its identity and has no foreign key.
     tx.execute_batch(
@@ -97,13 +80,6 @@ fn migrate_schema(conn: &Connection) -> rusqlite::Result<()> {
             session_id TEXT NOT NULL,
             shell_id BLOB NOT NULL CHECK (length(shell_id) = 16),
             PRIMARY KEY (route, session_id, shell_id)
-        );
-        CREATE TABLE IF NOT EXISTS pending_layout_closes (
-            scope TEXT NOT NULL CHECK (scope IN ('pane', 'session', 'tab', 'workspace', 'archive')),
-            workspace_id TEXT NOT NULL,
-            target_id TEXT NOT NULL,
-            payload TEXT CHECK ((scope = 'archive') = (payload IS NOT NULL)),
-            PRIMARY KEY (scope, workspace_id, target_id)
         );
         CREATE TABLE IF NOT EXISTS daemon_shell_ownership (
             route TEXT NOT NULL,
@@ -370,13 +346,7 @@ fn write_layout_close(
     daemon_closes: &[PendingDaemonClose],
     grant_id: Option<&str>,
 ) -> Result<Vec<PendingDaemonClose>, TerminalCloseError> {
-    let (scope, intent_workspace_id, target_id) = intent.row_key();
-    tx.execute(
-        "INSERT INTO pending_layout_closes (scope, workspace_id, target_id, payload)
-         VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
-        params![scope, intent_workspace_id, target_id, payload],
-    )
-    .map_err(|error| error.to_string())?;
+    super::layout_closes::write_intent(&tx, intent, payload)?;
     let mut closes = daemon_closes.to_vec();
     if let Some(workspace_id) = workspace_id {
         for id in closed_sessions {
@@ -642,10 +612,15 @@ impl DatabaseStore {
     }
 
     pub(crate) fn pending_terminal_replacements(&self) -> Result<Vec<PendingTerminalReplacement>, String> {
-        let conn = self.conn.lock().unwrap();
+        Self::read_terminal_replacements(&self.conn.lock().unwrap())
+    }
+
+    /// Order each chain from the oldest binding to the newest. Session UUIDs
+    /// and the composite primary key carry no chronological information.
+    pub(super) fn read_terminal_replacements(conn: &Connection) -> Result<Vec<PendingTerminalReplacement>, String> {
         let mut select = conn.prepare(
             "SELECT workspace_id, session_id, replacement_id FROM pending_local_terminal_restarts
-             WHERE replacement_active = 1 ORDER BY workspace_id, session_id",
+             WHERE replacement_active = 1",
         ).map_err(|error| error.to_string())?;
         let rows = select.query_map([], |row| {
             Ok(PendingTerminalReplacement {
@@ -654,7 +629,25 @@ impl DatabaseStore {
                 replacement_id: Uuid::from_bytes(row.get(2)?),
             })
         }).map_err(|error| error.to_string())?;
-        rows.collect::<Result<_, _>>().map_err(|error| error.to_string())
+        let mut edges = std::collections::BTreeMap::new();
+        let mut successors = HashSet::new();
+        for row in rows {
+            let edge = row.map_err(|error| error.to_string())?;
+            successors.insert((edge.workspace_id.clone(), edge.replacement_session_id()));
+            edges.insert((edge.workspace_id.clone(), edge.old_session_id.clone()), edge);
+        }
+        let roots: Vec<_> = edges.keys().filter(|key| !successors.contains(*key)).cloned().collect();
+        let mut ordered = Vec::with_capacity(edges.len());
+        for mut key in roots {
+            while let Some(edge) = edges.remove(&key) {
+                key.1 = edge.replacement_session_id();
+                ordered.push(edge);
+            }
+        }
+        if !edges.is_empty() {
+            return Err("Terminal replacement journal contains a cycle".into());
+        }
+        Ok(ordered)
     }
 
     /// Forget an applied alias only after its replacement is saved in layout.
@@ -862,87 +855,6 @@ impl DatabaseStore {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub(crate) fn pending_layout_closes(&self) -> Result<Vec<LayoutCloseIntent>, String> {
-        let conn = self.conn.lock().unwrap();
-        let mut select = conn
-            .prepare(
-                "SELECT scope, workspace_id, target_id, payload FROM pending_layout_closes ORDER BY rowid",
-            )
-            .map_err(|error| error.to_string())?;
-        let rows = select
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?;
-        rows.map(|row| {
-            let (scope, workspace_id, target_id, payload) =
-                row.map_err(|error| error.to_string())?;
-            match scope.as_str() {
-                "pane" => Ok(LayoutCloseIntent::Pane(target_id)),
-                "session" => Ok(LayoutCloseIntent::Session {
-                    workspace_id,
-                    session_id: target_id,
-                }),
-                "tab" => Ok(LayoutCloseIntent::Tab {
-                    workspace_id,
-                    tab_id: target_id,
-                }),
-                "workspace" => Ok(LayoutCloseIntent::Workspace(workspace_id)),
-                "archive" => {
-                    let entry: ArchivedWorkspaceSnapshot = serde_json::from_str(
-                        payload
-                            .as_deref()
-                            .ok_or("Archive close payload is missing")?,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    if entry.workspace_id != workspace_id || entry.archive_id != target_id {
-                        return Err("Archive close payload has a different identity".into());
-                    }
-                    Ok(LayoutCloseIntent::Archive(Box::new(entry)))
-                }
-                _ => Err(format!("Unknown layout close scope {scope}")),
-            }
-        })
-        .collect()
-    }
-
-    pub(crate) fn retire_layout_closes(&self, intents: &[LayoutCloseIntent]) -> Result<(), String> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
-        {
-            let mut delete = tx.prepare_cached(
-                "DELETE FROM pending_layout_closes WHERE scope = ?1 AND workspace_id = ?2 AND target_id = ?3",
-            ).map_err(|error| error.to_string())?;
-            for intent in intents {
-                delete
-                    .execute(intent.row_key())
-                    .map_err(|error| error.to_string())?;
-            }
-        }
-        tx.commit().map_err(|error| error.to_string())
-    }
-
-    pub(crate) fn has_pending_layout_close(
-        &self,
-        intent: &LayoutCloseIntent,
-    ) -> Result<bool, String> {
-        self.conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pending_layout_closes
-             WHERE scope = ?1 AND workspace_id = ?2 AND target_id = ?3)",
-                intent.row_key(),
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())
-    }
-
     pub(crate) fn pending_daemon_closes(&self) -> Result<Vec<PendingDaemonClose>, String> {
         read_shell_records(
             &self.conn.lock().unwrap(),
@@ -976,6 +888,7 @@ impl DatabaseStore {
 
 #[cfg(test)]
 mod tests {
+    use crate::state::PendingArchive;
     use super::*;
 
     #[test]
@@ -1522,6 +1435,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_unarchive_settles_only_proven_history_before_acknowledging() {
+        let root = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::test_file(&root.path().join("history.sqlite"));
+        let store = crate::state::AppStateStore::default();
+        let mut selected = store.snapshot();
+        let replacement = selected.workspaces[0].workspace_id.0.clone();
+        let mut entry = crate::state::build_archive_entry(&selected.workspaces[0]);
+        entry.workspace_id = "old-workspace".into();
+        entry.worktree_path = Some(root.path().display().to_string());
+        let cwd = entry.worktree_path.as_deref().unwrap();
+        // An older build already moved a conversation to the replacement.
+        for (thread, owner) in [("moved", &replacement), ("unrelated", &replacement), ("still-archived", &entry.workspace_id)] {
+            db.upsert_agent_chat_session(thread, owner, Some(cwd), "hermes").unwrap();
+        }
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO hermes_bindings(thread_id,workspace_id,cwd,binding) VALUES ('moved',?1,?2,'{}')",
+            params![entry.workspace_id, cwd],
+        ).unwrap();
+        let pending = PendingArchive { entry: entry.clone(), restored_workspace_id: Some(replacement.clone()), hermes_thread_ids: None };
+        db.record_layout_close(&LayoutCloseIntent::Archive(Box::new(pending)), &[]).unwrap();
+        let intents = db.pending_layout_closes().unwrap();
+        db.settle_layout_closes(&intents, &selected, false).unwrap();
+        assert_eq!(db.get_agent_chat_session("still-archived").unwrap().workspace_id, replacement);
+        selected.workspaces.clear();
+        selected.archived_workspaces.push(entry.clone());
+        db.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER fail_transfer BEFORE UPDATE OF workspace_id ON agent_chat_sessions
+             BEGIN SELECT RAISE(ABORT, 'fixture transfer failure'); END;",
+        ).unwrap();
+        assert!(db.settle_layout_closes(&intents, &selected, true).is_err());
+        assert!(db.pending_archive(&entry).unwrap().is_some());
+        assert_eq!(db.get_agent_chat_session("moved").unwrap().workspace_id, replacement);
+        db.conn.lock().unwrap().execute_batch("DROP TRIGGER fail_transfer").unwrap();
+        db.settle_layout_closes(&intents, &selected, true).unwrap();
+        assert!(db.pending_layout_closes().unwrap().is_empty());
+        for thread in ["moved", "still-archived"] {
+            assert_eq!(db.get_agent_chat_session(thread).unwrap().workspace_id, entry.workspace_id);
+        }
+        assert_eq!(db.get_agent_chat_session("unrelated").unwrap().workspace_id, replacement);
+    }
+
+    #[test]
     fn old_pane_rows_migrate_to_scoped_layout_intents_once() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("state.sqlite");
@@ -1563,7 +1518,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [shell]
             );
-            db.retire_layout_closes(&[session]).unwrap();
+            db.settle_layout_closes(&[session], &crate::state::AppStateStore::default().snapshot(), true).unwrap();
         }
         let db = DatabaseStore::test_file(&path);
         assert!(db.pending_layout_closes().unwrap().is_empty());

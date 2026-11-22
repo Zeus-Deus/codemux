@@ -125,6 +125,14 @@ impl Serve {
         Self { child: cmd.spawn().unwrap(), root }
     }
 
+    fn restart(&mut self) {
+        assert!(self.child.try_wait().unwrap().is_some());
+        let log = std::fs::File::create(self.root.path().join("serve.log")).unwrap();
+        self.child = serve_command(self.root.path(), free_loopback_port())
+            .stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap();
+        self.wait_ready();
+    }
+
     fn log(&self) -> String {
         std::fs::read_to_string(self.root.path().join("serve.log")).unwrap_or_default()
     }
@@ -683,21 +691,306 @@ fn serve_sigterm_saves_workspace_layout_and_exits_successfully() {
 }
 
 #[test]
-fn serve_rejects_a_corrupt_layout_without_overwriting_it() {
+fn serve_saves_its_layout_without_overwriting_the_recovery_copy() {
     let root = tempfile::tempdir().unwrap();
     let layout = layout_path(root.path());
     let corrupt = b"{\"workspaces\":[";
     std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
     std::fs::write(&layout, corrupt).unwrap();
 
+    #[cfg(target_os = "macos")]
+    let data_dir = root.path().join("Library/Application Support");
+    #[cfg(not(target_os = "macos"))]
+    let data_dir = root.path().join("data");
+    let orphan = data_dir.join(codemux_lib::APP_DIR_NAME).join("scrollback/missing-workspace");
+    std::fs::create_dir_all(&orphan).unwrap();
+    let scrollback = orphan.join("pane.dat");
+    std::fs::write(&scrollback, b"terminal history").unwrap();
+
     let mut serve = Serve::spawn_in(root);
-    let status = serve.wait_for_exit().expect("serve should reject a corrupt layout");
-    let log = serve.log();
-    assert_eq!(status.code(), Some(1), "serve exited with {status}:\n{log}");
-    assert!(log.lines().any(|line| {
-        line.starts_with("[codemux serve]") && line.contains("Failed to decode workspace layout")
-    }), "serve did not report the layout decode error:\n{log}");
-    assert_eq!(std::fs::read(layout).unwrap(), corrupt);
+    serve.wait_ready();
+    let (workspace_id, _) = serve.workspace("during-recovery");
+    let status = serve.shutdown().expect("serve should stop after SIGTERM");
+    assert!(status.success(), "serve exited with {status}:\n{}", serve.log());
+
+    let saved: Value = serde_json::from_slice(&std::fs::read(layout.with_extension("json.recovery-session")).unwrap()).unwrap();
+    assert!(saved["workspaces"].as_array().unwrap().iter().any(|workspace| {
+        workspace["workspace_id"].as_str() == Some(workspace_id.as_str())
+    }));
+    let backup = std::fs::read_to_string(layout.with_extension("json.recovery-pending")).unwrap();
+    assert_eq!(std::fs::read(layout.with_file_name(backup.trim())).unwrap(), corrupt);
+    assert_eq!(std::fs::read(scrollback).unwrap(), b"terminal history");
+}
+
+#[test]
+fn serve_keeps_a_repair_installed_during_recovery_through_shutdown() {
+    let mut serve = Serve::start();
+    let (original, _) = serve.workspace("original");
+    assert!(serve.shutdown().unwrap().success());
+    let layout = layout_path(serve.root.path());
+    let repaired = std::fs::read(&layout).unwrap();
+    std::fs::write(&layout, b"broken").unwrap();
+    serve.restart();
+    let backup = recovery_backup_path(&layout);
+    std::fs::write(&backup, &repaired).unwrap();
+    std::fs::rename(backup, &layout).unwrap();
+    let (id, _) = serve.workspace("flush-after-repair");
+    // Closing a workspace forces a journaled layout flush. Normal shutdown
+    // then drains the queued writer and does its guarded final save.
+    serve.ok(&["workspace", "close", &id, "--json"]);
+    assert!(serve.shutdown().unwrap().success(), "{}", serve.log());
+    assert_eq!(std::fs::read(&layout).unwrap(), repaired);
+    serve.restart();
+    serve.ok(&["workspace", "info", &original, "--json"]);
+    assert!(!layout.with_extension("json.recovery-pending").exists());
+}
+
+#[test]
+fn serve_replays_journal_only_sync_closes_during_recovery() {
+    use codemux_lib::state::{build_archive_entry, AppStateSnapshot};
+    let mut serve = Serve::start();
+    let (closed, _) = serve.workspace("close-before-crash");
+    let (archived, _) = serve.workspace("archive-before-crash");
+    assert!(serve.shutdown().unwrap().success());
+    let layout = layout_path(serve.root.path());
+    let original = std::fs::read(&layout).unwrap();
+    let snapshot: AppStateSnapshot = serde_json::from_slice(&original).unwrap();
+    let entry = build_archive_entry(snapshot.workspaces.iter().find(|ws| ws.workspace_id.0 == archived).unwrap());
+    let db = rusqlite::Connection::open(layout.with_file_name("codemux.db")).unwrap();
+    for id in [closed.as_str(), archived.as_str(), "missing-only"] {
+        db.execute("INSERT INTO workspaces_sync (workspace_id, title, server_id, dirty)
+                    VALUES (?1, ?1, 'cloud-' || ?1, 0) ON CONFLICT(user_id, workspace_id)
+                    DO UPDATE SET server_id = excluded.server_id, dirty = 0", [id]).unwrap();
+    }
+    // Exact durable state after the old journal commit, before record_closed.
+    db.execute("INSERT INTO pending_layout_closes VALUES ('workspace', ?1, '', NULL)", [&closed]).unwrap();
+    db.execute("INSERT INTO pending_layout_closes VALUES ('archive', ?1, ?2, ?3)",
+        rusqlite::params![archived, entry.archive_id, serde_json::to_string(&entry).unwrap()]).unwrap();
+    std::fs::write(&layout, b"broken").unwrap();
+    for _ in 0..2 {
+        serve.restart();
+        assert!(serve.shutdown().unwrap().success());
+        for id in [closed.as_str(), archived.as_str(), "missing-only"] {
+            let (deleted, dirty, server): (bool, bool, String) = db.query_row(
+                "SELECT deleted_at IS NOT NULL, dirty, server_id FROM workspaces_sync WHERE workspace_id = ?1",
+                [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+            assert_eq!((deleted, dirty), (id != "missing-only", id != "missing-only"), "{id}");
+            assert_eq!(server, format!("cloud-{id}"));
+        }
+        assert!(recovery_backup_path(&layout).exists());
+    }
+}
+
+// Boot in a fresh process each time so only the saved layout, scrollback,
+// and database survive the restart.
+#[test]
+fn corrupt_layout_restart_preserves_pane_and_sync_row() {
+    exercise_recovery_exit("discarded-before-boot");
+}
+
+#[test]
+fn corrupt_layout_discard_while_running_preserves_pane_and_sync_row() {
+    exercise_recovery_exit("discarded-while-running");
+}
+
+#[test]
+fn corrupt_layout_repair_preserves_legacy_pane_and_sync_row() {
+    exercise_recovery_exit("repaired");
+}
+
+fn recovery_backup_path(layout: &Path) -> PathBuf {
+    let backup = std::fs::read_to_string(layout.with_extension("json.recovery-pending")).unwrap();
+    layout.with_file_name(backup.trim())
+}
+
+fn exercise_recovery_exit(exit: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    for program in ["pkill", "fuser"] {
+        std::os::unix::fs::symlink("/bin/true", bin.join(program)).unwrap();
+    }
+    let boot = |phase: &str| -> Value {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        isolate(&mut cmd, root.path());
+        let output = cmd
+            .env("CODEMUX_TEST_LAYOUT_BOOT", phase)
+            .env("CODEMUX_DISABLE_PTY_DAEMON", "1")
+            .env("CODEMUX_API_URL", "http://127.0.0.1:1")
+            .env("SHELL", "/bin/true")
+            .args(["--ignored", "--exact", "write_panes_and_reconcile_fixture", "--nocapture"])
+            .output().unwrap();
+        assert!(output.status.success(), "{phase} boot:\n{}", String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice(&std::fs::read(root.path().join(format!("{phase}.json"))).unwrap()).unwrap()
+    };
+    let original = boot("original");
+    let layout = layout_path(root.path());
+    assert_eq!(original["on_boot"], json!(["workspace-1", "pane-3", "session-4", "surface-2", "tab-5"]));
+    let legacy_layout = std::fs::read(&layout).unwrap();
+    std::fs::write(&layout, b"{\"workspaces\":[").unwrap();
+    let recovery = boot("recovery");
+    let pending_restart = boot("pending-restart");
+    assert_eq!(pending_restart["on_boot"], recovery["after_create"], "saved recovery identities must restore");
+    for report in [&recovery, &pending_restart] {
+        assert_eq!(report["original"], original["original"], "scrollback bytes, metadata and linked row");
+        // Both the fallback and later allocations must be distinct, including
+        // sessions: scrollback metadata can also be looked up by session alone.
+        for id in report["after_create"].as_array().unwrap() {
+            assert!(!original["after_create"].as_array().unwrap().contains(id), "reused {id}");
+        }
+    }
+    if exit == "repaired" {
+        // The user repairs the set-aside layout and restores it over the fallback.
+        let backup = recovery_backup_path(&layout);
+        std::fs::write(&backup, legacy_layout).unwrap();
+        std::fs::rename(backup, &layout).unwrap();
+    } else if exit == "discarded-before-boot" {
+        std::fs::remove_file(recovery_backup_path(&layout)).unwrap();
+    }
+
+    let exited = boot(exit);
+    assert_eq!(layout.with_extension("json.recovery-pending").exists(), exit == "discarded-while-running");
+    let expected = if exit == "repaired" { &original } else { &pending_restart };
+    assert_eq!(exited["on_boot"], expected["after_create"]);
+    if matches!(exit, "repaired" | "discarded-while-running") {
+        assert_eq!(exited["original"], original["original"]);
+    } else {
+        // Discard makes the absent workspace eligible for normal cleanup.
+        // Its tombstone still belongs to the original cloud workspace.
+        for field in ["id", "workspace_id", "server_id", "title"] {
+            assert_eq!(exited["original"]["row"][field], original["original"]["row"][field]);
+        }
+        assert!(exited["original"]["row"]["deleted_at"].is_string());
+        assert!(exited["original"]["scrollback"].is_null(), "startup cleans orphan scrollback");
+    }
+    let later = boot("later");
+    assert!(!layout.with_extension("json.recovery-pending").exists());
+    if exit == "discarded-while-running" {
+        assert!(later["original"]["row"]["deleted_at"].is_string());
+        assert!(later["original"]["scrollback"].is_null());
+    }
+    assert_eq!(later["on_boot"], exited["after_create"]);
+    if exit == "repaired" {
+        assert_eq!(later["original"], original["original"]);
+    }
+    for report in [&exited, &later] {
+        for id in report["created"].as_array().unwrap() {
+            for previous in [&original, &recovery, &pending_restart] {
+                assert!(!previous["after_create"].as_array().unwrap().contains(id), "reused {id}");
+            }
+            assert!(!report["on_boot"].as_array().unwrap().contains(id), "reused live {id}");
+        }
+    }
+}
+
+fn write_legacy_layout(layout: &Path) {
+    use codemux_lib::state;
+
+    // Start from a saved pre-UUID workspace, independent of how this
+    // binary allocates new IDs. All references match its numeric IDs.
+    let mut snapshot = state::AppStateStore::default().snapshot();
+    let ws = &mut snapshot.workspaces[0];
+    ws.workspace_id.0 = "workspace-1".into();
+    snapshot.active_workspace_id = ws.workspace_id.clone();
+    let surface = &mut ws.surfaces[0];
+    surface.surface_id.0 = "surface-2".into();
+    ws.active_surface_id = surface.surface_id.clone();
+    ws.tabs[0].surface_id = Some(surface.surface_id.clone());
+    ws.tabs[0].tab_id = "tab-5".into();
+    ws.active_tab_id = ws.tabs[0].tab_id.clone();
+    let state::PaneNodeSnapshot::Terminal { pane_id, session_id, .. } = &mut surface.root else {
+        panic!("expected a terminal");
+    };
+    pane_id.0 = "pane-3".into();
+    session_id.0 = "session-4".into();
+    surface.active_pane_id = pane_id.clone();
+    snapshot.terminal_sessions[0].session_id = session_id.clone();
+    std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
+    std::fs::write(layout, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "run by the recovery tests in a private home"]
+fn write_panes_and_reconcile_fixture() {
+    use codemux_lib::{database::DatabaseStore, scrollback, state, workspaces_sync};
+    use tauri::Manager;
+
+    let phase = std::env::var("CODEMUX_TEST_LAYOUT_BOOT").expect("requires an isolated fixture");
+    let layout = layout_path(&std::env::current_dir().unwrap());
+    if phase == "original" {
+        write_legacy_layout(&layout);
+    }
+    let app = codemux_lib::build_headless_app().unwrap();
+    let store = app.state::<state::AppStateStore>();
+    let db = app.state::<DatabaseStore>();
+    if phase == "discarded-while-running" {
+        assert!(state::layout_recovery_pending());
+        std::fs::remove_file(recovery_backup_path(&layout)).unwrap();
+        assert!(state::load_persisted_state().is_some());
+    }
+    assert_eq!(state::layout_recovery_pending(), matches!(phase.as_str(), "recovery" | "pending-restart" | "discarded-while-running"));
+
+    let layout_ids = |ws: &state::WorkspaceSnapshot| {
+        let state::PaneNodeSnapshot::Terminal { pane_id, session_id, .. } = &ws.surfaces[0].root else {
+            panic!("expected a terminal");
+        };
+        [
+            ws.workspace_id.0.clone(), pane_id.0.clone(), session_id.0.clone(),
+            ws.surfaces[0].surface_id.0.clone(), ws.tabs[0].tab_id.clone(),
+        ]
+    };
+    let on_boot: Vec<_> = store.snapshot().workspaces.iter().flat_map(layout_ids).collect();
+    let created = store.create_workspace_at_path(std::env::current_dir().unwrap().join(&phase));
+    let workspaces = store.snapshot().workspaces;
+    let after_create: Vec<_> = workspaces.iter().flat_map(layout_ids).collect();
+    let transcript = |title: &str| format!("$ echo {title}\r\n\x1b[32m{title}\x1b[0m\r\n");
+    for ws in &workspaces {
+        if ws.workspace_id != created && !matches!(phase.as_str(), "original" | "recovery") {
+            continue;
+        }
+        let [workspace_id, pane_id, session_id, ..] = layout_ids(ws);
+        let title = format!("{phase} {workspace_id}");
+        store.rename_workspace(&workspace_id, title.clone());
+        scrollback::save_scrollback(&scrollback::ScrollbackPayload {
+            workspace_id, pane_id, session_id,
+            working_directory: ws.cwd.clone(), original_command: None, cols: 80, rows: 24,
+            data: transcript(&title), adapter_captures: Default::default(), adapter_id: None,
+            alternate_buffer: false,
+        }).unwrap();
+    }
+    workspaces_sync::reconcile_from_state(&db, &store).unwrap();
+    let rows = db.list_workspaces_sync();
+    for ws in &store.snapshot().workspaces {
+        let [workspace_id, pane_id, session_id, ..] = layout_ids(ws);
+        let saved = scrollback::load_scrollback(&workspace_id, &pane_id).unwrap();
+        assert_eq!(saved.data, transcript(&ws.title));
+        assert_eq!(saved.meta.session_id, session_id);
+        assert!(rows.iter().any(|r| r.workspace_id.as_ref() == Some(&ws.workspace_id.0) && r.title == ws.title));
+    }
+    let new_row = rows.iter().find(|r| r.workspace_id.as_ref() == Some(&created.0)).unwrap();
+    assert_eq!(new_row.server_id, None, "{phase}: {} inherited an old cloud row", created.0);
+    state::flush_persisted_state(&store).unwrap();
+
+    let original_row = || db.list_workspaces_sync_for_sync().into_iter()
+        .find(|row| row.workspace_id.as_deref() == Some("workspace-1")).unwrap();
+    if phase == "original" {
+        db.mark_workspace_sync_synced(original_row().id, Some("cloud-original")).unwrap();
+    }
+    let meta = scrollback::meta_path_for("workspace-1", "pane-3");
+    assert_eq!(meta.exists(), meta.with_extension("dat").exists());
+    let report = json!({
+        "on_boot": on_boot,
+        "after_create": after_create,
+        "created": layout_ids(&store.find_workspace(&created.0).unwrap()),
+        "original": {
+            "scrollback": meta.exists().then(|| json!({
+                "data": std::fs::read_to_string(meta.with_extension("dat")).unwrap(),
+                "meta": std::fs::read_to_string(meta).unwrap(),
+            })),
+            "row": original_row(),
+        }
+    });
+    std::fs::write(format!("{phase}.json"), serde_json::to_vec(&report).unwrap()).unwrap();
 }
 
 #[test]
@@ -757,11 +1050,11 @@ fn serve_preserves_an_unreadable_layout_link() {
     std::os::unix::fs::symlink(&target, &layout).unwrap();
 
     let mut serve = Serve::spawn_in(root);
-    let status = serve.wait_for_exit().expect("serve should reject an unreadable layout");
-    let log = serve.log();
-    assert_eq!(status.code(), Some(1), "serve exited with {status}:\n{log}");
-    assert!(log.contains("Failed to read workspace layout"), "{log}");
-    assert_eq!(std::fs::read_link(layout).unwrap(), target);
+    serve.wait_ready();
+    let status = serve.shutdown().expect("serve should stop after SIGTERM");
+    assert!(status.success(), "serve exited with {status}:\n{}", serve.log());
+    let backup = std::fs::read_to_string(layout.with_extension("json.recovery-pending")).unwrap();
+    assert_eq!(std::fs::read_link(layout.with_file_name(backup.trim())).unwrap(), target);
 }
 
 #[cfg(target_os = "linux")]

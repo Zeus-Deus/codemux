@@ -379,11 +379,7 @@ pub async fn workspaces_sync_now<R: tauri::Runtime>(
         let db_state: tauri::State<'_, DatabaseStore> = app.state();
         let app_state: tauri::State<'_, crate::state::AppStateStore> =
             app.state();
-        let snapshot = app_state.snapshot();
-        crate::workspaces_sync::reconcile_from_snapshot(
-            db_state.inner(),
-            &snapshot,
-        )?;
+        crate::workspaces_sync::reconcile_from_state(db_state.inner(), app_state.inner())?;
     }
     crate::workspaces_sync::try_sync_with_app(&app).await
 }
@@ -1841,6 +1837,13 @@ mod tests {
             shell_id,
         };
         let db = DatabaseStore::test_file(&root.join("reconcile-copy.sqlite"));
+        std::fs::write(root.join("layout.json"), b"invalid layout").unwrap();
+        assert!(crate::state::load_persisted_state_checked().unwrap().is_none());
+        assert!(crate::state::layout_recovery_pending());
+        crate::workspaces_sync::reconcile_from_state(&db, &layout).unwrap();
+        let row = db.list_workspaces_sync().into_iter()
+            .find(|row| row.workspace_id.as_deref() == Some(&workspace_id)).unwrap();
+        db.mark_workspace_sync_synced(row.id, Some("cloud-copy")).unwrap();
         db.remember_daemon_shell(&ownership).unwrap();
         let app = tauri::test::mock_app();
         app.manage(layout);
@@ -1877,6 +1880,9 @@ mod tests {
             assert!(!copy.join("teardown-ran").exists());
 
             let db = app.state::<DatabaseStore>();
+            let closed = db.list_workspaces_sync_for_sync().into_iter().find(|r| r.id == row.id).unwrap();
+            assert_eq!(closed.server_id.as_deref(), Some("cloud-copy"));
+            assert!(closed.deleted_at.is_some());
             assert!(db.daemon_shell_ownership().unwrap().is_empty());
             while !client.list().await.unwrap().is_empty() || !db.pending_daemon_closes().unwrap().is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
