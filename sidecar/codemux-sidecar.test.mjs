@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { ROLE_ENV, selectRole } from "./sidecar-role.mjs";
 
@@ -35,7 +35,8 @@ test("no argument and no (or an empty) environment role means Claude", () => {
   }
 });
 
-const binary = process.env.CODEMUX_SIDECAR_TEST_BINARY;
+// Absolute, because some tests run the binary from another working directory.
+const binary = process.env.CODEMUX_SIDECAR_TEST_BINARY && resolve(process.env.CODEMUX_SIDECAR_TEST_BINARY);
 const skip = binary ? false : "set CODEMUX_SIDECAR_TEST_BINARY to the compiled codemux-sidecar";
 function run(args, { env = {}, input, cwd, program = binary } = {}) {
   const result = spawnSync(program, args, {
