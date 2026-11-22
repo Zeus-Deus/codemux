@@ -26,14 +26,15 @@ pub(crate) fn host_mcp_server(root: &Path) -> crate::agent_provider::claude::pro
 
 /// Called by the single-threaded CLI before constructing Tokio. This pins a
 /// server-distributed Claude sidecar for the existing live capability cache.
+/// Pins the resolved Claude runtime, including an override made absolute, so
+/// every later spawn uses that path whatever its working directory. An
+/// invalid override is left in place for `resolve_sidecar` to report.
 pub fn initialize_runtime() {
-    if std::env::var_os(crate::agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV).is_none() {
-        if let Ok(path) = resolve_sidecar() {
-            std::env::set_var(
-                crate::agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV,
-                path,
-            );
-        }
+    if let Ok(path) = resolve_sidecar() {
+        std::env::set_var(
+            crate::agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV,
+            path,
+        );
     }
 }
 /// The Claude sidecar beside `codemux-remote`: the bundled multi-role binary
