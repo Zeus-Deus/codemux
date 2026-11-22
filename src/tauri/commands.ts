@@ -6,6 +6,7 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 
 import { bytesToBase64 } from "@/lib/agent-chat/attachment-block";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { useEditorStore } from "@/stores/editor-store";
 import {
   noteLocalActivationFallback,
   noteLocalWorkspaceActivation,
@@ -595,7 +596,7 @@ async function refreshRemoteWorkspaceView(workspaceId: string, tabId: string | u
 }
 
 export const closeTab = (workspaceId: string, tabId: string) =>
-  invoke("close_tab", { workspaceId, tabId });
+  useEditorStore.getState().closeTab(tabId, () => invoke("close_tab", { workspaceId, tabId }));
 
 export const activateTab = async (workspaceId: string, tabId: string) => {
   const sequence = beginRemoteNavigation();

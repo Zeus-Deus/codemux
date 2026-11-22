@@ -33,11 +33,13 @@ const HEADER_LEN = 5;
  */
 export const IROH_MAX_FRAME_LEN = 64 * 1024 * 1024;
 
+/** Retain one iroh read window's worth of scratch space between frames. */
+const RETAINED_BUFFER_LIMIT = 64 * 1024;
+
 /** One decoded wire frame. */
 export interface IrohFrame {
   kind: number;
-  /** Payload bytes. May be a view into the decoder's buffer — copy before
-   *  retaining it past the next {@link FrameDecoder.next} call. */
+  /** Owned payload bytes. */
   payload: Uint8Array;
 }
 
@@ -81,21 +83,32 @@ export function encodeFrame(kind: number, payload: Uint8Array): Uint8Array {
  * decoder returns a fatal `CodecError`.
  */
 export class FrameDecoder {
-  /** Buffered, not-yet-consumed bytes. */
+  /** Unread bytes occupy the half-open range [start, end). */
   private buf = new Uint8Array(0);
+  private start = 0;
+  private end = 0;
 
   /** Append freshly read bytes. */
   push(chunk: Uint8Array): void {
     if (chunk.length === 0) return;
-    if (this.buf.length === 0) {
-      // Copy so a caller reusing its read buffer can't mutate ours.
-      this.buf = chunk.slice();
-      return;
+    if (chunk.length > this.buf.length - this.end) {
+      const unread = this.buffered;
+      const needed = unread + chunk.length;
+      if (needed > this.buf.length) {
+        // Grow geometrically so a large fragmented frame does not copy
+        // its entire prefix each time another chunk arrives.
+        const grown = Math.min(this.buf.length * 2, HEADER_LEN + IROH_MAX_FRAME_LEN);
+        const buf = new Uint8Array(Math.max(needed, grown));
+        buf.set(this.buf.subarray(this.start, this.end));
+        this.buf = buf;
+      } else {
+        this.buf.copyWithin(0, this.start, this.end);
+      }
+      this.start = 0;
+      this.end = unread;
     }
-    const merged = new Uint8Array(this.buf.length + chunk.length);
-    merged.set(this.buf, 0);
-    merged.set(chunk, this.buf.length);
-    this.buf = merged;
+    this.buf.set(chunk, this.end);
+    this.end += chunk.length;
   }
 
   /**
@@ -103,30 +116,34 @@ export class FrameDecoder {
    * frame. Throws {@link IrohCodecError} on a malformed header.
    */
   next(): IrohFrame | null {
-    if (this.buf.length < HEADER_LEN) return null;
-    const kind = this.buf[0];
+    if (this.buffered < HEADER_LEN) return null;
+    const kind = this.buf[this.start];
     if (kind !== KIND_TEXT && kind !== KIND_BINARY) {
       throw new IrohCodecError("unknown_kind", kind);
     }
-    const view = new DataView(
-      this.buf.buffer,
-      this.buf.byteOffset,
-      this.buf.byteLength,
-    );
-    const len = view.getUint32(1, false);
+    const view = new DataView(this.buf.buffer);
+    const len = view.getUint32(this.start + 1, false);
     if (len > IROH_MAX_FRAME_LEN) {
       throw new IrohCodecError("frame_too_large", len);
     }
-    if (this.buf.length < HEADER_LEN + len) return null;
-    // Copy the payload out so consuming the buffer (below) can't alias it.
-    const payload = this.buf.slice(HEADER_LEN, HEADER_LEN + len);
-    // subarray shares memory (no copy) — the consumed prefix is simply dropped.
-    this.buf = this.buf.subarray(HEADER_LEN + len);
+    if (this.buffered < HEADER_LEN + len) return null;
+    const payloadStart = this.start + HEADER_LEN;
+    this.start = payloadStart + len;
+    const payload = this.buf.slice(payloadStart, this.start);
+    // Release a large frame's backing storage even if the same read
+    // contained the start of the next frame.
+    if (this.buf.length > RETAINED_BUFFER_LIMIT && this.buffered <= RETAINED_BUFFER_LIMIT) {
+      this.buf = this.buf.slice(this.start, this.end);
+      this.start = 0;
+      this.end = this.buf.length;
+    } else if (this.start === this.end) {
+      this.start = this.end = 0;
+    }
     return { kind, payload };
   }
 
   /** Bytes currently buffered (partial frame). Exposed for tests. */
   get buffered(): number {
-    return this.buf.length;
+    return this.end - this.start;
   }
 }

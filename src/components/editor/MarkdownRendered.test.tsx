@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (path: string) => `mock-asset:${path}`,
@@ -245,6 +245,63 @@ describe("MarkdownRendered", () => {
     const link = container.querySelector("a");
     expect(link).not.toBeNull();
     expect(link!.getAttribute("href") ?? "").not.toContain("javascript:");
+  });
+
+  it("never lets a local file's raw HTML run script or restyle the app", () => {
+    const { container } = render(
+      <MarkdownRendered
+        content={[
+          `<iframe srcdoc="<script>parent.x()</script>"></iframe>`,
+          `<script>window.x()</script>`,
+          `<style>body{display:none}</style>`,
+          `<img src="x.png" onerror="window.x()">`,
+          ``,
+          `still here`,
+        ].join("\n")}
+        filePath="/repo/README.md"
+      />,
+    );
+    expect(container.querySelector("iframe, script, style")).toBeNull();
+    expect(container.querySelector("img")?.hasAttribute("onerror")).toBe(false);
+    expect(container.textContent).toContain("still here");
+  });
+
+  it("keeps Windows drive paths and data images in a local file", () => {
+    const { container } = render(
+      <MarkdownRendered
+        content={`<img src="C:\\repo\\logo.png">\n\n<img src="data:image/png;base64,AAAA">`}
+        filePath={"C:\\repo\\README.md"}
+      />,
+    );
+    const imgs = container.querySelectorAll("img");
+    expect(imgs[0].getAttribute("src")).toBe("mock-asset:C:\\repo\\logo.png");
+    expect(imgs[1].getAttribute("src")).toBe("data:image/png;base64,AAAA");
+  });
+
+  it.each([
+    ["a raw named anchor", `[Setup](#setup)\n\n<a name="setup"></a>\n\ntext`, "a[href='#setup']"],
+    ["a raw id", `[Setup](#setup)\n\n<h2 id="setup">Setup</h2>`, "a[href='#setup']"],
+    ["a footnote", `Claim.[^1]\n\n[^1]: Source.`, "a[data-footnote-ref]"],
+    ["a footnote's way back", `Claim.[^1]\n\n[^1]: Source.`, "a[data-footnote-backref]"],
+  ])("follows an in-page link to %s", (_label, content, linkSelector) => {
+    const scrolled: Element[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      scrolled.push(this);
+    };
+    try {
+      const { container } = render(
+        <MarkdownRendered content={content} filePath="/repo/README.md" />,
+      );
+      const link = container.querySelector(linkSelector);
+      expect(link).not.toBeNull();
+      expect(fireEvent.click(link!)).toBe(false);
+      expect(scrolled).toHaveLength(1);
+      expect(container.contains(scrolled[0])).toBe(true);
+      expect(scrolled[0]).not.toBe(link);
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
   });
 
   it("still re-renders when content actually changes", () => {

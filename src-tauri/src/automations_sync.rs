@@ -13,14 +13,16 @@
 //! `dirty` and logs once; the next sync retries. `404` from the API is
 //! treated as "endpoint not deployed yet" — a harmless skip.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
 
+use crate::sync_guard::{
+    combine, order_by_last_attempt, record_attempt, signed_in_token, Attempts, SyncGuard, SyncRequest,
+};
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
-use crate::sync_guard::{order_by_last_attempt, record_attempt, sync_client, Attempts, SyncGuard, SYNC_BUDGET};
-use crate::auth::{api_base_url, is_token_expired, load_token};
+use crate::auth::{api_base_url, AuthState};
 use crate::database::automation_triggers::AutomationTrigger;
 use crate::database::{AutomationRecord, DatabaseStore};
 
@@ -78,10 +80,6 @@ struct AutomationUpsertBody<'a> {
     retention_limit: i64,
 }
 
-/// Guards against overlapping sync runs (foreground sync vs. the
-/// fire-and-forget sync each mutation triggers).
-static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-
 /// Build the two host-identity maps: local `host_id` → `server_id`, and
 /// `server_id` → local `host_id`. Only hosts that have synced (have a
 /// `server_id`) appear.
@@ -97,94 +95,34 @@ fn host_maps(db: &DatabaseStore) -> (HashMap<i64, String>, HashMap<String, i64>)
     (local_to_server, server_to_local)
 }
 
-/// Resolve the local DB + token from app state and run pull-then-push.
-/// `Ok(())` when the user is not signed in — sync is not an error then.
-/// One sync pass at a time. Without it a second pass — a background tick
-/// and "Sync now", or two edits each scheduling a sync — could settle a
-/// deletion whose row the first pass is still uploading, before that
-/// upload returns the server id the DELETE needs.
+// Pulls and writes for known server IDs share this lock. A first POST may
+// wait indefinitely for its receipt, so it runs after the lock is released.
 static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// When each row was last sent (see [`order_by_last_attempt`]).
 static ATTEMPTS: Attempts = std::sync::LazyLock::new(Default::default);
 
-/// Coalesces [`schedule_background_sync`] requests.
-pub(crate) static BACKGROUND: crate::sync_guard::Coalescer = crate::sync_guard::Coalescer::new();
-
-/// Sync in the background, fire-and-forget. Requests made while a pass is
-/// running collapse into one follow-up pass after it, so mutations and
-/// scheduler ticks never queue up a pass each. A failed sync is logged, not
-/// surfaced: the rows stay dirty and a later pass retries them.
-pub fn schedule_background_sync<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
-    if !BACKGROUND.request() {
-        return;
-    }
-    tauri::async_runtime::spawn(async move {
-        loop {
-            if let Err(error) = try_sync_with_app(&app).await {
-                eprintln!("[codemux::automations] background sync failed: {error}");
-            }
-            if !BACKGROUND.finished_pass() {
-                break;
-            }
-        }
-    });
-}
-
+/// Sync the signed-in user's registry in the background.
 pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
-    // Queue before reading the session: a pass that waited out a sign-out
-    // or account switch must sync whoever is signed in now, not upload the
-    // new account's automations with the old account's token.
-    let _one_at_a_time = SYNC_LOCK.lock().await;
-    let db = app.state::<DatabaseStore>();
-    // No auth state means no session to sync for.
-    let Some(auth) = app.try_state::<crate::auth::AuthState>() else {
+    // The scheduler retries pending writes on its next tick.
+    let Ok(linked_lock) = SYNC_LOCK.try_lock() else {
         return Ok(());
     };
-    let (generation, token) = auth.session_snapshot(|| valid_token(&db));
+    let Some(auth) = app.try_state::<AuthState>() else {
+        return Ok(());
+    };
+    let db = app.state::<DatabaseStore>();
+    let (generation, token) = signed_in_token(&auth, &db);
     let Some(token) = token else {
         return Ok(());
     };
-    sync_locked(&token, &db, SyncGuard::session(&auth, generation)).await
-}
+    let guard = SyncGuard::session(&auth, generation);
+    let request = SyncRequest::linked(&token, guard);
+    let pull = pull_locked(&request, &db, None).await;
+    let linked = push_linked(&request, &db).await;
+    drop(linked_lock);
 
-/// One pull-then-push pass, queued behind any other.
-pub async fn sync_once(token: &str, db: &DatabaseStore) -> Result<(), String> {
-    let _one_at_a_time = SYNC_LOCK.lock().await;
-    sync_locked(token, db, SyncGuard::unchecked()).await
-}
-
-/// Pull, then push. Called with [`SYNC_LOCK`] held. The pass stops
-/// starting requests once [`SYNC_BUDGET`] is spent, but never abandons one
-/// it has started: each request ends by its own timeout, so the pass always
-/// learns whether an upload took — or keeps the row to try again.
-async fn sync_locked(token: &str, db: &DatabaseStore, guard: SyncGuard<'_>) -> Result<(), String> {
-    sync_with(token, db, &guard.within(SYNC_BUDGET), &sync_client()).await
-}
-
-async fn sync_with(
-    token: &str,
-    db: &DatabaseStore,
-    guard: &SyncGuard<'_>,
-    client: &reqwest::Client,
-) -> Result<(), String> {
-    let pull_err = pull_guarded(token, db, None, guard, client).await.err();
-    let push_err = push_guarded(token, db, guard, client).await.err();
-    match (pull_err, push_err) {
-        (None, None) => Ok(()),
-        (Some(p), None) => Err(format!("pull failed: {p}")),
-        (None, Some(p)) => Err(format!("push failed: {p}")),
-        (Some(a), Some(b)) => Err(format!("pull failed: {a}; push failed: {b}")),
-    }
-}
-
-fn valid_token(db: &DatabaseStore) -> Option<String> {
-    let (token, expires_at) = load_token(db)?;
-    if is_token_expired(&expires_at) {
-        None
-    } else {
-        Some(token)
-    }
+    guard.ensure_current()?;
+    let unlinked = push_unlinked(&token, &db).await;
+    combine(pull, linked.and(unlinked))
 }
 
 /// Pull server automations into the local DB. Idempotent. A local row
@@ -200,28 +138,24 @@ pub async fn pull(
     db: &DatabaseStore,
     host_filter: Option<&str>,
 ) -> Result<(), String> {
-    pull_guarded(token, db, host_filter, &SyncGuard::unchecked(), &sync_client()).await
+    let _linked = SYNC_LOCK.lock().await;
+    let request = SyncRequest::linked(token, SyncGuard::unchecked());
+    pull_locked(&request, db, host_filter).await
 }
 
-async fn pull_guarded(
-    token: &str,
+async fn pull_locked(
+    request: &SyncRequest<'_>,
     db: &DatabaseStore,
     host_filter: Option<&str>,
-    guard: &SyncGuard<'_>,
-    client: &reqwest::Client,
 ) -> Result<(), String> {
-    let base = api_base_url();
-    guard.ensure_current()?;
-    let mut url = format!("{base}/api/automations");
+    let mut path = "/api/automations".to_string();
     if let Some(host) = host_filter {
-        url.push_str(&format!("?hostServerId={}", urlencoding::encode(host)));
+        path.push_str(&format!("?hostServerId={}", urlencoding::encode(host)));
     }
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
+    // A first-upload receipt can bind during the GET. Only sweep IDs
+    // already known when the request started.
+    let local = request.commit(|| db.list_automations_for_sync())?;
+    let resp = request.send(request.request(Method::GET, &path)).await?;
     if !resp.status().is_success() {
         // 404 = endpoint not deployed yet — harmless skip.
         if resp.status().as_u16() == 404 {
@@ -231,15 +165,17 @@ async fn pull_guarded(
     }
     let body: ListAutomationsResponse =
         resp.json().await.map_err(|e| format!("Parse: {e}"))?;
-    // Written only while the session that asked is still current.
-    guard.commit(|| apply_pulled(db, &body))?
+
+    request.commit(|| apply_pulled(db, &body, &local))?
 }
 
-fn apply_pulled(db: &DatabaseStore, body: &ListAutomationsResponse) -> Result<(), String> {
+fn apply_pulled(
+    db: &DatabaseStore,
+    body: &ListAutomationsResponse,
+    local: &[AutomationRecord],
+) -> Result<(), String> {
     let (_local_to_server, server_to_local) = host_maps(db);
-    let local = db.list_automations_for_sync();
-    let server_ids: std::collections::HashSet<String> =
-        body.automations.iter().map(|a| a.id.clone()).collect();
+    let server_ids: HashSet<String> = body.automations.iter().map(|a| a.id.clone()).collect();
 
     for a in &body.automations {
         let host_id = a
@@ -285,7 +221,7 @@ fn apply_pulled(db: &DatabaseStore, body: &ListAutomationsResponse) -> Result<()
 
     // Server-side deletion sweep. A row with unpushed changes is left to
     // its push, which settles a row the server dropped (see `push_update`).
-    for row in &local {
+    for row in local {
         if let Some(sid) = &row.server_id {
             if !server_ids.contains(sid) && row.deleted_at.is_none() && !row.dirty {
                 eprintln!(
@@ -318,46 +254,49 @@ fn apply_pulled(db: &DatabaseStore, body: &ListAutomationsResponse) -> Result<()
 /// Push dirty local automations. Each row is handled independently so
 /// one failure does not strand the rest.
 pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
-    push_guarded(token, db, &SyncGuard::unchecked(), &sync_client()).await
+    let linked = SYNC_LOCK.lock().await;
+    sync_fixed(token, db, linked, false).await
 }
 
-async fn push_guarded(
+async fn sync_fixed(
     token: &str,
     db: &DatabaseStore,
-    guard: &SyncGuard<'_>,
-    client: &reqwest::Client,
+    linked_lock: tokio::sync::MutexGuard<'_, ()>,
+    pull_first: bool,
 ) -> Result<(), String> {
-    let base = api_base_url();
-    let (local_to_server, mut dirty) = guard.commit(|| (host_maps(db).0, db.list_dirty_automations()))?;
+    let request = SyncRequest::linked(token, SyncGuard::unchecked());
+    if pull_first {
+        pull_locked(&request, db, None).await?;
+    }
+    let linked = push_linked(&request, db).await;
+    drop(linked_lock);
+    let unlinked = push_unlinked(token, db).await;
+    linked.and(unlinked)
+}
+
+async fn push_linked(request: &SyncRequest<'_>, db: &DatabaseStore) -> Result<(), String> {
+    let (local_to_server, mut dirty) =
+        request.commit(|| (host_maps(db).0, db.list_dirty_automations()))?;
+    dirty.retain(|row| row.server_id.is_some());
     order_by_last_attempt(&ATTEMPTS, &mut dirty, |row| row.id);
     let mut any_failed = false;
     // The account's list, fetched at most once a pass, and only if a row
     // turns out to be gone.
-    let mut listed: Option<Option<std::collections::HashSet<String>>> = None;
+    let mut listed: Option<Option<HashSet<String>>> = None;
 
     for row in &dirty {
-        // Out of time: the rest goes first next pass.
-        if guard.expired() {
+        if request.expired() {
             any_failed = true;
             break;
         }
         record_attempt(&ATTEMPTS, row.id);
-        // Webhook automations stay on this device: the API has no trigger
-        // field, so another device would read one as a broken schedule.
-        // Clear `dirty` instead, which also lets a tombstone be purged.
-        if row.trigger_type == AutomationTrigger::Webhook {
-            if let Err(error) = guard.commit(|| db.mark_automation_synced(row.id, None)).and_then(|r| r) {
-                eprintln!("[automations-sync] could not settle local id {}: {error}", row.id);
-                any_failed = true;
-            }
-            continue;
-        }
-        let result = if row.deleted_at.is_some() {
-            push_delete(client, &base, token, row, db, guard).await
-        } else if row.server_id.is_none() {
-            push_insert(client, &base, token, row, &local_to_server, db, guard).await
+        // Webhook automations stay on this device; the API has no trigger field.
+        let result = if row.trigger_type == AutomationTrigger::Webhook {
+            request.commit(|| db.mark_automation_pushed(row))?
+        } else if row.deleted_at.is_some() {
+            push_delete(request, row, db).await
         } else {
-            push_update(client, &base, token, row, &local_to_server, db, &mut listed, guard).await
+            push_update(request, row, &local_to_server, db, &mut listed).await
         };
         if let Err(error) = result {
             eprintln!("[automations-sync] push failed for local id {}: {error}", row.id);
@@ -365,7 +304,7 @@ async fn push_guarded(
         }
     }
 
-    guard.commit(|| db.purge_acknowledged_automation_deletes())??;
+    request.commit(|| db.purge_acknowledged_automation_deletes())??;
 
     if any_failed {
         Err("one or more automation pushes failed; see logs".into())
@@ -392,6 +331,33 @@ fn upsert_body<'a>(
     }
 }
 
+async fn push_unlinked(token: &str, db: &DatabaseStore) -> Result<(), String> {
+    let base = api_base_url();
+    let client = reqwest::Client::new();
+    let (local_to_server, _) = host_maps(db);
+    let dirty = db.list_dirty_automations();
+    let mut any_failed = false;
+
+    for row in dirty.iter().filter(|row| row.server_id.is_none()) {
+        let result = if row.deleted_at.is_some() || row.trigger_type == AutomationTrigger::Webhook {
+            db.mark_automation_synced(row.id, None)
+        } else {
+            push_insert(&client, &base, token, row, &local_to_server, db).await
+        };
+        if let Err(error) = result {
+            eprintln!("[automations-sync] push failed for local id {}: {error}", row.id);
+            any_failed = true;
+        }
+    }
+
+    db.purge_acknowledged_automation_deletes()?;
+    if any_failed {
+        Err("one or more automation pushes failed; see logs".into())
+    } else {
+        Ok(())
+    }
+}
+
 async fn push_insert(
     client: &reqwest::Client,
     base: &str,
@@ -399,9 +365,7 @@ async fn push_insert(
     row: &AutomationRecord,
     local_to_server: &HashMap<i64, String>,
     db: &DatabaseStore,
-    guard: &SyncGuard<'_>,
 ) -> Result<(), String> {
-    guard.ensure_current()?;
     let resp = client
         .post(format!("{base}/api/automations"))
         .header("Authorization", format!("Bearer {token}"))
@@ -414,92 +378,67 @@ async fn push_insert(
     }
     let parsed: OneAutomationResponse =
         resp.json().await.map_err(|e| format!("Parse: {e}"))?;
-    guard.commit(|| db.mark_automation_pushed(row, Some(&parsed.automation.id)))??;
+    db.mark_automation_synced(row.id, Some(&parsed.automation.id))?;
     Ok(())
 }
 
 async fn push_update(
-    client: &reqwest::Client,
-    base: &str,
-    token: &str,
+    request: &SyncRequest<'_>,
     row: &AutomationRecord,
     local_to_server: &HashMap<i64, String>,
     db: &DatabaseStore,
-    listed: &mut Option<Option<std::collections::HashSet<String>>>,
-    guard: &SyncGuard<'_>,
+    listed: &mut Option<Option<HashSet<String>>>,
 ) -> Result<(), String> {
     let server_id = row
         .server_id
         .as_ref()
         .ok_or_else(|| "push_update called without server_id".to_string())?;
-    guard.ensure_current()?;
-    let resp = client
-        .patch(format!("{base}/api/automations/{server_id}"))
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&upsert_body(row, local_to_server))
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
-    if resp.status().as_u16() == 404 && server_lacks_automation(client, base, token, server_id, listed, guard).await {
-        // Deleted on another device before this edit reached the account.
-        // The pull leaves dirty rows alone, so settle it here: the
-        // removal wins, as it does for a clean row.
-        eprintln!("[automations-sync] server no longer has {server_id}; dropping the local edit");
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        return guard.commit(|| {
-        db.mark_automation_synced(row.id, None)?;
-        db.upsert_automation_from_server(
-            server_id,
-            &row.name,
-            &row.prompt,
-            &row.agent,
-            &row.schedule,
-            &row.timezone,
-            row.host_id,
-            row.project_path.as_deref(),
-            row.project_remote.as_deref(),
-            row.enabled,
-            row.retention_limit,
-            &row.created_at,
-            &now,
-            Some(&now),
+    let resp = request
+        .send(
+            request
+                .request(Method::PATCH, &format!("/api/automations/{server_id}"))
+                .json(&upsert_body(row, local_to_server)),
         )
-        })?;
+        .await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND
+        && server_lacks_automation(request, server_id, listed).await
+    {
+        // A deleted server row wins once the PATCH snapshot is still current.
+        return request.commit(|| db.mark_automation_missing(row))?;
     }
     if !resp.status().is_success() {
         return Err(format!("API error: {}", resp.status()));
     }
-    guard.commit(|| db.mark_automation_pushed(row, None))??;
-    Ok(())
+    request.commit(|| db.mark_automation_pushed(row))?
 }
 
-/// Whether the account's automation list is readable and has no row
+/// Whether the account's automation list is readable and has no live row
 /// `server_id`. A server without the automations API answers 404 to
 /// everything, so a 404 alone does not say the row is gone. The list is
 /// fetched once per push pass, into `listed`; if it cannot be read, no row
 /// is taken to be gone.
 async fn server_lacks_automation(
-    client: &reqwest::Client,
-    base: &str,
-    token: &str,
+    request: &SyncRequest<'_>,
     server_id: &str,
-    listed: &mut Option<Option<std::collections::HashSet<String>>>,
-    guard: &SyncGuard<'_>,
+    listed: &mut Option<Option<HashSet<String>>>,
 ) -> bool {
     if listed.is_none() {
         let ids = async {
-            guard.ensure_current().ok()?;
-            let resp = client
-                .get(format!("{base}/api/automations"))
-                .header("Authorization", format!("Bearer {token}"))
-                .send()
+            let resp = request
+                .send(request.request(Method::GET, "/api/automations"))
                 .await
                 .ok()?;
             if !resp.status().is_success() {
                 return None;
             }
             let body = resp.json::<ListAutomationsResponse>().await.ok()?;
-            Some(body.automations.into_iter().map(|a| a.id).collect())
+            Some(
+                body.automations
+                    .into_iter()
+                    .filter(|a| a.deleted_at.is_none())
+                    .map(|a| a.id)
+                    .collect(),
+            )
         }
         .await;
         *listed = Some(ids);
@@ -508,53 +447,32 @@ async fn server_lacks_automation(
 }
 
 async fn push_delete(
-    client: &reqwest::Client,
-    base: &str,
-    token: &str,
+    request: &SyncRequest<'_>,
     row: &AutomationRecord,
     db: &DatabaseStore,
-    guard: &SyncGuard<'_>,
 ) -> Result<(), String> {
-    let server_id = match &row.server_id {
-        Some(sid) => sid,
-        None => {
-            // Created and deleted before it ever synced — nothing on
-            // the server. Clear `dirty` so the tombstone is purged.
-            guard.commit(|| db.mark_automation_synced(row.id, None))??;
-            return Ok(());
-        }
-    };
-    guard.ensure_current()?;
-    let resp = client
-        .delete(format!("{base}/api/automations/{server_id}"))
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
+    let server_id = row
+        .server_id
+        .as_ref()
+        .ok_or_else(|| "push_delete called without server_id".to_string())?;
+    let resp = request
+        .send(request.request(Method::DELETE, &format!("/api/automations/{server_id}")))
+        .await?;
     // 404 = already gone server-side — also a success for our purposes.
     if !resp.status().is_success() && resp.status().as_u16() != 404 {
         return Err(format!("API error: {}", resp.status()));
     }
     // Clear `dirty` so `purge_acknowledged_automation_deletes` removes
     // the tombstone on the next pass.
-    guard.commit(|| db.mark_automation_pushed(row, None))??;
-    Ok(())
+    request.commit(|| db.mark_automation_pushed(row))?
 }
 
-/// Foreground sync with the in-progress guard. Used at scheduler
-/// startup and by the periodic pull in the tick loop.
+/// Foreground sync with a fixed token. Skip if another pass owns the lock.
 pub async fn sync_automations(token: &str, db: &DatabaseStore) -> Result<(), String> {
-    if SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+    let Ok(linked) = SYNC_LOCK.try_lock() else {
         return Ok(());
-    }
-    let result = async {
-        pull(token, db, None).await?;
-        push(token, db).await?;
-        Ok(())
-    }
-    .await;
-    SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-    result
+    };
+    sync_fixed(token, db, linked, true).await
 }
 
 #[cfg(test)]
@@ -746,7 +664,9 @@ mod tests {
         // The PATCH carrying the pause is in flight when it is deleted.
         let in_flight = db.get_automation(row.id).unwrap();
         db.delete_automation(row.id).unwrap();
-        db.mark_automation_pushed(&in_flight, None).unwrap();
+        db.mark_automation_pushed(&in_flight).unwrap();
+        assert!(db.list_dirty_automations()[0].deleted_at.is_some());
+        db.mark_automation_missing(&in_flight).unwrap();
 
         let after = db
             .list_automations_for_sync()
@@ -754,6 +674,110 @@ mod tests {
             .find(|r| r.id == row.id)
             .unwrap();
         assert!(after.deleted_at.is_some() && after.dirty, "the deletion still goes up");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn background_sync_skips_a_busy_linked_pass_and_retries_pending_edits() {
+        use crate::auth::save_token;
+        use futures_util::FutureExt;
+
+        let app = tauri::test::mock_app();
+        app.manage(init_test_database());
+        app.manage(AuthState::default());
+        let db = app.state::<DatabaseStore>();
+        save_token(&db, "token", "2099-01-01T00:00:00Z").unwrap();
+        let row = db.insert_automation(&sample_input()).unwrap();
+        db.mark_automation_synced(row.id, Some("srv-paused"))
+            .unwrap();
+        db.set_automation_enabled(row.id, false).unwrap();
+
+        let linked_lock = SYNC_LOCK.lock().await;
+        assert!(matches!(
+            try_sync_with_app(app.handle()).now_or_never(),
+            Some(Ok(()))
+        ));
+        assert!(db.get_automation(row.id).unwrap().dirty);
+        drop(linked_lock);
+
+        let mut server = mockito::Server::new_async().await;
+        let list = server
+            .mock("GET", "/api/automations")
+            .with_body(format!(
+                r#"{{"automations":[{}]}}"#,
+                server_copy("srv-paused", "Paused")
+            ))
+            .create_async()
+            .await;
+        let patch = server
+            .mock("PATCH", "/api/automations/srv-paused")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({ "enabled": false }),
+            ))
+            .with_status(204)
+            .create_async()
+            .await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let result = try_sync_with_app(app.handle()).await;
+        std::env::remove_var("CODEMUX_API_URL");
+
+        result.unwrap();
+        list.assert_async().await;
+        patch.assert_async().await;
+        let row = db.get_automation(row.id).unwrap();
+        assert!(!row.enabled && !row.dirty);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn an_account_switch_during_pull_discards_the_reply_and_stops_writes() {
+        use crate::auth::save_token;
+
+        let app = tauri::test::mock_app();
+        app.manage(init_test_database());
+        app.manage(AuthState::default());
+        let db = app.state::<DatabaseStore>();
+        let expiry = "2099-01-01T00:00:00Z";
+        save_token(&db, "account-a", expiry).unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let list = server
+            .mock("GET", "/api/automations")
+            .match_header("authorization", "Bearer account-a")
+            .with_body_from_request({
+                let app = app.handle().clone();
+                move |_| {
+                    let db = app.state::<DatabaseStore>();
+                    app.state::<AuthState>().replace_session(|| {
+                        save_token(&db, "account-b", expiry).unwrap();
+                        db.insert_automation(&sample_input()).unwrap();
+                    });
+                    format!(
+                        r#"{{"automations":[{}]}}"#,
+                        server_copy("srv-a", "Account A")
+                    )
+                    .into_bytes()
+                }
+            })
+            .create_async()
+            .await;
+        let post = server
+            .mock("POST", "/api/automations")
+            .expect(0)
+            .create_async()
+            .await;
+
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let result = try_sync_with_app(app.handle()).await;
+        std::env::remove_var("CODEMUX_API_URL");
+
+        assert!(result.unwrap_err().contains("account changed"));
+        list.assert_async().await;
+        post.assert_async().await;
+        let rows = db.list_automations_for_sync();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, sample_input().name);
+        assert!(rows[0].dirty);
     }
 
     #[tokio::test]
@@ -784,13 +808,21 @@ mod tests {
             db.mark_automation_synced(row.id, Some(sid)).unwrap();
             ids.push(row.id);
         }
+        db.update_automation(
+            ids[0],
+            &AutomationInput { name: "Renamed and paused".into(), ..sample_input() },
+        )
+        .unwrap();
         db.set_automation_enabled(ids[0], false).unwrap();
         db.delete_automation(ids[1]).unwrap();
 
-        pull("token", &db, None).await.unwrap();
+        let result = pull("token", &db, None).await;
+        std::env::remove_var("CODEMUX_API_URL");
+        result.unwrap();
 
         let rows = db.list_automations_for_sync();
         let row = |id: i64| rows.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(row(ids[0]).name, "Renamed and paused");
         assert!(!row(ids[0]).enabled && row(ids[0]).dirty, "a pause is not reverted");
         assert!(
             row(ids[1]).deleted_at.is_some() && row(ids[1]).dirty,
@@ -798,6 +830,5 @@ mod tests {
         );
         assert_eq!(row(ids[2]).name, "Untouched", "a clean row still takes the server copy");
         assert_eq!(rows.len(), 3, "no duplicate rows");
-        std::env::remove_var("CODEMUX_API_URL");
     }
 }

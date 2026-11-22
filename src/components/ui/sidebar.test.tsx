@@ -9,6 +9,7 @@ vi.mock("@/hooks/use-mobile", () => ({ useIsMobile: () => mobile.value }))
 afterEach(() => {
   cleanup()
   mobile.value = false
+  vi.restoreAllMocks()
 })
 
 describe("desktop sidebar toggle", () => {
@@ -29,6 +30,69 @@ describe("desktop sidebar toggle", () => {
     fireEvent.click(screen.getByRole("button", { name: "Toggle Sidebar" }))
     fireEvent.click(screen.getByRole("button", { name: "Toggle Sidebar" }))
     expect(wrapper.style.getPropertyValue("--sidebar-width")).toBe("350px")
+  })
+
+  // Writing `--sidebar-width` on the wrapper restyles the whole app shell, so
+  // a drag frame cost tens of ms. Mid-drag only the gap and panel move.
+  it("resizes only the sidebar boxes mid-drag, not the shared width variable", () => {
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
+      cb(0)
+      return 0
+    })
+    const { container } = render(
+      <SidebarProvider>
+        <Sidebar collapsible="icon"><SidebarRail /></Sidebar>
+      </SidebarProvider>
+    )
+    const wrapper = container.querySelector<HTMLElement>('[data-slot="sidebar-wrapper"]')!
+    const gap = container.querySelector<HTMLElement>('[data-slot="sidebar-gap"]')!
+    const panel = container.querySelector<HTMLElement>('[data-slot="sidebar-container"]')!
+    fireEvent.pointerDown(screen.getByRole("separator"))
+    fireEvent.pointerMove(window, { clientX: 320 })
+    expect(wrapper.style.getPropertyValue("--sidebar-width")).toBe("288px")
+    expect(gap.style.width).toBe("320px")
+    expect(panel.style.width).toBe("320px")
+    fireEvent.pointerUp(window)
+    expect(wrapper.style.getPropertyValue("--sidebar-width")).toBe("320px")
+    expect(gap.style.width).toBe("")
+    expect(panel.style.width).toBe("")
+  })
+
+  it("leaves a collapsed rail at its own width while dragged", () => {
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
+      cb(0)
+      return 0
+    })
+    const { container } = render(
+      <SidebarProvider defaultOpen={false}>
+        <Sidebar collapsible="icon"><SidebarRail /></Sidebar>
+      </SidebarProvider>
+    )
+    const gap = container.querySelector<HTMLElement>('[data-slot="sidebar-gap"]')!
+    fireEvent.pointerDown(screen.getByRole("separator"))
+    fireEvent.pointerMove(window, { clientX: 320 })
+    expect(gap.style.width).toBe("")
+    fireEvent.pointerUp(window)
+  })
+
+  it("ends the drag when the pointer is cancelled", () => {
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
+      cb(0)
+      return 0
+    })
+    const { container } = render(
+      <SidebarProvider>
+        <Sidebar collapsible="icon"><SidebarRail /></Sidebar>
+      </SidebarProvider>
+    )
+    const wrapper = container.querySelector<HTMLElement>('[data-slot="sidebar-wrapper"]')!
+    const gap = container.querySelector<HTMLElement>('[data-slot="sidebar-gap"]')!
+    fireEvent.pointerDown(screen.getByRole("separator"))
+    fireEvent.pointerMove(window, { clientX: 320 })
+    fireEvent.pointerCancel(window)
+    expect(wrapper).not.toHaveAttribute("data-resizing")
+    expect(gap.style.width).toBe("")
+    expect(wrapper.style.getPropertyValue("--sidebar-width")).toBe("320px")
   })
 
   it("keeps the mobile Sheet toggle and its own animation", () => {

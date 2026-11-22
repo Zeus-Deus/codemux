@@ -61,6 +61,7 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { useShallow } from "zustand/react/shallow";
 
 import { TasksPanel, TasksPaneActions } from "@/components/chat/TasksPanel";
@@ -612,6 +613,8 @@ export const RightPanel = memo(function RightPanel({
   const dropPane = useCallback(
     (id: RightPanelTab) => {
       closeRightPanelPane(workspaceId, id);
+      const filePath = docPanePath(id);
+      if (filePath) useEditorStore.getState().removeTab(docEditorTabId(workspaceId, filePath));
       if (id === "side-chat") {
         // Closing the pane is the end of the side chat: reap its fork.
         const open = useSideChatStore.getState().activeByWorkspace[workspaceId];
@@ -628,10 +631,40 @@ export const RightPanel = memo(function RightPanel({
     [closeRightPanelPane, workspaceId],
   );
 
+  const requestPaneClose = useCallback(
+    (id: RightPanelTab, focusAfterSave?: RightPanelTab | null) => {
+      const filePath = docPanePath(id);
+      if (filePath) {
+        const tabId = docEditorTabId(workspaceId, filePath);
+        const editor = useEditorStore.getState();
+        if (editor.getTab(tabId)?.pendingSave) {
+          void editor.awaitPendingSaves(tabId).then((savedTab) => {
+            const current = editor.getTab(tabId);
+            if (!savedTab || current !== savedTab) {
+              if (current) {
+                toast.error(`Kept ${baseName(filePath)} open. Check that its latest edits are saved before closing.`);
+              }
+              return;
+            }
+            const ui = useUIStore.getState();
+            const wasActive = ui.getRightPanelTab(workspaceId) === id;
+            dropPane(id);
+            if (wasActive && focusAfterSave && ui.getRightPanelPanes(workspaceId).includes(focusAfterSave)) {
+              setRightPanelTab(workspaceId, focusAfterSave);
+            }
+          });
+          return false;
+        }
+      }
+      dropPane(id);
+      return true;
+    },
+    [dropPane, workspaceId, setRightPanelTab],
+  );
+
   const handleClose = useCallback(
     (id: RightPanelTab) => {
-      dropPane(id);
-      if (id !== activePane) return;
+      if (!requestPaneClose(id) || id !== activePane) return;
       const index = visiblePanes.indexOf(id);
       const remaining = visiblePanes.filter((pane) => pane !== id);
       setRightPanelTab(
@@ -639,7 +672,7 @@ export const RightPanel = memo(function RightPanel({
         remaining[Math.min(index, remaining.length - 1)] ?? RIGHT_PANEL_EMPTY,
       );
     },
-    [dropPane, setRightPanelTab, workspaceId, activePane, visiblePanes],
+    [requestPaneClose, setRightPanelTab, workspaceId, activePane, visiblePanes],
   );
 
   // The tab context menu's bulk closes. One focus decision for the batch:
@@ -647,12 +680,16 @@ export const RightPanel = memo(function RightPanel({
   // pane list.
   const handleCloseMany = useCallback(
     (ids: RightPanelTab[], focus: RightPanelTab | null) => {
-      ids.forEach(dropPane);
-      if (activePane !== null && ids.includes(activePane)) {
-        setRightPanelTab(workspaceId, focus ?? RIGHT_PANEL_EMPTY);
+      let closedActivePane = false;
+      for (const id of ids) {
+        if (requestPaneClose(id, focus) && id === activePane) closedActivePane = true;
       }
+      if (!closedActivePane) return;
+      // A saving document can remain after "Close all tabs".
+      const remaining = useUIStore.getState().getRightPanelPanes(workspaceId);
+      setRightPanelTab(workspaceId, focus ?? visiblePanes.find((id) => remaining.includes(id)) ?? RIGHT_PANEL_EMPTY);
     },
-    [dropPane, setRightPanelTab, workspaceId, activePane],
+    [requestPaneClose, setRightPanelTab, workspaceId, activePane, visiblePanes],
   );
 
   // Stable so the memoized tab strip doesn't re-render with the deck.

