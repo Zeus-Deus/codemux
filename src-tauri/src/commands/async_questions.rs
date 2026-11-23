@@ -6,7 +6,8 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use super::agent_chat::{
     ensure_live_session_guarded, fan_out_to_thread_channels, feature_flag_on, lookup_provider,
-    run_checkpoints_enabled, AgentChatEventPayload, GitTurnDispatchCheckpoint, ProviderRegistry,
+    native_thread_gate, run_checkpoints_enabled, AgentChatEventPayload, GitTurnDispatchCheckpoint,
+    ProviderRegistry,
 };
 use crate::agent_control::{GuardedTurnCheckpoint, NativeControlGuard};
 use crate::agent_provider::{
@@ -46,38 +47,6 @@ pub fn agent_chat_question_attention(
     db.async_question_attention()
 }
 
-fn publish<R: Runtime>(
-    app: &AppHandle<R>,
-    thread_id: &ThreadId,
-    question_id: &str,
-    resolution: &QuestionResolution,
-    row_id: i64,
-) {
-    let event = ProviderRuntimeEvent::QuestionResolved {
-        thread_id: thread_id.clone(),
-        question_id: question_id.into(),
-        resolution: resolution.clone(),
-    };
-    publish_attention(app);
-    // Resolutions reach clients here, not through `forward_event`, so tell
-    // delegation directly: a delegated child waiting on this question is
-    // working again (or done) once it is answered or dismissed.
-    super::delegation::observe(app, &event, Some(row_id));
-    // Every answer, dismissal and reopen is committed before it is published,
-    // so a thread wait woken here reads the question's new state.
-    crate::agent_control::wait::signal(Some(&thread_id.0));
-    fan_out_to_thread_channels(
-        app,
-        thread_id,
-        &AgentChatEventPayload {
-            thread_id: thread_id.clone(),
-            event,
-            persisted_id: Some(row_id),
-            retained_images: Vec::new(),
-        },
-    );
-}
-
 fn change<R: Runtime>(
     app: &AppHandle<R>,
     thread_id: &ThreadId,
@@ -86,9 +55,28 @@ fn change<R: Runtime>(
     next: &QuestionResolution,
 ) -> Result<Option<i64>, String> {
     let db: State<'_, DatabaseStore> = app.state();
+    let gate = native_thread_gate(app, &thread_id.0);
+    let delivery = gate.transcript_delivery.lock().unwrap();
     let row_id = db.change_async_question(&thread_id.0, question_id, previous, next)?;
     if let Some(id) = row_id {
-        publish(app, thread_id, question_id, next, id);
+        let payload = AgentChatEventPayload {
+            thread_id: thread_id.clone(),
+            event: ProviderRuntimeEvent::QuestionResolved {
+                thread_id: thread_id.clone(),
+                question_id: question_id.into(),
+                resolution: next.clone(),
+            },
+            persisted_id: Some(id),
+            retained_images: Vec::new(),
+        };
+        let delegation_effects = super::delegation::observe(app, &payload.event, Some(id));
+        publish_attention(app);
+        fan_out_to_thread_channels(app, thread_id, &payload);
+        drop(delivery);
+        for effect in delegation_effects {
+            effect.run(app);
+        }
+        crate::agent_control::wait::signal(Some(&thread_id.0));
     }
     Ok(row_id)
 }

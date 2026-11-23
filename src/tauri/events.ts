@@ -380,13 +380,15 @@ export interface TurnUsage {
  *
  *  `used_tokens` is the live occupancy of the model's context window
  *  (bounded — the number the meter visualizes); `total_processed_tokens`
- *  is the monotonic lifetime sum for the thread including everything
+ *  is the provider's monotonic lifetime sum including everything
  *  compaction discarded (unbounded, text-only). After a compaction the
  *  former drops while the latter keeps climbing. Optional fields are
  *  `#[serde(default)]` on the Rust side — absent means unknown, and the
  *  UI degrades (no bar/percent without `max_tokens`) rather than
  *  guessing a denominator. */
 export interface ContextUsageSnapshot {
+  /** Source provider. Older transcript rows may omit it. */
+  provider?: AgentChatProviderKind | null;
   used_tokens: number;
   /** Omitted unless strictly greater than `used_tokens`. */
   total_processed_tokens?: number | null;

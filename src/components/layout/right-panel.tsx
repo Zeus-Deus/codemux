@@ -87,6 +87,7 @@ import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
 import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { isMarkdownFile } from "@/components/editor/EditorPane";
+import { contextUsageForProvider } from "@/lib/agent-chat/context-usage";
 import {
   closeSideChat,
   lastSideChatTurn,
@@ -326,6 +327,7 @@ export const RightPanel = memo(function RightPanel({
   const enableAgentChat = useFeatureFlags((state) => state.enableAgentChat);
   const {
     threadId,
+    provider: activeChatProvider,
     tasks: activeChatTasks,
     updatedAt: tasksUpdatedAt,
     streaming: tasksThreadStreaming = false,
@@ -335,7 +337,10 @@ export const RightPanel = memo(function RightPanel({
       ? activeChatTasks
       : null;
   const contextUsage = useAgentChatStore((s) =>
-    threadId ? (s.threads[threadId]?.contextUsage ?? null) : null,
+    contextUsageForProvider(
+      threadId ? (s.threads[threadId]?.contextUsage ?? null) : null,
+      activeChatProvider,
+    ),
   );
 
   // The Orchestration pane appears only once a run is approved (design:
@@ -1200,8 +1205,7 @@ export const RightPanel = memo(function RightPanel({
         }
         tokens={
           contextUsage?.total_processed_tokens ??
-          contextUsage?.used_tokens ??
-          null
+          (activeChatProvider === "antigravity" ? null : contextUsage?.used_tokens ?? null)
         }
       />
     </div>

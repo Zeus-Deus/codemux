@@ -54,7 +54,8 @@ export const MAX_WARM_TAIL_ROWS = 2_000;
 export interface ReplayOptions {
   /** The backend authoritatively confirmed a turn is in flight. */
   runLive?: boolean;
-  /** Provider that owns the thread. Decides whether an unresolved
+  /** Provider that owns the thread. Identifies legacy context readings in
+   *  the current provider segment and decides whether an unresolved
    *  persisted request is still answerable once no turn is live — see
    *  `providerRequestsSurviveSessionRestart`. Omitted means "assume
    *  process-local callbacks", i.e. today's expire-on-hydrate behavior. */
@@ -126,7 +127,7 @@ export function replayTimed(
   opts?: ReplayOptions,
 ): ChatThreadState {
   const parsed = timed.map((row) => row.event);
-  const state = foldReplayPayloads(createEmptyThreadState(), timed);
+  const state = foldReplayPayloads(createEmptyThreadState(), timed, opts?.provider);
   return finalizeReplay(state, parsed, opts, false, false, settleClock(timed));
 }
 
@@ -187,7 +188,7 @@ export function applyTimedReplayTail(
   opts: ReplayOptions & { previousUnsettled: boolean },
 ): ChatThreadState {
   const parsed = timed.map((row) => row.event);
-  const merged = foldReplayPayloads(base, timed);
+  const merged = foldReplayPayloads(base, timed, opts.provider);
   return finalizeReplay(
     merged,
     parsed,
@@ -208,17 +209,45 @@ export function applyTimedReplayTail(
 function foldReplayPayloads(
   base: ChatThreadState,
   timed: TimedReplayPayload[],
+  provider?: AgentChatProviderKind | null,
 ): ChatThreadState {
   let state = base;
-  for (const row of timed) {
+  let segmentProvider = base.contextUsage?.provider ?? provider;
+  let nextSwitchIndex = 0;
+  for (let index = 0; index < timed.length; index++) {
+    const row = timed[index];
+    let event = row.event;
+    if (event.type === "provider_switched") {
+      segmentProvider = event.to_provider;
+    }
+    if (event.type === "context_usage_updated" && event.usage.provider == null) {
+      // A tagged startup reading can precede its switch divider. Use the
+      // divider's outgoing provider to identify earlier untagged readings.
+      // The cursor only moves forward, even on long legacy transcripts.
+      nextSwitchIndex = Math.max(nextSwitchIndex, index + 1);
+      while (
+        nextSwitchIndex < timed.length &&
+        timed[nextSwitchIndex].event.type !== "provider_switched"
+      ) {
+        nextSwitchIndex++;
+      }
+      const nextSwitch = timed[nextSwitchIndex]?.event;
+      const owner = nextSwitch?.type === "provider_switched"
+        ? nextSwitch.from_provider
+        : segmentProvider;
+      // Antigravity had no context readings before provider tagging.
+      if (owner && owner !== "antigravity") {
+        event = { ...event, usage: { ...event.usage, provider: owner } };
+      }
+    }
     const previous = state;
     state = applyEvent(
       state,
-      row.event,
+      event,
       row.createdAtMs == null ? undefined : () => row.createdAtMs!,
     );
     if (row.persistedId != null) {
-      state = stampSearchSourceId(previous, state, row.event, row.persistedId);
+      state = stampSearchSourceId(previous, state, event, row.persistedId);
     }
   }
   return state;

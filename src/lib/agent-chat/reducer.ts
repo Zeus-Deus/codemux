@@ -902,7 +902,8 @@ function settleWorkflowForToolResult(
  *    travels on snapshots where it exceeds `used_tokens`. A later
  *    snapshot that omits it (or reports a smaller value) must not make
  *    the "Total processed" row shrink or vanish, so the larger known
- *    value is merged forward.
+ *    value is merged forward within the same provider. A switch starts a
+ *    new accounting scope even when the Codemux thread ID stays the same.
  */
 function applyContextUsage(
   state: ChatThreadState,
@@ -912,7 +913,10 @@ function applyContextUsage(
   if (typeof used !== "number" || !Number.isFinite(used) || used < 0) {
     return state;
   }
-  const prevTotal = finiteOrNull(state.contextUsage?.total_processed_tokens);
+  const previous = state.contextUsage;
+  const prevTotal = (previous?.provider ?? null) === (usage.provider ?? null)
+    ? finiteOrNull(previous?.total_processed_tokens)
+    : null;
   const nextTotal = finiteOrNull(usage.total_processed_tokens);
   const total =
     prevTotal !== null && (nextTotal === null || nextTotal < prevTotal)
@@ -2281,7 +2285,15 @@ function applyEventInner(
         handoffKind: event.handoff_kind,
         truncated: event.truncated ?? false,
       };
-      return { ...next, messages: appendItem(next.messages, item) };
+      return {
+        ...next,
+        // The new provider can report its startup reading before the switch
+        // divider. Keep that reading and clear any reading from the old run.
+        contextUsage: next.contextUsage?.provider === event.to_provider
+          ? next.contextUsage
+          : null,
+        messages: appendItem(next.messages, item),
+      };
     }
 
     case "resume_cursor_updated": {

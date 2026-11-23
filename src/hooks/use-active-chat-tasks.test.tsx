@@ -72,6 +72,7 @@ describe("useActiveChatTasks", () => {
     );
 
     expect(result.current.threadId).toBe("thread-1");
+    expect(result.current.provider).toBe("codex");
     expect(result.current.tasks?.tasks[0]?.title).toBe(
       "Inspect the implementation",
     );
@@ -84,6 +85,7 @@ describe("useActiveChatTasks", () => {
 
     expect(result.current).toEqual({
       threadId: null,
+      provider: null,
       tasks: null,
       updatedAt: null,
       streaming: false,

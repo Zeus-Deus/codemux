@@ -361,7 +361,7 @@ mod tests {
     //! Model option before Mode and offers thinking levels per model family.
     use super::*;
     use crate::agent_provider::{
-        ApprovalDecision, CompletedItem, ProviderRuntimeEvent, SendTurnInput,
+        ApprovalDecision, CompletedItem, ProviderRuntimeEvent, SendTurnInput, TurnStatus,
     };
     use futures_util::StreamExt;
     use serde_json::json;
@@ -446,6 +446,80 @@ mod tests {
         let (_, reply) = turn(&provider, &mut events, &thread, "report", None).await;
         assert_eq!(reply, "mode:default model:gemini-flash thinking:minimal");
         provider.stop_session(thread).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_usage_updates_report_occupancy_without_billing() {
+        let (provider, events, thread, _root) = started("ask").await;
+        let mut events: ProviderEventStream = Box::pin(events.inspect(|event| match event {
+            ProviderRuntimeEvent::UsageRecorded { .. } => {
+                panic!("context snapshots must not record billable usage: {event:?}")
+            }
+            ProviderRuntimeEvent::TurnCompleted { status, usage, .. } => {
+                assert!(matches!(status, TurnStatus::Success), "{status:?}");
+                assert!(usage.is_none(), "context snapshots must not set turn usage");
+            }
+            _ => {}
+        }));
+
+        assert_context_usage(&mut events, &thread, 0, 1_048_576).await;
+        for (prompt, used) in [("grow-context", 40_000), ("/compact", 3_000)] {
+            provider.send_turn(send(&thread, prompt)).await.unwrap();
+            assert_context_usage(&mut events, &thread, used, 1_048_576).await;
+            wait_for_turn(&mut events).await;
+        }
+
+        let ready = tokio::time::timeout(
+            Duration::from_secs(20),
+            events.by_ref().any(|event| async move {
+                matches!(
+                    event,
+                    ProviderRuntimeEvent::SessionStateChanged {
+                        status: SessionStatus::Ready,
+                        ..
+                    }
+                )
+            }),
+        )
+        .await
+        .expect("session did not become idle");
+        assert!(ready, "provider event stream closed before the session became idle");
+        provider
+            .set_model(thread.clone(), "gemini-pro".into())
+            .await
+            .unwrap();
+        assert_context_usage(&mut events, &thread, 3_000, 262_144).await;
+        // Drain through one more turn to check events after the idle snapshot.
+        turn(&provider, &mut events, &thread, "report", None).await;
+        provider.stop_session(thread).await.unwrap();
+    }
+
+    async fn assert_context_usage(
+        events: &mut ProviderEventStream,
+        thread: &ThreadId,
+        used: u64,
+        size: u64,
+    ) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = events.next().await {
+                match event {
+                    ProviderRuntimeEvent::ContextUsageUpdated { thread_id, usage } => {
+                        assert_eq!(&thread_id, thread);
+                        assert_eq!(usage.used_tokens, used);
+                        assert_eq!(usage.max_tokens, Some(size));
+                        assert_eq!(usage.total_processed_tokens, None);
+                        return;
+                    }
+                    ProviderRuntimeEvent::TurnCompleted { .. } => {
+                        panic!("turn finished before its context usage was reported");
+                    }
+                    _ => {}
+                }
+            }
+            panic!("provider event stream closed before reporting context usage");
+        })
+        .await
+        .expect("context usage timed out");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

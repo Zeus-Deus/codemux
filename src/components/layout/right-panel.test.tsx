@@ -6,9 +6,10 @@ import { toast } from "sonner";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkflowRunItem } from "@/lib/agent-chat/types";
-import type { TasksSnapshot } from "@/tauri/events";
+import type { ProviderRuntimeEvent, TasksSnapshot } from "@/tauri/events";
 import type {
   AgentBrowserSession,
+  AgentChatProviderKind,
   AppStateSnapshot,
   PaneNodeSnapshot,
   WorkspaceSnapshot,
@@ -58,6 +59,7 @@ vi.mock("@/components/browser/BrowserPane", () => ({
 const mocks = vi.hoisted(() => ({
   workflow: { run: null as WorkflowRunItem | null, threadId: null as string | null },
   tasks: null as TasksSnapshot | null,
+  tasksProvider: "claude" as AgentChatProviderKind,
   // Whether the focused chat thread is mid-run. Feeds the status foot's
   // "agents working" count.
   tasksStreaming: true,
@@ -77,6 +79,7 @@ vi.mock("@/components/workflow/use-workspace-workflow", () => ({
 vi.mock("@/hooks/use-active-chat-tasks", () => ({
   useActiveChatTasks: () => ({
     threadId: "thread-1",
+    provider: mocks.tasksProvider,
     tasks: mocks.tasks,
     streaming: mocks.tasksStreaming,
   }),
@@ -241,6 +244,7 @@ afterEach(() => {
   cleanup();
   mocks.workflow = { run: null, threadId: null };
   mocks.tasks = null;
+  mocks.tasksProvider = "claude";
   mocks.tasksStreaming = true;
   mocks.titlebarOverlay = true;
   mocks.remote = false;
@@ -975,6 +979,67 @@ describe("RightPanel browser pane", () => {
 describe("RightPanel while the chat streams", () => {
   afterEach(() => {
     useAgentChatStore.setState({ threads: {} });
+  });
+
+  it("shows only a reported lifetime total for Antigravity", () => {
+    mocks.tasksProvider = "antigravity";
+    const { ensureThread, applyEvent } = useAgentChatStore.getState();
+    ensureThread("thread-1");
+    applyEvent("thread-1", {
+      type: "context_usage_updated",
+      thread_id: "thread-1",
+      usage: { provider: "antigravity", used_tokens: 40_000, max_tokens: 1_048_576 },
+    });
+    renderDeck();
+    expect(screen.queryByTestId("right-panel-token-total")).not.toBeInTheDocument();
+
+    act(() => applyEvent("thread-1", {
+      type: "context_usage_updated",
+      thread_id: "thread-1",
+      usage: {
+        provider: "antigravity",
+        used_tokens: 3_000,
+        max_tokens: 1_048_576,
+        total_processed_tokens: 40_000,
+      },
+    }));
+    expect(screen.getByTestId("right-panel-token-total")).toHaveTextContent("Σ 40k tok");
+  });
+
+  it.each(["live", "replay"])("drops the old provider's lifetime total on a %s switch to Antigravity", (mode) => {
+    const id = "thread-1";
+    const events: ProviderRuntimeEvent[] = [
+      { type: "context_usage_updated", thread_id: id, usage: { used_tokens: 5_000, total_processed_tokens: 40_000 } },
+      // Startup publishes before the switch divider.
+      { type: "context_usage_updated", thread_id: id, usage: { provider: "antigravity", used_tokens: 9_000 } },
+      {
+        type: "provider_switched", thread_id: id, from_provider: "claude",
+        to_provider: "antigravity", handoff_kind: "direct",
+      },
+    ];
+    const store = useAgentChatStore.getState();
+    store.ensureThread(id);
+    if (mode === "live") {
+      store.applyEvent(id, events[0]);
+      const view = renderDeck();
+      expect(screen.getByTestId("right-panel-token-total")).toHaveTextContent("Σ 40k tok");
+      mocks.tasksProvider = "antigravity";
+      view.rerender(
+        <TooltipProvider>
+          <RightPanel workspace={makeWorkspace()} activeTab="files" />
+        </TooltipProvider>,
+      );
+      expect(screen.queryByTestId("right-panel-token-total")).not.toBeInTheDocument();
+      act(() => store.applyEvents(id, events.slice(1)));
+    } else {
+      mocks.tasksProvider = "antigravity";
+      store.hydrateThread(id, events.map((event, index) => ({ id: index + 1, payload: JSON.stringify(event) })));
+      renderDeck();
+    }
+    expect(screen.queryByTestId("right-panel-token-total")).not.toBeInTheDocument();
+    expect(useAgentChatStore.getState().threads[id]?.contextUsage).toMatchObject({
+      provider: "antigravity", used_tokens: 9_000, total_processed_tokens: null,
+    });
   });
 
   function streamReply(text: string) {

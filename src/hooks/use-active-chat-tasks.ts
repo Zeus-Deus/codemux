@@ -2,7 +2,7 @@ import { useMemo } from "react";
 
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import type { TasksSnapshot } from "@/tauri/events";
-import type { PaneNodeSnapshot, WorkspaceSnapshot } from "@/tauri/types";
+import type { AgentChatProviderKind, PaneNodeSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 
 function findPane(
   node: PaneNodeSnapshot,
@@ -20,6 +20,7 @@ function findPane(
 /** Resolve task state for the focused leaf in the workspace's active surface. */
 export function useActiveChatTasks(workspace: WorkspaceSnapshot | null): {
   threadId: string | null;
+  provider: AgentChatProviderKind | null;
   tasks: TasksSnapshot | null;
   /** When the snapshot was last applied (ms), for the panel caption. */
   updatedAt?: number | null;
@@ -29,15 +30,16 @@ export function useActiveChatTasks(workspace: WorkspaceSnapshot | null): {
    *  rather than on an `in_progress` row alone. */
   streaming?: boolean;
 } {
-  const threadId = useMemo(() => {
+  const chat = useMemo(() => {
     if (!workspace) return null;
     const surface = workspace.surfaces.find(
       (candidate) => candidate.surface_id === workspace.active_surface_id,
     );
     if (!surface) return null;
     const pane = findPane(surface.root, surface.active_pane_id);
-    return pane?.kind === "agent_chat" ? pane.thread_id : null;
+    return pane?.kind === "agent_chat" ? pane : null;
   }, [workspace]);
+  const threadId = chat?.thread_id ?? null;
 
   const tasks = useAgentChatStore((state) =>
     threadId ? (state.threads[threadId]?.tasks ?? null) : null,
@@ -48,5 +50,5 @@ export function useActiveChatTasks(workspace: WorkspaceSnapshot | null): {
   const streaming = useAgentChatStore((state) =>
     threadId ? (state.threads[threadId]?.streaming ?? false) : false,
   );
-  return { threadId, tasks, updatedAt, streaming };
+  return { threadId, provider: chat?.provider ?? null, tasks, updatedAt, streaming };
 }

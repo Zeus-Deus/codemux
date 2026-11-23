@@ -444,6 +444,19 @@ impl DelegationState {
         child: &str,
         change: impl FnOnce(&mut Task) -> T,
     ) -> Option<T> {
+        let (out, changed) = self.update_state(app, child, change)?;
+        if changed {
+            self.emit_card(app, child);
+        }
+        Some(out)
+    }
+
+    fn update_state<R: Runtime, T>(
+        &self,
+        app: &AppHandle<R>,
+        child: &str,
+        change: impl FnOnce(&mut Task) -> T,
+    ) -> Option<(T, bool)> {
         let (out, changed) = {
             let mut inner = self.lock();
             let task = inner
@@ -454,15 +467,16 @@ impl DelegationState {
             (out, task.refresh_activity())
         };
         persist_live(app, child);
-        if changed {
-            self.emit_card(app, child);
-        }
-        Some(out)
+        Some((out, changed))
     }
 
     /// Emit the current card for `child` on its parent, through
     /// `forward_event` so it is persisted and hydrated like any subagent row.
     pub(super) fn emit_card<R: Runtime>(&self, app: &AppHandle<R>, child: &str) {
+        // Snapshot only after taking the publication lock. A concurrent
+        // dismissal can update the child while a card waits on the parent.
+        let gate = super::agent_chat::native_thread_gate(app, child);
+        let _delivery = gate.task_card_delivery.lock().unwrap();
         let card = self
             .lock()
             .tasks
@@ -1583,19 +1597,46 @@ pub(crate) async fn run_starter<R: Runtime>(
 
 // ── Hooks ────────────────────────────────────────────────────────────
 
-/// Called by `forward_event` after persistence for every event. Tracks a
-/// child's final text, turn status, open requests and usage-limit pause,
-/// re-emits its card when the activity line changes, and schedules the
-/// idle check. A parent's `TurnCompleted` schedules a delivery attempt.
-pub(crate) fn observe<R: Runtime>(
+/// Work that can publish another transcript event. Run this after releasing
+/// the observed thread's delivery lock.
+pub(super) enum ObservationEffect {
+    RefreshCard(String),
+    DeliverResults(String),
+    FailTask { child: String, reason: String },
+    CheckIdle(String),
+}
+
+impl ObservationEffect {
+    pub(super) fn run<R: Runtime>(self, app: &AppHandle<R>) {
+        match self {
+            Self::RefreshCard(child) => app.state::<DelegationState>().emit_card(app, &child),
+            Self::DeliverResults(parent) => {
+                task_changes().notify_waiters();
+                spawn_deliver(app, &parent, SETTLE_DELAY);
+            }
+            Self::FailTask { child, reason } => {
+                let state = app.state::<DelegationState>();
+                if let Some(parent) = state.finish(app, &child, Phase::Failed(reason)) {
+                    spawn_deliver(app, &parent, Duration::ZERO);
+                }
+            }
+            Self::CheckIdle(child) => spawn_settle(app, &child),
+        }
+    }
+}
+
+/// Apply durable event state before giving the pane its row. The caller can
+/// then publish cards and schedule follow-up work outside the delivery lock.
+pub(super) fn observe<R: Runtime>(
     app: &AppHandle<R>,
     event: &ProviderRuntimeEvent,
     persisted_id: Option<i64>,
-) {
+) -> Vec<ObservationEffect> {
+    let mut effects = Vec::new();
     // The token stream says nothing delegation cares about.
     if super::queued_turns::exiting() || matches!(event, ProviderRuntimeEvent::ContentDelta { .. })
     {
-        return;
+        return effects;
     }
     if let ProviderRuntimeEvent::ItemCompleted {
         thread_id,
@@ -1620,10 +1661,10 @@ pub(crate) fn observe<R: Runtime>(
                         if let (Some(state), Some(child)) =
                             (app.try_state::<DelegationState>(), record.child_thread_id)
                         {
-                            state.update(app, &child, |t| {
+                            state.update_state(app, &child, |t| {
                                 t.tool_call_id = Some(tool_use_id.clone())
                             });
-                            state.emit_card(app, &child);
+                            effects.push(ObservationEffect::RefreshCard(child));
                         }
                     }
                 }
@@ -1631,15 +1672,15 @@ pub(crate) fn observe<R: Runtime>(
         }
     }
     let Some(state) = app.try_state::<DelegationState>() else {
-        return;
+        return effects;
     };
     let (thread, is_child, is_parent) = {
         let inner = state.lock();
         if inner.tasks.is_empty() {
-            return;
+            return effects;
         }
         let Some(ThreadId(thread)) = thread_id_for_event(event) else {
-            return;
+            return effects;
         };
         let is_child = inner
             .tasks
@@ -1735,31 +1776,32 @@ pub(crate) fn observe<R: Runtime>(
                 }
             }
         }
-        task_changes().notify_waiters();
-        spawn_deliver(app, &thread, SETTLE_DELAY);
+        effects.push(ObservationEffect::DeliverResults(thread.clone()));
     }
     if !is_child {
-        return;
+        return effects;
     }
     let open_question = matches!(event, ProviderRuntimeEvent::QuestionResolved { .. })
         && app
             .try_state::<DatabaseStore>()
             .is_some_and(|db| db.has_open_async_question(&thread));
-    let Some((settle, failure)) = state.update(app, &thread, |task| {
+    let Some(((settle, failure), changed)) = state.update_state(app, &thread, |task| {
         if task.stopping {
             return (false, None);
         }
         task.observe(event, persisted_id, open_question)
     }) else {
-        return;
+        return effects;
     };
-    if let Some(reason) = failure {
-        if let Some(parent) = state.finish(app, &thread, Phase::Failed(reason)) {
-            spawn_deliver(app, &parent, Duration::ZERO);
-        }
-    } else if settle {
-        spawn_settle(app, &thread);
+    if changed {
+        effects.push(ObservationEffect::RefreshCard(thread.clone()));
     }
+    if let Some(reason) = failure {
+        effects.push(ObservationEffect::FailTask { child: thread, reason });
+    } else if settle {
+        effects.push(ObservationEffect::CheckIdle(thread));
+    }
+    effects
 }
 
 /// A user message on `thread_id` starts a new round for it: a fresh
@@ -2141,6 +2183,116 @@ mod tests {
         task.finished_at_ms = phase.is_terminal().then_some(373_000);
         task.phase = phase;
         task
+    }
+
+    #[test]
+    fn dismissed_question_clears_delegated_waiting_state_before_card_delivery() {
+        use crate::agent_provider::{QuestionResolution, UserQuestion, UserQuestionSet};
+        use crate::commands::agent_chat::{
+            native_thread_gate, AgentChatChannelRegistry, AgentChatEventPayload, ProviderRegistry,
+            RunActivityTracker, SubagentTracker,
+        };
+        use crate::commands::async_questions::{agent_chat_answer_question, QuestionAction};
+        use crate::observability::ObservabilityStore;
+        use std::sync::{mpsc, Arc};
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle();
+        let child = ThreadId("delegated-question-order".into());
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("parent", "ws", None, "claude").unwrap();
+        db.upsert_agent_chat_session(&child.0, "ws", None, "codex").unwrap();
+        let mut running = task(0, Phase::Running);
+        running.refresh_activity();
+        let task_id = running.task_id.clone();
+        db.admit_delegation_task(&record_of(&child.0, &running), None, &json!({})).unwrap();
+        let state = DelegationState::default();
+        state.lock().tasks.insert(child.0.clone(), running);
+        let registry = ProviderRegistry::new();
+        tauri::async_runtime::block_on(registry.set_codex(Arc::new(
+            crate::agent_provider::codex::CodexAgentProvider::new(Default::default()),
+        )));
+        let observability = ObservabilityStore::default();
+        let mut flags = observability.feature_flags();
+        flags.enable_agent_chat = true;
+        observability.set_feature_flags(flags);
+        app.manage(observability);
+        app.manage(registry);
+        app.manage(db);
+        app.manage(state);
+        app.manage(crate::agent_control::NativeControlState::default());
+        app.manage(AppStateStore::default());
+        app.manage(AgentChatChannelRegistry::default());
+        app.manage(SubagentTracker::default());
+        app.manage(RunActivityTracker::default());
+
+        let (tx, rx) = mpsc::channel();
+        let watcher = handle.clone();
+        let channel = tauri::ipc::Channel::new(move |body| {
+            let payload = body.deserialize::<AgentChatEventPayload>().unwrap();
+            let waiting = watcher.state::<DelegationState>()
+                .task_matches(&payload.thread_id.0, Task::awaits_user);
+            tx.send((payload.event, waiting)).unwrap();
+            Ok(())
+        });
+        handle.state::<AgentChatChannelRegistry>().attach(&child.0, channel);
+
+        let parent = native_thread_gate(handle, "parent");
+        let timeout = Duration::from_secs(5);
+        std::thread::scope(|scope| {
+            // The child can deliver the question, but its subsequent card
+            // update cannot finish while the parent delivery gate is held.
+            let blocked_card = parent.transcript_delivery.lock().unwrap();
+            let ask = scope.spawn(|| {
+                forward_event(handle, ProviderRuntimeEvent::QuestionsAsked {
+                    thread_id: child.clone(),
+                    question: UserQuestionSet {
+                        id: "q".into(),
+                        target: "native".into(),
+                        source_item_id: "q".into(),
+                        source_turn_id: "run".into(),
+                        text: String::new(),
+                        questions: vec![UserQuestion { title: "Which storage?".into(), options: vec![] }],
+                        subagent_id: None,
+                    },
+                });
+            });
+            let (event, waiting) = rx.recv_timeout(timeout).unwrap();
+            assert!(matches!(event, ProviderRuntimeEvent::QuestionsAsked { .. }));
+            assert!(waiting, "the task must be waiting when the question reaches the pane");
+            let deadline = std::time::Instant::now() + timeout;
+            while Arc::strong_count(&parent) < 2 {
+                assert!(std::time::Instant::now() < deadline, "the deferred card was never published");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!ask.is_finished());
+
+            let dismiss = scope.spawn(|| tauri::async_runtime::block_on(agent_chat_answer_question(
+                handle.clone(), child.clone(), "q".into(), QuestionAction::Dismiss,
+            )));
+            let (event, waiting) = rx.recv_timeout(timeout).unwrap();
+            assert!(matches!(event, ProviderRuntimeEvent::QuestionResolved {
+                resolution: QuestionResolution::Dismissed, ..
+            }));
+            assert!(!waiting, "a dismissed question must clear live waiting state");
+            let record = handle.state::<DatabaseStore>().delegation_task(&task_id).unwrap().unwrap();
+            assert!(record.pending_request.is_none());
+            assert_eq!(record.status, TaskStatus::Running);
+            drop(blocked_card);
+            ask.join().unwrap();
+            assert_eq!(dismiss.join().unwrap().unwrap(), QuestionResolution::Dismissed);
+        });
+
+        assert!(!handle.state::<DelegationState>().task_matches(&child.0, Task::awaits_user));
+        let parent_rows = handle.state::<DatabaseStore>().list_agent_chat_messages("parent");
+        let cards = parent_rows.iter().map(|row| {
+            let event: ProviderRuntimeEvent = serde_json::from_str(row).unwrap();
+            let ProviderRuntimeEvent::SubagentUpdated { subagent, .. } = event else {
+                panic!("unexpected parent event: {event:?}");
+            };
+            subagent.activity.unwrap()
+        }).collect::<Vec<_>>();
+        assert_eq!(cards, ["Waiting for your answer in its workspace", "Working in its workspace"]);
     }
 
     #[test]

@@ -53,6 +53,55 @@ describe("replayPayloads", () => {
     });
   });
 
+  it("preserves a legacy lifetime total on the same provider's first tagged update", () => {
+    const legacy: ProviderRuntimeEvent = {
+      type: "context_usage_updated",
+      thread_id: "t",
+      usage: { used_tokens: 30_000, total_processed_tokens: 91_000 },
+    };
+    const tagged: ProviderRuntimeEvent = {
+      type: "context_usage_updated",
+      thread_id: "t",
+      usage: { provider: "claude", used_tokens: 40_000 },
+    };
+    const opts = { provider: "claude" } as const;
+    const restored = replayPayloads([event(legacy)], opts);
+    for (const state of [
+      applyEvent(restored, tagged),
+      replayPayloads([event(legacy), event(tagged)], opts),
+      applyReplayTail(restored, [tagged], { ...opts, previousUnsettled: false }),
+    ]) {
+      expect(state.contextUsage).toMatchObject({
+        provider: "claude", used_tokens: 40_000, total_processed_tokens: 91_000,
+      });
+    }
+  });
+
+  it("attributes legacy readings before a switch to its outgoing provider", () => {
+    const state = replayPayloads([
+      event({
+        type: "context_usage_updated",
+        thread_id: "t",
+        usage: { used_tokens: 30_000, total_processed_tokens: 91_000 },
+      }),
+      event({
+        type: "context_usage_updated",
+        thread_id: "t",
+        usage: { provider: "claude", used_tokens: 4_000 },
+      }),
+      event({
+        type: "provider_switched",
+        thread_id: "t",
+        from_provider: "codex",
+        to_provider: "claude",
+        handoff_kind: "direct",
+      }),
+    ], { provider: "claude" });
+    expect(state.contextUsage).toMatchObject({
+      provider: "claude", used_tokens: 4_000, total_processed_tokens: null,
+    });
+  });
+
   it("maps a user_message envelope's images onto the item", () => {
     const state = replayPayloads([
       JSON.stringify({

@@ -2738,6 +2738,35 @@ impl AcpSession {
                 .await;
             return;
         }
+        if kind == "usage_update" && self.dialect.is_antigravity() {
+            // Antigravity reports live context occupancy, including outside
+            // a prompt. Child sessions have their own context windows.
+            if params.get("sessionId").and_then(Value::as_str)
+                != Some(self.provider_session_id.0.as_str())
+            {
+                return;
+            }
+            let (Some(used_tokens), Some(size)) = (
+                update.get("used").and_then(Value::as_u64),
+                update.get("size").and_then(Value::as_u64).filter(|size| *size > 0),
+            ) else {
+                return;
+            };
+            let usage = {
+                let mut state = self.state.lock().await;
+                state.context.observe_max_tokens(Some(size));
+                state
+                    .context
+                    .snapshot_for_reported_occupancy(used_tokens, None, None)
+            };
+            if let Some(usage) = usage {
+                let _ = self.event_tx.send(ProviderRuntimeEvent::ContextUsageUpdated {
+                    thread_id: self.thread_id.clone(),
+                    usage,
+                });
+            }
+            return;
+        }
         if kind == "current_mode_update" {
             let mode = update
                 .get("currentModeId")

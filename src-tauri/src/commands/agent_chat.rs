@@ -25,10 +25,10 @@ use tokio::io::AsyncReadExt;
 
 use crate::agent_control::{NativeControlGuard, NativeControlState, ThreadGate};
 use crate::agent_provider::{
-    AgentProvider, ApprovalDecision, CostSource, ProviderChatCapabilities, ProviderError,
-    ProviderKind, ProviderRuntimeEvent, RequestId, RequestResponseFailureReason, SendTurnInput,
-    SerializableProviderError, SessionStatus, StartSessionInput, SubagentTaskKind, ThreadId,
-    TurnDispatchCheckpoint, TurnId, UserMessageImage,
+    AgentProvider, ApprovalDecision, ContextUsageSnapshot, CostSource, ProviderChatCapabilities,
+    ProviderError, ProviderKind, ProviderRuntimeEvent, RequestId, RequestResponseFailureReason,
+    SendTurnInput, SerializableProviderError, SessionStatus, StartSessionInput, SubagentTaskKind,
+    ThreadId, TurnDispatchCheckpoint, TurnId, UserMessageImage,
 };
 use crate::commands::usage::PlanQuotaStore;
 use crate::database::{
@@ -120,9 +120,69 @@ pub struct ProviderRegistry {
     cursor: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     grok: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     antigravity: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+    startup_context: Mutex<HashMap<ThreadId, (ProviderKind, Option<ContextUsageSnapshot>)>>,
     hermes: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     acp: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     opencode: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+}
+
+/// Coalesce context updates from the starting provider until it owns the
+/// durable thread. Separate bridge tasks can still be draining older events.
+struct StartupContext<'a> {
+    registry: &'a ProviderRegistry,
+    thread_id: ThreadId,
+}
+
+impl<'a> StartupContext<'a> {
+    fn begin(registry: &'a ProviderRegistry, thread_id: ThreadId, provider: ProviderKind) -> Self {
+        // The caller holds the per-thread resume lock for the entire start.
+        registry
+            .startup_context
+            .lock()
+            .unwrap()
+            .insert(thread_id.clone(), (provider, None));
+        Self { registry, thread_id }
+    }
+
+    fn capture(registry: &ProviderRegistry, event: &ProviderRuntimeEvent) -> bool {
+        let ProviderRuntimeEvent::ContextUsageUpdated { thread_id, usage } = event else {
+            return false;
+        };
+        let mut pending = registry.startup_context.lock().unwrap();
+        let Some((provider, slot)) = pending.get_mut(thread_id) else {
+            return false;
+        };
+        if usage.provider != Some(*provider) {
+            return false;
+        }
+        *slot = Some(usage.clone());
+        true
+    }
+
+    fn publish<R: Runtime>(&self, app: &AppHandle<R>) {
+        let mut pending = self.registry.startup_context.lock().unwrap();
+        // Keep the bridge behind this write so a newer update cannot be
+        // persisted ahead of the snapshot it replaces.
+        if let Some((_, Some(usage))) = pending.remove(&self.thread_id) {
+            forward_event(
+                app,
+                ProviderRuntimeEvent::ContextUsageUpdated {
+                    thread_id: self.thread_id.clone(),
+                    usage,
+                },
+            );
+        }
+    }
+}
+
+impl Drop for StartupContext<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .startup_context
+            .lock()
+            .unwrap()
+            .remove(&self.thread_id);
+    }
 }
 
 impl ProviderRegistry {
@@ -1602,6 +1662,7 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
         }
         return Err(error);
     }
+    let startup_context = StartupContext::begin(&registry, input.thread_id.clone(), provider);
     let cancellation = Arc::new(crate::agent_control::NativeStartCancellation {gate:native_gate.clone(),generation});
     let session = match impl_.start_session_with_cancellation(input, Some(cancellation)).await {
         Ok(session) => session,
@@ -1760,6 +1821,7 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
         // not at session start. That keeps queued prompts aligned with both
         // the workspace and the provider's accepted-turn history.
     }
+    startup_context.publish(&app);
     crate::state::emit_app_state(&app);
     Ok(session.thread_id)
 }
@@ -4275,7 +4337,8 @@ async fn send_turn_internal<R: Runtime>(
     // unaffected.
     match &result.queued_id {
         None => {
-            let row_id = persist_user_message(
+            persist_and_deliver_user_message(
+                &app,
                 &db,
                 &thread_id_for_persist,
                 &user_text_for_persist,
@@ -4285,36 +4348,7 @@ async fn send_turn_internal<R: Runtime>(
                 result.steered,
                 &provenance,
                 Some(&input.text),
-            );
-            if row_id.is_some() {
-                crate::plugins::platform_transport::committed(&app, &thread_id_for_persist);
-            }
-            bind_turn_checkpoint_transcript(
-                &app,
-                &db,
-                &thread_id_for_persist,
-                input.client_nonce.as_deref(),
-                row_id,
-            );
-            if !result.steered {
-                let nonce = input.client_nonce.as_deref();
-                super::turn_diff::on_turn_bound(&app, &thread_id_for_persist, nonce, &result.turn_id.0);
-            }
-            // Then fan the row out to everyone watching this thread. The
-            // sender already painted this bubble and drops the copy on its
-            // nonce; any OTHER attached client (a second window, a paired
-            // web-remote browser) needs it, both to render the turn and to
-            // keep its cursor from stepping over an id it never saw. See
-            // `fan_out_user_message`.
-            fan_out_user_message(
-                &app,
-                &thread_id_for_persist,
-                row_id,
-                &user_text_for_persist,
-                &saved_images,
-                input.client_nonce.as_deref(),
-                result.steered.then_some(&result.turn_id),
-                &provenance,
+                true,
             );
         }
         // Queued: stash the (already-on-disk) image records and the
@@ -5224,6 +5258,41 @@ fn persist_user_message(
     db.control_append_user_message(thread_id, &payload, &turn_id.0, steered)
         .ok()
         .flatten()
+}
+
+/// Save the prompt and deliver its row before any other producer advances
+/// the thread's live cursor. The sender deduplicates its optimistic bubble.
+#[allow(clippy::too_many_arguments)]
+fn persist_and_deliver_user_message<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &DatabaseStore,
+    thread_id: &str,
+    text: &str,
+    images: &[PersistedChatImage],
+    client_nonce: Option<&str>,
+    turn_id: &TurnId,
+    steered: bool,
+    provenance: &crate::agent_provider::message::MessageProvenance,
+    agent_text: Option<&str>,
+    deliver: bool,
+) {
+    let gate = native_thread_gate(app, thread_id);
+    let _delivery = gate.transcript_delivery.lock().unwrap();
+    let row_id = persist_user_message(
+        db, thread_id, text, images, client_nonce, turn_id, steered, provenance, agent_text,
+    );
+    if row_id.is_some() {
+        crate::plugins::platform_transport::committed(app, thread_id);
+    }
+    bind_turn_checkpoint_transcript(app, db, thread_id, client_nonce, row_id);
+    if !steered {
+        super::turn_diff::on_turn_bound(app, thread_id, client_nonce, &turn_id.0);
+    }
+    if deliver {
+        fan_out_user_message(
+            app, thread_id, row_id, text, images, client_nonce, steered.then_some(turn_id), provenance,
+        );
+    }
 }
 
 /// Derive a short dropdown title from the first user turn's text.
@@ -8311,7 +8380,13 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
             use futures_util::StreamExt;
             eprintln!("[codemux::agent_chat] event bridge started for {kind:?}");
             let mut open_requests = OpenRequests::new(kind);
-            while let Some(event) = stream.next().await {
+            while let Some(mut event) = stream.next().await {
+                if let ProviderRuntimeEvent::ContextUsageUpdated { usage, .. } = &mut event {
+                    usage.provider = Some(kind);
+                    if StartupContext::capture(&app.state::<ProviderRegistry>(), &event) {
+                        continue;
+                    }
+                }
                 if !requests_survive {
                     for (thread_id, request_id) in open_requests.observe(&event) {
                         forward_event(
@@ -8573,38 +8648,6 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     // Plugin chat tap: every event, before anything below can swallow it
     // (usage and plan-quota events return early). One atomic load when off.
     crate::plugins::tap::emit(app, &event);
-    // Row id of whatever this event wrote to `agent_chat_messages`, if
-    // anything. Persistence happens BEFORE fan-out (below), so the live
-    // payload can carry the durable position of its own row — that is
-    // what lets a resuming pane tell "already replayed from the tail"
-    // apart from "new".
-    let mut persisted_id: Option<i64> = None;
-    if let ProviderRuntimeEvent::QuestionsAsked {
-        thread_id,
-        question,
-    } = &event
-    {
-        let db: State<'_, DatabaseStore> = app.state();
-        match db.record_async_question(&thread_id.0, question) {
-            Ok(Some(id)) => {
-                persisted_id = Some(id);
-                super::async_questions::publish_attention(app);
-            }
-            Ok(None) => return, // Native duplicate/replay, including already answered questions.
-            Err(error) => {
-                forward_event(app, ProviderRuntimeEvent::ItemCompleted {
-                    thread_id: thread_id.clone(), turn_id: TurnId(question.source_turn_id.clone()),
-                    subagent_id: question.subagent_id.clone(),
-                    item: crate::agent_provider::CompletedItem::AssistantText {
-                        text: format!("{}\n\n{}\n\nCould not save this question. Reply in the conversation instead.", question.text, question.questions.iter().map(|q| q.title.as_str()).collect::<Vec<_>>().join("\n")),
-                    },
-                });
-                eprintln!("[codemux] could not persist async question: {error}");
-                return;
-            }
-        }
-    }
-
     // Plan quota is provider-scoped level state, not transcript or
     // history: intercept it, update the in-memory store, and return. Like
     // `UsageRecorded` it is never persisted and never fanned out — but
@@ -8822,7 +8865,12 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 let deferred=provider.is_some_and(crate::agent_control::delivery::deferred_acceptance);
                 let _ = db.finish_message_delivery(id,if deferred {"submitting"}else{"accepted"},Some(&result),None);
             }
-            let row_id = persist_user_message(
+            // A nonce or message ID lets attached clients deduplicate the
+            // immediate copy against the queued bubble they already saw.
+            let deliver = pending.provenance.message_id.is_some()
+                || pending.client_nonce.as_deref().is_some_and(|n| !n.is_empty());
+            persist_and_deliver_user_message(
+                app,
                 &db,
                 &thread_id.0,
                 text,
@@ -8832,46 +8880,8 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 *steered,
                 &pending.provenance,
                 pending.replay.as_ref().map(|r|r.prompt.as_str()),
+                deliver,
             );
-            if row_id.is_some() {
-                crate::plugins::platform_transport::committed(app, &thread_id.0);
-            }
-            bind_turn_checkpoint_transcript(
-                app,
-                &db,
-                &thread_id.0,
-                pending.client_nonce.as_deref(),
-                row_id,
-            );
-            if !*steered {
-                let nonce = pending.client_nonce.as_deref();
-                super::turn_diff::on_turn_bound(app, &thread_id.0, nonce, &turn_id.0);
-            }
-            // Fan the row out under its own id, so every attached client's
-            // cursor moves over it instead of over it. Gated on a nonce
-            // because the nonce IS the dedup key here: `TurnQueued` already
-            // put a greyed bubble on every client attached at enqueue time,
-            // and without a token to match it by, this copy would render a
-            // second one. With it, clients holding the queued bubble skip
-            // the copy, and a client that attached mid-queue inserts the
-            // turn it missed (the later `QueuedTurnDispatched` then finds no
-            // `queued` marker on that fresh bubble and leaves it in place).
-            if pending.provenance.message_id.is_some() || pending
-                .client_nonce
-                .as_deref()
-                .is_some_and(|n| !n.is_empty())
-            {
-                fan_out_user_message(
-                    app,
-                    &thread_id.0,
-                    row_id,
-                    text,
-                    &pending.images,
-                    pending.client_nonce.as_deref(),
-                    (*steered).then_some(turn_id),
-                    &pending.provenance,
-                );
-            }
         }
     }
     // A queued turn was cancelled before it dispatched, so its envelope
@@ -8934,6 +8944,55 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     if let Some(state) = app.try_state::<NativeControlState>() {
         state.observe_event(&event);
     }
+    // Durable events share this gate with prompt and question writes. A
+    // pane can advance its replay cursor as soon as it receives a row, so
+    // the next producer must wait through delivery as well as persistence.
+    let persist = should_persist_event(&event);
+    let transcript_gate = if persist || matches!(&event, ProviderRuntimeEvent::QuestionsAsked { .. }) {
+        thread_id_for_event(&event).map(|thread_id| native_thread_gate(app, &thread_id.0))
+    } else {
+        None
+    };
+    let transcript_delivery = transcript_gate
+        .as_ref()
+        .map(|gate| gate.transcript_delivery.lock().unwrap());
+    if let ProviderRuntimeEvent::ContextUsageUpdated { thread_id, usage } = &event {
+        // The outgoing provider can still have readings in its bridge.
+        // Once the new provider owns the row, only its readings belong in
+        // the transcript. Its own startup readings wait for the upsert.
+        let db = app.state::<DatabaseStore>();
+        if usage.provider.is_some_and(|provider| {
+            db.get_agent_chat_session(&thread_id.0)
+                .is_some_and(|row| row.provider != super::provider_switch::slug(provider))
+        }) {
+            return;
+        }
+    }
+    // Carry the row ID in the live payload so a hydrated pane can tell
+    // whether it already replayed this event from disk.
+    let mut persisted_id = None;
+    if let ProviderRuntimeEvent::QuestionsAsked { thread_id, question } = &event {
+        let db: State<'_, DatabaseStore> = app.state();
+        match db.record_async_question(&thread_id.0, question) {
+            Ok(Some(id)) => {
+                persisted_id = Some(id);
+                super::async_questions::publish_attention(app);
+            }
+            Ok(None) => return, // Native duplicate/replay, including already answered questions.
+            Err(error) => {
+                drop(transcript_delivery);
+                forward_event(app, ProviderRuntimeEvent::ItemCompleted {
+                    thread_id: thread_id.clone(), turn_id: TurnId(question.source_turn_id.clone()),
+                    subagent_id: question.subagent_id.clone(),
+                    item: crate::agent_provider::CompletedItem::AssistantText {
+                        text: format!("{}\n\n{}\n\nCould not save this question. Reply in the conversation instead.", question.text, question.questions.iter().map(|q| q.title.as_str()).collect::<Vec<_>>().join("\n")),
+                    },
+                });
+                eprintln!("[codemux] could not persist async question: {error}");
+                return;
+            }
+        }
+    }
     // Best-effort transcript persistence so the SessionSelector resume
     // path can replay the visible conversation. We only persist events
     // that mutate the rendered transcript; partial deltas, lifecycle
@@ -8945,7 +9004,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     // Local images a top-level reply links to get conversation-owned copies;
     // the live payload names them once the row that owns them exists.
     let mut retained_images = Vec::new();
-    if should_persist_event(&event) {
+    if persist {
         if let Some(thread_id) = thread_id_for_event(&event) {
             if !thread_id.0.is_empty() {
                 let planned = plan_reply_images(app, &event);
@@ -9023,16 +9082,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             activity.record(&activity_thread.0, &event, SystemTime::now());
         }
     }
-    super::delegation::observe(app, &event, persisted_id);
-    // After the subagent tracker saw the event, so a turn end that only
-    // yields to delegated work reads as such.
-    super::restart_resume::on_event(app, &event);
-    // Waiters read persisted state (transcript, questions, queue journal,
-    // delivery and task rows), so they hear of a change only now.
-    if crate::agent_control::wait::wakes_waiters(&event) {
-        crate::agent_control::wait::signal(thread_id_for_event(&event).as_ref().map(|thread| thread.0.as_str()));
-    }
-
+    let delegation_effects = super::delegation::observe(app, &event, persisted_id);
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are
         // forwarded with an empty ThreadId so the frontend at least
@@ -9051,9 +9101,17 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         if let Err(error) = app.emit(AGENT_CHAT_EVENT, &payload) {
             eprintln!("[codemux::agent_chat] Failed to emit {AGENT_CHAT_EVENT}: {error}");
         }
-        return;
+    } else {
+        fan_out_to_thread_channels(app, &thread_id, &payload);
     }
-    fan_out_to_thread_channels(app, &thread_id, &payload);
+    drop(transcript_delivery);
+    for effect in delegation_effects {
+        effect.run(app);
+    }
+    super::restart_resume::on_event(app, &payload.event);
+    if crate::agent_control::wait::wakes_waiters(&payload.event) {
+        crate::agent_control::wait::signal(thread_id_for_event(&payload.event).as_ref().map(|thread| thread.0.as_str()));
+    }
 }
 
 /// Copies to keep for a top-level reply's linked local images. A device
@@ -13166,6 +13224,220 @@ mod tests {
         app.manage(state);
         app.manage(registry);
         (app, workspace)
+    }
+
+    #[tokio::test]
+    async fn antigravity_startup_context_is_durable_for_late_attach() {
+        use crate::agent_provider::antigravity::{
+            AntigravityAgentProvider, AntigravityProviderConfig,
+        };
+
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AppStateStore::default());
+        app.manage(AgentChatChannelRegistry::default());
+        app.manage(SubagentTracker::default());
+        app.manage(RunActivityTracker::default());
+        app.manage(ProviderRegistry::new());
+        let handle = app.handle();
+        let registry = handle.state::<ProviderRegistry>();
+        let provider = Arc::new(AntigravityAgentProvider::new(AntigravityProviderConfig {
+            binary: crate::test_isolation::fixture_bin(format!(
+                "fake_antigravity_acp{}",
+                std::env::consts::EXE_SUFFIX,
+            )),
+            ..AntigravityProviderConfig::default()
+        }));
+        registry.set_antigravity(provider.clone()).await;
+        spawn_event_bridge(handle.clone()).await;
+
+        let thread = ThreadId("antigravity-startup-context".into());
+        let cwd = tempfile::tempdir().unwrap();
+        let startup = StartupContext::begin(&registry, thread.clone(), ProviderKind::Antigravity);
+        provider
+            .start_session(serde_json::from_value(json!({
+                "thread_id": thread, "cwd": cwd.path(), "additional_directories": [],
+            })).unwrap())
+            .await
+            .unwrap();
+        // Wait until the bridge has consumed the `session/new` frame while
+        // there's still no session row or attached pane.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if registry.startup_context.lock().unwrap()[&thread].1.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("startup reading did not reach the event bridge");
+
+        let db = handle.state::<DatabaseStore>();
+        assert!(db.get_agent_chat_session(&thread.0).is_none());
+        let workspace = handle.state::<AppStateStore>().snapshot().active_workspace_id.0;
+        db.upsert_agent_chat_session(&thread.0, &workspace, None, "antigravity").unwrap();
+        startup.publish(handle);
+
+        let (channel, received) = capture_channel();
+        handle.state::<AgentChatChannelRegistry>().attach(&thread.0, channel);
+        let rows = agent_chat_list_messages(db, thread.0.clone()).await.unwrap();
+        let [row] = rows.as_slice() else { panic!("expected one initial context reading: {rows:?}") };
+        let event: ProviderRuntimeEvent = serde_json::from_str(row).unwrap();
+        let ProviderRuntimeEvent::ContextUsageUpdated { thread_id, usage } = event else {
+            panic!("expected a context update, got {event:?}");
+        };
+        assert_eq!(thread_id, thread);
+        assert_eq!(usage.provider, Some(ProviderKind::Antigravity));
+        assert_eq!(usage.used_tokens, 0);
+        assert_eq!(usage.max_tokens, Some(1_048_576));
+        assert!(received.lock().unwrap().iter().all(|payload| {
+            !matches!(payload.event, ProviderRuntimeEvent::ContextUsageUpdated { .. })
+        }));
+        provider.stop_session(thread).await.unwrap();
+    }
+
+    #[test]
+    fn antigravity_startup_context_and_switch_reach_a_hydrated_pane_in_row_order() {
+        assert_antigravity_live_row_order(false);
+    }
+
+    #[test]
+    fn antigravity_context_and_prompt_reach_a_mirrored_pane_in_row_order() {
+        assert_antigravity_live_row_order(true);
+    }
+
+    fn antigravity_startup_reading(thread_id: &ThreadId) -> ProviderRuntimeEvent {
+        ProviderRuntimeEvent::ContextUsageUpdated {
+            thread_id: thread_id.clone(),
+            usage: ContextUsageSnapshot {
+                provider: Some(ProviderKind::Antigravity),
+                used_tokens: 0,
+                total_processed_tokens: None,
+                max_tokens: Some(1_048_576),
+                last_used_tokens: None,
+                compacts_automatically: None,
+            },
+        }
+    }
+
+    fn assert_antigravity_live_row_order(send_prompt: bool) {
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AgentChatChannelRegistry::default());
+        app.manage(NativeControlState::default());
+        app.manage(SubagentTracker::default());
+        app.manage(RunActivityTracker::default());
+        let handle = app.handle();
+        let thread = ThreadId("antigravity-switch-context".into());
+        let db = handle.state::<DatabaseStore>();
+        db.upsert_agent_chat_session(&thread.0, "workspace", None, "antigravity")
+            .unwrap();
+        let old_row = db
+            .append_agent_chat_message(
+                &thread.0,
+                &json!({ "type": "user_message", "text": "hello" }).to_string(),
+            )
+            .unwrap()
+            .unwrap();
+
+        let channels = handle.state::<AgentChatChannelRegistry>();
+        let (channel, received) = capture_channel();
+        channels.attach(&thread.0, channel);
+        let gate = native_thread_gate(handle, &thread.0);
+        let wait_for = |condition: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !condition() {
+                assert!(std::time::Instant::now() < deadline, "event delivery did not progress");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        std::thread::scope(|scope| {
+            // Stall after SQLite assigns a row ID and before the pane sees
+            // the event. The startup buffer has already been released.
+            let blocked_delivery = channels.fanout.lock().unwrap();
+            scope.spawn(|| forward_event(handle, antigravity_startup_reading(&thread)));
+            wait_for(&|| db.max_agent_chat_message_id(&thread.0).unwrap_or(0) > old_row);
+            assert!(matches!(
+                gate.transcript_delivery.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            let usage_row = db.max_agent_chat_message_id(&thread.0).unwrap();
+            scope.spawn(|| {
+                if send_prompt {
+                    persist_and_deliver_user_message(
+                        handle, &db, &thread.0, "continue", &[], None,
+                        &TurnId("prompt".into()), false, &Default::default(), None, true,
+                    );
+                } else {
+                    forward_event(handle, ProviderRuntimeEvent::ProviderSwitched {
+                        thread_id: thread.clone(),
+                        from_provider: ProviderKind::Claude,
+                        from_model: None,
+                        to_provider: ProviderKind::Antigravity,
+                        to_model: None,
+                        handoff_kind: "direct".into(),
+                        truncated: false,
+                    });
+                }
+            });
+            // Both producers now hold a reference to the same thread gate.
+            wait_for(&|| Arc::strong_count(&gate) == 3);
+            assert_eq!(db.max_agent_chat_message_id(&thread.0), Some(usage_row));
+            assert!(received.lock().unwrap().is_empty());
+            drop(blocked_delivery);
+        });
+
+        let received = received.lock().unwrap();
+        let [usage, next] = received.as_slice() else {
+            panic!("expected two live events");
+        };
+        assert!(matches!(usage.event, ProviderRuntimeEvent::ContextUsageUpdated { .. }));
+        if send_prompt {
+            assert!(matches!(&next.event, ProviderRuntimeEvent::UserMessage { text, .. } if text == "continue"));
+        } else {
+            assert!(matches!(next.event, ProviderRuntimeEvent::ProviderSwitched { .. }));
+        }
+        assert!(old_row < usage.persisted_id.unwrap());
+        assert!(usage.persisted_id.unwrap() < next.persisted_id.unwrap());
+    }
+
+    #[test]
+    fn antigravity_startup_reading_survives_a_late_outgoing_provider_reading() {
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AgentChatChannelRegistry::default());
+        app.manage(SubagentTracker::default());
+        app.manage(RunActivityTracker::default());
+        let handle = app.handle();
+        let thread = ThreadId("antigravity-switch-outgoing-context".into());
+        let db = handle.state::<DatabaseStore>();
+        db.upsert_agent_chat_session(&thread.0, "workspace", None, "claude").unwrap();
+
+        let (channel, received) = capture_channel();
+        handle.state::<AgentChatChannelRegistry>().attach(&thread.0, channel);
+        let mut outgoing = antigravity_startup_reading(&thread);
+        if let ProviderRuntimeEvent::ContextUsageUpdated { usage, .. } = &mut outgoing {
+            usage.provider = Some(ProviderKind::Claude);
+            usage.used_tokens = 50_000;
+        }
+        let registry = ProviderRegistry::new();
+        let startup = StartupContext::begin(&registry, thread.clone(), ProviderKind::Antigravity);
+        assert!(StartupContext::capture(&registry, &antigravity_startup_reading(&thread)));
+        assert!(!StartupContext::capture(&registry, &outgoing));
+        db.upsert_agent_chat_session(&thread.0, "workspace", None, "antigravity").unwrap();
+        startup.publish(handle);
+        forward_event(handle, outgoing);
+
+        let received = received.lock().unwrap();
+        let [live] = received.as_slice() else { panic!("expected only the incoming provider's reading") };
+        let saved = db.list_agent_chat_messages(&thread.0);
+        let [row] = saved.as_slice() else { panic!("expected only the incoming provider's transcript row") };
+        let replay: ProviderRuntimeEvent = serde_json::from_str(row).unwrap();
+        for event in [&live.event, &replay] {
+            assert!(matches!(event, ProviderRuntimeEvent::ContextUsageUpdated { usage, .. }
+                if usage.provider == Some(ProviderKind::Antigravity) && usage.used_tokens == 0));
+        }
     }
 
     /// Pulling a workspace back must not leave its chat editing the device

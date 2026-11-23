@@ -347,8 +347,8 @@ pub struct TurnUsage {
 /// `used_tokens` is the *live* occupancy of the model's context window
 /// right now (input including cache reads/writes plus output of the
 /// latest completed iteration) — bounded, and the number the meter
-/// visualizes. `total_processed_tokens` is the monotonic lifetime sum
-/// across the whole thread, including everything compaction has since
+/// visualizes. `total_processed_tokens` is the provider's monotonic
+/// lifetime sum, including everything compaction has since
 /// discarded — unbounded, informational only. After a compaction the
 /// former drops while the latter keeps climbing.
 ///
@@ -357,11 +357,15 @@ pub struct TurnUsage {
 /// token count rather than guessing a denominator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextUsageSnapshot {
+    /// The source of the reading, stamped by the chat event bridge. Older
+    /// transcript rows may not have a provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderKind>,
     /// Tokens currently occupying the live context window. Adapters
     /// clamp this to `max_tokens` when both are known so the UI can
     /// never render >100%.
     pub used_tokens: u64,
-    /// Monotonic lifetime token total for the thread. Adapters omit it
+    /// Monotonic lifetime token total from this provider. Adapters omit it
     /// unless it is strictly greater than `used_tokens`, so a fresh
     /// thread doesn't show a redundant duplicate line.
     #[serde(default)]

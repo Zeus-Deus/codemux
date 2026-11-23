@@ -9,6 +9,8 @@
 //!   - `session/new` and `session/resume` answer with config options listing
 //!     the Model option FIRST, then Mode, then a thinking level whose values
 //!     depend on the selected model's family.
+//!   - On `session/new` and after switching to Gemini Pro, it reports the
+//!     current context occupancy and window through `usage_update`.
 //!   - `session/set_config_option` validates the value and echoes the options.
 //!   - `session/prompt` behaviour is chosen by the prompt text:
 //!       * `need-approval` asks `session/request_permission` with allow-once /
@@ -19,6 +21,8 @@
 //!       * `self-mode:<mode>` switches its own mode, announcing it with a
 //!         `current_mode_update`, and answers `ok`.
 //!       * `report` answers `mode:<mode> model:<model> thinking:<level>`.
+//!       * `grow-context` and `/compact` report increased and decreased
+//!         context occupancy, respectively.
 //!       * `arm-drift` makes the next switch to `plan` be acknowledged and
 //!         then immediately followed by a switch of its own to `auto`.
 //!       * anything else answers `ok`.
@@ -61,6 +65,18 @@ fn chunk(text: &str) {
             "sessionId": SESSION_ID,
             "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": text } }
         }
+    }));
+}
+
+fn usage_update(session_id: &str, used: u64, size: u64, cost_usd: Option<f64>) {
+    let mut update = json!({ "sessionUpdate": "usage_update", "used": used, "size": size });
+    if let Some(amount) = cost_usd {
+        update["cost"] = json!({ "amount": amount, "currency": "USD" });
+    }
+    write_line(&json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": { "sessionId": session_id, "update": update }
     }));
 }
 
@@ -113,7 +129,8 @@ impl State {
 
     fn set_option(&mut self, id: &Value, params: &Value) {
         let value = params.get("value").and_then(Value::as_str).unwrap_or_default();
-        let accepted = match params.get("configId").and_then(Value::as_str) {
+        let config_id = params.get("configId").and_then(Value::as_str);
+        let accepted = match config_id {
             Some("mode") if MODES.contains(&value) => {
                 self.mode = value.into();
                 log_mode(&self.mode);
@@ -132,6 +149,9 @@ impl State {
         };
         if accepted {
             respond(id, json!({ "configOptions": self.config_options() }));
+            if config_id == Some("model") && value == "gemini-pro" {
+                usage_update(SESSION_ID, 3_000, 262_144, None);
+            }
             if self.drift_after_plan && self.mode == "plan" {
                 self.drift_after_plan = false;
                 self.mode = "auto".into();
@@ -205,6 +225,11 @@ impl State {
         } else if text.contains("report") {
             chunk(&format!("mode:{} model:{} thinking:{}", self.mode, self.model, self.thinking));
             respond(&id, json!({ "stopReason": "end_turn" }));
+        } else if matches!(text, "grow-context" | "/compact") {
+            let used = if text == "/compact" { 3_000 } else { 40_000 };
+            usage_update(SESSION_ID, used, 1_048_576, Some(0.125));
+            chunk("ok");
+            respond(&id, json!({ "stopReason": "end_turn" }));
         } else {
             chunk("ok");
             respond(&id, json!({ "stopReason": "end_turn" }));
@@ -275,7 +300,11 @@ fn main() {
             "session/new" | "session/resume" if !state.authenticated => {
                 fail(&id, -32000, "Authentication required")
             }
-            "session/new" => respond(&id, json!({ "sessionId": SESSION_ID, "configOptions": state.config_options() })),
+            "session/new" => {
+                usage_update("other-session", 9_000, 1_048_576, None);
+                usage_update(SESSION_ID, 0, 1_048_576, None);
+                respond(&id, json!({ "sessionId": SESSION_ID, "configOptions": state.config_options() }));
+            }
             "session/resume" => respond(&id, json!({ "configOptions": state.config_options() })),
             "session/set_config_option" => state.set_option(&id, &params),
             "session/set_mode" => fail(&id, -32601, "use the mode config option"),
