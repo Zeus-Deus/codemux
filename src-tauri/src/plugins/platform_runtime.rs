@@ -22,10 +22,12 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::bundled_sidecar::{self, SidecarRole};
+
 const MAX_MESSAGE: usize = 1_048_576;
 const MAX_MESSAGES_PER_INVOCATION: usize = 10_000;
 const MAX_HOST_CALLS: usize = 4096;
-pub const PLUGIN_HOST_PATH_ENV: &str = "CODEMUX_PLUGIN_HOST_PATH";
+pub const PLUGIN_HOST_PATH_ENV: &str = SidecarRole::PluginHost.path_env();
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,7 +125,12 @@ pub type PluginHostCallback = Arc<
 #[derive(Clone, Debug)]
 pub struct PluginRuntimeConfig {
     pub executable: Option<PathBuf>,
+    /// Leading arguments; for the bundled sidecar they select the plugin
+    /// host role and must stay first.
     pub args: Vec<String>,
+    /// Set on top of the minimal inherited allowlist; for the bundled
+    /// sidecar, the role its re-executions fall back to.
+    pub env: Vec<(String, String)>,
     pub startup_timeout: Duration,
     pub invocation_timeout: Duration,
     pub stop_grace: Duration,
@@ -132,9 +139,20 @@ pub struct PluginRuntimeConfig {
 }
 impl Default for PluginRuntimeConfig {
     fn default() -> Self {
+        Self::with_plugin_host(None)
+    }
+}
+impl PluginRuntimeConfig {
+    /// Default limits, launching the plugin host resolved from `resources`.
+    pub fn with_plugin_host(resources: Option<&Path>) -> Self {
+        let (executable, args, env) = match resolve_plugin_host(resources) {
+            Some(command) => (Some(command.program), command.args, command.env),
+            None => (None, Vec::new(), Vec::new()),
+        };
         Self {
-            executable: resolve_plugin_host(None),
-            args: vec![],
+            executable,
+            args,
+            env,
             startup_timeout: Duration::from_secs(10),
             invocation_timeout: Duration::from_secs(30),
             stop_grace: Duration::from_millis(500),
@@ -143,31 +161,12 @@ impl Default for PluginRuntimeConfig {
         }
     }
 }
-pub fn resolve_plugin_host(resources: Option<&Path>) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(PLUGIN_HOST_PATH_ENV).filter(|s| !s.is_empty()) {
-        return Some(path.into());
-    }
-    let name = format!(
-        "codemux-plugin-host-{}{}",
-        crate::agent_provider::claude::sidecar_path::target_triple(),
-        if cfg!(windows) { ".exe" } else { "" }
-    );
-    if let Some(resources) = resources {
-        let path = resources.join("binaries").join(&name);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    #[cfg(debug_assertions)]
-    {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("binaries")
-            .join(&name);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
+/// The plugin host role of the bundled sidecar; see
+/// [`bundled_sidecar::resolve_command`] for the search order. A
+/// [`PLUGIN_HOST_PATH_ENV`] override is launched without the role argument
+/// or environment, as before the sidecars shared a binary.
+pub fn resolve_plugin_host(resources: Option<&Path>) -> Option<bundled_sidecar::SidecarCommand> {
+    bundled_sidecar::resolve_command(SidecarRole::PluginHost, resources)
 }
 struct Slot {
     generation: String,
@@ -471,6 +470,8 @@ impl WorkerProcess {
             }
         }
         // Bun/Node injection options and provider credentials are deliberately not inherited.
+        // The configured variables are Codemux's own constants, not inherited values.
+        command.envs(config.env.iter().map(|(key, value)| (key, value)));
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().map_err(|e| {
@@ -1028,6 +1029,7 @@ ctx.handle('action:malformed',()=>{writeSync(1,'invalid\n');return {}});}"#).unw
                 .join("../sidecar/plugin-host/main.mjs")
                 .to_string_lossy()
                 .into()],
+            env: Vec::new(),
             startup_timeout: Duration::from_secs(5),
             invocation_timeout: Duration::from_secs(5),
             stop_grace: Duration::ZERO,
@@ -1069,6 +1071,50 @@ ctx.handle('action:malformed',()=>{writeSync(1,'invalid\n');return {}});}"#).unw
         assert_eq!(output["data"]["operationId"], "operation");
         assert_eq!(output["data"]["value"], "host-value");
         assert_eq!(output["data"]["denied"], true);
+        supervisor.shutdown().await;
+    }
+    /// The fixture runs the plugin host under the Bun interpreter, where
+    /// `process.execPath` is Bun. In the shipped multi-role binary it is the
+    /// binary itself, whose default role is Claude: plugin code that
+    /// re-executes it with ordinary arguments must get the plugin host back.
+    /// Uses the production launch configuration and the staged binary.
+    #[tokio::test]
+    async fn compiled_plugin_host_reexecution_gets_the_plugin_host() {
+        let (temp, _, mut input) = fixture();
+        let config = PluginRuntimeConfig {
+            startup_timeout: Duration::from_secs(20),
+            invocation_timeout: Duration::from_secs(30),
+            ..PluginRuntimeConfig::with_plugin_host(None)
+        };
+        let staged = bundled_sidecar::dev_binaries_dir().join(bundled_sidecar::binary_name());
+        let staged_is_built = std::fs::metadata(&staged).is_ok_and(|meta| meta.len() > 0);
+        if config.executable.as_ref() != Some(&staged) || !staged_is_built {
+            eprintln!(
+                "skipping: needs the staged {} (scripts/build-sidecars.sh) and no plugin host override",
+                staged.display()
+            );
+            return;
+        }
+        assert_eq!(config.args, SidecarRole::PluginHost.args());
+        assert_eq!(config.env, SidecarRole::PluginHost.env());
+        std::fs::write(
+            temp.path().join("plugin.mjs"),
+            r#"import {spawnSync} from 'node:child_process';
+export function activate(ctx){ctx.handle('action:reexec',()=>{
+const r=spawnSync(process.execPath,['--check'],{input:'',encoding:'utf8',timeout:20000});
+return {data:{status:r.status,stdout:r.stdout}};});}"#,
+        )
+        .unwrap();
+        input.handler = "action:reexec".into();
+        let supervisor = PluginSupervisor::new(config);
+        let output = supervisor
+            .invoke(input, host(), RuntimeCancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            output["data"],
+            json!({"status": 0, "stdout": "{\"protocol\":1,\"runtime\":\"codemux-plugin-host\"}\n"})
+        );
         supervisor.shutdown().await;
     }
     #[tokio::test]

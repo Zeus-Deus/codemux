@@ -561,6 +561,13 @@ impl JsonRpcChild {
         for (k, v) in &config.env {
             cmd.env(k, v);
         }
+        // Every Claude sidecar starts here (desktop and codemux-remote) and
+        // relies on the bundled binary's default role, so a role selector
+        // must not reach it from the process or from a chat's env overlay;
+        // hence after the overlay. The plugin host, the only role selected
+        // through the environment, is started elsewhere
+        // (`plugins::platform_runtime`).
+        cmd.env_remove(crate::bundled_sidecar::ROLE_ENV);
         if let Some(cwd) = &config.cwd {
             cmd.current_dir(cwd);
         }
@@ -1844,6 +1851,18 @@ mod safety_tests {
         let isolated = JsonRpcChild::spawn_isolated(config(HashMap::new())).await.unwrap();
         assert_eq!(isolated.request("env", serde_json::json!({})).await.unwrap()["marker"], "1", "the isolated clear keeps the marker");
         isolated.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn children_never_get_a_sidecar_role_even_from_the_overlay() {
+        let script = "import json,os,sys\nfor line in sys.stdin:\n    request=json.loads(line)\n    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'role':os.environ.get('CODEMUX_SIDECAR_ROLE')}}),flush=True)\n";
+        let overlay = HashMap::from([(crate::bundled_sidecar::ROLE_ENV.to_string(), "plugin-host".to_string())]);
+        let child = JsonRpcChild::spawn(SpawnConfig {
+            program: which::which("python3").unwrap(),
+            args: vec!["-u".into(), "-c".into(), script.into()],
+            env: overlay, cwd: None, default_timeout: Duration::from_secs(5),
+        }).await.unwrap();
+        assert_eq!(child.request("env", serde_json::json!({})).await.unwrap()["role"], serde_json::Value::Null);
+        child.shutdown().await.unwrap();
     }
     #[tokio::test]
     async fn queued_ordinary_writer_cannot_append_after_partial_frame_cancellation() {

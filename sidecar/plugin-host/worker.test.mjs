@@ -10,8 +10,10 @@ async function fixture(t, code) {
   const directory = await mkdtemp(path.join(tmpdir(), "codemux-plugin-worker-"));
   await writeFile(path.join(directory, "plugin.mjs"), code);
   const child = spawn(process.env.CODEMUX_PLUGIN_HOST_TEST_BINARY || process.execPath,
-    process.env.CODEMUX_PLUGIN_HOST_TEST_BINARY ? [] : [fileURLToPath(new URL("./main.mjs", import.meta.url))],
-    { stdio: ["pipe", "pipe", "pipe"], env: { PATH: process.env.PATH } });
+    // The bundled binary needs its role selector first; it runs Claude by default.
+    process.env.CODEMUX_PLUGIN_HOST_TEST_BINARY ? ["--codemux-role=plugin-host"] : [fileURLToPath(new URL("./main.mjs", import.meta.url))],
+    // As Codemux launches it (SidecarRole::PluginHost in src-tauri/src/bundled_sidecar.rs).
+    { stdio: ["pipe", "pipe", "pipe"], env: { PATH: process.env.PATH, CODEMUX_SIDECAR_ROLE: "plugin-host" } });
   const queue = [], waiters = [];
   let input = "", failure;
   child.stdout.on("data", chunk => {
@@ -90,4 +92,24 @@ test("secret and effect/operation receipt queries preserve the active invocation
     f.send({ type: "host-result", invocationId: call.invocationId, callId: call.callId, ok: true, value: index });
   }
   assert.deepEqual((await f.next()).result.data, [0, 1, 2]);
+});
+
+// In the compiled binary `process.execPath` is the multi-role codemux-sidecar,
+// whose default role is Claude. Plugin code that re-executes it with ordinary
+// arguments (here the plugin host's own `--check`) must get the plugin host
+// back, as it did when the plugin host was its own binary. Under the Node
+// interpreter `process.execPath` is Node, so this needs the compiled binary.
+// The Rust test compiled_plugin_host_reexecution_gets_the_plugin_host covers
+// the same through Codemux's own launch configuration.
+test("plugin code that re-executes process.execPath gets the plugin host again", {
+  skip: process.env.CODEMUX_PLUGIN_HOST_TEST_BINARY ? false : "set CODEMUX_PLUGIN_HOST_TEST_BINARY to the compiled codemux-sidecar",
+}, async t => {
+  const f = await fixture(t, `import {spawnSync} from 'node:child_process';
+    export function activate(ctx){ctx.handle('action:reexec',()=>{
+      const r=spawnSync(process.execPath,['--check'],{input:'',encoding:'utf8',timeout:20000});
+      return {data:{status:r.status,stdout:r.stdout,error:r.error?String(r.error):null}};});}`);
+  f.invoke("action:reexec");
+  assert.deepEqual((await f.next()).result.data, {
+    status: 0, stdout: '{"protocol":1,"runtime":"codemux-plugin-host"}\n', error: null,
+  });
 });

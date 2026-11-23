@@ -1796,12 +1796,15 @@ pub(crate) fn claude_plugin_env() -> Option<(&'static str, String)> {
 }
 
 /// Remove every agent identity var from a user terminal's environment, so
-/// `codemux ...` typed there is always the owner. The app scrubs them at
-/// startup too; this also covers a daemon adopted from an older instance.
+/// `codemux ...` typed there is always the owner, and the bundled sidecar's
+/// role selector, so a sidecar started from there runs its default role. The
+/// app scrubs both at startup too; this also covers a daemon adopted from an
+/// older instance.
 pub(crate) fn strip_agent_identity_env(cmd: &mut CommandBuilder) {
     for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
         cmd.env_remove(key);
     }
+    cmd.env_remove(crate::bundled_sidecar::ROLE_ENV);
 }
 
 /// Build worktree environment variables and dynamic agent context for a PTY session.
@@ -4560,11 +4563,13 @@ mod tests {
         for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
             cmd.env(key, "inherited");
         }
+        cmd.env(crate::bundled_sidecar::ROLE_ENV, "plugin-host");
         cmd.env("CODEMUX_WORKSPACE_ID", "ws");
         strip_agent_identity_env(&mut cmd);
         for key in crate::control_identity::AGENT_IDENTITY_ENV_VARS {
             assert_eq!(cmd.get_env(key), None, "{key} reached a user terminal");
         }
+        assert_eq!(cmd.get_env(crate::bundled_sidecar::ROLE_ENV), None, "a sidecar role reached a user terminal");
         assert!(cmd.get_env("CODEMUX_WORKSPACE_ID").is_some(), "routing vars stay");
         // Every PTY spawn strips them, and the daemon-backed env list never
         // adds them back.

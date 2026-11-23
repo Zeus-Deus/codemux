@@ -1,10 +1,12 @@
 # claude-agent sidecar
 
 A tiny TypeScript JSON-RPC server that Codemux's Rust side spawns as a
-subprocess. Compiled to a standalone binary with Bun (`bun build
---compile`), shipped alongside Codemux as a Tauri "external bin", and
-used as the execution home for any runtime that's easier to express in
-TypeScript than in Rust.
+subprocess. It ships as the default role of Codemux's single bundled Bun
+executable, `codemux-sidecar-<triple>` (shared with the managed workflow
+sidecar and the plugin host; each role runs in its own process), which
+`scripts/build-sidecars.sh` compiles from `sidecar/codemux-sidecar.mjs`
+and Tauri bundles as a resource. It is also the execution home for any
+runtime that's easier to express in TypeScript than in Rust.
 
 ## Current scope
 
@@ -22,24 +24,30 @@ callbacks from the SDK are bridged to the Rust side as
 
 ## Build
 
-For the host platform:
+Codemux ships this sidecar inside the bundled binary. From the
+repository root, with the reviewed Bun version the script enforces:
 
 ```sh
-bun install
-bun run build
+bash scripts/build-sidecars.sh
 ```
 
-For every supported platform at once:
+That stages `src-tauri/binaries/codemux-sidecar-<triple>` (`.exe` on
+Windows), which runs this sidecar when started without a
+`--codemux-role` argument. The SSH remote path installs the same binary
+on devices as `~/.local/bin/codemux-claude-sidecar`.
 
-```sh
-bun install
-bun run build:all
-```
+The role comes from a leading `--codemux-role=<role>` argument, else
+`CODEMUX_SIDECAR_ROLE`, else Claude. Codemux sets `CODEMUX_SIDECAR_ROLE`
+only when it starts the plugin host, so plugin code that re-executes
+`process.execPath` gets the plugin host back; see
+`sidecar/codemux-sidecar.mjs`. Codemux's path overrides
+(`CODEMUX_CLAUDE_SIDECAR_PATH`, `CODEMUX_SIDECAR_PATH` for the multi-role
+binary, and the per-role ones) are listed in
+`src-tauri/src/bundled_sidecar.rs`.
 
-Per-target scripts (`build:linux-x64`, `build:linux-arm64`,
-`build:darwin-x64`, `build:darwin-arm64`, `build:windows-x64`) exist
-for CI. Binaries land in `dist/codemux-claude-sidecar-<target>` (with
-`.exe` on Windows).
+For a Claude-only binary while debugging (e.g. the orchestration-live
+e2e harness), `bun install && bun run build` writes
+`dist/codemux-claude-sidecar`.
 
 ## Run manually
 

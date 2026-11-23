@@ -32,7 +32,14 @@ const REMOTE_CLAUDE_SIDECAR_STAMP: &str = "~/.local/bin/.codemux-claude-sidecar.
 /// [`DeviceProgram`]. The SDK only spawns `claude` on the first turn, so
 /// check for the CLI up front: a missing install then fails at start with
 /// exit 127 instead of mid-conversation.
-const CLAUDE_LAUNCH_SCRIPT: &str = "command -v \"$1\" >/dev/null 2>&1 || \
+///
+/// The runtime is started without arguments, so it is Claude only while no
+/// `CODEMUX_SIDECAR_ROLE` ([`crate::bundled_sidecar::ROLE_ENV`]) reaches
+/// it. The device's login profile and the chat's env overlay both run
+/// before this script, so it drops the variable itself (POSIX `unset`; the
+/// script always runs under `sh`).
+const CLAUDE_LAUNCH_SCRIPT: &str = "unset CODEMUX_SIDECAR_ROLE; \
+     command -v \"$1\" >/dev/null 2>&1 || \
      { echo 'claude: command not found' >&2; exit 127; }; \
      case $1 in */*) PATH=\"${1%/*}:$PATH\"; export PATH;; esac; \
      exec \"$HOME/.local/bin/codemux-claude-sidecar\"";
@@ -735,6 +742,86 @@ mod tests {
             .env("HOME", "/nonexistent-codemux-home")
             .output()
             .unwrap()
+    }
+
+    /// A device home whose login profile exports a sidecar role, and the
+    /// exact command ssh would hand that device's login shell to start the
+    /// Claude runtime, with a chat env overlay that sets the role too.
+    fn device_home_with_a_role() -> (tempfile::TempDir, String) {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".local/bin")).unwrap();
+        std::fs::write(
+            home.path().join(".profile"),
+            "CODEMUX_SIDECAR_ROLE=plugin-host; export CODEMUX_SIDECAR_ROLE\n",
+        )
+        .unwrap();
+        let cfg = claude_spawn_config(
+            &device(),
+            &DeviceProgram("/bin/sh".into()),
+            &HashMap::from([(
+                crate::bundled_sidecar::ROLE_ENV.to_string(),
+                "plugin-host".to_string(),
+            )]),
+            home.path(),
+            Duration::from_secs(20),
+        )
+        .unwrap();
+        (home, cfg.args.last().unwrap().clone())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_launch_drops_a_sidecar_role_after_the_overlay() {
+        use std::os::unix::fs::PermissionsExt;
+        let (home, script) = device_home_with_a_role();
+        let overlay = script.find("CODEMUX_SIDECAR_ROLE=plugin-host").expect("overlay");
+        let unset = script.find("unset CODEMUX_SIDECAR_ROLE;").expect("unset");
+        assert!(overlay < unset, "{script}");
+        // Run it as the device would, with a stand-in runtime that reports
+        // the role it was started with.
+        let runtime = home.path().join(".local/bin/codemux-claude-sidecar");
+        std::fs::write(&runtime, "#!/bin/sh\nprintf 'role=%s\\n' \"${CODEMUX_SIDECAR_ROLE-none}\"\n").unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", home.path())
+            .env(crate::bundled_sidecar::ROLE_ENV, "plugin-host")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "role=none\n", "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// The real bundled binary, started through the device launch with a
+    /// role in the process environment, the login profile and the overlay,
+    /// still runs Claude. Needs `scripts/build-sidecars.sh`; skipped (with a
+    /// message) without the binary.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bundled_binary_launched_on_a_device_with_a_role_answers_claude_ping() {
+        let binary = crate::bundled_sidecar::dev_binaries_dir().join(crate::bundled_sidecar::binary_name());
+        if !binary.is_file() {
+            eprintln!("[ssh::sidecar] {} not built; run scripts/build-sidecars.sh", binary.display());
+            return;
+        }
+        let (home, script) = device_home_with_a_role();
+        std::os::unix::fs::symlink(&binary, home.path().join(".local/bin/codemux-claude-sidecar")).unwrap();
+        let child = JsonRpcChild::spawn(crate::json_rpc_child::SpawnConfig {
+            program: "sh".into(),
+            args: vec!["-c".into(), script],
+            env: HashMap::from([
+                ("HOME".to_string(), home.path().display().to_string()),
+                (crate::bundled_sidecar::ROLE_ENV.to_string(), "plugin-host".to_string()),
+            ]),
+            cwd: None,
+            default_timeout: Duration::from_secs(20),
+        })
+        .await
+        .unwrap();
+        let reply = child.request("ping", serde_json::json!({"via": "ssh-launch"})).await.unwrap();
+        assert_eq!(reply["pong"], true, "{reply}");
+        assert_eq!(reply["echo"]["via"], "ssh-launch", "{reply}");
+        child.shutdown().await.unwrap();
     }
 
     #[test]

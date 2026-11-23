@@ -49,7 +49,7 @@ fn try_real_sidecar_binary() -> Option<PathBuf> {
     };
     let candidate = manifest
         .join("binaries")
-        .join(format!("codemux-claude-sidecar-{triple}{ext}"));
+        .join(format!("codemux-sidecar-{triple}{ext}"));
     if candidate.exists() && is_executable(&candidate) {
         Some(candidate)
     } else {
@@ -2356,7 +2356,7 @@ async fn auth_probe_unauthenticated_matches_common_patterns() {
 #[ignore = "requires real claude CLI + Anthropic auth; run manually"]
 async fn claude_real_session() {
     let Some(real) = try_real_sidecar_binary() else {
-        panic!("real sidecar not built; run bash scripts/build-claude-sidecar.sh");
+        panic!("real sidecar not built; run bash scripts/build-sidecars.sh");
     };
     let provider = ClaudeAgentProvider::new(ClaudeProviderConfig {
         sidecar_binary: Some(real),

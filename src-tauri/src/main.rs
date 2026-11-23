@@ -79,6 +79,8 @@ mod native_signal_log {
 }
 
 fn main() {
+    // Before anything can start a thread or a child (see the function).
+    codemux_lib::bundled_sidecar::scrub_inherited_role();
     codemux_lib::execution::initialize_user_cli_path();
     // Generate unique startup ID to track multiple instances
     let startup_id = SystemTime::now()

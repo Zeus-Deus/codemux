@@ -4,9 +4,9 @@
   "version": "0.27.0",
   "identifier": "com.codemux.app",
   "build": {
-    "beforeDevCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh && bash scripts/build-managed-workflow-sidecar.sh && bash scripts/build-plugin-host.sh && bash scripts/build-codemux-remote.sh --profile debug && npm run dev",
+    "beforeDevCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-sidecars.sh && bash scripts/build-codemux-remote.sh --profile debug && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh --strict && bash scripts/build-managed-workflow-sidecar.sh --strict && bash scripts/build-plugin-host.sh --strict && npm run build && bash scripts/build-codemux-remote.sh --stub",
+    "beforeBuildCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-sidecars.sh --strict && npm run build && bash scripts/build-codemux-remote.sh --stub",
     "beforeBundleCommand": "bash scripts/build-codemux-remote.sh --stage-tauri-build",
     "frontendDist": "../dist"
   },
@@ -39,9 +39,7 @@
       "binaries/agent-browser"
     ],
     "resources": [
-      "binaries/codemux-claude-sidecar-*",
-      "binaries/codemux-managed-workflow-sidecar-*",
-      "binaries/codemux-plugin-host-*",
+      "binaries/codemux-sidecar-*",
       "binaries/node_modules/@cursor/sdk-*/**/*",
       "binaries/codemux-remote-*"
     ],
@@ -57,6 +55,7 @@
     },
     "windows": {
       "nsis": {
+        "installerHooks": "./windows/installer-hooks.nsh",
         "languages": ["English"],
         "displayLanguageSelector": false,
         "installerIcon": null,

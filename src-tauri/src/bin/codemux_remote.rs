@@ -306,6 +306,9 @@ enum ServeSubcommand {
 
 #[cfg(unix)]
 fn main() -> ExitCode {
+    // It starts Claude sidecars and the PTY daemon's shells; before any
+    // thread or child starts (see the function).
+    codemux_lib::bundled_sidecar::scrub_inherited_role();
     let cli = Cli::parse();
     // Started from a Codemux terminal, this process inherits that terminal's
     // Claude Code plugin; the tasks, chats and services it runs get their own

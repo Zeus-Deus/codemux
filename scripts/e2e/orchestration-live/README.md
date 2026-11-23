@@ -31,7 +31,7 @@ npm run build     # debug serve loads <repo>/dist
 
 A fresh worktree also needs placeholder files for every
 `src-tauri/binaries/*` name in the main checkout (including
-`codemux-managed-workflow-sidecar-<triple>`), or `tauri-build` panics.
+`codemux-sidecar-<triple>`), or `tauri-build` panics.
 
 Then:
 

@@ -53,7 +53,7 @@
 # a failed beforeBundleCommand aborts `tauri build` before bundling — so in
 # release.yml nothing is uploaded with a wrong-profile or truncated sidecar.
 #
-# Pattern mirrors copy-agent-browser.sh and build-claude-sidecar.sh.
+# Pattern mirrors copy-agent-browser.sh and build-sidecars.sh.
 
 set -euo pipefail
 

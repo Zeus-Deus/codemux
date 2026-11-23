@@ -5,10 +5,8 @@ set -euo pipefail
 
 if [[ $# == 3 && $1 == --set-rpath ]]; then
   case "$3" in
-    */codemux.AppDir/usr/lib/codemux/binaries/codemux-managed-workflow-sidecar-x86_64-unknown-linux-gnu|\
-    */codemux.AppDir/usr/lib/codemux/binaries/codemux-managed-workflow-sidecar-aarch64-unknown-linux-gnu|\
-    */codemux.AppDir/usr/lib/codemux/binaries/codemux-claude-sidecar-x86_64-unknown-linux-gnu|\
-    */codemux.AppDir/usr/lib/codemux/binaries/codemux-claude-sidecar-aarch64-unknown-linux-gnu)
+    */codemux.AppDir/usr/lib/codemux/binaries/codemux-sidecar-x86_64-unknown-linux-gnu|\
+    */codemux.AppDir/usr/lib/codemux/binaries/codemux-sidecar-aarch64-unknown-linux-gnu)
       sections="$(readelf --wide --sections "$3")"
       if [[ $sections =~ [[:space:]]\.bun[[:space:]] ]]; then
         echo "[codemux::appimage] preserving Bun sidecar: $3" >&2

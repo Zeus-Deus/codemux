@@ -16,14 +16,15 @@ const owned = new Set();
 function start(program, args, env = process.env, options = {}) {
   const child = spawn(program, args, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], ...options });
   owned.add(child);
-  child.once('exit', () => owned.delete(child));
+  child.once('close', () => owned.delete(child));
   child.once('error', () => owned.delete(child));
   let output = '';
   child.stdout.on('data', data => { output = (output + data).slice(-20000); });
   child.stderr.on('data', data => { output = (output + data).slice(-20000); });
+  // `close`, not `exit`: only then has all of the output been read.
   child.done = new Promise((done, fail) => {
     child.once('error', fail);
-    child.once('exit', code => done({ code, output }));
+    child.once('close', code => done({ code, output }));
   });
   child.done.catch(() => {});
   return child;
@@ -44,14 +45,38 @@ async function run(program, args, env, options) {
     return result.output;
   } finally { clearTimeout(timer); }
 }
-async function until(label, fn) {
-  const deadline = Date.now() + 60000;
+async function until(label, fn, timeout = 60000, interval = 250) {
+  const deadline = Date.now() + timeout;
   let last;
   while (Date.now() < deadline) {
     try { const value = await fn(); if (value) return value; } catch (error) { last = error; }
-    await delay(250);
+    await delay(interval);
   }
   throw Error(`${label}: ${last?.message ?? 'timed out'}`);
+}
+const exists = file => stat(file).then(() => true, error => {
+  if (error.code === 'ENOENT') return false;
+  throw error;
+});
+// Holds `file` open with no sharing, as a still-running old sidecar holds its
+// .exe, until the returned function releases it. Resolves only once the
+// handle is open: a failed open stops the script before it prints `held`.
+async function holdOpen(file) {
+  const holder = start('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    "$ErrorActionPreference = 'Stop'; $f = [System.IO.File]::Open($env:CODEMUX_HELD_FILE, 'Open', 'Read', 'None'); [Console]::Out.WriteLine('held'); [void][Console]::In.ReadLine(); $f.Close()"],
+  { ...process.env, CODEMUX_HELD_FILE: file });
+  const timer = setTimeout(() => { void stop(holder); }, 60000);
+  try {
+    await new Promise((resolve, reject) => {
+      createInterface({ input: holder.stdout }).on('line', line => { if (line.trim() === 'held') resolve(); });
+      holder.done.then(result => reject(Error(`Holding ${file} failed: ${result.output}`)));
+    });
+  } finally { clearTimeout(timer); }
+  return async () => {
+    holder.stdin.end('\n');
+    const result = await holder.done;
+    assert.equal(result.code, 0, result.output);
+  };
 }
 function rpc(program, env) {
   const child = start(program, [], env);
@@ -92,8 +117,9 @@ const stalePath = process.env[pathKey].split(';').filter(entry => {
 }).join(';');
 const staleEnv = { ...process.env, [pathKey]: stalePath };
 const repairedEnv = { ...staleEnv, [pathKey]: `${dirname(install.cli)};${stalePath}` };
-const sidecar = resolve('sidecar/claude-agent/dist/codemux-claude-sidecar-windows-x64.exe');
-const stagedSidecar = resolve('src-tauri/binaries/codemux-claude-sidecar-x86_64-pc-windows-msvc.exe');
+// The bundled multi-role sidecar runs Claude when started without a role.
+const sidecar = resolve('sidecar/dist/codemux-sidecar-x86_64-pc-windows-msvc.exe');
+const stagedSidecar = resolve('src-tauri/binaries/codemux-sidecar-x86_64-pc-windows-msvc.exe');
 let debugPolicy = false;
 let socket;
 let hiddenCli;
@@ -127,10 +153,44 @@ try {
 
   const installer = resolve(process.argv[2]);
   const appDir = join(process.env.RUNNER_TEMP, 'Codemux install with spaces');
-  await mkdir(appDir, { recursive: true });
-  // NSIS requires /D= to be the final, unquoted argument, including spaces.
-  await run(installer, ['/S', `/D=${appDir}`], undefined, { windowsVerbatimArguments: true });
-  const bundledSidecar = join(appDir, 'binaries', 'codemux-claude-sidecar-x86_64-pc-windows-msvc.exe');
+  // Releases through v0.27.0 shipped these; src-tauri/windows/installer-hooks.nsh
+  // removes them after an install and before an uninstall, in this order,
+  // retrying one that is in use for about 3.5 s. Seed them as an older install
+  // would have left them, and install the way the updater does, with two held
+  // open as sidecars of the old app that are still exiting.
+  const retiredSidecars = ['codemux-claude-sidecar', 'codemux-managed-workflow-sidecar', 'codemux-plugin-host']
+    .map(name => join(appDir, 'binaries', `${name}-x86_64-pc-windows-msvc.exe`));
+  const seedRetiredSidecars = () => Promise.all(retiredSidecars.map(file => writeFile(file, 'retired')));
+  const [unlocked, releasedDuringRetries, heldThroughout] = retiredSidecars;
+  await mkdir(join(appDir, 'binaries'), { recursive: true });
+  await seedRetiredSidecars();
+  let releaseRetried = await holdOpen(releasedDuringRetries);
+  let releaseHeld = await holdOpen(heldThroughout);
+  try {
+    // NSIS requires /D= to be the final, unquoted argument, including spaces.
+    const installing = start(installer, ['/S', '/UPDATE', `/D=${appDir}`], undefined, { windowsVerbatimArguments: true });
+    const timer = setTimeout(() => { void stop(installing); }, 300000);
+    let exited = false;
+    installing.done.then(() => { exited = true; });
+    try {
+      // The first file's deletion means the hook has just started retrying
+      // the second. Release that one about 1 s into its retries: deleted only
+      // if the hook tries again.
+      await until('Install hook deletes the unlocked retired sidecar', async () => exited || !(await exists(unlocked)), 300000, 50);
+      await delay(1000);
+      await releaseRetried(); releaseRetried = undefined;
+      const result = await installing.done;
+      // A file in use throughout must not fail the update.
+      assert.equal(result.code, 0, `${installer}: ${result.output}`);
+    } finally { clearTimeout(timer); }
+    assert.equal(await exists(unlocked), false, `${unlocked} survived the update install`);
+    assert.equal(await exists(releasedDuringRetries), false, `${releasedDuringRetries} was released during the hook's retries but survived the update install`);
+    assert.equal(await exists(heldThroughout), true, `${heldThroughout} was in use throughout the update install but is gone`);
+  } finally {
+    await releaseRetried?.();
+    await releaseHeld(); releaseHeld = undefined;
+  }
+  const bundledSidecar = join(appDir, 'binaries', 'codemux-sidecar-x86_64-pc-windows-msvc.exe');
   assert.ok((await stat(bundledSidecar)).size > 0, 'Installer must ship the Claude sidecar');
   evidence.bundledSidecar = bundledSidecar;
   // A debug app can fall back to the checkout's staged sidecar. Hide that
@@ -207,6 +267,20 @@ try {
       });
     }
   }
+
+  // The uninstaller only knows the current resource list; the hook covers the
+  // retired files. `_?=` runs it in place and waits for it to finish.
+  await seedRetiredSidecars();
+  await run(join(appDir, 'uninstall.exe'), ['/S', `_?=${appDir}`], undefined, { windowsVerbatimArguments: true });
+  for (const file of retiredSidecars) {
+    assert.equal(await exists(file), false, `${file} survived the uninstall`);
+  }
+  await assert.rejects(stat(bundledSidecar), { code: 'ENOENT' }, 'Uninstall must remove the bundled sidecar');
+  evidence.checks.push({
+    label: 'retired-sidecars',
+    install: { deleted: [unlocked, releasedDuringRetries], leftInUse: heldThroughout },
+    uninstall: { deleted: retiredSidecars },
+  });
 } catch (error) {
   evidence.failure = String(error.stack ?? error);
   throw error;

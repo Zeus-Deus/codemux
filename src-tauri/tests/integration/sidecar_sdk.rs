@@ -34,7 +34,7 @@ fn try_sidecar_binary_path() -> Option<PathBuf> {
     let binaries = manifest_dir.join("binaries");
     let triple = current_target_triple();
     let ext = if triple.contains("windows") { ".exe" } else { "" };
-    let path = binaries.join(format!("codemux-claude-sidecar-{triple}{ext}"));
+    let path = binaries.join(format!("codemux-sidecar-{triple}{ext}"));
     if path.exists() && is_executable(&path) {
         Some(path)
     } else {
@@ -81,7 +81,7 @@ fn require_sidecar() -> Option<PathBuf> {
         None => {
             eprintln!(
                 "[sidecar_sdk] sidecar binary not found; build with \
-                 `bash scripts/build-claude-sidecar.sh` and retry"
+                 `bash scripts/build-sidecars.sh` and retry"
             );
             None
         }

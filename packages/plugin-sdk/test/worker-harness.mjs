@@ -74,8 +74,10 @@ export async function durableHost(t, options={}) {
 }
 export async function worker(t, relativeDirectory, host, options={}) {
   const directory=path.resolve(ROOT,relativeDirectory),manifest=JSON.parse(await readFile(path.join(directory,'codemux-plugin.json'),'utf8'));
+  // The bundled sidecar binary needs its role selector first (it runs Claude by
+  // default) and, as Codemux launches it, the role for re-executions.
   const binary=process.env.CODEMUX_PLUGIN_HOST_TEST_BINARY;
-  const child=spawn(binary?path.resolve(binary):process.execPath,binary?[]:[path.join(ROOT,'sidecar/plugin-host/main.mjs')],{env:{PATH:process.env.PATH},stdio:['pipe','pipe','pipe']});
+  const child=spawn(binary?path.resolve(binary):process.execPath,binary?['--codemux-role=plugin-host']:[path.join(ROOT,'sidecar/plugin-host/main.mjs')],{env:{PATH:process.env.PATH,CODEMUX_SIDECAR_ROLE:'plugin-host'},stdio:['pipe','pipe','pipe']});
   let input='',stderr='',serial=0,exited=false;
   const pending=new Map(),scopes=new Map(),messages=[],waiters=[];
   const send=message=>child.stdin.write(JSON.stringify(message)+'\n');

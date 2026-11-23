@@ -24,6 +24,7 @@ pub mod auth;
 pub mod automations;
 pub mod automations_sync;
 pub mod branch_name;
+pub mod bundled_sidecar;
 pub mod json_rpc_child;
 pub mod local_session_import;
 pub mod mcp_cleanup;
@@ -1493,24 +1494,30 @@ fn build_core_app<R: tauri::Runtime>(
             // editing one first. No-op when signed out.
             crate::hosts_sync::spawn_startup_host_sync(app.handle().clone());
 
-            // Resolve the bundled claude-agent sidecar and pin the path via
-            // env var so the adapter (which has no AppHandle access at
-            // construction time) can find it. `resolve_sidecar` honors an
-            // already-set override, then Tauri's resource dir (the
-            // per-target binary staged into the `codemux-claude-sidecar-*`
-            // resources glob for release builds), then — debug builds only —
+            // Resolve the bundled sidecar's Claude role and pin its path via
+            // an env var so the adapters (which have no AppHandle access at
+            // construction time) can find it. The other roles live in the
+            // same binary (see `bundled_sidecar`) and need a role argument, so
+            // their spawn sites resolve it from the resource dir recorded
+            // here instead of a pinned path, which would be launched without
+            // one. `resolve_sidecar` honors an already-set override, then Tauri's
+            // resource dir (the per-target binary staged into the
+            // `codemux-sidecar-*` resources glob for release builds), then — debug builds only —
             // the `src-tauri/binaries/` dev-tree copy that `npm run
             // tauri:dev` does not stage into the resource dir. Returns `None`
             // when the binary exists nowhere, leaving the provider slot empty
             // (provider_not_configured) rather than pinning a bad path.
             //
-            // The bun --compile binary is huge (~100 MB) with the dynamic
+            // The bun --compile binary is huge (~110 MB) with the dynamic
             // section at offset 96 MB, which patchelf corrupts when run by
             // linuxdeploy during AppImage bundling. Shipping it as a resource
             // (usr/share/...) instead of an externalBin (usr/bin/) keeps it
             // out of linuxdeploy's scan path. See `tauri.conf.json` for the
             // mirror change.
             let resource_dir = app.handle().path().resource_dir().ok();
+            if let Some(dir) = &resource_dir {
+                crate::bundled_sidecar::set_resource_dir(dir.clone());
+            }
             if let Some(sidecar) = agent_provider::claude::sidecar_path::resolve_sidecar(
                 resource_dir.as_deref(),
             ) {
@@ -1518,9 +1525,6 @@ fn build_core_app<R: tauri::Runtime>(
                     agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV,
                     sidecar,
                 );
-            }
-            if let Some(sidecar) = agent_provider::managed_bridge::resolve_sidecar(resource_dir.as_deref()) {
-                std::env::set_var(agent_provider::managed_bridge::SIDECAR_PATH_ENV, sidecar);
             }
 
             // Agent-chat provider registry initialisation.

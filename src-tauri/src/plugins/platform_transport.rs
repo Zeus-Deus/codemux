@@ -55,10 +55,7 @@ impl PluginPlatformState {
                     .ok_or("Plugin data directory is unavailable")?
                     .join("plugin-platform");
                 let resources = app.path().resource_dir().ok();
-                let config = PluginRuntimeConfig {
-                    executable: super::platform_runtime::resolve_plugin_host(resources.as_deref()),
-                    ..Default::default()
-                };
+                let config = PluginRuntimeConfig::with_plugin_host(resources.as_deref());
                 Ok(Arc::new(PluginPlatform {
                     service: Arc::new(PlatformService::open(root.join("state"))),
                     packages: PlatformPackageStore::new(root.join("packages")),
