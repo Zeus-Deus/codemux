@@ -17,8 +17,9 @@
 //!   climbs, and is omitted unless it is strictly greater than
 //!   `used_tokens` (a fresh thread would otherwise render a redundant
 //!   duplicate line).
-//! * **No-op suppression** — an identical repeat snapshot, or a
-//!   computed occupancy of zero, produces no event at all.
+//! * **No-op suppression** — an identical repeat snapshot produces no
+//!   event. A computed zero is treated as unknown unless the provider
+//!   explicitly reports the occupancy.
 //!
 //! Adapters own one tracker per session and feed it their decoded
 //! numbers; the tracker decides whether an event is warranted.
@@ -125,6 +126,16 @@ impl ContextUsageTracker {
         if used_tokens == 0 {
             return None;
         }
+        self.snapshot_for_reported_occupancy(used_tokens, last_used_tokens, compacts_automatically)
+    }
+
+    /// Preserve an explicit zero when the provider reports live occupancy.
+    pub(super) fn snapshot_for_reported_occupancy(
+        &mut self,
+        used_tokens: u64,
+        last_used_tokens: Option<u64>,
+        compacts_automatically: Option<bool>,
+    ) -> Option<ContextUsageSnapshot> {
         self.last_live_used = used_tokens;
         let used = match self.max_tokens {
             Some(max) => used_tokens.min(max),
