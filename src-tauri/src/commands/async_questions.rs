@@ -69,12 +69,13 @@ fn change<R: Runtime>(
             persisted_id: Some(id),
             retained_images: Vec::new(),
         };
+        let delegation_effects = super::delegation::observe(app, &payload.event, Some(id));
         publish_attention(app);
         fan_out_to_thread_channels(app, thread_id, &payload);
         drop(delivery);
-        // Resolutions bypass the provider bridge. Tell delegation and
-        // thread waiters after the row is committed and delivered.
-        super::delegation::observe(app, &payload.event, Some(id));
+        for effect in delegation_effects {
+            effect.run(app);
+        }
         crate::agent_control::wait::signal(Some(&thread_id.0));
     }
     Ok(row_id)

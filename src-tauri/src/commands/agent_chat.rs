@@ -9082,6 +9082,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             activity.record(&activity_thread.0, &event, SystemTime::now());
         }
     }
+    let delegation_effects = super::delegation::observe(app, &event, persisted_id);
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are
         // forwarded with an empty ThreadId so the frontend at least
@@ -9104,9 +9105,9 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         fan_out_to_thread_channels(app, &thread_id, &payload);
     }
     drop(transcript_delivery);
-    // Delegation can publish another event. Release the delivery gate
-    // first and keep the subagent status observation before restart-resume.
-    super::delegation::observe(app, &payload.event, persisted_id);
+    for effect in delegation_effects {
+        effect.run(app);
+    }
     super::restart_resume::on_event(app, &payload.event);
     if crate::agent_control::wait::wakes_waiters(&payload.event) {
         crate::agent_control::wait::signal(thread_id_for_event(&payload.event).as_ref().map(|thread| thread.0.as_str()));

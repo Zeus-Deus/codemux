@@ -18,6 +18,8 @@ pub(crate) struct ThreadGate {
     pub(crate) dispatch: Arc<tokio::sync::Mutex<()>>,
     /// Keeps durable chat events in transcript row order through delivery.
     pub(crate) transcript_delivery: Mutex<()>,
+    /// Orders snapshots of this child's task card on its parent's transcript.
+    pub(crate) task_card_delivery: Mutex<()>,
 }
 impl ThreadGate {
     pub(crate) fn generation(&self) -> u64 {
