@@ -87,6 +87,7 @@ import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
 import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { isMarkdownFile } from "@/components/editor/EditorPane";
+import { contextUsageForProvider } from "@/lib/agent-chat/context-usage";
 import {
   closeSideChat,
   lastSideChatTurn,
@@ -336,7 +337,10 @@ export const RightPanel = memo(function RightPanel({
       ? activeChatTasks
       : null;
   const contextUsage = useAgentChatStore((s) =>
-    threadId ? (s.threads[threadId]?.contextUsage ?? null) : null,
+    contextUsageForProvider(
+      threadId ? (s.threads[threadId]?.contextUsage ?? null) : null,
+      activeChatProvider,
+    ),
   );
 
   // The Orchestration pane appears only once a run is approved (design:

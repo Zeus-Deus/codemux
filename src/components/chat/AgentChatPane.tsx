@@ -53,7 +53,7 @@ import {
   enqueueAgentChatEvent,
   flushAgentChatEvents,
 } from "@/lib/agent-chat/event-batcher";
-import { resolveContextWindowTokens } from "@/lib/agent-chat/context-usage";
+import { contextUsageForProvider, resolveContextWindowTokens } from "@/lib/agent-chat/context-usage";
 import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
 import { codexTurnPermissionOverride } from "@/lib/agent-chat/mode-compatibility";
 import {
@@ -1033,7 +1033,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // usage lands once per provider report while a turn streams, and folding it
   // into `settings` would re-run every settings consumer on each report.
   const contextUsage = useAgentChatStore((s) =>
-    threadId ? (s.threads[threadId]?.contextUsage ?? null) : null,
+    contextUsageForProvider(threadId ? (s.threads[threadId]?.contextUsage ?? null) : null, provider),
   );
   const contextUsageSeedMaxTokens = resolveContextWindowTokens(
     activeModel,

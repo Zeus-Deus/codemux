@@ -14,7 +14,19 @@
  * a made-up fraction of a guessed window.
  */
 import type { ContextUsageSnapshot } from "@/tauri/events";
-import type { ChatModelInfo } from "@/tauri/types";
+import type { AgentChatProviderKind, ChatModelInfo } from "@/tauri/types";
+
+/** A pane can change providers before the new provider's first reading. */
+export function contextUsageForProvider(
+  usage: ContextUsageSnapshot | null,
+  provider: AgentChatProviderKind | null,
+): ContextUsageSnapshot | null {
+  if (!usage) return null;
+  // Antigravity support starts with tagged readings. Older untagged
+  // readings are still displayable for providers that produced them.
+  if (usage.provider == null) return provider === "antigravity" ? null : usage;
+  return usage.provider === provider ? usage : null;
+}
 
 /** Drop `NaN` / `Infinity` / `null` / `undefined` to a single `null`. */
 function finite(value: number | null | undefined): number | null {

@@ -8373,7 +8373,10 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
             use futures_util::StreamExt;
             eprintln!("[codemux::agent_chat] event bridge started for {kind:?}");
             let mut open_requests = OpenRequests::new(kind);
-            while let Some(event) = stream.next().await {
+            while let Some(mut event) = stream.next().await {
+                if let ProviderRuntimeEvent::ContextUsageUpdated { usage, .. } = &mut event {
+                    usage.provider = Some(kind);
+                }
                 if kind == ProviderKind::Antigravity
                     && AntigravityStartupContext::capture(&app.state::<ProviderRegistry>(), &event)
                 {
@@ -13297,6 +13300,7 @@ mod tests {
             panic!("expected a context update, got {event:?}");
         };
         assert_eq!(thread_id, thread);
+        assert_eq!(usage.provider, Some(ProviderKind::Antigravity));
         assert_eq!(usage.used_tokens, 0);
         assert_eq!(usage.max_tokens, Some(1_048_576));
         assert!(received.lock().unwrap().iter().all(|payload| {

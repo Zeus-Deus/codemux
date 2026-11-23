@@ -145,6 +145,7 @@ impl ContextUsageTracker {
         // live occupancy was clamped down to the window.
         let total_processed_tokens = Some(self.lifetime_total).filter(|total| *total > used);
         let snapshot = ContextUsageSnapshot {
+            provider: None,
             used_tokens: used,
             total_processed_tokens,
             max_tokens: self.max_tokens,

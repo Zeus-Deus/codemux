@@ -713,6 +713,7 @@ impl Inner {
                     self.emit(ProviderRuntimeEvent::ContextUsageUpdated {
                         thread_id: thread,
                         usage: ContextUsageSnapshot {
+                            provider: None,
                             used_tokens: used,
                             max_tokens: update.get("size").and_then(Value::as_u64),
                             total_processed_tokens: None,

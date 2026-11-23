@@ -2825,6 +2825,19 @@ describe("context-window usage", () => {
     expect(larger.contextUsage?.total_processed_tokens).toBe(120_000);
   });
 
+  it("clears the old provider's reading when the switch has no startup snapshot", () => {
+    const switching = runEvents([
+      usage("t1", { provider: "claude", used_tokens: 30_000, total_processed_tokens: 91_000 }),
+      {
+        type: "provider_switched", thread_id: "t1", from_provider: "claude",
+        to_provider: "antigravity", handoff_kind: "direct",
+      },
+    ]);
+    expect(switching.contextUsage).toBeNull();
+    const updated = applyEvent(switching, usage("t1", { provider: "antigravity", used_tokens: 9_000 }));
+    expect(updated.contextUsage?.total_processed_tokens).toBeNull();
+  });
+
   it("restores through the hydrate replay path after a restart", () => {
     const state = replayPayloads([
       JSON.stringify({ type: "user_message", thread_id: "t1", text: "hi" }),
