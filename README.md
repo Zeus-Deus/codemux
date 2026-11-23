@@ -47,6 +47,14 @@ chmod +x Codemux-*.AppImage
 - [GitHub CLI](https://cli.github.com/) — PR creation and GitHub integration
 - [xdg-utils](https://www.freedesktop.org/wiki/Software/xdg-utils/) — open in file manager
 
+### Hyprland file dialogs
+
+Codemux does not change your compositor's config. Omarchy already floats portal file dialogs. On plain Hyprland, add this to your own config if you want them floating too. This is the Lua config syntax of Hyprland 0.55 and later (shown for 0.57):
+
+```lua
+hl.window_rule({ match = { class = "^(xdg-desktop-portal-gtk)$" }, float = true, center = true, size = { 800, 600 } })
+```
+
 ## Quick Start
 
 1. Launch Codemux

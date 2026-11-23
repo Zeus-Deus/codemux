@@ -177,7 +177,9 @@ fn show_desktop_notification_blocking<R: Runtime>(
     let mut notification = notify_rust::Notification::new();
     notification.summary(&payload.title).body(&payload.body);
 
-    #[cfg(unix)]
+    // notify-rust's hints, urgency and actions exist only on its XDG/D-Bus
+    // backend (Linux and the BSDs), not on its macOS or Windows backends.
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         notification
             .hint(notify_rust::Hint::DesktopEntry(
@@ -208,10 +210,11 @@ fn show_desktop_notification_blocking<R: Runtime>(
     // open the agent's pane. This already runs on its own thread, so the wait
     // does not block the caller. On other platforms `wait_for_action` is a
     // no-op or unavailable, so the notify-rust click handler is the only path.
+    // The pane opens first so a slow compositor fallback in
+    // `focus_main_window` cannot delay it.
     #[cfg(target_os = "linux")]
     handle.wait_for_action(|action| {
         if action == "default" {
-            focus_app(app);
             let _ = app.emit(
                 NOTIFICATION_ACTIVATE_EVENT,
                 NotificationActivatePayload {
@@ -219,6 +222,7 @@ fn show_desktop_notification_blocking<R: Runtime>(
                     pane_id: payload.pane_id.clone(),
                 },
             );
+            crate::desktop::focus_main_window(app);
         }
     });
 
@@ -226,27 +230,6 @@ fn show_desktop_notification_blocking<R: Runtime>(
     {
         let _ = handle;
         let _ = app;
-    }
-}
-
-/// Bring the Codemux window to the foreground. On Hyprland this includes
-/// jumping to whichever workspace the window currently lives on.
-fn focus_app<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let class = format!("class:{}", app.config().identifier);
-        let _ = Command::new("hyprctl")
-            .args(["dispatch", "focuswindow", &class])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
     }
 }
 
