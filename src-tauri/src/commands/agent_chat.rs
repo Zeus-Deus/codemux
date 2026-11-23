@@ -9004,6 +9004,19 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     if let Some(state) = app.try_state::<NativeControlState>() {
         state.observe_event(&event);
     }
+    // Startup readings come from the provider bridge, while the switch
+    // divider comes from the command task. Deliver them in row order so a
+    // pane that advances its replay cursor cannot discard the earlier row.
+    let context_gate = match &event {
+        ProviderRuntimeEvent::ContextUsageUpdated { thread_id, .. }
+        | ProviderRuntimeEvent::ProviderSwitched { thread_id, .. } => {
+            Some(native_thread_gate(app, &thread_id.0))
+        }
+        _ => None,
+    };
+    let _context_delivery = context_gate
+        .as_ref()
+        .map(|gate| gate.context_delivery.lock().unwrap());
     // Best-effort transcript persistence so the SessionSelector resume
     // path can replay the visible conversation. We only persist events
     // that mutate the rendered transcript; partial deltas, lifecycle
@@ -13307,6 +13320,89 @@ mod tests {
             !matches!(payload.event, ProviderRuntimeEvent::ContextUsageUpdated { .. })
         }));
         provider.stop_session(thread).await.unwrap();
+    }
+
+    #[test]
+    fn antigravity_startup_context_and_switch_reach_a_hydrated_pane_in_row_order() {
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AgentChatChannelRegistry::default());
+        app.manage(NativeControlState::default());
+        app.manage(SubagentTracker::default());
+        app.manage(RunActivityTracker::default());
+        let handle = app.handle();
+        let thread = ThreadId("antigravity-switch-context".into());
+        let db = handle.state::<DatabaseStore>();
+        db.upsert_agent_chat_session(&thread.0, "workspace", None, "antigravity")
+            .unwrap();
+        let old_row = db
+            .append_agent_chat_message(
+                &thread.0,
+                &json!({ "type": "user_message", "text": "hello" }).to_string(),
+            )
+            .unwrap()
+            .unwrap();
+
+        let channels = handle.state::<AgentChatChannelRegistry>();
+        let (channel, received) = capture_channel();
+        channels.attach(&thread.0, channel);
+        let gate = native_thread_gate(handle, &thread.0);
+        let wait_for = |condition: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !condition() {
+                assert!(std::time::Instant::now() < deadline, "event delivery did not progress");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        std::thread::scope(|scope| {
+            // Stall after SQLite assigns a row ID and before the pane sees
+            // the event. The startup buffer has already been released.
+            let blocked_delivery = channels.fanout.lock().unwrap();
+            scope.spawn(|| {
+                forward_event(handle, ProviderRuntimeEvent::ContextUsageUpdated {
+                    thread_id: thread.clone(),
+                    usage: ContextUsageSnapshot {
+                        provider: Some(ProviderKind::Antigravity),
+                        used_tokens: 0,
+                        total_processed_tokens: None,
+                        max_tokens: Some(1_048_576),
+                        last_used_tokens: None,
+                        compacts_automatically: None,
+                    },
+                });
+            });
+            wait_for(&|| db.max_agent_chat_message_id(&thread.0).unwrap_or(0) > old_row);
+            assert!(matches!(
+                gate.context_delivery.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            let usage_row = db.max_agent_chat_message_id(&thread.0).unwrap();
+            scope.spawn(|| {
+                forward_event(handle, ProviderRuntimeEvent::ProviderSwitched {
+                    thread_id: thread.clone(),
+                    from_provider: ProviderKind::Claude,
+                    from_model: None,
+                    to_provider: ProviderKind::Antigravity,
+                    to_model: None,
+                    handoff_kind: "direct".into(),
+                    truncated: false,
+                });
+            });
+            // Both producers now hold a reference to the same thread gate.
+            wait_for(&|| Arc::strong_count(&gate) == 3);
+            assert_eq!(db.max_agent_chat_message_id(&thread.0), Some(usage_row));
+            assert!(received.lock().unwrap().is_empty());
+            drop(blocked_delivery);
+        });
+
+        let received = received.lock().unwrap();
+        let [usage, divider] = received.as_slice() else {
+            panic!("expected two live events");
+        };
+        assert!(matches!(usage.event, ProviderRuntimeEvent::ContextUsageUpdated { .. }));
+        assert!(matches!(divider.event, ProviderRuntimeEvent::ProviderSwitched { .. }));
+        assert!(old_row < usage.persisted_id.unwrap());
+        assert!(usage.persisted_id.unwrap() < divider.persisted_id.unwrap());
     }
 
     /// Pulling a workspace back must not leave its chat editing the device
