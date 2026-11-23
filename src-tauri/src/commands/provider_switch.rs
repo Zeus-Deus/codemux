@@ -76,7 +76,7 @@ impl Drop for SwitchMark {
 }
 
 /// The provider's name as `agent_chat_sessions.provider` stores it.
-fn slug(provider: ProviderKind) -> String {
+pub(super) fn slug(provider: ProviderKind) -> String {
     serde_json::to_value(provider)
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))

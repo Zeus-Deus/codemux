@@ -16,8 +16,8 @@ pub(crate) struct ThreadGate {
     generation: AtomicU64,
     cancelled: tokio::sync::Notify,
     pub(crate) dispatch: Arc<tokio::sync::Mutex<()>>,
-    /// Keeps context readings and provider switches in transcript row order.
-    pub(crate) context_delivery: Mutex<()>,
+    /// Keeps durable chat events in transcript row order through delivery.
+    pub(crate) transcript_delivery: Mutex<()>,
 }
 impl ThreadGate {
     pub(crate) fn generation(&self) -> u64 {
