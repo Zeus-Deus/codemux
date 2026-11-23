@@ -326,6 +326,7 @@ export const RightPanel = memo(function RightPanel({
   const enableAgentChat = useFeatureFlags((state) => state.enableAgentChat);
   const {
     threadId,
+    provider: activeChatProvider,
     tasks: activeChatTasks,
     updatedAt: tasksUpdatedAt,
     streaming: tasksThreadStreaming = false,
@@ -1200,8 +1201,7 @@ export const RightPanel = memo(function RightPanel({
         }
         tokens={
           contextUsage?.total_processed_tokens ??
-          contextUsage?.used_tokens ??
-          null
+          (activeChatProvider === "antigravity" ? null : contextUsage?.used_tokens ?? null)
         }
       />
     </div>

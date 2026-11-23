@@ -25,10 +25,10 @@ use tokio::io::AsyncReadExt;
 
 use crate::agent_control::{NativeControlGuard, NativeControlState, ThreadGate};
 use crate::agent_provider::{
-    AgentProvider, ApprovalDecision, CostSource, ProviderChatCapabilities, ProviderError,
-    ProviderKind, ProviderRuntimeEvent, RequestId, RequestResponseFailureReason, SendTurnInput,
-    SerializableProviderError, SessionStatus, StartSessionInput, SubagentTaskKind, ThreadId,
-    TurnDispatchCheckpoint, TurnId, UserMessageImage,
+    AgentProvider, ApprovalDecision, ContextUsageSnapshot, CostSource, ProviderChatCapabilities,
+    ProviderError, ProviderKind, ProviderRuntimeEvent, RequestId, RequestResponseFailureReason,
+    SendTurnInput, SerializableProviderError, SessionStatus, StartSessionInput, SubagentTaskKind,
+    ThreadId, TurnDispatchCheckpoint, TurnId, UserMessageImage,
 };
 use crate::commands::usage::PlanQuotaStore;
 use crate::database::{
@@ -120,9 +120,66 @@ pub struct ProviderRegistry {
     cursor: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     grok: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     antigravity: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+    antigravity_startup_context: Mutex<HashMap<ThreadId, Option<ContextUsageSnapshot>>>,
     hermes: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     acp: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     opencode: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+}
+
+/// The ACP child can report its context before startup creates a durable
+/// thread. Coalesce updates until that row is ready for the event bridge.
+struct AntigravityStartupContext<'a> {
+    registry: &'a ProviderRegistry,
+    thread_id: ThreadId,
+}
+
+impl<'a> AntigravityStartupContext<'a> {
+    fn begin(registry: &'a ProviderRegistry, thread_id: ThreadId) -> Self {
+        // The caller holds the per-thread resume lock for the entire start.
+        registry
+            .antigravity_startup_context
+            .lock()
+            .unwrap()
+            .insert(thread_id.clone(), None);
+        Self { registry, thread_id }
+    }
+
+    fn capture(registry: &ProviderRegistry, event: &ProviderRuntimeEvent) -> bool {
+        let ProviderRuntimeEvent::ContextUsageUpdated { thread_id, usage } = event else {
+            return false;
+        };
+        let mut pending = registry.antigravity_startup_context.lock().unwrap();
+        let Some(slot) = pending.get_mut(thread_id) else {
+            return false;
+        };
+        *slot = Some(usage.clone());
+        true
+    }
+
+    fn publish<R: Runtime>(&self, app: &AppHandle<R>) {
+        let mut pending = self.registry.antigravity_startup_context.lock().unwrap();
+        // Keep the bridge behind this write so a newer update cannot be
+        // persisted ahead of the snapshot it replaces.
+        if let Some(Some(usage)) = pending.remove(&self.thread_id) {
+            forward_event(
+                app,
+                ProviderRuntimeEvent::ContextUsageUpdated {
+                    thread_id: self.thread_id.clone(),
+                    usage,
+                },
+            );
+        }
+    }
+}
+
+impl Drop for AntigravityStartupContext<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .antigravity_startup_context
+            .lock()
+            .unwrap()
+            .remove(&self.thread_id);
+    }
 }
 
 impl ProviderRegistry {
@@ -1602,6 +1659,8 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
         }
         return Err(error);
     }
+    let startup_context = (provider == ProviderKind::Antigravity)
+        .then(|| AntigravityStartupContext::begin(&registry, input.thread_id.clone()));
     let cancellation = Arc::new(crate::agent_control::NativeStartCancellation {gate:native_gate.clone(),generation});
     let session = match impl_.start_session_with_cancellation(input, Some(cancellation)).await {
         Ok(session) => session,
@@ -1759,6 +1818,9 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
         // Checkpoints are captured at each provider's real dispatch boundary,
         // not at session start. That keeps queued prompts aligned with both
         // the workspace and the provider's accepted-turn history.
+    }
+    if let Some(startup_context) = startup_context {
+        startup_context.publish(&app);
     }
     crate::state::emit_app_state(&app);
     Ok(session.thread_id)
@@ -8312,6 +8374,11 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
             eprintln!("[codemux::agent_chat] event bridge started for {kind:?}");
             let mut open_requests = OpenRequests::new(kind);
             while let Some(event) = stream.next().await {
+                if kind == ProviderKind::Antigravity
+                    && AntigravityStartupContext::capture(&app.state::<ProviderRegistry>(), &event)
+                {
+                    continue;
+                }
                 if !requests_survive {
                     for (thread_id, request_id) in open_requests.observe(&event) {
                         forward_event(
@@ -13166,6 +13233,76 @@ mod tests {
         app.manage(state);
         app.manage(registry);
         (app, workspace)
+    }
+
+    #[tokio::test]
+    async fn antigravity_startup_context_is_durable_for_late_attach() {
+        use crate::agent_provider::antigravity::{
+            AntigravityAgentProvider, AntigravityProviderConfig,
+        };
+
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AppStateStore::default());
+        app.manage(AgentChatChannelRegistry::default());
+        app.manage(SubagentTracker::default());
+        app.manage(RunActivityTracker::default());
+        app.manage(ProviderRegistry::new());
+        let handle = app.handle();
+        let registry = handle.state::<ProviderRegistry>();
+        let provider = Arc::new(AntigravityAgentProvider::new(AntigravityProviderConfig {
+            binary: crate::test_isolation::fixture_bin(format!(
+                "fake_antigravity_acp{}",
+                std::env::consts::EXE_SUFFIX,
+            )),
+            ..AntigravityProviderConfig::default()
+        }));
+        registry.set_antigravity(provider.clone()).await;
+        spawn_event_bridge(handle.clone()).await;
+
+        let thread = ThreadId("antigravity-startup-context".into());
+        let cwd = tempfile::tempdir().unwrap();
+        let startup = AntigravityStartupContext::begin(&registry, thread.clone());
+        provider
+            .start_session(serde_json::from_value(json!({
+                "thread_id": thread, "cwd": cwd.path(), "additional_directories": [],
+            })).unwrap())
+            .await
+            .unwrap();
+        // Wait until the bridge has consumed the `session/new` frame while
+        // there's still no session row or attached pane.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if registry.antigravity_startup_context.lock().unwrap()[&thread].is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("startup reading did not reach the event bridge");
+
+        let db = handle.state::<DatabaseStore>();
+        assert!(db.get_agent_chat_session(&thread.0).is_none());
+        let workspace = handle.state::<AppStateStore>().snapshot().active_workspace_id.0;
+        db.upsert_agent_chat_session(&thread.0, &workspace, None, "antigravity").unwrap();
+        startup.publish(handle);
+
+        let (channel, received) = capture_channel();
+        handle.state::<AgentChatChannelRegistry>().attach(&thread.0, channel);
+        let rows = agent_chat_list_messages(db, thread.0.clone()).await.unwrap();
+        let [row] = rows.as_slice() else { panic!("expected one initial context reading: {rows:?}") };
+        let event: ProviderRuntimeEvent = serde_json::from_str(row).unwrap();
+        let ProviderRuntimeEvent::ContextUsageUpdated { thread_id, usage } = event else {
+            panic!("expected a context update, got {event:?}");
+        };
+        assert_eq!(thread_id, thread);
+        assert_eq!(usage.used_tokens, 0);
+        assert_eq!(usage.max_tokens, Some(1_048_576));
+        assert!(received.lock().unwrap().iter().all(|payload| {
+            !matches!(payload.event, ProviderRuntimeEvent::ContextUsageUpdated { .. })
+        }));
+        provider.stop_session(thread).await.unwrap();
     }
 
     /// Pulling a workspace back must not leave its chat editing the device
