@@ -1,4 +1,4 @@
-import { useEffect, type HTMLAttributeReferrerPolicy } from "react";
+import { useEffect } from "react";
 import { createPortal } from "react-dom";
 import { ExternalLink, X } from "lucide-react";
 
@@ -11,7 +11,6 @@ export interface ImageLightboxProps {
   /** The URL as written in the source, for the browser affordance. When
    *  the image is a local asset there is nothing useful to open. */
   href?: string | null;
-  referrerPolicy?: HTMLAttributeReferrerPolicy;
   onClose: () => void;
 }
 
@@ -28,7 +27,7 @@ export interface ImageLightboxProps {
  * have to be overridden back off. Escape and a backdrop click are the
  * whole interaction.
  */
-export function ImageLightbox({ src, alt, href, referrerPolicy, onClose }: ImageLightboxProps) {
+export function ImageLightbox({ src, alt, href, onClose }: ImageLightboxProps) {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
@@ -59,7 +58,6 @@ export function ImageLightbox({ src, alt, href, referrerPolicy, onClose }: Image
       <img
         src={src}
         alt={alt}
-        referrerPolicy={referrerPolicy}
         data-testid="image-lightbox-image"
         // The image itself is not a dismiss target — you click it to
         // look closer, not to leave.

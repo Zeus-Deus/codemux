@@ -35,13 +35,18 @@ function webUrl(value: string | undefined): URL | null {
 }
 
 /** OS-facing asset URLs also use HTTP(S) on some Tauri platforms. */
-function forgeResourceUrl(value: string | undefined): string | undefined {
+function forgeLinkUrl(value: string | undefined): string | undefined {
   const url = webUrl(value);
   if (!url || url.origin === window.location.origin) return undefined;
   const host = url.hostname.replace(/\.+$/, "");
   if (host === "asset.localhost" || host === "tauri.localhost") return undefined;
   return url.href;
 }
+
+const FORGE_SCHEMA: SanitizeSchema = {
+  ...defaultSchema,
+  tagNames: defaultSchema.tagNames?.filter((tag) => tag !== "picture" && tag !== "source"),
+};
 
 const ID_PREFIX = defaultSchema.clobberPrefix ?? "";
 
@@ -121,10 +126,8 @@ interface Props {
   /**
    * The content came from the forge rather than the local disk — a pull
    * request description or a review comment anyone can post. Raw HTML
-   * is always sanitized (bots lean on `<details>` and `<img>`, so it
-   * still renders, but a `<style>`, `<iframe>` or `<base>` cannot reach
-   * the app's DOM); this additionally drops the local-only image
-   * sources a remote author has no business using.
+   * is always sanitized. Forge images render their descriptions so
+   * opening a review cannot make image requests to a contributor's URLs.
    */
   untrusted?: boolean;
 }
@@ -171,7 +174,7 @@ function MarkdownRenderedImpl({
   // after it is parsed, never before, and on every surface: an
   // `<iframe srcdoc>` that survived would run script in this webview.
   const rehypePlugins = useMemo<PluggableList>(
-    () => [rehypeRaw, untrusted ? rehypeSanitize : [rehypeSanitize, LOCAL_FILE_SCHEMA]],
+    () => [rehypeRaw, [rehypeSanitize, untrusted ? FORGE_SCHEMA : LOCAL_FILE_SCHEMA]],
     [untrusted],
   );
 
@@ -187,10 +190,11 @@ function MarkdownRenderedImpl({
        * the end of the story. Nothing is re-encoded on the way, so an
        * animated GIF keeps animating in both places.
        */
-      img: ({ src, alt, srcSet, referrerPolicy, ...rest }) => {
+      img: ({ src, alt, ...rest }) => {
         const label = alt ?? "";
+        if (untrusted) return label || "Image";
         let imagePath = src;
-        if (!untrusted && src && !isRemoteOrDataUrl(src) && (filePath || isAbsoluteFsPath(src))) {
+        if (src && !isRemoteOrDataUrl(src) && (filePath || isAbsoluteFsPath(src))) {
           // Markdown destinations are URLs, but the asset protocol expects a
           // filesystem path and encodes it again. Decode only the destination,
           // leaving the base file's literal directory names intact.
@@ -200,15 +204,12 @@ function MarkdownRenderedImpl({
             // Raw HTML can contain a literal '%' instead of a URL escape.
           }
         }
-        const resolved = untrusted ? forgeResourceUrl(src) : resolveAssetSrc(imagePath, filePath);
-        if (untrusted && !resolved) return label;
+        const resolved = resolveAssetSrc(imagePath, filePath);
         return (
           <img
             {...rest}
             src={resolved}
-            srcSet={untrusted ? undefined : srcSet}
             alt={label}
-            referrerPolicy={untrusted ? "no-referrer" : referrerPolicy}
             loading="lazy"
             data-testid="markdown-image"
             className="my-2 max-h-[360px] w-auto max-w-full cursor-zoom-in rounded-md border border-border/60 object-contain"
@@ -217,7 +218,7 @@ function MarkdownRenderedImpl({
               setZoomed({
                 src: resolved,
                 alt: label,
-                href: (untrusted ? resolved : src) ?? null,
+                href: src ?? null,
               });
             }}
           />
@@ -238,7 +239,7 @@ function MarkdownRenderedImpl({
        */
       a: ({ href, children, ...rest }) => {
         const fragment = href?.startsWith("#") ? href.slice(1) : null;
-        const external = untrusted ? forgeResourceUrl(href) : webUrl(href)?.href;
+        const external = untrusted ? forgeLinkUrl(href) : webUrl(href)?.href;
         return (
           <a
             {...rest}
@@ -297,7 +298,6 @@ function MarkdownRenderedImpl({
       src={zoomed.src}
       alt={zoomed.alt}
       href={zoomed.href}
-      referrerPolicy={untrusted ? "no-referrer" : undefined}
       onClose={closeZoom}
     />
   ) : null;

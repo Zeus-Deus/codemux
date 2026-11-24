@@ -278,7 +278,7 @@ describe("MarkdownRendered", () => {
     expect(imgs[1].getAttribute("src")).toBe("data:image/png;base64,AAAA");
   });
 
-  it("only fetches external web images in forge markdown", () => {
+  it("renders forge image descriptions without fetching image URLs", () => {
     const { container, getByText } = render(
       <MarkdownRendered
         untrusted
@@ -290,23 +290,14 @@ describe("MarkdownRendered", () => {
           "![In-app picture](/api/sample.png)",
           "![Same-origin picture](" + window.location.origin + "/sample.png)",
           '<img src="http://asset.localhost/pictures/sample.png" alt="Asset picture">',
-          '<img src="https://example.com/another.png" srcset="/pictures/sample.png 2x">',
+          '<picture><source srcset="https://example.com/another.png 2x"><img src="/sample.png" alt="Picture fallback"></picture>',
         ].join("\n\n")}
       />,
     );
-    const imgs = container.querySelectorAll("img");
-    expect(Array.from(imgs, (img) => img.getAttribute("src"))).toEqual([
-      "https://example.com/screenshot.png",
-      "https://example.com/another.png",
-    ]);
-    expect(imgs[0]).toHaveAttribute("referrerpolicy", "no-referrer");
-    expect(imgs[1]).not.toHaveAttribute("srcset");
+    expect(container.querySelector("img, picture, source, [srcset]")).toBeNull();
+    expect(getByText("Screenshot")).toBeInTheDocument();
     expect(getByText("Local picture")).toBeInTheDocument();
-    fireEvent.click(imgs[0]);
-    expect(document.querySelector("[data-testid='image-lightbox-image']")).toHaveAttribute(
-      "referrerpolicy",
-      "no-referrer",
-    );
+    expect(getByText("Picture fallback")).toBeInTheDocument();
   });
 
   it("gives forge markdown links only web or in-document destinations", () => {
