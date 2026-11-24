@@ -216,16 +216,122 @@ mod unix_transport {
 
 #[cfg(windows)]
 mod windows_transport {
-    use std::os::windows::io::AsRawHandle;
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::Path;
     use tokio::net::windows::named_pipe::{
         ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
     };
     use tokio::sync::Mutex;
-    use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Security::{EqualSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER},
+        System::{
+            Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId},
+            Threading::{
+                GetCurrentProcess, OpenProcess, OpenProcessToken,
+                PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        },
+    };
 
     pub type ServerStream = NamedPipeServer;
     pub type ClientStream = NamedPipeClient;
+
+    fn invalid_peer(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, message)
+    }
+
+    fn process_token(process: HANDLE) -> io::Result<OwnedHandle> {
+        let mut token = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if token.is_null() {
+            return Err(invalid_peer("control pipe process has no token"));
+        }
+        // SAFETY: OpenProcessToken returned an owned, non-null handle.
+        Ok(unsafe { OwnedHandle::from_raw_handle(token) })
+    }
+
+    fn token_user(token: &OwnedHandle) -> io::Result<Vec<usize>> {
+        let mut required = 0u32;
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                std::ptr::null_mut(),
+                0,
+                &mut required,
+            );
+        }
+        if required < std::mem::size_of::<TOKEN_USER>() as u32 || required > 65_536 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid token user size"));
+        }
+        // Vec<usize> provides the alignment required by TOKEN_USER. Windows
+        // writes the SID into this same buffer and sets User.Sid to point at it.
+        let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buffer = vec![0usize; words];
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                (words * std::mem::size_of::<usize>()) as u32,
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(buffer)
+    }
+
+    fn same_user_process(pid: u32) -> io::Result<()> {
+        if pid == 0 {
+            return Err(invalid_peer("control pipe peer has no process id"));
+        }
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: OpenProcess returned an owned, non-null handle.
+        let process = unsafe { OwnedHandle::from_raw_handle(process) };
+        let peer_token = process_token(process.as_raw_handle())?;
+        let owner_token = process_token(unsafe { GetCurrentProcess() })?;
+        let peer_user = token_user(&peer_token)?;
+        let owner_user = token_user(&owner_token)?;
+        // SAFETY: both aligned buffers contain TOKEN_USER values returned by
+        // GetTokenInformation, and remain alive through the SID comparison.
+        let peer_sid = unsafe { (*(peer_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        let owner_sid = unsafe { (*(owner_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        if peer_sid.is_null() || owner_sid.is_null() || unsafe { EqualSid(peer_sid, owner_sid) } == 0 {
+            return Err(invalid_peer("control pipe peer is not this OS user"));
+        }
+        Ok(())
+    }
+
+    fn client_pid(server: &NamedPipeServer) -> io::Result<u32> {
+        let mut pid = 0;
+        if unsafe { GetNamedPipeClientProcessId(server.as_raw_handle(), &mut pid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if pid == 0 {
+            return Err(invalid_peer("control pipe client has no process id"));
+        }
+        Ok(pid)
+    }
+
+    fn authenticate_server(handle: HANDLE) -> io::Result<()> {
+        let mut pid = 0;
+        if unsafe { GetNamedPipeServerProcessId(handle, &mut pid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if pid == 0 {
+            return Err(invalid_peer("control pipe server has no process id"));
+        }
+        same_user_process(pid)
+    }
 
     /// Wraps the "current waiting server instance" for a named pipe. Windows
     /// named pipes consume a server instance on every client connect, so we
@@ -251,26 +357,30 @@ mod windows_transport {
     }
 
     impl Listener {
-        /// The stream and the connecting process's kernel-reported pid.
+        /// The stream and the connecting process's kernel-reported pid. A
+        /// foreign account cannot acquire the owner's control authority even
+        /// if the process default pipe ACL is wider than expected.
         pub async fn accept(&self) -> std::io::Result<(ServerStream, Option<u32>)> {
             let mut guard = self.pending.lock().await;
-            let server = guard.take().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "named pipe listener has no pending server instance",
-                )
-            })?;
-            server.connect().await?;
-            let mut peer_pid = 0;
-            let peer_pid = (unsafe { GetNamedPipeClientProcessId(server.as_raw_handle(), &mut peer_pid) } != 0
-                && peer_pid != 0)
-                .then_some(peer_pid);
-            // Eagerly create the next server instance so the listener is
-            // ready to accept another client as soon as this one is handed
-            // to its handler task.
-            let next = ServerOptions::new().create(&self.pipe_name)?;
-            *guard = Some(next);
-            Ok((server, peer_pid))
+            loop {
+                let pending = guard.as_ref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::Other, "named pipe listener has no pending server instance")
+                })?;
+                let connected = pending.connect().await;
+                let server = guard.take().expect("pending server exists");
+                // Re-arm before examining the connected process. Rejected
+                // clients and aborted connects must not disable the listener.
+                *guard = Some(ServerOptions::new().create(&self.pipe_name)?);
+                if connected.is_err() {
+                    continue;
+                }
+                match client_pid(&server).and_then(|pid| same_user_process(pid).map(|()| pid)) {
+                    Ok(pid) => return Ok((server, Some(pid))),
+                    Err(error) => {
+                        crate::diagnostics::stderr_line(&format!("[codemux::control] Refused named pipe client: {error}"));
+                    }
+                }
+            }
         }
     }
 
@@ -300,7 +410,10 @@ mod windows_transport {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
             match ClientOptions::new().open(&pipe_name) {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    authenticate_server(stream.as_raw_handle())?;
+                    return Ok(stream);
+                }
                 Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                     last_err = Some(err);
                     continue;
@@ -316,16 +429,36 @@ mod windows_transport {
         }))
     }
 
-    /// Blocking probe: does a server respond on this pipe right now?
-    /// Opens the pipe via the std sync API so this is callable before the
-    /// tokio runtime exists.
+    /// Blocking probe: an owned server must be listening, not merely any
+    /// process that claimed the predictable name before the app started.
     pub fn sync_liveness_probe(path: &Path) -> bool {
         let pipe_name = path.to_string_lossy().into_owned();
-        std::fs::OpenOptions::new()
+        let Ok(stream) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&pipe_name)
-            .is_ok()
+        else {
+            return false;
+        };
+        match authenticate_server(stream.as_raw_handle()) {
+            Ok(()) => true,
+            Err(error) => {
+                crate::diagnostics::stderr_line(&format!("[codemux::control] Ignoring untrusted named pipe server: {error}"));
+                false
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::same_user_process;
+
+        #[test]
+        fn process_user_must_be_attested() {
+            same_user_process(std::process::id()).expect("current process has its own user SID");
+            assert!(same_user_process(0).is_err());
+            assert!(same_user_process(u32::MAX).is_err());
+        }
     }
 }
 
