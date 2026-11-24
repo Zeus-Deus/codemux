@@ -835,7 +835,8 @@ describe("cursor hydrate — the turn-active probe", () => {
  */
 describe("cursor hydrate — tail-first cold open", () => {
   beforeEach(() => {
-    useAgentChatStore.setState({ threads: {} });
+    // Restore actions too: a state update can carry a spy into the next state.
+    useAgentChatStore.setState({ ...useAgentChatStore.getInitialState() }, true);
   });
 
   /** 3 turns of user + assistant, ids 1..6. */
