@@ -21,7 +21,7 @@
 //! routes serve it. Tests live in this file's `mod tests` and in
 //! `remote/server.rs` and `remote/mcp.rs`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -72,7 +72,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "worktree_create",
-            description: "Creates a git worktree on this host and registers it in this host's codemux-remote registry (shown under Devices in the Codemux app), in one call. Runs `git worktree add` under ~/.codemux/worktrees/<repo>/<branch>, fetching `base` from origin first so new branches start at the remote tip. Also provisions the worktree like the desktop: gitignored include files (.env & co) are copied from the parent repo before this returns, and the project's `.codemux/config.json` setup commands run in the background with CODEMUX_ROOT_PATH/CODEMUX_WORKSPACE_PATH/CODEMUX_BRANCH/CODEMUX_PORT set (see the `setup` field of the response). Asking again for a branch that already has a worktree returns it with `created: false`. Use this (NOT workspace_create) to fork a branch off an existing git repo on this host. For a brand-new project, first `git init` a folder (e.g. via terminal_spawn/terminal_write), then call this against it.",
+            description: "Creates a git worktree on this host and registers it in this host's codemux-remote registry (shown under Devices in the Codemux app), in one call. Runs `git worktree add` under ~/.codemux/worktrees/<repo>/<branch>, fetching `base` from origin first so new branches start at the remote tip. Also provisions the worktree like the desktop: gitignored include files (.env & co) are copied from the parent repo before this returns, and the `setup` field reports whether repository commands require an explicit `codemux-remote worktree setup` on the host. Asking again for a branch that already has a worktree returns it with `created: false`. Use this (NOT workspace_create) to fork a branch off an existing git repo on this host. For a brand-new project, first `git init` a folder (e.g. via terminal_spawn/terminal_write), then call this against it.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -285,23 +285,8 @@ struct WorktreeCreateInput {
     name: Option<String>,
 }
 
-fn worktree_create(params: &Value, store: &WorkspaceStore) -> ToolResult {
-    worktree_create_with(params, store, &SetupRunner::Thread)
-}
-
-/// Where a new worktree's setup commands run.
-pub enum SetupRunner {
-    /// A background thread. Right for the long-lived `serve` daemon.
-    Thread,
-    /// A detached `<exe> worktree setup` process logging to `log_dir`.
-    /// Right for a one-shot CLI call, whose threads die when it exits.
-    Detached { exe: PathBuf, log_dir: PathBuf },
-}
-
-/// The `worktree_create` tool with a choice of setup runner, so the
-/// `codemux-remote worktree create` CLI can run it in-process when no
-/// daemon is up.
-pub fn worktree_create_with(params: &Value, store: &WorkspaceStore, runner: &SetupRunner) -> ToolResult {
+/// Create a worktree and register it on this host.
+pub fn worktree_create(params: &Value, store: &WorkspaceStore) -> ToolResult {
     let input: WorktreeCreateInput =
         serde_json::from_value(params.clone()).map_err(|e| ToolError::invalid(e.to_string()))?;
 
@@ -339,14 +324,10 @@ pub fn worktree_create_with(params: &Value, store: &WorkspaceStore, runner: &Set
             .map_err(workspace_err)?,
     };
 
-    // Desktop parity (issue #78): provision the new worktree the same
-    // way the desktop does after `git worktree add`. Provisioning never
-    // fails the tool — a workspace whose setup script broke is still a
-    // registered, usable workspace (matching the desktop, where setup
-    // failures only surface as a notification). A reused worktree was
-    // provisioned when it was made.
+    // Copy includes for a new checkout. Running repository setup on this
+    // host is a separate, explicit CLI action.
     let setup = if created.created {
-        provision_worktree_workspace(&ws, runner)
+        provision_worktree_workspace(&ws)
     } else {
         Value::Null
     };
@@ -359,25 +340,8 @@ pub fn worktree_create_with(params: &Value, store: &WorkspaceStore, runner: &Set
     }))
 }
 
-/// Headless equivalent of the desktop's `spawn_setup_scripts` pipeline:
-/// copy gitignored include files (`.env` & co) from the parent repo,
-/// then run the project's setup commands with the standard `CODEMUX_*`
-/// env and the deterministic per-workspace port.
-///
-/// - The includes copy is fast and runs inline, so the files are in
-///   place the moment `worktree_create` returns.
-/// - Setup commands can take minutes (`npm install`), so they run in the
-///   background (see [`SetupRunner`]) — same fire-and-forget shape as
-///   the desktop — and the tool response only reports what was scheduled.
-///
-/// Differences from the desktop, by design:
-/// - Config comes from `.codemux/config.json` (workspace dir → repo
-///   root) only. The Settings-UI fallback lives in the desktop's
-///   SQLite database, which does not exist on a headless host.
-/// - Progress goes to stderr (the daemon's journal, or a detached run's
-///   log file) instead of Tauri events, because there is no frontend to
-///   notify.
-fn provision_worktree_workspace(ws: &Workspace, runner: &SetupRunner) -> Value {
+/// Copy worktree includes and report repository setup commands for review.
+fn provision_worktree_workspace(ws: &Workspace) -> Value {
     let workspace_path = std::path::PathBuf::from(&ws.path);
     let root_path = crate::scripts::resolve_root_path(&workspace_path);
     let config = crate::config::workspace_config::read_workspace_config(&workspace_path);
@@ -402,56 +366,14 @@ fn provision_worktree_workspace(ws: &Workspace, runner: &SetupRunner) -> Value {
         }
     };
 
-    // Step 2: setup commands, in the background. The port is derived
-    // from the workspace id exactly like the desktop, so a project's
-    // setup script sees a stable CODEMUX_PORT for this workspace.
-    let port = crate::scripts::allocate_workspace_port(&ws.id);
-    let setup_commands = config.as_ref().map(|c| c.setup.len()).unwrap_or(0);
-    let mut setup_running = false;
-    let mut log = None;
-
-    if let Some(config) = config.filter(|c| !c.setup.is_empty()) {
-        match runner {
-            SetupRunner::Thread => {
-                let ws_id = ws.id.clone();
-                let ws_name = ws.name.clone();
-                let branch = ws.branch.clone();
-                std::thread::spawn(move || {
-                    let outcome = crate::scripts::run_setup_commands(
-                        &workspace_path,
-                        &ws_name,
-                        &ws_id,
-                        &config,
-                        &root_path,
-                        branch.as_deref(),
-                        Some(port),
-                        &mut |event| log_setup_event(&ws_id, event),
-                    );
-                    if let Err(e) = outcome {
-                        eprintln!("[codemux-remote] setup failed for workspace {ws_id}: {e}");
-                    }
-                });
-                setup_running = true;
-            }
-            SetupRunner::Detached { exe, log_dir } => match spawn_detached_setup(exe, log_dir, ws) {
-                Ok(path) => {
-                    setup_running = true;
-                    log = Some(path.to_string_lossy().to_string());
-                }
-                Err(e) => eprintln!(
-                    "[codemux-remote] couldn't start setup for workspace {}: {e}",
-                    ws.id
-                ),
-            },
-        }
-    }
-
+    let setup_commands = config.as_ref().map_or(0, |config| config.setup.len());
     json!({
-        "port": port,
+        "port": crate::scripts::allocate_workspace_port(&ws.id),
         "includes_copied": includes_copied,
         "setup_commands": setup_commands,
-        "setup_running": setup_running,
-        "log": log,
+        "setup_running": false,
+        "setup_requires_explicit_run": setup_commands > 0,
+        "log": null,
     })
 }
 
@@ -476,48 +398,7 @@ fn log_setup_event(ws_id: &str, event: crate::scripts::SetupEvent<'_>) {
     }
 }
 
-/// Start `<exe> worktree setup` for `ws` in its own session, with output
-/// to a log file. `setsid` keeps the end of the SSH session that ran the
-/// CLI from taking setup down with it, and not holding the CLI's
-/// stdout/stderr matters too: ssh waits for every holder of those pipes
-/// to close before it returns.
-fn spawn_detached_setup(exe: &Path, log_dir: &Path, ws: &Workspace) -> Result<PathBuf, String> {
-    use std::os::unix::process::CommandExt;
-
-    std::fs::create_dir_all(log_dir).map_err(|e| format!("create {}: {e}", log_dir.display()))?;
-    let log_path = log_dir.join(format!("setup-{}.log", ws.id));
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| format!("open {}: {e}", log_path.display()))?;
-    let log_err = log.try_clone().map_err(|e| format!("open {}: {e}", log_path.display()))?;
-
-    let mut cmd = std::process::Command::new(exe);
-    // `--flag=value` so values that start with `-` stay values.
-    cmd.args(["worktree", "setup"])
-        .arg(format!("--path={}", ws.path))
-        .arg(format!("--workspace-id={}", ws.id))
-        .arg(format!("--name={}", ws.name));
-    if let Some(branch) = &ws.branch {
-        cmd.arg(format!("--branch={branch}"));
-    }
-    cmd.stdin(std::process::Stdio::null()).stdout(log).stderr(log_err);
-    // SAFETY: setsid is async-signal-safe.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    cmd.spawn().map_err(|e| format!("spawn {}: {e}", exe.display()))?;
-    Ok(log_path)
-}
-
-/// Body of the detached `codemux-remote worktree setup` process: run the
-/// worktree's setup commands to completion, logging progress to stderr.
+/// Run the worktree's setup commands when explicitly requested on this host.
 pub fn run_worktree_setup(
     workspace_path: &Path,
     name: &str,
@@ -813,11 +694,10 @@ mod tests {
 
     /// Desktop-parity provisioning (issue #78): the daemon's
     /// worktree_create must copy gitignored include files into the new
-    /// worktree and run the project's setup script with the standard
-    /// CODEMUX_* env + deterministic port.
+    /// worktree and leave setup for an explicit action on the host.
     #[test]
     #[serial]
-    fn worktree_create_runs_setup_scripts_with_env_and_includes() {
+    fn worktree_create_copies_includes_and_waits_for_explicit_setup() {
         let home = TempDir::new().unwrap();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
@@ -852,7 +732,8 @@ mod tests {
 
         // The tool response reports the provisioning summary.
         assert_eq!(setup["setup_commands"], 1);
-        assert_eq!(setup["setup_running"], true);
+        assert_eq!(setup["setup_running"], false);
+        assert_eq!(setup["setup_requires_explicit_run"], true);
         let port = setup["port"].as_u64().expect("port") as u16;
         assert!((3100..6500).contains(&port), "port {port} out of range");
         assert!(
@@ -872,17 +753,15 @@ mod tests {
             "SECRET=from-root"
         );
 
-        // Setup commands run in the background; poll for the marker.
         let marker = wt.join("setup-ran.txt");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !marker.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "setup script never ran (no {})",
-                marker.display()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        assert!(!marker.exists());
+        run_worktree_setup(
+            &wt,
+            ws["name"].as_str().unwrap(),
+            ws["id"].as_str().unwrap(),
+            ws["branch"].as_str(),
+        )
+        .unwrap();
         let recorded = std::fs::read_to_string(&marker).unwrap();
         let parts: Vec<&str> = recorded.split('|').collect();
         assert_eq!(parts.len(), 5, "marker: {recorded}");
@@ -935,9 +814,7 @@ mod tests {
         }
     }
 
-    /// A failing setup script must not fail worktree_create: the
-    /// workspace is still created and registered (matching the desktop,
-    /// where setup failures only surface as a notification).
+    /// Repository setup is informational during worktree creation.
     #[test]
     #[serial]
     fn worktree_create_with_failing_setup_still_succeeds() {
@@ -963,8 +840,9 @@ mod tests {
             "base": "main"
         });
         let out = worktree_create(&params, &store)
-            .expect("tool must not fail when the setup script fails");
+            .expect("tool creates the worktree without running setup");
         assert_eq!(out["setup"]["setup_commands"], 1);
+        assert_eq!(out["setup"]["setup_running"], false);
         assert!(out["workspace"]["id"].is_string());
 
         match prev_home {
@@ -1007,74 +885,7 @@ mod tests {
         }
     }
 
-    /// The CLI's runner: setup goes to a separate `<exe> worktree setup`
-    /// process in its own session, logging to a file, so it survives the
-    /// one-shot CLI (and its SSH session) exiting.
-    #[test]
-    #[serial]
-    fn detached_runner_starts_setup_in_its_own_session() {
-        let home = TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
-
-        let repo = TempDir::new().unwrap();
-        init_repo(repo.path());
-        std::fs::create_dir_all(repo.path().join(".codemux")).unwrap();
-        std::fs::write(repo.path().join(".codemux/config.json"), r#"{"setup": ["true"]}"#).unwrap();
-        commit_all(repo.path(), "add setup");
-
-        // Stand-in for codemux-remote: records its args and whether it
-        // leads its own session (sid == pid after setsid).
-        let bin = TempDir::new().unwrap();
-        let marker = bin.path().join("ran.txt");
-        let exe = bin.path().join("fake-codemux-remote");
-        std::fs::write(
-            &exe,
-            format!(
-                "#!/bin/sh\nsid=$(ps -o sid= -p $$ | tr -d ' ')\necho \"$sid $$ $*\" > {}\necho logged\n",
-                marker.display()
-            ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let store_dir = TempDir::new().unwrap();
-        let store = open_store(&store_dir);
-        let log_dir = store_dir.path().join("logs");
-        let runner = SetupRunner::Detached { exe, log_dir: log_dir.clone() };
-        let params = json!({
-            "repo_path": repo.path().to_string_lossy(),
-            "branch": "detached",
-            "base": "main"
-        });
-        let out = worktree_create_with(&params, &store, &runner).expect("worktree_create");
-        assert_eq!(out["setup"]["setup_running"], true);
-        let log = std::path::PathBuf::from(out["setup"]["log"].as_str().expect("log path"));
-        assert!(log.starts_with(&log_dir));
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !marker.exists() || std::fs::read_to_string(&log).unwrap_or_default().is_empty() {
-            assert!(std::time::Instant::now() < deadline, "detached setup never ran");
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        let recorded = std::fs::read_to_string(&marker).unwrap();
-        let mut parts = recorded.split_whitespace();
-        let (sid, pid) = (parts.next().unwrap(), parts.next().unwrap());
-        assert_eq!(sid, pid, "setup runs as its own session leader: {recorded}");
-        let ws = &out["workspace"];
-        assert!(recorded.contains("worktree setup"), "{recorded}");
-        assert!(recorded.contains(&format!("--workspace-id={}", ws["id"].as_str().unwrap())));
-        assert!(recorded.contains("--branch=detached"));
-        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "logged");
-
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-
-    /// The detached process body runs the setup commands to completion
+    /// An explicit setup runs its commands to completion
     /// with the same env the daemon's thread uses.
     #[test]
     fn run_worktree_setup_runs_commands_synchronously() {

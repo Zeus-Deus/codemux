@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end harness for issue #78: headless daemon worktree creation
-# runs setup scripts + worktree includes (desktop parity).
+# End-to-end harness for headless worktree includes and explicit setup.
 #
 # Stands up a clean containerized host (no desktop, no dev environment),
 # mounts the built `codemux-remote` binary, seeds a git repo with a
@@ -9,8 +8,8 @@
 # surface (`tools/call worktree_create`) exactly like the MCP bridge
 # does — and asserts on the container's filesystem that:
 #   1. the worktree was created at the canonical path,
-#   2. the setup script ran with CODEMUX_BRANCH/CODEMUX_PORT injected,
-#   3. the gitignored .env was copied from the main checkout.
+#   2. the gitignored .env was copied from the main checkout,
+#   3. setup ran with CODEMUX_BRANCH/CODEMUX_PORT only when requested.
 #
 # Requires: docker, python3, and a debug build of codemux-remote
 # (`cargo build --manifest-path src-tauri/Cargo.toml --bin codemux-remote`).
@@ -90,26 +89,29 @@ RESPONSE="$(docker exec "$CONTAINER" curl -sf -X POST "$ENDPOINT/tools/call" \
 printf '%s\n' "$RESPONSE" | python3 -m json.tool
 
 WS_PATH="$(printf '%s' "$RESPONSE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["workspace"]["path"])')"
+WS_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["workspace"]["id"])')"
+WS_NAME="$(printf '%s' "$RESPONSE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["workspace"]["name"])')"
 RUNNING="$(printf '%s' "$RESPONSE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["setup"]["setup_running"])')"
+REQUIRES_RUN="$(printf '%s' "$RESPONSE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["setup"]["setup_requires_explicit_run"])')"
 PORT="$(printf '%s' "$RESPONSE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["setup"]["port"])')"
-[ "$RUNNING" = "True" ] || { err "setup.setup_running should be true"; exit 1; }
+[ "$RUNNING" = "False" ] || { err "worktree creation started setup automatically"; exit 1; }
+[ "$REQUIRES_RUN" = "True" ] || { err "daemon did not report required setup"; exit 1; }
 
-log "worktree at $WS_PATH — polling for setup marker"
 MARKER="$WS_PATH/setup-ran.txt"
-for i in $(seq 1 100); do
-  if docker exec "$CONTAINER" test -f "$MARKER"; then break; fi
-  sleep 0.2
-done
+docker exec "$CONTAINER" test ! -e "$MARKER" || { err "setup ran before approval"; exit 1; }
+GOT_ENV="$(docker exec "$CONTAINER" cat "$WS_PATH/.env")"
+[ "$GOT_ENV" = "SECRET=docker-host" ] || { err ".env not copied"; exit 1; }
+
+log "running explicit setup for the worktree at $WS_PATH"
+docker exec "$CONTAINER" codemux-remote worktree setup +  --path "$WS_PATH" --workspace-id "$WS_ID" --name "$WS_NAME" --branch feature/provision
 docker exec "$CONTAINER" test -f "$MARKER" || {
-  err "setup script never ran"; docker exec "$CONTAINER" cat /root/state/serve.log || true; exit 1;
+  err "explicit setup did not create its marker"; exit 1;
 }
 
 GOT_BRANCH="$(docker exec "$CONTAINER" sed -n 1p "$MARKER")"
 GOT_PORT="$(docker exec "$CONTAINER" sed -n 2p "$MARKER")"
-GOT_ENV="$(docker exec "$CONTAINER" cat "$WS_PATH/.env")"
 
 [ "$GOT_BRANCH" = "feature/provision" ] || { err "CODEMUX_BRANCH wrong: $GOT_BRANCH"; exit 1; }
 [ "$GOT_PORT" = "$PORT" ] || { err "CODEMUX_PORT mismatch: $GOT_PORT vs $PORT"; exit 1; }
-[ "$GOT_ENV" = "SECRET=docker-host" ] || { err ".env not copied: $GOT_ENV"; exit 1; }
 
-log "PASS — daemon-created worktree was provisioned (setup script ran with branch=$GOT_BRANCH port=$GOT_PORT, .env copied)"
+log "PASS — includes copied on create and explicit setup received branch=$GOT_BRANCH and port=$GOT_PORT"

@@ -958,12 +958,12 @@ async fn platform_worktree_setup_stops_once_its_paired_device_is_revoked() {
         let connection = shared.connections.connect_for_test("paired");
         let mut device = caller(&f.record);
         device.control = ControlCaller::remote("paired".into());
-        std::fs::create_dir_all(f.root.path().join(".codemux")).unwrap();
-        std::fs::write(
-            f.root.path().join(".codemux/config.json"),
-            json!({"setup": ["touch setup-first"]}).to_string(),
-        )
-        .unwrap();
+        f.app.state::<DatabaseStore>()
+            .set_project_scripts(&f.root.path().to_string_lossy(), &crate::database::ProjectScripts {
+                setup: vec!["touch setup-first".into()],
+                ..Default::default()
+            })
+            .unwrap();
         let mut outcomes = setup_outcomes(&f);
         let branch = match withdrawal {
             Withdrawal::Revoked => "device-revoked",

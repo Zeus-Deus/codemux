@@ -1,6 +1,4 @@
-use crate::config::workspace_config::{
-    find_git_root, read_effective_config, read_workspace_config, WorkspaceConfig,
-};
+use crate::config::workspace_config::{find_git_root, read_saved_config, WorkspaceConfig};
 use crate::database::DatabaseStore;
 use crate::workspace_service::Checkpoint;
 use serde::Serialize;
@@ -266,13 +264,13 @@ struct WorktreeIncludesApplied {
 }
 
 /// Run the full setup pipeline: worktree includes copy + setup scripts.
-/// Resolves config from file/DB.
+/// The caller selects the configuration according to its authority.
 pub fn run_setup_scripts<R: Runtime>(
     workspace_path: &Path,
     workspace_name: &str,
     workspace_id: &str,
     app_handle: &AppHandle<R>,
-    db: Option<&DatabaseStore>,
+    config: Option<WorkspaceConfig>,
     branch: Option<&str>,
     port: Option<u16>,
 ) -> Result<(), String> {
@@ -282,13 +280,6 @@ pub fn run_setup_scripts<R: Runtime>(
     );
 
     let root_path = resolve_root_path(workspace_path);
-
-    // Read config to get worktree_includes setting for fallback
-    let config = if let Some(db) = db {
-        read_effective_config(workspace_path, db)
-    } else {
-        read_workspace_config(workspace_path)
-    };
 
     let setting_patterns = config
         .as_ref()
@@ -573,15 +564,11 @@ fn frontend_events<'a, R: Runtime>(
     }
 }
 
-/// The folder's teardown commands: its `.codemux/config.json`, else the
-/// project's saved scripts when `db` is given.
-pub fn teardown_commands(workspace_path: &Path, db: Option<&DatabaseStore>) -> Vec<String> {
-    let config = if let Some(db) = db {
-        read_effective_config(workspace_path, db)
-    } else {
-        read_workspace_config(workspace_path)
-    };
-    config.map(|config| config.teardown).unwrap_or_default()
+/// Automatic teardown uses the commands explicitly saved in Settings.
+pub fn teardown_commands(workspace_path: &Path, db: &DatabaseStore) -> Vec<String> {
+    read_saved_config(workspace_path, db)
+        .map(|config| config.teardown)
+        .unwrap_or_default()
 }
 
 /// Runs `commands` (see [`teardown_commands`]) in order, stopping at the
@@ -638,11 +625,8 @@ const TEARDOWN_SCRIPT: &str = "teardown-script";
 /// Runs one setup or teardown command with `sh -c` in `folder`, its output
 /// captured, and waits for it.
 ///
-/// These commands are repository content: `.codemux/config.json`, which any
-/// agent working in the folder can write, overrides the project's saved
-/// scripts, and agents can make them run (`rerun_setup`, workspace and
-/// worktree creation, closing a worktree's workspace). So each one runs as an
-/// agent process, whoever triggered it: the env marker and the ancestry
+/// These commands can execute repository content, so each one runs as an
+/// agent process. The env marker and the ancestry
 /// registration make a `codemux` it starts an agent on the control socket,
 /// refused admin commands, never the owner.
 ///
@@ -737,7 +721,7 @@ mod tests {
             let (folder, config) = (dir.path().to_path_buf(), config.clone());
             let run = std::thread::spawn(move || match name {
                 "setup" => run_setup_commands(&folder, "ws", "ws-1", &config, &folder, None, None, &mut |_| {}),
-                _ => run_teardown_scripts(&folder, "ws", "ws-1", &teardown_commands(&folder, None), &Checkpoint::default()),
+                _ => run_teardown_scripts(&folder, "ws", "ws-1", &config.teardown, &Checkpoint::default()),
             });
             let out = dir.path().join(format!("{name}.out"));
             let deadline = Instant::now() + Duration::from_secs(20);

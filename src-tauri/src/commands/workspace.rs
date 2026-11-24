@@ -1935,7 +1935,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     let mut torn_down = Ok(());
     if !force && !hermes_pending {
         if let Some(folder) = teardown {
-            let commands = crate::scripts::teardown_commands(Path::new(&folder), Some(db));
+            let commands = crate::scripts::teardown_commands(Path::new(&folder), db);
             let teardown = CompletedTeardown { folder, commands };
             if !teardown.commands.is_empty() && !attempt.already_ran(&teardown) {
                 let (title, id, checkpoint) = (ws_title.clone(), workspace_id.clone(), checkpoint.clone());
@@ -3608,11 +3608,8 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
     let root_path = crate::scripts::resolve_root_path(workspace_path);
 
     let config =
-        crate::config::workspace_config::read_effective_config(workspace_path, db);
-    let setting_patterns = config
-        .as_ref()
-        .map(|c| c.worktree_includes.clone())
-        .unwrap_or_default();
+        crate::config::workspace_config::read_automatic_lifecycle_config(workspace_path, db);
+    let setting_patterns = config.worktree_includes.clone();
 
     let (ws_title, ws_branch) = {
         let snapshot = state.snapshot();
@@ -3639,7 +3636,7 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
         // copies nothing and starts no command. The copy and each command can
         // take long, so the runner asks again before every command.
         if let Err(refusal) = checkpoint.check() {
-            let error = crate::scripts::report_setup_stopped(&app2, &ws_id, config.as_ref(), &refusal);
+            let error = crate::scripts::report_setup_stopped(&app2, &ws_id, Some(&config), &refusal);
             eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {error}");
             return;
         }
@@ -3662,14 +3659,12 @@ fn spawn_setup_scripts<R: tauri::Runtime>(
         }
 
         // Step 2: Run setup commands
-        if let Some(config) = config {
-            if !config.setup.is_empty() {
-                if let Err(e) = crate::scripts::run_setup_scripts_with_config(
-                    &ws_path, &ws_title, &ws_id, &app2, &config, &root_path,
-                    ws_branch.as_deref(), Some(port), &checkpoint,
-                ) {
-                    eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {e}");
-                }
+        if !config.setup.is_empty() {
+            if let Err(e) = crate::scripts::run_setup_scripts_with_config(
+                &ws_path, &ws_title, &ws_id, &app2, &config, &root_path,
+                ws_branch.as_deref(), Some(port), &checkpoint,
+            ) {
+                eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {e}");
             }
         }
     });
@@ -3703,8 +3698,9 @@ pub fn run_workspace_setup<R: tauri::Runtime>(
         (ws.cwd.clone(), ws.title.clone(), ws.git_branch.clone())
     };
     let port = crate::scripts::allocate_workspace_port(&workspace_id);
+    let config = crate::config::workspace_config::read_effective_config(Path::new(&cwd), &db);
     crate::scripts::run_setup_scripts(
-        Path::new(&cwd), &title, &workspace_id, &app, Some(&db),
+        Path::new(&cwd), &title, &workspace_id, &app, config,
         branch.as_deref(), Some(port),
     )
 }
@@ -5097,6 +5093,13 @@ mod archive_guard_tests {
         assert!(refuse_checkout_in_use(&snapshot, checkout.path(), &[]).is_err());
     }
 
+    fn save_teardown(db: &crate::database::DatabaseStore, folder: &Path, command: &str) {
+        db.set_project_scripts(&folder.to_string_lossy(), &crate::database::ProjectScripts {
+            teardown: vec![command.to_owned()],
+            ..Default::default()
+        }).unwrap();
+    }
+
     /// A chat child workspace borrows its parent's folder: closing it, by
     /// any route, never runs the folder's teardown scripts.
     #[tokio::test]
@@ -5108,12 +5111,6 @@ mod archive_guard_tests {
         }
         use tauri::Manager;
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".codemux")).unwrap();
-        std::fs::write(
-            dir.path().join(".codemux/config.json"),
-            r#"{"teardown": ["echo \"$CODEMUX_WORKSPACE_NAME\" >> teardown-ran"]}"#,
-        )
-        .unwrap();
         let marker = dir.path().join("teardown-ran");
         let cwd = dir.path().display().to_string();
         let store = AppStateStore::default();
@@ -5130,6 +5127,7 @@ mod archive_guard_tests {
         let app = close_test_app(store);
         let state = app.state::<AppStateStore>();
         let db = app.state::<crate::database::DatabaseStore>();
+        save_teardown(&db, dir.path(), r#"echo "$CODEMUX_WORKSPACE_NAME" >> teardown-ran"#);
 
         close_workspace(app.handle().clone(), app.state(), app.state(), children[0].clone(), None).await.unwrap();
         close_workspace_with_worktree_impl(app.handle().clone(), &state, &db, children[1].clone(), false, None, None)
@@ -5153,15 +5151,11 @@ mod archive_guard_tests {
 
         let root = crate::test_isolation::isolated_root().unwrap();
         let folder = root.join("workspace");
-        std::fs::create_dir_all(folder.join(".codemux")).unwrap();
-        std::fs::write(
-            folder.join(".codemux/config.json"),
-            r#"{"teardown": ["echo teardown >> teardown-ran"]}"#,
-        ).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
         let marker = folder.join("teardown-ran");
 
         let store = AppStateStore::default();
-        let workspace_id = store.create_empty_workspace_at_path(folder).0;
+        let workspace_id = store.create_empty_workspace_at_path(folder.clone()).0;
         crate::state::flush_persisted_state(&store).unwrap();
         let saved = std::fs::read(root.join("layout.json")).unwrap();
         let db_path = root.join("workspace-close.sqlite");
@@ -5171,6 +5165,7 @@ mod archive_guard_tests {
         app.manage(crate::database::DatabaseStore::test_file(&db_path));
         let state = app.state::<AppStateStore>();
         let db = app.state::<crate::database::DatabaseStore>();
+        save_teardown(&db, &folder, "echo teardown >> teardown-ran");
         let fault = rusqlite::Connection::open(&db_path).unwrap();
         fault.execute_batch(
             "CREATE TRIGGER reject_layout_close BEFORE INSERT ON pending_layout_closes
@@ -5209,18 +5204,8 @@ mod archive_guard_tests {
             return;
         }
         use tauri::Manager;
-        let with_teardown = || {
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(dir.path().join(".codemux")).unwrap();
-            std::fs::write(
-                dir.path().join(".codemux/config.json"),
-                r#"{"teardown": ["echo \"$CODEMUX_WORKSPACE_NAME\" >> teardown-ran"]}"#,
-            )
-            .unwrap();
-            dir
-        };
-        let root = with_teardown();
-        let worktree = with_teardown();
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
         let ran = |dir: &tempfile::TempDir| std::fs::read_to_string(dir.path().join("teardown-ran")).ok();
         let store = AppStateStore::default();
         let open_root = |store: &AppStateStore, title: &str| {
@@ -5238,6 +5223,10 @@ mod archive_guard_tests {
         let app = close_test_app(store);
         let state = app.state::<AppStateStore>();
         let db = app.state::<crate::database::DatabaseStore>();
+
+        for folder in [root.path(), worktree.path()] {
+            save_teardown(&db, folder, r#"echo "$CODEMUX_WORKSPACE_NAME" >> teardown-ran"#);
+        }
 
         archive_workspace_impl(app.handle().clone(), &state, &db, archived).await.unwrap();
         close_workspace_with_worktree_impl(app.handle().clone(), &state, &db, tracked, false, None, None)

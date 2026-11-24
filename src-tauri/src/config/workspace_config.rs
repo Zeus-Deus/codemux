@@ -83,15 +83,53 @@ pub fn read_effective_config(
         return Some(config);
     }
 
-    // Fall back to DB-stored project scripts
     let root = find_git_root(workspace_path).unwrap_or_else(|| workspace_path.to_path_buf());
-    let scripts = db.get_project_scripts(&root.to_string_lossy())?;
-    Some(WorkspaceConfig {
+    db.get_project_scripts(&root.to_string_lossy()).map(saved_workspace_config)
+}
+
+/// Lifecycle events may be triggered by opening an untrusted checkout.
+/// Only commands explicitly saved in Settings can run automatically.
+/// The file still supplies include patterns when present.
+pub fn read_automatic_lifecycle_config(
+    workspace_path: &Path,
+    db: &DatabaseStore,
+) -> WorkspaceConfig {
+    let mut config = read_saved_config(workspace_path, db).unwrap_or_default();
+    if let Some(file) = read_workspace_config(workspace_path) {
+        config.worktree_includes = file.worktree_includes;
+    }
+    config
+}
+
+pub(crate) fn read_saved_config(workspace_path: &Path, db: &DatabaseStore) -> Option<WorkspaceConfig> {
+    let root = find_git_root(workspace_path).unwrap_or_else(|| workspace_path.to_path_buf());
+    let checkout = workspace_path.canonicalize().ok()?;
+    let resolved_root = root.canonicalize().ok()?;
+    let scripts = db
+        .get_project_scripts(&resolved_root.to_string_lossy())
+        .or_else(|| db.get_project_scripts(&root.to_string_lossy()))?;
+    // A checkout can contain a .git file that points anywhere. A directory
+    // outside the saved project only inherits its commands when Git has
+    // actually registered that directory as one of the project's worktrees.
+    if !checkout.starts_with(&resolved_root)
+        && !crate::git::git_list_worktrees(&resolved_root)
+            .ok()?
+            .into_iter()
+            .filter(|worktree| !worktree.is_bare)
+            .any(|worktree| Path::new(&worktree.path).canonicalize().ok().as_ref() == Some(&checkout))
+    {
+        return None;
+    }
+    Some(saved_workspace_config(scripts))
+}
+
+fn saved_workspace_config(scripts: crate::database::ProjectScripts) -> WorkspaceConfig {
+    WorkspaceConfig {
         setup: scripts.setup,
         teardown: scripts.teardown,
         run: scripts.run,
         worktree_includes: scripts.worktree_includes,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +310,37 @@ mod tests {
         assert_eq!(config.setup, vec!["file-setup-cmd"]);
         assert_eq!(config.teardown, vec!["file-teardown-cmd"]);
         assert_eq!(config.run, Some("file-run-cmd".into()));
+    }
+
+    #[test]
+    fn automatic_lifecycle_requires_commands_saved_on_this_device() {
+        let db = crate::database::init_test_database();
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".codemux");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.json"),
+            r#"{"setup":["repo-setup"],"teardown":["repo-teardown"],"worktree_includes":["file-pattern"]}"#,
+        )
+        .unwrap();
+
+        let automatic = read_automatic_lifecycle_config(dir.path(), &db);
+        assert!(automatic.setup.is_empty());
+        assert!(automatic.teardown.is_empty());
+        assert_eq!(automatic.worktree_includes, ["file-pattern"]);
+
+        db.set_project_scripts(&dir.path().to_string_lossy(), &crate::database::ProjectScripts {
+            setup: vec!["local-setup".into()],
+            teardown: vec!["local-teardown".into()],
+            ..Default::default()
+        }).unwrap();
+        let automatic = read_automatic_lifecycle_config(dir.path(), &db);
+        assert_eq!(automatic.setup, ["local-setup"]);
+        assert_eq!(automatic.teardown, ["local-teardown"]);
+        assert_eq!(automatic.worktree_includes, ["file-pattern"]);
+
+        let explicit = read_effective_config(dir.path(), &db).unwrap();
+        assert_eq!(explicit.setup, ["repo-setup"]);
     }
 }
 

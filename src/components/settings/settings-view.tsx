@@ -2829,7 +2829,8 @@ export function SettingsView() {
                 <div className="size-1.5 rounded-full bg-warning shrink-0 mt-1.5" />
                 <p className="text-body-sm text-muted-foreground leading-relaxed">
                   A <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemux/config.json</code> file was found.
-                  File-based configuration takes precedence over these settings.
+                  Automatic setup and teardown use the commands saved below. The file supplies
+                  worktree include patterns and commands for Re-run setup and Run.
                 </p>
               </SettingsCard>
             )}

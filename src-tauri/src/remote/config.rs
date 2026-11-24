@@ -53,9 +53,3 @@ pub fn workspaces_root(state_dir: &std::path::Path) -> PathBuf {
 pub fn serve_log_path(state_dir: &std::path::Path) -> PathBuf {
     state_dir.join("serve.log")
 }
-
-/// Logs of worktree setup commands that `worktree create` ran detached
-/// because no daemon was up to own them.
-pub fn logs_dir(state_dir: &std::path::Path) -> PathBuf {
-    state_dir.join("logs")
-}

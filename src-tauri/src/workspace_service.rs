@@ -1248,12 +1248,16 @@ mod tests {
         use tauri::Listener;
         let dir = tempfile::tempdir().unwrap();
         let project = repo(dir.path(), "project", "main");
-        std::fs::create_dir(project.join(".codemux")).unwrap();
-        std::fs::write(project.join(".codemux/config.json"), r#"{"setup": ["touch first", "touch second"]}"#).unwrap();
         std::fs::write(project.join(".env"), "SECRET=1").unwrap();
         let state = AppStateStore::default();
         state.create_empty_workspace_at_path(project.clone());
         let app = mock_app(state);
+        app.state::<crate::database::DatabaseStore>()
+            .set_project_scripts(&project.to_string_lossy(), &crate::database::ProjectScripts {
+                setup: vec!["touch first".into(), "touch second".into()],
+                ..Default::default()
+            })
+            .unwrap();
         let (sender, mut ended) = tokio::sync::mpsc::unbounded_channel();
         for name in ["workspace-setup-failed", "workspace-setup-complete"] {
             let sender = sender.clone();

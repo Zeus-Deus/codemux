@@ -2076,8 +2076,10 @@ pub(crate) async fn dispatch_request_as<R: Runtime>(
                     tokio::task::spawn_blocking(move || {
                         let db: State<'_, crate::database::DatabaseStore> = app.state();
                         let port = crate::scripts::allocate_workspace_port(&ws_id);
+                        let folder = std::path::Path::new(&cwd);
+                        let config = crate::config::workspace_config::read_automatic_lifecycle_config(folder, &db);
                         crate::scripts::run_setup_scripts(
-                            std::path::Path::new(&cwd), &title, &ws_id, &app, Some(&db),
+                            folder, &title, &ws_id, &app, Some(config),
                             branch.as_deref(), Some(port),
                         )?;
                         Ok::<_, String>(serde_json::json!({ "workspace_id": ws_id, "status": "complete" }))
