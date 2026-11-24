@@ -12,7 +12,7 @@ export async function probeCursorNatives(): Promise<void> {
   try {
     const nativeName = `@cursor/sdk-${process.platform}-${process.arch}`;
     let nativeDir: string | undefined;
-    // These are the same executable/argv ancestor roots used by SDK 1.0.37's
+    // These are the same executable/argv ancestor roots used by SDK 1.0.39's
     // vendored-helper resolver. The probe's workspace is outside those roots.
     for (const entry of [process.argv[1], process.execPath]) {
       if (!entry) continue;
@@ -21,7 +21,7 @@ export async function probeCursorNatives(): Promise<void> {
         const candidate = join(current, "node_modules", nativeName);
         try {
           const metadata: unknown = JSON.parse(await readFile(join(candidate, "package.json"), "utf8"));
-          if (!object(metadata) || metadata.name !== nativeName || metadata.version !== "1.0.37") {
+          if (!object(metadata) || metadata.name !== nativeName || metadata.version !== "1.0.39") {
             throw new Error("Cursor native package version mismatch");
           }
           nativeDir = candidate; break;
@@ -56,8 +56,8 @@ export async function probeCursorNatives(): Promise<void> {
       apiKey: "", tools: ["mcp"], disallowedTools: ["task"], agents: {}, mcpServers: {},
       local: { cwd: owned, settingSources: [], enableAgentRetries: false },
     });
-    process.stdout.write(JSON.stringify({ protocolVersion: 1, cursorAdapterVersion: "cursor-sdk-1.0.37",
-      nativePackageVersion: "1.0.37", ripgrepReady: true, parserReady: true, workspaceReady: true,
+    process.stdout.write(JSON.stringify({ protocolVersion: 1, cursorAdapterVersion: "cursor-sdk-1.0.39",
+      nativePackageVersion: "1.0.39", ripgrepReady: true, parserReady: true, workspaceReady: true,
       modelTurns: 0 }) + "\n");
   } finally {
     await release?.();

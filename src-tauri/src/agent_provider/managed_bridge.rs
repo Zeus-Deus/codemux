@@ -648,12 +648,12 @@ impl Drop for ManagedBridgeSession {
 mod tests {
     use super::*;
     fn ack() -> Value {
-        json!({"protocolVersion":1,"provider":"cursor","adapterVersion":"cursor-sdk-1.0.37","sessionId":"fresh","tools":["workflow_result"],"isolation":{"nativeTools":[],"nativeFanout":false,"ambientConfig":false}})
+        json!({"protocolVersion":1,"provider":"cursor","adapterVersion":"cursor-sdk-1.0.39","sessionId":"fresh","tools":["workflow_result"],"isolation":{"nativeTools":[],"nativeFanout":false,"ambientConfig":false}})
     }
     #[test]
     fn managed_bridge_rejects_catalog_version_or_isolation_mismatch() {
         let names = vec!["workflow_result".to_string()];
-        assert!(validate_ready(ack(), ProviderKind::Cursor, "cursor-sdk-1.0.37", &names).is_ok());
+        assert!(validate_ready(ack(), ProviderKind::Cursor, "cursor-sdk-1.0.39", &names).is_ok());
         for (pointer, value) in [
             ("/protocolVersion", json!(2)),
             ("/provider", json!("codex")),
@@ -668,7 +668,7 @@ mod tests {
             let mut value_ack = ack();
             *value_ack.pointer_mut(pointer).unwrap() = value;
             assert!(
-                validate_ready(value_ack, ProviderKind::Cursor, "cursor-sdk-1.0.37", &names)
+                validate_ready(value_ack, ProviderKind::Cursor, "cursor-sdk-1.0.39", &names)
                     .is_err(),
                 "{pointer}"
             );

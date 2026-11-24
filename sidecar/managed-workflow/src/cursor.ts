@@ -3,7 +3,7 @@ import { isAbsolute, join } from "node:path";
 import type { AgentOptions, SDKAgent, Run, SDKCustomTool, SDKJsonValue, SdkAuthStatus } from "@cursor/sdk";
 import type { Host, Initialize, Json, Ready, Runtime } from "./contract";
 
-export const CURSOR_ADAPTER_VERSION = "cursor-sdk-1.0.37";
+export const CURSOR_ADAPTER_VERSION = "cursor-sdk-1.0.39";
 
 /** The injectable facade exercises the actual admission options without paid calls. */
 export interface CursorSdk {

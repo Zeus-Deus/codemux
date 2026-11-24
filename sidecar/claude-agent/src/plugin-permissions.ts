@@ -99,7 +99,7 @@ function cliRules(
   );
 }
 
-/** Runtime seam is deliberately checked: SDK 0.2.114 implements getSettings
+/** Runtime seam is deliberately checked: the pinned SDK implements getSettings
  * but omits it from Query's public type. The contract test pins that version. */
 export async function queryPermissionSettings(
   query: unknown,
