@@ -4,14 +4,17 @@ import { render, screen, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 const mockOpenExternalUrl = vi.fn().mockResolvedValue({ kind: "browser" });
+vi.mock("@tauri-apps/api/core", () => ({
+  convertFileSrc: (path: string) => `mock-asset:${path}`,
+}));
 vi.mock("@/lib/open-url", () => ({
   openExternalUrl: (...a: unknown[]) => mockOpenExternalUrl(...a),
 }));
 
 import { MarkdownRendered } from "./MarkdownRendered";
 
-const SHOT = "https://example.com/before-after.png";
-const DOC = `Here is the fix.\n\n![before and after](${SHOT})\n`;
+const SHOT = "mock-asset:/tmp/a/before-after.png";
+const DOC = "Here is the fix.\n\n![before and after](./before-after.png)\n";
 
 afterEach(() => {
   cleanup();
@@ -20,7 +23,7 @@ afterEach(() => {
 
 describe("embedded images in rendered markdown", () => {
   it("renders inline at a readable cap rather than at the file's own size", () => {
-    render(<MarkdownRendered content={DOC} inline />);
+    render(<MarkdownRendered content={DOC} filePath="/tmp/a/README.md" inline />);
 
     const img = screen.getByTestId("markdown-image");
     expect(img).toHaveAttribute("src", SHOT);
@@ -32,7 +35,7 @@ describe("embedded images in rendered markdown", () => {
 
   it("opens a lightbox on click and closes it again on Escape", async () => {
     const user = userEvent.setup();
-    render(<MarkdownRendered content={DOC} inline />);
+    render(<MarkdownRendered content={DOC} filePath="/tmp/a/README.md" inline />);
 
     expect(screen.queryByTestId("image-lightbox")).not.toBeInTheDocument();
 
@@ -48,7 +51,7 @@ describe("embedded images in rendered markdown", () => {
 
   it("closes on a backdrop click but not on a click of the image itself", async () => {
     const user = userEvent.setup();
-    render(<MarkdownRendered content={DOC} inline />);
+    render(<MarkdownRendered content={DOC} filePath="/tmp/a/README.md" inline />);
 
     await user.click(screen.getByTestId("markdown-image"));
     // Clicking the picture is looking closer, not leaving.
@@ -57,16 +60,6 @@ describe("embedded images in rendered markdown", () => {
 
     await user.click(screen.getByTestId("image-lightbox"));
     expect(screen.queryByTestId("image-lightbox")).not.toBeInTheDocument();
-  });
-
-  it("offers the original in the browser", async () => {
-    const user = userEvent.setup();
-    render(<MarkdownRendered content={DOC} inline />);
-
-    await user.click(screen.getByTestId("markdown-image"));
-    await user.click(screen.getByTestId("image-lightbox-open-external"));
-
-    expect(mockOpenExternalUrl).toHaveBeenCalledWith(SHOT);
   });
 
   it("has nothing to open in a browser for a local asset", async () => {

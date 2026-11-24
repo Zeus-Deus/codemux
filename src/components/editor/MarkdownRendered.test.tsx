@@ -1,19 +1,22 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 const mockOpenExternalUrl = vi.hoisted(() => vi.fn().mockResolvedValue("browser"));
+const mockOpenUrl = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (path: string) => `mock-asset:${path}`,
 }));
 vi.mock("@/lib/open-url", () => ({ openExternalUrl: mockOpenExternalUrl }));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: mockOpenUrl }));
 
 import { MarkdownRendered } from "./MarkdownRendered";
 
 afterEach(() => {
   cleanup();
   mockOpenExternalUrl.mockClear();
+  mockOpenUrl.mockClear();
 });
 
 describe("MarkdownRendered", () => {
@@ -71,23 +74,60 @@ describe("MarkdownRendered", () => {
   });
 
   it.each([
-    ["![](https://example.com/my%20diagram.png)", "/repo/guide.md", "https://example.com/my%20diagram.png"],
     ["![](./my%20diagram.png)", null, "./my%20diagram.png"],
     ["![](/my%20diagram.png)", null, "mock-asset:/my diagram.png"],
-  ])("resolves %s with base %s", (content, filePath, expected) => {
+  ])("resolves local %s with base %s", (content, filePath, expected) => {
     const { container } = render(<MarkdownRendered content={content} filePath={filePath} />);
     expect(container.querySelector("img")?.getAttribute("src")).toBe(expected);
   });
 
-  it("leaves remote URLs alone", () => {
-    const { container } = render(
+  it.each([
+    ["![Diagram](https://example.com/x.png)", "https://example.com/x.png"],
+    ['<img src="https://example.com/x.png" alt="Diagram">', "https://example.com/x.png"],
+    ["![Diagram](http://127.0.0.1:4141/status)", "http://127.0.0.1:4141/status"],
+    ["![Diagram](https%3A%2F%2Fevil.example%2Fpixel)", "https://evil.example/pixel"],
+    ['<img src="https%3A%2F%2Fevil.example%2Fpixel" alt="Diagram">', "https://evil.example/pixel"],
+    ["![Diagram](%2F%2Fevil.example%2Fpixel)", "//evil.example/pixel"],
+  ])("requires confirmation before opening a remote image from %s", (content, src) => {
+    const { container, getByRole } = render(
       <MarkdownRendered
-        content={`![](https://example.com/x.png)`}
+        content={content}
         filePath="/repo/docs/guide.md"
       />,
     );
-    const img = container.querySelector("img");
-    expect(img!.getAttribute("src")).toBe("https://example.com/x.png");
+    expect(container.querySelector("img, picture, source")).toBeNull();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+    fireEvent.click(getByRole("button", { name: /diagram/i }));
+    expect(screen.getByText(src)).toBeInTheDocument();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Open image" }));
+    expect(mockOpenUrl).toHaveBeenCalledExactlyOnceWith(src);
+  });
+
+  it("removes raw picture sources that would fetch remotely", () => {
+    const { container, getByRole } = render(
+      <MarkdownRendered
+        content={'<picture><source srcset="https://example.com/secret.png 2x"><img src="https://example.com/fallback.png" alt="Fallback"></picture>'}
+        filePath="/repo/README.md"
+      />,
+    );
+    expect(container.querySelector("img, picture, source, [srcset]")).toBeNull();
+    expect(getByRole("button", { name: /fallback/i })).toBeInTheDocument();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+  });
+
+  it("does not follow a wrapping link when an image asks for confirmation", () => {
+    const { container, getByRole } = render(
+      <MarkdownRendered
+        content="[![Diagram](https://example.com/x.png)](https://example.com/page)"
+        filePath="/repo/README.md"
+      />,
+    );
+    expect(container.querySelector("img")).toBeNull();
+    fireEvent.click(getByRole("button", { name: /diagram/i }));
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+    expect(screen.getByText("https://example.com/x.png")).toBeInTheDocument();
   });
 
   it("leaves data URIs alone", () => {
@@ -99,6 +139,16 @@ describe("MarkdownRendered", () => {
     );
     const img = container.querySelector("img");
     expect(img!.getAttribute("src")).toBe("data:image/png;base64,AAA");
+  });
+
+  it.each([
+    "blob:https://example.com/0b4b6d96-4752-4e9b-b258-7bc7f989693b",
+    "asset://localhost/tmp/screenshot.png",
+    "tauri://localhost/tmp/screenshot.png",
+  ])("preserves a local preview source: %s", (src) => {
+    const { container } = render(<MarkdownRendered content={`![Local](${src})`} />);
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(src);
+    expect(mockOpenUrl).not.toHaveBeenCalled();
   });
 
   it("renders relative paths verbatim when no filePath is supplied", () => {
