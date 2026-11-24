@@ -2,13 +2,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 
+const mockOpenExternalUrl = vi.hoisted(() => vi.fn().mockResolvedValue("browser"));
+
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (path: string) => `mock-asset:${path}`,
 }));
+vi.mock("@/lib/open-url", () => ({ openExternalUrl: mockOpenExternalUrl }));
 
 import { MarkdownRendered } from "./MarkdownRendered";
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  mockOpenExternalUrl.mockClear();
+});
 
 describe("MarkdownRendered", () => {
   it("rewrites relative image paths against the markdown file's dir", () => {
@@ -319,6 +325,52 @@ describe("MarkdownRendered", () => {
     for (const label of ["Relative", "App", "Asset"]) {
       expect(getByText(label)).not.toHaveAttribute("href");
     }
+  });
+
+  it.each([
+    "[relative](./notes.md)",
+    "[absolute](/tmp/notes.md)",
+    "[protocol-relative](//example.com/notes)",
+    "[mail](mailto:reader@example.com)",
+    "[opaque HTTP](http:example.com)",
+    '<a href="./notes.md" target="_blank">raw relative</a>',
+  ])("keeps a local document link from navigating the webview: %s", (content) => {
+    const { container } = render(<MarkdownRendered content={content} filePath="/repo/README.md" />);
+    const link = container.querySelector("a");
+    expect(link).not.toBeNull();
+    expect(link).not.toHaveAttribute("href");
+    expect(link).not.toHaveAttribute("target");
+    expect(fireEvent.click(link!)).toBe(false);
+    expect(fireEvent(link!, new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }))).toBe(false);
+    expect(mockOpenExternalUrl).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("keeps app and asset URLs inert with untrusted=%s", (untrusted) => {
+    const { getByText } = render(
+      <MarkdownRendered
+        untrusted={untrusted}
+        content={[
+          `[App](${window.location.origin}/settings)`,
+          "[Asset](http://asset.localhost/pictures/sample.png)",
+          "[Tauri](http://tauri.localhost/pictures/sample.png)",
+        ].join("\n\n")}
+      />,
+    );
+    for (const label of ["App", "Asset", "Tauri"]) {
+      expect(getByText(label)).not.toHaveAttribute("href");
+    }
+  });
+
+  it.each([false, true])("opens an absolute external URL deliberately with untrusted=%s", (untrusted) => {
+    const href = "https://example.com/notes";
+    const { getByText } = render(<MarkdownRendered content={`[web](${href})`} untrusted={untrusted} />);
+    const link = getByText("web");
+    expect(link).toHaveAttribute("href", href);
+    expect(fireEvent.click(link)).toBe(false);
+    expect(fireEvent(link, new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }))).toBe(false);
+    expect(mockOpenExternalUrl).toHaveBeenCalledTimes(2);
+    expect(mockOpenExternalUrl).toHaveBeenNthCalledWith(1, href, expect.objectContaining({ event: expect.any(Object) }));
+    expect(mockOpenExternalUrl).toHaveBeenNthCalledWith(2, href, expect.objectContaining({ event: expect.any(Object) }));
   });
 
   it.each([
