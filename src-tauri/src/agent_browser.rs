@@ -423,22 +423,104 @@ fn kill_process_on_port(port: u16) {
 /// log/PID-file integration" rather than fail the whole flow.
 pub fn run_dir() -> Option<PathBuf> {
     let dir = dirs::home_dir()?.join(".codemux").join("run");
-    if std::fs::create_dir_all(&dir).is_err() {
+    prepare_run_dir(&dir)?;
+    Some(dir)
+}
+
+fn prepare_run_dir(dir: &std::path::Path) -> Option<()> {
+    prepare_browser_directory(dir.parent()?, false)?;
+    prepare_browser_directory(dir, true)
+}
+
+fn prepare_browser_directory(dir: &std::path::Path, private: bool) -> Option<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    let meta = std::fs::symlink_metadata(dir).ok()?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
         return None;
     }
-    Some(dir)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return None;
+        }
+        if !private && meta.permissions().mode() & 0o022 != 0 {
+            return None;
+        }
+        if private && meta.permissions().mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Junctions are reparse points, even when FileType::is_symlink()
+        // does not recognize them as symbolic links.
+        if meta.file_attributes() & 0x400 != 0 {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    Some(())
+}
+
+fn open_session_log(path: &std::path::Path) -> Option<std::fs::File> {
+    #[cfg(windows)]
+    {
+        // Existing logs may predate private-file creation. Only append when
+        // their ACL still grants access solely to this account.
+        return match clack_private_fs::create_new_file(path) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                clack_private_fs::require_private_file(path).ok()?;
+                std::fs::OpenOptions::new().append(true).open(path).ok()
+            }
+            Err(_) => None,
+        };
+    }
+
+    #[cfg(not(windows))]
+    {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600)).ok()?;
+    }
+    Some(file)
+    }
 }
 
 /// Path to the per-session PID file written by codemux when it spawns
 /// the agent-browser daemon. Used by `close()` for targeted PID-based
 /// teardown and by `new_with_adoption()` for safe restart adoption.
 pub fn session_pid_path(session_name: &str) -> Option<PathBuf> {
+    validate_session_name(session_name).ok()?;
     Some(run_dir()?.join(format!("agent-browser-{session_name}.pid")))
 }
 
 /// Path to the per-session stderr log file. Captured during daemon
 /// spawn so the next investigation has a paper trail.
 fn session_log_path(session_name: &str) -> Option<PathBuf> {
+    validate_session_name(session_name).ok()?;
     Some(run_dir()?.join(format!("agent-browser-{session_name}.log")))
 }
 
@@ -448,10 +530,22 @@ fn session_log_path(session_name: &str) -> Option<PathBuf> {
 /// real daemon PID since the CLI command we run is just a thin wrapper
 /// that forks the daemon and exits.
 fn read_agent_browser_daemon_pid(session_name: &str) -> Option<u32> {
+    validate_session_name(session_name).ok()?;
     let home = dirs::home_dir()?;
     let path = home
         .join(".agent-browser")
         .join(format!("{session_name}.pid"));
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return None;
+        }
+    }
     let content = std::fs::read_to_string(path).ok()?;
     content.trim().parse::<u32>().ok()
 }
@@ -461,10 +555,34 @@ fn read_agent_browser_daemon_pid(session_name: &str) -> Option<u32> {
 /// because an agent-browser session can still function without the PID
 /// file (we just lose the safe-adoption path on next restart).
 fn write_session_pid(session_name: &str, pid: u32) {
+    use std::io::Write;
+
     let Some(path) = session_pid_path(session_name) else {
         return;
     };
-    if let Err(error) = std::fs::write(&path, pid.to_string()) {
+    #[cfg(windows)]
+    let result = (|| -> std::io::Result<()> {
+        let mut file = match clack_private_fs::create_new_file(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                clack_private_fs::require_private_file(&path)?;
+                std::fs::OpenOptions::new().write(true).truncate(true).open(&path)?
+            }
+            Err(error) => return Err(error),
+        };
+        file.write_all(pid.to_string().as_bytes())?;
+        file.sync_all()
+    })();
+    #[cfg(not(windows))]
+    let result = (|| -> std::io::Result<()> {
+        let parent = path.parent().ok_or_else(|| std::io::Error::other("PID path has no parent"))?;
+        let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+        staged.write_all(pid.to_string().as_bytes())?;
+        staged.as_file().sync_all()?;
+        staged.persist(&path).map_err(|error| error.error)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
         eprintln!(
             "[codemux::browser] failed to write PID file {}: {error}",
             path.display()
@@ -649,9 +767,34 @@ fn session_name(browser_id: &str) -> &str {
     if browser_id.is_empty() { "default" } else { browser_id }
 }
 
+fn validate_session_name(name: &str) -> Result<(), String> {
+    // The name also becomes a PID/log filename. Keep it to one segment even
+    // though Unix command arguments are quoted separately below.
+    if name.is_empty()
+        || name.len() > 64
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\', '\0'])
+        || name.chars().any(char::is_control)
+    {
+        return Err("Invalid browser session name".into());
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "windows"))]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn shell_binary(binary: &str) -> String {
+    // The fallback is two fixed argv words; every resolved path is one word.
+    if binary == "npx agent-browser" {
+        binary.to_string()
+    } else {
+        shell_quote(binary)
+    }
 }
 
 /// JavaScript that queries the DOM for all interactive elements.
@@ -876,21 +1019,16 @@ fn resolve_binary() -> String {
 
 /// Split `resolve_binary()`'s return value into `(program, prefix_args)` so it
 /// can drive `Command::new(...).args(...)` directly on Windows. The function
-/// either returns a single binary path (most installs / dev) or the literal
-/// `"npx agent-browser"` fallback (no bundled sidecar AND no node_modules).
+/// either returns a single binary path (most installs / dev) or a path to npx
+/// followed by the fixed `agent-browser` argument.
 /// In the npx case we want the spawn to be `npx -> agent-browser <action> ...`,
 /// not `Command::new("npx agent-browser")` which Windows treats as a single
 /// (nonexistent) executable name.
 #[cfg(target_os = "windows")]
 fn split_resolved_binary(bin: &str) -> (String, Vec<String>) {
     let trimmed = bin.trim();
-    if let Some(idx) = trimmed.find(' ') {
-        let (program, rest) = trimmed.split_at(idx);
-        let prefix = rest
-            .split_whitespace()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
-        (program.to_string(), prefix)
+    if let Some(program) = trimmed.strip_suffix(" agent-browser") {
+        (program.to_string(), vec!["agent-browser".to_string()])
     } else {
         (trimmed.to_string(), Vec::new())
     }
@@ -1227,7 +1365,8 @@ fn run_agent_browser_native(
 
 #[cfg(not(target_os = "windows"))]
 fn build_agent_browser_command(session: &str, action: &str, params: &serde_json::Value) -> Result<String, String> {
-    let bin = resolve_binary();
+    let bin = shell_binary(&resolve_binary());
+    let session = shell_quote(session);
     let command = match action {
         "open_url" | "open" => {
             let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
@@ -1345,6 +1484,7 @@ fn truncate_on_boundary(s: &str, max_bytes: usize) -> &str {
 
 fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value, stream_port: u16) -> Result<BrowserAutomationResult, String> {
     let session = session_name(browser_id);
+    validate_session_name(session)?;
 
     #[cfg(target_os = "windows")]
     let (stdout, stderr, status_success) = {
@@ -1550,6 +1690,15 @@ impl AgentBrowserManager {
         let mut saw_any = false;
         for entry in entries.flatten() {
             let path = entry.path();
+            // A PID file must be one of our regular files. Ignore links even
+            // when an older or compromised runtime directory contains them.
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            #[cfg(windows)]
+            if clack_private_fs::require_private_file(&path).is_err() {
+                continue;
+            }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
@@ -1559,6 +1708,9 @@ impl AgentBrowserManager {
             else {
                 continue;
             };
+            if validate_session_name(session_name).is_err() {
+                continue;
+            }
             saw_any = true;
             let Some(pid) = std::fs::read_to_string(&path)
                 .ok()
@@ -1613,6 +1765,7 @@ impl AgentBrowserManager {
     ///      can race against the daemon's still-flushing socket on
     ///      TIME_WAIT, so we prefer giving the OS a moment by advancing.
     pub async fn allocate_port(&self, session_key: &str) -> Result<u16, String> {
+        validate_session_name(session_name(session_key))?;
         let mut sessions = self.sessions.lock().await;
         if let Some(s) = sessions.get(session_key) {
             return Ok(s.port);
@@ -1723,7 +1876,7 @@ impl AgentBrowserManager {
                 let mut cmd = std::process::Command::new("sh");
                 cmd.args([
                     "-c",
-                    &format!("{} open about:blank --headless --session {}", bin, session),
+                    &format!("{} open about:blank --headless --session {}", shell_binary(&bin), shell_quote(&session)),
                 ])
                 .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
                 .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
@@ -1859,7 +2012,7 @@ impl AgentBrowserManager {
             #[cfg(not(target_os = "windows"))]
             let output = {
                 let mut cmd = std::process::Command::new("sh");
-                cmd.args(["-c", &format!("{} screenshot --session {}", bin, session)])
+                cmd.args(["-c", &format!("{} screenshot --session {}", shell_binary(&bin), shell_quote(&session))])
                     .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
                     .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
                     .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
@@ -1919,6 +2072,7 @@ impl AgentBrowserManager {
     /// callers should not be blocked from retrying or moving on.
     pub async fn close(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id).to_string();
+        validate_session_name(&session)?;
 
         // Step 1: pop the session under the lock so nothing else races us.
         let removed = self.sessions.lock().await.remove(browser_id);
@@ -1974,7 +2128,7 @@ impl AgentBrowserManager {
             let mut cmd = std::process::Command::new("sh");
             cmd.args([
                 "-c",
-                &format!("{} close --session {} 2>/dev/null", bin, session),
+                &format!("{} close --session {} 2>/dev/null", shell_binary(&bin), shell_quote(session)),
             ]);
             let _ = output_capture_with_timeout(cmd, CLOSE_TIMEOUT);
         }
@@ -2022,6 +2176,7 @@ impl AgentBrowserManager {
     ///   6. Return the WebSocket URL.
     pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id).to_string();
+        validate_session_name(&session)?;
 
         // Serialize start_stream calls. The old code held a single Mutex<bool>
         // across the entire operation (including sleeps). Without this, concurrent
@@ -2083,7 +2238,7 @@ impl AgentBrowserManager {
                     let mut cmd = std::process::Command::new("sh");
                     cmd.args([
                         "-c",
-                        &format!("{} close --session {} 2>/dev/null", bin, session_for_close),
+                        &format!("{} close --session {} 2>/dev/null", shell_binary(&bin), shell_quote(&session_for_close)),
                     ]);
                     let _ = output_capture_with_timeout(cmd, CLOSE_TIMEOUT);
                 }
@@ -2118,13 +2273,7 @@ impl AgentBrowserManager {
             // Best-effort — if we can't open the log file we fall back to the
             // inherited stderr so behavior matches the pre-fix baseline.
             let log_path = session_log_path(&session);
-            let log_file = log_path.as_ref().and_then(|p| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(p)
-                    .ok()
-            });
+            let log_file = log_path.as_deref().and_then(open_session_log);
 
             #[cfg(target_os = "windows")]
             {
@@ -2172,7 +2321,7 @@ impl AgentBrowserManager {
             {
                 let launch_cmd = format!(
                     "{} open about:blank --headless --session {}",
-                    bin, session
+                    shell_binary(&bin), shell_quote(&session)
                 );
                 let mut cmd = std::process::Command::new("sh");
                 cmd.args(["-c", &launch_cmd])
@@ -2486,11 +2635,38 @@ mod tests {
     fn build_command_open_uses_navigation_load_wait_only() {
         let cmd = build_agent_browser_command("test-session", "open", &serde_json::json!({"url": "https://example.com"})).unwrap();
         let bin = resolve_binary();
-        assert!(cmd.starts_with(&bin), "Command should start with resolved binary: {}", cmd);
-        assert!(cmd.contains("--session test-session"));
+        assert!(cmd.starts_with(&shell_binary(&bin)), "Command should start with resolved binary: {}", cmd);
+        assert!(cmd.contains("--session 'test-session'"));
         assert!(cmd.contains("https://example.com"));
         assert!(!cmd.contains("wait --load"), "open already waits for load: {}", cmd);
         assert!(!cmd.contains("stream disable"), "Should NOT restart stream: {}", cmd);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn browser_command_treats_session_metacharacters_as_one_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("injected");
+        let session = format!("browser; touch {} #", marker.display());
+        let cmd = build_agent_browser_command(&session, "screenshot", &serde_json::json!({})).unwrap();
+        let session_arg = cmd.split_once("--session ").unwrap().1;
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -- {session_arg}; printf '%s' \"$1\""))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), session);
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn browser_session_names_cannot_escape_runtime_directory() {
+        let manager = AgentBrowserManager::new();
+        assert!(manager.allocate_port("../outside").await.is_err());
+        assert!(manager.close("../outside").await.is_err());
+        assert!(manager.start_stream("../outside").await.is_err());
+        assert!(session_pid_path("../outside").is_none());
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -2708,9 +2884,13 @@ mod tests {
     #[test]
     fn split_resolved_binary_handles_plain_path() {
         let (program, prefix) =
-            split_resolved_binary(r"C:\Users\u\node_modules\agent-browser\bin\agent-browser-win32-x64.exe");
-        assert!(program.ends_with("agent-browser-win32-x64.exe"));
+            split_resolved_binary(r"C:\Users\Some User\node_modules\agent-browser\bin\agent-browser-win32-x64.exe");
+        assert_eq!(program, r"C:\Users\Some User\node_modules\agent-browser\bin\agent-browser-win32-x64.exe");
         assert!(prefix.is_empty());
+
+        let (program, prefix) = split_resolved_binary(r"C:\Program Files\nodejs\npx.cmd agent-browser");
+        assert_eq!(program, r"C:\Program Files\nodejs\npx.cmd");
+        assert_eq!(prefix, vec!["agent-browser".to_string()]);
     }
 
     #[tokio::test]
@@ -3079,6 +3259,46 @@ Active Connections
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_directory_and_browser_logs_are_owner_only() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let run = temp.path().join(".codemux/run");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_run_dir(&run).unwrap();
+        assert_eq!(std::fs::metadata(&run).unwrap().permissions().mode() & 0o777, 0o700);
+
+        let app_dir = run.parent().unwrap();
+        std::fs::set_permissions(app_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(prepare_run_dir(&run).is_none());
+        std::fs::set_permissions(app_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let log = run.join("browser.log");
+        std::fs::write(&log, b"existing log").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_session_log(&log).unwrap();
+        assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let target = temp.path().join("outside.log");
+        std::fs::write(&target, b"keep").unwrap();
+        symlink(&target, run.join("linked.log")).unwrap();
+        assert!(open_session_log(&run.join("linked.log")).is_none());
+        assert_eq!(std::fs::read(target).unwrap(), b"keep");
+
+        let outside = temp.path().join("outside-dir");
+        std::fs::create_dir(&outside).unwrap();
+        let linked_run = temp.path().join("linked-run");
+        symlink(outside, &linked_run).unwrap();
+        assert!(prepare_run_dir(&linked_run).is_none());
+
+        let linked_app = temp.path().join("linked-app");
+        symlink(temp.path().join(".codemux"), &linked_app).unwrap();
+        assert!(prepare_run_dir(&linked_app.join("run")).is_none());
+    }
+
     /// Round-trip a PID through `write_session_pid` + the read helper.
     /// Confirms the on-disk format matches what
     /// `read_agent_browser_daemon_pid` expects so the runtime
@@ -3098,6 +3318,21 @@ Active Connections
             !path.exists(),
             "clear_session_pid must remove the file we wrote"
         );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("outside.pid");
+            std::fs::write(&target, b"keep").unwrap();
+            symlink(&target, &path).unwrap();
+            write_session_pid(&name, 54321);
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "54321");
+            assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            clear_session_pid(&name);
+        }
     }
 
     // ── Periodic orphan sweep helper (issue #126) ─────────────────────
