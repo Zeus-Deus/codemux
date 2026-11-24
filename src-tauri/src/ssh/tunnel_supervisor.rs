@@ -443,11 +443,19 @@ fn circuit_open(failures: &[Instant]) -> bool {
 mod tests {
     use super::*;
 
+    fn private_test_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
     #[tokio::test]
     async fn startup_timeout_reconnects_and_reaps_ssh() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let fake_ssh = dir.path().join("ssh");
         std::fs::write(
             &fake_ssh,
@@ -522,7 +530,7 @@ mod tests {
     async fn shutdown_kills_ssh_that_is_still_connecting() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let fake_ssh = dir.path().join("ssh");
         std::fs::write(
             &fake_ssh,
@@ -581,7 +589,7 @@ mod tests {
     async fn stale_local_socket_is_not_reported_as_connected() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         // An ssh that never binds the forward (e.g. stuck authenticating).
         let fake_ssh = dir.path().join("ssh");
         std::fs::write(&fake_ssh, "#!/bin/sh\nexec /bin/sleep 300\n").unwrap();
