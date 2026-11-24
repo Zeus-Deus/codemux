@@ -429,41 +429,33 @@ pub async fn search_file_names(
     }
 
     let limit = max_results.unwrap_or(50);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
 
     tokio::task::spawn_blocking(move || {
-        let base = Path::new(&path);
-
-        // Try fd first
-        if let Ok(results) = search_with_fd(&path, &query, limit) {
-            // Convert to relative paths
-            return Ok(results
-                .into_iter()
-                .map(|p| {
-                    Path::new(&p)
-                        .strip_prefix(base)
-                        .map(|r| r.to_string_lossy().to_string())
-                        .unwrap_or(p)
-                })
-                .collect());
-        }
-
-        // Fall back to find
-        search_with_find(&path, &query, limit, base)
+        // An absolute root is always a path argument to find, even when
+        // the caller supplied a name starting with a dash.
+        let base = std::path::absolute(&path)
+            .map_err(|error| format!("Invalid file search path: {error}"))?;
+        search_with_fd(&base, &query, limit).or_else(|_| search_with_find(&base, &query, limit))
     })
     .await
     .map_err(|e| format!("search_file_names task join failed: {e}"))?
 }
 
-fn search_with_fd(path: &str, query: &str, limit: u32) -> Result<Vec<String>, String> {
+fn search_with_fd(path: &Path, query: &str, limit: u32) -> Result<Vec<String>, String> {
     let output = Command::new("fd")
         .args([
             "--type",
             "f",
             "--max-results",
             &limit.to_string(),
+            "--print0",
+            "--",
             query,
-            path,
         ])
+        .arg(path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
@@ -473,12 +465,7 @@ fn search_with_fd(path: &str, query: &str, limit: u32) -> Result<Vec<String>, St
         return Err("fd returned no results".to_string());
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
-        .collect())
+    Ok(relative_filename_matches(path, &output.stdout, limit))
 }
 
 // `async fn` so the `which` + `xdg-open` subprocesses run on the blocking
@@ -509,15 +496,10 @@ pub async fn reveal_in_file_manager(path: String) -> Result<(), String> {
     .map_err(|e| format!("reveal_in_file_manager task join failed: {e}"))?
 }
 
-fn search_with_find(
-    path: &str,
-    query: &str,
-    limit: u32,
-    base: &Path,
-) -> Result<Vec<String>, String> {
+fn search_with_find(path: &Path, query: &str, limit: u32) -> Result<Vec<String>, String> {
     let output = Command::new("find")
+        .arg(path)
         .args([
-            path,
             "-type",
             "f",
             "-iname",
@@ -537,24 +519,30 @@ fn search_with_find(
             "-not",
             "-path",
             "*/__pycache__/*",
+            "-print0",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("find failed: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
-        .lines()
-        .filter(|l| !l.is_empty())
+    Ok(relative_filename_matches(path, &output.stdout, limit))
+}
+
+fn relative_filename_matches(base: &Path, output: &[u8], limit: u32) -> Vec<String> {
+    let stdout = String::from_utf8_lossy(output);
+    stdout
+        .split('\0')
+        .filter(|name| !name.is_empty())
         .take(limit as usize)
-        .map(|p| {
-            Path::new(p)
-                .strip_prefix(base)
-                .map(|r| r.to_string_lossy().to_string())
-                .unwrap_or_else(|_| p.to_string())
+        .map(|name| {
+            let path = Path::new(name);
+            path.strip_prefix(base)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned()
         })
-        .collect())
+        .collect()
 }
 
 // Existence probe for chat file links. Agents sometimes emit a bare
@@ -1878,6 +1866,23 @@ mod tests {
             .await
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_file_names_keeps_leading_dash_and_newline_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let filename = "--release\nnotes.txt";
+        std::fs::write(dir.path().join(filename), "notes").unwrap();
+
+        let found = super::search_file_names(path_str(dir.path()), "--release".into(), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(found, [filename]);
+        assert_eq!(
+            super::search_with_find(dir.path(), "--release", 1).unwrap(),
+            [filename]
+        );
     }
 
     #[tokio::test]

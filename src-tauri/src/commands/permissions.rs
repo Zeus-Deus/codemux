@@ -36,14 +36,11 @@ pub async fn list_tool_permissions(
     }
 
     if let Some(root) = project_root.as_ref() {
-        let project_settings = Path::new(root).join(".claude").join("settings.json");
-        if project_settings.exists() {
-            rules.extend(parse_settings_file(&project_settings, "project")?);
-        }
-
-        let local_settings = Path::new(root).join(".claude").join("settings.local.json");
-        if local_settings.exists() {
-            rules.extend(parse_settings_file(&local_settings, "local")?);
+        for scope in ["project", "local"] {
+            let path = path_for_scope(scope, Some(root))?;
+            if let Some(settings) = contained_project_settings(Path::new(root), &path)? {
+                rules.extend(parse_settings_file(&settings, scope)?);
+            }
         }
     }
 
@@ -54,15 +51,19 @@ pub async fn list_tool_permissions(
 ///
 /// The `scope` field on the input determines which file we touch; the
 /// `tool_name` + `rule_content` pair must match an entry in the matching
-/// `permissions.<behavior>` array. Last-write-wins — if the user's
-/// Claude CLI is editing the same file at the same instant, one of the
-/// two writes will land last. For MVP we accept that and document it.
+/// `permissions.<behavior>` array. If the settings changed while preparing
+/// the edit, the UI can reload the latest rules before retrying.
 #[tauri::command]
 pub async fn remove_tool_permission(
     rule: PermissionRule,
     project_root: Option<String>,
 ) -> Result<(), String> {
     let path = path_for_scope(&rule.scope, project_root.as_deref())?;
+    let path = match (rule.scope.as_str(), project_root.as_deref()) {
+        ("project" | "local", Some(root)) => contained_project_settings(Path::new(root), &path)?
+            .ok_or_else(|| format!("Settings file {} no longer exists", path.display()))?,
+        _ => path,
+    };
 
     let content = tokio::fs::read_to_string(&path)
         .await
@@ -101,41 +102,38 @@ pub async fn remove_tool_permission(
 
     let new_content = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("Failed to serialize settings: {e}"))?;
-    atomic_write(&path, new_content.as_bytes())
+    atomic_write(&path, content.as_bytes(), new_content.as_bytes())
         .await
         .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
 
     Ok(())
 }
 
-/// Write `content` to `path` via a sibling tempfile + atomic rename.
-///
-/// Standard pattern: write to `<path>.tmp` then rename onto the target.
-/// `rename` is atomic on POSIX when both paths live on the same
-/// filesystem (we ensure this by placing the tempfile next to the
-/// target). On Windows, `rename` over an existing file is not always
-/// atomic — accept that for now since Codemux's primary platforms are
-/// Linux/macOS.
-///
-/// This blocks partial-write corruption (writer crashes mid-write) and
-/// truncate-on-empty races (`tokio::fs::write` truncates first, then
-/// writes — a crash leaves the file empty). It does **not** prevent
-/// the lost-update race against the Claude CLI editing the same file
-/// concurrently — that needs an OS-level lock (`flock`/`LockFileEx`),
-/// which is intentionally deferred per Stage 7's risk budget.
-async fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let tmp_path = path.with_extension("json.tmp");
-    // Best-effort cleanup: if a previous run crashed and left a stale
-    // `.tmp`, we'd hit "file exists" depending on the FS. Truncating
-    // via `write` keeps the path simple.
-    tokio::fs::write(&tmp_path, content).await?;
-    if let Err(rename_err) = tokio::fs::rename(&tmp_path, path).await {
-        // Best-effort cleanup of the tempfile; the original file is
-        // intact since rename failed.
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(rename_err);
+async fn atomic_write(path: &Path, original: &[u8], content: &[u8]) -> std::io::Result<()> {
+    let (path, original, content) = (path.to_path_buf(), original.to_vec(), content.to_vec());
+    tokio::task::spawn_blocking(move || {
+        crate::config_file::replace_if_unchanged(&path, Some(&original), &content)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+fn contained_project_settings(root: &Path, path: &Path) -> Result<Option<PathBuf>, String> {
+    let resolved = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Failed to resolve {}: {error}", path.display())),
+    };
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve project root: {error}"))?;
+    if !resolved.starts_with(&root) || !resolved.is_file() {
+        return Err(format!(
+            "{} must resolve to a file inside the project",
+            path.display()
+        ));
     }
-    Ok(())
+    Ok(Some(resolved))
 }
 
 fn path_for_scope(scope: &str, project_root: Option<&str>) -> Result<PathBuf, String> {
@@ -423,7 +421,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("settings.json");
         fs::write(&path, b"old").unwrap();
-        atomic_write(&path, b"new").await.unwrap();
+        atomic_write(&path, b"old", b"new").await.unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
 
         // No `.tmp` sidecar in the directory after success.
@@ -433,6 +431,34 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(entries, vec!["settings.json".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn atomic_write_preserves_an_existing_sibling_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        let sibling = path.with_extension("json.tmp");
+        fs::write(&path, b"old").unwrap();
+        fs::write(&sibling, b"unrelated").unwrap();
+
+        atomic_write(&path, b"old", b"new").await.unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(fs::read(&sibling).unwrap(), b"unrelated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_settings_must_stay_in_the_project() {
+        let project = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let settings = write_settings(other.path(), "settings.json", "{}");
+        let linked_dir = project.path().join(".claude");
+        std::os::unix::fs::symlink(settings.parent().unwrap(), &linked_dir).unwrap();
+
+        assert!(
+            contained_project_settings(project.path(), &linked_dir.join("settings.json")).is_err()
+        );
     }
 
     #[tokio::test]
@@ -447,7 +473,7 @@ mod tests {
         let path = tmp.path().join("settings.json");
         fs::write(&path, b"original").unwrap();
 
-        atomic_write(&path, b"replacement").await.unwrap();
+        atomic_write(&path, b"original", b"replacement").await.unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
     }
