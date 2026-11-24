@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
 import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
@@ -85,7 +85,7 @@ import { useAppStore } from "@/stores/app-store";
 import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
 
 type SpyActions = {
-  [K in keyof MaterializeActions]: ReturnType<typeof vi.fn>;
+  [K in keyof MaterializeActions]: Mock<NonNullable<MaterializeActions[K]>>;
 };
 
 function makeActions(): SpyActions {

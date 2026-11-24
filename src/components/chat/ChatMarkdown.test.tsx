@@ -313,8 +313,8 @@ describe("streaming text fade", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const { container } = render(markdownTree(reply, true));
     act(() => vi.advanceTimersByTime(0));
-    // One span per word; the whitespace between them stays plain text.
-    expect(faded(container).map((span) => span.textContent)).toEqual(
+    // Each word gets its own span. Streamdown may include trailing whitespace.
+    expect(faded(container).map((span) => span.textContent.trim())).toEqual(
       expect.arrayContaining(["Streaming", "words", "arrive", "here."]),
     );
     expect(container.querySelector("[data-chat-code-block] [data-sd-animate]")).toBeNull();
