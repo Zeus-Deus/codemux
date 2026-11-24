@@ -267,6 +267,11 @@ export async function connectOverIroh(args: ConnectArgs): Promise<void> {
             }
             args.handlers.onPending();
           },
+          onBrowserRejected: (reason) => {
+            finish(new Error(reason === "session_revoked"
+              ? `Remote Access on ${args.device.name} revoked this browser.`
+              : "Refresh this tab to update Codemux, then try again."));
+          },
           onMintError: (err: DeviceRegistryError) => {
             if (!settled && (
               err.kind === "offline" ||

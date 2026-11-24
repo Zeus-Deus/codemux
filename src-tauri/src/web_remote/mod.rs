@@ -1775,7 +1775,7 @@ pub fn web_remote_reject_session<R: Runtime>(
 ) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
     app.state::<crate::database::DatabaseStore>()
-        .web_remote_delete_session(&session_id)?;
+        .web_remote_reject_session(&session_id)?;
     shared.connections.close_session(&session_id);
     emit_state_changed(&app);
     Ok(build_status(&app, &shared))

@@ -328,12 +328,11 @@ fn reject_frame_bytes(reject: &HandshakeReject) -> Vec<u8> {
 // over the LAN via `/api/pair` or `/api/pair-account`). The **account** (relay)
 // handshake is the from-anywhere path: the browser has no pre-existing device
 // session — it holds a short-lived **connection grant** the control plane signed
-// after verifying it owns this account and this device. The grant IS the
-// credential; the desktop verifies it out-of-band and, on success, mints a fresh
-// `web_remote_sessions` row so everything downstream (`/ws` frames, revocation)
-// is identical to a paired session.
+// after verifying it owns this account and this device. The browser also
+// presents a stable, per-host credential over QUIC so approval and revocation
+// apply to that browser, rather than all browsers signed into the account.
 //
-//   C→S  kind 0  {"t":"hello-account","grant":"<grant>","nonce":"<browserNonce>"}
+//   C→S  kind 0  {"t":"hello-account","grant":"<grant>","nonce":"<browserNonce>","browser_key":"<key>"}
 //   S→C  kind 0  {"t":"welcome","session_id":"<id>"}         (on accept)
 //   S→C  kind 0  {"t":"unauthorized","reason":"<code>"}      (on reject)
 
@@ -344,6 +343,7 @@ struct AccountHello {
     /// the same value is embedded in the grant, so a valid grant echoes it back
     /// through the verify endpoint and the two must agree.
     nonce: String,
+    browser_key: String,
 }
 
 /// Why an account (grant) handshake was refused. Maps to the
@@ -364,6 +364,10 @@ pub enum AccountHandshakeReject {
     /// The grant verified but its bound nonce disagrees with the one the browser
     /// presented in the frame — a replay / grant-substitution signal.
     NonceMismatch,
+    /// The browser needs a client that can present its own identity.
+    BrowserKeyRequired,
+    /// This browser's previously paired session was revoked.
+    Revoked,
     /// The verified session is still pending desktop approval.
     Pending,
     /// Minting the session row failed.
@@ -378,6 +382,8 @@ impl AccountHandshakeReject {
             AccountHandshakeReject::WrongNode => "wrong_device",
             AccountHandshakeReject::WrongAccount => "account_mismatch",
             AccountHandshakeReject::NonceMismatch => "nonce_mismatch",
+            AccountHandshakeReject::BrowserKeyRequired => "client_update_required",
+            AccountHandshakeReject::Revoked => "session_revoked",
             AccountHandshakeReject::Pending => "pending_approval",
             AccountHandshakeReject::Internal(_) => "internal_error",
         }
@@ -406,8 +412,8 @@ fn is_account_handshake(frame: &Frame) -> bool {
         == Some("hello-account")
 }
 
-/// Parse a `hello-account` first frame into its grant + nonce. `None` if the
-/// frame is malformed or the grant is empty.
+/// Parse a `hello-account` first frame. `None` if the frame is malformed or
+/// the grant is empty.
 fn parse_account_hello(frame: &Frame) -> Option<AccountHello> {
     if frame.kind != KIND_TEXT {
         return None;
@@ -425,7 +431,12 @@ fn parse_account_hello(frame: &Frame) -> Option<AccountHello> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    Some(AccountHello { grant, nonce })
+    let browser_key = value
+        .get("browser_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some(AccountHello { grant, nonce, browser_key })
 }
 
 /// The `POST /api/devices/grant/verify` response shape. The endpoint returns
@@ -499,15 +510,9 @@ fn evaluate_grant(
         Some(own) if !own.is_empty() && own == uid => {}
         _ => return Err(AccountHandshakeReject::WrongAccount),
     }
-    // Nonce binding: a valid grant carries the browser's per-dial nonce, so the
-    // verify response echoes it. It must equal what the browser presented in the
-    // frame — a mismatch means a grant minted for a different dial was replayed.
-    // Only enforced when the response actually echoes a nonce (never rejects a
-    // legitimate connection, which by construction always matches).
-    if let Some(bound) = resp.nonce.as_deref() {
-        if !bound.is_empty() && bound != presented_nonce {
-            return Err(AccountHandshakeReject::NonceMismatch);
-        }
+    // A verified grant must be bound to the dial's nonempty nonce.
+    if presented_nonce.is_empty() || resp.nonce.as_deref() != Some(presented_nonce) {
+        return Err(AccountHandshakeReject::NonceMismatch);
     }
     Ok(GrantIdentity {
         user_id: uid.to_string(),
@@ -515,19 +520,9 @@ fn evaluate_grant(
     })
 }
 
-/// Reuse an existing non-revoked account session for `uid` so repeated relay
-/// dials (e.g. retries while a session is pending approval) don't pile up
-/// duplicate `web_remote_sessions` rows. Returns `(session_id, approved)`.
-fn existing_account_session(db: &DatabaseStore, uid: &str) -> Option<(String, bool)> {
-    db.web_remote_list_sessions()
-        .into_iter()
-        .find(|s| s.source == "account" && s.account_user_id.as_deref() == Some(uid))
-        .map(|s| (s.id, s.approved))
-}
-
 /// Admit an account (grant) handshake: verify the grant with the control plane,
 /// run the accept matrix against this desktop's own identity, then mint (or
-/// reuse) an account-tagged session row. Returns the `session_id` to bind the
+/// reuse) the browser's own account-tagged session row. Returns the `session_id` to bind the
 /// stream to, or a reject reason. Approval composes exactly as the token path:
 /// an account session defaults to pending unless `trust_account_browsers` is on,
 /// and a pending session refuses the stream (the desktop approves it in the
@@ -542,48 +537,38 @@ async fn authorize_account_handshake(
     own_node_id: &str,
     hello: &AccountHello,
 ) -> Result<String, AccountHandshakeReject> {
-    // Snapshot the approval policy up front so the non-Send config mutex guard
-    // is never held across the verify await.
-    let approve_policy = {
-        let cfg = shared.config.lock().unwrap();
-        super::account_session_approved(&cfg)
-    };
-    let own_user_id = crate::auth::load_cached_user(db).map(|u| u.id);
+    if hello.browser_key.len() != auth::TOKEN_BYTES * 2
+        || !hello.browser_key.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(AccountHandshakeReject::BrowserKeyRequired);
+    }
 
     let base = crate::auth::api_base_url();
     let resp = verify_grant(&base, &hello.grant)
         .await
         .map_err(|_| AccountHandshakeReject::Unverified)?;
 
+    // Read account and approval state after the network await.
+    let own_user_id = crate::auth::load_cached_user(db).map(|u| u.id);
     let identity = evaluate_grant(&resp, own_node_id, own_user_id.as_deref(), &hello.nonce)?;
-
-    // Mint once per account (reuse an existing row on retry), tagged
-    // `source="account"` + the verified account user id. The plaintext token is
-    // discarded — the iroh stream binds directly to `session_id`, so no bearer
-    // is ever presented on this transport.
-    let (session_id, approved) = match existing_account_session(db, &identity.user_id) {
-        Some(existing) => existing,
-        None => {
-            let id = uuid::Uuid::new_v4().to_string();
-            let token = super::auth::random_token();
-            let token_hash = super::auth::sha256_hex(&token);
-            db.web_remote_insert_account_session(
-                &id,
-                None,
-                None,
-                &token_hash,
-                approve_policy,
-                &identity.user_id,
-            )
-            .map_err(AccountHandshakeReject::Internal)?;
-            (id, approve_policy)
-        }
-    };
-
-    if !approved {
+    let cfg = shared.config.lock().unwrap();
+    if !super::relay_wanted(&cfg) {
+        return Err(AccountHandshakeReject::Unverified);
+    }
+    let session = db
+        .web_remote_relay_session(
+            &identity.user_id,
+            &auth::sha256_hex(&hello.browser_key),
+            super::account_session_approved(&cfg),
+        )
+        .map_err(AccountHandshakeReject::Internal)?;
+    if session.revoked {
+        return Err(AccountHandshakeReject::Revoked);
+    }
+    if !session.approved {
         return Err(AccountHandshakeReject::Pending);
     }
-    Ok(session_id)
+    Ok(session.id)
 }
 
 fn welcome_frame_bytes(session_id: &str) -> Vec<u8> {
@@ -869,6 +854,9 @@ async fn handle_bi_stream<R: Runtime>(
         match admit {
             Ok(id) => id,
             Err(reject) => {
+                if reject == AccountHandshakeReject::Pending {
+                    super::emit_state_changed(&app);
+                }
                 let _ =
                     write_frame(&mut send, KIND_TEXT, &account_reject_frame_bytes(&reject)).await;
                 let _ = send.finish();
@@ -1216,12 +1204,25 @@ mod tests {
     const OWN_NODE: &str = "own-node-id-abc";
     const OWN_UID: &str = "user-owner-1";
 
+    fn account_hello(grant: &str, nonce: &str) -> AccountHello {
+        AccountHello {
+            grant: grant.into(),
+            nonce: nonce.into(),
+            browser_key: random_token(),
+        }
+    }
+
     fn account_hello_frame(grant: &str, nonce: &str) -> Frame {
         Frame {
             kind: KIND_TEXT,
-            payload: json!({ "t": "hello-account", "grant": grant, "nonce": nonce })
-                .to_string()
-                .into_bytes(),
+            payload: json!({
+                "t": "hello-account",
+                "grant": grant,
+                "nonce": nonce,
+                "browser_key": "synthetic-key",
+            })
+            .to_string()
+            .into_bytes(),
         }
     }
 
@@ -1256,6 +1257,7 @@ mod tests {
         let parsed = parse_account_hello(&account_hello_frame("the-grant", "the-nonce")).unwrap();
         assert_eq!(parsed.grant, "the-grant");
         assert_eq!(parsed.nonce, "the-nonce");
+        assert_eq!(parsed.browser_key, "synthetic-key");
         // Missing/empty grant is malformed.
         assert!(parse_account_hello(&account_hello_frame("", "n")).is_none());
         assert!(parse_account_hello(&Frame {
@@ -1318,6 +1320,12 @@ mod tests {
         // — a replay / grant-substitution signal.
         assert_eq!(
             evaluate_grant(&good_verify("bound"), OWN_NODE, Some(OWN_UID), "other").unwrap_err(),
+            AccountHandshakeReject::NonceMismatch
+        );
+        let mut missing = good_verify("bound");
+        missing.nonce = None;
+        assert_eq!(
+            evaluate_grant(&missing, OWN_NODE, Some(OWN_UID), "bound").unwrap_err(),
             AccountHandshakeReject::NonceMismatch
         );
     }
@@ -1411,7 +1419,7 @@ mod tests {
         let mock = mock_verify_admit(&mut server, "nonce-xyz").await;
         let url = server.url();
 
-        let hello = AccountHello { grant: "good-grant".into(), nonce: "nonce-xyz".into() };
+        let hello = account_hello("good-grant", "nonce-xyz");
         let session_id = run_account_admit(&url, &db, &shared, &hello)
             .await
             .expect("a good grant for our node + account is admitted");
@@ -1423,12 +1431,18 @@ mod tests {
         assert_eq!(row.account_user_id.as_deref(), Some(OWN_UID));
         assert!(row.approved, "trust_account_browsers admits immediately");
 
-        // A second dial for the same account REUSES the row (no duplicate).
+        // A second dial from the same browser reuses the row.
         let mock2 = mock_verify_admit(&mut server, "nonce-xyz").await;
         let again = run_account_admit(&url, &db, &shared, &hello).await.unwrap();
         mock2.assert_async().await;
-        assert_eq!(again, session_id, "repeat dials reuse the account session row");
+        assert_eq!(again, session_id, "repeat dials reuse the browser's session row");
         assert_eq!(db.web_remote_list_sessions().len(), 1, "no duplicate rows");
+
+        db.web_remote_revoke_session(&session_id).unwrap();
+        assert_eq!(
+            run_account_admit(&url, &db, &shared, &hello).await,
+            Err(AccountHandshakeReject::Revoked)
+        );
     }
 
     #[tokio::test]
@@ -1442,15 +1456,48 @@ mod tests {
         let _mock = mock_verify_admit(&mut server, "n").await;
         let url = server.url();
 
-        let hello = AccountHello { grant: "g".into(), nonce: "n".into() };
+        db.web_remote_insert_account_session(
+            "approved-lan", None, None, &sha256_hex(&random_token()), true, OWN_UID,
+        ).unwrap();
+        let hello = account_hello("g", "n");
         let err = run_account_admit(&url, &db, &shared, &hello)
             .await
             .expect_err("an untrusted account browser pends until approved");
         assert_eq!(err, AccountHandshakeReject::Pending);
         // The pending row still exists so the desktop can approve it.
-        let row = db.web_remote_list_sessions().into_iter().next().expect("a pending row");
+        let row = db.web_remote_list_sessions().into_iter().find(|row| !row.approved)
+            .expect("a pending row");
         assert_eq!(row.source, "account");
-        assert!(!row.approved);
+        db.web_remote_set_session_approved(&row.id, true).unwrap();
+        assert_eq!(run_account_admit(&url, &db, &shared, &hello).await, Ok(row.id));
+
+        let second_browser = account_hello("g", "n");
+        assert_eq!(
+            run_account_admit(&url, &db, &shared, &second_browser).await,
+            Err(AccountHandshakeReject::Pending)
+        );
+        assert_eq!(db.web_remote_list_sessions().len(), 3);
+        let pending = db.web_remote_list_sessions().into_iter().find(|row| !row.approved)
+            .expect("the second browser has its own pending row");
+        db.web_remote_reject_session(&pending.id).unwrap();
+        assert_eq!(
+            run_account_admit(&url, &db, &shared, &second_browser).await,
+            Err(AccountHandshakeReject::Revoked)
+        );
+        assert_eq!(db.web_remote_list_sessions().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn account_handshake_requires_browser_key() {
+        let db = init_test_database();
+        let shared = shared_with_trust(true);
+        let mut hello = account_hello("g", "n");
+        hello.browser_key.clear();
+        assert_eq!(
+            authorize_account_handshake(&db, &shared, OWN_NODE, &hello).await,
+            Err(AccountHandshakeReject::BrowserKeyRequired)
+        );
+        assert!(db.web_remote_list_sessions().is_empty());
     }
 
     #[tokio::test]
@@ -1471,7 +1518,7 @@ mod tests {
             .await;
         let url = server.url();
 
-        let hello = AccountHello { grant: "forged".into(), nonce: "n".into() };
+        let hello = account_hello("invalid-grant", "n");
         let err = run_account_admit(&url, &db, &shared, &hello)
             .await
             .expect_err("an invalid grant is rejected");
@@ -1506,7 +1553,7 @@ mod tests {
             .await;
         let url = server.url();
 
-        let hello = AccountHello { grant: "g".into(), nonce: "n".into() };
+        let hello = account_hello("g", "n");
         let err = run_account_admit(&url, &db, &shared, &hello)
             .await
             .expect_err("a grant for another node is rejected");
@@ -1541,7 +1588,7 @@ mod tests {
             .await;
         let url = server.url();
 
-        let hello = AccountHello { grant: "g".into(), nonce: "n".into() };
+        let hello = account_hello("g", "n");
         let err = run_account_admit(&url, &db, &shared, &hello)
             .await
             .expect_err("a grant for a different account is rejected");

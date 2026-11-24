@@ -104,7 +104,7 @@ function mount(dialer?: IrohDialer): Harness {
   const ws = new IrohWebSocket({
     dialer: d,
     target: () => ({ nodeId: "node-abc", relayUrl: "https://relay.example" }),
-    handshake: () => ({ grant: "v1.grant.sig", nonce: "nonce-xyz" }),
+    handshake: () => ({ grant: "v1.grant.sig", nonce: "nonce-xyz", browserKey: "test-key" }),
     onReject: (kind, reason) => h.rejects.push({ kind, reason }),
     onError: (err) => h.errors.push(err),
   });
@@ -126,6 +126,7 @@ describe("IrohWebSocket handshake", () => {
       t: "hello-account",
       grant: "v1.grant.sig",
       nonce: "nonce-xyz",
+      browser_key: "test-key",
     });
     expect(h.opened).toBe(0); // not open until welcome
     h.stream.deliver(welcome());

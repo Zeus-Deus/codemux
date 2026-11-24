@@ -15,7 +15,7 @@
  *   1. On construction it dials the desktop's `node_id` (via the injected
  *      {@link IrohDialer}, backed by the lazily-loaded wasm client) and, once the
  *      bi-stream is open, sends the account handshake as its FIRST control frame:
- *      `{"t":"hello-account","grant":"<grant>","nonce":"<browserNonce>"}`.
+ *      `{"t":"hello-account","grant":"<grant>","nonce":"<browserNonce>","browser_key":"<key>"}`.
  *   2. It consumes the desktop's reply internally: `{"t":"welcome",…}` fires
  *      `onopen` (the transport then sends `listen`/`invoke` frames exactly as
  *      over WS); `{"t":"unauthorized","reason":…}` is reported via `onReject`
@@ -68,8 +68,8 @@ export interface IrohSocketOptions {
   /** Resolves the target `node_id` (+ optional relay hint) at connect time —
    *  read lazily so a reconnect can pick up a freshly minted descriptor. */
   target(): { nodeId: string; relayUrl?: string | null };
-  /** Resolves the `{grant, nonce}` for the `hello-account` first frame. */
-  handshake(): { grant: string; nonce: string };
+  /** Resolves the credentials for the `hello-account` first frame. */
+  handshake(): { grant: string; nonce: string; browserKey: string };
   /** Handshake was rejected by the desktop (never fires on success). */
   onReject?(kind: IrohRejectKind, reason: string): void;
   /** A transport-level failure (dial/read/write/codec error) before or after
@@ -145,8 +145,8 @@ export class IrohWebSocket implements WebSocketLike {
     }
     this.stream = stream;
     try {
-      const { grant, nonce } = this.opts.handshake();
-      const hello = JSON.stringify({ t: "hello-account", grant, nonce });
+      const { grant, nonce, browserKey } = this.opts.handshake();
+      const hello = JSON.stringify({ t: "hello-account", grant, nonce, browser_key: browserKey });
       await this.writeFrame(KIND_TEXT, textEncoder.encode(hello));
     } catch (err) {
       this.fail(err);

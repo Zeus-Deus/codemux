@@ -15,7 +15,8 @@
  *     the bootstrap re-signs-in); a transient/offline failure → `503` (→ the
  *     transport's normal backoff retry, so a briefly-offline desktop reconnects).
  *   - a `wsFactory` that opens an {@link IrohWebSocket} to the cached grant's
- *     `node_id`, sending `{grant, browserNonce}` in the `hello-account` frame.
+ *     `node_id`, sending the grant, nonce, and per-host browser credential
+ *     in the encrypted `hello-account` frame.
  *
  * The transport abandons a ticket request that stalls and starts a new one, so
  * mints can overlap. Only the newest, un-cancelled mint may replace the cached
@@ -43,6 +44,8 @@ export interface IrohConnectionOptions {
   dialer: IrohDialer;
   /** The desktop reported the session is pending approval (poll continues). */
   onPending?(): void;
+  /** The desktop refused this browser or requires a newer client. */
+  onBrowserRejected?(reason: "session_revoked" | "client_update_required"): void;
   /** A grant mint failed; advisory for UI ("device offline, retrying…"). The
    *  transport still retries on its own backoff. */
   onMintError?(err: DeviceRegistryError): void;
@@ -118,17 +121,49 @@ export function createIrohConnection(
         if (!grant || !nonce) {
           throw new Error("iroh: no grant minted before handshake");
         }
-        return { grant: grant.grant, nonce };
+        return { grant: grant.grant, nonce, browserKey: browserKeyForNode(grant.nodeId) };
       },
-      onReject: (kind) => {
-        if (kind === "fatal") fatal = true;
-        else opts.onPending?.();
+      onReject: (kind, reason) => {
+        if (kind === "pending") {
+          opts.onPending?.();
+          return;
+        }
+        fatal = true;
+        if (reason === "session_revoked" || reason === "client_update_required") {
+          opts.onBrowserRejected?.(reason);
+        }
       },
       onError: opts.onTransportError,
     });
   };
 
   return { fetchImpl, wsFactory };
+}
+
+const memoryBrowserKeys = new Map<string, string>();
+
+/** Store an independent credential per host so a host only sees the key
+ *  used to pair with it. If storage is denied, retain it for this page. */
+function browserKeyForNode(nodeId: string): string {
+  const storageKey = `codemux.iroh.browser-key.v1.${nodeId}`;
+  try {
+    const stored = window.localStorage.getItem(storageKey);
+    if (stored && /^[0-9a-f]{64}$/.test(stored)) return stored;
+  } catch {
+    // Browser policy can deny storage access.
+  }
+
+  const existing = memoryBrowserKeys.get(nodeId);
+  if (existing) return existing;
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  const key = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  try {
+    window.localStorage.setItem(storageKey, key);
+  } catch {
+    // Approval lasts for this page when storage is unavailable.
+    memoryBrowserKeys.set(nodeId, key);
+  }
+  return key;
 }
 
 function abandoned(): DOMException {
