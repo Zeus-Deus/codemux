@@ -71,7 +71,7 @@ export interface IrohSocketOptions {
   /** Resolves the credentials for the `hello-account` first frame. */
   handshake(): { grant: string; nonce: string; browserKey: string };
   /** Handshake was rejected by the desktop (never fires on success). */
-  onReject?(kind: IrohRejectKind, reason: string): void;
+  onReject?(kind: IrohRejectKind, reason: string, browserLabel?: string): void;
   /** A transport-level failure (dial/read/write/codec error) before or after
    *  open. Advisory only — `onclose` always follows. */
   onError?(err: unknown): void;
@@ -84,6 +84,7 @@ const textDecoder = new TextDecoder();
 interface HandshakeReply {
   t?: string;
   reason?: string;
+  browser_label?: string;
 }
 
 /**
@@ -231,7 +232,13 @@ export class IrohWebSocket implements WebSocketLike {
       const reason = typeof reply.reason === "string" ? reply.reason : "unknown";
       const kind: IrohRejectKind =
         reason === "pending_approval" ? "pending" : "fatal";
-      this.opts.onReject?.(kind, reason);
+      const browserLabel =
+        kind === "pending" &&
+        typeof reply.browser_label === "string" &&
+        /^Relay browser [0-9A-F]{8}$/.test(reply.browser_label)
+          ? reply.browser_label
+          : undefined;
+      this.opts.onReject?.(kind, reason, browserLabel);
       // Not a transport error — the stream is simply closed by the desktop.
       this.teardown({ reason });
       return;

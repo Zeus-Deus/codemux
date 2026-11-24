@@ -375,6 +375,25 @@ describe("openEnvironmentConnection", () => {
     connection.close();
   });
 
+  it.each([
+    ["session_revoked", "This machine revoked access for this client."],
+    ["client_update_required", "Update Codemux and try again."],
+  ])("reports relay refusal %s separately from account sign-in", async (reason, error) => {
+    const machine = new FakeMachine((frame) =>
+      frame.t === "hello-account" ? { t: "unauthorized", reason } : null,
+    );
+    const { patches, onUpdate } = collect();
+    const connection = openEnvironmentConnection({
+      device,
+      registry: { connectDevice: async () => grant },
+      dialer: { dial: async () => machine },
+      onUpdate,
+    });
+    await settle();
+    expect(patches[patches.length - 1]).toEqual({ status: "unauthorized", error });
+    connection.close();
+  });
+
   it("reports an offline machine and stops reporting once closed", async () => {
     const { patches, onUpdate } = collect();
     const connection = openEnvironmentConnection({

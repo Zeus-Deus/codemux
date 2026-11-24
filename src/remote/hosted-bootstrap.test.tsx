@@ -29,6 +29,7 @@ function state(over: Partial<HostedState> = {}): HostedState {
     selected: null,
     error: null,
     connectStatus: "connecting",
+    browserLabel: null,
     busy: false,
     ...over,
   };
@@ -59,6 +60,21 @@ describe("HostedScreen", () => {
     expect(screen.queryByText("Connecting")).not.toBeInTheDocument();
     expect(screen.getByText("No devices yet")).toBeInTheDocument();
     expect(controller.getState().phase).toBe("devices");
+  });
+
+  it("identifies the matching browser entry while waiting for approval", () => {
+    render(
+      <HostedScreen
+        state={state({
+          phase: "connecting",
+          connectStatus: "waiting-approval",
+          browserLabel: "Relay browser 1234ABCD",
+        })}
+        flow={flow()}
+        apiHost="api.codemux.org"
+      />,
+    );
+    expect(screen.getByText(/approve “Relay browser 1234ABCD”/i)).toBeInTheDocument();
   });
 
   it("names the product and says what the page is before asking for credentials", () => {

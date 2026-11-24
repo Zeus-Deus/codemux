@@ -16,7 +16,7 @@ export interface EnvironmentDescriptor {
  * Where a connection to another environment stands.
  * - `pending-approval`: the machine has not yet approved this device.
  * - `offline`: the machine is unreachable; the client keeps retrying.
- * - `unauthorized`: the account session ended; retry stops until sign-in.
+ * - `unauthorized`: the account session ended or the machine refused this client.
  */
 export type EnvironmentStatus =
   | "connecting"

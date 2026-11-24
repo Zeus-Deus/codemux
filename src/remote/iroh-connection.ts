@@ -43,7 +43,7 @@ export interface IrohConnectionOptions {
   deviceId: string;
   dialer: IrohDialer;
   /** The desktop reported the session is pending approval (poll continues). */
-  onPending?(): void;
+  onPending?(browserLabel?: string): void;
   /** The desktop refused this browser or requires a newer client. */
   onBrowserRejected?(reason: "session_revoked" | "client_update_required"): void;
   /** A grant mint failed; advisory for UI ("device offline, retrying…"). The
@@ -123,9 +123,9 @@ export function createIrohConnection(
         }
         return { grant: grant.grant, nonce, browserKey: browserKeyForNode(grant.nodeId) };
       },
-      onReject: (kind, reason) => {
+      onReject: (kind, reason, browserLabel) => {
         if (kind === "pending") {
-          opts.onPending?.();
+          opts.onPending?.(browserLabel);
           return;
         }
         fatal = true;

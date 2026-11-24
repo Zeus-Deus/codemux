@@ -369,7 +369,7 @@ pub enum AccountHandshakeReject {
     /// This browser's previously paired session was revoked.
     Revoked,
     /// The verified session is still pending desktop approval.
-    Pending,
+    Pending { browser_label: String },
     /// Minting the session row failed.
     Internal(String),
 }
@@ -384,16 +384,18 @@ impl AccountHandshakeReject {
             AccountHandshakeReject::NonceMismatch => "nonce_mismatch",
             AccountHandshakeReject::BrowserKeyRequired => "client_update_required",
             AccountHandshakeReject::Revoked => "session_revoked",
-            AccountHandshakeReject::Pending => "pending_approval",
+            AccountHandshakeReject::Pending { .. } => "pending_approval",
             AccountHandshakeReject::Internal(_) => "internal_error",
         }
     }
 }
 
 fn account_reject_frame_bytes(reject: &AccountHandshakeReject) -> Vec<u8> {
-    json!({ "t": "unauthorized", "reason": reject.code() })
-        .to_string()
-        .into_bytes()
+    let mut reply = json!({ "t": "unauthorized", "reason": reject.code() });
+    if let AccountHandshakeReject::Pending { browser_label } = reject {
+        reply["browser_label"] = json!(browser_label);
+    }
+    reply.to_string().into_bytes()
 }
 
 /// Whether a first frame is a `hello-account` frame (the account/relay path).
@@ -555,10 +557,15 @@ async fn authorize_account_handshake(
     if !super::relay_wanted(&cfg) {
         return Err(AccountHandshakeReject::Unverified);
     }
+    // Use a separate digest for the user-visible label so the label does not
+    // expose any part of the stored credential hash.
+    let label_hash = auth::sha256_hex(&format!("relay-browser-label:{}", hello.browser_key));
+    let browser_label = format!("Relay browser {}", label_hash[..8].to_ascii_uppercase());
     let session = db
         .web_remote_relay_session(
             &identity.user_id,
             &auth::sha256_hex(&hello.browser_key),
+            &browser_label,
             super::account_session_approved(&cfg),
         )
         .map_err(AccountHandshakeReject::Internal)?;
@@ -566,7 +573,9 @@ async fn authorize_account_handshake(
         return Err(AccountHandshakeReject::Revoked);
     }
     if !session.approved {
-        return Err(AccountHandshakeReject::Pending);
+        return Err(AccountHandshakeReject::Pending {
+            browser_label: session.name.unwrap_or(browser_label),
+        });
     }
     Ok(session.id)
 }
@@ -854,7 +863,7 @@ async fn handle_bi_stream<R: Runtime>(
         match admit {
             Ok(id) => id,
             Err(reject) => {
-                if reject == AccountHandshakeReject::Pending {
+                if matches!(reject, AccountHandshakeReject::Pending { .. }) {
                     super::emit_state_changed(&app);
                 }
                 let _ =
@@ -1337,7 +1346,12 @@ mod tests {
         assert_eq!(AccountHandshakeReject::WrongNode.code(), "wrong_device");
         assert_eq!(AccountHandshakeReject::WrongAccount.code(), "account_mismatch");
         assert_eq!(AccountHandshakeReject::NonceMismatch.code(), "nonce_mismatch");
-        assert_eq!(AccountHandshakeReject::Pending.code(), "pending_approval");
+        let pending = AccountHandshakeReject::Pending {
+            browser_label: "Relay browser 1234ABCD".into(),
+        };
+        assert_eq!(pending.code(), "pending_approval");
+        let reply: Value = serde_json::from_slice(&account_reject_frame_bytes(&pending)).unwrap();
+        assert_eq!(reply["browser_label"], "Relay browser 1234ABCD");
         assert_eq!(
             AccountHandshakeReject::Internal("x".into()).code(),
             "internal_error"
@@ -1463,22 +1477,28 @@ mod tests {
         let err = run_account_admit(&url, &db, &shared, &hello)
             .await
             .expect_err("an untrusted account browser pends until approved");
-        assert_eq!(err, AccountHandshakeReject::Pending);
+        let AccountHandshakeReject::Pending { browser_label } = err else {
+            panic!("new browser must be pending")
+        };
         // The pending row still exists so the desktop can approve it.
         let row = db.web_remote_list_sessions().into_iter().find(|row| !row.approved)
             .expect("a pending row");
         assert_eq!(row.source, "account");
+        assert_eq!(row.name.as_deref(), Some(browser_label.as_str()));
         db.web_remote_set_session_approved(&row.id, true).unwrap();
         assert_eq!(run_account_admit(&url, &db, &shared, &hello).await, Ok(row.id));
 
         let second_browser = account_hello("g", "n");
-        assert_eq!(
-            run_account_admit(&url, &db, &shared, &second_browser).await,
-            Err(AccountHandshakeReject::Pending)
-        );
+        let Err(AccountHandshakeReject::Pending { browser_label: second_label }) =
+            run_account_admit(&url, &db, &shared, &second_browser).await
+        else {
+            panic!("the second browser must be pending")
+        };
+        assert_ne!(browser_label, second_label);
         assert_eq!(db.web_remote_list_sessions().len(), 3);
         let pending = db.web_remote_list_sessions().into_iter().find(|row| !row.approved)
             .expect("the second browser has its own pending row");
+        assert_eq!(pending.name.as_deref(), Some(second_label.as_str()));
         db.web_remote_reject_session(&pending.id).unwrap();
         assert_eq!(
             run_account_admit(&url, &db, &shared, &second_browser).await,

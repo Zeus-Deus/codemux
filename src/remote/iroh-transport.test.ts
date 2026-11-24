@@ -72,8 +72,8 @@ class FakeIrohStream implements IrohByteStream {
 
 const welcome = () =>
   encodeFrame(KIND_TEXT, enc.encode(JSON.stringify({ t: "welcome", session_id: "s1" })));
-const unauthorized = (reason: string) =>
-  encodeFrame(KIND_TEXT, enc.encode(JSON.stringify({ t: "unauthorized", reason })));
+const unauthorized = (reason: string, browserLabel?: string) =>
+  encodeFrame(KIND_TEXT, enc.encode(JSON.stringify({ t: "unauthorized", reason, browser_label: browserLabel })));
 
 async function tick(n = 8): Promise<void> {
   for (let i = 0; i < n; i++) await Promise.resolve();
@@ -85,7 +85,7 @@ interface Harness {
   opened: number;
   closes: Array<{ reason?: string }>;
   messages: unknown[];
-  rejects: Array<{ kind: IrohRejectKind; reason: string }>;
+  rejects: Array<{ kind: IrohRejectKind; reason: string; browserLabel?: string }>;
   errors: unknown[];
 }
 
@@ -105,7 +105,7 @@ function mount(dialer?: IrohDialer): Harness {
     dialer: d,
     target: () => ({ nodeId: "node-abc", relayUrl: "https://relay.example" }),
     handshake: () => ({ grant: "v1.grant.sig", nonce: "nonce-xyz", browserKey: "test-key" }),
-    onReject: (kind, reason) => h.rejects.push({ kind, reason }),
+    onReject: (kind, reason, browserLabel) => h.rejects.push({ kind, reason, browserLabel }),
     onError: (err) => h.errors.push(err),
   });
   ws.onopen = () => (h.opened += 1);
@@ -137,9 +137,11 @@ describe("IrohWebSocket handshake", () => {
   it("reports a pending rejection and closes (transport will keep polling)", async () => {
     const h = mount();
     await tick();
-    h.stream.deliver(unauthorized("pending_approval"));
+    h.stream.deliver(unauthorized("pending_approval", "Relay browser 1234ABCD"));
     await tick();
-    expect(h.rejects).toEqual([{ kind: "pending", reason: "pending_approval" }]);
+    expect(h.rejects).toEqual([
+      { kind: "pending", reason: "pending_approval", browserLabel: "Relay browser 1234ABCD" },
+    ]);
     expect(h.opened).toBe(0);
     expect(h.closes).toHaveLength(1);
   });

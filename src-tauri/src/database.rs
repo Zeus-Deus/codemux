@@ -6095,6 +6095,7 @@ impl DatabaseStore {
         &self,
         account_user_id: &str,
         relay_browser_hash: &str,
+        name: &str,
         approved: bool,
     ) -> Result<WebRemoteSessionRecord, String> {
         let conn = self.conn.lock().unwrap();
@@ -6119,10 +6120,10 @@ impl DatabaseStore {
             crate::web_remote::auth::sha256_hex(&crate::web_remote::auth::random_token());
         conn.execute(
             "INSERT INTO web_remote_sessions
-                (id, token_hash, created_at, last_seen_at, approved, source, account_user_id, relay_browser_hash)
-             VALUES (?1, ?2, datetime('now'), datetime('now'), ?3, 'account', ?4, ?5)
+                (id, token_hash, created_at, last_seen_at, approved, source, account_user_id, relay_browser_hash, name)
+             VALUES (?1, ?2, datetime('now'), datetime('now'), ?3, 'account', ?4, ?5, ?6)
              ON CONFLICT(account_user_id, relay_browser_hash) DO NOTHING",
-            params![id, token_hash, approved as i64, account_user_id, relay_browser_hash],
+            params![id, token_hash, approved as i64, account_user_id, relay_browser_hash, name],
         )
         .map_err(|e| format!("Failed to insert web_remote relay session: {e}"))?;
         find_session().map_err(|e| format!("Failed to read web_remote relay session: {e}"))
