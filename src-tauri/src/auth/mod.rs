@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 
@@ -265,6 +265,28 @@ pub(crate) fn token_file_path() -> PathBuf {
     data_dir.join(crate::APP_DIR_NAME).join("auth-token.enc")
 }
 
+/// The database transaction revokes account browser sessions and marks the
+/// legacy import handled. A failed cleanup must not leave sign-out incomplete.
+pub(crate) fn clear_token_for_sign_out(db: &DatabaseStore) -> Result<(), String> {
+    clear_token_for_sign_out_at(db, &token_file_path())
+}
+
+fn clear_token_for_sign_out_at(db: &DatabaseStore, path: &Path) -> Result<(), String> {
+    clear_token(db)?;
+    if let Err(error) = remove_legacy_token_file_at(path) {
+        eprintln!("[auth] Signed out, but could not remove legacy token file: {error}");
+    }
+    Ok(())
+}
+
+fn remove_legacy_token_file_at(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Failed to remove legacy auth token: {error}")),
+    }
+}
+
 fn machine_id() -> &'static [u8] {
     static MACHINE_ID: OnceLock<Vec<u8>> = OnceLock::new();
     MACHINE_ID.get_or_init(read_machine_id)
@@ -458,15 +480,8 @@ pub fn load_stored_auth_method(db: &DatabaseStore) -> Option<String> {
     stored.auth_method
 }
 
-pub fn clear_token(db: &DatabaseStore) {
-    use std::io::Write;
-    let msg = format!(
-        "[auth] CLEAR_TOKEN CALLED - backtrace:\n{}\n",
-        std::backtrace::Backtrace::force_capture()
-    );
-    let _ = std::io::stderr().write_all(msg.as_bytes());
-    let _ = std::io::stderr().flush();
-    db.clear_auth_token();
+pub fn clear_token(db: &DatabaseStore) -> Result<(), String> {
+    db.clear_auth_token()
 }
 
 pub fn is_token_expired(expires_at: &str) -> bool {
@@ -748,7 +763,9 @@ fn emit_auth_state<R: tauri::Runtime>(
         CallbackVerifyOutcome::Unauthorized => auth_state
             .replace_session_if_current(session_generation, || {
                 let db: tauri::State<'_, DatabaseStore> = app.state();
-                clear_token(&db);
+                if let Err(error) = clear_token(&db) {
+                    eprintln!("[auth] Could not remove invalid token: {error}");
+                }
                 crate::settings_sync::clear_cache();
                 crate::settings_sync::set_cache_owner(None);
                 auth_state.set_auth_method(None);
@@ -844,6 +861,41 @@ mod tests {
     }
 
     #[test]
+    fn legacy_token_cleanup_reports_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth-token.enc");
+        fs::write(&path, b"old token").unwrap();
+        remove_legacy_token_file_at(&path).unwrap();
+        assert!(!path.exists());
+        remove_legacy_token_file_at(&path).unwrap();
+
+        fs::create_dir(&path).unwrap();
+        assert!(remove_legacy_token_file_at(&path).is_err());
+    }
+
+    #[test]
+    fn legacy_cleanup_failure_does_not_keep_account_sessions_active() {
+        let db = test_db();
+        db.save_auth_token(b"cached session").unwrap();
+        db.web_remote_insert_account_session(
+            "account-browser",
+            None,
+            None,
+            "hash",
+            true,
+            "account-1",
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth-token.enc");
+        fs::create_dir(&path).unwrap();
+
+        clear_token_for_sign_out_at(&db, &path).unwrap();
+        assert!(db.load_auth_token().is_none());
+        assert!(db.web_remote_get_session("account-browser").unwrap().revoked);
+    }
+
+    #[test]
     fn token_save_load_roundtrip() {
         let db = test_db();
         let token = "test-token-abc123";
@@ -856,7 +908,7 @@ mod tests {
         assert_eq!(t, token);
         assert_eq!(e, expires);
 
-        clear_token(&db);
+        clear_token(&db).unwrap();
         assert!(load_token(&db).is_none());
     }
 
@@ -882,7 +934,7 @@ mod tests {
         assert_eq!(load_stored_auth_method(&db).as_deref(), Some("email"));
 
         // Clearing the token wipes everything including auth_method.
-        clear_token(&db);
+        clear_token(&db).unwrap();
         assert!(load_stored_auth_method(&db).is_none());
     }
 

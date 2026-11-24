@@ -267,7 +267,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 24;
+const SCHEMA_VERSION: u32 = 25;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -632,6 +632,58 @@ fn database_path() -> Option<PathBuf> {
     Some(config.join(crate::APP_DIR_NAME).join("codemux.db"))
 }
 
+/// Keep the persisted conversations, auth token and other account data out of
+/// reach of other local users. SQLite creates the database and its WAL files
+/// with the process umask, which is commonly 022. Tighten the directory first
+/// so newly created files are private even before their own modes are fixed.
+fn ensure_private_database_storage(db_path: &std::path::Path) -> Result<(), String> {
+    let parent = db_path
+        .parent()
+        .ok_or_else(|| "Database path has no parent directory".to_string())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(|e| format!("Failed to create config directory: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed to create config directory: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = std::fs::symlink_metadata(parent)
+            .map_err(|e| format!("Failed to inspect config directory: {e}"))?;
+        let uid = unsafe { libc::getuid() };
+        if !dir.file_type().is_dir() || dir.uid() != uid {
+            return Err("Config directory is not owned by this user in a real directory".into());
+        }
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to make config directory private: {e}"))?;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = db_path.as_os_str().to_os_string();
+            name.push(suffix);
+            let path = std::path::PathBuf::from(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_file() && meta.uid() == uid => {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .map_err(|e| format!("Failed to make database file private: {e}"))?;
+                }
+                Ok(_) => return Err(format!("Database path is not an owned regular file: {}", path.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("Failed to inspect database file: {e}")),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn create_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(agent_control::SCHEMA).map_err(|e| e.to_string())?;
     mcp_connector::migrate(conn)?;
@@ -696,6 +748,10 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             id INTEGER PRIMARY KEY CHECK (id = 1),
             encrypted_data BLOB NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS legacy_auth_token_import (
+            id INTEGER PRIMARY KEY CHECK (id = 1)
         );
 
         CREATE TABLE IF NOT EXISTS agent_chat_sessions (
@@ -1471,14 +1527,11 @@ fn open_connection(path: &std::path::Path) -> Result<Connection, String> {
 pub fn init_database() -> Result<DatabaseStore, String> {
     let db_path = database_path().ok_or("Could not determine config directory")?;
 
-    // Ensure parent directory exists
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create config directory: {e}"))?;
-    }
-
+    ensure_private_database_storage(&db_path)?;
     let conn = open_connection(&db_path)?;
     create_schema(&conn)?;
+    // WAL and shared-memory files may have been created by the connection.
+    ensure_private_database_storage(&db_path)?;
 
     eprintln!(
         "[codemux::database] SQLite initialized at {}",
@@ -5985,10 +6038,51 @@ impl DatabaseStore {
 
 // ── Auth Tokens ──
 
+const MARK_LEGACY_AUTH_TOKEN_HANDLED: &str =
+    "INSERT OR IGNORE INTO legacy_auth_token_import (id) VALUES (1)";
+
+/// Restrict the old token file before its contents are read. Older builds
+/// created it with the process umask, which could expose its reversible
+/// machine-ID encryption to other local users.
+fn ensure_private_legacy_auth_token_file(path: &std::path::Path) -> Result<bool, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => meta,
+        Ok(_) => return Err("Legacy auth token path is not a regular file".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("Failed to inspect legacy auth token: {error}")),
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let parent = path.parent().ok_or("Legacy auth token path has no parent")?;
+        let dir = std::fs::symlink_metadata(parent)
+            .map_err(|e| format!("Failed to inspect legacy auth token directory: {e}"))?;
+        let uid = unsafe { libc::getuid() };
+        if !dir.file_type().is_dir() || dir.uid() != uid || meta.uid() != uid {
+            return Err("Legacy auth token is not owned by this user in a real directory".into());
+        }
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to make legacy auth token directory private: {e}"))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Failed to make legacy auth token private: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    let _ = meta;
+
+    Ok(true)
+}
+
 impl DatabaseStore {
     pub fn save_auth_token(&self, encrypted_data: &[u8]) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        Self::write_auth_token(&conn, encrypted_data)
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction()
+            .map_err(|error| format!("Failed to save auth token: {error}"))?;
+        Self::write_auth_token(&transaction, encrypted_data)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to save auth token: {error}"))
     }
 
     fn write_auth_token(conn: &Connection, encrypted_data: &[u8]) -> Result<(), String> {
@@ -5996,7 +6090,9 @@ impl DatabaseStore {
             "INSERT OR REPLACE INTO auth_tokens (id, encrypted_data, updated_at) VALUES (1, ?1, datetime('now'))",
             params![encrypted_data],
         )
-        .map_err(|e| format!("Failed to save auth token: {e}"))?;
+        .map_err(|error| format!("Failed to save auth token: {error}"))?;
+        conn.execute(MARK_LEGACY_AUTH_TOKEN_HANDLED, [])
+            .map_err(|error| format!("Failed to mark legacy auth token handled: {error}"))?;
         Ok(())
     }
 
@@ -6020,6 +6116,40 @@ impl DatabaseStore {
         transaction.commit().map_err(|error| error.to_string())
     }
 
+    /// Import the pre-SQLite token at most once. The marker is committed with
+    /// the import, so a leftover file cannot sign the user back in after a
+    /// successful sign-out, even when deleting that file fails.
+    pub fn migrate_legacy_auth_token(&self, old_path: &std::path::Path) -> Result<(), String> {
+        let legacy_exists = ensure_private_legacy_auth_token_file(old_path)?;
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction().map_err(|e| format!("Failed to migrate auth token: {e}"))?;
+        let handled: bool = transaction
+            .query_row("SELECT EXISTS(SELECT 1 FROM legacy_auth_token_import WHERE id = 1)", [], |row| row.get(0))
+            .map_err(|e| format!("Failed to check legacy auth token migration: {e}"))?;
+        if !handled {
+            let token_exists: bool = transaction
+                .query_row("SELECT EXISTS(SELECT 1 FROM auth_tokens WHERE id = 1)", [], |row| row.get(0))
+                .map_err(|e| format!("Failed to check stored auth token: {e}"))?;
+            if !token_exists && legacy_exists {
+                let data = std::fs::read(old_path)
+                    .map_err(|e| format!("Failed to read legacy auth token: {e}"))?;
+                transaction.execute(
+                    "INSERT INTO auth_tokens (id, encrypted_data, updated_at) VALUES (1, ?1, datetime('now'))",
+                    params![data],
+                )
+                .map_err(|e| format!("Failed to import legacy auth token: {e}"))?;
+            }
+            transaction.execute(MARK_LEGACY_AUTH_TOKEN_HANDLED, [])
+                .map_err(|e| format!("Failed to mark legacy auth token handled: {e}"))?;
+        }
+        transaction.commit().map_err(|e| format!("Failed to commit legacy auth token migration: {e}"))?;
+        match std::fs::remove_file(old_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("Failed to remove legacy auth token: {error}")),
+        }
+    }
+
     pub fn load_auth_token(&self) -> Option<Vec<u8>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -6030,20 +6160,24 @@ impl DatabaseStore {
         .ok()
     }
 
-    pub fn clear_auth_token(&self) {
+    pub fn clear_auth_token(&self) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
-        let result: rusqlite::Result<()> = (|| {
-            let transaction = conn.transaction()?;
-            transaction.execute(
-                "UPDATE web_remote_sessions SET revoked = 1 WHERE revoked = 0 AND source = 'account'",
-                [],
-            )?;
-            transaction.execute("DELETE FROM auth_tokens WHERE id = 1", [])?;
-            transaction.commit()
-        })();
-        if let Err(error) = result {
-            log::warn!("Failed to clear auth and revoke account browser sessions: {error}");
-        }
+        let transaction = conn
+            .transaction()
+            .map_err(|error| format!("Failed to clear auth token: {error}"))?;
+        transaction.execute(
+            "UPDATE web_remote_sessions SET revoked = 1 WHERE revoked = 0 AND source = 'account'",
+            [],
+        )
+        .map_err(|error| format!("Failed to revoke account browser sessions: {error}"))?;
+        transaction.execute(MARK_LEGACY_AUTH_TOKEN_HANDLED, [])
+            .map_err(|error| format!("Failed to mark legacy auth token handled: {error}"))?;
+        transaction.execute("DELETE FROM auth_tokens WHERE id = 1", [])
+            .map_err(|error| format!("Failed to clear auth token: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to clear auth token: {error}"))?;
+        Ok(())
     }
 }
 
@@ -7612,6 +7746,146 @@ mod tests {
     }
 
     // ── Integration / Lifecycle ──
+
+    #[cfg(unix)]
+    #[test]
+    fn database_storage_tightens_existing_and_new_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old_dir = dir.path().join("existing");
+        std::fs::create_dir(&old_dir).unwrap();
+        let old_db = old_dir.join("codemux.db");
+        for suffix in ["", "-wal", "-shm"] {
+            let path = std::path::PathBuf::from(format!("{}{suffix}", old_db.display()));
+            std::fs::write(&path, b"existing private data").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        std::fs::set_permissions(&old_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_private_database_storage(&old_db).unwrap();
+        assert_eq!(std::fs::metadata(&old_dir).unwrap().permissions().mode() & 0o777, 0o700);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = std::path::PathBuf::from(format!("{}{suffix}", old_db.display()));
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        let new_db = dir.path().join("new").join("codemux.db");
+        ensure_private_database_storage(&new_db).unwrap();
+        let conn = open_connection(&new_db).unwrap();
+        create_schema(&conn).unwrap();
+        ensure_private_database_storage(&new_db).unwrap();
+        assert_eq!(
+            std::fs::metadata(new_db.parent().unwrap()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(std::fs::metadata(&new_db).unwrap().permissions().mode() & 0o777, 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let path = std::path::PathBuf::from(format!("{}{suffix}", new_db.display()));
+            if path.exists() {
+                assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_storage_rejects_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let linked_dir = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_dir, &linked_dir).unwrap();
+        assert!(ensure_private_database_storage(&linked_dir.join("codemux.db")).is_err());
+
+        let real_db = real_dir.join("real.db");
+        std::fs::write(&real_db, b"unrelated data").unwrap();
+        std::os::unix::fs::symlink(&real_db, real_dir.join("codemux.db")).unwrap();
+        assert!(ensure_private_database_storage(&real_dir.join("codemux.db")).is_err());
+        assert_eq!(std::fs::read(&real_db).unwrap(), b"unrelated data");
+    }
+
+    #[test]
+    fn auth_token_saves_mark_legacy_import_handled() {
+        for account_id in [None, Some("account-1")] {
+            let db = init_test_database();
+            match account_id {
+                Some(account_id) => db
+                    .save_auth_token_for_account(b"cached session", account_id)
+                    .unwrap(),
+                None => db.save_auth_token(b"cached session").unwrap(),
+            }
+            let conn = db.conn.lock().unwrap();
+            let handled: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM legacy_auth_token_import WHERE id = 1)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(handled);
+        }
+    }
+
+    #[test]
+    fn clearing_auth_token_reports_database_write_failure() {
+        let db = init_test_database();
+        db.save_auth_token(b"cached session").unwrap();
+        db.conn.lock().unwrap().execute_batch("PRAGMA query_only=ON").unwrap();
+
+        assert!(db.clear_auth_token().is_err());
+        assert_eq!(db.load_auth_token().as_deref(), Some(&b"cached session"[..]));
+    }
+
+    #[test]
+    fn legacy_auth_token_cannot_return_after_sign_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("codemux.db");
+        let old_path = dir.path().join("auth-token.enc");
+        std::fs::write(&old_path, b"legacy session").unwrap();
+
+        {
+            let conn = open_connection(&db_path).unwrap();
+            create_schema(&conn).unwrap();
+            let db = DatabaseStore { conn: Mutex::new(conn) };
+            db.migrate_legacy_auth_token(&old_path).unwrap();
+            assert_eq!(db.load_auth_token().as_deref(), Some(&b"legacy session"[..]));
+            assert!(!old_path.exists());
+            db.clear_auth_token().unwrap();
+            assert!(db.load_auth_token().is_none());
+        }
+
+        // Simulate a leftover or recreated legacy file on the next startup.
+        std::fs::write(&old_path, b"legacy session").unwrap();
+        let conn = open_connection(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+        let db = DatabaseStore { conn: Mutex::new(conn) };
+        db.migrate_legacy_auth_token(&old_path).unwrap();
+        assert!(db.load_auth_token().is_none());
+        assert!(!old_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_auth_token_is_private_before_import() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old_dir = dir.path().join("codemux");
+        std::fs::create_dir(&old_dir).unwrap();
+        let old_path = old_dir.join("auth-token.enc");
+        std::fs::write(&old_path, b"legacy session").unwrap();
+        std::fs::set_permissions(&old_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&old_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(ensure_private_legacy_auth_token_file(&old_path).unwrap());
+        assert_eq!(std::fs::metadata(&old_dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&old_path).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let link = old_dir.join("linked-token");
+        std::os::unix::fs::symlink(&old_path, &link).unwrap();
+        assert!(ensure_private_legacy_auth_token_file(&link).is_err());
+    }
 
     #[test]
     fn lifecycle_file_persistence() {

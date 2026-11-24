@@ -954,17 +954,14 @@ fn build_core_app<R: tauri::Runtime>(
                 ));
             }
 
-            // Migrate auth token from file to SQLite (one-time)
+            // Migrate the pre-SQLite auth token at most once. The database
+            // keeps a durable marker so a leftover file cannot restore a
+            // session after sign-out.
             {
                 let db: tauri::State<'_, database::DatabaseStore> = app.handle().state();
                 let old_path = crate::auth::token_file_path();
-                if old_path.exists() {
-                    if db.load_auth_token().is_none() {
-                        if let Ok(data) = std::fs::read(&old_path) {
-                            let _ = db.save_auth_token(&data);
-                        }
-                    }
-                    let _ = std::fs::remove_file(&old_path);
+                if let Err(error) = db.migrate_legacy_auth_token(&old_path) {
+                    eprintln!("[auth] Could not finish legacy token migration: {error}");
                 }
 
                 // Establish the account-scoped settings owner before any
@@ -976,7 +973,9 @@ fn build_core_app<R: tauri::Runtime>(
                 match auth::load_token(&db) {
                     Some((_token, expires_at)) if auth::is_token_expired(&expires_at) => {
                         auth_state.replace_session(|| {
-                            auth::clear_token(&db);
+                            if let Err(error) = auth::clear_token(&db) {
+                                eprintln!("[auth] Could not remove expired token: {error}");
+                            }
                             settings_sync::clear_cache();
                             settings_sync::set_cache_owner(None);
                             auth_state.set_auth_method(None);

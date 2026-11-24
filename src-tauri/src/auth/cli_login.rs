@@ -38,7 +38,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use serde::Deserialize;
 
 use crate::auth::{
-    api_base_url, clear_token, derive_auth_secret, is_token_expired, load_cached_user,
+    api_base_url, derive_auth_secret, is_token_expired, load_cached_user,
     load_stored_auth_method, load_token, login_email_api, save_auth, save_stored_auth_method,
     AuthUser,
 };
@@ -350,10 +350,10 @@ pub(crate) fn status_exit_code(report: &AuthStatusReport) -> i32 {
 /// state without also deleting the *real* settings-sync cache: that path
 /// resolves through `dirs::data_dir()` with no test seam, so calling it
 /// from a unit test would clobber the running developer's cache.
-pub(crate) fn clear_session_record(db: &DatabaseStore) -> bool {
+pub(crate) fn clear_session_record(db: &DatabaseStore) -> Result<bool, String> {
     let had_session = load_token(db).is_some();
-    clear_token(db);
-    had_session
+    crate::auth::clear_token_for_sign_out(db)?;
+    Ok(had_session)
 }
 
 /// Clear the cached session. Mirrors `commands::auth::sign_out`'s
@@ -364,10 +364,10 @@ pub(crate) fn clear_session_record(db: &DatabaseStore) -> bool {
 ///
 /// Returns `true` when there was something to clear, so the command can
 /// say "Signed out" versus "Already signed out" without a second read.
-pub(crate) fn sign_out(db: &DatabaseStore) -> bool {
-    let had_session = clear_session_record(db);
+pub(crate) fn sign_out(db: &DatabaseStore) -> Result<bool, String> {
+    let had_session = clear_session_record(db)?;
     crate::settings_sync::clear_cache();
-    had_session
+    Ok(had_session)
 }
 
 // ── Terminal input ───────────────────────────────────────────────
@@ -571,7 +571,7 @@ pub(crate) async fn ensure_signed_in(
 /// `codemux logout`.
 pub fn run_logout() -> Result<(), String> {
     let db = open_db()?;
-    if sign_out(&db) {
+    if sign_out(&db)? {
         println!("✓ Signed out. The cached session on this machine was cleared.");
     } else {
         println!("Already signed out — no cached session on this machine.");
@@ -1043,7 +1043,7 @@ mod tests {
         // with no test seam. The session record is the part that matters
         // here — everything `codemux login` wrote.
         assert!(
-            clear_session_record(&db),
+            clear_session_record(&db).unwrap(),
             "reports that a session was cleared"
         );
         assert!(load_token(&db).is_none());
@@ -1052,7 +1052,7 @@ mod tests {
         assert!(matches!(auth_status(&db), AuthStatusReport::SignedOut));
 
         assert!(
-            !clear_session_record(&db),
+            !clear_session_record(&db).unwrap(),
             "second logout reports nothing to clear"
         );
     }

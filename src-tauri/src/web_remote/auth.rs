@@ -523,7 +523,7 @@ mod tests {
             "second", None, None, &sha256_hex("second-browser"), true, &user.id,
         ).unwrap();
         let second = AccountSessionGuard::new(&db, "second").unwrap();
-        db.clear_auth_token();
+        db.clear_auth_token().unwrap();
         tokio::time::timeout(Duration::from_secs(1), second.expired()).await.unwrap();
         assert!(authenticate(&db, "second-browser").is_none());
         assert!(authenticate(&db, "paired-browser").is_some());

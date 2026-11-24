@@ -46,6 +46,12 @@ pub struct SessionRefresh {
 
 const AUTH_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+fn discard_invalid_token(db: &DatabaseStore) {
+    if let Err(error) = clear_token(db) {
+        eprintln!("[auth] Could not remove invalid token: {error}");
+    }
+}
+
 enum VerifyOutcome {
     Verified(AuthUser),
     Unauthorized,
@@ -204,7 +210,7 @@ pub fn bootstrap_session(
             }),
             Some((_token, expires_at)) if is_token_expired(&expires_at) => auth_state
                 .replace_session_if_current(session_generation, || {
-                    clear_token(&db);
+                    discard_invalid_token(&db);
                     crate::settings_sync::clear_cache();
                     crate::settings_sync::set_cache_owner(None);
                     auth_state.set_auth_method(None);
@@ -280,7 +286,7 @@ pub async fn refresh_session<R: tauri::Runtime>(
     };
     if is_token_expired(&expires_at) {
         let cleared = auth_state.replace_session_if_current(session_generation, || {
-            clear_token(&db);
+            discard_invalid_token(&db);
             crate::settings_sync::clear_cache();
             crate::settings_sync::set_cache_owner(None);
             auth_state.set_auth_method(None);
@@ -351,7 +357,7 @@ pub async fn refresh_session<R: tauri::Runtime>(
         }
         VerifyOutcome::Unauthorized => Ok(auth_state
             .replace_session_if_current(session_generation, || {
-                clear_token(&db);
+                discard_invalid_token(&db);
                 crate::settings_sync::clear_cache();
                 crate::settings_sync::set_cache_owner(None);
                 auth_state.set_auth_method(None);
@@ -567,13 +573,14 @@ pub fn sign_out<R: tauri::Runtime>(
     auth_state: State<'_, AuthState>,
 ) -> Result<(), String> {
     auth_state.replace_session(|| {
-        clear_token(&db);
+        crate::auth::clear_token_for_sign_out(&db)?;
         crate::settings_sync::clear_cache();
         crate::settings_sync::set_cache_owner(None);
 
         // Clear the session's provider tag alongside auth.
         auth_state.set_auth_method(None);
-    });
+        Ok::<(), String>(())
+    })?;
 
     // Reset frontend settings store to defaults before auth-state-changed
     let _ = app.emit(
@@ -609,7 +616,7 @@ pub fn get_auth_token(
             Some((_token, expires_at)) if is_token_expired(&expires_at) => {
                 if auth_state
                     .replace_session_if_current(session_generation, || {
-                        clear_token(&db);
+                        discard_invalid_token(&db);
                         crate::settings_sync::clear_cache();
                         crate::settings_sync::set_cache_owner(None);
                         auth_state.set_auth_method(None);
