@@ -101,6 +101,16 @@ struct StoredAuth {
     auth_method: Option<String>,
 }
 
+/// Extract the owner of an unexpired stored sign-in from an encrypted snapshot.
+pub(crate) fn active_account_id_from_record(record: &[u8]) -> Option<String> {
+    let plaintext = decrypt_data(record).ok()?;
+    let stored: StoredAuth = serde_json::from_slice(&plaintext).ok()?;
+    if is_token_expired(&stored.expires_at) {
+        return None;
+    }
+    Some(stored.user?.id)
+}
+
 // ── Auth State (managed by Tauri) ────────────────────────────────
 
 pub struct AuthState {

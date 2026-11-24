@@ -86,6 +86,7 @@ describe("mapAccountPairError", () => {
     expect(mapAccountPairError(403, "account_signed_out")).toMatch(
       /Sign in to your Codemux account on the desktop/i,
     );
+    expect(mapAccountPairError(409, "account_session_changed")).toMatch(/sign-in changed/i);
     expect(mapAccountPairError(429, "rate_limited")).toMatch(/Too many/i);
   });
 

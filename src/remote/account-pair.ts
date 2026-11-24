@@ -110,6 +110,8 @@ export function mapAccountPairError(
       return "Sign in to your Codemux account on the desktop first, then try again.";
     case "account_mismatch":
       return "That account isn't the one signed in on this desktop. Sign in with the desktop's account.";
+    case "account_session_changed":
+      return "The desktop’s sign-in changed. Try signing in again.";
     case "account_auth_failed":
       return "That email or password is incorrect.";
     case "origin_mismatch":

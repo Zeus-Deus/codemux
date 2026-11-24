@@ -64,6 +64,12 @@ hl.window_rule({ match = { class = "^(xdg-desktop-portal-gtk)$" }, float = true,
 
 Split panes with keybinds, open a browser pane for testing, and use the changes panel to review diffs and commit when ready.
 
+## Browser remote access
+
+Direct browser account pairing is available on the desktop's loopback address. For access from another device, use a pairing link or **From anywhere**.
+
+To enable browser account pairing through a local HTTPS reverse proxy, bind **Remote Access** to loopback and launch Codemux with `CODEMUX_WEB_REMOTE_TLS_PROXY_TOKEN` set to a random 64-character hexadecimal secret. For `/api/health`, `/api/pair`, `/api/pair-account`, and `/ws`, overwrite both `X-Codemux-Proxy-Token` with that secret and `X-Forwarded-Proto` with `https`. Forward only HTTPS requests to this upstream and preserve the public `Host` and `Origin`. Keep the token in server-side configuration. While proxy mode is configured, the proxy credential is required even for loopback account pairing.
+
 ## Outside agents (MCP)
 
 Codemux is an MCP server. Claude Code, Codex, a Hermes chat bot, or any MCP client can drive it:
