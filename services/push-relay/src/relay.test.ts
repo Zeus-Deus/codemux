@@ -200,17 +200,16 @@ describe("registration", () => {
     expect(await res.json()).toEqual({ error: "unsupported_app" });
   });
 
-  it("rate-limits registrations per client IP", async () => {
+  it("shares a registration limit when no trusted client IP resolver is configured", async () => {
     const t = setup({ limits: { registrationsPerHour: 2 } });
     const body = { platform: "ios", token: IOS_TOKEN, appId: APP_ID };
     const fromIp = (ip: string) => t.call("POST", "/v1/devices", body, { "x-forwarded-for": `${ip}, 10.0.0.1` });
     expect((await fromIp("1.1.1.1")).status).toBe(201);
-    expect((await fromIp("1.1.1.1")).status).toBe(201);
-    const limited = await fromIp("1.1.1.1");
+    expect((await fromIp("2.2.2.2")).status).toBe(201);
+    const limited = await fromIp("3.3.3.3");
     expect(limited.status).toBe(429);
     expect(limited.headers.get("retry-after")).toBe("3600");
     expect(await limited.json()).toEqual({ error: "rate_limited" });
-    expect((await fromIp("2.2.2.2")).status).toBe(201);
     t.advance(60 * 60 * 1000);
     expect((await fromIp("1.1.1.1")).status).toBe(201);
   });

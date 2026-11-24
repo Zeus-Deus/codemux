@@ -34,7 +34,7 @@ export interface PushRelayOptions {
   /** APNs topics (bundle ids) and Android package names accepted at registration. */
   allowedApps: { ios: string[]; android: string[] };
   now?: () => number;
-  /** Only trust x-forwarded-for when the relay sits behind a proxy that sets it. */
+  /** Resolve the client address from server metadata or a trusted proxy. */
   getClientIp?: (request: Request) => string;
   limits?: PushRelayLimits;
 }
@@ -77,8 +77,9 @@ function json(status: number, body: unknown, headers: Record<string, string> = {
 
 const noContent = () => new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
 
-export function defaultClientIp(request: Request): string {
-  return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+export function defaultClientIp(_request: Request): string {
+  // Fetch's Request does not expose the connection's peer address.
+  return "unknown";
 }
 
 export function createPushRelay(options: PushRelayOptions): PushRelay {
