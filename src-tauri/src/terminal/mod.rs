@@ -2417,8 +2417,8 @@ fn spawn_pty_for_session_in_process<R: Runtime>(
             }
         }
     }
-    if let Some((port, token)) = crate::hooks::hook_endpoint() {
-        cmd.env("CODEMUX_HOOK_PORT", port.to_string());
+    if let Some((endpoint, token)) = crate::hooks::hook_endpoint() {
+        cmd.env("CODEMUX_HOOK_ENDPOINT", endpoint);
         cmd.env("CODEMUX_HOOK_TOKEN", token);
     }
 

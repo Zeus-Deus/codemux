@@ -1439,8 +1439,8 @@ async fn spawn_prepared_session<R: Runtime>(
         env.push(("CODEMUX_PANE_ID".into(), pane_id.clone()));
     }
     if !is_remote {
-        if let Some((port, token)) = crate::hooks::hook_endpoint() {
-            env.push(("CODEMUX_HOOK_PORT".into(), port.to_string()));
+        if let Some((endpoint, token)) = crate::hooks::hook_endpoint() {
+            env.push(("CODEMUX_HOOK_ENDPOINT".into(), endpoint.to_owned()));
             env.push(("CODEMUX_HOOK_TOKEN".into(), token.to_owned()));
         }
     }

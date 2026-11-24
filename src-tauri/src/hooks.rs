@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -8,6 +7,13 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::state::{self, AppStateStore, PaneStatus};
+
+#[cfg(unix)]
+#[path = "hooks/unix_transport.rs"]
+mod transport;
+#[cfg(windows)]
+#[path = "hooks/windows_transport.rs"]
+mod transport;
 
 static HOOK_ENDPOINT: OnceLock<HookEndpoint> = OnceLock::new();
 static MONITOR_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
@@ -18,57 +24,51 @@ const MAX_HOOK_REQUEST_BYTES: usize = 4096;
 const HOOK_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct HookEndpoint {
-    port: u16,
+    address: String,
     token: String,
 }
 
-pub fn hook_endpoint() -> Option<(u16, &'static str)> {
+pub fn hook_endpoint() -> Option<(&'static str, &'static str)> {
     HOOK_ENDPOINT
         .get()
-        .map(|endpoint| (endpoint.port, endpoint.token.as_str()))
+        .map(|endpoint| (endpoint.address.as_str(), endpoint.token.as_str()))
 }
 
-/// Start the agent hook notification server on a random localhost port.
+/// Start the agent hook listener on an account-protected local transport.
 pub fn start_hook_server<R: Runtime>(app: AppHandle<R>) {
-    let listener = TcpListener::bind("127.0.0.1:0").and_then(|listener| {
-        listener.set_nonblocking(true)?;
-        Ok(listener)
-    });
-    let endpoint = listener.and_then(|listener| Ok((listener.local_addr()?.port(), listener)));
-    let (port, listener) = match endpoint {
+    let listener = {
+        let runtime = tauri::async_runtime::handle();
+        let _enter = runtime.inner().enter();
+        transport::Listener::bind()
+    };
+    let mut listener = match listener {
         Ok(endpoint) => endpoint,
         Err(error) => {
             eprintln!("[codemux::hooks] Failed to bind hook server: {error}");
             return;
         }
     };
+    let address = listener.endpoint().to_owned();
     let token = uuid::Uuid::new_v4().simple().to_string();
     if HOOK_ENDPOINT
         .set(HookEndpoint {
-            port,
+            address: address.clone(),
             token: token.clone(),
         })
         .is_err()
     {
         return;
     }
-    if write_active_hook_endpoint(port, &token).is_none() {
+    if write_active_hook_endpoint(&address, &token).is_none() {
         eprintln!("[codemux::hooks] Failed to publish the active hook endpoint");
     }
 
     tauri::async_runtime::spawn(async move {
-        let listener = match tokio::net::TcpListener::from_std(listener) {
-            Ok(listener) => listener,
-            Err(error) => {
-                eprintln!("[codemux::hooks] Failed to start hook server: {error}");
-                return;
-            }
-        };
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_HOOK_CONNECTIONS));
         let token: Arc<str> = Arc::from(token);
         loop {
             let stream = match listener.accept().await {
-                Ok((stream, _)) => stream,
+                Ok(stream) => stream,
                 Err(error) => {
                     eprintln!("[codemux::hooks] Failed to accept hook connection: {error}");
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -88,7 +88,7 @@ pub fn start_hook_server<R: Runtime>(app: AppHandle<R>) {
 }
 
 async fn serve_hook<R: Runtime>(
-    mut stream: tokio::net::TcpStream,
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     app: &AppHandle<R>,
     token: &str,
 ) -> std::io::Result<()> {
@@ -400,7 +400,7 @@ fn start_agent_exit_monitor<R: Runtime>(app: AppHandle<R>, session_id: String, s
 #[cfg(not(target_os = "windows"))]
 const HOOK_SCRIPT: &str = r#"#!/bin/sh
 # Codemux agent lifecycle hook — notifies the hook server of agent status changes.
-# Injected env: CODEMUX_HOOK_PORT, CODEMUX_HOOK_TOKEN, CODEMUX_SESSION_ID
+# Injected env: CODEMUX_HOOK_ENDPOINT, CODEMUX_HOOK_TOKEN, CODEMUX_SESSION_ID
 [ -z "$CODEMUX_SESSION_ID" ] && exit 0
 
 # Event type comes from the first arg when the agent's hook config can pass
@@ -444,32 +444,32 @@ if [ "$EVENT_TYPE" = "Notification" ]; then
 fi
 
 # Persistent PTYs survive Codemux restarts, but their process environment
-# cannot be updated: CODEMUX_HOOK_PORT can therefore point at the previous
-# app instance. Try the inherited port first (important if two app instances
-# coexist), then retry the port published by the current app. The retry lives
+# cannot be updated: the inherited endpoint may point at the previous
+# app instance. Try it first (important if two app instances coexist),
+# then retry the endpoint published by the current app. The retry lives
 # in the detached subshell so hooks stay non-blocking.
 send_hook() {
-  PORT="$1"
+  ENDPOINT="$1"
   TOKEN="$2"
-  case "$PORT" in ''|*[!0-9]*) return 1 ;; esac
-  [ "${#PORT}" -le 5 ] || return 1
+  case "$ENDPOINT" in /*) ;; *) return 1 ;; esac
   case "$TOKEN" in ''|*[!0-9a-f]*) return 1 ;; esac
   [ "${#TOKEN}" -eq 32 ] || return 1
   printf 'Authorization: Bearer %s\n' "$TOKEN" |
     curl -q -fsS --noproxy '*' --connect-timeout 1 --max-time 2 \
-      --header @- --get --request POST \
+      --unix-socket "$ENDPOINT" --header @- --get --request POST \
       --data-urlencode "sessionId=$CODEMUX_SESSION_ID" \
       --data-urlencode "eventType=$EVENT_TYPE" \
       --data-urlencode "agentSessionId=$AGENT_SID" \
-      "http://127.0.0.1:${PORT}/hook" >/dev/null 2>&1
+      "http://localhost/hook" >/dev/null 2>&1
 }
 
 (
-  send_hook "$CODEMUX_HOOK_PORT" "$CODEMUX_HOOK_TOKEN" && exit 0
+  send_hook "$CODEMUX_HOOK_ENDPOINT" "$CODEMUX_HOOK_TOKEN" && exit 0
   SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
-  read -r ACTIVE_PORT ACTIVE_TOKEN < "$SCRIPT_DIR/active-endpoint" || exit 0
-  [ "$ACTIVE_PORT $ACTIVE_TOKEN" = "$CODEMUX_HOOK_PORT $CODEMUX_HOOK_TOKEN" ] && exit 0
-  send_hook "$ACTIVE_PORT" "$ACTIVE_TOKEN" || true
+  read -r VERSION ACTIVE_ENDPOINT ACTIVE_TOKEN < "$SCRIPT_DIR/active-endpoint" || exit 0
+  [ "$VERSION" = v1 ] || exit 0
+  [ "$ACTIVE_ENDPOINT $ACTIVE_TOKEN" = "$CODEMUX_HOOK_ENDPOINT $CODEMUX_HOOK_TOKEN" ] && exit 0
+  send_hook "$ACTIVE_ENDPOINT" "$ACTIVE_TOKEN" || true
 ) >/dev/null 2>&1 &
 exit 0
 "#;
@@ -479,7 +479,7 @@ exit 0
 /// PowerShell so cmd.exe can invoke it without bash/curl/jq.
 #[cfg(target_os = "windows")]
 const HOOK_SCRIPT_PS1: &str = r#"# Codemux agent lifecycle hook (Windows / PowerShell)
-# Injected env: CODEMUX_HOOK_PORT, CODEMUX_HOOK_TOKEN, CODEMUX_SESSION_ID
+# Injected env: CODEMUX_HOOK_ENDPOINT, CODEMUX_HOOK_TOKEN, CODEMUX_SESSION_ID
 $ErrorActionPreference = 'SilentlyContinue'
 if (-not $env:CODEMUX_SESSION_ID)   { exit 0 }
 $eventType = if ($args.Count -gt 0) { $args[0] } else { '' }
@@ -513,37 +513,41 @@ if ($eventType -eq 'Notification') {
     if ($notifMsg -notmatch '(?i)permission|approval') { exit 0 }
 }
 
-function Send-CodemuxHook([string]$port, [string]$token) {
-    if ($port -notmatch '^[0-9]{1,5}$' -or $token -cnotmatch '^[0-9a-f]{32}$') {
+function Send-CodemuxHook([string]$endpoint, [string]$token) {
+    if ($endpoint -cnotmatch '^codemux-hook-[0-9a-f]{32}$' -or $token -cnotmatch '^[0-9a-f]{32}$') {
         return $false
     }
     $session = [uri]::EscapeDataString($env:CODEMUX_SESSION_ID)
     $event = [uri]::EscapeDataString($eventType)
     $agent = [uri]::EscapeDataString($agentSid)
-    $url = "http://127.0.0.1:$port/hook?sessionId=$session&eventType=$event&agentSessionId=$agent"
+    $target = "/hook?sessionId=$session&eventType=$event&agentSessionId=$agent"
+    $pipe = $null
+    $reader = $null
     try {
-        $request = [System.Net.WebRequest]::CreateHttp($url)
-        $request.Method = 'POST'
-        $request.ContentLength = 0
-        $request.Proxy = $null
-        $request.AllowAutoRedirect = $false
-        $request.Timeout = 2000
-        $request.Headers['Authorization'] = "Bearer $token"
-        $response = $request.GetResponse()
-        try { return [int]$response.StatusCode -eq 200 } finally { $response.Dispose() }
+        $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', $endpoint, 'InOut', 'Asynchronous', 'Identification')
+        $pipe.Connect(1000)
+        $request = [System.Text.Encoding]::ASCII.GetBytes("POST $target HTTP/1.1`r`nHost: localhost`r`nAuthorization: Bearer $token`r`nContent-Length: 0`r`n`r`n")
+        $write = $pipe.WriteAsync($request, 0, $request.Length)
+        if (-not $write.Wait(1000)) { return $false }
+        $reader = [System.IO.StreamReader]::new($pipe)
+        $response = $reader.ReadLineAsync()
+        return $response.Wait(1000) -and $response.Result -eq 'HTTP/1.1 200 OK'
     } catch {
         return $false
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if ($pipe) { $pipe.Dispose() }
     }
 }
 
 # A daemon-backed terminal may retain credentials across an app restart.
 # Retry the current endpoint when the inherited listener stops answering.
-if (-not (Send-CodemuxHook $env:CODEMUX_HOOK_PORT $env:CODEMUX_HOOK_TOKEN)) {
+if (-not (Send-CodemuxHook $env:CODEMUX_HOOK_ENDPOINT $env:CODEMUX_HOOK_TOKEN)) {
     $active = ''
     try { $active = (Get-Content (Join-Path $PSScriptRoot 'active-endpoint') -Raw).Trim() } catch {}
-    if ($active -ne "$env:CODEMUX_HOOK_PORT $env:CODEMUX_HOOK_TOKEN") {
-        $activePort, $activeToken = $active -split ' ', 2
-        [void](Send-CodemuxHook $activePort $activeToken)
+    $version, $activeEndpoint, $activeToken = $active -split ' ', 3
+    if ($version -eq 'v1' -and "$activeEndpoint $activeToken" -ne "$env:CODEMUX_HOOK_ENDPOINT $env:CODEMUX_HOOK_TOKEN") {
+        [void](Send-CodemuxHook $activeEndpoint $activeToken)
     }
 }
 exit 0
@@ -557,7 +561,7 @@ exit 0
 #[cfg(not(target_os = "windows"))]
 const GEMINI_HOOK_SCRIPT: &str = r#"#!/bin/sh
 # Codemux Gemini lifecycle hook — notifies the hook server of agent status.
-# Injected env: CODEMUX_HOOK_PORT, CODEMUX_HOOK_TOKEN, CODEMUX_SESSION_ID
+# Injected env: CODEMUX_HOOK_ENDPOINT, CODEMUX_HOOK_TOKEN, CODEMUX_SESSION_ID
 
 EVENT_TYPE="${1:-}"
 
@@ -575,27 +579,27 @@ if command -v jq >/dev/null 2>&1; then
 fi
 
 send_hook() {
-  PORT="$1"
+  ENDPOINT="$1"
   TOKEN="$2"
-  case "$PORT" in ''|*[!0-9]*) return 1 ;; esac
-  [ "${#PORT}" -le 5 ] || return 1
+  case "$ENDPOINT" in /*) ;; *) return 1 ;; esac
   case "$TOKEN" in ''|*[!0-9a-f]*) return 1 ;; esac
   [ "${#TOKEN}" -eq 32 ] || return 1
   printf 'Authorization: Bearer %s\n' "$TOKEN" |
     curl -q -fsS --noproxy '*' --connect-timeout 1 --max-time 2 \
-      --header @- --get --request POST \
+      --unix-socket "$ENDPOINT" --header @- --get --request POST \
       --data-urlencode "sessionId=$CODEMUX_SESSION_ID" \
       --data-urlencode "eventType=$EVENT_TYPE" \
       --data-urlencode "agentSessionId=$AGENT_SID" \
-      "http://127.0.0.1:${PORT}/hook" >/dev/null 2>&1
+      "http://localhost/hook" >/dev/null 2>&1
 }
 
 (
-  send_hook "$CODEMUX_HOOK_PORT" "$CODEMUX_HOOK_TOKEN" && exit 0
+  send_hook "$CODEMUX_HOOK_ENDPOINT" "$CODEMUX_HOOK_TOKEN" && exit 0
   SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
-  read -r ACTIVE_PORT ACTIVE_TOKEN < "$SCRIPT_DIR/active-endpoint" || exit 0
-  [ "$ACTIVE_PORT $ACTIVE_TOKEN" = "$CODEMUX_HOOK_PORT $CODEMUX_HOOK_TOKEN" ] && exit 0
-  send_hook "$ACTIVE_PORT" "$ACTIVE_TOKEN" || true
+  read -r VERSION ACTIVE_ENDPOINT ACTIVE_TOKEN < "$SCRIPT_DIR/active-endpoint" || exit 0
+  [ "$VERSION" = v1 ] || exit 0
+  [ "$ACTIVE_ENDPOINT $ACTIVE_TOKEN" = "$CODEMUX_HOOK_ENDPOINT $CODEMUX_HOOK_TOKEN" ] && exit 0
+  send_hook "$ACTIVE_ENDPOINT" "$ACTIVE_TOKEN" || true
 ) >/dev/null 2>&1 &
 exit 0
 "#;
@@ -619,14 +623,14 @@ fn user_home_dir() -> Option<String> {
 }
 
 /// Publish the endpoint atomically so reattached PTYs always read a matching
-/// port and credential. The temporary file uses owner-only mode on Unix and
+/// address and credential. The temporary file uses owner-only mode on Unix and
 /// inherits the user's profile directory permissions on Windows.
-fn write_active_hook_endpoint(port: u16, token: &str) -> Option<PathBuf> {
+fn write_active_hook_endpoint(address: &str, token: &str) -> Option<PathBuf> {
     let home = user_home_dir()?;
-    write_active_hook_endpoint_in(&PathBuf::from(home).join(".codemux/hooks"), port, token)
+    write_active_hook_endpoint_in(&PathBuf::from(home).join(".codemux/hooks"), address, token)
 }
 
-fn write_active_hook_endpoint_in(hooks_dir: &Path, port: u16, token: &str) -> Option<PathBuf> {
+fn write_active_hook_endpoint_in(hooks_dir: &Path, address: &str, token: &str) -> Option<PathBuf> {
     std::fs::create_dir_all(hooks_dir).ok()?;
     #[cfg(unix)]
     {
@@ -641,7 +645,7 @@ fn write_active_hook_endpoint_in(hooks_dir: &Path, port: u16, token: &str) -> Op
     }
     let path = hooks_dir.join(ACTIVE_HOOK_ENDPOINT_FILE);
     let mut staged = tempfile::NamedTempFile::new_in(hooks_dir).ok()?;
-    writeln!(staged, "{port} {token}").ok()?;
+    writeln!(staged, "v1 {address} {token}").ok()?;
     staged.persist(&path).ok()?;
     Some(path)
 }
@@ -1122,17 +1126,19 @@ pub fn register_gemini_hooks() {}
 const OPENCODE_TRANSPORT_JS: &str = r#"import { readFile } from "node:fs/promises";
 import { request } from "node:http";
 
-const ACTIVE_PORT_PATH = {{ACTIVE_PORT_PATH}};
+const ACTIVE_ENDPOINT_PATH = {{ACTIVE_PORT_PATH}};
 
 let reports = Promise.resolve();
 
-const postHook = (port, token, eventType) => new Promise((resolve) => {
-  if (!/^[0-9]{1,5}$/.test(port ?? "") || Number(port) > 65535 || !/^[0-9a-f]{32}$/.test(token ?? "")) {
+const postHook = (endpoint, token, eventType) => new Promise((resolve) => {
+  if (!endpoint?.startsWith("/") || !/^[0-9a-f]{32}$/.test(token ?? "")) {
     resolve(false);
     return;
   }
   const query = new URLSearchParams({ sessionId: process.env.CODEMUX_SESSION_ID ?? "", eventType });
-  const hook = request(`http://127.0.0.1:${port}/hook?${query}`, {
+  const hook = request({
+    socketPath: endpoint,
+    path: `/hook?${query}`,
     method: "POST",
     agent: false,
     headers: { Authorization: `Bearer ${token}`, "Content-Length": "0" },
@@ -1147,15 +1153,17 @@ const postHook = (port, token, eventType) => new Promise((resolve) => {
 
 const notify = (eventType) => {
   reports = reports.then(async () => {
-    const port = process.env.CODEMUX_HOOK_PORT;
+    const endpoint = process.env.CODEMUX_HOOK_ENDPOINT;
     const token = process.env.CODEMUX_HOOK_TOKEN;
-    if (await postHook(port, token, eventType)) return;
+    if (await postHook(endpoint, token, eventType)) return;
     let active = "";
     try {
-      active = (await readFile(ACTIVE_PORT_PATH, "utf8")).trim();
+      active = (await readFile(ACTIVE_ENDPOINT_PATH, "utf8")).trim();
     } catch {}
-    const [activePort, activeToken] = active.split(" ");
-    if (activePort !== port || activeToken !== token) await postHook(activePort, activeToken, eventType);
+    const [version, activeEndpoint, activeToken] = active.split(" ");
+    if (version === "v1" && (activeEndpoint !== endpoint || activeToken !== token)) {
+      await postHook(activeEndpoint, activeToken, eventType);
+    }
   }).catch(() => {});
 };
 "#;
@@ -1865,7 +1873,7 @@ mod tests {
         for template in [OPENCODE_PLUGIN_TEMPLATE, OPENCODE_TUI_PLUGIN_TEMPLATE] {
             let plugin = render_opencode_plugin(template, path);
             assert!(
-                plugin.contains(&format!("const ACTIVE_PORT_PATH = \"{path}\";")),
+                plugin.contains(&format!("const ACTIVE_ENDPOINT_PATH = \"{path}\";")),
                 "plugin must inline the active-endpoint path as a JS string"
             );
             assert!(
@@ -1873,7 +1881,7 @@ mod tests {
                 "plugin must not leave a placeholder unsubstituted"
             );
             assert!(
-                plugin.contains("CODEMUX_SESSION_ID") && plugin.contains("CODEMUX_HOOK_PORT"),
+                plugin.contains("CODEMUX_SESSION_ID") && plugin.contains("CODEMUX_HOOK_ENDPOINT"),
                 "plugin must report this pane and no-op outside Codemux"
             );
             // Normalizes to the canonical vocabulary map_event_type understands.
@@ -1887,7 +1895,7 @@ mod tests {
     #[test]
     fn opencode_plugin_paths_are_json_escaped() {
         let plugin = render_opencode_plugin(OPENCODE_TUI_PLUGIN_TEMPLATE, "/home/o\"brien/x");
-        assert!(plugin.contains(r#"const ACTIVE_PORT_PATH = "/home/o\"brien/x";"#));
+        assert!(plugin.contains(r#"const ACTIVE_ENDPOINT_PATH = "/home/o\"brien/x";"#));
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1959,9 +1967,10 @@ const server = http.createServer((req, res) => {
   reported.push(new URL(req.url, "http://hook").searchParams.get("eventType"));
   res.end();
 });
-await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+const endpoint = process.argv[3];
+await new Promise((resolve) => server.listen(endpoint, resolve));
 process.env.CODEMUX_SESSION_ID = "pane-1";
-process.env.CODEMUX_HOOK_PORT = String(server.address().port);
+process.env.CODEMUX_HOOK_ENDPOINT = endpoint;
 process.env.CODEMUX_HOOK_TOKEN = token;
 const { default: plugin } = await import(process.argv[2]);
 
@@ -2026,6 +2035,7 @@ console.log(JSON.stringify(reported));
         let output = match std::process::Command::new("node")
             .arg(&harness_path)
             .arg(format!("file://{}", plugin_path.display()))
+            .arg(dir.path().join("hook.sock"))
             .output()
         {
             Ok(output) => output,
@@ -2096,10 +2106,10 @@ console.log(JSON.stringify(reported));
     #[test]
     fn active_hook_endpoint_file_tracks_the_current_listener() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_active_hook_endpoint_in(dir.path(), 43123, "test-token").unwrap();
+        let path = write_active_hook_endpoint_in(dir.path(), "test-endpoint", "test-token").unwrap();
 
         assert_eq!(path, dir.path().join(ACTIVE_HOOK_ENDPOINT_FILE));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "43123 test-token\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1 test-endpoint test-token\n");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2127,8 +2137,67 @@ console.log(JSON.stringify(reported));
         assert_eq!(event.agent_session_id, "ses_1");
     }
 
+    #[tokio::test]
+    async fn installed_notifier_delivers_an_event_over_the_private_transport() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut listener = transport::Listener::bind().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let token = "11111111111111111111111111111111";
+        write_active_hook_endpoint_in(directory.path(), listener.endpoint(), token).unwrap();
+
+        #[cfg(unix)]
+        let mut command = {
+            if std::process::Command::new("curl").arg("--version").output().is_err() {
+                eprintln!("skipping: curl is unavailable");
+                return;
+            }
+            let script = directory.path().join("notify.sh");
+            std::fs::write(&script, HOOK_SCRIPT).unwrap();
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.arg(script);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let script = directory.path().join("notify.ps1");
+            std::fs::write(&script, HOOK_SCRIPT_PS1).unwrap();
+            let mut command = tokio::process::Command::new("powershell.exe");
+            command.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]);
+            command.arg(script);
+            command
+        };
+        let mut child = command
+            .arg("UserPromptSubmit")
+            .env_remove("CODEMUX_HOOK_ENDPOINT")
+            .env_remove("CODEMUX_HOOK_TOKEN")
+            .env("CODEMUX_SESSION_ID", "fixture-pane")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stream = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < MAX_HOOK_REQUEST_BYTES);
+                request.push(stream.read_u8().await.unwrap());
+            }
+            let event = parse_hook_request(std::str::from_utf8(&request).unwrap(), token).unwrap();
+            assert_eq!(event.event_type, "UserPromptSubmit");
+            assert_eq!(event.session_id, "fixture-pane");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            assert!(child.wait().await.unwrap().success());
+        })
+        .await
+        .expect("installed notifier did not report its event");
+    }
+
     #[test]
-    fn every_notifier_can_retry_the_published_active_port() {
+    fn every_notifier_can_retry_the_published_endpoint() {
         #[cfg(not(target_os = "windows"))]
         {
             assert!(HOOK_SCRIPT.contains("$SCRIPT_DIR/active-endpoint"));
@@ -2140,17 +2209,16 @@ console.log(JSON.stringify(reported));
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn notify_script_retries_the_current_port_after_a_stale_inherited_port() {
+    fn notify_script_retries_the_current_endpoint_after_a_stale_inherited_endpoint() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("notify.sh");
         std::fs::write(&script_path, HOOK_SCRIPT).unwrap();
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        write_active_hook_endpoint_in(dir.path(), 43210, "22222222222222222222222222222222").unwrap();
+        write_active_hook_endpoint_in(dir.path(), "/fixtures/current.sock", "22222222222222222222222222222222").unwrap();
 
-        // Replace curl with a deterministic probe: the inherited port fails,
-        // the active-endpoint retry succeeds, and both attempted URLs are logged.
+        // The inherited socket fails and the active-endpoint retry succeeds.
         let bin_dir = dir.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let fake_curl = bin_dir.join("curl");
@@ -2159,18 +2227,18 @@ console.log(JSON.stringify(reported));
             r#"#!/bin/sh
 for ARG in "$@"; do
   case "$ARG" in
-    http://*) URL="$ARG" ;;
+    /fixtures/*.sock) ENDPOINT="$ARG" ;;
     sessionId=*) SESSION="$ARG" ;;
     eventType=*) EVENT="$ARG" ;;
   esac
 done
 IFS= read -r AUTH
-case "$URL $AUTH" in
-  *:43199/hook' Authorization: Bearer 11111111111111111111111111111111') LABEL=inherited ;;
-  *:43210/hook' Authorization: Bearer 22222222222222222222222222222222') LABEL=active ;;
+case "$ENDPOINT $AUTH" in
+  '/fixtures/old.sock Authorization: Bearer 11111111111111111111111111111111') LABEL=inherited ;;
+  '/fixtures/current.sock Authorization: Bearer 22222222222222222222222222222222') LABEL=active ;;
   *) exit 1 ;;
 esac
-printf '%s %s %s %s\n' "$LABEL" "$URL" "$SESSION" "$EVENT" >> "$HOOK_TEST_LOG"
+printf '%s %s %s %s\n' "$LABEL" "$ENDPOINT" "$SESSION" "$EVENT" >> "$HOOK_TEST_LOG"
 [ "$LABEL" = active ]
 "#,
         )
@@ -2185,7 +2253,7 @@ printf '%s %s %s %s\n' "$LABEL" "$URL" "$SESSION" "$EVENT" >> "$HOOK_TEST_LOG"
             cache_key: "fixture".into(),
         };
         let (_, managed_env) = grant.launch(HashMap::from([
-            ("CODEMUX_HOOK_PORT".into(), "43199".into()),
+            ("CODEMUX_HOOK_ENDPOINT".into(), "/fixtures/old.sock".into()),
             ("CODEMUX_HOOK_TOKEN".into(), "11111111111111111111111111111111".into()),
             ("CODEMUX_SESSION_ID".into(), "session-resumed".into()),
         ]));
@@ -2213,8 +2281,8 @@ printf '%s %s %s %s\n' "$LABEL" "$URL" "$SESSION" "$EVENT" >> "$HOOK_TEST_LOG"
             2,
             "expected inherited + active-endpoint attempts: {log}"
         );
-        assert!(attempts[0].starts_with("inherited http://127.0.0.1:43199/hook "));
-        assert!(attempts[1].starts_with("active http://127.0.0.1:43210/hook "));
+        assert!(attempts[0].starts_with("inherited /fixtures/old.sock "));
+        assert!(attempts[1].starts_with("active /fixtures/current.sock "));
         assert!(attempts[1].contains("sessionId=session-resumed"));
         assert!(attempts[1].contains("eventType=UserPromptSubmit"));
     }

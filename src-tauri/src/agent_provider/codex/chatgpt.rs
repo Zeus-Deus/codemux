@@ -137,7 +137,7 @@ pub(super) fn managed_launch_input(key: &str) -> bool {
         "CODEMUX_WORKSPACE_ID"
             | "CODEMUX_PANE_ID"
             | "CODEMUX_SESSION_ID"
-            | "CODEMUX_HOOK_PORT"
+            | "CODEMUX_HOOK_ENDPOINT"
             | "CODEMUX_HOOK_TOKEN"
             | "CODEMUX_CONTROL_SOCKET"
     )
@@ -1713,7 +1713,7 @@ mod tests {
             ("LD_PRELOAD".into(), "/foreign.so".into()),
             ("CODEMUX_WORKSPACE_ID".into(), "workspace".into()),
             ("CODEMUX_SESSION_ID".into(), "notifier-session".into()),
-            ("CODEMUX_HOOK_PORT".into(), "43199".into()),
+            ("CODEMUX_HOOK_ENDPOINT".into(), "hook-fixture".into()),
             ("CODEMUX_HOOK_TOKEN".into(), "11111111111111111111111111111111".into()),
         ]);
         let (args, env) = grant.launch(caller);
@@ -1730,7 +1730,7 @@ mod tests {
         assert_eq!(env["CODEX_HOME"], "/synthetic/managed-home");
         assert_eq!(env["CODEMUX_WORKSPACE_ID"], "workspace");
         assert_eq!(env["CODEMUX_SESSION_ID"], "notifier-session");
-        assert_eq!(env["CODEMUX_HOOK_PORT"], "43199");
+        assert_eq!(env["CODEMUX_HOOK_ENDPOINT"], "hook-fixture");
         assert_eq!(env["CODEMUX_HOOK_TOKEN"], "11111111111111111111111111111111");
         assert!(!text.contains(&env["CODEMUX_HOOK_TOKEN"]));
         for key in ["OPENAI_BASE_URL", "OPENAI_API_KEY", "LD_PRELOAD"] {
