@@ -61,6 +61,7 @@
 //! concern it defends against cannot arise without ambient cookies; see the
 //! design doc §1.3). Every subsequent frame rides that approved session.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -600,21 +601,74 @@ fn key_file_path() -> PathBuf {
     data_dir.join(crate::APP_DIR_NAME).join(KEY_FILE)
 }
 
-/// Persist `key`'s 32 raw bytes, machine-guarded (the same AES-256-GCM
-/// machine-id envelope the encrypted auth token uses) and `0600` on Unix, so
-/// the device's iroh identity — and thus its `node_id` — is stable across
-/// restarts and never sits in plaintext at rest.
-fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+fn ensure_private_key_dir(parent: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(|e| format!("create iroh key directory: {e}"))?;
+        let meta = std::fs::symlink_metadata(parent)
+            .map_err(|e| format!("inspect iroh key directory: {e}"))?;
+        if !meta.file_type().is_dir() {
+            return Err("iroh key directory is not a regular directory".to_string());
+        }
+        if meta.permissions().mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("secure iroh key directory: {e}"))?;
+        }
     }
-    let sealed = crate::auth::encrypt_data(&key.to_bytes())?;
-    std::fs::write(path, &sealed).map_err(|e| format!("write iroh key: {e}"))?;
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(parent).map_err(|e| format!("create iroh key directory: {e}"))?;
+    Ok(())
+}
+
+/// Reject symlinks and repair older key files before any read or rewrite.
+fn secure_existing_key_file(path: &Path) -> Result<(), String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("inspect iroh key file: {e}")),
+    };
+    if !meta.file_type().is_file() {
+        return Err("iroh key path is not a regular file".to_string());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        if meta.permissions().mode() & 0o777 != 0o600 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("secure iroh key file: {e}"))?;
+        }
     }
+    Ok(())
+}
+
+/// Persist the machine-guarded identity under owner-only directory and file
+/// permissions. Set permissions before writing any key material.
+fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
+    let parent = path.parent().ok_or("iroh key path has no parent")?;
+    ensure_private_key_dir(parent)?;
+    secure_existing_key_file(path)?;
+    let sealed = crate::auth::encrypt_data(&key.to_bytes())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|e| format!("open iroh key file: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("secure iroh key file: {e}"))?;
+    }
+    file.write_all(&sealed)
+        .map_err(|e| format!("write iroh key: {e}"))?;
     Ok(())
 }
 
@@ -623,19 +677,30 @@ fn persist_secret_key(path: &Path, key: &SecretKey) -> Result<(), String> {
 /// comes up, with a new `node_id`).
 fn load_or_create_secret_key() -> Result<SecretKey, String> {
     let path = key_file_path();
-    if let Ok(sealed) = std::fs::read(&path) {
-        if let Ok(bytes) = crate::auth::decrypt_data(&sealed) {
-            if let Some(arr) = to_key_array(&bytes) {
-                return Ok(SecretKey::from_bytes(&arr));
+    load_or_create_secret_key_at(&path)
+}
+
+fn load_or_create_secret_key_at(path: &Path) -> Result<SecretKey, String> {
+    let parent = path.parent().ok_or("iroh key path has no parent")?;
+    ensure_private_key_dir(parent)?;
+    secure_existing_key_file(path)?;
+    match std::fs::read(path) {
+        Ok(sealed) => {
+            if let Ok(bytes) = crate::auth::decrypt_data(&sealed) {
+                if let Some(arr) = to_key_array(&bytes) {
+                    return Ok(SecretKey::from_bytes(&arr));
+                }
             }
+            log::warn!(
+                "[codemux::web_remote] iroh identity key at {} unreadable; regenerating",
+                path.display()
+            );
         }
-        log::warn!(
-            "[codemux::web_remote] iroh identity key at {} unreadable; regenerating",
-            path.display()
-        );
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("read iroh key file: {e}")),
     }
     let key = SecretKey::generate();
-    persist_secret_key(&path, &key)?;
+    persist_secret_key(path, &key)?;
     Ok(key)
 }
 
@@ -652,7 +717,11 @@ fn to_key_array(bytes: &[u8]) -> Option<[u8; 32]> {
 /// identity key **without** binding an endpoint. `None` when relay mode has
 /// never been enabled (no key persisted yet).
 pub fn persisted_node_id() -> Option<String> {
-    let sealed = std::fs::read(key_file_path()).ok()?;
+    let path = key_file_path();
+    std::fs::symlink_metadata(&path).ok()?;
+    ensure_private_key_dir(path.parent()?).ok()?;
+    secure_existing_key_file(&path).ok()?;
+    let sealed = std::fs::read(path).ok()?;
     let bytes = crate::auth::decrypt_data(&sealed).ok()?;
     let arr = to_key_array(&bytes)?;
     Some(SecretKey::from_bytes(&arr).public().to_string())
@@ -1128,6 +1197,40 @@ mod tests {
         // A wrong-length blob is rejected (treated as absent → regenerate).
         assert!(to_key_array(&[0u8; 31]).is_none());
         assert!(to_key_array(&[0u8; 33]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_is_private_on_creation_and_existing_load() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("codemux");
+        let path = dir.join(KEY_FILE);
+        let key = SecretKey::generate();
+        persist_secret_key(&path, &key).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let loaded = load_or_create_secret_key_at(&path).unwrap();
+        assert_eq!(loaded.public(), key.public(), "loading must keep the device identity");
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iroh_identity_key_load_rejects_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("codemux");
+        std::fs::create_dir(&dir).unwrap();
+        let target = temp.path().join("other-file");
+        std::fs::write(&target, b"not a key").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(KEY_FILE)).unwrap();
+        let err = load_or_create_secret_key_at(&dir.join(KEY_FILE)).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
     }
 
     // ── Handshake / session gate ──────────────────────────────────────
