@@ -1397,7 +1397,7 @@ fn build_core_app<R: tauri::Runtime>(
             config::watch_theme_file(handle.clone());
 
             // Hook server must be running BEFORE PTYs spawn so that restored
-            // sessions get CODEMUX_HOOK_PORT in their environment.
+            // sessions get the hook endpoint and its token in their environment.
             hooks::start_hook_server(app.handle().clone());
             // Register agent lifecycle hooks so the status dot tracks
             // working / needs-input / done. Claude Code always; Codex,

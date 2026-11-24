@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,102 +9,188 @@ use tauri::{AppHandle, Manager, Runtime};
 
 use crate::state::{self, AppStateStore, PaneStatus};
 
-static HOOK_PORT: OnceLock<u16> = OnceLock::new();
+static HOOK_ENDPOINT: OnceLock<HookEndpoint> = OnceLock::new();
 static MONITOR_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 
-const ACTIVE_HOOK_PORT_FILE: &str = "active-port";
+const ACTIVE_HOOK_ENDPOINT_FILE: &str = "active-endpoint";
+const MAX_HOOK_CONNECTIONS: usize = 32;
+const MAX_HOOK_REQUEST_BYTES: usize = 4096;
+const HOOK_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub fn hook_port() -> Option<u16> {
-    HOOK_PORT.get().copied()
+struct HookEndpoint {
+    port: u16,
+    token: String,
+}
+
+pub fn hook_endpoint() -> Option<(u16, &'static str)> {
+    HOOK_ENDPOINT
+        .get()
+        .map(|endpoint| (endpoint.port, endpoint.token.as_str()))
 }
 
 /// Start the agent hook notification server on a random localhost port.
-/// Returns the allocated port number.
-pub fn start_hook_server<R: Runtime>(app: AppHandle<R>) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind hook server");
-    let port = listener.local_addr().unwrap().port();
-    HOOK_PORT.set(port).ok();
-    if write_active_hook_port(port).is_none() {
-        eprintln!("[codemux::hooks] Failed to publish active hook server port {port}");
+pub fn start_hook_server<R: Runtime>(app: AppHandle<R>) {
+    let listener = TcpListener::bind("127.0.0.1:0").and_then(|listener| {
+        listener.set_nonblocking(true)?;
+        Ok(listener)
+    });
+    let endpoint = listener.and_then(|listener| Ok((listener.local_addr()?.port(), listener)));
+    let (port, listener) = match endpoint {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            eprintln!("[codemux::hooks] Failed to bind hook server: {error}");
+            return;
+        }
+    };
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    if HOOK_ENDPOINT
+        .set(HookEndpoint {
+            port,
+            token: token.clone(),
+        })
+        .is_err()
+    {
+        return;
+    }
+    if write_active_hook_endpoint(port, &token).is_none() {
+        eprintln!("[codemux::hooks] Failed to publish the active hook endpoint");
     }
 
-    std::thread::spawn(move || {
-        // Accept connections until the app exits
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-
-            let app = app.clone();
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 2048];
-                let n = match stream.read(&mut buf) {
-                    Ok(n) if n > 0 => n,
-                    _ => return,
-                };
-                let request = String::from_utf8_lossy(&buf[..n]);
-
-                // Parse the GET request line for query parameters
-                let first_line = request.lines().next().unwrap_or("");
-                if !first_line.starts_with("GET /hook") {
-                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-                    return;
+    tauri::async_runtime::spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(listener) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("[codemux::hooks] Failed to start hook server: {error}");
+                return;
+            }
+        };
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_HOOK_CONNECTIONS));
+        let token: Arc<str> = Arc::from(token);
+        loop {
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(error) => {
+                    eprintln!("[codemux::hooks] Failed to accept hook connection: {error}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
                 }
-
-                let query = first_line
-                    .split_once('?')
-                    .and_then(|(_, rest)| rest.split_once(' ').map(|(q, _)| q))
-                    .unwrap_or("");
-
-                let params: std::collections::HashMap<&str, &str> = query
-                    .split('&')
-                    .filter_map(|pair| pair.split_once('='))
-                    .collect();
-
-                let event_type = params.get("eventType").copied().unwrap_or("");
-                let session_id = params.get("sessionId").copied().unwrap_or("");
-                let agent_session_id = params.get("agentSessionId").copied().unwrap_or("");
-
-                if event_type.is_empty() || session_id.is_empty() {
-                    let _ =
-                        stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
-                    return;
-                }
-
-                // Always store the agent session ID — it reflects the CURRENT
-                // session running in this pane. Anything on this machine can
-                // reach this port, and the id later lands in a resume command
-                // typed into the pane's shell, so only a plain token is kept.
-                if crate::session_adapters::is_safe_capture(agent_session_id) {
-                    let state: tauri::State<'_, AppStateStore> = app.state();
-                    // `handle_lifecycle_event` below emits, but only for event
-                    // types it recognises — an unrecognised one returns early,
-                    // and this write would then never reach the renderer.
-                    if state.set_terminal_adapter_capture(
-                        session_id,
-                        "claude_session_id",
-                        agent_session_id,
-                    ) {
-                        crate::state::schedule_emit_app_state(&app);
-                    }
-                }
-
-                let status = match map_event_type(event_type) {
-                    Some(s) => s,
-                    None => {
-                        // Unknown event type — acknowledge but ignore
-                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-                        return;
-                    }
-                };
-
-                handle_lifecycle_event(&app, session_id, status);
-
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            };
+            let Ok(slot) = slots.clone().try_acquire_owned() else {
+                continue;
+            };
+            let (app, token) = (app.clone(), token.clone());
+            tokio::spawn(async move {
+                let _slot = slot;
+                let _ = tokio::time::timeout(HOOK_TIMEOUT, serve_hook(stream, &app, &token)).await;
             });
         }
     });
+}
 
-    port
+async fn serve_hook<R: Runtime>(
+    mut stream: tokio::net::TcpStream,
+    app: &AppHandle<R>,
+    token: &str,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buffer = [0; MAX_HOOK_REQUEST_BYTES];
+    let mut end = 0;
+    let status = loop {
+        let read = stream.read(&mut buffer[end..]).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        end += read;
+        if buffer[..end].windows(4).any(|window| window == b"\r\n\r\n") {
+            break match std::str::from_utf8(&buffer[..end]) {
+                Ok(request) => match parse_hook_request(request, token) {
+                    Ok(event) => {
+                        apply_hook_event(app, event);
+                        "200 OK"
+                    }
+                    Err(status) => status,
+                },
+                Err(_) => "400 Bad Request",
+            };
+        }
+        if end == buffer.len() {
+            break "431 Request Header Fields Too Large";
+        }
+    };
+
+    let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    stream.write_all(response.as_bytes()).await
+}
+
+struct HookEvent {
+    event_type: String,
+    session_id: String,
+    agent_session_id: String,
+}
+
+fn parse_hook_request(request: &str, token: &str) -> Result<HookEvent, &'static str> {
+    let (head, _) = request.split_once("\r\n\r\n").ok_or("400 Bad Request")?;
+    let (line, headers) = head.split_once("\r\n").ok_or("400 Bad Request")?;
+    let mut parts = line.split_whitespace();
+    if parts.next() != Some("POST") {
+        return Err("405 Method Not Allowed");
+    }
+    let target = parts.next().ok_or("400 Bad Request")?;
+    let (path, query) = target.split_once('?').ok_or("404 Not Found")?;
+    if path != "/hook" {
+        return Err("404 Not Found");
+    }
+    let mut auth_headers = headers.lines().filter_map(|header| {
+        let (name, value) = header.split_once(':')?;
+        name.eq_ignore_ascii_case("authorization")
+            .then_some(value.trim())
+    });
+    let credential = auth_headers
+        .next()
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or("401 Unauthorized")?;
+    if auth_headers.next().is_some()
+        || !crate::automations::webhook::constant_time_eq(credential.as_bytes(), token.as_bytes())
+    {
+        return Err("401 Unauthorized");
+    }
+
+    let mut event = HookEvent {
+        event_type: String::new(),
+        session_id: String::new(),
+        agent_session_id: String::new(),
+    };
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "eventType" => event.event_type = value.into_owned(),
+            "sessionId" => event.session_id = value.into_owned(),
+            "agentSessionId" => event.agent_session_id = value.into_owned(),
+            _ => {}
+        }
+    }
+    if event.event_type.is_empty() || event.session_id.is_empty() {
+        return Err("400 Bad Request");
+    }
+    Ok(event)
+}
+
+fn apply_hook_event<R: Runtime>(app: &AppHandle<R>, event: HookEvent) {
+    // The captured ID later becomes a shell argument. Accept only a plain
+    // token even from an authenticated notifier.
+    if crate::session_adapters::is_safe_capture(&event.agent_session_id) {
+        let state: tauri::State<'_, AppStateStore> = app.state();
+        if state.set_terminal_adapter_capture(
+            &event.session_id,
+            "claude_session_id",
+            &event.agent_session_id,
+        ) {
+            crate::state::schedule_emit_app_state(app);
+        }
+    }
+    if let Some(status) = map_event_type(&event.event_type) {
+        handle_lifecycle_event(app, &event.session_id, status);
+    }
 }
 
 /// Map agent-specific event names to canonical PaneStatus.
@@ -314,7 +400,7 @@ fn start_agent_exit_monitor<R: Runtime>(app: AppHandle<R>, session_id: String, s
 #[cfg(not(target_os = "windows"))]
 const HOOK_SCRIPT: &str = r#"#!/bin/sh
 # Codemux agent lifecycle hook — notifies the hook server of agent status changes.
-# Injected env: CODEMUX_HOOK_PORT, CODEMUX_SESSION_ID
+# Injected env: CODEMUX_HOOK_PORT, CODEMUX_HOOK_TOKEN, CODEMUX_SESSION_ID
 [ -z "$CODEMUX_SESSION_ID" ] && exit 0
 
 # Event type comes from the first arg when the agent's hook config can pass
@@ -364,30 +450,36 @@ fi
 # in the detached subshell so hooks stay non-blocking.
 send_hook() {
   PORT="$1"
-  [ -n "$PORT" ] || return 1
-  URL="http://127.0.0.1:${PORT}/hook?sessionId=${CODEMUX_SESSION_ID}&eventType=${EVENT_TYPE}"
-  if [ -n "$AGENT_SID" ]; then
-    URL="${URL}&agentSessionId=${AGENT_SID}"
-  fi
-  curl -fsS --connect-timeout 1 --max-time 2 "$URL" >/dev/null 2>&1
+  TOKEN="$2"
+  case "$PORT" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#PORT}" -le 5 ] || return 1
+  case "$TOKEN" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#TOKEN}" -eq 32 ] || return 1
+  printf 'Authorization: Bearer %s\n' "$TOKEN" |
+    curl -q -fsS --noproxy '*' --connect-timeout 1 --max-time 2 \
+      --header @- --get --request POST \
+      --data-urlencode "sessionId=$CODEMUX_SESSION_ID" \
+      --data-urlencode "eventType=$EVENT_TYPE" \
+      --data-urlencode "agentSessionId=$AGENT_SID" \
+      "http://127.0.0.1:${PORT}/hook" >/dev/null 2>&1
 }
 
 (
-  send_hook "$CODEMUX_HOOK_PORT" && exit 0
+  send_hook "$CODEMUX_HOOK_PORT" "$CODEMUX_HOOK_TOKEN" && exit 0
   SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
-  ACTIVE_PORT=$(cat "$SCRIPT_DIR/active-port" 2>/dev/null)
-  [ "$ACTIVE_PORT" = "$CODEMUX_HOOK_PORT" ] && exit 0
-  send_hook "$ACTIVE_PORT" || true
+  read -r ACTIVE_PORT ACTIVE_TOKEN < "$SCRIPT_DIR/active-endpoint" || exit 0
+  [ "$ACTIVE_PORT $ACTIVE_TOKEN" = "$CODEMUX_HOOK_PORT $CODEMUX_HOOK_TOKEN" ] && exit 0
+  send_hook "$ACTIVE_PORT" "$ACTIVE_TOKEN" || true
 ) >/dev/null 2>&1 &
 exit 0
 "#;
 
 /// Windows equivalent of HOOK_SCRIPT — same protocol (read stdin JSON,
-/// extract session_id, fire-and-forget GET to the hook server) but in
+/// extract session_id, send an authenticated POST to the hook server) but in
 /// PowerShell so cmd.exe can invoke it without bash/curl/jq.
 #[cfg(target_os = "windows")]
 const HOOK_SCRIPT_PS1: &str = r#"# Codemux agent lifecycle hook (Windows / PowerShell)
-# Injected env: CODEMUX_HOOK_PORT, CODEMUX_SESSION_ID
+# Injected env: CODEMUX_HOOK_PORT, CODEMUX_HOOK_TOKEN, CODEMUX_SESSION_ID
 $ErrorActionPreference = 'SilentlyContinue'
 if (-not $env:CODEMUX_SESSION_ID)   { exit 0 }
 $eventType = if ($args.Count -gt 0) { $args[0] } else { '' }
@@ -421,26 +513,37 @@ if ($eventType -eq 'Notification') {
     if ($notifMsg -notmatch '(?i)permission|approval') { exit 0 }
 }
 
-function Send-CodemuxHook([string]$port) {
-    if (-not $port) { return $false }
-    $url = "http://127.0.0.1:$port/hook?sessionId=$($env:CODEMUX_SESSION_ID)&eventType=$eventType"
-    if ($agentSid) { $url = "$url&agentSessionId=$agentSid" }
+function Send-CodemuxHook([string]$port, [string]$token) {
+    if ($port -notmatch '^[0-9]{1,5}$' -or $token -cnotmatch '^[0-9a-f]{32}$') {
+        return $false
+    }
+    $session = [uri]::EscapeDataString($env:CODEMUX_SESSION_ID)
+    $event = [uri]::EscapeDataString($eventType)
+    $agent = [uri]::EscapeDataString($agentSid)
+    $url = "http://127.0.0.1:$port/hook?sessionId=$session&eventType=$event&agentSessionId=$agent"
     try {
-        Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 2 | Out-Null
-        return $true
+        $request = [System.Net.WebRequest]::CreateHttp($url)
+        $request.Method = 'POST'
+        $request.ContentLength = 0
+        $request.Proxy = $null
+        $request.AllowAutoRedirect = $false
+        $request.Timeout = 2000
+        $request.Headers['Authorization'] = "Bearer $token"
+        $response = $request.GetResponse()
+        try { return [int]$response.StatusCode -eq 200 } finally { $response.Dispose() }
     } catch {
         return $false
     }
 }
 
-# A daemon-backed PTY can outlive the app that supplied its environment.
-# Prefer that inherited app's port, then fall back to the port published by
-# the current Codemux process when the old listener is gone.
-if (-not (Send-CodemuxHook $env:CODEMUX_HOOK_PORT)) {
-    $activePort = ''
-    try { $activePort = (Get-Content (Join-Path $PSScriptRoot 'active-port') -Raw).Trim() } catch {}
-    if ($activePort -and $activePort -ne $env:CODEMUX_HOOK_PORT) {
-        [void](Send-CodemuxHook $activePort)
+# A daemon-backed terminal may retain credentials across an app restart.
+# Retry the current endpoint when the inherited listener stops answering.
+if (-not (Send-CodemuxHook $env:CODEMUX_HOOK_PORT $env:CODEMUX_HOOK_TOKEN)) {
+    $active = ''
+    try { $active = (Get-Content (Join-Path $PSScriptRoot 'active-endpoint') -Raw).Trim() } catch {}
+    if ($active -ne "$env:CODEMUX_HOOK_PORT $env:CODEMUX_HOOK_TOKEN") {
+        $activePort, $activeToken = $active -split ' ', 2
+        [void](Send-CodemuxHook $activePort $activeToken)
     }
 }
 exit 0
@@ -454,7 +557,7 @@ exit 0
 #[cfg(not(target_os = "windows"))]
 const GEMINI_HOOK_SCRIPT: &str = r#"#!/bin/sh
 # Codemux Gemini lifecycle hook — notifies the hook server of agent status.
-# Injected env: CODEMUX_HOOK_PORT, CODEMUX_SESSION_ID
+# Injected env: CODEMUX_HOOK_PORT, CODEMUX_HOOK_TOKEN, CODEMUX_SESSION_ID
 
 EVENT_TYPE="${1:-}"
 
@@ -473,20 +576,26 @@ fi
 
 send_hook() {
   PORT="$1"
-  [ -n "$PORT" ] || return 1
-  URL="http://127.0.0.1:${PORT}/hook?sessionId=${CODEMUX_SESSION_ID}&eventType=${EVENT_TYPE}"
-  if [ -n "$AGENT_SID" ]; then
-    URL="${URL}&agentSessionId=${AGENT_SID}"
-  fi
-  curl -fsS --connect-timeout 1 --max-time 2 "$URL" >/dev/null 2>&1
+  TOKEN="$2"
+  case "$PORT" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#PORT}" -le 5 ] || return 1
+  case "$TOKEN" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#TOKEN}" -eq 32 ] || return 1
+  printf 'Authorization: Bearer %s\n' "$TOKEN" |
+    curl -q -fsS --noproxy '*' --connect-timeout 1 --max-time 2 \
+      --header @- --get --request POST \
+      --data-urlencode "sessionId=$CODEMUX_SESSION_ID" \
+      --data-urlencode "eventType=$EVENT_TYPE" \
+      --data-urlencode "agentSessionId=$AGENT_SID" \
+      "http://127.0.0.1:${PORT}/hook" >/dev/null 2>&1
 }
 
 (
-  send_hook "$CODEMUX_HOOK_PORT" && exit 0
+  send_hook "$CODEMUX_HOOK_PORT" "$CODEMUX_HOOK_TOKEN" && exit 0
   SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
-  ACTIVE_PORT=$(cat "$SCRIPT_DIR/active-port" 2>/dev/null)
-  [ "$ACTIVE_PORT" = "$CODEMUX_HOOK_PORT" ] && exit 0
-  send_hook "$ACTIVE_PORT" || true
+  read -r ACTIVE_PORT ACTIVE_TOKEN < "$SCRIPT_DIR/active-endpoint" || exit 0
+  [ "$ACTIVE_PORT $ACTIVE_TOKEN" = "$CODEMUX_HOOK_PORT $CODEMUX_HOOK_TOKEN" ] && exit 0
+  send_hook "$ACTIVE_PORT" "$ACTIVE_TOKEN" || true
 ) >/dev/null 2>&1 &
 exit 0
 "#;
@@ -509,21 +618,31 @@ fn user_home_dir() -> Option<String> {
     }
 }
 
-/// Publish the current app instance's hook-server port next to the shared
-/// notifier scripts. Daemon-backed terminals retain the environment of the
-/// app instance that originally spawned them, so their inherited
-/// `CODEMUX_HOOK_PORT` becomes stale after an app restart. The scripts try
-/// that inherited port first, then read this file and retry against the
-/// current listener.
-fn write_active_hook_port(port: u16) -> Option<std::path::PathBuf> {
+/// Publish the endpoint atomically so reattached PTYs always read a matching
+/// port and credential. The temporary file uses owner-only mode on Unix and
+/// inherits the user's profile directory permissions on Windows.
+fn write_active_hook_endpoint(port: u16, token: &str) -> Option<PathBuf> {
     let home = user_home_dir()?;
-    write_active_hook_port_in(&std::path::PathBuf::from(home).join(".codemux/hooks"), port)
+    write_active_hook_endpoint_in(&PathBuf::from(home).join(".codemux/hooks"), port, token)
 }
 
-fn write_active_hook_port_in(hooks_dir: &std::path::Path, port: u16) -> Option<std::path::PathBuf> {
+fn write_active_hook_endpoint_in(hooks_dir: &Path, port: u16, token: &str) -> Option<PathBuf> {
     std::fs::create_dir_all(hooks_dir).ok()?;
-    let path = hooks_dir.join(ACTIVE_HOOK_PORT_FILE);
-    write_hook_artifact(&path, &format!("{port}\n"), false)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(hooks_dir).ok()?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o022 != 0
+        {
+            return None;
+        }
+    }
+    let path = hooks_dir.join(ACTIVE_HOOK_ENDPOINT_FILE);
+    let mut staged = tempfile::NamedTempFile::new_in(hooks_dir).ok()?;
+    writeln!(staged, "{port} {token}").ok()?;
+    staged.persist(&path).ok()?;
     Some(path)
 }
 
@@ -998,19 +1117,53 @@ pub fn register_gemini_hooks() {
 #[cfg(target_os = "windows")]
 pub fn register_gemini_hooks() {}
 
-/// JS shared by both OpenCode plugins: reports a canonical event straight to
-/// the hook server.
-///
-/// Reports are chained and each one is awaited: the hook server only answers
-/// after it has applied the status, so a quick `Start` → `Stop` can never
-/// land reversed (detached `notify.sh` runs give no such ordering). Like
-/// `notify.sh`, it tries the inherited port first, then the port the running
-/// app published — persistent PTYs keep a stale `CODEMUX_HOOK_PORT` across
-/// app restarts.
-///
-/// `{{ACTIVE_PORT_PATH}}` is substituted with a JSON string literal.
+/// Report events in order so the current pane status matches the plugin.
 #[cfg(not(target_os = "windows"))]
 const OPENCODE_TRANSPORT_JS: &str = r#"import { readFile } from "node:fs/promises";
+import { request } from "node:http";
+
+const ACTIVE_PORT_PATH = {{ACTIVE_PORT_PATH}};
+
+let reports = Promise.resolve();
+
+const postHook = (port, token, eventType) => new Promise((resolve) => {
+  if (!/^[0-9]{1,5}$/.test(port ?? "") || Number(port) > 65535 || !/^[0-9a-f]{32}$/.test(token ?? "")) {
+    resolve(false);
+    return;
+  }
+  const query = new URLSearchParams({ sessionId: process.env.CODEMUX_SESSION_ID ?? "", eventType });
+  const hook = request(`http://127.0.0.1:${port}/hook?${query}`, {
+    method: "POST",
+    agent: false,
+    headers: { Authorization: `Bearer ${token}`, "Content-Length": "0" },
+    signal: AbortSignal.timeout(2000),
+  }, (response) => {
+    response.resume();
+    resolve(response.statusCode === 200);
+  });
+  hook.once("error", () => resolve(false));
+  hook.end();
+});
+
+const notify = (eventType) => {
+  reports = reports.then(async () => {
+    const port = process.env.CODEMUX_HOOK_PORT;
+    const token = process.env.CODEMUX_HOOK_TOKEN;
+    if (await postHook(port, token, eventType)) return;
+    let active = "";
+    try {
+      active = (await readFile(ACTIVE_PORT_PATH, "utf8")).trim();
+    } catch {}
+    const [activePort, activeToken] = active.split(" ");
+    if (activePort !== port || activeToken !== token) await postHook(activePort, activeToken, eventType);
+  }).catch(() => {});
+};
+"#;
+
+// Retain the exact previous generated transport so we can retire an
+// unmodified OpenCode 1.x plugin when the user upgrades OpenCode.
+#[cfg(not(target_os = "windows"))]
+const PRE_AUTH_OPENCODE_TRANSPORT_JS: &str = r#"import { readFile } from "node:fs/promises";
 
 const ACTIVE_PORT_PATH = {{ACTIVE_PORT_PATH}};
 
@@ -1360,7 +1513,7 @@ fn opencode_config_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Render an OpenCode plugin template with the shared transport and the
-/// absolute `active-port` path inlined.
+/// absolute endpoint file path inlined.
 #[cfg(not(target_os = "windows"))]
 fn render_opencode_plugin(template: &str, active_port_path: &str) -> String {
     let path_literal = serde_json::to_string(active_port_path).unwrap_or_else(|_| "\"\"".into());
@@ -1382,7 +1535,7 @@ pub async fn register_opencode_plugin() {
     let Some(home) = user_home_dir() else { return };
     let active_port_path = PathBuf::from(home)
         .join(".codemux/hooks")
-        .join(ACTIVE_HOOK_PORT_FILE);
+        .join(ACTIVE_HOOK_ENDPOINT_FILE);
     let active_port_path = active_port_path.to_string_lossy();
     if install_opencode_plugin_in(&config_dir, &active_port_path, None).is_none() {
         return;
@@ -1412,11 +1565,18 @@ fn install_opencode_plugin_in(
         Some(2) => {
             // Retire only our exact legacy bytes, after confirming the replacement
             // is on disk. Never follow a symlink or remove a customized plugin.
+            let old_endpoint = Path::new(active_port_path).with_file_name("active-port");
+            let old_endpoint_literal = serde_json::to_string(&old_endpoint.to_string_lossy()).ok()?;
+            let pre_auth_legacy = OPENCODE_PLUGIN_TEMPLATE
+                .replace("{{TRANSPORT}}", PRE_AUTH_OPENCODE_TRANSPORT_JS)
+                .replace("{{ACTIVE_PORT_PATH}}", &old_endpoint_literal);
             if std::fs::read(&path).ok().as_deref() == Some(content.as_bytes())
                 && std::fs::symlink_metadata(&legacy_path)
                     .ok()
                     .is_some_and(|meta| meta.is_file() && !meta.permissions().readonly())
-                && std::fs::read(&legacy_path).ok().as_deref() == Some(legacy.as_bytes())
+                && std::fs::read(&legacy_path).ok().is_some_and(|bytes| {
+                    bytes == legacy.as_bytes() || bytes == pre_auth_legacy.as_bytes()
+                })
             {
                 if let Err(error) = std::fs::remove_file(&legacy_path) {
                     eprintln!(
@@ -1701,12 +1861,12 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn opencode_plugins_inline_transport_and_guard_env() {
-        let path = "/home/test/.codemux/hooks/active-port";
+        let path = "/home/test/.codemux/hooks/active-endpoint";
         for template in [OPENCODE_PLUGIN_TEMPLATE, OPENCODE_TUI_PLUGIN_TEMPLATE] {
             let plugin = render_opencode_plugin(template, path);
             assert!(
                 plugin.contains(&format!("const ACTIVE_PORT_PATH = \"{path}\";")),
-                "plugin must inline the active-port path as a JS string"
+                "plugin must inline the active-endpoint path as a JS string"
             );
             assert!(
                 !plugin.contains("{{"),
@@ -1789,13 +1949,20 @@ mod tests {
         const HARNESS: &str = r#"
 import http from "node:http";
 const reported = [];
+const token = "11111111111111111111111111111111";
 const server = http.createServer((req, res) => {
+  if (req.method !== "POST" || req.headers.authorization !== `Bearer ${token}`) {
+    res.statusCode = 401;
+    res.end();
+    return;
+  }
   reported.push(new URL(req.url, "http://hook").searchParams.get("eventType"));
   res.end();
 });
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 process.env.CODEMUX_SESSION_ID = "pane-1";
 process.env.CODEMUX_HOOK_PORT = String(server.address().port);
+process.env.CODEMUX_HOOK_TOKEN = token;
 const { default: plugin } = await import(process.argv[2]);
 
 const cache = { status: {}, permission: {}, form: {} };
@@ -1851,7 +2018,7 @@ console.log(JSON.stringify(reported));
         let harness_path = dir.path().join("harness.mjs");
         std::fs::write(
             &plugin_path,
-            render_opencode_plugin(OPENCODE_TUI_PLUGIN_TEMPLATE, "/nonexistent/active-port"),
+            render_opencode_plugin(OPENCODE_TUI_PLUGIN_TEMPLATE, "/nonexistent/active-endpoint"),
         )
         .unwrap();
         std::fs::write(&harness_path, HARNESS).unwrap();
@@ -1927,23 +2094,48 @@ console.log(JSON.stringify(reported));
     }
 
     #[test]
-    fn active_hook_port_file_tracks_the_current_listener() {
+    fn active_hook_endpoint_file_tracks_the_current_listener() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_active_hook_port_in(dir.path(), 43123).unwrap();
+        let path = write_active_hook_endpoint_in(dir.path(), 43123, "test-token").unwrap();
 
-        assert_eq!(path, dir.path().join(ACTIVE_HOOK_PORT_FILE));
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "43123\n");
+        assert_eq!(path, dir.path().join(ACTIVE_HOOK_ENDPOINT_FILE));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "43123 test-token\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn hook_request_requires_a_matching_bearer_credential() {
+        let request = "POST /hook?sessionId=pane&eventType=Start&agentSessionId=ses_1 HTTP/1.1\r\nHost: localhost";
+        let unauthenticated = format!("{request}\r\n\r\n");
+        let authenticated = format!("{request}\r\nAuthorization: Bearer current-token\r\n\r\n");
+
+        assert_eq!(
+            parse_hook_request(&unauthenticated, "current-token").err(),
+            Some("401 Unauthorized")
+        );
+        assert_eq!(
+            parse_hook_request(&authenticated, "rotated-token").err(),
+            Some("401 Unauthorized")
+        );
+        let event = parse_hook_request(&authenticated, "current-token").unwrap();
+        assert_eq!(event.session_id, "pane");
+        assert_eq!(event.event_type, "Start");
+        assert_eq!(event.agent_session_id, "ses_1");
     }
 
     #[test]
     fn every_notifier_can_retry_the_published_active_port() {
         #[cfg(not(target_os = "windows"))]
         {
-            assert!(HOOK_SCRIPT.contains("$SCRIPT_DIR/active-port"));
-            assert!(GEMINI_HOOK_SCRIPT.contains("$SCRIPT_DIR/active-port"));
+            assert!(HOOK_SCRIPT.contains("$SCRIPT_DIR/active-endpoint"));
+            assert!(GEMINI_HOOK_SCRIPT.contains("$SCRIPT_DIR/active-endpoint"));
         }
         #[cfg(target_os = "windows")]
-        assert!(HOOK_SCRIPT_PS1.contains("Join-Path $PSScriptRoot 'active-port'"));
+        assert!(HOOK_SCRIPT_PS1.contains("Join-Path $PSScriptRoot 'active-endpoint'"));
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1955,10 +2147,10 @@ console.log(JSON.stringify(reported));
         let script_path = dir.path().join("notify.sh");
         std::fs::write(&script_path, HOOK_SCRIPT).unwrap();
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        write_active_hook_port_in(dir.path(), 43210).unwrap();
+        write_active_hook_endpoint_in(dir.path(), 43210, "22222222222222222222222222222222").unwrap();
 
         // Replace curl with a deterministic probe: the inherited port fails,
-        // the active-port retry succeeds, and both attempted URLs are logged.
+        // the active-endpoint retry succeeds, and both attempted URLs are logged.
         let bin_dir = dir.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let fake_curl = bin_dir.join("curl");
@@ -1966,10 +2158,20 @@ console.log(JSON.stringify(reported));
             &fake_curl,
             r#"#!/bin/sh
 for ARG in "$@"; do
-  case "$ARG" in http://*) URL="$ARG" ;; esac
+  case "$ARG" in
+    http://*) URL="$ARG" ;;
+    sessionId=*) SESSION="$ARG" ;;
+    eventType=*) EVENT="$ARG" ;;
+  esac
 done
-printf '%s\n' "$URL" >> "$HOOK_TEST_LOG"
-case "$URL" in *:43199/*) exit 7 ;; *) exit 0 ;; esac
+IFS= read -r AUTH
+case "$URL $AUTH" in
+  *:43199/hook' Authorization: Bearer 11111111111111111111111111111111') LABEL=inherited ;;
+  *:43210/hook' Authorization: Bearer 22222222222222222222222222222222') LABEL=active ;;
+  *) exit 1 ;;
+esac
+printf '%s %s %s %s\n' "$LABEL" "$URL" "$SESSION" "$EVENT" >> "$HOOK_TEST_LOG"
+[ "$LABEL" = active ]
 "#,
         )
         .unwrap();
@@ -1979,6 +2181,7 @@ case "$URL" in *:43199/*) exit 7 ;; *) exit 0 ;; esac
         let status = std::process::Command::new(&script_path)
             .arg("UserPromptSubmit")
             .env("CODEMUX_HOOK_PORT", "43199")
+            .env("CODEMUX_HOOK_TOKEN", "11111111111111111111111111111111")
             .env("CODEMUX_SESSION_ID", "session-resumed")
             .env("HOOK_TEST_LOG", &log_path)
             .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
@@ -1999,10 +2202,10 @@ case "$URL" in *:43199/*) exit 7 ;; *) exit 0 ;; esac
         assert_eq!(
             attempts.len(),
             2,
-            "expected inherited + active-port attempts: {log}"
+            "expected inherited + active-endpoint attempts: {log}"
         );
-        assert!(attempts[0].contains(":43199/hook?"));
-        assert!(attempts[1].contains(":43210/hook?"));
+        assert!(attempts[0].starts_with("inherited http://127.0.0.1:43199/hook "));
+        assert!(attempts[1].starts_with("active http://127.0.0.1:43210/hook "));
         assert!(attempts[1].contains("sessionId=session-resumed"));
         assert!(attempts[1].contains("eventType=UserPromptSubmit"));
     }
@@ -2402,7 +2605,7 @@ case "$URL" in *:43199/*) exit 7 ;; *) exit 0 ;; esac
     fn hook_artifacts_are_idempotent_and_keep_existing_mode() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
-        let plugin = render_opencode_plugin(OPENCODE_TUI_PLUGIN_TEMPLATE, "/test/active-port");
+        let plugin = render_opencode_plugin(OPENCODE_TUI_PLUGIN_TEMPLATE, "/test/active-endpoint");
         let extension = build_pi_extension("/test/.codemux/hooks/notify.sh");
         for (relative, body, executable) in [
             (".codemux/hooks/notify.sh", HOOK_SCRIPT, true),
@@ -2445,7 +2648,7 @@ case "$URL" in *:43199/*) exit 7 ;; *) exit 0 ;; esac
     #[test]
     fn hook_opencode_unknown_version_installs_plural_and_leaves_legacy_alone() {
         let home = tempfile::tempdir().unwrap();
-        let active = "/test/.codemux/hooks/active-port";
+        let active = "/test/.codemux/hooks/active-endpoint";
         for major in [None, Some(3)] {
             let config = home.path().join(format!("{major:?}"));
             install_opencode_plugin_in(&config, active, major).unwrap();
@@ -2470,7 +2673,7 @@ case "$URL" in *:43199/*) exit 7 ;; *) exit 0 ;; esac
     fn hook_opencode_always_installs_plural_and_retires_only_generated_legacy() {
         let home = tempfile::tempdir().unwrap();
         let config = home.path().join(".config/opencode");
-        let active = "/test/.codemux/hooks/active-port";
+        let active = "/test/.codemux/hooks/active-endpoint";
         let legacy = config.join("plugin/codemux-notify.js");
         let modern = config.join("plugins/codemux/tui.js");
         install_opencode_plugin_in(&config, active, Some(1)).unwrap();
@@ -2716,7 +2919,7 @@ case "$URL" in *:43199/*) exit 7 ;; *) exit 0 ;; esac
             .unwrap()
             .trim_start_matches('v');
         let major: u32 = version.split('.').next().unwrap().parse().unwrap();
-        let active = home.path().join(".codemux/hooks/active-port");
+        let active = home.path().join(".codemux/hooks/active-endpoint");
         let active = active.to_str().unwrap();
         install_opencode_plugin_in(&config, active, Some(1)).unwrap();
         assert_eq!(major, 2, "select an installed OpenCode 2.x binary");

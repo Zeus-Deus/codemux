@@ -32,6 +32,8 @@ mod unix_transport {
     use std::path::Path;
     use tokio::net::{UnixListener, UnixStream};
 
+    use crate::control_identity::local_peer_credentials;
+
     pub type ServerStream = UnixStream;
     pub type ClientStream = UnixStream;
 
@@ -50,18 +52,21 @@ mod unix_transport {
         /// The stream and the peer's pid (`SO_PEERCRED`), when the kernel
         /// reports one. A peer in another pid namespace reads as 0.
         pub async fn accept(&self) -> std::io::Result<(ServerStream, Option<u32>)> {
-            let (stream, _) = self.0.accept().await?;
-            let peer_pid = stream
-                .peer_cred()
-                .ok()
-                .and_then(|cred| cred.pid())
-                .and_then(|pid| u32::try_from(pid).ok());
-            Ok((stream, peer_pid))
+            loop {
+                let (stream, _) = self.0.accept().await?;
+                let Ok(peer) = local_peer_credentials(&stream) else {
+                    continue;
+                };
+                let peer_pid = peer.pid().and_then(|pid| u32::try_from(pid).ok());
+                return Ok((stream, peer_pid));
+            }
         }
     }
 
     pub async fn connect(path: &Path) -> std::io::Result<ClientStream> {
-        UnixStream::connect(path).await
+        let stream = UnixStream::connect(path).await?;
+        local_peer_credentials(&stream)?;
+        Ok(stream)
     }
 
     /// Blocking probe: does a server respond on this path right now?

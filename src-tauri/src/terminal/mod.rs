@@ -2417,8 +2417,9 @@ fn spawn_pty_for_session_in_process<R: Runtime>(
             }
         }
     }
-    if let Some(port) = crate::hooks::hook_port() {
+    if let Some((port, token)) = crate::hooks::hook_endpoint() {
         cmd.env("CODEMUX_HOOK_PORT", port.to_string());
+        cmd.env("CODEMUX_HOOK_TOKEN", token);
     }
 
     // Add codemux CLI shim to PATH so `codemux` commands work in user terminals.
