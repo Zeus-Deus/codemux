@@ -659,7 +659,7 @@ export function WorkspaceContextMenuItems({
         // wrapped so a misclick within 10s is one tap away from
         // recovery. Data-safety guardrail for Phase 4.
         toast.undoable({
-          message: `Pushed to ${host.name}`,
+          message: result.message,
           description: "Tap Undo within 10s to pull it back.",
           onUndo: async () => {
             const undoResult = await workspacePullBack(
@@ -726,7 +726,7 @@ export function WorkspaceContextMenuItems({
                 sourceHost.id,
               );
               if (undoResult.ok) {
-                toast.success(`Pushed back to ${sourceHost.name}`);
+                toast.success(undoResult.message);
               } else {
                 toast.error("Push back failed", {
                   description: undoResult.message,
@@ -1074,7 +1074,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
         // "Pull back to this device" item; gives users a 10s
         // escape hatch (Phase-4 safety guardrail).
         toast.undoable({
-          message: `Pushed to ${host.name}`,
+          message: result.message,
           description: "Tap Undo within 10s to pull it back.",
           onUndo: async () => {
             const undoResult = await workspacePullBack(

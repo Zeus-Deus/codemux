@@ -717,46 +717,45 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
         // conversation. Every outcome releases the gate.
         let migration =
             crate::commands::agent_chat::begin_workspace_migration(&app, &workspace_id).await;
+        let target_matches = || {
+            db.list_hosts().into_iter().any(|current| {
+                current.id == host_id && current.ssh_target == host.ssh_target
+            })
+        };
+        if !target_matches() {
+            return Err("The saved SSH target changed before the copy.".into());
+        }
         let result = crate::ssh::push_workspace(opts).await;
         let outcome = match result {
             crate::ssh::PushResult::Pushed { rsync_summary, .. } => {
                 // Atomicity guarantee — see fn doc. Stamp host_id
                 // ONLY after rsync confirms success.
-                if let Err(error) =
+                let assignment = if target_matches() {
                     app_state.set_workspace_host_id(&workspace_id, Some(host_id))
-                {
-                    eprintln!(
-                        "[hosts] push succeeded but host_id assignment failed: {error}"
-                    );
+                } else {
+                    Err("the saved SSH target changed during the copy".into())
+                };
+                if let Err(error) = assignment {
+                    return Ok(WorkspacePushOutcome {
+                        ok: false,
+                        message: format!(
+                            "Workspace copied to {}. Host assignment failed with {error}.",
+                            host.name
+                        ),
+                        remote_path: Some(remote_path_str),
+                        rsync_summary: Some(rsync_summary),
+                    });
                 }
-                // Spawn (or replace) the TunnelSupervisor that keeps
-                // the remote daemon reachable. The supervisor handles
-                // SSH flaps with its built-in exponential backoff +
-                // circuit breaker. Registered by workspace id so
-                // subsequent push/pull/close can find and shut it
-                // down.
-                // Forget the cached PtyDaemonClient BEFORE
-                // installing the new supervisor. A re-push with a
-                // stale client in cache would have the next spawn
-                // attempt connect to the OLD tunnel's socket
-                // (which is about to be torn down), causing the
-                // shell to hang at "Starting…" forever.
-                crate::ssh::forget_workspace_client(&workspace_id).await;
-                match crate::ssh::TunnelSupervisor::spawn(
-                    host.ssh_target.clone(),
-                    &workspace_id,
-                    "$HOME/.local/bin/codemux-remote".to_string(),
-                ) {
-                    Ok(supervisor) => {
-                        crate::ssh::install_supervisor(&workspace_id, supervisor.clone()).await;
-                        crate::ssh::spawn_tunnel_status_forwarder(
-                            app.clone(),
-                            workspace_id.clone(),
-                            &supervisor,
-                        );
-                    }
-                    Err(error) => eprintln!("[hosts] workspace pushed, but could not open SSH tunnel: {error}"),
-                }
+                // Seal the prior terminal handles at the placement commit.
+                // Guarded cleanup retains the route that owns each old shell.
+                let closing = terminate_workspace_sessions(&app, &workspace_id);
+                crate::terminal::emit_migrating_for_workspace(
+                    &app, &workspace_id, &format!("Switching to {}…", host.name),
+                );
+                let mut tunnel_error = crate::ssh::registry::replace_workspace_tunnel(
+                    &app, &workspace_id, host_id, &host.ssh_target,
+                    drain_terminal_closes(closing),
+                ).await.err();
 
                 // Sync Claude session JSONLs from
                 // ~/.claude/projects/<local-encoded>/ to the
@@ -855,10 +854,6 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
                         ),
                     }
                 }
-                // host_id names the host and the conversations are there:
-                // chats may start again, on the host.
-                drop(migration);
-
                 // Close any pre-existing sessions on this workspace's
                 // remote daemon BEFORE respawning. The daemon process
                 // outlives the Codemux app — a session_id from a
@@ -877,84 +872,65 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
                 //
                 // Filter defensively by workspace_id anyway in case
                 // that invariant ever changes.
-                match crate::ssh::client_for_workspace(
-                    &app,
-                    &workspace_id,
-                    Some(host_id),
-                )
-                .await
-                {
-                    Ok(remote_client) => match remote_client.list().await {
-                        Ok(remote_sessions) => {
-                            let mut closed = 0usize;
-                            for s in remote_sessions {
-                                if !s.workspace_id.is_empty()
-                                    && s.workspace_id != workspace_id
-                                {
-                                    continue;
+                if tunnel_error.is_none() {
+                    match crate::ssh::client_for_workspace(
+                        &app,
+                        &workspace_id,
+                        Some(host_id),
+                    )
+                    .await
+                    {
+                        Ok(remote_client) => match remote_client.list().await {
+                            Ok(remote_sessions) => {
+                                let mut closed = 0usize;
+                                for s in remote_sessions {
+                                    if !s.workspace_id.is_empty()
+                                        && s.workspace_id != workspace_id
+                                    {
+                                        continue;
+                                    }
+                                    if let Err(e) =
+                                        remote_client.close(s.session_id.clone()).await
+                                    {
+                                        eprintln!(
+                                            "[hosts] failed to close stale remote session \
+                                             {} on push: {e}",
+                                            s.session_id
+                                        );
+                                    } else {
+                                        closed += 1;
+                                    }
                                 }
-                                if let Err(e) =
-                                    remote_client.close(s.session_id.clone()).await
-                                {
-                                    eprintln!(
-                                        "[hosts] failed to close stale remote session \
-                                         {} on push: {e}",
-                                        s.session_id
-                                    );
-                                } else {
-                                    closed += 1;
-                                }
+                                eprintln!(
+                                    "[hosts] closed {closed} stale remote session(s) for \
+                                     workspace {workspace_id} before respawn"
+                                );
                             }
-                            eprintln!(
-                                "[hosts] closed {closed} stale remote session(s) for \
-                                 workspace {workspace_id} before respawn"
-                            );
+                            Err(e) => eprintln!(
+                                "[hosts] failed to list remote sessions before respawn: {e}"
+                            ),
+                        },
+                        Err(error) => {
+                            tunnel_error = Some(error.to_string());
                         }
-                        Err(e) => eprintln!(
-                            "[hosts] failed to list remote sessions before respawn: {e}"
-                        ),
-                    },
-                    Err(e) => eprintln!(
-                        "[hosts] failed to reach remote daemon for pre-respawn \
-                         cleanup: {e} (continuing — fresh sessions will be created \
-                         but stale ones may persist on the daemon)"
-                    ),
+                    }
                 }
 
-                // Stop-sync-restart for live PTYs: terminate the
-                // workspace's existing local sessions, then
-                // explicitly re-spawn each pane's session so the
-                // user's terminals come back online on the remote
-                // daemon. We tried "let the frontend respawn from
-                // GC" originally but the frontend has no auto-
-                // respawn path (the cache GC only DISPOSES dead
-                // entries); without an explicit backend respawn
-                // the user just sees "shell ended" overlays and
-                // has to manually close + reopen every pane.
-                //
-                // `spawn_pty_for_session` is idempotent per
-                // session id (gated by `try_reserve_session_spawn`),
-                // and now routes through `client_for_workspace`
-                // which sees host_id is set → remote daemon →
-                // fresh shells appear on the host machine.
-                terminate_workspace_sessions(&app, &workspace_id);
-                // Show a "Switching to <host>…" overlay on every pane for the
-                // window between the old PTYs dying and the remote replacements
-                // producing output. Without it the user stares at frozen local
-                // scrollback with no signal anything is happening. Auto-dismissed
-                // when the respawned session goes Ready / emits its first output.
-                crate::terminal::emit_migrating_for_workspace(
-                    &app,
-                    &workspace_id,
-                    &format!("Switching to {}…", host.name),
-                );
+                // Restart panes after the remote history and daemon are ready.
                 crate::terminal::spawn_missing_ptys_for_workspace(
                     app.clone(),
                     &workspace_id,
                 );
+                drop(migration);
                 WorkspacePushOutcome {
                     ok: true,
-                    message: format!("Workspace pushed to {}", host.name),
+                    message: match tunnel_error {
+                        Some(error) => format!(
+                            "Workspace copied to {}. Terminal connection failed with {error}.",
+                            host.name
+                        ),
+                        None => format!("Pushed to {}", host.name),
+                    },
                     remote_path: Some(remote_path_str.clone()),
                     rsync_summary: Some(rsync_summary),
                 }
@@ -1026,6 +1002,12 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     workspace_id: String,
 ) -> Result<WorkspacePullOutcome, String> {
+    // Acquire the migration gate before capturing the host and source path.
+    // A transfer queued behind another move must use the committed placement.
+    #[cfg(unix)]
+    let migration =
+        crate::commands::agent_chat::begin_workspace_migration(&app, &workspace_id).await;
+
     // Resolve State guards in a tight pre-await scope and capture
     // owned values so the State guards drop before any `.await`
     // (they are not Send).
@@ -1134,13 +1116,6 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
         }
         // De-dup while preserving order (uid-keyed == basename when no uid).
         candidate_sources.dedup();
-
-        // Same as push: stop the workspace's chat sessions before copying
-        // it back, so none keeps editing the host copy, and hold new ones
-        // off until host_id is cleared, so the next send starts each one on
-        // this computer once this succeeds. Every outcome releases the gate.
-        let migration =
-            crate::commands::agent_chat::begin_workspace_migration(&app, &workspace_id).await;
 
         // Try each candidate; only a "remote path missing" outcome is
         // worth retrying the next one — success / rsync error / host
@@ -1282,22 +1257,10 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
                 // again and the next pane spawn uses the local
                 // pty-daemon.
                 app_state.set_workspace_host_id(&workspace_id, None)?;
-                // The conversations came back above: chats may start again,
-                // here.
-                drop(migration);
-                // Forget the cached tunneled client BEFORE shutting
-                // down the supervisor — order matters because the
-                // cached client holds a socket that the supervisor
-                // is about to unbind.
-                crate::ssh::forget_workspace_client(&workspace_id).await;
-                crate::ssh::shutdown_supervisor(&workspace_id).await;
-                // Symmetric to push: terminate remote-routed PTY
-                // sessions and immediately respawn each pane's
-                // session on the local daemon (host_id is now
-                // None, so `client_for_workspace` returns the
-                // local singleton). Same agent-caveat as push —
-                // see the long comment in `workspace_push_to_host`.
-                terminate_workspace_sessions(&app, &workspace_id);
+                let closing = terminate_workspace_sessions(&app, &workspace_id);
+                crate::ssh::registry::shutdown_supervisor_after(
+                    &workspace_id, drain_terminal_closes(closing),
+                ).await;
                 // Mirror of the push overlay: "Returning to this device…" while
                 // the remote PTYs are torn down and the local replacements come
                 // up. Same auto-dismiss on Ready / first output.
@@ -1310,6 +1273,7 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
                     app.clone(),
                     &workspace_id,
                 );
+                drop(migration);
                 WorkspacePullOutcome {
                     ok: true,
                     message: format!("Workspace pulled back from {}", host.name),
@@ -1832,7 +1796,7 @@ fn record_opencode_session_capture<R: tauri::Runtime>(
 fn terminate_workspace_sessions<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     workspace_id: &str,
-) {
+) -> Vec<tauri::async_runtime::JoinHandle<()>> {
     let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
     let pty_state: tauri::State<'_, crate::terminal::PtyState> = app.state();
     let snapshot = app_state.snapshot();
@@ -1842,7 +1806,7 @@ fn terminate_workspace_sessions<R: tauri::Runtime>(
         .find(|w| w.workspace_id.0 == workspace_id)
         .map(|w| crate::state::collect_terminal_sessions(&w.surfaces))
         .unwrap_or_default();
-    for sid in session_ids {
+    session_ids.into_iter().filter_map(|sid| {
         // Use the keep-channel variant so the frontend's xterm output
         // channel survives the kill-and-respawn. Otherwise the user
         // has to tab-switch away and back to see the respawned PTY's
@@ -1854,8 +1818,16 @@ fn terminate_workspace_sessions<R: tauri::Runtime>(
             app,
             &pty_state.sessions,
             &sid,
-        );
-    }
+        )
+    }).collect()
+}
+
+#[cfg(unix)]
+async fn drain_terminal_closes(tasks: Vec<tauri::async_runtime::JoinHandle<()>>) {
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        futures_util::future::join_all(tasks),
+    ).await;
 }
 
 #[cfg(test)]

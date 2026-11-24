@@ -161,30 +161,26 @@ daemon_alive() {
     kill -0 "$pid" 2>/dev/null
 }
 lock_socket_path() {
-    LOCK=$1
-    attempts=0
-    while ! ln -s "$$" "$LOCK" 2>/dev/null; do
-        previous=$(readlink "$LOCK" 2>/dev/null) || previous=
-        case "$previous" in
-            ''|0|*[!0-9]*) ;;
-            *)
-                if ! kill -0 "$previous" 2>/dev/null &&
-                   [ "$(readlink "$LOCK" 2>/dev/null)" = "$previous" ]; then
-                    rm -f "$LOCK" || return 1
-                    continue
-                fi
-                ;;
-        esac
-        [ "$attempts" -lt 30 ] || return 1
-        attempts=$((attempts+1))
-        sleep 0.1
-    done
-    trap 'rm -f "$LOCK"' 0
-    trap 'exit 1' HUP INT TERM
+    # This file lives in an already verified private directory and is never
+    # unlinked. The kernel releases its lock when the last descriptor closes.
+    [ ! -L "$1" ] && { [ ! -e "$1" ] || { [ -f "$1" ] && [ -O "$1" ]; }; } || return 1
+    exec 9>>"$1" || return 1
+    if command -v flock >/dev/null 2>&1; then
+        flock -x -w 3 9
+    elif command -v perl >/dev/null 2>&1; then
+        # macOS provides Perl's flock even without a flock executable.
+        perl -MFcntl=:flock -e '
+            open(my $lock, "<&=9") or exit 1;
+            alarm 3;
+            flock($lock, LOCK_EX) or exit 1;
+        '
+    else
+        printf '%s\n' 'Codemux SSH tunnels need flock or Perl on the remote host' >&2
+        return 1
+    fi
 }
 unlock_socket_path() {
-    rm -f "$LOCK" || return 1
-    trap - 0 HUP INT TERM
+    exec 9>&-
 }
 "#;
 
@@ -216,7 +212,7 @@ socket_fits() {
     [ "${#1}" -le "$((103 - ${#KEY} - 6))" ]
 }
 MARKER="$STATE/$KEY.root"
-lock_socket_path "$STATE/$KEY.lock" || exit 1
+lock_socket_path "$STATE/$KEY.lock.fd" || exit 1
 ROOT=
 if [ -f "$MARKER" ] && [ ! -L "$MARKER" ]; then
     ROOT=$(cat "$MARKER") || ROOT=
@@ -332,6 +328,7 @@ pub(super) async fn discover_remote_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
     use std::os::unix::net::{UnixListener, UnixStream};
 
     const WORKSPACE: &str = "abc123";
@@ -476,5 +473,82 @@ mod tests {
         ] {
             assert!(parse_discovered_socket(output.as_bytes(), WORKSPACE).is_err());
         }
+    }
+
+    #[test]
+    fn advisory_lock_releases_after_the_holder_exits() {
+        // Both implementations must leave the lock on the parent shell's
+        // descriptor after the utility exits, and release it upon shell exit.
+        for utility in ["flock", "perl"] {
+            let Some(binary) = std::env::var_os("PATH")
+                .into_iter()
+                .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+                .map(|path| path.join(utility))
+                .find(|path| path.is_file())
+            else {
+                continue;
+            };
+            let fixture = private_temp();
+            std::os::unix::fs::symlink(binary, fixture.path().join(utility)).unwrap();
+            let lock = fixture.path().join("lock.fd");
+            let script = format!(
+                "{DIRECTORY_CHECKS}\nlock_socket_path \"$1\" || exit 1\nprintf 'locked\\n'\nexec /bin/sleep 30"
+            );
+            let mut holder = std::process::Command::new("/bin/sh")
+                .args(["-c", &script, "fixture"])
+                .arg(&lock)
+                .env("PATH", fixture.path())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut signal = String::new();
+            BufReader::new(holder.stdout.take().unwrap())
+                .read_line(&mut signal)
+                .unwrap();
+            let contender = || {
+                std::process::Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        &format!("{DIRECTORY_CHECKS}\nlock_socket_path \"$1\""),
+                        "fixture",
+                    ])
+                    .arg(&lock)
+                    .env("PATH", fixture.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            };
+            let concurrent_acquired = contender();
+            let _ = holder.kill();
+            holder.wait().unwrap();
+            assert_eq!(signal, "locked\n", "{utility} acquired the lock");
+            assert!(
+                !concurrent_acquired,
+                "{utility} excluded a concurrent process"
+            );
+            assert!(contender(), "{utility} released the lock on process exit");
+            assert!(lock.is_file(), "the lock file remains stable");
+        }
+    }
+
+    #[test]
+    fn concurrent_discovery_reuses_one_fallback_with_an_old_pid_symlink_present() {
+        let home = private_temp();
+        let long_home = home.path().join("h".repeat(100));
+        let state = long_home.join(".cmux-tunnels");
+        fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink("2147483647", state.join(format!("{WORKSPACE}.lock"))).unwrap();
+        let tmp = private_temp();
+
+        let (first, second) = std::thread::scope(|scope| {
+            let discover = || run_discovery(&long_home, None, tmp.path()).unwrap();
+            let thread = scope.spawn(discover);
+            let second = discover();
+            (thread.join().unwrap(), second)
+        });
+        assert_eq!(first, second);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 }

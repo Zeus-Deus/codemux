@@ -207,9 +207,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
             );
             void refreshSync();
             if (undoResult.ok) {
-              toast.success(
-                `Sent ${syncRow.title} back to ${sourceHost.name}`,
-              );
+              toast.success(undoResult.message);
             } else {
               toast.error("Push back failed", {
                 description: undoResult.message,

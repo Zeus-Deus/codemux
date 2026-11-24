@@ -139,13 +139,13 @@ if ! private_directory "$DIR"; then
     printf '%s\n' 'Codemux tunnel requires an owner-only socket directory' >&2
     exit 1
 fi
-lock_socket_path "$SOCK.start" || exit 1
+lock_socket_path "$SOCK.start.fd" || exit 1
 if ! daemon_alive "$SOCK"; then
     rm -f "$SOCK" "$PIDF" || exit 1
     if command -v setsid >/dev/null 2>&1; then
-        setsid "$BIN" pty-daemon --socket "$SOCK" </dev/null >>"$LOG" 2>&1 &
+        setsid "$BIN" pty-daemon --socket "$SOCK" </dev/null >>"$LOG" 2>&1 9>&- &
     else
-        nohup "$BIN" pty-daemon --socket "$SOCK" </dev/null >>"$LOG" 2>&1 &
+        nohup "$BIN" pty-daemon --socket "$SOCK" </dev/null >>"$LOG" 2>&1 9>&- &
     fi
 fi
 i=0

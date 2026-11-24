@@ -3295,7 +3295,7 @@ pub(crate) fn terminate_pty_session_keep_channel<R: Runtime>(
     app: &AppHandle<R>,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
-) {
+) -> Option<tauri::async_runtime::JoinHandle<()>> {
     // Mutate in place if persistent. Returns Some(daemon_client) for
     // a persistent session we handled, None otherwise (we then fall
     // through to the regular terminate).
@@ -3334,7 +3334,7 @@ pub(crate) fn terminate_pty_session_keep_channel<R: Runtime>(
             // tunneled client; for local persistent it's the singleton
             // local daemon client. Background tokio task so we stay
             // sync at this call site.
-            if let Some(client) = daemon_client {
+            daemon_client.map(|client| {
                 let app = app.clone();
                 let session_id = session_id.to_string();
                 tauri::async_runtime::spawn(async move {
@@ -3353,8 +3353,8 @@ pub(crate) fn terminate_pty_session_keep_channel<R: Runtime>(
                              {session_id}: {error}"
                         ),
                     }
-                });
-            }
+                })
+            })
         }
         None => {
             // Not persistent (or runtime missing) — defer to the
@@ -3362,6 +3362,7 @@ pub(crate) fn terminate_pty_session_keep_channel<R: Runtime>(
             if let Some(runtime) = remove_session_runtime(sessions, session_id) {
                 terminate_removed_session(runtime, session_id);
             }
+            None
         }
     }
 }
@@ -4871,7 +4872,7 @@ mod tests {
             }
 
             let app = tauri::test::mock_app();
-            terminate_pty_session_keep_channel(app.handle(), &sessions, "session-X");
+            let _close = terminate_pty_session_keep_channel(app.handle(), &sessions, "session-X");
             // Give the spawned tokio task a tick to run, even though
             // we're not asserting on its side-effects.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
