@@ -63,18 +63,20 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::ws::Message;
-use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
+use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, Runtime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::time::timeout;
 
 use super::server::OutboundRx;
-use super::Shared;
+use super::{ListenerLife, Shared};
 use crate::database::DatabaseStore;
 use crate::web_remote::auth::{self, AuthedSession};
 
@@ -84,6 +86,9 @@ pub const IROH_ALPN: &[u8] = b"codemux/web-remote/0";
 
 /// File (under the app data dir) holding the machine-guarded iroh identity key.
 const KEY_FILE: &str = "web-remote-iroh.key";
+const MAX_RELAY_CONNECTIONS: usize = 64;
+const MAX_HANDSHAKE_LEN: usize = 8 * 1024;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Kind-tagged, length-delimited codec ─────────────────────────────
 
@@ -144,14 +149,24 @@ pub fn encode_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
 /// boundary-less QUIC byte stream. Feed it arbitrary read chunks with
 /// [`push`](Self::push); pull complete frames with
 /// [`next_frame`](Self::next_frame).
-#[derive(Default)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
+    max_frame_len: usize,
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self::with_limit(MAX_FRAME_LEN)
+    }
 }
 
 impl FrameDecoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn with_limit(max_frame_len: usize) -> Self {
+        Self { buf: Vec::new(), max_frame_len }
     }
 
     /// Append freshly read bytes.
@@ -171,7 +186,7 @@ impl FrameDecoder {
             return Err(CodecError::UnknownKind(kind));
         }
         let len = u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
-        if len > MAX_FRAME_LEN {
+        if len > self.max_frame_len {
             return Err(CodecError::FrameTooLarge(len));
         }
         if self.buf.len() < HEADER_LEN + len {
@@ -471,7 +486,12 @@ struct GrantIdentity {
 /// the same `CODEMUX_API_URL` base every other API call reads.
 async fn verify_grant(base: &str, grant: &str) -> Result<GrantVerifyResponse, String> {
     let url = format!("{base}/api/devices/grant/verify");
-    let resp = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(HANDSHAKE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("grant verify client failed: {e}"))?;
+    let resp = client
         .post(&url)
         .json(&json!({ "grant": grant }))
         .send()
@@ -659,6 +679,7 @@ pub fn persisted_node_id() -> Option<String> {
 struct RunningIroh {
     endpoint: Endpoint,
     accept: tauri::async_runtime::JoinHandle<()>,
+    shutdown: watch::Sender<bool>,
 }
 
 /// Owns the (optional) running iroh endpoint. Lives inside [`Shared`] so the
@@ -715,6 +736,12 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(key)
         .alpns(vec![IROH_ALPN.to_vec()])
+        .transport_config(
+            QuicTransportConfig::builder()
+                .max_concurrent_bidi_streams(1u32.into())
+                .max_concurrent_uni_streams(0u32.into())
+                .build(),
+        )
         .bind()
         .await
         .map_err(|e| format!("iroh endpoint bind failed: {e}"))?;
@@ -729,14 +756,17 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
         let cfg = shared.config.lock().unwrap();
         let wanted = super::relay_wanted(&cfg);
         if wanted {
+            let (shutdown, life) = watch::channel(false);
             let accept = tauri::async_runtime::spawn(accept_loop(
                 app.clone(),
                 shared.clone(),
                 endpoint.clone(),
+                ListenerLife(life),
             ));
             let running = RunningIroh {
                 endpoint: endpoint.clone(),
                 accept,
+                shutdown,
             };
             shared.iroh.install(running, node_id.clone());
         }
@@ -778,6 +808,7 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
 /// [`ConnectionRegistry`]: super::server::ConnectionRegistry
 pub(crate) fn stop(shared: &Arc<Shared>) {
     if let Some(running) = shared.iroh.take() {
+        running.shutdown.send_replace(true);
         running.accept.abort();
         let endpoint = running.endpoint;
         tauri::async_runtime::spawn(async move {
@@ -789,34 +820,51 @@ pub(crate) fn stop(shared: &Arc<Shared>) {
 // ── Accept + connection bridge ──────────────────────────────────────
 
 /// Accept incoming iroh connections until the endpoint closes.
-async fn accept_loop<R: Runtime>(app: AppHandle<R>, shared: Arc<Shared>, endpoint: Endpoint) {
+async fn accept_loop<R: Runtime>(
+    app: AppHandle<R>,
+    shared: Arc<Shared>,
+    endpoint: Endpoint,
+    life: ListenerLife,
+) {
+    let connections = Arc::new(Semaphore::new(MAX_RELAY_CONNECTIONS));
     while let Some(incoming) = endpoint.accept().await {
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            incoming.refuse();
+            continue;
+        };
         let app = app.clone();
         let shared = shared.clone();
+        let life = life.clone();
         tauri::async_runtime::spawn(async move {
-            match incoming.await {
-                Ok(conn) => handle_connection(app, shared, conn).await,
-                Err(e) => eprintln!("[codemux::web_remote] iroh incoming connection failed: {e}"),
+            let _permit = permit;
+            if let Ok(Ok(conn)) = timeout(HANDSHAKE_TIMEOUT, incoming).await {
+                handle_connection(app, shared, conn, life).await;
             }
         });
     }
 }
 
-/// One accepted iroh connection. A connection may carry several bi-streams;
-/// each bi-stream is an independent web-remote "socket" (its own handshake, its
-/// own registry entry), mirroring how each WS upgrade is one socket.
-async fn handle_connection<R: Runtime>(app: AppHandle<R>, shared: Arc<Shared>, conn: Connection) {
-    loop {
-        match conn.accept_bi().await {
-            Ok((send, recv)) => {
-                let app = app.clone();
-                let shared = shared.clone();
-                tauri::async_runtime::spawn(handle_bi_stream(app, shared, send, recv));
-            }
-            // The connection closed (or errored) — stop accepting its streams.
-            Err(_) => break,
-        }
+/// One QUIC connection carries the browser's one control stream.
+async fn handle_connection<R: Runtime>(
+    app: AppHandle<R>,
+    shared: Arc<Shared>,
+    conn: Connection,
+    life: ListenerLife,
+) {
+    if let Ok(Ok((send, recv))) = timeout(HANDSHAKE_TIMEOUT, conn.accept_bi()).await {
+        handle_bi_stream(app, shared, send, recv, life).await;
     }
+    conn.close(0u32.into(), b"control stream closed");
+}
+
+async fn reject_handshake(send: &mut SendStream, payload: &[u8]) {
+    let _ = timeout(HANDSHAKE_TIMEOUT, async {
+        write_frame(send, KIND_TEXT, payload).await.ok()?;
+        send.finish().ok()?;
+        // Let the peer receive the reply before its QUIC connection closes.
+        send.stopped().await.ok()
+    })
+    .await;
 }
 
 /// Bridge one iroh bi-stream into the shared web-remote connection handling:
@@ -829,16 +877,17 @@ async fn handle_bi_stream<R: Runtime>(
     shared: Arc<Shared>,
     mut send: SendStream,
     mut recv: RecvStream,
+    mut life: ListenerLife,
 ) {
-    let mut decoder = FrameDecoder::new();
+    let mut decoder = FrameDecoder::with_limit(MAX_HANDSHAKE_LEN);
     let mut readbuf = vec![0u8; 16 * 1024];
 
     // 1. Handshake: the first frame either presents an existing session token
     //    (LAN/Tailscale path) or an account connection grant (from-anywhere
     //    path). The `t` field routes it; each path resolves to a `session_id`
     //    the stream then binds to, or writes an `unauthorized` frame and closes.
-    let handshake = match read_frame(&mut recv, &mut decoder, &mut readbuf).await {
-        Ok(Some(f)) => f,
+    let handshake = match timeout(HANDSHAKE_TIMEOUT, read_frame(&mut recv, &mut decoder, &mut readbuf)).await {
+        Ok(Ok(Some(f))) => f,
         _ => return, // stream ended / codec error before a handshake arrived
     };
     let session_id = if is_account_handshake(&handshake) {
@@ -850,15 +899,17 @@ async fn handle_bi_stream<R: Runtime>(
             Some(h) => h,
             None => {
                 let reject = AccountHandshakeReject::Malformed;
-                let _ =
-                    write_frame(&mut send, KIND_TEXT, &account_reject_frame_bytes(&reject)).await;
-                let _ = send.finish();
+                reject_handshake(&mut send, &account_reject_frame_bytes(&reject)).await;
                 return;
             }
         };
         let admit = {
             let db = app.state::<DatabaseStore>();
-            authorize_account_handshake(&db, &shared, &own_node_id, &hello).await
+            tokio::select! {
+                biased;
+                _ = life.stopped() => return,
+                result = authorize_account_handshake(&db, &shared, &own_node_id, &hello) => result,
+            }
         };
         match admit {
             Ok(id) => id,
@@ -866,9 +917,7 @@ async fn handle_bi_stream<R: Runtime>(
                 if matches!(reject, AccountHandshakeReject::Pending { .. }) {
                     super::emit_state_changed(&app);
                 }
-                let _ =
-                    write_frame(&mut send, KIND_TEXT, &account_reject_frame_bytes(&reject)).await;
-                let _ = send.finish();
+                reject_handshake(&mut send, &account_reject_frame_bytes(&reject)).await;
                 return;
             }
         }
@@ -882,8 +931,7 @@ async fn handle_bi_stream<R: Runtime>(
         match session {
             Ok(s) => s.id,
             Err(reject) => {
-                let _ = write_frame(&mut send, KIND_TEXT, &reject_frame_bytes(&reject)).await;
-                let _ = send.finish();
+                reject_handshake(&mut send, &reject_frame_bytes(&reject)).await;
                 return;
             }
         }
@@ -896,10 +944,28 @@ async fn handle_bi_stream<R: Runtime>(
     let conn_id = shared
         .connections
         .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());
+    if !life.live() || !super::server::session_active(&app, &session_id) {
+        shared.connections.unregister(conn_id);
+        return;
+    }
     super::emit_state_changed(&app);
 
     // 3. Acknowledge, then hand the send half to the writer task.
-    let _ = write_frame(&mut send, KIND_TEXT, &welcome_frame_bytes(&session_id)).await;
+    let welcome = timeout(HANDSHAKE_TIMEOUT, async {
+        write_frame(&mut send, KIND_TEXT, &welcome_frame_bytes(&session_id)).await
+    });
+    let sent = tokio::select! {
+        biased;
+        _ = life.stopped() => false,
+        _ = close_rx.changed() => false,
+        result = welcome => matches!(result, Ok(Ok(()))),
+    };
+    if !sent {
+        shared.connections.unregister(conn_id);
+        super::emit_state_changed(&app);
+        return;
+    }
+    decoder.max_frame_len = MAX_FRAME_LEN;
     let writer = tauri::async_runtime::spawn(writer_loop(send, out_rx));
 
     // 4. Ordered dispatch lane (terminal input keeps client-send order), exactly
@@ -919,6 +985,8 @@ async fn handle_bi_stream<R: Runtime>(
     // 5. Reader loop: dispatch client frames until close / EOF / revocation.
     loop {
         tokio::select! {
+            biased;
+            _ = life.stopped() => break,
             changed = close_rx.changed() => {
                 if changed.is_err() || *close_rx.borrow() {
                     break;
@@ -973,6 +1041,16 @@ mod tests {
         assert_eq!(empty[0], KIND_BINARY);
         assert_eq!(&empty[1..5], &0u32.to_be_bytes());
         assert_eq!(empty.len(), HEADER_LEN);
+    }
+
+    #[test]
+    fn handshake_header_is_checked_against_the_smaller_limit() {
+        let payload = vec![0; MAX_HANDSHAKE_LEN + 1];
+        let frame = encode_frame(KIND_TEXT, &payload);
+        let mut decoder = FrameDecoder::with_limit(MAX_HANDSHAKE_LEN);
+        // The advertised length is rejected as soon as the header arrives.
+        decoder.push(&frame[..HEADER_LEN]);
+        assert_eq!(decoder.next_frame(), Err(CodecError::FrameTooLarge(payload.len())));
     }
 
     #[test]

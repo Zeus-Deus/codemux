@@ -34,6 +34,8 @@ pub const TICKET_TTL: Duration = Duration::from_secs(30);
 pub const RATE_LIMIT_MAX: usize = 5;
 /// Rate-limit sliding window.
 pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+/// Maximum pairing-rate entries kept for unauthenticated peers.
+const RATE_LIMIT_MAX_PEERS: usize = 4096;
 /// Entropy for pairing / session / ticket secrets.
 pub const TOKEN_BYTES: usize = 32;
 
@@ -210,7 +212,13 @@ impl TicketStore {
 
 #[derive(Default)]
 pub struct RateLimiter {
-    inner: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    inner: Mutex<RateLimitState>,
+}
+
+#[derive(Default)]
+struct RateLimitState {
+    hits: HashMap<IpAddr, Vec<Instant>>,
+    last_prune: Option<Instant>,
 }
 
 impl RateLimiter {
@@ -218,9 +226,18 @@ impl RateLimiter {
     /// (≤ `RATE_LIMIT_MAX` within `RATE_LIMIT_WINDOW`). A rejected attempt
     /// is *not* recorded, so a blocked client that backs off recovers.
     pub fn check_and_record(&self, ip: IpAddr) -> bool {
-        let mut map = self.inner.lock().unwrap();
+        let mut state = self.inner.lock().unwrap();
         let now = Instant::now();
-        let hits = map.entry(ip).or_default();
+        if state.last_prune.is_none_or(|last| now.duration_since(last) >= RATE_LIMIT_WINDOW) {
+            state.hits.retain(|_, hits| {
+                hits.last().is_some_and(|last| now.duration_since(*last) < RATE_LIMIT_WINDOW)
+            });
+            state.last_prune = Some(now);
+        }
+        if state.hits.len() >= RATE_LIMIT_MAX_PEERS && !state.hits.contains_key(&ip) {
+            return false;
+        }
+        let hits = state.hits.entry(ip).or_default();
         hits.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
         if hits.len() >= RATE_LIMIT_MAX {
             return false;
@@ -401,6 +418,25 @@ mod tests {
         assert!(!rl.check_and_record(ip), "attempt beyond limit blocked");
         // A different IP is unaffected.
         assert!(rl.check_and_record("203.0.113.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn rate_limiter_recycles_expired_peers_and_bounds_storage() {
+        let rl = RateLimiter::default();
+        for i in 0..RATE_LIMIT_MAX_PEERS {
+            assert!(rl.check_and_record(IpAddr::V6(std::net::Ipv6Addr::from(i as u128))));
+        }
+        let next = "203.0.113.9".parse().unwrap();
+        assert!(!rl.check_and_record(next));
+        {
+            let mut state = rl.inner.lock().unwrap();
+            assert_eq!(state.hits.len(), RATE_LIMIT_MAX_PEERS);
+            let expired = Instant::now() - RATE_LIMIT_WINDOW;
+            state.hits.values_mut().for_each(|hits| *hits = vec![expired]);
+            state.last_prune = Some(expired);
+        }
+        assert!(rl.check_and_record(next));
+        assert_eq!(rl.inner.lock().unwrap().hits.len(), 1);
     }
 
     #[test]
