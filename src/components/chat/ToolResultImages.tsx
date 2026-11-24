@@ -2,7 +2,18 @@ import { useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { agentChatGetToolResultImage } from "@/tauri/commands";
 import type { LazyToolResultStub } from "@/lib/agent-chat/lazy-tool-result";
-import { ImageOff } from "lucide-react";
+import { ImageIcon, ImageOff } from "lucide-react";
+
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 import {
   ImageLightbox,
@@ -10,6 +21,10 @@ import {
   IMAGE_LIGHTBOX_MEDIA_CLASS,
 } from "@/components/chat/ImageLightbox";
 import type { ToolResultImage } from "@/lib/agent-chat/tool-result-images";
+
+function needsRemoteConfirmation(image: ToolResultImage): boolean {
+  return !image.trustedLocal && /^https?:\/\//i.test(image.src.trim());
+}
 
 /**
  * Renders images returned inside a tool result (e.g. a screenshot from
@@ -25,8 +40,11 @@ export function ToolResultImages({ images, onImageError }: {
   onImageError?: () => void;
 }) {
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
-  const lightboxImage =
-    lightboxIndex !== null ? images[lightboxIndex] : undefined;
+  const [approvedRemoteSources, setApprovedRemoteSources] = useState<Record<number, string>>({});
+  const selectedImage = lightboxIndex !== null ? images[lightboxIndex] : undefined;
+  const lightboxImage = lightboxIndex !== null && selectedImage && (
+    !needsRemoteConfirmation(selectedImage) || approvedRemoteSources[lightboxIndex] === selectedImage.src
+  ) ? selectedImage : undefined;
 
   if (images.length === 0) return null;
 
@@ -36,6 +54,8 @@ export function ToolResultImages({ images, onImageError }: {
         <ToolResultThumbnail
           key={`${image.src.slice(0, 48)}-${i}`}
           image={image}
+          approved={!needsRemoteConfirmation(image) || approvedRemoteSources[i] === image.src}
+          onConfirm={() => setApprovedRemoteSources((current) => ({ ...current, [i]: image.src }))}
           onOpen={() => setLightboxIndex(i)}
           onImageError={onImageError}
         />
@@ -58,14 +78,55 @@ export function ToolResultImages({ images, onImageError }: {
  *  one bad source can't blank the rest of the row. */
 function ToolResultThumbnail({
   image,
+  approved,
+  onConfirm,
   onOpen,
   onImageError,
 }: {
   image: ToolResultImage;
+  approved: boolean;
+  onConfirm: () => void;
   onOpen: () => void;
   onImageError?: () => void;
 }) {
   const [failed, setFailed] = useState(false);
+  const [confirmationSrc, setConfirmationSrc] = useState<string | null>(null);
+
+  if (!approved) {
+    return (
+      <AlertDialog
+        open={confirmationSrc === image.src}
+        onOpenChange={(open) => setConfirmationSrc(open ? image.src : null)}
+      >
+        <button
+          type="button"
+          onClick={() => setConfirmationSrc(image.src)}
+          className="flex h-20 w-28 cursor-pointer flex-col items-center justify-center gap-1 rounded-lg border border-hairline bg-surface-1 text-label text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
+          aria-label="Load remote image"
+        >
+          <ImageIcon className="size-5" aria-hidden />
+          Load remote image
+        </button>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Load remote image?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Loading this image will contact its host. Check the address before continuing.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="select-text break-all rounded-lg bg-muted px-3 py-2 font-mono text-label text-muted-foreground">
+            {image.src}
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={() => { onConfirm(); setConfirmationSrc(null); }}>
+              Load image
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    );
+  }
 
   if (failed) {
     return (
@@ -87,6 +148,7 @@ function ToolResultThumbnail({
     >
       <img
         src={image.src}
+        referrerPolicy="no-referrer"
         alt={image.mediaType ?? "tool result image"}
         className="max-h-40 max-w-[240px] object-contain"
         onError={onImageError ?? (() => setFailed(true))}
@@ -116,6 +178,7 @@ function LightboxImage({ image, onImageError }: {
   return (
     <img
       src={image.src}
+      referrerPolicy="no-referrer"
       alt={image.mediaType ?? "tool result image"}
       className={IMAGE_LIGHTBOX_MEDIA_CLASS}
       onError={onImageError ?? (() => setFailed(true))}
@@ -266,7 +329,10 @@ function LazyToolResultImage({ stub, pointer }: { stub: LazyToolResultStub; poin
   };
 
   if (source && !failed) {
-    return <ToolResultImages images={[{ src: source.local ? convertFileSrc(source.src) : source.src }]}
+    return <ToolResultImages images={[{
+      src: source.local ? convertFileSrc(source.src) : source.src,
+      trustedLocal: source.local,
+    }]}
       onImageError={source.local ? readFallback : undefined} />;
   }
   return (

@@ -486,6 +486,40 @@ describe("GenericToolBody edge cases", () => {
 });
 
 describe("Tool result images", () => {
+  it("requires confirmation before loading an untrusted URL image", () => {
+    const url = "https://private.example.test/screenshot.png";
+    render(<ToolCallBody item={makeTool({ result_content: [
+      { type: "image_url", image_url: { url } },
+    ] })} />);
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent(url);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load image" }));
+    expect(screen.getByRole("img")).toHaveAttribute("src", url);
+    expect(screen.getByRole("img")).toHaveAttribute("referrerpolicy", "no-referrer");
+  });
+
+  it("requires a new confirmation if an approved URL image changes", () => {
+    const prefix = "https://private.example.test/very-long-screenshot-name-";
+    const item = (url: string) => makeTool({ result_content: [
+      { type: "image_url", image_url: { url } },
+    ] });
+    const view = render(<ToolCallBody item={item(`${prefix}one.png`)} />);
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load image" }));
+    expect(screen.getByRole("img")).toHaveAttribute("src", `${prefix}one.png`);
+
+    view.rerender(<ToolCallBody item={item(`${prefix}two.png`)} />);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load remote image" })).toBeInTheDocument();
+  });
+
   it("renders a valid image block as a thumbnail without dumping its base64 payload", () => {
     render(
       <ToolCallBody

@@ -138,6 +138,36 @@ describe("lazy tool-result body", () => {
     expect(screen.getByRole("img")).toHaveAttribute("src", "data:image/svg+xml;base64,AAAA");
   });
 
+  it("requires confirmation for a remote URL in inline stub metadata", () => {
+    const url = "https://private.example.test/inline.png";
+    const item = stubbedTool({ result_content: { [LAZY_TOOL_RESULT_KEY]: {
+      row_id: ROW_ID, bytes: 40_000, preview: "image", line_count: 1, has_images: true,
+      images: [{ pointer: "/0", src: url }],
+    } } });
+    render(<ToolCallBody item={item} />);
+
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(agentChatGetToolResultImage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load image" }));
+    expect(screen.getByRole("img")).toHaveAttribute("src", url);
+  });
+
+  it("requires confirmation for a remote URL returned by a lazy image handle", async () => {
+    const url = "https://private.example.test/handled.png";
+    vi.mocked(agentChatGetToolResultImage).mockResolvedValue({ src: url, local: false });
+    render(<ToolCallBody item={imageStub()} />);
+
+    expect(await screen.findByRole("button", { name: "Load remote image" })).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(agentChatGetToolResultImage).toHaveBeenCalledWith(ROW_ID, "/1");
+    fireEvent.click(screen.getByRole("button", { name: "Load remote image" }));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent(url);
+    fireEvent.click(screen.getByRole("button", { name: "Load image" }));
+    expect(screen.getByRole("img")).toHaveAttribute("src", url);
+  });
+
   it("reuses a bounded binary cache across hosted remounts and revokes idle URLs", async () => {
     vi.mocked(agentChatGetToolResultImage)
       .mockResolvedValueOnce({ src: "/managed/tool.png", local: true })
