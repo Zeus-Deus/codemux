@@ -66,9 +66,15 @@ Split panes with keybinds, open a browser pane for testing, and use the changes 
 
 ## Browser remote access
 
-Direct browser account pairing is available on the desktop's loopback address. For access from another device, use a pairing link or **From anywhere**.
+Browser account sign-in and secret submissions require either an authenticated HTTPS reverse proxy or explicit permission to use HTTP on the desktop's loopback address. To allow the loopback exception, launch Codemux with `CODEMUX_WEB_REMOTE_ALLOW_HTTP_ACCOUNT_PAIRING=1`. Account sign-in also requires enabling the account sign-in setting. Pairing links still work on direct HTTP, and **From anywhere** uses the encrypted relay.
 
-To enable browser account pairing through a local HTTPS reverse proxy, bind **Remote Access** to loopback and launch Codemux with `CODEMUX_WEB_REMOTE_TLS_PROXY_TOKEN` set to a random 64-character hexadecimal secret. For `/api/health`, `/api/pair`, `/api/pair-account`, and `/ws`, overwrite both `X-Codemux-Proxy-Token` with that secret and `X-Forwarded-Proto` with `https`. Forward only HTTPS requests to this upstream and preserve the public `Host` and `Origin`. Keep the token in server-side configuration. While proxy mode is configured, the proxy credential is required even for loopback account pairing.
+For HTTPS, bind **Remote Access** to loopback and start Codemux with `CODEMUX_WEB_REMOTE_TLS_PROXY_TOKEN` set to a random 64-character hexadecimal secret. Accept only HTTPS traffic at the proxy, preserve the public `Host` and `Origin`, and forward WebSocket upgrades. Overwrite these incoming headers on `/api/health`, `/api/pair`, `/api/pair-account`, and `/ws`:
+
+- `X-Codemux-Proxy-Token` with the server-side token.
+- `X-Forwarded-Proto` with `https`.
+- `X-Codemux-Client-IP` with the client's single IPv4 or IPv6 address as determined by your trusted proxy configuration. Discard any value supplied by the browser. Codemux uses this address for pairing rate limits.
+
+When the proxy token is configured, account sign-in and secret submissions require valid HTTPS proxy headers even when the backend socket is reached from loopback.
 
 ## Outside agents (MCP)
 

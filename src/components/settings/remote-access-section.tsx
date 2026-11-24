@@ -1859,10 +1859,10 @@ export function RemoteAccessSection() {
                   title="Allow account sign-in instead of a pairing link"
                   detail={
                     <>
-                      Browsers on this desktop or connecting through a local
-                      HTTPS proxy can sign in with the Codemux account this
-                      desktop uses. Use a pairing link for other network
-                      connections. From anywhere uses your account.
+                      Browser sign-in and secret submissions require an HTTPS
+                      proxy or a launch opt-in for HTTP on this desktop. Use
+                      a pairing link for other direct connections. From
+                      anywhere uses your account.
                     </>
                   }
                   checked={accountModeEnabled}

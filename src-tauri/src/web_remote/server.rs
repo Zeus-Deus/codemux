@@ -24,7 +24,7 @@
 //! `?compress=deflate` — see [`super::compress`].
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -457,13 +457,24 @@ async fn health<R: Runtime>(
 }
 
 const TLS_PROXY_TOKEN_ENV: &str = "CODEMUX_WEB_REMOTE_TLS_PROXY_TOKEN";
+const ALLOW_HTTP_ACCOUNT_PAIRING_ENV: &str = "CODEMUX_WEB_REMOTE_ALLOW_HTTP_ACCOUNT_PAIRING";
 pub(crate) const TLS_PROXY_TOKEN_HEADER: &str = "x-codemux-proxy-token";
+const TLS_PROXY_CLIENT_IP_HEADER: &str = "x-codemux-client-ip";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AccountTransport {
     Insecure,
     Loopback,
-    HttpsProxy,
+    HttpsProxy(IpAddr),
+}
+
+impl AccountTransport {
+    fn pairing_ip(self, peer: IpAddr) -> IpAddr {
+        match self {
+            Self::HttpsProxy(client_ip) => client_ip,
+            Self::Loopback | Self::Insecure => peer.to_canonical(),
+        }
+    }
 }
 
 fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -476,6 +487,7 @@ fn classify_account_transport(
     peer: SocketAddr,
     headers: &HeaderMap,
     proxy_token: Option<&str>,
+    allow_loopback_http: bool,
 ) -> AccountTransport {
     use AccountTransport::*;
     if !super::endpoints::is_local_peer(peer.ip()) {
@@ -494,24 +506,33 @@ fn classify_account_transport(
             && single_header(headers, TLS_PROXY_TOKEN_HEADER).is_some_and(|provided| {
                 auth::constant_time_eq(expected.as_bytes(), provided.as_bytes())
             });
-        return if proxy_is_authenticated
-            && single_header(headers, "x-forwarded-proto") == Some("https")
-            && origin.is_none_or(|value| value.starts_with("https://"))
+        if !proxy_is_authenticated
+            || single_header(headers, "x-forwarded-proto") != Some("https")
+            || origin.is_some_and(|value| !value.starts_with("https://"))
         {
-            HttpsProxy
-        } else {
-            Insecure
-        };
+            return Insecure;
+        }
+        return single_header(headers, TLS_PROXY_CLIENT_IP_HEADER)
+            .and_then(|value| value.parse::<IpAddr>().ok())
+            .map(|ip| ip.to_canonical())
+            .filter(|ip| {
+                !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && *ip != IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
+            })
+            .map_or(Insecure, HttpsProxy);
     }
 
-    // A transparent loopback connection is only the default for direct
-    // clients. Forwarded requests require explicitly authenticated ingress.
-    if [
-        "forwarded", "via", "x-forwarded-for", "x-forwarded-host",
-        "x-forwarded-proto", "x-real-ip", TLS_PROXY_TOKEN_HEADER,
-    ]
-    .into_iter()
-    .any(|header| headers.contains_key(header))
+    // HTTP loopback is an explicit exception. Forwarded requests require
+    // authenticated ingress even when their appearance is that of loopback.
+    if !allow_loopback_http
+        || [
+            "forwarded", "via", "x-forwarded-for", "x-forwarded-host",
+            "x-forwarded-proto", "x-real-ip", TLS_PROXY_TOKEN_HEADER,
+            TLS_PROXY_CLIENT_IP_HEADER,
+        ]
+        .into_iter()
+        .any(|header| headers.contains_key(header))
         || origin.is_some_and(|value| !value.starts_with("http://"))
     {
         return Insecure;
@@ -533,15 +554,22 @@ fn classify_account_transport(
 }
 
 fn account_transport(peer: SocketAddr, headers: &HeaderMap) -> AccountTransport {
-    static PROXY_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let token = PROXY_TOKEN.get_or_init(|| {
-        std::env::var_os(TLS_PROXY_TOKEN_ENV).map(|value| value.to_string_lossy().into_owned())
+    static CONFIG: std::sync::OnceLock<(Option<String>, bool)> = std::sync::OnceLock::new();
+    let (token, allow_loopback_http) = CONFIG.get_or_init(|| {
+        let token = std::env::var_os(TLS_PROXY_TOKEN_ENV)
+            .map(|value| value.to_string_lossy().into_owned());
+        let allow_loopback_http = std::env::var(ALLOW_HTTP_ACCOUNT_PAIRING_ENV).as_deref() == Ok("1");
+        (token, allow_loopback_http)
     });
-    classify_account_transport(peer, headers, token.as_deref())
+    classify_account_transport(peer, headers, token.as_deref(), *allow_loopback_http)
 }
 
 fn pairing_response_headers(transport: AccountTransport, session_token: &str) -> HeaderMap {
-    let secure = if transport == AccountTransport::HttpsProxy { "; Secure" } else { "" };
+    let secure = if matches!(transport, AccountTransport::HttpsProxy(_)) {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!("{SESSION_COOKIE}={session_token}; HttpOnly; SameSite=Strict; Path=/{secure}");
     let mut out = HeaderMap::new();
     if let Ok(value) = cookie.parse() {
@@ -568,8 +596,9 @@ async fn pair<R: Runtime>(
         return error(StatusCode::FORBIDDEN, "origin_mismatch");
     }
     let shared = app.state::<WebRemoteState>().shared();
+    let transport = account_transport(peer, &headers);
 
-    if !shared.rate.check_and_record(peer.ip()) {
+    if !shared.rate.check_and_record(transport.pairing_ip(peer.ip())) {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let consume = shared.pairing.consume_named(&body.token);
@@ -615,7 +644,7 @@ async fn pair<R: Runtime>(
 
     // HttpOnly so JS can't read it; SameSite=Strict so a cross-site page
     // can't drive authed asset GETs with the stored cookie.
-    let out_headers = pairing_response_headers(account_transport(peer, &headers), &session_token);
+    let out_headers = pairing_response_headers(transport, &session_token);
     (
         StatusCode::OK,
         out_headers,
@@ -660,7 +689,7 @@ async fn pair_account<R: Runtime>(
 
     // Same per-IP limiter the pairing path uses — an account attempt is a
     // credential attempt and must not be a brute-force oracle.
-    if !shared.rate.check_and_record(peer.ip()) {
+    if !shared.rate.check_and_record(transport.pairing_ip(peer.ip())) {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
 
@@ -1216,38 +1245,75 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[test]
-    fn account_pairing_distinguishes_direct_loopback_from_authenticated_proxy() {
+    fn direct_http_account_pairing_requires_an_explicit_loopback_opt_in() {
+        use AccountTransport::*;
+        let local: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let lan: SocketAddr = "192.0.2.12:12345".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "[::1]:4377".parse().unwrap());
+        assert_eq!(classify_account_transport(local, &headers, None, false), Insecure);
+        assert_eq!(classify_account_transport(local, &headers, None, true), Loopback);
+        assert_eq!(classify_account_transport(lan, &headers, None, true), Insecure);
+        let token = "a".repeat(64);
+        assert_eq!(classify_account_transport(local, &headers, Some(&token), true), Insecure);
+
+        // A client-supplied address never changes a direct pairing-code quota.
+        headers.insert(TLS_PROXY_CLIENT_IP_HEADER, "192.0.2.20".parse().unwrap());
+        let transport = classify_account_transport(local, &headers, None, true);
+        assert_eq!(transport, Insecure);
+        assert_eq!(transport.pairing_ip(local.ip()), local.ip());
+    }
+
+    #[test]
+    fn https_proxy_requires_authentication_and_one_valid_client_ip() {
         use AccountTransport::*;
         let local: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let lan: SocketAddr = "192.0.2.12:12345".parse().unwrap();
         let token = "a".repeat(64);
+        let ip: IpAddr = "192.0.2.20".parse().unwrap();
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "[::1]:4377".parse().unwrap());
-        assert_eq!(classify_account_transport(local, &headers, None), Loopback);
-        assert_eq!(classify_account_transport(lan, &headers, None), Insecure);
-        assert_eq!(classify_account_transport(local, &headers, Some(&token)), Insecure);
-
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        assert_eq!(classify_account_transport(local, &headers, None), Insecure);
         headers.insert(header::HOST, "remote.example".parse().unwrap());
         headers.insert(header::ORIGIN, "https://remote.example".parse().unwrap());
-        headers.insert(TLS_PROXY_TOKEN_HEADER, "untrusted".parse().unwrap());
-        assert_eq!(classify_account_transport(local, &headers, Some(&token)), Insecure);
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert(TLS_PROXY_TOKEN_HEADER, token.parse().unwrap());
-        assert_eq!(classify_account_transport(local, &headers, None), Insecure);
-        assert_eq!(classify_account_transport(lan, &headers, Some(&token)), Insecure);
-        let transport = classify_account_transport(local, &headers, Some(&token));
-        assert_eq!(transport, HttpsProxy);
+        let classify = |headers: &HeaderMap| classify_account_transport(local, headers, Some(&token), false);
+        assert_eq!(classify(&headers), Insecure, "a proxy must assert a client address");
 
-        let response = pairing_response_headers(transport, "synthetic-session-token");
+        for invalid in ["not-an-address", "192.0.2.20, 192.0.2.21", "192.0.2.20:8000", "0.0.0.0", "ff02::1"] {
+            headers.insert(TLS_PROXY_CLIENT_IP_HEADER, invalid.parse().unwrap());
+            assert_eq!(classify(&headers), Insecure, "{invalid}");
+        }
+        headers.insert(TLS_PROXY_CLIENT_IP_HEADER, "::ffff:192.0.2.20".parse().unwrap());
+        headers.append(TLS_PROXY_CLIENT_IP_HEADER, "192.0.2.21".parse().unwrap());
+        assert_eq!(classify(&headers), Insecure, "duplicate address headers are ambiguous");
+        headers.insert(TLS_PROXY_CLIENT_IP_HEADER, "::ffff:192.0.2.20".parse().unwrap());
+        headers.insert(TLS_PROXY_TOKEN_HEADER, "untrusted".parse().unwrap());
+        assert_eq!(classify(&headers), Insecure);
+        headers.insert(TLS_PROXY_TOKEN_HEADER, token.parse().unwrap());
+        assert_eq!(classify_account_transport(local, &headers, None, true), Insecure);
+        assert_eq!(classify_account_transport(lan, &headers, Some(&token), false), Insecure);
+
+        let first = classify(&headers);
+        assert_eq!(first, HttpsProxy(ip));
+        let response = pairing_response_headers(first, "synthetic-session-token");
         assert!(response[header::SET_COOKIE].to_str().unwrap().ends_with("; Secure"));
         assert_eq!(response[header::CACHE_CONTROL], "no-store");
 
+        let quotas = auth::RateLimiter::default();
+        for _ in 0..auth::RATE_LIMIT_MAX {
+            assert!(quotas.check_and_record(first.pairing_ip(local.ip())));
+        }
+        headers.insert(TLS_PROXY_CLIENT_IP_HEADER, "192.0.2.20".parse().unwrap());
+        assert!(!quotas.check_and_record(classify(&headers).pairing_ip(local.ip())));
+        headers.insert(TLS_PROXY_CLIENT_IP_HEADER, "2001:db8::21".parse().unwrap());
+        assert!(quotas.check_and_record(classify(&headers).pairing_ip(local.ip())));
+        assert!(quotas.check_and_record(Insecure.pairing_ip(local.ip())));
+
         headers.append("x-forwarded-proto", "http".parse().unwrap());
-        assert_eq!(classify_account_transport(local, &headers, Some(&token)), Insecure);
+        assert_eq!(classify(&headers), Insecure);
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert(header::ORIGIN, "http://remote.example".parse().unwrap());
-        assert_eq!(classify_account_transport(local, &headers, Some(&token)), Insecure);
+        assert_eq!(classify(&headers), Insecure);
     }
 
     #[test]

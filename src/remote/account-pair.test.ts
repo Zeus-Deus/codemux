@@ -103,7 +103,7 @@ describe("pairAccount", () => {
     const fetchImpl = vi.fn<typeof fetch>();
     await expect(
       pairAccount("http://192.0.2.10:4377", "user@example.com", "fixture", fetchImpl),
-    ).rejects.toThrow(/requires HTTPS or a browser on the desktop/i);
+    ).rejects.toThrow(/requires HTTPS or an explicit HTTP opt-in/i);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 

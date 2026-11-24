@@ -105,7 +105,7 @@ export function mapAccountPairError(
     case "account_mode_disabled":
       return "Account sign-in isn't enabled on this desktop. Turn on Account access in Remote Access settings, or pair with a code.";
     case "account_secure_transport_required":
-      return "Account sign-in requires HTTPS or a browser on the desktop. Use a pairing code or connect through From anywhere.";
+      return "Account sign-in requires HTTPS or an explicit HTTP opt-in on the desktop. Use a pairing code or connect through From anywhere.";
     case "account_signed_out":
       return "Sign in to your Codemux account on the desktop first, then try again.";
     case "account_mismatch":
