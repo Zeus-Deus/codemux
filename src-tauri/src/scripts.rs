@@ -3,9 +3,11 @@ use crate::config::workspace_config::{
 };
 use crate::database::DatabaseStore;
 use crate::workspace_service::Checkpoint;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions};
 use serde::Serialize;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{self, ErrorKind, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Output, Stdio};
 use tauri::{AppHandle, Emitter, Runtime};
 
@@ -104,12 +106,7 @@ use crate::workspace_paths::paths_equal;
 ///   2. `worktree_includes` from project settings
 ///   3. Hardcoded defaults (`DEFAULT_WORKTREE_INCLUDES`)
 ///
-/// If `root_path` and `worktree_path` resolve to the same directory (i.e., the
-/// workspace is the project root itself, not a separate git worktree), this is
-/// a no-op. Without that guard, the copy step would call
-/// `std::fs::copy(src, src)`, which on Linux truncates the file to zero bytes
-/// because Rust opens the destination with `O_TRUNC` *before* reading the
-/// source. See `test_worktree_includes_same_root_does_not_truncate`.
+/// Skip the copy when both paths resolve to the same checkout.
 pub fn process_worktree_includes(
     root_path: &Path,
     worktree_path: &Path,
@@ -199,6 +196,10 @@ fn copy_matching_files(
     }
 
     let mut copied = Vec::new();
+    let source = Dir::open_ambient_dir(root_path, cap_std::ambient_authority())
+        .map_err(|error| format!("Open include source {}: {error}", root_path.display()))?;
+    let destination = Dir::open_ambient_dir(worktree_path, cap_std::ambient_authority())
+        .map_err(|error| format!("Open include destination {}: {error}", worktree_path.display()))?;
 
     // NUL records preserve Unicode and embedded newlines without Git's
     // C-style quoting. Unix paths may also contain non-UTF-8 bytes.
@@ -217,45 +218,107 @@ fn copy_matching_files(
                 .map_err(|e| format!("Invalid worktree include path: {e}"))?,
         );
 
-        let src = root_path.join(relative_path);
-        let dst = worktree_path.join(relative_path);
-
-        if !src.exists() || !src.is_file() {
-            continue;
+        if copy_confined_include(&source, &destination, relative_path)
+            .map_err(|error| format!("Copy worktree include {}: {error}", relative_path.display()))?
+        {
+            copied.push(relative_path.to_string_lossy().into_owned());
         }
-
-        // Defense-in-depth: never copy a file onto itself. `std::fs::copy`
-        // opens the destination with O_TRUNC before reading the source, so a
-        // self-copy silently zeroes the file. The outer
-        // `process_worktree_includes` already short-circuits when root and
-        // worktree paths match, but a symlink inside the worktree could still
-        // alias back to the source.
-        if paths_equal(&src, &dst) {
-            eprintln!(
-                "[codemux::scripts] skipping self-copy for {}",
-                src.display()
-            );
-            continue;
-        }
-
-        if let Some(parent) = dst.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
-            }
-        }
-
-        std::fs::copy(&src, &dst)
-            .map_err(|e| format!("Failed to copy {} → {}: {e}", src.display(), dst.display()))?;
-        copied.push(relative_path.to_string_lossy().into_owned());
     }
 
     Ok(copied)
 }
 
-/// Resolve the git root for a workspace path, with fallback.
+fn copy_confined_include(source: &Dir, destination: &Dir, path: &Path) -> io::Result<bool> {
+    if !path.components().all(|component| matches!(component, Component::Normal(_))) {
+        return Err(io::Error::new(ErrorKind::InvalidInput, "Invalid worktree include path"));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(ErrorKind::InvalidInput, "Missing worktree include parent")
+    })?;
+    let mut read = OpenOptions::new();
+    read.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        read.custom_flags(libc::O_NONBLOCK);
+    }
+    match source.symlink_metadata(path) {
+        Ok(entry) if is_regular_include(&entry) => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    let mut input = source.open_with(path, &read)?;
+    let metadata = input.metadata()?;
+    if !is_regular_include(&metadata) {
+        return Ok(false);
+    }
+
+    match destination.symlink_metadata(path) {
+        Ok(entry) if !is_regular_include(&entry) => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    destination.create_dir_all(parent)?;
+
+    // A new file never truncates an existing inode that another path could
+    // share. The final rename replaces only the confined directory entry.
+    let stage = parent.join(format!(".codemux-include-{}.tmp", uuid::Uuid::new_v4()));
+    let mut write = OpenOptions::new();
+    write.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        write.mode(0o600);
+    }
+    let mut output = destination.open_with(&stage, &write)?;
+    let staged = io::copy(&mut input, &mut output)
+        .and_then(|_| output.set_permissions(metadata.permissions()));
+    drop(output);
+    match staged.and_then(|_| destination.rename(&stage, destination, path)) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let _ = destination.remove_file(&stage);
+            Err(error)
+        }
+    }
+}
+
+fn is_regular_include(metadata: &cap_std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    metadata.is_file()
+}
+
+/// Resolve a workspace's git root. A checkout outside that root must be
+/// registered with Git before it can use the root as an include source.
 pub fn resolve_root_path(workspace_path: &Path) -> PathBuf {
-    find_git_root(workspace_path).unwrap_or_else(|| workspace_path.to_path_buf())
+    let Some(root) = find_git_root(workspace_path) else {
+        return workspace_path.to_path_buf();
+    };
+    let (Ok(checkout), Ok(canonical_root)) = (workspace_path.canonicalize(), root.canonicalize())
+    else {
+        return workspace_path.to_path_buf();
+    };
+    if checkout.starts_with(&canonical_root)
+        || crate::git::git_list_worktrees(&canonical_root).is_ok_and(|worktrees| {
+            worktrees.into_iter().any(|worktree| {
+                !worktree.is_bare
+                    && Path::new(&worktree.path).canonicalize().ok().as_ref() == Some(&checkout)
+            })
+        })
+    {
+        root
+    } else {
+        workspace_path.to_path_buf()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -906,6 +969,97 @@ mod tests {
             fs::read_to_string(worktree.path().join(".env")).unwrap(),
             "SECRET=abc"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_includes_keep_file_links_outside_the_copy() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let external = outside.path().join("external.txt");
+        fs::write(&external, "unchanged").unwrap();
+        fs::write(root.path().join(".env"), "value=local").unwrap();
+        symlink(&external, root.path().join(".env.link")).unwrap();
+        symlink(&external, worktree.path().join(".env")).unwrap();
+
+        let authority = cap_std::ambient_authority();
+        let source = Dir::open_ambient_dir(root.path(), authority).unwrap();
+        let destination = Dir::open_ambient_dir(worktree.path(), authority).unwrap();
+        assert!(!copy_confined_include(&source, &destination, Path::new(".env")).unwrap());
+        assert!(!copy_confined_include(&source, &destination, Path::new(".env.link")).unwrap());
+        assert_eq!(fs::read_to_string(&external).unwrap(), "unchanged");
+        assert!(!worktree.path().join(".env.link").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_includes_confine_destination_parents() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("settings")).unwrap();
+        fs::write(root.path().join("settings/.env"), "value=local").unwrap();
+        symlink(outside.path(), worktree.path().join("settings")).unwrap();
+
+        let authority = cap_std::ambient_authority();
+        let source = Dir::open_ambient_dir(root.path(), authority).unwrap();
+        let destination = Dir::open_ambient_dir(worktree.path(), authority).unwrap();
+        assert!(copy_confined_include(&source, &destination, Path::new("settings/.env")).is_err());
+        assert!(!outside.path().join(".env").exists());
+    }
+
+    #[test]
+    fn worktree_includes_replace_only_the_destination_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let existing = root.path().join("previous.txt");
+        fs::write(&existing, "old").unwrap();
+        fs::write(root.path().join(".env"), "new").unwrap();
+        fs::hard_link(&existing, worktree.path().join(".env")).unwrap();
+
+        let authority = cap_std::ambient_authority();
+        let source = Dir::open_ambient_dir(root.path(), authority).unwrap();
+        let destination = Dir::open_ambient_dir(worktree.path(), authority).unwrap();
+        assert!(copy_confined_include(&source, &destination, Path::new(".env")).unwrap());
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "old");
+        assert_eq!(fs::read_to_string(worktree.path().join(".env")).unwrap(), "new");
+        assert_eq!(fs::read_dir(worktree.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn worktree_includes_resolve_only_registered_external_checkouts() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("project");
+        let registered = fixture.path().join("registered");
+        let unregistered = fixture.path().join("unregistered");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&unregistered).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{:?}", output);
+        };
+        git(&["init", "-b", "main"]);
+        git(&[
+            "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+            "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Fixture",
+        ]);
+        git(&["worktree", "add", "--detach", registered.to_str().unwrap()]);
+        fs::copy(registered.join(".git"), unregistered.join(".git")).unwrap();
+
+        assert_eq!(
+            resolve_root_path(&registered).canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
+        assert_eq!(resolve_root_path(&unregistered), unregistered);
     }
 
     #[test]
