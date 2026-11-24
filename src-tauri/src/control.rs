@@ -3473,7 +3473,7 @@ mod tests {
     #[tokio::test]
     async fn narrowed_client_refuses_an_old_server_that_replaced_a_new_one() {
         let dir = tempfile::tempdir().unwrap();
-        let path = [dir.path().join("app.sock")];
+        let path = [dir.path().join(format!("{SOCKET_BASENAME}.sock"))];
         let read_only = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly), agent: None };
 
         let (new_app, seen) = spawn_line_server(&path[0], CONTROL_PROTOCOL_VERSION);
@@ -3482,6 +3482,7 @@ mod tests {
         assert!(reply.ok);
         assert_eq!(*seen.lock().unwrap(), vec![(0, "status".to_owned()), (0, "notify".to_owned())]);
         new_app.abort();
+        assert!(new_app.await.unwrap_err().is_cancelled());
 
         // `bind` replaces the socket file, as a restarted app does.
         let (old_app, seen) = spawn_line_server(&path[0], 1);
