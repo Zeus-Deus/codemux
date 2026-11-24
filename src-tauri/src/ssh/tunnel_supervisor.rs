@@ -19,7 +19,10 @@
 
 #![cfg(unix)]
 
-use crate::ssh::tunnel::{build_tunnel_argv, TunnelOptions};
+use crate::ssh::exec::validate_ssh_target;
+use crate::ssh::tunnel::{
+    build_tunnel_argv, has_private_socket_parent, prepare_local_socket, wait_for_socket, TunnelOptions,
+};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -148,7 +151,9 @@ impl TunnelSupervisor {
         if let Some(task) = task {
             let _ = task.await;
         }
-        let _ = std::fs::remove_file(&self.inner.local_socket);
+        if has_private_socket_parent(&self.inner.local_socket) {
+            let _ = std::fs::remove_file(&self.inner.local_socket);
+        }
     }
 }
 
@@ -206,8 +211,12 @@ async fn run_supervisor(
         // "the socket exists", so clear it first or the next attempt
         // reports Connected before ssh has even authenticated.
         // (StreamLocalBindUnlink lets ssh rebind the path either way.)
-        remove_stale_socket(&local_socket);
-        let spawn_res = cmd.spawn();
+        let spawn_res = validate_ssh_target(ssh_target)
+            .and_then(|()| prepare_local_socket(&local_socket))
+            .and_then(|()| {
+                remove_stale_socket(&local_socket);
+                cmd.spawn().map_err(|error| error.to_string())
+            });
         let mut child = match spawn_res {
             Ok(c) => {
                 crate::trace_cloud_push!(
@@ -228,7 +237,7 @@ async fn run_supervisor(
             }
         };
 
-        // Wait for the socket to appear (or SSH to die before it does).
+        // Wait for the local socket and authenticated remote readiness.
         let socket_ready = tokio::select! {
             ready = wait_for_socket(&local_socket, &mut child, SPAWN_TIMEOUT) => Some(ready),
             _ = shutdown_rx.wait_for(|stop| *stop) => None,
@@ -330,51 +339,6 @@ async fn sleep_or_shutdown(
 
 /// Poll for the local socket to appear OR for SSH to exit. Returns
 /// `Ok(())` if the socket appears in time, `Err(reason)` otherwise.
-async fn wait_for_socket(
-    local_socket: &Path,
-    child: &mut tokio::process::Child,
-    deadline: Duration,
-) -> Result<(), String> {
-    let start = Instant::now();
-    let mut last_log_at_secs: u64 = 0;
-    crate::trace_cloud_push!(
-        "[tunnel-supervisor] waiting for local socket {:?} (deadline {:?})",
-        local_socket, deadline
-    );
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!(
-                "ssh exited before tunnel came up (status={status})"
-            ));
-        }
-        if local_socket.exists() {
-            // Tiny grace beat so the daemon's listener is fully up.
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            crate::trace_cloud_push!(
-                "[tunnel-supervisor] local socket appeared after {:?}",
-                start.elapsed()
-            );
-            return Ok(());
-        }
-        let elapsed_secs = start.elapsed().as_secs();
-        if elapsed_secs > last_log_at_secs {
-            // Per-second progress so we know the loop is alive.
-            crate::trace_cloud_push!(
-                "[tunnel-supervisor] still waiting for socket (elapsed {}s, ssh alive)",
-                elapsed_secs
-            );
-            last_log_at_secs = elapsed_secs;
-        }
-        if start.elapsed() >= deadline {
-            return Err(format!(
-                "socket {:?} did not appear within {:?}",
-                local_socket, deadline
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 /// Block until the supervised SSH child exits or shutdown signals.
 /// Returns `true` if child exited (need to reconnect), `false` if
 /// shutdown.

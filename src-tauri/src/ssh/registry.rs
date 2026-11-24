@@ -163,7 +163,10 @@ pub fn local_socket_for_workspace(workspace_id: &str) -> PathBuf {
     // 48-bit space (birthday collisions ~2^24 workspaces). 16 stays well
     // under the 104-byte macOS sun_path limit (see the test below).
     let truncated = &short[..short.len().min(16)];
-    std::env::temp_dir().join(format!("codemux-tunnel-{truncated}.sock"))
+    let directory = format!(".cmux-{}", unsafe { libc::geteuid() });
+    std::env::temp_dir()
+        .join(directory)
+        .join(format!("{truncated}.sock"))
 }
 
 /// Compute the conventional remote socket path for a workspace's
@@ -181,7 +184,7 @@ pub fn remote_socket_for_workspace(workspace_id: &str) -> String {
     // 48-bit space (birthday collisions ~2^24 workspaces). 16 stays well
     // under the 104-byte macOS sun_path limit (see the test below).
     let truncated = &short[..short.len().min(16)];
-    format!("/tmp/codemux-ptyd-{truncated}.sock")
+    format!("/tmp/codemux-ptyd-{truncated}.d/pty.sock")
 }
 
 /// Per-workspace `PtyDaemonClient` cache. Local workspaces share the
@@ -338,10 +341,8 @@ async fn connect_tunnel_daemon(
     supervisor: &TunnelSupervisor,
 ) -> Result<Arc<PtyDaemonClient>, PtyDaemonError> {
     // Wait for the tunnel to become Connected (or fail loudly).
-    // Connected fires when the LOCAL socket file appears, i.e.
-    // when SSH -L successfully bound the local side. It does NOT
-    // mean the remote daemon is up and listening yet — see the
-    // connect+hello retry loop below.
+    // Connected fires after SSH binds the local forward and its authenticated
+    // remote command confirms that the daemon socket is ready.
     let tunnel_wait = Duration::from_secs(20);
     let mut rx = supervisor.subscribe();
     // Mark the initial subscribed value as seen so `rx.changed()`
