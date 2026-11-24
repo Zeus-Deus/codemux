@@ -1071,7 +1071,7 @@ mod tests {
         let (out, registered) = tokio::join!(run, probe);
         let out = out.expect("printenv must run");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "resolver");
-        assert_eq!(registered, cfg!(target_os = "linux"), "registered for ancestry on Linux");
+        assert_eq!(registered, cfg!(any(target_os = "linux", target_os = "macos")), "registered for ancestry on this platform");
     }
 
     #[tokio::test]

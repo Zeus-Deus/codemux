@@ -178,29 +178,29 @@ fn inherited_identity_vars() -> impl Iterator<Item = &'static str> {
 /// Records a process Codemux just started for an agent (a provider runtime,
 /// OpenCode's server, an automation run, the conflict resolver). The socket
 /// then treats it and every descendant as an agent process, even when an MCP
-/// client cleared the env marker on the way. Linux only; elsewhere the env
-/// marker is the only signal.
+/// client cleared the env marker on the way.
 ///
 /// Any new code that starts a model with tools outside `JsonRpcChild` must
 /// call this and set [`AGENT_PROCESS_ENV`].
 pub(crate) fn register_agent_process(pid: u32) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     ancestry::register(pid);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     let _ = pid;
 }
 
 /// Whether `pid` is a registered agent process or descends from one.
 pub(crate) fn is_agent_descendant(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        ancestry::is_descendant(pid)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        false
-    }
+    peer_agent_status(pid).unwrap_or(false)
+}
+
+/// `None` means the peer's ancestry could not be attested. A socket request
+/// with that status must not gain the local owner's authority.
+fn peer_agent_status(pid: u32) -> Option<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    { ancestry::status(pid) }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    { let _ = pid; None }
 }
 
 #[cfg(target_os = "linux")]
@@ -243,27 +243,78 @@ mod ancestry {
         roots.insert(pid, start);
     }
 
-    pub(super) fn is_descendant(pid: u32) -> bool {
-        if ROOTS.lock().unwrap_or_else(PoisonError::into_inner).is_empty() {
-            return false;
-        }
+    pub(super) fn status(pid: u32) -> Option<bool> {
+        if pid == 0 { return None; }
         // Walk up to init or to this app (whose own children are not agents
         // unless registered), reading /proc outside the lock.
         let own = std::process::id();
         let mut chain = Vec::new();
         let mut pid = pid;
         while chain.len() < MAX_HOPS && pid > 1 && pid != own {
-            let Some((parent, start)) = stat(pid) else { break };
+            let (parent, start) = stat(pid)?;
             chain.push((pid, start));
+            if parent == 0 { return None; }
             pid = parent;
         }
+        if chain.len() == MAX_HOPS && pid > 1 && pid != own { return None; }
         let roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
-        chain.iter().any(|(pid, start)| roots.get(pid) == Some(start))
+        Some(chain.iter().any(|(pid, start)| roots.get(pid) == Some(start)))
     }
 
     #[cfg(test)]
     pub(super) fn len() -> usize {
         ROOTS.lock().unwrap_or_else(PoisonError::into_inner).len()
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+mod ancestry {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    const PRUNE_AT: usize = 4096;
+    const MAX_HOPS: usize = 64;
+    // Start time prevents a reused pid from inheriting a previous agent's
+    // mark. sysinfo supplies the OS process table on both platforms.
+    static ROOTS: Mutex<BTreeMap<u32, u64>> = Mutex::new(BTreeMap::new());
+
+    fn snapshot() -> System {
+        let mut system = System::new();
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+        system
+    }
+
+    pub(super) fn register(pid: u32) {
+        let system = snapshot();
+        let Some(process) = system.process(Pid::from_u32(pid)) else { return };
+        let start = process.start_time();
+        if start == 0 { return; }
+        let mut roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
+        if roots.len() >= PRUNE_AT {
+            roots.retain(|pid, start| {
+                system.process(Pid::from_u32(*pid)).is_some_and(|process| process.start_time() == *start)
+            });
+        }
+        roots.insert(pid, start);
+    }
+
+    pub(super) fn status(pid: u32) -> Option<bool> {
+        if pid == 0 { return None; }
+        let system = snapshot();
+        let roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let own = std::process::id();
+        let mut current = pid;
+        for _ in 0..MAX_HOPS {
+            if current == own { return Some(false); }
+            // pid 1 is launchd on macOS; pid 4 is System on Windows.
+            if current == 1 || (cfg!(windows) && current == 4) { return Some(false); }
+            let process = system.process(Pid::from_u32(current))?;
+            if roots.get(&current) == Some(&process.start_time()) { return Some(true); }
+            current = process.parent()?.as_u32();
+        }
+        // Excessive depth or an incomplete process snapshot is unverified.
+        None
     }
 }
 
@@ -421,7 +472,7 @@ fn narrowed(command: &str, required: Access, access: ControlAccess) -> Result<()
 pub(crate) enum SocketCaller {
     /// The owner (principal `local`) or a named same-user client (`local:<slug>`).
     Local(ControlCaller),
-    /// A process started by a Codemux agent (env marker or, on Linux, process
+    /// A process started by a Codemux agent (env marker or process
     /// ancestry). Never `CallerKind::Agent`: the socket cannot know the chat's
     /// ceiling, so it rank-compares the process's own `access`.
     Agent { kind: String, access: ControlAccess },
@@ -456,20 +507,24 @@ impl SocketCaller {
     }
 }
 
-/// Resolves who sent a socket request. No client is the owner; a named client
-/// is `local:<slug>`, attributed as an outside assistant. An agent marker, or
-/// a peer that descends from a registered agent process, wins over any name:
-/// a name or access level can then only narrow.
+/// Resolves who sent a socket request. A verified non-agent peer without a
+/// client is the owner; a named client is `local:<slug>`. An agent marker or
+/// registered agent ancestry wins over any name. Unverifiable peers get only
+/// read access, regardless of what they claim in the request.
 pub(crate) fn resolve_socket_caller(client: Option<ControlClient>, peer_pid: Option<u32>) -> SocketCaller {
     let client = client.unwrap_or_default();
     let access = client.access.unwrap_or(ControlAccess::FullAccess);
+    let peer_agent = match peer_pid.and_then(peer_agent_status) {
+        Some(is_agent) => is_agent,
+        None => return SocketCaller::Agent { kind: "unverified".to_owned(), access: ControlAccess::ReadOnly },
+    };
     // The kind is only logged; bound what an arbitrary client may send.
-    let agent = client
-        .agent
-        .map(|agent| AgentProcess::from_marker(&agent.kind).kind)
-        .or_else(|| peer_pid.filter(|pid| is_agent_descendant(*pid)).map(|_| "process-tree".to_owned()));
+    let agent = client.agent.map(|agent| AgentProcess::from_marker(&agent.kind).kind);
     if let Some(kind) = agent {
         return SocketCaller::Agent { kind, access };
+    }
+    if peer_agent {
+        return SocketCaller::Agent { kind: "process-tree".to_owned(), access };
     }
     let name = client.name.as_deref().and_then(ClientName::parse);
     SocketCaller::Local(ControlCaller::local(name.as_ref(), access))
@@ -757,27 +812,41 @@ mod tests {
 
     #[test]
     fn socket_clients_resolve_to_local_principals() {
-        let owner = local_caller(resolve_socket_caller(None, None));
+        let own_pid = Some(std::process::id());
+        let owner = local_caller(resolve_socket_caller(None, own_pid));
         assert_eq!(owner.principal, "local");
         assert_eq!(owner.access, FullAccess);
-        let narrowed = local_caller(resolve_socket_caller(client(None, Some(ReadOnly), None), None));
+        let narrowed = local_caller(resolve_socket_caller(client(None, Some(ReadOnly), None), own_pid));
         assert_eq!((narrowed.principal.as_str(), narrowed.access), ("local", ReadOnly));
-        let named = local_caller(resolve_socket_caller(client(Some("Hermes Agent"), Some(Supervised), None), None));
+        let named = local_caller(resolve_socket_caller(client(Some("Hermes Agent"), Some(Supervised), None), own_pid));
         assert_eq!(named.principal, "local:hermes-agent");
         assert_eq!(named.label.as_deref(), Some("Hermes Agent"));
         assert_eq!(named.access, Supervised);
-        let junk = local_caller(resolve_socket_caller(client(Some("---"), None, None), None));
+        let junk = local_caller(resolve_socket_caller(client(Some("---"), None, None), own_pid));
         assert_eq!(junk.principal, "local", "an unusable name is the owner");
-        let own_pid = local_caller(resolve_socket_caller(None, Some(std::process::id())));
-        assert_eq!(own_pid.principal, "local", "the app itself is not an agent");
+        assert_eq!(peer_agent_status(std::process::id()), Some(false), "the app itself is not an agent");
+    }
+
+    #[test]
+    fn missing_peer_cannot_claim_owner_access() {
+        for peer_pid in [None, Some(0), Some(u32::MAX)] {
+            let caller = resolve_socket_caller(client(Some("owner"), Some(FullAccess), None), peer_pid);
+            assert!(matches!(&caller, SocketCaller::Agent { kind, access: ReadOnly } if kind == "unverified"), "{caller:?}");
+            assert!(caller.permits("status", Access::Read).is_ok());
+            assert!(caller.permits("notify", Access::Write).is_err());
+            assert_eq!(caller.permits("web_remote_enable", Access::Admin).unwrap_err().code, ErrorCode::AdminRefused);
+        }
     }
 
     #[test]
     fn agent_markers_win_over_names() {
-        let marked = resolve_socket_caller(client(Some("hermes"), Some(Supervised), Some("opencode")), None);
+        let own_pid = Some(std::process::id());
+        let marked = resolve_socket_caller(client(Some("hermes"), Some(Supervised), Some("opencode")), own_pid);
         assert!(matches!(&marked, SocketCaller::Agent { kind, access: Supervised } if kind == "opencode"), "{marked:?}");
-        let default_access = resolve_socket_caller(client(None, None, Some("1")), None);
+        let default_access = resolve_socket_caller(client(None, None, Some("1")), own_pid);
         assert!(matches!(default_access, SocketCaller::Agent { access: FullAccess, .. }));
+        let unverified = resolve_socket_caller(client(None, Some(FullAccess), Some("1")), None);
+        assert!(matches!(unverified, SocketCaller::Agent { access: ReadOnly, .. }));
     }
 
     #[test]
@@ -825,6 +894,8 @@ mod tests {
             register_agent_process(shell.0.id());
             assert!(is_agent_descendant(shell.0.id()), "the registered process itself");
             assert!(is_agent_descendant(sleep_pid), "its child");
+            let unmarked = resolve_socket_caller(None, Some(sleep_pid));
+            assert!(matches!(unmarked, SocketCaller::Agent { kind, access: ControlAccess::FullAccess } if kind == "process-tree"));
             assert!(!is_agent_descendant(std::process::id()), "the app is never its own agent");
             assert!(!is_agent_descendant(1));
             // The grandchild was started by this test; stop it by pid.
@@ -877,5 +948,23 @@ mod tests {
             let (parent, _) = ancestry::stat(tricky.0.id()).unwrap();
             assert_eq!(parent, std::process::id());
         }
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn registered_process_with_cleared_marker_remains_an_agent() {
+        use std::process::Command;
+        #[cfg(target_os = "macos")]
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        #[cfg(windows)]
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 > NUL"])
+            .spawn()
+            .unwrap();
+        register_agent_process(child.id());
+        let caller = resolve_socket_caller(client(Some("owner"), Some(FullAccess), None), Some(child.id()));
+        assert!(matches!(caller, SocketCaller::Agent { kind, access: FullAccess } if kind == "process-tree"));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

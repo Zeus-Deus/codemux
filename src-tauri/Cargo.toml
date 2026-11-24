@@ -237,6 +237,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     # IO_STATUS_BLOCK for confined skill writes and CancelIoEx for OpenCode shutdown.
     "Win32_System_IO",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

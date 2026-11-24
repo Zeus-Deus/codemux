@@ -216,11 +216,13 @@ mod unix_transport {
 
 #[cfg(windows)]
 mod windows_transport {
+    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
     use tokio::net::windows::named_pipe::{
         ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
     };
     use tokio::sync::Mutex;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 
     pub type ServerStream = NamedPipeServer;
     pub type ClientStream = NamedPipeClient;
@@ -249,8 +251,7 @@ mod windows_transport {
     }
 
     impl Listener {
-        /// The stream and the peer's pid. Named pipes report none here, so
-        /// only the env marker identifies agent processes on Windows.
+        /// The stream and the connecting process's kernel-reported pid.
         pub async fn accept(&self) -> std::io::Result<(ServerStream, Option<u32>)> {
             let mut guard = self.pending.lock().await;
             let server = guard.take().ok_or_else(|| {
@@ -260,12 +261,16 @@ mod windows_transport {
                 )
             })?;
             server.connect().await?;
+            let mut peer_pid = 0;
+            let peer_pid = (unsafe { GetNamedPipeClientProcessId(server.as_raw_handle(), &mut peer_pid) } != 0
+                && peer_pid != 0)
+                .then_some(peer_pid);
             // Eagerly create the next server instance so the listener is
             // ready to accept another client as soon as this one is handed
             // to its handler task.
             let next = ServerOptions::new().create(&self.pipe_name)?;
             *guard = Some(next);
-            Ok((server, None))
+            Ok((server, peer_pid))
         }
     }
 
@@ -371,14 +376,20 @@ const SOCKET_BASENAME: &str = "codemux";
 #[cfg(unix)]
 pub fn control_socket_path() -> Option<PathBuf> {
     let socket_file = format!("{SOCKET_BASENAME}.sock");
+    let uid = unsafe { libc::geteuid() };
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-        return Some(runtime_dir.join(&socket_file));
+        if private_runtime_dir(&runtime_dir, uid) {
+            return Some(runtime_dir.join(&socket_file));
+        }
+        crate::diagnostics::stderr_line(&format!(
+            "[codemux::control] XDG_RUNTIME_DIR {} is not an owned private directory; using the fallback",
+            runtime_dir.display()
+        ));
     }
 
     // Create the fallback privately in one operation. An existing entry
     // must already be a private directory owned by this account.
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    let uid = unsafe { libc::geteuid() };
     let fallback_dir = fallback_runtime_dir(uid);
     if let Err(error) = fs::DirBuilder::new().mode(0o700).create(&fallback_dir) {
         let private = error.kind() == std::io::ErrorKind::AlreadyExists
@@ -393,10 +404,18 @@ pub fn control_socket_path() -> Option<PathBuf> {
         }
     }
     crate::diagnostics::stderr_line(&format!(
-        "[codemux::control] XDG_RUNTIME_DIR unset, using fallback: {}",
+        "[codemux::control] Using fallback runtime dir: {}",
         fallback_dir.display()
     ));
     Some(fallback_dir.join(&socket_file))
+}
+
+#[cfg(unix)]
+fn private_runtime_dir(path: &std::path::Path, uid: u32) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    path.is_absolute() && fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.is_dir() && meta.uid() == uid && meta.permissions().mode() & 0o777 == 0o700
+    })
 }
 
 /// The runtime dir the server falls back to without `XDG_RUNTIME_DIR`.
@@ -415,7 +434,7 @@ fn fallback_runtime_dir(uid: u32) -> PathBuf {
 pub(crate) fn control_socket_candidates() -> Vec<PathBuf> {
     let uid = unsafe { libc::geteuid() };
     socket_candidates(
-        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|dir| private_runtime_dir(dir, uid)),
         std::path::Path::new("/run/user"),
         uid,
         || client_fallback_socket(fallback_runtime_dir(uid), uid),
@@ -454,14 +473,13 @@ fn socket_candidates(
     uid: u32,
     fallback: impl FnOnce() -> Option<PathBuf>,
 ) -> Vec<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
     let socket_file = format!("{SOCKET_BASENAME}.sock");
     if let Some(runtime_dir) = xdg_runtime_dir {
         return vec![runtime_dir.join(socket_file)];
     }
     let runtime_dir = run_user.join(uid.to_string());
     let mut candidates = Vec::new();
-    if fs::metadata(&runtime_dir).is_ok_and(|meta| meta.is_dir() && meta.uid() == uid) {
+    if private_runtime_dir(&runtime_dir, uid) {
         candidates.push(runtime_dir.join(&socket_file));
     }
     candidates.extend(fallback());
@@ -3108,11 +3126,15 @@ mod tests {
         assert_eq!(socket_candidates(None, run_user.path(), uid, tmp), vec![fallback.clone()], "no runtime dir yet");
         let own = run_user.path().join(uid.to_string());
         fs::create_dir(&own).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&own, fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
             socket_candidates(None, run_user.path(), uid, tmp),
             vec![own.join(&socket_file), fallback.clone()],
             "the systemd runtime dir comes before the /tmp fallback"
         );
+        fs::set_permissions(&own, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(socket_candidates(None, run_user.path(), uid, tmp), vec![fallback.clone()], "a shared runtime dir is not used");
         let foreign = run_user.path().join((uid + 1).to_string());
         fs::create_dir(&foreign).unwrap();
         assert_eq!(
@@ -3137,6 +3159,24 @@ mod tests {
         let own = root.path().to_path_buf();
         assert_eq!(client_fallback_socket(own.clone(), uid), Some(own.join(&socket_file)));
         assert_eq!(client_fallback_socket(own, uid + 1), None, "a dir another uid owns is never used");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_runtime_directory_rejects_symlinks_and_shared_modes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let uid = fs::metadata(root.path()).unwrap().uid();
+        let private = root.path().join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(private_runtime_dir(&private, uid));
+        assert!(!private_runtime_dir(&private, uid.wrapping_add(1)));
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        assert!(!private_runtime_dir(&link, uid));
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!private_runtime_dir(&private, uid));
     }
 
     /// A one-connection-at-a-time line server: answers every line with
