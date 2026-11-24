@@ -3472,7 +3472,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn narrowed_client_refuses_an_old_server_that_replaced_a_new_one() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_control_test_dir();
         let path = [dir.path().join(format!("{SOCKET_BASENAME}.sock"))];
         let read_only = ControlClient { name: None, access: Some(crate::agent_control::ControlAccess::ReadOnly), agent: None };
 
@@ -4068,9 +4068,19 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn private_control_test_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn control_bind_replaces_a_stale_socket_but_keeps_a_live_endpoint() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_control_test_dir();
         let path = dir.path().join(format!("{SOCKET_BASENAME}.sock"));
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
 
@@ -4085,7 +4095,7 @@ mod tests {
     async fn control_bind_preserves_unexpected_entries() {
         use std::os::unix::fs::{symlink, FileTypeExt, PermissionsExt};
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_control_test_dir();
         let filename = format!("{SOCKET_BASENAME}.sock");
         let path = dir.path().join(&filename);
         fs::write(&path, b"owned file").unwrap();
