@@ -278,6 +278,49 @@ describe("MarkdownRendered", () => {
     expect(imgs[1].getAttribute("src")).toBe("data:image/png;base64,AAAA");
   });
 
+  it("renders forge image descriptions without fetching image URLs", () => {
+    const { container, getByText } = render(
+      <MarkdownRendered
+        untrusted
+        filePath="/repo/README.md"
+        content={[
+          "![Screenshot](https://example.com/screenshot.png)",
+          "![Local picture](/pictures/sample.png)",
+          "![Relative picture](./sample.png)",
+          "![In-app picture](/api/sample.png)",
+          "![Same-origin picture](" + window.location.origin + "/sample.png)",
+          '<img src="http://asset.localhost/pictures/sample.png" alt="Asset picture">',
+          '<picture><source srcset="https://example.com/another.png 2x"><img src="/sample.png" alt="Picture fallback"></picture>',
+        ].join("\n\n")}
+      />,
+    );
+    expect(container.querySelector("img, picture, source, [srcset]")).toBeNull();
+    expect(getByText("Screenshot")).toBeInTheDocument();
+    expect(getByText("Local picture")).toBeInTheDocument();
+    expect(getByText("Picture fallback")).toBeInTheDocument();
+  });
+
+  it("gives forge markdown links only web or in-document destinations", () => {
+    const { getByText } = render(
+      <MarkdownRendered
+        untrusted
+        content={[
+          "[Docs](https://example.com/docs)",
+          "[Section](#section)",
+          "[Relative](./other.md)",
+          "[App](/settings)",
+          "[Asset](http://asset.localhost/pictures/sample.png)",
+        ].join("\n\n")}
+      />,
+    );
+    expect(getByText("Docs")).toHaveAttribute("href", "https://example.com/docs");
+    expect(getByText("Docs")).toHaveAttribute("rel", "noopener noreferrer");
+    expect(getByText("Section")).toHaveAttribute("href", "#section");
+    for (const label of ["Relative", "App", "Asset"]) {
+      expect(getByText(label)).not.toHaveAttribute("href");
+    }
+  });
+
   it.each([
     ["a raw named anchor", `[Setup](#setup)\n\n<a name="setup"></a>\n\ntext`, "a[href='#setup']"],
     ["a raw id", `[Setup](#setup)\n\n<h2 id="setup">Setup</h2>`, "a[href='#setup']"],

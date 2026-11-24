@@ -25,6 +25,29 @@ function safeUrlTransform(url: string): string {
   return DANGEROUS_URL.test(url) ? "" : url;
 }
 
+function webUrl(value: string | undefined): URL | null {
+  if (!value || !/^https?:\/\//i.test(value)) return null;
+  try {
+    return new URL(value);
+  } catch {
+    return null;
+  }
+}
+
+/** OS-facing asset URLs also use HTTP(S) on some Tauri platforms. */
+function forgeLinkUrl(value: string | undefined): string | undefined {
+  const url = webUrl(value);
+  if (!url || url.origin === window.location.origin) return undefined;
+  const host = url.hostname.replace(/\.+$/, "");
+  if (host === "asset.localhost" || host === "tauri.localhost") return undefined;
+  return url.href;
+}
+
+const FORGE_SCHEMA: SanitizeSchema = {
+  ...defaultSchema,
+  tagNames: defaultSchema.tagNames?.filter((tag) => tag !== "picture" && tag !== "source"),
+};
+
 const ID_PREFIX = defaultSchema.clobberPrefix ?? "";
 
 const DRIVE_LETTERS = [..."abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"];
@@ -103,10 +126,8 @@ interface Props {
   /**
    * The content came from the forge rather than the local disk — a pull
    * request description or a review comment anyone can post. Raw HTML
-   * is always sanitized (bots lean on `<details>` and `<img>`, so it
-   * still renders, but a `<style>`, `<iframe>` or `<base>` cannot reach
-   * the app's DOM); this additionally drops the local-only image
-   * sources a remote author has no business using.
+   * is always sanitized. Forge images render their descriptions so
+   * opening a review cannot make image requests to a contributor's URLs.
    */
   untrusted?: boolean;
 }
@@ -153,7 +174,7 @@ function MarkdownRenderedImpl({
   // after it is parsed, never before, and on every surface: an
   // `<iframe srcdoc>` that survived would run script in this webview.
   const rehypePlugins = useMemo<PluggableList>(
-    () => [rehypeRaw, untrusted ? rehypeSanitize : [rehypeSanitize, LOCAL_FILE_SCHEMA]],
+    () => [rehypeRaw, [rehypeSanitize, untrusted ? FORGE_SCHEMA : LOCAL_FILE_SCHEMA]],
     [untrusted],
   );
 
@@ -170,6 +191,8 @@ function MarkdownRenderedImpl({
        * animated GIF keeps animating in both places.
        */
       img: ({ src, alt, ...rest }) => {
+        const label = alt ?? "";
+        if (untrusted) return label || "Image";
         let imagePath = src;
         if (src && !isRemoteOrDataUrl(src) && (filePath || isAbsoluteFsPath(src))) {
           // Markdown destinations are URLs, but the asset protocol expects a
@@ -182,7 +205,6 @@ function MarkdownRenderedImpl({
           }
         }
         const resolved = resolveAssetSrc(imagePath, filePath);
-        const label = alt ?? "";
         return (
           <img
             {...rest}
@@ -196,7 +218,7 @@ function MarkdownRenderedImpl({
               setZoomed({
                 src: resolved,
                 alt: label,
-                href: typeof src === "string" ? src : null,
+                href: src ?? null,
               });
             }}
           />
@@ -215,30 +237,38 @@ function MarkdownRenderedImpl({
        * renders the PR description in the Review panel, which is exactly
        * where "see #482" tends to be written.
        */
-      a: ({ href, children, ...rest }) => (
-        <a
-          {...rest}
-          href={href}
-          rel="noopener noreferrer"
-          onClick={(event) => {
-            if (href?.startsWith("#")) {
-              // Sanitizing prefixes every `id` and `name` so a document
-              // cannot shadow the app's own, which leaves an in-page link
-              // pointing at the unprefixed one. Resolve it here.
-              event.preventDefault();
-              scrollToFragment(event.currentTarget, href.slice(1));
-              return;
-            }
-            if (!href || !/^https?:\/\//i.test(href)) return;
-            event.preventDefault();
-            void openExternalUrl(href, { event });
-          }}
-        >
-          {children}
-        </a>
-      ),
+      a: ({ href, children, ...rest }) => {
+        const fragment = href?.startsWith("#") ? href.slice(1) : null;
+        const external = untrusted ? forgeLinkUrl(href) : webUrl(href)?.href;
+        return (
+          <a
+            {...rest}
+            href={untrusted ? (fragment === null ? external : href) : href}
+            target={external ? "_blank" : undefined}
+            rel="noopener noreferrer"
+            onClick={(event) => {
+              if (fragment !== null) {
+                // Sanitizing prefixes id and name, so resolve the link
+                // within this rendered document.
+                event.preventDefault();
+                scrollToFragment(event.currentTarget, fragment);
+              } else if (external) {
+                event.preventDefault();
+                void openExternalUrl(external, { event });
+              }
+            }}
+            onAuxClick={(event) => {
+              if (event.button !== 1) return;
+              if (fragment !== null || external) event.preventDefault();
+              if (external) void openExternalUrl(external, { event });
+            }}
+          >
+            {children}
+          </a>
+        );
+      },
     }),
-    [filePath],
+    [filePath, untrusted],
   );
 
   const body = (
