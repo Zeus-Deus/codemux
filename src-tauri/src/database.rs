@@ -5988,12 +5988,36 @@ impl DatabaseStore {
 impl DatabaseStore {
     pub fn save_auth_token(&self, encrypted_data: &[u8]) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
+        Self::write_auth_token(&conn, encrypted_data)
+    }
+
+    fn write_auth_token(conn: &Connection, encrypted_data: &[u8]) -> Result<(), String> {
         conn.execute(
             "INSERT OR REPLACE INTO auth_tokens (id, encrypted_data, updated_at) VALUES (1, ?1, datetime('now'))",
             params![encrypted_data],
         )
         .map_err(|e| format!("Failed to save auth token: {e}"))?;
         Ok(())
+    }
+
+    /// Save the verified owner and revoke another account's browser access
+    /// in the same transaction. Pairing-code sessions belong to the host.
+    pub(crate) fn save_auth_token_for_account(
+        &self,
+        encrypted_data: &[u8],
+        account_id: &str,
+    ) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE web_remote_sessions SET revoked = 1
+                 WHERE revoked = 0 AND source = 'account' AND account_user_id IS NOT ?1",
+                params![account_id],
+            )
+            .map_err(|error| format!("Failed to revoke previous account's remote sessions: {error}"))?;
+        Self::write_auth_token(&transaction, encrypted_data)?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     pub fn load_auth_token(&self) -> Option<Vec<u8>> {
@@ -6007,8 +6031,19 @@ impl DatabaseStore {
     }
 
     pub fn clear_auth_token(&self) {
-        let conn = self.conn.lock().unwrap();
-        let _ = conn.execute("DELETE FROM auth_tokens WHERE id = 1", []);
+        let mut conn = self.conn.lock().unwrap();
+        let result: rusqlite::Result<()> = (|| {
+            let transaction = conn.transaction()?;
+            transaction.execute(
+                "UPDATE web_remote_sessions SET revoked = 1 WHERE revoked = 0 AND source = 'account'",
+                [],
+            )?;
+            transaction.execute("DELETE FROM auth_tokens WHERE id = 1", [])?;
+            transaction.commit()
+        })();
+        if let Err(error) = result {
+            log::warn!("Failed to clear auth and revoke account browser sessions: {error}");
+        }
     }
 }
 

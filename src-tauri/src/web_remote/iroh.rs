@@ -548,13 +548,12 @@ async fn authorize_account_handshake(
         let cfg = shared.config.lock().unwrap();
         super::account_session_approved(&cfg)
     };
-    let own_user_id = crate::auth::load_cached_user(db).map(|u| u.id);
-
     let base = crate::auth::api_base_url();
     let resp = verify_grant(&base, &hello.grant)
         .await
         .map_err(|_| AccountHandshakeReject::Unverified)?;
 
+    let own_user_id = crate::auth::load_active_account_id(db);
     let identity = evaluate_grant(&resp, own_node_id, own_user_id.as_deref(), &hello.nonce)?;
 
     // Mint once per account (reuse an existing row on retry), tagged
@@ -899,6 +898,11 @@ async fn handle_bi_stream<R: Runtime>(
     let conn_id = shared
         .connections
         .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());
+    let db = app.state::<DatabaseStore>();
+    let Some(account) = auth::AccountSessionGuard::new(&db, &session_id) else {
+        shared.connections.unregister(conn_id);
+        return;
+    };
     super::emit_state_changed(&app);
 
     // 3. Acknowledge, then hand the send half to the writer task.
@@ -920,8 +924,11 @@ async fn handle_bi_stream<R: Runtime>(
     };
 
     // 5. Reader loop: dispatch client frames until close / EOF / revocation.
+    let account_expired = account.expired();
+    tokio::pin!(account_expired);
     loop {
         tokio::select! {
+            _ = &mut account_expired => break,
             changed = close_rx.changed() => {
                 if changed.is_err() || *close_rx.borrow() {
                     break;
@@ -930,6 +937,9 @@ async fn handle_bi_stream<R: Runtime>(
             frame = read_frame(&mut recv, &mut decoder, &mut readbuf) => {
                 match frame {
                     Ok(Some(f)) if f.kind == KIND_TEXT => {
+                        if !account.active() {
+                            break;
+                        }
                         let txt = String::from_utf8_lossy(&f.payload);
                         super::server::handle_text_frame(
                             &app, &shared, conn_id, &out_tx, &ordered_tx, &txt,

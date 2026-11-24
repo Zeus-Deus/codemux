@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 
 use tauri::Manager;
@@ -265,7 +265,12 @@ pub(crate) fn token_file_path() -> PathBuf {
     data_dir.join(crate::APP_DIR_NAME).join("auth-token.enc")
 }
 
-fn machine_id() -> Vec<u8> {
+fn machine_id() -> &'static [u8] {
+    static MACHINE_ID: OnceLock<Vec<u8>> = OnceLock::new();
+    MACHINE_ID.get_or_init(read_machine_id)
+}
+
+fn read_machine_id() -> Vec<u8> {
     // Try /etc/machine-id (Linux), then fallback to hostname
     if let Ok(id) = fs::read_to_string("/etc/machine-id") {
         return id.trim().as_bytes().to_vec();
@@ -293,7 +298,7 @@ fn machine_id() -> Vec<u8> {
 
 fn derive_key(salt: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(&machine_id());
+    hasher.update(machine_id());
     hasher.update(salt);
     hasher.finalize().into()
 }
@@ -368,7 +373,10 @@ pub fn save_auth(
     };
     let json = serde_json::to_vec(&stored).map_err(|e| format!("serialize: {e}"))?;
     let encrypted = encrypt_data(&json)?;
-    db.save_auth_token(&encrypted)
+    match user {
+        Some(user) => db.save_auth_token_for_account(&encrypted, &user.id),
+        None => db.save_auth_token(&encrypted),
+    }
 }
 
 /// Dev/test-only: seed an offline auth session so an automated end-to-end
@@ -433,6 +441,14 @@ pub fn load_cached_user(db: &DatabaseStore) -> Option<AuthUser> {
     let decrypted = decrypt_data(&data).ok()?;
     let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
     stored.user
+}
+
+/// Identity eligible to admit account-based remote sessions.
+pub(crate) fn load_active_account_id(db: &DatabaseStore) -> Option<String> {
+    let data = db.load_auth_token()?;
+    let decrypted = decrypt_data(&data).ok()?;
+    let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
+    (!is_token_expired(&stored.expires_at)).then_some(stored.user?.id)
 }
 
 pub fn load_stored_auth_method(db: &DatabaseStore) -> Option<String> {

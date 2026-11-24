@@ -103,12 +103,14 @@ pub(super) async fn ws_proxy<R: Runtime>(
         let connection = shared.connections.register_browser_proxy(&session.id, close);
         // Register before checking again so a revocation during the upgrade
         // is either visible here or can signal this bridge to close.
-        if super::server::session_active(&app, &session.id) {
+        let db = app.state::<crate::database::DatabaseStore>();
+        if let Some(account) = super::auth::AccountSessionGuard::new(&db, &session.id) {
             tokio::select! {
                 biased;
                 _ = closed.changed() => {}
                 _ = life.stopped() => {}
-                _ = bridge_ws(socket, port) => {}
+                _ = account.expired() => {}
+                _ = bridge_ws(socket, port, &account) => {}
             }
         }
         shared.connections.unregister(connection);
@@ -118,7 +120,7 @@ pub(super) async fn ws_proxy<R: Runtime>(
 /// Bidirectionally pipe an upgraded client socket to the loopback daemon at
 /// `port`. Both directions await each send, so a slow peer stalls the reader
 /// on the other side (TCP backpressure) instead of buffering unboundedly.
-async fn bridge_ws(client: WebSocket, port: u16) {
+async fn bridge_ws(client: WebSocket, port: u16, account: &super::auth::AccountSessionGuard<'_>) {
     let url = format!("ws://127.0.0.1:{port}");
     let daemon = match tokio_tungstenite::connect_async(&url).await {
         Ok((ws, _)) => ws,
@@ -137,6 +139,9 @@ async fn bridge_ws(client: WebSocket, port: u16) {
     // Client → daemon.
     let c2d = async move {
         while let Some(Ok(msg)) = client_rx.next().await {
+            if !account.active() {
+                break;
+            }
             let closing = matches!(msg, AxumMessage::Close(_));
             if let Some(out) = axum_to_tungstenite(msg) {
                 if daemon_tx.send(out).await.is_err() {

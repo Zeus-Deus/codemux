@@ -724,9 +724,8 @@ async fn ws_upgrade<R: Runtime>(
 }
 
 pub(super) fn session_active<R: Runtime>(app: &AppHandle<R>, session_id: &str) -> bool {
-    app.state::<crate::database::DatabaseStore>()
-        .web_remote_get_session(session_id)
-        .is_some_and(|s| !s.revoked && s.approved)
+    auth::active_session(&app.state::<crate::database::DatabaseStore>(), session_id)
+        .is_some_and(|session| session.approved)
 }
 
 /// Serve a frontend asset. Missing route-looking paths fall back to
@@ -826,8 +825,6 @@ async fn handle_socket<R: Runtime>(
     plaintext: bool,
 ) {
     let shared = app.state::<WebRemoteState>().shared();
-    app.state::<crate::database::DatabaseStore>()
-        .web_remote_touch_session(&session_id);
 
     let (mut sink, mut stream) = socket.split();
     let (close_tx, mut close_rx) = watch::channel(false);
@@ -835,6 +832,12 @@ async fn handle_socket<R: Runtime>(
     let conn_id = shared
         .connections
         .register(&session_id, Transport::Lan, out_tx.clone(), close_tx.clone());
+    let db = app.state::<crate::database::DatabaseStore>();
+    let Some(account) = auth::AccountSessionGuard::new(&db, &session_id) else {
+        shared.connections.unregister(conn_id);
+        return;
+    };
+    db.web_remote_touch_session(&session_id);
     if plaintext {
         shared.connections.mark_plaintext(conn_id);
     }
@@ -905,8 +908,11 @@ async fn handle_socket<R: Runtime>(
     };
 
     // Reader: dispatch client frames until close/error/revocation.
+    let account_expired = account.expired();
+    tokio::pin!(account_expired);
     loop {
         tokio::select! {
+            _ = &mut account_expired => break,
             changed = close_rx.changed() => {
                 if changed.is_err() || *close_rx.borrow() {
                     break;
@@ -915,6 +921,9 @@ async fn handle_socket<R: Runtime>(
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(txt))) => {
+                        if !account.active() {
+                            break;
+                        }
                         handle_text_frame(&app, &shared, conn_id, &out_tx, &ordered_tx, &txt);
                     }
                     Some(Ok(Message::Pong(_))) => {

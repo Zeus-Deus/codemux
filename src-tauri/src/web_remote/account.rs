@@ -109,7 +109,7 @@ pub(crate) async fn verify_and_mint(
     // 2. The desktop must be signed in — account mode verifies "same account"
     //    against the desktop's own cached user, and there's nothing to compare
     //    to when it's signed out.
-    let cached = crate::auth::load_cached_user(db).ok_or(AccountPairError::DesktopSignedOut)?;
+    let cached_id = crate::auth::load_active_account_id(db).ok_or(AccountPairError::DesktopSignedOut)?;
 
     // 3. Server-side sign-in with the client-derived secret. The typed
     //    `AuthSecret` boundary is preserved: a derived secret, never a raw
@@ -121,7 +121,8 @@ pub(crate) async fn verify_and_mint(
 
     // 4. Same-account gate. Credentials for a *different* account get nothing —
     //    a browser reaches only devices under its own account.
-    if resolved.user.id != cached.id {
+    let current_id = crate::auth::load_active_account_id(db).ok_or(AccountPairError::DesktopSignedOut)?;
+    if resolved.user.id != cached_id || current_id != cached_id {
         return Err(AccountPairError::Mismatch);
     }
 
@@ -137,7 +138,7 @@ pub(crate) async fn verify_and_mint(
         user_agent.as_deref(),
         &token_hash,
         approved,
-        &cached.id,
+        &cached_id,
     )
     .map_err(AccountPairError::Internal)?;
 
