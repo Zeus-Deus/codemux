@@ -7339,8 +7339,9 @@ const handlers: Record<string, Handler> = {
     return {
       ok: true,
       message:
-        `codemux-remote v${MOCK_REMOTE_VERSION} reinstalled on ${host.name} — daemon restarted; ` +
-        "the next push uses the fresh binary.",
+        `codemux-remote v${MOCK_REMOTE_VERSION} reinstalled on ${host.name}. ` +
+        "Active terminal daemons keep running and use the new binary when they restart. " +
+        "The headless service will use the new binary when it restarts.",
     };
   },
 

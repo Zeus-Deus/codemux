@@ -3212,8 +3212,8 @@ export const hostsBootstrapInstall = (id: number, uname: string) =>
   invoke<HostBootstrapResult>("hosts_bootstrap_install", { id, uname });
 
 /** Force-reinstall `codemux-remote` on a host regardless of the version
- *  already installed, and restart its pty-daemon so the fresh binary
- *  takes effect immediately. The dev-workflow escape hatch: rebuilding
+ *  already installed. Active terminal daemons keep their sessions and use
+ *  the new binary when they restart. The dev-workflow escape hatch: rebuilding
  *  `codemux-remote` keeps the version string the same, so the push-time
  *  version check would otherwise skip the upgrade and leave the host on
  *  a stale binary. The backend re-probes the uname itself, so no prior

@@ -437,10 +437,9 @@ async fn check_and_upgrade<R: Runtime>(
 /// its JSON output. Returns:
 /// - `Some(n)` — the daemon answered (`n` may be 0).
 /// - `None` — couldn't determine (daemon down, ssh error, or an OLD daemon
-///   binary whose `serve status` predates the field). Callers treat `None`
-///   as "no confirmed live sessions → safe to restart", because a daemon we
-///   can't reach has nothing to lose by restarting.
-async fn probe_live_host_sessions(ssh_target: &str) -> Option<u64> {
+///   binary whose `serve status` predates the field). Callers choose whether
+///   an unknown count should defer a restart.
+pub(crate) async fn probe_live_host_sessions(ssh_target: &str) -> Option<u64> {
     use std::process::Stdio;
     let cmd_str = live_sessions_script();
     let output = tokio::time::timeout(Duration::from_secs(12), async {

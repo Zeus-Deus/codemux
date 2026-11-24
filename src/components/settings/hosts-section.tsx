@@ -194,9 +194,8 @@ export function HostsSection() {
 
   // Probe first. A missing, broken or out-of-date helper is installed over
   // in place (the probe's uname picks the binary), which leaves the
-  // device's running terminals alone. The forced reinstall restarts its
-  // terminal daemon, so it's only the fallback: no uname to go on, or a
-  // repair of a device that already reports ready.
+  // device's running terminals alone. A forced reinstall does the same,
+  // and is the fallback when no uname is available or the device is ready.
   const setUpAgain = async (host: HostView) => {
     setHostBusy(host.id, "setup");
     try {
@@ -218,7 +217,7 @@ export function HostsSection() {
       const check = await hostsTestConnection(host.id);
       recordTest(host.id, check);
       if (isReady(check)) {
-        toast.success(`${host.name} is ready`);
+        toast.success(`${host.name} is ready`, { description: install.message });
       } else {
         toast.error(`Couldn't set up ${host.name}`, { description: check.message });
       }

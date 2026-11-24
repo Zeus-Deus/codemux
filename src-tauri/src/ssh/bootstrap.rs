@@ -1007,6 +1007,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn upload_script_replaces_path_without_invalidating_open_binary() {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("codemux-remote");
+        std::fs::write(&path, b"old executable").unwrap();
+        let mut open_old_binary = std::fs::File::open(&path).unwrap();
+        let replacement = b"new executable";
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(upload_script(path.to_str().unwrap(), replacement.len() as u64))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(replacement).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+
+        let mut old_content = Vec::new();
+        open_old_binary.read_to_end(&mut old_content).unwrap();
+        assert_eq!(old_content, b"old executable");
+    }
+
     #[test]
     fn shell_arg_handles_shell_metachars() {
         // A pathological remote path including $(, `, &, ;, etc. The
