@@ -1,8 +1,20 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { ExternalLink } from "lucide-react";
 
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { MessageCopyButton } from "@/components/chat/MessageCopyButton";
 import { MESSAGE_GROUP_CLASS } from "@/components/chat/message-action";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogMedia,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   HTML_RENDER_INITIAL_HEIGHT,
   HTML_RENDER_MAX_HEIGHT,
@@ -85,11 +97,21 @@ function HtmlRenderDocument({
   const frameRef = useRef<HTMLIFrameElement>(null);
   const [loaded, setLoaded] = useState(false);
   const [contentHeight, setContentHeight] = useState<number>();
+  const [pendingUrl, setPendingUrl] = useState<string | null>(null);
+  const pendingUrlRef = useRef<string | null>(null);
   // The page is built with the theme it first mounts under; later changes
   // are posted to it, so switching themes never reloads the page or resets
   // its state.
   const [initialTheme] = useState(theme);
   const srcDoc = useMemo(() => buildHtmlRenderDocument(html, initialTheme), [html, initialTheme]);
+
+  const dismissLink = () => {
+    pendingUrlRef.current = null;
+    setPendingUrl(null);
+  };
+
+  // A new page must not inherit an open-link request from the previous one.
+  useLayoutEffect(dismissLink, [srcDoc]);
 
   const postTheme = () => {
     frameRef.current?.contentWindow?.postMessage(htmlRenderThemeMessage(theme), "*");
@@ -108,14 +130,17 @@ function HtmlRenderDocument({
         return;
       }
       const url = readHtmlRenderLinkRequest(event.data);
-      // Open only for a click the reader just made in this frame, so a page
-      // cannot open links on its own.
+      // Frame scripts can forge open-link messages, even after an unrelated
+      // click. The parent owns the confirmation and keeps the first request
+      // until the reader chooses what to do with it.
       if (
         url !== undefined &&
+        pendingUrlRef.current === null &&
         document.activeElement === frame &&
         navigator.userActivation?.isActive !== false
       ) {
-        void openExternalUrl(url);
+        pendingUrlRef.current = url;
+        setPendingUrl(url);
       }
     };
     window.addEventListener("message", onMessage);
@@ -127,22 +152,52 @@ function HtmlRenderDocument({
   );
 
   return (
-    <iframe
-      ref={frameRef}
-      srcDoc={srcDoc}
-      title={title}
-      // Never allow-same-origin: the opaque origin keeps the page out of the app.
-      sandbox="allow-scripts"
-      className="block w-full border-0"
-      // A frame whose color scheme differs from its document's paints an
-      // opaque canvas, so the blank document a frame starts with would flash
-      // white on a dark theme. Once the page is in, the frame follows it.
-      style={{ height, colorScheme: loaded ? theme.scheme : "light" }}
-      onLoad={() => {
-        setLoaded(true);
-        // Covers a theme change that landed while the page was loading.
-        postTheme();
-      }}
-    />
+    <>
+      <iframe
+        ref={frameRef}
+        srcDoc={srcDoc}
+        title={title}
+        // Never allow-same-origin: the opaque origin keeps the page out of the app.
+        sandbox="allow-scripts"
+        className="block w-full border-0"
+        // A frame whose color scheme differs from its document's paints an
+        // opaque canvas, so the blank document a frame starts with would flash
+        // white on a dark theme. Once the page is in, the frame follows it.
+        style={{ height, colorScheme: loaded ? theme.scheme : "light" }}
+        onLoad={() => {
+          setLoaded(true);
+          // Covers a theme change that landed while the page was loading.
+          postTheme();
+        }}
+      />
+      <AlertDialog open={pendingUrl !== null} onOpenChange={(open) => !open && dismissLink()}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogMedia>
+              <ExternalLink aria-hidden="true" />
+            </AlertDialogMedia>
+            <AlertDialogTitle>Open external link?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This page asked to open a link. Check the address before continuing.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="select-text break-all rounded-lg bg-muted px-3 py-2 font-mono text-label text-muted-foreground">
+            {pendingUrl}
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (pendingUrl !== null) void openExternalUrl(pendingUrl);
+                dismissLink();
+              }}
+            >
+              <ExternalLink data-icon="inline-start" aria-hidden="true" />
+              Open link
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   );
 }

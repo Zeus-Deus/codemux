@@ -1,12 +1,19 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { act, cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 
+const mocks = vi.hoisted(() => ({ openExternalUrl: vi.fn().mockResolvedValue("browser") }));
+
+vi.mock("@/lib/open-url", () => ({ openExternalUrl: mocks.openExternalUrl }));
+
 import { HtmlRenderFrame } from "./HtmlRenderFrame";
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  mocks.openExternalUrl.mockClear();
+});
 
 function renderCall(overrides: Partial<ToolCallItem> = {}): ToolCallItem {
   return {
@@ -21,6 +28,17 @@ function renderCall(overrides: Partial<ToolCallItem> = {}): ToolCallItem {
     approval_request_id: null,
     ...overrides,
   };
+}
+
+function postLink(frame: HTMLIFrameElement, url: string, source: Window | null = frame.contentWindow) {
+  act(() => {
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        source,
+        data: { jsonrpc: "2.0", method: "ui/open-link", params: { url } },
+      }),
+    );
+  });
 }
 
 describe("HtmlRenderFrame", () => {
@@ -63,6 +81,38 @@ describe("HtmlRenderFrame", () => {
       );
     });
     expect(frame.style.height).toBe(before);
+  });
+
+  it("requires a parent-owned confirmation before opening a link requested by the page", async () => {
+    render(<HtmlRenderFrame item={renderCall()} />);
+    const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
+    frame.focus();
+    postLink(frame, "https://example.com/one");
+
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("https://example.com/one");
+    expect(mocks.openExternalUrl).not.toHaveBeenCalled();
+
+    // A frame script can send more requests while the dialog is open. It
+    // cannot silently replace the address the reader is checking.
+    postLink(frame, "https://example.com/two");
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("https://example.com/two");
+
+    fireEvent.click(screen.getByRole("button", { name: "Open link" }));
+    await waitFor(() => expect(mocks.openExternalUrl).toHaveBeenCalledWith("https://example.com/one"));
+    expect(mocks.openExternalUrl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not open a link when the reader cancels or the message came from another window", () => {
+    render(<HtmlRenderFrame item={renderCall()} />);
+    const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
+    frame.focus();
+    postLink(frame, "https://example.com/foreign", window);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+
+    postLink(frame, "https://example.com/real");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(mocks.openExternalUrl).not.toHaveBeenCalled();
   });
 
   it("posts new font stacks to an open page without reloading it", async () => {
