@@ -59,17 +59,15 @@ const CONFIG_KEY: &str = "web_remote.config";
 
 // ── Bind scope (which interfaces the server listens on) ──────────────
 //
-// The default (`all`) binds `0.0.0.0` — every interface — so any LAN or
-// tailnet peer can reach the server. On a hostile network that also exposes
-// the port on the untrusted segment. The other two scopes narrow the
-// exposure so the port simply isn't open on interfaces the user doesn't
-// trust:
+// The default binds only loopback. `all` must be explicitly selected: its
+// plain HTTP transport exposes pairing, session tokens and control traffic to
+// anyone who can observe the network. The other scopes narrow exposure:
 //   - `tailscale` — the tailnet address(es) plus loopback, so the port is
 //     reachable only over the mesh VPN (and locally), never on the LAN.
 //   - `loopback`  — `127.0.0.1` only; reachable only from this machine
 //     (e.g. tunnelled in over SSH).
 
-/// All interfaces (`0.0.0.0`) — the default, historical behavior.
+/// All interfaces (`0.0.0.0`) — explicit plain-HTTP opt-in only.
 pub const BIND_SCOPE_ALL: &str = "all";
 /// Tailnet address(es) + loopback only.
 pub const BIND_SCOPE_TAILSCALE: &str = "tailscale";
@@ -77,7 +75,7 @@ pub const BIND_SCOPE_TAILSCALE: &str = "tailscale";
 pub const BIND_SCOPE_LOOPBACK: &str = "loopback";
 
 fn default_bind_scope() -> String {
-    BIND_SCOPE_ALL.to_string()
+    BIND_SCOPE_LOOPBACK.to_string()
 }
 
 /// Whether `scope` is one of the three recognised bind scopes.
@@ -121,10 +119,13 @@ pub struct WebRemoteConfig {
     pub port: u16,
     pub require_approval: bool,
     /// Which interfaces to bind: `all` (0.0.0.0) | `tailscale` | `loopback`.
-    /// `#[serde(default)]` so a config persisted before this field existed
-    /// deserializes to the historical `all` behavior instead of failing.
+    /// `#[serde(default)]` makes older configs without a scope safe by default.
     #[serde(default = "default_bind_scope")]
     pub bind_scope: String,
+    /// True only after an explicit selection of `all` on this version. Legacy
+    /// `all` configs lack this field and are migrated to loopback on load.
+    #[serde(default)]
+    pub allow_insecure_all_interfaces: bool,
     /// Master toggle for account mode (Stage A): when off, `POST
     /// /api/pair-account` refuses with 403 and a browser cannot mint a session
     /// by signing into the desktop's Codemux account. Default **off**, mirroring
@@ -160,6 +161,7 @@ impl Default for WebRemoteConfig {
             port: DEFAULT_PORT,
             require_approval: false,
             bind_scope: default_bind_scope(),
+            allow_insecure_all_interfaces: false,
             account_mode_enabled: false,
             trust_account_browsers: false,
             relay_mode_enabled: false,
@@ -466,9 +468,9 @@ pub(crate) fn control_pair_from(
     shared: &Arc<Shared>,
     suggested_name: Option<String>,
 ) -> Result<ControlPairing, String> {
-    let (enabled, lan_enabled, port) = {
+    let (enabled, lan_enabled, port, scope) = {
         let cfg = shared.config.lock().unwrap();
-        (cfg.enabled, cfg.lan_enabled, cfg.port)
+        (cfg.enabled, cfg.lan_enabled, cfg.port, cfg.bind_scope.clone())
     };
     if !enabled {
         return Err("Remote access is not enabled — enable it in Settings first".to_string());
@@ -495,7 +497,7 @@ pub(crate) fn control_pair_from(
     // CLI's URL matches what the Settings pane would surface. Fall back to
     // the first endpoint (loopback is always first) so a loopback-only host
     // still yields a usable local URL.
-    let eps = endpoints::list(port);
+    let eps = endpoints_for_scope(port, &scope);
     let chosen = eps
         .iter()
         .find(|e| e.recommended)
@@ -537,10 +539,8 @@ pub struct ControlEnableResult {
     /// The live server + device status after the enable (or config change).
     pub status: WebRemoteStatus,
     /// The recommended endpoint's base URL (`http://<host>:<port>`) — the same
-    /// single `recommended` pick the Settings pane surfaces (MagicDNS → tailnet
-    /// → local network → public), falling back to the first enumerated entry
-    /// (loopback) when nothing is reachable from off-box. `None` only if no
-    /// endpoint could be enumerated at all.
+    /// single `recommended` pick the Settings pane surfaces, filtered to
+    /// addresses allowed by the active bind scope. Falls back to loopback.
     pub endpoint_url: Option<String>,
     /// The recommended endpoint's host (IP literal or MagicDNS name).
     pub endpoint_host: Option<String>,
@@ -576,6 +576,7 @@ fn apply_enable_request(
         cfg.port = p;
     }
     if let Some(s) = scope {
+        cfg.allow_insecure_all_interfaces = s == BIND_SCOPE_ALL;
         cfg.bind_scope = s;
     }
     Ok(())
@@ -599,12 +600,30 @@ pub fn keeps_relay_only(relay_mode_enabled: bool, lan_enabled: bool, has_lan_fla
     !has_lan_flags && relay_mode_enabled && !lan_enabled
 }
 
-/// The recommended reachable endpoint for `port`: the single `recommended` pick
-/// from the endpoint enumeration, falling back to the first entry (loopback is
-/// always present) so a loopback-only host still yields a usable local URL.
-/// Mirrors [`control_pair_from`]'s endpoint choice.
-fn recommended_endpoint(port: u16) -> Option<endpoints::Endpoint> {
-    let eps = endpoints::list(port);
+/// Keep only addresses where the HTTP listener actually binds. The raw
+/// enumeration also includes addresses on interfaces excluded by the scope.
+fn endpoints_for_scope(port: u16, scope: &str) -> Vec<endpoints::Endpoint> {
+    filter_endpoints_for_scope(endpoints::list(port), scope)
+}
+
+fn filter_endpoints_for_scope(
+    endpoints: Vec<endpoints::Endpoint>,
+    scope: &str,
+) -> Vec<endpoints::Endpoint> {
+    endpoints
+        .into_iter()
+        .filter(|endpoint| match scope {
+            BIND_SCOPE_ALL => true,
+            BIND_SCOPE_TAILSCALE => matches!(endpoint.kind.as_str(), "loopback" | "tailnet" | "magicdns"),
+            _ => endpoint.kind == "loopback",
+        })
+        .collect()
+}
+
+/// The recommended reachable endpoint at the configured scope, falling back
+/// to loopback when no off-device address is bound.
+fn recommended_endpoint(port: u16, scope: &str) -> Option<endpoints::Endpoint> {
+    let eps = endpoints_for_scope(port, scope);
     eps.iter()
         .find(|e| e.recommended)
         .or_else(|| eps.first())
@@ -733,6 +752,7 @@ async fn enable_request<R: Runtime>(
                     cfg.lan_enabled = previous.lan_enabled;
                     cfg.port = previous.port;
                     cfg.bind_scope = previous.bind_scope;
+                    cfg.allow_insecure_all_interfaces = previous.allow_insecure_all_interfaces;
                 }
                 persist_config(app, &shared);
                 // `enable_core` broadcast `enabled: false`; the restore may
@@ -743,7 +763,7 @@ async fn enable_request<R: Runtime>(
         }
     };
 
-    let ep = recommended_endpoint(status.port);
+    let ep = recommended_endpoint(status.port, &status.bind_scope);
     Ok(ControlEnableResult {
         endpoint_url: ep.as_ref().map(|e| e.url.clone()),
         endpoint_host: ep.as_ref().map(|e| e.host.clone()),
@@ -911,9 +931,18 @@ pub(crate) fn hydrate_config_from(shared: &Arc<Shared>, db: &crate::database::Da
 /// Read the persisted config straight from the settings store. Missing or
 /// unparseable → [`WebRemoteConfig::default`], matching [`load_config`].
 pub fn load_config_from_db(db: &crate::database::DatabaseStore) -> WebRemoteConfig {
-    db.get_setting(CONFIG_KEY)
+    let mut cfg: WebRemoteConfig = db.get_setting(CONFIG_KEY)
         .and_then(|v| serde_json::from_str(&v).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Older releases stored `all` without recording a deliberate plaintext
+    // network opt-in. Never reopen that listener just because it was persisted.
+    if (cfg.bind_scope == BIND_SCOPE_ALL && !cfg.allow_insecure_all_interfaces)
+        || !is_valid_bind_scope(&cfg.bind_scope)
+    {
+        cfg.bind_scope = BIND_SCOPE_LOOPBACK.to_string();
+        cfg.allow_insecure_all_interfaces = false;
+    }
+    cfg
 }
 
 /// Write the config to the settings store. Unlike [`persist_config`] (which is
@@ -957,7 +986,8 @@ where
 ///   `tailnet` is empty — it must NEVER silently fall back to all interfaces
 ///   (that would re-expose the port on the hostile network the scope exists
 ///   to hide from).
-/// - `all` (and any unrecognised value) → `0.0.0.0:port` (every interface).
+/// - `all` → `0.0.0.0:port` (every interface, explicit opt-in only).
+/// - Unknown scopes fail closed.
 fn bind_addrs_from(scope: &str, port: u16, tailnet: Vec<IpAddr>) -> Result<Vec<SocketAddr>, String> {
     match scope {
         BIND_SCOPE_LOOPBACK => Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)]),
@@ -976,9 +1006,8 @@ fn bind_addrs_from(scope: &str, port: u16, tailnet: Vec<IpAddr>) -> Result<Vec<S
             }
             Ok(addrs)
         }
-        // `all` and any unknown value: bind every interface (historical
-        // behavior). Unknown values are normalised away in `web_remote_set_config`.
-        _ => Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)]),
+        BIND_SCOPE_ALL => Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)]),
+        _ => Err(format!("Unknown access scope: {scope}")),
     }
 }
 
@@ -1023,6 +1052,9 @@ async fn start_server<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> R
 async fn bind_listeners<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> Result<(), String> {
     let (port, scope) = {
         let cfg = shared.config.lock().unwrap();
+        if cfg.bind_scope == BIND_SCOPE_ALL && !cfg.allow_insecure_all_interfaces {
+            return Err("Plain HTTP on all interfaces requires an explicit access-scope opt-in".into());
+        }
         (cfg.port, cfg.bind_scope.clone())
     };
     // Resolve the bind scope to concrete addresses first. A `tailscale` scope
@@ -1561,6 +1593,7 @@ fn apply_config_change(cfg: &mut WebRemoteConfig, change: ConfigChange) -> bool 
         cfg.require_approval = r;
     }
     if let Some(s) = change.bind_scope {
+        cfg.allow_insecure_all_interfaces = s == BIND_SCOPE_ALL;
         cfg.bind_scope = s;
     }
     // Account-mode toggles never rebind the listener (they only gate the
@@ -1602,13 +1635,13 @@ async fn set_config_core<R: Runtime>(
         }
     }
 
-    let (old_port, old_scope, address_changed, switches_changed) = {
+    let (old_port, old_scope, old_all_opt_in, address_changed, switches_changed) = {
         let mut cfg = shared.config.lock().unwrap();
-        let (old_port, old_scope) = (cfg.port, cfg.bind_scope.clone());
+        let (old_port, old_scope, old_all_opt_in) = (cfg.port, cfg.bind_scope.clone(), cfg.allow_insecure_all_interfaces);
         let (old_lan, old_relay) = (cfg.lan_enabled, cfg.relay_mode_enabled);
         let address_changed = apply_config_change(&mut cfg, change);
         let switches_changed = cfg.lan_enabled != old_lan || cfg.relay_mode_enabled != old_relay;
-        (old_port, old_scope, address_changed, switches_changed)
+        (old_port, old_scope, old_all_opt_in, address_changed, switches_changed)
     };
     persist_config(app, shared);
 
@@ -1630,6 +1663,7 @@ async fn set_config_core<R: Runtime>(
                 let mut cfg = shared.config.lock().unwrap();
                 cfg.port = old_port;
                 cfg.bind_scope = old_scope;
+                cfg.allow_insecure_all_interfaces = old_all_opt_in;
             }
             persist_config(app, shared);
             let _ = start_listener(app, shared).await;
@@ -1701,11 +1735,11 @@ pub fn web_remote_list_endpoints<R: Runtime>(app: AppHandle<R>) -> Vec<endpoints
     // The enumerated URLs carry the port, so they must reflect the persisted
     // config rather than the pre-boot default.
     ensure_config_hydrated(&app, &shared);
-    let (port, relay_mode_enabled) = {
+    let (port, scope, relay_mode_enabled) = {
         let cfg = shared.config.lock().unwrap();
-        (cfg.port, cfg.relay_mode_enabled)
+        (cfg.port, cfg.bind_scope.clone(), cfg.relay_mode_enabled)
     };
-    let mut list = endpoints::list(port);
+    let mut list = endpoints_for_scope(port, &scope);
     // Surface the from-anywhere iroh endpoint (host = the device's node_id) only
     // when relay mode is on and a stable identity exists. Appended last so it
     // never displaces the HTTP endpoints' "recommended" hint.
@@ -1840,7 +1874,8 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.port, DEFAULT_PORT);
         assert!(!cfg.require_approval);
-        assert_eq!(cfg.bind_scope, BIND_SCOPE_ALL, "default scope is all interfaces");
+        assert_eq!(cfg.bind_scope, BIND_SCOPE_LOOPBACK, "default scope stays on this machine");
+        assert!(!cfg.allow_insecure_all_interfaces);
     }
 
     #[test]
@@ -1851,6 +1886,7 @@ mod tests {
             port: 5000,
             require_approval: true,
             bind_scope: BIND_SCOPE_TAILSCALE.to_string(),
+            allow_insecure_all_interfaces: false,
             account_mode_enabled: false,
             trust_account_browsers: false,
             relay_mode_enabled: false,
@@ -1864,12 +1900,12 @@ mod tests {
     }
 
     #[test]
-    fn config_without_bind_scope_deserializes_to_all() {
-        // A config persisted before `bind_scope` existed must load as the
-        // historical all-interfaces behavior, not fail — `#[serde(default)]`.
+    fn config_without_bind_scope_deserializes_to_loopback() {
+        // A config persisted before `bind_scope` existed must not reopen
+        // every interface on upgrade.
         let legacy = r#"{"enabled":true,"port":4377,"require_approval":false}"#;
         let cfg: WebRemoteConfig = serde_json::from_str(legacy).unwrap();
-        assert_eq!(cfg.bind_scope, BIND_SCOPE_ALL);
+        assert_eq!(cfg.bind_scope, BIND_SCOPE_LOOPBACK);
         assert!(cfg.enabled);
     }
 
@@ -1906,6 +1942,7 @@ mod tests {
             port: 4377,
             require_approval: false,
             bind_scope: BIND_SCOPE_ALL.to_string(),
+            allow_insecure_all_interfaces: true,
             account_mode_enabled: true,
             trust_account_browsers: true,
             relay_mode_enabled: true,
@@ -2005,18 +2042,37 @@ mod tests {
     }
 
     #[test]
-    fn bind_scope_unknown_value_defaults_to_all() {
-        // `bind_addrs_from` treats an unrecognised scope as all-interfaces so
-        // it can never leave the server unbindable; `web_remote_set_config`
-        // rejects unknown values before they are ever persisted.
-        let addrs = bind_addrs_from("wat", 4377, vec![]).unwrap();
-        assert_eq!(addrs, vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4377)]);
+    fn bind_scope_unknown_value_fails_closed() {
+        assert!(bind_addrs_from("wat", 4377, vec![]).is_err());
     }
 
     #[test]
     fn bind_scope_loopback_binds_loopback_only() {
         let addrs = bind_addrs_from(BIND_SCOPE_LOOPBACK, 4377, vec![]).unwrap();
         assert_eq!(addrs, vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4377)]);
+    }
+
+    #[test]
+    fn endpoint_list_only_advertises_bound_scope() {
+        let endpoint = |kind: &str| endpoints::Endpoint {
+            kind: kind.to_string(),
+            group: kind.to_string(),
+            host: kind.to_string(),
+            port: DEFAULT_PORT,
+            url: format!("http://{kind}:{}", DEFAULT_PORT),
+            secure: kind == "loopback",
+            recommended: false,
+            label: kind.to_string(),
+        };
+        let all = vec![endpoint("loopback"), endpoint("lan"), endpoint("public"), endpoint("tailnet"), endpoint("magicdns")];
+        let kinds = |scope| filter_endpoints_for_scope(all.clone(), scope)
+            .into_iter()
+            .map(|e| e.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(kinds(BIND_SCOPE_LOOPBACK), ["loopback"]);
+        assert_eq!(kinds(BIND_SCOPE_TAILSCALE), ["loopback", "tailnet", "magicdns"]);
+        assert_eq!(kinds(BIND_SCOPE_ALL), ["loopback", "lan", "public", "tailnet", "magicdns"]);
+        assert_eq!(kinds("unknown"), ["loopback"]);
     }
 
     #[test]
@@ -2183,6 +2239,21 @@ mod tests {
     }
 
     #[test]
+    fn all_interfaces_requires_an_explicit_selection_and_survives_restart() {
+        let db = crate::database::DatabaseStore::new_in_memory();
+        let mut cfg = load_config_from_db(&db);
+        apply_enable_request(&mut cfg, Some(BIND_SCOPE_ALL.to_string()), None).unwrap();
+        assert!(cfg.allow_insecure_all_interfaces);
+        save_config_to_db(&db, &cfg).unwrap();
+        let restored = load_config_from_db(&db);
+        assert_eq!(restored.bind_scope, BIND_SCOPE_ALL);
+        assert!(restored.allow_insecure_all_interfaces);
+
+        apply_enable_request(&mut cfg, Some(BIND_SCOPE_LOOPBACK.to_string()), None).unwrap();
+        assert!(!cfg.allow_insecure_all_interfaces);
+    }
+
+    #[test]
     fn apply_enable_request_without_flags_keeps_current_scope_and_port() {
         // `codemux remote enable` with no flags enables on the existing config.
         let mut cfg = WebRemoteConfig {
@@ -2203,7 +2274,7 @@ mod tests {
         assert!(err.contains("Unknown access scope"), "clear error: {err}");
         // Nothing was mutated — the switch stays off, so nothing is persisted.
         assert!(!cfg.enabled, "an invalid request never flips enable on");
-        assert_eq!(cfg.bind_scope, BIND_SCOPE_ALL);
+        assert_eq!(cfg.bind_scope, BIND_SCOPE_LOOPBACK);
     }
 
     #[test]
@@ -2364,6 +2435,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_all_interfaces_config_loads_on_loopback() {
+        let db = crate::database::DatabaseStore::new_in_memory();
+        db.set_setting(
+            CONFIG_KEY,
+            r#"{"enabled":true,"lan_enabled":true,"port":4377,"require_approval":false,"bind_scope":"all"}"#,
+        ).unwrap();
+        let cfg = load_config_from_db(&db);
+        assert_eq!(cfg.bind_scope, BIND_SCOPE_LOOPBACK);
+        assert!(!cfg.allow_insecure_all_interfaces);
+        assert!(cfg.enabled && cfg.lan_enabled);
+        let shared = Arc::new(Shared::default());
+        hydrate_config_from(&shared, &db);
+        assert_eq!(shared.config.lock().unwrap().bind_scope, BIND_SCOPE_LOOPBACK);
+    }
+
+    #[test]
     fn enable_after_hydration_leaves_untouched_fields_alone() {
         // `Shared` is built before any DB exists, so its config starts as the
         // all-default value. Persisting THAT (as an enable does) without
@@ -2426,7 +2513,7 @@ mod tests {
         let cfg = shared.config.lock().unwrap().clone();
         assert!(!cfg.enabled);
         assert_eq!(cfg.port, DEFAULT_PORT);
-        assert_eq!(cfg.bind_scope, BIND_SCOPE_ALL);
+        assert_eq!(cfg.bind_scope, BIND_SCOPE_LOOPBACK);
         assert!(!cfg.relay_mode_enabled);
     }
 
@@ -2611,7 +2698,7 @@ mod tests {
         assert!(!apply_config_change(&mut cfg, same_port));
 
         let scope = ConfigChange {
-            bind_scope: Some(BIND_SCOPE_LOOPBACK.into()),
+            bind_scope: Some(BIND_SCOPE_TAILSCALE.into()),
             ..ConfigChange::default()
         };
         assert!(apply_config_change(&mut cfg, scope));

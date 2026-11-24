@@ -657,6 +657,9 @@ pub fn format_connect_report(report: &ConnectReport) -> String {
             "✓ Remote access configured (relay mode on, scope {}, port {})\n",
             report.scope, report.port
         ));
+        if report.scope == super::BIND_SCOPE_ALL {
+            out.push_str("⚠ Plain HTTP on every interface exposes pairing and session traffic to network observers. Use a trusted network or an HTTPS proxy with direct access to this port blocked.\n");
+        }
     } else {
         out.push_str(
             "✓ Remote access configured (relay only — nothing listens on your network)\n",
@@ -773,6 +776,10 @@ pub fn format_connect_status(status: &ConnectStatus) -> String {
         status.scope,
         scope_note(&status.scope)
     ));
+    if status.scope == super::BIND_SCOPE_ALL {
+        out.push_str("  Warning:      All interfaces use plain HTTP; network observers can intercept sessions.\n");
+        out.push_str("                Use a trusted network or an HTTPS proxy that blocks the direct port.\n");
+    }
     out.push_str(&format!("  Port:         {}\n", status.port));
     if let Some(live) = status.live.as_ref().filter(|l| l.enabled) {
         match (&live.bind_error, live.listening) {
@@ -1066,7 +1073,7 @@ async fn configure_via_control_socket(
             .unwrap_or(DEFAULT_PORT),
         bind_scope: status["bind_scope"]
             .as_str()
-            .unwrap_or(super::BIND_SCOPE_ALL)
+            .unwrap_or(super::BIND_SCOPE_LOOPBACK)
             .to_string(),
         relay_mode_enabled: status["relay_mode_enabled"].as_bool().unwrap_or(true),
         ..WebRemoteConfig::default()
@@ -1697,7 +1704,7 @@ mod tests {
         apply_connect_request(&mut cfg, None, None).unwrap();
         assert!(cfg.enabled, "the server binds");
         assert!(cfg.relay_mode_enabled, "and is reachable from anywhere");
-        assert_eq!(cfg.bind_scope, super::super::BIND_SCOPE_ALL);
+        assert_eq!(cfg.bind_scope, super::super::BIND_SCOPE_LOOPBACK);
         assert_eq!(cfg.port, DEFAULT_PORT);
     }
 
@@ -1836,7 +1843,7 @@ mod tests {
     fn installed_report() -> ConnectReport {
         ConnectReport {
             identity: "user@example.com".to_string(),
-            scope: super::super::BIND_SCOPE_ALL.to_string(),
+            scope: super::super::BIND_SCOPE_LOOPBACK.to_string(),
             port: DEFAULT_PORT,
             lan_enabled: true,
             service: ServiceReport::Installed(InstallReport {
@@ -1855,6 +1862,15 @@ mod tests {
         assert!(text.contains(MANAGE_URL));
         assert_eq!(text.matches('✓').count(), 3, "three steps, three ticks:\n{text}");
         assert!(!text.contains('⚠'), "nothing to warn about:\n{text}");
+    }
+
+    #[test]
+    fn all_interfaces_report_warns_about_plain_http() {
+        let mut report = installed_report();
+        report.scope = super::super::BIND_SCOPE_ALL.to_string();
+        let text = format_connect_report(&report);
+        assert!(text.contains("Plain HTTP on every interface"), "{text}");
+        assert!(text.contains("session traffic"), "{text}");
     }
 
     #[test]

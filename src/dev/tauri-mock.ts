@@ -4342,7 +4342,7 @@ function resourceMetrics(): ResourceMetricsSnapshot {
 let webRemotePort = MOCK_WEB_REMOTE_PORT;
 let webRemoteEnabled = false;
 let webRemoteRequireApproval = true;
-let webRemoteBindScope: WebRemoteBindScope = "all";
+let webRemoteBindScope: WebRemoteBindScope = "loopback";
 // Account mode (Stage A): on by default in the mock so the Settings → Remote
 // Access "Account access" subsection is exercisable under `npm run dev`.
 // `accountSignedIn` mirrors the desktop being signed into a Codemux account
@@ -7413,7 +7413,14 @@ const handlers: Record<string, Handler> = {
   web_remote_iroh_node_id: () =>
     webRemoteRelayEnabled && !webRemoteRelayDown ? MOCK_RELAY_NODE_ID : null,
   web_remote_create_pairing: () => mockWebRemotePairing(),
-  web_remote_list_endpoints: () => mockWebRemoteEndpoints(webRemotePort),
+  web_remote_list_endpoints: () =>
+    mockWebRemoteEndpoints(webRemotePort).filter((endpoint) => {
+      if (webRemoteBindScope === "all") return true;
+      if (webRemoteBindScope === "tailscale") {
+        return ["loopback", "tailnet", "magicdns"].includes(endpoint.kind);
+      }
+      return endpoint.kind === "loopback";
+    }),
   web_remote_list_sessions: () => webRemoteSessions,
   web_remote_revoke_session: (a) => {
     webRemoteSessions = webRemoteSessions.filter((s) => s.id !== a.sessionId);

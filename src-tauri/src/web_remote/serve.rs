@@ -18,7 +18,7 @@
 //! another instance already holds the control endpoint, and the GUI's boot
 //! path (in `main.rs`) refuses to start when a `serve` instance does.
 
-use crate::web_remote::{self, BIND_SCOPE_ALL};
+use crate::web_remote::{self, BIND_SCOPE_ALL, BIND_SCOPE_LOOPBACK};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -78,7 +78,7 @@ impl ShutdownAdmission {
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     /// Bind scope: `all` | `tailscale` | `loopback`. `None` = fall back to the
-    /// persisted scope (or `all` on first run).
+    /// persisted scope (or `loopback` on first run).
     pub scope: Option<String>,
     /// Port to bind. `None` = the persisted port (default 4377).
     pub port: Option<u16>,
@@ -251,13 +251,13 @@ fn flush_shutdown_state<R: Runtime>(app: &AppHandle<R>, drain_result: Result<(),
 ///
 /// - an explicit `--scope` always wins;
 /// - no flag on a machine that was already configured keeps its scope;
-/// - no flag on first run defaults to `all` — the away-from-home SSH case,
-///   where nothing else would be reachable.
+/// - no flag on first run defaults to `loopback`; SSH tunnels and the encrypted
+///   relay can still make it reachable without exposing session traffic.
 fn resolve_scope(explicit: Option<String>, persisted_enabled: bool) -> Option<String> {
     match (explicit, persisted_enabled) {
         (Some(s), _) => Some(s),
-        (None, true) => None,                     // keep persisted scope
-        (None, false) => Some(BIND_SCOPE_ALL.to_string()), // first-run default
+        (None, true) => None, // keep persisted scope
+        (None, false) => Some(BIND_SCOPE_LOOPBACK.to_string()), // first-run default
     }
 }
 
@@ -286,7 +286,7 @@ pub async fn serve_startup<R: tauri::Runtime>(
     // Decide relay-only on the switches as persisted, BEFORE `--relay` below
     // turns relay mode on (which would make a fresh config look relay-only).
     // An explicit relay-only setup stays relay-only even with the kill switch
-    // off, and then keeps its persisted scope too — the first-run `all`
+    // off, and then keeps its persisted scope too — the first-run `loopback`
     // default below exists to open a listener.
     let keep_relay_only = web_remote::keeps_relay_only(
         persisted.relay_mode_enabled,
@@ -353,7 +353,9 @@ fn print_banner<R: tauri::Runtime>(
     println!("  Port:         {port}");
     println!("  Access scope: {scope} ({scope_note})");
     if scope == BIND_SCOPE_ALL {
-        println!("                Plain HTTP on every interface. On untrusted networks use --scope tailscale or --relay.");
+        println!("                Plain HTTP on every interface lets network observers intercept pairing and session traffic.");
+        println!("                Use --scope tailscale, --scope loopback with an SSH tunnel,");
+        println!("                or an HTTPS proxy that blocks direct access to this port.");
     }
     if let Some(err) = &result.status.bind_error {
         // Relay mode kept the server up without its LAN listener; say so
@@ -535,9 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn no_scope_flag_on_first_run_defaults_to_all() {
-        // Nothing configured yet: bind every interface, because the SSH box
-        // this runs on is reachable no other way.
-        assert_eq!(resolve_scope(None, false), Some("all".to_string()));
+    fn no_scope_flag_on_first_run_defaults_to_loopback() {
+        assert_eq!(resolve_scope(None, false), Some("loopback".to_string()));
     }
 }

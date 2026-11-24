@@ -159,7 +159,7 @@ pub enum CommandSet {
     Serve {
         /// Which interfaces to expose the server on: `all` (every interface),
         /// `tailscale` (tailnet + loopback only), or `loopback` (this machine
-        /// only). Defaults to `all` on first run, or the persisted scope if
+        /// only). Defaults to `loopback` on first run, or the persisted scope if
         /// remote access was already configured.
         #[arg(long, value_parser = ["all", "tailscale", "loopback"])]
         scope: Option<String>,
@@ -187,7 +187,7 @@ pub enum CommandSet {
         #[arg(long)]
         email: Option<String>,
         /// Which interfaces the local server binds: `all`, `tailscale`, or
-        /// `loopback`. Leave unset to keep the current scope (`all` on a
+        /// `loopback`. Leave unset to keep the current scope (`loopback` on a
         /// first run). From-anywhere access works regardless of this.
         #[arg(long, value_parser = ["all", "tailscale", "loopback"])]
         scope: Option<String>,
@@ -1243,8 +1243,8 @@ async fn run_control_cli(cli: Cli) -> Result<Exit, String> {
 
 /// Pretty-print the `web_remote_pair` result for a human at a terminal: a
 /// scannable QR of the pairing URL, then the link, token, endpoint, and
-/// expiry. The QR encodes the same `http://host:port/#pair=<token>` URL the
-/// link shows, so a phone camera can pair without any typing.
+/// expiry. A loopback URL is labeled local-only so it is not mistaken for a
+/// link a phone can open directly.
 pub(crate) fn print_pairing(data: &Value) {
     let url = data["pairing_url"].as_str().unwrap_or_default();
     let token = data["token"].as_str().unwrap_or_default();
@@ -1272,8 +1272,13 @@ pub(crate) fn print_pairing(data: &Value) {
         println!("Expires:       {expires_at}");
     }
     println!();
-    println!("Scan the QR with your phone — or open the link in any browser on a");
-    println!("device that can reach this machine — to pair it. One-time use.");
+    if kind == "loopback" {
+        println!("This link works only on this machine. Use an SSH tunnel or a trusted");
+        println!("tailnet endpoint before opening it on another device. One-time use.");
+    } else {
+        println!("Scan the QR with your phone — or open the link in any browser on a");
+        println!("device that can reach this machine — to pair it. One-time use.");
+    }
 }
 
 /// Print the outcome of `codemux remote enable`: the port + bind scope the
@@ -1283,7 +1288,7 @@ pub(crate) fn print_pairing(data: &Value) {
 fn print_enable_result(data: &Value) {
     let status = &data["status"];
     let port = status["port"].as_u64().unwrap_or(0);
-    let scope = status["bind_scope"].as_str().unwrap_or("all");
+    let scope = status["bind_scope"].as_str().unwrap_or("loopback");
     let already_running = data["already_running"].as_bool().unwrap_or(false);
     let endpoint_url = data["endpoint_url"].as_str().unwrap_or_default();
     let endpoint_host = data["endpoint_host"].as_str().unwrap_or_default();
@@ -1303,6 +1308,13 @@ fn print_enable_result(data: &Value) {
         _ => "every interface",
     };
     println!("Access scope:  {scope} ({scope_note})");
+    if scope == "all" {
+        println!("Warning:       Plain HTTP on every interface exposes pairing and session traffic");
+        println!("               to network observers. Use a trusted network or an HTTPS proxy");
+        println!("               with direct access to this port blocked.");
+    } else if scope == "loopback" {
+        println!("               Other devices need an SSH tunnel or an encrypted tailnet endpoint.");
+    }
     if let Some(err) = status["bind_error"].as_str() {
         // Relay mode kept remote access on without its LAN listener; don't
         // print an address nothing is listening on.

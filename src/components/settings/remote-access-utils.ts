@@ -31,7 +31,7 @@ export const BIND_SCOPE_OPTIONS: BindScopeOption[] = [
     value: "all",
     label: "All networks",
     detail:
-      "Listens on every network interface. Anyone on your LAN or mesh with the port can reach it.",
+      "Plain HTTP on every interface. Network observers can intercept pairing links, sessions, and control traffic. Use a trusted network or an HTTPS proxy with direct access to this port blocked.",
   },
   {
     value: "tailscale",
@@ -122,10 +122,10 @@ export function describeExposure(status: WebRemoteStatus | null): string {
   return "Nothing can reach this machine yet — turn on a way to connect below.";
 }
 
-/** The effective bind scope for a status payload, defaulting to `all` when
- *  the field is absent (a config persisted before the field existed). */
+/** The effective bind scope for a status payload, defaulting to loopback when
+ *  the field is absent. */
 export function bindScopeOf(status: WebRemoteStatus | null): WebRemoteBindScope {
-  return status?.bind_scope ?? "all";
+  return status?.bind_scope ?? "loopback";
 }
 
 /** The short control label for a scope, for interpolating into copy. Falls

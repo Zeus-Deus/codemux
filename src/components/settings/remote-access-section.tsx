@@ -845,6 +845,7 @@ export function RemoteAccessSection() {
   const [sessionBusy, setSessionBusy] = useState<string | null>(null);
   const [revokingAll, setRevokingAll] = useState(false);
   const [confirmRevokeAll, setConfirmRevokeAll] = useState(false);
+  const [confirmAllNetworks, setConfirmAllNetworks] = useState(false);
 
   const refreshEndpoints = useCallback(async () => {
     try {
@@ -1196,7 +1197,7 @@ export function RemoteAccessSection() {
     [enterCutoff, reconcileAfterRebind],
   );
 
-  const handleSetScope = useCallback(
+  const applySetScope = useCallback(
     async (next: WebRemoteBindScope) => {
       if (next === bindScope) return;
 
@@ -1235,6 +1236,17 @@ export function RemoteAccessSection() {
       }
     },
     [applyScopeRemote, bindScope, refreshEndpoints, reportLanOutcome, transport],
+  );
+
+  const handleSetScope = useCallback(
+    (next: WebRemoteBindScope) => {
+      if (next === "all" && next !== bindScope) {
+        setConfirmAllNetworks(true);
+        return;
+      }
+      void applySetScope(next);
+    },
+    [applySetScope, bindScope],
   );
 
   const applyLan = useCallback(
@@ -2001,6 +2013,32 @@ export function RemoteAccessSection() {
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={confirmCutoff}>Continue</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={confirmAllNetworks} onOpenChange={setConfirmAllNetworks}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Expose remote access on all networks?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This opens a plain HTTP listener on every network interface.
+              Someone who can observe the network could intercept pairing
+              links, session credentials, and control traffic. Use a trusted
+              network or use an HTTPS proxy with direct access to this port
+              blocked.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                setConfirmAllNetworks(false);
+                void applySetScope("all");
+              }}
+            >
+              Expose on all networks
+            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

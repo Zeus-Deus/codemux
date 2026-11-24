@@ -309,9 +309,8 @@ describe("RemoteAccessSection — disabled", () => {
     expect(screen.getByRole("heading", { name: /^Remote Access$/i })).toBeInTheDocument();
     const toggle = screen.getByRole("switch", { name: /toggle remote access/i });
     expect(toggle).toHaveAttribute("data-state", "unchecked");
-    // A legacy config (no `lan_enabled`) still has its listener on, scoped to
-    // all networks — so turning this on really would open every interface.
-    expect(screen.getByText(/every network interface/i)).toBeInTheDocument();
+    // A legacy config with no scope now previews the loopback listener.
+    expect(screen.getByText(/this device only \(127\.0\.0\.1\)/i)).toBeInTheDocument();
 
     // Collapsed while off.
     expect(screen.queryByText(/Ways to connect/i)).toBeNull();
@@ -432,7 +431,7 @@ describe("RemoteAccessSection — enabled", () => {
     expect(screen.getByLabelText(/pairing QR code/i)).toBeInTheDocument();
   });
 
-  it("defaults the access scope to All networks and switches to Tailscale only", async () => {
+  it("defaults the access scope to This device only and switches to Tailscale only", async () => {
     const user = userEvent.setup();
     cmds.webRemoteSetConfig.mockResolvedValueOnce(
       status({
@@ -444,10 +443,8 @@ describe("RemoteAccessSection — enabled", () => {
     );
     render(<RemoteAccessSection />);
 
-    // No explicit bind_scope on the initial status → the control defaults to
-    // "All networks" being selected.
-    const allBtn = await screen.findByRole("radio", { name: /all networks/i });
-    await waitFor(() => expect(allBtn).toHaveAttribute("aria-checked", "true"));
+    const loopbackBtn = await screen.findByRole("radio", { name: /this device only/i });
+    await waitFor(() => expect(loopbackBtn).toHaveAttribute("aria-checked", "true"));
 
     await user.click(screen.getByRole("radio", { name: /tailscale only/i }));
     await waitFor(() =>
@@ -459,6 +456,27 @@ describe("RemoteAccessSection — enabled", () => {
         "aria-checked",
         "true",
       ),
+    );
+  });
+
+  it("requires confirmation before exposing plain HTTP on all networks", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(enabledStatus());
+    cmds.webRemoteSetConfig.mockResolvedValueOnce(status({
+      enabled: true,
+      running: true,
+      bind_scope: "all",
+    }));
+    render(<RemoteAccessSection />);
+
+    await user.click(await screen.findByRole("radio", { name: /all networks/i }));
+    const dialog = screen.getByRole("alertdialog");
+    expect(within(dialog).getByText(/session credentials/i)).toBeInTheDocument();
+    expect(cmds.webRemoteSetConfig).not.toHaveBeenCalled();
+
+    await user.click(within(dialog).getByRole("button", { name: /expose on all networks/i }));
+    await waitFor(() =>
+      expect(cmds.webRemoteSetConfig).toHaveBeenCalledWith({ bindScope: "all" }),
     );
   });
 
@@ -1107,7 +1125,7 @@ describe("RemoteAccessSection — web-client rebind disconnect", () => {
       expect(cmds.webRemoteSetConfig).toHaveBeenCalledWith({ bindScope: "tailscale" }),
     );
 
-    // Optimistic value sticks (no snap-back to All networks)…
+    // Optimistic value sticks (no snap-back to this device only)…
     await waitFor(() =>
       expect(
         screen.getByRole("radio", { name: /tailscale only/i }),
@@ -1135,7 +1153,7 @@ describe("RemoteAccessSection — web-client rebind disconnect", () => {
     // Reverted: the control snaps back to the server's actual scope.
     await waitFor(() =>
       expect(
-        screen.getByRole("radio", { name: /all networks/i }),
+        screen.getByRole("radio", { name: /this device only/i }),
       ).toHaveAttribute("aria-checked", "true"),
     );
     expect(screen.queryByText(/reconnecting to this device/i)).toBeNull();
