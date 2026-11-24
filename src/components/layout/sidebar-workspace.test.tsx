@@ -35,7 +35,6 @@ vi.mock("@/tauri/commands", () => ({
   // Cloud-push step 2 additions — same shape as the other mock in
   // sidebar-workspace-row.test.tsx.
   hostsList: vi.fn().mockResolvedValue([]),
-  setWorkspaceHost: vi.fn().mockResolvedValue(undefined),
   workspacePushToHost: vi
     .fn()
     .mockResolvedValue({ ok: true, message: "", remote_path: null, rsync_summary: null }),

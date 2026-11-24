@@ -3306,7 +3306,6 @@ fn build_core_app<R: tauri::Runtime>(
             commands::get_local_device_name,
             commands::hosts_ssh_config_hosts,
             commands::remote_workspace::create_workspace_on_host,
-            commands::set_workspace_host,
             commands::workspace_push_to_host,
             commands::workspace_pull_back,
             commands::automations_list,

@@ -3429,11 +3429,6 @@ export const workspacePushToHost = (workspaceId: string, hostId: number) =>
 export const workspacePullBack = (workspaceId: string) =>
   invoke<WorkspacePullOutcome>("workspace_pull_back", { workspaceId });
 
-/** Assign (or clear) the host a workspace runs on. `null` clears
- *  the assignment (back to local). */
-export const setWorkspaceHost = (workspaceId: string, hostId: number | null) =>
-  invoke<void>("set_workspace_host", { workspaceId, hostId });
-
 // ── Workspaces sync (cross-device workspace registry) ──
 //
 // One row per workspace this user owns, across every device they

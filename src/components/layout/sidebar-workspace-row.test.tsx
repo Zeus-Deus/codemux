@@ -65,7 +65,6 @@ vi.mock("@/tauri/commands", () => ({
   // Pull back / push handlers. Mock them as no-ops so the existing
   // checkout-default tests keep passing.
   hostsList: vi.fn().mockResolvedValue([]),
-  setWorkspaceHost: vi.fn().mockResolvedValue(undefined),
   workspacePushToHost: vi
     .fn()
     .mockResolvedValue({ ok: true, message: "", remote_path: null, rsync_summary: null }),

@@ -90,7 +90,6 @@ pub(super) fn affects_workspace_layout(cmd: &str) -> bool {
             | "resize_pty"
             | "resize_split"
             | "restart_terminal_session"
-            | "set_workspace_host"
             | "set_workspace_muted"
             | "set_workspace_pinned"
             | "split_pane"
@@ -590,6 +589,7 @@ mod tests {
             "web_remote_disable",
             "hosts_add",
             "hosts_ssh_config_hosts",
+            "set_workspace_host",
             "plugin:shell|execute",
             "future_command",
             // Webhook URL tokens, signing setup and the secret store stay on
