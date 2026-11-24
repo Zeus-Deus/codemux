@@ -5,6 +5,14 @@ use crate::{
     state::{AppStateStore, PaneNodeSnapshot, PaneStatus},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use openssl::{
+    bn::{BigNum, BigNumContext},
+    ec::{EcGroup, EcKey, EcPoint, PointConversionForm},
+    error::ErrorStack,
+    nid::Nid,
+    pkey::{PKey, Private},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -15,11 +23,24 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Manager, Runtime};
-use web_push::{ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushMessageBuilder};
 
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 static LAST_EVENT: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
 static SEND_LIMIT: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+const MAX_PUSH_PLAINTEXT_BYTES: usize = 3052;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SubscriptionInfo {
+    endpoint: String,
+    keys: SubscriptionKeys,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SubscriptionKeys {
+    p256dh: String,
+    auth: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Categories {
     attention: bool,
@@ -52,9 +73,9 @@ fn read_store() -> Result<Store, String> {
         )
         .map_err(|_| "Invalid push configuration".into());
     }
-    let group = openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1)
+    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
         .map_err(|_| "Cannot create push key")?;
-    let key = openssl::ec::EcKey::generate(&group).map_err(|_| "Cannot create push key")?;
+    let key = EcKey::generate(&group).map_err(|_| "Cannot create push key")?;
     let store = Store {
         private_key: URL_SAFE_NO_PAD.encode(
             key.private_key()
@@ -118,6 +139,65 @@ fn valid_subscription(sub: &SubscriptionInfo) -> bool {
             .is_ok_and(|v| v.len() == 65 && v[0] == 4)
 }
 
+/// Import the base64url-encoded P-256 scalar already stored by Codemux.
+fn vapid_key(encoded: &str) -> Result<EcKey<Private>, &'static str> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| "Invalid push key")?;
+    if bytes.len() != 32 {
+        return Err("Invalid push key");
+    }
+    let import = || -> Result<_, ErrorStack> {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let scalar = BigNum::from_slice(&bytes)?;
+        let mut context = BigNumContext::new()?;
+        let mut public = EcPoint::new(&group)?;
+        public.mul_generator2(&group, &scalar, &mut context)?;
+        let key = EcKey::from_private_components(&group, &scalar, &public)?;
+        key.check_key()?;
+        Ok(key)
+    };
+    import().map_err(|_| "Invalid push key")
+}
+
+fn vapid_public_key(key: &EcKey<Private>) -> Result<Vec<u8>, ErrorStack> {
+    let mut context = BigNumContext::new()?;
+    key.public_key()
+        .to_bytes(key.group(), PointConversionForm::UNCOMPRESSED, &mut context)
+}
+
+fn vapid_authorization(key: EcKey<Private>, endpoint: &str) -> Result<String, &'static str> {
+    let sign = || -> Result<_, Box<dyn std::error::Error>> {
+        let public = URL_SAFE_NO_PAD.encode(vapid_public_key(&key)?);
+        let private = PKey::from_ec_key(key)?.private_key_to_pkcs8()?;
+        let now = chrono::Utc::now().timestamp();
+        let claims = json!({
+            "aud": reqwest::Url::parse(endpoint)?.origin().ascii_serialization(),
+            "sub": "https://codemux.org",
+            "iat": now,
+            "nbf": now,
+            "exp": now + 12 * 60 * 60,
+        });
+        let token = encode(
+            &Header::new(Algorithm::ES256),
+            &claims,
+            &EncodingKey::from_ec_der(&private),
+        )?;
+        Ok(format!("vapid t={token}, k={public}"))
+    };
+    sign().map_err(|_| "Cannot sign notification")
+}
+
+fn encrypt_notification(sub: &SubscriptionInfo, content: &[u8]) -> Result<Vec<u8>, &'static str> {
+    const ERROR: &str = "Cannot encrypt notification";
+    if content.len() > MAX_PUSH_PLAINTEXT_BYTES {
+        return Err(ERROR);
+    }
+    let public = URL_SAFE_NO_PAD.decode(&sub.keys.p256dh).map_err(|_| ERROR)?;
+    let auth = URL_SAFE_NO_PAD.decode(&sub.keys.auth).map_err(|_| ERROR)?;
+    ece::encrypt(&public, &auth, content).map_err(|_| ERROR)
+}
+
 pub async fn invoke<R: Runtime>(
     app: &AppHandle<R>,
     session: &str,
@@ -145,9 +225,9 @@ pub async fn invoke<R: Runtime>(
     let mut store = read_store()?;
     match cmd {
         "web_push_config" => {
-            let key = VapidSignatureBuilder::from_base64_no_sub(&store.private_key)
-                .map_err(|_| "Invalid push key")?;
-            Ok(json!({"public_key":URL_SAFE_NO_PAD.encode(key.get_public_key())}))
+            let key = vapid_key(&store.private_key)?;
+            let public = vapid_public_key(&key).map_err(|_| "Invalid push key")?;
+            Ok(json!({"public_key": URL_SAFE_NO_PAD.encode(public)}))
         }
         "web_push_status" => Ok(store
             .subscribers
@@ -252,30 +332,20 @@ async fn send<R: Runtime>(
     };
     payload["host"] = json!(subscriber.host);
     let content = serde_json::to_vec(&payload).map_err(|_| "Invalid notification")?;
-    let mut signature = VapidSignatureBuilder::from_base64(&key, &subscriber.subscription)
-        .map_err(|_| "Invalid push key")?;
-    signature.add_claim("sub", "https://codemux.org");
-    let mut builder = WebPushMessageBuilder::new(&subscriber.subscription);
-    builder.set_vapid_signature(signature.build().map_err(|_| "Cannot sign notification")?);
-    builder.set_payload(ContentEncoding::Aes128Gcm, &content);
-    builder.set_ttl(3600);
-    let message = builder.build().map_err(|_| "Cannot encrypt notification")?;
-    let encrypted = message.payload.ok_or("Missing encrypted payload")?;
+    let authorization = vapid_authorization(vapid_key(&key)?, &subscriber.subscription.endpoint)?;
+    let encrypted = encrypt_notification(&subscriber.subscription, &content)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|_| "Cannot start push client")?;
-    let mut request = client
+    let response = client
         .post(&subscriber.subscription.endpoint)
         .header("TTL", "3600")
         .header("Content-Encoding", "aes128gcm")
-        .header("Content-Type", "application/octet-stream");
-    for (name, value) in encrypted.crypto_headers {
-        request = request.header(name, value);
-    }
-    let response = request
-        .body(encrypted.content)
+        .header("Content-Type", "application/octet-stream")
+        .header(reqwest::header::AUTHORIZATION, authorization)
+        .body(encrypted)
         .send()
         .await
         .map_err(|_| "Push service is unreachable")?;
@@ -443,6 +513,66 @@ fn agent_event<R: Runtime>(app: &AppHandle<R>, source: &str, category: &'static 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::{decode, DecodingKey, Validation};
+
+    #[test]
+    fn stored_vapid_scalar_keeps_the_public_key_and_signs_for_the_push_origin() {
+        // The scalar 1 has the P-256 generator as its public key.
+        let stored = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE";
+        let public = "BGsX0fLhLEJH-Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU";
+        let key = vapid_key(stored).unwrap();
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(vapid_public_key(&key).unwrap()),
+            public,
+        );
+        let header = vapid_authorization(key, "https://fcm.googleapis.com:443/fcm/send/test").unwrap();
+        let (token, header_key) = header
+            .strip_prefix("vapid t=")
+            .unwrap()
+            .split_once(", k=")
+            .unwrap();
+        assert_eq!(header_key, public);
+        let point = URL_SAFE_NO_PAD.decode(header_key).unwrap();
+        let verification_key = DecodingKey::from_ec_components(
+            &URL_SAFE_NO_PAD.encode(&point[1..33]),
+            &URL_SAFE_NO_PAD.encode(&point[33..]),
+        )
+        .unwrap();
+        let mut validation = Validation::new(Algorithm::ES256);
+        validation.set_audience(&["https://fcm.googleapis.com"]);
+        validation.sub = Some("https://codemux.org".into());
+        validation.validate_nbf = true;
+        let claims = decode::<Value>(token, &verification_key, &validation)
+            .unwrap()
+            .claims;
+        assert_eq!(
+            claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+            12 * 60 * 60,
+        );
+    }
+
+    #[test]
+    fn existing_subscription_json_encrypts_an_interoperable_aes128gcm_payload() {
+        let (recipient, auth) = ece::generate_keypair_and_auth_secret().unwrap();
+        let stored = json!({
+            "endpoint": "https://fcm.googleapis.com/fcm/send/test",
+            "keys": {
+                "p256dh": URL_SAFE_NO_PAD.encode(recipient.pub_as_raw().unwrap()),
+                "auth": URL_SAFE_NO_PAD.encode(auth),
+            },
+        });
+        let subscription: SubscriptionInfo = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&subscription).unwrap(), stored);
+        assert!(valid_subscription(&subscription));
+        let content = br#"{"title":"Ready for review"}"#;
+        let body = encrypt_notification(&subscription, content).unwrap();
+        assert_eq!(
+            ece::decrypt(&recipient.raw_components().unwrap(), &auth, &body).unwrap(),
+            content,
+        );
+        assert!(encrypt_notification(&subscription, &[0; MAX_PUSH_PLAINTEXT_BYTES + 1]).is_err());
+    }
+
     #[test]
     fn failed_turns_do_not_also_announce_success_and_new_runs_reset() {
         let mut last = HashMap::new();
@@ -457,7 +587,13 @@ mod tests {
     }
     #[test]
     fn subscription_keys_must_be_valid_sizes() {
-        let sub = SubscriptionInfo::new("https://web.push.apple.com/test", "BA", "AA");
+        let sub = SubscriptionInfo {
+            endpoint: "https://web.push.apple.com/test".into(),
+            keys: SubscriptionKeys {
+                p256dh: "BA".into(),
+                auth: "AA".into(),
+            },
+        };
         assert!(!valid_subscription(&sub));
     }
     #[test]
