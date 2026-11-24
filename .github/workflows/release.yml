@@ -28,7 +28,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Install Linux system dependencies
         if: matrix.os == 'ubuntu-22.04'
@@ -50,7 +52,7 @@ jobs:
         # actual bundles, not just type-checks..
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         # Installs the stable toolchain for whichever OS the job is running
         # on — MSVC on windows-latest, GNU on ubuntu-22.04. No toolchain
         # override needed.
@@ -61,7 +63,7 @@ jobs:
         run: ./scripts/windows-native-perl.ps1
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri -> target
           # Per-OS cache key so Linux and Windows release artifacts never
@@ -73,7 +75,7 @@ jobs:
           save-if: false
 
       - name: Setup Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           # Node 22 for the project's npm scripts. The action itself is on
           # @v5 (Node 24 runtime) so it won't trip GitHub's Node-20-actions
@@ -98,7 +100,7 @@ jobs:
         # linuxdeploy's `ldd` pass can load them. The AppImage step's
         # "Failed to run ldd" came from patchelf corrupting Bun executables,
         # which scripts/patchelf-skip-bun.sh prevents (PATCHELF below).
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.3.12"
 
@@ -247,11 +249,13 @@ jobs:
         # (vendored, frozen since 2022) so we leave that alone — only the
         # plugin needs pinning.
         run: |
-          mkdir -p ~/.cache/tauri
-          curl -fsSL -o ~/.cache/tauri/linuxdeploy-plugin-appimage.AppImage \
+          set -euo pipefail
+          plugin="$RUNNER_TEMP/linuxdeploy-plugin-appimage.AppImage"
+          curl -fsSL -o "$plugin" \
             https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-appimage-x86_64.AppImage
-          chmod +x ~/.cache/tauri/linuxdeploy-plugin-appimage.AppImage
-          ls -la ~/.cache/tauri/
+          printf '%s  %s\n' '992d502a248e14ab185448ddf6f6e7d25558cb84d4623c354c3af350c25fccb3' "$plugin" | sha256sum --check
+          mkdir -p ~/.cache/tauri
+          install -m 0755 "$plugin" ~/.cache/tauri/linuxdeploy-plugin-appimage.AppImage
 
       - name: Build and release (Linux)
         if: matrix.os == 'ubuntu-22.04'
@@ -260,7 +264,7 @@ jobs:
         # the compressor, which makes the default gzip-6 RPM take ~15 min; zstd
         # consumes larger chunks per write, so it roughly halves that and is
         # smaller. zstd payloads need rpm >= 4.14 (RHEL 8, Fedora 28, Leap 15).
-        uses: tauri-apps/tauri-action@action-v0.6.2
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -290,7 +294,7 @@ jobs:
 
       - name: Build and release (Windows)
         if: matrix.os == 'windows-latest'
-        uses: tauri-apps/tauri-action@action-v0.6.2
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Same Ed25519 updater key as the Linux job. Tauri CLI on
@@ -345,7 +349,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Verify the Linux release is published
         env:
@@ -368,24 +374,24 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang binaryen
 
       - name: Setup Rust with wasm target
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: wasm32-unknown-unknown
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: iroh-wasm -> target
           key: hosted-web-wasm32-unknown-unknown
 
       - name: Cache wasm-bindgen CLI
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: iroh-wasm/.tools
           key: wasm-bindgen-cli-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('iroh-wasm/Cargo.toml') }}
 
       - name: Setup Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: npm

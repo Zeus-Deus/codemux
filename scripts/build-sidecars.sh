@@ -76,7 +76,7 @@ mkdir -p "$binary_dir" "$sidecar_dir/dist"
 
 # Each program keeps its own package and lockfile; the bundler resolves every
 # import from the importing file's own node_modules.
-(cd "$sidecar_dir/claude-agent" && { bun install --frozen-lockfile 2>/dev/null || bun install; })
+(cd "$sidecar_dir/claude-agent" && bun install --frozen-lockfile)
 # The Cursor SDK's native package is per-platform, so install the target's.
 (cd "$sidecar_dir/managed-workflow" && bun install --frozen-lockfile --os "$sdk_os" --cpu "$sdk_arch")
 
