@@ -396,12 +396,12 @@ describe("Claude plugin bridge permissions", () => {
     }
   });
 });
-test("pinned SDK 0.2.114 getSettings control contract (review this test on SDK bumps)", async () => {
+test("pinned SDK 0.2.141 getSettings control contract (review this test on SDK bumps)", async () => {
   const entry = import.meta.resolve("@anthropic-ai/claude-agent-sdk");
   const pkg = JSON.parse(
     await readFile(new URL("package.json", entry), "utf8"),
   );
-  expect(pkg.version).toBe("0.2.114");
+  expect(pkg.version).toBe("0.2.141");
   const root = await mkdtemp(join(tmpdir(), "codemux-sdk-settings-"));
   const fixture = pathToFileURL(join(root, "settings fixture.mjs"));
   const prompts = new AsyncPromptQueue<
