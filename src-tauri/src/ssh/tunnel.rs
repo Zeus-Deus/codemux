@@ -31,17 +31,12 @@ use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
 use super::exec::{sh_quote, validate_ssh_target};
+use super::tunnel_paths::{forward_socket_path, is_private_directory, verified_ssh_args, DIRECTORY_CHECKS};
 
 const TUNNEL_READY: &str = "codemux:pty-tunnel-ready:v1";
 
 pub(super) fn has_private_socket_parent(path: &Path) -> bool {
-    path.parent()
-        .and_then(|parent| fs::symlink_metadata(parent).ok())
-        .is_some_and(|metadata| {
-            metadata.is_dir()
-                && metadata.uid() == unsafe { libc::geteuid() }
-                && metadata.mode() & 0o777 == 0o700
-        })
+    path.parent().is_some_and(is_private_directory)
 }
 
 pub(super) fn prepare_local_socket(path: &Path) -> Result<(), String> {
@@ -127,48 +122,30 @@ pub struct TunnelOptions<'a> {
 /// The daemon's own idle-reaper (1h with zero sessions) handles cleanup of
 /// an abandoned detached daemon, so this never leaks indefinitely.
 pub fn build_remote_command(remote_socket: &str, binary: &str) -> String {
-    let legacy_socket = remote_socket
-        .strip_suffix(".d/pty.sock")
-        .map(|base| format!("{base}.sock"))
-        .unwrap_or_default();
     let binary = match binary.strip_prefix("$HOME/") {
         Some(relative) => format!("\"$HOME\"/{}", sh_quote(relative)),
         None => sh_quote(binary),
     };
     let script = format!(
-        r#"umask 077
-SOCK={socket}
-OLD={legacy}
-BIN={binary}
+        "umask 077\nUID_NUMBER=$(id -u) || exit 1\nSOCK={}\nBIN={}\n{}{}",
+        sh_quote(remote_socket),
+        binary,
+        DIRECTORY_CHECKS,
+        r#"
 DIR=$(dirname "$SOCK") || exit 1
 PIDF="$SOCK.pid"
 LOG="$SOCK.log"
-mode() {{ stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null; }}
-mkdir -m 700 "$DIR" 2>/dev/null || :
-if [ ! -d "$DIR" ] || [ -L "$DIR" ] || [ ! -O "$DIR" ] || [ "$(mode "$DIR")" != 700 ]; then
+if ! private_directory "$DIR"; then
     printf '%s\n' 'Codemux tunnel requires an owner-only socket directory' >&2
     exit 1
 fi
-daemon_alive() {{
-    [ -S "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] && [ "$(mode "$1")" = 600 ] || return 1
-    [ -f "$1.pid" ] && [ ! -L "$1.pid" ] && [ -O "$1.pid" ] || return 1
-    case "$(mode "$1.pid")" in 600|640|644) ;; *) return 1 ;; esac
-    pid=$(cat "$1.pid") || return 1
-    case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
-    kill -0 "$pid" 2>/dev/null
-}}
+lock_socket_path "$SOCK.start" || exit 1
 if ! daemon_alive "$SOCK"; then
-    # Move an active owner-only legacy socket without interrupting its sessions.
-    # Do not read a foreign daemon's PID file or reuse its socket.
-    if [ -n "$OLD" ] && daemon_alive "$OLD"; then
-        cp "$OLD.pid" "$PIDF" && mv -f "$OLD" "$SOCK" || exit 1
+    rm -f "$SOCK" "$PIDF" || exit 1
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$BIN" pty-daemon --socket "$SOCK" </dev/null >>"$LOG" 2>&1 &
     else
-        rm -f "$SOCK" "$PIDF" || exit 1
-        if command -v setsid >/dev/null 2>&1; then
-            setsid "$BIN" pty-daemon --socket "$SOCK" </dev/null >>"$LOG" 2>&1 &
-        else
-            nohup "$BIN" pty-daemon --socket "$SOCK" </dev/null >>"$LOG" 2>&1 &
-        fi
+        nohup "$BIN" pty-daemon --socket "$SOCK" </dev/null >>"$LOG" 2>&1 &
     fi
 fi
 i=0
@@ -177,10 +154,9 @@ while ! daemon_alive "$SOCK"; do
     i=$((i+1))
     sleep 0.1
 done
-printf '%s\n' '{TUNNEL_READY}'
+unlock_socket_path || exit 1
+printf '%s\n' 'codemux:pty-tunnel-ready:v1'
 exec sleep 2147483647"#,
-        socket = sh_quote(remote_socket),
-        legacy = sh_quote(&legacy_socket),
     );
     format!("exec sh -c {}", sh_quote(&script))
 }
@@ -188,15 +164,8 @@ exec sleep 2147483647"#,
 /// Build the ssh argv we use to spawn the tunneled daemon. Extracted
 /// so tests can assert the exact flags without forking ssh.
 pub fn build_tunnel_argv(opts: &TunnelOptions<'_>) -> Vec<String> {
-    vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "StrictHostKeyChecking=yes".into(),
-        "-o".into(),
-        "ForwardAgent=no".into(),
-        "-o".into(),
-        "ControlPath=none".into(),
+    let mut args: Vec<_> = verified_ssh_args().into_iter().map(String::from).collect();
+    args.extend([
         "-o".into(),
         "ServerAliveInterval=30".into(),
         "-o".into(),
@@ -217,7 +186,8 @@ pub fn build_tunnel_argv(opts: &TunnelOptions<'_>) -> Vec<String> {
         // Remote command: reuse a live detached daemon or spawn one
         // detached, then hold the forward open. See `build_remote_command`.
         build_remote_command(opts.remote_socket, opts.remote_binary),
-    ]
+    ]);
+    args
 }
 
 /// Wait for both the SSH forward and the remote daemon's authenticated
@@ -267,6 +237,9 @@ pub async fn spawn_ssh_tunnel(
     spawn_timeout: Duration,
 ) -> Result<TunnelHandle, String> {
     validate_ssh_target(opts.ssh_target)?;
+    if !forward_socket_path(opts.local_socket) || !forward_socket_path(Path::new(opts.remote_socket)) {
+        return Err("SSH tunnel socket paths must be short absolute paths".into());
+    }
     prepare_local_socket(opts.local_socket)?;
     let argv = build_tunnel_argv(&opts);
     let mut cmd = Command::new("ssh");
@@ -303,7 +276,6 @@ pub async fn spawn_ssh_tunnel(
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
     fn options() -> (PathBuf, TunnelOptions<'static>) {
@@ -334,6 +306,7 @@ mod tests {
         //   local socket from a previous run
         // - ServerAlive keeps the tunnel from going stale under NAT
         for must_have in [
+            "-T",
             "BatchMode=yes",
             "StrictHostKeyChecking=yes",
             "ForwardAgent=no",
@@ -472,29 +445,4 @@ mod tests {
         assert!(prepare_local_socket(&socket).is_err());
     }
 
-    #[tokio::test]
-    async fn remote_command_moves_owner_only_legacy_socket_before_signaling_ready() {
-        let dir = tempfile::tempdir().unwrap();
-        let legacy = dir.path().join("pty.sock");
-        let socket = dir.path().join("pty.d/pty.sock");
-        let _listener = UnixListener::bind(&legacy).unwrap();
-        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o600)).unwrap();
-        let pidfile = dir.path().join("pty.sock.pid");
-        fs::write(&pidfile, std::process::id().to_string()).unwrap();
-        fs::set_permissions(&pidfile, fs::Permissions::from_mode(0o600)).unwrap();
-
-        let script = build_remote_command(socket.to_str().unwrap(), "/unused/codemux-remote");
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", &script])
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let ready = wait_for_socket(&socket, &mut child, Duration::from_secs(3)).await;
-        child.kill().await.unwrap();
-        ready.unwrap();
-        assert!(has_private_socket_parent(&socket));
-        assert!(!legacy.exists());
-        assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
-    }
 }

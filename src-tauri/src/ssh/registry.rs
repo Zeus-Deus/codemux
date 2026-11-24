@@ -23,9 +23,8 @@
 #![cfg(unix)]
 
 use crate::pty_daemon::{PtyDaemonClient, PtyDaemonError};
-use crate::ssh::tunnel_supervisor::{TunnelStatus, TunnelSupervisor};
+use crate::ssh::tunnel_supervisor::{TunnelStatus, TunnelSupervisor, FIRST_CONNECT_WAIT};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::Emitter;
@@ -148,45 +147,6 @@ pub async fn shutdown_all() {
     futures_util::future::join_all(supervisors.iter().map(|s| s.shutdown())).await;
 }
 
-/// Helper for the push flow: compose a stable local socket path
-/// from the workspace id. Putting all tunnels under a single dir
-/// keeps cleanup easy + avoids per-call temp-file allocation. The
-/// hash-truncated workspace id stays well under Darwin's 104-byte
-/// sun_path limit.
-pub fn local_socket_for_workspace(workspace_id: &str) -> PathBuf {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    workspace_id.hash(&mut hasher);
-    let short = format!("{:x}", hasher.finish());
-    // Full 16 hex chars (the whole u64) — truncating to 12 left only a
-    // 48-bit space (birthday collisions ~2^24 workspaces). 16 stays well
-    // under the 104-byte macOS sun_path limit (see the test below).
-    let truncated = &short[..short.len().min(16)];
-    let directory = format!(".cmux-{}", unsafe { libc::geteuid() });
-    std::env::temp_dir()
-        .join(directory)
-        .join(format!("{truncated}.sock"))
-}
-
-/// Compute the conventional remote socket path for a workspace's
-/// tunnel. Same id-hash truncation as the local side so the two
-/// match up visually in process listings, and short enough to fit
-/// macOS-server sun_path limits if anyone ever runs codemux-remote
-/// on a Mac.
-pub fn remote_socket_for_workspace(workspace_id: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    workspace_id.hash(&mut hasher);
-    let short = format!("{:x}", hasher.finish());
-    // Full 16 hex chars (the whole u64) — truncating to 12 left only a
-    // 48-bit space (birthday collisions ~2^24 workspaces). 16 stays well
-    // under the 104-byte macOS sun_path limit (see the test below).
-    let truncated = &short[..short.len().min(16)];
-    format!("/tmp/codemux-ptyd-{truncated}.d/pty.sock")
-}
-
 /// Per-workspace `PtyDaemonClient` cache. Local workspaces share the
 /// singleton local daemon client; remote workspaces each get their
 /// own client connected through their per-workspace SSH tunnel.
@@ -210,19 +170,18 @@ pub(crate) struct CleanupDaemonTunnel {
 }
 
 impl CleanupDaemonTunnel {
-    pub(crate) async fn start(workspace_id: &str, ssh_target: &str) -> Self {
+    pub(crate) async fn start(workspace_id: &str, ssh_target: &str) -> Result<Self, PtyDaemonError> {
         let key = format!("terminal-cleanup:{}", uuid::Uuid::new_v4());
         let mut supervisors = registry().await.lock().await;
         // Register without an await after spawning so cancellation cannot
         // leave a live tunnel outside the app's shutdown registry.
         let supervisor = TunnelSupervisor::spawn(
             ssh_target.to_string(),
-            remote_socket_for_workspace(workspace_id),
-            local_socket_for_workspace(&key),
+            workspace_id,
             REMOTE_DAEMON_BINARY.to_string(),
-        );
+        ).map_err(PtyDaemonError::Daemon)?;
         supervisors.insert(key.clone(), supervisor);
-        Self { key, client: None }
+        Ok(Self { key, client: None })
     }
 
     pub(crate) async fn client(
@@ -313,14 +272,11 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
                         "Workspace's host {host_id} is no longer in the local hosts list"
                     ))
                 })?;
-            let local_socket = local_socket_for_workspace(workspace_id);
-            let remote_socket = remote_socket_for_workspace(workspace_id);
             let s = TunnelSupervisor::spawn(
                 host.ssh_target.clone(),
-                remote_socket,
-                local_socket,
+                workspace_id,
                 REMOTE_DAEMON_BINARY.to_string(),
-            );
+            ).map_err(PtyDaemonError::Daemon)?;
             install_supervisor(workspace_id, s.clone()).await;
             spawn_tunnel_status_forwarder(app.clone(), workspace_id.to_string(), &s);
             s
@@ -343,7 +299,7 @@ async fn connect_tunnel_daemon(
     // Wait for the tunnel to become Connected (or fail loudly).
     // Connected fires after SSH binds the local forward and its authenticated
     // remote command confirms that the daemon socket is ready.
-    let tunnel_wait = Duration::from_secs(20);
+    let tunnel_wait = FIRST_CONNECT_WAIT;
     let mut rx = supervisor.subscribe();
     // Mark the initial subscribed value as seen so `rx.changed()`
     // wakes ONLY on subsequent updates. Without this, on a freshly
@@ -487,37 +443,4 @@ pub async fn forget_workspace_client(workspace_id: &str) {
     let map = workspace_clients().await;
     let mut guard = map.lock().await;
     guard.remove(workspace_id);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn local_socket_for_workspace_is_deterministic() {
-        let a = local_socket_for_workspace("workspace-42");
-        let b = local_socket_for_workspace("workspace-42");
-        assert_eq!(a, b, "same workspace id must yield same socket path");
-    }
-
-    #[test]
-    fn local_socket_for_workspace_distinguishes_workspaces() {
-        let a = local_socket_for_workspace("workspace-42");
-        let b = local_socket_for_workspace("workspace-43");
-        assert_ne!(a, b, "different workspace ids must yield different paths");
-    }
-
-    #[test]
-    fn local_socket_path_fits_sun_path_limit() {
-        // Darwin's sun_path is 104 bytes; we should stay well under
-        // that even when the system tempdir is longish (e.g.
-        // /var/folders/... on macOS).
-        let path = local_socket_for_workspace("workspace-with-long-name");
-        let len = path.to_string_lossy().len();
-        assert!(
-            len < 100,
-            "socket path is {len} bytes, must stay under 104 for Darwin: {}",
-            path.display()
-        );
-    }
 }

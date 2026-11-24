@@ -1953,9 +1953,11 @@ async fn drain_pending_daemon_closes<R: Runtime>(
                             if let Some(ssh_target) = &route.ssh_target {
                                 let mut tunnel = cleanup_tunnel.lock().await;
                                 if tunnel.is_none() {
-                                    *tunnel = Some(crate::ssh::registry::CleanupDaemonTunnel::start(
+                                    let started = crate::ssh::registry::CleanupDaemonTunnel::start(
                                         &route.workspace_id, ssh_target,
-                                    ).await);
+                                    ).await;
+                                    let Ok(started) = started else { return false };
+                                    *tunnel = Some(started);
                                 }
                                 tunnel.as_mut().expect("cleanup tunnel initialized")
                                     .client(&route.workspace_id).await

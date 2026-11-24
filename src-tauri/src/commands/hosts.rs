@@ -735,10 +735,6 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
                 // circuit breaker. Registered by workspace id so
                 // subsequent push/pull/close can find and shut it
                 // down.
-                let local_socket =
-                    crate::ssh::local_socket_for_workspace(&workspace_id);
-                let remote_socket =
-                    crate::ssh::remote_socket_for_workspace(&workspace_id);
                 // Forget the cached PtyDaemonClient BEFORE
                 // installing the new supervisor. A re-push with a
                 // stale client in cache would have the next spawn
@@ -746,27 +742,21 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
                 // (which is about to be torn down), causing the
                 // shell to hang at "Starting…" forever.
                 crate::ssh::forget_workspace_client(&workspace_id).await;
-                let supervisor = crate::ssh::TunnelSupervisor::spawn(
+                match crate::ssh::TunnelSupervisor::spawn(
                     host.ssh_target.clone(),
-                    remote_socket,
-                    local_socket,
-                    // Absolute path via $HOME, not bare
-                    // `codemux-remote`. Non-interactive SSH
-                    // shells often don't have ~/.local/bin on
-                    // PATH (only interactive shells do, via
-                    // ~/.profile / ~/.bashrc). Bootstrap installs
-                    // here, tunnel must reach here.
+                    &workspace_id,
                     "$HOME/.local/bin/codemux-remote".to_string(),
-                );
-                crate::ssh::install_supervisor(&workspace_id, supervisor.clone())
-                    .await;
-                // Surface reconnect / circuit-open state to the UI for this
-                // freshly-pushed workspace.
-                crate::ssh::spawn_tunnel_status_forwarder(
-                    app.clone(),
-                    workspace_id.clone(),
-                    &supervisor,
-                );
+                ) {
+                    Ok(supervisor) => {
+                        crate::ssh::install_supervisor(&workspace_id, supervisor.clone()).await;
+                        crate::ssh::spawn_tunnel_status_forwarder(
+                            app.clone(),
+                            workspace_id.clone(),
+                            &supervisor,
+                        );
+                    }
+                    Err(error) => eprintln!("[hosts] workspace pushed, but could not open SSH tunnel: {error}"),
+                }
 
                 // Sync Claude session JSONLs from
                 // ~/.claude/projects/<local-encoded>/ to the
