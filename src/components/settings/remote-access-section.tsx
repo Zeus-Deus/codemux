@@ -1859,12 +1859,10 @@ export function RemoteAccessSection() {
                   title="Allow account sign-in instead of a pairing link"
                   detail={
                     <>
-                      A browser that reaches this address can sign in with{" "}
-                      <span className="font-medium text-foreground">
-                        the Codemux account
-                      </span>{" "}
-                      this desktop uses — no pairing link to copy. Only affects
-                      this way in; From anywhere always uses your account.
+                      Browsers on this desktop or connecting through a local
+                      HTTPS proxy can sign in with the Codemux account this
+                      desktop uses. Use a pairing link for other network
+                      connections. From anywhere uses your account.
                     </>
                   }
                   checked={accountModeEnabled}

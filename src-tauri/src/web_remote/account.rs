@@ -91,18 +91,8 @@ pub(crate) async fn verify_and_mint(
     device_name: Option<String>,
     user_agent: Option<String>,
 ) -> Result<AccountPairOutcome, AccountPairError> {
-    // Snapshot the config values up front so the non-Send `std::sync::Mutex`
-    // guard is never held across the `.await` below.
-    let (account_mode_enabled, approved) = {
-        let cfg = shared.config.lock().unwrap();
-        (
-            cfg.account_mode_enabled,
-            super::account_session_approved(&cfg),
-        )
-    };
-
     // 1. Master toggle. Off → refuse before touching the account at all.
-    if !account_mode_enabled {
+    if !shared.config.lock().unwrap().account_mode_enabled {
         return Err(AccountPairError::Disabled);
     }
 
@@ -119,11 +109,16 @@ pub(crate) async fn verify_and_mint(
         .await
         .map_err(|_| AccountPairError::AuthFailed)?;
 
-    // 4. Same-account gate. Credentials for a *different* account get nothing —
-    //    a browser reaches only devices under its own account.
-    if resolved.user.id != cached.id {
+    // The owner or admission policy can change while verification is in flight.
+    let cfg = shared.config.lock().unwrap();
+    if !cfg.account_mode_enabled {
+        return Err(AccountPairError::Disabled);
+    }
+    let current = crate::auth::load_cached_user(db).ok_or(AccountPairError::DesktopSignedOut)?;
+    if resolved.user.id != cached.id || current.id != cached.id {
         return Err(AccountPairError::Mismatch);
     }
+    let approved = super::account_session_approved(&cfg);
 
     // 5. Mint the session, tagged `source = "account"` + the verified user id,
     //    returning the plaintext token once (only its hash is stored).

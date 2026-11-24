@@ -431,13 +431,17 @@ fn compression_layer() -> CompressionLayer {
 
 // ── HTTP handlers ───────────────────────────────────────────────────
 
-async fn health<R: Runtime>(State(app): State<AppHandle<R>>) -> Response {
+async fn health<R: Runtime>(
+    State(app): State<AppHandle<R>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     let version = app.package_info().version.to_string();
     // Advertise whether account mode is on so the pre-app bootstrap knows to
     // offer the "sign in with your Codemux account" screen alongside the
     // paste-a-code path. Public + non-sensitive: it only says which admission
     // methods this server accepts, never anything about the account itself.
-    let account_mode_enabled = app
+    let account_mode_enabled = account_pair_transport_ok(peer, &headers) && app
         .state::<WebRemoteState>()
         .shared()
         .config
@@ -450,6 +454,45 @@ async fn health<R: Runtime>(State(app): State<AppHandle<R>>) -> Response {
         "account_mode_enabled": account_mode_enabled,
     }))
     .into_response()
+}
+
+fn local_https_proxy(peer: SocketAddr, headers: &HeaderMap) -> bool {
+    super::endpoints::is_local_peer(peer.ip())
+        && headers.get("x-forwarded-proto").is_some_and(|proto| proto == "https")
+        && headers.get(header::ORIGIN).is_none_or(|origin| {
+            origin.to_str().is_ok_and(|origin| origin.starts_with("https://"))
+        })
+}
+
+/// Account proof is reusable at the account API, so only receive it on the
+/// same machine or through HTTPS terminated by a local reverse proxy.
+fn account_pair_transport_ok(peer: SocketAddr, headers: &HeaderMap) -> bool {
+    if !super::endpoints::is_local_peer(peer.ip()) {
+        return false;
+    }
+    if local_https_proxy(peer, headers) {
+        return true;
+    }
+    let Some(authority) = headers.get(header::HOST).and_then(|value| {
+        value.to_str().ok()?.parse::<axum::http::uri::Authority>().ok()
+    }) else {
+        return false;
+    };
+    let host = authority.host();
+    host.eq_ignore_ascii_case("localhost")
+        || host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>()
+            .is_ok_and(super::endpoints::is_local_peer)
+}
+
+fn pairing_response_headers(peer: SocketAddr, headers: &HeaderMap, session_token: &str) -> HeaderMap {
+    let secure = if local_https_proxy(peer, headers) { "; Secure" } else { "" };
+    let cookie = format!("{SESSION_COOKIE}={session_token}; HttpOnly; SameSite=Strict; Path=/{secure}");
+    let mut out = HeaderMap::new();
+    if let Ok(value) = cookie.parse() {
+        out.insert(header::SET_COOKIE, value);
+    }
+    out.insert(header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    out
 }
 
 #[derive(Deserialize)]
@@ -516,11 +559,7 @@ async fn pair<R: Runtime>(
 
     // HttpOnly so JS can't read it; SameSite=Strict so a cross-site page
     // can't drive authed asset GETs with the stored cookie.
-    let cookie = format!("{SESSION_COOKIE}={session_token}; HttpOnly; SameSite=Strict; Path=/");
-    let mut out_headers = HeaderMap::new();
-    if let Ok(v) = cookie.parse() {
-        out_headers.insert(header::SET_COOKIE, v);
-    }
+    let out_headers = pairing_response_headers(peer, &headers, &session_token);
     (
         StatusCode::OK,
         out_headers,
@@ -556,6 +595,9 @@ async fn pair_account<R: Runtime>(
 ) -> Response {
     if !auth::origin_ok(&headers) {
         return error(StatusCode::FORBIDDEN, "origin_mismatch");
+    }
+    if !account_pair_transport_ok(peer, &headers) {
+        return error(StatusCode::FORBIDDEN, "account_secure_transport_required");
     }
     let shared = app.state::<WebRemoteState>().shared();
 
@@ -593,14 +635,7 @@ async fn pair_account<R: Runtime>(
 
     // HttpOnly + SameSite=Strict cookie, identical to /api/pair, so authed
     // asset/`<img>` GETs work for account sessions too.
-    let cookie = format!(
-        "{SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/",
-        outcome.session_token
-    );
-    let mut out_headers = HeaderMap::new();
-    if let Ok(v) = cookie.parse() {
-        out_headers.insert(header::SET_COOKIE, v);
-    }
+    let out_headers = pairing_response_headers(peer, &headers, &outcome.session_token);
     (
         StatusCode::OK,
         out_headers,
@@ -654,7 +689,7 @@ async fn ws_ticket<R: Runtime>(State(app): State<AppHandle<R>>, headers: HeaderM
         .web_remote_touch_session(&session.id);
 
     let ticket = app.state::<WebRemoteState>().shared().tickets.issue(&session.id);
-    Json(json!({ "ticket": ticket })).into_response()
+    ([(header::CACHE_CONTROL, "no-store")], Json(json!({ "ticket": ticket }))).into_response()
 }
 
 /// A browser still waiting for approval withdraws its own request (it
@@ -717,8 +752,8 @@ async fn ws_upgrade<R: Runtime>(
     }
 
     let app_for_socket = app.clone();
+    let plaintext = !account_pair_transport_ok(peer, &headers);
     ws.on_upgrade(move |socket| {
-        let plaintext = !super::endpoints::is_local_peer(peer.ip());
         handle_socket(app_for_socket, session_id, socket, compress_frames, plaintext)
     })
 }
@@ -1120,6 +1155,30 @@ pub(super) fn require_session<R: Runtime>(
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn account_pairing_credentials_require_loopback_or_local_https_proxy() {
+        let local: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let lan: SocketAddr = "192.0.2.12:12345".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "[::1]:4377".parse().unwrap());
+        assert!(account_pair_transport_ok(local, &headers));
+        assert!(!account_pair_transport_ok(lan, &headers));
+
+        headers.insert(header::HOST, "remote.example".parse().unwrap());
+        assert!(!account_pair_transport_ok(local, &headers));
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert(header::ORIGIN, "https://remote.example".parse().unwrap());
+        assert!(account_pair_transport_ok(local, &headers));
+        assert!(!account_pair_transport_ok(lan, &headers));
+
+        let response = pairing_response_headers(local, &headers, "synthetic-session-token");
+        assert!(response[header::SET_COOKIE].to_str().unwrap().ends_with("; Secure"));
+        assert_eq!(response[header::CACHE_CONTROL], "no-store");
+
+        headers.insert(header::ORIGIN, "http://remote.example".parse().unwrap());
+        assert!(!account_pair_transport_ok(local, &headers));
+    }
 
     #[test]
     fn connection_registry_close_session_signals_and_frames() {

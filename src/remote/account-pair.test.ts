@@ -54,8 +54,10 @@ describe("fetchServerInfo", () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(200, { ok: true, version: "9.9.9", account_mode_enabled: true }),
     ) as unknown as typeof fetch;
-    const info = await fetchServerInfo("http://host:4377", fetchImpl);
+    const info = await fetchServerInfo("https://host.example", fetchImpl);
     expect(info).toEqual({ version: "9.9.9", accountModeEnabled: true });
+    const lanInfo = await fetchServerInfo("http://host:4377", fetchImpl);
+    expect(lanInfo).toEqual({ version: "9.9.9", accountModeEnabled: false });
   });
 
   it("degrades to no-account-mode on a probe failure", async () => {
@@ -96,6 +98,14 @@ describe("mapAccountPairError", () => {
 // ── pairAccount round-trip incl. pending-approval handling ──────────
 
 describe("pairAccount", () => {
+  it("refuses to send credentials to an HTTP network origin", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    await expect(
+      pairAccount("http://192.0.2.10:4377", "user@example.com", "fixture", fetchImpl),
+    ).rejects.toThrow(/requires HTTPS or a browser on the desktop/i);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it("stores the session and reports approved when the desktop trusts it", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(200, {
@@ -106,7 +116,7 @@ describe("pairAccount", () => {
     ) as unknown as typeof fetch;
 
     const result = await pairAccount(
-      "http://host:4377",
+      "http://127.0.0.1:4377",
       "user@example.com",
       "hunter2",
       fetchImpl,
@@ -145,7 +155,7 @@ describe("pairAccount", () => {
     ) as unknown as typeof fetch;
 
     const result = await pairAccount(
-      "http://host:4377",
+      "https://host.example",
       "user@example.com",
       "hunter2",
       fetchImpl,
@@ -161,7 +171,7 @@ describe("pairAccount", () => {
     ) as unknown as typeof fetch;
 
     await expect(
-      pairAccount("http://host:4377", "user@example.com", "wrong", fetchImpl),
+      pairAccount("https://host.example", "user@example.com", "wrong", fetchImpl),
     ).rejects.toThrow(/email or password is incorrect/i);
     expect(loadSession()).toBeNull();
   });
