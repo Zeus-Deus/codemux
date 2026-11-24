@@ -34,8 +34,8 @@ export interface PushRelayOptions {
   /** APNs topics (bundle ids) and Android package names accepted at registration. */
   allowedApps: { ios: string[]; android: string[] };
   now?: () => number;
-  /** Only trust x-forwarded-for when the relay sits behind a proxy that sets it. */
-  getClientIp?: (request: Request) => string;
+  /** Required for registration. Use server peer metadata or a trusted ingress proxy. */
+  getClientIp?: (request: Request) => string | null | undefined;
   limits?: PushRelayLimits;
 }
 
@@ -77,8 +77,9 @@ function json(status: number, body: unknown, headers: Record<string, string> = {
 
 const noContent = () => new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
 
-export function defaultClientIp(request: Request): string {
-  return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+/** Explicitly share one registration bucket when ingress already limits requests. */
+export function defaultClientIp(_request: Request): string {
+  return "unknown";
 }
 
 export function createPushRelay(options: PushRelayOptions): PushRelay {
@@ -86,7 +87,6 @@ export function createPushRelay(options: PushRelayOptions): PushRelay {
   const basePath = (options.basePath ?? "").replace(/\/+$/, "");
   const store = options.store ?? createMemoryStore({ now });
   const rateLimiter = options.rateLimiter ?? createMemoryRateLimiter({ now });
-  const getClientIp = options.getClientIp ?? defaultClientIp;
   const registrationsPerHour = options.limits?.registrationsPerHour ?? 20;
   const sendsPerHour = options.limits?.sendsPerHour ?? 120;
   const senders: Record<Platform, Deliver | undefined> = {
@@ -115,7 +115,9 @@ export function createPushRelay(options: PushRelayOptions): PushRelay {
   }
 
   async function register(request: Request): Promise<Response> {
-    await enforce(`register:${getClientIp(request)}`, registrationsPerHour);
+    const clientIp = options.getClientIp?.(request);
+    if (!clientIp) throw new HttpError(503, { error: "registration_unavailable" });
+    await enforce(`register:${clientIp}`, registrationsPerHour);
     const body = asObject(await readJson(request));
     const platform = body.platform;
     if (platform !== "ios" && platform !== "android") {

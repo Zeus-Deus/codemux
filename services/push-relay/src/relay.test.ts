@@ -2,7 +2,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import type { ApnsTransport } from "./apns";
 import { sha256Hex } from "./jwt";
-import { createPushRelay, type PushRelayOptions } from "./relay";
+import { createPushRelay, defaultClientIp, type PushRelayOptions } from "./relay";
 import { createMemoryStore } from "./store";
 import { decodeJwt, generateEcKeyPair, generateRsaKeyPair, toPkcs8Pem, verifyJwt } from "./test-helpers";
 
@@ -56,6 +56,7 @@ function setup(overrides: Partial<PushRelayOptions> = {}) {
     basePath: "/api/push",
     store,
     now,
+    getClientIp: () => "test-client",
     allowedApps: { ios: [APP_ID], android: [APP_ID] },
     apns: { teamId: "TEAM123456", keyId: "KEY1234567", privateKeyPem: ecPem, send },
     fcm: {
@@ -143,7 +144,7 @@ describe("health and routing", () => {
         controller.close();
       },
     });
-    const res2 = await createPushRelay({ allowedApps: { ios: [APP_ID], android: [] } }).handle(
+    const res2 = await createPushRelay({ allowedApps: { ios: [APP_ID], android: [] }, getClientIp: () => "test-client" }).handle(
       new Request("https://x/v1/devices", { method: "POST", body: streamed, duplex: "half" } as RequestInit),
     );
     expect(res2.status).toBe(413);
@@ -200,17 +201,25 @@ describe("registration", () => {
     expect(await res.json()).toEqual({ error: "unsupported_app" });
   });
 
-  it("rate-limits registrations per client IP", async () => {
-    const t = setup({ limits: { registrationsPerHour: 2 } });
+  it("disables registration without trusted client address metadata", async () => {
+    const t = setup({ getClientIp: undefined });
+    const body = { platform: "ios", token: IOS_TOKEN, appId: APP_ID };
+    const result = await t.call("POST", "/v1/devices", body, { "x-forwarded-for": "192.0.2.1" });
+    expect(result.status).toBe(503);
+    expect(await result.json()).toEqual({ error: "registration_unavailable" });
+    expect((await t.call("GET", "/v1/health")).status).toBe(200);
+  });
+
+  it("supports an explicit shared limit without trusting forwarded headers", async () => {
+    const t = setup({ limits: { registrationsPerHour: 2 }, getClientIp: defaultClientIp });
     const body = { platform: "ios", token: IOS_TOKEN, appId: APP_ID };
     const fromIp = (ip: string) => t.call("POST", "/v1/devices", body, { "x-forwarded-for": `${ip}, 10.0.0.1` });
     expect((await fromIp("1.1.1.1")).status).toBe(201);
-    expect((await fromIp("1.1.1.1")).status).toBe(201);
-    const limited = await fromIp("1.1.1.1");
+    expect((await fromIp("2.2.2.2")).status).toBe(201);
+    const limited = await fromIp("3.3.3.3");
     expect(limited.status).toBe(429);
     expect(limited.headers.get("retry-after")).toBe("3600");
     expect(await limited.json()).toEqual({ error: "rate_limited" });
-    expect((await fromIp("2.2.2.2")).status).toBe(201);
     t.advance(60 * 60 * 1000);
     expect((await fromIp("1.1.1.1")).status).toBe(201);
   });

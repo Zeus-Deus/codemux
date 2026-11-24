@@ -8,7 +8,7 @@ Paths are relative to `basePath`. All JSON responses carry `content-type: applic
 
 | Method & path | Caller | Auth | Body | Success | Errors |
 | --- | --- | --- | --- | --- | --- |
-| `POST /v1/devices` | phone | none (rate-limited per IP, 20/h) | `{platform, token, appId, apnsEnvironment?, mutedCategories?}` | `201 {deviceId, sendKey, manageKey}` | 400 `invalid_request` / `unsupported_app`, 429 |
+| `POST /v1/devices` | phone | none (rate-limited, 20/h by default) | `{platform, token, appId, apnsEnvironment?, mutedCategories?}` | `201 {deviceId, sendKey, manageKey}` | 400 `invalid_request` / `unsupported_app`, 429, 503 `registration_unavailable` |
 | `PUT /v1/devices/:id` | phone | `Bearer <manageKey>` | `{token?, apnsEnvironment?, mutedCategories?}` (at least one) | 204 | 400, 401, 404 |
 | `DELETE /v1/devices/:id` | phone | `Bearer <manageKey>` | — | 204 | 401, 404 |
 | `POST /v1/devices/:id/notifications` | desktop | `Bearer <sendKey>` | `{title≤120, body≤400, category, collapseKey?≤64, data?, ttlSeconds?}` | `202 {delivered:true}` | 400, 401, 404, 410 `gone` (device deleted), 429 (120/h per device), 502 `upstream_failed`, 503 `platform_unavailable` |
@@ -27,7 +27,8 @@ const relay = createPushRelay({
   allowedApps: { ios: ["org.codemux.app"], android: ["org.codemux.app"] },
   apns: { teamId: env.APNS_TEAM_ID, keyId: env.APNS_KEY_ID, privateKeyPem: env.APNS_KEY_P8 },
   fcm: { projectId: sa.project_id, clientEmail: sa.client_email, privateKeyPem: sa.private_key },
-  getClientIp: (req) => req.headers.get("x-real-ip") ?? "unknown",
+  // For a relay reachable only through a proxy that overwrites x-real-ip.
+  getClientIp: (req) => req.headers.get("x-real-ip"),
 });
 
 app.all("/api/push/*", (c) => relay.handle(c.req.raw));
@@ -43,7 +44,7 @@ app.all("/api/push/*", (c) => relay.handle(c.req.raw));
 
 - Two 256-bit capabilities per device. The `sendKey` only lets its holder notify that one device; the phone hands it to its paired desktops. The `manageKey` stays on the phone and alone can change the token or delete the device, so a compromised desktop can't redirect notifications meant for the phone. The relay stores only sha256 hashes and compares them in constant time.
 - Device ids are 128-bit random, so 404 vs 401 does not enable useful enumeration.
-- Registrations are rate-limited per client IP and sends per device. `getClientIp` defaults to the first `x-forwarded-for` entry, which is only trustworthy behind a proxy that overwrites it.
+- Sends are rate-limited per device. Registration requires `getClientIp` to supply the server's peer address or a header that a trusted ingress proxy overwrites. Restrict direct access to the relay when using a proxy header. If ingress already limits registration traffic, explicitly pass `getClientIp: defaultClientIp` to use a shared relay limit.
 - Payloads carry only a title, a short body, a category, and opaque ids. The relay never sees chat content beyond the title/body the desktop chooses to send, and it logs nothing about requests or tokens.
 - Invalid tokens reported by APNs/FCM delete the registration and return 410, so the desktop can stop sending.
 
