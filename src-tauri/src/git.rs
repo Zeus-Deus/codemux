@@ -127,7 +127,8 @@ pub(crate) const GIT_PROCESS_KIND: &str = "git-hook";
 /// and everything it starts inherits it: a `codemux` that a hook runs reaches
 /// the control socket as an agent, refused admin commands, never as the owner.
 /// Unlike setup scripts, git is not registered for ancestry (most callers wait
-/// on `output()`, which gives no pid), so the inherited marker is the signal.
+/// on `output()`, which gives no pid). The socket checks this marker on a live
+/// git/gh/glab ancestor, even when a hook clears its own environment.
 ///
 /// Git also runs with `GIT_OPTIONAL_LOCKS=0`. Codemux reads status and
 /// diffs in the background while agents commit in the same checkout; an

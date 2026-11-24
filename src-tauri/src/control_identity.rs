@@ -203,6 +203,18 @@ fn peer_agent_status(pid: u32) -> Option<bool> {
     { let _ = pid; None }
 }
 
+/// Git, gh and glab can run repository-controlled hooks or helpers. Their
+/// launch helpers add the agent marker, but `Command::output()` hides their
+/// pid from registration. The marker on the *ancestor* process survives a
+/// hook clearing its own environment.
+fn source_control_process(name: &str) -> bool {
+    matches!(name.trim().to_ascii_lowercase().as_str(), "git" | "git.exe" | "gh" | "gh.exe" | "glab" | "glab.exe")
+}
+
+fn agent_env_entry(entry: &str) -> bool {
+    entry.split_once('=').is_some_and(|(key, _)| key.eq_ignore_ascii_case(AGENT_PROCESS_ENV))
+}
+
 #[cfg(target_os = "linux")]
 mod ancestry {
     use std::collections::BTreeMap;
@@ -258,7 +270,20 @@ mod ancestry {
         }
         if chain.len() == MAX_HOPS && pid > 1 && pid != own { return None; }
         let roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
-        Some(chain.iter().any(|(pid, start)| roots.get(pid) == Some(start)))
+        if chain.iter().any(|(pid, start)| roots.get(pid) == Some(start)) { return Some(true); }
+        drop(roots);
+        for (pid, _) in chain {
+            if source_control_marker(pid)? { return Some(true); }
+        }
+        Some(false)
+    }
+
+    fn source_control_marker(pid: u32) -> Option<bool> {
+        let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        if !super::source_control_process(name.trim_end()) { return Some(false); }
+        let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+        if environ.is_empty() { return None; }
+        Some(environ.split(|byte| *byte == 0).any(|entry| super::agent_env_entry(&String::from_utf8_lossy(entry))))
     }
 
     #[cfg(test)]
@@ -271,7 +296,7 @@ mod ancestry {
 mod ancestry {
     use std::collections::BTreeMap;
     use std::sync::{Mutex, PoisonError};
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     const PRUNE_AT: usize = 4096;
     const MAX_HOPS: usize = 64;
@@ -301,8 +326,7 @@ mod ancestry {
 
     pub(super) fn status(pid: u32) -> Option<bool> {
         if pid == 0 { return None; }
-        let system = snapshot();
-        let roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut system = snapshot();
         let own = std::process::id();
         let mut current = pid;
         let mut child_start = None;
@@ -310,16 +334,33 @@ mod ancestry {
             if current == own { return Some(false); }
             // pid 1 is launchd on macOS; pid 4 is System on Windows.
             if current == 1 || (cfg!(windows) && current == 4) { return Some(false); }
-            let process = system.process(Pid::from_u32(current))?;
+            let pid = Pid::from_u32(current);
+            let process = system.process(pid)?;
             let start = process.start_time();
+            let parent = process.parent()?.as_u32();
+            let source_control = super::source_control_process(&process.name().to_string_lossy());
             // A live process in a parent's reused PID slot cannot be the
             // ancestor of a child that started before it.
             if start == 0 || child_start.is_some_and(|child| start > child) {
                 return None;
             }
-            if roots.get(&current) == Some(&process.start_time()) { return Some(true); }
+            if ROOTS.lock().unwrap_or_else(PoisonError::into_inner).get(&current) == Some(&start) {
+                return Some(true);
+            }
+            if source_control {
+                system.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[pid]),
+                    false,
+                    ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
+                );
+                let process = system.process(pid)?;
+                if process.start_time() != start || process.environ().is_empty() { return None; }
+                if process.environ().iter().any(|entry| super::agent_env_entry(&entry.to_string_lossy())) {
+                    return Some(true);
+                }
+            }
             child_start = Some(start);
-            current = process.parent()?.as_u32();
+            current = parent;
         }
         // Excessive depth or an incomplete process snapshot is unverified.
         None
@@ -844,6 +885,19 @@ mod tests {
             assert!(caller.permits("notify", Access::Write).is_err());
             assert_eq!(caller.permits("web_remote_enable", Access::Admin).unwrap_err().code, ErrorCode::AdminRefused);
         }
+    }
+
+    #[test]
+    fn source_control_marker_names_are_exact() {
+        for name in ["git", "git.exe", "gh", "GH.EXE", "glab", "glab.exe"] {
+            assert!(source_control_process(name), "{name}");
+        }
+        for name in ["git-upload-pack", "legit", "ssh", "git.exe.bak"] {
+            assert!(!source_control_process(name), "{name}");
+        }
+        assert!(agent_env_entry("CODEMUX_AGENT_PROCESS="));
+        assert!(agent_env_entry("codemux_agent_process=git-hook"));
+        assert!(!agent_env_entry("CODEMUX_AGENT_PROCESS_EXTRA=1"));
     }
 
     #[test]

@@ -93,6 +93,65 @@ async fn hooks_and_fsmonitor_run_with_the_agent_marker() {
     saw_marker(&hook, "git_command_tokio checkout");
 }
 
+/// `Command::output()` gives the caller no child pid to register. A hook can
+/// remove its own marker, so the socket must find the marked Git ancestor.
+#[cfg(unix)]
+#[test]
+fn hook_clearing_its_marker_cannot_claim_control_socket_owner() {
+    use crate::agent_control::{Access, ErrorCode};
+    use crate::control_identity::{resolve_socket_caller, SocketCaller};
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let setup = |args: &[&str]| {
+        let output = std::process::Command::new("git").current_dir(&repo).args(args).output().unwrap();
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    };
+    setup(&["init", "-q"]);
+    setup(&[
+        "-c", "user.name=Codemux test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+        "commit", "-q", "--allow-empty", "-m", "seed",
+    ]);
+
+    let pid_file = dir.path().join("hook.pid");
+    let marker_file = dir.path().join("hook.marker");
+    let release_file = dir.path().join("hook.go");
+    let hook = repo.join(".git/hooks/post-checkout");
+    setup(&["config", "core.hooksPath", hook.parent().unwrap().to_str().unwrap()]);
+    let body = format!(
+        "#!/bin/sh\nunset {AGENT_PROCESS_ENV}\nprintf '%s' \"${{{AGENT_PROCESS_ENV}-unset}}\" > '{}'\necho $$ > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n",
+        marker_file.display(), pid_file.display(), release_file.display()
+    );
+    std::fs::write(&hook, body).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) { let _ = std::fs::write(&self.0, ""); }
+    }
+    let release = Release(release_file);
+    let command_repo = repo.clone();
+    let run = std::thread::spawn(move || git_command().current_dir(command_repo).args(["checkout", "-q", "-b", "probe"]).output());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let hook_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = text.trim().parse::<u32>() { break pid; }
+        }
+        assert!(Instant::now() < deadline, "Git did not start the checkout hook");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(std::fs::read_to_string(marker_file).unwrap(), "unset");
+    let caller = resolve_socket_caller(None, Some(hook_pid));
+    assert!(matches!(&caller, SocketCaller::Agent { .. }), "cleared hook marker became owner: {caller:?}");
+    assert_eq!(caller.permits("web_remote_enable", Access::Admin).unwrap_err().code, ErrorCode::AdminRefused);
+    drop(release);
+    let output = run.join().unwrap().unwrap();
+    assert!(output.status.success(), "checkout: {}", String::from_utf8_lossy(&output.stderr));
+}
+
 /// What production code must not call: anything else that starts git, or
 /// `gh` and `glab`, which start git themselves.
 const RAW_GIT: [&str; 9] = [
