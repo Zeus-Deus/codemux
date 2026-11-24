@@ -35,7 +35,7 @@ function webUrl(value: string | undefined): URL | null {
 }
 
 /** OS-facing asset URLs also use HTTP(S) on some Tauri platforms. */
-function forgeLinkUrl(value: string | undefined): string | undefined {
+function externalLinkUrl(value: string | undefined): string | undefined {
   const url = webUrl(value);
   if (!url || url.origin === window.location.origin) return undefined;
   const host = url.hostname.replace(/\.+$/, "");
@@ -227,11 +227,9 @@ function MarkdownRenderedImpl({
       /**
        * Links go somewhere deliberate rather than nowhere.
        *
-       * Without this override an `<a href>` here would try to navigate
-       * the webview itself — unloading the single-page app, or being
-       * dropped silently. So the click is taken over: a pull request in
-       * an open project opens the Pull Requests page, and everything
-       * else (and any shift-click) goes to the system browser.
+       * Without this override an `<a href>` here could navigate the
+       * webview itself. Keep only in-document fragments and absolute
+       * external web URLs live, then take over their clicks.
        *
        * This is the second of the two shared markdown surfaces. It
        * renders the PR description in the Review panel, which is exactly
@@ -239,27 +237,28 @@ function MarkdownRenderedImpl({
        */
       a: ({ href, children, ...rest }) => {
         const fragment = href?.startsWith("#") ? href.slice(1) : null;
-        const external = untrusted ? forgeLinkUrl(href) : webUrl(href)?.href;
+        const external = externalLinkUrl(href);
         return (
           <a
             {...rest}
-            href={untrusted ? (fragment === null ? external : href) : href}
+            href={fragment === null ? external : href}
             target={external ? "_blank" : undefined}
             rel="noopener noreferrer"
             onClick={(event) => {
+              event.preventDefault();
               if (fragment !== null) {
                 // Sanitizing prefixes id and name, so resolve the link
                 // within this rendered document.
-                event.preventDefault();
                 scrollToFragment(event.currentTarget, fragment);
               } else if (external) {
-                event.preventDefault();
                 void openExternalUrl(external, { event });
               }
             }}
             onAuxClick={(event) => {
+              // A middle click does not fire onClick, so suppress native
+              // navigation for every destination here as well.
               if (event.button !== 1) return;
-              if (fragment !== null || external) event.preventDefault();
+              event.preventDefault();
               if (external) void openExternalUrl(external, { event });
             }}
           >
