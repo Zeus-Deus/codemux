@@ -28,6 +28,7 @@ describe("HtmlRenderFrame", () => {
     render(<HtmlRenderFrame item={renderCall()} />);
     const frame = screen.getByTitle("Weekly turns");
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
     expect(frame.getAttribute("srcdoc")).toContain("<p>hi</p>");
     expect(frame.getAttribute("srcdoc")).toContain('<style id="codemux-theme">');
   });

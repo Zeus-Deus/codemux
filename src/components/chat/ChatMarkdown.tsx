@@ -213,12 +213,16 @@ const markdownComponents: Components = {
   ...CHAT_MARKDOWN_COMPONENTS,
   inlineCode: InlineSourceReference,
   a: ChatMarkdownLink,
+  // Local filesystem images have already become `chat-local-image` nodes.
+  // Leave every other image as a confirmed link so message text cannot
+  // trigger a request to an arbitrary remote host just by being displayed.
+  img: ImageReference,
   [CHAT_LINK_FAVICON_TAG]: MarkdownLinkFavicon,
   [CHAT_LOCAL_IMAGE_TAG]: MarkdownLocalImage,
   [CHAT_FILE_LINK_TAG]: FileLinkElement,
 };
 
-function PassiveImage(props: ComponentProps<"img"> | (Record<string, unknown> & ExtraProps)) {
+function ImageReference(props: ComponentProps<"img"> | (Record<string, unknown> & ExtraProps)) {
   const { src, alt } = props;
   const href = typeof src === "string" ? src : undefined;
   const label = typeof alt === "string" && alt ? alt : href || "Image reference";
@@ -230,7 +234,7 @@ function PassiveImage(props: ComponentProps<"img"> | (Record<string, unknown> & 
 const passiveMarkdownComponents: Components = {
   ...CHAT_MARKDOWN_COMPONENTS,
   a: ChatMarkdownLink,
-  img: PassiveImage,
+  img: ImageReference,
 };
 const passiveRehypePlugins = [rehypeSelectionSafeText];
 

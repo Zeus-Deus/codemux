@@ -75,7 +75,7 @@ describe("ChatMarkdown selection compatibility", () => {
 });
 
 describe("ChatMarkdown rich external links", () => {
-  it("adds the destination favicon to any labelled http(s) link", () => {
+  it("adds the destination favicon to a trusted labelled http(s) link", () => {
     const { container } = render(
       <ChatMarkdown>
         {"Committed and shipped: [PR #235](https://github.com/example/repo/pull/235)."}
@@ -259,7 +259,7 @@ describe("ChatMarkdown rich external links", () => {
 
   it("falls back to a globe when a site's favicon fails", () => {
     const { container } = render(
-      <ChatMarkdown>{"[Reference](https://missing-favicon.invalid/page)"}</ChatMarkdown>,
+      <ChatMarkdown>{"[Reference](https://gitlab.com/page)"}</ChatMarkdown>,
     );
     const wrapper = container.querySelector(".chat-markdown-link-favicon");
     const image = wrapper?.querySelector("img");
@@ -274,7 +274,7 @@ describe("ChatMarkdown rich external links", () => {
   it("holds only the label's first character in the nowrap span for styled labels", () => {
     const { container } = render(
       <ChatMarkdown>
-        {"[**A very long bolded release title**](https://example.com/releases/1)"}
+        {"[**A very long bolded release title**](https://github.com/releases/1)"}
       </ChatMarkdown>,
     );
 
@@ -289,7 +289,7 @@ describe("ChatMarkdown rich external links", () => {
     expect(leading?.textContent).toBe("A");
     expect(leading?.querySelector("img")).toHaveAttribute(
       "src",
-      "https://www.google.com/s2/favicons?domain=example.com&sz=32",
+      "https://www.google.com/s2/favicons?domain=github.com&sz=32",
     );
     expect(link).toHaveTextContent("A very long bolded release title");
   });
@@ -318,11 +318,13 @@ describe("ChatMarkdown rich external links", () => {
     expect(link?.querySelector(".chat-markdown-link-favicon")).not.toBeNull();
   });
 
-  it("requests no favicon for a non-public destination", () => {
-    const { container } = render(
-      <ChatMarkdown>{"[dashboard](http://192.168.1.10:8080/status)"}</ChatMarkdown>,
-    );
-
+  it.each([
+    "http://192.168.1.10:8080/status",
+    "https://git.corp.example.com/project",
+    "https://private.github.com/project",
+    "https://ordinary-public-site.com/page",
+  ])("requests no favicon for an unlisted destination (%s)", (url) => {
+    const { container } = render(<ChatMarkdown>{`[dashboard](${url})`}</ChatMarkdown>);
     const wrapper = container.querySelector(".chat-markdown-link-favicon");
     expect(wrapper?.querySelector("img")).toBeNull();
     expect(wrapper?.querySelector("svg")).toBeInTheDocument();

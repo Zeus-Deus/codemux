@@ -133,6 +133,7 @@ function HtmlRenderDocument({
       title={title}
       // Never allow-same-origin: the opaque origin keeps the page out of the app.
       sandbox="allow-scripts"
+      referrerPolicy="no-referrer"
       className="block w-full border-0"
       // A frame whose color scheme differs from its document's paints an
       // opaque canvas, so the blank document a frame starts with would flash
