@@ -42,6 +42,15 @@ const PTY_ATTACH_COMMAND = "attach_pty_output";
  *  delivered on this event supersedes the HTTP seed (the no-stale guard). */
 const APP_STATE_EVENT = "app-state-changed";
 
+function parseOpenerUrl(value: unknown): URL | undefined {
+  if (typeof value !== "string" || !/^(?:https?:\/\/|mailto:|tel:)/i.test(value)) return;
+  try {
+    return new URL(value);
+  } catch {
+    return undefined;
+  }
+}
+
 export interface InstallShimOptions {
   viewHost?: string;
   /** Server origin the transport talks to (also the asset origin). */
@@ -271,12 +280,12 @@ export function installShim(options: InstallShimOptions): ShimHandle {
       return undefined;
     }
 
-    // Opener — open in a new tab (real behavior, unlike the mock's toast).
-    if (cmd === "plugin:opener|open_url" || cmd === "plugin:opener|open_path") {
-      const url = args.url ?? args.path;
-      if (typeof url === "string") {
-        window.open(url, "_blank", "noopener,noreferrer");
-      }
+    // Match the desktop opener's default URL scope. The filesystem opener
+    // has no browser equivalent, and a file path must not become a URL.
+    if (cmd === "plugin:opener|open_url") {
+      const url = parseOpenerUrl(args.url);
+      if (!url) throw new Error("This URL cannot be opened in the remote client");
+      window.open(url.href, "_blank", "noopener,noreferrer");
       return undefined;
     }
     if (cmd.startsWith("plugin:opener|")) return undefined;

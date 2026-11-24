@@ -278,6 +278,58 @@ describe("MarkdownRendered", () => {
     expect(imgs[1].getAttribute("src")).toBe("data:image/png;base64,AAAA");
   });
 
+  it("only fetches external web images in forge markdown", () => {
+    const { container, getByText } = render(
+      <MarkdownRendered
+        untrusted
+        filePath="/repo/README.md"
+        content={[
+          "![Screenshot](https://example.com/screenshot.png)",
+          "![Local picture](/pictures/sample.png)",
+          "![Relative picture](./sample.png)",
+          "![In-app picture](/api/sample.png)",
+          "![Same-origin picture](" + window.location.origin + "/sample.png)",
+          '<img src="http://asset.localhost/pictures/sample.png" alt="Asset picture">',
+          '<img src="https://example.com/another.png" srcset="/pictures/sample.png 2x">',
+        ].join("\n\n")}
+      />,
+    );
+    const imgs = container.querySelectorAll("img");
+    expect(Array.from(imgs, (img) => img.getAttribute("src"))).toEqual([
+      "https://example.com/screenshot.png",
+      "https://example.com/another.png",
+    ]);
+    expect(imgs[0]).toHaveAttribute("referrerpolicy", "no-referrer");
+    expect(imgs[1]).not.toHaveAttribute("srcset");
+    expect(getByText("Local picture")).toBeInTheDocument();
+    fireEvent.click(imgs[0]);
+    expect(document.querySelector("[data-testid='image-lightbox-image']")).toHaveAttribute(
+      "referrerpolicy",
+      "no-referrer",
+    );
+  });
+
+  it("gives forge markdown links only web or in-document destinations", () => {
+    const { getByText } = render(
+      <MarkdownRendered
+        untrusted
+        content={[
+          "[Docs](https://example.com/docs)",
+          "[Section](#section)",
+          "[Relative](./other.md)",
+          "[App](/settings)",
+          "[Asset](http://asset.localhost/pictures/sample.png)",
+        ].join("\n\n")}
+      />,
+    );
+    expect(getByText("Docs")).toHaveAttribute("href", "https://example.com/docs");
+    expect(getByText("Docs")).toHaveAttribute("rel", "noopener noreferrer");
+    expect(getByText("Section")).toHaveAttribute("href", "#section");
+    for (const label of ["Relative", "App", "Asset"]) {
+      expect(getByText(label)).not.toHaveAttribute("href");
+    }
+  });
+
   it.each([
     ["a raw named anchor", `[Setup](#setup)\n\n<a name="setup"></a>\n\ntext`, "a[href='#setup']"],
     ["a raw id", `[Setup](#setup)\n\n<h2 id="setup">Setup</h2>`, "a[href='#setup']"],

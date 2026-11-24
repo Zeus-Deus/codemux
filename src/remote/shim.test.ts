@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { Channel } from "@tauri-apps/api/core";
 import { releaseRemoteChannel } from "./channel";
 import { installShim, type ShimHandle } from "./shim";
@@ -51,6 +51,7 @@ afterEach(() => {
   for (const h of handles) h.transport.close();
   handles.length = 0;
   FakeWebSocket.reset();
+  vi.restoreAllMocks();
 });
 
 describe("shim install", () => {
@@ -99,6 +100,22 @@ describe("invoke routing", () => {
     await expect(internals().invoke("plugin:window|is_maximized")).resolves.toBe(false);
     await expect(internals().invoke("plugin:window|scale_factor")).resolves.toBe(1);
     // None of these produced an invoke frame.
+    expect(ws.parsedSent().some((m) => m.t === "invoke")).toBe(false);
+  });
+
+  it("opens only the desktop URL schemes and never opens file paths", async () => {
+    const { ws } = await setup();
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    for (const url of ["https://example.com/docs", "http://localhost:1420/docs", "mailto:help@example.com", "tel:+12345"]) {
+      await internals().invoke("plugin:opener|open_url", { url });
+      expect(open).toHaveBeenLastCalledWith(url, "_blank", "noopener,noreferrer");
+    }
+    open.mockClear();
+    for (const url of ["file:///sample.txt", "data:text/plain,hello", "//example.com/docs", "https://%/"]) {
+      await expect(internals().invoke("plugin:opener|open_url", { url })).rejects.toThrow(/cannot be opened/);
+    }
+    await internals().invoke("plugin:opener|open_path", { path: "https://example.com/docs" });
+    expect(open).not.toHaveBeenCalled();
     expect(ws.parsedSent().some((m) => m.t === "invoke")).toBe(false);
   });
 });
