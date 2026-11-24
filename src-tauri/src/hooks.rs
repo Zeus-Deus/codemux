@@ -2178,11 +2178,20 @@ printf '%s %s %s %s\n' "$LABEL" "$URL" "$SESSION" "$EVENT" >> "$HOOK_TEST_LOG"
         std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o755)).unwrap();
         let log_path = dir.path().join("curl.log");
 
+        let grant = crate::agent_provider::codex::chatgpt::ManagedGrant {
+            access_token: "fixture".into(),
+            revision: "fixture".into(),
+            home: dir.path().join("codex-home"),
+            cache_key: "fixture".into(),
+        };
+        let (_, managed_env) = grant.launch(HashMap::from([
+            ("CODEMUX_HOOK_PORT".into(), "43199".into()),
+            ("CODEMUX_HOOK_TOKEN".into(), "11111111111111111111111111111111".into()),
+            ("CODEMUX_SESSION_ID".into(), "session-resumed".into()),
+        ]));
         let status = std::process::Command::new(&script_path)
             .arg("UserPromptSubmit")
-            .env("CODEMUX_HOOK_PORT", "43199")
-            .env("CODEMUX_HOOK_TOKEN", "11111111111111111111111111111111")
-            .env("CODEMUX_SESSION_ID", "session-resumed")
+            .envs(managed_env)
             .env("HOOK_TEST_LOG", &log_path)
             .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
             .stdin(std::process::Stdio::null())
