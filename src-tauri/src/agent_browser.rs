@@ -869,19 +869,43 @@ fn owned_browser_pid(session: &str, pid: u32) -> Option<BrowserPidRecord> {
     (record.pid == pid && browser_process_matches(&record, session)).then_some(record)
 }
 
-fn browser_control_endpoint_ready(session: &str, dir: &std::path::Path) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserControlEndpointProbe {
+    Reachable,
+    Absent,
+    Inconclusive,
+}
+
+/// A full backlog, timeout, or inspection error cannot prove the endpoint is
+/// gone. Callers may retire ownership files only after an `Absent` result.
+fn probe_browser_control_endpoint(session: &str, dir: &std::path::Path) -> BrowserControlEndpointProbe {
     #[cfg(unix)]
     {
-        std::os::unix::net::UnixStream::connect(dir.join(format!("{session}.sock"))).is_ok()
+        let path = dir.join(format!("{session}.sock"));
+        match connect_unix_browser_control_until(&path, Instant::now() + Duration::from_millis(50)) {
+            Ok(_) => BrowserControlEndpointProbe::Reachable,
+            Err(error) if matches!(error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => BrowserControlEndpointProbe::Absent,
+            Err(_) => BrowserControlEndpointProbe::Inconclusive,
+        }
     }
     #[cfg(windows)]
     {
         let port = browser_control_port(session, dir);
-        std::net::TcpStream::connect_timeout(
+        match std::net::TcpStream::connect_timeout(
             &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             Duration::from_millis(50),
-        ).is_ok()
+        ) {
+            Ok(_) => BrowserControlEndpointProbe::Reachable,
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => BrowserControlEndpointProbe::Absent,
+            Err(_) => BrowserControlEndpointProbe::Inconclusive,
+        }
     }
+}
+
+/// Existing cleanup callers need a conservative yes/no answer.
+fn browser_control_endpoint_ready(session: &str, dir: &std::path::Path) -> bool {
+    probe_browser_control_endpoint(session, dir) != BrowserControlEndpointProbe::Absent
 }
 
 #[cfg(windows)]
@@ -1004,7 +1028,7 @@ fn stop_owned_browser_daemon(session: &str, record: &BrowserPidRecord, bin: &str
 
 /// A full Unix listen backlog can block a normal connect indefinitely.
 /// Resolve the control socket under the same deadline as the close request.
-#[cfg(all(unix, any(test, target_os = "macos")))]
+#[cfg(unix)]
 fn connect_unix_browser_control_until(
     socket_path: &std::path::Path,
     deadline: Instant,
@@ -4130,21 +4154,29 @@ impl AgentBrowserManager {
     /// Reconcile a provisional `running` flag with the verified daemon after
     /// a first or failed command. The lifecycle gate remains held by callers.
     async fn refresh_running_session(&self, browser_id: &str, session: &str, outcome: BrowserActionOutcome) -> Result<bool, String> {
+        let previous = self.sessions.lock().await.get(browser_id)
+            .map(|entry| (entry.pid, entry.pid_start_time));
         let lookup_session = session.to_owned();
-        let record = tokio::task::spawn_blocking(move || live_owned_browser_record(&lookup_session))
+        // Socket connect and process inspection may wait on the OS. Keep
+        // both off the async executor and outside the shared session map.
+        let (record, confirmed_gone, endpoint_live) = tokio::task::spawn_blocking(move || {
+            let record = live_owned_browser_record(&lookup_session);
+            let confirmed_gone = previous.is_some_and(|(pid, start)| {
+                pid.is_some_and(process_exit_confirmed)
+                    || pid.zip(start).is_some_and(|(old_pid, old_start)| {
+                        process_start_time(old_pid).is_some_and(|live_start| live_start != old_start)
+                    })
+            });
+            let endpoint_live = record.is_none() && run_dir_for_session(&lookup_session)
+                .map_or(true, |dir| browser_control_endpoint_ready(&lookup_session, &dir));
+            (record, confirmed_gone, endpoint_live)
+        })
             .await
-            .ok()
-            .flatten();
+            .map_err(|error| format!("Could not inspect browser session {session}: {error}"))?;
         let pid = record.as_ref().map(|record| record.pid);
         let mut ready = false;
         if let Some(entry) = self.sessions.lock().await.get_mut(browser_id) {
             if record.is_none() {
-                let confirmed_gone = entry.pid.is_some_and(process_exit_confirmed)
-                    || entry.pid.zip(entry.pid_start_time).is_some_and(|(old_pid, old_start)| {
-                        process_start_time(old_pid).is_some_and(|live_start| live_start != old_start)
-                    });
-                let endpoint_live = run_dir_for_session(session)
-                    .is_some_and(|dir| browser_control_endpoint_ready(session, &dir));
                 if (!confirmed_gone || endpoint_live) && (entry.running || entry.browser_ready || entry.confirmation_pending
                     || outcome == BrowserActionOutcome::ConfirmationPending) {
                     entry.confirmation_pending |= outcome == BrowserActionOutcome::ConfirmationPending;
@@ -4790,32 +4822,47 @@ impl AgentBrowserManager {
         ownership: Option<bool>,
     ) -> Result<BrowserPidRecord, String> {
         let expected_start = self.sessions.lock().await.get(browser_id).and_then(|entry| entry.pid_start_time);
-        let reused = expected_start.is_some_and(|start| {
-            process_start_time(expected_pid).is_some_and(|current| current != start)
-        });
-        if reused {
-            let dir = run_dir_for_session(session)
-                .ok_or_else(|| format!("Cannot inspect browser session {session}"))?;
-            if browser_control_endpoint_ready(session, &dir) {
-                return Err(format!("Could not verify replaced browser session {session} control endpoint"));
-            }
-            if read_daemon_pid_file(&dir.join(format!("{session}.pid"))) == Some(expected_pid) {
-                let old = read_browser_pid_record(&dir.join(format!("agent-browser-{session}.pid")))
-                    .filter(|old| old.pid == expected_pid && Some(old.start_time) == expected_start)
-                    .ok_or_else(|| format!("Could not retire replaced browser session {session}"))?;
-                if !cleanup_reused_browser_lock_files_in(&dir, session, &old) {
-                    return Err(format!("Could not retire replaced browser session {session}"));
+        let lookup_session = session.to_owned();
+        let record_missing = record.is_none();
+        // Process inspection and Unix socket connection can block. Do not
+        // hold up the async executor while checking whether a session exited.
+        let departed = tokio::task::spawn_blocking(move || -> Result<Option<&'static str>, String> {
+            let reused = expected_start.is_some_and(|start| {
+                process_start_time(expected_pid).is_some_and(|current| current != start)
+            });
+            if reused {
+                let dir = run_dir_for_session(&lookup_session)
+                    .ok_or_else(|| format!("Cannot inspect browser session {lookup_session}"))?;
+                if probe_browser_control_endpoint(&lookup_session, &dir) != BrowserControlEndpointProbe::Absent {
+                    return Err(format!("Could not verify replaced browser session {lookup_session} control endpoint"));
                 }
+                if read_daemon_pid_file(&dir.join(format!("{lookup_session}.pid"))) == Some(expected_pid) {
+                    let old = read_browser_pid_record(&dir.join(format!("agent-browser-{lookup_session}.pid")))
+                        .filter(|old| old.pid == expected_pid && Some(old.start_time) == expected_start)
+                        .ok_or_else(|| format!("Could not retire replaced browser session {lookup_session}"))?;
+                    if !cleanup_reused_browser_lock_files_in(&dir, &lookup_session, &old) {
+                        return Err(format!("Could not retire replaced browser session {lookup_session}"));
+                    }
+                }
+                return Ok(Some("daemon was replaced"));
             }
-            self.clear_stale_running_stream_allocation(browser_id, port).await;
-            return Err(format!("Browser session {session} daemon was replaced"));
-        }
-        if record.is_none() && process_exit_confirmed(expected_pid) {
-            if run_dir_for_session(session).is_some_and(|dir| browser_control_endpoint_ready(session, &dir)) {
-                return Err(format!("Could not verify browser session {session} control endpoint"));
+            if record_missing && process_exit_confirmed(expected_pid) {
+                let probe = run_dir_for_session(&lookup_session)
+                    .map_or(BrowserControlEndpointProbe::Inconclusive, |dir| {
+                        probe_browser_control_endpoint(&lookup_session, &dir)
+                    });
+                if probe != BrowserControlEndpointProbe::Absent {
+                    return Err(format!("Could not verify browser session {lookup_session} control endpoint"));
+                }
+                return Ok(Some("daemon exited"));
             }
+            Ok(None)
+        })
+        .await
+        .map_err(|error| format!("Could not inspect browser session {session}: {error}"))??;
+        if let Some(reason) = departed {
             self.clear_stale_running_stream_allocation(browser_id, port).await;
-            return Err(format!("Browser session {session} daemon exited"));
+            return Err(format!("Browser session {session} {reason}"));
         }
         if record.as_ref().is_some_and(|record| record.pid != expected_pid) {
             return Err(format!("Could not verify browser session {session} daemon identity"));
@@ -5125,6 +5172,104 @@ pub(crate) fn orphaned_ws_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn saturated_control_socket(path: &std::path::Path) -> (socket2::Socket, Vec<socket2::Socket>) {
+        let address = socket2::SockAddr::unix(path).unwrap();
+        let listener = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        listener.bind(&address).unwrap();
+        listener.listen(1).unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..32 {
+            let client = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+            client.set_nonblocking(true).unwrap();
+            match client.connect(&address) {
+                Ok(()) => clients.push(client),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    clients.push(client);
+                    return (listener, clients);
+                }
+                Err(error) => panic!("Could not fill browser control backlog: {error}"),
+            }
+        }
+        panic!("Browser control backlog did not fill");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_endpoint_probe_distinguishes_absence_from_inspection_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "browser-control-probe";
+        assert_eq!(probe_browser_control_endpoint(session, dir.path()), BrowserControlEndpointProbe::Absent);
+        assert!(!browser_control_endpoint_ready(session, dir.path()));
+
+        let socket_path = dir.path().join(format!("{session}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        assert_eq!(probe_browser_control_endpoint(session, dir.path()), BrowserControlEndpointProbe::Reachable);
+        drop(listener);
+        std::fs::remove_file(socket_path).unwrap();
+
+        let overlong_dir = dir.path().join("x".repeat(120));
+        assert_eq!(probe_browser_control_endpoint(session, &overlong_dir), BrowserControlEndpointProbe::Inconclusive);
+        assert!(browser_control_endpoint_ready(session, &overlong_dir));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_endpoint_probe_distinguishes_reachable_from_absent_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "browser-control-probe";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(dir.path().join(format!("{session}.port")), port.to_string()).unwrap();
+        assert_eq!(probe_browser_control_endpoint(session, dir.path()), BrowserControlEndpointProbe::Reachable);
+        drop(listener);
+        assert_eq!(probe_browser_control_endpoint(session, dir.path()), BrowserControlEndpointProbe::Absent);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_control_socket_backlog_is_bounded_and_inconclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "browser-control-backlog";
+        let socket_path = dir.path().join(format!("{session}.sock"));
+        let (_listener, _clients) = saturated_control_socket(&socket_path);
+        let start = Instant::now();
+        assert_eq!(probe_browser_control_endpoint(session, dir.path()), BrowserControlEndpointProbe::Inconclusive);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(browser_control_endpoint_ready(session, dir.path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_control_probe_keeps_session_map_and_executor_available() {
+        let manager = std::sync::Arc::new(AgentBrowserManager::new());
+        let session = format!("browser-probe-lock-{}", uuid::Uuid::new_v4().simple());
+        let dir = run_dir_for_session(&session).unwrap();
+        let socket_path = dir.join(format!("{session}.sock"));
+        let (_listener, _clients) = saturated_control_socket(&socket_path);
+        manager.allocate_port(&session).await.unwrap();
+        manager.sessions.lock().await.get_mut(&session).unwrap().running = true;
+
+        let start = Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let manager = manager.clone();
+            let session = session.clone();
+            tasks.push(tokio::spawn(async move {
+                manager.refresh_running_session(&session, &session, BrowserActionOutcome::Failed).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(start.elapsed() < Duration::from_millis(250), "Control probes blocked the async executor");
+        let guard = tokio::time::timeout(Duration::from_millis(250), manager.sessions.lock()).await.unwrap();
+        assert!(guard.get(&session).unwrap().running);
+        drop(guard);
+        for task in tasks {
+            assert!(task.await.unwrap().is_err());
+        }
+        std::fs::remove_file(socket_path).unwrap();
+    }
 
     fn test_browser_record(pid: u32, start_time: u64, token: String) -> BrowserPidRecord {
         let (owner_pid, owner_start_time) = current_app_process_identity().unwrap();
