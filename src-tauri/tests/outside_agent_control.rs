@@ -142,7 +142,12 @@ fn boot() -> World {
         .canonicalize()
         .unwrap();
     // The socket path must fit `sun_path`, so it gets a short dir of its own.
-    let runtime = tempfile::Builder::new().prefix("oac-").tempdir().unwrap().keep();
+    let runtime = tempfile::Builder::new()
+        .prefix("oac-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+        .keep();
     assert_eq!(std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777, 0o700);
     let bin = root.join("bin");
     let home = root.join("home");
