@@ -17,7 +17,7 @@
 //! every state-touching request so a page on another site cannot ride a
 //! browser's stored cookie.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -217,8 +217,10 @@ pub struct RateLimiter {
 
 #[derive(Default)]
 struct RateLimitState {
-    hits: HashMap<IpAddr, Vec<Instant>>,
-    last_prune: Option<Instant>,
+    hits: HashMap<IpAddr, usize>,
+    // A record per accepted attempt, capped at MAX_PEERS times MAX hits.
+    // Recording under one lock keeps expiry in the same order as insertion.
+    attempts: VecDeque<(Instant, IpAddr)>,
 }
 
 impl RateLimiter {
@@ -227,22 +229,33 @@ impl RateLimiter {
     /// is *not* recorded, so a blocked client that backs off recovers.
     pub fn check_and_record(&self, ip: IpAddr) -> bool {
         let mut state = self.inner.lock().unwrap();
-        let now = Instant::now();
-        if state.last_prune.is_none_or(|last| now.duration_since(last) >= RATE_LIMIT_WINDOW) {
-            state.hits.retain(|_, hits| {
-                hits.last().is_some_and(|last| now.duration_since(*last) < RATE_LIMIT_WINDOW)
-            });
-            state.last_prune = Some(now);
+        state.check_and_record_at(ip, Instant::now())
+    }
+}
+
+impl RateLimitState {
+    fn check_and_record_at(&mut self, ip: IpAddr, now: Instant) -> bool {
+        while let Some(&(recorded, peer)) = self.attempts.front() {
+            if now.duration_since(recorded) < RATE_LIMIT_WINDOW {
+                break;
+            }
+            self.attempts.pop_front();
+            let count = self.hits.get_mut(&peer).expect("queued attempt has a bucket");
+            *count -= 1;
+            if *count == 0 {
+                self.hits.remove(&peer);
+            }
         }
-        if state.hits.len() >= RATE_LIMIT_MAX_PEERS && !state.hits.contains_key(&ip) {
+
+        if self.hits.len() >= RATE_LIMIT_MAX_PEERS && !self.hits.contains_key(&ip) {
             return false;
         }
-        let hits = state.hits.entry(ip).or_default();
-        hits.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
-        if hits.len() >= RATE_LIMIT_MAX {
+        let count = self.hits.entry(ip).or_default();
+        if *count >= RATE_LIMIT_MAX {
             return false;
         }
-        hits.push(now);
+        *count += 1;
+        self.attempts.push_back((now, ip));
         true
     }
 }
@@ -421,22 +434,29 @@ mod tests {
     }
 
     #[test]
-    fn rate_limiter_recycles_expired_peers_and_bounds_storage() {
-        let rl = RateLimiter::default();
-        for i in 0..RATE_LIMIT_MAX_PEERS {
-            assert!(rl.check_and_record(IpAddr::V6(std::net::Ipv6Addr::from(i as u128))));
-        }
+    fn rate_limiter_reclaims_expired_capacity_without_evicting_active_peers() {
+        let mut state = RateLimitState::default();
+        let start = Instant::now();
+        let oldest = "203.0.113.7".parse().unwrap();
         let next = "203.0.113.9".parse().unwrap();
-        assert!(!rl.check_and_record(next));
-        {
-            let mut state = rl.inner.lock().unwrap();
-            assert_eq!(state.hits.len(), RATE_LIMIT_MAX_PEERS);
-            let expired = Instant::now() - RATE_LIMIT_WINDOW;
-            state.hits.values_mut().for_each(|hits| *hits = vec![expired]);
-            state.last_prune = Some(expired);
+        let later = start + Duration::from_secs(30);
+        assert!(state.check_and_record_at(oldest, start));
+        for i in 0..RATE_LIMIT_MAX_PEERS - 1 {
+            let peer = IpAddr::V6(std::net::Ipv6Addr::from(i as u128));
+            for _ in 0..RATE_LIMIT_MAX {
+                assert!(state.check_and_record_at(peer, later));
+            }
         }
-        assert!(rl.check_and_record(next));
-        assert_eq!(rl.inner.lock().unwrap().hits.len(), 1);
+        assert_eq!(state.hits.len(), RATE_LIMIT_MAX_PEERS);
+        assert!(!state.check_and_record_at(next, later));
+        assert_eq!(state.attempts.len(), 1 + (RATE_LIMIT_MAX_PEERS - 1) * RATE_LIMIT_MAX);
+
+        let expiry = start + RATE_LIMIT_WINDOW;
+        assert!(state.check_and_record_at(next, expiry));
+        assert_eq!(state.hits.len(), RATE_LIMIT_MAX_PEERS);
+        assert!(!state.hits.contains_key(&oldest));
+        assert!(!state.check_and_record_at(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), expiry));
+        assert_eq!(state.attempts.len(), 1 + (RATE_LIMIT_MAX_PEERS - 1) * RATE_LIMIT_MAX);
     }
 
     #[test]

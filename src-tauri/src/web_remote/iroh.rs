@@ -368,9 +368,10 @@ struct AccountHello {
 pub enum AccountHandshakeReject {
     /// The first frame was not a well-formed `hello-account` control frame.
     Malformed,
-    /// The control plane did not vouch for the grant (bad signature, expired,
-    /// or the verify call itself failed) — `valid:false` or a network error.
+    /// The verifier explicitly rejected the grant with `valid:false`.
     Unverified,
+    /// The verifier could not answer. Close the stream to let the client retry.
+    VerifierUnavailable,
     /// The grant is for a different device's `node_id` than this desktop's.
     WrongNode,
     /// The grant's account `uid` is not the desktop's signed-in user (or the
@@ -390,10 +391,11 @@ pub enum AccountHandshakeReject {
 }
 
 impl AccountHandshakeReject {
-    fn code(&self) -> &'static str {
-        match self {
+    fn code(&self) -> Option<&'static str> {
+        Some(match self {
             AccountHandshakeReject::Malformed => "malformed_handshake",
             AccountHandshakeReject::Unverified => "grant_invalid",
+            AccountHandshakeReject::VerifierUnavailable => return None,
             AccountHandshakeReject::WrongNode => "wrong_device",
             AccountHandshakeReject::WrongAccount => "account_mismatch",
             AccountHandshakeReject::NonceMismatch => "nonce_mismatch",
@@ -401,16 +403,16 @@ impl AccountHandshakeReject {
             AccountHandshakeReject::Revoked => "session_revoked",
             AccountHandshakeReject::Pending { .. } => "pending_approval",
             AccountHandshakeReject::Internal(_) => "internal_error",
-        }
+        })
     }
 }
 
-fn account_reject_frame_bytes(reject: &AccountHandshakeReject) -> Vec<u8> {
-    let mut reply = json!({ "t": "unauthorized", "reason": reject.code() });
+fn account_reject_frame_bytes(reject: &AccountHandshakeReject) -> Option<Vec<u8>> {
+    let mut reply = json!({ "t": "unauthorized", "reason": reject.code()? });
     if let AccountHandshakeReject::Pending { browser_label } = reject {
         reply["browser_label"] = json!(browser_label);
     }
-    reply.to_string().into_bytes()
+    Some(reply.to_string().into_bytes())
 }
 
 /// Whether a first frame is a `hello-account` frame (the account/relay path).
@@ -484,25 +486,27 @@ struct GrantIdentity {
 /// Call the control plane's grant-verify endpoint. This is a machine-to-machine
 /// check — the grant is the sole credential, so no user bearer is sent. Reuses
 /// the same `CODEMUX_API_URL` base every other API call reads.
-async fn verify_grant(base: &str, grant: &str) -> Result<GrantVerifyResponse, String> {
+async fn verify_grant(
+    base: &str,
+    grant: &str,
+    deadline: Duration,
+) -> Option<GrantVerifyResponse> {
     let url = format!("{base}/api/devices/grant/verify");
     let client = reqwest::Client::builder()
-        .timeout(HANDSHAKE_TIMEOUT)
+        .timeout(deadline)
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|e| format!("grant verify client failed: {e}"))?;
-    let resp = client
+        .ok()?;
+    let response = client
         .post(&url)
         .json(&json!({ "grant": grant }))
         .send()
         .await
-        .map_err(|e| format!("grant verify request failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("grant verify returned {}", resp.status()));
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
     }
-    resp.json::<GrantVerifyResponse>()
-        .await
-        .map_err(|e| format!("grant verify parse failed: {e}"))
+    response.json::<GrantVerifyResponse>().await.ok()
 }
 
 /// Pure accept/reject matrix for a verified grant, given this desktop's own
@@ -550,14 +554,15 @@ fn evaluate_grant(
 /// and a pending session refuses the stream (the desktop approves it in the
 /// device list, then the browser reconnects).
 ///
-/// Takes `db` + `own_node_id` explicitly (rather than reaching through an
-/// `AppHandle`) so the full network + mint path is unit-testable with a mocked
-/// verify endpoint and an in-memory DB.
+/// Takes the database and verifier settings explicitly, so the full network
+/// and mint path can be tested against a local verifier and an in-memory DB.
 async fn authorize_account_handshake(
     db: &DatabaseStore,
     shared: &Arc<Shared>,
     own_node_id: &str,
     hello: &AccountHello,
+    api_base: &str,
+    verify_deadline: Duration,
 ) -> Result<String, AccountHandshakeReject> {
     if hello.browser_key.len() != auth::TOKEN_BYTES * 2
         || !hello.browser_key.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
@@ -565,10 +570,9 @@ async fn authorize_account_handshake(
         return Err(AccountHandshakeReject::BrowserKeyRequired);
     }
 
-    let base = crate::auth::api_base_url();
-    let resp = verify_grant(&base, &hello.grant)
+    let resp = verify_grant(api_base, &hello.grant, verify_deadline)
         .await
-        .map_err(|_| AccountHandshakeReject::Unverified)?;
+        .ok_or(AccountHandshakeReject::VerifierUnavailable)?;
 
     // Read account and approval state after the network await.
     let own_user_id = crate::auth::load_cached_user(db).map(|u| u.id);
@@ -867,6 +871,14 @@ async fn reject_handshake(send: &mut SendStream, payload: &[u8]) {
     .await;
 }
 
+async fn reject_account_handshake(send: &mut SendStream, reject: &AccountHandshakeReject) {
+    // A verifier outage ends the connection without a denial frame. Browsers
+    // can use their usual transport retry and mint a fresh grant and nonce.
+    if let Some(payload) = account_reject_frame_bytes(reject) {
+        reject_handshake(send, &payload).await;
+    }
+}
+
 /// Bridge one iroh bi-stream into the shared web-remote connection handling:
 /// handshake → register → writer + ordered lane → reader loop → teardown. This
 /// is the iroh sibling of [`super::server`]'s `handle_socket`; the frame
@@ -884,8 +896,8 @@ async fn handle_bi_stream<R: Runtime>(
 
     // 1. Handshake: the first frame either presents an existing session token
     //    (LAN/Tailscale path) or an account connection grant (from-anywhere
-    //    path). The `t` field routes it; each path resolves to a `session_id`
-    //    the stream then binds to, or writes an `unauthorized` frame and closes.
+    //    path). The `t` field routes it; an admitted stream binds to its
+    //    session ID. Definitive denials send an `unauthorized` frame.
     let handshake = match timeout(HANDSHAKE_TIMEOUT, read_frame(&mut recv, &mut decoder, &mut readbuf)).await {
         Ok(Ok(Some(f))) => f,
         _ => return, // stream ended / codec error before a handshake arrived
@@ -899,16 +911,19 @@ async fn handle_bi_stream<R: Runtime>(
             Some(h) => h,
             None => {
                 let reject = AccountHandshakeReject::Malformed;
-                reject_handshake(&mut send, &account_reject_frame_bytes(&reject)).await;
+                reject_account_handshake(&mut send, &reject).await;
                 return;
             }
         };
         let admit = {
             let db = app.state::<DatabaseStore>();
+            let api_base = crate::auth::api_base_url();
             tokio::select! {
                 biased;
                 _ = life.stopped() => return,
-                result = authorize_account_handshake(&db, &shared, &own_node_id, &hello) => result,
+                result = authorize_account_handshake(
+                    &db, &shared, &own_node_id, &hello, &api_base, HANDSHAKE_TIMEOUT,
+                ) => result,
             }
         };
         match admit {
@@ -917,7 +932,7 @@ async fn handle_bi_stream<R: Runtime>(
                 if matches!(reject, AccountHandshakeReject::Pending { .. }) {
                     super::emit_state_changed(&app);
                 }
-                reject_handshake(&mut send, &account_reject_frame_bytes(&reject)).await;
+                reject_account_handshake(&mut send, &reject).await;
                 return;
             }
         }
@@ -1419,28 +1434,28 @@ mod tests {
 
     #[test]
     fn account_reject_codes_are_stable() {
-        assert_eq!(AccountHandshakeReject::Malformed.code(), "malformed_handshake");
-        assert_eq!(AccountHandshakeReject::Unverified.code(), "grant_invalid");
-        assert_eq!(AccountHandshakeReject::WrongNode.code(), "wrong_device");
-        assert_eq!(AccountHandshakeReject::WrongAccount.code(), "account_mismatch");
-        assert_eq!(AccountHandshakeReject::NonceMismatch.code(), "nonce_mismatch");
+        assert_eq!(AccountHandshakeReject::Malformed.code(), Some("malformed_handshake"));
+        assert_eq!(AccountHandshakeReject::Unverified.code(), Some("grant_invalid"));
+        assert_eq!(AccountHandshakeReject::WrongNode.code(), Some("wrong_device"));
+        assert_eq!(AccountHandshakeReject::WrongAccount.code(), Some("account_mismatch"));
+        assert_eq!(AccountHandshakeReject::NonceMismatch.code(), Some("nonce_mismatch"));
         let pending = AccountHandshakeReject::Pending {
             browser_label: "Relay browser 1234ABCD".into(),
         };
-        assert_eq!(pending.code(), "pending_approval");
-        let reply: Value = serde_json::from_slice(&account_reject_frame_bytes(&pending)).unwrap();
+        assert_eq!(pending.code(), Some("pending_approval"));
+        let payload = account_reject_frame_bytes(&pending).unwrap();
+        let reply: Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(reply["browser_label"], "Relay browser 1234ABCD");
         assert_eq!(
             AccountHandshakeReject::Internal("x".into()).code(),
-            "internal_error"
+            Some("internal_error")
         );
     }
 
     // ── Full account admission: grant verify (mocked) → session mint ──
     //
-    // These mock `POST /api/devices/grant/verify` via mockito + `CODEMUX_API_URL`
-    // and NEVER hit the real API. `CODEMUX_API_URL` mutation is serialized under
-    // the shared `mockserver` group with the auth/account tests.
+    // Inject a local verifier address directly so these tests do not contact
+    // the real API or change process-wide configuration.
 
     fn seed_owner(db: &DatabaseStore) {
         use crate::auth::{save_auth, AuthUser};
@@ -1490,14 +1505,8 @@ mod tests {
         shared: &Arc<Shared>,
         hello: &AccountHello,
     ) -> Result<String, AccountHandshakeReject> {
-        let prev = std::env::var("CODEMUX_API_URL").ok();
-        std::env::set_var("CODEMUX_API_URL", api_url);
-        let out = authorize_account_handshake(db, shared, OWN_NODE, hello).await;
-        match prev {
-            Some(v) => std::env::set_var("CODEMUX_API_URL", v),
-            None => std::env::remove_var("CODEMUX_API_URL"),
-        }
-        out
+        authorize_account_handshake(db, shared, OWN_NODE, hello, api_url, HANDSHAKE_TIMEOUT)
+            .await
     }
 
     #[tokio::test]
@@ -1592,7 +1601,9 @@ mod tests {
         let mut hello = account_hello("g", "n");
         hello.browser_key.clear();
         assert_eq!(
-            authorize_account_handshake(&db, &shared, OWN_NODE, &hello).await,
+            authorize_account_handshake(
+                &db, &shared, OWN_NODE, &hello, "http://127.0.0.1:0", HANDSHAKE_TIMEOUT,
+            ).await,
             Err(AccountHandshakeReject::BrowserKeyRequired)
         );
         assert!(db.web_remote_list_sessions().is_empty());
@@ -1621,7 +1632,50 @@ mod tests {
             .await
             .expect_err("an invalid grant is rejected");
         assert_eq!(err, AccountHandshakeReject::Unverified);
+        let frame = account_reject_frame_bytes(&err).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&frame).unwrap(),
+            json!({ "t": "unauthorized", "reason": "grant_invalid" })
+        );
         assert!(db.web_remote_list_sessions().is_empty(), "no row on a bad grant");
+    }
+
+    #[tokio::test]
+    async fn account_handshake_closes_without_denial_when_verification_times_out() {
+        let db = init_test_database();
+        seed_owner(&db);
+        let shared = shared_with_trust(true);
+        // Accept TCP connections at the kernel without answering any request.
+        let verifier = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", verifier.local_addr().unwrap());
+        let hello = account_hello("grant", "nonce");
+        let reject = authorize_account_handshake(
+            &db, &shared, OWN_NODE, &hello, &url, Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reject, AccountHandshakeReject::VerifierUnavailable);
+        assert!(account_reject_frame_bytes(&reject).is_none());
+        assert!(db.web_remote_list_sessions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_handshake_closes_without_denial_when_verifier_is_unavailable() {
+        let db = init_test_database();
+        seed_owner(&db);
+        let shared = shared_with_trust(true);
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/devices/grant/verify")
+            .with_status(503)
+            .create_async()
+            .await;
+        let hello = account_hello("grant", "nonce");
+        let reject = run_account_admit(&server.url(), &db, &shared, &hello).await.unwrap_err();
+        mock.assert_async().await;
+        assert_eq!(reject, AccountHandshakeReject::VerifierUnavailable);
+        assert!(account_reject_frame_bytes(&reject).is_none());
+        assert!(db.web_remote_list_sessions().is_empty());
     }
 
     #[tokio::test]
