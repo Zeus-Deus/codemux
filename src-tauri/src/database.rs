@@ -276,6 +276,9 @@ pub(crate) const ACCOUNT_AUTH_VERIFICATION_TTL: Duration = Duration::from_secs(6
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
     rejected_auth_records: Mutex<HashSet<Vec<u8>>>,
+    // Keep failed API rejection cleanup distinct from failed expiry cleanup
+    // when a later sign-in settles the same still-persisted row.
+    api_rejected_auth_records: Mutex<HashSet<Vec<u8>>>,
     // Browser sessions cannot trust a cached account merely because its
     // encrypted token survived a prior process. Proof is process-local and
     // expires, so failed durable 401 revocation also suspends running peers.
@@ -1592,6 +1595,7 @@ impl DatabaseStore {
         Self {
             conn: Mutex::new(conn),
             rejected_auth_records: Mutex::new(HashSet::new()),
+            api_rejected_auth_records: Mutex::new(HashSet::new()),
             verified_account_auth_records: Mutex::new(HashMap::new()),
         }
     }
@@ -6369,9 +6373,9 @@ impl DatabaseStore {
             .map_err(|error| format!("Failed to inspect current auth record: {error}"))
     }
 
-    /// A rejected row must be durably revoked before a new sign-in captures
-    /// its auth revision. Otherwise the background retry can invalidate the
-    /// new sign-in after it has launched.
+    /// Settle a locally suspended row before launching another sign-in. An
+    /// API rejection preserves the launch revision, while expiry cleanup
+    /// still invalidates earlier sign-ins.
     pub(crate) fn settle_rejected_auth_before_sign_in(&self) -> Result<bool, String> {
         let current = self.load_raw_auth_token().map_err(|error| {
             format!("Cannot start sign-in while auth storage cannot be inspected: {error}")
@@ -6382,7 +6386,13 @@ impl DatabaseStore {
         if !self.rejected_auth_records.lock().unwrap().contains(&current) {
             return Ok(false);
         }
-        self.clear_auth_token_if_current(&current).map_err(|error| {
+        let api_rejected = self.api_rejected_auth_records.lock().unwrap().contains(&current);
+        let result = if api_rejected {
+            self.clear_rejected_auth_token_if_current(&current)
+        } else {
+            self.clear_auth_token_if_current(&current)
+        };
+        result.map_err(|error| {
             format!("Cannot start sign-in until rejected account cleanup is saved: {error}")
         })
     }
@@ -6392,6 +6402,9 @@ impl DatabaseStore {
         let transaction = conn
             .transaction()
             .map_err(|error| format!("Failed to clear auth token: {error}"))?;
+        // An explicit sign-out must invalidate sign-ins already in flight,
+        // even when no auth row remains after a rejected-session cleanup.
+        Self::advance_auth_revision(&transaction, None)?;
         Self::erase_auth_record(&transaction)?;
         transaction
             .commit()
@@ -6399,19 +6412,39 @@ impl DatabaseStore {
     }
 
     pub(crate) fn clear_auth_token_if_current(&self, expected: &[u8]) -> Result<bool, String> {
+        self.clear_auth_token_if_current_with_revision(expected, true)
+    }
+
+    /// Remove an API-rejected credential without invalidating a fresh sign-in
+    /// that another process started before this cleanup could be persisted.
+    pub(crate) fn clear_rejected_auth_token_if_current(
+        &self,
+        expected: &[u8],
+    ) -> Result<bool, String> {
+        self.api_rejected_auth_records.lock().unwrap().insert(expected.to_vec());
+        self.clear_auth_token_if_current_with_revision(expected, false)
+    }
+
+    fn clear_auth_token_if_current_with_revision(
+        &self,
+        expected: &[u8],
+        advance_revision: bool,
+    ) -> Result<bool, String> {
         // Even if SQLite cannot start or commit the revocation transaction,
         // reject this record for local and account-browser access now.
         self.rejected_auth_records.lock().unwrap().insert(expected.to_vec());
         self.verified_account_auth_records.lock().unwrap().remove(expected);
         self.with_current_auth(expected, None, true, |conn| {
             Self::require_persistent_auth_connection(conn)?;
+            if advance_revision {
+                Self::advance_auth_revision(conn, None)?;
+            }
             Self::erase_auth_record(conn)
         })
             .map(|cleared| cleared.is_some())
     }
 
     fn erase_auth_record(conn: &Connection) -> Result<(), String> {
-        Self::advance_auth_revision(conn, None)?;
         Self::revoke_account_sessions(conn, None)?;
         conn.execute(MARK_LEGACY_AUTH_TOKEN_HANDLED, [])
             .map_err(|error| format!("Failed to mark legacy auth token handled: {error}"))?;
@@ -6755,7 +6788,7 @@ mod tests {
         // The peer received a definitive 401, but SQLite could not commit
         // revocation. The serving host has not yet learned of that rejection.
         peer.test_set_query_only(true);
-        assert!(peer.clear_auth_token_if_current(&record).is_err());
+        assert!(peer.clear_rejected_auth_token_if_current(&record).is_err());
         assert_eq!(host.load_raw_auth_token().unwrap(), Some(record.clone()));
         assert!(crate::web_remote::auth::authenticate(&host, browser_token).is_some());
 
@@ -6828,6 +6861,62 @@ mod tests {
             .save_auth_token_if_revision(b"stale-token", None, initial)
             .unwrap());
         assert!(reopened.load_auth_token().is_none());
+    }
+
+    #[test]
+    fn rejected_cleanup_does_not_cancel_a_sign_in_started_in_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let host = DatabaseStore::test_file(&path);
+        let cli = DatabaseStore::test_file(&path);
+        host.save_auth_token(b"rejected-token").unwrap();
+        host.web_remote_insert_account_session(
+            "old-browser", None, None, "old-browser-hash", true, "old-account",
+        ).unwrap();
+        let rejected = host.load_raw_auth_token().unwrap().unwrap();
+
+        // The serving process rejects the old token while the database is
+        // unwritable. The CLI cannot see its in-memory rejection and starts a
+        // fresh sign-in before the serving process can finish cleanup.
+        host.test_set_query_only(true);
+        assert!(host.clear_rejected_auth_token_if_current(&rejected).is_err());
+        let launch_revision = cli.auth_session_revision().unwrap();
+        host.test_set_query_only(false);
+        assert!(host.clear_rejected_auth_token_if_current(&rejected).unwrap());
+        assert_eq!(cli.auth_session_revision().unwrap(), launch_revision);
+        assert!(host.load_raw_auth_token().unwrap().is_none());
+        assert!(host.web_remote_get_session("old-browser").unwrap().revoked);
+
+        assert!(cli.save_auth_token_if_revision(b"fresh-token", None, launch_revision).unwrap());
+        assert_eq!(host.load_raw_auth_token().unwrap().as_deref(), Some(b"fresh-token".as_slice()));
+
+        // Real sign-out and replacement still invalidate a sign-in launched
+        // against the previous revision, including after rejected cleanup.
+        let before_sign_out = cli.auth_session_revision().unwrap();
+        host.clear_auth_token().unwrap();
+        assert!(!cli.save_auth_token_if_revision(b"stale-after-sign-out", None, before_sign_out).unwrap());
+        let before_replacement = cli.auth_session_revision().unwrap();
+        host.save_auth_token(b"replacement-token").unwrap();
+        assert!(!cli.save_auth_token_if_revision(b"stale-after-replacement", None, before_replacement).unwrap());
+        assert_eq!(cli.load_raw_auth_token().unwrap().as_deref(), Some(b"replacement-token".as_slice()));
+    }
+
+    #[test]
+    fn failed_expiry_cleanup_still_invalidates_pending_sign_in_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let host = DatabaseStore::test_file(&path);
+        let cli = DatabaseStore::test_file(&path);
+        host.save_auth_token(b"expired-token").unwrap();
+        let expired = host.load_raw_auth_token().unwrap().unwrap();
+
+        host.test_set_query_only(true);
+        assert!(host.clear_auth_token_if_current(&expired).is_err());
+        let launch_revision = cli.auth_session_revision().unwrap();
+        host.test_set_query_only(false);
+        assert!(host.settle_rejected_auth_before_sign_in().unwrap());
+        assert_eq!(cli.auth_session_revision().unwrap(), launch_revision + 1);
+        assert!(!cli.save_auth_token_if_revision(b"stale-token", None, launch_revision).unwrap());
     }
 
     #[test]

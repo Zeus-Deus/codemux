@@ -385,8 +385,34 @@ impl AuthState {
         record: &AuthRecord,
         on_clear: impl FnOnce(),
     ) -> Result<bool, String> {
+        self.clear_session_if_current_with(db, generation, record, false, on_clear)
+    }
+
+    pub(crate) fn clear_rejected_session_if_current(
+        &self,
+        db: &DatabaseStore,
+        generation: u64,
+        record: &AuthRecord,
+        on_clear: impl FnOnce(),
+    ) -> Result<bool, String> {
+        self.clear_session_if_current_with(db, generation, record, true, on_clear)
+    }
+
+    fn clear_session_if_current_with(
+        &self,
+        db: &DatabaseStore,
+        generation: u64,
+        record: &AuthRecord,
+        rejected: bool,
+        on_clear: impl FnOnce(),
+    ) -> Result<bool, String> {
         self.replace_session_if_current(generation, || {
-            if !db.clear_auth_token_if_current(&record.encrypted)? {
+            let cleared = if rejected {
+                db.clear_rejected_auth_token_if_current(&record.encrypted)?
+            } else {
+                db.clear_auth_token_if_current(&record.encrypted)?
+            };
+            if !cleared {
                 return Ok(None);
             }
             self.clear_local_session();
@@ -914,7 +940,7 @@ fn emit_auth_state<R: tauri::Runtime>(
             })
             .unwrap_or(Ok(false)),
         CallbackVerifyOutcome::Unauthorized => {
-            auth_state.clear_session_if_current(&db, session_generation, &record, || {
+            auth_state.clear_rejected_session_if_current(&db, session_generation, &record, || {
                 emit_callback_auth_state(app, None, None)
             })
         }
@@ -1094,7 +1120,7 @@ mod tests {
         state.set_local_session(Some(&record.stored));
         let (generation, _) = state.session_snapshot(|| ());
         let mut emitted_signed_out = false;
-        let error = state.clear_session_if_current(&db, generation, &record, || {
+        let error = state.clear_rejected_session_if_current(&db, generation, &record, || {
             emitted_signed_out = true;
         }).unwrap_err();
 
@@ -1146,7 +1172,7 @@ mod tests {
             "CREATE TRIGGER reject_auth_clear BEFORE DELETE ON auth_tokens
              BEGIN SELECT RAISE(ABORT, 'fixture rejected clear'); END;",
         ).unwrap();
-        assert!(db.clear_auth_token_if_current(&record.encrypted).is_err());
+        assert!(db.clear_rejected_auth_token_if_current(&record.encrypted).is_err());
         assert!(crate::web_remote::auth::authenticate(&db, browser_token).is_none());
         drop(db);
 
@@ -1160,7 +1186,7 @@ mod tests {
         rusqlite::Connection::open(&db_path).unwrap()
             .execute_batch("DROP TRIGGER reject_auth_clear")
             .unwrap();
-        assert!(reopened.clear_auth_token_if_current(&record.encrypted).unwrap());
+        assert!(reopened.clear_rejected_auth_token_if_current(&record.encrypted).unwrap());
         drop(reopened);
 
         let recovered = DatabaseStore::test_file(&db_path);
@@ -1344,7 +1370,7 @@ mod tests {
         ).unwrap();
         let old_revision = db.auth_session_revision().unwrap();
         db.test_set_query_only(true);
-        assert!(db.clear_auth_token_if_current(old.encrypted()).is_err());
+        assert!(db.clear_rejected_auth_token_if_current(old.encrypted()).is_err());
         assert!(state.generate_csrf_state(&db).unwrap_err().contains("cleanup is saved"));
         assert_eq!(db.auth_session_revision().unwrap(), old_revision);
 
@@ -1352,11 +1378,11 @@ mod tests {
         let (csrf, cleaned_rejection) = state.generate_csrf_state(&db).unwrap();
         assert!(cleaned_rejection);
         let launch_revision = db.auth_session_revision().unwrap();
-        assert_eq!(launch_revision, old_revision + 1);
+        assert_eq!(launch_revision, old_revision);
         assert!(db.load_raw_auth_token().unwrap().is_none());
-        // A retry that already observed the old row cannot advance the launch
-        // revision once this cleanup has committed.
-        assert!(!db.clear_auth_token_if_current(old.encrypted()).unwrap());
+        // A retry that already observed the old row cannot clear a later
+        // callback's new session once this cleanup has committed.
+        assert!(!db.clear_rejected_auth_token_if_current(old.encrypted()).unwrap());
         assert_eq!(db.auth_session_revision().unwrap(), launch_revision);
 
         let launch = state.consume_csrf_state(&csrf).unwrap();
